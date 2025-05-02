@@ -8,6 +8,7 @@ use tokio::sync::Notify;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use crate::fs::fragmented_upload::cleanup_stale_uploads;
 use crate::handlers::error_handlers::handler_404;
 use crate::routes::file_system_routes;
 
@@ -17,6 +18,7 @@ mod structs;
 mod types;
 mod utils;
 mod fs;
+mod statics;
 
 #[tokio::main]
 async fn main() {
@@ -39,6 +41,10 @@ async fn main() {
 }
 
 async fn server() {
+    tokio::spawn(async {
+        cleanup_stale_uploads().await;
+    });
+
     let file_system_port = SocketAddr::from(([127, 0, 0, 1], 50001));
     let file_system_listener = TcpListener::bind(file_system_port).await.unwrap();
     let serve_file_system = file_system_routes::serve_file_system_routes().fallback(handler_404);

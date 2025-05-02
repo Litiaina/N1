@@ -13,7 +13,7 @@ use crate::fs::direct_upload::upload_file;
 use crate::fs::directory_editor::{create_directory, delete_directory, delete_file, rename_file_query};
 use crate::fs::directory_viewer::{stream_file, view_directory, view_file};
 use crate::fs::download_manager::download_file;
-use crate::fs::fragmented_upload::{finalize_merged_fragments, upload_fragments};
+use crate::fs::fragmented_upload::{check_uploaded_chunks, finalize_merged_fragments, upload_fragments};
 use crate::types::shared_state_type::SharedState;
 
 const MAX_FILE_SIZE: usize = 5 * 1024 * 1024 * 1024;
@@ -28,6 +28,7 @@ pub fn serve_file_system_routes() -> Router {
         .route("/files/directory/delete/{*path}", delete(delete_directory))
         .route("/files/upload/{*path}", post(upload_file))
         .route("/files/upload/v2/{*path}", post(upload_fragments)).with_state(state)
+        .route("/files/upload/check/{*path}", get(check_uploaded_chunks))
         .route("/files/finalize/{*path}", post(finalize_merged_fragments))
         .route("/files/view/{*path}", get(view_file))
         .route("/files/stream/{*path}", get(stream_file))
