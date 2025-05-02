@@ -9,11 +9,9 @@ use tokio::fs;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{error, warn};
+use crate::fs::fs_constants::{DEFAULT_BUFFER_SIZE, MAX_CONCURRENT};
 use crate::utils::directory_validation::sanitize_directory_name;
 use crate::utils::file_extension_util::get_file_extension;
-
-const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
-const MAX_CONCURRENT: usize = 10;
 
 pub async fn upload_file(
     Path(directory): Path<String>,

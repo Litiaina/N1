@@ -6,20 +6,34 @@ use axum::{
     routing::post,
     Router,
 };
+use axum::routing::{delete, get, put};
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
-
-use crate::fs::{direct_upload, fragmented_upload};
+use crate::fs::direct_upload::upload_file;
+use crate::fs::directory_editor::{create_directory, delete_directory, delete_file, rename_file_query};
+use crate::fs::directory_viewer::{stream_file, view_directory, view_file};
+use crate::fs::download_manager::download_file;
+use crate::fs::fragmented_upload::{finalize_merged_fragments, upload_fragments};
 use crate::types::shared_state_type::SharedState;
 
 const MAX_FILE_SIZE: usize = 5 * 1024 * 1024 * 1024;
 
 pub fn serve_file_system_routes() -> Router {
+
     let state: SharedState = Arc::new(Mutex::new(HashMap::new()));
+
     Router::new()
-        .route("/files/upload/{*path}", post(direct_upload::upload_file))
-        .route("/files/upload/v2/{*path}", post(fragmented_upload::upload_fragments)).with_state(state)
-        .route("/files/finalize/{*path}", post(fragmented_upload::finalize_merged_fragments))
+        .route("/files/{*path}", get(view_directory))
+        .route("/files/directory/create/{*path}", post(create_directory))
+        .route("/files/directory/delete/{*path}", delete(delete_directory))
+        .route("/files/upload/{*path}", post(upload_file))
+        .route("/files/upload/v2/{*path}", post(upload_fragments)).with_state(state)
+        .route("/files/finalize/{*path}", post(finalize_merged_fragments))
+        .route("/files/view/{*path}", get(view_file))
+        .route("/files/stream/{*path}", get(stream_file))
+        .route("/files/download/{*path}", get(download_file))
+        .route("/files/rename/{*path}", put(rename_file_query))
+        .route("/files/delete/{*path}", post(delete_file))
         .layer(DefaultBodyLimit::max(MAX_FILE_SIZE))
         .layer(
             CorsLayer::new()

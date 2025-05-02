@@ -129,7 +129,7 @@ pub async fn finalize_merged_fragments(Path(path): Path<String>) -> impl IntoRes
         if merged_path.exists() && merged_path.extension().and_then(|e| e.to_str()) == Some("merged") {
             let new_path = merged_path.with_extension(ext);
             if let Err(e) = fs::rename(merged_path, &new_path).await {
-                error!("Failed to rename {:?} -> {:?}: {}", merged_path, new_path, e);
+                info!("Failed to rename {:?} -> {:?}: {}", merged_path, new_path, e);
                 continue;
             }
 
