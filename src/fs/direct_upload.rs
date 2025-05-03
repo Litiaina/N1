@@ -8,7 +8,7 @@ use serde_json::json;
 use tokio::fs;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex, Semaphore};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use crate::fs::fs_constants::{DEFAULT_BUFFER_SIZE, MAX_CONCURRENT};
 use crate::utils::directory_validation::sanitize_directory_name;
 use crate::utils::file_extension_util::get_file_extension;
@@ -19,79 +19,103 @@ pub async fn upload_file(
 ) -> Result<impl IntoResponse, StatusCode> {
     let sanitized_directory = sanitize_directory_name(&directory);
     let directory_path = PathBuf::from(format!("storage-files/{}", sanitized_directory));
+
     fs::create_dir_all(&directory_path)
         .await
         .map_err(|err| {
-            error!("Failed to create 'storage-files' folder: {}", err);
+            error!("Failed to create directory: {err}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    while let Some(mut field) = multipart.next_field().await.map_err(|error| {
-        tracing::error!("Error getting next field: {error}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })? {
-        let name = field
-            .name()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "name".to_owned());
+    loop {
+        let mut field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(err) => {
+                error!("Failed to read field: {err}");
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
 
-        let file_type = field
-            .content_type()
-            .map(ToString::to_string)
-            .ok_or_else(|| {
-                warn!("No content type found");
-                StatusCode::BAD_REQUEST
-            })?;
+        let name = field.name().unwrap_or("upload").to_string();
+        let content_type = field.content_type().ok_or_else(|| {
+            warn!("Missing content type");
+            StatusCode::BAD_REQUEST
+        })?;
 
-        let file_extension = get_file_extension(&file_type).ok_or_else(|| {
-            error!("Unsupported file type: {}", file_type);
+        let ext = get_file_extension(content_type).ok_or_else(|| {
+            error!("Unsupported content type: {content_type}");
             StatusCode::UNSUPPORTED_MEDIA_TYPE
         })?;
 
-        let file_path = directory_path.join(format!("{}.{}", name, file_extension));
-        let file = fs::File::create(&file_path).await.map_err(|error| {
-            tracing::error!("Error creating file: {error}");
+        let temp_filename = format!("{}.{}.part", name, ext);
+        let final_filename = format!("{}.{}", name, ext);
+        let temp_path = directory_path.join(&temp_filename);
+        let final_path = directory_path.join(&final_filename);
+
+        let file = fs::File::create(&temp_path).await.map_err(|err| {
+            error!("Failed to create temp file: {err}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-        let writer = BufWriter::with_capacity(DEFAULT_BUFFER_SIZE, file);
-        let writer = Arc::new(Mutex::new(writer));
-
+        let writer = Arc::new(Mutex::new(BufWriter::with_capacity(DEFAULT_BUFFER_SIZE, file)));
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
-        let mut chunk_tasks = vec![];
+        let mut tasks = Vec::new();
+        let mut total_bytes = 0usize;
 
-        while let Some(data) = field.chunk().await.map_err(|error| {
-            tracing::error!("Error getting chunk: {error}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })? {
+        loop {
+            let chunk = match field.chunk().await {
+                Ok(Some(data)) => data,
+                Ok(None) => break,
+                Err(err) => {
+                    error!("Failed to read chunk: {err}");
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            };
+
+            total_bytes += chunk.len();
+            let writer_clone = Arc::clone(&writer);
             let permit = semaphore.clone().acquire_owned().await.unwrap();
-            let writer_clone = writer.clone();
+            let chunk_copy = chunk.clone();
 
-            let chunk_task = tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let mut writer = writer_clone.lock().await;
-                writer.write_all(&data).await.map_err(|error| {
-                    tracing::error!("Error writing chunk to file: {error}");
+                writer.write_all(&chunk_copy).await.map_err(|err| {
+                    error!("Failed to write chunk: {err}");
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
-
                 drop(permit);
-                Ok::<(), StatusCode>(())
+                Ok::<_, StatusCode>(())
             });
 
-            chunk_tasks.push(chunk_task);
+            tasks.push(task);
         }
 
-        for chunk_task in chunk_tasks {
-            chunk_task.await.map_err(|error| {
-                tracing::error!("Chunk write task failed: {error:?}");
+        for task in tasks {
+            task.await.map_err(|err| {
+                error!("Join error during chunk write: {err:?}");
                 StatusCode::INTERNAL_SERVER_ERROR
             })??;
         }
 
-        writer.lock().await.flush().await.map_err(|error| {
-            tracing::error!("Error flushing file buffer: {error}");
+        let mut writer = writer.lock().await;
+        writer.flush().await.map_err(|err| {
+            error!("Failed to flush buffer: {err}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+        writer.get_mut().sync_all().await.map_err(|err| {
+            error!("Failed to sync file to disk: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        fs::rename(&temp_path, &final_path).await.map_err(|err| {
+            error!("Failed to rename file: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        info!(
+            "Uploaded '{}' to '{}', total bytes: {}",
+            name, sanitized_directory, total_bytes
+        );
     }
 
-    Ok(Json(json!({"message": "File uploaded successfully"})))
+    Ok(Json(json!({ "message": "File uploaded successfully" })))
 }
