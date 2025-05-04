@@ -10,7 +10,7 @@ use axum::routing::{delete, get, put};
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 use crate::fs::direct_upload::upload_file;
-use crate::fs::directory_editor::{create_directory, delete_directory, delete_file, rename_file_query};
+use crate::fs::directory_manager::{create_directory, delete_directory, delete_file, rename_file_query};
 use crate::fs::directory_viewer::{stream_file, view_directory, view_file};
 use crate::fs::download_manager::download_file;
 use crate::fs::fragmented_upload::{check_uploaded_chunks, finalize_merged_fragments, upload_fragments};
