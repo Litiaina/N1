@@ -12,6 +12,7 @@ use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout};
 use tracing::{error, info, warn};
+use walkdir::WalkDir;
 use crate::fs::fs_constants::{CLEANUP_INTERVAL, FILE_TTL, IO_TIMEOUT, MAX_CHUNK_SIZE};
 use crate::statics::merge_semaphore_static::MERGE_SEMAPHORE;
 use crate::structs::file_metadata_struct::FileMetadata;
@@ -166,22 +167,65 @@ pub async fn cleanup_stale_uploads() {
         sleep(CLEANUP_INTERVAL).await;
 
         let root = PathBuf::from("storage-files");
-        if let Ok(mut dirs) = fs::read_dir(&root).await {
-            while let Ok(Some(entry)) = dirs.next_entry().await {
-                if let Ok(mut uploads) = fs::read_dir(entry.path()).await {
-                    while let Ok(Some(upload)) = uploads.next_entry().await {
-                        if let Ok(metadata) = fs::metadata(upload.path()).await {
-                            if let Ok(modified) = metadata.modified() {
-                                if SystemTime::now().duration_since(modified).unwrap_or(Duration::ZERO) > FILE_TTL {
-                                    let _ = fs::remove_dir_all(upload.path()).await;
-                                }
-                            }
-                        }
+
+        for entry in WalkDir::new(&root)
+            .min_depth(2)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_dir())
+        {
+            let dir_path = entry.path().to_path_buf();
+
+            match is_unfinished_upload(&dir_path, FILE_TTL).await {
+                Ok(true) => {
+                    match fs::remove_dir_all(&dir_path).await {
+                        Ok(_) => info!("✅ Deleted stale unfinished upload: {:?}", dir_path),
+                        Err(e) => warn!("⚠️ Failed to delete {:?}: {:?}", dir_path, e),
                     }
+                }
+                Ok(false) => {
+                    info!("⏩ Skipped (not stale or finalized): {:?}", dir_path);
+                }
+                Err(e) => {
+                    warn!("⚠️ Could not check {:?}: {:?}", dir_path, e);
                 }
             }
         }
     }
+}
+
+pub async fn is_unfinished_upload(dir: &std::path::Path, ttl: Duration) -> Result<bool, io::Error> {
+    let mut oldest_chunk_time: Option<SystemTime> = None;
+    let mut found_chunk = false;
+
+    let mut entries = fs::read_dir(dir).await?;
+
+    while let Some(entry) = entries.next_entry().await? {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+
+        if file_name.starts_with("chunk_") {
+            found_chunk = true;
+            let metadata = entry.metadata().await?;
+            if let Ok(modified) = metadata.modified() {
+                oldest_chunk_time = Some(match oldest_chunk_time {
+                    Some(oldest) => oldest.min(modified),
+                    None => modified,
+                });
+            }
+        }
+    }
+
+    if !found_chunk {
+        return Ok(false);
+    }
+
+    if let Some(time) = oldest_chunk_time {
+        let age = SystemTime::now().duration_since(time).unwrap_or(Duration::ZERO);
+        return Ok(age > ttl);
+    }
+
+    Ok(false)
 }
 
 async fn merge_fragments(

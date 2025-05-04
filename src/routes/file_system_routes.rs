@@ -34,7 +34,7 @@ pub fn serve_file_system_routes() -> Router {
         .route("/files/stream/{*path}", get(stream_file))
         .route("/files/download/{*path}", get(download_file))
         .route("/files/rename/{*path}", put(rename_file_query))
-        .route("/files/delete/{*path}", post(delete_file))
+        .route("/files/delete/{*path}", delete(delete_file))
         .layer(DefaultBodyLimit::max(MAX_FILE_SIZE))
         .layer(
             CorsLayer::new()
