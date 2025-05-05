@@ -31,6 +31,7 @@ pub async fn upload_fragments(
         total_chunks,
         original_filename,
         mime_type,
+        checksum,
     } = params;
 
     if chunk_index >= total_chunks {
@@ -97,12 +98,25 @@ pub async fn upload_fragments(
         return (StatusCode::INTERNAL_SERVER_ERROR, "Flush failed").into_response();
     }
 
+    let actual_checksum = hex::encode(hasher.finalize());
+
+    if let Some(expected_checksum) = checksum {
+        if expected_checksum != actual_checksum {
+            error!(
+                "Checksum mismatch for chunk {}: expected {}, got {}",
+                chunk_index, expected_checksum, actual_checksum
+            );
+            let _ = fs::remove_file(&temp_path).await;
+            return (StatusCode::BAD_REQUEST, "Checksum mismatch").into_response();
+        }
+    }
+
     if let Err(e) = fs::rename(&temp_path, &file_path).await {
         error!("Rename error: {:?}", e);
         return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to finalize chunk file").into_response();
     }
 
-    info!("Chunk {} written with checksum {:?}", chunk_index, hex::encode(hasher.finalize()));
+    info!("Chunk {} written and verified with checksum {}", chunk_index, actual_checksum);
 
     let mut should_merge = false;
 
@@ -141,7 +155,7 @@ pub async fn upload_fragments(
         return (StatusCode::ACCEPTED, "Final chunk received, merge started").into_response();
     }
 
-    (StatusCode::OK, "Chunk received").into_response()
+    (StatusCode::OK, "Chunk received and validated").into_response()
 }
 
 pub async fn check_uploaded_fragments(

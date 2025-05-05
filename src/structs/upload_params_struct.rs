@@ -7,4 +7,5 @@ pub struct UploadParams {
     pub total_chunks: usize,
     pub original_filename: Option<String>,
     pub mime_type: Option<String>,
+    pub checksum: Option<String>
 }
