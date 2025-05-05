@@ -7,13 +7,12 @@ use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::{fs, io};
-use tokio::fs::File;
+use tokio::fs::{File, ReadDir};
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::Semaphore;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use tracing::{error, info, warn};
-use walkdir::WalkDir;
-use crate::fs::fs_constants::{CLEANUP_INTERVAL, FILE_TTL, IO_TIMEOUT, MAX_CHUNK_SIZE};
+use crate::fs::fs_constants::{IO_TIMEOUT, MAX_CHUNK_SIZE};
 use crate::statics::merge_semaphore_static::MERGE_SEMAPHORE;
 use crate::structs::file_metadata_struct::FileMetadata;
 use crate::structs::upload_params_struct::UploadParams;
@@ -105,47 +104,47 @@ pub async fn upload_fragments(
 
     info!("Chunk {} written with checksum {:?}", chunk_index, hex::encode(hasher.finalize()));
 
+    let mut should_merge = false;
+
     {
         let mut guard = state.lock().await;
         let entry = guard.entry(file_id.clone()).or_insert_with(|| vec![None; total_chunks]);
-        entry[chunk_index] = Some(file_path.clone());
+        entry[chunk_index] = Some(file_path);
 
         if entry.iter().all(|x| x.is_some()) {
-            drop(guard);
-
-            let sem = MERGE_SEMAPHORE.get_or_init(|| async {
-                Semaphore::new(2)
-            }).await;
-
-            let permit = match sem.acquire().await {
-                Ok(p) => p,
-                Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "Merge semaphore error").into_response(),
-            };
-
-            let result = merge_fragments(
-                &sanitized_directory,
-                &file_id,
-                total_chunks,
-                original_filename.clone(),
-                mime_type.clone(),
-            ).await;
-
-            drop(permit);
-
-            return match result {
-                Ok(_) => (StatusCode::OK, "File assembled").into_response(),
-                Err(err) => {
-                    error!("Merge error: {}", err);
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Merge failed").into_response()
-                }
-            };
+            should_merge = true;
         }
+    }
+
+    if should_merge {
+        let dir = sanitized_directory;
+        let id = file_id;
+        let name = original_filename;
+        let mime = mime_type;
+
+        tokio::spawn(async move {
+            let sem = MERGE_SEMAPHORE
+                .get_or_init(|| async { Semaphore::new(2) })
+                .await;
+
+            let _permit = sem.acquire().await;
+
+            if let Err(err) = assemble_fragments(&dir, &id, total_chunks, name.clone(), mime.clone()).await {
+                error!("Async merge failed for {}: {:?}", id, err);
+            } else {
+                if let Err(e) = finalize_assembled_fragment_after_merge(&dir).await {
+                    error!("Finalization failed after merge for {}: {:?}", id, e);
+                }
+            }
+        });
+
+        return (StatusCode::ACCEPTED, "Final chunk received, merge started").into_response();
     }
 
     (StatusCode::OK, "Chunk received").into_response()
 }
 
-pub async fn check_uploaded_chunks(
+pub async fn check_uploaded_fragments(
     Path(path): Path<String>,
     Query(params): Query<UploadParams>,
 ) -> impl IntoResponse {
@@ -160,38 +159,6 @@ pub async fn check_uploaded_chunks(
     }
 
     (StatusCode::OK, axum::Json(uploaded)).into_response()
-}
-
-pub async fn cleanup_stale_uploads() {
-    loop {
-        sleep(CLEANUP_INTERVAL).await;
-
-        let root = PathBuf::from("storage-files");
-
-        for entry in WalkDir::new(&root)
-            .min_depth(2)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_dir())
-        {
-            let dir_path = entry.path().to_path_buf();
-
-            match is_unfinished_upload(&dir_path, FILE_TTL).await {
-                Ok(true) => {
-                    match fs::remove_dir_all(&dir_path).await {
-                        Ok(_) => info!("✅ Deleted stale unfinished upload: {:?}", dir_path),
-                        Err(e) => warn!("⚠️ Failed to delete {:?}: {:?}", dir_path, e),
-                    }
-                }
-                Ok(false) => {
-                    info!("⏩ Skipped (not stale or finalized): {:?}", dir_path);
-                }
-                Err(e) => {
-                    warn!("⚠️ Could not check {:?}: {:?}", dir_path, e);
-                }
-            }
-        }
-    }
 }
 
 pub async fn is_unfinished_upload(dir: &std::path::Path, ttl: Duration) -> Result<bool, io::Error> {
@@ -228,7 +195,7 @@ pub async fn is_unfinished_upload(dir: &std::path::Path, ttl: Duration) -> Resul
     Ok(false)
 }
 
-async fn merge_fragments(
+async fn assemble_fragments(
     directory: &str,
     file_id: &str,
     total_chunks: usize,
@@ -270,16 +237,7 @@ async fn merge_fragments(
     Ok(())
 }
 
-pub async fn finalize_merged_fragments(Path(path): Path<String>) -> impl IntoResponse {
-    let sanitized_directory = sanitize_directory_name(&path);
-    let new_dir = format!("storage-files/{}", sanitized_directory);
-    let uploads_dir = std::path::Path::new(&new_dir);
-
-    let mut entries = match fs::read_dir(uploads_dir).await {
-        Ok(entries) => entries,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read uploads dir: {}", e)).into_response(),
-    };
-
+async fn process_finalization(mut entries: ReadDir) -> usize {
     let mut rename_tasks = FuturesUnordered::new();
 
     while let Ok(Some(entry)) = entries.next_entry().await {
@@ -312,6 +270,37 @@ pub async fn finalize_merged_fragments(Path(path): Path<String>) -> impl IntoRes
             renamed_files += 1;
         }
     }
+
+    if renamed_files > 0 {
+        info!("{} files assembled", renamed_files)
+    } else {
+        warn!("{} files assembled", renamed_files)
+    }
+
+    renamed_files
+}
+
+pub async fn finalize_assembled_fragment_after_merge(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let sanitized_directory = sanitize_directory_name(&path);
+    let new_dir = format!("storage-files/{}", sanitized_directory);
+    let uploads_dir = std::path::Path::new(&new_dir);
+    let entries = fs::read_dir(uploads_dir).await?;
+    process_finalization(entries).await;
+
+    Ok(())
+}
+
+pub async fn finalize_assembled_fragments(Path(path): Path<String>) -> impl IntoResponse {
+    let sanitized_directory = sanitize_directory_name(&path);
+    let new_dir = format!("storage-files/{}", sanitized_directory);
+    let uploads_dir = std::path::Path::new(&new_dir);
+
+    let entries = match fs::read_dir(uploads_dir).await {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read uploads dir: {}", e)).into_response(),
+    };
+
+    let renamed_files = process_finalization(entries).await;
 
     (StatusCode::OK, format!("{} files successfully assembled", renamed_files)).into_response()
 }

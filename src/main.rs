@@ -8,7 +8,7 @@ use tokio::sync::Notify;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use crate::fs::fragmented_upload::cleanup_stale_uploads;
+use crate::fs::cleanup_manager::cleanup_stale_uploads;
 use crate::handlers::error_handlers::handler_404;
 use crate::routes::file_system_routes;
 
