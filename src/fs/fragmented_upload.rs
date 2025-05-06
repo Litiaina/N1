@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -173,40 +172,6 @@ pub async fn check_uploaded_fragments(
     }
 
     (StatusCode::OK, axum::Json(uploaded)).into_response()
-}
-
-pub async fn is_unfinished_upload(dir: &std::path::Path, ttl: Duration) -> Result<bool, io::Error> {
-    let mut oldest_chunk_time: Option<SystemTime> = None;
-    let mut found_chunk = false;
-
-    let mut entries = fs::read_dir(dir).await?;
-
-    while let Some(entry) = entries.next_entry().await? {
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy();
-
-        if file_name.starts_with("chunk_") {
-            found_chunk = true;
-            let metadata = entry.metadata().await?;
-            if let Ok(modified) = metadata.modified() {
-                oldest_chunk_time = Some(match oldest_chunk_time {
-                    Some(oldest) => oldest.min(modified),
-                    None => modified,
-                });
-            }
-        }
-    }
-
-    if !found_chunk {
-        return Ok(false);
-    }
-
-    if let Some(time) = oldest_chunk_time {
-        let age = SystemTime::now().duration_since(time).unwrap_or(Duration::ZERO);
-        return Ok(age > ttl);
-    }
-
-    Ok(false)
 }
 
 async fn assemble_fragments(
