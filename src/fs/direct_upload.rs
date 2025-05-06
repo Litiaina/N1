@@ -37,19 +37,44 @@ pub async fn upload_file(
             }
         };
 
-        let name = field.name().unwrap_or("upload").to_string();
+        let original_filename = field.file_name().unwrap_or("upload").to_string();
         let content_type = field.content_type().ok_or_else(|| {
             warn!("Missing content type");
             StatusCode::BAD_REQUEST
         })?;
 
-        let ext = get_file_extension(content_type).ok_or_else(|| {
-            error!("Unsupported content type: {content_type}");
-            StatusCode::UNSUPPORTED_MEDIA_TYPE
-        })?;
+        let path = std::path::Path::new(&original_filename);
+        let stem = path.file_stem()
+            .map(|s| s.to_string_lossy())
+            .unwrap_or_else(|| "upload".into());
+        let ext = path.extension()
+            .map(|e| e.to_string_lossy())
+            .or_else(|| get_file_extension(content_type).map(|e| e.into()))
+            .ok_or_else(|| {
+                error!("Could not determine file extension for: {original_filename}");
+                StatusCode::UNSUPPORTED_MEDIA_TYPE
+            })?;
 
-        let temp_filename = format!("{}.{}.part", name, ext);
-        let final_filename = format!("{}.{}", name, ext);
+        let mut counter = 0;
+        let final_filename = loop {
+            let candidate = if counter == 0 {
+                format!("{}.{}", stem, ext)
+            } else {
+                format!("{}[{}].{}", stem, counter, ext)
+            };
+            let test_path = directory_path.join(&candidate);
+
+            if !fs::try_exists(&test_path).await.map_err(|err| {
+                error!("Failed to check for existing file: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })? {
+                break candidate;
+            }
+
+            counter += 1;
+        };
+
+        let temp_filename = format!("{}.part", final_filename);
         let temp_path = directory_path.join(&temp_filename);
         let final_path = directory_path.join(&final_filename);
 
@@ -113,7 +138,7 @@ pub async fn upload_file(
 
         info!(
             "Uploaded '{}' to '{}', total bytes: {}",
-            name, sanitized_directory, total_bytes
+            final_filename, sanitized_directory, total_bytes
         );
     }
 
