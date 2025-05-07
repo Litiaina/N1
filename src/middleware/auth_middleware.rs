@@ -62,7 +62,7 @@ pub async fn auth(req: Request, next: Next) -> Response {
 async fn validate_api_key(api_key: &str) -> Result<bool, mongodb::error::Error> {
     get_collection("users")
         .await
-        .find_one(doc! { "api_key": api_key }, None)
+        .find_one(doc! { "api_key": api_key })
         .await
         .map(|user| user.is_some())
 }
