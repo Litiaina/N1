@@ -24,3 +24,5 @@ hex = "0.4.3"
 sha2 = "0.10.9"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 axum-extra = "0.10.1"
+url = "2.5.4"
+mongodb = "2.8.2"

@@ -15,6 +15,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use crate::fs::cleanup_manager::cleanup_stale_uploads;
 use crate::handlers::error_handlers::handler_404;
+use crate::middleware::auth_middleware::auth;
 use crate::routes::file_system_routes;
 use crate::structs::port_structs::Ports;
 
@@ -25,6 +26,8 @@ mod types;
 mod utils;
 mod fs;
 mod statics;
+mod middleware;
+mod database_api;
 
 #[tokio::main]
 async fn main() {
@@ -56,6 +59,21 @@ async fn server() {
         https: 50001,
     };
 
+    //EXECUTE THIS FOR BUILD RELEASE
+    // let exe_dir = env::current_exe()
+    //     .expect("Failed to find executable path")
+    //     .parent()
+    //     .expect("Failed to get executable directory")
+    //     .to_path_buf();
+    //
+    // let config = RustlsConfig::from_pem_file(
+    //     exe_dir.join("cert.pem"),
+    //     exe_dir.join("key.pem"),
+    // )
+    //     .await
+    //     .unwrap();
+
+    //EXECUTE THIS FOR DEBUG DEVELOPMENT
     let config = RustlsConfig::from_pem_file(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("certificates")
@@ -68,7 +86,7 @@ async fn server() {
         .unwrap();
 
     let file_system_port = SocketAddr::from(([127, 0, 0, 1], file_system_ports.https));
-    let serve_file_system = file_system_routes::serve_file_system_routes().fallback(handler_404);
+    let serve_file_system = file_system_routes::serve_file_system_routes().layer(axum::middleware::from_fn(auth)).fallback(handler_404);
 
     let file_system_task = tokio::spawn(serve(
         file_system_port,
