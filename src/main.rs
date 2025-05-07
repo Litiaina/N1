@@ -1,16 +1,22 @@
+use axum::handler::HandlerWithoutStateExt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
-use axum::Router;
+use std::time::Duration;
+use axum::http::{StatusCode, Uri};
+use axum::http::uri::Authority;
+use axum::{BoxError, Router};
+use axum::response::Redirect;
+use axum_extra::extract::Host;
+use axum_server::tls_rustls::RustlsConfig;
 use chrono::Local;
-use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::Notify;
-use tower_http::trace::TraceLayer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use crate::fs::cleanup_manager::cleanup_stale_uploads;
 use crate::handlers::error_handlers::handler_404;
 use crate::routes::file_system_routes;
+use crate::structs::port_structs::Ports;
 
 mod handlers;
 mod routes;
@@ -45,35 +51,101 @@ async fn server() {
         cleanup_stale_uploads().await;
     });
 
-    let file_system_port = SocketAddr::from(([127, 0, 0, 1], 50001));
-    let file_system_listener = TcpListener::bind(file_system_port).await.unwrap();
+    let file_system_ports = Ports {
+        http: 3001,
+        https: 3000,
+    };
+
+    let config = RustlsConfig::from_pem_file(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("certificates")
+            .join("cert.pem"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("certificates")
+            .join("key.pem"),
+    )
+        .await
+        .unwrap();
+
+    let file_system_port = SocketAddr::from(([127, 0, 0, 1], file_system_ports.https));
     let serve_file_system = file_system_routes::serve_file_system_routes().fallback(handler_404);
-    let shutdown_notify = Arc::new(Notify::new());
 
     let file_system_task = tokio::spawn(serve(
-        file_system_listener,
+        file_system_port,
         serve_file_system,
-        "file_system",
-        shutdown_notify.clone(),
+        Arc::from("file-system".to_string()),
+        file_system_ports,
+        config
     ));
 
-    let _ = tokio::join!(
-        file_system_task
+    let _ =  tokio::join!(
+        file_system_task,
     );
 }
 
-async fn serve(listener: TcpListener, app: Router, name: &str, shutdown_notify: Arc<Notify>) {
-    tracing::info!("{} => {}", name, listener.local_addr().unwrap());
-    if let Err(err) = axum::serve(listener, app.layer(TraceLayer::new_for_http()))
-        .with_graceful_shutdown(shutdown_signal(shutdown_notify))
-        .await
-    {
-        eprintln!("Error serving {}: {}", name, err);
-    }
-    println!("{} => service terminated", name);
+async fn serve(socket: SocketAddr, app: Router, name: Arc<String>, ports: Ports, cert: RustlsConfig) {
+    tracing::info!("{} on port => {} type: https", name, socket);
+
+    let handle = axum_server::Handle::new();
+
+    let server_name_for_task = Arc::clone(&name);
+    let shutdown_future = shutdown_signal(Arc::clone(&server_name_for_task), handle.clone());
+    tokio::spawn(redirect_http_to_https(server_name_for_task, ports, shutdown_future));
+
+    let mut server = axum_server::bind_rustls(socket, cert).handle(handle);
+    server.http_builder().http2().enable_connect_protocol();
+    server.serve(app.into_make_service()).await.unwrap();
 }
 
-async fn shutdown_signal(shutdown_notify: Arc<Notify>) {
+async fn redirect_http_to_https<F>(name: Arc<String>, ports: Ports, signal: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    fn make_https(host: &str, uri: Uri, https_port: u16) -> Result<Uri, BoxError> {
+        let mut parts = uri.into_parts();
+
+        parts.scheme = Some(axum::http::uri::Scheme::HTTPS);
+
+        if parts.path_and_query.is_none() {
+            parts.path_and_query = Some("/".parse().unwrap());
+        }
+
+        let authority: Authority = host.parse()?;
+        let bare_host = match authority.port() {
+            Some(port_struct) => authority
+                .as_str()
+                .strip_suffix(port_struct.as_str())
+                .unwrap()
+                .strip_suffix(':')
+                .unwrap(),
+            None => authority.as_str(),
+        };
+
+        parts.authority = Some(format!("{bare_host}:{https_port}").parse()?);
+
+        Ok(Uri::from_parts(parts)?)
+    }
+
+    let redirect = move |Host(host): Host, uri: Uri| async move {
+        match make_https(&host, uri, ports.https) {
+            Ok(uri) => Ok(Redirect::permanent(&uri.to_string())),
+            Err(error) => {
+                tracing::warn!(%error, "failed to convert URI to HTTPS");
+                Err(StatusCode::BAD_REQUEST)
+            }
+        }
+    };
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], ports.http));
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    tracing::info!("{} on port => {} type: http", name, addr);
+    axum::serve(listener, redirect.into_make_service())
+        .with_graceful_shutdown(signal)
+        .await
+        .unwrap();
+}
+
+async fn shutdown_signal(name: Arc<String>, handle: axum_server::Handle) {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -96,5 +168,6 @@ async fn shutdown_signal(shutdown_notify: Arc<Notify>) {
         _ = terminate => {},
     }
 
-    shutdown_notify.notify_one();
+    tracing::info!("{} => shutdown received", name);
+    handle.graceful_shutdown(Some(Duration::from_secs(10)));
 }

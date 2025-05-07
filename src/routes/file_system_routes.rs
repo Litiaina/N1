@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use axum::{
     extract::DefaultBodyLimit,
-    http::{header::CONTENT_TYPE, Method},
+    http::Method,
     routing::post,
     Router,
 };
-use axum::http::StatusCode;
+use axum::http::{HeaderName, StatusCode};
 use axum::routing::{delete, get, put};
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
@@ -41,14 +41,18 @@ pub fn serve_file_system_routes() -> Router {
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
+                .allow_headers([
+                    HeaderName::from_static("x-api-key"),
+                    HeaderName::from_static("content-type"),
+                ])
                 .allow_methods([
                     Method::GET,
                     Method::POST,
                     Method::PATCH,
                     Method::PUT,
                     Method::DELETE,
+                    Method::OPTIONS
                 ])
-                .allow_headers([CONTENT_TYPE]),
         )
 }
 
