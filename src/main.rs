@@ -17,7 +17,7 @@ use crate::fs::cleanup_manager::cleanup_stale_uploads;
 use crate::handlers::error_handlers::handler_404;
 use crate::middleware::auth_middleware::auth;
 use crate::routes::file_system_routes;
-use crate::structs::port_structs::Ports;
+use crate::structs::port_struct::Ports;
 
 mod handlers;
 mod routes;
