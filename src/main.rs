@@ -52,8 +52,8 @@ async fn server() {
     });
 
     let file_system_ports = Ports {
-        http: 3001,
-        https: 3000,
+        http: 51000,
+        https: 50001,
     };
 
     let config = RustlsConfig::from_pem_file(
