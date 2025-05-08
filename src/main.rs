@@ -1,6 +1,6 @@
+use std::env;
 use axum::handler::HandlerWithoutStateExt;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use axum::http::{Method, StatusCode, Uri};
@@ -61,28 +61,15 @@ async fn server() {
         https: 50001,
     };
 
-    //EXECUTE THIS FOR BUILD RELEASE
-    // let exe_dir = env::current_exe()
-    //     .expect("Failed to find executable path")
-    //     .parent()
-    //     .expect("Failed to get executable directory")
-    //     .to_path_buf();
-    //
-    // let config = RustsConfig::from_pem_file(
-    //     exe_dir.join("cert.pem"),
-    //     exe_dir.join("key.pem"),
-    // )
-    //     .await
-    //     .unwrap();
+    let exe_dir = env::current_exe()
+        .expect("Failed to find executable path")
+        .parent()
+        .expect("Failed to get executable directory")
+        .to_path_buf();
 
-    //EXECUTE THIS FOR DEBUG DEVELOPMENT
     let config = RustlsConfig::from_pem_file(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("certificates")
-            .join("cert.pem"),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("certificates")
-            .join("key.pem"),
+        exe_dir.join("cert.pem"),
+        exe_dir.join("key.pem"),
     )
         .await
         .unwrap();
