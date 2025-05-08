@@ -5,9 +5,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use axum::http::Method;
-use mongodb::bson::doc;
 use tracing::{error, warn};
-use crate::database_api::database::get_collection;
+use crate::validation::database_validation::validate_api_key;
 
 pub async fn auth(req: Request, next: Next) -> Response {
     let uri = req.uri();
@@ -57,14 +56,6 @@ pub async fn auth(req: Request, next: Next) -> Response {
             internal_server_error("Database error while validating API key")
         }
     }
-}
-
-async fn validate_api_key(api_key: &str) -> Result<bool, mongodb::error::Error> {
-    get_collection("users")
-        .await
-        .find_one(doc! { "api_key": api_key })
-        .await
-        .map(|user| user.is_some())
 }
 
 fn unauthorized_response(reason: &str) -> Response {

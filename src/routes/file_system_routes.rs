@@ -24,24 +24,31 @@ pub fn serve_file_system_routes() -> Router {
     let state: SharedState = Arc::new(Mutex::new(HashMap::new()));
 
     Router::new()
-        .route("/files/{*path}", get(view_directory))
-        .route("/files/directory/create/{*path}", post(create_directory))
-        .route("/files/directory/delete/{*path}", delete(delete_directory))
-        .route("/files/upload/{*path}", post(upload_file))
-        .route("/files/upload/v2/{*path}", post(upload_fragments)).with_state(state)
-        .route("/files/upload/check/{*path}", get(check_uploaded_fragments))
-        .route("/files/finalize/{*path}", post(finalize_assembled_fragments))
-        .route("/files/view/{*path}", get(view_file))
-        .route("/files/stream/{*path}", get(stream_file))
-        .route("/files/download/{*path}", get(download_file))
-        .route("/files/rename/{*path}", put(rename_file_query))
-        .route("/files/delete/{*path}", delete(delete_file))
+        .route("/dir", get(view_directory))
+        .route("/dir/{*path}", get(view_directory))
+        .route("/dir/create/{*path}", post(create_directory))
+        .route("/dir/delete/{*path}", delete(delete_directory))
+        .route("/dir/file/upload", post(upload_file))
+        .route("/dir/file/upload/{*path}", post(upload_file))
+        .route("/dir/file/upload/v2", post(upload_fragments)).with_state(Arc::clone(&state))
+        .route("/dir/file/upload/v2/{*path}", post(upload_fragments)).with_state(Arc::clone(&state))
+        .route("/dir/file/upload/check/{*path}", get(check_uploaded_fragments))
+        .route("/dir/file/finalize", post(finalize_assembled_fragments))
+        .route("/dir/file/finalize/{*path}", post(finalize_assembled_fragments))
+        .route("/dir/file/view/{*path}", get(view_file))
+        .route("/dir/file/stream/{*path}", get(stream_file))
+        .route("/dir/file/download/{*path}", get(download_file))
+        .route("/dir/file/rename", put(rename_file_query))
+        .route("/dir/file/rename/{*path}", put(rename_file_query))
+        .route("/dir/file/delete", delete(delete_file))
+        .route("/dir/file/delete/{*path}", delete(delete_file))
         .layer(DefaultBodyLimit::max(MAX_FILE_SIZE))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_headers([
                     HeaderName::from_static("x-api-key"),
+                    HeaderName::from_static("uid"),
                     HeaderName::from_static("content-type"),
                 ])
                 .allow_methods([

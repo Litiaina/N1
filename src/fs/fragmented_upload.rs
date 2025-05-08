@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use axum::extract::{Multipart, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
@@ -16,10 +16,12 @@ use crate::statics::merge_semaphore_static::MERGE_SEMAPHORE;
 use crate::structs::file_metadata_struct::FileMetadata;
 use crate::structs::upload_params_struct::UploadParams;
 use crate::types::shared_state_type::SharedState;
-use crate::utils::directory_validation::sanitize_directory_name;
+use crate::utils::directory_validation::sanitize_path;
+use crate::utils::header_extractor::extract_uid_from_header;
 
 pub async fn upload_fragments(
-    Path(path): Path<String>,
+    header: HeaderMap,
+    path: Option<Path<String>>,
     Query(params): Query<UploadParams>,
     State(state): State<SharedState>,
     mut multipart: Multipart,
@@ -33,12 +35,26 @@ pub async fn upload_fragments(
         checksum,
     } = params;
 
+    let validated_uid = match extract_uid_from_header(&header).await {
+        Ok(email) => email,
+        Err(code) => return code.into_response(),
+    };
+
     if chunk_index >= total_chunks {
         return (StatusCode::BAD_REQUEST, "Invalid chunk index").into_response();
     }
 
-    let sanitized_directory = sanitize_directory_name(&path);
-    let upload_dir = PathBuf::from(format!("storage-files/{}/{}", sanitized_directory, &file_id));
+    let relative_path = path
+        .as_ref()
+        .map(|Path(p)| sanitize_path(p))
+        .unwrap_or_default();
+
+    let upload_dir = if relative_path.is_empty() {
+        PathBuf::from(format!("storage-files/{}/{}", validated_uid, &file_id))
+    } else {
+        PathBuf::from(format!("storage-files/{}/{}/{}", validated_uid, relative_path, &file_id))
+    };
+
     fs::create_dir_all(&upload_dir).await.unwrap();
 
     let mut field = match timeout(IO_TIMEOUT, multipart.next_field()).await {
@@ -130,7 +146,8 @@ pub async fn upload_fragments(
     }
 
     if should_merge {
-        let dir = sanitized_directory;
+        let uid = validated_uid;
+        let dir = relative_path;
         let id = file_id;
         let name = original_filename;
         let mime = mime_type;
@@ -142,10 +159,10 @@ pub async fn upload_fragments(
 
             let _permit = sem.acquire().await;
 
-            if let Err(err) = assemble_fragments(&dir, &id, total_chunks, name.clone(), mime.clone()).await {
+            if let Err(err) = assemble_fragments(&uid, &dir, &id, total_chunks, name.clone(), mime.clone()).await {
                 error!("Async merge failed for {}: {:?}", id, err);
             } else {
-                if let Err(e) = finalize_assembled_fragment_after_merge(&dir).await {
+                if let Err(e) = finalize_assembled_fragment_after_merge(&uid, &dir).await {
                     error!("Finalization failed after merge for {}: {:?}", id, e);
                 }
             }
@@ -158,10 +175,16 @@ pub async fn upload_fragments(
 }
 
 pub async fn check_uploaded_fragments(
+    header: HeaderMap,
     Path(path): Path<String>,
     Query(params): Query<UploadParams>,
 ) -> impl IntoResponse {
-    let upload_dir = PathBuf::from(format!("storage-files/{}/{}/", sanitize_directory_name(&path), params.file_id));
+    let validated_email = match extract_uid_from_header(&header).await {
+        Ok(email) => email,
+        Err(code) => return code.into_response(),
+    };
+    let sanitized_path = sanitize_path(&path);
+    let upload_dir = PathBuf::from(format!("storage-files/{}/{}/{}/", validated_email, sanitized_path, params.file_id));
     let mut uploaded = vec![false; params.total_chunks];
 
     for i in 0..params.total_chunks {
@@ -175,14 +198,18 @@ pub async fn check_uploaded_fragments(
 }
 
 async fn assemble_fragments(
+    uid: &str,
     directory: &str,
     file_id: &str,
     total_chunks: usize,
     original_filename: Option<String>,
     mime_type: Option<String>,
 ) -> Result<(), io::Error> {
-    let upload_dir = PathBuf::from(format!("storage-files/{}/{}", directory, file_id));
-    let merged_path = PathBuf::from(format!("storage-files/{}/{}.merged", directory, file_id));
+    let (upload_dir, merged_path) = if !directory.is_empty() {
+        (PathBuf::from(format!("storage-files/{}/{}/{}", uid, directory, file_id)), PathBuf::from(format!("storage-files/{}/{}/{}.merged", uid, directory, file_id)))
+    } else {
+        (PathBuf::from(format!("storage-files/{}/{}", uid, file_id)), PathBuf::from(format!("storage-files/{}/{}.merged", uid, file_id)))
+    };
     let output_file = File::create(&merged_path).await?;
     let mut writer = BufWriter::new(output_file);
 
@@ -204,7 +231,7 @@ async fn assemble_fragments(
         merged_path: merged_path.to_string_lossy().to_string(),
     };
     let json = serde_json::to_string_pretty(&metadata)?;
-    fs::write(format!("storage-files/{}/{}.json", directory, file_id), json).await?;
+    fs::write(format!("storage-files/{}/{}/{}.json", uid, directory, file_id), json).await?;
 
     for i in 0..total_chunks {
         let chunk_path = upload_dir.join(format!("chunk_{}", i));
@@ -259,9 +286,9 @@ async fn process_finalization(mut entries: ReadDir) -> usize {
     renamed_files
 }
 
-pub async fn finalize_assembled_fragment_after_merge(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let sanitized_directory = sanitize_directory_name(&path);
-    let new_dir = format!("storage-files/{}", sanitized_directory);
+pub async fn finalize_assembled_fragment_after_merge(uid: &str, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let sanitized_path = sanitize_path(&path);
+    let new_dir = format!("storage-files/{}/{}", &uid, sanitized_path);
     let uploads_dir = std::path::Path::new(&new_dir);
     let entries = fs::read_dir(uploads_dir).await?;
     process_finalization(entries).await;
@@ -269,9 +296,23 @@ pub async fn finalize_assembled_fragment_after_merge(path: &str) -> Result<(), B
     Ok(())
 }
 
-pub async fn finalize_assembled_fragments(Path(path): Path<String>) -> impl IntoResponse {
-    let sanitized_directory = sanitize_directory_name(&path);
-    let new_dir = format!("storage-files/{}", sanitized_directory);
+pub async fn finalize_assembled_fragments(header: HeaderMap, path: Option<Path<String>>) -> impl IntoResponse {
+    let validated_uid = match extract_uid_from_header(&header).await {
+        Ok(email) => email,
+        Err(code) => return code.into_response(),
+    };
+
+    let relative_path = path
+        .as_ref()
+        .map(|Path(p)| sanitize_path(p))
+        .unwrap_or_default();
+
+    let new_dir = if relative_path.is_empty() {
+        format!("storage-files/{}", validated_uid)
+    } else {
+        format!("storage-files/{}/{}", validated_uid, relative_path)
+    };
+
     let uploads_dir = std::path::Path::new(&new_dir);
 
     let entries = match fs::read_dir(uploads_dir).await {

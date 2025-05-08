@@ -1,25 +1,37 @@
 use percent_encoding::percent_decode_str;
 use std::path::PathBuf;
 use axum::extract::{Path, Query};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use axum::response::IntoResponse;
 use serde_json::json;
 use tokio::fs;
 use tracing::error;
+use crate::structs::delete_file_params::DeleteFileParams;
 use crate::structs::rename_params_struct::RenameParams;
-use crate::utils::directory_validation::sanitize_directory_name;
+use crate::utils::directory_validation::sanitize_path;
+use crate::utils::header_extractor::extract_uid_from_header;
 
 pub async fn rename_file_query(
-    Path(base_dir): Path<String>,
+    header: HeaderMap,
+    path: Option<Path<String>>,
     Query(params): Query<RenameParams>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let decoded_dir = percent_decode_str(&base_dir)
-        .decode_utf8()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let validated_uid = match extract_uid_from_header(&header).await {
+        Ok(email) => email,
+        Err(code) => return Err(code),
+    };
 
-    let sanitized_dir = sanitize_directory_name(&decoded_dir);
-    let full_dir_path = PathBuf::from(format!("storage-files/{}", sanitized_dir));
+    let relative_path = path
+        .as_ref()
+        .map(|Path(p)| sanitize_path(p))
+        .unwrap_or_default();
+
+    let full_dir_path = if relative_path.is_empty() {
+        PathBuf::from(format!("storage-files/{}", validated_uid))
+    } else {
+        PathBuf::from(format!("storage-files/{}/{}", validated_uid, relative_path))
+    };
 
     if !full_dir_path.exists() {
         return Err(StatusCode::NOT_FOUND);
@@ -37,7 +49,7 @@ pub async fn rename_file_query(
         .unwrap_or("");
 
     let new_file_name_with_ext = if file_extension.is_empty() {
-        params.new_file_name.clone()
+        params.new_file_name
     } else {
         format!("{}.{}", params.new_file_name, file_extension)
     };
@@ -51,22 +63,38 @@ pub async fn rename_file_query(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    Ok(Json(json!({"message": "File renamed successfully"})))
+    Ok(Json(json!({ "message": "File renamed successfully" })))
 }
 
-pub async fn delete_file(Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
-    let decoded_path = percent_decode_str(&path)
-        .decode_utf8()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+pub async fn delete_file(
+    header: HeaderMap,
+    path: Option<Path<String>>,
+    Query(params): Query<DeleteFileParams>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let validated_uid = match extract_uid_from_header(&header).await {
+        Ok(email) => email,
+        Err(code) => return Err(code),
+    };
 
-    let file_path = PathBuf::from(format!("storage-files/{}", decoded_path));
+    let relative_path = path
+        .as_ref()
+        .map(|Path(p)| sanitize_path(p))
+        .unwrap_or_default();
+
+    let base_dir = if relative_path.is_empty() {
+        format!("storage-files/{}", validated_uid)
+    } else {
+        format!("storage-files/{}/{}", validated_uid, relative_path)
+    };
+
+    let file_path = PathBuf::from(base_dir).join(&params.file_to_delete);
 
     if !file_path.exists() {
         return Err(StatusCode::NOT_FOUND);
     }
 
     match fs::remove_file(&file_path).await {
-        Ok(_) => Ok(Json(json!({"message": "File deleted successfully"})).into_response()),
+        Ok(_) => Ok(Json(json!({ "message": "File deleted successfully" })).into_response()),
         Err(err) => {
             let error_message = format!("Failed to delete file: {}", err);
             Ok(Json(json!({ "error": error_message })).into_response())
@@ -74,12 +102,16 @@ pub async fn delete_file(Path(path): Path<String>) -> Result<impl IntoResponse, 
     }
 }
 
-pub async fn create_directory(Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
+pub async fn create_directory(header: HeaderMap, Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
+    let validated_uid = match extract_uid_from_header(&header).await {
+        Ok(email) => email,
+        Err(code) => return Err(code),
+    };
     let decoded_path = percent_decode_str(&path)
         .decode_utf8()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let directory_path = PathBuf::from(format!("storage-files/{}", decoded_path));
+    let directory_path = PathBuf::from(format!("storage-files/{}/{}", validated_uid, decoded_path));
 
     if directory_path.exists() {
         return Ok(Json(json!({"message": "Folder already exists"})).into_response());
@@ -93,12 +125,16 @@ pub async fn create_directory(Path(path): Path<String>) -> Result<impl IntoRespo
     Ok(Json(json!({"message": "Folder created successfully"})).into_response())
 }
 
-pub async fn delete_directory(Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
+pub async fn delete_directory(header: HeaderMap, Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
+    let validated_uid = match extract_uid_from_header(&header).await {
+        Ok(email) => email,
+        Err(code) => return Err(code),
+    };
     let decoded_path = percent_decode_str(&path)
         .decode_utf8()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let directory_path = PathBuf::from(format!("storage-files/{}", decoded_path));
+    let directory_path = PathBuf::from(format!("storage-files/{}/{}", validated_uid, decoded_path));
 
     if !directory_path.exists() {
         return Ok(Json(json!({"message": "Folder does not exist"})).into_response());

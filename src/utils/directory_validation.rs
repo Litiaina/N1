@@ -1,9 +1,9 @@
 use std::path::{Component, Path, PathBuf};
 
-pub fn sanitize_directory_name(directory: &str) -> String {
+pub fn sanitize_path(path: &str) -> String {
     let mut clean_path = PathBuf::new();
 
-    for component in Path::new(directory).components() {
+    for component in Path::new(path).components() {
         match component {
             Component::Normal(part) => {
                 let part_str = part.to_string_lossy()

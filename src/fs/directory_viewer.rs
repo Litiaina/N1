@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use axum::response::{IntoResponse, Response};
 use mime_guess::from_path;
@@ -15,11 +15,27 @@ use tokio_util::io::ReaderStream;
 use walkdir::WalkDir;
 use crate::structs::file_detail_struct::FileDetail;
 use crate::structs::range_header_struct::RangeHeader;
-use crate::utils::directory_validation::sanitize_directory_name;
+use crate::utils::directory_validation::sanitize_path;
+use crate::utils::header_extractor::extract_uid_from_header;
 
-pub async fn view_directory(Path(path): Path<String>) -> impl IntoResponse {
-    let sanitized_directory = sanitize_directory_name(&path);
-    let file_path = PathBuf::from(format!("storage-files/{}", sanitized_directory));
+pub async fn view_directory(header: HeaderMap, path: Option<Path<String>>) -> impl IntoResponse {
+    let validated_uid = match extract_uid_from_header(&header).await {
+        Ok(uid) => uid,
+        Err(code) => return code.into_response(),
+    };
+
+    let relative_path = path
+        .as_ref()
+        .map(|Path(p)| sanitize_path(p))
+        .unwrap_or_default();
+
+    let full_path = if relative_path.is_empty() {
+        format!("storage-files/{}", validated_uid)
+    } else {
+        format!("storage-files/{}/{}", validated_uid, relative_path)
+    };
+
+    let file_path = PathBuf::from(full_path);
     let mut files = Vec::new();
 
     match fs::read_dir(&file_path).await {
@@ -58,15 +74,20 @@ pub async fn view_directory(Path(path): Path<String>) -> impl IntoResponse {
                 }
             }
         }
-        Err(_) => (),
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
 
     let response_body = json!({ "files": files });
-    Json(response_body)
+    Json(response_body).into_response()
 }
 
-pub async fn view_file(Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
-    let file_path = PathBuf::from(format!("storage-files/{}", path));
+pub async fn view_file(header: HeaderMap, Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
+    let validated_uid = match extract_uid_from_header(&header).await {
+        Ok(email) => email,
+        Err(code) => return Err(code),
+    };
+    let sanitized_directory = sanitize_path(&path);
+    let file_path = PathBuf::from(format!("storage-files/{}/{}", validated_uid, sanitized_directory));
     let mut file = fs::File::open(&file_path)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
@@ -89,10 +110,16 @@ pub async fn view_file(Path(path): Path<String>) -> Result<impl IntoResponse, St
 }
 
 pub async fn stream_file(
+    header: HeaderMap,
     Path(path): Path<String>,
     Query(range_header): Query<RangeHeader>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let file_path = format!("storage-files/{}", path);
+    let validated_uid = match extract_uid_from_header(&header).await {
+        Ok(email) => email,
+        Err(code) => return Err(code),
+    };
+    let sanitized_directory = sanitize_path(&path);
+    let file_path = PathBuf::from(format!("storage-files/{}/{}", validated_uid, sanitized_directory));
     let file = fs::File::open(&file_path)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;

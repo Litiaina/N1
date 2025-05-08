@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use axum::extract::{Multipart, Path};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use axum::response::IntoResponse;
 use serde_json::json;
@@ -10,15 +10,30 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{error, info, warn};
 use crate::fs::fs_constants::{DEFAULT_BUFFER_SIZE, MAX_CONCURRENT};
-use crate::utils::directory_validation::sanitize_directory_name;
+use crate::utils::directory_validation::sanitize_path;
 use crate::utils::file_extension_util::get_file_extension;
+use crate::utils::header_extractor::extract_uid_from_header;
 
 pub async fn upload_file(
-    Path(directory): Path<String>,
+    header: HeaderMap,
+    path: Option<Path<String>>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let sanitized_directory = sanitize_directory_name(&directory);
-    let directory_path = PathBuf::from(format!("storage-files/{}", sanitized_directory));
+    let validated_uid = match extract_uid_from_header(&header).await {
+        Ok(email) => email,
+        Err(code) => return Err(code),
+    };
+
+    let relative_path = path
+        .as_ref()
+        .map(|Path(p)| sanitize_path(p))
+        .unwrap_or_default();
+
+    let directory_path = if relative_path.is_empty() {
+        PathBuf::from(format!("storage-files/{}", validated_uid))
+    } else {
+        PathBuf::from(format!("storage-files/{}/{}", validated_uid, relative_path))
+    };
 
     fs::create_dir_all(&directory_path)
         .await
@@ -136,10 +151,11 @@ pub async fn upload_file(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-        info!(
-            "Uploaded '{}' to '{}', total bytes: {}",
-            final_filename, sanitized_directory, total_bytes
-        );
+        if relative_path.is_empty() {
+            info!("Uploaded '{}' to '{}', total bytes: {}",final_filename, format!("{}", validated_uid), total_bytes);
+        } else {
+            info!("Uploaded '{}' to '{}', total bytes: {}",final_filename, format!("{}/{}", validated_uid, relative_path), total_bytes);
+        }
     }
 
     Ok(Json(json!({ "message": "File uploaded successfully" })))

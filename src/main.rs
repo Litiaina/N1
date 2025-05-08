@@ -30,6 +30,7 @@ mod fs;
 mod statics;
 mod middleware;
 mod database_api;
+mod validation;
 
 #[tokio::main]
 async fn main() {

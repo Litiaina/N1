@@ -2,17 +2,23 @@ use axum::body::{Body, Bytes};
 use std::path::PathBuf;
 use std::pin::Pin;
 use axum::extract::Path;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::Stream;
 use mime_guess::from_path;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, BufReader};
 use crate::fs::fs_constants::DEFAULT_BUFFER_SIZE;
+use crate::utils::directory_validation::sanitize_path;
+use crate::utils::header_extractor::extract_uid_from_header;
 
-pub async fn download_file(Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
-    let file_path = PathBuf::from(format!("storage-files/{}", path));
-
+pub async fn download_file(header: HeaderMap, Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
+    let validated_uid = match extract_uid_from_header(&header).await {
+        Ok(email) => email,
+        Err(code) => return Err(code),
+    };
+    let sanitized_path = sanitize_path(&path);
+    let file_path = PathBuf::from(format!("storage-files/{}/{}", validated_uid, sanitized_path));
     let file = fs::File::open(&file_path)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
