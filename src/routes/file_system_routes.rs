@@ -6,7 +6,7 @@ use axum::{
     routing::post,
     Router,
 };
-use axum::http::{HeaderName, StatusCode};
+use axum::http::HeaderName;
 use axum::routing::{delete, get, put};
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
@@ -24,7 +24,6 @@ pub fn serve_file_system_routes() -> Router {
     let state: SharedState = Arc::new(Mutex::new(HashMap::new()));
 
     Router::new()
-        .route("/ping", get(ping).options(|| async { StatusCode::OK }))
         .route("/files/{*path}", get(view_directory))
         .route("/files/directory/create/{*path}", post(create_directory))
         .route("/files/directory/delete/{*path}", delete(delete_directory))
@@ -54,8 +53,4 @@ pub fn serve_file_system_routes() -> Router {
                     Method::OPTIONS
                 ])
         )
-}
-
-async fn ping() -> &'static str {
-    "pong"
 }

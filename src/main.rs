@@ -3,20 +3,22 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use axum::http::{StatusCode, Uri};
+use axum::http::{Method, StatusCode, Uri};
 use axum::http::uri::Authority;
 use axum::{BoxError, Router};
 use axum::response::Redirect;
+use axum::routing::get;
 use axum_extra::extract::Host;
 use axum_server::tls_rustls::RustlsConfig;
 use chrono::Local;
 use tokio::signal;
+use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use crate::fs::cleanup_manager::cleanup_stale_uploads;
 use crate::handlers::error_handlers::handler_404;
 use crate::middleware::auth_middleware::auth;
-use crate::routes::file_system_routes;
+use crate::routes::file_system_routes::serve_file_system_routes;
 use crate::structs::port_struct::Ports;
 
 mod handlers;
@@ -66,7 +68,7 @@ async fn server() {
     //     .expect("Failed to get executable directory")
     //     .to_path_buf();
     //
-    // let config = RustlsConfig::from_pem_file(
+    // let config = RustsConfig::from_pem_file(
     //     exe_dir.join("cert.pem"),
     //     exe_dir.join("key.pem"),
     // )
@@ -86,7 +88,11 @@ async fn server() {
         .unwrap();
 
     let file_system_port = SocketAddr::from(([127, 0, 0, 1], file_system_ports.https));
-    let serve_file_system = file_system_routes::serve_file_system_routes().layer(axum::middleware::from_fn(auth)).fallback(handler_404);
+    let serve_file_system = Router::new()
+        .route("/ping", get(ping).options(|| async { StatusCode::OK }))
+        .layer(CorsLayer::new().allow_origin(Any).allow_methods([Method::GET]))
+        .merge(serve_file_system_routes().layer(axum::middleware::from_fn(auth)))
+        .fallback(handler_404);
 
     let file_system_task = tokio::spawn(serve(
         file_system_port,
@@ -188,4 +194,8 @@ async fn shutdown_signal(name: Arc<String>, handle: axum_server::Handle) {
 
     tracing::info!("{} => shutdown received", name);
     handle.graceful_shutdown(Some(Duration::from_secs(10)));
+}
+
+async fn ping() -> &'static str {
+    "pong"
 }
