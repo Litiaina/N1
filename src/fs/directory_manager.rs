@@ -1,5 +1,6 @@
 use percent_encoding::percent_decode_str;
 use std::path::PathBuf;
+use std::time::UNIX_EPOCH;
 use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
@@ -7,9 +8,11 @@ use axum::response::IntoResponse;
 use serde_json::json;
 use tokio::fs;
 use tracing::error;
-use crate::structs::delete_file_params::DeleteFileParams;
+use crate::structs::delete_file_params_struct::DeleteFileParams;
+use crate::structs::file_metadata_struct::FileMetadata;
+use crate::structs::metadata_params_struct::MetadataParams;
 use crate::structs::rename_params_struct::RenameParams;
-use crate::utils::directory_validation::sanitize_path;
+use crate::validation::directory_validation::sanitize_path;
 use crate::utils::header_extractor::extract_uid_from_header;
 
 pub async fn rename_file_query(
@@ -17,10 +20,7 @@ pub async fn rename_file_query(
     path: Option<Path<String>>,
     Query(params): Query<RenameParams>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = match extract_uid_from_header(&header).await {
-        Ok(email) => email,
-        Err(code) => return Err(code),
-    };
+    let validated_uid = extract_uid_from_header(&header).map_err(|code| code)?;
 
     let relative_path = path
         .as_ref()
@@ -71,10 +71,7 @@ pub async fn delete_file(
     path: Option<Path<String>>,
     Query(params): Query<DeleteFileParams>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = match extract_uid_from_header(&header).await {
-        Ok(email) => email,
-        Err(code) => return Err(code),
-    };
+    let validated_uid = extract_uid_from_header(&header).map_err(|code| code)?;
 
     let relative_path = path
         .as_ref()
@@ -103,10 +100,7 @@ pub async fn delete_file(
 }
 
 pub async fn create_directory(header: HeaderMap, Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = match extract_uid_from_header(&header).await {
-        Ok(email) => email,
-        Err(code) => return Err(code),
-    };
+    let validated_uid = extract_uid_from_header(&header).map_err(|code| code)?;
     let decoded_path = percent_decode_str(&path)
         .decode_utf8()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -126,10 +120,7 @@ pub async fn create_directory(header: HeaderMap, Path(path): Path<String>) -> Re
 }
 
 pub async fn delete_directory(header: HeaderMap, Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = match extract_uid_from_header(&header).await {
-        Ok(email) => email,
-        Err(code) => return Err(code),
-    };
+    let validated_uid = extract_uid_from_header(&header).map_err(|code| code)?;
     let decoded_path = percent_decode_str(&path)
         .decode_utf8()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -146,4 +137,41 @@ pub async fn delete_directory(header: HeaderMap, Path(path): Path<String>) -> Re
     }
 
     Ok(Json(json!({"message": "Folder deleted successfully"})).into_response())
+}
+
+pub async fn get_file_metadata(Query(params): Query<MetadataParams>, path: Option<Path<String>>, ) -> impl IntoResponse {
+    let validated_uid = if !params.uid.is_empty() {
+        params.uid.clone()
+    } else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+
+    let relative_path = path
+        .as_ref()
+        .map(|Path(p)| p.trim_matches('/').to_string())
+        .unwrap_or_default();
+
+    let file_path = if relative_path.is_empty() {
+        PathBuf::from(format!("storage-files/{}/{}", validated_uid, params.file_name))
+    } else {
+        PathBuf::from(format!("storage-files/{}/{}/{}", validated_uid, relative_path, params.file_name))
+    };
+
+    let metadata = match fs::metadata(&file_path).await {
+        Ok(meta) => meta,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let modified = metadata.modified().ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let info = FileMetadata {
+        file_name: params.file_name,
+        file_size: metadata.len(),
+        last_modified: modified,
+    };
+
+    Json(info).into_response()
 }

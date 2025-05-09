@@ -13,10 +13,10 @@ use tokio::time::timeout;
 use tracing::{error, info, warn};
 use crate::fs::fs_constants::{IO_TIMEOUT, MAX_CHUNK_SIZE};
 use crate::statics::merge_semaphore_static::MERGE_SEMAPHORE;
-use crate::structs::file_metadata_struct::FileMetadata;
+use crate::structs::upload_metadata_struct::UploadMetadata;
 use crate::structs::upload_params_struct::UploadParams;
 use crate::types::shared_state_type::SharedState;
-use crate::utils::directory_validation::sanitize_path;
+use crate::validation::directory_validation::sanitize_path;
 use crate::utils::header_extractor::extract_uid_from_header;
 
 pub async fn upload_fragments(
@@ -25,7 +25,7 @@ pub async fn upload_fragments(
     Query(params): Query<UploadParams>,
     State(state): State<SharedState>,
     mut multipart: Multipart,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, impl IntoResponse> {
     let UploadParams {
         file_id,
         chunk_index,
@@ -35,13 +35,10 @@ pub async fn upload_fragments(
         checksum,
     } = params;
 
-    let validated_uid = match extract_uid_from_header(&header).await {
-        Ok(email) => email,
-        Err(code) => return code.into_response(),
-    };
+    let validated_uid = extract_uid_from_header(&header).map_err(|status| status.into_response())?;
 
     if chunk_index >= total_chunks {
-        return (StatusCode::BAD_REQUEST, "Invalid chunk index").into_response();
+        return Err((StatusCode::BAD_REQUEST, "Invalid chunk index").into_response());
     }
 
     let relative_path = path
@@ -59,14 +56,14 @@ pub async fn upload_fragments(
 
     let mut field = match timeout(IO_TIMEOUT, multipart.next_field()).await {
         Ok(Ok(Some(field))) => field,
-        Ok(Ok(None)) => return (StatusCode::BAD_REQUEST, "No multipart field found").into_response(),
+        Ok(Ok(None)) => return Err((StatusCode::BAD_REQUEST, "No multipart field found").into_response()),
         Ok(Err(e)) => {
             error!("Multipart error: {:?}", e);
-            return (StatusCode::BAD_REQUEST, "Invalid multipart data").into_response();
+            return Err((StatusCode::BAD_REQUEST, "Invalid multipart data").into_response());
         },
         Err(e) => {
             error!("Timeout while reading multipart field: {:?}", e);
-            return (StatusCode::REQUEST_TIMEOUT, "Timeout reading multipart").into_response();
+            return Err((StatusCode::REQUEST_TIMEOUT, "Timeout reading multipart").into_response());
         }
     };
 
@@ -74,12 +71,12 @@ pub async fn upload_fragments(
     let temp_path = file_path.with_extension("tmp");
 
     if file_path.exists() {
-        return (StatusCode::CONFLICT, "Chunk already uploaded").into_response();
+        return Err((StatusCode::CONFLICT, "Chunk already uploaded").into_response());
     }
 
     let mut file = match timeout(IO_TIMEOUT, File::create(&temp_path)).await {
         Ok(Ok(f)) => f,
-        _ => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create chunk file").into_response(),
+        _ => return Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed to create chunk file").into_response()),
     };
 
     let mut hasher = Sha256::new();
@@ -89,28 +86,28 @@ pub async fn upload_fragments(
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             error!("Chunk read error: {:?}", e);
-            return (StatusCode::BAD_REQUEST, "Failed to read chunk").into_response();
+            return Err((StatusCode::BAD_REQUEST, "Failed to read chunk").into_response());
         },
         Err(e) => {
             error!("Timeout while reading chunk: {:?}", e);
-            return (StatusCode::REQUEST_TIMEOUT, "Timeout reading chunk").into_response();
+            return Err((StatusCode::REQUEST_TIMEOUT, "Timeout reading chunk").into_response());
         }
     } {
         total_written += chunk.len();
         if total_written > MAX_CHUNK_SIZE {
             warn!("Chunk size limit exceeded: {} bytes", total_written);
-            return (StatusCode::PAYLOAD_TOO_LARGE, "Chunk too large").into_response();
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, "Chunk too large").into_response());
         }
         hasher.update(&chunk);
         if let Err(e) = timeout(IO_TIMEOUT, file.write_all(&chunk)).await {
             error!("Write timeout or error: {:?}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed writing chunk").into_response();
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed writing chunk").into_response());
         }
     }
 
     if let Err(e) = timeout(IO_TIMEOUT, file.flush()).await {
         error!("Flush error: {:?}", e);
-        return (StatusCode::INTERNAL_SERVER_ERROR, "Flush failed").into_response();
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "Flush failed").into_response());
     }
 
     let actual_checksum = hex::encode(hasher.finalize());
@@ -122,13 +119,13 @@ pub async fn upload_fragments(
                 chunk_index, expected_checksum, actual_checksum
             );
             let _ = fs::remove_file(&temp_path).await;
-            return (StatusCode::BAD_REQUEST, "Checksum mismatch").into_response();
+            return Err((StatusCode::BAD_REQUEST, "Checksum mismatch").into_response());
         }
     }
 
     if let Err(e) = fs::rename(&temp_path, &file_path).await {
         error!("Rename error: {:?}", e);
-        return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to finalize chunk file").into_response();
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed to finalize chunk file").into_response());
     }
 
     info!("Chunk {} written and verified with checksum {}", chunk_index, actual_checksum);
@@ -168,23 +165,20 @@ pub async fn upload_fragments(
             }
         });
 
-        return (StatusCode::ACCEPTED, "Final chunk received, merge started").into_response();
+        return Ok((StatusCode::ACCEPTED, "Final chunk received, merge started").into_response());
     }
 
-    (StatusCode::OK, "Chunk received and validated").into_response()
+    Ok((StatusCode::OK, "Chunk received and validated").into_response())
 }
 
 pub async fn check_uploaded_fragments(
     header: HeaderMap,
     Path(path): Path<String>,
     Query(params): Query<UploadParams>,
-) -> impl IntoResponse {
-    let validated_email = match extract_uid_from_header(&header).await {
-        Ok(email) => email,
-        Err(code) => return code.into_response(),
-    };
+) -> Result<impl IntoResponse, StatusCode> {
+    let validated_uid = extract_uid_from_header(&header).map_err(|status| status)?;
     let sanitized_path = sanitize_path(&path);
-    let upload_dir = PathBuf::from(format!("storage-files/{}/{}/{}/", validated_email, sanitized_path, params.file_id));
+    let upload_dir = PathBuf::from(format!("storage-files/{}/{}/{}/", validated_uid, sanitized_path, params.file_id));
     let mut uploaded = vec![false; params.total_chunks];
 
     for i in 0..params.total_chunks {
@@ -194,7 +188,7 @@ pub async fn check_uploaded_fragments(
         }
     }
 
-    (StatusCode::OK, axum::Json(uploaded)).into_response()
+    Ok((StatusCode::OK, axum::Json(uploaded)))
 }
 
 async fn assemble_fragments(
@@ -224,7 +218,7 @@ async fn assemble_fragments(
     }
     writer.flush().await?;
 
-    let metadata = FileMetadata {
+    let metadata = UploadMetadata {
         original_filename,
         mime_type,
         uploaded_at: chrono::Utc::now().to_rfc3339(),
@@ -254,7 +248,7 @@ async fn process_finalization(mut entries: ReadDir) -> usize {
 
         rename_tasks.push(tokio::spawn(async move {
             let json_str = fs::read_to_string(&path).await.ok()?;
-            let metadata: FileMetadata = serde_json::from_str(&json_str).ok()?;
+            let metadata: UploadMetadata = serde_json::from_str(&json_str).ok()?;
             let orig_name = metadata.original_filename?;
             let ext = std::path::Path::new(&orig_name).extension()?.to_str()?;
 
@@ -296,11 +290,8 @@ pub async fn finalize_assembled_fragment_after_merge(uid: &str, path: &str) -> R
     Ok(())
 }
 
-pub async fn finalize_assembled_fragments(header: HeaderMap, path: Option<Path<String>>) -> impl IntoResponse {
-    let validated_uid = match extract_uid_from_header(&header).await {
-        Ok(email) => email,
-        Err(code) => return code.into_response(),
-    };
+pub async fn finalize_assembled_fragments(header: HeaderMap, path: Option<Path<String>>) -> Result<impl IntoResponse, impl IntoResponse> {
+    let validated_uid = extract_uid_from_header(&header).map_err(|status| status.into_response())?;
 
     let relative_path = path
         .as_ref()
@@ -317,10 +308,10 @@ pub async fn finalize_assembled_fragments(header: HeaderMap, path: Option<Path<S
 
     let entries = match fs::read_dir(uploads_dir).await {
         Ok(e) => e,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read uploads dir: {}", e)).into_response(),
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read uploads dir: {}", e)).into_response()),
     };
 
     let renamed_files = process_finalization(entries).await;
 
-    (StatusCode::OK, format!("{} files successfully assembled", renamed_files)).into_response()
+    Ok((StatusCode::OK, format!("{} files successfully assembled", renamed_files)).into_response())
 }

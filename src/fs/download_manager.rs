@@ -1,66 +1,55 @@
-use axum::body::{Body, Bytes};
+use std::io::SeekFrom;
+use axum::body::Body;
 use std::path::PathBuf;
-use std::pin::Pin;
-use axum::extract::Path;
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Path, Query};
+use axum::http::{StatusCode};
 use axum::response::{IntoResponse, Response};
-use futures::Stream;
-use mime_guess::from_path;
-use tokio::fs;
-use tokio::io::{AsyncReadExt, BufReader};
-use crate::fs::fs_constants::DEFAULT_BUFFER_SIZE;
-use crate::utils::directory_validation::sanitize_path;
-use crate::utils::header_extractor::extract_uid_from_header;
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use crate::structs::download_params_struct::DownloadParams;
+use crate::validation::directory_validation::sanitize_path;
 
-pub async fn download_file(header: HeaderMap, Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = match extract_uid_from_header(&header).await {
-        Ok(email) => email,
-        Err(code) => return Err(code),
+pub async fn download_file(Query(params): Query<DownloadParams>, path: Option<Path<String>>) -> impl IntoResponse {
+    let validated_uid = if !params.uid.is_empty() {
+        params.uid
+    } else {
+        return StatusCode::BAD_REQUEST.into_response()
     };
-    let sanitized_path = sanitize_path(&path);
-    let file_path = PathBuf::from(format!("storage-files/{}/{}", validated_uid, sanitized_path));
-    let file = fs::File::open(&file_path)
-        .await
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+    
+    let relative_path = path
+        .as_ref()
+        .map(|Path(p)| sanitize_path(p))
+        .unwrap_or_default();
 
-    let file_metadata = file
-        .metadata()
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let file_path = if relative_path.is_empty() {
+        PathBuf::from(format!("storage-files/{}/{}", validated_uid, params.file_name))
+    } else {
+        PathBuf::from(format!("storage-files/{}/{}/{}", validated_uid, relative_path, params.file_name))
+    };
 
-    let mime_type = from_path(&file_path).first_or_octet_stream();
+    let mut file = match File::open(&file_path).await {
+        Ok(f) => f,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
 
-    let file_name = file_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("file");
+    let mut buffer = vec![0; params.chunk_size];
+    if let Err(_) = file.seek(SeekFrom::Start(params.offset)).await {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
 
-    let mut reader = BufReader::new(file);
-    let mut buffer = vec![0; DEFAULT_BUFFER_SIZE];
+    let bytes_read = match file.read(&mut buffer).await {
+        Ok(n) => n,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
 
-    let stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static>> =
-        Box::pin(async_stream::stream! {
-            loop {
-                match reader.read(&mut buffer).await {
-                    Ok(read_size) if read_size == 0 => break,
-                    Ok(read_size) => yield Ok(Bytes::copy_from_slice(&buffer[..read_size])),
-                    Err(e) => {
-                        yield Err(e);
-                        break;
-                    }
-                }
-            }
-        });
+    if bytes_read == 0 {
+        return StatusCode::NO_CONTENT.into_response();
+    }
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", file_name),
-        )
-        .header("Content-Type", mime_type.as_ref())
-        .header("Content-Length", file_metadata.len().to_string())
-        .body(Body::from_stream(stream))
+    let body = Body::from(buffer[..bytes_read].to_vec());
+
+    Response::builder()
+        .header("Content-Type", "application/octet-stream")
+        .body(body)
         .unwrap()
-        .into_response())
 }

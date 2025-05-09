@@ -12,17 +12,13 @@ use serde_json::json;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 use tokio_util::io::ReaderStream;
-use walkdir::WalkDir;
 use crate::structs::file_detail_struct::FileDetail;
-use crate::structs::range_header_struct::RangeHeader;
-use crate::utils::directory_validation::sanitize_path;
+use crate::structs::uid_params_struct::UIDParams;
+use crate::validation::directory_validation::{get_dir_size, sanitize_path};
 use crate::utils::header_extractor::extract_uid_from_header;
 
-pub async fn view_directory(header: HeaderMap, path: Option<Path<String>>) -> impl IntoResponse {
-    let validated_uid = match extract_uid_from_header(&header).await {
-        Ok(uid) => uid,
-        Err(code) => return code.into_response(),
-    };
+pub async fn view_directory(header: HeaderMap, path: Option<Path<String>>) -> Result<impl IntoResponse, StatusCode> {
+    let validated_uid = extract_uid_from_header(&header).map_err(|code| code)?;
 
     let relative_path = path
         .as_ref()
@@ -74,17 +70,18 @@ pub async fn view_directory(header: HeaderMap, path: Option<Path<String>>) -> im
                 }
             }
         }
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return Err(StatusCode::NOT_FOUND),
     };
 
     let response_body = json!({ "files": files });
-    Json(response_body).into_response()
+    Ok(Json(response_body))
 }
 
-pub async fn view_file(header: HeaderMap, Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = match extract_uid_from_header(&header).await {
-        Ok(email) => email,
-        Err(code) => return Err(code),
+pub async fn view_file(Query(params): Query<UIDParams>, Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
+    let validated_uid = if !params.uid.is_empty() {
+        params.uid
+    } else {
+        return Err(StatusCode::BAD_REQUEST)
     };
     let sanitized_directory = sanitize_path(&path);
     let file_path = PathBuf::from(format!("storage-files/{}/{}", validated_uid, sanitized_directory));
@@ -109,91 +106,71 @@ pub async fn view_file(header: HeaderMap, Path(path): Path<String>) -> Result<im
         .into_response())
 }
 
-pub async fn stream_file(
-    header: HeaderMap,
-    Path(path): Path<String>,
-    Query(range_header): Query<RangeHeader>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = match extract_uid_from_header(&header).await {
-        Ok(email) => email,
-        Err(code) => return Err(code),
+pub async fn stream_file(Query(params): Query<UIDParams>, headers: HeaderMap, Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
+    let validated_uid = if !params.uid.is_empty() {
+        params.uid
+    } else {
+        return Err(StatusCode::BAD_REQUEST)
     };
     let sanitized_directory = sanitize_path(&path);
     let file_path = PathBuf::from(format!("storage-files/{}/{}", validated_uid, sanitized_directory));
-    let file = fs::File::open(&file_path)
+
+    let mime_type = from_path(&file_path).first_or_octet_stream();
+
+    let mut file = fs::File::open(&file_path)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    let mime_type = from_path(&file_path).first_or_octet_stream();
     let file_size = file
         .metadata()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .len();
 
-    let (start, end) = if let Some(range) = range_header.range {
-        let range = range
-            .strip_prefix("bytes=")
-            .ok_or(StatusCode::RANGE_NOT_SATISFIABLE)?;
+    let range_header = headers.get("range").and_then(|v| v.to_str().ok());
 
-        let mut parts = range.split('-');
-        let start = parts.next().unwrap_or("0").parse::<u64>().unwrap_or(0);
-        let end = parts
-            .next()
-            .unwrap_or(&file_size.to_string())
-            .parse::<u64>()
-            .unwrap_or(file_size);
+    let (start, end, status_code) = if let Some(range) = range_header {
+        if let Some(range) = range.strip_prefix("bytes=") {
+            let mut parts = range.split('-');
+            let start = parts.next().unwrap_or("0").parse::<u64>().unwrap_or(0);
+            let end = parts
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(file_size - 1);
 
-        if start > end || end >= file_size {
+            if start > end || end >= file_size {
+                return Err(StatusCode::RANGE_NOT_SATISFIABLE);
+            }
+
+            (start, end, StatusCode::PARTIAL_CONTENT)
+        } else {
             return Err(StatusCode::RANGE_NOT_SATISFIABLE);
         }
-
-        (start, end)
     } else {
-        (0, file_size - 1)
+        (0, file_size - 1, StatusCode::OK)
     };
 
-    let file = fs::File::open(file_path)
-        .await
-        .map_err(|_| StatusCode::NOT_FOUND)?;
-    let mut reader = BufReader::new(file);
-    reader
-        .seek(SeekFrom::Start(start))
+    file.seek(SeekFrom::Start(start))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let reader = BufReader::new(file).take(end - start + 1);
     let stream = ReaderStream::new(reader).map(|result| {
         result
-            .map(|bytes| axum::body::Bytes::from(bytes))
+            .map(Bytes::from)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Stream error"))
     });
 
     let body = Body::from_stream(stream);
 
-    Ok(Response::builder()
-        .status(StatusCode::PARTIAL_CONTENT)
+    let mut response = Response::builder()
+        .status(status_code)
         .header("Content-Type", mime_type.to_string())
-        .header(
-            "Content-Range",
-            format!("bytes {}-{}/{}", start, end, file_size),
-        )
-        .header("Content-Length", end - start + 1)
-        .body(body)
-        .unwrap())
-}
+        .header("Content-Length", (end - start + 1).to_string());
 
-async fn get_dir_size(path: &PathBuf) -> u64 {
-    let mut total_size = 0;
-
-    for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
-        let metadata = fs::metadata(entry.path()).await;
-
-        if let Ok(metadata) = metadata {
-            if metadata.is_file() {
-                total_size += metadata.len();
-            }
-        }
+    if status_code == StatusCode::PARTIAL_CONTENT {
+        response = response.header("Content-Range", format!("bytes {}-{}/{}", start, end, file_size));
     }
 
-    total_size
+    Ok(response.body(body).unwrap())
 }

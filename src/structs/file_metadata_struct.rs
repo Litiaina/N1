@@ -1,9 +1,8 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 pub struct FileMetadata {
-    pub original_filename: Option<String>,
-    pub mime_type: Option<String>,
-    pub uploaded_at: String,
-    pub merged_path: String,
+    pub file_name: String,
+    pub file_size: u64,
+    pub last_modified: u64,
 }

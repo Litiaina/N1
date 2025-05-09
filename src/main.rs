@@ -1,23 +1,25 @@
 use std::env;
+use std::io::{self, Write};
+use std::fs::File;
 use axum::handler::HandlerWithoutStateExt;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use axum::http::{Method, StatusCode, Uri};
+use axum::http::{StatusCode, Uri};
 use axum::http::uri::Authority;
 use axum::{BoxError, Router};
 use axum::response::Redirect;
-use axum::routing::get;
 use axum_extra::extract::Host;
 use axum_server::tls_rustls::RustlsConfig;
 use chrono::Local;
+use dotenv::dotenv;
 use tokio::signal;
-use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use crate::fs::cleanup_manager::cleanup_stale_uploads;
+use crate::fs::fs_constants::ENV_FILE;
 use crate::handlers::error_handlers::handler_404;
-use crate::middleware::auth_middleware::auth;
 use crate::routes::file_system_routes::serve_file_system_routes;
 use crate::structs::port_struct::Ports;
 
@@ -29,7 +31,6 @@ mod utils;
 mod fs;
 mod statics;
 mod middleware;
-mod database_api;
 mod validation;
 
 #[tokio::main]
@@ -49,6 +50,22 @@ async fn main() {
     tracing::info!("{} - Status: ONLINE", current_time);
     tracing::info!("Press CTRL+C to terminate");
     tracing::info!("══════════════ ACTIVE CONNECTIONS ══════════════");
+    if !Path::new(ENV_FILE).exists() {
+        match create_env_file(ENV_FILE) {
+            Ok(_) => {
+                tracing::info!(
+                    "Created .env file. Please configure it with your environment variables."
+                );
+            }
+            Err(e) => {
+                eprintln!("Failed to create .env file: {}", e);
+                return;
+            }
+        }
+    } else {
+        dotenv().ok();
+        tracing::info!("Loaded environment variables from .env file.");
+    }
     server().await
 }
 
@@ -76,11 +93,7 @@ async fn server() {
         .unwrap();
 
     let file_system_port = SocketAddr::from(([127, 0, 0, 1], file_system_ports.https));
-    let serve_file_system = Router::new()
-        .route("/ping", get(ping).options(|| async { StatusCode::OK }))
-        .layer(CorsLayer::new().allow_origin(Any).allow_methods([Method::GET]))
-        .merge(serve_file_system_routes().layer(axum::middleware::from_fn(auth)))
-        .fallback(handler_404);
+    let serve_file_system = serve_file_system_routes().fallback(handler_404);
 
     let file_system_task = tokio::spawn(serve(
         file_system_port,
@@ -184,6 +197,8 @@ async fn shutdown_signal(name: Arc<String>, handle: axum_server::Handle) {
     handle.graceful_shutdown(Some(Duration::from_secs(10)));
 }
 
-async fn ping() -> &'static str {
-    "pong"
+fn create_env_file(path: &str) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    writeln!(file, "API_KEYS=key_1,key_2,")?;
+    Ok(())
 }
