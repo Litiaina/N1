@@ -199,6 +199,6 @@ async fn shutdown_signal(name: Arc<String>, handle: axum_server::Handle) {
 
 fn create_env_file(path: &str) -> io::Result<()> {
     let mut file = File::create(path)?;
-    writeln!(file, "API_KEYS=key_1,key_2,")?;
+    writeln!(file, "API_KEYS=key_1,key_2,key_3")?;
     Ok(())
 }
