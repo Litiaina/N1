@@ -1,66 +1,142 @@
-use std::collections::HashSet;
-use axum::{
-    extract::Request,
-    http::StatusCode,
-    middleware::Next,
-    response::{IntoResponse, Response},
-};
-use axum::http::Method;
-use once_cell::sync::Lazy;
-use tracing::{error, warn};
+use std::env;
+use std::fmt::Display;
+use std::sync::LazyLock;
+use std::time::SystemTime;
+use axum::{http::StatusCode, response::{IntoResponse, Response}, Json, RequestPartsExt};
+use axum::body::Body;
+use axum::extract::{FromRequestParts, Request};
+use axum::http::request::Parts;
+use axum::middleware::Next;
+use axum_extra::TypedHeader;
+use headers::Authorization;
+use headers::authorization::Bearer;
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use serde_json::json;
+use crate::enums::auth_error_enum::AuthError;
+use crate::structs::auth_structs::{AuthBody, Claims, LoginRequest};
+use crate::validation::auth_validation::validate_auth;
 
-
-static VALID_API_KEYS: Lazy<HashSet<String>> = Lazy::new(|| {
-    let raw = std::env::var("API_KEYS").expect("Missing API_KEYS environment variable");
-
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect()
+static JWT_KEYS: LazyLock<Keys> = LazyLock::new(|| {
+    let secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    Keys::new(secret.as_bytes())
 });
 
-pub async fn auth(req: Request, next: Next) -> Response {
-    let uri = req.uri();
-    let path = uri.path();
-    let method = req.method();
-    let headers = req.headers();
-
-    if matches!(method, &Method::OPTIONS | &Method::HEAD) {
-        return next.run(req).await;
-    }
-
-    let api_key = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|auth| {
-            let auth_trimmed = auth.trim();
-            auth_trimmed
-                .get(0..7)
-                .filter(|prefix| prefix.eq_ignore_ascii_case("Bearer "))
-                .map(|_| auth_trimmed[7..].trim().to_string())
-        });
-
-    let api_key = match api_key {
-        Some(key) if !key.is_empty() => key,
-        Some(_) => {
-            warn!("[AUTH] Empty API key provided for request to '{}'", path);
-            return unauthorized_response();
-        }
-        None => {
-            error!("[AUTH] Missing API key in request to '{}'", path);
-            return unauthorized_response();
-        }
+pub async fn auth(req: Request<Body>, next: Next) -> Result<Response, AuthError> {
+    let header = req.headers().get("authorization");
+    let token = match header {
+        Some(value) => value.to_str().ok().and_then(|auth_str| auth_str.strip_prefix("Bearer ")),
+        None => None,
     };
 
-    if VALID_API_KEYS.contains(&api_key) {
-        next.run(req).await
+    if let Some(token) = token {
+        let decoding_key = &JWT_KEYS.decoding;
+        let validation = Validation::default();
+
+        match decode::<Claims>(token, decoding_key, &validation) {
+            Ok(_) => {
+                Ok(next.run(req).await)
+            }
+            Err(_) => {
+                Err(AuthError::InvalidToken)
+            }
+        }
     } else {
-        warn!("[AUTH] Unauthorized access attempt to '{}'", path);
-        unauthorized_response()
+        Err(AuthError::InvalidToken)
     }
 }
 
-fn unauthorized_response() -> Response {
-    (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
+
+pub async fn authorize(Json(payload): Json<LoginRequest>) -> Result<Json<AuthBody>, AuthError> {
+    if payload.email.is_empty() || payload.password.is_empty() {
+        return Err(AuthError::MissingCredentials);
+    }
+
+    match validate_auth(&payload.email, &payload.password).await {
+        Ok(valid) => {
+            if valid {
+                let exp = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() + 24 * 60 * 60;
+
+                let claims = Claims {
+                    email: payload.email.to_owned(),
+                    exp: exp as usize,
+                };
+
+                let token = encode(&Header::default(), &claims, &JWT_KEYS.encoding)
+                    .map_err(|_| AuthError::TokenCreation)?;
+
+                Ok(Json(AuthBody::new(token)))
+            } else {
+                Err(AuthError::WrongCredentials)
+            }
+        },
+        Err(_) => {
+            Err(AuthError::WrongCredentials)
+        },
+    }
+}
+
+impl Display for Claims {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "uid: {}", self.email)
+    }
+}
+
+impl AuthBody {
+    fn new(access_token: String) -> Self {
+        Self {
+            access_token,
+            token_type: "Bearer".to_string(),
+        }
+    }
+}
+
+impl<S> FromRequestParts<S> for Claims
+where
+    S: Send + Sync,
+{
+    type Rejection = AuthError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let TypedHeader(Authorization(bearer)) = parts
+            .extract::<TypedHeader<Authorization<Bearer>>>()
+            .await
+            .map_err(|_| AuthError::InvalidToken)?;
+
+        let token_data = decode::<Claims>(bearer.token(), &JWT_KEYS.decoding, &Validation::default())
+            .map_err(|_| AuthError::InvalidToken)?;
+
+        Ok(token_data.claims)
+    }
+}
+
+impl IntoResponse for AuthError {
+    fn into_response(self) -> Response {
+        let (status, error_message) = match self {
+            AuthError::WrongCredentials => (StatusCode::UNAUTHORIZED, "Wrong credentials"),
+            AuthError::MissingCredentials => (StatusCode::BAD_REQUEST, "Missing credentials"),
+            AuthError::TokenCreation => (StatusCode::INTERNAL_SERVER_ERROR, "Token creation error"),
+            AuthError::InvalidToken => (StatusCode::BAD_REQUEST, "Invalid token"),
+        };
+        let body = Json(json!({
+            "error": error_message,
+        }));
+        (status, body).into_response()
+    }
+}
+
+struct Keys {
+    encoding: EncodingKey,
+    decoding: DecodingKey,
+}
+
+impl Keys {
+    fn new(secret: &[u8]) -> Self {
+        Self {
+            encoding: EncodingKey::from_secret(secret),
+            decoding: DecodingKey::from_secret(secret),
+        }
+    }
 }

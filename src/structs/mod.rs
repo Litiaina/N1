@@ -8,3 +8,4 @@ pub mod uid_params_struct;
 pub mod download_params_struct;
 pub mod file_metadata_struct;
 pub mod metadata_params_struct;
+pub mod auth_structs;
