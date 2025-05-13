@@ -1,6 +1,27 @@
 use std::path::{Component, Path, PathBuf};
+use mongodb::bson::doc;
+use mongodb::error::Error;
 use tokio::fs;
 use walkdir::WalkDir;
+use crate::database::api::get_collection;
+use crate::fs::fs_constants::AUTH_COLLECTION;
+
+pub async fn get_allocated_storage(uid: &str) -> Result<Option<u64>, Error> {
+    let user_doc = get_collection(AUTH_COLLECTION)
+        .await
+        .find_one(doc! { "uid": uid })
+        .await?;
+
+    if let Some(doc) = user_doc {
+        if let Ok(allocated) = doc.get_i64("allocated_storage") {
+            if let Ok(value) = u64::try_from(allocated) {
+                return Ok(Some(value));
+            }
+        }
+    }
+
+    Ok(None)
+}
 
 pub fn sanitize_path(path: &str) -> String {
     let mut clean_path = PathBuf::new();

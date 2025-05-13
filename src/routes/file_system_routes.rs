@@ -1,11 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use axum::{
-    extract::DefaultBodyLimit,
-    http::Method,
-    routing::post,
-    Router,
-};
+use axum::{extract::DefaultBodyLimit, http::Method, routing::post, Router};
 use axum::http::{HeaderName, StatusCode};
 use axum::middleware::from_fn;
 use axum::routing::{delete, get, put};
@@ -17,28 +12,33 @@ use crate::fs::directory_viewer::{stream_file, view_directory, view_file};
 use crate::fs::download_manager::download_file;
 use crate::fs::fragmented_upload::{check_uploaded_fragments, finalize_assembled_fragments, upload_fragments};
 use crate::middleware::auth_middleware::{auth, authorize};
+use crate::middleware::storage_middleware::enforce_storage_limit;
 use crate::types::shared_state_type::SharedState;
 
 const MAX_FILE_SIZE: usize = 5 * 1024 * 1024 * 1024;
 
 pub fn serve_file_system_routes() -> Router {
     let state: SharedState = Arc::new(Mutex::new(HashMap::new()));
-    
+
+    let upload_routes = Router::new()
+        .route("/dir/file/upload/", post(upload_file))
+        .route("/dir/file/upload/{*path}", post(upload_file))
+        .route("/dir/file/upload/v2/", post(upload_fragments)).with_state(Arc::clone(&state))
+        .route("/dir/file/upload/v2/{*path}", post(upload_fragments)).with_state(Arc::clone(&state))
+        .layer(from_fn(enforce_storage_limit));
+
     let protected_routes = Router::new()
         .route("/dir/", get(view_directory))
         .route("/dir/{*path}", get(view_directory))
         .route("/dir/create/{*path}", post(create_directory))
         .route("/dir/delete/{*path}", delete(delete_directory))
-        .route("/dir/file/upload/", post(upload_file))
-        .route("/dir/file/upload/{*path}", post(upload_file))
-        .route("/dir/file/upload/v2/", post(upload_fragments)).with_state(Arc::clone(&state))
-        .route("/dir/file/upload/v2/{*path}", post(upload_fragments)).with_state(Arc::clone(&state))
         .route("/dir/file/finalize/", post(finalize_assembled_fragments))
         .route("/dir/file/finalize/{*path}", post(finalize_assembled_fragments))
         .route("/dir/file/rename/", put(rename_file_query))
         .route("/dir/file/rename/{*path}", put(rename_file_query))
         .route("/dir/file/delete/", delete(delete_file))
         .route("/dir/file/delete/{*path}", delete(delete_file))
+        .merge(upload_routes)
         .layer(from_fn(auth));
 
     Router::new()
@@ -75,4 +75,3 @@ pub fn serve_file_system_routes() -> Router {
 async fn ping() -> &'static str {
     "pong"
 }
-
