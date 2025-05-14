@@ -20,19 +20,14 @@ pub async fn cleanup_stale_uploads() {
         {
             let dir_path = entry.path().to_path_buf();
 
-            match is_unfinished_upload(&dir_path, FILE_TTL).await {
-                Ok(true) => {
-                    match fs::remove_dir_all(&dir_path).await {
-                        Ok(_) => info!("✅ Deleted stale unfinished upload: {:?}", dir_path),
-                        Err(e) => warn!("⚠️ Failed to delete {:?}: {:?}", dir_path, e),
-                    }
+            if let Ok(true) = is_unfinished_upload(&dir_path, FILE_TTL).await {
+                if let Err(e) = fs::remove_dir_all(&dir_path).await {
+                    warn!("⚠️ Failed to delete {:?}: {:?}", dir_path, e);
+                } else {
+                    info!("✅ Deleted stale unfinished upload: {:?}", dir_path);
                 }
-                Ok(false) => {
-                    info!("⏩ Skipped (not stale or finalized): {:?}", dir_path);
-                }
-                Err(e) => {
-                    warn!("⚠️ Could not check {:?}: {:?}", dir_path, e);
-                }
+            } else if let Err(e) = is_unfinished_upload(&dir_path, FILE_TTL).await {
+                warn!("⚠️ Could not check {:?}: {:?}", dir_path, e);
             }
         }
     }
