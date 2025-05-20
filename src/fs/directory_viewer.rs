@@ -12,7 +12,7 @@ use serde_json::json;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 use tokio_util::io::ReaderStream;
-use crate::structs::file_detail_struct::FileDetail;
+use crate::structs::file_detail_params_struct::FileDetail;
 use crate::structs::uid_params_struct::UIDParams;
 use crate::validation::directory_validation::{get_dir_size, sanitize_path};
 use crate::utils::header_extractor::extract_uid_from_header;

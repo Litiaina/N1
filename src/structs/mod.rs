@@ -1,6 +1,6 @@
 pub mod upload_params_struct;
 pub mod upload_metadata_struct;
-pub mod file_detail_struct;
+pub mod file_detail_params_struct;
 pub mod rename_params_struct;
 pub mod port_struct;
 pub mod delete_file_params_struct;
@@ -9,3 +9,4 @@ pub mod download_params_struct;
 pub mod file_metadata_struct;
 pub mod metadata_params_struct;
 pub mod auth_structs;
+pub mod capacity_struct;

@@ -11,6 +11,7 @@ use crate::fs::directory_manager::{create_directory, delete_directory, delete_fi
 use crate::fs::directory_viewer::{stream_file, view_directory, view_file};
 use crate::fs::download_manager::download_file;
 use crate::fs::fragmented_upload::{check_uploaded_fragments, finalize_assembled_fragments, upload_fragments};
+use crate::handlers::dir_info_handlers::get_storage_capacity;
 use crate::middleware::auth_middleware::{auth, authorize};
 use crate::middleware::storage_middleware::enforce_storage_limit;
 use crate::types::shared_state_type::SharedState;
@@ -38,6 +39,7 @@ pub fn serve_file_system_routes() -> Router {
         .route("/dir/file/rename/{*path}", put(rename_file_query))
         .route("/dir/file/delete/", delete(delete_file))
         .route("/dir/file/delete/{*path}", delete(delete_file))
+        .route("/dir/capacity", get(get_storage_capacity))
         .merge(upload_routes)
         .layer(from_fn(auth));
 
