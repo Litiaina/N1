@@ -289,17 +289,39 @@ async fn process_finalization(mut entries: ReadDir) -> usize {
             let json_str = fs::read_to_string(&path).await.ok()?;
             let metadata: UploadMetadata = serde_json::from_str(&json_str).ok()?;
             let orig_name = metadata.original_filename?;
-            let ext = std::path::Path::new(&orig_name).extension()?.to_str()?;
 
             let merged_path = std::path::Path::new(&metadata.merged_path);
-            if merged_path.exists() && merged_path.extension()?.to_str()? == "merged" {
-                let new_path = merged_path.with_extension(ext);
-                fs::rename(merged_path, &new_path).await.ok()?;
-                fs::remove_file(path).await.ok()?;
-                Some(())
-            } else {
-                None
+            if !merged_path.exists() || merged_path.extension()?.to_str()? != "merged" {
+                return None;
             }
+
+            let parent_dir = merged_path.parent()?;
+            let orig_path = parent_dir.join(&orig_name);
+            let mut final_path = orig_path.clone();
+
+            if final_path.exists() {
+                let stem = std::path::Path::new(&orig_name)
+                    .file_stem()?
+                    .to_string_lossy();
+                let ext = std::path::Path::new(&orig_name)
+                    .extension()
+                    .map(|e| format!(".{}", e.to_string_lossy()))
+                    .unwrap_or_default();
+
+                for i in 1..1000 {
+                    let candidate = parent_dir.join(format!("{} [{}]{}", stem, i, ext));
+                    if !candidate.exists() {
+                        final_path = candidate;
+                        break;
+                    }
+                }
+            }
+
+            fs::rename(merged_path, &final_path).await.ok()?;
+            fs::remove_file(path).await.ok()?;
+
+            info!("Renamed {:?} to {:?}", merged_path, final_path);
+            Some(())
         }));
     }
 
@@ -311,9 +333,9 @@ async fn process_finalization(mut entries: ReadDir) -> usize {
     }
 
     if renamed_files > 0 {
-        info!("{} files assembled", renamed_files)
+        info!("{} files assembled and renamed", renamed_files)
     } else {
-        warn!("{} files assembled", renamed_files)
+        warn!("No files assembled or renamed")
     }
 
     renamed_files
