@@ -77,7 +77,7 @@ pub async fn upload_fragments(
     let temp_path = file_path.with_extension("tmp");
 
     if file_path.exists() {
-        return Ok((StatusCode::OK, "Chunk already uploaded").into_response());
+        return Err((StatusCode::CONFLICT, "Chunk already uploaded").into_response());
     }
 
     let mut file = match timeout(IO_TIMEOUT, File::create(&temp_path)).await {
