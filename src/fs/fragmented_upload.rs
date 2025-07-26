@@ -122,18 +122,22 @@ pub async fn upload_fragments(
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "Flush failed").into_response());
     }
 
-    let actual_checksum = hex::encode(hasher.finalize());
+    let actual_checksum = if let Some(expected_checksum) = checksum.as_ref() {
+        let computed = hex::encode(hasher.finalize());
 
-    if let Some(expected_checksum) = checksum {
-        if expected_checksum != actual_checksum {
+        if expected_checksum != &computed {
             error!(
                 "Checksum mismatch for chunk {}: expected {}, got {}",
-                chunk_index, expected_checksum, actual_checksum
+                chunk_index, expected_checksum, computed
             );
             let _ = fs::remove_file(&temp_path).await;
             return Err((StatusCode::BAD_REQUEST, "Checksum mismatch").into_response());
         }
-    }
+
+        Some(computed)
+    } else {
+        None
+    };
 
     if let Err(e) = fs::rename(&temp_path, &file_path).await {
         error!("Rename error: {:?}", e);
@@ -145,8 +149,12 @@ pub async fn upload_fragments(
     }
 
     info!(
-        "Chunk {} written and verified with checksum {}",
-        chunk_index, actual_checksum
+        "Chunk {} written{}",
+        chunk_index,
+        actual_checksum
+            .as_ref()
+            .map(|cs| format!(" and verified with checksum {}", cs))
+            .unwrap_or_else(|| " (no checksum provided)".to_string())
     );
 
     let mut should_merge = false;
