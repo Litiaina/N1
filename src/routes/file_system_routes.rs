@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use axum::{extract::DefaultBodyLimit, http::Method, routing::post, Router};
 use axum::http::{HeaderName, StatusCode};
 use axum::middleware::from_fn;
@@ -70,7 +71,8 @@ pub fn serve_file_system_routes() -> Router {
                     Method::PUT,
                     Method::DELETE,
                     Method::OPTIONS,
-                ]),
+                ])
+                .max_age(Duration::from_secs(86400)),
         )
 }
 
