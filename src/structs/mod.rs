@@ -10,3 +10,4 @@ pub mod file_metadata_struct;
 pub mod metadata_params_struct;
 pub mod auth_structs;
 pub mod capacity_struct;
+pub mod path_manager_struct;

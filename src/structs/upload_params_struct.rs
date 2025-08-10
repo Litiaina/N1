@@ -1,11 +1,11 @@
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct UploadParams {
     pub file_id: String,
-    pub chunk_index: usize,
     pub total_chunks: usize,
-    pub original_filename: Option<String>,
+    pub chunk_index: usize,
+    pub original_filename: String,
     pub mime_type: Option<String>,
-    pub checksum: Option<String>
+    pub checksum: Option<String>,
 }

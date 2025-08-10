@@ -43,6 +43,18 @@ pub fn sanitize_path(path: &str) -> String {
     clean_path.to_string_lossy().to_string()
 }
 
+pub fn sanitize_fragmented_path(path: &str) -> PathBuf {
+    path.split('/')
+        .filter_map(|s| {
+            if s.is_empty() || s == "." || s == ".." {
+                None
+            } else {
+                Some(s)
+            }
+        })
+        .collect()
+}
+
 pub async fn get_dir_size(path: &PathBuf) -> u64 {
     let mut total_size = 0;
 

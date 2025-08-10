@@ -11,7 +11,7 @@ use crate::fs::direct_upload::upload_file;
 use crate::fs::directory_manager::{create_directory, delete_directory, delete_file, get_file_metadata, rename_file_query};
 use crate::fs::directory_viewer::{stream_file, stream_file_v2, view_directory, view_file};
 use crate::fs::download_manager::download_file;
-use crate::fs::fragmented_upload::{check_uploaded_fragments, finalize_assembled_fragments, upload_fragments};
+use crate::fs::fragmented_upload::{check_uploaded_fragments, upload_fragments};
 use crate::handlers::dir_info_handlers::get_storage_capacity;
 use crate::middleware::auth_middleware::{auth, authorize};
 use crate::middleware::storage_middleware::enforce_storage_limit;
@@ -34,8 +34,6 @@ pub fn serve_file_system_routes() -> Router {
         .route("/dir/{*path}", get(view_directory))
         .route("/dir/create/{*path}", post(create_directory))
         .route("/dir/delete/{*path}", delete(delete_directory))
-        .route("/dir/file/finalize/", post(finalize_assembled_fragments))
-        .route("/dir/file/finalize/{*path}", post(finalize_assembled_fragments))
         .route("/dir/file/rename/", put(rename_file_query))
         .route("/dir/file/rename/{*path}", put(rename_file_query))
         .route("/dir/file/delete/", delete(delete_file))
@@ -47,7 +45,7 @@ pub fn serve_file_system_routes() -> Router {
     Router::new()
         .route("/ping", get(ping).options(|| async { StatusCode::OK }))
         .route("/authenticate", post(authorize))
-        .route("/dir/file/upload/check/{*path}", get(check_uploaded_fragments))
+        .route("/dir/file/upload/check/{*path}", get(check_uploaded_fragments)).with_state(Arc::clone(&state))
         .route("/dir/file/view/{*path}", get(view_file))
         .route("/dir/file/stream/{*path}", get(stream_file))
         .route("/dir/file/stream/v2/{*path}", get(stream_file_v2))
