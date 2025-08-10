@@ -1,23 +1,27 @@
+use crate::fs::fs_constants::INITIAL_CHUNK_SIZE;
+use crate::structs::file_detail_params_struct::FileDetail;
+use crate::structs::uid_params_struct::UIDParams;
+use crate::utils::header_extractor::extract_uid_from_header;
+use crate::validation::directory_validation::{get_dir_size, sanitize_path};
+use axum::Json;
+use axum::body::{Body, Bytes};
+use axum::extract::{Path, Query};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use futures_util::stream::StreamExt;
+use mime_guess::from_path;
+use serde_json::json;
 use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
-use axum::body::{Body, Bytes};
-use axum::extract::{Path, Query};
-use axum::http::{HeaderMap, StatusCode};
-use axum::Json;
-use axum::response::{IntoResponse, Response};
-use mime_guess::from_path;
-use serde_json::json;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 use tokio_util::io::ReaderStream;
-use crate::structs::file_detail_params_struct::FileDetail;
-use crate::structs::uid_params_struct::UIDParams;
-use crate::validation::directory_validation::{get_dir_size, sanitize_path};
-use crate::utils::header_extractor::extract_uid_from_header;
 
-pub async fn view_directory(header: HeaderMap, path: Option<Path<String>>) -> Result<impl IntoResponse, StatusCode> {
+pub async fn view_directory(
+    header: HeaderMap,
+    path: Option<Path<String>>,
+) -> Result<impl IntoResponse, StatusCode> {
     let validated_uid = extract_uid_from_header(&header).map_err(|code| code)?;
 
     let relative_path = path
@@ -77,14 +81,20 @@ pub async fn view_directory(header: HeaderMap, path: Option<Path<String>>) -> Re
     Ok(Json(response_body))
 }
 
-pub async fn view_file(Query(params): Query<UIDParams>, Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
+pub async fn view_file(
+    Query(params): Query<UIDParams>,
+    Path(path): Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
     let validated_uid = if !params.uid.is_empty() {
         params.uid
     } else {
-        return Err(StatusCode::BAD_REQUEST)
+        return Err(StatusCode::BAD_REQUEST);
     };
     let sanitized_directory = sanitize_path(&path);
-    let file_path = PathBuf::from(format!("storage-files/{}/{}", validated_uid, sanitized_directory));
+    let file_path = PathBuf::from(format!(
+        "storage-files/{}/{}",
+        validated_uid, sanitized_directory
+    ));
     let mut file = fs::File::open(&file_path)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
@@ -106,14 +116,21 @@ pub async fn view_file(Query(params): Query<UIDParams>, Path(path): Path<String>
         .into_response())
 }
 
-pub async fn stream_file(Query(params): Query<UIDParams>, headers: HeaderMap, Path(path): Path<String>) -> Result<impl IntoResponse, StatusCode> {
+pub async fn stream_file(
+    Query(params): Query<UIDParams>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
     let validated_uid = if !params.uid.is_empty() {
         params.uid
     } else {
-        return Err(StatusCode::BAD_REQUEST)
+        return Err(StatusCode::BAD_REQUEST);
     };
     let sanitized_directory = sanitize_path(&path);
-    let file_path = PathBuf::from(format!("storage-files/{}/{}", validated_uid, sanitized_directory));
+    let file_path = PathBuf::from(format!(
+        "storage-files/{}/{}",
+        validated_uid, sanitized_directory
+    ));
 
     let mime_type = from_path(&file_path).first_or_octet_stream();
 
@@ -169,8 +186,104 @@ pub async fn stream_file(Query(params): Query<UIDParams>, headers: HeaderMap, Pa
         .header("Content-Length", (end - start + 1).to_string());
 
     if status_code == StatusCode::PARTIAL_CONTENT {
-        response = response.header("Content-Range", format!("bytes {}-{}/{}", start, end, file_size));
+        response = response.header(
+            "Content-Range",
+            format!("bytes {}-{}/{}", start, end, file_size),
+        );
     }
 
     Ok(response.body(body).unwrap())
+}
+
+pub async fn stream_file_v2(
+    Query(params): Query<UIDParams>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+) -> Result<impl IntoResponse, Response> {
+    if params.uid.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "UID cannot be empty.").into_response());
+    }
+
+    let sanitized_directory = sanitize_path(&path);
+    let file_path = PathBuf::from(format!(
+        "storage-files/{}/{}",
+        params.uid, sanitized_directory
+    ));
+
+    let metadata = fs::metadata(&file_path)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "File not found.").into_response())?;
+
+    let file_size = metadata.len();
+    let mime_type = from_path(&file_path).first_or_octet_stream();
+    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    let (start, end) = parse_range_header(range_header, file_size)
+        .unwrap_or((0, INITIAL_CHUNK_SIZE.min(file_size).saturating_sub(1)));
+
+    if start >= file_size || end >= file_size || start > end {
+        return Err(StatusCode::RANGE_NOT_SATISFIABLE.into_response());
+    }
+
+    let mut file = fs::File::open(&file_path)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "File not found.").into_response())?;
+
+    file.seek(SeekFrom::Start(start))
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Error seeking file.").into_response())?;
+
+    let content_length = end - start + 1;
+    let reader = BufReader::new(file);
+    let stream = ReaderStream::new(reader.take(content_length));
+    let body = Body::from_stream(stream);
+
+    let response = Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header(header::CONTENT_TYPE, mime_type.to_string())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, content_length.to_string())
+        .header(
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", start, end, file_size),
+        )
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(body)
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to build response.",
+            )
+                .into_response()
+        })?;
+
+    Ok(response)
+}
+
+fn parse_range_header(range_header: Option<&str>, file_size: u64) -> Option<(u64, u64)> {
+    let range_str = range_header?.strip_prefix("bytes=")?;
+    let mut parts = range_str.split('-');
+    let start_str = parts.next()?;
+    let end_str = parts.next().unwrap_or("");
+
+    if start_str.is_empty() {
+        let suffix_len = end_str.parse::<u64>().ok()?;
+        if suffix_len == 0 || suffix_len > file_size {
+            return None;
+        }
+        Some((file_size - suffix_len, file_size - 1))
+    } else {
+        let start = start_str.parse::<u64>().ok()?;
+        if start >= file_size {
+            return None;
+        }
+        let end = if end_str.is_empty() {
+            file_size - 1
+        } else {
+            end_str.parse::<u64>().ok()?
+        };
+        if start > end || end >= file_size {
+            return None;
+        }
+        Some((start, end))
+    }
 }

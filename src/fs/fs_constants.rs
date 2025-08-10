@@ -10,3 +10,4 @@ pub const AUTH_COLLECTION: &str = "auth";
 pub const STORAGE_ROOT: &str = "storage-files";
 pub const CHUNK_PREFIX: &str = "chunk_";
 pub const TMP_EXT: &str = "tmp";
+pub const INITIAL_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
