@@ -12,7 +12,7 @@ pub struct TranscodeJob {
 #[derive(Deserialize, Clone, Debug)]
 pub struct QualityParameters {
     pub name: String,
-    pub height: u32,
+    pub height: i64,
     pub video_bitrate: String,
     pub audio_bitrate: String,
 }
@@ -34,7 +34,8 @@ pub struct TranscodeResponse {
 #[derive(Deserialize, Debug)]
 pub struct FFProbeStream {
     pub codec_type: String,
-    pub height: Option<u32>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
     pub bit_rate: Option<String>,
 }
 

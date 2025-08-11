@@ -16,7 +16,7 @@ use crate::fs::directory_viewer::{stream_file, stream_file_v2, stream_hls_file, 
 use crate::fs::download_manager::download_file;
 use crate::fs::fragmented_upload::{check_uploaded_fragments, upload_fragments};
 use crate::handlers::dir_info_handlers::get_storage_capacity;
-use crate::handlers::transcode_handler::{transcode_status_handler, transcode_video_handler};
+use crate::handlers::transcoder_handler::{transcode_status_handler, transcode_video_handler};
 use crate::middleware::auth_middleware::{auth, authorize};
 use crate::middleware::storage_middleware::enforce_storage_limit;
 use crate::types::shared_state_type::SharedState;

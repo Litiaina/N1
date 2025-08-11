@@ -1,5 +1,5 @@
 use crate::enums::transcoder_enums::JobStatus;
-use crate::structs::transcode_structs::{
+use crate::structs::transcoder_structs::{
     FFProbeOutput, QualityParameters, TranscodeJob, TranscodeJobStatus, TranscodeRequest,
     TranscodeResponse,
 };
@@ -10,8 +10,8 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use mongodb::Database;
 use mongodb::bson::{Uuid as BsonUuid, doc};
-use std::path::PathBuf;
 use serde_json::json;
+use std::path::PathBuf;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -60,8 +60,10 @@ pub async fn transcode_video_handler(
 
     task::spawn(async move {
         info!(uid = %uid_owned, %job_id, "Starting background transcode job.");
-
         let mut qualities_to_process: Vec<QualityParameters> = Vec::new();
+        let mut original_width: i64 = 0;
+        let mut original_height: i64 = 0;
+
         if include_source {
             let ffprobe_output = Command::new("ffprobe")
                 .arg("-v")
@@ -72,14 +74,19 @@ pub async fn transcode_video_handler(
                 .arg(&source_file_owned)
                 .output()
                 .await;
+
             if let Ok(output) = ffprobe_output {
                 if let Ok(parsed) = serde_json::from_slice::<FFProbeOutput>(&output.stdout) {
                     let video_stream = parsed.streams.iter().find(|s| s.codec_type == "video");
                     let audio_stream = parsed.streams.iter().find(|s| s.codec_type == "audio");
+
                     if let (Some(video), Some(audio)) = (video_stream, audio_stream) {
+                        original_width = video.width.unwrap_or(0);
+                        original_height = video.height.unwrap_or(0);
+
                         qualities_to_process.push(QualityParameters {
                             name: "Source".to_string(),
-                            height: video.height.unwrap_or(0),
+                            height: original_height, // Use the actual source height
                             video_bitrate: video
                                 .bit_rate
                                 .clone()
@@ -93,6 +100,7 @@ pub async fn transcode_video_handler(
                 }
             }
         }
+
         qualities_to_process.extend(qualities_payload.unwrap_or_else(|| {
             vec![
                 QualityParameters {
@@ -129,6 +137,7 @@ pub async fn transcode_video_handler(
             .arg("48")
             .arg("-sc_threshold")
             .arg("0");
+
         for quality in &qualities_to_process {
             let segment_filename = base_output_dir.join(format!("{}_%03d.ts", quality.name));
             let playlist_filename = base_output_dir.join(format!("{}.m3u8", quality.name));
@@ -172,12 +181,19 @@ pub async fn transcode_video_handler(
                     let master_playlist_path = base_output_dir.join("master.m3u8");
                     let mut master_playlist_content = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
 
+                    let aspect_ratio: f64 = if original_height > 0 && original_width > 0 {
+                        original_width as f64 / original_height as f64
+                    } else {
+                        16.0 / 9.0
+                    };
+
                     for quality in &qualities_to_process {
                         let video_bw = quality
                             .video_bitrate
                             .replace('k', "000")
                             .parse::<u32>()
                             .unwrap_or(0);
+
                         let audio_bw = quality
                             .audio_bitrate
                             .replace('k', "000")
@@ -185,9 +201,17 @@ pub async fn transcode_video_handler(
                             .unwrap_or(0);
                         let total_bandwidth = video_bw + audio_bw;
 
+                        let width = if quality.name == "Source" {
+                            original_width
+                        } else {
+                            let calculated_width =
+                                (quality.height as f64 * aspect_ratio).round() as i64;
+                            calculated_width - (calculated_width % 2)
+                        };
+
                         master_playlist_content.push_str(&format!(
-                            "#EXT-X-STREAM-INF:BANDWIDTH={},RESOLUTION=-1x{}\n{}.m3u8\n",
-                            total_bandwidth, quality.height, quality.name
+                            "#EXT-X-STREAM-INF:BANDWIDTH={},RESOLUTION={}x{}\n{}.m3u8\n",
+                            total_bandwidth, width, quality.height, quality.name
                         ));
                     }
 
@@ -225,6 +249,7 @@ pub async fn transcode_video_handler(
         let jobs_collection = db_clone.collection::<TranscodeJob>("jobs");
         let query = doc! { "_id": job_id };
         let update = doc! { "$set": { "status": mongodb::bson::to_bson(&final_status).unwrap() } };
+
         if let Err(e) = jobs_collection.update_one(query, update).await {
             error!(%job_id, error = %e, "Failed to update job status in database.");
         }
