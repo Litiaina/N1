@@ -95,7 +95,7 @@ async fn server() {
         .unwrap();
 
     let file_system_port = SocketAddr::from(([127, 0, 0, 1], file_system_ports.https));
-    let serve_file_system = serve_file_system_routes().fallback(handler_404);
+    let serve_file_system = serve_file_system_routes().await.fallback(handler_404);
 
     let file_system_task = tokio::spawn(serve(
         file_system_port,

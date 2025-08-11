@@ -1,10 +1,10 @@
 use mongodb::{Client, Collection, Database};
 use mongodb::bson::Document;
+use crate::database::database_constants::{DATABASE, DATABASE_URL};
 
 pub async fn database_connect() -> mongodb::error::Result<Database> {
-    let uri = "mongodb://localhost:27017";
-    let client = Client::with_uri_str(uri).await?;
-    let database = client.database("litiaina-cloud-database");
+    let client = Client::with_uri_str(DATABASE_URL).await?;
+    let database = client.database(DATABASE);
     Ok(database)
 }
 
