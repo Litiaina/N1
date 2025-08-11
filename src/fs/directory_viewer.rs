@@ -287,3 +287,64 @@ fn parse_range_header(range_header: Option<&str>, file_size: u64) -> Option<(u64
         Some((start, end))
     }
 }
+
+pub async fn stream_hls_file(
+    Query(params): Query<UIDParams>,
+    Path(path): Path<String>,
+) -> Result<impl IntoResponse, Response> {
+    if params.uid.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "UID cannot be empty.").into_response());
+    }
+
+    let sanitized_directory = sanitize_path(&path);
+    let file_path = PathBuf::from(format!(
+        "storage-files/{}/{}",
+        params.uid, sanitized_directory
+    ));
+
+    let file_name = match std::path::Path::new(&path)
+        .file_name()
+        .and_then(|s| s.to_str())
+    {
+        Some(name) => name,
+        None => return Err((StatusCode::BAD_REQUEST, "Invalid file path.").into_response()),
+    };
+
+    if !file_name.ends_with(".m3u8") && !file_name.ends_with(".ts") {
+        return Err((StatusCode::BAD_REQUEST, "Invalid file type.").into_response());
+    }
+
+    let metadata = match fs::metadata(&file_path).await {
+        Ok(meta) => meta,
+        Err(_) => return Err((StatusCode::NOT_FOUND, "File not found.").into_response()),
+    };
+
+    let mime_type = if file_name.ends_with(".m3u8") {
+        "application/vnd.apple.mpegurl"
+    } else {
+        "video/mp2t"
+    };
+    let file_size = metadata.len();
+    let file = fs::File::open(&file_path)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "File not found.").into_response())?;
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime_type)
+        .header(header::CONTENT_LENGTH, file_size.to_string())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, "public, max-age=3600")
+        .body(body)
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to build response.",
+            )
+                .into_response()
+        })?;
+
+    Ok(response)
+}
