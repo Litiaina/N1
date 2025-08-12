@@ -53,8 +53,8 @@ pub async fn serve_file_system_routes() -> Router {
         .layer(from_fn(auth));
 
     let protected_transcoding_routes = Router::new()
-        .route("/dir/file/transcode/file/video", post(transcode_video_handler))
-        .route("/dir/file/transcode/file/status", get(transcode_status_handler))
+        .route("/dir/file/transcode/video", post(transcode_video_handler))
+        .route("/dir/file/transcode/status", get(transcode_status_handler))
         .with_state(db)
         .layer(from_fn(auth));
 
