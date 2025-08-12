@@ -54,7 +54,6 @@ pub async fn transcode_video_handler(
     task::spawn(async move {
         if let Err(e) = process_transcoding_job(db_clone, job_id, full_source_path, payload).await {
             error!(%job_id, error = %e, "Transcoding job failed.");
-            // Update job status to Failed in the database
             let jobs_collection = db.collection::<TranscodeJob>("jobs");
             let query = doc! { "_id": job_id };
             let update = doc! { "$set": { "status": mongodb::bson::to_bson(&JobStatus::Failed { reason: e }).unwrap(), "progress": 100.0 } };
@@ -196,7 +195,6 @@ fn generate_adaptive_ladder(
 
     let qualities = custom_qualities.unwrap_or_else(|| {
         vec![
-            // Standard qualities
             Quality {
                 height: 2160,
                 bitrate: 18000,
