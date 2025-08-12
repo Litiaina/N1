@@ -55,22 +55,6 @@ pub fn sanitize_fragmented_path(path: &str) -> PathBuf {
         .collect()
 }
 
-pub fn sanitize_transcoder_path(path: &str) -> PathBuf {
-    let path = Path::new(path);
-    let mut sanitized = PathBuf::new();
-
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => {
-                sanitized.push(part);
-            }
-            _ => (),
-        }
-    }
-    sanitized
-}
-
-
 pub async fn get_dir_size(path: &PathBuf) -> u64 {
     let mut total_size = 0;
 

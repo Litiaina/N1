@@ -3,7 +3,7 @@ use crate::structs::transcoder_structs::{
     FFProbeOutput, Quality, Rendition, TranscodeJob, TranscodeRequest, TranscodeResponse,
     TranscodeStatusRequest,
 };
-use crate::validation::directory_validation::sanitize_transcoder_path;
+use crate::validation::directory_validation::sanitize_path;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -12,7 +12,6 @@ use mongodb::Database;
 use mongodb::bson::{Uuid as BsonUuid, doc};
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::{fs, task};
@@ -25,18 +24,11 @@ pub async fn transcode_video_handler(
     if payload.uid.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "UID cannot be empty".to_string()));
     }
-    if payload.source_path.contains("..") {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Invalid source path: '..' is not allowed".to_string(),
-        ));
-    }
 
-    let sanitized_directory = sanitize_transcoder_path(&payload.source_path);
+    let sanitized_directory = sanitize_path(&payload.source_path);
     let full_source_path = PathBuf::from(format!(
         "storage-files/{}/{}",
-        payload.uid,
-        sanitized_directory.display()
+        payload.uid, sanitized_directory
     ));
 
     if !full_source_path.exists() {
@@ -62,6 +54,7 @@ pub async fn transcode_video_handler(
     task::spawn(async move {
         if let Err(e) = process_transcoding_job(db_clone, job_id, full_source_path, payload).await {
             error!(%job_id, error = %e, "Transcoding job failed.");
+            // Update job status to Failed in the database
             let jobs_collection = db.collection::<TranscodeJob>("jobs");
             let query = doc! { "_id": job_id };
             let update = doc! { "$set": { "status": mongodb::bson::to_bson(&JobStatus::Failed { reason: e }).unwrap(), "progress": 100.0 } };
@@ -125,8 +118,16 @@ async fn process_transcoding_job(
         warn!(%job_id, error = %e, "Failed to update job with renditions list.");
     }
 
-    update_job_status(&jobs_collection, job_id, JobStatus::Encoding, 5.0).await;
+    update_job_status(&jobs_collection, job_id, JobStatus::Encoding, 5.0).await; // 5% for setup
     let base_output_dir = PathBuf::from(format!("{}_HLS", source_str));
+
+    if base_output_dir.exists() {
+        info!(%job_id, path = %base_output_dir.display(), "Removing existing output directory.");
+        fs::remove_dir_all(&base_output_dir)
+            .await
+            .map_err(|e| format!("Failed to remove existing output directory: {}", e))?;
+    }
+
     fs::create_dir_all(&base_output_dir)
         .await
         .map_err(|e| format!("Failed to create output directory: {}", e))?;
@@ -195,6 +196,7 @@ fn generate_adaptive_ladder(
 
     let qualities = custom_qualities.unwrap_or_else(|| {
         vec![
+            // Standard qualities
             Quality {
                 height: 2160,
                 bitrate: 18000,
@@ -224,6 +226,11 @@ fn generate_adaptive_ladder(
                 height: 360,
                 bitrate: 800,
                 audio_bitrate: 96,
+            },
+            Quality {
+                height: 144,
+                bitrate: 400,
+                audio_bitrate: 64,
             },
         ]
     });
@@ -269,11 +276,8 @@ async fn transcode_rendition(
     let playlist_filename = output_dir.join(format!("{}.m3u8", rendition_name));
     let log_file_path = output_dir.join(format!("ffmpeg_{}_pass", rendition_name));
 
-    let fps_str = fps.map_or("-1".to_string(), |f| f.to_string());
-    let vf_filter = format!(
-        "scale={}:{},fps={}",
-        rendition.width, rendition.height, fps_str
-    );
+    let fps_str = fps.map_or("30".to_string(), |f| f.to_string());
+    let vf_filter = format!("scale={}:{}", rendition.width, rendition.height);
     let video_bitrate_str = format!("{}k", rendition.video_bitrate);
     let audio_bitrate_str = format!("{}k", rendition.audio_bitrate);
 
@@ -286,6 +290,8 @@ async fn transcode_rendition(
         "-an",
         "-vf",
         &vf_filter,
+        "-r",
+        &fps_str,
         "-vcodec",
         "libx264",
         "-preset",
@@ -301,22 +307,27 @@ async fn transcode_rendition(
         if cfg!(windows) { "NUL" } else { "/dev/null" },
     ]);
 
-    let pass1_status = Command::new("ffmpeg")
+    let pass1_output = Command::new("ffmpeg")
         .args(&pass1_args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .output()
         .await
-        .map_err(|e| format!("FFMPEG pass 1 execution failed: {}", e))?;
+        .map_err(|e| format!("FFMPEG pass 1 command failed to execute: {}", e))?;
 
-    if !pass1_status.success() {
-        return Err("FFMPEG pass 1 failed. Check logs for details.".to_string());
+    if !pass1_output.status.success() {
+        let stderr = String::from_utf8_lossy(&pass1_output.stderr);
+        return Err(format!(
+            "FFMPEG pass 1 failed. Stderr: {}. Check the log file at: {}",
+            stderr,
+            log_file_path.with_extension("log").display()
+        ));
     }
 
     let mut pass2_args = base_args.clone();
     pass2_args.extend(vec![
         "-vf",
         &vf_filter,
+        "-r",
+        &fps_str,
         "-c:v",
         "libx264",
         "-preset",
@@ -348,7 +359,11 @@ async fn transcode_rendition(
 
     if !pass2_output.status.success() {
         let stderr = String::from_utf8_lossy(&pass2_output.stderr);
-        return Err(format!("FFMPEG pass 2 failed: {}", stderr));
+        return Err(format!(
+            "FFMPEG pass 2 failed. Stderr: {}. Check the log file at: {}",
+            stderr,
+            log_file_path.with_extension("log").display()
+        ));
     }
 
     let log_file_main = log_file_path.with_extension("log");
