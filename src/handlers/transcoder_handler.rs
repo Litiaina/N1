@@ -8,6 +8,7 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use chrono::Utc;
 use mongodb::Database;
 use mongodb::bson::{Uuid as BsonUuid, doc};
 use serde_json::json;
@@ -24,6 +25,12 @@ pub async fn transcode_video_handler(
     if payload.uid.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "UID cannot be empty".to_string()));
     }
+    if payload.source_path.contains("..") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid source path: '..' is not allowed".to_string(),
+        ));
+    }
 
     let sanitized_directory = sanitize_path(&payload.source_path);
     let full_source_path = PathBuf::from(format!(
@@ -36,15 +43,86 @@ pub async fn transcode_video_handler(
         return Err((StatusCode::NOT_FOUND, "Source file not found".to_string()));
     }
 
+    let jobs_collection = db.collection::<TranscodeJob>("jobs");
+
+    let timeout_duration = chrono::Duration::minutes(5);
+    let stale_threshold_timestamp = (Utc::now() - timeout_duration).timestamp_millis();
+
+    let failed_status_bson = match mongodb::bson::to_bson(&JobStatus::Failed {
+        reason: "Job timed out due to server inactivity.".to_string(),
+    }) {
+        Ok(bson) => bson,
+        Err(e) => {
+            error!(error = %e, "Failed to serialize Failed status for stale job cleanup.");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal configuration error.".to_string(),
+            ));
+        }
+    };
+
+    let stale_job_query = doc! {
+        "status": { "$in": ["preparing", "encoding", "packaging"] },
+        "last_heartbeat": { "$lt": stale_threshold_timestamp }
+    };
+    let update_stale = doc! {
+        "$set": { "status": failed_status_bson }
+    };
+
+    match jobs_collection
+        .update_many(stale_job_query, update_stale)
+        .await
+    {
+        Ok(result) => {
+            if result.modified_count > 0 {
+                warn!("Cleaned up {} stale jobs.", result.modified_count);
+            }
+        }
+        Err(e) => {
+            error!(error = %e, "Error during stale job cleanup.");
+        }
+    }
+
+    let active_job_query = doc! {
+        "uid": &payload.uid,
+        "source_path": &payload.source_path,
+        "status": { "$in": ["queued", "preparing", "encoding", "packaging"] }
+    };
+
+    match jobs_collection.find_one(active_job_query).await {
+        Ok(Some(active_job)) => {
+            warn!(job_id = %active_job.job_id, "Attempted to transcode a video that is already being processed.");
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "This video is already being processed under job ID: {}",
+                    active_job.job_id
+                ),
+            ));
+        }
+        Ok(None) => {
+            info!(
+                "No active job found for {}. Proceeding with new transcode.",
+                &payload.source_path
+            );
+        }
+        Err(e) => {
+            error!(error = %e, "Database error while checking for active jobs.");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+    }
+
     let job_id = BsonUuid::new();
     let new_job = TranscodeJob {
         job_id,
+        uid: payload.uid.clone(),
+        source_path: payload.source_path.clone(),
         status: JobStatus::Queued,
         renditions: Vec::new(),
         progress: 0.0,
+        last_heartbeat: Utc::now().timestamp_millis(),
     };
 
-    let jobs_collection = db.collection::<TranscodeJob>("jobs");
     if let Err(e) = jobs_collection.insert_one(&new_job).await {
         error!(error = %e, "Failed to insert new job into database.");
         return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
@@ -56,7 +134,7 @@ pub async fn transcode_video_handler(
             error!(%job_id, error = %e, "Transcoding job failed.");
             let jobs_collection = db.collection::<TranscodeJob>("jobs");
             let query = doc! { "_id": job_id };
-            let update = doc! { "$set": { "status": mongodb::bson::to_bson(&JobStatus::Failed { reason: e }).unwrap(), "progress": 100.0 } };
+            let update = doc! { "$set": { "status": mongodb::bson::to_bson(&JobStatus::Failed { reason: e }).unwrap_or_default(), "progress": 100.0 } };
             if let Err(db_err) = jobs_collection.update_one(query, update).await {
                 error!(%job_id, error = %db_err, "Failed to update job status to Failed in DB.");
             }
@@ -81,8 +159,8 @@ async fn process_transcoding_job(
     let source_str = source_path.to_string_lossy().to_string();
 
     update_job_status(&jobs_collection, job_id, JobStatus::Preparing, 0.0).await;
+    update_job_heartbeat(&jobs_collection, job_id).await;
 
-    info!(%job_id, "Probing source video file.");
     let probe_output = probe_video(&source_str).await?;
     let video_stream = probe_output
         .streams
@@ -101,8 +179,6 @@ async fn process_transcoding_job(
         16.0 / 9.0
     };
 
-    info!(%job_id, source_height, "Generating adaptive quality ladder.");
-
     let preset = request.preset;
     let fps = request.fps;
 
@@ -112,16 +188,16 @@ async fn process_transcoding_job(
     }
 
     let query = doc! { "_id": job_id };
-    let update = doc! { "$set": { "renditions": mongodb::bson::to_bson(&renditions).unwrap() } };
+    let update =
+        doc! { "$set": { "renditions": mongodb::bson::to_bson(&renditions).unwrap_or_default() } };
     if let Err(e) = jobs_collection.update_one(query, update).await {
         warn!(%job_id, error = %e, "Failed to update job with renditions list.");
     }
 
-    update_job_status(&jobs_collection, job_id, JobStatus::Encoding, 5.0).await; // 5% for setup
+    update_job_status(&jobs_collection, job_id, JobStatus::Encoding, 5.0).await;
     let base_output_dir = PathBuf::from(format!("{}_HLS", source_str));
 
     if base_output_dir.exists() {
-        info!(%job_id, path = %base_output_dir.display(), "Removing existing output directory.");
         fs::remove_dir_all(&base_output_dir)
             .await
             .map_err(|e| format!("Failed to remove existing output directory: {}", e))?;
@@ -133,7 +209,7 @@ async fn process_transcoding_job(
 
     let total_renditions = renditions.len() as f32;
     for (i, rendition) in renditions.iter().enumerate() {
-        info!(%job_id, quality = %rendition.name, "Starting transcode for rendition.");
+        update_job_heartbeat(&jobs_collection, job_id).await;
 
         let progress_start = 5.0 + (i as f32 / total_renditions) * 90.0;
         update_job_progress(&jobs_collection, job_id, progress_start).await;
@@ -150,16 +226,14 @@ async fn process_transcoding_job(
             error!(%job_id, quality = %rendition.name, error = %e, "Rendition transcode failed.");
             e
         })?;
-        info!(%job_id, quality = %rendition.name, "Finished transcode for rendition.");
     }
 
-    info!(%job_id, "Generating master HLS playlist.");
+    update_job_heartbeat(&jobs_collection, job_id).await;
     update_job_status(&jobs_collection, job_id, JobStatus::Packaging, 95.0).await;
     generate_master_playlist(&base_output_dir, &renditions)
         .await
         .map_err(|e| format!("Failed to generate master playlist: {}", e))?;
 
-    info!(%job_id, "Transcoding job completed successfully.");
     update_job_status(&jobs_collection, job_id, JobStatus::Completed, 100.0).await;
 
     Ok(())
@@ -278,9 +352,7 @@ async fn transcode_rendition(
     let vf_filter = format!("scale={}:{}", rendition.width, rendition.height);
     let video_bitrate_str = format!("{}k", rendition.video_bitrate);
     let audio_bitrate_str = format!("{}k", rendition.audio_bitrate);
-
     let preset_str = preset.unwrap_or("slow");
-
     let base_args = vec!["-y", "-i", source_file];
 
     let mut pass1_args = base_args.clone();
@@ -398,14 +470,29 @@ async fn generate_master_playlist(
     Ok(())
 }
 
+async fn update_job_heartbeat(collection: &mongodb::Collection<TranscodeJob>, job_id: BsonUuid) {
+    let query = doc! { "_id": job_id };
+    let update = doc! { "$set": { "last_heartbeat": Utc::now().timestamp_millis() } };
+    if let Err(e) = collection.update_one(query, update).await {
+        warn!(%job_id, error = %e, "Failed to update job heartbeat.");
+    }
+}
+
 async fn update_job_status(
     collection: &mongodb::Collection<TranscodeJob>,
     job_id: BsonUuid,
     status: JobStatus,
     progress: f32,
 ) {
+    let status_bson = match mongodb::bson::to_bson(&status) {
+        Ok(bson) => bson,
+        Err(e) => {
+            error!(%job_id, error = %e, "Failed to serialize job status.");
+            return;
+        }
+    };
     let query = doc! { "_id": job_id };
-    let update = doc! { "$set": { "status": mongodb::bson::to_bson(&status).unwrap(), "progress": progress as f64 } };
+    let update = doc! { "$set": { "status": status_bson, "progress": progress as f64 } };
     if let Err(e) = collection.update_one(query, update).await {
         error!(%job_id, error = %e, "Failed to update job status in database.");
     }

@@ -6,9 +6,12 @@ use crate::enums::transcoder_enums::JobStatus;
 pub struct TranscodeJob {
     #[serde(rename = "_id")]
     pub job_id: BsonUuid,
+    pub uid: String,
+    pub source_path: String,
     pub status: JobStatus,
     pub progress: f32,
     pub renditions: Vec<Rendition>,
+    pub last_heartbeat: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
