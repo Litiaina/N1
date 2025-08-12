@@ -1,8 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "snake_case")]
 pub enum JobStatus {
-    Processing,
+    Queued,
+    Preparing,
+    Encoding,
+    Packaging,
     Completed,
     Failed { reason: String },
 }
