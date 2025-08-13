@@ -1,18 +1,18 @@
-use std::path::PathBuf;
+use crate::fs::fs_constants::DEFAULT_BUFFER_SIZE;
+use crate::utils::file_extension_util::get_file_extension;
+use crate::utils::header_extractor::extract_uid_from_header;
+use crate::validation::directory_validation::sanitize_path;
+use axum::Json;
 use axum::extract::{Multipart, Path};
 use axum::http::{HeaderMap, StatusCode};
-use axum::Json;
 use axum::response::IntoResponse;
 use futures_util::TryStreamExt;
 use serde_json::json;
+use std::path::PathBuf;
 use tokio::fs;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio_util::io::StreamReader;
 use tracing::{error, info, warn};
-use crate::fs::fs_constants::DEFAULT_BUFFER_SIZE;
-use crate::validation::directory_validation::sanitize_path;
-use crate::utils::file_extension_util::get_file_extension;
-use crate::utils::header_extractor::extract_uid_from_header;
 
 pub async fn upload_file(
     header: HeaderMap,
@@ -95,10 +95,12 @@ pub async fn upload_file(
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
         let mut reader = StreamReader::new(field_stream);
 
-        let bytes_copied = tokio::io::copy(&mut reader, &mut writer).await.map_err(|e| {
-            error!("Failed to copy data: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        let bytes_copied = tokio::io::copy(&mut reader, &mut writer)
+            .await
+            .map_err(|e| {
+                error!("Failed to copy data: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
         writer.flush().await.map_err(|e| {
             error!("Failed to flush writer: {e}");

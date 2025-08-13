@@ -1,23 +1,20 @@
 use crate::enums::app_error_enum::AppError;
-use crate::fs::fs_constants::{
-    CHUNK_PREFIX, IO_TIMEOUT, MAX_CHUNK_SIZE, MERGE_CONCURRENCY, STORAGE_ROOT, TMP_EXT,
-};
-use crate::statics::merge_semaphore_static::MERGE_SEMAPHORE;
-use crate::structs::path_manager_struct::PathManager;
-use crate::structs::upload_metadata_struct::UploadMetadata;
+use crate::fs::fs_constants::{IO_TIMEOUT, MAX_CHUNK_SIZE, MERGE_CONCURRENCY, TMP_EXT};
+use crate::statics::merge_semaphore_static::{FILE_UPLOAD_LOCKS, MERGE_SEMAPHORE};
 use crate::structs::upload_params_struct::UploadParams;
-use crate::types::shared_state_type::SharedState;
 use crate::utils::header_extractor::extract_uid_from_fragmented_header;
-use crate::validation::directory_validation::sanitize_fragmented_path;
+use crate::structs::path_manager_struct::PathManager;
+use crate::structs::resumable_upload_status_struct::ResumableUploadStatus;
+use crate::structs::upload_session_struct::UploadSession;
 use axum::{
-    body::Body,
-    extract::{Multipart, Path, Query, State},
-    http::{HeaderMap, Response, StatusCode},
+    extract::{Multipart, Path, Query, multipart::MultipartError},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use futures_util::stream::TryStreamExt;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     future::Future,
     path::{Path as StdPath, PathBuf},
 };
@@ -29,117 +26,64 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response<Body> {
-        let (status, message) = match self {
-            AppError::Io(e, context) => {
-                error!("IO error during '{}': {}", context, e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("IO operation failed: {}", context),
-                )
-            }
-            AppError::Timeout(context) => {
-                error!("Timeout during '{}'", context);
-                (
-                    StatusCode::REQUEST_TIMEOUT,
-                    format!("Operation timed out: {}", context),
-                )
-            }
-            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.to_string()),
-            AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.to_string()),
-            AppError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg.to_string()),
-            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
-            AppError::Multipart(e) => {
-                error!("Multipart error: {}", e);
-                (
-                    StatusCode::BAD_REQUEST,
-                    "Invalid multipart request".to_string(),
-                )
-            }
-        };
-        (status, message).into_response()
-    }
-}
-
-impl PathManager {
-    fn new(uid: String, relative_path: String, file_id: String) -> Self {
-        Self {
-            uid,
-            relative_path: sanitize_fragmented_path(&relative_path),
-            file_id,
-        }
-    }
-    fn upload_dir(&self) -> PathBuf {
-        PathBuf::from(STORAGE_ROOT)
-            .join(&self.uid)
-            .join(&self.relative_path)
-            .join(&self.file_id)
-    }
-    fn chunk_path(&self, index: usize) -> PathBuf {
-        self.upload_dir().join(format!("{}{}", CHUNK_PREFIX, index))
-    }
-}
-
 pub async fn upload_fragments(
-    State(state): State<SharedState>,
     header: HeaderMap,
     path: Option<Path<String>>,
     Query(params): Query<UploadParams>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, AppError> {
     let uid = extract_uid_from_fragmented_header(&header)?;
+
     if params.chunk_index >= params.total_chunks {
-        return Err(AppError::BadRequest("Invalid chunk index."));
+        return Err(AppError::BadRequest("Invalid chunk index.".to_string()));
     }
 
-    let path_manager = PathManager::new(
-        uid.clone(),
+    let paths = PathManager::new(
+        uid,
         path.map_or_else(String::new, |p| p.0),
         params.file_id.clone(),
     );
 
     with_io_timeout(
         "create upload directory",
-        fs::create_dir_all(path_manager.upload_dir()),
+        fs::create_dir_all(paths.upload_dir()),
     )
     .await?;
 
     let field = with_timeout("reading multipart field", multipart.next_field())
         .await?
-        .map_err(AppError::Multipart)?
-        .ok_or(AppError::BadRequest("No multipart field found in request."))?;
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::BadRequest("No multipart field found in request.".to_string()))?;
 
-    save_and_verify_chunk_stream(&path_manager, params.chunk_index, field, &params.checksum)
-        .await?;
+    save_and_verify_chunk_stream(&paths, params.chunk_index, field, &params.checksum).await?;
 
-    let all_chunks_uploaded = update_upload_state(
-        &state,
-        &params.file_id,
-        params.chunk_index,
-        params.total_chunks,
-    )
-    .await;
+    let is_complete = update_session_and_check_completion(&paths, &params).await?;
 
-    if all_chunks_uploaded {
-        state.lock().await.remove(&params.file_id);
+    if is_complete {
+        info!(
+            "All chunks for file_id '{}' received. Spawning merge task.",
+            params.file_id
+        );
         tokio::spawn(async move {
-            info!(
-                "All chunks for file_id '{}' received. Spawning merge task.",
-                params.file_id
-            );
-            if let Err(e) = assemble_and_finalize_file(
-                path_manager,
-                params.total_chunks,
-                params.original_filename,
-                params.mime_type,
-            )
-            .await
-            {
-                error!(
-                    "Failed to assemble file_id '{}'. Error: {:?}",
-                    params.file_id, e
-                );
+            match UploadSession::from_disk(&paths).await {
+                Ok(session) => {
+                    let (file_id, original_filename, total_chunks) = (
+                        session.file_id,
+                        session.original_filename,
+                        session.total_chunks,
+                    );
+                    if let Err(e) =
+                        assemble_and_finalize_file(paths, original_filename, total_chunks).await
+                    {
+                        error!("Failed to assemble file_id '{}'. Error: {:?}", file_id, e);
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Could not load session for merging file_id '{}': {:?}",
+                        paths.file_id, e
+                    );
+                }
             }
         });
         Ok((
@@ -153,18 +97,65 @@ pub async fn upload_fragments(
 }
 
 pub async fn check_uploaded_fragments(
-    State(state): State<SharedState>,
     header: HeaderMap,
-    Path(file_id): Path<String>,
+    path_params: Option<Path<String>>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, AppError> {
-    let _uid = extract_uid_from_fragmented_header(&header)?;
-    let uploaded_chunks = state
-        .lock()
-        .await
-        .get(&file_id)
-        .cloned()
-        .unwrap_or_default();
-    Ok(Json(uploaded_chunks))
+    let uid = extract_uid_from_fragmented_header(&header)?;
+    let file_id = params
+        .get("file_id")
+        .ok_or_else(|| AppError::BadRequest("Query param 'file_id' is required.".to_string()))?;
+
+    let paths = PathManager::new(
+        uid,
+        path_params.map_or_else(String::new, |p| p.0),
+        file_id.clone(),
+    );
+
+    match UploadSession::from_disk(&paths).await {
+        Ok(session) => Ok(Json(ResumableUploadStatus {
+            uploaded_chunks: session.uploaded_chunks,
+        })),
+        Err(_) => {
+            warn!("No active upload session found for file_id '{}'.", file_id);
+            Ok(Json(ResumableUploadStatus {
+                uploaded_chunks: vec![],
+            }))
+        }
+    }
+}
+
+async fn update_session_and_check_completion(
+    paths: &PathManager,
+    params: &UploadParams,
+) -> Result<bool, AppError> {
+    let file_lock = {
+        let mut locks_manager = FILE_UPLOAD_LOCKS.lock().await;
+        locks_manager
+            .entry(params.file_id.clone())
+            .or_default()
+            .clone()
+    };
+    let _guard = file_lock.lock().await;
+
+    let mut session = match UploadSession::from_disk(paths).await {
+        Ok(s) => {
+            if s.total_chunks != params.total_chunks
+                || s.original_filename != params.original_filename
+            {
+                return Err(AppError::Conflict(
+                    "Upload parameters mismatch with existing session.".to_string(),
+                ));
+            }
+            s
+        }
+        Err(_) => UploadSession::new(paths, params).await?,
+    };
+
+    session.mark_chunk_as_uploaded(params.chunk_index);
+    session.save().await?;
+
+    Ok(session.is_complete())
 }
 
 async fn save_and_verify_chunk_stream(
@@ -174,36 +165,37 @@ async fn save_and_verify_chunk_stream(
     expected_checksum: &Option<String>,
 ) -> Result<(), AppError> {
     let final_path = paths.chunk_path(index);
-    if fs::try_exists(&final_path).await.unwrap_or(false) {
-        return Err(AppError::Conflict("Chunk already exists."));
-    }
     let temp_path = final_path.with_extension(TMP_EXT);
-    let mut file = with_io_timeout("creating chunk file", File::create(&temp_path)).await?;
-    let mut writer = BufWriter::new(&mut file);
     let mut hasher = Sha256::new();
-    let mut total_written = 0;
-    let mut stream = field.map_err(AppError::Multipart);
 
-    loop {
-        match with_timeout("reading chunk stream", stream.try_next()).await? {
-            Ok(Some(chunk)) => {
-                total_written += chunk.len();
-                if total_written > MAX_CHUNK_SIZE {
-                    let _ = fs::remove_file(&temp_path).await;
-                    return Err(AppError::PayloadTooLarge("Chunk size exceeds the limit."));
+    {
+        let mut file = with_io_timeout("creating chunk file", File::create(&temp_path)).await?;
+        let mut writer = BufWriter::new(&mut file);
+        let mut total_written = 0;
+        let mut stream = field.map_err(AppError::from);
+
+        loop {
+            match with_timeout("reading chunk stream", stream.try_next()).await? {
+                Ok(Some(chunk)) => {
+                    total_written += chunk.len();
+                    if total_written > MAX_CHUNK_SIZE {
+                        let _ = fs::remove_file(&temp_path).await;
+                        return Err(AppError::PayloadTooLarge(
+                            "Chunk size exceeds the limit.".to_string(),
+                        ));
+                    }
+                    hasher.update(&chunk);
+                    with_io_timeout("writing chunk data", writer.write_all(&chunk)).await?;
                 }
-                hasher.update(&chunk);
-                with_io_timeout("writing chunk data", writer.write_all(&chunk)).await?;
-            }
-            Ok(None) => break,
-            Err(e) => {
-                let _ = fs::remove_file(&temp_path).await;
-                return Err(e);
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = fs::remove_file(&temp_path).await;
+                    return Err(e);
+                }
             }
         }
+        with_io_timeout("flushing chunk file", writer.flush()).await?;
     }
-
-    with_io_timeout("flushing chunk file", writer.flush()).await?;
 
     if let Some(expected) = expected_checksum {
         let computed = hex::encode(hasher.finalize());
@@ -213,7 +205,7 @@ async fn save_and_verify_chunk_stream(
                 index, expected, computed
             );
             let _ = fs::remove_file(&temp_path).await;
-            return Err(AppError::BadRequest("Checksum mismatch."));
+            return Err(AppError::BadRequest("Checksum mismatch.".to_string()));
         }
     }
 
@@ -221,28 +213,11 @@ async fn save_and_verify_chunk_stream(
     Ok(())
 }
 
-async fn update_upload_state(
-    state: &SharedState,
-    file_id: &str,
-    index: usize,
-    total: usize,
-) -> bool {
-    let mut guard = state.lock().await;
-    let entry = guard
-        .entry(file_id.to_string())
-        .or_insert_with(|| vec![false; total]);
-    if index < entry.len() {
-        entry[index] = true;
-    }
-    entry.iter().all(|&uploaded| uploaded)
-}
-
 async fn assemble_and_finalize_file(
     paths: PathManager,
-    total_chunks: usize,
     original_filename: String,
-    mime_type: Option<String>,
-) -> Result<impl IntoResponse, AppError> {
+    total_chunks: usize,
+) -> Result<(), AppError> {
     let semaphore = MERGE_SEMAPHORE
         .get_or_init(|| async { Semaphore::new(MERGE_CONCURRENCY) })
         .await;
@@ -252,16 +227,27 @@ async fn assemble_and_finalize_file(
         .expect("Semaphore is never closed");
 
     info!("Starting assembly for file_id: {}", paths.file_id);
-    let final_path =
-        determine_final_path(&paths.upload_dir().parent().unwrap(), &original_filename).await?;
+    let final_path = determine_final_path(&paths.final_dir(), &original_filename).await?;
     let temp_merged_path = final_path.with_extension("merged.tmp");
 
     {
-        let mut output_file =
+        let output_file =
             with_io_timeout("creating merged file", File::create(&temp_merged_path)).await?;
-        let mut writer = BufWriter::new(&mut output_file);
+        let mut writer = BufWriter::new(output_file);
+
         for i in 0..total_chunks {
             let chunk_path = paths.chunk_path(i);
+            if !fs::try_exists(&chunk_path).await.unwrap_or(false) {
+                error!(
+                    "Missing chunk {} during assembly for file_id: {}",
+                    i, paths.file_id
+                );
+                let _ = fs::remove_file(&temp_merged_path).await;
+                return Err(AppError::Conflict(format!(
+                    "Missing chunk {} during final assembly.",
+                    i
+                )));
+            }
             let mut chunk_file = with_io_timeout("opening chunk", File::open(&chunk_path)).await?;
             let mut reader = BufReader::new(&mut chunk_file);
             with_io_timeout("copying chunk data", io::copy(&mut reader, &mut writer)).await?;
@@ -274,26 +260,21 @@ async fn assemble_and_finalize_file(
         fs::rename(&temp_merged_path, &final_path),
     )
     .await?;
+
     with_io_timeout("cleaning up chunks", fs::remove_dir_all(paths.upload_dir())).await?;
+
     info!("Successfully assembled file: {}", final_path.display());
-
-    let metadata = UploadMetadata {
-        original_filename,
-        mime_type,
-        uploaded_at: chrono::Utc::now().to_rfc3339(),
-    };
-
-    Ok((StatusCode::OK, Json(metadata)))
+    Ok(())
 }
 
 async fn determine_final_path(
     base_dir: &StdPath,
     original_filename: &str,
 ) -> Result<PathBuf, AppError> {
-    let mut final_path = base_dir.join(original_filename);
+    let final_path = base_dir.join(original_filename);
     if !fs::try_exists(&final_path)
         .await
-        .map_err(|e| AppError::Io(e, "checking final path"))?
+        .map_err(|e| AppError::from((e, "checking final path")))?
     {
         return Ok(final_path);
     }
@@ -313,13 +294,15 @@ async fn determine_final_path(
         let candidate = base_dir.join(&new_name);
         if !fs::try_exists(&candidate)
             .await
-            .map_err(|e| AppError::Io(e, "checking candidate path"))?
+            .map_err(|e| AppError::from((e, "checking candidate path")))?
         {
-            final_path = candidate;
-            break;
+            return Ok(candidate);
         }
     }
-    Ok(final_path)
+
+    Err(AppError::Conflict(
+        "Could not determine a unique filename after 1000 attempts.".to_string(),
+    ))
 }
 
 async fn with_timeout<F, T>(context: &'static str, fut: F) -> Result<T, AppError>
@@ -328,16 +311,27 @@ where
 {
     timeout(IO_TIMEOUT, fut)
         .await
-        .map_err(|_| AppError::Timeout(context))
+        .map_err(|_| AppError::Timeout(context.to_string()))
 }
 
-async fn with_io_timeout<F, T>(context: &'static str, fut: F) -> Result<T, AppError>
+pub(crate) async fn with_io_timeout<F, T>(context: &'static str, fut: F) -> Result<T, AppError>
 where
     F: Future<Output = Result<T, io::Error>>,
 {
     match timeout(IO_TIMEOUT, fut).await {
         Ok(Ok(val)) => Ok(val),
-        Ok(Err(e)) => Err(AppError::Io(e, context)),
-        Err(_) => Err(AppError::Timeout(context)),
+        Ok(Err(e)) => Err(AppError::from((e, context))),
+        Err(_) => Err(AppError::Timeout(context.to_string())),
+    }
+}
+impl From<(io::Error, &'static str)> for AppError {
+    fn from(err: (io::Error, &'static str)) -> Self {
+        AppError::Io(err.0, err.1.to_string())
+    }
+}
+
+impl From<MultipartError> for AppError {
+    fn from(err: MultipartError) -> Self {
+        AppError::Multipart(err.to_string())
     }
 }

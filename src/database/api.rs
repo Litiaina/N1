@@ -1,6 +1,6 @@
-use mongodb::{Client, Collection, Database};
-use mongodb::bson::Document;
 use crate::database::database_constants::{DATABASE, DATABASE_URL};
+use mongodb::bson::Document;
+use mongodb::{Client, Collection, Database};
 
 pub async fn database_connect() -> mongodb::error::Result<Database> {
     let client = Client::with_uri_str(DATABASE_URL).await?;

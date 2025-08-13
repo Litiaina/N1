@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use once_cell::sync::Lazy;
+use std::collections::HashMap;
 
 pub fn get_file_extension(file_type: &str) -> Option<&'static str> {
     static MIME_TYPE_MAP: Lazy<HashMap<&str, &str>> = Lazy::new(|| {
@@ -88,11 +88,20 @@ pub fn get_file_extension(file_type: &str) -> Option<&'static str> {
         map.insert("application/vnd.adobe.photoshop", "psd");
         map.insert("application/vnd.adobe.illustrator", "ai");
         map.insert("application/msword", "doc");
-        map.insert("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx");
+        map.insert(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "docx",
+        );
         map.insert("application/vnd.ms-excel", "xls");
-        map.insert("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx");
+        map.insert(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "xlsx",
+        );
         map.insert("application/vnd.ms-powerpoint", "ppt");
-        map.insert("application/vnd.openxmlformats-officedocument.presentationml.presentation", "pptx");
+        map.insert(
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "pptx",
+        );
         map.insert("application/vnd.ms-xpsdocument", "xps");
         map.insert("application/vnd.apple.keynote", "key");
         map.insert("application/vnd.apple.numbers", "numbers");

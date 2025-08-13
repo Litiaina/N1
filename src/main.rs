@@ -1,39 +1,39 @@
-use std::env;
-use std::io::{self, Write};
-use std::fs::File;
-use axum::handler::HandlerWithoutStateExt;
-use std::net::SocketAddr;
-use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
-use axum::http::{StatusCode, Uri};
-use axum::http::uri::Authority;
-use axum::{BoxError, Router};
-use axum::response::Redirect;
-use axum_extra::extract::Host;
-use axum_server::tls_rustls::RustlsConfig;
-use chrono::Local;
-use dotenv::dotenv;
-use tokio::signal;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 use crate::fs::cleanup_manager::cleanup_stale_uploads;
 use crate::fs::fs_constants::ENV_FILE;
 use crate::handlers::error_handlers::handler_404;
 use crate::routes::file_system_routes::serve_file_system_routes;
 use crate::structs::port_struct::Ports;
+use axum::handler::HandlerWithoutStateExt;
+use axum::http::uri::Authority;
+use axum::http::{StatusCode, Uri};
+use axum::response::Redirect;
+use axum::{BoxError, Router};
+use axum_extra::extract::Host;
+use axum_server::tls_rustls::RustlsConfig;
+use chrono::Local;
+use dotenv::dotenv;
+use std::env;
+use std::fs::File;
+use std::io::{self, Write};
+use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::signal;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
+mod database;
+mod enums;
+mod fs;
 mod handlers;
+mod middleware;
 mod routes;
+mod statics;
 mod structs;
 mod types;
 mod utils;
-mod fs;
-mod statics;
-mod middleware;
 mod validation;
-mod database;
-mod enums;
 
 #[tokio::main]
 async fn main() {
@@ -87,10 +87,7 @@ async fn server() {
         .expect("Failed to get executable directory")
         .to_path_buf();
 
-    let config = RustlsConfig::from_pem_file(
-        exe_dir.join("cert.pem"),
-        exe_dir.join("key.pem"),
-    )
+    let config = RustlsConfig::from_pem_file(exe_dir.join("cert.pem"), exe_dir.join("key.pem"))
         .await
         .unwrap();
 
@@ -102,22 +99,30 @@ async fn server() {
         serve_file_system,
         Arc::from("file-system".to_string()),
         file_system_ports,
-        config
+        config,
     ));
 
-    let _ =  tokio::join!(
-        file_system_task,
-    );
+    let _ = tokio::join!(file_system_task,);
 }
 
-async fn serve(socket: SocketAddr, app: Router, name: Arc<String>, ports: Ports, cert: RustlsConfig) {
+async fn serve(
+    socket: SocketAddr,
+    app: Router,
+    name: Arc<String>,
+    ports: Ports,
+    cert: RustlsConfig,
+) {
     tracing::info!("{} on port => {} type: https", name, socket);
 
     let handle = axum_server::Handle::new();
 
     let server_name_for_task = Arc::clone(&name);
     let shutdown_future = shutdown_signal(Arc::clone(&server_name_for_task), handle.clone());
-    tokio::spawn(redirect_http_to_https(server_name_for_task, ports, shutdown_future));
+    tokio::spawn(redirect_http_to_https(
+        server_name_for_task,
+        ports,
+        shutdown_future,
+    ));
 
     let mut server = axum_server::bind_rustls(socket, cert).handle(handle);
     server.http_builder().http2().enable_connect_protocol();

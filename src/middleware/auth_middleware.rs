@@ -1,20 +1,24 @@
-use std::env;
-use std::fmt::Display;
-use std::sync::LazyLock;
-use std::time::SystemTime;
-use axum::{http::StatusCode, response::{IntoResponse, Response}, Json, RequestPartsExt};
+use crate::enums::auth_error_enum::AuthError;
+use crate::structs::auth_structs::{AuthBody, Claims, LoginRequest};
+use crate::validation::auth_validation::validate_auth;
 use axum::body::Body;
 use axum::extract::{FromRequestParts, Request};
 use axum::http::request::Parts;
 use axum::middleware::Next;
+use axum::{
+    Json, RequestPartsExt,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use axum_extra::TypedHeader;
 use headers::Authorization;
 use headers::authorization::Bearer;
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde_json::json;
-use crate::enums::auth_error_enum::AuthError;
-use crate::structs::auth_structs::{AuthBody, Claims, LoginRequest};
-use crate::validation::auth_validation::validate_auth;
+use std::env;
+use std::fmt::Display;
+use std::sync::LazyLock;
+use std::time::SystemTime;
 
 static JWT_KEYS: LazyLock<Keys> = LazyLock::new(|| {
     let secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
@@ -24,7 +28,10 @@ static JWT_KEYS: LazyLock<Keys> = LazyLock::new(|| {
 pub async fn auth(req: Request<Body>, next: Next) -> Result<Response, AuthError> {
     let header = req.headers().get("authorization");
     let token = match header {
-        Some(value) => value.to_str().ok().and_then(|auth_str| auth_str.strip_prefix("Bearer ")),
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|auth_str| auth_str.strip_prefix("Bearer ")),
         None => None,
     };
 
@@ -33,12 +40,8 @@ pub async fn auth(req: Request<Body>, next: Next) -> Result<Response, AuthError>
         let validation = Validation::default();
 
         match decode::<Claims>(token, decoding_key, &validation) {
-            Ok(_) => {
-                Ok(next.run(req).await)
-            }
-            Err(_) => {
-                Err(AuthError::InvalidToken)
-            }
+            Ok(_) => Ok(next.run(req).await),
+            Err(_) => Err(AuthError::InvalidToken),
         }
     } else {
         Err(AuthError::InvalidToken)
@@ -56,7 +59,8 @@ pub async fn authorize(Json(payload): Json<LoginRequest>) -> Result<Json<AuthBod
                 let exp = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap()
-                    .as_secs() + 24 * 60 * 60;
+                    .as_secs()
+                    + 24 * 60 * 60;
 
                 let claims = Claims {
                     email: payload.email.to_owned(),
@@ -70,10 +74,8 @@ pub async fn authorize(Json(payload): Json<LoginRequest>) -> Result<Json<AuthBod
             } else {
                 Err(AuthError::WrongCredentials)
             }
-        },
-        Err(_) => {
-            Err(AuthError::WrongCredentials)
-        },
+        }
+        Err(_) => Err(AuthError::WrongCredentials),
     }
 }
 
@@ -104,8 +106,9 @@ where
             .await
             .map_err(|_| AuthError::InvalidToken)?;
 
-        let token_data = decode::<Claims>(bearer.token(), &JWT_KEYS.decoding, &Validation::default())
-            .map_err(|_| AuthError::InvalidToken)?;
+        let token_data =
+            decode::<Claims>(bearer.token(), &JWT_KEYS.decoding, &Validation::default())
+                .map_err(|_| AuthError::InvalidToken)?;
 
         Ok(token_data.claims)
     }

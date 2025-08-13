@@ -1,10 +1,10 @@
-use std::path::{Component, Path, PathBuf};
-use mongodb::bson::doc;
-use mongodb::error::Error;
-use tokio::fs;
-use walkdir::WalkDir;
 use crate::database::api::get_collection;
 use crate::fs::fs_constants::AUTH_COLLECTION;
+use mongodb::bson::doc;
+use mongodb::error::Error;
+use std::path::{Component, Path, PathBuf};
+use tokio::fs;
+use walkdir::WalkDir;
 
 pub async fn get_allocated_storage(uid: &str) -> Result<Option<u64>, Error> {
     let user_doc = get_collection(AUTH_COLLECTION)
@@ -29,7 +29,8 @@ pub fn sanitize_path(path: &str) -> String {
     for component in Path::new(path).components() {
         match component {
             Component::Normal(part) => {
-                let part_str = part.to_string_lossy()
+                let part_str = part
+                    .to_string_lossy()
                     .replace('\0', "")
                     .replace(['/', '\\'], "");
                 clean_path.push(part_str);

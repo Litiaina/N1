@@ -1,10 +1,10 @@
+use crate::fs::fs_constants::{CLEANUP_INTERVAL, FILE_TTL};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
-use tokio::{fs, io};
 use tokio::time::sleep;
+use tokio::{fs, io};
 use tracing::{info, warn};
 use walkdir::WalkDir;
-use crate::fs::fs_constants::{CLEANUP_INTERVAL, FILE_TTL};
 
 pub async fn cleanup_stale_uploads() {
     loop {
@@ -60,7 +60,9 @@ async fn is_unfinished_upload(dir: &std::path::Path, ttl: Duration) -> Result<bo
     }
 
     if let Some(time) = oldest_chunk_time {
-        let age = SystemTime::now().duration_since(time).unwrap_or(Duration::ZERO);
+        let age = SystemTime::now()
+            .duration_since(time)
+            .unwrap_or(Duration::ZERO);
         return Ok(age > ttl);
     }
 

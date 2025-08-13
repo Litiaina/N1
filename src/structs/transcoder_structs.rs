@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
-use mongodb::bson::Uuid as BsonUuid;
 use crate::enums::transcoder_enums::JobStatus;
+use mongodb::bson::Uuid as BsonUuid;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TranscodeJob {
