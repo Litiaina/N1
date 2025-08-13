@@ -12,3 +12,5 @@ pub const MAX_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 pub const STORAGE_ROOT: &str = "storage-files";
 pub const TMP_EXT: &str = "tmp";
 pub const MERGE_CONCURRENCY: usize = 4;
+pub const METADATA_FILENAME: &str = "metadata.json";
+pub const TEMP_UPLOAD_ROOT: &str = ".tmp";

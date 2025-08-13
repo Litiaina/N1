@@ -31,7 +31,6 @@ mod middleware;
 mod routes;
 mod statics;
 mod structs;
-mod types;
 mod utils;
 mod validation;
 

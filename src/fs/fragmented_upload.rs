@@ -1,11 +1,11 @@
 use crate::enums::app_error_enum::AppError;
 use crate::fs::fs_constants::{IO_TIMEOUT, MAX_CHUNK_SIZE, MERGE_CONCURRENCY, TMP_EXT};
 use crate::statics::merge_semaphore_static::{FILE_UPLOAD_LOCKS, MERGE_SEMAPHORE};
-use crate::structs::upload_params_struct::UploadParams;
-use crate::utils::header_extractor::extract_uid_from_fragmented_header;
 use crate::structs::path_manager_struct::PathManager;
 use crate::structs::resumable_upload_status_struct::ResumableUploadStatus;
+use crate::structs::upload_params_struct::UploadParams;
 use crate::structs::upload_session_struct::UploadSession;
+use crate::utils::header_extractor::extract_uid_from_fragmented_header;
 use axum::{
     extract::{Multipart, Path, Query, multipart::MultipartError},
     http::{HeaderMap, StatusCode},
@@ -305,7 +305,7 @@ async fn determine_final_path(
     ))
 }
 
-async fn with_timeout<F, T>(context: &'static str, fut: F) -> Result<T, AppError>
+pub async fn with_timeout<F, T>(context: &'static str, fut: F) -> Result<T, AppError>
 where
     F: Future<Output = T>,
 {

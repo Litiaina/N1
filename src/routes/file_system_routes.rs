@@ -8,28 +8,25 @@ use crate::fs::directory_viewer::{
 };
 use crate::fs::download_manager::download_file;
 use crate::fs::fragmented_upload::{check_uploaded_fragments, upload_fragments};
+use crate::fs::stateless_fragmented_upload::{
+    finalize_upload_session, get_upload_status, initiate_upload_session, upload_chunk,
+};
 use crate::handlers::dir_info_handlers::get_storage_capacity;
 use crate::handlers::transcoder_handler::{transcode_status_handler, transcode_video_handler};
 use crate::middleware::auth_middleware::{auth, authorize};
 use crate::middleware::storage_middleware::enforce_storage_limit;
-use crate::types::shared_state_type::SharedState;
 use axum::http::{HeaderName, StatusCode};
 use axum::middleware::from_fn;
 use axum::routing::{delete, get, put};
 use axum::{Router, extract::DefaultBodyLimit, http::Method, routing::post};
 use mongodb::Client;
 use mongodb::options::ClientOptions;
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
 const MAX_FILE_SIZE: usize = 5 * 1024 * 1024 * 1024;
 
 pub async fn serve_file_system_routes() -> Router {
-    let state: SharedState = Arc::new(Mutex::new(HashMap::new()));
-
     let client_options = ClientOptions::parse(DATABASE_URL)
         .await
         .expect("Failed to parse MongoDB URI");
@@ -41,6 +38,26 @@ pub async fn serve_file_system_routes() -> Router {
         .route("/dir/file/upload/{*path}", post(upload_file))
         .route("/dir/file/upload/v2/", post(upload_fragments))
         .route("/dir/file/upload/v2/{*path}", post(upload_fragments))
+        .route(
+            "/dir/file/upload/v3/initiate/",
+            post(initiate_upload_session),
+        )
+        .route(
+            "/dir/file/upload/v3/initiate/{*path}",
+            post(initiate_upload_session),
+        )
+        .route(
+            "/dir/file/upload/v3/{:file_id}/{:chunk_index}",
+            put(upload_chunk),
+        )
+        .route(
+            "/dir/file/upload/v3/{:file_id}/status",
+            get(get_upload_status),
+        )
+        .route(
+            "/dir/file/upload/v3/{:file_id}/finalize",
+            post(finalize_upload_session),
+        )
         .layer(from_fn(enforce_storage_limit));
 
     let protected_routes = Router::new()
@@ -69,7 +86,6 @@ pub async fn serve_file_system_routes() -> Router {
             "/dir/file/upload/check/{*path}",
             get(check_uploaded_fragments),
         )
-        .with_state(Arc::clone(&state))
         .route("/dir/file/view/{*path}", get(view_file))
         .route("/dir/file/stream/{*path}", get(stream_file))
         .route("/dir/file/stream/v2/{*path}", get(stream_file_v2))
