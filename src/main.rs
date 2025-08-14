@@ -46,9 +46,9 @@ async fn main() {
         .init();
 
     let current_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    tracing::info!("╔════════════════════════════════════════════════════════════════════╗");
-    tracing::info!("║         L I T I A I N A  F I L E  S Y S T E M  S E R V E R         ║");
-    tracing::info!("╚════════════════════════════════════════════════════════════════════╝");
+    tracing::info!("╔═════════════════════════════════════════════════════════════╗");
+    tracing::info!("║         L I T I A I N A  S T O R A G E  S E R V E R         ║");
+    tracing::info!("╚═════════════════════════════════════════════════════════════╝");
     tracing::info!("{} - Status: ONLINE", current_time);
     tracing::info!("Press CTRL+C to terminate");
     tracing::info!("══════════════ ACTIVE CONNECTIONS ══════════════");
