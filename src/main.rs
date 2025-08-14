@@ -33,6 +33,7 @@ mod statics;
 mod structs;
 mod utils;
 mod validation;
+mod object_storage;
 
 #[tokio::main]
 async fn main() {

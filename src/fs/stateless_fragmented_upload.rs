@@ -273,7 +273,7 @@ async fn assemble_and_finalize_file(paths: PathManager<'_>) -> Result<(), AppErr
     Ok(())
 }
 
-async fn parse_uploaded_chunks(reader: &mut ReadDir) -> Vec<u64> {
+pub async fn parse_uploaded_chunks(reader: &mut ReadDir) -> Vec<u64> {
     let mut chunks = Vec::new();
     while let Ok(Some(entry)) = reader.next_entry().await {
         if let Some(name_str) = entry.file_name().to_str() {

@@ -14,3 +14,4 @@ pub const TMP_EXT: &str = "tmp";
 pub const MERGE_CONCURRENCY: usize = 4;
 pub const METADATA_FILENAME: &str = "metadata.json";
 pub const TEMP_UPLOAD_ROOT: &str = ".tmp";
+pub const MAX_FILE_SIZE: usize = 5 * 1024 * 1024 * 1024;

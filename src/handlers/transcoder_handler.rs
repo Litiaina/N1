@@ -13,13 +13,16 @@ use mongodb::Database;
 use mongodb::bson::{Uuid as BsonUuid, doc};
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::{fs, task};
 use tracing::{error, info, warn};
+use crate::database::database_constants::DATABASE;
+use crate::routes::file_system_routes::AppState;
 
 pub async fn transcode_video_handler(
-    State(db): State<Database>,
+    State(db): State<Arc<AppState>>,
     Json(payload): Json<TranscodeRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if payload.uid.is_empty() {
@@ -43,7 +46,7 @@ pub async fn transcode_video_handler(
         return Err((StatusCode::NOT_FOUND, "Source file not found".to_string()));
     }
 
-    let jobs_collection = db.collection::<TranscodeJob>("jobs");
+    let jobs_collection = db.db_client.database(DATABASE).collection::<TranscodeJob>("jobs");
 
     let timeout_duration = chrono::Duration::minutes(5);
     let stale_threshold_timestamp = (Utc::now() - timeout_duration).timestamp_millis();
@@ -128,11 +131,11 @@ pub async fn transcode_video_handler(
         return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
     }
 
-    let db_clone = db.clone();
+    let db_clone = db.db_client.database(DATABASE);
     task::spawn(async move {
         if let Err(e) = process_transcoding_job(db_clone, job_id, full_source_path, payload).await {
             error!(%job_id, error = %e, "Transcoding job failed.");
-            let jobs_collection = db.collection::<TranscodeJob>("jobs");
+            let jobs_collection = db.db_client.database(DATABASE).collection::<TranscodeJob>("jobs");
             let query = doc! { "_id": job_id };
             let update = doc! { "$set": { "status": mongodb::bson::to_bson(&JobStatus::Failed { reason: e }).unwrap_or_default(), "progress": 100.0 } };
             if let Err(db_err) = jobs_collection.update_one(query, update).await {
@@ -511,7 +514,7 @@ async fn update_job_progress(
 }
 
 pub async fn transcode_status_handler(
-    State(db): State<Database>,
+    State(db): State<Arc<AppState>>,
     Query(query): Query<TranscodeStatusRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let job_id = match BsonUuid::parse_str(&query.job_id) {
@@ -519,7 +522,7 @@ pub async fn transcode_status_handler(
         Err(_) => return Err((StatusCode::BAD_REQUEST, "Invalid Job ID format".to_string())),
     };
 
-    let jobs_collection = db.collection::<TranscodeJob>("jobs");
+    let jobs_collection = db.db_client.database(DATABASE).collection::<TranscodeJob>("jobs");
     let query = doc! { "_id": job_id };
 
     match jobs_collection.find_one(query).await {

@@ -1,4 +1,5 @@
-use crate::database::database_constants::{DATABASE, DATABASE_URL};
+use std::sync::Arc;
+use crate::database::database_constants::DATABASE_URL;
 use crate::fs::direct_upload::upload_file;
 use crate::fs::directory_manager::{
     create_directory, delete_directory, delete_file, get_file_metadata, rename_file_query,
@@ -8,59 +9,92 @@ use crate::fs::directory_viewer::{
 };
 use crate::fs::download_manager::download_file;
 use crate::fs::fragmented_upload::{check_uploaded_fragments, upload_fragments};
-use crate::fs::stateless_fragmented_upload::{
-    finalize_upload_session, get_upload_status, initiate_upload_session, upload_chunk,
-};
+use crate::fs::stateless_fragmented_upload as legacy_upload;
 use crate::handlers::dir_info_handlers::get_storage_capacity;
 use crate::handlers::transcoder_handler::{transcode_status_handler, transcode_video_handler};
 use crate::middleware::auth_middleware::{auth, authorize};
 use crate::middleware::storage_middleware::enforce_storage_limit;
-use axum::http::{HeaderName, StatusCode};
+use axum::http::{HeaderName, Method, StatusCode};
 use axum::middleware::from_fn;
-use axum::routing::{delete, get, put};
-use axum::{Router, extract::DefaultBodyLimit, http::Method, routing::post};
-use mongodb::Client;
+use axum::routing::{delete, get, post, put};
+use axum::{extract::DefaultBodyLimit, Router};
 use mongodb::options::ClientOptions;
+use mongodb::Client;
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
+use crate::fs::fs_constants::MAX_FILE_SIZE;
+use crate::object_storage::object_storage_manager as object_storage;
 
-const MAX_FILE_SIZE: usize = 5 * 1024 * 1024 * 1024;
+pub struct AppState {
+    pub db_client: Client,
+}
 
 pub async fn serve_file_system_routes() -> Router {
     let client_options = ClientOptions::parse(DATABASE_URL)
         .await
         .expect("Failed to parse MongoDB URI");
-    let client = Client::with_options(client_options).expect("Failed to create MongoDB client");
-    let db = client.database(DATABASE);
+    let db_client = Client::with_options(client_options).expect("Failed to create MongoDB client");
+    let app_state = Arc::new(AppState { db_client });
 
+    let cors_layer = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_headers([
+            HeaderName::from_static("authorization"),
+            HeaderName::from_static("uid"),
+            HeaderName::from_static("content-type"),
+        ])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .max_age(Duration::from_secs(86400));
+
+    Router::new()
+        .route("/ping", get(ping).options(options_handler))
+        .route("/authenticate", post(authorize))
+        .merge(create_object_storage_routes())
+        .merge(create_legacy_fs_routes())
+        .with_state(Arc::clone(&app_state))
+        .layer(DefaultBodyLimit::max(MAX_FILE_SIZE))
+        .layer(cors_layer)
+}
+
+fn create_object_storage_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/v4/object/fragment/metadata/{:fragment}", get(object_storage::list_objects).options(options_handler))
+        .route("/v4/object/fragment/retrieve/{:fragment}/{*object_key}", get(object_storage::get_object).options(options_handler))
+        .route("/v4/object/fragment/retrieve/metadata/{:fragment}/{*object_key}", get(object_storage::get_object_metadata).options(options_handler))
+        .route("/v4/object/fragment/delete/{:fragment}/{*object_key}", delete(object_storage::delete_object).options(options_handler))
+        .route("/v4/object/fragment/upload/init/{:fragment}/{*object_key}", post(object_storage::initiate_object_upload).options(options_handler))
+        .route("/v4/object/fragment/upload/chunk/{:file_id}/{:chunk_index}", put(object_storage::upload_chunk).options(options_handler))
+        .route("/v4/object/fragment/upload/status/{:file_id}", get(object_storage::get_upload_status).options(options_handler))
+        .route("/v4/object/fragment/upload/finalize/{:file_id}", post(object_storage::finalize_object_upload).options(options_handler))
+        .layer(from_fn(auth))
+}
+
+fn create_legacy_fs_routes() -> Router<Arc<AppState>> {
     let upload_routes = Router::new()
-        .route("/dir/file/upload/", post(upload_file))
-        .route("/dir/file/upload/{*path}", post(upload_file))
-        .route("/dir/file/upload/v2/", post(upload_fragments))
-        .route("/dir/file/upload/v2/{*path}", post(upload_fragments))
-        .route(
-            "/dir/file/upload/v3/initiate/",
-            post(initiate_upload_session),
-        )
-        .route(
-            "/dir/file/upload/v3/initiate/{*path}",
-            post(initiate_upload_session),
-        )
-        .route(
-            "/dir/file/upload/v3/{:file_id}/{:chunk_index}",
-            put(upload_chunk),
-        )
-        .route(
-            "/dir/file/upload/v3/{:file_id}/status",
-            get(get_upload_status),
-        )
-        .route(
-            "/dir/file/upload/v3/{:file_id}/finalize",
-            post(finalize_upload_session),
-        )
+        .route("/dir/file/upload/", post(upload_file).options(options_handler))
+        .route("/dir/file/upload/{*path}", post(upload_file).options(options_handler))
+        .route("/dir/file/upload/v2/", post(upload_fragments).options(options_handler))
+        .route("/dir/file/upload/v2/{*path}", post(upload_fragments).options(options_handler))
+        .route("/dir/file/upload/v3/initiate/", post(legacy_upload::initiate_upload_session).options(options_handler))
+        .route("/dir/file/upload/v3/initiate/{*path}", post(legacy_upload::initiate_upload_session).options(options_handler))
+        .route("/dir/file/upload/v3/{:file_id}/{:chunk_index}", put(legacy_upload::upload_chunk).options(options_handler))
+        .route("/dir/file/upload/v3/{:file_id}/status", get(legacy_upload::get_upload_status).options(options_handler))
+        .route("/dir/file/upload/v3/{:file_id}/finalize", post(legacy_upload::finalize_upload_session).options(options_handler))
         .layer(from_fn(enforce_storage_limit));
 
-    let protected_routes = Router::new()
+    let transcoding_routes = Router::new()
+        .route("/dir/file/transcode/video", post(transcode_video_handler))
+        .route("/dir/file/transcode/status", get(transcode_status_handler))
+        .layer(from_fn(auth));
+
+    let protected_management_routes = Router::new()
         .route("/dir/", get(view_directory))
         .route("/dir/{*path}", get(view_directory))
         .route("/dir/create/{*path}", post(create_directory))
@@ -73,53 +107,24 @@ pub async fn serve_file_system_routes() -> Router {
         .merge(upload_routes)
         .layer(from_fn(auth));
 
-    let protected_transcoding_routes = Router::new()
-        .route("/dir/file/transcode/video", post(transcode_video_handler))
-        .route("/dir/file/transcode/status", get(transcode_status_handler))
-        .with_state(db)
-        .layer(from_fn(auth));
-
     Router::new()
-        .route("/ping", get(ping).options(|| async { StatusCode::OK }))
-        .route("/authenticate", post(authorize))
-        .route(
-            "/dir/file/upload/check/{*path}",
-            get(check_uploaded_fragments),
-        )
+        .route("/dir/file/upload/check/{*path}", get(check_uploaded_fragments))
         .route("/dir/file/view/{*path}", get(view_file))
         .route("/dir/file/stream/{*path}", get(stream_file))
         .route("/dir/file/stream/v2/{*path}", get(stream_file_v2))
-        .route(
-            "/dir/file/transcode/stream/hls/{*path}",
-            get(stream_hls_file),
-        )
+        .route("/dir/file/transcode/stream/hls/{*path}", get(stream_hls_file))
         .route("/dir/file/metadata/", get(get_file_metadata))
         .route("/dir/file/metadata/{*path}", get(get_file_metadata))
         .route("/dir/file/download/", get(download_file))
         .route("/dir/file/download/{*path}", get(download_file))
-        .merge(protected_transcoding_routes)
-        .merge(protected_routes)
-        .layer(DefaultBodyLimit::max(MAX_FILE_SIZE))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_headers([
-                    HeaderName::from_static("authorization"),
-                    HeaderName::from_static("uid"),
-                    HeaderName::from_static("content-type"),
-                ])
-                .allow_methods([
-                    Method::GET,
-                    Method::POST,
-                    Method::PATCH,
-                    Method::PUT,
-                    Method::DELETE,
-                    Method::OPTIONS,
-                ])
-                .max_age(Duration::from_secs(86400)),
-        )
+        .merge(transcoding_routes)
+        .merge(protected_management_routes)
 }
 
 async fn ping() -> &'static str {
     "pong"
+}
+
+async fn options_handler() -> StatusCode {
+    StatusCode::OK
 }
