@@ -15,3 +15,4 @@ pub mod uid_params_struct;
 pub mod upload_metadata_struct;
 pub mod upload_params_struct;
 pub mod upload_session_struct;
+pub mod object_storage_structs;

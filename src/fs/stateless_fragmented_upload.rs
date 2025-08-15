@@ -1,6 +1,6 @@
 use crate::enums::app_error_enum::AppError;
 use crate::fs::fs_constants::{
-    CHUNK_PREFIX, IO_TIMEOUT, MAX_CHUNK_SIZE, MERGE_CONCURRENCY, STORAGE_ROOT, TMP_EXT,
+    IO_TIMEOUT, MAX_CHUNK_SIZE, MERGE_CONCURRENCY, STORAGE_ROOT, TMP_EXT,
 };
 use crate::statics::merge_semaphore_static::MERGE_SEMAPHORE;
 use crate::utils::header_extractor::extract_uid_from_fragmented_header;
@@ -23,13 +23,14 @@ use std::{
     path::{Path as StdPath, PathBuf},
 };
 use tokio::{
-    fs::{self, File, ReadDir},
+    fs::{self, File},
     io::{self, AsyncWriteExt, BufReader, BufWriter},
     sync::Semaphore,
     time::timeout,
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use crate::object_storage::chunk_parser::parse_uploaded_chunks;
 
 pub async fn initiate_upload_session(
     header: axum::http::HeaderMap,
@@ -271,22 +272,6 @@ async fn assemble_and_finalize_file(paths: PathManager<'_>) -> Result<(), AppErr
         final_path.display()
     );
     Ok(())
-}
-
-pub async fn parse_uploaded_chunks(reader: &mut ReadDir) -> Vec<u64> {
-    let mut chunks = Vec::new();
-    while let Ok(Some(entry)) = reader.next_entry().await {
-        if let Some(name_str) = entry.file_name().to_str() {
-            if name_str.starts_with(CHUNK_PREFIX) && !name_str.ends_with(TMP_EXT) {
-                if let Some(index_str) = name_str.strip_prefix(CHUNK_PREFIX) {
-                    if let Ok(index) = index_str.parse::<u64>() {
-                        chunks.push(index);
-                    }
-                }
-            }
-        }
-    }
-    chunks
 }
 
 async fn determine_final_path(

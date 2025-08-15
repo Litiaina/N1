@@ -1,3 +1,4 @@
-pub mod object_storage_manager;
-pub mod object_storage_structs;
-pub mod object_storage_constants;
+pub mod manager;
+pub mod constants;
+pub mod upload;
+pub mod chunk_parser;
