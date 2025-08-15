@@ -8,29 +8,35 @@ use crate::object_storage::metadata_parser::find_latest_object_metadata;
 use crate::routes::storage_routes::AppState;
 use crate::structs::object_storage_structs::ObjectMetadata;
 use crate::utils::header_extractor::extract_uid_from_fragmented_header;
-use axum::response::Response;
-use axum::{
-    Json as AxumJson, Json,
-    body::Body,
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
-    response::IntoResponse,
-};
+use axum::Json as AxumJson;
+use axum::body::Body;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use futures_util::stream::TryStreamExt;
-use headers::HeaderValue;
 use mongodb::bson::doc;
+use std::collections::HashMap;
 use std::io::SeekFrom;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::{collections::HashMap, path::PathBuf};
-use tokio::fs;
-use tokio::fs::File;
-use tokio::io::AsyncReadExt;
-use tokio::io::{AsyncSeekExt, BufReader};
+use tokio::fs::{self, File};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 use tokio_util::io::ReaderStream;
 use tower::ServiceExt;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 pub async fn get_object(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((fragment, object_key)): Path<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    let uid = extract_uid_from_fragmented_header(&headers)?;
+    let metadata =
+        find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
+    stream_object_logic(headers, metadata).await
+}
+
+pub async fn download_object(
     State(state): State<Arc<AppState>>,
     header: HeaderMap,
     Path((fragment, object_key)): Path<(String, String)>,
@@ -39,103 +45,88 @@ pub async fn get_object(
     let uid = extract_uid_from_fragmented_header(&header)?;
     let metadata =
         find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
+    download_object_logic(req, metadata).await
+}
 
+pub async fn download_object_logic(
+    req: axum::http::Request<Body>,
+    metadata: ObjectMetadata,
+) -> Result<impl IntoResponse, AppError> {
     let physical_path = PathBuf::from(OBJECT_STORAGE_ROOT)
         .join(OBJECT_DATA_ROOT)
         .join(&metadata.physical_location);
 
-    match physical_path_error(&physical_path).await {
-        Ok(_) => {
-            let service = tower_http::services::ServeFile::new(physical_path);
-            match service.oneshot(req).await {
-                Ok(mut response) => {
-                    let content_type = metadata.content_type;
-                    match HeaderValue::from_str(&content_type) {
-                        Ok(header_value) => {
-                            response
-                                .headers_mut()
-                                .insert(header::CONTENT_TYPE, header_value);
-                        }
-                        Err(e) => {
-                            error!("Invalid content-type string in metadata: {}", e);
-                        }
-                    }
-                    Ok(response.into_response())
-                }
-                Err(err) => {
-                    error!("Failed to serve file: {}", err);
-                    Err(AppError::Conflict(format!("Failed to serve file: {}", err)))
-                }
+    physical_path_error(&physical_path).await?;
+
+    let service = tower_http::services::ServeFile::new(physical_path);
+    match service.oneshot(req).await {
+        Ok(mut response) => {
+            let content_type = metadata.content_type;
+            if let Ok(hv) = HeaderValue::from_str(&content_type) {
+                response.headers_mut().insert(header::CONTENT_TYPE, hv);
             }
+            response.headers_mut().insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_str(&format!("attachment; filename=\"{}\"", metadata.key))
+                    .unwrap_or(HeaderValue::from_static("attachment")),
+            );
+            Ok(response.into_response())
         }
-        Err(err) => Err(err),
+        Err(err) => {
+            tracing::error!("Failed to serve file for download: {}", err);
+            Err(AppError::Conflict(format!("Failed to serve file: {}", err)))
+        }
     }
 }
 
-pub async fn stream_object(
-    State(state): State<Arc<AppState>>,
+pub async fn stream_object_logic(
     headers: HeaderMap,
-    Path((fragment, object_key)): Path<(String, String)>,
+    metadata: ObjectMetadata,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = extract_uid_from_fragmented_header(&headers)?;
-    let metadata =
-        find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
-
     let physical_path = PathBuf::from(OBJECT_STORAGE_ROOT)
         .join(OBJECT_DATA_ROOT)
         .join(&metadata.physical_location);
 
-    match physical_path_error(&physical_path).await {
-        Ok(_) => {
-            let file_size = metadata.size_bytes;
-            let content_type = metadata.content_type;
+    physical_path_error(&physical_path).await?;
 
-            let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    let file_size = metadata.size_bytes;
+    let content_type = metadata.content_type;
+    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
 
-            let (start, end) = parse_range_header(range_header, file_size)
-                .unwrap_or((0, INITIAL_CHUNK_SIZE.min(file_size).saturating_sub(1)));
+    let (start, end) = parse_range_header(range_header, file_size)
+        .unwrap_or((0, INITIAL_CHUNK_SIZE.min(file_size).saturating_sub(1)));
 
-            if start >= file_size || end >= file_size || start > end {
-                return Err(AppError::RangeNotSatisfiable);
-            }
-
-            let mut file = File::open(&physical_path).await.map_err(|e| {
-                let context = format!("opening file '{}'", physical_path.display());
-                AppError::Io(e, context)
-            })?;
-
-            file.seek(SeekFrom::Start(start)).await.map_err(|e| {
-                let context = format!("seeking in file '{}'", physical_path.display());
-                AppError::Io(e, context)
-            })?;
-
-            let content_length = end - start + 1;
-            let reader = BufReader::new(file);
-            let stream = ReaderStream::new(reader.take(content_length));
-            let body = Body::from_stream(stream);
-
-            let response = Response::builder()
-                .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, content_type)
-                .header(header::ACCEPT_RANGES, "bytes")
-                .header(header::CONTENT_LENGTH, content_length.to_string())
-                .header(
-                    header::CONTENT_RANGE,
-                    format!("bytes {}-{}/{}", start, end, file_size),
-                )
-                .header(header::CACHE_CONTROL, "no-cache")
-                .body(body)
-                .map_err(|e| {
-                    AppError::InternalServerError(format!(
-                        "Failed to build streaming response: {}",
-                        e
-                    ))
-                })?;
-
-            Ok(response)
-        }
-        Err(err) => Err(err),
+    if start >= file_size || end >= file_size || start > end {
+        return Err(AppError::RangeNotSatisfiable);
     }
+
+    let mut file = File::open(&physical_path)
+        .await
+        .map_err(|e| AppError::Io(e, format!("opening file '{}'", physical_path.display())))?;
+
+    file.seek(SeekFrom::Start(start))
+        .await
+        .map_err(|e| AppError::Io(e, format!("seeking in file '{}'", physical_path.display())))?;
+
+    let content_length = end - start + 1;
+    let reader = BufReader::new(file);
+    let stream = ReaderStream::new(reader.take(content_length));
+    let body = Body::from_stream(stream);
+
+    let response = Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, content_length.to_string())
+        .header(
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", start, end, file_size),
+        )
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(body)
+        .map_err(|e| AppError::InternalServerError(format!("Failed to build response: {}", e)))?;
+
+    Ok(response)
 }
 
 pub async fn get_object_metadata(
@@ -196,10 +187,7 @@ pub async fn delete_object(
             )
             .await
             {
-                warn!(
-                    "Failed to delete physical file version during cleanup: {}",
-                    e
-                );
+                warn!("Failed to delete physical file version: {}", e);
             }
         }
     }
@@ -248,9 +236,9 @@ pub async fn list_objects(
     while let Some(result) = cursor
         .try_next()
         .await
-        .map_err(|_| AppError::Conflict("Failed to read from database cursor.".to_string()))?
+        .map_err(|_| AppError::Conflict("Failed to read from db cursor.".to_string()))?
     {
         objects.push(result);
     }
-    Ok(Json(objects))
+    Ok(AxumJson(objects))
 }

@@ -28,3 +28,5 @@ jsonwebtoken = "9.3.1"
 mongodb = "3.2.4"
 uuid = { version = "1.18.0", features = ["v4"] }
 tower = "0.5.2"
+hmac = "0.12.1"
+urlencoding = "2.1.3"

@@ -12,7 +12,7 @@ use crate::structs::object_storage_structs::{
 use crate::utils::header_extractor::extract_uid_from_fragmented_header;
 use axum::extract::multipart::Field;
 use axum::{
-    Json as AxumJson, Json,
+    Json as AxumJson,
     extract::{Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -64,7 +64,7 @@ pub async fn initiate_object_upload(
     info!("Initiated object upload session: {}", file_id);
     Ok((
         StatusCode::CREATED,
-        Json(InitiateUploadResponse { file_id }),
+        AxumJson(InitiateUploadResponse { file_id }),
     ))
 }
 
@@ -101,7 +101,7 @@ pub async fn get_object_upload_status(
     )
     .await?;
     let uploaded_chunks = parse_uploaded_chunks(&mut dir_reader).await;
-    Ok(Json(UploadStatusResponse {
+    Ok(AxumJson(UploadStatusResponse {
         total_size_bytes: metadata.total_size_bytes,
         uploaded_chunks,
         total_chunks: metadata.total_chunks,

@@ -23,8 +23,9 @@ use mongodb::Client;
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
 use crate::fs::fs_constants::MAX_FILE_SIZE;
-use crate::object_storage::manager::{delete_object, get_object, get_object_metadata, list_objects, stream_object};
+use crate::object_storage::manager::{delete_object, download_object, get_object, get_object_metadata, list_objects};
 use crate::object_storage::upload::{finalize_object_upload, get_object_upload_status, initiate_object_upload, object_upload_chunk};
+use crate::object_storage::sharing::{create_signed_url, get_shared_object};
 
 pub struct AppState {
     pub db_client: Client,
@@ -66,8 +67,10 @@ pub async fn serve_storage_routes() -> Router {
 
 fn create_object_storage_routes() -> Router<Arc<AppState>> {
     let protected_routes = Router::new()
+        .route("/v4/object/share", post(create_signed_url))
         .route("/v4/object/fragment/metadata/{:fragment}", get(list_objects).options(options_handler))
         .route("/v4/object/fragment/get/{:fragment}/{*object_key}", get(get_object).options(options_handler))
+        .route("/v4/object/fragment/download/{:fragment}/{*object_key}", get(download_object).options(options_handler))
         .route("/v4/object/fragment/get/metadata/{:fragment}/{*object_key}", get(get_object_metadata).options(options_handler))
         .route("/v4/object/fragment/delete/{:fragment}/{*object_key}", delete(delete_object).options(options_handler))
         .route("/v4/object/fragment/upload/init/{:fragment}/{*object_key}", post(initiate_object_upload).options(options_handler))
@@ -77,7 +80,7 @@ fn create_object_storage_routes() -> Router<Arc<AppState>> {
         .layer(from_fn(auth));
 
     Router::new()
-        .route("/v4/object/fragment/stream/{:fragment}/{*object_key}", get(stream_object))
+        .route("/v4/public/share", get(get_shared_object))
         .merge(protected_routes)
 }
 

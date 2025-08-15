@@ -75,3 +75,26 @@ pub struct ObjectMetadata {
     pub etag: String,
     pub physical_location: String,
 }
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SignedUrlDisposition {
+    #[default]
+    Inline,
+    Attachment,
+}
+
+#[derive(Deserialize)]
+pub struct CreateSignedUrlRequest {
+    pub fragment: String,
+    pub object_key: String,
+    pub expires_in: u64,
+    #[serde(default)]
+    pub disposition: SignedUrlDisposition,
+}
+
+#[derive(Serialize)]
+pub struct SignedUrlResponse {
+    pub url: String,
+    pub expires_at: String,
+}
