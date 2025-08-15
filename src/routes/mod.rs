@@ -1,1 +1,1 @@
-pub mod file_system_routes;
+pub mod storage_routes;

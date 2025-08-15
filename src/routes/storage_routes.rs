@@ -23,14 +23,14 @@ use mongodb::Client;
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
 use crate::fs::fs_constants::MAX_FILE_SIZE;
-use crate::object_storage::manager::{delete_object, get_object, get_object_metadata, list_objects};
+use crate::object_storage::manager::{delete_object, get_object, get_object_metadata, list_objects, stream_object};
 use crate::object_storage::upload::{finalize_object_upload, get_object_upload_status, initiate_object_upload, object_upload_chunk};
 
 pub struct AppState {
     pub db_client: Client,
 }
 
-pub async fn serve_file_system_routes() -> Router {
+pub async fn serve_storage_routes() -> Router {
     let client_options = ClientOptions::parse(DATABASE_URL)
         .await
         .expect("Failed to parse MongoDB URI");
@@ -65,16 +65,20 @@ pub async fn serve_file_system_routes() -> Router {
 }
 
 fn create_object_storage_routes() -> Router<Arc<AppState>> {
-    Router::new()
+    let protected_routes = Router::new()
         .route("/v4/object/fragment/metadata/{:fragment}", get(list_objects).options(options_handler))
-        .route("/v4/object/fragment/retrieve/{:fragment}/{*object_key}", get(get_object).options(options_handler))
-        .route("/v4/object/fragment/retrieve/metadata/{:fragment}/{*object_key}", get(get_object_metadata).options(options_handler))
+        .route("/v4/object/fragment/get/{:fragment}/{*object_key}", get(get_object).options(options_handler))
+        .route("/v4/object/fragment/get/metadata/{:fragment}/{*object_key}", get(get_object_metadata).options(options_handler))
         .route("/v4/object/fragment/delete/{:fragment}/{*object_key}", delete(delete_object).options(options_handler))
         .route("/v4/object/fragment/upload/init/{:fragment}/{*object_key}", post(initiate_object_upload).options(options_handler))
         .route("/v4/object/fragment/upload/chunk/{:file_id}/{:chunk_index}", put(object_upload_chunk).options(options_handler))
         .route("/v4/object/fragment/upload/status/{:file_id}", get(get_object_upload_status).options(options_handler))
         .route("/v4/object/fragment/upload/finalize/{:file_id}", post(finalize_object_upload).options(options_handler))
-        .layer(from_fn(auth))
+        .layer(from_fn(auth));
+
+    Router::new()
+        .route("/v4/object/fragment/stream/{:fragment}/{*object_key}", get(stream_object))
+        .merge(protected_routes)
 }
 
 fn create_legacy_fs_routes() -> Router<Arc<AppState>> {

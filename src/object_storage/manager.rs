@@ -1,9 +1,15 @@
 use crate::enums::app_error_enum::AppError;
 use crate::fs::fragmented_upload::with_io_timeout;
+use crate::fs::fs_constants::INITIAL_CHUNK_SIZE;
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_STORAGE_ROOT};
-use crate::routes::file_system_routes::AppState;
+use crate::object_storage::error_parser::physical_path_error;
+use crate::object_storage::header_parser::parse_range_header;
+use crate::object_storage::metadata_parser::find_latest_object_metadata;
+use crate::routes::storage_routes::AppState;
 use crate::structs::object_storage_structs::ObjectMetadata;
+use crate::structs::uid_params_struct::UIDParams;
 use crate::utils::header_extractor::extract_uid_from_fragmented_header;
+use axum::response::Response;
 use axum::{
     Json as AxumJson, Json,
     body::Body,
@@ -13,20 +19,30 @@ use axum::{
 };
 use futures_util::stream::TryStreamExt;
 use headers::HeaderValue;
-use mongodb::{Client as MongoClient, bson::doc};
+use mongodb::bson::doc;
+use std::io::SeekFrom;
 use std::sync::Arc;
 use std::{collections::HashMap, path::PathBuf};
 use tokio::fs;
+use tokio::fs::File;
+use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncSeekExt, BufReader};
+use tokio_util::io::ReaderStream;
 use tower::ServiceExt;
 use tracing::{error, info, warn};
 
 pub async fn get_object(
     State(state): State<Arc<AppState>>,
+    Query(params): Query<UIDParams>,
     header: HeaderMap,
     Path((fragment, object_key)): Path<(String, String)>,
     req: axum::http::Request<Body>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = extract_uid_from_fragmented_header(&header)?;
+    let uid = if params.uid.is_empty() {
+        extract_uid_from_fragmented_header(&header)?
+    } else {
+        params.uid
+    };
     let metadata =
         find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
 
@@ -34,35 +50,103 @@ pub async fn get_object(
         .join(OBJECT_DATA_ROOT)
         .join(&metadata.physical_location);
 
-    if !fs::try_exists(&physical_path).await.unwrap_or(false) {
-        error!(
-            "CRITICAL: Metadata found but physical file is missing at {}",
-            physical_path.display()
-        );
-        return Err(AppError::Conflict("Object data is missing.".to_string()));
-    }
-
-    let service = tower_http::services::ServeFile::new(physical_path);
-
-    match service.oneshot(req).await {
-        Ok(mut response) => {
-            let content_type = metadata.content_type;
-            match HeaderValue::from_str(&content_type) {
-                Ok(header_value) => {
-                    response
-                        .headers_mut()
-                        .insert(header::CONTENT_TYPE, header_value);
+    match physical_path_error(&physical_path).await {
+        Ok(_) => {
+            let service = tower_http::services::ServeFile::new(physical_path);
+            match service.oneshot(req).await {
+                Ok(mut response) => {
+                    let content_type = metadata.content_type;
+                    match HeaderValue::from_str(&content_type) {
+                        Ok(header_value) => {
+                            response
+                                .headers_mut()
+                                .insert(header::CONTENT_TYPE, header_value);
+                        }
+                        Err(e) => {
+                            error!("Invalid content-type string in metadata: {}", e);
+                        }
+                    }
+                    Ok(response.into_response())
                 }
-                Err(e) => {
-                    error!("Invalid content-type string in metadata: {}", e);
+                Err(err) => {
+                    error!("Failed to serve file: {}", err);
+                    Err(AppError::Conflict(format!("Failed to serve file: {}", err)))
                 }
             }
-            Ok(response.into_response())
         }
-        Err(err) => {
-            error!("Failed to serve file: {}", err);
-            Err(AppError::Conflict(format!("Failed to serve file: {}", err)))
+        Err(err) => Err(err),
+    }
+}
+
+pub async fn stream_object(
+    Query(params): Query<UIDParams>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((fragment, object_key)): Path<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    let uid = if params.uid.is_empty() {
+        extract_uid_from_fragmented_header(&headers)?
+    } else {
+        params.uid
+    };
+
+    let metadata =
+        find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
+
+    let physical_path = PathBuf::from(OBJECT_STORAGE_ROOT)
+        .join(OBJECT_DATA_ROOT)
+        .join(&metadata.physical_location);
+
+    match physical_path_error(&physical_path).await {
+        Ok(_) => {
+            let file_size = metadata.size_bytes;
+            let content_type = metadata.content_type;
+
+            let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+
+            let (start, end) = parse_range_header(range_header, file_size)
+                .unwrap_or((0, INITIAL_CHUNK_SIZE.min(file_size).saturating_sub(1)));
+
+            if start >= file_size || end >= file_size || start > end {
+                return Err(AppError::RangeNotSatisfiable);
+            }
+
+            let mut file = File::open(&physical_path).await.map_err(|e| {
+                let context = format!("opening file '{}'", physical_path.display());
+                AppError::Io(e, context)
+            })?;
+
+            file.seek(SeekFrom::Start(start)).await.map_err(|e| {
+                let context = format!("seeking in file '{}'", physical_path.display());
+                AppError::Io(e, context)
+            })?;
+
+            let content_length = end - start + 1;
+            let reader = BufReader::new(file);
+            let stream = ReaderStream::new(reader.take(content_length));
+            let body = Body::from_stream(stream);
+
+            let response = Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CONTENT_LENGTH, content_length.to_string())
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", start, end, file_size),
+                )
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(body)
+                .map_err(|e| {
+                    AppError::InternalServerError(format!(
+                        "Failed to build streaming response: {}",
+                        e
+                    ))
+                })?;
+
+            Ok(response)
         }
+        Err(err) => Err(err),
     }
 }
 
@@ -181,23 +265,4 @@ pub async fn list_objects(
         objects.push(result);
     }
     Ok(Json(objects))
-}
-
-async fn find_latest_object_metadata(
-    db: &MongoClient,
-    fragment: &str,
-    object_key: &str,
-    uid: &str,
-) -> Result<ObjectMetadata, AppError> {
-    let collection = db
-        .database("litiaina-storage")
-        .collection::<ObjectMetadata>("objects");
-
-    collection
-        .find_one(
-            doc! { "fragment": fragment, "key": object_key, "owner_uid": uid, "is_latest": true },
-        )
-        .await
-        .map_err(|_| AppError::Conflict("Database query failed.".to_string()))?
-        .ok_or(AppError::BadRequest("Object not found.".to_string()))
 }

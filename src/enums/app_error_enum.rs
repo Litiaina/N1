@@ -11,6 +11,8 @@ pub enum AppError {
     PayloadTooLarge(String),
     Unauthorized,
     Multipart(String),
+    RangeNotSatisfiable,
+    InternalServerError(String),
 }
 
 impl std::fmt::Display for AppError {
@@ -23,6 +25,8 @@ impl std::fmt::Display for AppError {
             AppError::PayloadTooLarge(msg) => write!(f, "Payload too large: {}", msg),
             AppError::Unauthorized => write!(f, "Unauthorized access"),
             AppError::Multipart(msg) => write!(f, "Multipart error: {}", msg),
+            AppError::RangeNotSatisfiable => write!(f, "Range not satisfiable"),
+            AppError::InternalServerError(msg) => write!(f, "Internal server error: {}", msg),
         }
     }
 }
@@ -61,6 +65,17 @@ impl IntoResponse for AppError {
                 (StatusCode::BAD_REQUEST, msg)
             }
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
+            AppError::RangeNotSatisfiable => (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "Range Not Satisfiable".to_string(),
+            ),
+            AppError::InternalServerError(msg) => {
+                tracing::error!("Internal Server Error: {}", msg);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "An internal server error occurred.".to_string(),
+                )
+            }
         };
 
         (status, message).into_response()

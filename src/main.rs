@@ -1,7 +1,7 @@
 use crate::fs::cleanup_manager::cleanup_stale_uploads;
 use crate::fs::fs_constants::ENV_FILE;
 use crate::handlers::error_handlers::handler_404;
-use crate::routes::file_system_routes::serve_file_system_routes;
+use crate::routes::storage_routes::serve_storage_routes;
 use crate::structs::port_struct::Ports;
 use axum::handler::HandlerWithoutStateExt;
 use axum::http::uri::Authority;
@@ -76,7 +76,7 @@ async fn server() {
         cleanup_stale_uploads().await;
     });
 
-    let file_system_ports = Ports {
+    let storage_ports = Ports {
         http: 51000,
         https: 50001,
     };
@@ -91,14 +91,14 @@ async fn server() {
         .await
         .unwrap();
 
-    let file_system_port = SocketAddr::from(([127, 0, 0, 1], file_system_ports.https));
-    let serve_file_system = serve_file_system_routes().await.fallback(handler_404);
+    let storage_port = SocketAddr::from(([127, 0, 0, 1], storage_ports.https));
+    let serve_storage = serve_storage_routes().await.fallback(handler_404);
 
     let file_system_task = tokio::spawn(serve(
-        file_system_port,
-        serve_file_system,
-        Arc::from("file-system".to_string()),
-        file_system_ports,
+        storage_port,
+        serve_storage,
+        Arc::from("storage-api".to_string()),
+        storage_ports,
         config,
     ));
 
