@@ -6,10 +6,9 @@ use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_STORAGE_ROOT};
 use crate::routes::storage_routes::AppState;
 use crate::statics::merge_semaphore_static::MERGE_SEMAPHORE;
 use crate::structs::object_storage_structs::{
-    InitiateUploadParams, InitiateUploadResponse, ObjectMetadata, TempUploadMetadata,
-    UploadStatusResponse,
+    InitiateUploadParams, InitiateUploadResponse, ObjectMetadata, ObjectPathManager,
+    TempUploadMetadata, UploadStatusResponse,
 };
-use crate::structs::stateless_fragment_upload_structs::PathManager;
 use crate::utils::header_extractor::extract_uid_from_fragmented_header;
 use axum::extract::multipart::Field;
 use axum::{
@@ -23,6 +22,7 @@ use mongodb::{Client as MongoClient, bson::doc};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::{collections::HashMap, path::PathBuf};
+use tokio::io::BufReader;
 use tokio::{
     fs::{self, File},
     io::{AsyncReadExt, AsyncWriteExt, BufWriter},
@@ -38,7 +38,7 @@ pub async fn initiate_object_upload(
 ) -> Result<impl IntoResponse, AppError> {
     let uid = extract_uid_from_fragmented_header(&header)?;
     let file_id = Uuid::new_v4().to_string();
-    let paths = PathManager::new(&file_id);
+    let paths = ObjectPathManager::new(&file_id);
     with_io_timeout(
         "create temp upload directory",
         fs::create_dir_all(paths.temp_upload_dir()),
@@ -73,7 +73,7 @@ pub async fn object_upload_chunk(
     Query(params): Query<HashMap<String, String>>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, AppError> {
-    let paths = PathManager::new(&file_id);
+    let paths = ObjectPathManager::new(&file_id);
     let field = with_timeout("reading multipart field", multipart.next_field())
         .await??
         .ok_or_else(|| AppError::BadRequest("No multipart field found.".to_string()))?;
@@ -85,7 +85,7 @@ pub async fn object_upload_chunk(
 pub async fn get_object_upload_status(
     Path(file_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    let paths = PathManager::new(&file_id);
+    let paths = ObjectPathManager::new(&file_id);
     let metadata: TempUploadMetadata = {
         let content = with_io_timeout(
             "reading metadata",
@@ -114,7 +114,7 @@ pub async fn finalize_object_upload(
 ) -> Result<impl IntoResponse, AppError> {
     info!("Finalization requested for upload session: {}", file_id);
     tokio::spawn(async move {
-        let paths = PathManager::new(&file_id);
+        let paths = ObjectPathManager::new(&file_id);
         if let Err(e) = assemble_and_index_object(&paths, state.db_client.clone()).await {
             error!(
                 "Failed to assemble and index object for file_id '{}'. Error: {:?}",
@@ -126,7 +126,7 @@ pub async fn finalize_object_upload(
 }
 
 async fn save_chunk_stream(
-    paths: &PathManager<'_>,
+    paths: &ObjectPathManager<'_>,
     index: u64,
     mut field: Field<'_>,
     expected_checksum: Option<&str>,
@@ -174,7 +174,7 @@ async fn save_chunk_stream(
 }
 
 async fn assemble_and_index_object(
-    paths: &PathManager<'_>,
+    paths: &ObjectPathManager<'_>,
     db: MongoClient,
 ) -> Result<(), AppError> {
     let semaphore = MERGE_SEMAPHORE
@@ -184,6 +184,7 @@ async fn assemble_and_index_object(
         .acquire()
         .await
         .expect("Semaphore is never closed");
+
     let temp_metadata: TempUploadMetadata = {
         let content = with_io_timeout(
             "reading metadata for assembly",
@@ -193,8 +194,9 @@ async fn assemble_and_index_object(
         serde_json::from_str(&content)
             .map_err(|_| AppError::Conflict("Invalid metadata file for assembly.".to_string()))?
     };
+
     info!(
-        "Starting assembly for object: {}/{}",
+        "Starting high-performance assembly for object: {}/{}",
         temp_metadata.fragment, temp_metadata.object_key
     );
 
@@ -203,18 +205,23 @@ async fn assemble_and_index_object(
     let physical_path = PathBuf::from(OBJECT_STORAGE_ROOT)
         .join(OBJECT_DATA_ROOT)
         .join(&physical_path_str);
+
     if let Some(parent) = physical_path.parent() {
         with_io_timeout("create final object directory", fs::create_dir_all(parent)).await?;
     }
+
     let temp_merged_path = paths
         .temp_upload_dir()
         .join(format!("{}.merged.tmp", temp_metadata.file_id));
+
     let mut final_hasher = Sha256::new();
     let final_size;
+
     {
         let output_file =
             with_io_timeout("creating merged file", File::create(&temp_merged_path)).await?;
         let mut writer = BufWriter::new(output_file);
+        let mut buffer = vec![0; 1024 * 64];
         for i in 0..temp_metadata.total_chunks {
             let chunk_path = paths.chunk_path(i);
             if !fs::try_exists(&chunk_path).await.unwrap_or(false) {
@@ -223,28 +230,40 @@ async fn assemble_and_index_object(
                     i
                 )));
             }
-            let mut chunk_file = with_io_timeout("opening chunk", File::open(&chunk_path)).await?;
-            let mut buf = Vec::new();
-            chunk_file
-                .read_to_end(&mut buf)
-                .await
-                .map_err(|e| AppError::from((e, "reading chunk")))?;
-            final_hasher.update(&buf);
-            writer
-                .write_all(&buf)
-                .await
-                .map_err(|e| AppError::from((e, "writing chunk")))?;
+
+            let chunk_file = with_io_timeout("opening chunk", File::open(&chunk_path)).await?;
+            let mut chunk_reader = BufReader::new(chunk_file);
+
+            loop {
+                let bytes_read = chunk_reader
+                    .read(&mut buffer)
+                    .await
+                    .map_err(|e| AppError::from((e, "reading chunk piece during assembly")))?;
+
+                if bytes_read == 0 {
+                    break;
+                }
+
+                let data_slice = &buffer[..bytes_read];
+                final_hasher.update(data_slice);
+                writer
+                    .write_all(data_slice)
+                    .await
+                    .map_err(|e| AppError::from((e, "writing chunk piece during assembly")))?;
+            }
         }
         with_io_timeout("flushing merged file", writer.flush()).await?;
         final_size = with_io_timeout("getting final size", writer.into_inner().metadata())
             .await?
             .len();
     }
+
     with_io_timeout(
         "moving assembled file to final destination",
         fs::rename(&temp_merged_path, &physical_path),
     )
     .await?;
+
     let final_checksum = hex::encode(final_hasher.finalize());
     let now = mongodb::bson::DateTime::now();
     let final_metadata = ObjectMetadata {
@@ -263,6 +282,7 @@ async fn assemble_and_index_object(
         etag: final_checksum,
         physical_location: physical_path_str,
     };
+
     let collection = db
         .database("litiaina-storage")
         .collection::<ObjectMetadata>("objects");
@@ -289,6 +309,7 @@ async fn assemble_and_index_object(
         fs::remove_dir_all(paths.temp_upload_dir()),
     )
     .await?;
+
     info!(
         "Successfully indexed new version of object: {}/{} (Version ID: {})",
         final_metadata.fragment, final_metadata.key, final_metadata.version_id

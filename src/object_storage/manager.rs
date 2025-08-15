@@ -7,7 +7,6 @@ use crate::object_storage::header_parser::parse_range_header;
 use crate::object_storage::metadata_parser::find_latest_object_metadata;
 use crate::routes::storage_routes::AppState;
 use crate::structs::object_storage_structs::ObjectMetadata;
-use crate::structs::uid_params_struct::UIDParams;
 use crate::utils::header_extractor::extract_uid_from_fragmented_header;
 use axum::response::Response;
 use axum::{
@@ -33,16 +32,11 @@ use tracing::{error, info, warn};
 
 pub async fn get_object(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<UIDParams>,
     header: HeaderMap,
     Path((fragment, object_key)): Path<(String, String)>,
     req: axum::http::Request<Body>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = if params.uid.is_empty() {
-        extract_uid_from_fragmented_header(&header)?
-    } else {
-        params.uid
-    };
+    let uid = extract_uid_from_fragmented_header(&header)?;
     let metadata =
         find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
 
@@ -79,17 +73,11 @@ pub async fn get_object(
 }
 
 pub async fn stream_object(
-    Query(params): Query<UIDParams>,
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((fragment, object_key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = if params.uid.is_empty() {
-        extract_uid_from_fragmented_header(&headers)?
-    } else {
-        params.uid
-    };
-
+    let uid = extract_uid_from_fragmented_header(&headers)?;
     let metadata =
         find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
 

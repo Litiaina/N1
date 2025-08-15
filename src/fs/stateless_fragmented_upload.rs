@@ -30,6 +30,7 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use crate::fs::fragmented_upload::with_io_timeout;
 use crate::object_storage::chunk_parser::parse_uploaded_chunks;
 
 pub async fn initiate_upload_session(
@@ -318,13 +319,3 @@ where
         .map_err(|_| AppError::Timeout(context.to_string()))
 }
 
-async fn with_io_timeout<F, T>(context: &'static str, fut: F) -> Result<T, AppError>
-where
-    F: Future<Output = Result<T, io::Error>>,
-{
-    match timeout(IO_TIMEOUT, fut).await {
-        Ok(Ok(val)) => Ok(val),
-        Ok(Err(e)) => Err(AppError::from((e, context))),
-        Err(_) => Err(AppError::Timeout(context.to_string())),
-    }
-}

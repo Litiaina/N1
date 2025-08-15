@@ -1,4 +1,32 @@
+use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use crate::fs::fs_constants::{CHUNK_PREFIX, OBJECT_METADATA_FILENAME, TEMP_UPLOAD_ROOT};
+use crate::object_storage::constants::OBJECT_STORAGE_ROOT;
+
+pub struct ObjectPathManager<'a> {
+    pub file_id: &'a str,
+}
+
+impl<'a> ObjectPathManager<'a> {
+    pub fn new(file_id: &'a str) -> Self {
+        Self { file_id }
+    }
+
+    pub fn temp_upload_dir(&self) -> PathBuf {
+        PathBuf::from(OBJECT_STORAGE_ROOT)
+            .join(TEMP_UPLOAD_ROOT)
+            .join(self.file_id)
+    }
+
+    pub fn chunk_path(&self, index: u64) -> PathBuf {
+        self.temp_upload_dir()
+            .join(format!("{}{}", CHUNK_PREFIX, index))
+    }
+
+    pub fn metadata_path(&self) -> PathBuf {
+        self.temp_upload_dir().join(OBJECT_METADATA_FILENAME)
+    }
+}
 
 #[derive(Deserialize)]
 pub struct InitiateUploadParams {
