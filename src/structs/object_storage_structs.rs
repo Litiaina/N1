@@ -47,6 +47,14 @@ pub struct UploadStatusResponse {
     pub total_chunks: u64,
 }
 
+#[derive(Deserialize)]
+pub struct RenameObjectRequest {
+    pub source_fragment: String,
+    pub source_key: String,
+    pub destination_fragment: String,
+    pub destination_key: String,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TempUploadMetadata {
     pub file_id: String,

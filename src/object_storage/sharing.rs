@@ -1,5 +1,5 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::manager::{download_object_logic, stream_object_logic};
+use crate::object_storage::retrieve::stream_object_logic;
 use crate::object_storage::metadata_parser::find_latest_object_metadata;
 use crate::routes::storage_routes::AppState;
 use crate::structs::object_storage_structs::{
@@ -18,6 +18,7 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, LazyLock};
+use crate::object_storage::download::download_object_logic;
 
 static URL_SIGNING_SECRET: LazyLock<String> =
     LazyLock::new(|| env::var("URL_SIGNING_SECRET").expect("URL_SIGNING_SECRET must be set"));

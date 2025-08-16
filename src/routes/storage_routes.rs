@@ -16,14 +16,17 @@ use crate::middleware::auth_middleware::{auth, authorize};
 use crate::middleware::storage_middleware::enforce_storage_limit;
 use axum::http::{HeaderName, Method, StatusCode};
 use axum::middleware::from_fn;
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{extract::DefaultBodyLimit, Router};
 use mongodb::options::ClientOptions;
 use mongodb::Client;
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
 use crate::fs::fs_constants::MAX_FILE_SIZE;
-use crate::object_storage::manager::{delete_object, download_object, get_object, get_object_metadata, list_objects};
+use crate::object_storage::delete::delete_object;
+use crate::object_storage::download::download_object;
+use crate::object_storage::retrieve::{stream_object, get_object_metadata, list_objects, get_object};
+use crate::object_storage::modify::rename_object;
 use crate::object_storage::upload::{finalize_object_upload, get_object_upload_status, initiate_object_upload, object_upload_chunk};
 use crate::object_storage::sharing::{create_signed_url, get_shared_object};
 
@@ -67,16 +70,18 @@ pub async fn serve_storage_routes() -> Router {
 
 fn create_object_storage_routes() -> Router<Arc<AppState>> {
     let protected_routes = Router::new()
-        .route("/v4/object/share", post(create_signed_url))
-        .route("/v4/object/fragment/metadata/{:fragment}", get(list_objects).options(options_handler))
-        .route("/v4/object/fragment/get/{:fragment}/{*object_key}", get(get_object).options(options_handler))
-        .route("/v4/object/fragment/download/{:fragment}/{*object_key}", get(download_object).options(options_handler))
-        .route("/v4/object/fragment/get/metadata/{:fragment}/{*object_key}", get(get_object_metadata).options(options_handler))
-        .route("/v4/object/fragment/delete/{:fragment}/{*object_key}", delete(delete_object).options(options_handler))
-        .route("/v4/object/fragment/upload/init/{:fragment}/{*object_key}", post(initiate_object_upload).options(options_handler))
-        .route("/v4/object/fragment/upload/chunk/{:file_id}/{:chunk_index}", put(object_upload_chunk).options(options_handler))
-        .route("/v4/object/fragment/upload/status/{:file_id}", get(get_object_upload_status).options(options_handler))
-        .route("/v4/object/fragment/upload/finalize/{:file_id}", post(finalize_object_upload).options(options_handler))
+        .route("/v4/fragment/object/share", post(create_signed_url))
+        .route("/v4/fragment/object/metadata/{:fragment}", get(list_objects).options(options_handler))
+        .route("/v4/fragment/object/get/{:fragment}/{*object_key}", get(get_object).options(options_handler))
+        .route("/v4/fragment/object/stream/{:fragment}/{*object_key}", get(stream_object).options(options_handler))
+        .route("/v4/fragment/object/get/metadata/{:fragment}/{*object_key}", get(get_object_metadata).options(options_handler))
+        .route("/v4/fragment/object/download/{:fragment}/{*object_key}", get(download_object).options(options_handler))
+        .route("/v4/fragment/object/rename", patch(rename_object).options(options_handler))
+        .route("/v4/fragment/object/delete/{:fragment}/{*object_key}", delete(delete_object).options(options_handler))
+        .route("/v4/fragment/object/upload/init/{:fragment}/{*object_key}", post(initiate_object_upload).options(options_handler))
+        .route("/v4/fragment/object/upload/chunk/{:file_id}/{:chunk_index}", put(object_upload_chunk).options(options_handler))
+        .route("/v4/fragment/object/upload/status/{:file_id}", get(get_object_upload_status).options(options_handler))
+        .route("/v4/fragment/object/upload/finalize/{:file_id}", post(finalize_object_upload).options(options_handler))
         .layer(from_fn(auth));
 
     Router::new()

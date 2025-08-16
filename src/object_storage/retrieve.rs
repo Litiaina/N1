@@ -1,5 +1,4 @@
 use crate::enums::app_error_enum::AppError;
-use crate::fs::fragmented_upload::with_io_timeout;
 use crate::fs::fs_constants::INITIAL_CHUNK_SIZE;
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_STORAGE_ROOT};
 use crate::object_storage::error_parser::physical_path_error;
@@ -11,7 +10,7 @@ use crate::utils::header_extractor::extract_uid_from_fragmented_header;
 use axum::Json as AxumJson;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::stream::TryStreamExt;
 use mongodb::bson::doc;
@@ -19,13 +18,57 @@ use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::fs::{self, File};
+use headers::HeaderValue;
+use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 use tokio_util::io::ReaderStream;
 use tower::ServiceExt;
-use tracing::{info, warn};
+use tracing::error;
 
 pub async fn get_object(
+    State(state): State<Arc<AppState>>,
+    header: HeaderMap,
+    Path((fragment, object_key)): Path<(String, String)>,
+    req: axum::http::Request<Body>,
+) -> Result<impl IntoResponse, AppError> {
+    let uid = extract_uid_from_fragmented_header(&header)?;
+
+    let metadata =
+        find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
+
+    let physical_path = PathBuf::from(OBJECT_STORAGE_ROOT)
+        .join(OBJECT_DATA_ROOT)
+        .join(&metadata.physical_location);
+
+    match physical_path_error(&physical_path).await {
+        Ok(_) => {
+            let service = tower_http::services::ServeFile::new(physical_path);
+            match service.oneshot(req).await {
+                Ok(mut response) => {
+                    let content_type = metadata.content_type;
+                    match HeaderValue::from_str(&content_type) {
+                        Ok(header_value) => {
+                            response
+                                .headers_mut()
+                                .insert(header::CONTENT_TYPE, header_value);
+                        }
+                        Err(e) => {
+                            error!("Invalid content-type string in metadata: {}", e);
+                        }
+                    }
+                    Ok(response.into_response())
+                }
+                Err(err) => {
+                    error!("Failed to serve file: {}", err);
+                    Err(AppError::Conflict(format!("Failed to serve file: {}", err)))
+                }
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+pub async fn stream_object(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((fragment, object_key)): Path<(String, String)>,
@@ -34,49 +77,6 @@ pub async fn get_object(
     let metadata =
         find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
     stream_object_logic(headers, metadata).await
-}
-
-pub async fn download_object(
-    State(state): State<Arc<AppState>>,
-    header: HeaderMap,
-    Path((fragment, object_key)): Path<(String, String)>,
-    req: axum::http::Request<Body>,
-) -> Result<impl IntoResponse, AppError> {
-    let uid = extract_uid_from_fragmented_header(&header)?;
-    let metadata =
-        find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
-    download_object_logic(req, metadata).await
-}
-
-pub async fn download_object_logic(
-    req: axum::http::Request<Body>,
-    metadata: ObjectMetadata,
-) -> Result<impl IntoResponse, AppError> {
-    let physical_path = PathBuf::from(OBJECT_STORAGE_ROOT)
-        .join(OBJECT_DATA_ROOT)
-        .join(&metadata.physical_location);
-
-    physical_path_error(&physical_path).await?;
-
-    let service = tower_http::services::ServeFile::new(physical_path);
-    match service.oneshot(req).await {
-        Ok(mut response) => {
-            let content_type = metadata.content_type;
-            if let Ok(hv) = HeaderValue::from_str(&content_type) {
-                response.headers_mut().insert(header::CONTENT_TYPE, hv);
-            }
-            response.headers_mut().insert(
-                header::CONTENT_DISPOSITION,
-                HeaderValue::from_str(&format!("attachment; filename=\"{}\"", metadata.key))
-                    .unwrap_or(HeaderValue::from_static("attachment")),
-            );
-            Ok(response.into_response())
-        }
-        Err(err) => {
-            tracing::error!("Failed to serve file for download: {}", err);
-            Err(AppError::Conflict(format!("Failed to serve file: {}", err)))
-        }
-    }
 }
 
 pub async fn stream_object_logic(
@@ -138,65 +138,6 @@ pub async fn get_object_metadata(
     let metadata =
         find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
     Ok(AxumJson(metadata))
-}
-
-pub async fn delete_object(
-    State(state): State<Arc<AppState>>,
-    header: HeaderMap,
-    Path((fragment, object_key)): Path<(String, String)>,
-) -> Result<impl IntoResponse, AppError> {
-    let uid = extract_uid_from_fragmented_header(&header)?;
-    let collection = state
-        .db_client
-        .database("litiaina-storage")
-        .collection::<ObjectMetadata>("objects");
-
-    let filter =
-        doc! { "fragment": fragment.clone(), "key": object_key.clone(), "owner_uid": uid.clone() };
-    let mut cursor = collection
-        .find(filter.clone())
-        .await
-        .map_err(|_| AppError::Conflict("Database query for find failed.".to_string()))?;
-
-    let mut physical_files_to_delete = Vec::new();
-    while let Some(metadata) = cursor
-        .try_next()
-        .await
-        .map_err(|_| AppError::Conflict("Cursor error.".to_string()))?
-    {
-        physical_files_to_delete.push(metadata.physical_location);
-    }
-
-    if physical_files_to_delete.is_empty() {
-        return Err(AppError::BadRequest("Object not found.".to_string()));
-    }
-
-    collection
-        .delete_many(filter)
-        .await
-        .map_err(|_| AppError::Conflict("Database delete_many failed.".to_string()))?;
-
-    for location in physical_files_to_delete {
-        let physical_path = PathBuf::from(OBJECT_STORAGE_ROOT)
-            .join(OBJECT_DATA_ROOT)
-            .join(location);
-        if fs::try_exists(&physical_path).await.unwrap_or(false) {
-            if let Err(e) = with_io_timeout(
-                "deleting physical object version",
-                fs::remove_file(physical_path),
-            )
-            .await
-            {
-                warn!("Failed to delete physical file version: {}", e);
-            }
-        }
-    }
-
-    info!(
-        "Deleted all versions of object: {}/{}",
-        fragment, object_key
-    );
-    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn list_objects(
