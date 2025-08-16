@@ -7,6 +7,7 @@ use futures_util::TryStreamExt;
 use mongodb::bson::doc;
 use tokio::fs;
 use tracing::{info, warn};
+use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
 use crate::enums::app_error_enum::AppError;
 use crate::fs::fragmented_upload::with_io_timeout;
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_STORAGE_ROOT};
@@ -22,7 +23,7 @@ pub async fn delete_object(
     let uid = extract_uid_from_fragmented_header(&header)?;
     let collection = state
         .db_client
-        .database("litiaina-storage")
+        .database(OBJECT_STORAGE_DATABASE)
         .collection::<ObjectMetadata>("objects");
 
     let filter =

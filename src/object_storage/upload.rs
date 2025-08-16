@@ -31,6 +31,7 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use crate::database::database_constants::{DATABASE, OBJECT_STORAGE_DATABASE};
 
 pub async fn initiate_object_upload(
     State(state): State<Arc<AppState>>,
@@ -39,8 +40,7 @@ pub async fn initiate_object_upload(
     AxumJson(params): AxumJson<InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
     let uid = extract_uid_from_fragmented_header(&header)?;
-
-    let auth_db = state.db_client.database("litiaina-cloud-database");
+    let auth_db = state.db_client.database(DATABASE);
     let auth_collection = auth_db.collection::<UserAuthDetails>("auth");
     let user_auth_details = auth_collection
         .find_one(doc! { "uid": &uid })
@@ -317,7 +317,7 @@ async fn assemble_and_index_object(
     };
 
     let collection = db
-        .database("litiaina-storage")
+        .database(OBJECT_STORAGE_DATABASE)
         .collection::<ObjectMetadata>("objects");
 
     let filter = doc! {

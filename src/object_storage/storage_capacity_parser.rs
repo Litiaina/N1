@@ -4,10 +4,11 @@ use futures_util::TryStreamExt;
 use mongodb::Client as MongoClient;
 use mongodb::bson;
 use mongodb::bson::doc;
+use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
 
 pub async fn calculate_storage_usage(db: &MongoClient, uid: &str) -> Result<u64, AppError> {
     let objects_collection = db
-        .database("litiaina-storage")
+        .database(OBJECT_STORAGE_DATABASE)
         .collection::<ObjectMetadata>("objects");
 
     let pipeline = vec![

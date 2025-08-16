@@ -1,8 +1,4 @@
 use crate::enums::app_error_enum::AppError;
-use crate::fs::fs_constants::INITIAL_CHUNK_SIZE;
-use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_STORAGE_ROOT};
-use crate::object_storage::error_parser::physical_path_error;
-use crate::object_storage::header_parser::parse_range_header;
 use crate::object_storage::metadata_parser::find_latest_object_metadata;
 use crate::routes::storage_routes::AppState;
 use crate::structs::object_storage_structs::ObjectMetadata;
@@ -10,20 +6,14 @@ use crate::utils::header_extractor::extract_uid_from_fragmented_header;
 use axum::Json as AxumJson;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::http::HeaderMap;
+use axum::response::IntoResponse;
 use futures_util::stream::TryStreamExt;
-use headers::HeaderValue;
 use mongodb::bson::doc;
 use std::collections::HashMap;
-use std::io::SeekFrom;
-use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
-use tokio_util::io::ReaderStream;
-use tower::ServiceExt;
-use tracing::error;
+use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
+use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
 
 pub async fn get_object(
     State(state): State<Arc<AppState>>,
@@ -32,40 +22,9 @@ pub async fn get_object(
     req: axum::http::Request<Body>,
 ) -> Result<impl IntoResponse, AppError> {
     let uid = extract_uid_from_fragmented_header(&header)?;
-
     let metadata =
         find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
-
-    let physical_path = PathBuf::from(OBJECT_STORAGE_ROOT)
-        .join(OBJECT_DATA_ROOT)
-        .join(&metadata.physical_location);
-
-    match physical_path_error(&physical_path).await {
-        Ok(_) => {
-            let service = tower_http::services::ServeFile::new(physical_path);
-            match service.oneshot(req).await {
-                Ok(mut response) => {
-                    let content_type = metadata.content_type;
-                    match HeaderValue::from_str(&content_type) {
-                        Ok(header_value) => {
-                            response
-                                .headers_mut()
-                                .insert(header::CONTENT_TYPE, header_value);
-                        }
-                        Err(e) => {
-                            error!("Invalid content-type string in metadata: {}", e);
-                        }
-                    }
-                    Ok(response.into_response())
-                }
-                Err(err) => {
-                    error!("Failed to serve file: {}", err);
-                    Err(AppError::Conflict(format!("Failed to serve file: {}", err)))
-                }
-            }
-        }
-        Err(err) => Err(err),
-    }
+    get_object_logic(metadata, req).await
 }
 
 pub async fn stream_object(
@@ -77,56 +36,6 @@ pub async fn stream_object(
     let metadata =
         find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
     stream_object_logic(headers, metadata).await
-}
-
-pub async fn stream_object_logic(
-    headers: HeaderMap,
-    metadata: ObjectMetadata,
-) -> Result<impl IntoResponse, AppError> {
-    let physical_path = PathBuf::from(OBJECT_STORAGE_ROOT)
-        .join(OBJECT_DATA_ROOT)
-        .join(&metadata.physical_location);
-
-    physical_path_error(&physical_path).await?;
-
-    let file_size = metadata.size_bytes;
-    let content_type = metadata.content_type;
-    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
-
-    let (start, end) = parse_range_header(range_header, file_size)
-        .unwrap_or((0, INITIAL_CHUNK_SIZE.min(file_size).saturating_sub(1)));
-
-    if start >= file_size || end >= file_size || start > end {
-        return Err(AppError::RangeNotSatisfiable);
-    }
-
-    let mut file = File::open(&physical_path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("opening file '{}'", physical_path.display())))?;
-
-    file.seek(SeekFrom::Start(start))
-        .await
-        .map_err(|e| AppError::Io(e, format!("seeking in file '{}'", physical_path.display())))?;
-
-    let content_length = end - start + 1;
-    let reader = BufReader::new(file);
-    let stream = ReaderStream::new(reader.take(content_length));
-    let body = Body::from_stream(stream);
-
-    let response = Response::builder()
-        .status(StatusCode::PARTIAL_CONTENT)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CONTENT_LENGTH, content_length.to_string())
-        .header(
-            header::CONTENT_RANGE,
-            format!("bytes {}-{}/{}", start, end, file_size),
-        )
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(body)
-        .map_err(|e| AppError::InternalServerError(format!("Failed to build response: {}", e)))?;
-
-    Ok(response)
 }
 
 pub async fn get_object_metadata(
@@ -149,7 +58,7 @@ pub async fn list_objects(
     let uid = extract_uid_from_fragmented_header(&header)?;
     let collection = state
         .db_client
-        .database("litiaina-storage")
+        .database(OBJECT_STORAGE_DATABASE)
         .collection::<ObjectMetadata>("objects");
     let limit: i64 = params
         .get("limit")
@@ -191,7 +100,7 @@ pub async fn list_fragments(
     let uid = extract_uid_from_fragmented_header(&header)?;
     let collection = state
         .db_client
-        .database("litiaina-storage")
+        .database(OBJECT_STORAGE_DATABASE)
         .collection::<ObjectMetadata>("objects");
 
     let filter = doc! { "owner_uid": uid };

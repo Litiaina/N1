@@ -1,5 +1,4 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::retrieve::stream_object_logic;
 use crate::object_storage::metadata_parser::find_latest_object_metadata;
 use crate::routes::storage_routes::AppState;
 use crate::structs::object_storage_structs::{
@@ -18,7 +17,9 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, LazyLock};
+use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
 use crate::object_storage::download::download_object_logic;
+use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
 
 static URL_SIGNING_SECRET: LazyLock<String> =
     LazyLock::new(|| env::var("URL_SIGNING_SECRET").expect("URL_SIGNING_SECRET must be set"));
@@ -42,8 +43,9 @@ pub async fn create_signed_url(
     let expires_timestamp = expires_at.timestamp();
 
     let disposition_str = match payload.disposition {
-        SignedUrlDisposition::Inline => "inline",
-        SignedUrlDisposition::Attachment => "attachment",
+        SignedUrlDisposition::View => "view",
+        SignedUrlDisposition::Stream => "stream",
+        SignedUrlDisposition::Download => "download"
     };
 
     let data_to_sign = format!(
@@ -114,7 +116,7 @@ pub async fn get_shared_object(
 
     let collection = state
         .db_client
-        .database("litiaina-storage")
+        .database(OBJECT_STORAGE_DATABASE)
         .collection::<ObjectMetadata>("objects");
     let metadata = collection
         .find_one(doc! { "fragment": &fragment, "key": &object_key, "is_latest": true })
@@ -138,13 +140,20 @@ pub async fn get_shared_object(
     .map_err(|_| AppError::BadRequest("Invalid signature.".to_string()))?;
 
     match disposition_str.as_str() {
-        "attachment" => {
-            let response = download_object_logic(req, metadata).await?;
+        "view" => {
+            let response = get_object_logic(metadata, req).await?;
             Ok(response.into_response())
-        }
-        _ => {
+        },
+        "stream" => {
             let response = stream_object_logic(headers, metadata).await?;
             Ok(response.into_response())
+        },
+        "download" => {
+            let response = download_object_logic(req, metadata).await?;
+            Ok(response.into_response())
+        },
+        _ => {
+            Err(AppError::BadRequest("Invalid disposition".to_string()))
         }
     }
 }

@@ -103,8 +103,9 @@ pub struct ObjectMetadata {
 #[serde(rename_all = "lowercase")]
 pub enum SignedUrlDisposition {
     #[default]
-    Inline,
-    Attachment,
+    View,
+    Stream,
+    Download,
 }
 
 #[derive(Deserialize)]

@@ -1,4 +1,5 @@
 use mongodb::{Client as MongoClient, bson::doc};
+use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
 use crate::enums::app_error_enum::AppError;
 use crate::structs::object_storage_structs::ObjectMetadata;
 
@@ -9,7 +10,7 @@ pub async fn find_latest_object_metadata(
     uid: &str,
 ) -> Result<ObjectMetadata, AppError> {
     let collection = db
-        .database("litiaina-storage")
+        .database(OBJECT_STORAGE_DATABASE)
         .collection::<ObjectMetadata>("objects");
 
     collection

@@ -5,6 +5,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use mongodb::bson::doc;
 use tracing::info;
+use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::metadata_parser::find_latest_object_metadata;
 use crate::routes::storage_routes::AppState;
@@ -19,7 +20,7 @@ pub async fn rename_object(
     let uid = extract_uid_from_fragmented_header(&header)?;
     let db_client = &state.db_client;
     let collection = db_client
-        .database("litiaina-storage")
+        .database(OBJECT_STORAGE_DATABASE)
         .collection::<ObjectMetadata>("objects");
 
     find_latest_object_metadata(
