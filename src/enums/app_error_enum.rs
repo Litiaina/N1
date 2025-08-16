@@ -13,6 +13,7 @@ pub enum AppError {
     Multipart(String),
     RangeNotSatisfiable,
     InternalServerError(String),
+    InsufficientStorage,
 }
 
 impl std::fmt::Display for AppError {
@@ -27,6 +28,7 @@ impl std::fmt::Display for AppError {
             AppError::Multipart(msg) => write!(f, "Multipart error: {}", msg),
             AppError::RangeNotSatisfiable => write!(f, "Range not satisfiable"),
             AppError::InternalServerError(msg) => write!(f, "Internal server error: {}", msg),
+            AppError::InsufficientStorage => write!(f, "Insufficient storage capacity"),
         }
     }
 }
@@ -76,6 +78,10 @@ impl IntoResponse for AppError {
                     "An internal server error occurred.".to_string(),
                 )
             }
+            AppError::InsufficientStorage => (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "Insufficient storage capacity.".to_string(),
+            ),
         };
 
         (status, message).into_response()

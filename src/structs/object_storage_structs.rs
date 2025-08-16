@@ -28,6 +28,21 @@ impl<'a> ObjectPathManager<'a> {
     }
 }
 
+#[derive(Serialize)]
+pub struct CapacityUsageResponse {
+    pub capacity_used: u64,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct TotalStorageUsage {
+    pub total_usage: u64,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct UserAuthDetails {
+    pub allocated_storage: u64,
+}
+
 #[derive(Deserialize)]
 pub struct InitiateUploadParams {
     pub content_type: Option<String>,

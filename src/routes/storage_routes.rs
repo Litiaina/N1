@@ -27,7 +27,7 @@ use crate::object_storage::delete::delete_object;
 use crate::object_storage::download::download_object;
 use crate::object_storage::retrieve::{stream_object, get_object_metadata, list_objects, get_object, list_fragments};
 use crate::object_storage::modify::rename_object;
-use crate::object_storage::upload::{finalize_object_upload, get_object_upload_status, initiate_object_upload, object_upload_chunk};
+use crate::object_storage::upload::{finalize_object_upload, get_capacity_usage, get_object_upload_status, initiate_object_upload, object_upload_chunk};
 use crate::object_storage::sharing::{create_signed_url, get_shared_object};
 
 pub struct AppState {
@@ -70,6 +70,7 @@ pub async fn serve_storage_routes() -> Router {
 
 fn create_object_storage_routes() -> Router<Arc<AppState>> {
     let protected_routes = Router::new()
+        .route("/v4/capacity/usage", get(get_capacity_usage).options(options_handler))
         .route("/v4/fragment/object/share", post(create_signed_url))
         .route("/v4/fragment/metadata", get(list_fragments).options(options_handler))
         .route("/v4/fragment/object/metadata/{:fragment}", get(list_objects).options(options_handler))

@@ -3,11 +3,12 @@ use crate::fs::fragmented_upload::{with_io_timeout, with_timeout};
 use crate::fs::fs_constants::{MAX_CHUNK_SIZE, MERGE_CONCURRENCY, TMP_EXT};
 use crate::object_storage::chunk_parser::parse_uploaded_chunks;
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_STORAGE_ROOT};
+use crate::object_storage::storage_capacity_parser::calculate_storage_usage;
 use crate::routes::storage_routes::AppState;
 use crate::statics::merge_semaphore_static::MERGE_SEMAPHORE;
 use crate::structs::object_storage_structs::{
-    InitiateUploadParams, InitiateUploadResponse, ObjectMetadata, ObjectPathManager,
-    TempUploadMetadata, UploadStatusResponse,
+    CapacityUsageResponse, InitiateUploadParams, InitiateUploadResponse, ObjectMetadata,
+    ObjectPathManager, TempUploadMetadata, UploadStatusResponse, UserAuthDetails,
 };
 use crate::utils::header_extractor::extract_uid_from_fragmented_header;
 use axum::extract::multipart::Field;
@@ -18,7 +19,7 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::stream::TryStreamExt;
-use mongodb::{Client as MongoClient, bson::doc};
+use mongodb::{Client as MongoClient, bson, bson::doc};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::{collections::HashMap, path::PathBuf};
@@ -32,11 +33,32 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 pub async fn initiate_object_upload(
+    State(state): State<Arc<AppState>>,
     header: HeaderMap,
     Path((fragment, object_key)): Path<(String, String)>,
     AxumJson(params): AxumJson<InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
     let uid = extract_uid_from_fragmented_header(&header)?;
+
+    let auth_db = state.db_client.database("litiaina-cloud-database");
+    let auth_collection = auth_db.collection::<UserAuthDetails>("auth");
+    let user_auth_details = auth_collection
+        .find_one(doc! { "uid": &uid })
+        .await
+        .map_err(|_| AppError::Conflict("Failed to query user details.".to_string()))?
+        .ok_or(AppError::Unauthorized)?;
+
+    let allocated_storage = user_auth_details.allocated_storage;
+    let current_usage = calculate_storage_usage(&state.db_client, &uid).await?;
+
+    if current_usage.saturating_add(params.total_size_bytes) > allocated_storage {
+        warn!(
+            "User {} exceeded storage quota. Usage: {}, Allocation: {}, Attempted Upload: {}",
+            uid, current_usage, allocated_storage, params.total_size_bytes
+        );
+        return Err(AppError::InsufficientStorage);
+    }
+
     let file_id = Uuid::new_v4().to_string();
     let paths = ObjectPathManager::new(&file_id);
     with_io_timeout(
@@ -66,6 +88,17 @@ pub async fn initiate_object_upload(
         StatusCode::CREATED,
         AxumJson(InitiateUploadResponse { file_id }),
     ))
+}
+
+pub async fn get_capacity_usage(
+    State(state): State<Arc<AppState>>,
+    header: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    let uid = extract_uid_from_fragmented_header(&header)?;
+    let current_usage = calculate_storage_usage(&state.db_client, &uid).await?;
+    Ok(AxumJson(CapacityUsageResponse {
+        capacity_used: current_usage,
+    }))
 }
 
 pub async fn object_upload_chunk(
@@ -265,7 +298,7 @@ async fn assemble_and_index_object(
     .await?;
 
     let final_checksum = hex::encode(final_hasher.finalize());
-    let now = mongodb::bson::DateTime::now();
+    let now = bson::DateTime::now();
     let final_metadata = ObjectMetadata {
         id: Uuid::new_v4().to_string(),
         fragment: temp_metadata.fragment,
