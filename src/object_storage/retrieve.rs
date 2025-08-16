@@ -13,12 +13,12 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::stream::TryStreamExt;
+use headers::HeaderValue;
 use mongodb::bson::doc;
 use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::sync::Arc;
-use headers::HeaderValue;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 use tokio_util::io::ReaderStream;
@@ -182,4 +182,24 @@ pub async fn list_objects(
         objects.push(result);
     }
     Ok(AxumJson(objects))
+}
+
+pub async fn list_fragments(
+    State(state): State<Arc<AppState>>,
+    header: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    let uid = extract_uid_from_fragmented_header(&header)?;
+    let collection = state
+        .db_client
+        .database("litiaina-storage")
+        .collection::<ObjectMetadata>("objects");
+
+    let filter = doc! { "owner_uid": uid };
+
+    let fragments = collection
+        .distinct("fragment", filter)
+        .await
+        .map_err(|_| AppError::Conflict("Database query for fragments failed.".to_string()))?;
+
+    Ok(AxumJson(fragments))
 }
