@@ -1,10 +1,10 @@
+use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
 use crate::enums::app_error_enum::AppError;
 use crate::structs::object_storage_structs::{ObjectMetadata, TotalStorageUsage};
 use futures_util::TryStreamExt;
 use mongodb::Client as MongoClient;
 use mongodb::bson;
 use mongodb::bson::doc;
-use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
 
 pub async fn calculate_storage_usage(db: &MongoClient, uid: &str) -> Result<u64, AppError> {
     let objects_collection = db
@@ -12,7 +12,16 @@ pub async fn calculate_storage_usage(db: &MongoClient, uid: &str) -> Result<u64,
         .collection::<ObjectMetadata>("objects");
 
     let pipeline = vec![
-        doc! { "$match": { "owner_uid": uid, "is_latest": true } },
+        doc! {
+            "$match": {
+                "owner_uid": uid,
+                "$or": [
+                    { "is_latest": true },
+                    // Corresponds to `UploadStatus::Pending`
+                    { "status": "Pending" }
+                ]
+            }
+        },
         doc! { "$group": { "_id": null, "total_usage": { "$sum": "$size_bytes" } } },
     ];
 

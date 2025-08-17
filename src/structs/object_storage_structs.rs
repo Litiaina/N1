@@ -1,7 +1,8 @@
-use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
+use crate::enums::upload_status_enum::UploadStatus;
 use crate::fs::fs_constants::{CHUNK_PREFIX, OBJECT_METADATA_FILENAME, TEMP_UPLOAD_ROOT};
 use crate::object_storage::constants::OBJECT_STORAGE_ROOT;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 pub struct ObjectPathManager<'a> {
     pub file_id: &'a str,
@@ -97,6 +98,9 @@ pub struct ObjectMetadata {
     pub last_modified: mongodb::bson::DateTime,
     pub etag: String,
     pub physical_location: String,
+    pub status: UploadStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]

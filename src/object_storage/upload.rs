@@ -1,4 +1,6 @@
+use crate::database::database_constants::{DATABASE, OBJECT_STORAGE_DATABASE};
 use crate::enums::app_error_enum::AppError;
+use crate::enums::upload_status_enum::UploadStatus;
 use crate::fs::fragmented_upload::{with_io_timeout, with_timeout};
 use crate::fs::fs_constants::{MAX_CHUNK_SIZE, MERGE_CONCURRENCY, TMP_EXT};
 use crate::object_storage::chunk_parser::parse_uploaded_chunks;
@@ -19,6 +21,7 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::stream::TryStreamExt;
+use mongodb::bson::{Bson, DateTime};
 use mongodb::{Client as MongoClient, bson, bson::doc};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -31,8 +34,10 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
-use crate::database::database_constants::{DATABASE, OBJECT_STORAGE_DATABASE};
 
+//Initiate object uploaded must have a database lock. Execute these commands on mongodb where the object storage database resides
+//Create the Unique Index -> db.upload_locks.createIndex({ "uid": 1 }, { unique: true })
+//Create the TTL Index-> db.upload_locks.createIndex({ "locked_at": 1 }, { expireAfterSeconds: 30 })
 pub async fn initiate_object_upload(
     State(state): State<Arc<AppState>>,
     header: HeaderMap,
@@ -40,54 +45,129 @@ pub async fn initiate_object_upload(
     AxumJson(params): AxumJson<InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
     let uid = extract_uid_from_fragmented_header(&header)?;
-    let auth_db = state.db_client.database(DATABASE);
-    let auth_collection = auth_db.collection::<UserAuthDetails>("auth");
-    let user_auth_details = auth_collection
-        .find_one(doc! { "uid": &uid })
-        .await
-        .map_err(|_| AppError::Conflict("Failed to query user details.".to_string()))?
-        .ok_or(AppError::Unauthorized)?;
+    let db_client = &state.db_client;
+    let lock_collection = db_client
+        .database(OBJECT_STORAGE_DATABASE)
+        .collection::<bson::Document>("upload_locks");
 
-    let allocated_storage = user_auth_details.allocated_storage;
-    let current_usage = calculate_storage_usage(&state.db_client, &uid).await?;
+    let lock_doc = doc! {
+        "uid": uid.clone(),
+        "locked_at": Bson::DateTime(DateTime::now())
+    };
 
-    if current_usage.saturating_add(params.total_size_bytes) > allocated_storage {
-        warn!(
-            "User {} exceeded storage quota. Usage: {}, Allocation: {}, Attempted Upload: {}",
-            uid, current_usage, allocated_storage, params.total_size_bytes
-        );
-        return Err(AppError::InsufficientStorage);
+    if let Err(e) = lock_collection.insert_one(lock_doc).await {
+        if let mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
+            ref write_error,
+        )) = *e.kind
+        {
+            if write_error.code == 11000 {
+                warn!(
+                    "User {} tried to initiate an upload while another was in progress.",
+                    uid
+                );
+                return Err(AppError::Conflict(
+                    "Another upload is currently being initiated. Please try again in a moment."
+                        .to_string(),
+                ));
+            }
+        }
+        error!("Failed to acquire database lock for user {}: {}", uid, e);
+        return Err(AppError::InternalServerError(
+            "Could not acquire upload lock.".to_string(),
+        ));
     }
 
-    let file_id = Uuid::new_v4().to_string();
-    let paths = ObjectPathManager::new(&file_id);
-    with_io_timeout(
-        "create temp upload directory",
-        fs::create_dir_all(paths.temp_upload_dir()),
-    )
-    .await?;
-    let metadata = TempUploadMetadata {
-        file_id: file_id.clone(),
-        fragment,
-        object_key,
-        uid,
-        content_type: params.content_type,
-        total_size_bytes: params.total_size_bytes,
-        total_chunks: params.total_chunks,
-        creation_timestamp: chrono::Utc::now().to_rfc3339(),
-    };
-    let metadata_content = serde_json::to_string_pretty(&metadata)
-        .map_err(|e| AppError::BadRequest(format!("Failed to serialize metadata: {}", e)))?;
-    with_io_timeout(
-        "writing metadata file",
-        fs::write(paths.metadata_path(), metadata_content),
-    )
-    .await?;
-    info!("Initiated object upload session: {}", file_id);
-    Ok((
-        StatusCode::CREATED,
-        AxumJson(InitiateUploadResponse { file_id }),
-    ))
+    let result = async {
+        let auth_db = db_client.database(DATABASE);
+        let auth_collection = auth_db.collection::<UserAuthDetails>("auth");
+        let user_auth_details = auth_collection
+            .find_one(doc! { "uid": &uid })
+            .await
+            .map_err(|_| AppError::Conflict("Failed to query user details.".to_string()))?
+            .ok_or(AppError::Unauthorized)?;
+
+        let allocated_storage = user_auth_details.allocated_storage;
+        let current_usage = calculate_storage_usage(db_client, &uid).await?;
+
+        if current_usage.saturating_add(params.total_size_bytes) > allocated_storage {
+            warn!(
+                "User {} exceeded storage quota. Usage: {}, Allocation: {}, Attempted Upload: {}",
+                uid, current_usage, allocated_storage, params.total_size_bytes
+            );
+            return Err(AppError::InsufficientStorage);
+        }
+
+        let file_id = Uuid::new_v4().to_string();
+
+        let now = DateTime::now();
+        let pending_metadata = ObjectMetadata {
+            id: Uuid::new_v4().to_string(),
+            fragment: fragment.clone(),
+            key: object_key.clone(),
+            version_id: "".to_string(),
+            is_latest: false,
+            size_bytes: params.total_size_bytes,
+            content_type: params.content_type.clone().unwrap_or_default(),
+            owner_uid: uid.clone(),
+            created_at: now,
+            last_modified: now,
+            etag: "".to_string(),
+            physical_location: "".to_string(),
+            status: UploadStatus::Pending,
+            session_id: Some(file_id.clone()),
+        };
+
+        let objects_collection = db_client
+            .database(OBJECT_STORAGE_DATABASE)
+            .collection::<ObjectMetadata>("objects");
+
+        objects_collection
+            .insert_one(&pending_metadata)
+            .await
+            .map_err(|e| {
+                error!("Failed to create pending record: {}", e);
+                AppError::InternalServerError("Failed to reserve storage space.".to_string())
+            })?;
+
+        let paths = ObjectPathManager::new(&file_id);
+        with_io_timeout(
+            "create temp upload directory",
+            fs::create_dir_all(paths.temp_upload_dir()),
+        )
+        .await?;
+        let metadata = TempUploadMetadata {
+            file_id: file_id.clone(),
+            fragment,
+            object_key,
+            uid: uid.clone(),
+            content_type: params.content_type,
+            total_size_bytes: params.total_size_bytes,
+            total_chunks: params.total_chunks,
+            creation_timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        let metadata_content = serde_json::to_string_pretty(&metadata)
+            .map_err(|e| AppError::BadRequest(format!("Failed to serialize metadata: {}", e)))?;
+        with_io_timeout(
+            "writing metadata file",
+            fs::write(paths.metadata_path(), metadata_content),
+        )
+        .await?;
+        info!(
+            "Initiated object upload session and reserved space for: {}",
+            file_id
+        );
+        Ok((
+            StatusCode::CREATED,
+            AxumJson(InitiateUploadResponse { file_id }),
+        ))
+    }
+    .await;
+
+    if let Err(e) = lock_collection.delete_one(doc! { "uid": &uid }).await {
+        error!("Failed to release database lock for user {}: {}", uid, e);
+    }
+
+    result
 }
 
 pub async fn get_capacity_usage(
@@ -298,27 +378,48 @@ async fn assemble_and_index_object(
     .await?;
 
     let final_checksum = hex::encode(final_hasher.finalize());
-    let now = bson::DateTime::now();
+    let now = DateTime::now();
+
+    let collection = db
+        .database(OBJECT_STORAGE_DATABASE)
+        .collection::<ObjectMetadata>("objects");
+
+    let pending_doc = collection
+        .find_one(doc! { "session_id": &temp_metadata.file_id })
+        .await
+        .map_err(|e| {
+            error!(
+                "Failed to find pending document for session {}: {}",
+                &temp_metadata.file_id, e
+            );
+            AppError::Conflict("Could not find the pending upload record.".to_string())
+        })?
+        .ok_or_else(|| {
+            error!(
+                "No pending document found for session {}",
+                &temp_metadata.file_id
+            );
+            AppError::Conflict("Pending upload record is missing.".to_string())
+        })?;
+
     let final_metadata = ObjectMetadata {
-        id: Uuid::new_v4().to_string(),
-        fragment: temp_metadata.fragment,
-        key: temp_metadata.object_key,
+        id: pending_doc.id,
+        fragment: temp_metadata.fragment.clone(),
+        key: temp_metadata.object_key.clone(),
         version_id: new_version_id,
         is_latest: true,
         size_bytes: final_size,
         content_type: temp_metadata
             .content_type
             .unwrap_or_else(|| "application/octet-stream".to_string()),
-        owner_uid: temp_metadata.uid,
+        owner_uid: temp_metadata.uid.clone(),
         created_at: now,
         last_modified: now,
         etag: final_checksum,
         physical_location: physical_path_str,
+        status: UploadStatus::Completed,
+        session_id: None,
     };
-
-    let collection = db
-        .database(OBJECT_STORAGE_DATABASE)
-        .collection::<ObjectMetadata>("objects");
 
     let filter = doc! {
         "fragment": final_metadata.fragment.clone(),
@@ -332,10 +433,17 @@ async fn assemble_and_index_object(
         AppError::Conflict("Failed to update old version record.".to_string())
     })?;
 
-    collection.insert_one(&final_metadata).await.map_err(|e| {
-        error!("Failed to insert new object version metadata: {}", e);
-        AppError::Conflict("Failed to create new version record.".to_string())
-    })?;
+    let filter_pending = doc! { "session_id": temp_metadata.file_id };
+    collection
+        .replace_one(filter_pending, &final_metadata)
+        .await
+        .map_err(|e| {
+            error!(
+                "Failed to replace pending record with final metadata: {}",
+                e
+            );
+            AppError::Conflict("Failed to finalize object metadata record.".to_string())
+        })?;
 
     with_io_timeout(
         "cleaning up temp directory",
