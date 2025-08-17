@@ -17,7 +17,6 @@ pub async fn calculate_storage_usage(db: &MongoClient, uid: &str) -> Result<u64,
                 "owner_uid": uid,
                 "$or": [
                     { "is_latest": true },
-                    // Corresponds to `UploadStatus::Pending`
                     { "status": "Pending" }
                 ]
             }

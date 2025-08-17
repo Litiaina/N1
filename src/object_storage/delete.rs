@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use futures_util::TryStreamExt;
 use mongodb::bson::doc;
@@ -12,15 +12,15 @@ use crate::enums::app_error_enum::AppError;
 use crate::fs::fragmented_upload::with_io_timeout;
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_STORAGE_ROOT};
 use crate::routes::storage_routes::AppState;
+use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::ObjectMetadata;
-use crate::utils::header_extractor::extract_uid_from_fragmented_header;
 
 pub async fn delete_object(
     State(state): State<Arc<AppState>>,
-    header: HeaderMap,
+    claims: Claims,
     Path((fragment, object_key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = extract_uid_from_fragmented_header(&header)?;
+    let uid = claims.uid;
     let collection = state
         .db_client
         .database(OBJECT_STORAGE_DATABASE)

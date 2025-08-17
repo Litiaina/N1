@@ -4,7 +4,6 @@ use crate::routes::storage_routes::AppState;
 use crate::structs::object_storage_structs::{
     CreateSignedUrlRequest, ObjectMetadata, SignedUrlDisposition, SignedUrlResponse,
 };
-use crate::utils::header_extractor::extract_uid_from_fragmented_header;
 use axum::Json as AxumJson;
 use axum::body::Body;
 use axum::extract::{Query, State};
@@ -20,16 +19,17 @@ use std::sync::{Arc, LazyLock};
 use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
 use crate::object_storage::download::download_object_logic;
 use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
+use crate::structs::auth_structs::Claims;
 
 static URL_SIGNING_SECRET: LazyLock<String> =
     LazyLock::new(|| env::var("URL_SIGNING_SECRET").expect("URL_SIGNING_SECRET must be set"));
 
 pub async fn create_signed_url(
     State(state): State<Arc<AppState>>,
-    header: HeaderMap,
+    claims: Claims,
     AxumJson(payload): AxumJson<CreateSignedUrlRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = extract_uid_from_fragmented_header(&header)?;
+    let uid = claims.uid;
     let metadata = find_latest_object_metadata(
         &state.db_client,
         &payload.fragment,

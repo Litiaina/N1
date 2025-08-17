@@ -3,4 +3,5 @@ pub enum AuthError {
     MissingCredentials,
     TokenCreation,
     InvalidToken,
+    InternalError,
 }

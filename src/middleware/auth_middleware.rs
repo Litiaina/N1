@@ -54,34 +54,33 @@ pub async fn authorize(Json(payload): Json<LoginRequest>) -> Result<Json<AuthBod
     }
 
     match validate_auth(&payload.email, &payload.password).await {
-        Ok(valid) => {
-            if valid {
-                let exp = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-                    + 24 * 60 * 60;
+        Ok(Some(uid)) => {
+            let exp = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 24 * 60 * 60;
 
-                let claims = Claims {
-                    email: payload.email.to_owned(),
-                    exp: exp as usize,
-                };
+            let claims = Claims {
+                email: payload.email.to_owned(),
+                password: payload.password.to_owned(),
+                uid,
+                exp: exp as usize,
+            };
 
-                let token = encode(&Header::default(), &claims, &JWT_KEYS.encoding)
-                    .map_err(|_| AuthError::TokenCreation)?;
+            let token = encode(&Header::default(), &claims, &JWT_KEYS.encoding)
+                .map_err(|_| AuthError::TokenCreation)?;
 
-                Ok(Json(AuthBody::new(token)))
-            } else {
-                Err(AuthError::WrongCredentials)
-            }
+            Ok(Json(AuthBody::new(token)))
         }
-        Err(_) => Err(AuthError::WrongCredentials),
+        Ok(None) => Err(AuthError::WrongCredentials),
+        Err(_) => Err(AuthError::InternalError),
     }
 }
 
 impl Display for Claims {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "uid: {}", self.email)
+        write!(f, "email: {}, uid: {}", self.email, self.uid)
     }
 }
 
@@ -121,6 +120,7 @@ impl IntoResponse for AuthError {
             AuthError::MissingCredentials => (StatusCode::BAD_REQUEST, "Missing credentials"),
             AuthError::TokenCreation => (StatusCode::INTERNAL_SERVER_ERROR, "Token creation error"),
             AuthError::InvalidToken => (StatusCode::UNAUTHORIZED, "Invalid token"),
+            AuthError::InternalError => (StatusCode::INTERNAL_SERVER_ERROR, "An internal error occurred"),
         };
         let body = Json(json!({
             "error": error_message,

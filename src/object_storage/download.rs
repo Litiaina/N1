@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap, HeaderValue};
+use axum::http::{header, HeaderValue};
 use axum::response::IntoResponse;
 use tower::ServiceExt;
 use crate::enums::app_error_enum::AppError;
@@ -10,16 +10,16 @@ use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_STORAGE_ROOT};
 use crate::object_storage::error_parser::physical_path_error;
 use crate::object_storage::metadata_parser::find_latest_object_metadata;
 use crate::routes::storage_routes::AppState;
+use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::ObjectMetadata;
-use crate::utils::header_extractor::extract_uid_from_fragmented_header;
 
 pub async fn download_object(
     State(state): State<Arc<AppState>>,
-    header: HeaderMap,
+    claims: Claims,
     Path((fragment, object_key)): Path<(String, String)>,
     req: axum::http::Request<Body>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = extract_uid_from_fragmented_header(&header)?;
+    let uid = claims.uid;
     let metadata =
         find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
     download_object_logic(req, metadata).await

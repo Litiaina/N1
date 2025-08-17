@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use axum::extract::State;
 use axum::Json as AxumJson;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use mongodb::bson::doc;
 use tracing::info;
@@ -9,15 +9,15 @@ use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::metadata_parser::find_latest_object_metadata;
 use crate::routes::storage_routes::AppState;
+use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{ObjectMetadata, RenameObjectRequest};
-use crate::utils::header_extractor::extract_uid_from_fragmented_header;
 
 pub async fn rename_object(
     State(state): State<Arc<AppState>>,
-    header: HeaderMap,
+    claims: Claims,
     AxumJson(payload): AxumJson<RenameObjectRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = extract_uid_from_fragmented_header(&header)?;
+    let uid = claims.uid;
     let db_client = &state.db_client;
     let collection = db_client
         .database(OBJECT_STORAGE_DATABASE)

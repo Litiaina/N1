@@ -12,12 +12,11 @@ use crate::structs::object_storage_structs::{
     CapacityUsageResponse, InitiateUploadParams, InitiateUploadResponse, ObjectMetadata,
     ObjectPathManager, TempUploadMetadata, UploadStatusResponse, UserAuthDetails,
 };
-use crate::utils::header_extractor::extract_uid_from_fragmented_header;
 use axum::extract::multipart::Field;
 use axum::{
     Json as AxumJson,
     extract::{Multipart, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
 };
 use futures_util::stream::TryStreamExt;
@@ -34,17 +33,18 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use crate::structs::auth_structs::Claims;
 
 //Initiate object uploaded must have a database lock. Execute these commands on mongodb where the object storage database resides
 //Create the Unique Index -> db.upload_locks.createIndex({ "uid": 1 }, { unique: true })
 //Create the TTL Index-> db.upload_locks.createIndex({ "locked_at": 1 }, { expireAfterSeconds: 30 })
 pub async fn initiate_object_upload(
     State(state): State<Arc<AppState>>,
-    header: HeaderMap,
+    claims: Claims,
     Path((fragment, object_key)): Path<(String, String)>,
     AxumJson(params): AxumJson<InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = extract_uid_from_fragmented_header(&header)?;
+    let uid = claims.uid;
     let db_client = &state.db_client;
     let lock_collection = db_client
         .database(OBJECT_STORAGE_DATABASE)
@@ -172,9 +172,9 @@ pub async fn initiate_object_upload(
 
 pub async fn get_capacity_usage(
     State(state): State<Arc<AppState>>,
-    header: HeaderMap,
+    claims: Claims,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = extract_uid_from_fragmented_header(&header)?;
+    let uid = claims.uid;
     let current_usage = calculate_storage_usage(&state.db_client, &uid).await?;
     Ok(AxumJson(CapacityUsageResponse {
         capacity_used: current_usage,
@@ -309,7 +309,7 @@ async fn assemble_and_index_object(
     };
 
     info!(
-        "Starting high-performance assembly for object: {}/{}",
+        "Starting assembly for object: {}/{}",
         temp_metadata.fragment, temp_metadata.object_key
     );
 

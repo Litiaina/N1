@@ -2,7 +2,6 @@ use crate::enums::app_error_enum::AppError;
 use crate::object_storage::metadata_parser::find_latest_object_metadata;
 use crate::routes::storage_routes::AppState;
 use crate::structs::object_storage_structs::ObjectMetadata;
-use crate::utils::header_extractor::extract_uid_from_fragmented_header;
 use axum::Json as AxumJson;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -14,14 +13,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
 use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
+use crate::structs::auth_structs::Claims;
 
 pub async fn get_object(
     State(state): State<Arc<AppState>>,
-    header: HeaderMap,
+    claims: Claims,
     Path((fragment, object_key)): Path<(String, String)>,
     req: axum::http::Request<Body>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = extract_uid_from_fragmented_header(&header)?;
+    let uid = claims.uid;
     let metadata =
         find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
     get_object_logic(metadata, req).await
@@ -29,10 +29,11 @@ pub async fn get_object(
 
 pub async fn stream_object(
     State(state): State<Arc<AppState>>,
+    claims: Claims,
     headers: HeaderMap,
     Path((fragment, object_key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = extract_uid_from_fragmented_header(&headers)?;
+    let uid = claims.uid;
     let metadata =
         find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
     stream_object_logic(headers, metadata).await
@@ -40,10 +41,10 @@ pub async fn stream_object(
 
 pub async fn get_object_metadata(
     State(state): State<Arc<AppState>>,
-    header: HeaderMap,
+    claims: Claims,
     Path((fragment, object_key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = extract_uid_from_fragmented_header(&header)?;
+    let uid = claims.uid;
     let metadata =
         find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
     Ok(AxumJson(metadata))
@@ -51,11 +52,11 @@ pub async fn get_object_metadata(
 
 pub async fn list_objects(
     State(state): State<Arc<AppState>>,
-    header: HeaderMap,
+    claims: Claims,
     Path(fragment): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = extract_uid_from_fragmented_header(&header)?;
+    let uid = claims.uid;
     let collection = state
         .db_client
         .database(OBJECT_STORAGE_DATABASE)
@@ -95,9 +96,9 @@ pub async fn list_objects(
 
 pub async fn list_fragments(
     State(state): State<Arc<AppState>>,
-    header: HeaderMap,
+    claims: Claims,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = extract_uid_from_fragmented_header(&header)?;
+    let uid = claims.uid;
     let collection = state
         .db_client
         .database(OBJECT_STORAGE_DATABASE)
