@@ -63,7 +63,6 @@ pub async fn authorize(Json(payload): Json<LoginRequest>) -> Result<Json<AuthBod
 
             let claims = Claims {
                 email: payload.email.to_owned(),
-                password: payload.password.to_owned(),
                 uid,
                 exp: exp as usize,
             };
