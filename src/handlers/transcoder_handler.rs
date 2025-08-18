@@ -1,4 +1,7 @@
+use crate::database::database_constants::DATABASE;
 use crate::enums::transcoder_enums::JobStatus;
+use crate::routes::storage_routes::AppState;
+use crate::structs::auth_structs::Claims;
 use crate::structs::transcoder_structs::{
     FFProbeOutput, Quality, Rendition, TranscodeJob, TranscodeRequest, TranscodeResponse,
     TranscodeStatusRequest,
@@ -18,16 +21,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::{fs, task};
 use tracing::{error, info, warn};
-use crate::database::database_constants::DATABASE;
-use crate::routes::storage_routes::AppState;
 
 pub async fn transcode_video_handler(
+    claims: Claims,
     State(db): State<Arc<AppState>>,
     Json(payload): Json<TranscodeRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if payload.uid.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "UID cannot be empty".to_string()));
-    }
     if payload.source_path.contains("..") {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -38,7 +37,7 @@ pub async fn transcode_video_handler(
     let sanitized_directory = sanitize_path(&payload.source_path);
     let full_source_path = PathBuf::from(format!(
         "storage-files/{}/{}",
-        payload.uid, sanitized_directory
+        &claims.uid, sanitized_directory
     ));
 
     if !full_source_path.exists() {
@@ -46,7 +45,10 @@ pub async fn transcode_video_handler(
         return Err((StatusCode::NOT_FOUND, "Source file not found".to_string()));
     }
 
-    let jobs_collection = db.db_client.database(DATABASE).collection::<TranscodeJob>("jobs");
+    let jobs_collection = db
+        .db_client
+        .database(DATABASE)
+        .collection::<TranscodeJob>("jobs");
 
     let timeout_duration = chrono::Duration::minutes(5);
     let stale_threshold_timestamp = (Utc::now() - timeout_duration).timestamp_millis();
@@ -87,7 +89,7 @@ pub async fn transcode_video_handler(
     }
 
     let active_job_query = doc! {
-        "uid": &payload.uid,
+        "uid": &claims.uid,
         "source_path": &payload.source_path,
         "status": { "$in": ["queued", "preparing", "encoding", "packaging"] }
     };
@@ -118,7 +120,7 @@ pub async fn transcode_video_handler(
     let job_id = BsonUuid::new();
     let new_job = TranscodeJob {
         job_id,
-        uid: payload.uid.clone(),
+        uid: claims.uid,
         source_path: payload.source_path.clone(),
         status: JobStatus::Queued,
         renditions: Vec::new(),
@@ -135,7 +137,10 @@ pub async fn transcode_video_handler(
     task::spawn(async move {
         if let Err(e) = process_transcoding_job(db_clone, job_id, full_source_path, payload).await {
             error!(%job_id, error = %e, "Transcoding job failed.");
-            let jobs_collection = db.db_client.database(DATABASE).collection::<TranscodeJob>("jobs");
+            let jobs_collection = db
+                .db_client
+                .database(DATABASE)
+                .collection::<TranscodeJob>("jobs");
             let query = doc! { "_id": job_id };
             let update = doc! { "$set": { "status": mongodb::bson::to_bson(&JobStatus::Failed { reason: e }).unwrap_or_default(), "progress": 100.0 } };
             if let Err(db_err) = jobs_collection.update_one(query, update).await {
@@ -522,7 +527,10 @@ pub async fn transcode_status_handler(
         Err(_) => return Err((StatusCode::BAD_REQUEST, "Invalid Job ID format".to_string())),
     };
 
-    let jobs_collection = db.db_client.database(DATABASE).collection::<TranscodeJob>("jobs");
+    let jobs_collection = db
+        .db_client
+        .database(DATABASE)
+        .collection::<TranscodeJob>("jobs");
     let query = doc! { "_id": job_id };
 
     match jobs_collection.find_one(query).await {

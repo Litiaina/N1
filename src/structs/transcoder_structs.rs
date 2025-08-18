@@ -32,7 +32,6 @@ pub struct Quality {
 
 #[derive(Deserialize)]
 pub struct TranscodeRequest {
-    pub uid: String,
     pub source_path: String,
     pub qualities: Option<Vec<Quality>>,
     pub preset: Option<String>,
