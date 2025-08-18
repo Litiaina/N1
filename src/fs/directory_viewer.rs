@@ -1,11 +1,9 @@
 use crate::fs::fs_constants::INITIAL_CHUNK_SIZE;
 use crate::structs::file_detail_params_struct::FileDetail;
-use crate::structs::uid_params_struct::UIDParams;
-use crate::utils::header_extractor::extract_uid_from_header;
 use crate::validation::directory_validation::{get_dir_size, sanitize_path};
 use axum::Json;
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, Query};
+use axum::extract::Path;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::stream::StreamExt;
@@ -18,12 +16,13 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 use tokio_util::io::ReaderStream;
 use crate::object_storage::header_parser::parse_range_header;
+use crate::structs::auth_structs::Claims;
 
 pub async fn view_directory(
-    header: HeaderMap,
+    claims: Claims,
     path: Option<Path<String>>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = extract_uid_from_header(&header).map_err(|code| code)?;
+    let validated_uid = &claims.uid;
 
     let relative_path = path
         .as_ref()
@@ -83,14 +82,10 @@ pub async fn view_directory(
 }
 
 pub async fn view_file(
-    Query(params): Query<UIDParams>,
+    claims: Claims,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = if !params.uid.is_empty() {
-        params.uid
-    } else {
-        return Err(StatusCode::BAD_REQUEST);
-    };
+    let validated_uid = &claims.uid;
     let sanitized_directory = sanitize_path(&path);
     let file_path = PathBuf::from(format!(
         "storage-files/{}/{}",
@@ -118,15 +113,11 @@ pub async fn view_file(
 }
 
 pub async fn stream_file(
-    Query(params): Query<UIDParams>,
+    claims: Claims,
     headers: HeaderMap,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = if !params.uid.is_empty() {
-        params.uid
-    } else {
-        return Err(StatusCode::BAD_REQUEST);
-    };
+    let validated_uid = claims.uid;
     let sanitized_directory = sanitize_path(&path);
     let file_path = PathBuf::from(format!(
         "storage-files/{}/{}",
@@ -197,18 +188,14 @@ pub async fn stream_file(
 }
 
 pub async fn stream_file_v2(
-    Query(params): Query<UIDParams>,
+    claims: Claims,
     headers: HeaderMap,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, Response> {
-    if params.uid.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "UID cannot be empty.").into_response());
-    }
-
     let sanitized_directory = sanitize_path(&path);
     let file_path = PathBuf::from(format!(
         "storage-files/{}/{}",
-        params.uid, sanitized_directory
+        &claims.uid, sanitized_directory
     ));
 
     let metadata = fs::metadata(&file_path)
@@ -261,17 +248,13 @@ pub async fn stream_file_v2(
 }
 
 pub async fn stream_hls_file(
-    Query(params): Query<UIDParams>,
+    claims: Claims,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, Response> {
-    if params.uid.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "UID cannot be empty.").into_response());
-    }
-
     let sanitized_directory = sanitize_path(&path);
     let file_path = PathBuf::from(format!(
         "storage-files/{}/{}",
-        params.uid, sanitized_directory
+        &claims.uid, sanitized_directory
     ));
 
     let file_name = match std::path::Path::new(&path)

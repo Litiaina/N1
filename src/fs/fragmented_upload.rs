@@ -5,10 +5,9 @@ use crate::structs::path_manager_struct::PathManager;
 use crate::structs::resumable_upload_status_struct::ResumableUploadStatus;
 use crate::structs::upload_params_struct::UploadParams;
 use crate::structs::upload_session_struct::UploadSession;
-use crate::utils::header_extractor::extract_uid_from_fragmented_header;
 use axum::{
     extract::{Multipart, Path, Query, multipart::MultipartError},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Json},
 };
 use futures_util::stream::TryStreamExt;
@@ -16,7 +15,6 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     future::Future,
-    path::{Path as StdPath, PathBuf},
 };
 use tokio::{
     fs::{self, File},
@@ -25,14 +23,16 @@ use tokio::{
     time::timeout,
 };
 use tracing::{error, info, warn};
+use crate::fs::stateless_fragmented_upload::determine_final_path;
+use crate::structs::auth_structs::Claims;
 
 pub async fn upload_fragments(
-    header: HeaderMap,
+    claims: Claims,
     path: Option<Path<String>>,
     Query(params): Query<UploadParams>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = extract_uid_from_fragmented_header(&header)?;
+    let uid = claims.uid;
 
     if params.chunk_index >= params.total_chunks {
         return Err(AppError::BadRequest("Invalid chunk index.".to_string()));
@@ -97,11 +97,11 @@ pub async fn upload_fragments(
 }
 
 pub async fn check_uploaded_fragments(
-    header: HeaderMap,
+    claims: Claims,
     path_params: Option<Path<String>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = extract_uid_from_fragmented_header(&header)?;
+    let uid = claims.uid;
     let file_id = params
         .get("file_id")
         .ok_or_else(|| AppError::BadRequest("Query param 'file_id' is required.".to_string()))?;
@@ -265,44 +265,6 @@ async fn assemble_and_finalize_file(
 
     info!("Successfully assembled file: {}", final_path.display());
     Ok(())
-}
-
-async fn determine_final_path(
-    base_dir: &StdPath,
-    original_filename: &str,
-) -> Result<PathBuf, AppError> {
-    let final_path = base_dir.join(original_filename);
-    if !fs::try_exists(&final_path)
-        .await
-        .map_err(|e| AppError::from((e, "checking final path")))?
-    {
-        return Ok(final_path);
-    }
-
-    let stem = final_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
-    let ext = final_path
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(|s| format!(".{}", s))
-        .unwrap_or_default();
-
-    for i in 1..=1000 {
-        let new_name = format!("{} ({}){}", stem, i, ext);
-        let candidate = base_dir.join(&new_name);
-        if !fs::try_exists(&candidate)
-            .await
-            .map_err(|e| AppError::from((e, "checking candidate path")))?
-        {
-            return Ok(candidate);
-        }
-    }
-
-    Err(AppError::Conflict(
-        "Could not determine a unique filename after 1000 attempts.".to_string(),
-    ))
 }
 
 pub async fn with_timeout<F, T>(context: &'static str, fut: F) -> Result<T, AppError>

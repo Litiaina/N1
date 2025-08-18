@@ -2,11 +2,10 @@ use crate::structs::delete_file_params_struct::DeleteFileParams;
 use crate::structs::file_metadata_struct::FileMetadata;
 use crate::structs::metadata_params_struct::MetadataParams;
 use crate::structs::rename_params_struct::RenameParams;
-use crate::utils::header_extractor::extract_uid_from_header;
 use crate::validation::directory_validation::sanitize_path;
 use axum::Json;
 use axum::extract::{Path, Query};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use percent_encoding::percent_decode_str;
 use serde_json::json;
@@ -14,13 +13,15 @@ use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 use tokio::fs;
 use tracing::error;
+use crate::fs::file_path_parser::file_path;
+use crate::structs::auth_structs::Claims;
 
 pub async fn rename_file_query(
-    header: HeaderMap,
+    claims: Claims,
     path: Option<Path<String>>,
     Query(params): Query<RenameParams>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = extract_uid_from_header(&header).map_err(|code| code)?;
+    let validated_uid = &claims.uid;
 
     let relative_path = path
         .as_ref()
@@ -67,11 +68,11 @@ pub async fn rename_file_query(
 }
 
 pub async fn delete_file(
-    header: HeaderMap,
+    claims: Claims,
     path: Option<Path<String>>,
     Query(params): Query<DeleteFileParams>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = extract_uid_from_header(&header).map_err(|code| code)?;
+    let validated_uid = &claims.uid;
 
     let relative_path = path
         .as_ref()
@@ -100,10 +101,10 @@ pub async fn delete_file(
 }
 
 pub async fn create_directory(
-    header: HeaderMap,
+    claims: Claims,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = extract_uid_from_header(&header).map_err(|code| code)?;
+    let validated_uid = &claims.uid;
     let decoded_path = percent_decode_str(&path)
         .decode_utf8()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -123,10 +124,10 @@ pub async fn create_directory(
 }
 
 pub async fn delete_directory(
-    header: HeaderMap,
+    claims: Claims,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = extract_uid_from_header(&header).map_err(|code| code)?;
+    let validated_uid = &claims.uid;
     let decoded_path = percent_decode_str(&path)
         .decode_utf8()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -146,31 +147,18 @@ pub async fn delete_directory(
 }
 
 pub async fn get_file_metadata(
+    claims: Claims,
     Query(params): Query<MetadataParams>,
     path: Option<Path<String>>,
 ) -> impl IntoResponse {
-    let validated_uid = if !params.uid.is_empty() {
-        params.uid.clone()
-    } else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
+    let validated_uid = &claims.uid;
 
     let relative_path = path
         .as_ref()
         .map(|Path(p)| p.trim_matches('/').to_string())
         .unwrap_or_default();
 
-    let file_path = if relative_path.is_empty() {
-        PathBuf::from(format!(
-            "storage-files/{}/{}",
-            validated_uid, params.file_name
-        ))
-    } else {
-        PathBuf::from(format!(
-            "storage-files/{}/{}/{}",
-            validated_uid, relative_path, params.file_name
-        ))
-    };
+    let file_path = file_path(validated_uid, &relative_path, &params.file_name).await;
 
     let metadata = match fs::metadata(&file_path).await {
         Ok(meta) => meta,

@@ -3,7 +3,6 @@ use crate::fs::fs_constants::{
     IO_TIMEOUT, MAX_CHUNK_SIZE, MERGE_CONCURRENCY, STORAGE_ROOT, TMP_EXT,
 };
 use crate::statics::merge_semaphore_static::MERGE_SEMAPHORE;
-use crate::utils::header_extractor::extract_uid_from_fragmented_header;
 use crate::validation::directory_validation::sanitize_fragmented_path;
 
 use crate::structs::stateless_fragment_upload_structs::{
@@ -30,15 +29,17 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use crate::fs::file_path_parser::find_unique_path;
 use crate::fs::fragmented_upload::with_io_timeout;
 use crate::object_storage::chunk_parser::parse_uploaded_chunks;
+use crate::structs::auth_structs::Claims;
 
 pub async fn initiate_upload_session(
-    header: axum::http::HeaderMap,
+    claims: Claims,
     path: Option<Path<String>>,
     AxumJson(params): AxumJson<InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = extract_uid_from_fragmented_header(&header)?;
+    let uid = claims.uid;
     let file_id = Uuid::new_v4().to_string();
     let paths = PathManager::new(&file_id);
 
@@ -97,7 +98,9 @@ pub async fn upload_chunk(
     Ok((StatusCode::OK, "Chunk uploaded successfully."))
 }
 
-pub async fn get_upload_status(Path(file_id): Path<String>) -> Result<impl IntoResponse, AppError> {
+pub async fn get_upload_status(
+    Path(file_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
     let paths = PathManager::new(&file_id);
 
     let metadata: UploadMetadata = {
@@ -275,7 +278,7 @@ async fn assemble_and_finalize_file(paths: PathManager<'_>) -> Result<(), AppErr
     Ok(())
 }
 
-async fn determine_final_path(
+pub async fn determine_final_path(
     base_dir: &StdPath,
     original_filename: &str,
 ) -> Result<PathBuf, AppError> {
@@ -295,19 +298,14 @@ async fn determine_final_path(
         .and_then(|s| s.to_str())
         .map(|s| format!(".{}", s))
         .unwrap_or_default();
-    for i in 1..=1000 {
-        let new_name = format!("{} ({}){}", stem, i, ext);
-        let candidate = base_dir.join(&new_name);
-        if !fs::try_exists(&candidate)
-            .await
-            .map_err(|e| AppError::from((e, "checking candidate path")))?
-        {
-            return Ok(candidate);
-        }
+
+    if let Some(candidate) = find_unique_path(base_dir, stem, &ext, 1000).await? {
+        Ok(candidate)
+    } else {
+        Err(AppError::Conflict(
+            "Could not determine a unique filename.".to_string(),
+        ))
     }
-    Err(AppError::Conflict(
-        "Could not determine a unique filename.".to_string(),
-    ))
 }
 
 async fn with_timeout<F, T>(context: &'static str, fut: F) -> Result<T, AppError>

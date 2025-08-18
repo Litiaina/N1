@@ -1,10 +1,9 @@
 use crate::fs::fs_constants::DEFAULT_BUFFER_SIZE;
 use crate::utils::file_extension_util::get_file_extension;
-use crate::utils::header_extractor::extract_uid_from_header;
 use crate::validation::directory_validation::sanitize_path;
 use axum::Json;
 use axum::extract::{Multipart, Path};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use futures_util::TryStreamExt;
 use serde_json::json;
@@ -13,13 +12,14 @@ use tokio::fs;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio_util::io::StreamReader;
 use tracing::{error, info, warn};
+use crate::structs::auth_structs::Claims;
 
 pub async fn upload_file(
-    header: HeaderMap,
+    claims: Claims,
     path: Option<Path<String>>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = extract_uid_from_header(&header).map_err(|code| code)?;
+    let validated_uid = &claims.uid;
 
     let relative_path = path
         .as_ref()
