@@ -1,6 +1,9 @@
+use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::metadata_parser::find_latest_object_metadata;
+use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
 use crate::routes::storage_routes::AppState;
+use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::ObjectMetadata;
 use axum::Json as AxumJson;
 use axum::body::Body;
@@ -11,9 +14,6 @@ use futures_util::stream::TryStreamExt;
 use mongodb::bson::doc;
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
-use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
-use crate::structs::auth_structs::Claims;
 
 pub async fn get_object(
     State(state): State<Arc<AppState>>,
@@ -61,13 +61,25 @@ pub async fn list_objects(
         .db_client
         .database(OBJECT_STORAGE_DATABASE)
         .collection::<ObjectMetadata>("objects");
+
     let limit: i64 = params
         .get("limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(100);
+
     let marker = params.get("marker").cloned();
 
-    let mut query = doc! { "fragment": fragment, "owner_uid": uid, "is_latest": true };
+    let show_all = params.get("show_all").map_or(false, |s| s == "true");
+
+    let mut query = doc! {
+        "fragment": fragment,
+        "owner_uid": uid,
+    };
+
+    if !show_all {
+        query.insert("is_latest", true);
+    }
+
     if let Some(marker_key) = marker {
         query.insert("key", doc! { "$gt": marker_key });
     }
@@ -81,16 +93,19 @@ pub async fn list_objects(
         .find(query)
         .with_options(find_options)
         .await
-        .map_err(|_| AppError::Conflict("Database query failed.".to_string()))?;
+        .map_err(|e| {
+            eprintln!("Database query failed: {:?}", e);
+            AppError::Conflict("Database query failed.".to_string())
+        })?;
 
     let mut objects = Vec::new();
-    while let Some(result) = cursor
-        .try_next()
-        .await
-        .map_err(|_| AppError::Conflict("Failed to read from db cursor.".to_string()))?
-    {
+    while let Some(result) = cursor.try_next().await.map_err(|e| {
+        eprintln!("Failed to read from db cursor: {:?}", e);
+        AppError::Conflict("Failed to read from database cursor.".to_string())
+    })? {
         objects.push(result);
     }
+
     Ok(AxumJson(objects))
 }
 

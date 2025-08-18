@@ -6,11 +6,11 @@ use tokio::{fs, io};
 use tracing::{info, warn};
 use walkdir::WalkDir;
 
-pub async fn cleanup_stale_uploads() {
+pub async fn cleanup_stale_uploads(source_path: &str) {
     loop {
         sleep(CLEANUP_INTERVAL).await;
 
-        let root = PathBuf::from("storage-files");
+        let root = PathBuf::from(source_path);
 
         for entry in WalkDir::new(&root)
             .min_depth(1)

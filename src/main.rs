@@ -1,5 +1,5 @@
 use crate::fs::cleanup_manager::cleanup_stale_uploads;
-use crate::fs::fs_constants::ENV_FILE;
+use crate::fs::fs_constants::{ENV_FILE, STORAGE_ROOT};
 use crate::handlers::error_handlers::handler_404;
 use crate::routes::storage_routes::serve_storage_routes;
 use crate::structs::port_struct::Ports;
@@ -22,6 +22,7 @@ use std::time::Duration;
 use tokio::signal;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use crate::object_storage::constants::OBJECT_STORAGE_ROOT;
 
 mod database;
 mod enums;
@@ -73,7 +74,8 @@ async fn main() {
 
 async fn server() {
     tokio::spawn(async {
-        cleanup_stale_uploads().await;
+        cleanup_stale_uploads(STORAGE_ROOT).await;
+        cleanup_stale_uploads(OBJECT_STORAGE_ROOT).await;
     });
 
     let storage_ports = Ports {
