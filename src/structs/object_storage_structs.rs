@@ -126,3 +126,9 @@ pub struct SignedUrlResponse {
     pub url: String,
     pub expires_at: String,
 }
+
+#[derive(Deserialize)]
+pub struct DeleteByPrefixRequest {
+    pub fragment: String,
+    pub prefix: String,
+}

@@ -23,7 +23,7 @@ use mongodb::Client;
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
 use crate::fs::fs_constants::MAX_FILE_SIZE;
-use crate::object_storage::delete::delete_object;
+use crate::object_storage::delete::{delete_object, delete_objects_by_prefix};
 use crate::object_storage::download::download_object;
 use crate::object_storage::retrieve::{stream_object, get_object_metadata, list_objects, get_object, list_fragments};
 use crate::object_storage::modify::rename_object;
@@ -80,6 +80,7 @@ fn create_object_storage_routes() -> Router<Arc<AppState>> {
         .route("/v4/fragment/object/download/{:fragment}/{*object_key}", get(download_object).options(options_handler))
         .route("/v4/fragment/object/rename", patch(rename_object).options(options_handler))
         .route("/v4/fragment/object/delete/{:fragment}/{*object_key}", delete(delete_object).options(options_handler))
+        .route("/v4/fragment/object/delete/prefix", delete(delete_objects_by_prefix).options(options_handler))
         .route("/v4/fragment/object/upload/init/{:fragment}/{*object_key}", post(initiate_object_upload).options(options_handler))
         .route("/v4/fragment/object/upload/chunk/{:file_id}/{:chunk_index}", put(object_upload_chunk).options(options_handler))
         .route("/v4/fragment/object/upload/status/{:file_id}", get(get_object_upload_status).options(options_handler))

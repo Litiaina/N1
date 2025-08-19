@@ -7,7 +7,10 @@ use crate::object_storage::chunk_parser::parse_uploaded_chunks;
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_STORAGE_ROOT};
 use crate::object_storage::storage_capacity_parser::calculate_storage_usage;
 use crate::routes::storage_routes::AppState;
-use crate::statics::merge_semaphore_static::MERGE_SEMAPHORE;
+use crate::statics::merge_semaphore_static::{
+    CHUNK_UPLOAD_SEMAPHORE, CHUNK_WRITE_LOCKS, MERGE_SEMAPHORE, PREFIX_DELETE_LOCKS,
+};
+use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
     CapacityUsageResponse, InitiateUploadParams, InitiateUploadResponse, ObjectMetadata,
     ObjectPathManager, TempUploadMetadata, UploadStatusResponse, UserAuthDetails,
@@ -26,6 +29,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::{collections::HashMap, path::PathBuf};
 use tokio::io::BufReader;
+use tokio::sync::Mutex;
 use tokio::{
     fs::{self, File},
     io::{AsyncReadExt, AsyncWriteExt, BufWriter},
@@ -33,7 +37,6 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
-use crate::structs::auth_structs::Claims;
 
 //Initiate object uploaded must have a database lock. Execute these commands on mongodb where the object storage database resides
 //Create the Unique Index -> db.upload_locks.createIndex({ "uid": 1 }, { unique: true })
@@ -44,6 +47,21 @@ pub async fn initiate_object_upload(
     Path((fragment, object_key)): Path<(String, String)>,
     AxumJson(params): AxumJson<InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
+    let is_locked = PREFIX_DELETE_LOCKS.iter().any(|lock| {
+        object_key.starts_with(lock.key())
+    });
+
+    if is_locked {
+        warn!(
+            "User {} tried to upload to a locked path: {}/{}",
+            claims.uid, fragment, object_key
+        );
+        return Err(AppError::Conflict(
+            "The target directory is currently undergoing a delete operation. Please try again later."
+                .to_string(),
+        ));
+    }
+
     let uid = claims.uid;
     let db_client = &state.db_client;
     let lock_collection = db_client
@@ -186,12 +204,27 @@ pub async fn object_upload_chunk(
     Query(params): Query<HashMap<String, String>>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, AppError> {
+    let _permit = CHUNK_UPLOAD_SEMAPHORE.acquire().await.map_err(|_| {
+        AppError::InternalServerError("Failed to acquire upload permit.".to_string())
+    })?;
+
+    let chunk_key = format!("{}-{}", file_id, chunk_index);
+    let chunk_lock = CHUNK_WRITE_LOCKS
+        .entry(chunk_key.clone())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+
+    let _lock_guard = chunk_lock.lock().await;
+
     let paths = ObjectPathManager::new(&file_id);
     let field = with_timeout("reading multipart field", multipart.next_field())
         .await??
         .ok_or_else(|| AppError::BadRequest("No multipart field found.".to_string()))?;
     let expected_checksum = params.get("checksum").map(|s| s.as_str());
     save_chunk_stream(&paths, chunk_index, field, expected_checksum).await?;
+
+    CHUNK_WRITE_LOCKS.remove(&chunk_key);
+
     Ok((StatusCode::OK, "Chunk uploaded successfully."))
 }
 
