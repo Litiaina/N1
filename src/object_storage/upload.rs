@@ -15,13 +15,18 @@ use crate::structs::object_storage_structs::{
     CapacityUsageResponse, InitiateUploadParams, InitiateUploadResponse, ObjectMetadata,
     ObjectPathManager, TempUploadMetadata, UploadStatusResponse, UserAuthDetails,
 };
+use axum::body::Body;
 use axum::extract::multipart::Field;
+use axum::http::HeaderMap;
 use axum::{
     Json as AxumJson,
     extract::{Multipart, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
 };
+use base64::engine::general_purpose;
+use base64::Engine;
+use futures_util::StreamExt;
 use futures_util::stream::TryStreamExt;
 use mongodb::bson::{Bson, DateTime};
 use mongodb::{Client as MongoClient, bson, bson::doc};
@@ -47,9 +52,9 @@ pub async fn initiate_object_upload(
     Path((fragment, object_key)): Path<(String, String)>,
     AxumJson(params): AxumJson<InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    let is_locked = PREFIX_DELETE_LOCKS.iter().any(|lock| {
-        object_key.starts_with(lock.key())
-    });
+    let is_locked = PREFIX_DELETE_LOCKS
+        .iter()
+        .any(|lock| object_key.starts_with(lock.key()));
 
     if is_locked {
         warn!(
@@ -228,6 +233,37 @@ pub async fn object_upload_chunk(
     Ok((StatusCode::OK, "Chunk uploaded successfully."))
 }
 
+pub async fn object_upload_chunk_raw(
+    Path((file_id, chunk_index)): Path<(String, u64)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<impl IntoResponse, AppError> {
+    let _permit = CHUNK_UPLOAD_SEMAPHORE.acquire().await.map_err(|_| {
+        AppError::InternalServerError("Failed to acquire upload permit.".to_string())
+    })?;
+
+    let chunk_key = format!("{}-{}", file_id, chunk_index);
+    let chunk_lock = CHUNK_WRITE_LOCKS
+        .entry(chunk_key.clone())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    let _lock_guard = chunk_lock.lock().await;
+
+    let paths = ObjectPathManager::new(&file_id);
+
+    let expected_checksum_b64 = headers
+        .get("Digest")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|s| s.strip_prefix("sha-256="))
+        .map(|s| s.to_string());
+
+    save_chunk_from_raw_stream(&paths, chunk_index, body, expected_checksum_b64).await?;
+
+    CHUNK_WRITE_LOCKS.remove(&chunk_key);
+
+    Ok((StatusCode::OK, "Chunk uploaded successfully."))
+}
+
 pub async fn get_object_upload_status(
     Path(file_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -309,6 +345,62 @@ async fn save_chunk_stream(
             warn!(
                 "Checksum mismatch for chunk {}: expected {}, got {}",
                 index, expected, computed_checksum
+            );
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(AppError::BadRequest("Checksum mismatch.".to_string()));
+        }
+    }
+
+    with_io_timeout("finalizing chunk", fs::rename(&temp_path, &final_path)).await?;
+    Ok(())
+}
+
+async fn save_chunk_from_raw_stream(
+    paths: &ObjectPathManager<'_>,
+    index: u64,
+    body: Body,
+    expected_checksum_b64: Option<String>,
+) -> Result<(), AppError> {
+    let final_path = paths.chunk_path(index);
+    let temp_path = final_path.with_extension(TMP_EXT);
+    let mut hasher = Sha256::new();
+
+    let file = with_io_timeout("creating chunk file", File::create(&temp_path)).await?;
+    let mut writer = BufWriter::new(file);
+    let mut total_written: usize = 0;
+
+    let mut stream = body.into_data_stream();
+
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result
+            .map_err(|e| AppError::BadRequest(format!("Error reading request body: {}", e)))?;
+
+        total_written += chunk.len();
+        if total_written > MAX_CHUNK_SIZE {
+            writer.flush().await.ok();
+            drop(writer);
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(AppError::PayloadTooLarge(
+                "Chunk size exceeds limit.".to_string(),
+            ));
+        }
+        hasher.update(&chunk);
+        with_io_timeout("writing chunk data", writer.write_all(&chunk)).await?;
+    }
+
+    with_io_timeout("flushing chunk file", writer.flush()).await?;
+
+    if let Some(expected_b64) = expected_checksum_b64 {
+        let expected_bytes = general_purpose::STANDARD.decode(expected_b64)
+            .map_err(|_| AppError::BadRequest("Invalid Base64 in Digest header.".to_string()))?;
+
+        let computed_hash = hasher.finalize();
+        if expected_bytes.as_slice() != computed_hash.as_slice() {
+            warn!(
+                "Checksum mismatch for chunk {}: expected (b64) {}, got (hex) {}",
+                index,
+                general_purpose::STANDARD.encode(&expected_bytes),
+                hex::encode(computed_hash)
             );
             let _ = fs::remove_file(&temp_path).await;
             return Err(AppError::BadRequest("Checksum mismatch.".to_string()));

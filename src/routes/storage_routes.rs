@@ -27,7 +27,7 @@ use crate::object_storage::delete::{delete_object, delete_objects_by_prefix};
 use crate::object_storage::download::download_object;
 use crate::object_storage::retrieve::{stream_object, get_object_metadata, list_objects, get_object, list_fragments};
 use crate::object_storage::modify::rename_object;
-use crate::object_storage::upload::{finalize_object_upload, get_capacity_usage, get_object_upload_status, initiate_object_upload, object_upload_chunk};
+use crate::object_storage::upload::{finalize_object_upload, get_capacity_usage, get_object_upload_status, initiate_object_upload, object_upload_chunk, object_upload_chunk_raw};
 use crate::object_storage::sharing::{create_signed_url, get_shared_object};
 
 pub struct AppState {
@@ -47,6 +47,7 @@ pub async fn serve_storage_routes() -> Router {
             HeaderName::from_static("authorization"),
             HeaderName::from_static("uid"),
             HeaderName::from_static("content-type"),
+            HeaderName::from_static("digest")
         ])
         .allow_methods([
             Method::GET,
@@ -83,6 +84,7 @@ fn create_object_storage_routes() -> Router<Arc<AppState>> {
         .route("/v4/fragment/object/delete/prefix", delete(delete_objects_by_prefix).options(options_handler))
         .route("/v4/fragment/object/upload/init/{:fragment}/{*object_key}", post(initiate_object_upload).options(options_handler))
         .route("/v4/fragment/object/upload/chunk/{:file_id}/{:chunk_index}", put(object_upload_chunk).options(options_handler))
+        .route("/v4/fragment/object/upload/chunk/raw/{:file_id}/{:chunk_index}", put(object_upload_chunk_raw).options(options_handler))
         .route("/v4/fragment/object/upload/status/{:file_id}", get(get_object_upload_status).options(options_handler))
         .route("/v4/fragment/object/upload/finalize/{:file_id}", post(finalize_object_upload).options(options_handler))
         .layer(from_fn(auth));
