@@ -43,9 +43,104 @@ use tokio::{
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-//Initiate object uploaded must have a database lock. Execute these commands on mongodb where the object storage database resides
-//Create the Unique Index -> db.upload_locks.createIndex({ "uid": 1 }, { unique: true })
-//Create the TTL Index-> db.upload_locks.createIndex({ "locked_at": 1 }, { expireAfterSeconds: 30 })
+/*
+# Database Setup for Concurrency Control
+
+**Last Updated:** August 22, 2025
+
+## 1. Introduction
+
+This document outlines the critical database setup required for the storage service to handle concurrent upload initiations correctly, especially in a horizontally-scaled (multi-server) environment.
+
+To prevent a race condition where multiple parallel requests could cause a user to exceed their storage quota, we use a "Database as a Lock" pattern. This requires a dedicated MongoDB collection (`upload_locks`) with two specific indexes. These indexes ensure that only one upload initiation process can run at a time for any given user, guaranteeing data consistency without requiring external services like Redis.
+
+**This setup is mandatory for the application to function correctly.**
+
+---
+
+## 2. Prerequisites
+
+* You must have access to the MongoDB instance hosting the application's data.
+* You must have the MongoDB Shell (`mongosh`) installed and available in your terminal's PATH.
+
+---
+
+## 3. Step-by-Step Instructions
+
+### Step 1: Connect to Your Database
+
+First, you need to connect to the correct database using the MongoDB Shell.
+
+1.  Open your terminal or command prompt.
+2.  Use the `mongosh` command with your database's connection string. Replace `"your-mongodb-connection-string"` with the actual connection string for your environment.
+
+    ```bash
+    # Example connection string
+    mongosh "mongodb+srv://<user>:<password>@<cluster-url>/<database_name>?retryWrites=true&w=majority"
+    ```
+
+3.  Once connected, ensure you are operating on the correct database. Based on your setup, this is likely `litiaina-storage`. Run the `use` command:
+
+    ```javascript
+    use litiaina-storage;
+    ```
+
+    The shell should respond with `switched to db litiaina-storage`. You are now ready to create the indexes.
+
+### Step 2: Create the `upload_locks` Collection and Indexes
+
+The following commands will automatically create the `upload_locks` collection if it doesn't already exist and then apply the necessary indexes to it.
+
+**1. Create the Unique Index (The Lock Mechanism)**
+
+This is the most critical index. It enforces a unique constraint on the `uid` field, making it impossible for two server instances to acquire a lock for the same user simultaneously.
+
+* **Copy and paste the following command into your `mongosh` terminal and press Enter:**
+
+    ```javascript
+    db.upload_locks.createIndex({ "uid": 1 }, { unique: true })
+    ```
+
+**2. Create the TTL Index (The Safety Net)**
+
+This index is a safety measure. It automatically deletes lock documents that are older than 30 seconds. This prevents a user from being permanently locked out if a server crashes after acquiring a lock but before releasing it.
+
+* **Copy and paste the following command into your `mongosh` terminal and press Enter:**
+
+    ```javascript
+    db.upload_locks.createIndex({ "locked_at": 1 }, { expireAfterSeconds: 30 })
+    ```
+
+---
+
+## 4. Verification
+
+After running the commands, you can verify that the indexes were created successfully.
+
+1.  Run the `getIndexes()` command on the `upload_locks` collection:
+
+    ```javascript
+    db.upload_locks.getIndexes()
+    ```
+
+2.  The output should be an array containing three indexes: the default `_id_` index, and the two you just created. It will look similar to this:
+
+    ```json
+    [
+      { v: 2, key: { _id: 1 }, name: '_id_' },
+      { v: 2, key: { uid: 1 }, name: 'uid_1', unique: true },
+      { v: 2, key: { locked_at: 1 }, name: 'locked_at_1', expireAfterSeconds: 30 }
+    ]
+    ```
+
+If your output matches this structure, your database is correctly configured.
+
+---
+
+## 5. Conclusion
+
+Once these indexes are in place, the storage backend is ready for deployment in a horizontally-scaled environment. The locking mechanism will now correctly prevent storage quota race conditions.
+*/
 pub async fn initiate_object_upload(
     State(state): State<Arc<AppState>>,
     claims: Claims,
