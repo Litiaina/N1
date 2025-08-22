@@ -1,5 +1,6 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use mongodb::error::Error as MongoDbError;
 use std::io;
 
 #[derive(Debug)]
@@ -14,6 +15,13 @@ pub enum AppError {
     RangeNotSatisfiable,
     InternalServerError(String),
     InsufficientStorage,
+    MongoDb(MongoDbError),
+}
+
+impl From<MongoDbError> for AppError {
+    fn from(err: MongoDbError) -> Self {
+        AppError::MongoDb(err)
+    }
 }
 
 impl std::fmt::Display for AppError {
@@ -29,6 +37,7 @@ impl std::fmt::Display for AppError {
             AppError::RangeNotSatisfiable => write!(f, "Range not satisfiable"),
             AppError::InternalServerError(msg) => write!(f, "Internal server error: {}", msg),
             AppError::InsufficientStorage => write!(f, "Insufficient storage capacity"),
+            AppError::MongoDb(err) => write!(f, "Database error: {}", err),
         }
     }
 }
@@ -37,6 +46,7 @@ impl std::error::Error for AppError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             AppError::Io(err, _) => Some(err),
+            AppError::MongoDb(err) => Some(err),
             _ => None,
         }
     }
@@ -82,6 +92,13 @@ impl IntoResponse for AppError {
                 StatusCode::INSUFFICIENT_STORAGE,
                 "Insufficient storage capacity.".to_string(),
             ),
+            AppError::MongoDb(err) => {
+                tracing::error!("Database Error: {}", err);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "A database error occurred.".to_string(),
+                )
+            }
         };
 
         (status, message).into_response()

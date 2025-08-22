@@ -392,7 +392,7 @@ pub async fn finalize_object_upload(
     info!("Finalization requested for upload session: {}", file_id);
     tokio::spawn(async move {
         let paths = ObjectPathManager::new(&file_id);
-        if let Err(e) = assemble_and_index_object(&paths, state.db_client.clone()).await {
+        if let Err(e) = assemble_and_index_object(&paths, Arc::clone(&state.db_client)).await {
             error!(
                 "Failed to assemble and index object for file_id '{}'. Error: {:?}",
                 file_id, e
@@ -508,7 +508,7 @@ async fn save_chunk_from_raw_stream(
 
 async fn assemble_and_index_object(
     paths: &ObjectPathManager<'_>,
-    db: MongoClient,
+    db: Arc<MongoClient>,
 ) -> Result<(), AppError> {
     let semaphore = MERGE_SEMAPHORE
         .get_or_init(|| async { Semaphore::new(MERGE_CONCURRENCY) })

@@ -11,3 +11,4 @@ pub mod modify;
 pub mod delete;
 pub mod storage_capacity_parser;
 pub mod object_parser;
+pub mod garbage_collector;

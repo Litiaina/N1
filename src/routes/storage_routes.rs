@@ -14,6 +14,7 @@ use crate::handlers::dir_info_handlers::get_storage_capacity;
 use crate::handlers::transcoder_handler::{transcode_status_handler, transcode_video_handler};
 use crate::middleware::auth_middleware::{auth, authorize};
 use crate::middleware::storage_middleware::enforce_storage_limit;
+use crate::object_storage::garbage_collector::run_garbage_collector;
 use axum::http::{HeaderName, Method, StatusCode};
 use axum::middleware::from_fn;
 use axum::routing::{delete, get, patch, post, put};
@@ -31,15 +32,20 @@ use crate::object_storage::upload::{finalize_object_upload, get_capacity_usage, 
 use crate::object_storage::sharing::{create_signed_url, get_shared_object};
 
 pub struct AppState {
-    pub db_client: Client,
+    pub db_client: Arc<Client>,
 }
 
 pub async fn serve_storage_routes() -> Router {
     let client_options = ClientOptions::parse(DATABASE_URL)
         .await
         .expect("Failed to parse MongoDB URI");
-    let db_client = Client::with_options(client_options).expect("Failed to create MongoDB client");
-    let app_state = Arc::new(AppState { db_client });
+    let db_client = Arc::new(Client::with_options(client_options).expect("Failed to create MongoDB client"));
+    let app_state = 
+    Arc::new(AppState { db_client: Arc::clone(&db_client) });
+
+    tokio::spawn(async move {
+        run_garbage_collector(Arc::clone(&db_client)).await;
+    });
 
     let cors_layer = CorsLayer::new()
         .allow_origin(Any)
