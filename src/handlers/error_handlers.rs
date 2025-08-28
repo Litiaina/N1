@@ -1,8 +1,7 @@
 use axum::response::Html;
 use axum::{http::StatusCode, response::IntoResponse};
 
-pub async fn handler_404() -> impl IntoResponse {
-    let html = r#"
+pub const NOT_FOUND_HTML: &str = r#"
 <!DOCTYPE html>
 <html lang="en">
   <head>
@@ -173,5 +172,6 @@ pub async fn handler_404() -> impl IntoResponse {
 </html>
 "#;
 
-    (StatusCode::NOT_FOUND, Html(html))
+pub async fn handler_404() -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, Html(NOT_FOUND_HTML))
 }

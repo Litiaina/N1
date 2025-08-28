@@ -1,6 +1,10 @@
+use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
 use crate::enums::app_error_enum::AppError;
+use crate::object_storage::download::download_object_logic;
 use crate::object_storage::metadata_parser::find_latest_object_metadata;
+use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
 use crate::routes::storage_routes::AppState;
+use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
     CreateSignedUrlRequest, ObjectMetadata, SignedUrlDisposition, SignedUrlResponse,
 };
@@ -16,13 +20,12 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, LazyLock};
-use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
-use crate::object_storage::download::download_object_logic;
-use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
-use crate::structs::auth_structs::Claims;
 
 static URL_SIGNING_SECRET: LazyLock<String> =
     LazyLock::new(|| env::var("URL_SIGNING_SECRET").expect("URL_SIGNING_SECRET must be set"));
+
+const MAX_EXPIRATION_SECONDS: i64 = 60 * 60 * 24 * 7;
+const BASE_URL: &str = "https://storage.litiaina.com";
 
 pub async fn create_signed_url(
     State(state): State<Arc<AppState>>,
@@ -38,6 +41,13 @@ pub async fn create_signed_url(
     )
     .await?;
 
+    if payload.expires_in as i64 > MAX_EXPIRATION_SECONDS {
+        return Err(AppError::BadRequest(format!(
+            "Expiration cannot exceed {} seconds.",
+            MAX_EXPIRATION_SECONDS
+        )));
+    }
+
     let expires_in = Duration::seconds(payload.expires_in as i64);
     let expires_at = Utc::now() + expires_in;
     let expires_timestamp = expires_at.timestamp();
@@ -45,7 +55,7 @@ pub async fn create_signed_url(
     let disposition_str = match payload.disposition {
         SignedUrlDisposition::View => "view",
         SignedUrlDisposition::Stream => "stream",
-        SignedUrlDisposition::Download => "download"
+        SignedUrlDisposition::Download => "download",
     };
 
     let data_to_sign = format!(
@@ -59,10 +69,9 @@ pub async fn create_signed_url(
     mac.update(data_to_sign.as_bytes());
     let signature = hex::encode(mac.finalize().into_bytes());
 
-    let base_url = "https://storage.litiaina.com";
     let url = format!(
         "{}/v4/public/share?fragment={}&object_key={}&expires={}&signature={}&disposition={}",
-        base_url,
+        BASE_URL,
         urlencoding::encode(&payload.fragment),
         urlencoding::encode(&payload.object_key),
         expires_timestamp,
@@ -111,7 +120,7 @@ pub async fn get_shared_object(
         .map_err(|_| AppError::BadRequest("Invalid expiration format.".to_string()))?;
 
     if Utc::now().timestamp() > expires_timestamp {
-        return Err(AppError::BadRequest("URL has expired.".to_string()));
+        return Err(AppError::NotFound);
     }
 
     let collection = state
@@ -143,17 +152,15 @@ pub async fn get_shared_object(
         "view" => {
             let response = get_object_logic(metadata, req).await?;
             Ok(response.into_response())
-        },
+        }
         "stream" => {
             let response = stream_object_logic(headers, metadata).await?;
             Ok(response.into_response())
-        },
+        }
         "download" => {
             let response = download_object_logic(req, metadata).await?;
             Ok(response.into_response())
-        },
-        _ => {
-            Err(AppError::BadRequest("Invalid disposition".to_string()))
         }
+        _ => Err(AppError::BadRequest("Invalid disposition".to_string())),
     }
 }

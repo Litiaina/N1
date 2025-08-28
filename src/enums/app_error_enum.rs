@@ -1,7 +1,9 @@
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use mongodb::error::Error as MongoDbError;
 use std::io;
+
+use crate::handlers::error_handlers;
 
 #[derive(Debug)]
 pub enum AppError {
@@ -16,6 +18,7 @@ pub enum AppError {
     InternalServerError(String),
     InsufficientStorage,
     MongoDb(MongoDbError),
+    NotFound,
 }
 
 impl From<MongoDbError> for AppError {
@@ -38,6 +41,7 @@ impl std::fmt::Display for AppError {
             AppError::InternalServerError(msg) => write!(f, "Internal server error: {}", msg),
             AppError::InsufficientStorage => write!(f, "Insufficient storage capacity"),
             AppError::MongoDb(err) => write!(f, "Database error: {}", err),
+            AppError::NotFound => write!(f, "Not found"),
         }
     }
 }
@@ -54,53 +58,56 @@ impl std::error::Error for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
+        match self {
+            AppError::NotFound => {
+                (StatusCode::NOT_FOUND, Html(error_handlers::NOT_FOUND_HTML)).into_response()
+            }
             AppError::Io(e, context) => {
                 tracing::error!("IO error during '{}': {}", context, e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("IO operation failed: {}", context),
-                )
+                let message = format!("IO operation failed: {}", context);
+                (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
             }
             AppError::Timeout(context) => {
                 tracing::error!("Timeout during '{}'", context);
-                (
-                    StatusCode::REQUEST_TIMEOUT,
-                    format!("Operation timed out: {}", context),
-                )
+                let message = format!("Operation timed out: {}", context);
+                (StatusCode::REQUEST_TIMEOUT, message).into_response()
             }
-            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-            AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
-            AppError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg),
+            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+            AppError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
+            AppError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg).into_response(),
             AppError::Multipart(msg) => {
                 tracing::error!("Multipart error: {}", msg);
-                (StatusCode::BAD_REQUEST, msg)
+                (StatusCode::BAD_REQUEST, msg).into_response()
             }
-            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
+            AppError::Unauthorized => {
+                (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()).into_response()
+            }
             AppError::RangeNotSatisfiable => (
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 "Range Not Satisfiable".to_string(),
-            ),
+            )
+                .into_response(),
             AppError::InternalServerError(msg) => {
                 tracing::error!("Internal Server Error: {}", msg);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "An internal server error occurred.".to_string(),
                 )
+                    .into_response()
             }
             AppError::InsufficientStorage => (
                 StatusCode::INSUFFICIENT_STORAGE,
                 "Insufficient storage capacity.".to_string(),
-            ),
+            )
+                .into_response(),
             AppError::MongoDb(err) => {
                 tracing::error!("Database Error: {}", err);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "A database error occurred.".to_string(),
                 )
+                    .into_response()
             }
-        };
-
-        (status, message).into_response()
+        }
     }
 }
