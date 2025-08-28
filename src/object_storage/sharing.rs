@@ -16,6 +16,7 @@ use axum::response::{IntoResponse, Response};
 use chrono::{Duration, Utc};
 use hmac::{Hmac, Mac};
 use mongodb::bson::doc;
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode, utf8_percent_encode};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::env;
@@ -26,6 +27,14 @@ static URL_SIGNING_SECRET: LazyLock<String> =
 
 const MAX_EXPIRATION_SECONDS: i64 = 60 * 60 * 24 * 7;
 const BASE_URL: &str = "https://storage.litiaina.com";
+
+const QUERY_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'<')
+    .add(b'>')
+    .add(b'`');
 
 pub async fn create_signed_url(
     State(state): State<Arc<AppState>>,
@@ -72,11 +81,11 @@ pub async fn create_signed_url(
     let url = format!(
         "{}/v4/public/share?fragment={}&object_key={}&expires={}&signature={}&disposition={}",
         BASE_URL,
-        urlencoding::encode(&payload.fragment),
-        urlencoding::encode(&payload.object_key),
+        utf8_percent_encode(&payload.fragment, QUERY_ENCODE_SET),
+        utf8_percent_encode(&payload.object_key, QUERY_ENCODE_SET),
         expires_timestamp,
         signature,
-        disposition_str
+        utf8_percent_encode(disposition_str, QUERY_ENCODE_SET)
     );
 
     Ok(AxumJson(SignedUrlResponse {
@@ -85,41 +94,69 @@ pub async fn create_signed_url(
     }))
 }
 
+struct SignedUrlQuery {
+    fragment: String,
+    object_key: String,
+    expires_timestamp: i64,
+    provided_signature: String,
+    disposition: String,
+}
+
+impl SignedUrlQuery {
+    fn from_params(params: &Query<HashMap<String, String>>) -> Result<Self, AppError> {
+        let fragment_encoded = params
+            .get("fragment")
+            .ok_or_else(|| AppError::BadRequest("Missing fragment.".to_string()))?;
+        let object_key_encoded = params
+            .get("object_key")
+            .ok_or_else(|| AppError::BadRequest("Missing object_key.".to_string()))?;
+        let expires_str = params
+            .get("expires")
+            .ok_or_else(|| AppError::BadRequest("Missing expiration.".to_string()))?;
+        let provided_signature = params
+            .get("signature")
+            .ok_or_else(|| AppError::BadRequest("Missing signature.".to_string()))?;
+
+        let fragment = percent_decode(fragment_encoded.as_bytes())
+            .decode_utf8()
+            .map_err(|_| AppError::BadRequest("Invalid fragment encoding.".to_string()))?
+            .to_string();
+        let object_key = percent_decode(object_key_encoded.as_bytes())
+            .decode_utf8()
+            .map_err(|_| AppError::BadRequest("Invalid object_key encoding.".to_string()))?
+            .to_string();
+
+        let expires_timestamp = expires_str
+            .parse::<i64>()
+            .map_err(|_| AppError::BadRequest("Invalid expiration format.".to_string()))?;
+
+        let disposition = match params.get("disposition") {
+            Some(encoded_val) => percent_decode(encoded_val.as_bytes())
+                .decode_utf8()
+                .map_err(|_| AppError::BadRequest("Invalid disposition encoding.".to_string()))?
+                .to_string(),
+            None => "view".to_string(),
+        };
+
+        Ok(Self {
+            fragment,
+            object_key,
+            expires_timestamp,
+            provided_signature: provided_signature.clone(),
+            disposition,
+        })
+    }
+}
+
 pub async fn get_shared_object(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<HashMap<String, String>>,
+    params: Query<HashMap<String, String>>,
     headers: HeaderMap,
     req: axum::http::Request<Body>,
 ) -> Result<Response, AppError> {
-    let fragment_encoded = params
-        .get("fragment")
-        .ok_or_else(|| AppError::BadRequest("Missing fragment.".to_string()))?;
-    let object_key_encoded = params
-        .get("object_key")
-        .ok_or_else(|| AppError::BadRequest("Missing object_key.".to_string()))?;
-    let expires_str = params
-        .get("expires")
-        .ok_or_else(|| AppError::BadRequest("Missing expiration.".to_string()))?;
-    let provided_signature = params
-        .get("signature")
-        .ok_or_else(|| AppError::BadRequest("Missing signature.".to_string()))?;
-    let disposition_str = params
-        .get("disposition")
-        .cloned()
-        .unwrap_or_else(|| "inline".to_string());
+    let query = SignedUrlQuery::from_params(&params)?;
 
-    let fragment = urlencoding::decode(fragment_encoded)
-        .map_err(|_| AppError::BadRequest("Invalid fragment encoding.".to_string()))?
-        .to_string();
-    let object_key = urlencoding::decode(object_key_encoded)
-        .map_err(|_| AppError::BadRequest("Invalid object_key encoding.".to_string()))?
-        .to_string();
-
-    let expires_timestamp = expires_str
-        .parse::<i64>()
-        .map_err(|_| AppError::BadRequest("Invalid expiration format.".to_string()))?;
-
-    if Utc::now().timestamp() > expires_timestamp {
+    if Utc::now().timestamp() > query.expires_timestamp {
         return Err(AppError::NotFound);
     }
 
@@ -127,28 +164,34 @@ pub async fn get_shared_object(
         .db_client
         .database(OBJECT_STORAGE_DATABASE)
         .collection::<ObjectMetadata>("objects");
+
     let metadata = collection
-        .find_one(doc! { "fragment": &fragment, "key": &object_key, "is_latest": true })
+        .find_one(doc! { "fragment": &query.fragment, "key": &query.object_key, "is_latest": true })
         .await
         .map_err(|_| AppError::Conflict("Database query failed.".to_string()))?
-        .ok_or(AppError::BadRequest("Object not found.".to_string()))?;
+        .ok_or(AppError::NotFound)?;
 
     let data_to_sign = format!(
         "{}:{}:{}:{}:{}",
-        metadata.owner_uid, metadata.fragment, metadata.key, expires_timestamp, disposition_str
+        metadata.owner_uid,
+        metadata.fragment,
+        metadata.key,
+        query.expires_timestamp,
+        query.disposition
     );
+
     type HmacSha256 = Hmac<Sha256>;
     let mut mac = HmacSha256::new_from_slice(URL_SIGNING_SECRET.as_bytes())
         .map_err(|_| AppError::Conflict("Invalid signing key configuration.".to_string()))?;
     mac.update(data_to_sign.as_bytes());
 
     mac.verify_slice(
-        &hex::decode(provided_signature)
+        &hex::decode(&query.provided_signature)
             .map_err(|_| AppError::BadRequest("Invalid signature format.".to_string()))?,
     )
     .map_err(|_| AppError::BadRequest("Invalid signature.".to_string()))?;
 
-    match disposition_str.as_str() {
+    match query.disposition.as_str() {
         "view" => {
             let response = get_object_logic(metadata, req).await?;
             Ok(response.into_response())
