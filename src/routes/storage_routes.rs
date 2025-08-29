@@ -53,7 +53,8 @@ pub async fn serve_storage_routes() -> Router {
             HeaderName::from_static("authorization"),
             HeaderName::from_static("uid"),
             HeaderName::from_static("content-type"),
-            HeaderName::from_static("digest")
+            HeaderName::from_static("digest"),
+            HeaderName::from_static("buffer"),
         ])
         .allow_methods([
             Method::GET,

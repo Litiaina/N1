@@ -2,7 +2,9 @@ use crate::database::database_constants::{DATABASE, OBJECT_STORAGE_DATABASE};
 use crate::enums::app_error_enum::AppError;
 use crate::enums::upload_status_enum::UploadStatus;
 use crate::fs::fragmented_upload::{with_io_timeout, with_timeout};
-use crate::fs::fs_constants::{MAX_CHUNK_SIZE, MERGE_CONCURRENCY, TMP_EXT};
+use crate::fs::fs_constants::{
+    MAX_BUFFER_SIZE, MAX_CHUNK_SIZE, MERGE_CONCURRENCY, MIN_BUFFER_SIZE, TMP_EXT,
+};
 use crate::object_storage::chunk_parser::parse_uploaded_chunks;
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_STORAGE_ROOT};
 use crate::object_storage::storage_capacity_parser::calculate_storage_usage;
@@ -24,8 +26,8 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use base64::engine::general_purpose;
 use base64::Engine;
+use base64::engine::general_purpose;
 use futures_util::StreamExt;
 use futures_util::stream::TryStreamExt;
 use mongodb::bson::{Bson, DateTime};
@@ -310,7 +312,7 @@ pub async fn object_upload_chunk(
 
     let chunk_key = format!("{}-{}", file_id, chunk_index);
     let chunk_lock = CHUNK_WRITE_LOCKS
-        .entry(chunk_key.clone())
+        .entry(chunk_key)
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone();
 
@@ -322,8 +324,6 @@ pub async fn object_upload_chunk(
         .ok_or_else(|| AppError::BadRequest("No multipart field found.".to_string()))?;
     let expected_checksum = params.get("checksum").map(|s| s.as_str());
     save_chunk_stream(&paths, chunk_index, field, expected_checksum).await?;
-
-    CHUNK_WRITE_LOCKS.remove(&chunk_key);
 
     Ok((StatusCode::OK, "Chunk uploaded successfully."))
 }
@@ -339,7 +339,7 @@ pub async fn object_upload_chunk_raw(
 
     let chunk_key = format!("{}-{}", file_id, chunk_index);
     let chunk_lock = CHUNK_WRITE_LOCKS
-        .entry(chunk_key.clone())
+        .entry(chunk_key)
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone();
     let _lock_guard = chunk_lock.lock().await;
@@ -352,9 +352,20 @@ pub async fn object_upload_chunk_raw(
         .and_then(|s| s.strip_prefix("sha-256="))
         .map(|s| s.to_string());
 
-    save_chunk_from_raw_stream(&paths, chunk_index, body, expected_checksum_b64).await?;
+    let expected_buffer_size = headers
+        .get("Buffer")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|s| s.strip_prefix("memory-size="))
+        .and_then(|s| s.parse::<usize>().ok());
 
-    CHUNK_WRITE_LOCKS.remove(&chunk_key);
+    save_chunk_from_raw_stream(
+        &paths,
+        chunk_index,
+        body,
+        expected_checksum_b64,
+        expected_buffer_size,
+    )
+    .await?;
 
     Ok((StatusCode::OK, "Chunk uploaded successfully."))
 }
@@ -455,13 +466,18 @@ async fn save_chunk_from_raw_stream(
     index: u64,
     body: Body,
     expected_checksum_b64: Option<String>,
+    chunk_buffer_size: Option<usize>,
 ) -> Result<(), AppError> {
     let final_path = paths.chunk_path(index);
     let temp_path = final_path.with_extension(TMP_EXT);
     let mut hasher = Sha256::new();
 
+    let buffer_size = chunk_buffer_size
+        .unwrap_or(MIN_BUFFER_SIZE)
+        .min(MAX_BUFFER_SIZE);
+
     let file = with_io_timeout("creating chunk file", File::create(&temp_path)).await?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = BufWriter::with_capacity(buffer_size, file);
     let mut total_written: usize = 0;
 
     let mut stream = body.into_data_stream();
@@ -485,20 +501,35 @@ async fn save_chunk_from_raw_stream(
 
     with_io_timeout("flushing chunk file", writer.flush()).await?;
 
-    if let Some(expected_b64) = expected_checksum_b64 {
-        let expected_bytes = general_purpose::STANDARD.decode(expected_b64)
-            .map_err(|_| AppError::BadRequest("Invalid Base64 in Digest header.".to_string()))?;
+    match expected_checksum_b64 {
+        Some(expected_b64) => {
+            let expected_bytes = general_purpose::STANDARD
+                .decode(expected_b64)
+                .map_err(|_| {
+                    AppError::BadRequest("Invalid Base64 in Digest header.".to_string())
+                })?;
 
-        let computed_hash = hasher.finalize();
-        if expected_bytes.as_slice() != computed_hash.as_slice() {
+            let computed_hash = hasher.finalize();
+            if expected_bytes.as_slice() != computed_hash.as_slice() {
+                warn!(
+                    "Checksum mismatch for chunk {}: expected (b64) {}, got (hex) {}",
+                    index,
+                    general_purpose::STANDARD.encode(&expected_bytes),
+                    hex::encode(computed_hash)
+                );
+                let _ = fs::remove_file(&temp_path).await;
+                return Err(AppError::BadRequest("Checksum mismatch.".to_string()));
+            }
+        }
+        None => {
             warn!(
-                "Checksum mismatch for chunk {}: expected (b64) {}, got (hex) {}",
-                index,
-                general_purpose::STANDARD.encode(&expected_bytes),
-                hex::encode(computed_hash)
+                "Missing Digest header for binary chunk upload for chunk index {}",
+                index
             );
             let _ = fs::remove_file(&temp_path).await;
-            return Err(AppError::BadRequest("Checksum mismatch.".to_string()));
+            return Err(AppError::BadRequest(
+                "Digest header is required for binary chunk uploads.".to_string(),
+            ));
         }
     }
 
@@ -653,7 +684,7 @@ async fn assemble_and_index_object(
         AppError::Conflict("Failed to update old version record.".to_string())
     })?;
 
-    let filter_pending = doc! { "session_id": temp_metadata.file_id };
+    let filter_pending = doc! { "session_id": &temp_metadata.file_id };
     collection
         .replace_one(filter_pending, &final_metadata)
         .await
@@ -675,5 +706,16 @@ async fn assemble_and_index_object(
         "Successfully indexed new version of object: {}/{} (Version ID: {})",
         final_metadata.fragment, final_metadata.key, final_metadata.version_id
     );
+
+    for i in 0..temp_metadata.total_chunks {
+        let chunk_key = format!("{}-{}", temp_metadata.file_id, i);
+        CHUNK_WRITE_LOCKS.remove(&chunk_key);
+    }
+
+    info!(
+        "Cleaned up chunk locks for session {}",
+        temp_metadata.file_id
+    );
+
     Ok(())
 }
