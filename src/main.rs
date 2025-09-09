@@ -89,7 +89,6 @@ async fn main() {
             }
         }
     } else {
-        //let _ = &CONFIG.garbage_collector;
         tracing::info!("Loaded configuration from '{}' file.", CONFIG_FILE);
     }
 
