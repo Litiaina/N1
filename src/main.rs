@@ -1,7 +1,9 @@
 use crate::fs::cleanup_manager::cleanup_stale_uploads;
-use crate::fs::fs_constants::{ENV_FILE, STORAGE_ROOT};
+use crate::fs::fs_constants::{CONFIG_FILE, ENV_FILE, STORAGE_ROOT};
 use crate::handlers::error_handlers::handler_404;
 use crate::routes::storage_routes::serve_storage_routes;
+use crate::settings::create_config::create_default_config_ini;
+use crate::settings::create_env::create_env_file;
 use crate::structs::port_struct::Ports;
 use axum::handler::HandlerWithoutStateExt;
 use axum::http::uri::Authority;
@@ -13,8 +15,6 @@ use axum_server::tls_rustls::RustlsConfig;
 use chrono::Local;
 use dotenv::dotenv;
 use std::env;
-use std::fs::File;
-use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -28,15 +28,20 @@ mod enums;
 mod fs;
 mod handlers;
 mod middleware;
+mod object_storage;
 mod routes;
+mod settings;
 mod statics;
 mod structs;
 mod utils;
 mod validation;
-mod object_storage;
 
 #[tokio::main]
 async fn main() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install 'ring' as the default TLS provider.");
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -52,6 +57,7 @@ async fn main() {
     tracing::info!("{} - Status: ONLINE", current_time);
     tracing::info!("Press CTRL+C to terminate");
     tracing::info!("══════════════ ACTIVE CONNECTIONS ══════════════");
+
     if !Path::new(ENV_FILE).exists() {
         match create_env_file(ENV_FILE) {
             Ok(_) => {
@@ -68,6 +74,25 @@ async fn main() {
         dotenv().ok();
         tracing::info!("Loaded environment variables from .env file.");
     }
+
+    if !Path::new(CONFIG_FILE).exists() {
+        match create_default_config_ini(CONFIG_FILE) {
+            Ok(_) => {
+                tracing::info!(
+                    "Created default '{}' file with standard settings.",
+                    CONFIG_FILE
+                );
+            }
+            Err(e) => {
+                tracing::error!("FATAL: Failed to create '{}' file: {}", CONFIG_FILE, e);
+                return;
+            }
+        }
+    } else {
+        //let _ = &CONFIG.garbage_collector;
+        tracing::info!("Loaded configuration from '{}' file.", CONFIG_FILE);
+    }
+
     server().await
 }
 
@@ -202,11 +227,4 @@ async fn shutdown_signal(name: Arc<String>, handle: axum_server::Handle) {
 
     tracing::info!("{} => shutdown received", name);
     handle.graceful_shutdown(Some(Duration::from_secs(10)));
-}
-
-fn create_env_file(path: &str) -> io::Result<()> {
-    let mut file = File::create(path)?;
-    writeln!(file, "JWT_SECRET=enter_jwt_secret_here")?;
-    writeln!(file, "URL_SIGNING_SECRET=enter_url_signing_secret_here")?;
-    Ok(())
 }

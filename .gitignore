@@ -25,3 +25,7 @@ Desktop.ini
 # Environment variables
 .env
 .env.*
+
+# Config variables
+config.ini
+.ini.*

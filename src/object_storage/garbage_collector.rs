@@ -1,47 +1,59 @@
-//! # Garbage Collector for Stale Uploads
-//!
-//! This module provides a background task that periodically cleans up abandoned
-//! multipart uploads. It operates by querying the MongoDB database for metadata
-//! records with a "Pending" status that are older than a specified Time-To-Live (TTL).
-//!
-//! This approach is highly efficient because it uses a targeted database query
-//! instead of scanning the entire filesystem for old temporary files.
-
 use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
 use crate::enums::app_error_enum::AppError;
-use crate::fs::fs_constants::{CLEANUP_INTERVAL, FILE_TTL, TEMP_UPLOAD_ROOT};
-use crate::object_storage::constants::OBJECT_STORAGE_ROOT;
-use crate::structs::object_storage_structs::ObjectMetadata;
+use crate::settings::config::CONFIG;
+use crate::statics::merge_semaphore_static::CHUNK_WRITE_LOCKS;
+use crate::structs::object_storage_structs::{
+    ObjectMetadata, ObjectPathManager, TempUploadMetadata,
+};
 use chrono::{Duration, Utc};
-use futures_util::TryStreamExt;
 use mongodb::{
     Client as MongoClient,
     bson::{Bson, doc},
 };
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use tokio::{fs, time::sleep};
 use tracing::{info, warn};
 
 pub async fn run_garbage_collector(db_client: Arc<MongoClient>) {
+    let cleanup_interval =
+        StdDuration::from_secs(CONFIG.garbage_collector.cleanup_interval_seconds);
+    let file_ttl = StdDuration::from_secs(CONFIG.garbage_collector.file_ttl_seconds);
+
     info!(
-        "🗑️ Garbage Collector started. Cycle interval: {:?}",
-        CLEANUP_INTERVAL
+        "🗑️ Garbage Collector started. Cycle interval: {:?}, File TTL: {:?}",
+        cleanup_interval, file_ttl
     );
+
     loop {
-        sleep(CLEANUP_INTERVAL).await;
+        sleep(cleanup_interval).await;
         info!("🗑️ Running garbage collection cycle for stale pending uploads...");
 
-        if let Err(e) = cleanup_stale_pending_uploads(&db_client, FILE_TTL).await {
-            warn!("🗑️ Garbage collection cycle failed: {}", e);
+        loop {
+            match cleanup_one_stale_upload(&db_client, file_ttl).await {
+                Ok(Some(session_id)) => {
+                    info!("🗑️ Cleaned up stale upload session: {}", session_id);
+                }
+                Ok(None) => {
+                    info!("🗑️ No more stale pending uploads found in this cycle.");
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        "🗑️ Garbage collection failed on one record, ending cycle early: {}",
+                        e
+                    );
+                    break;
+                }
+            }
         }
     }
 }
 
-async fn cleanup_stale_pending_uploads(
+async fn cleanup_one_stale_upload(
     db: &MongoClient,
-    ttl: std::time::Duration,
-) -> Result<(), AppError> {
+    ttl: StdDuration,
+) -> Result<Option<String>, AppError> {
     let collection = db
         .database(OBJECT_STORAGE_DATABASE)
         .collection::<ObjectMetadata>("objects");
@@ -54,43 +66,44 @@ async fn cleanup_stale_pending_uploads(
         "created_at": { "$lt": Bson::DateTime(std::time::SystemTime::from(stale_threshold).into()) }
     };
 
-    let cursor = collection.find(filter.clone()).await?;
-    let stale_records: Vec<ObjectMetadata> = cursor.try_collect().await?;
+    let stale_record = collection.find_one_and_delete(filter).await?;
 
-    if stale_records.is_empty() {
-        info!("🗑️ No stale pending uploads found.");
-        return Ok(());
-    }
-
-    info!(
-        "🗑️ Found {} stale pending uploads to clean up.",
-        stale_records.len()
-    );
-
-    for record in &stale_records {
+    if let Some(record) = stale_record {
         if let Some(session_id) = &record.session_id {
-            let temp_upload_dir = PathBuf::from(OBJECT_STORAGE_ROOT)
-                .join(TEMP_UPLOAD_ROOT)
-                .join(session_id);
+            let paths = ObjectPathManager::new(session_id);
+            let temp_upload_dir = paths.temp_upload_dir();
+
+            if let Ok(content) = fs::read_to_string(paths.metadata_path()).await {
+                if let Ok(temp_metadata) = serde_json::from_str::<TempUploadMetadata>(&content) {
+                    for i in 0..temp_metadata.total_chunks {
+                        let chunk_key = format!("{}-{}", temp_metadata.file_id, i);
+                        CHUNK_WRITE_LOCKS.remove(&chunk_key);
+                    }
+                    info!(
+                        "🗑️ Cleaned up {} in-memory chunk locks for session {}",
+                        temp_metadata.total_chunks, session_id
+                    );
+                }
+            } else {
+                warn!(
+                    "🗑️ Could not read temp metadata for session {}, unable to clean up chunk locks.",
+                    session_id
+                );
+            }
 
             if temp_upload_dir.exists() {
                 if let Err(e) = fs::remove_dir_all(&temp_upload_dir).await {
                     warn!(
-                        "🗑️ Failed to delete stale temp directory {:?}: {}",
-                        temp_upload_dir, e
+                        "🗑️ Failed to delete stale temp directory {:?} for session {}: {}. The metadata record has already been deleted.",
+                        temp_upload_dir, session_id, e
                     );
-                } else {
-                    info!("🗑️ Deleted stale temp directory: {:?}", temp_upload_dir);
                 }
             }
+            Ok(Some(session_id.clone()))
+        } else {
+            Ok(None)
         }
+    } else {
+        Ok(None)
     }
-
-    let delete_result = collection.delete_many(filter).await?;
-    info!(
-        "🗑️ Deleted {} stale metadata records from the database.",
-        delete_result.deleted_count
-    );
-
-    Ok(())
 }

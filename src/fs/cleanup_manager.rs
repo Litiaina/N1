@@ -1,4 +1,4 @@
-use crate::fs::fs_constants::{CLEANUP_INTERVAL, FILE_TTL};
+use crate::settings::config::CONFIG;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use tokio::time::sleep;
@@ -8,7 +8,10 @@ use walkdir::WalkDir;
 
 pub async fn cleanup_stale_uploads(source_path: &str) {
     loop {
-        sleep(CLEANUP_INTERVAL).await;
+        let cleanup_interval =
+            Duration::from_secs(CONFIG.garbage_collector.cleanup_interval_seconds);
+        let file_ttl = Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds);
+        sleep(cleanup_interval).await;
 
         let root = PathBuf::from(source_path);
 
@@ -20,13 +23,13 @@ pub async fn cleanup_stale_uploads(source_path: &str) {
         {
             let dir_path = entry.path().to_path_buf();
 
-            if let Ok(true) = is_unfinished_upload(&dir_path, FILE_TTL).await {
+            if let Ok(true) = is_unfinished_upload(&dir_path, file_ttl).await {
                 if let Err(e) = fs::remove_dir_all(&dir_path).await {
                     warn!("⚠️ Failed to delete {:?}: {:?}", dir_path, e);
                 } else {
                     info!("✅ Deleted stale unfinished upload: {:?}", dir_path);
                 }
-            } else if let Err(e) = is_unfinished_upload(&dir_path, FILE_TTL).await {
+            } else if let Err(e) = is_unfinished_upload(&dir_path, file_ttl).await {
                 warn!("⚠️ Could not check {:?}: {:?}", dir_path, e);
             }
         }
