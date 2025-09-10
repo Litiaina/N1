@@ -25,7 +25,7 @@ use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
 use crate::fs::fs_constants::MAX_FILE_SIZE;
 use crate::object_storage::delete::{delete_object, delete_objects_by_prefix};
-use crate::object_storage::download::download_object;
+use crate::object_storage::download::{download_object, download_object_chunk};
 use crate::object_storage::retrieve::{stream_object, get_object_metadata, list_objects, get_object, list_fragments};
 use crate::object_storage::modify::rename_object;
 use crate::object_storage::upload::{finalize_object_upload, get_capacity_usage, get_object_upload_status, initiate_object_upload, object_upload_chunk, object_upload_chunk_raw};
@@ -86,6 +86,7 @@ fn create_object_storage_routes() -> Router<Arc<AppState>> {
         .route("/v4/fragment/object/stream/{:fragment}/{*object_key}", get(stream_object).options(options_handler))
         .route("/v4/fragment/object/get/metadata/{:fragment}/{*object_key}", get(get_object_metadata).options(options_handler))
         .route("/v4/fragment/object/download/{:fragment}/{*object_key}", get(download_object).options(options_handler))
+        .route("/v4/fragment/object/download/v2/{:fragment}/{*object_key}", get(download_object_chunk).options(options_handler))
         .route("/v4/fragment/object/rename", patch(rename_object).options(options_handler))
         .route("/v4/fragment/object/delete/{:fragment}/{*object_key}", delete(delete_object).options(options_handler))
         .route("/v4/fragment/object/delete/prefix", delete(delete_objects_by_prefix).options(options_handler))

@@ -79,8 +79,9 @@ pub async fn create_signed_url(
     let signature = hex::encode(mac.finalize().into_bytes());
 
     let url = format!(
-        "{}/v4/public/share?fragment={}&object_key={}&expires={}&signature={}&disposition={}",
+        "{}/v4/public/share?owner_uid={}&fragment={}&object_key={}&expires={}&signature={}&disposition={}",
         BASE_URL,
+        utf8_percent_encode(&metadata.owner_uid, QUERY_ENCODE_SET),
         utf8_percent_encode(&payload.fragment, QUERY_ENCODE_SET),
         utf8_percent_encode(&payload.object_key, QUERY_ENCODE_SET),
         expires_timestamp,
@@ -95,6 +96,7 @@ pub async fn create_signed_url(
 }
 
 struct SignedUrlQuery {
+    owner_uid: String,
     fragment: String,
     object_key: String,
     expires_timestamp: i64,
@@ -104,6 +106,9 @@ struct SignedUrlQuery {
 
 impl SignedUrlQuery {
     fn from_params(params: &Query<HashMap<String, String>>) -> Result<Self, AppError> {
+        let owner_uid_encoded = params
+            .get("owner_uid")
+            .ok_or_else(|| AppError::BadRequest("Missing owner_uid.".to_string()))?;
         let fragment_encoded = params
             .get("fragment")
             .ok_or_else(|| AppError::BadRequest("Missing fragment.".to_string()))?;
@@ -117,6 +122,10 @@ impl SignedUrlQuery {
             .get("signature")
             .ok_or_else(|| AppError::BadRequest("Missing signature.".to_string()))?;
 
+        let owner_uid = percent_decode(owner_uid_encoded.as_bytes())
+            .decode_utf8()
+            .map_err(|_| AppError::BadRequest("Invalid owner_uid encoding.".to_string()))?
+            .to_string();
         let fragment = percent_decode(fragment_encoded.as_bytes())
             .decode_utf8()
             .map_err(|_| AppError::BadRequest("Invalid fragment encoding.".to_string()))?
@@ -139,6 +148,7 @@ impl SignedUrlQuery {
         };
 
         Ok(Self {
+            owner_uid,
             fragment,
             object_key,
             expires_timestamp,
@@ -166,7 +176,7 @@ pub async fn get_shared_object(
         .collection::<ObjectMetadata>("objects");
 
     let metadata = collection
-        .find_one(doc! { "fragment": &query.fragment, "key": &query.object_key, "is_latest": true })
+        .find_one(doc! { "owner_uid": &query.owner_uid, "fragment": &query.fragment, "key": &query.object_key, "is_latest": true })
         .await
         .map_err(|_| AppError::Conflict("Database query failed.".to_string()))?
         .ok_or(AppError::NotFound)?;

@@ -132,3 +132,9 @@ pub struct DeleteByPrefixRequest {
     pub fragment: String,
     pub prefix: String,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct ChunkDownloadParams {
+    pub offset: u64,
+    pub chunk_size: usize,
+}
