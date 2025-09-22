@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use crate::database::database_constants::DATABASE_URL;
 use crate::fs::direct_upload::upload_file;
 use crate::fs::directory_manager::{
     create_directory, delete_directory, delete_file, get_file_metadata, rename_file_query,
@@ -15,6 +14,7 @@ use crate::handlers::transcoder_handler::{transcode_status_handler, transcode_vi
 use crate::middleware::auth_middleware::{auth, authorize};
 use crate::middleware::storage_middleware::enforce_storage_limit;
 use crate::object_storage::garbage_collector::run_garbage_collector;
+use crate::statics::database_statics::DATABASE_URL;
 use axum::http::{HeaderName, Method, StatusCode};
 use axum::middleware::from_fn;
 use axum::routing::{delete, get, patch, post, put};
@@ -36,7 +36,7 @@ pub struct AppState {
 }
 
 pub async fn serve_storage_routes() -> Router {
-    let client_options = ClientOptions::parse(DATABASE_URL)
+    let client_options = ClientOptions::parse(&*DATABASE_URL)
         .await
         .expect("Failed to parse MongoDB URI");
     let db_client = Arc::new(Client::with_options(client_options).expect("Failed to create MongoDB client"));

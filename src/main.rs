@@ -1,6 +1,7 @@
 use crate::fs::cleanup_manager::cleanup_stale_uploads;
 use crate::fs::fs_constants::{CONFIG_FILE, ENV_FILE, STORAGE_ROOT};
 use crate::handlers::error_handlers::handler_404;
+use crate::object_storage::setup::setup_database_locks;
 use crate::routes::storage_routes::serve_storage_routes;
 use crate::settings::create_config::create_default_config_ini;
 use crate::settings::create_env::create_env_file;
@@ -91,6 +92,10 @@ async fn main() {
     } else {
         tracing::info!("Loaded configuration from '{}' file.", CONFIG_FILE);
     }
+
+    setup_database_locks()
+        .await
+        .expect("Failed to setup database locks");
 
     server().await
 }
