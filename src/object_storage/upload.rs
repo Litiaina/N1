@@ -28,10 +28,12 @@ use axum::{
 };
 use base64::Engine;
 use base64::engine::general_purpose;
+use chrono::Utc;
 use futures_util::StreamExt;
 use futures_util::stream::TryStreamExt;
 use mongodb::bson::{Bson, DateTime};
-use mongodb::{Client as MongoClient, bson, bson::doc};
+use mongodb::error::{ErrorKind, WriteFailure};
+use mongodb::{Client as MongoClient, bson::doc};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::{collections::HashMap, path::PathBuf};
@@ -149,14 +151,15 @@ pub async fn initiate_object_upload(
     Path((fragment, object_key)): Path<(String, String)>,
     AxumJson(params): AxumJson<InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    let is_locked = PREFIX_DELETE_LOCKS
-        .iter()
-        .any(|lock| object_key.starts_with(lock.key()));
+    let uid = claims.uid;
 
-    if is_locked {
+    if PREFIX_DELETE_LOCKS
+        .iter()
+        .any(|lock| object_key.starts_with(lock.key()))
+    {
         warn!(
             "User {} tried to upload to a locked path: {}/{}",
-            claims.uid, fragment, object_key
+            uid, fragment, object_key
         );
         return Err(AppError::Conflict(
             "The target directory is currently undergoing a delete operation. Please try again later."
@@ -164,22 +167,18 @@ pub async fn initiate_object_upload(
         ));
     }
 
-    let uid = claims.uid;
     let db_client = &state.db_client;
-    let lock_collection = db_client
+    let locks_collection = db_client
         .database(OBJECT_STORAGE_DATABASE)
-        .collection::<bson::Document>("upload_locks");
+        .collection::<mongodb::bson::Document>("upload_locks");
 
     let lock_doc = doc! {
-        "uid": uid.clone(),
-        "locked_at": Bson::DateTime(DateTime::now())
+        "uid": &uid,
+        "locked_at": Bson::DateTime(DateTime::now()),
     };
 
-    if let Err(e) = lock_collection.insert_one(lock_doc).await {
-        if let mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
-            ref write_error,
-        )) = *e.kind
-        {
+    if let Err(e) = locks_collection.insert_one(lock_doc).await {
+        if let ErrorKind::Write(WriteFailure::WriteError(write_error)) = e.kind.as_ref() {
             if write_error.code == 11000 {
                 warn!(
                     "User {} tried to initiate an upload while another was in progress.",
@@ -198,8 +197,10 @@ pub async fn initiate_object_upload(
     }
 
     let result = async {
-        let auth_db = db_client.database(DATABASE);
-        let auth_collection = auth_db.collection::<UserAuthDetails>("auth");
+        let auth_collection = db_client
+            .database(DATABASE)
+            .collection::<UserAuthDetails>("auth");
+
         let user_auth_details = auth_collection
             .find_one(doc! { "uid": &uid })
             .await
@@ -218,8 +219,8 @@ pub async fn initiate_object_upload(
         }
 
         let file_id = Uuid::new_v4().to_string();
-
         let now = DateTime::now();
+
         let pending_metadata = ObjectMetadata {
             id: Uuid::new_v4().to_string(),
             fragment: fragment.clone(),
@@ -250,11 +251,13 @@ pub async fn initiate_object_upload(
             })?;
 
         let paths = ObjectPathManager::new(&file_id);
+
         with_io_timeout(
             "create temp upload directory",
-            fs::create_dir_all(paths.temp_upload_dir()),
+            tokio::fs::create_dir_all(paths.temp_upload_dir()),
         )
         .await?;
+
         let metadata = TempUploadMetadata {
             file_id: file_id.clone(),
             fragment,
@@ -263,19 +266,23 @@ pub async fn initiate_object_upload(
             content_type: params.content_type,
             total_size_bytes: params.total_size_bytes,
             total_chunks: params.total_chunks,
-            creation_timestamp: chrono::Utc::now().to_rfc3339(),
+            creation_timestamp: Utc::now().to_rfc3339(),
         };
+
         let metadata_content = serde_json::to_string_pretty(&metadata)
             .map_err(|e| AppError::BadRequest(format!("Failed to serialize metadata: {}", e)))?;
+
         with_io_timeout(
             "writing metadata file",
-            fs::write(paths.metadata_path(), metadata_content),
+            tokio::fs::write(paths.metadata_path(), metadata_content),
         )
         .await?;
+
         info!(
             "Initiated object upload session and reserved space for: {}",
             file_id
         );
+
         Ok((
             StatusCode::CREATED,
             AxumJson(InitiateUploadResponse { file_id }),
@@ -283,7 +290,7 @@ pub async fn initiate_object_upload(
     }
     .await;
 
-    if let Err(e) = lock_collection.delete_one(doc! { "uid": &uid }).await {
+    if let Err(e) = locks_collection.delete_one(doc! { "uid": &uid }).await {
         error!("Failed to release database lock for user {}: {}", uid, e);
     }
 
