@@ -110,7 +110,8 @@ fn create_legacy_fs_routes() -> Router<Arc<AppState>> {
         .route("/dir/file/upload/v2/{*path}", post(upload_fragments).options(options_handler))
         .route("/dir/file/upload/v3/initiate/", post(legacy_upload::initiate_upload_session).options(options_handler))
         .route("/dir/file/upload/v3/initiate/{*path}", post(legacy_upload::initiate_upload_session).options(options_handler))
-        .route("/dir/file/upload/v3/{:file_id}/{:chunk_index}", put(legacy_upload::upload_chunk).options(options_handler))
+        .route("/dir/file/upload/multipart/v3/{:file_id}/{:chunk_index}", put(legacy_upload::upload_chunk_multipart).options(options_handler))
+        .route("/dir/file/upload/v3/{:file_id}/{:chunk_index}", put(legacy_upload::upload_chunk_binary).options(options_handler))
         .route("/dir/file/upload/v3/{:file_id}/status", get(legacy_upload::get_upload_status).options(options_handler))
         .route("/dir/file/upload/v3/{:file_id}/finalize", post(legacy_upload::finalize_upload_session).options(options_handler))
         .layer(from_fn(enforce_storage_limit));

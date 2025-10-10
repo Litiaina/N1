@@ -1,19 +1,29 @@
 use crate::enums::app_error_enum::AppError;
 use crate::fs::fs_constants::{
-    IO_TIMEOUT, MAX_CHUNK_SIZE, MERGE_CONCURRENCY, STORAGE_ROOT, TMP_EXT,
+    IO_TIMEOUT, MAX_BUFFER_SIZE, MAX_CHUNK_SIZE, MERGE_CONCURRENCY, MIN_BUFFER_SIZE, STORAGE_ROOT,
+    TMP_EXT,
 };
 use crate::statics::merge_semaphore_static::MERGE_SEMAPHORE;
 use crate::validation::directory_validation::sanitize_fragmented_path;
 
+use crate::fs::file_path_parser::find_unique_path;
+use crate::fs::fragmented_upload::with_io_timeout;
+use crate::object_storage::chunk_parser::parse_uploaded_chunks;
+use crate::structs::auth_structs::Claims;
 use crate::structs::stateless_fragment_upload_structs::{
     InitiateUploadParams, InitiateUploadResponse, PathManager, UploadMetadata, UploadStatusResponse,
 };
+use axum::body::Body;
+use axum::http::HeaderMap;
 use axum::{
     Json as AxumJson,
     extract::{Multipart, Path, Query},
     http::StatusCode,
     response::{IntoResponse, Json},
 };
+use base64::Engine;
+use base64::engine::general_purpose;
+use futures_util::StreamExt;
 use futures_util::stream::TryStreamExt;
 use sha2::{Digest, Sha256};
 use std::{
@@ -29,10 +39,6 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
-use crate::fs::file_path_parser::find_unique_path;
-use crate::fs::fragmented_upload::with_io_timeout;
-use crate::object_storage::chunk_parser::parse_uploaded_chunks;
-use crate::structs::auth_structs::Claims;
 
 pub async fn initiate_upload_session(
     claims: Claims,
@@ -78,7 +84,39 @@ pub async fn initiate_upload_session(
     ))
 }
 
-pub async fn upload_chunk(
+pub async fn upload_chunk_binary(
+    path_params: Path<(String, u64)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<impl IntoResponse, AppError> {
+    let (file_id, chunk_index) = path_params.0;
+    let paths = PathManager::new(&file_id);
+
+    let expected_checksum_b64 = headers
+        .get("Digest")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|s| s.strip_prefix("sha-256="))
+        .map(|s| s.to_string());
+
+    let expected_buffer_size = headers
+        .get("Buffer")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|s| s.strip_prefix("memory-size="))
+        .and_then(|s| s.parse::<usize>().ok());
+
+    save_chunk_binary(
+        &paths,
+        chunk_index,
+        body,
+        expected_checksum_b64,
+        expected_buffer_size,
+    )
+    .await?;
+
+    Ok((StatusCode::OK, "Chunk uploaded successfully."))
+}
+
+pub async fn upload_chunk_multipart(
     path_params: Path<(String, u64)>,
     Query(params): Query<HashMap<String, String>>,
     mut multipart: Multipart,
@@ -93,14 +131,12 @@ pub async fn upload_chunk(
 
     let expected_checksum = params.get("checksum").map(|s| s.as_str());
 
-    save_chunk_stream(&paths, chunk_index, field, expected_checksum).await?;
+    save_chunk_multipart(&paths, chunk_index, field, expected_checksum).await?;
 
     Ok((StatusCode::OK, "Chunk uploaded successfully."))
 }
 
-pub async fn get_upload_status(
-    Path(file_id): Path<String>,
-) -> Result<impl IntoResponse, AppError> {
+pub async fn get_upload_status(Path(file_id): Path<String>) -> Result<impl IntoResponse, AppError> {
     let paths = PathManager::new(&file_id);
 
     let metadata: UploadMetadata = {
@@ -142,7 +178,83 @@ pub async fn finalize_upload_session(
     Ok((StatusCode::ACCEPTED, "Finalization process started."))
 }
 
-async fn save_chunk_stream(
+async fn save_chunk_binary(
+    paths: &PathManager<'_>,
+    index: u64,
+    body: Body,
+    expected_checksum_b64: Option<String>,
+    chunk_buffer_size: Option<usize>,
+) -> Result<(), AppError> {
+    let final_path = paths.chunk_path(index);
+    let temp_path = final_path.with_extension(TMP_EXT);
+    let mut hasher = Sha256::new();
+
+    let buffer_size = chunk_buffer_size
+        .unwrap_or(MIN_BUFFER_SIZE)
+        .min(MAX_BUFFER_SIZE);
+
+    let file = with_io_timeout("creating chunk file", File::create(&temp_path)).await?;
+    let mut writer = BufWriter::with_capacity(buffer_size, file);
+    let mut total_written: usize = 0;
+
+    let mut stream = body.into_data_stream();
+
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result
+            .map_err(|e| AppError::BadRequest(format!("Error reading request body: {}", e)))?;
+
+        total_written += chunk.len();
+        if total_written > MAX_CHUNK_SIZE {
+            writer.flush().await.ok();
+            drop(writer);
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(AppError::PayloadTooLarge(
+                "Chunk size exceeds limit.".to_string(),
+            ));
+        }
+        hasher.update(&chunk);
+        with_io_timeout("writing chunk data", writer.write_all(&chunk)).await?;
+    }
+
+    with_io_timeout("flushing chunk file", writer.flush()).await?;
+
+    match expected_checksum_b64 {
+        Some(expected_b64) => {
+            let expected_bytes = general_purpose::STANDARD
+                .decode(expected_b64)
+                .map_err(|_| {
+                    AppError::BadRequest("Invalid Base64 in Digest header.".to_string())
+                })?;
+
+            let computed_hash = hasher.finalize();
+            if expected_bytes.as_slice() != computed_hash.as_slice() {
+                warn!(
+                    "Checksum mismatch for chunk {}: expected (b64) {}, got (hex) {}",
+                    index,
+                    general_purpose::STANDARD.encode(&expected_bytes),
+                    hex::encode(computed_hash)
+                );
+                let _ = fs::remove_file(&temp_path).await;
+                return Err(AppError::BadRequest("Checksum mismatch.".to_string()));
+            }
+        }
+        None => {
+            warn!(
+                "Missing Digest header for binary chunk upload for chunk index {}",
+                index
+            );
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(AppError::BadRequest(
+                "Digest header is required for binary chunk uploads.".to_string(),
+            ));
+        }
+    }
+
+    with_io_timeout("finalizing chunk", fs::rename(&temp_path, &final_path)).await?;
+    Ok(())
+}
+
+async fn save_chunk_multipart(
     paths: &PathManager<'_>,
     index: u64,
     field: axum::extract::multipart::Field<'_>,
@@ -316,4 +428,3 @@ where
         .await
         .map_err(|_| AppError::Timeout(context.to_string()))
 }
-

@@ -1,6 +1,8 @@
 use crate::fs::fs_constants::INITIAL_CHUNK_SIZE;
+use crate::object_storage::header_parser::parse_range_header;
+use crate::structs::auth_structs::Claims;
 use crate::structs::file_detail_params_struct::FileDetail;
-use crate::validation::directory_validation::{get_dir_size, sanitize_path};
+use crate::validation::directory_validation::sanitize_path;
 use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::Path;
@@ -12,73 +14,93 @@ use serde_json::json;
 use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
-use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
+use tokio::{fs, task};
 use tokio_util::io::ReaderStream;
-use crate::object_storage::header_parser::parse_range_header;
-use crate::structs::auth_structs::Claims;
+use walkdir::WalkDir;
 
 pub async fn view_directory(
     claims: Claims,
     path: Option<Path<String>>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = &claims.uid;
+    let validated_uid = claims.uid.clone();
 
     let relative_path = path
         .as_ref()
         .map(|Path(p)| sanitize_path(p))
         .unwrap_or_default();
 
+    let user_storage_root = PathBuf::from(format!("storage-files/{}", validated_uid));
+
     let full_path = if relative_path.is_empty() {
-        format!("storage-files/{}", validated_uid)
+        user_storage_root.clone()
     } else {
-        format!("storage-files/{}/{}", validated_uid, relative_path)
+        user_storage_root.join(&relative_path)
     };
 
-    let file_path = PathBuf::from(full_path);
-    let mut files = Vec::new();
+    if !full_path.is_dir() {
+        return Err(StatusCode::NOT_FOUND);
+    }
 
-    match fs::read_dir(&file_path).await {
-        Ok(mut dir) => {
-            while let Ok(Some(entry)) = dir.next_entry().await {
-                let path = entry.path();
-                let file_name = match entry.file_name().into_string() {
-                    Ok(name) => name,
-                    Err(_) => continue,
+    let files_result = task::spawn_blocking(move || {
+        let mut files = Vec::new();
+
+        for entry in WalkDir::new(&full_path)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            let entry_path = entry.path();
+
+            let file_name = match entry.file_name().to_str() {
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+
+            if let Ok(metadata) = entry.metadata() {
+                let unix_timestamp = metadata
+                    .created()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs());
+
+                let is_dir = metadata.is_dir();
+
+                let mime_type = if is_dir {
+                    "directory".to_string()
+                } else {
+                    from_path(entry_path).first_or_octet_stream().to_string()
                 };
 
-                if let Ok(metadata) = entry.metadata().await {
-                    let created = metadata.created().ok();
-                    let unix_timestamp = created
-                        .and_then(|created| created.duration_since(UNIX_EPOCH).ok())
-                        .map_or(0, |duration| duration.as_secs());
+                let file_size = if is_dir { 0 } else { metadata.len() };
 
-                    let mime_type = if metadata.is_dir() {
-                        "directory".to_string()
-                    } else {
-                        from_path(&path).first_or_octet_stream().to_string()
-                    };
+                let relative_entry_path = entry_path
+                    .strip_prefix(&user_storage_root)
+                    .unwrap_or(entry_path)
+                    .to_str()
+                    .unwrap_or("")
+                    .to_string();
 
-                    let file_size = if metadata.is_dir() {
-                        get_dir_size(&path).await
-                    } else {
-                        metadata.len()
-                    };
-
-                    files.push(FileDetail {
-                        name: file_name,
-                        created: unix_timestamp,
-                        file_type: mime_type,
-                        size: file_size,
-                    });
-                }
+                files.push(FileDetail {
+                    name: file_name,
+                    path: relative_entry_path,
+                    created: unix_timestamp,
+                    file_type: mime_type,
+                    size: file_size,
+                });
             }
         }
-        Err(_) => return Err(StatusCode::NOT_FOUND),
-    };
+        files
+    })
+    .await;
 
-    let response_body = json!({ "files": files });
-    Ok(Json(response_body))
+    match files_result {
+        Ok(files) => {
+            let response_body = json!({ "files": files });
+            Ok(Json(response_body))
+        }
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 pub async fn view_file(
