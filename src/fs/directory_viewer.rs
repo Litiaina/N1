@@ -17,6 +17,7 @@ use std::time::UNIX_EPOCH;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 use tokio::{fs, task};
 use tokio_util::io::ReaderStream;
+use tracing::error;
 use walkdir::WalkDir;
 
 pub async fn view_directory(
@@ -39,8 +40,14 @@ pub async fn view_directory(
     };
 
     if !full_path.is_dir() {
+        error!(
+            "Requested path not found or not a directory: {:?}",
+            full_path
+        );
         return Err(StatusCode::NOT_FOUND);
     }
+
+    let root_clone = user_storage_root.clone();
 
     let files_result = task::spawn_blocking(move || {
         let mut files = Vec::new();
@@ -65,7 +72,6 @@ pub async fn view_directory(
                     .map_or(0, |d| d.as_secs());
 
                 let is_dir = metadata.is_dir();
-
                 let mime_type = if is_dir {
                     "directory".to_string()
                 } else {
@@ -75,11 +81,10 @@ pub async fn view_directory(
                 let file_size = if is_dir { 0 } else { metadata.len() };
 
                 let relative_entry_path = entry_path
-                    .strip_prefix(&user_storage_root)
+                    .strip_prefix(&root_clone)
                     .unwrap_or(entry_path)
-                    .to_str()
-                    .unwrap_or("")
-                    .to_string();
+                    .to_string_lossy()
+                    .replace('\\', "/");
 
                 files.push(FileDetail {
                     name: file_name,
@@ -95,11 +100,11 @@ pub async fn view_directory(
     .await;
 
     match files_result {
-        Ok(files) => {
-            let response_body = json!({ "files": files });
-            Ok(Json(response_body))
+        Ok(files) => Ok(Json(json!({ "files": files }))),
+        Err(e) => {
+            error!("Directory scan task failed: {:?}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 

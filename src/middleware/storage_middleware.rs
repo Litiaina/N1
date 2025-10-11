@@ -1,3 +1,4 @@
+use crate::structs::auth_structs::Claims;
 use crate::validation::directory_validation::{get_allocated_storage, get_dir_size};
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
@@ -5,15 +6,14 @@ use axum::middleware::Next;
 use axum::response::IntoResponse;
 use std::path::PathBuf;
 
-pub async fn enforce_storage_limit(req: Request, next: Next) -> impl IntoResponse {
+pub async fn enforce_storage_limit(claims: Claims, req: Request, next: Next) -> impl IntoResponse {
     let method = req.method();
-    let headers = req.headers();
 
     if matches!(method, &Method::OPTIONS | &Method::HEAD) {
         return next.run(req).await;
     }
 
-    let uid = headers.get("uid").and_then(|v| v.to_str().ok());
+    let uid = Some(claims.uid.as_str());
 
     let uid = match uid {
         Some(key) if !key.is_empty() => key,
