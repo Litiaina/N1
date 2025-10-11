@@ -52,9 +52,9 @@ async fn main() {
         .init();
 
     let current_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    tracing::info!("╔═════════════════════════════════════════════════════════════╗");
-    tracing::info!("║         L I T I A I N A  S T O R A G E  S E R V E R         ║");
-    tracing::info!("╚═════════════════════════════════════════════════════════════╝");
+    tracing::info!("╔══════════════════════════════════════╗");
+    tracing::info!("║         L I T I A I N A  N 1         ║");
+    tracing::info!("╚══════════════════════════════════════╝");
     tracing::info!("{} - Status: ONLINE", current_time);
     tracing::info!("Press CTRL+C to terminate");
     tracing::info!("══════════════ ACTIVE CONNECTIONS ══════════════");
