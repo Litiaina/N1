@@ -18,7 +18,7 @@ It bridges two storage paradigms — a **hierarchical file system** and an **obj
 ## ✨ Core Features
 
 > 🗂️ **Unified File & Object Storage**  
-> - Combines **POSIX-style file system** semantics with **S3-compatible object APIs**.  
+> - Combines **POSIX-style file system** semantics with **Custom object APIs**.  
 > - Ideal for **application backends**, **local archives**, or **edge deployments** needing dual access patterns.  
 >  
 > ⚙️ **Optimized Structured Data Handling**  
