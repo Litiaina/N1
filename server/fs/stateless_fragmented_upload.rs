@@ -227,7 +227,7 @@ async fn save_chunk_binary(
                 })?;
 
             let computed_hash = hasher.finalize();
-            if expected_bytes.as_slice() != computed_hash.as_slice() {
+            if expected_bytes.as_slice() != computed_hash.as_ref() as &[u8] {
                 warn!(
                     "Checksum mismatch for chunk {}: expected (b64) {}, got (hex) {}",
                     index,

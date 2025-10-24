@@ -6,5 +6,7 @@ pub fn create_env_file(path: &str) -> io::Result<()> {
     writeln!(file, "JWT_SECRET=enter_jwt_secret_here")?;
     writeln!(file, "URL_SIGNING_SECRET=enter_url_signing_secret_here")?;
     writeln!(file, "DATABASE_URL=mongodb://localhost:27017")?;
+    writeln!(file, "SERVER_AUTH_KEY=enter_server_auth_key_here")?;
+    writeln!(file, "SERVER_AUTH_PATH=userdata/server/admin/key")?;
     Ok(())
 }

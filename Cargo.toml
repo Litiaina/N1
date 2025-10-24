@@ -36,3 +36,9 @@ base64 = "0.22.1"
 rust-ini = "0.21.3"
 rustls = { version = "0.23.31", features = ["ring"] }
 features = "0.10.0"
+server_cli = { path = "./server_cli" }
+hostname = "0.4.1"
+
+[[bin]]
+name = "litiaina-n1"
+path = "server/main.rs"
