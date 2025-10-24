@@ -4,6 +4,8 @@ pub enum CliCommand {
     Exit,
     Status,
     Help,
+    Clear,
+    Clean,
     Unknown(String),
 }
 
@@ -13,6 +15,8 @@ impl CliCommand {
             "/exit" => CliCommand::Exit,
             "/status" => CliCommand::Status,
             "/help" => CliCommand::Help,
+            "/clear" => CliCommand::Clear,
+            "/clean" => CliCommand::Clean,
             other => CliCommand::Unknown(other.to_string()),
         }
     }

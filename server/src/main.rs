@@ -1,10 +1,12 @@
-use crate::fs::cleanup_manager::cleanup_stale_uploads;
+use crate::fs::cleanup_manager::{interval_cleanup, start_cleanup};
 use crate::fs::fs_constants::{CONFIG_FILE, ENV_FILE, STORAGE_ROOT};
 use crate::handlers::error_handlers::handler_404;
+use crate::object_storage::garbage_collector::run_garbage_collector;
 use crate::object_storage::setup::setup_database_locks;
-use crate::routes::storage_routes::serve_storage_routes;
+use crate::routes::storage_routes::{AppState, serve_storage_routes};
 use crate::settings::create_config::create_default_config_ini;
 use crate::settings::create_env::create_env_file;
+use crate::statics::database_statics::DATABASE_URL;
 use crate::structs::port_struct::Ports;
 use crate::utils::date_time_formatter::LocalTimer;
 use axum::handler::HandlerWithoutStateExt;
@@ -17,7 +19,9 @@ use axum_server::tls_rustls::RustlsConfig;
 use chrono::Local;
 use dotenv::dotenv;
 use ini::Ini;
-use server_cli::server_login;
+use mongodb::Client;
+use mongodb::options::ClientOptions;
+use server_core::{self, server_login, start_cli};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::str::FromStr;
@@ -114,8 +118,14 @@ async fn main() {
     tracing::info!("│ Start Time     : {}", current_time);
     tracing::info!("│ Administrator  : {}", user);
     tracing::info!("│ PID            : {}", std::process::id());
-    tracing::info!("│ Hostname       : {}", hostname::get().unwrap_or_default().to_string_lossy());
-    tracing::info!("│ Working Dir    : {}", std::env::current_dir().unwrap_or_default().display());
+    tracing::info!(
+        "│ Hostname       : {}",
+        hostname::get().unwrap_or_default().to_string_lossy()
+    );
+    tracing::info!(
+        "│ Working Dir    : {}",
+        std::env::current_dir().unwrap_or_default().display()
+    );
     tracing::info!("│ Command        : /exit to terminate the session");
     tracing::info!("╞════════════════════════ ACTIVE CONNECTIONS ════════════════════════╡");
 
@@ -128,7 +138,7 @@ async fn main() {
 
 pub async fn run_server() {
     tokio::spawn(async {
-        cleanup_stale_uploads(STORAGE_ROOT).await;
+        interval_cleanup(STORAGE_ROOT).await;
     });
 
     let config = Ini::load_from_file("config.ini").expect("Failed to load config.ini");
@@ -191,8 +201,25 @@ pub async fn run_server() {
 
     {
         tokio::time::sleep(Duration::from_millis(100)).await;
+        let client_options = ClientOptions::parse(&*DATABASE_URL)
+            .await
+            .expect("Failed to parse MongoDB URI");
+        let db_client = Arc::new(
+            Client::with_options(client_options).expect("Failed to create MongoDB client"),
+        );
+        let app_state = Arc::new(AppState {
+            db_client: Arc::clone(&db_client),
+        });
+
         tokio::spawn(async move {
-            server_cli::initialize::start_cli(Arc::clone(&shutdown_handle)).await;
+            start_cli(shutdown_handle, move || {
+                let app_state = Arc::clone(&app_state);
+                async move {
+                    run_garbage_collector(Arc::clone(&app_state.db_client)).await;
+                    start_cleanup(STORAGE_ROOT).await;
+                }
+            })
+            .await;
         });
     }
 

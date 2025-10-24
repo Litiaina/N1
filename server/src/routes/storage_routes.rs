@@ -13,7 +13,7 @@ use crate::handlers::dir_info_handlers::get_storage_capacity;
 use crate::handlers::transcoder_handler::{transcode_status_handler, transcode_video_handler};
 use crate::middleware::auth_middleware::{auth, authorize};
 use crate::middleware::storage_middleware::enforce_storage_limit;
-use crate::object_storage::garbage_collector::run_garbage_collector;
+use crate::object_storage::garbage_collector::interval_garbage_collector;
 use crate::statics::database_statics::DATABASE_URL;
 use axum::http::{HeaderName, Method, StatusCode};
 use axum::middleware::from_fn;
@@ -44,7 +44,7 @@ pub async fn serve_storage_routes() -> Router {
     Arc::new(AppState { db_client: Arc::clone(&db_client) });
 
     tokio::spawn(async move {
-        run_garbage_collector(Arc::clone(&db_client)).await;
+        interval_garbage_collector(Arc::clone(&db_client)).await;
     });
 
     let cors_layer = CorsLayer::new()

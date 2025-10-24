@@ -14,8 +14,8 @@ use std::{env, fs};
 use tokio::io::{AsyncBufReadExt, BufReader, stdin};
 use tracing::{error, info};
 
-use crate::constants::{NONCE_LEN, PBKDF2_ITERATIONS, SALT_LEN};
-use crate::parser;
+use crate::cli::constants::{NONCE_LEN, PBKDF2_ITERATIONS, SALT_LEN};
+use crate::cli::parser;
 
 fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
     let mut key = [0u8; 32];

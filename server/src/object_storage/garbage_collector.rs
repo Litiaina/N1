@@ -16,6 +16,38 @@ use tokio::{fs, time::sleep};
 use tracing::{info, warn};
 
 pub async fn run_garbage_collector(db_client: Arc<MongoClient>) {
+    let cleanup_interval = StdDuration::from_secs(3);
+    let file_ttl = StdDuration::from_secs(3);
+
+    info!(
+        "Object storage cleaning in: {:?}, File TTL: {:?}",
+        cleanup_interval, file_ttl
+    );
+
+    sleep(cleanup_interval).await;
+    info!("Cleaning object stale pending uploads...");
+
+    loop {
+        match cleanup_one_stale_upload(&db_client, file_ttl).await {
+            Ok(Some(session_id)) => {
+                info!("🗑️ Cleaned up stale upload session: {}", session_id);
+            }
+            Ok(None) => {
+                info!("🗑️ No more stale pending uploads found in this cycle.");
+                break;
+            }
+            Err(e) => {
+                warn!(
+                    "🗑️ Garbage collection failed on one record, ending cycle early: {}",
+                    e
+                );
+                break;
+            }
+        }
+    }
+}
+
+pub async fn interval_garbage_collector(db_client: Arc<MongoClient>) {
     let cleanup_interval =
         StdDuration::from_secs(CONFIG.garbage_collector.cleanup_interval_seconds);
     let file_ttl = StdDuration::from_secs(CONFIG.garbage_collector.file_ttl_seconds);
