@@ -11,7 +11,6 @@ pub mod rename_params_struct;
 pub mod resumable_upload_status_struct;
 pub mod stateless_fragment_upload_structs;
 pub mod transcoder_structs;
-pub mod upload_metadata_struct;
 pub mod upload_params_struct;
 pub mod upload_session_struct;
 pub mod object_storage_structs;

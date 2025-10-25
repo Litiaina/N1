@@ -307,16 +307,21 @@ where
 
 pub async fn shutdown_signal(handle: Arc<axum_server::Handle>) {
     #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
-    };
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate =
+            signal(SignalKind::terminate()).expect("failed to install signal handler");
+
+        terminate.recv().await;
+    }
 
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    terminate.await;
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to listen for ctrl+c event");
+    }
 
     handle.graceful_shutdown(Some(Duration::from_secs(10)));
 }
