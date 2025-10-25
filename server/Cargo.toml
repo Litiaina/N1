@@ -45,3 +45,4 @@ rust-ini.workspace = true
 rustls.workspace = true
 features.workspace = true
 hostname.workspace = true
+bytes.workspace = true

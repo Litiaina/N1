@@ -1,19 +1,20 @@
-use std::io::SeekFrom;
-use std::path::PathBuf;
-use axum::body::Body;
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
-use tokio_util::io::ReaderStream;
-use tower::ServiceExt;
-use tracing::error;
 use crate::enums::app_error_enum::AppError;
 use crate::fs::fs_constants::INITIAL_CHUNK_SIZE;
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_STORAGE_ROOT};
 use crate::object_storage::error_parser::physical_path_error;
 use crate::object_storage::header_parser::parse_range_header;
 use crate::structs::object_storage_structs::ObjectMetadata;
+use axum::body::Body;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
+use futures_util::stream;
+use std::io::SeekFrom;
+use std::path::PathBuf;
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tower::ServiceExt;
+use tracing::error;
 
 pub async fn get_object_logic(
     metadata: ObjectMetadata,
@@ -81,8 +82,35 @@ pub async fn stream_object_logic(
         .map_err(|e| AppError::Io(e, format!("seeking in file '{}'", physical_path.display())))?;
 
     let content_length = end - start + 1;
-    let reader = BufReader::new(file);
-    let stream = ReaderStream::new(reader.take(content_length));
+
+    let chunk_size: usize = match file_size {
+        0..=10_000_000 => 64 * 1024,
+        10_000_001..=100_000_000 => 128 * 1024,
+        100_000_001..=1_000_000_000 => 256 * 1024,
+        _ => 512 * 1024,
+    };
+
+    let stream = stream::unfold(
+        (file, content_length),
+        move |(mut file, mut remaining)| async move {
+            if remaining == 0 {
+                return None;
+            }
+
+            let mut buf = vec![0u8; chunk_size.min(remaining as usize)];
+            match file.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(n) => {
+                    remaining -= n as u64;
+                    buf.truncate(n);
+                    let bytes = Bytes::from(buf);
+                    Some((Ok::<Bytes, std::io::Error>(bytes), (file, remaining)))
+                }
+                Err(e) => Some((Err(e), (file, remaining))),
+            }
+        },
+    );
+
     let body = Body::from_stream(stream);
 
     let response = Response::builder()
@@ -94,7 +122,7 @@ pub async fn stream_object_logic(
             header::CONTENT_RANGE,
             format!("bytes {}-{}/{}", start, end, file_size),
         )
-        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CACHE_CONTROL, "public, max-age=3600")
         .body(body)
         .map_err(|e| AppError::InternalServerError(format!("Failed to build response: {}", e)))?;
 
