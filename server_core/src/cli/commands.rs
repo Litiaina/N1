@@ -66,20 +66,11 @@ where
                 info!("│ CPU usage          : {:.2} %", process.cpu_usage());
                 info!("│ Disk usage (read)  : {} bytes", disk.read_bytes);
                 info!("│ Disk usage (write) : {} bytes", disk.written_bytes);
-                info!(
-                    "│ Disk usage (total) : {} bytes",
-                    disk.total_read_bytes + disk.total_written_bytes
-                );
+                info!("│ Disk usage (total) : {} bytes",disk.total_read_bytes + disk.total_written_bytes);
                 info!("│ Memory usage       : {} bytes", process.memory());
                 info!("│ PID                : {}", std::process::id());
-                info!(
-                    "│ Hostname           : {}",
-                    hostname::get().unwrap_or_default().to_string_lossy()
-                );
-                info!(
-                    "│ Working Dir        : {}",
-                    std::env::current_dir().unwrap_or_default().display()
-                );
+                info!("│ Hostname           : {}",hostname::get().unwrap_or_default().to_string_lossy());
+                info!("│ Working Dir        : {}",std::env::current_dir().unwrap_or_default().display());
             } else {
                 error!("Process not found!");
             }
