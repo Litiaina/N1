@@ -193,7 +193,7 @@ pub async fn run_server() {
 
     {
         tokio::spawn(async move {
-            let (handle, join) = serve(storage_addr, serve_storage, storage_ports, cert).await;
+            let (handle, join) = serve(ip, storage_addr, serve_storage, storage_ports, cert).await;
             let mut lock = shutdown_handle_clone.lock().await;
             *lock = Some((handle, join));
         });
@@ -229,6 +229,7 @@ pub async fn run_server() {
 }
 
 async fn serve(
+    ip: IpAddr,
     socket: SocketAddr,
     app: Router,
     ports: Ports,
@@ -241,6 +242,7 @@ async fn serve(
     let handle_clone_for_redirect = Arc::clone(&handle);
     tokio::spawn(async move {
         redirect_http_to_https(
+            ip,
             ports,
             shutdown_signal(Arc::clone(&handle_clone_for_redirect)),
         )
@@ -257,7 +259,7 @@ async fn serve(
     (handle, join)
 }
 
-async fn redirect_http_to_https<F>(ports: Ports, signal: F)
+async fn redirect_http_to_https<F>(ip: IpAddr, ports: Ports, signal: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
@@ -296,7 +298,7 @@ where
         }
     };
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], ports.http));
+    let addr = SocketAddr::from((ip, ports.http));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     tracing::info!("Port => {} type: http", addr);
     axum::serve(listener, redirect.into_make_service())

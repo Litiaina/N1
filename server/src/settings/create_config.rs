@@ -10,7 +10,8 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("http_port", "51000")
         .set("https_port", "50001")
         .set("cert_path", "certificates/cert.pem")
-        .set("key_path", "certificates/key.pem");
+        .set("key_path", "certificates/key.pem")
+        .set("sharable_url", "https://127.0.0.1:50001");
 
     //Garbage Collector
     conf.with_section(Some("garbage_collector"))

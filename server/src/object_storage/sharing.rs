@@ -15,6 +15,7 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use chrono::{Duration, Utc};
 use hmac::{Hmac, Mac};
+use ini::Ini;
 use mongodb::bson::doc;
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode, utf8_percent_encode};
 use sha2::Sha256;
@@ -25,8 +26,16 @@ use std::sync::{Arc, LazyLock};
 static URL_SIGNING_SECRET: LazyLock<String> =
     LazyLock::new(|| env::var("URL_SIGNING_SECRET").expect("URL_SIGNING_SECRET must be set"));
 
+static BASE_URL: LazyLock<String> = LazyLock::new(|| {
+    let config = Ini::load_from_file("config.ini").unwrap_or_else(|_| Ini::new());
+    let server_section = config.section(Some("server"));
+
+    server_section
+        .and_then(|sec| sec.get("sharable_url"))
+        .unwrap_or("https://127.0.0.1:50001").to_string()
+});
+
 const MAX_EXPIRATION_SECONDS: i64 = 60 * 60 * 24 * 7;
-const BASE_URL: &str = "https://storage.litiaina.com";
 
 const QUERY_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -80,7 +89,7 @@ pub async fn create_signed_url(
 
     let url = format!(
         "{}/v4/public/share?owner_uid={}&fragment={}&object_key={}&expires={}&signature={}&disposition={}",
-        BASE_URL,
+        BASE_URL.to_string(),
         utf8_percent_encode(&metadata.owner_uid, QUERY_ENCODE_SET),
         utf8_percent_encode(&payload.fragment, QUERY_ENCODE_SET),
         utf8_percent_encode(&payload.object_key, QUERY_ENCODE_SET),
