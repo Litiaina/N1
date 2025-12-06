@@ -1,14 +1,13 @@
 use crate::fs::cleanup_manager::{interval_cleanup, start_cleanup};
-use crate::fs::fs_constants::{CONFIG_FILE, ENV_FILE, STORAGE_ROOT};
+use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
 use crate::object_storage::garbage_collector::run_garbage_collector;
 use crate::object_storage::setup::setup_database_locks;
 use crate::routes::storage_routes::{AppState, serve_storage_routes};
-use crate::settings::create_config::create_default_config_ini;
-use crate::settings::create_env::create_env_file;
 use crate::statics::database_statics::DATABASE_URL;
 use crate::structs::port_struct::Ports;
 use crate::utils::date_time_formatter::LocalTimer;
+use crate::validation::enforce_init_settings::{ensure_config_file, ensure_env_file};
 use axum::handler::HandlerWithoutStateExt;
 use axum::http::uri::Authority;
 use axum::http::{StatusCode, Uri};
@@ -23,7 +22,6 @@ use mongodb::Client;
 use mongodb::options::ClientOptions;
 use server_core::{self, server_login, start_cli};
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,38 +67,17 @@ async fn main() {
 
     init_tracing().expect("Failed to initialize tracing subscriber");
 
-    if !Path::new(ENV_FILE).exists() {
-        match create_env_file(ENV_FILE) {
-            Ok(_) => {
-                tracing::info!(
-                    "Created .env file. Please configure it with your environment variables."
-                );
-            }
-            Err(e) => {
-                eprintln!("Failed to create .env file: {}", e);
-                return;
-            }
-        }
-    } else {
-        dotenv().ok();
-        tracing::info!("Loaded environment variables from .env file.");
+    if let Err(e) = ensure_env_file() {
+        tracing::error!("Failed to ensure .env file: {}", e);
+        return;
     }
 
-    if !Path::new(CONFIG_FILE).exists() {
-        match create_default_config_ini(CONFIG_FILE) {
-            Ok(_) => {
-                tracing::info!(
-                    "Created default '{}' file with standard settings.",
-                    CONFIG_FILE
-                );
-            }
-            Err(e) => {
-                tracing::error!("FATAL: Failed to create '{}' file: {}", CONFIG_FILE, e);
-                return;
-            }
-        }
-    } else {
-        tracing::info!("Loaded configuration from '{}' file.", CONFIG_FILE);
+    dotenv().ok();
+    tracing::info!("Loaded environment variables from .env file.");
+
+    if let Err(e) = ensure_config_file() {
+        tracing::error!("Failed to ensure config file: {}", e);
+        return;
     }
 
     let user = loop {
@@ -118,14 +95,8 @@ async fn main() {
     tracing::info!("│ Start Time     : {}", current_time);
     tracing::info!("│ Administrator  : {}", user);
     tracing::info!("│ PID            : {}", std::process::id());
-    tracing::info!(
-        "│ Hostname       : {}",
-        hostname::get().unwrap_or_default().to_string_lossy()
-    );
-    tracing::info!(
-        "│ Working Dir    : {}",
-        std::env::current_dir().unwrap_or_default().display()
-    );
+    tracing::info!("│ Hostname       : {}", hostname::get().unwrap_or_default().to_string_lossy());
+    tracing::info!("│ Working Dir    : {}", std::env::current_dir().unwrap_or_default().display());
     tracing::info!("│ Command        : /exit to terminate the session");
     tracing::info!("╞════════════════════════ ACTIVE CONNECTIONS ════════════════════════╡");
 

@@ -1,31 +1,51 @@
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Write};
+use std::path::Path;
 
-pub fn create_env_file(path: &str) -> io::Result<()> {
-    let mut file = File::create(path)?;
+use tracing::info;
 
-    // DATABASE
-    writeln!(file, "# ==========================")?;
-    writeln!(file, "# DATABASE")?;
-    writeln!(file, "# ==========================")?;
-    writeln!(file, "DATABASE_URL=mongodb://localhost:27017")?;
+pub fn create_env_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
+    let path = path.as_ref();
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let tmp_path = path.with_extension("tmp");
+    let mut file = File::create(&tmp_path)?;
+
+    writeln!(file, "# ───────────────── N1 ENV CONFIGURATION ─────────────────")?;
+    writeln!(file, "# Edit these values before starting the server.")?;
     writeln!(file)?;
 
-    // SERVER AUTH
-    writeln!(file, "# ==========================")?;
-    writeln!(file, "# SERVER AUTH")?;
-    writeln!(file, "# ==========================")?;
+    writeln!(file, "# Secret key used for signing JWT tokens")?;
+    writeln!(file, "JWT_SECRET=enter_jwt_secret_here")?;
+    writeln!(file)?;
+
+    writeln!(file, "# Secret key used for URL signing and validation")?;
+    writeln!(file, "URL_SIGNING_SECRET=enter_url_signing_secret_here")?;
+    writeln!(file)?;
+
+    writeln!(file, "# Server authentication key (for admin access)")?;
     writeln!(file, "SERVER_AUTH_KEY=enter_server_auth_key_here")?;
+    writeln!(file)?;
+
+    writeln!(file, "# Path to the server admin key storage")?;
     writeln!(file, "SERVER_AUTH_PATH=userdata/server/admin/key")?;
     writeln!(file)?;
 
-    // SECURITY
-    writeln!(file, "# ==========================")?;
-    writeln!(file, "# SECURITY")?;
-    writeln!(file, "# ==========================")?;
-    writeln!(file, "JWT_SECRET=enter_jwt_secret_here")?;
-    writeln!(file, "URL_SIGNING_SECRET=enter_url_signing_secret_here")?;
+    writeln!(file,"# MongoDB connection string (update if remote DB is used)")?;
+    writeln!(file, "DATABASE_URL=mongodb://localhost:27017")?;
     writeln!(file)?;
+
+    writeln!(file,"# ─────────────────────────────────────────────────────────")?;
+
+    file.flush()?;
+    drop(file);
+
+    fs::rename(&tmp_path, &path)?;
+
+    info!("Created new .env file at '{}'. Please configure it before running the server.", path.display());
 
     Ok(())
 }
