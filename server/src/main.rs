@@ -224,7 +224,7 @@ async fn serve(
     server.http_builder().http2().enable_connect_protocol();
 
     let join = tokio::spawn(async move {
-        server.serve(app.into_make_service()).await.unwrap();
+        server.serve(app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
     });
 
     (handle, join)

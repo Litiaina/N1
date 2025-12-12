@@ -20,7 +20,7 @@ use std::fmt::Display;
 use std::sync::LazyLock;
 use std::time::SystemTime;
 
-static JWT_KEYS: LazyLock<Keys> = LazyLock::new(|| {
+pub static JWT_KEYS: LazyLock<Keys> = LazyLock::new(|| {
     let secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
     Keys::new(secret.as_bytes())
 });
@@ -128,9 +128,9 @@ impl IntoResponse for AuthError {
     }
 }
 
-struct Keys {
-    encoding: EncodingKey,
-    decoding: DecodingKey,
+pub struct Keys {
+    pub encoding: EncodingKey,
+    pub decoding: DecodingKey,
 }
 
 impl Keys {

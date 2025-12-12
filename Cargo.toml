@@ -43,3 +43,5 @@ pbkdf2 = "0.12.2"
 bson = { version = "3.0.0", features = ["serde"] }
 sysinfo = "0.37.2"
 bytes = "1.10.1"
+tower_governor = "0.8.0"
+governor = "0.10.2"

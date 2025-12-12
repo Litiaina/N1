@@ -46,3 +46,5 @@ rustls.workspace = true
 features.workspace = true
 hostname.workspace = true
 bytes.workspace = true
+tower_governor.workspace = true
+governor.workspace = true
