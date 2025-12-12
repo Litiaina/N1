@@ -37,8 +37,8 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("view_limit_per_second", "30")
         .set("view_limit_burst_size", "100") 
         // Upload: Accommodates 6 parallel workers on high-speed connections
-        .set("upload_limit_per_second", "100")
-        .set("upload_limit_burst_size", "50")
+        .set("upload_limit_per_second", "300")
+        .set("upload_limit_burst_size", "3000")
         // Transcode: Very CPU heavy, strict limit
         .set("transcode_limit_per_second", "1")
         .set("transcode_limit_burst_size", "2")

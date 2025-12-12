@@ -16,7 +16,7 @@ use crate::middleware::rate_limiter_middleware::{RateLimitLayers};
 use crate::middleware::storage_middleware::enforce_storage_limit;
 use crate::object_storage::garbage_collector::interval_garbage_collector;
 use crate::statics::database_statics::DATABASE_URL;
-use axum::http::{HeaderName, Method, StatusCode};
+use axum::http::{HeaderName, Method};
 use axum::middleware::from_fn;
 use axum::routing::{delete, get, patch, post, put};
 use axum::{extract::DefaultBodyLimit, Router};
@@ -57,6 +57,7 @@ pub async fn serve_storage_routes() -> Router {
             HeaderName::from_static("content-type"),
             HeaderName::from_static("digest"),
             HeaderName::from_static("buffer"),
+            HeaderName::from_static("range"), 
         ])
         .allow_methods([
             Method::GET,
@@ -70,27 +71,27 @@ pub async fn serve_storage_routes() -> Router {
 
     let object_storage_routes = {
         let read_ops = Router::new()
-            .route("/v4/capacity/usage", get(get_capacity_usage).options(options_handler))
-            .route("/v4/fragment/metadata", get(list_fragments).options(options_handler))
-            .route("/v4/fragment/object/metadata/{:fragment}", get(list_objects).options(options_handler))
-            .route("/v4/fragment/object/get/{:fragment}/{*object_key}", get(get_object).options(options_handler))
-            .route("/v4/fragment/object/stream/{:fragment}/{*object_key}", get(stream_object).options(options_handler))
-            .route("/v4/fragment/object/get/metadata/{:fragment}/{*object_key}", get(get_object_metadata).options(options_handler))
-            .route("/v4/fragment/object/download/{:fragment}/{*object_key}", get(download_object).options(options_handler))
-            .route("/v4/fragment/object/download/v2/{:fragment}/{*object_key}", get(download_object_chunk).options(options_handler))
-            .route("/v4/fragment/object/upload/status/{:file_id}", get(get_object_upload_status).options(options_handler))
+            .route("/v4/capacity/usage", get(get_capacity_usage))
+            .route("/v4/fragment/metadata", get(list_fragments))
+            .route("/v4/fragment/object/metadata/{:fragment}", get(list_objects))
+            .route("/v4/fragment/object/get/{:fragment}/{*object_key}", get(get_object))
+            .route("/v4/fragment/object/stream/{:fragment}/{*object_key}", get(stream_object))
+            .route("/v4/fragment/object/get/metadata/{:fragment}/{*object_key}", get(get_object_metadata))
+            .route("/v4/fragment/object/download/{:fragment}/{*object_key}", get(download_object))
+            .route("/v4/fragment/object/download/v2/{:fragment}/{*object_key}", get(download_object_chunk))
+            .route("/v4/fragment/object/upload/status/{:file_id}", get(get_object_upload_status))
             .route("/v4/fragment/object/share", post(create_signed_url));
 
         let read_ops = layers.layer_view(read_ops);
 
         let write_ops = Router::new()
-            .route("/v4/fragment/object/rename", patch(rename_object).options(options_handler))
-            .route("/v4/fragment/object/delete/{:fragment}/{*object_key}", delete(delete_object).options(options_handler))
-            .route("/v4/fragment/object/delete/prefix", delete(delete_objects_by_prefix).options(options_handler))
-            .route("/v4/fragment/object/upload/init/{:fragment}/{*object_key}", post(initiate_object_upload).options(options_handler))
-            .route("/v4/fragment/object/upload/chunk/{:file_id}/{:chunk_index}", put(object_upload_chunk).options(options_handler))
-            .route("/v4/fragment/object/upload/chunk/raw/{:file_id}/{:chunk_index}", put(object_upload_chunk_raw).options(options_handler))
-            .route("/v4/fragment/object/upload/finalize/{:file_id}", post(finalize_object_upload).options(options_handler));
+            .route("/v4/fragment/object/rename", patch(rename_object))
+            .route("/v4/fragment/object/delete/{:fragment}/{*object_key}", delete(delete_object))
+            .route("/v4/fragment/object/delete/prefix", delete(delete_objects_by_prefix))
+            .route("/v4/fragment/object/upload/init/{:fragment}/{*object_key}", post(initiate_object_upload))
+            .route("/v4/fragment/object/upload/chunk/{:file_id}/{:chunk_index}", put(object_upload_chunk))
+            .route("/v4/fragment/object/upload/chunk/raw/{:file_id}/{:chunk_index}", put(object_upload_chunk_raw))
+            .route("/v4/fragment/object/upload/finalize/{:file_id}", post(finalize_object_upload));
         
         let write_ops = layers.layer_upload(write_ops);
 
@@ -99,29 +100,29 @@ pub async fn serve_storage_routes() -> Router {
             .merge(write_ops)
             .layer(from_fn(auth));
 
-        let sharing_routes = Router::new()
+        let public_routes = Router::new()
             .route("/v4/public/share", get(get_shared_object));
         
-        let sharing_routes = layers.layer_sharing(sharing_routes);
+        let public_routes = layers.layer_sharing(public_routes);
 
         Router::new()
             .merge(protected_routes)
-            .merge(sharing_routes)
+            .merge(public_routes)
             .with_state(Arc::clone(&app_state))
     };
 
     let legacy_fs_routes = {
         let upload_routes = Router::new()
-            .route("/dir/file/upload/", post(upload_file).options(options_handler))
-            .route("/dir/file/upload/{*path}", post(upload_file).options(options_handler))
-            .route("/dir/file/upload/v2/", post(upload_fragments).options(options_handler))
-            .route("/dir/file/upload/v2/{*path}", post(upload_fragments).options(options_handler))
-            .route("/dir/file/upload/v3/initiate/", post(legacy_upload::initiate_upload_session).options(options_handler))
-            .route("/dir/file/upload/v3/initiate/{*path}", post(legacy_upload::initiate_upload_session).options(options_handler))
-            .route("/dir/file/upload/multipart/v3/{:file_id}/{:chunk_index}", put(legacy_upload::upload_chunk_multipart).options(options_handler))
-            .route("/dir/file/upload/v3/{:file_id}/{:chunk_index}", put(legacy_upload::upload_chunk_binary).options(options_handler))
-            .route("/dir/file/upload/v3/{:file_id}/status", get(legacy_upload::get_upload_status).options(options_handler))
-            .route("/dir/file/upload/v3/{:file_id}/finalize", post(legacy_upload::finalize_upload_session).options(options_handler))
+            .route("/dir/file/upload/", post(upload_file))
+            .route("/dir/file/upload/{*path}", post(upload_file))
+            .route("/dir/file/upload/v2/", post(upload_fragments))
+            .route("/dir/file/upload/v2/{*path}", post(upload_fragments))
+            .route("/dir/file/upload/v3/initiate/", post(legacy_upload::initiate_upload_session))
+            .route("/dir/file/upload/v3/initiate/{*path}", post(legacy_upload::initiate_upload_session))
+            .route("/dir/file/upload/multipart/v3/{:file_id}/{:chunk_index}", put(legacy_upload::upload_chunk_multipart))
+            .route("/dir/file/upload/v3/{:file_id}/{:chunk_index}", put(legacy_upload::upload_chunk_binary))
+            .route("/dir/file/upload/v3/{:file_id}/status", get(legacy_upload::get_upload_status))
+            .route("/dir/file/upload/v3/{:file_id}/finalize", post(legacy_upload::finalize_upload_session))
             .layer(from_fn(enforce_storage_limit));
         
         let upload_routes = layers.layer_upload(upload_routes);
@@ -174,7 +175,7 @@ pub async fn serve_storage_routes() -> Router {
         .with_state(Arc::clone(&app_state));
 
     let ping_route = Router::new()
-        .route("/ping", get(ping).options(options_handler));
+        .route("/ping", get(ping));
     let ping_route = layers.layer_global(ping_route); 
 
     Router::new()
@@ -188,8 +189,4 @@ pub async fn serve_storage_routes() -> Router {
 
 async fn ping() -> &'static str {
     "pong"
-}
-
-async fn options_handler() -> StatusCode {
-    StatusCode::OK
 }

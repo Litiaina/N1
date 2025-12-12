@@ -64,8 +64,8 @@ fn get_rate_limit_config() -> RateLimitSettings {
             auth_burst: 5,
             view_per_sec: 30,
             view_burst: 100,
-            upload_per_sec: 100,
-            upload_burst: 50,
+            upload_per_sec: 300,
+            upload_burst: 3000,
             transcode_per_sec: 1,
             transcode_burst: 2,
             sharing_per_sec: 50,
@@ -112,8 +112,8 @@ fn get_rate_limit_config() -> RateLimitSettings {
                             transcode_per_sec: get_val!("transcode_limit_per_second", defaults.transcode_per_sec),
                             transcode_burst: get_val!("transcode_limit_burst_size", defaults.transcode_burst),
 
-                            sharing_per_sec: get_val!("sharing_per_second", defaults.global_per_sec),
-                            sharing_burst: get_val!("sharing_burst_size", defaults.global_burst),
+                            sharing_per_sec: get_val!("sharing_limit_per_second", defaults.sharing_per_sec),
+                            sharing_burst: get_val!("sharing_limit_burst_size", defaults.sharing_burst),
 
                             global_per_sec: get_val!("global_limit_per_second", defaults.global_per_sec),
                             global_burst: get_val!("global_limit_burst_size", defaults.global_burst),
