@@ -48,8 +48,10 @@ struct RateLimitSettings {
     upload_burst: u32,
     transcode_per_sec: u64,
     transcode_burst: u32,
+    sharing_per_sec: u64,
+    sharing_burst: u32,
     global_per_sec: u64,
-    global_burst: u32,
+    global_burst: u32
 }
 
 static RATE_LIMIT_CONFIG: OnceLock<RateLimitSettings> = OnceLock::new();
@@ -58,16 +60,18 @@ fn get_rate_limit_config() -> RateLimitSettings {
     *RATE_LIMIT_CONFIG.get_or_init(|| {
         let defaults = RateLimitSettings {
             enabled: true,
-            auth_per_sec: 1,
+            auth_per_sec: 2,
             auth_burst: 5,
-            view_per_sec: 100,
-            view_burst: 2000,
-            upload_per_sec: 300,
-            upload_burst: 3000,
-            transcode_per_sec: 5,
-            transcode_burst: 10,
+            view_per_sec: 30,
+            view_burst: 100,
+            upload_per_sec: 100,
+            upload_burst: 50,
+            transcode_per_sec: 1,
+            transcode_burst: 2,
+            sharing_per_sec: 50,
+            sharing_burst: 100,
             global_per_sec: 200,
-            global_burst: 2000,
+            global_burst: 300
         };
 
         let config_result = Ini::load_from_file("config.ini");
@@ -107,9 +111,13 @@ fn get_rate_limit_config() -> RateLimitSettings {
                             
                             transcode_per_sec: get_val!("transcode_limit_per_second", defaults.transcode_per_sec),
                             transcode_burst: get_val!("transcode_limit_burst_size", defaults.transcode_burst),
-                            
+
+                            sharing_per_sec: get_val!("sharing_per_second", defaults.global_per_sec),
+                            sharing_burst: get_val!("sharing_burst_size", defaults.global_burst),
+
                             global_per_sec: get_val!("global_limit_per_second", defaults.global_per_sec),
                             global_burst: get_val!("global_limit_burst_size", defaults.global_burst),
+
                         }
                     },
                     None => {
@@ -131,7 +139,8 @@ pub struct RateLimitLayers {
     pub view: Option<GovernorLayer<UserKeyExtractor, NoOpMiddleware, Body>>,
     pub upload: Option<GovernorLayer<UserKeyExtractor, NoOpMiddleware, Body>>,
     pub transcode: Option<GovernorLayer<UserKeyExtractor, NoOpMiddleware, Body>>,
-    pub global: Option<GovernorLayer<SmartIpKeyExtractor, NoOpMiddleware, Body>>,
+      pub sharing: Option<GovernorLayer<SmartIpKeyExtractor, NoOpMiddleware, Body>>,
+    pub global: Option<GovernorLayer<SmartIpKeyExtractor, NoOpMiddleware, Body>>
 }
 
 impl RateLimitLayers {
@@ -144,7 +153,8 @@ impl RateLimitLayers {
                 view: None,
                 upload: None,
                 transcode: None,
-                global: None,
+                sharing: None,
+                global: None
             };
         }
 
@@ -172,6 +182,12 @@ impl RateLimitLayers {
             .key_extractor(UserKeyExtractor)
             .finish().unwrap();
 
+        let sharing_conf = GovernorConfigBuilder::default()
+            .per_second(limits.sharing_per_sec)
+            .burst_size(limits.sharing_burst)
+            .key_extractor(SmartIpKeyExtractor)
+            .finish().unwrap();
+
         let global_conf = GovernorConfigBuilder::default()
             .per_second(limits.global_per_sec)
             .burst_size(limits.global_burst)
@@ -183,7 +199,8 @@ impl RateLimitLayers {
             view: Some(GovernorLayer::new(view_conf)),
             upload: Some(GovernorLayer::new(upload_conf)),
             transcode: Some(GovernorLayer::new(transcode_conf)),
-            global: Some(GovernorLayer::new(global_conf)),
+            sharing: Some(GovernorLayer::new(sharing_conf)),
+            global: Some(GovernorLayer::new(global_conf))
         }
     }
 
@@ -221,6 +238,16 @@ impl RateLimitLayers {
     where S: Clone + Send + Sync + 'static 
     {
         if let Some(layer) = &self.transcode {
+            router.layer(layer.clone())
+        } else {
+            router
+        }
+    }
+
+    pub fn layer_sharing<S>(&self, router: Router<S>) -> Router<S> 
+    where S: Clone + Send + Sync + 'static 
+    {
+        if let Some(layer) = &self.sharing {
             router.layer(layer.clone())
         } else {
             router

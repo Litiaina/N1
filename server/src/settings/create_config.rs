@@ -26,30 +26,28 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
     conf.with_section(Some("jwt_token_config"))
         .set("login_token_expiration", "600"); // 10 minutes
 
-    //Storage config
-    conf.with_section(Some("garbage_collector"))
-        .set("cleanup_interval_seconds", "86400")
-        .set("file_ttl_seconds", "86400");
-
     //Rate limiter config
     conf.with_section(Some("rate_limiter_config"))
         // Enable or Disable rate limiter
         .set("enable_rate_limiting", "true")
-        // Auth
-        .set("auth_limit_per_second", "1")
+        // Auth: Strict. Human input speed only.
+        .set("auth_limit_per_second", "2")
         .set("auth_limit_burst_size", "5")
-        // View operations
-        .set("view_limit_per_second", "100")
-        .set("view_limit_burst_size", "2000")
-        // Upload operations
-        .set("upload_limit_per_second", "300")
-        .set("upload_limit_burst_size", "3000")
-        // Transcode operations
-        .set("transcode_limit_per_second", "5")
-        .set("transcode_limit_burst_size", "10")
-        // Global fallback
-        .set("global_limit_per_second", "200")
-        .set("global_limit_burst_size", "2000");
+        // View: Accommodates ThumbnailLoader queue (4 concurrent)
+        .set("view_limit_per_second", "30")
+        .set("view_limit_burst_size", "100") 
+        // Upload: Accommodates 6 parallel workers on high-speed connections
+        .set("upload_limit_per_second", "100")
+        .set("upload_limit_burst_size", "50")
+        // Transcode: Very CPU heavy, strict limit
+        .set("transcode_limit_per_second", "1")
+        .set("transcode_limit_burst_size", "2")
+        // Sharing: Browser image fetching (max ~6 concurrent connections)
+        .set("sharing_limit_per_second", "50")
+        .set("sharing_limit_burst_size", "100")
+        // Global: Safety net (View + Upload + Sharing overhead)
+        .set("global_limit_per_second", "200") 
+        .set("global_limit_burst_size", "300");
 
     //Write config file
     conf.write_to_file(path)

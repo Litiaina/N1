@@ -99,14 +99,14 @@ pub async fn serve_storage_routes() -> Router {
             .merge(write_ops)
             .layer(from_fn(auth));
 
-        let public_routes = Router::new()
+        let sharing_routes = Router::new()
             .route("/v4/public/share", get(get_shared_object));
         
-        let public_routes = layers.layer_global(public_routes);
+        let sharing_routes = layers.layer_sharing(sharing_routes);
 
         Router::new()
             .merge(protected_routes)
-            .merge(public_routes)
+            .merge(sharing_routes)
             .with_state(Arc::clone(&app_state))
     };
 
