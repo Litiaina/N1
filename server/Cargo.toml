@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Internal dependencies
-server_core = { path = "../server_core" }
+server_cli = { path = "../server_cli" }
 
 # External workspace dependencies
 axum.workspace = true
@@ -48,3 +48,4 @@ hostname.workspace = true
 bytes.workspace = true
 tower_governor.workspace = true
 governor.workspace = true
+moka.workspace = true

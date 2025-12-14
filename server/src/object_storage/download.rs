@@ -1,13 +1,13 @@
 use crate::enums::app_error_enum::AppError;
+use crate::object_storage::caching::get_metadata_with_cache;
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_STORAGE_ROOT};
 use crate::object_storage::error_parser::physical_path_error;
-use crate::object_storage::metadata_parser::find_latest_object_metadata;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{ChunkDownloadParams, ObjectMetadata};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderValue, Response, StatusCode, header};
+use axum::http::{HeaderValue, Response, header};
 use axum::response::IntoResponse;
 use std::io::SeekFrom;
 use std::path::PathBuf;
@@ -22,9 +22,10 @@ pub async fn download_object(
     Path((fragment, object_key)): Path<(String, String)>,
     req: axum::http::Request<Body>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = claims.uid;
-    let metadata =
-        find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
+    let uid = claims.uid.to_string();
+
+    let metadata = get_metadata_with_cache(&state.db_client, &fragment, &object_key, &uid).await?;
+
     download_object_logic(req, metadata).await
 }
 
@@ -65,10 +66,9 @@ pub async fn download_object_chunk(
     Path((fragment, object_key)): Path<(String, String)>,
     Query(params): Query<ChunkDownloadParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = claims.uid;
+    let uid = claims.uid.to_string();
 
-    let metadata =
-        find_latest_object_metadata(&state.db_client, &fragment, &object_key, &uid).await?;
+    let metadata = get_metadata_with_cache(&state.db_client, &fragment, &object_key, &uid).await?;
 
     let physical_path = PathBuf::from(OBJECT_STORAGE_ROOT)
         .join(OBJECT_DATA_ROOT)
@@ -94,23 +94,30 @@ pub async fn download_object_chunk(
     }
 
     let mut buffer = vec![0; params.chunk_size];
-    if let Err(e) = file.read_exact(&mut buffer).await {
-        tracing::error!(
-            "Failed to read exact chunk from file {:?}: {}",
-            physical_path,
-            e
-        );
-        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            return Ok(StatusCode::NO_CONTENT.into_response());
+
+    match file.read(&mut buffer).await {
+        Ok(0) => {
+            return Ok(Response::builder()
+                .status(axum::http::StatusCode::NO_CONTENT)
+                .body(Body::empty())
+                .unwrap()
+                .into_response());
         }
-        return Err(AppError::InternalServerError(
-            "Failed to read file chunk.".to_string(),
-        ));
+        Ok(bytes_read) => {
+            buffer.truncate(bytes_read);
+        }
+        Err(e) => {
+            tracing::error!("Failed to read chunk from file {:?}: {}", physical_path, e);
+            return Err(AppError::InternalServerError(
+                "Failed to read file chunk.".to_string(),
+            ));
+        }
     }
 
     let body = Body::from(buffer);
     Ok(Response::builder()
         .header("Content-Type", "application/octet-stream")
         .body(body)
-        .unwrap())
+        .unwrap()
+        .into_response())
 }

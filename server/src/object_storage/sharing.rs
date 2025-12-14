@@ -1,12 +1,12 @@
-use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
 use crate::enums::app_error_enum::AppError;
+use crate::object_storage::caching::get_metadata_with_cache;
 use crate::object_storage::download::download_object_logic;
 use crate::object_storage::metadata_parser::find_latest_object_metadata;
 use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
-    CreateSignedUrlRequest, ObjectMetadata, SignedUrlDisposition, SignedUrlResponse,
+    CreateSignedUrlRequest, SignedUrlDisposition, SignedUrlResponse,
 };
 use axum::Json as AxumJson;
 use axum::body::Body;
@@ -16,7 +16,6 @@ use axum::response::{IntoResponse, Response};
 use chrono::{Duration, Utc};
 use hmac::{Hmac, Mac};
 use ini::Ini;
-use mongodb::bson::doc;
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode, utf8_percent_encode};
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -32,7 +31,8 @@ static BASE_URL: LazyLock<String> = LazyLock::new(|| {
 
     server_section
         .and_then(|sec| sec.get("sharable_url"))
-        .unwrap_or("https://127.0.0.1:50001").to_string()
+        .unwrap_or("https://127.0.0.1:50001")
+        .to_string()
 });
 
 const MAX_EXPIRATION_SECONDS: i64 = 60 * 60 * 24 * 7;
@@ -179,24 +179,17 @@ pub async fn get_shared_object(
         return Err(AppError::NotFound);
     }
 
-    let collection = state
-        .db_client
-        .database(OBJECT_STORAGE_DATABASE)
-        .collection::<ObjectMetadata>("objects");
-
-    let metadata = collection
-        .find_one(doc! { "owner_uid": &query.owner_uid, "fragment": &query.fragment, "key": &query.object_key, "is_latest": true })
-        .await
-        .map_err(|_| AppError::Conflict("Database query failed.".to_string()))?
-        .ok_or(AppError::NotFound)?;
+    let metadata = get_metadata_with_cache(
+        &state.db_client,
+        &query.fragment,
+        &query.object_key,
+        &query.owner_uid,
+    )
+    .await?;
 
     let data_to_sign = format!(
         "{}:{}:{}:{}:{}",
-        metadata.owner_uid,
-        metadata.fragment,
-        metadata.key,
-        query.expires_timestamp,
-        query.disposition
+        metadata.owner_uid, metadata.fragment, metadata.key, query.expires_timestamp, query.disposition
     );
 
     type HmacSha256 = Hmac<Sha256>;

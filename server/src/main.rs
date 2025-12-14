@@ -20,7 +20,7 @@ use dotenv::dotenv;
 use ini::Ini;
 use mongodb::Client;
 use mongodb::options::ClientOptions;
-use server_core::{self, server_login, start_cli};
+use server_cli::{self, server_login, start_cli};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;

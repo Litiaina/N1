@@ -40,6 +40,12 @@ pub async fn get_object_logic(
                             error!("Invalid content-type string in metadata: {}", e);
                         }
                     }
+
+                    response.headers_mut().insert(
+                        header::CONTENT_DISPOSITION,
+                        HeaderValue::from_static("inline"),
+                    );
+
                     Ok(response.into_response())
                 }
                 Err(err) => {
@@ -123,6 +129,7 @@ pub async fn stream_object_logic(
             format!("bytes {}-{}/{}", start, end, file_size),
         )
         .header(header::CACHE_CONTROL, "public, max-age=3600")
+        .header(header::CONTENT_DISPOSITION, "inline")
         .body(body)
         .map_err(|e| AppError::InternalServerError(format!("Failed to build response: {}", e)))?;
 

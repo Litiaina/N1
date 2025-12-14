@@ -13,3 +13,4 @@ pub mod storage_capacity_parser;
 pub mod object_parser;
 pub mod garbage_collector;
 pub mod setup;
+pub mod caching;
