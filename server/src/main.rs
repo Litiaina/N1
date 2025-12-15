@@ -106,14 +106,8 @@ async fn main() {
     tracing::info!("│ Start Time     : {}", current_time);
     tracing::info!("│ Administrator  : {}", user);
     tracing::info!("│ PID            : {}", std::process::id());
-    tracing::info!(
-        "│ Hostname       : {}",
-        hostname::get().unwrap_or_default().to_string_lossy()
-    );
-    tracing::info!(
-        "│ Working Dir    : {}",
-        std::env::current_dir().unwrap_or_default().display()
-    );
+    tracing::info!("│ Hostname       : {}", hostname::get().unwrap_or_default().to_string_lossy());
+    tracing::info!("│ Working Dir    : {}", std::env::current_dir().unwrap_or_default().display());
     tracing::info!("│ Command        : /exit to terminate the session");
     tracing::info!("╞════════════════════════ ACTIVE CONNECTIONS ════════════════════════╡");
 
@@ -161,12 +155,7 @@ pub async fn run_server() {
         .map(|v| v.to_string())
         .unwrap_or_else(|| "key.pem".to_string());
 
-    let conf = Ini::load_from_file("config.ini").unwrap_or_else(|_| {
-        println!("Config file not found, using defaults");
-        Ini::new()
-    });
-
-    let storage_path = conf
+    let storage_path = config
         .section(Some("disk_config"))
         .and_then(|s| s.get("storage_path"))
         .unwrap_or("object-storage-array");
