@@ -1,10 +1,10 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::get_metadata_with_cache;
-use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_STORAGE_ROOT};
+use crate::object_storage::constants::OBJECT_DATA_ROOT;
 use crate::object_storage::error_parser::physical_path_error;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
-use crate::structs::object_storage_structs::{ChunkDownloadParams, ObjectMetadata};
+use crate::structs::object_storage_structs::{ChunkDownloadParams, OBJECT_STORAGE_ROOT, ObjectMetadata};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, Response, header};
@@ -33,7 +33,8 @@ pub async fn download_object_logic(
     req: axum::http::Request<Body>,
     metadata: ObjectMetadata,
 ) -> Result<impl IntoResponse, AppError> {
-    let physical_path = PathBuf::from(OBJECT_STORAGE_ROOT)
+    let root_path = OBJECT_STORAGE_ROOT.get().expect("Config not initialized!");
+    let physical_path = PathBuf::from(root_path)
         .join(OBJECT_DATA_ROOT)
         .join(&metadata.physical_location);
 
@@ -70,7 +71,9 @@ pub async fn download_object_chunk(
 
     let metadata = get_metadata_with_cache(&state.db_client, &fragment, &object_key, &uid).await?;
 
-    let physical_path = PathBuf::from(OBJECT_STORAGE_ROOT)
+    let root_path = OBJECT_STORAGE_ROOT.get().expect("Config not initialized!");
+
+    let physical_path = PathBuf::from(root_path)
         .join(OBJECT_DATA_ROOT)
         .join(&metadata.physical_location);
 

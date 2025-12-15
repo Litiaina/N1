@@ -5,6 +5,7 @@ use crate::object_storage::garbage_collector::run_garbage_collector;
 use crate::object_storage::setup::setup_database_locks;
 use crate::routes::storage_routes::{AppState, serve_storage_routes};
 use crate::statics::database_statics::DATABASE_URL;
+use crate::structs::object_storage_structs::OBJECT_STORAGE_ROOT;
 use crate::structs::port_struct::Ports;
 use crate::utils::date_time_formatter::LocalTimer;
 use crate::validation::enforce_init_settings::{ensure_config_file, ensure_env_file};
@@ -21,6 +22,7 @@ use ini::Ini;
 use mongodb::Client;
 use mongodb::options::ClientOptions;
 use server_cli::{self, server_login, start_cli};
+use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -46,7 +48,7 @@ pub fn init_tracing() -> Result<(), tracing_subscriber::util::TryInitError> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "info,litiaina_n2=trace,server_cli=trace,axum=info,hyper=info".into()
+                "info,litiaina_n1=trace,server_cli=trace,axum=info,hyper=info".into()
             }),
         )
         .with(
@@ -80,10 +82,19 @@ async fn main() {
         return;
     }
 
-    let user = loop {
-        match server_login().await {
-            Ok(access_id) => break access_id,
-            Err(e) => tracing::error!("{}", e),
+    let bypass_login = env::var("ENABLE_LOCK").unwrap_or("true".to_string()) == "false";
+    let user = if bypass_login {
+        tracing::warn!("⚠️ SECURITY LOCK BYPASSED: ENABLE_LOCK is false in .env");
+        "unknown".to_string()
+    } else {
+        loop {
+            match server_login().await {
+                Ok(access_id) => break access_id,
+                Err(e) => {
+                    tracing::error!("Login failed: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
         }
     };
 
@@ -95,8 +106,14 @@ async fn main() {
     tracing::info!("│ Start Time     : {}", current_time);
     tracing::info!("│ Administrator  : {}", user);
     tracing::info!("│ PID            : {}", std::process::id());
-    tracing::info!("│ Hostname       : {}", hostname::get().unwrap_or_default().to_string_lossy());
-    tracing::info!("│ Working Dir    : {}", std::env::current_dir().unwrap_or_default().display());
+    tracing::info!(
+        "│ Hostname       : {}",
+        hostname::get().unwrap_or_default().to_string_lossy()
+    );
+    tracing::info!(
+        "│ Working Dir    : {}",
+        std::env::current_dir().unwrap_or_default().display()
+    );
     tracing::info!("│ Command        : /exit to terminate the session");
     tracing::info!("╞════════════════════════ ACTIVE CONNECTIONS ════════════════════════╡");
 
@@ -143,6 +160,20 @@ pub async fn run_server() {
         .get("key_path")
         .map(|v| v.to_string())
         .unwrap_or_else(|| "key.pem".to_string());
+
+    let conf = Ini::load_from_file("config.ini").unwrap_or_else(|_| {
+        println!("Config file not found, using defaults");
+        Ini::new()
+    });
+
+    let storage_path = conf
+        .section(Some("disk_config"))
+        .and_then(|s| s.get("storage_path"))
+        .unwrap_or("object-storage-array");
+
+    OBJECT_STORAGE_ROOT
+        .set(storage_path.to_string())
+        .expect("Double initialization of config!");
 
     let storage_ports = Ports {
         http: http_port,
@@ -224,7 +255,10 @@ async fn serve(
     server.http_builder().http2().enable_connect_protocol();
 
     let join = tokio::spawn(async move {
-        server.serve(app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+        server
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+            .unwrap();
     });
 
     (handle, join)

@@ -1,4 +1,4 @@
-use crate::fs::fs_constants::{CHUNK_PREFIX, METADATA_FILENAME, STORAGE_ROOT, TEMP_UPLOAD_ROOT};
+use crate::fs::fs_constants::{CHUNK_PREFIX, METADATA_FILENAME, STORAGE_ROOT, TEMP_UPLOAD_EXTENTION};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -46,7 +46,7 @@ impl<'a> PathManager<'a> {
 
     pub fn temp_upload_dir(&self) -> PathBuf {
         PathBuf::from(STORAGE_ROOT)
-            .join(TEMP_UPLOAD_ROOT)
+            .join(TEMP_UPLOAD_EXTENTION)
             .join(self.file_id)
     }
 

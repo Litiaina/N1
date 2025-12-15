@@ -1,8 +1,10 @@
 use crate::enums::upload_status_enum::UploadStatus;
-use crate::fs::fs_constants::{CHUNK_PREFIX, OBJECT_METADATA_FILENAME, TEMP_UPLOAD_ROOT};
-use crate::object_storage::constants::OBJECT_STORAGE_ROOT;
+use crate::fs::fs_constants::{CHUNK_PREFIX, OBJECT_METADATA_FILENAME, TEMP_UPLOAD_EXTENTION};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+pub static OBJECT_STORAGE_ROOT: OnceLock<String> = OnceLock::new();
 
 pub struct ObjectPathManager<'a> {
     pub file_id: &'a str,
@@ -13,9 +15,13 @@ impl<'a> ObjectPathManager<'a> {
         Self { file_id }
     }
 
+    fn get_root(&self) -> &str {
+        OBJECT_STORAGE_ROOT.get().expect("Config not initialized! Call init_config() first.")
+    }
+
     pub fn temp_upload_dir(&self) -> PathBuf {
-        PathBuf::from(OBJECT_STORAGE_ROOT)
-            .join(TEMP_UPLOAD_ROOT)
+        PathBuf::from(self.get_root())
+            .join(TEMP_UPLOAD_EXTENTION)
             .join(self.file_id)
     }
 

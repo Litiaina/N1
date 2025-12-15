@@ -6,7 +6,7 @@ use crate::fs::fs_constants::{
     MAX_BUFFER_SIZE, MAX_CHUNK_SIZE, MERGE_CONCURRENCY, MIN_BUFFER_SIZE, TMP_EXT,
 };
 use crate::object_storage::chunk_parser::parse_uploaded_chunks;
-use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_STORAGE_ROOT};
+use crate::object_storage::constants::OBJECT_DATA_ROOT;
 use crate::object_storage::storage_capacity_parser::calculate_storage_usage;
 use crate::routes::storage_routes::AppState;
 use crate::statics::merge_semaphore_static::{
@@ -14,8 +14,7 @@ use crate::statics::merge_semaphore_static::{
 };
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
-    CapacityUsageResponse, InitiateUploadParams, InitiateUploadResponse, ObjectMetadata,
-    ObjectPathManager, TempUploadMetadata, UploadStatusResponse, UserAuthDetails,
+    CapacityUsageResponse, InitiateUploadParams, InitiateUploadResponse, OBJECT_STORAGE_ROOT, ObjectMetadata, ObjectPathManager, TempUploadMetadata, UploadStatusResponse, UserAuthDetails
 };
 use axum::body::Body;
 use axum::extract::multipart::Field;
@@ -571,9 +570,10 @@ async fn assemble_and_index_object(
         temp_metadata.fragment, temp_metadata.object_key
     );
 
+    let root_path = OBJECT_STORAGE_ROOT.get().expect("Config not initialized!");
     let new_version_id = Uuid::new_v4().to_string();
     let physical_path_str = format!("{}/{}.data", temp_metadata.fragment, new_version_id);
-    let physical_path = PathBuf::from(OBJECT_STORAGE_ROOT)
+    let physical_path = PathBuf::from(root_path)
         .join(OBJECT_DATA_ROOT)
         .join(&physical_path_str);
 

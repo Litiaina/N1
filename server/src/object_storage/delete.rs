@@ -1,11 +1,11 @@
 use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
 use crate::enums::app_error_enum::AppError;
 use crate::fs::fragmented_upload::with_io_timeout;
-use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_STORAGE_ROOT};
+use crate::object_storage::constants::OBJECT_DATA_ROOT;
 use crate::routes::storage_routes::AppState;
 use crate::statics::merge_semaphore_static::PREFIX_DELETE_LOCKS;
 use crate::structs::auth_structs::Claims;
-use crate::structs::object_storage_structs::{DeleteByPrefixRequest, ObjectMetadata};
+use crate::structs::object_storage_structs::{DeleteByPrefixRequest, OBJECT_STORAGE_ROOT, ObjectMetadata};
 use axum::Json as AxumJson;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -54,7 +54,8 @@ pub async fn delete_object(
         .map_err(|_| AppError::Conflict("Database delete_many failed.".to_string()))?;
 
     for location in physical_files_to_delete {
-        let physical_path = PathBuf::from(OBJECT_STORAGE_ROOT)
+        let root_path = OBJECT_STORAGE_ROOT.get().expect("Config not initialized!");
+        let physical_path = PathBuf::from(root_path)
             .join(OBJECT_DATA_ROOT)
             .join(location);
         if fs::try_exists(&physical_path).await.unwrap_or(false) {
@@ -160,7 +161,8 @@ pub async fn delete_objects_by_prefix(
     tokio::spawn(async move {
         let mut deleted_count = 0;
         for location in physical_files_to_delete {
-            let physical_path = PathBuf::from(OBJECT_STORAGE_ROOT)
+            let root_path = OBJECT_STORAGE_ROOT.get().expect("Config not initialized!");
+            let physical_path = PathBuf::from(root_path)
                 .join(OBJECT_DATA_ROOT)
                 .join(location);
 

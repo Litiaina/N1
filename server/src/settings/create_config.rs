@@ -13,6 +13,11 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("key_path", "certificates/key.pem")
         .set("sharable_url", "https://127.0.0.1:50001");
 
+    //Storage disk configuration
+    conf.with_section(Some("disk_config"))
+        //Root storage path
+        .set("storage_path", "object-storage-array");
+
     //Garbage collector
     conf.with_section(Some("garbage_collector"))
         .set("cleanup_interval_seconds", "86400")
