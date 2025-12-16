@@ -2,14 +2,13 @@ use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::get_metadata_with_cache;
 use crate::object_storage::download::stream_object;
 use crate::object_storage::metadata_parser::find_latest_metadata_on_disk;
-use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
     CreateSignedUrlRequest, SignedUrlDisposition, SignedUrlResponse,
 };
 use axum::Json as AxumJson;
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::Query;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use chrono::{Duration, Utc};
@@ -19,7 +18,7 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::env;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 static URL_SIGNING_SECRET: LazyLock<String> =
     LazyLock::new(|| env::var("URL_SIGNING_SECRET").expect("URL_SIGNING_SECRET must be set"));
@@ -45,7 +44,6 @@ const QUERY_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'`');
 
 pub async fn create_signed_url(
-    State(_state): State<Arc<AppState>>,
     claims: Claims,
     AxumJson(payload): AxumJson<CreateSignedUrlRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -159,7 +157,6 @@ impl SignedUrlQuery {
 }
 
 pub async fn get_shared_object(
-    State(_state): State<Arc<AppState>>,
     params: Query<HashMap<String, String>>,
     headers: HeaderMap,
     _req: axum::http::Request<Body>,

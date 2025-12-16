@@ -877,9 +877,9 @@ dependencies = [
 
 [[package]]
 name = "governor"
-version = "0.10.3"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff83dc4460ab14800fedf2d147c6577251775a20d4fc12aef21b5c371efe6df6"
+checksum = "9efcab3c1958580ff1f25a2a41be1668f7603d849bb63af523b208a3cc1223b8"
 dependencies = [
  "cfg-if",
  "dashmap",

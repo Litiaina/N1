@@ -1,25 +1,22 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::get_metadata_with_cache;
 use crate::object_storage::header_parser::parse_range_header;
-use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
     ChunkQuery, ObjectKeyQuery, ObjectMetadata, ObjectPathManager, PartMetadata,
 };
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures_util::stream;
 use std::io::SeekFrom;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 pub async fn download_object(
-    State(_state): State<Arc<AppState>>,
     claims: Claims,
     Path(fragment): Path<String>,
     Query(query): Query<ObjectKeyQuery>,
@@ -33,7 +30,6 @@ pub async fn download_object(
 }
 
 pub async fn download_object_chunk(
-    State(_state): State<Arc<AppState>>,
     claims: Claims,
     Path(fragment): Path<String>,
     Query(params): Query<ChunkQuery>,

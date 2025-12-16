@@ -27,7 +27,7 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::fs::fs_constants::MAX_FILE_SIZE;
 use crate::object_storage::delete::delete_object;
 use crate::object_storage::download::{download_object, download_object_chunk};
-use crate::object_storage::retrieve::{get_object, get_object_metadata, list_objects, stream_object};
+use crate::object_storage::retrieve::{get_object, get_object_metadata, list_fragments, list_objects, stream_object};
 use crate::object_storage::modify::rename_object;
 use crate::object_storage::upload::{
     finalize_object_upload, get_capacity_usage, get_upload_status, initiate_object_upload, object_upload_part
@@ -74,6 +74,7 @@ pub async fn serve_storage_routes() -> Router {
     let object_storage_routes = {
         let read_ops = Router::new()
             .route("/v4/capacity/usage", get(get_capacity_usage))
+            .route("/v4/fragment/metadata", get(list_fragments))
             .route("/v4/fragment/object/metadata/{:fragment}", get(list_objects))
             .route("/v4/fragment/object/get/{:fragment}/{*object_key}", get(get_object))
             .route("/v4/fragment/object/stream/{:fragment}/{*object_key}", get(stream_object))

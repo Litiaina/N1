@@ -11,7 +11,7 @@ fn get_cache() -> &'static Cache<String, ObjectMetadata> {
     METADATA_CACHE.get_or_init(|| {
         Cache::builder()
             .max_capacity(10_000)
-            .time_to_live(Duration::from_secs(300)) // 5 minutes TTL
+            .time_to_live(Duration::from_secs(300))
             .build()
     })
 }

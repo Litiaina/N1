@@ -1,23 +1,19 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::invalidate_cache;
 use crate::object_storage::constants::OBJECT_META_FILE;
-use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
     ObjectMetadata, ObjectPathManager, RenameObjectRequest,
 };
 use axum::{
-    extract::State,
     http::StatusCode,
     response::IntoResponse,
     Json as AxumJson,
 };
-use std::sync::Arc;
 use tokio::fs;
 use tracing::{error, info};
 
 pub async fn rename_object(
-    State(_state): State<Arc<AppState>>,
     claims: Claims,
     AxumJson(payload): AxumJson<RenameObjectRequest>,
 ) -> Result<impl IntoResponse, AppError> {
