@@ -1,141 +1,213 @@
-use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
 use crate::enums::app_error_enum::AppError;
+use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_META_FILE};
 use crate::settings::config::CONFIG;
-use crate::statics::merge_semaphore_static::CHUNK_WRITE_LOCKS;
-use crate::structs::object_storage_structs::{
-    ObjectMetadata, ObjectPathManager, TempUploadMetadata,
-};
-use chrono::{Duration, Utc};
-use mongodb::{
-    Client as MongoClient,
-    bson::{Bson, doc},
-};
+use crate::structs::object_storage_structs::OBJECT_STORAGE_ROOT;
+use mongodb::Client as MongoClient;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
-use tokio::{fs, time::sleep};
-use tracing::{info, warn};
+use std::time::{Duration, SystemTime};
+use tokio::fs;
+use tokio::time::sleep;
+use tracing::{error, info, warn};
 
-pub async fn run_garbage_collector(db_client: Arc<MongoClient>) {
-    let cleanup_interval = StdDuration::from_secs(3);
-    let file_ttl = StdDuration::from_secs(3);
+pub async fn run_garbage_collector(_db_client: Arc<MongoClient>) {
+    let file_ttl = Duration::from_secs(60);
 
-    info!(
-        "Object storage cleaning in: {:?}, File TTL: {:?}",
-        cleanup_interval, file_ttl
-    );
+    info!("🗑️ GC (One-Time) executing. TTL: {:?}", file_ttl);
 
-    sleep(cleanup_interval).await;
-    info!("Cleaning object stale pending uploads...");
-
-    loop {
-        match cleanup_one_stale_upload(&db_client, file_ttl).await {
-            Ok(Some(session_id)) => {
-                info!("🗑️ Cleaned up stale upload session: {}", session_id);
-            }
-            Ok(None) => {
-                info!("🗑️ No more stale pending uploads found in this cycle.");
-                break;
-            }
-            Err(e) => {
-                warn!(
-                    "🗑️ Garbage collection failed on one record, ending cycle early: {}",
-                    e
-                );
-                break;
-            }
-        }
+    if let Err(e) = perform_filesystem_cleanup(file_ttl).await {
+        error!("🗑️ GC One-Time run failed: {}", e);
+    } else {
+        info!("🗑️ GC (One-Time) completed successfully.");
     }
 }
 
-pub async fn interval_garbage_collector(db_client: Arc<MongoClient>) {
-    let cleanup_interval =
-        StdDuration::from_secs(CONFIG.garbage_collector.cleanup_interval_seconds);
-    let file_ttl = StdDuration::from_secs(CONFIG.garbage_collector.file_ttl_seconds);
+pub async fn interval_garbage_collector(_db_client: Arc<MongoClient>) {
+    let cleanup_interval = Duration::from_secs(CONFIG.garbage_collector.cleanup_interval_seconds);
+    let file_ttl = Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds);
 
     info!(
-        "🗑️ Garbage Collector started. Cycle interval: {:?}, File TTL: {:?}",
+        "🗑️ GC (Interval) started. Interval: {:?}, TTL: {:?}",
         cleanup_interval, file_ttl
     );
 
     loop {
         sleep(cleanup_interval).await;
-        info!("🗑️ Running garbage collection cycle for stale pending uploads...");
-
-        loop {
-            match cleanup_one_stale_upload(&db_client, file_ttl).await {
-                Ok(Some(session_id)) => {
-                    info!("🗑️ Cleaned up stale upload session: {}", session_id);
-                }
-                Ok(None) => {
-                    info!("🗑️ No more stale pending uploads found in this cycle.");
-                    break;
-                }
-                Err(e) => {
-                    warn!(
-                        "🗑️ Garbage collection failed on one record, ending cycle early: {}",
-                        e
-                    );
-                    break;
-                }
-            }
+        if let Err(e) = perform_filesystem_cleanup(file_ttl).await {
+            error!("🗑️ GC Cycle failed: {}", e);
         }
     }
 }
 
-async fn cleanup_one_stale_upload(
-    db: &MongoClient,
-    ttl: StdDuration,
-) -> Result<Option<String>, AppError> {
-    let collection = db
-        .database(OBJECT_STORAGE_DATABASE)
-        .collection::<ObjectMetadata>("objects");
+async fn perform_filesystem_cleanup(ttl: Duration) -> Result<(), AppError> {
+    let root_str = OBJECT_STORAGE_ROOT
+        .get()
+        .ok_or_else(|| AppError::InternalServerError("Storage root not initialized".to_string()))?;
 
-    let stale_threshold =
-        Utc::now() - Duration::from_std(ttl).expect("Failed to convert TTL to chrono::Duration");
+    let storage_root = PathBuf::from(root_str).join(OBJECT_DATA_ROOT);
 
-    let filter = doc! {
-        "status": "Pending",
-        "created_at": { "$lt": Bson::DateTime(std::time::SystemTime::from(stale_threshold).into()) }
+    if !fs::try_exists(&storage_root).await.unwrap_or(false) {
+        return Ok(());
+    }
+
+    let mut uid_entries = match fs::read_dir(&storage_root).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            error!("Failed to read storage root: {}", e);
+            return Err(AppError::Io(e, "read storage root".into()));
+        }
     };
 
-    let stale_record = collection.find_one_and_delete(filter).await?;
+    while let Ok(Some(entry)) = uid_entries.next_entry().await {
+        let path = entry.path();
+        if entry
+            .file_type()
+            .await
+            .map(|ft| ft.is_dir())
+            .unwrap_or(false)
+        {
+            let _ = process_uid_directory(&path, ttl).await;
+            tokio::task::yield_now().await;
+        }
+    }
 
-    if let Some(record) = stale_record {
-        if let Some(session_id) = &record.session_id {
-            let paths = ObjectPathManager::new(session_id);
-            let temp_upload_dir = paths.temp_upload_dir();
+    Ok(())
+}
 
-            if let Ok(content) = fs::read_to_string(paths.metadata_path()).await {
-                if let Ok(temp_metadata) = serde_json::from_str::<TempUploadMetadata>(&content) {
-                    for i in 0..temp_metadata.total_chunks {
-                        let chunk_key = format!("{}-{}", temp_metadata.file_id, i);
-                        CHUNK_WRITE_LOCKS.remove(&chunk_key);
-                    }
-                    info!(
-                        "🗑️ Cleaned up {} in-memory chunk locks for session {}",
-                        temp_metadata.total_chunks, session_id
-                    );
+async fn process_uid_directory(uid_path: &Path, ttl: Duration) -> Result<(), AppError> {
+    let mut entries = match fs::read_dir(uid_path).await {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let is_dir = entry
+            .file_type()
+            .await
+            .map(|ft| ft.is_dir())
+            .unwrap_or(false);
+
+        if is_dir {
+            let _ = process_fragment_directory(&path, ttl).await;
+        }
+    }
+
+    Ok(())
+}
+
+async fn process_fragment_directory(frag_path: &Path, ttl: Duration) -> Result<bool, AppError> {
+    let is_empty = {
+        let mut entries = match fs::read_dir(frag_path).await {
+            Ok(e) => e,
+            Err(_) => return Ok(true),
+        };
+
+        let mut empty = true;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let is_dir = entry
+                .file_type()
+                .await
+                .map(|ft| ft.is_dir())
+                .unwrap_or(false);
+
+            if is_dir {
+                if !process_key_directory(&path, ttl).await? {
+                    empty = false;
                 }
             } else {
-                warn!(
-                    "🗑️ Could not read temp metadata for session {}, unable to clean up chunk locks.",
-                    session_id
-                );
+                empty = false;
             }
-
-            if temp_upload_dir.exists() {
-                if let Err(e) = fs::remove_dir_all(&temp_upload_dir).await {
-                    warn!(
-                        "🗑️ Failed to delete stale temp directory {:?} for session {}: {}. The metadata record has already been deleted.",
-                        temp_upload_dir, session_id, e
-                    );
-                }
-            }
-            Ok(Some(session_id.clone()))
-        } else {
-            Ok(None)
         }
-    } else {
-        Ok(None)
+        empty
+    };
+
+    if is_empty {
+        info!("🗑️ Removing empty fragment directory: {:?}", frag_path);
+        if let Err(e) = fs::remove_dir(frag_path).await {
+            warn!("Failed to remove empty fragment dir {:?}: {}", frag_path, e);
+            return Ok(false);
+        }
+        return Ok(true);
     }
+
+    Ok(false)
+}
+
+async fn process_key_directory(key_path: &Path, ttl: Duration) -> Result<bool, AppError> {
+    let is_empty = {
+        let mut entries = match fs::read_dir(key_path).await {
+            Ok(e) => e,
+            Err(_) => return Ok(true),
+        };
+
+        let mut empty = true;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let is_dir = entry
+                .file_type()
+                .await
+                .map(|ft| ft.is_dir())
+                .unwrap_or(false);
+
+            if is_dir {
+                if !check_and_clean_version(&path, ttl).await {
+                    empty = false;
+                }
+            } else {
+                empty = false;
+            }
+        }
+        empty
+    };
+
+    if is_empty {
+        info!("🗑️ Removing empty object key directory: {:?}", key_path);
+        if let Err(e) = fs::remove_dir(key_path).await {
+            warn!("Failed to remove empty key dir {:?}: {}", key_path, e);
+            return Ok(false);
+        }
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+async fn check_and_clean_version(version_path: &Path, ttl: Duration) -> bool {
+    let meta_path = version_path.join(OBJECT_META_FILE);
+
+    if fs::try_exists(&meta_path).await.unwrap_or(false) {
+        return false;
+    }
+
+    let metadata = match fs::metadata(version_path).await {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    let modified = match metadata.modified() {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+
+    let now = SystemTime::now();
+    let age = match now.duration_since(modified) {
+        Ok(d) => d,
+        Err(_) => Duration::from_secs(0),
+    };
+
+    if age > ttl {
+        info!(
+            "🗑️ Found stale incomplete version at {:?} (Age: {:?}). Deleting...",
+            version_path, age
+        );
+        if let Err(e) = fs::remove_dir_all(version_path).await {
+            warn!("Failed to delete stale version {:?}: {}", version_path, e);
+            return false;
+        }
+        return true;
+    }
+
+    false
 }

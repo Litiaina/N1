@@ -1,7 +1,7 @@
 use crate::fs::fs_constants::{CHUNK_PREFIX, TMP_EXT};
 use tokio::fs::ReadDir;
 
-pub async fn parse_uploaded_chunks(reader: &mut ReadDir) -> Vec<u64> {
+pub async fn parse_uploaded_parts(reader: &mut ReadDir) -> Vec<u64> {
     let mut chunks = Vec::new();
     while let Ok(Some(entry)) = reader.next_entry().await {
         if let Some(name_str) = entry.file_name().to_str() {

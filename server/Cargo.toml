@@ -49,3 +49,5 @@ bytes.workspace = true
 tower_governor.workspace = true
 governor.workspace = true
 moka.workspace = true
+ulid.workspace = true
+libc.workspace = true

@@ -1,4 +1,3 @@
-use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,7 +8,5 @@ use crate::object_storage::constants::MAX_CONCURRENT_UPLOADS;
 pub static MERGE_SEMAPHORE: tokio::sync::OnceCell<Semaphore> = tokio::sync::OnceCell::const_new();
 pub static CHUNK_UPLOAD_SEMAPHORE: Lazy<Semaphore> =
     Lazy::new(|| Semaphore::new(MAX_CONCURRENT_UPLOADS));
-pub static CHUNK_WRITE_LOCKS: Lazy<DashMap<String, Arc<Mutex<()>>>> = Lazy::new(DashMap::new);
 pub static FILE_UPLOAD_LOCKS: Lazy<Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>> =
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
-pub static PREFIX_DELETE_LOCKS: Lazy<DashMap<String, Arc<Mutex<()>>>> = Lazy::new(DashMap::new);

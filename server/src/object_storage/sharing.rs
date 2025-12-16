@@ -1,8 +1,7 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::get_metadata_with_cache;
-use crate::object_storage::download::download_object_logic;
-use crate::object_storage::metadata_parser::find_latest_object_metadata;
-use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
+use crate::object_storage::download::stream_object;
+use crate::object_storage::metadata_parser::find_latest_metadata_on_disk;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
@@ -16,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use chrono::{Duration, Utc};
 use hmac::{Hmac, Mac};
 use ini::Ini;
-use percent_encoding::{AsciiSet, CONTROLS, percent_decode, utf8_percent_encode};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::env;
@@ -46,18 +45,14 @@ const QUERY_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'`');
 
 pub async fn create_signed_url(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     claims: Claims,
     AxumJson(payload): AxumJson<CreateSignedUrlRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
-    let metadata = find_latest_object_metadata(
-        &state.db_client,
-        &payload.fragment,
-        &payload.object_key,
-        &uid,
-    )
-    .await?;
+    let clean_key = payload.object_key.trim_start_matches('/');
+
+    let metadata = find_latest_metadata_on_disk(&uid, &payload.fragment, clean_key).await?;
 
     if payload.expires_in as i64 > MAX_EXPIRATION_SECONDS {
         return Err(AppError::BadRequest(format!(
@@ -78,7 +73,11 @@ pub async fn create_signed_url(
 
     let data_to_sign = format!(
         "{}:{}:{}:{}:{}",
-        metadata.owner_uid, metadata.fragment, metadata.key, expires_timestamp, disposition_str
+        metadata.owner_uid,
+        metadata.fragment,
+        metadata.object_key,
+        expires_timestamp,
+        disposition_str
     );
 
     type HmacSha256 = Hmac<Sha256>;
@@ -92,7 +91,7 @@ pub async fn create_signed_url(
         BASE_URL.to_string(),
         utf8_percent_encode(&metadata.owner_uid, QUERY_ENCODE_SET),
         utf8_percent_encode(&payload.fragment, QUERY_ENCODE_SET),
-        utf8_percent_encode(&payload.object_key, QUERY_ENCODE_SET),
+        utf8_percent_encode(&metadata.object_key, QUERY_ENCODE_SET),
         expires_timestamp,
         signature,
         utf8_percent_encode(disposition_str, QUERY_ENCODE_SET)
@@ -115,63 +114,55 @@ struct SignedUrlQuery {
 
 impl SignedUrlQuery {
     fn from_params(params: &Query<HashMap<String, String>>) -> Result<Self, AppError> {
-        let owner_uid_encoded = params
+        let owner_uid = params
             .get("owner_uid")
-            .ok_or_else(|| AppError::BadRequest("Missing owner_uid.".to_string()))?;
-        let fragment_encoded = params
+            .ok_or_else(|| AppError::BadRequest("Missing owner_uid.".to_string()))?
+            .to_string();
+
+        let fragment = params
             .get("fragment")
-            .ok_or_else(|| AppError::BadRequest("Missing fragment.".to_string()))?;
-        let object_key_encoded = params
+            .ok_or_else(|| AppError::BadRequest("Missing fragment.".to_string()))?
+            .to_string();
+
+        let object_key = params
             .get("object_key")
-            .ok_or_else(|| AppError::BadRequest("Missing object_key.".to_string()))?;
+            .ok_or_else(|| AppError::BadRequest("Missing object_key.".to_string()))?
+            .to_string();
+
         let expires_str = params
             .get("expires")
             .ok_or_else(|| AppError::BadRequest("Missing expiration.".to_string()))?;
+
         let provided_signature = params
             .get("signature")
-            .ok_or_else(|| AppError::BadRequest("Missing signature.".to_string()))?;
-
-        let owner_uid = percent_decode(owner_uid_encoded.as_bytes())
-            .decode_utf8()
-            .map_err(|_| AppError::BadRequest("Invalid owner_uid encoding.".to_string()))?
-            .to_string();
-        let fragment = percent_decode(fragment_encoded.as_bytes())
-            .decode_utf8()
-            .map_err(|_| AppError::BadRequest("Invalid fragment encoding.".to_string()))?
-            .to_string();
-        let object_key = percent_decode(object_key_encoded.as_bytes())
-            .decode_utf8()
-            .map_err(|_| AppError::BadRequest("Invalid object_key encoding.".to_string()))?
+            .ok_or_else(|| AppError::BadRequest("Missing signature.".to_string()))?
             .to_string();
 
         let expires_timestamp = expires_str
             .parse::<i64>()
             .map_err(|_| AppError::BadRequest("Invalid expiration format.".to_string()))?;
 
-        let disposition = match params.get("disposition") {
-            Some(encoded_val) => percent_decode(encoded_val.as_bytes())
-                .decode_utf8()
-                .map_err(|_| AppError::BadRequest("Invalid disposition encoding.".to_string()))?
-                .to_string(),
-            None => "view".to_string(),
-        };
+        let disposition = params
+            .get("disposition")
+            .cloned()
+            .unwrap_or_else(|| "view".to_string());
 
         Ok(Self {
             owner_uid,
             fragment,
             object_key,
             expires_timestamp,
-            provided_signature: provided_signature.clone(),
+            provided_signature,
             disposition,
         })
     }
 }
 
 pub async fn get_shared_object(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     params: Query<HashMap<String, String>>,
     headers: HeaderMap,
-    req: axum::http::Request<Body>,
+    _req: axum::http::Request<Body>,
 ) -> Result<Response, AppError> {
     let query = SignedUrlQuery::from_params(&params)?;
 
@@ -179,17 +170,17 @@ pub async fn get_shared_object(
         return Err(AppError::NotFound);
     }
 
-    let metadata = get_metadata_with_cache(
-        &state.db_client,
-        &query.fragment,
-        &query.object_key,
-        &query.owner_uid,
-    )
-    .await?;
+    let clean_key = query.object_key.trim_start_matches('/');
+
+    let metadata = get_metadata_with_cache(&query.fragment, clean_key, &query.owner_uid).await?;
 
     let data_to_sign = format!(
         "{}:{}:{}:{}:{}",
-        metadata.owner_uid, metadata.fragment, metadata.key, query.expires_timestamp, query.disposition
+        metadata.owner_uid,
+        metadata.fragment,
+        metadata.object_key,
+        query.expires_timestamp,
+        query.disposition
     );
 
     type HmacSha256 = Hmac<Sha256>;
@@ -203,19 +194,12 @@ pub async fn get_shared_object(
     )
     .map_err(|_| AppError::BadRequest("Invalid signature.".to_string()))?;
 
-    match query.disposition.as_str() {
-        "view" => {
-            let response = get_object_logic(metadata, req).await?;
-            Ok(response.into_response())
-        }
-        "stream" => {
-            let response = stream_object_logic(headers, metadata).await?;
-            Ok(response.into_response())
-        }
-        "download" => {
-            let response = download_object_logic(req, metadata).await?;
-            Ok(response.into_response())
-        }
-        _ => Err(AppError::BadRequest("Invalid disposition".to_string())),
-    }
+    let disposition_type = match query.disposition.as_str() {
+        "view" | "stream" => "inline",
+        "download" => "attachment",
+        _ => "inline",
+    };
+
+    let response = stream_object(metadata, headers, disposition_type).await?;
+    Ok(response.into_response())
 }

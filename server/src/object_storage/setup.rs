@@ -3,9 +3,9 @@ use mongodb::{
     bson::{Document, doc},
     options::{ClientOptions, IndexOptions},
 };
-use tracing::info;
 use std::error::Error;
 use std::time::Duration;
+use tracing::info;
 
 use crate::{
     database::database_constants::OBJECT_STORAGE_DATABASE, statics::database_statics::DATABASE_URL,

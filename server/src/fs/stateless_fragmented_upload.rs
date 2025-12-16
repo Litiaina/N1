@@ -8,7 +8,7 @@ use crate::validation::directory_validation::sanitize_fragmented_path;
 
 use crate::fs::file_path_parser::find_unique_path;
 use crate::fs::fragmented_upload::with_io_timeout;
-use crate::object_storage::chunk_parser::parse_uploaded_chunks;
+use crate::object_storage::part_parser::parse_uploaded_parts;
 use crate::structs::auth_structs::Claims;
 use crate::structs::stateless_fragment_upload_structs::{
     InitiateUploadParams, InitiateUploadResponse, PathManager, UploadMetadata, UploadStatusResponse,
@@ -154,7 +154,7 @@ pub async fn get_upload_status(Path(file_id): Path<String>) -> Result<impl IntoR
         fs::read_dir(paths.temp_upload_dir()),
     )
     .await?;
-    let uploaded_chunks = parse_uploaded_chunks(&mut dir_reader).await;
+    let uploaded_chunks = parse_uploaded_parts(&mut dir_reader).await;
 
     Ok(Json(UploadStatusResponse {
         original_filename: metadata.original_filename,

@@ -1,43 +1,37 @@
-use crate::database::database_constants::OBJECT_STORAGE_DATABASE;
+use crate::database::database_constants::DATABASE;
 use crate::enums::app_error_enum::AppError;
-use crate::structs::object_storage_structs::{ObjectMetadata, TotalStorageUsage};
-use futures_util::TryStreamExt;
+use crate::structs::object_storage_structs::UserAuthDetails;
 use mongodb::Client as MongoClient;
-use mongodb::bson;
 use mongodb::bson::doc;
 
 pub async fn calculate_storage_usage(db: &MongoClient, uid: &str) -> Result<u64, AppError> {
-    let objects_collection = db
-        .database(OBJECT_STORAGE_DATABASE)
-        .collection::<ObjectMetadata>("objects");
+    let auth_collection = db.database(DATABASE).collection::<UserAuthDetails>("auth");
 
-    let pipeline = vec![
-        doc! {
-            "$match": {
-                "owner_uid": uid,
-                "$or": [
-                    { "is_latest": true },
-                    { "status": "Pending" }
-                ]
-            }
-        },
-        doc! { "$group": { "_id": null, "total_usage": { "$sum": "$size_bytes" } } },
-    ];
-
-    let mut cursor = objects_collection
-        .aggregate(pipeline)
+    let user_details = auth_collection
+        .find_one(doc! { "uid": uid })
         .await
-        .map_err(|_| AppError::Conflict("Failed to calculate storage usage.".to_string()))?;
+        .map_err(|_| AppError::InternalServerError("Database query failed.".to_string()))?
+        .ok_or(AppError::Unauthorized)?;
 
-    if let Some(result) = cursor
-        .try_next()
+    Ok(user_details.storage_used)
+}
+
+pub async fn increment_storage_usage(
+    db: &MongoClient,
+    uid: &str,
+    bytes: i64,
+) -> Result<(), AppError> {
+    let auth_collection = db.database(DATABASE).collection::<UserAuthDetails>("auth");
+
+    auth_collection
+        .update_one(
+            doc! { "uid": uid },
+            doc! { "$inc": { "storage_used": bytes } },
+        )
         .await
-        .map_err(|_| AppError::Conflict("Failed to read usage result.".to_string()))?
-    {
-        if let Ok(usage_doc) = bson::from_document::<TotalStorageUsage>(result) {
-            return Ok(usage_doc.total_usage);
-        }
-    }
+        .map_err(|_| {
+            AppError::InternalServerError("Failed to update storage quota.".to_string())
+        })?;
 
-    Ok(0)
+    Ok(())
 }

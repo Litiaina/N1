@@ -1,38 +1,68 @@
-use crate::enums::upload_status_enum::UploadStatus;
-use crate::fs::fs_constants::{CHUNK_PREFIX, OBJECT_METADATA_FILENAME, TEMP_UPLOAD_EXTENTION};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
 pub static OBJECT_STORAGE_ROOT: OnceLock<String> = OnceLock::new();
 
-pub struct ObjectPathManager<'a> {
-    pub file_id: &'a str,
+pub struct ObjectPathManager {
+    pub root: PathBuf,
 }
 
-impl<'a> ObjectPathManager<'a> {
-    pub fn new(file_id: &'a str) -> Self {
-        Self { file_id }
+impl ObjectPathManager {
+    pub fn new() -> Self {
+        let root = OBJECT_STORAGE_ROOT
+            .get()
+            .expect("Config not initialized!")
+            .clone();
+        Self {
+            root: PathBuf::from(root),
+        }
     }
 
-    fn get_root(&self) -> &str {
-        OBJECT_STORAGE_ROOT.get().expect("Config not initialized! Call init_config() first.")
+    pub fn get_object_dir(&self, uid: &str, fragment: &str, key: &str) -> PathBuf {
+        self.root
+            .join("storage")
+            .join(uid)
+            .join(fragment)
+            .join(key)
     }
 
-    pub fn temp_upload_dir(&self) -> PathBuf {
-        PathBuf::from(self.get_root())
-            .join(TEMP_UPLOAD_EXTENTION)
-            .join(self.file_id)
+    pub fn get_version_dir(&self, uid: &str, fragment: &str, key: &str, version_id: &str) -> PathBuf {
+        self.get_object_dir(uid, fragment, key).join(version_id)
     }
+}
 
-    pub fn chunk_path(&self, index: u64) -> PathBuf {
-        self.temp_upload_dir()
-            .join(format!("{}{}", CHUNK_PREFIX, index))
-    }
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PartMetadata {
+    pub part_index: u64,
+    pub size_bytes: u64,
+    pub file_name: String,
+    pub created_at: i64,
+}
 
-    pub fn metadata_path(&self) -> PathBuf {
-        self.temp_upload_dir().join(OBJECT_METADATA_FILENAME)
-    }
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ObjectMetadata {
+    pub object_key: String,
+    pub fragment: String,
+    pub version_id: String,
+    pub upload_session_id: String,
+    pub owner_uid: String,
+    pub content_type: String,
+    pub total_size_bytes: u64,
+    pub created_at: i64,
+    pub parts: Vec<PartMetadata>,
+}
+
+#[derive(Deserialize)]
+pub struct InitiateUploadParams {
+    pub content_type: Option<String>,
+    pub total_size_bytes: u64,
+}
+
+#[derive(Serialize)]
+pub struct InitiateUploadResponse {
+    pub session_id: String,
+    pub version_id: String,
 }
 
 #[derive(Serialize)]
@@ -41,32 +71,10 @@ pub struct CapacityUsageResponse {
 }
 
 #[derive(Deserialize, Debug)]
-pub struct TotalStorageUsage {
-    pub total_usage: u64,
-}
-
-#[derive(Deserialize, Debug)]
 pub struct UserAuthDetails {
     pub allocated_storage: u64,
-}
-
-#[derive(Deserialize)]
-pub struct InitiateUploadParams {
-    pub content_type: Option<String>,
-    pub total_size_bytes: u64,
-    pub total_chunks: u64,
-}
-
-#[derive(Serialize)]
-pub struct InitiateUploadResponse {
-    pub file_id: String,
-}
-
-#[derive(Serialize)]
-pub struct UploadStatusResponse {
-    pub total_size_bytes: u64,
-    pub uploaded_chunks: Vec<u64>,
-    pub total_chunks: u64,
+    #[serde(default)] 
+    pub storage_used: u64, 
 }
 
 #[derive(Deserialize)]
@@ -75,38 +83,6 @@ pub struct RenameObjectRequest {
     pub source_key: String,
     pub destination_fragment: String,
     pub destination_key: String,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct TempUploadMetadata {
-    pub file_id: String,
-    pub fragment: String,
-    pub object_key: String,
-    pub uid: String,
-    pub content_type: Option<String>,
-    pub total_size_bytes: u64,
-    pub total_chunks: u64,
-    pub creation_timestamp: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ObjectMetadata {
-    #[serde(rename = "_id")]
-    pub id: String,
-    pub fragment: String,
-    pub key: String,
-    pub version_id: String,
-    pub is_latest: bool,
-    pub size_bytes: u64,
-    pub content_type: String,
-    pub owner_uid: String,
-    pub created_at: mongodb::bson::DateTime,
-    pub last_modified: mongodb::bson::DateTime,
-    pub etag: String,
-    pub physical_location: String,
-    pub status: UploadStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
@@ -134,13 +110,18 @@ pub struct SignedUrlResponse {
 }
 
 #[derive(Deserialize)]
-pub struct DeleteByPrefixRequest {
-    pub fragment: String,
-    pub prefix: String,
+pub struct ObjectKeyQuery {
+    pub object_key: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ChunkDownloadParams {
+#[derive(Serialize)]
+pub struct UploadStatusResponse {
+    pub uploaded_parts: Vec<u64>,
+}
+
+#[derive(Deserialize)]
+pub struct ChunkQuery {
+    pub object_key: String,
     pub offset: u64,
     pub chunk_size: usize,
 }
