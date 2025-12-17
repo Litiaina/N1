@@ -1,15 +1,12 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::invalidate_cache;
-use crate::object_storage::constants::OBJECT_META_FILE;
+use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_META_FILE};
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
-    ObjectMetadata, ObjectPathManager, RenameObjectRequest,
+    ObjectMetadata, ObjectPathManager, RenameFragmentQuery, RenameObjectRequest,
 };
-use axum::{
-    http::StatusCode,
-    response::IntoResponse,
-    Json as AxumJson,
-};
+use axum::extract::Query;
+use axum::{Json as AxumJson, http::StatusCode, response::IntoResponse};
 use tokio::fs;
 use tracing::{error, info};
 
@@ -20,8 +17,13 @@ pub async fn rename_object(
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
 
-    let source_dir = path_manager.get_object_dir(&uid, &payload.source_fragment, &payload.source_key);
-    let dest_dir = path_manager.get_object_dir(&uid, &payload.destination_fragment, &payload.destination_key);
+    let source_dir =
+        path_manager.get_object_dir(&uid, &payload.source_fragment, &payload.source_key);
+    let dest_dir = path_manager.get_object_dir(
+        &uid,
+        &payload.destination_fragment,
+        &payload.destination_key,
+    );
 
     if !fs::try_exists(&source_dir).await.unwrap_or(false) {
         return Err(AppError::NotFound);
@@ -37,13 +39,18 @@ pub async fn rename_object(
         if !fs::try_exists(parent).await.unwrap_or(false) {
             fs::create_dir_all(parent).await.map_err(|e| {
                 error!("Failed to create destination fragment directory: {}", e);
-                AppError::InternalServerError("Failed to prepare destination directory.".to_string())
+                AppError::InternalServerError(
+                    "Failed to prepare destination directory.".to_string(),
+                )
             })?;
         }
     }
 
     fs::rename(&source_dir, &dest_dir).await.map_err(|e| {
-        error!("Failed to move object directory from {:?} to {:?}: {}", source_dir, dest_dir, e);
+        error!(
+            "Failed to move object directory from {:?} to {:?}: {}",
+            source_dir, dest_dir, e
+        );
         AppError::InternalServerError("Failed to rename object.".to_string())
     })?;
 
@@ -53,9 +60,14 @@ pub async fn rename_object(
     })?;
 
     while let Ok(Some(entry)) = versions.next_entry().await {
-        if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
+        if entry
+            .file_type()
+            .await
+            .map(|ft| ft.is_dir())
+            .unwrap_or(false)
+        {
             let meta_path = entry.path().join(OBJECT_META_FILE);
-            
+
             if fs::try_exists(&meta_path).await.unwrap_or(false) {
                 match fs::read(&meta_path).await {
                     Ok(bytes) => {
@@ -66,21 +78,34 @@ pub async fn rename_object(
                             match mongodb::bson::to_vec(&meta) {
                                 Ok(new_bytes) => {
                                     if let Err(e) = fs::write(&meta_path, new_bytes).await {
-                                        error!("Failed to write updated metadata for version {:?}: {}", entry.file_name(), e);
+                                        error!(
+                                            "Failed to write updated metadata for version {:?}: {}",
+                                            entry.file_name(),
+                                            e
+                                        );
                                     }
                                 }
                                 Err(e) => error!("Failed to serialize updated metadata: {}", e),
                             }
                         }
                     }
-                    Err(e) => error!("Failed to read metadata for updating {:?}: {}", entry.file_name(), e),
+                    Err(e) => error!(
+                        "Failed to read metadata for updating {:?}: {}",
+                        entry.file_name(),
+                        e
+                    ),
                 }
             }
         }
     }
 
     invalidate_cache(&payload.source_fragment, &payload.source_key, &uid).await;
-    invalidate_cache(&payload.destination_fragment, &payload.destination_key, &uid).await;
+    invalidate_cache(
+        &payload.destination_fragment,
+        &payload.destination_key,
+        &uid,
+    )
+    .await;
 
     info!(
         "Renamed object from {}/{} to {}/{}",
@@ -91,4 +116,55 @@ pub async fn rename_object(
     );
 
     Ok(StatusCode::OK)
+}
+
+pub async fn rename_fragment(
+    claims: Claims,
+    Query(query): Query<RenameFragmentQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let uid = claims.uid;
+    let path_manager = ObjectPathManager::new();
+
+    let user_storage_root = path_manager.root.join(OBJECT_DATA_ROOT).join(&uid);
+
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        let source_path = user_storage_root.join(&query.fragment_to_rename);
+        let dest_path = user_storage_root.join(&query.new_name);
+
+        if !source_path.exists() {
+            return Err(AppError::NotFound);
+        }
+
+        if dest_path.exists() {
+            return Err(AppError::Conflict(format!(
+                "Destination fragment '{}' already exists.",
+                query.new_name
+            )));
+        }
+
+        std::fs::rename(&source_path, &dest_path).map_err(|e| {
+            error!(
+                "Failed to rename fragment from {:?} to {:?}: {}",
+                source_path, dest_path, e
+            );
+            AppError::InternalServerError("Failed to rename fragment.".to_string())
+        })?;
+
+        info!(
+            "Renamed fragment '{}' to '{}' for user {}",
+            query.fragment_to_rename, query.new_name, uid
+        );
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
+
+    Ok((
+        StatusCode::OK,
+        AxumJson(serde_json::json!({
+            "status": "success",
+            "message": "Fragment renamed successfully"
+        })),
+    ))
 }

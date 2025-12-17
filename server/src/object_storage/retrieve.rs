@@ -95,7 +95,7 @@ pub async fn list_fragments(
 ) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
-    let user_storage_root = path_manager.root.join("storage").join(&uid);
+    let user_storage_root = path_manager.root.join(OBJECT_DATA_ROOT).join(&uid);
 
     let fragments = tokio::task::spawn_blocking(move || -> Result<Vec<String>, std::io::Error> {
         if !user_storage_root.exists() {

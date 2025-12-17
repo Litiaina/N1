@@ -131,3 +131,9 @@ pub struct UploadPartQuery {
     pub object_key: String,
     pub buffer_size: Option<usize>,
 }
+
+#[derive(Deserialize)]
+pub struct RenameFragmentQuery {
+    pub fragment_to_rename: String,
+    pub new_name: String,
+}

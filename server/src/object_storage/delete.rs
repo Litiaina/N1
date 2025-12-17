@@ -1,10 +1,11 @@
-use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::invalidate_cache;
 use crate::object_storage::metadata_parser::find_latest_metadata_on_disk;
 use crate::object_storage::storage_capacity_parser::increment_storage_usage;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::ObjectPathManager;
+use crate::{enums::app_error_enum::AppError, object_storage::constants::OBJECT_DATA_ROOT};
+use axum::Json as AxumJson;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -42,4 +43,41 @@ pub async fn delete_object(
     info!("Deleted object: {}/{}", fragment, object_key);
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn delete_fragment(
+    claims: Claims,
+    Path(fragment_name): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let uid = claims.uid;
+    let path_manager = ObjectPathManager::new();
+
+    let user_storage_root = path_manager.root.join(OBJECT_DATA_ROOT).join(&uid);
+
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        let fragment_path = user_storage_root.join(&fragment_name);
+
+        if !fragment_path.exists() {
+            return Err(AppError::NotFound);
+        }
+
+        std::fs::remove_dir_all(&fragment_path).map_err(|e| {
+            error!("Failed to delete fragment {:?}: {}", fragment_path, e);
+            AppError::InternalServerError("Failed to delete fragment.".to_string())
+        })?;
+
+        info!("Deleted fragment '{}' for user {}", fragment_name, uid);
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
+
+    Ok((
+        StatusCode::OK,
+        AxumJson(serde_json::json!({
+            "status": "success",
+            "message": "Fragment deleted successfully"
+        })),
+    ))
 }
