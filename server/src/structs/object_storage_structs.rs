@@ -125,3 +125,9 @@ pub struct ChunkQuery {
     pub offset: u64,
     pub chunk_size: usize,
 }
+
+#[derive(Deserialize)]
+pub struct UploadPartQuery {
+    pub object_key: String,
+    pub buffer_size: Option<usize>,
+}

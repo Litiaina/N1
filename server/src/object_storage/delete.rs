@@ -22,22 +22,23 @@ pub async fn delete_object(
     let uid = claims.uid;
 
     let meta = find_latest_metadata_on_disk(&uid, &fragment, &object_key).await?;
-
     let size_to_free = meta.total_size_bytes as i64;
 
     let path_manager = ObjectPathManager::new();
-
     let object_dir = path_manager.get_object_dir(&uid, &fragment, &object_key);
 
-    fs::remove_dir_all(&object_dir).await.map_err(|e| {
-        error!("Failed to delete object directory: {}", e);
-        AppError::InternalServerError("Failed to delete object.".to_string())
-    })?;
+    let fs_task = async {
+        fs::remove_dir_all(&object_dir).await.map_err(|e| {
+            error!("Failed to delete object directory: {}", e);
+            AppError::InternalServerError("Failed to delete object.".to_string())
+        })
+    };
 
-    increment_storage_usage(&state.db_client, &uid, -size_to_free).await?;
-
-    invalidate_cache(&fragment, &object_key, &uid).await;
-
+    let db_task = increment_storage_usage(&state.db_client, &uid, -size_to_free);
+    let cache_task = invalidate_cache(&fragment, &object_key, &uid);
+    let (fs_result, db_result, _) = tokio::join!(fs_task, db_task, cache_task);
+    fs_result?;
+    db_result?;
     info!("Deleted object: {}/{}", fragment, object_key);
 
     Ok(StatusCode::NO_CONTENT)

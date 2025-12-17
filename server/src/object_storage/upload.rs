@@ -11,7 +11,8 @@ use crate::statics::merge_semaphore_static::CHUNK_UPLOAD_SEMAPHORE;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
     CapacityUsageResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery,
-    ObjectMetadata, ObjectPathManager, PartMetadata, UploadStatusResponse, UserAuthDetails,
+    ObjectMetadata, ObjectPathManager, PartMetadata, UploadPartQuery, UploadStatusResponse,
+    UserAuthDetails,
 };
 use axum::body::Body;
 use axum::{
@@ -21,7 +22,7 @@ use axum::{
     response::IntoResponse,
 };
 use chrono::Utc;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use mongodb::bson::doc;
 #[cfg(not(unix))]
 use std::path::Path;
@@ -30,11 +31,12 @@ use tokio::fs::{self, File};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tracing::info;
 use ulid::Ulid;
+use walkdir::WalkDir;
 
 #[cfg(unix)]
 pub async fn sync_dir(path: &Path) -> Result<(), AppError> {
-    use tokio::fs::OpenOptions;
     use std::os::unix::fs::OpenOptionsExt;
+    use tokio::fs::OpenOptions;
 
     let dir = OpenOptions::new()
         .read(true)
@@ -148,10 +150,11 @@ pub async fn get_upload_status(
 pub async fn object_upload_part(
     claims: Claims,
     AxumPath((fragment, version_id, part_index)): AxumPath<(String, String, u64)>,
-    Query(key_query): Query<ObjectKeyQuery>,
+    Query(query): Query<UploadPartQuery>,
     body: Body,
 ) -> Result<impl IntoResponse, AppError> {
-    let object_key = key_query.object_key;
+    let object_key = query.object_key;
+    let buffer_size = query.buffer_size.unwrap_or(128 * 1024).max(4096);
 
     let _permit = CHUNK_UPLOAD_SEMAPHORE
         .acquire()
@@ -175,7 +178,8 @@ pub async fn object_upload_part(
     let file = File::create(&part_path)
         .await
         .map_err(|e| AppError::Io(e, "create part file".into()))?;
-    let mut writer = BufWriter::new(file);
+
+    let mut writer = BufWriter::with_capacity(buffer_size, file);
     let mut size_bytes = 0;
 
     let mut stream = body.into_data_stream();
@@ -195,12 +199,6 @@ pub async fn object_upload_part(
         .await
         .map_err(|e| AppError::Io(e, "flush part".into()))?;
 
-    let part_file = writer.into_inner();
-    part_file
-        .sync_all()
-        .await
-        .map_err(|e| AppError::Io(e, "sync part data".into()))?;
-
     let part_meta = PartMetadata {
         part_index,
         size_bytes,
@@ -212,19 +210,9 @@ pub async fn object_upload_part(
         AppError::InternalServerError(format!("Failed to serialize part metadata: {}", e))
     })?;
 
-    let mut meta_file = File::create(&meta_path)
+    fs::write(&meta_path, bson_data)
         .await
-        .map_err(|e| AppError::Io(e, "create meta file".into()))?;
-
-    meta_file
-        .write_all(&bson_data)
-        .await
-        .map_err(|e| AppError::Io(e, "write meta data".into()))?;
-
-    meta_file
-        .sync_all()
-        .await
-        .map_err(|e| AppError::Io(e, "sync meta file".into()))?;
+        .map_err(|e| AppError::Io(e, "write part meta".into()))?;
 
     Ok((StatusCode::OK, "Part uploaded."))
 }
@@ -242,42 +230,62 @@ pub async fn finalize_object_upload(
     let path_manager = ObjectPathManager::new();
     let version_dir = path_manager.get_version_dir(&uid, &fragment, &object_key, &version_id);
 
-    let mut entries = fs::read_dir(&version_dir)
+    let version_dir_clone = version_dir.clone();
+    let part_paths =
+        tokio::task::spawn_blocking(move || -> Result<Vec<std::path::PathBuf>, AppError> {
+            let mut paths = Vec::new();
+            for entry in WalkDir::new(&version_dir_clone)
+                .max_depth(1)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if name.ends_with(PART_META_SUFFIX) {
+                            paths.push(path.to_owned());
+                        }
+                    }
+                }
+            }
+            Ok(paths)
+        })
         .await
-        .map_err(|e| AppError::Io(e, "read dir".into()))?;
+        .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
 
-    let mut parts: Vec<PartMetadata> = Vec::new();
-    let mut total_size_calculated = 0;
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if name_str.ends_with(PART_META_SUFFIX) {
-            let data = fs::read(entry.path())
-                .await
-                .map_err(|e| AppError::Io(e, "read meta".into()))?;
-
-            let part: PartMetadata = mongodb::bson::from_slice(&data)
-                .map_err(|_| AppError::InternalServerError("Corrupt part meta".into()))?;
-
-            total_size_calculated += part.size_bytes;
-            parts.push(part);
-        }
-    }
-
-    if parts.is_empty() {
+    if part_paths.is_empty() {
         return Err(AppError::BadRequest(
             "No parts found to finalize.".to_string(),
         ));
     }
 
+    let parts_result: Result<Vec<PartMetadata>, AppError> = stream::iter(part_paths)
+        .map(|path| async move {
+            let data = fs::read(&path)
+                .await
+                .map_err(|e| AppError::Io(e, "read part meta".into()))?;
+
+            let part: PartMetadata = mongodb::bson::from_slice(&data)
+                .map_err(|_| AppError::InternalServerError("Corrupt part meta".into()))?;
+
+            Ok(part)
+        })
+        .buffer_unordered(50)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect();
+
+    let mut parts = parts_result?;
+
     parts.sort_by_key(|p| p.part_index);
 
+    let mut total_size_calculated = 0;
     for (i, part) in parts.iter().enumerate() {
         if part.part_index != i as u64 {
             return Err(AppError::BadRequest(format!("Missing part index {}", i)));
         }
+        total_size_calculated += part.size_bytes;
     }
 
     let object_meta = ObjectMetadata {
@@ -294,8 +302,9 @@ pub async fn finalize_object_upload(
         parts,
     };
 
-    let bson_data = mongodb::bson::to_vec(&object_meta)
-        .map_err(|e| AppError::InternalServerError(format!("Failed to serialize object metadata: {}", e)))?;
+    let bson_data = mongodb::bson::to_vec(&object_meta).map_err(|e| {
+        AppError::InternalServerError(format!("Failed to serialize object metadata: {}", e))
+    })?;
 
     let meta_path = version_dir.join(OBJECT_META_FILE);
 
