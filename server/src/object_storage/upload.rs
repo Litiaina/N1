@@ -29,7 +29,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncWriteExt, BufWriter};
-use tracing::info;
+use tracing::{error, info};
 use ulid::Ulid;
 use walkdir::WalkDir;
 
@@ -231,7 +231,8 @@ pub async fn finalize_object_upload(
     let version_dir = path_manager.get_version_dir(&uid, &fragment, &object_key, &version_id);
 
     let version_dir_clone = version_dir.clone();
-    let part_paths =
+
+    let part_meta_paths =
         tokio::task::spawn_blocking(move || -> Result<Vec<std::path::PathBuf>, AppError> {
             let mut paths = Vec::new();
             for entry in WalkDir::new(&version_dir_clone)
@@ -253,13 +254,13 @@ pub async fn finalize_object_upload(
         .await
         .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
 
-    if part_paths.is_empty() {
+    if part_meta_paths.is_empty() {
         return Err(AppError::BadRequest(
             "No parts found to finalize.".to_string(),
         ));
     }
 
-    let parts_result: Result<Vec<PartMetadata>, AppError> = stream::iter(part_paths)
+    let parts_result: Result<Vec<PartMetadata>, AppError> = stream::iter(part_meta_paths.clone())
         .map(|path| async move {
             let data = fs::read(&path)
                 .await
@@ -277,7 +278,6 @@ pub async fn finalize_object_upload(
         .collect();
 
     let mut parts = parts_result?;
-
     parts.sort_by_key(|p| p.part_index);
 
     let mut total_size_calculated = 0;
@@ -307,7 +307,6 @@ pub async fn finalize_object_upload(
     })?;
 
     let meta_path = version_dir.join(OBJECT_META_FILE);
-
     let mut final_meta_file = File::create(&meta_path)
         .await
         .map_err(|e| AppError::Io(e, "create object meta".into()))?;
@@ -322,10 +321,18 @@ pub async fn finalize_object_upload(
         .await
         .map_err(|e| AppError::Io(e, "sync object meta".into()))?;
 
+    let cleanup_futures = stream::iter(part_meta_paths)
+        .map(|path| async move {
+            if let Err(e) = fs::remove_file(&path).await {
+                error!("Failed to cleanup part meta file {:?}: {}", path, e);
+            }
+        })
+        .buffer_unordered(20);
+
+    cleanup_futures.collect::<Vec<_>>().await;
+
     sync_dir(&version_dir).await?;
-
     increment_storage_usage(&state.db_client, &uid, total_size_calculated as i64).await?;
-
     invalidate_cache(&fragment, &object_key, &uid).await;
 
     info!(
