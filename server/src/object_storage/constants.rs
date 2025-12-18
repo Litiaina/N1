@@ -4,3 +4,4 @@ pub const PART_SUFFIX: &str = ".data";
 pub const PART_META_SUFFIX: &str = ".meta.bson";
 pub const BROWSER_CACHE_MAX_AGE: u64 = 3600;
 pub const MAX_CONCURRENT_UPLOADS: usize = 100;
+pub const CHUNK_SIZE: usize = 128 * 1024;

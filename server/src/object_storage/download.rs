@@ -1,5 +1,6 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::get_metadata_with_cache;
+use crate::object_storage::constants::CHUNK_SIZE;
 use crate::object_storage::header_parser::parse_range_header;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
@@ -10,6 +11,7 @@ use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use chrono::{TimeZone, Utc};
 use futures_util::stream;
 use std::io::SeekFrom;
 use std::path::PathBuf;
@@ -92,12 +94,12 @@ pub async fn download_object_chunk(
                         .map_err(|e| AppError::Io(e, "seek part".into()))?;
                 }
 
-                let mut chunk = vec![0u8; to_read];
-                file.read_exact(&mut chunk)
+                let current_len = result_buffer.len();
+                result_buffer.resize(current_len + to_read, 0);
+                
+                file.read_exact(&mut result_buffer[current_len..])
                     .await
                     .map_err(|e| AppError::Io(e, "read part".into()))?;
-
-                result_buffer.extend_from_slice(&chunk);
             }
         }
 
@@ -123,121 +125,115 @@ pub async fn stream_object(
 ) -> Result<impl IntoResponse, AppError> {
     let file_size = metadata.total_size_bytes;
 
-    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    let ObjectMetadata {
+        content_type,
+        parts,
+        owner_uid,
+        fragment,
+        object_key,
+        version_id,
+        created_at,
+        ..
+    } = metadata;
 
-    let (start, end, is_partial) = if let Some(range) = range_header {
-        match parse_range_header(Some(range), file_size) {
-            Some((s, e)) => (s, e, true),
-            None => return Err(AppError::RangeNotSatisfiable),
-        }
-    } else {
-        (0, file_size.saturating_sub(1), false)
-    };
+    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    let (start, end) = parse_range_header(range_header, file_size).unwrap_or((0, file_size.saturating_sub(1)));
 
     if start >= file_size {
         return Err(AppError::RangeNotSatisfiable);
     }
 
     let content_length = end - start + 1;
-
-    let clean_stored_key = metadata.object_key.trim_start_matches('/');
+    let clean_stored_key = object_key.trim_start_matches('/');
 
     let path_manager = ObjectPathManager::new();
-    let version_dir = path_manager.get_version_dir(
-        &metadata.owner_uid,
-        &metadata.fragment,
-        clean_stored_key,
-        &metadata.version_id,
-    );
+    let version_dir = path_manager.get_version_dir(&owner_uid, &fragment, clean_stored_key, &version_id);
 
-    if !tokio::fs::try_exists(&version_dir).await.unwrap_or(false) {
-        tracing::error!("Physical directory missing for object: {:?}", version_dir);
-        return Err(AppError::NotFound);
-    }
-
-    let filename = std::path::Path::new(&clean_stored_key)
+    let filename = std::path::Path::new(clean_stored_key)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("download")
         .to_string();
 
-    let ObjectMetadata {
-        content_type,
-        parts,
-        ..
-    } = metadata;
-
     struct StreamState {
         pos: u64,
-        end_pos: u64,
+        end: u64,
         parts: Vec<PartMetadata>,
         version_dir: PathBuf,
-        current_file: Option<(usize, File)>,
+        current_file: Option<File>,
+        current_part_index: usize,
+        current_part_start_offset: u64,
+    }
+
+    let mut current_offset = 0;
+    let mut start_part_index = 0;
+    let mut start_part_start_offset = 0;
+
+    for (idx, part) in parts.iter().enumerate() {
+        let part_end = current_offset + part.size_bytes;
+        if start >= current_offset && start < part_end {
+            start_part_index = idx;
+            start_part_start_offset = current_offset;
+            break;
+        }
+        current_offset = part_end;
     }
 
     let initial_state = StreamState {
         pos: start,
-        end_pos: end,
+        end,
         parts,
         version_dir,
         current_file: None,
+        current_part_index: start_part_index,
+        current_part_start_offset: start_part_start_offset,
     };
 
     let stream = stream::unfold(initial_state, move |mut state| async move {
-        if state.pos > state.end_pos {
+        if state.pos > state.end {
             return None;
         }
 
-        let mut current_offset = 0;
-        let mut target_part_idx = None;
-        let mut part_relative_offset = 0;
+        let mut part = &state.parts[state.current_part_index];
+        let part_end_global = state.current_part_start_offset + part.size_bytes;
 
-        for (idx, part) in state.parts.iter().enumerate() {
-            let part_end = current_offset + part.size_bytes;
-            if state.pos >= current_offset && state.pos < part_end {
-                target_part_idx = Some(idx);
-                part_relative_offset = state.pos - current_offset;
-                break;
+        if state.pos >= part_end_global {
+            state.current_part_index += 1;
+            if state.current_part_index >= state.parts.len() {
+                return None; 
             }
-            current_offset = part_end;
+            state.current_part_start_offset = part_end_global;
+            state.current_file = None; 
+            part = &state.parts[state.current_part_index];
         }
 
-        let part_idx = match target_part_idx {
-            Some(idx) => idx,
-            None => return None,
-        };
-
-        let part = &state.parts[part_idx];
-
-        let mut file = match state.current_file.take() {
-            Some((idx, f)) if idx == part_idx => f,
-            _ => {
-                let part_path = state.version_dir.join(&part.file_name);
-                let mut f = match File::open(&part_path).await {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::error!("Failed to open part {:?}: {}", part_path, e);
-                        return Some((Err(AppError::Io(e, "open part".into())), state));
+        if state.current_file.is_none() {
+            let part_path = state.version_dir.join(&part.file_name);
+            match File::open(&part_path).await {
+                Ok(mut f) => {
+                    let relative_pos = state.pos - state.current_part_start_offset;
+                    if let Err(e) = f.seek(SeekFrom::Start(relative_pos)).await {
+                        return Some((Err(AppError::Io(e, "seek part".into())), state));
                     }
-                };
-                if let Err(e) = f.seek(SeekFrom::Start(part_relative_offset)).await {
-                    return Some((Err(AppError::Io(e, "seek part".into())), state));
+                    state.current_file = Some(f);
                 }
-                f
+                Err(e) => {
+                    return Some((Err(AppError::Io(e, "open part".into())), state));
+                }
             }
-        };
+        }
 
-        let part_remaining = part.size_bytes - part_relative_offset;
-        let req_remaining = state.end_pos - state.pos + 1;
-        let read_size = 64 * 1024;
-        let to_read = (read_size as u64).min(part_remaining).min(req_remaining) as usize;
+        let part_remaining = part.size_bytes - (state.pos - state.current_part_start_offset);
+        let req_remaining = state.end - state.pos + 1;
+        let to_read = (CHUNK_SIZE as u64).min(part_remaining).min(req_remaining) as usize;
 
         let mut buf = vec![0u8; to_read];
+        let file = state.current_file.as_mut().unwrap();
+
         match file.read_exact(&mut buf).await {
             Ok(_) => {
                 let bytes = Bytes::from(buf);
                 state.pos += to_read as u64;
-                state.current_file = Some((part_idx, file));
                 Some((Ok(bytes), state))
             }
             Err(e) => Some((Err(AppError::Io(e, "read part".into())), state)),
@@ -245,22 +241,23 @@ pub async fn stream_object(
     });
 
     let body = Body::from_stream(stream);
+    let etag = format!("\"{}\"", version_id);
+    let last_modified = Utc.timestamp_opt(created_at, 0)
+        .single()
+        .map(|dt| dt.to_rfc2822())
+        .unwrap_or_else(|| "Thu, 01 Jan 1970 00:00:00 GMT".to_string());
 
     let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, content_type)
         .header(header::ACCEPT_RANGES, "bytes")
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("{}; filename=\"{}\"", disposition_type, filename),
-        );
+        .header(header::ETAG, etag) 
+        .header(header::LAST_MODIFIED, last_modified)
+        .header(header::CONTENT_DISPOSITION, format!("{}; filename=\"{}\"", disposition_type, filename));
 
-    if is_partial {
+    if content_length < file_size {
         builder = builder
             .status(StatusCode::PARTIAL_CONTENT)
-            .header(
-                header::CONTENT_RANGE,
-                format!("bytes {}-{}/{}", start, end, file_size),
-            )
+            .header(header::CONTENT_RANGE,format!("bytes {}-{}/{}", start, end, file_size),)
             .header(header::CONTENT_LENGTH, content_length.to_string());
     } else {
         builder = builder
