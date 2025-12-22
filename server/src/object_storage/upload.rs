@@ -300,6 +300,7 @@ pub async fn finalize_object_upload(
         total_size_bytes: total_size_calculated,
         created_at: Utc::now().timestamp(),
         parts,
+        is_delete_marker: false
     };
 
     let bson_data = mongodb::bson::to_vec(&object_meta).map_err(|e| {

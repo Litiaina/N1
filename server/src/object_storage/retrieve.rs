@@ -76,16 +76,25 @@ pub async fn list_objects(
         .take(limit)
         .collect::<Vec<_>>();
 
-    let objects = stream::iter(target_keys)
+    let mut objects = stream::iter(target_keys)
         .map(|key| {
             let frag = fragment.clone();
             let u = uid.clone();
             async move { get_metadata_with_cache(&frag, &key, &u).await }
         })
         .buffer_unordered(64)
-        .filter_map(|res| async { res.ok() })
+        .filter_map(|res| async { 
+            match res {
+                Ok(meta) => {
+                    if meta.is_delete_marker { None } else { Some(meta) }
+                },
+                Err(_) => None 
+            }
+        })
         .collect::<Vec<_>>()
         .await;
+
+    objects.sort_by(|a, b| a.object_key.cmp(&b.object_key));
 
     Ok(AxumJson(objects))
 }
@@ -133,6 +142,10 @@ pub async fn get_object_metadata(
 ) -> Result<impl IntoResponse, AppError> {
     let metadata = get_metadata_with_cache(&fragment, &object_key, &claims.uid).await?;
 
+    if metadata.is_delete_marker {
+        return Err(AppError::NotFound);
+    }
+
     Ok(AxumJson(metadata))
 }
 
@@ -144,6 +157,10 @@ pub async fn get_object(
     let uid = claims.uid;
 
     let metadata = get_metadata_with_cache(&fragment, &object_key, &uid).await?;
+
+    if metadata.is_delete_marker {
+        return Err(AppError::NotFound);
+    }
 
     let mut response = get_object_logic(metadata, req).await?.into_response();
 
@@ -165,6 +182,10 @@ pub async fn stream_object(
 ) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
     let metadata = get_metadata_with_cache(&fragment, &object_key, &uid).await?;
+
+    if metadata.is_delete_marker {
+        return Err(AppError::NotFound);
+    }
 
     stream_object_logic(headers, metadata).await
 }

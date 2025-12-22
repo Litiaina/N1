@@ -4,6 +4,7 @@ use std::sync::LazyLock;
 pub struct GarbageCollectorConfig {
     pub cleanup_interval_seconds: u64,
     pub file_ttl_seconds: u64,
+    pub retention_days: u64,
 }
 
 pub struct Config {
@@ -27,10 +28,16 @@ pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
         .parse()
         .expect("'file_ttl_seconds' must be a valid positive integer.");
 
+    let retention_days: u64 = gc_section.get("retention_days")
+        .expect("Missing 'retention_days' in [garbage_collector] section")
+        .parse()
+        .expect("'retention_days' must be a valid positive integer.");
+
     Config {
         garbage_collector: GarbageCollectorConfig {
             cleanup_interval_seconds,
             file_ttl_seconds,
+            retention_days,
         },
     }
 });

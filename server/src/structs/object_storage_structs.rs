@@ -51,6 +51,8 @@ pub struct ObjectMetadata {
     pub total_size_bytes: u64,
     pub created_at: i64,
     pub parts: Vec<PartMetadata>,
+    #[serde(default)] 
+    pub is_delete_marker: bool, 
 }
 
 #[derive(Deserialize)]

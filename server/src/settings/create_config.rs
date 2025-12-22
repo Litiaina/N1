@@ -20,8 +20,9 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
 
     //Garbage collector
     conf.with_section(Some("garbage_collector"))
-        .set("cleanup_interval_seconds", "86400")
-        .set("file_ttl_seconds", "86400");
+        .set("cleanup_interval_seconds", "3600")
+        .set("file_ttl_seconds", "3600")
+        .set("retention_days", "30");
 
     //Upload & Storage limits
     conf.with_section(Some("set_limits"))

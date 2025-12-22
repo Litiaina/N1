@@ -28,6 +28,10 @@ pub async fn download_object(
 
     let metadata = get_metadata_with_cache(&fragment, clean_key, &claims.uid).await?;
 
+    if metadata.is_delete_marker {
+        return Err(AppError::NotFound);
+    }
+
     stream_object(metadata, headers, "attachment").await
 }
 
@@ -39,6 +43,10 @@ pub async fn download_object_chunk(
     let clean_key = params.object_key.trim_start_matches('/');
 
     let metadata = get_metadata_with_cache(&fragment, clean_key, &claims.uid).await?;
+
+    if metadata.is_delete_marker {
+        return Err(AppError::NotFound);
+    }
 
     let clean_stored_key = metadata.object_key.trim_start_matches('/');
 
@@ -123,6 +131,10 @@ pub async fn stream_object(
     headers: HeaderMap,
     disposition_type: &str,
 ) -> Result<impl IntoResponse, AppError> {
+    if metadata.is_delete_marker {
+        return Err(AppError::NotFound);
+    }
+
     let file_size = metadata.total_size_bytes;
 
     let ObjectMetadata {
