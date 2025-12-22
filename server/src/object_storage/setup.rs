@@ -5,7 +5,6 @@ use mongodb::{
 };
 use std::error::Error;
 use std::time::Duration;
-use tracing::info;
 
 use crate::{
     database::database_constants::OBJECT_STORAGE_DATABASE, statics::database_statics::DATABASE_URL,
@@ -35,8 +34,6 @@ pub async fn setup_database_locks() -> Result<Client, Box<dyn Error>> {
     locks_collection
         .create_indexes(vec![uid_index, locked_at_index])
         .await?;
-
-    info!("✅ 'upload_locks' collection indexes checked/created successfully.");
 
     Ok(client)
 }

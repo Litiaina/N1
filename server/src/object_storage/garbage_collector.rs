@@ -3,8 +3,9 @@ use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_META_FILE};
 use crate::settings::config::CONFIG;
 use crate::structs::object_storage_structs::{OBJECT_STORAGE_ROOT, ObjectMetadata};
 use mongodb::Client as MongoClient;
+use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::time::sleep;
@@ -13,11 +14,16 @@ use walkdir::WalkDir;
 
 pub async fn run_lifecycle_manager(_db_client: Arc<MongoClient>) {
     let cleanup_interval = Duration::from_secs(CONFIG.garbage_collector.cleanup_interval_seconds);
-    let file_ttl = Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds);
+    let file_ttl = if CONFIG.garbage_collector.file_ttl_seconds > 0 {
+        Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds)
+    } else {
+        Duration::from_secs(3600)
+    };
 
     loop {
         info!("⏳ Lifecycle Manager: Starting scan...");
-        if let Err(e) = perform_lifecycle_scan().await {
+        
+        if let Err(e) = perform_lifecycle_scan(file_ttl).await {
             error!("Lifecycle Scan Failed: {}", e);
         }
 
@@ -29,7 +35,22 @@ pub async fn run_lifecycle_manager(_db_client: Arc<MongoClient>) {
     }
 }
 
-async fn perform_lifecycle_scan() -> Result<(), AppError> {
+pub async fn run_garbage_collector(_db_client: Arc<MongoClient>) {
+    let file_ttl = Duration::from_secs(60);
+    info!("🗑️ GC (One-Time) executing...");
+
+    if let Err(e) = perform_lifecycle_scan(file_ttl).await {
+        error!("🗑️ GC (One-Time) Lifecycle Scan failed: {}", e);
+    }
+
+    if let Err(e) = perform_filesystem_cleanup(file_ttl).await {
+        error!("🗑️ GC (One-Time) Filesystem Cleanup failed: {}", e);
+    } else {
+        info!("🗑️ GC (One-Time) completed successfully.");
+    }
+}
+
+async fn perform_lifecycle_scan(ttl: Duration) -> Result<(), AppError> {
     let root_str = OBJECT_STORAGE_ROOT
         .get()
         .ok_or(AppError::InternalServerError("No root".into()))?;
@@ -40,18 +61,27 @@ async fn perform_lifecycle_scan() -> Result<(), AppError> {
             return Ok(());
         }
 
+        let mut object_dirs = HashSet::new();
+
         for entry in WalkDir::new(&storage_root)
-            .min_depth(3)
-            .max_depth(3)
             .into_iter()
             .filter_map(|e| e.ok())
         {
-            if entry.file_type().is_dir() {
-                if let Err(e) = process_object_lifecycle(entry.path()) {
-                    error!("Error processing lifecycle for {:?}: {}", entry.path(), e);
+            if entry.file_type().is_file() && entry.file_name() == OBJECT_META_FILE {
+                if let Some(version_dir) = entry.path().parent() {
+                    if let Some(object_dir) = version_dir.parent() {
+                        object_dirs.insert(object_dir.to_path_buf());
+                    }
                 }
             }
         }
+
+        for object_dir in object_dirs {
+            if let Err(e) = process_object_lifecycle(&object_dir, ttl) {
+                error!("Error processing lifecycle for {:?}: {}", object_dir, e);
+            }
+        }
+        
         Ok(())
     })
     .await
@@ -60,66 +90,80 @@ async fn perform_lifecycle_scan() -> Result<(), AppError> {
     Ok(())
 }
 
-fn process_object_lifecycle(object_dir: &std::path::Path) -> Result<(), AppError> {
-    let mut versions = Vec::new();
-    let read_dir =
-        std::fs::read_dir(object_dir).map_err(|e| AppError::Io(e, "read obj dir".into()))?;
+fn process_object_lifecycle(object_dir: &Path, ttl: Duration) -> Result<(), AppError> {
+    let read_dir = fs::read_dir(object_dir).map_err(|e| AppError::Io(e, "read obj dir".into()))?;
+    
+    let mut valid_versions = Vec::new();
+    let mut incomplete_versions = Vec::new();
 
     for entry in read_dir.flatten() {
-        if entry.path().is_dir() {
+        let path = entry.path();
+        if path.is_dir() {
             if let Some(name) = entry.file_name().to_str() {
-                versions.push(name.to_string());
+                let meta_path = path.join(OBJECT_META_FILE);
+                if meta_path.exists() {
+                    valid_versions.push(name.to_string());
+                } else {
+                    incomplete_versions.push(path.clone());
+                }
             }
         }
     }
 
-    versions.sort();
+    for folder_path in incomplete_versions {
+        if let Ok(metadata) = fs::metadata(&folder_path) {
+            let modified = metadata.modified().unwrap_or(SystemTime::now());
+            let age = SystemTime::now().duration_since(modified).unwrap_or(Duration::ZERO);
+            
+            if age > ttl {
+                info!("♻️ Lifecycle: Removing stale incomplete upload at {:?}", folder_path);
+                let _ = fs::remove_dir_all(&folder_path);
+            }
+        }
+    }
 
-    if versions.is_empty() {
-        let _ = std::fs::remove_dir(object_dir);
+    valid_versions.sort();
+
+    if valid_versions.is_empty() {
+        let _ = fs::remove_dir(object_dir);
         return Ok(());
     }
 
-    let latest_version_id = versions.last().unwrap().clone();
+    let latest_version_id = valid_versions.last().unwrap().clone();
     let retention_duration = Duration::from_secs(CONFIG.garbage_collector.retention_days * 86400);
 
-    for version_id in &versions {
+    for version_id in &valid_versions {
         let is_latest = version_id == &latest_version_id;
         let version_path = object_dir.join(version_id);
         let meta_path = version_path.join(OBJECT_META_FILE);
 
-        if let Ok(metadata) = std::fs::metadata(&version_path) {
+        if let Ok(metadata) = fs::metadata(&version_path) {
             if let Ok(modified) = metadata.modified() {
                 if let Ok(age) = SystemTime::now().duration_since(modified) {
                     if age < retention_duration {
-                        continue;
+                        continue; 
                     }
                 }
             }
         }
 
-        if let Ok(data) = std::fs::read(&meta_path) {
+        if let Ok(data) = fs::read(&meta_path) {
             if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
                 if !is_latest {
-                    info!(
-                        "♻️ Lifecycle: Deleting old version {}/{}",
-                        meta.object_key, version_id
-                    );
-                    let _ = std::fs::remove_dir_all(&version_path);
+                    info!("♻️ Lifecycle: Deleting old version {}/{}", meta.object_key, version_id);
+                    let _ = fs::remove_dir_all(&version_path);
                     continue;
                 }
 
                 if is_latest && meta.is_delete_marker {
-                    info!(
-                        "♻️ Lifecycle: Cleaning up expired delete marker {}/{}",
-                        meta.object_key, version_id
-                    );
-                    let _ = std::fs::remove_dir_all(&version_path);
+                    info!("♻️ Lifecycle: Cleaning up expired delete marker {}/{}", meta.object_key, version_id);
+                    let _ = fs::remove_dir_all(&version_path);
                 }
             }
         }
     }
 
+    let _ = fs::remove_dir(object_dir);
     Ok(())
 }
 
@@ -142,55 +186,38 @@ async fn perform_filesystem_cleanup(ttl: Duration) -> Result<(), AppError> {
         {
             let path = entry.path();
 
-            if path == storage_root {
-                continue;
-            }
-            if !path.is_dir() {
+            if path == storage_root { continue; }
+            if !path.is_dir() { continue; }
+
+            if path.join(OBJECT_META_FILE).exists() {
                 continue;
             }
 
             let mut has_subdirs = false;
             let mut has_files = false;
-            let mut has_meta = false;
 
             if let Ok(read_dir) = fs::read_dir(path) {
                 for child in read_dir.flatten() {
                     if let Ok(ft) = child.file_type() {
                         if ft.is_dir() {
                             has_subdirs = true;
-                            break;
-                        } else if ft.is_file() {
+                            break; 
+                        } else {
                             has_files = true;
-                            if child.file_name() == OBJECT_META_FILE {
-                                has_meta = true;
-                            }
                         }
                     }
                 }
             }
 
-            if has_subdirs {
-                continue;
-            }
-
-            if has_meta {
-                continue;
-            }
+            if has_subdirs { continue; }
 
             if has_files {
                 let metadata = fs::metadata(path).ok();
-                let modified = metadata
-                    .and_then(|m| m.modified().ok())
-                    .unwrap_or(SystemTime::now());
-                let age = SystemTime::now()
-                    .duration_since(modified)
-                    .unwrap_or(Duration::ZERO);
+                let modified = metadata.and_then(|m| m.modified().ok()).unwrap_or(SystemTime::now());
+                let age = SystemTime::now().duration_since(modified).unwrap_or(Duration::ZERO);
 
                 if age > ttl {
-                    info!(
-                        "🗑️ Found stale incomplete upload: {:?} (Age: {:?}). Deleting...",
-                        path, age
-                    );
+                    info!("🗑️ GC: Found failed upload (no meta): {:?} (Age: {:?}). Deleting...", path, age);
                     let _ = fs::remove_dir_all(path);
                 }
                 continue;
@@ -205,15 +232,4 @@ async fn perform_filesystem_cleanup(ttl: Duration) -> Result<(), AppError> {
     .map_err(|e| AppError::InternalServerError(format!("GC Task Error: {}", e)))??;
 
     Ok(())
-}
-
-pub async fn run_garbage_collector(_db_client: Arc<MongoClient>) {
-    let file_ttl = Duration::from_secs(60);
-    info!("🗑️ GC (One-Time) executing. TTL: {:?}", file_ttl);
-
-    if let Err(e) = perform_filesystem_cleanup(file_ttl).await {
-        error!("🗑️ GC One-Time run failed: {}", e);
-    } else {
-        info!("🗑️ GC (One-Time) completed successfully.");
-    }
 }

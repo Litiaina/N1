@@ -1,9 +1,9 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::get_metadata_with_cache;
-use crate::object_storage::constants::{BROWSER_CACHE_MAX_AGE, OBJECT_DATA_ROOT};
+use crate::object_storage::constants::{BROWSER_CACHE_MAX_AGE, OBJECT_DATA_ROOT, OBJECT_META_FILE};
 use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
 use crate::structs::auth_structs::Claims;
-use crate::structs::object_storage_structs::ObjectPathManager;
+use crate::structs::object_storage_structs::{ObjectMetadata, ObjectPathManager};
 use axum::{
     Json as AxumJson,
     body::Body,
@@ -13,6 +13,7 @@ use axum::{
 };
 use futures_util::{StreamExt, stream};
 use std::collections::HashMap;
+use tokio::fs;
 use walkdir::WalkDir;
 
 pub async fn list_objects(
@@ -27,6 +28,11 @@ pub async fn list_objects(
         .join(OBJECT_DATA_ROOT)
         .join(&uid)
         .join(&fragment);
+
+    let include_deleted = params
+        .get("include_deleted")
+        .map(|v| v == "true")
+        .unwrap_or(false);
 
     let keys = tokio::task::spawn_blocking(move || -> Result<Vec<String>, std::io::Error> {
         if !fragment_dir.exists() {
@@ -83,12 +89,16 @@ pub async fn list_objects(
             async move { get_metadata_with_cache(&frag, &key, &u).await }
         })
         .buffer_unordered(64)
-        .filter_map(|res| async { 
+        .filter_map(|res| async move {
             match res {
                 Ok(meta) => {
-                    if meta.is_delete_marker { None } else { Some(meta) }
-                },
-                Err(_) => None 
+                    if !include_deleted && meta.is_delete_marker {
+                        None
+                    } else {
+                        Some(meta)
+                    }
+                }
+                Err(_) => None,
             }
         })
         .collect::<Vec<_>>()
@@ -99,9 +109,44 @@ pub async fn list_objects(
     Ok(AxumJson(objects))
 }
 
-pub async fn list_fragments(
+pub async fn list_object_versions(
     claims: Claims,
+    Path((fragment, object_key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
+    let uid = claims.uid;
+    let path_manager = ObjectPathManager::new();
+    let clean_key = object_key.trim_start_matches('/');
+
+    let object_dir = path_manager.get_object_dir(&uid, &fragment, clean_key);
+
+    if !fs::try_exists(&object_dir).await.unwrap_or(false) {
+        return Err(AppError::NotFound);
+    }
+
+    let mut versions = Vec::new();
+    let mut entries = fs::read_dir(&object_dir)
+        .await
+        .map_err(|e| AppError::Io(e, "read obj dir".into()))?;
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Ok(ft) = entry.file_type().await {
+            if ft.is_dir() {
+                let meta_path = entry.path().join(OBJECT_META_FILE);
+                if let Ok(data) = fs::read(&meta_path).await {
+                    if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
+                        versions.push(meta);
+                    }
+                }
+            }
+        }
+    }
+
+    versions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    Ok(AxumJson(versions))
+}
+
+pub async fn list_fragments(claims: Claims) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
     let user_storage_root = path_manager.root.join(OBJECT_DATA_ROOT).join(&uid);

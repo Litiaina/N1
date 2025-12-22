@@ -1,25 +1,27 @@
+use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::invalidate_cache;
-use crate::object_storage::constants::OBJECT_META_FILE;
+use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_META_FILE};
 use crate::object_storage::storage_capacity_parser::increment_storage_usage;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{ObjectMetadata, ObjectPathManager};
-use crate::{enums::app_error_enum::AppError};
+use axum::Json;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
 };
 use chrono::Utc;
-use ulid::Ulid;
+use futures_util::{StreamExt, stream};
 use std::sync::Arc;
 use tokio::fs;
 use tracing::{error, info};
+use ulid::Ulid;
 
 pub async fn delete_object_version(
     State(state): State<Arc<AppState>>,
     claims: Claims,
-    Path((fragment, object_key, version_id)): Path<(String, String, String)>,
+    Path((fragment, version_id, object_key)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
@@ -31,6 +33,7 @@ pub async fn delete_object_version(
 
     let meta_path = version_dir.join(OBJECT_META_FILE);
     let mut size_to_free = 0;
+
     if let Ok(data) = fs::read(&meta_path).await {
         if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
             if !meta.is_delete_marker {
@@ -50,6 +53,87 @@ pub async fn delete_object_version(
     
     invalidate_cache(&fragment, &object_key, &uid).await;
     info!("Hard deleted version: {}/{} (v: {})", fragment, object_key, version_id);
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn delete_object_permanently(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Path((fragment, object_key)): Path<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    let uid = claims.uid;
+    let path_manager = ObjectPathManager::new();
+    let object_dir = path_manager.get_object_dir(&uid, &fragment, &object_key);
+
+    if !fs::try_exists(&object_dir).await.unwrap_or(false) {
+        return Err(AppError::NotFound);
+    }
+
+    let mut version_paths = Vec::new();
+    let mut entries = fs::read_dir(&object_dir).await.map_err(|e| AppError::Io(e, "read object dir".into()))?;
+    
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Ok(ft) = entry.file_type().await {
+            if ft.is_dir() {
+                version_paths.push(entry.path());
+            }
+        }
+    }
+
+    let results: Vec<i64> = stream::iter(version_paths)
+        .map(|path| async move {
+            let mut freed_bytes = 0;
+            
+            let mut has_subdirs = false;
+            if let Ok(mut sub_entries) = fs::read_dir(&path).await {
+                while let Ok(Some(sub)) = sub_entries.next_entry().await {
+                    if let Ok(sub_ft) = sub.file_type().await {
+                        if sub_ft.is_dir() {
+                            has_subdirs = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if has_subdirs {
+                return 0;
+            }
+
+            let meta_path = path.join(OBJECT_META_FILE);
+            if let Ok(data) = fs::read(&meta_path).await {
+                if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
+                    if !meta.is_delete_marker {
+                        freed_bytes = meta.total_size_bytes as i64;
+                    }
+                }
+            }
+
+            if let Err(e) = fs::remove_dir_all(&path).await {
+                error!("Failed to delete version dir {:?}: {}", path, e);
+                return 0;
+            }
+
+            freed_bytes
+        })
+        .buffer_unordered(20)
+        .collect()
+        .await;
+
+    let total_size_to_free: i64 = results.iter().sum();
+
+    let _ = fs::remove_dir(&object_dir).await;
+
+    if total_size_to_free > 0 {
+        increment_storage_usage(&state.db_client, &uid, -total_size_to_free).await?;
+    }
+
+    invalidate_cache(&fragment, &object_key, &uid).await;
+    info!(
+        "Permanently deleted object versions: {}/{} (Freed: {} bytes)",
+        fragment, object_key, total_size_to_free
+    );
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -89,4 +173,41 @@ pub async fn delete_object(
     info!("Created delete marker: {}/{}", fragment, object_key);
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn delete_fragment(
+    claims: Claims,
+    Path(fragment): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let uid = claims.uid;
+    let path_manager = ObjectPathManager::new();
+
+    let user_storage_root = path_manager.root.join(OBJECT_DATA_ROOT).join(&uid);
+
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        let fragment_path = user_storage_root.join(&fragment);
+
+        if !fragment_path.exists() {
+            return Err(AppError::NotFound);
+        }
+
+        std::fs::remove_dir_all(&fragment_path).map_err(|e| {
+            error!("Failed to delete fragment {:?}: {}", fragment_path, e);
+            AppError::InternalServerError("Failed to delete fragment.".to_string())
+        })?;
+
+        info!("Deleted fragment '{}' for user {}", fragment, uid);
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "success",
+            "message": "Fragment deleted successfully"
+        })),
+    ))
 }

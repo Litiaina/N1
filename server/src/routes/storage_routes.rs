@@ -25,9 +25,9 @@
     use std::time::Duration;
     use tower_http::cors::{Any, CorsLayer};
     use crate::fs::fs_constants::MAX_FILE_SIZE;
-    use crate::object_storage::delete::{delete_object, delete_object_version};
+    use crate::object_storage::delete::{delete_fragment, delete_object, delete_object_permanently, delete_object_version};
     use crate::object_storage::download::{download_object, download_object_chunk};
-    use crate::object_storage::retrieve::{get_object, get_object_metadata, list_fragments, list_objects, stream_object};
+    use crate::object_storage::retrieve::{get_object, get_object_metadata, list_fragments, list_object_versions, list_objects, stream_object};
     use crate::object_storage::modify::{rename_fragment, rename_object};
     use crate::object_storage::upload::{
         finalize_object_upload, get_capacity_usage, get_upload_status, initiate_object_upload, object_upload_part
@@ -75,8 +75,8 @@
             let read_ops = Router::new()
                 .route("/v4/capacity/usage", get(get_capacity_usage))
                 .route("/v4/fragment/metadata", get(list_fragments))
-                .route("/v4/fragment/rename", patch(rename_fragment))
                 .route("/v4/fragment/object/metadata/{:fragment}", get(list_objects))
+                .route("/v4/fragment/object/versions/{:fragment}/{*object_key}", get(list_object_versions))
                 .route("/v4/fragment/object/get/{:fragment}/{*object_key}", get(get_object))
                 .route("/v4/fragment/object/stream/{:fragment}/{*object_key}", get(stream_object))
                 .route("/v4/fragment/object/get/metadata/{:fragment}/{*object_key}", get(get_object_metadata))
@@ -88,8 +88,11 @@
 
             let write_ops = Router::new()
                 .route("/v4/fragment/object/rename", patch(rename_object))
+                .route("/v4/fragment/delete/{:fragment_name}", delete(delete_fragment))
                 .route("/v4/fragment/object/delete/{:fragment}/{*object_key}", delete(delete_object))
                 .route("/v4/fragment/object/delete/version/{:fragment}/{:version_id}/{*object_key}", delete(delete_object_version))
+                .route("/v4/fragment/object/delete/permanent/{:fragment}/{*object_key}", delete(delete_object_permanently))
+                .route("/v4/fragment/rename", patch(rename_fragment))
                 .route("/v4/fragment/object/upload/init/{:fragment}/{*object_key}", post(initiate_object_upload))
                 .route("/v4/fragment/object/upload/status/{:fragment}/{:version_id}", get(get_upload_status))
                 .route("/v4/fragment/object/upload/chunk/{:fragment}/{:version_id}/{:part_index}", put(object_upload_part))
