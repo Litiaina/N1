@@ -114,6 +114,7 @@ pub struct SignedUrlResponse {
 #[derive(Deserialize)]
 pub struct ObjectKeyQuery {
     pub object_key: String,
+    pub version_id: Option<String>,
 }
 
 #[derive(Serialize)]

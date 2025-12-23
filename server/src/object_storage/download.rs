@@ -1,5 +1,5 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::caching::get_metadata_with_cache;
+use crate::object_storage::caching::{get_metadata_with_cache, get_version_metadata_with_cache};
 use crate::object_storage::object_parser::stream_object_logic;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
@@ -21,7 +21,11 @@ pub async fn download_object(
 ) -> Result<impl IntoResponse, AppError> {
     let clean_key = query.object_key.trim_start_matches('/');
 
-    let metadata = get_metadata_with_cache(&fragment, clean_key, &claims.uid).await?;
+    let metadata = if let Some(version_id) = &query.version_id {
+        get_version_metadata_with_cache(&fragment, clean_key, version_id, &claims.uid).await?
+    } else {
+        get_metadata_with_cache(&fragment, clean_key, &claims.uid).await?
+    };
 
     if metadata.is_delete_marker {
         return Err(AppError::NotFound);
