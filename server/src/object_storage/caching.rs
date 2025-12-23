@@ -17,7 +17,6 @@ fn get_cache() -> &'static Cache<String, ObjectMetadata> {
     })
 }
 
-// Existing function for latest version
 pub async fn get_metadata_with_cache(
     fragment: &str,
     object_key: &str,
