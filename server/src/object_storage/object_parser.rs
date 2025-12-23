@@ -1,10 +1,12 @@
 use crate::enums::app_error_enum::AppError;
+use crate::object_storage::constants::CHUNK_SIZE;
 use crate::object_storage::header_parser::parse_range_header;
 use crate::structs::object_storage_structs::{ObjectMetadata, ObjectPathManager, PartMetadata};
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use chrono::{TimeZone, Utc};
 use futures_util::stream;
 use std::io::SeekFrom;
 use std::path::PathBuf;
@@ -16,12 +18,13 @@ pub async fn get_object_logic(
     req: axum::http::Request<Body>,
 ) -> Result<impl IntoResponse, AppError> {
     let (parts, _body) = req.into_parts();
-    stream_object_logic(parts.headers, metadata).await
+    stream_object_logic(parts.headers, metadata, "inline").await
 }
 
 pub async fn stream_object_logic(
     headers: HeaderMap,
     metadata: ObjectMetadata,
+    disposition_type: &str,
 ) -> Result<impl IntoResponse, AppError> {
     let file_size = metadata.total_size_bytes;
 
@@ -32,6 +35,7 @@ pub async fn stream_object_logic(
         fragment,
         object_key,
         version_id,
+        created_at,
         ..
     } = metadata;
 
@@ -44,9 +48,16 @@ pub async fn stream_object_logic(
     }
 
     let content_length = end - start + 1;
+    let clean_stored_key = object_key.trim_start_matches('/');
 
     let path_manager = ObjectPathManager::new();
-    let version_dir = path_manager.get_version_dir(&owner_uid, &fragment, &object_key, &version_id);
+    let version_dir = path_manager.get_version_dir(&owner_uid, &fragment, clean_stored_key, &version_id);
+
+    let filename = std::path::Path::new(clean_stored_key)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("download")
+        .to_string();
 
     struct StreamState {
         pos: u64,
@@ -60,13 +71,13 @@ pub async fn stream_object_logic(
 
     let mut current_offset = 0;
     let mut start_part_index = 0;
-    let mut start_part_offset = 0;
+    let mut start_part_start_offset = 0;
 
     for (idx, part) in parts.iter().enumerate() {
         let part_end = current_offset + part.size_bytes;
         if start >= current_offset && start < part_end {
             start_part_index = idx;
-            start_part_offset = current_offset;
+            start_part_start_offset = current_offset;
             break;
         }
         current_offset = part_end;
@@ -79,7 +90,7 @@ pub async fn stream_object_logic(
         version_dir,
         current_file: None,
         current_part_index: start_part_index,
-        current_part_start_offset: start_part_offset,
+        current_part_start_offset: start_part_start_offset,
     };
 
     let stream = stream::unfold(initial_state, move |mut state| async move {
@@ -116,8 +127,6 @@ pub async fn stream_object_logic(
             }
         }
 
-        const CHUNK_SIZE: usize = 128 * 1024;
-
         let part_remaining = part.size_bytes - (state.pos - state.current_part_start_offset);
         let req_remaining = state.end - state.pos + 1;
         let to_read = (CHUNK_SIZE as u64).min(part_remaining).min(req_remaining) as usize;
@@ -137,15 +146,31 @@ pub async fn stream_object_logic(
     });
 
     let body = Body::from_stream(stream);
+    
+    let etag = format!("\"{}\"", version_id);
+    let last_modified = Utc.timestamp_opt(created_at, 0)
+        .single()
+        .map(|dt| dt.to_rfc2822())
+        .unwrap_or_else(|| "Thu, 01 Jan 1970 00:00:00 GMT".to_string());
 
-    Ok(Response::builder()
-        .status(StatusCode::PARTIAL_CONTENT)
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
-        .header(header::CONTENT_LENGTH, content_length.to_string())
-        .header(header::CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, file_size))
         .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CACHE_CONTROL, "public, max-age=3600")
-        .header(header::CONTENT_DISPOSITION, "inline")
-        .body(body)
-        .unwrap())
+        .header(header::ETAG, etag) 
+        .header(header::LAST_MODIFIED, last_modified)
+        .header(header::CONTENT_DISPOSITION, format!("{}; filename=\"{}\"", disposition_type, filename))
+        .header(header::CACHE_CONTROL, "public, max-age=3600");
+
+    if content_length < file_size {
+        builder = builder
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, file_size))
+            .header(header::CONTENT_LENGTH, content_length.to_string());
+    } else {
+        builder = builder
+            .header(header::CONTENT_LENGTH, file_size.to_string());
+    }
+
+    Ok(builder.body(body).unwrap())
 }

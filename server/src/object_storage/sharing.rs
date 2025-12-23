@@ -1,7 +1,7 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::get_metadata_with_cache;
-use crate::object_storage::download::stream_object;
 use crate::object_storage::metadata_parser::find_latest_metadata_on_disk;
+use crate::object_storage::object_parser::stream_object_logic;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
     CreateSignedUrlRequest, SignedUrlDisposition, SignedUrlResponse,
@@ -197,6 +197,6 @@ pub async fn get_shared_object(
         _ => "inline",
     };
 
-    let response = stream_object(metadata, headers, disposition_type).await?;
+    let response = stream_object_logic(headers, metadata, disposition_type).await?;
     Ok(response.into_response())
 }
