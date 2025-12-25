@@ -1,111 +1,174 @@
 <div align="center">
+  <img
+    src="https://github.com/Litiaina/litiaina-admin-webpage/blob/master/images/litiaina_icon.png?raw=true"
+    alt="Litiaina Icon"
+    width="150"
+    height="150"
+  />
 
-<img src="https://github.com/Litiaina/litiaina-admin-webpage/blob/master/images/litiaina_icon.png?raw=true" alt="Litiaina Icon" width="150" height="150" style="vertical-align: middle; margin-right: 10px;"/>
+  <h1>Litiaina N1</h1>
 
-# Litiaina N1
-
-**A high-performance single-node unstructured object storage engine — combining file system semantics with object storage in one cohesive platform.**
-
+  <p>
+    A high-performance, single-node object storage engine engineered for
+    extreme throughput, predictable latency, and filesystem-level efficiency.
+  </p>
 </div>
 
 ---
 
-## 🧭 Overview
+## 🧭 What Is N1?
 
-**Litiaina N1** is a **single-node unstructured object storage engine** built for **performance**, **efficiency**, and **data integrity**.  
-It bridges two paradigms — a **POSIX-like hierarchical file system** and a **chunked object storage layer** — enabling seamless management of unstructured data without relying on external databases.  
+**Litiaina N1** is a purpose-built storage engine that pushes a *single machine* to its physical limits.
 
-Designed for developers, researchers, and system operators, N1 delivers reliable storage and fast access without the complexity of clustering, distributed coordination, or external metadata backends.
+Instead of optimizing for cluster coordination or eventual consistency, N1 is designed to:
+- Saturate disk bandwidth
+- Eliminate lock contention
+- Stream data with minimal CPU overhead
+- Preserve long-term filesystem health
 
----
-
-## ✨ Core Features
-
-### 🗂️ Unified File & Object Storage
-- Combines **POSIX-style file system semantics** with **part-based object storage APIs**  
-- Ideal for **application backends**, **local archives**, and **edge deployments** requiring both filesystem and object access  
-
-### ⚙️ Optimized Unstructured Data Handling
-- Supports **high-throughput, parallel reads/writes**  
-- Manages **atomic metadata operations** and **chunked storage**  
-- Designed for unstructured workloads like logs, analytics dumps, telemetry, and binaries  
-
-### 💾 Commit-Time Metadata & Atomic Writes
-- Guarantees **consistency and durability** via **metadata-driven finalize operations**  
-- Protects against corruption during power loss or system interruptions  
-
-### 🗜️ Chunk-Based Storage Pipeline
-- Stores objects in **discrete parts** to optimize disk usage and minimize I/O  
-- Object streams are reconstructed logically at read time  
-- Finalize is metadata-only, enabling **fast commit** without full object assembly  
-
-### 🔐 Authentication & Access Control
-- Supports **local credentials**, **API tokens**, and **secure key stores**  
-- Enforces **per-user authentication** and **fine-grained access policies**  
-
-### 📊 Storage Quotas & Resource Management
-- Enforces **per-user or per-directory capacity limits**  
-- Provides **real-time usage tracking and reporting**  
-
-### 🌐 WebDAV & REST Access Layers
-- Mount N1 as a **network drive** via WebDAV  
-- Access and manage objects through **RESTful APIs**  
-
-### 🔗 Local Object Gateway
-- Generate **signed URLs** or **tokenized links** for secure object retrieval  
-
-### 🧩 Plugin-Ready Module System
-- Extend functionality with **analytics modules**, **data processors**, or **backup hooks**  
+N1 treats the local filesystem (RAID 10 + XFS) as a trusted, high-speed substrate and removes all distributed-system tax to deliver **wire-speed object I/O**.
 
 ---
 
-## 🧠 Architecture Overview
+## ⚡ Core Capabilities
 
-**Litiaina N1** is designed for **single-node unstructured operation**, prioritizing **low latency**, **durability**, and **system simplicity**.
+### 🚀 Lockless, Linear Scalability
 
-### 🗂️ File System Layer
-- Standard directory-based access  
-- Optimized for **local workloads** and **low-latency I/O**  
-- Supports **atomic metadata updates**  
-
-### ☁️ Object Storage Layer
-- Exposes objects via **REST APIs** or **SDKs**  
-- Manages **chunked object storage**, avoiding in-place assembly  
-- Maintains **internal metadata mappings** for fast retrieval  
-
-🧩 *Both layers share unified authentication, quota management, and compression pipelines.*
+- Fully lockless write path for uploads
+- Scales linearly with CPU cores
+- No global mutexes, no upload serialization
+- Stable performance under sustained concurrency
 
 ---
 
-## 🔄 Data Flow Summary
+### 🔁 Zero-Copy Streaming I/O
 
-1. **Ingestion Layer** — Accepts data via file writes, HTTP uploads, or SDK/API requests  
-2. **Chunked Storage Layer** — Manages object parts with **atomic commit semantics**  
-3. **Read Layer** — Streams objects logically from individual chunks  
-4. **Access Layer** — Unified **filesystem and object interfaces**  
-5. **Policy Engine** — Enforces quotas, permissions, and retention policies  
-
----
-
-## 💡 Typical Use Cases
-
-- 🧠 Developer or research environments with unstructured datasets  
-- 💼 On-premise storage for internal applications, analytics, or media  
-- 📁 Self-hosted NAS supporting object-style access  
-- 🧩 Lightweight single-server storage for multi-user workloads  
+- Direct streaming from network socket to disk buffers
+- No intermediate buffering layers
+- Constant memory usage regardless of object size
+- Ideal for multi-GB to multi-TB objects
 
 ---
 
-## 🔮 Roadmap & Planned Enhancements
+### 🧱 Filesystem-Aware Design
 
-- 🧠 Local deduplication and chunk-level optimization  
-- 📦 Snapshot and rollback support for versioned storage  
-- 🔐 End-to-end encryption with optional HSM integration  
-- 📊 Built-in metrics endpoint for real-time monitoring  
+- Aggressive cleanup of temporary metadata files
+- Minimal inode footprint even at massive object counts
+- Optimized for XFS behavior under heavy parallel I/O
+- Long-running deployments without filesystem degradation
 
 ---
 
-## 🚀 Why “Unstructured Object Storage Engine”?
+### 💾 Strong Write Safety
 
-**Litiaina N1** emphasizes **durable, high-performance storage** while avoiding external dependencies like databases.  
-It acts as a **foundation layer** of the Litiaina ecosystem — a **single-node, reliable core** that unifies filesystem and object paradigms for modern workloads.
+- Atomic object finalization
+- Objects become visible only after durable `sync_all()`
+- Partial or failed uploads are never exposed
+- Crash-safe behavior by design
+
+---
+
+### 📦 High-Throughput Object Ingestion
+
+- Designed for sustained sequential writes
+- Parallel part ingestion with fast finalization
+- Handles raw video, AI datasets, VM images, and scientific data
+- Optimized for bandwidth, not request count
+
+---
+
+### 🔄 Native Versioning & Lifecycle Control
+
+- Immutable version IDs per upload
+- Soft delete with instant rollback
+- Background lifecycle engine enforces retention policies
+- Fast garbage collection without touching hot paths
+
+---
+
+### 🔍 Efficient Reads & Seeking
+
+- Metadata cached in-memory (Moka)
+- Range reads open only the required chunk files
+- Fast random access for media seeking and analytics
+- Avoids large file scans for small reads
+
+---
+
+## 🧠 Internal Architecture (N1)
+
+### Write Path
+
+1. Incoming data streams into temporary `.data` chunk files
+2. Parts are written locklessly and independently
+3. Finalization writes a single immutable `object_meta.bson`
+4. Temporary metadata is immediately purged
+
+---
+
+### Read Path
+
+- Metadata is resolved from memory cache
+- Only required chunk files are opened
+- Byte-range reads avoid unnecessary disk I/O
+- Optimized for high request concurrency
+
+---
+
+### Lifecycle Engine
+
+- Uses filesystem timestamps to skip healthy objects
+- Avoids parsing metadata unless necessary
+- Enables extremely fast maintenance scans
+- Designed to run continuously without performance impact
+
+---
+
+## 🔄 End-to-End Data Flow
+
+- Upload begins → quota validated
+- Data streams → lockless chunk writes
+- Finalization → atomic commit + metadata write
+- Download → zero-copy streaming of requested byte range
+
+---
+
+## 💡 Where N1 Excels
+
+- 🏎️ **High-Bitrate Media Pipelines**  
+  Raw 4K / 8K video ingest, post-production, and streaming
+
+- 🧠 **AI / ML Training Storage**  
+  Feeding GPUs with massive datasets at disk-speed
+
+- 🧪 **Scientific & Research Workloads**  
+  Simulation outputs, sensor data, and experimental results
+
+- 🏢 **On-Premise Performance Storage**  
+  Predictable, high-throughput object storage without cluster overhead
+
+- ⚡ **Edge & Ingest Nodes**  
+  Ultra-fast front-line storage ahead of slower distributed systems
+
+---
+
+## 🔮 Roadmap: N2 (Distributed Evolution)
+
+- Multi-node scaling using per-part erasure coding
+- Automatic data rebalancing across nodes
+- JBOD-first design with software-defined redundancy
+- Same object model, distributed execution
+
+---
+
+## 🚀 Why Litiaina N1?
+
+Most storage systems are designed to survive failure across hundreds of machines.
+
+**Litiaina N1 is designed to go as fast as physics allows on one.**
+
+No consensus.
+No coordination.
+No latency inflation.
+
+Just raw, predictable performance.
