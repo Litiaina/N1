@@ -1,18 +1,18 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_META_FILE};
+use crate::object_storage::quota_manager::update_quota;
 use crate::settings::config::CONFIG;
-use crate::structs::object_storage_structs::{OBJECT_STORAGE_ROOT, ObjectMetadata};
-use mongodb::Client as MongoClient;
+use crate::structs::object_storage_structs::{OBJECT_STORAGE_ROOT, ObjectMetadata, ReservationReceipt};
+use tokio::runtime::Handle;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
-pub async fn run_lifecycle_manager(_db_client: Arc<MongoClient>) {
+pub async fn run_lifecycle_manager() {
     let cleanup_interval = Duration::from_secs(CONFIG.garbage_collector.cleanup_interval_seconds);
     let file_ttl = if CONFIG.garbage_collector.file_ttl_seconds > 0 {
         Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds)
@@ -35,7 +35,7 @@ pub async fn run_lifecycle_manager(_db_client: Arc<MongoClient>) {
     }
 }
 
-pub async fn run_garbage_collector(_db_client: Arc<MongoClient>) {
+pub async fn run_garbage_collector() {
     let file_ttl = Duration::from_secs(60);
     info!("🗑️ GC (One-Time) executing...");
 
@@ -48,6 +48,46 @@ pub async fn run_garbage_collector(_db_client: Arc<MongoClient>) {
     } else {
         info!("🗑️ GC (One-Time) completed successfully.");
     }
+}
+
+fn get_refund_amount(path: &Path) -> u64 {
+    let reservation_path = path.join("reservation.bson");
+    if let Ok(data) = std::fs::read(&reservation_path) {
+        if let Ok(receipt) = mongodb::bson::from_slice::<ReservationReceipt>(&data) {
+            return receipt.amount;
+        }
+    }
+
+    let mut total = 0;
+    for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() {
+            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    total
+}
+
+fn extract_uid(path: &Path, storage_root: &Path) -> Option<String> {
+    path.strip_prefix(storage_root)
+        .ok()?
+        .components()
+        .next()?
+        .as_os_str()
+        .to_str()
+        .map(|s| s.to_string())
+}
+
+fn refund_quota_async(uid: String, amount: u64) {
+    if amount == 0 { return; }
+    
+    let handle = Handle::current();
+    handle.spawn(async move {
+        if let Err(e) = update_quota(&uid, -(amount as i64)).await {
+            warn!("GC: Failed to refund quota for user {}: {}", uid, e);
+        } else {
+            info!("GC: Refunded {} bytes to user {}", amount, uid);
+        }
+    });
 }
 
 async fn perform_lifecycle_scan(ttl: Duration) -> Result<(), AppError> {
@@ -77,7 +117,7 @@ async fn perform_lifecycle_scan(ttl: Duration) -> Result<(), AppError> {
         }
 
         for object_dir in object_dirs {
-            if let Err(e) = process_object_lifecycle(&object_dir, ttl) {
+            if let Err(e) = process_object_lifecycle(&object_dir, &storage_root, ttl) {
                 error!("Error processing lifecycle for {:?}: {}", object_dir, e);
             }
         }
@@ -90,7 +130,7 @@ async fn perform_lifecycle_scan(ttl: Duration) -> Result<(), AppError> {
     Ok(())
 }
 
-fn process_object_lifecycle(object_dir: &Path, ttl: Duration) -> Result<(), AppError> {
+fn process_object_lifecycle(object_dir: &Path, storage_root: &Path, ttl: Duration) -> Result<(), AppError> {
     let read_dir = fs::read_dir(object_dir).map_err(|e| AppError::Io(e, "read obj dir".into()))?;
     
     let mut valid_versions = Vec::new();
@@ -116,8 +156,14 @@ fn process_object_lifecycle(object_dir: &Path, ttl: Duration) -> Result<(), AppE
             let age = SystemTime::now().duration_since(modified).unwrap_or(Duration::ZERO);
             
             if age > ttl {
+                let refund_amount = get_refund_amount(&folder_path);
+                
                 info!("♻️ Lifecycle: Removing stale incomplete upload at {:?}", folder_path);
-                let _ = fs::remove_dir_all(&folder_path);
+                if fs::remove_dir_all(&folder_path).is_ok() && refund_amount > 0 {
+                    if let Some(uid) = extract_uid(object_dir, storage_root) {
+                        refund_quota_async(uid, refund_amount);
+                    }
+                }
             }
         }
     }
@@ -150,8 +196,13 @@ fn process_object_lifecycle(object_dir: &Path, ttl: Duration) -> Result<(), AppE
         if let Ok(data) = fs::read(&meta_path) {
             if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
                 if !is_latest {
+                    let size = meta.total_size_bytes as i64;
                     info!("♻️ Lifecycle: Deleting old version {}/{}", meta.object_key, version_id);
-                    let _ = fs::remove_dir_all(&version_path);
+                    if fs::remove_dir_all(&version_path).is_ok() {
+                        if let Some(uid) = extract_uid(object_dir, storage_root) {
+                            refund_quota_async(uid, size as u64);
+                        }
+                    }
                     continue;
                 }
 
@@ -189,6 +240,10 @@ async fn perform_filesystem_cleanup(ttl: Duration) -> Result<(), AppError> {
             if path == storage_root { continue; }
             if !path.is_dir() { continue; }
 
+            if path.parent() == Some(&storage_root) {
+                continue;
+            }
+
             if path.join(OBJECT_META_FILE).exists() {
                 continue;
             }
@@ -217,8 +272,15 @@ async fn perform_filesystem_cleanup(ttl: Duration) -> Result<(), AppError> {
                 let age = SystemTime::now().duration_since(modified).unwrap_or(Duration::ZERO);
 
                 if age > ttl {
-                    info!("🗑️ GC: Found failed upload (no meta): {:?} (Age: {:?}). Deleting...", path, age);
-                    let _ = fs::remove_dir_all(path);
+                    let refund_amount = get_refund_amount(path);
+                    
+                    info!("🗑️ GC: Found failed upload (no meta): {:?} (Age: {:?}, Size: {}). Deleting...", path, age, refund_amount);
+                    
+                    if fs::remove_dir_all(path).is_ok() && refund_amount > 0 {
+                        if let Some(uid) = extract_uid(path, &storage_root) {
+                            refund_quota_async(uid, refund_amount);
+                        }
+                    }
                 }
                 continue;
             }

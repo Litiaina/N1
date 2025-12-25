@@ -1,39 +1,82 @@
-use mongodb::{
-    Client, IndexModel,
-    bson::{Document, doc},
-    options::{ClientOptions, IndexOptions},
-};
+use futures_util::StreamExt;
+use mongodb::{Client, bson::doc, options::ClientOptions};
 use std::error::Error;
-use std::time::Duration;
+use tracing::{error, info, warn};
+use walkdir::WalkDir;
 
 use crate::{
-    database::database_constants::OBJECT_STORAGE_DATABASE, statics::database_statics::DATABASE_URL,
+    database::database_constants::DATABASE,
+    object_storage::{
+        constants::OBJECT_META_FILE,
+        quota_manager::{init_quota_file, set_storage_used},
+    },
+    statics::database_statics::DATABASE_URL,
+    structs::object_storage_structs::{ObjectMetadata, ObjectPathManager, UserRecord},
 };
 
-pub async fn setup_database_locks() -> Result<Client, Box<dyn Error>> {
+pub async fn setup_quota() -> Result<(), Box<dyn Error>> {
+    info!("Background Task: Connecting to MongoDB for Quota Sync...");
+
     let client_options = ClientOptions::parse(&*DATABASE_URL).await?;
     let client = Client::with_options(client_options)?;
-    let db = client.database(OBJECT_STORAGE_DATABASE);
-    let locks_collection = db.collection::<Document>("upload_locks");
-    let unique_index_options = IndexOptions::builder().unique(true).build();
+    let db = client.database(DATABASE);
+    let auth_collection = db.collection::<UserRecord>("auth");
 
-    let uid_index = IndexModel::builder()
-        .keys(doc! { "uid": 1 })
-        .options(unique_index_options)
-        .build();
+    info!("Background Task: Verifying consistency (MongoDB <-> Disk)...");
 
-    let ttl_index_options = IndexOptions::builder()
-        .expire_after(Duration::from_secs(30))
-        .build();
+    let mut cursor = auth_collection.find(doc! {}).await?;
+    let mut count = 0;
+    let path_manager = ObjectPathManager::new();
 
-    let locked_at_index = IndexModel::builder()
-        .keys(doc! { "locked_at": 1 })
-        .options(ttl_index_options)
-        .build();
+    while let Some(result) = cursor.next().await {
+        match result {
+            Ok(user) => {
+                let uid = user.uid.clone();
 
-    locks_collection
-        .create_indexes(vec![uid_index, locked_at_index])
-        .await?;
+                if let Err(e) = init_quota_file(&uid, user.allocated_storage).await {
+                    error!("Failed to sync quota file for {}: {}", uid, e);
+                    continue;
+                }
 
-    Ok(client)
+                let user_dir = path_manager.get_user_dir(&uid);
+
+                if user_dir.exists() {
+                    let calculated_usage = tokio::task::spawn_blocking(move || {
+                        let mut total = 0u64;
+                        for entry in WalkDir::new(&user_dir).into_iter().filter_map(|e| e.ok()) {
+                            if entry.file_name() == OBJECT_META_FILE {
+                                if let Ok(data) = std::fs::read(entry.path()) {
+                                    if let Ok(meta) =
+                                        mongodb::bson::from_slice::<ObjectMetadata>(&data)
+                                    {
+                                        if !meta.is_delete_marker {
+                                            total += meta.total_size_bytes;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        total
+                    })
+                    .await?;
+
+                    if let Err(e) = set_storage_used(&uid, calculated_usage).await {
+                        warn!("Failed to update usage stats for {}: {}", uid, e);
+                    }
+                }
+
+                count += 1;
+            }
+            Err(e) => {
+                error!("Failed to retrieve user document during sync: {}", e);
+            }
+        }
+    }
+
+    info!(
+        "Background Task: Consistency check complete. Verified {} users.",
+        count
+    );
+
+    Ok(())
 }

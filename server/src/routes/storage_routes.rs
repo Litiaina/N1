@@ -48,7 +48,7 @@
         let layers = RateLimitLayers::new();
 
         tokio::spawn(async move {
-            run_lifecycle_manager(Arc::clone(&db_client)).await;
+            run_lifecycle_manager().await;
         });
 
         let cors_layer = CorsLayer::new()

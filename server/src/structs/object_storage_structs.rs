@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use crate::object_storage::constants::OBJECT_DATA_ROOT;
+
 pub static OBJECT_STORAGE_ROOT: OnceLock<String> = OnceLock::new();
 
 pub struct ObjectPathManager {
@@ -19,10 +21,14 @@ impl ObjectPathManager {
         }
     }
 
-    pub fn get_object_dir(&self, uid: &str, fragment: &str, key: &str) -> PathBuf {
+    pub fn get_user_dir(&self, uid: &str) -> PathBuf {
         self.root
-            .join("storage")
+            .join(OBJECT_DATA_ROOT)
             .join(uid)
+    }
+
+    pub fn get_object_dir(&self, uid: &str, fragment: &str, key: &str) -> PathBuf {
+        self.get_user_dir(uid)
             .join(fragment)
             .join(key)
     }
@@ -30,6 +36,11 @@ impl ObjectPathManager {
     pub fn get_version_dir(&self, uid: &str, fragment: &str, key: &str, version_id: &str) -> PathBuf {
         self.get_object_dir(uid, fragment, key).join(version_id)
     }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ReservationReceipt {
+    pub amount: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -70,13 +81,6 @@ pub struct InitiateUploadResponse {
 #[derive(Serialize)]
 pub struct CapacityUsageResponse {
     pub capacity_used: u64,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct UserAuthDetails {
-    pub allocated_storage: u64,
-    #[serde(default)] 
-    pub storage_used: u64, 
 }
 
 #[derive(Deserialize)]
@@ -139,4 +143,23 @@ pub struct UploadPartQuery {
 pub struct RenameFragmentQuery {
     pub fragment_to_rename: String,
     pub new_name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Quota {
+    pub allocated_storage: u64,
+    pub storage_used: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UserRecord {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<mongodb::bson::oid::ObjectId>,
+    pub uid: String,
+    pub email: String,
+    #[serde(rename = "password")] 
+    pub password_hash: String, 
+    pub allocated_storage: u64,
+    #[serde(default)]
+    pub created_at: i64,
 }

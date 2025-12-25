@@ -3,16 +3,15 @@ use crate::enums::app_error_enum::AppError;
 use crate::fs::fragmented_upload::with_io_timeout;
 use crate::object_storage::caching::invalidate_cache;
 use crate::object_storage::constants::{OBJECT_META_FILE, PART_META_SUFFIX, PART_SUFFIX};
-use crate::object_storage::storage_capacity_parser::{
-    calculate_storage_usage, increment_storage_usage,
-};
+use crate::object_storage::quota_manager::{init_quota_file, try_reserve_quota, update_quota};
+use crate::object_storage::storage_capacity_parser::calculate_storage_usage;
 use crate::routes::storage_routes::AppState;
 use crate::statics::merge_semaphore_static::CHUNK_UPLOAD_SEMAPHORE;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
     CapacityUsageResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery,
-    ObjectMetadata, ObjectPathManager, PartMetadata, UploadPartQuery, UploadStatusResponse,
-    UserAuthDetails,
+    ObjectMetadata, ObjectPathManager, PartMetadata, ReservationReceipt, UploadPartQuery,
+    UploadStatusResponse, UserRecord,
 };
 use axum::body::Body;
 use axum::{
@@ -29,7 +28,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncWriteExt, BufWriter};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use ulid::Ulid;
 use walkdir::WalkDir;
 
@@ -64,22 +63,29 @@ pub async fn initiate_object_upload(
     AxumJson(params): AxumJson<InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
-    let auth_collection = state
-        .db_client
-        .database(DATABASE)
-        .collection::<UserAuthDetails>("auth");
-    let user_details = auth_collection
-        .find_one(doc! { "uid": &uid })
-        .await
-        .map_err(|_| AppError::InternalServerError("Auth DB check failed.".to_string()))?
-        .ok_or(AppError::Unauthorized)?;
 
-    if user_details
-        .storage_used
-        .saturating_add(params.total_size_bytes)
-        > user_details.allocated_storage
-    {
-        return Err(AppError::InsufficientStorage);
+    if let Err(e) = try_reserve_quota(&uid, params.total_size_bytes).await {
+        if let AppError::Unauthorized = e {
+            info!(
+                "Quota missing for {}, fetching allocation from MongoDB...",
+                uid
+            );
+            let auth_collection = state
+                .db_client
+                .database(DATABASE)
+                .collection::<UserRecord>("auth");
+            let user_record = auth_collection
+                .find_one(doc! { "uid": &uid })
+                .await
+                .map_err(|_| AppError::InternalServerError("Auth DB unreachable".into()))?
+                .ok_or(AppError::Unauthorized)?;
+
+            init_quota_file(&uid, user_record.allocated_storage).await?;
+
+            try_reserve_quota(&uid, params.total_size_bytes).await?;
+        } else {
+            return Err(e);
+        }
     }
 
     let version_id = Ulid::new().to_string();
@@ -88,15 +94,30 @@ pub async fn initiate_object_upload(
     let path_manager = ObjectPathManager::new();
     let version_dir = path_manager.get_version_dir(&uid, &fragment, &object_key, &version_id);
 
-    with_io_timeout(
+    if let Err(e) = with_io_timeout(
         "creating upload directory",
         fs::create_dir_all(&version_dir),
     )
-    .await?;
+    .await
+    {
+        let _ = update_quota(&uid, -(params.total_size_bytes as i64)).await;
+        return Err(e);
+    }
+
+    let receipt = ReservationReceipt {
+        amount: params.total_size_bytes,
+    };
+
+    if let Ok(bytes) = mongodb::bson::to_vec(&receipt) {
+        let receipt_path = version_dir.join("reservation.bson");
+        if let Err(e) = fs::write(&receipt_path, bytes).await {
+            warn!("Failed to write reservation receipt for {}: {}", uid, e);
+        }
+    }
 
     info!(
-        "Initiated upload: {}/{} (v: {})",
-        fragment, object_key, version_id
+        "Initiated upload: {}/{} (v: {}) [Reserved: {} bytes]",
+        fragment, object_key, version_id, params.total_size_bytes
     );
 
     Ok((
@@ -218,7 +239,6 @@ pub async fn object_upload_part(
 }
 
 pub async fn finalize_object_upload(
-    State(state): State<Arc<AppState>>,
     claims: Claims,
     AxumPath((fragment, version_id, session_id)): AxumPath<(String, String, String)>,
     Query(key_query): Query<ObjectKeyQuery>,
@@ -300,7 +320,7 @@ pub async fn finalize_object_upload(
         total_size_bytes: total_size_calculated,
         created_at: Utc::now().timestamp(),
         parts,
-        is_delete_marker: false
+        is_delete_marker: false,
     };
 
     let bson_data = mongodb::bson::to_vec(&object_meta).map_err(|e| {
@@ -331,9 +351,23 @@ pub async fn finalize_object_upload(
         .buffer_unordered(20);
 
     cleanup_futures.collect::<Vec<_>>().await;
-
+    let receipt_path = version_dir.join("reservation.bson");
+    let _ = fs::remove_file(receipt_path).await;
+    
     sync_dir(&version_dir).await?;
-    increment_storage_usage(&state.db_client, &uid, total_size_calculated as i64).await?;
+
+    let reserved_size = params.total_size_bytes as i64;
+    let actual_size = total_size_calculated as i64;
+    let delta = actual_size - reserved_size;
+
+    if delta != 0 {
+        update_quota(&uid, delta).await?;
+        info!(
+            "Quota adjustment for {}: {} bytes (Reserved: {}, Actual: {})",
+            uid, delta, reserved_size, actual_size
+        );
+    }
+
     invalidate_cache(&fragment, &object_key, &uid).await;
 
     info!(
@@ -344,11 +378,8 @@ pub async fn finalize_object_upload(
     Ok((StatusCode::OK, "Upload finalized."))
 }
 
-pub async fn get_capacity_usage(
-    State(state): State<Arc<AppState>>,
-    claims: Claims,
-) -> Result<impl IntoResponse, AppError> {
-    let usage = calculate_storage_usage(&state.db_client, &claims.uid).await?;
+pub async fn get_capacity_usage(claims: Claims) -> Result<impl IntoResponse, AppError> {
+    let usage = calculate_storage_usage(&claims.uid).await?;
     Ok(AxumJson(CapacityUsageResponse {
         capacity_used: usage,
     }))

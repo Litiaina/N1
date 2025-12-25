@@ -1,25 +1,19 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::invalidate_cache;
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_META_FILE};
-use crate::object_storage::storage_capacity_parser::increment_storage_usage;
-use crate::routes::storage_routes::AppState;
+use crate::object_storage::quota_manager::update_quota;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{ObjectMetadata, ObjectPathManager};
 use axum::Json;
-use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
-};
+use axum::{extract::Path, http::StatusCode, response::IntoResponse};
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
-use std::sync::Arc;
 use tokio::fs;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use ulid::Ulid;
+use walkdir::WalkDir;
 
 pub async fn delete_object_version(
-    State(state): State<Arc<AppState>>,
     claims: Claims,
     Path((fragment, version_id, object_key)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -48,17 +42,21 @@ pub async fn delete_object_version(
     })?;
 
     if size_to_free > 0 {
-        increment_storage_usage(&state.db_client, &uid, -size_to_free).await?;
+        if let Err(e) = update_quota(&uid, -size_to_free).await {
+            error!("Failed to refund quota for user {}: {}", uid, e);
+        }
     }
-    
+
     invalidate_cache(&fragment, &object_key, &uid).await;
-    info!("Hard deleted version: {}/{} (v: {})", fragment, object_key, version_id);
+    info!(
+        "Hard deleted version: {}/{} (v: {})",
+        fragment, object_key, version_id
+    );
 
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn delete_object_permanently(
-    State(state): State<Arc<AppState>>,
     claims: Claims,
     Path((fragment, object_key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -71,8 +69,10 @@ pub async fn delete_object_permanently(
     }
 
     let mut version_paths = Vec::new();
-    let mut entries = fs::read_dir(&object_dir).await.map_err(|e| AppError::Io(e, "read object dir".into()))?;
-    
+    let mut entries = fs::read_dir(&object_dir)
+        .await
+        .map_err(|e| AppError::Io(e, "read object dir".into()))?;
+
     while let Ok(Some(entry)) = entries.next_entry().await {
         if let Ok(ft) = entry.file_type().await {
             if ft.is_dir() {
@@ -84,7 +84,7 @@ pub async fn delete_object_permanently(
     let results: Vec<i64> = stream::iter(version_paths)
         .map(|path| async move {
             let mut freed_bytes = 0;
-            
+
             let mut has_subdirs = false;
             if let Ok(mut sub_entries) = fs::read_dir(&path).await {
                 while let Ok(Some(sub)) = sub_entries.next_entry().await {
@@ -126,7 +126,9 @@ pub async fn delete_object_permanently(
     let _ = fs::remove_dir(&object_dir).await;
 
     if total_size_to_free > 0 {
-        increment_storage_usage(&state.db_client, &uid, -total_size_to_free).await?;
+        if let Err(e) = update_quota(&uid, -total_size_to_free).await {
+            error!("Failed to refund quota for user {}: {}", uid, e);
+        }
     }
 
     invalidate_cache(&fragment, &object_key, &uid).await;
@@ -149,7 +151,9 @@ pub async fn delete_object(
     let path_manager = ObjectPathManager::new();
     let version_dir = path_manager.get_version_dir(&uid, &fragment, &object_key, &version_id);
 
-    fs::create_dir_all(&version_dir).await.map_err(|e| AppError::Io(e, "create marker dir".into()))?;
+    fs::create_dir_all(&version_dir)
+        .await
+        .map_err(|e| AppError::Io(e, "create marker dir".into()))?;
 
     let delete_marker = ObjectMetadata {
         object_key: object_key.clone(),
@@ -164,10 +168,13 @@ pub async fn delete_object(
         is_delete_marker: true,
     };
 
-    let bson_data = mongodb::bson::to_vec(&delete_marker).map_err(|_| AppError::InternalServerError("BSON error".into()))?;
-    
+    let bson_data = mongodb::bson::to_vec(&delete_marker)
+        .map_err(|_| AppError::InternalServerError("BSON error".into()))?;
+
     let meta_path = version_dir.join(OBJECT_META_FILE);
-    fs::write(&meta_path, bson_data).await.map_err(|e| AppError::Io(e, "write marker".into()))?;
+    fs::write(&meta_path, bson_data)
+        .await
+        .map_err(|e| AppError::Io(e, "write marker".into()))?;
 
     invalidate_cache(&fragment, &object_key, &uid).await;
     info!("Created delete marker: {}/{}", fragment, object_key);
@@ -183,10 +190,32 @@ pub async fn delete_fragment(
     let path_manager = ObjectPathManager::new();
 
     let user_storage_root = path_manager.root.join(OBJECT_DATA_ROOT).join(&uid);
+    let fragment_path = user_storage_root.join(&fragment);
+
+    let scan_path = fragment_path.clone();
+    let refund_amount = tokio::task::spawn_blocking(move || -> i64 {
+        if !scan_path.exists() {
+            return 0;
+        }
+
+        let mut total_size: u64 = 0;
+        for entry in WalkDir::new(&scan_path).into_iter().filter_map(|e| e.ok()) {
+            if entry.file_name() == OBJECT_META_FILE {
+                if let Ok(data) = std::fs::read(entry.path()) {
+                    if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
+                        if !meta.is_delete_marker {
+                            total_size += meta.total_size_bytes;
+                        }
+                    }
+                }
+            }
+        }
+        total_size as i64
+    })
+    .await
+    .unwrap_or(0);
 
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-        let fragment_path = user_storage_root.join(&fragment);
-
         if !fragment_path.exists() {
             return Err(AppError::NotFound);
         }
@@ -196,12 +225,26 @@ pub async fn delete_fragment(
             AppError::InternalServerError("Failed to delete fragment.".to_string())
         })?;
 
-        info!("Deleted fragment '{}' for user {}", fragment, uid);
-
         Ok(())
     })
     .await
     .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
+
+    info!("Deleted fragment '{}' for user {}", fragment, uid);
+
+    if refund_amount > 0 {
+        if let Err(e) = update_quota(&uid, -refund_amount).await {
+            warn!(
+                "Failed to refund quota after fragment delete for {}: {}",
+                uid, e
+            );
+        } else {
+            info!(
+                "Refunded {} bytes to user {} after fragment delete",
+                refund_amount, uid
+            );
+        }
+    }
 
     Ok((
         StatusCode::OK,

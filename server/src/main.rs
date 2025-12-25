@@ -2,9 +2,8 @@ use crate::fs::cleanup_manager::{interval_cleanup, start_cleanup};
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
 use crate::object_storage::garbage_collector::run_garbage_collector;
-use crate::object_storage::setup::setup_database_locks;
-use crate::routes::storage_routes::{AppState, serve_storage_routes};
-use crate::statics::database_statics::DATABASE_URL;
+use crate::object_storage::setup::setup_quota;
+use crate::routes::storage_routes::serve_storage_routes;
 use crate::structs::object_storage_structs::OBJECT_STORAGE_ROOT;
 use crate::structs::port_struct::Ports;
 use crate::utils::date_time_formatter::LocalTimer;
@@ -19,8 +18,6 @@ use axum_server::tls_rustls::RustlsConfig;
 use chrono::Local;
 use dotenv::dotenv;
 use ini::Ini;
-use mongodb::Client;
-use mongodb::options::ClientOptions;
 use server_cli::{self, server_login, start_cli};
 use std::env;
 use std::net::{IpAddr, SocketAddr};
@@ -111,10 +108,6 @@ async fn main() {
     tracing::info!("│ Command        : /exit to terminate the session");
     tracing::info!("╞════════════════════════ ACTIVE CONNECTIONS ════════════════════════╡");
 
-    setup_database_locks()
-        .await
-        .expect("Failed to setup database locks");
-
     run_server().await
 }
 
@@ -182,6 +175,10 @@ pub async fn run_server() {
 
     let shutdown_handle_clone = Arc::clone(&shutdown_handle);
 
+    setup_quota()
+        .await
+        .expect("Failed to setup database locks");
+
     {
         tokio::spawn(async move {
             let (handle, join) = serve(ip, storage_addr, serve_storage, storage_ports, cert).await;
@@ -191,22 +188,10 @@ pub async fn run_server() {
     }
 
     {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let client_options = ClientOptions::parse(&*DATABASE_URL)
-            .await
-            .expect("Failed to parse MongoDB URI");
-        let db_client = Arc::new(
-            Client::with_options(client_options).expect("Failed to create MongoDB client"),
-        );
-        let app_state = Arc::new(AppState {
-            db_client: Arc::clone(&db_client),
-        });
-
         tokio::spawn(async move {
             start_cli(shutdown_handle, move || {
-                let app_state = Arc::clone(&app_state);
                 async move {
-                    run_garbage_collector(Arc::clone(&app_state.db_client)).await;
+                    run_garbage_collector().await;
                     start_cleanup(STORAGE_ROOT).await;
                 }
             })
