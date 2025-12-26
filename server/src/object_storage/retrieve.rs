@@ -1,5 +1,5 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::caching::get_metadata_with_cache;
+use crate::object_storage::caching::{get_metadata_with_cache, get_object_keys_with_cache};
 use crate::object_storage::constants::{BROWSER_CACHE_MAX_AGE, OBJECT_DATA_ROOT, OBJECT_META_FILE};
 use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
 use crate::structs::auth_structs::Claims;
@@ -22,44 +22,8 @@ pub async fn list_objects(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
-    let path_manager = ObjectPathManager::new();
-    let fragment_dir = path_manager
-        .root
-        .join(OBJECT_DATA_ROOT)
-        .join(&uid)
-        .join(&fragment);
-
-    let include_deleted = params
-        .get("include_deleted")
-        .map(|v| v == "true")
-        .unwrap_or(false);
-
-    let keys = tokio::task::spawn_blocking(move || -> Result<Vec<String>, std::io::Error> {
-        if !fragment_dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut collected_keys = Vec::with_capacity(1000);
-
-        for entry in WalkDir::new(&fragment_dir)
-            .min_depth(1)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if entry.file_type().is_dir() {
-                if let Ok(relative) = entry.path().strip_prefix(&fragment_dir) {
-                    let key = relative.to_string_lossy().replace("\\", "/");
-                    collected_keys.push(key);
-                }
-            }
-        }
-
-        collected_keys.sort();
-        Ok(collected_keys)
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))?
-    .map_err(|e| AppError::Io(e, "list objects scan".into()))?;
+    let keys_arc = get_object_keys_with_cache(&uid, &fragment).await?;
+    let keys = keys_arc.as_ref(); 
 
     let start_index = if let Some(marker) = params.get("marker") {
         match keys.binary_search(marker) {
@@ -73,19 +37,22 @@ pub async fn list_objects(
     let limit: usize = params
         .get("limit")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
-    let limit = limit.min(1000);
+        .unwrap_or(100)
+        .min(1000);
 
     let target_keys = keys
-        .into_iter()
+        .iter()
         .skip(start_index)
         .take(limit)
+        .cloned()
         .collect::<Vec<_>>();
+
+    let include_deleted = params.get("include_deleted").map(|v| v == "true").unwrap_or(false);
 
     let mut objects = stream::iter(target_keys)
         .map(|key| {
-            let frag = fragment.clone();
-            let u = uid.clone();
+            let frag = &fragment;
+            let u = &uid;
             async move { get_metadata_with_cache(&frag, &key, &u).await }
         })
         .buffer_unordered(64)

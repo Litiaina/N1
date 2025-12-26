@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::caching::invalidate_cache;
+use crate::object_storage::caching::{invalidate_cache, invalidate_list_cache};
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_META_FILE};
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -84,12 +84,10 @@ pub async fn rename_object(
     }
 
     invalidate_cache(&payload.source_fragment, &payload.source_key, &uid).await;
-    invalidate_cache(
-        &payload.destination_fragment,
-        &payload.destination_key,
-        &uid,
-    )
-    .await;
+    invalidate_cache(&payload.destination_fragment, &payload.destination_key, &uid).await;
+
+    invalidate_list_cache(&uid, &payload.source_fragment).await;
+    invalidate_list_cache(&uid, &payload.destination_fragment).await;
 
     info!(
         "Renamed object from {}/{} to {}/{}",
@@ -118,7 +116,7 @@ pub async fn rename_fragment(
 
     let user_storage_root = path_manager.root.join(OBJECT_DATA_ROOT).join(&uid);
 
-    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+    let (query, uid) = tokio::task::spawn_blocking(move || -> Result<(RenameFragmentQuery, String), AppError> {
         let source_path = user_storage_root.join(&query.fragment_to_rename);
         let dest_path = user_storage_root.join(&query.new_name);
 
@@ -146,10 +144,13 @@ pub async fn rename_fragment(
             query.fragment_to_rename, query.new_name, uid
         );
 
-        Ok(())
+        Ok((query, uid))
     })
     .await
     .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
+
+    invalidate_list_cache(&uid, &query.fragment_to_rename).await;
+    invalidate_list_cache(&uid, &query.new_name).await;
 
     Ok((
         StatusCode::OK,
