@@ -1,16 +1,21 @@
+use std::sync::Arc;
+
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::invalidate_cache;
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_META_FILE};
+use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
     ObjectMetadata, ObjectPathManager, RenameFragmentQuery, RenameObjectRequest,
 };
-use axum::extract::Query;
+use crate::websocket::ws_structs::StorageEventPayload;
+use axum::extract::{Query, State};
 use axum::{Json as AxumJson, http::StatusCode, response::IntoResponse};
 use tokio::fs;
 use tracing::{error, info};
 
 pub async fn rename_object(
+    State(state): State<Arc<AppState>>,
     claims: Claims,
     AxumJson(payload): AxumJson<RenameObjectRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -60,40 +65,19 @@ pub async fn rename_object(
     })?;
 
     while let Ok(Some(entry)) = versions.next_entry().await {
-        if entry
-            .file_type()
-            .await
-            .map(|ft| ft.is_dir())
-            .unwrap_or(false)
-        {
+        if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
             let meta_path = entry.path().join(OBJECT_META_FILE);
 
             if fs::try_exists(&meta_path).await.unwrap_or(false) {
-                match fs::read(&meta_path).await {
-                    Ok(bytes) => {
-                        if let Ok(mut meta) = mongodb::bson::from_slice::<ObjectMetadata>(&bytes) {
-                            meta.fragment = payload.destination_fragment.clone();
-                            meta.object_key = payload.destination_key.clone();
+                if let Ok(bytes) = fs::read(&meta_path).await {
+                    if let Ok(mut meta) = mongodb::bson::from_slice::<ObjectMetadata>(&bytes) {
+                        meta.fragment = payload.destination_fragment.clone();
+                        meta.object_key = payload.destination_key.clone();
 
-                            match mongodb::bson::to_vec(&meta) {
-                                Ok(new_bytes) => {
-                                    if let Err(e) = fs::write(&meta_path, new_bytes).await {
-                                        error!(
-                                            "Failed to write updated metadata for version {:?}: {}",
-                                            entry.file_name(),
-                                            e
-                                        );
-                                    }
-                                }
-                                Err(e) => error!("Failed to serialize updated metadata: {}", e),
-                            }
+                        if let Ok(new_bytes) = mongodb::bson::to_vec(&meta) {
+                            let _ = fs::write(&meta_path, new_bytes).await;
                         }
                     }
-                    Err(e) => error!(
-                        "Failed to read metadata for updating {:?}: {}",
-                        entry.file_name(),
-                        e
-                    ),
                 }
             }
         }
@@ -114,6 +98,13 @@ pub async fn rename_object(
         payload.destination_fragment,
         payload.destination_key
     );
+
+    state.emit(&uid, StorageEventPayload::FileRenamed {
+        source_fragment: payload.source_fragment,
+        source_key: payload.source_key,
+        destination_fragment: payload.destination_fragment,
+        destination_key: payload.destination_key,
+    });
 
     Ok(StatusCode::OK)
 }

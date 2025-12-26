@@ -13,6 +13,7 @@ use crate::structs::object_storage_structs::{
     ObjectMetadata, ObjectPathManager, PartMetadata, ReservationReceipt, UploadPartQuery,
     UploadStatusResponse, UserRecord,
 };
+use crate::websocket::ws_structs::StorageEventPayload;
 use axum::body::Body;
 use axum::{
     Json as AxumJson,
@@ -239,6 +240,7 @@ pub async fn object_upload_part(
 }
 
 pub async fn finalize_object_upload(
+    State(state): State<Arc<AppState>>,
     claims: Claims,
     AxumPath((fragment, version_id, session_id)): AxumPath<(String, String, String)>,
     Query(key_query): Query<ObjectKeyQuery>,
@@ -353,7 +355,7 @@ pub async fn finalize_object_upload(
     cleanup_futures.collect::<Vec<_>>().await;
     let receipt_path = version_dir.join("reservation.bson");
     let _ = fs::remove_file(receipt_path).await;
-    
+
     sync_dir(&version_dir).await?;
 
     let reserved_size = params.total_size_bytes as i64;
@@ -369,6 +371,8 @@ pub async fn finalize_object_upload(
     }
 
     invalidate_cache(&fragment, &object_key, &uid).await;
+
+    state.emit(&uid, StorageEventPayload::FileUploaded(object_meta));
 
     info!(
         "Finalized object: {}/{} (Size: {})",

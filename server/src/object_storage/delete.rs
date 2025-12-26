@@ -1,10 +1,15 @@
+use std::sync::Arc;
+
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::invalidate_cache;
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_META_FILE};
 use crate::object_storage::quota_manager::update_quota;
+use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{ObjectMetadata, ObjectPathManager};
+use crate::websocket::ws_structs::StorageEventPayload;
 use axum::Json;
+use axum::extract::State;
 use axum::{extract::Path, http::StatusCode, response::IntoResponse};
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
@@ -14,6 +19,7 @@ use ulid::Ulid;
 use walkdir::WalkDir;
 
 pub async fn delete_object_version(
+    State(state): State<Arc<AppState>>,
     claims: Claims,
     Path((fragment, version_id, object_key)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -48,15 +54,23 @@ pub async fn delete_object_version(
     }
 
     invalidate_cache(&fragment, &object_key, &uid).await;
+
     info!(
         "Hard deleted version: {}/{} (v: {})",
         fragment, object_key, version_id
     );
 
+    state.emit(&uid, StorageEventPayload::FileDeleted {
+        fragment,
+        object_key,
+        version_id: Some(version_id),
+    });
+
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn delete_object_permanently(
+    State(state): State<Arc<AppState>>,
     claims: Claims,
     Path((fragment, object_key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -132,15 +146,23 @@ pub async fn delete_object_permanently(
     }
 
     invalidate_cache(&fragment, &object_key, &uid).await;
+
     info!(
         "Permanently deleted object versions: {}/{} (Freed: {} bytes)",
         fragment, object_key, total_size_to_free
     );
 
+    state.emit(&uid, StorageEventPayload::FileDeleted {
+        fragment,
+        object_key,
+        version_id: None, 
+    });
+
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn delete_object(
+    State(state): State<Arc<AppState>>,
     claims: Claims,
     Path((fragment, object_key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -177,12 +199,20 @@ pub async fn delete_object(
         .map_err(|e| AppError::Io(e, "write marker".into()))?;
 
     invalidate_cache(&fragment, &object_key, &uid).await;
+
     info!("Created delete marker: {}/{}", fragment, object_key);
+
+    state.emit(&uid, StorageEventPayload::FileDeleted {
+        fragment,
+        object_key,
+        version_id: None,
+    });
 
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn delete_fragment(
+    State(state): State<Arc<AppState>>,
     claims: Claims,
     Path(fragment): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -245,6 +275,10 @@ pub async fn delete_fragment(
             );
         }
     }
+
+    state.emit(&uid, StorageEventPayload::FragmentDeleted {
+        fragment: fragment,
+    });
 
     Ok((
         StatusCode::OK,

@@ -40,6 +40,7 @@ mod statics;
 mod structs;
 mod utils;
 mod validation;
+mod websocket;
 
 pub fn init_tracing() -> Result<(), tracing_subscriber::util::TryInitError> {
     tracing_subscriber::registry()
