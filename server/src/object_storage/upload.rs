@@ -1,7 +1,7 @@
 use crate::database::database_constants::DATABASE;
 use crate::enums::app_error_enum::AppError;
 use crate::fs::fragmented_upload::with_io_timeout;
-use crate::object_storage::caching::{invalidate_cache, invalidate_list_cache};
+use crate::object_storage::caching::{add_key_to_list_cache, invalidate_cache};
 use crate::object_storage::constants::{OBJECT_META_FILE, PART_META_SUFFIX, PART_SUFFIX};
 use crate::object_storage::quota_manager::{init_quota_file, try_reserve_quota, update_quota};
 use crate::object_storage::storage_capacity_parser::calculate_storage_usage;
@@ -105,7 +105,12 @@ pub async fn initiate_object_upload(
         return Err(e);
     }
 
-    invalidate_list_cache(&uid, &fragment).await;
+    info!(
+        "Initiated upload: {}/{} (v: {}) [Reserved: {} bytes]",
+        fragment, object_key, version_id, params.total_size_bytes
+    );
+
+    add_key_to_list_cache(&uid, &fragment, object_key).await;
 
     let receipt = ReservationReceipt {
         amount: params.total_size_bytes,
@@ -117,11 +122,6 @@ pub async fn initiate_object_upload(
             warn!("Failed to write reservation receipt for {}: {}", uid, e);
         }
     }
-
-    info!(
-        "Initiated upload: {}/{} (v: {}) [Reserved: {} bytes]",
-        fragment, object_key, version_id, params.total_size_bytes
-    );
 
     Ok((
         StatusCode::CREATED,
@@ -373,9 +373,8 @@ pub async fn finalize_object_upload(
     }
 
     invalidate_cache(&fragment, &object_key, &uid).await;
-    invalidate_list_cache(&uid, &fragment).await;
 
-    state.emit(&uid, StorageEventPayload::FileUploaded(object_meta));
+    state.emit(&uid, StorageEventPayload::FileUploaded(object_meta.clone()));
 
     info!(
         "Finalized object: {}/{} (Size: {})",

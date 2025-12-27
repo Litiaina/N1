@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::caching::{invalidate_cache, invalidate_list_cache};
+use crate::object_storage::caching::{invalidate_cache, invalidate_list_cache, remove_key_from_list_cache};
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_META_FILE};
 use crate::object_storage::quota_manager::update_quota;
 use crate::routes::storage_routes::AppState;
@@ -148,8 +148,8 @@ pub async fn delete_object_permanently(
         }
     }
 
+    remove_key_from_list_cache(&uid, &fragment, &object_key).await;
     invalidate_cache(&fragment, &object_key, &uid).await;
-    invalidate_list_cache(&uid, &fragment).await;
 
     info!(
         "Permanently deleted object versions: {}/{} (Freed: {} bytes)",
@@ -203,7 +203,6 @@ pub async fn delete_object(
         .map_err(|e| AppError::Io(e, "write marker".into()))?;
 
     invalidate_cache(&fragment, &object_key, &uid).await;
-    invalidate_list_cache(&uid, &fragment).await;
 
     info!("Created delete marker: {}/{}", fragment, object_key);
 
@@ -265,7 +264,6 @@ pub async fn delete_fragment(
     .await
     .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
 
-    invalidate_list_cache(&uid, &fragment).await;
     invalidate_list_cache(&uid, &fragment).await;
 
     info!("Deleted fragment '{}' for user {}", fragment, uid);

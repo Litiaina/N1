@@ -168,7 +168,8 @@ pub async fn run_server() {
         .expect("Failed to load TLS certificates");
 
     let storage_addr = SocketAddr::from((ip, storage_ports.https));
-    let serve_storage = serve_storage_routes().await.fallback(handler_404);
+    let (storage_router, app_state) = serve_storage_routes().await;
+    let serve_storage = storage_router.fallback(handler_404);
 
     let shutdown_handle: Arc<
         Mutex<Option<(Arc<axum_server::Handle>, tokio::task::JoinHandle<()>)>>,
@@ -189,10 +190,12 @@ pub async fn run_server() {
     }
 
     {
+        let app_state = Arc::clone(&app_state);
         tokio::spawn(async move {
             start_cli(shutdown_handle, move || {
+                let app_state = Arc::clone(&app_state);
                 async move {
-                    run_garbage_collector().await;
+                    run_garbage_collector(app_state).await;
                     start_cleanup(STORAGE_ROOT).await;
                 }
             })

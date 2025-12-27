@@ -8,6 +8,30 @@ pub struct WsAuthParams {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(tag = "op", content = "d")]
+pub enum ServerMessage {
+    #[serde(rename = "HELLO")]
+    Hello { connection_id: String },
+    
+    #[serde(rename = "PONG")]
+    Pong,
+
+    #[serde(rename = "EVENT")]
+    Event(StorageEvent),
+
+    #[serde(rename = "ERROR")]
+    Error { code: String, message: String },
+
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "op", content = "d")]
+pub enum ClientMessage {
+    #[serde(rename = "PING")]
+    Ping,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "data")]
 pub enum StorageEventPayload {
     #[serde(rename = "FILE_UPLOADED")]
@@ -32,10 +56,26 @@ pub enum StorageEventPayload {
     FragmentDeleted {
         fragment: String,
     },
+
+    #[serde(rename = "SYSTEM_MESSAGE")]
+    SystemMessage {
+        message: String,
+        severity: String,
+    },
+
+    #[serde(rename = "STATE_INVALIDATED")]
+    StateInvalidated,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StorageEvent {
+    pub timestamp_ms: u64,
     #[serde(flatten)]
     pub payload: StorageEventPayload,
+}
+
+#[derive(serde::Deserialize)]
+pub struct BroadcastReq {
+    pub message: String,
+    pub severity: String,
 }

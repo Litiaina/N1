@@ -1,18 +1,21 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_META_FILE};
 use crate::object_storage::quota_manager::update_quota;
+use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
 use crate::structs::object_storage_structs::{OBJECT_STORAGE_ROOT, ObjectMetadata, ReservationReceipt};
+use crate::websocket::ws_structs::StorageEventPayload;
 use tokio::runtime::Handle;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
-pub async fn run_lifecycle_manager() {
+pub async fn run_lifecycle_manager(state: Arc<AppState>) {
     let cleanup_interval = Duration::from_secs(CONFIG.garbage_collector.cleanup_interval_seconds);
     let file_ttl = if CONFIG.garbage_collector.file_ttl_seconds > 0 {
         Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds)
@@ -23,11 +26,11 @@ pub async fn run_lifecycle_manager() {
     loop {
         info!("⏳ Lifecycle Manager: Starting scan...");
         
-        if let Err(e) = perform_lifecycle_scan(file_ttl).await {
+        if let Err(e) = perform_lifecycle_scan(file_ttl, state.clone()).await {
             error!("Lifecycle Scan Failed: {}", e);
         }
 
-        if let Err(e) = perform_filesystem_cleanup(file_ttl).await {
+        if let Err(e) = perform_filesystem_cleanup(file_ttl, state.clone()).await {
             error!("Filesystem Cleanup Failed: {}", e);
         }
 
@@ -35,15 +38,15 @@ pub async fn run_lifecycle_manager() {
     }
 }
 
-pub async fn run_garbage_collector() {
+pub async fn run_garbage_collector(state: Arc<AppState>) {
     let file_ttl = Duration::from_secs(60);
     info!("🗑️ GC (One-Time) executing...");
 
-    if let Err(e) = perform_lifecycle_scan(file_ttl).await {
+    if let Err(e) = perform_lifecycle_scan(file_ttl, state.clone()).await {
         error!("🗑️ GC (One-Time) Lifecycle Scan failed: {}", e);
     }
 
-    if let Err(e) = perform_filesystem_cleanup(file_ttl).await {
+    if let Err(e) = perform_filesystem_cleanup(file_ttl, state.clone()).await {
         error!("🗑️ GC (One-Time) Filesystem Cleanup failed: {}", e);
     } else {
         info!("🗑️ GC (One-Time) completed successfully.");
@@ -77,7 +80,7 @@ fn extract_uid(path: &Path, storage_root: &Path) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn refund_quota_async(uid: String, amount: u64) {
+fn refund_quota_async(uid: String, amount: u64, state: Arc<AppState>) {
     if amount == 0 { return; }
     
     let handle = Handle::current();
@@ -86,11 +89,12 @@ fn refund_quota_async(uid: String, amount: u64) {
             warn!("GC: Failed to refund quota for user {}: {}", uid, e);
         } else {
             info!("GC: Refunded {} bytes to user {}", amount, uid);
+            state.emit(&uid, StorageEventPayload::StateInvalidated);
         }
     });
 }
 
-async fn perform_lifecycle_scan(ttl: Duration) -> Result<(), AppError> {
+async fn perform_lifecycle_scan(ttl: Duration, state: Arc<AppState>) -> Result<(), AppError> {
     let root_str = OBJECT_STORAGE_ROOT
         .get()
         .ok_or(AppError::InternalServerError("No root".into()))?;
@@ -117,7 +121,7 @@ async fn perform_lifecycle_scan(ttl: Duration) -> Result<(), AppError> {
         }
 
         for object_dir in object_dirs {
-            if let Err(e) = process_object_lifecycle(&object_dir, &storage_root, ttl) {
+            if let Err(e) = process_object_lifecycle(&object_dir, &storage_root, ttl, &state) {
                 error!("Error processing lifecycle for {:?}: {}", object_dir, e);
             }
         }
@@ -130,7 +134,7 @@ async fn perform_lifecycle_scan(ttl: Duration) -> Result<(), AppError> {
     Ok(())
 }
 
-fn process_object_lifecycle(object_dir: &Path, storage_root: &Path, ttl: Duration) -> Result<(), AppError> {
+fn process_object_lifecycle(object_dir: &Path, storage_root: &Path, ttl: Duration, state: &Arc<AppState>) -> Result<(), AppError> {
     let read_dir = fs::read_dir(object_dir).map_err(|e| AppError::Io(e, "read obj dir".into()))?;
     
     let mut valid_versions = Vec::new();
@@ -161,7 +165,7 @@ fn process_object_lifecycle(object_dir: &Path, storage_root: &Path, ttl: Duratio
                 info!("♻️ Lifecycle: Removing stale incomplete upload at {:?}", folder_path);
                 if fs::remove_dir_all(&folder_path).is_ok() && refund_amount > 0 {
                     if let Some(uid) = extract_uid(object_dir, storage_root) {
-                        refund_quota_async(uid, refund_amount);
+                        refund_quota_async(uid, refund_amount, state.clone());
                     }
                 }
             }
@@ -200,7 +204,7 @@ fn process_object_lifecycle(object_dir: &Path, storage_root: &Path, ttl: Duratio
                     info!("♻️ Lifecycle: Deleting old version {}/{}", meta.object_key, version_id);
                     if fs::remove_dir_all(&version_path).is_ok() {
                         if let Some(uid) = extract_uid(object_dir, storage_root) {
-                            refund_quota_async(uid, size as u64);
+                            refund_quota_async(uid, size as u64, state.clone());
                         }
                     }
                     continue;
@@ -218,7 +222,7 @@ fn process_object_lifecycle(object_dir: &Path, storage_root: &Path, ttl: Duratio
     Ok(())
 }
 
-async fn perform_filesystem_cleanup(ttl: Duration) -> Result<(), AppError> {
+async fn perform_filesystem_cleanup(ttl: Duration, state: Arc<AppState>) -> Result<(), AppError> {
     let root_str = OBJECT_STORAGE_ROOT
         .get()
         .ok_or_else(|| AppError::InternalServerError("Storage root not initialized".to_string()))?;
@@ -278,7 +282,7 @@ async fn perform_filesystem_cleanup(ttl: Duration) -> Result<(), AppError> {
                     
                     if fs::remove_dir_all(path).is_ok() && refund_amount > 0 {
                         if let Some(uid) = extract_uid(path, &storage_root) {
-                            refund_quota_async(uid, refund_amount);
+                            refund_quota_async(uid, refund_amount, state.clone());
                         }
                     }
                 }

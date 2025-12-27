@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::caching::{invalidate_cache, invalidate_list_cache};
+use crate::object_storage::caching::{invalidate_cache, invalidate_list_cache, rename_key_in_list_cache};
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_META_FILE};
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
-    ObjectMetadata, ObjectPathManager, RenameFragmentQuery, RenameObjectRequest,
+    ObjectMetadata, ObjectPathManager, RenameFragmentQuery, RenameObjectRequest
 };
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::extract::{Query, State};
@@ -58,36 +58,52 @@ pub async fn rename_object(
         );
         AppError::InternalServerError("Failed to rename object.".to_string())
     })?;
+    
+    let dest_key_bg = payload.destination_key.clone();
+    let dest_frag_bg = payload.destination_fragment.clone();
 
-    let mut versions = fs::read_dir(&dest_dir).await.map_err(|e| {
-        error!("Failed to read destination directory after move: {}", e);
-        AppError::InternalServerError("Object moved, but failed to update metadata.".to_string())
-    })?;
+    tokio::spawn(async move {
+        let mut read_dir = match fs::read_dir(&dest_dir).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                error!("Background Rename Task: Failed to read dir {:?}: {}", dest_dir, e);
+                return;
+            }
+        };
 
-    while let Ok(Some(entry)) = versions.next_entry().await {
-        if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
-            let meta_path = entry.path().join(OBJECT_META_FILE);
-
-            if fs::try_exists(&meta_path).await.unwrap_or(false) {
-                if let Ok(bytes) = fs::read(&meta_path).await {
-                    if let Ok(mut meta) = mongodb::bson::from_slice::<ObjectMetadata>(&bytes) {
-                        meta.fragment = payload.destination_fragment.clone();
-                        meta.object_key = payload.destination_key.clone();
-
-                        if let Ok(new_bytes) = mongodb::bson::to_vec(&meta) {
-                            let _ = fs::write(&meta_path, new_bytes).await;
+        while let Ok(Some(entry)) = read_dir.next_entry().await {
+            if let Ok(ft) = entry.file_type().await {
+                if ft.is_dir() {
+                    let version_path = entry.path();
+                    let meta_path = version_path.join(OBJECT_META_FILE);
+                    
+                    if fs::try_exists(&meta_path).await.unwrap_or(false) {
+                        if let Ok(data) = fs::read(&meta_path).await {
+                            if let Ok(mut meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
+                                meta.object_key = dest_key_bg.clone();
+                                meta.fragment = dest_frag_bg.clone();
+                                
+                                if let Ok(bytes) = mongodb::bson::to_vec(&meta) {
+                                    let _ = fs::write(&meta_path, bytes).await;
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-    }
+    });
 
     invalidate_cache(&payload.source_fragment, &payload.source_key, &uid).await;
     invalidate_cache(&payload.destination_fragment, &payload.destination_key, &uid).await;
 
-    invalidate_list_cache(&uid, &payload.source_fragment).await;
-    invalidate_list_cache(&uid, &payload.destination_fragment).await;
+    rename_key_in_list_cache(
+        &uid,
+        &payload.source_fragment,
+        &payload.source_key,
+        &payload.destination_fragment,
+        &payload.destination_key
+    ).await;
 
     info!(
         "Renamed object from {}/{} to {}/{}",

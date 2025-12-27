@@ -30,35 +30,31 @@ use crate::object_storage::upload::{
     object_upload_part,
 };
 use crate::statics::database_statics::DATABASE_URL;
-use crate::websocket::handler::ws_handler;
-use crate::websocket::ws_structs::{StorageEvent, StorageEventPayload};
-use axum::http::{HeaderName, Method, StatusCode};
+use crate::websocket::handler::{system_broadcast_handler, ws_handler};
+use crate::websocket::manager::WsConnectionManager;
+use crate::websocket::ws_structs::StorageEventPayload;
+use axum::http::{HeaderName, Method};
 use axum::middleware::from_fn;
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Router, extract::DefaultBodyLimit};
-use dashmap::DashMap;
 use mongodb::Client;
 use mongodb::options::ClientOptions;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 
 pub struct AppState {
     pub db_client: Arc<Client>,
-    pub user_channels: DashMap<String, broadcast::Sender<StorageEvent>>,
+    pub ws_manager: WsConnectionManager,
 }
 
 impl AppState {
     pub fn emit(&self, uid: &str, payload: StorageEventPayload) {
-        if let Some(sender) = self.user_channels.get(uid) {
-            let event = StorageEvent { payload };
-            let _ = sender.send(event);
-        }
+        self.ws_manager.publish(uid, payload);
     }
 }
 
-pub async fn serve_storage_routes() -> Router {
+pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
     let layers = RateLimitLayers::new();
 
     let client_options = ClientOptions::parse(&*DATABASE_URL)
@@ -67,13 +63,16 @@ pub async fn serve_storage_routes() -> Router {
     let db_client =
         Arc::new(Client::with_options(client_options).expect("Failed to create MongoDB client"));
 
+    let ws_manager = WsConnectionManager::new();
+
     let app_state = Arc::new(AppState {
         db_client: Arc::clone(&db_client),
-        user_channels: DashMap::new(),
+        ws_manager,
     });
 
+    let lifecycle_state = Arc::clone(&app_state);
     tokio::spawn(async move {
-        run_lifecycle_manager().await;
+        run_lifecycle_manager(lifecycle_state).await;
     });
 
     let cors_layer = CorsLayer::new()
@@ -202,6 +201,21 @@ pub async fn serve_storage_routes() -> Router {
             .layer(from_fn(auth))
     };
 
+    let ws_routes = {
+        let upgrade_route = Router::new()
+            .route("/ws", get(ws_handler));
+
+        let broadcast_route = Router::new()
+            .route("/v4/system/broadcast", post(system_broadcast_handler))
+            .layer(from_fn(auth));
+
+        let broadcast_route = layers.layer_upload(broadcast_route);
+
+        Router::new()
+            .merge(upgrade_route)
+            .merge(broadcast_route)
+    };
+
     let auth_route = Router::new()
         .route("/authenticate", post(authorize));
     let auth_route = layers.layer_auth(auth_route);
@@ -210,23 +224,17 @@ pub async fn serve_storage_routes() -> Router {
         .route("/ping", get(ping));
     let ping_route = layers.layer_global(ping_route);
 
-    let ws_route = Router::new()
-        .route("/ws", get(ws_handler).options(options_ok))
-        .route("/ws/", get(ws_handler).options(options_ok));
-
-    Router::new()
+    let router = Router::new()
         .merge(ping_route)
         .merge(auth_route)
         .merge(object_storage_routes)
         .merge(legacy_fs_routes)
-        .merge(ws_route)
+        .merge(ws_routes)
         .layer(DefaultBodyLimit::max(MAX_FILE_SIZE))
         .layer(cors_layer)
-        .with_state(app_state)
-}
+        .with_state(Arc::clone(&app_state));
 
-async fn options_ok() -> StatusCode {
-    StatusCode::OK
+    (router, app_state)
 }
 
 async fn ping() -> &'static str {
