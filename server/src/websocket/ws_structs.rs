@@ -12,16 +12,12 @@ pub struct WsAuthParams {
 pub enum ServerMessage {
     #[serde(rename = "HELLO")]
     Hello { connection_id: String },
-    
+
     #[serde(rename = "PONG")]
     Pong,
 
     #[serde(rename = "EVENT")]
     Event(StorageEvent),
-
-    #[serde(rename = "ERROR")]
-    Error { code: String, message: String },
-
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,7 +32,7 @@ pub enum ClientMessage {
 pub enum StorageEventPayload {
     #[serde(rename = "FILE_UPLOADED")]
     FileUploaded(ObjectMetadata),
-    
+
     #[serde(rename = "FILE_DELETED")]
     FileDeleted {
         fragment: String,
@@ -53,15 +49,10 @@ pub enum StorageEventPayload {
     },
 
     #[serde(rename = "FRAGMENT_DELETED")]
-    FragmentDeleted {
-        fragment: String,
-    },
+    FragmentDeleted { fragment: String },
 
     #[serde(rename = "SYSTEM_MESSAGE")]
-    SystemMessage {
-        message: String,
-        severity: String,
-    },
+    SystemMessage { message: String, severity: String },
 
     #[serde(rename = "STATE_INVALIDATED")]
     StateInvalidated,

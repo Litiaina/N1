@@ -1,8 +1,8 @@
-use std::sync::Arc;
+use crate::websocket::ws_structs::{StorageEvent, StorageEventPayload};
 use dashmap::DashMap;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::info;
-use crate::websocket::ws_structs::{StorageEvent, StorageEventPayload};
 
 const CHANNEL_CAPACITY: usize = 10_000;
 
@@ -24,14 +24,24 @@ impl WsConnectionManager {
             let (tx, _rx) = broadcast::channel(CHANNEL_CAPACITY);
             tx
         });
-        
+
         entry.subscribe()
+    }
+
+    pub fn cleanup_connection(&self, uid: &str) {
+        if let Some(entry) = self.sessions.get(uid) {
+            if entry.receiver_count() == 0 {
+                info!("Cleaning up empty session for user: {}", uid);
+                drop(entry);
+                self.sessions.remove(uid);
+            }
+        }
     }
 
     pub fn publish(&self, uid: &str, event_payload: StorageEventPayload) -> usize {
         if let Some(sender) = self.sessions.get(uid) {
             if sender.receiver_count() == 0 {
-                drop(sender); 
+                drop(sender);
                 self.sessions.remove(uid);
                 return 0;
             }
@@ -43,9 +53,7 @@ impl WsConnectionManager {
 
             match sender.send(event) {
                 Ok(receiver_count) => receiver_count,
-                Err(_) => {
-                    0
-                }
+                Err(_) => 0,
             }
         } else {
             0
@@ -57,10 +65,15 @@ impl WsConnectionManager {
             timestamp_ms: chrono::Utc::now().timestamp_millis() as u64,
             payload,
         };
-        
-        for r in self.sessions.iter() {
-            let _ = r.value().send(event.clone());
-        }
+
+        self.sessions.retain(|_, sender| {
+            if sender.receiver_count() > 0 {
+                let _ = sender.send(event.clone());
+                true
+            } else {
+                false
+            }
+        });
     }
 
     pub fn broadcast_announcement(&self, message: &str, severity: &str) {
