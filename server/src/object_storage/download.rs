@@ -46,14 +46,11 @@ pub async fn download_object_chunk(
     if metadata.is_delete_marker {
         return Err(AppError::NotFound);
     }
-
-    let clean_stored_key = metadata.object_key.trim_start_matches('/');
-
     let path_manager = ObjectPathManager::new();
-    let version_dir = path_manager.get_version_dir(
+    
+    let version_dir = path_manager.get_blob_dir(
         &metadata.owner_uid,
         &metadata.fragment,
-        clean_stored_key,
         &metadata.version_id,
     );
 

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -27,14 +28,33 @@ impl ObjectPathManager {
             .join(uid)
     }
 
-    pub fn get_object_dir(&self, uid: &str, fragment: &str, key: &str) -> PathBuf {
+    pub fn get_blob_dir(&self, uid: &str, fragment: &str, version_id: &str) -> PathBuf {
         self.get_user_dir(uid)
             .join(fragment)
-            .join(key)
+            .join("blobs")
+            .join(version_id)
     }
 
-    pub fn get_version_dir(&self, uid: &str, fragment: &str, key: &str, version_id: &str) -> PathBuf {
-        self.get_object_dir(uid, fragment, key).join(version_id)
+    pub fn get_index_dir(&self, uid: &str, fragment: &str) -> PathBuf {
+        self.get_user_dir(uid)
+            .join(fragment)
+            .join("index")
+    }
+
+    pub fn get_metadata_path(&self, uid: &str, fragment: &str, object_key: &str, version_id: &str) -> PathBuf {
+        let mut hasher = Sha256::new();
+        hasher.update(object_key.as_bytes());
+        let hash = hex::encode(hasher.finalize());
+
+        let shard1 = &hash[0..2];
+        let shard2 = &hash[2..4];
+        
+        let filename = format!("{}#{}.bson", hash, version_id);
+        
+        self.get_index_dir(uid, fragment)
+            .join(shard1)
+            .join(shard2)
+            .join(filename)
     }
 }
 

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::{invalidate_cache, invalidate_list_cache, remove_key_from_list_cache};
-use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_META_FILE};
+use crate::object_storage::constants::OBJECT_DATA_ROOT;
 use crate::object_storage::quota_manager::update_quota;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -13,8 +13,9 @@ use axum::extract::State;
 use axum::{extract::Path, http::StatusCode, response::IntoResponse};
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
+use sha2::{Digest, Sha256};
 use tokio::fs;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use ulid::Ulid;
 use walkdir::WalkDir;
 
@@ -25,16 +26,12 @@ pub async fn delete_object_version(
 ) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
-    let version_dir = path_manager.get_version_dir(&uid, &fragment, &object_key, &version_id);
 
-    if !fs::try_exists(&version_dir).await.unwrap_or(false) {
-        return Err(AppError::NotFound);
-    }
+    let index_path = path_manager.get_metadata_path(&uid, &fragment, &object_key, &version_id);
+    let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
 
-    let meta_path = version_dir.join(OBJECT_META_FILE);
     let mut size_to_free = 0;
-
-    if let Ok(data) = fs::read(&meta_path).await {
+    if let Ok(data) = fs::read(&index_path).await {
         if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
             if !meta.is_delete_marker {
                 size_to_free = meta.total_size_bytes as i64;
@@ -42,10 +39,25 @@ pub async fn delete_object_version(
         }
     }
 
-    fs::remove_dir_all(&version_dir).await.map_err(|e| {
-        error!("Failed to delete version directory: {}", e);
-        AppError::InternalServerError("Failed to delete version.".to_string())
+    fs::remove_file(&index_path).await.map_err(|e| {
+        error!("Failed to delete version metadata: {}", e);
+        AppError::InternalServerError("Failed to delete version metadata.".to_string())
     })?;
+
+    if let Some(shard_h2) = index_path.parent() {
+        if fs::remove_dir(shard_h2).await.is_ok() {
+            if let Some(shard_h1) = shard_h2.parent() {
+                let _ = fs::remove_dir(shard_h1).await;
+            }
+        }
+    }
+
+    if fs::try_exists(&blob_dir).await.unwrap_or(false) {
+        fs::remove_dir_all(&blob_dir).await.map_err(|e| {
+            error!("Failed to delete blob directory: {}", e);
+            AppError::InternalServerError("Failed to delete blobs.".to_string())
+        })?;
+    }
 
     if size_to_free > 0 {
         if let Err(e) = update_quota(&uid, -size_to_free).await {
@@ -79,68 +91,79 @@ pub async fn delete_object_permanently(
 ) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
-    let object_dir = path_manager.get_object_dir(&uid, &fragment, &object_key);
 
-    if !fs::try_exists(&object_dir).await.unwrap_or(false) {
+    let mut hasher = Sha256::new();
+    hasher.update(object_key.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+
+    let shard1 = &hash[0..2];
+    let shard2 = &hash[2..4];
+
+    let shard_dir = path_manager
+        .get_index_dir(&uid, &fragment)
+        .join(shard1)
+        .join(shard2);
+
+    if !fs::try_exists(&shard_dir).await.unwrap_or(false) {
         return Err(AppError::NotFound);
     }
 
-    let mut version_paths = Vec::new();
-    let mut entries = fs::read_dir(&object_dir)
+    let prefix = format!("{}#", hash);
+    let mut version_metadata_files = Vec::new();
+
+    let mut entries = fs::read_dir(&shard_dir)
         .await
-        .map_err(|e| AppError::Io(e, "read object dir".into()))?;
+        .map_err(|e| AppError::Io(e, "read index shard".into()))?;
 
     while let Ok(Some(entry)) = entries.next_entry().await {
-        if let Ok(ft) = entry.file_type().await {
-            if ft.is_dir() {
-                version_paths.push(entry.path());
-            }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(&prefix) && name.ends_with(".bson") {
+            version_metadata_files.push(entry.path());
         }
     }
 
-    let results: Vec<i64> = stream::iter(version_paths)
-        .map(|path| async move {
-            let mut freed_bytes = 0;
+    let results: Vec<i64> = stream::iter(version_metadata_files)
+        .map(|meta_path| {
+            let pm = &path_manager;
+            let u = &uid;
+            let f = &fragment;
+            async move {
+                let mut freed_bytes = 0;
+                let mut version_id = String::new();
 
-            let mut has_subdirs = false;
-            if let Ok(mut sub_entries) = fs::read_dir(&path).await {
-                while let Ok(Some(sub)) = sub_entries.next_entry().await {
-                    if let Ok(sub_ft) = sub.file_type().await {
-                        if sub_ft.is_dir() {
-                            has_subdirs = true;
-                            break;
+                if let Ok(data) = fs::read(&meta_path).await {
+                    if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
+                        version_id = meta.version_id.clone();
+                        if !meta.is_delete_marker {
+                            freed_bytes = meta.total_size_bytes as i64;
                         }
                     }
                 }
-            }
 
-            if has_subdirs {
-                return 0;
-            }
-
-            let meta_path = path.join(OBJECT_META_FILE);
-            if let Ok(data) = fs::read(&meta_path).await {
-                if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
-                    if !meta.is_delete_marker {
-                        freed_bytes = meta.total_size_bytes as i64;
-                    }
+                if let Err(e) = fs::remove_file(&meta_path).await {
+                    error!("Failed to delete index file {:?}: {}", meta_path, e);
+                    return 0;
                 }
-            }
 
-            if let Err(e) = fs::remove_dir_all(&path).await {
-                error!("Failed to delete version dir {:?}: {}", path, e);
-                return 0;
-            }
+                if !version_id.is_empty() {
+                    let blob_dir = pm.get_blob_dir(u, f, &version_id);
+                    let _ = fs::remove_dir_all(&blob_dir).await;
+                }
 
-            freed_bytes
+                freed_bytes
+            }
         })
         .buffer_unordered(20)
         .collect()
         .await;
 
-    let total_size_to_free: i64 = results.iter().sum();
+    if fs::remove_dir(&shard_dir).await.is_ok() {
+        if let Some(parent) = shard_dir.parent() {
+            let _ = fs::remove_dir(parent).await;
+        }
+    }
 
-    let _ = fs::remove_dir(&object_dir).await;
+    let total_size_to_free: i64 = results.iter().sum();
 
     if total_size_to_free > 0 {
         if let Err(e) = update_quota(&uid, -total_size_to_free).await {
@@ -156,11 +179,14 @@ pub async fn delete_object_permanently(
         fragment, object_key, total_size_to_free
     );
 
-    state.emit(&uid, StorageEventPayload::FileDeleted {
-        fragment,
-        object_key,
-        version_id: None, 
-    });
+    state.emit(
+        &uid,
+        StorageEventPayload::FileDeleted {
+            fragment,
+            object_key,
+            version_id: None,
+        },
+    );
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -175,11 +201,16 @@ pub async fn delete_object(
     let session_id = Ulid::new().to_string();
 
     let path_manager = ObjectPathManager::new();
-    let version_dir = path_manager.get_version_dir(&uid, &fragment, &object_key, &version_id);
 
-    fs::create_dir_all(&version_dir)
-        .await
-        .map_err(|e| AppError::Io(e, "create marker dir".into()))?;
+    let index_path = path_manager.get_metadata_path(&uid, &fragment, &object_key, &version_id);
+
+    if let Some(parent) = index_path.parent() {
+        if !fs::try_exists(parent).await.unwrap_or(false) {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| AppError::Io(e, "create index shard".into()))?;
+        }
+    }
 
     let delete_marker = ObjectMetadata {
         object_key: object_key.clone(),
@@ -197,8 +228,7 @@ pub async fn delete_object(
     let bson_data = mongodb::bson::to_vec(&delete_marker)
         .map_err(|_| AppError::InternalServerError("BSON error".into()))?;
 
-    let meta_path = version_dir.join(OBJECT_META_FILE);
-    fs::write(&meta_path, bson_data)
+    fs::write(&index_path, bson_data)
         .await
         .map_err(|e| AppError::Io(e, "write marker".into()))?;
 
@@ -206,11 +236,14 @@ pub async fn delete_object(
 
     info!("Created delete marker: {}/{}", fragment, object_key);
 
-    state.emit(&uid, StorageEventPayload::FileDeleted {
-        fragment,
-        object_key,
-        version_id: None,
-    });
+    state.emit(
+        &uid,
+        StorageEventPayload::FileDeleted {
+            fragment,
+            object_key,
+            version_id: None,
+        },
+    );
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -226,15 +259,18 @@ pub async fn delete_fragment(
     let user_storage_root = path_manager.root.join(OBJECT_DATA_ROOT).join(&uid);
     let fragment_path = user_storage_root.join(&fragment);
 
-    let scan_path = fragment_path.clone();
+    let index_dir = fragment_path.join("index");
+
     let refund_amount = tokio::task::spawn_blocking(move || -> i64 {
-        if !scan_path.exists() {
+        if !index_dir.exists() {
             return 0;
         }
 
         let mut total_size: u64 = 0;
-        for entry in WalkDir::new(&scan_path).into_iter().filter_map(|e| e.ok()) {
-            if entry.file_name() == OBJECT_META_FILE {
+        for entry in WalkDir::new(&index_dir).into_iter().filter_map(|e| e.ok()) {
+            if entry.file_type().is_file()
+                && entry.file_name().to_string_lossy().ends_with(".bson")
+            {
                 if let Ok(data) = std::fs::read(entry.path()) {
                     if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
                         if !meta.is_delete_marker {
@@ -270,9 +306,10 @@ pub async fn delete_fragment(
 
     if refund_amount > 0 {
         if let Err(e) = update_quota(&uid, -refund_amount).await {
-            warn!(
+            tracing::warn!(
                 "Failed to refund quota after fragment delete for {}: {}",
-                uid, e
+                uid,
+                e
             );
         } else {
             info!(

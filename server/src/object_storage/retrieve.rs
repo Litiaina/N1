@@ -1,6 +1,6 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::{get_metadata_with_cache, get_object_keys_with_cache};
-use crate::object_storage::constants::{BROWSER_CACHE_MAX_AGE, OBJECT_DATA_ROOT, OBJECT_META_FILE};
+use crate::object_storage::constants::{BROWSER_CACHE_MAX_AGE, OBJECT_DATA_ROOT};
 use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{ObjectMetadata, ObjectPathManager};
@@ -12,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::{StreamExt, stream};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio::fs;
 use walkdir::WalkDir;
@@ -82,27 +83,35 @@ pub async fn list_object_versions(
 ) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
-    let clean_key = object_key.trim_start_matches('/');
+    
+    let mut hasher = Sha256::new();
+    hasher.update(object_key.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+    
+    let shard1 = &hash[0..2];
+    let shard2 = &hash[2..4];
+    
+    let shard_dir = path_manager.get_index_dir(&uid, &fragment)
+        .join(shard1)
+        .join(shard2);
 
-    let object_dir = path_manager.get_object_dir(&uid, &fragment, clean_key);
-
-    if !fs::try_exists(&object_dir).await.unwrap_or(false) {
+    if !fs::try_exists(&shard_dir).await.unwrap_or(false) {
         return Err(AppError::NotFound);
     }
 
+    let prefix = format!("{}#", hash);
     let mut versions = Vec::new();
-    let mut entries = fs::read_dir(&object_dir)
+    
+    let mut entries = fs::read_dir(&shard_dir)
         .await
-        .map_err(|e| AppError::Io(e, "read obj dir".into()))?;
+        .map_err(|e| AppError::Io(e, "read index shard".into()))?;
 
     while let Ok(Some(entry)) = entries.next_entry().await {
-        if let Ok(ft) = entry.file_type().await {
-            if ft.is_dir() {
-                let meta_path = entry.path().join(OBJECT_META_FILE);
-                if let Ok(data) = fs::read(&meta_path).await {
-                    if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
-                        versions.push(meta);
-                    }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(&prefix) && name.ends_with(".bson") {
+            if let Ok(data) = fs::read(entry.path()).await {
+                if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
+                    versions.push(meta);
                 }
             }
         }

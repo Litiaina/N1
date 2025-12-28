@@ -1,10 +1,8 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_META_FILE};
 use crate::object_storage::metadata_parser::{find_latest_metadata_on_disk, read_bson_metadata};
 use crate::structs::object_storage_structs::{ObjectMetadata, ObjectPathManager};
 use moka::future::Cache;
 use once_cell::sync::Lazy;
-use tracing::warn;
 use walkdir::WalkDir;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,45 +38,28 @@ pub async fn get_object_keys_with_cache(
 
     cache.try_get_with(cache_key, async {
         let path_manager = ObjectPathManager::new();
-        let fragment_dir = path_manager
-            .root
-            .join(OBJECT_DATA_ROOT)
-            .join(uid)
-            .join(fragment);
+        let index_dir = path_manager.get_index_dir(uid, fragment);
 
         let keys = tokio::task::spawn_blocking(move || -> Result<Vec<String>, std::io::Error> {
-            if !fragment_dir.exists() {
+            if !index_dir.exists() {
                 return Ok(Vec::new());
             }
 
             let mut collected_keys = Vec::with_capacity(4096);
             
-            let walker = WalkDir::new(&fragment_dir)
-                .min_depth(1)
-                .follow_links(false);
-
-            for entry_res in walker.into_iter() {
-                match entry_res {
-                    Ok(entry) => {
-                        let file_name = entry.file_name().to_string_lossy();
-                        if file_name.starts_with('.') {
-                            continue;
+            for entry in WalkDir::new(&index_dir).into_iter().filter_map(|e| e.ok()) {
+                if entry.file_type().is_file() && entry.file_name().to_string_lossy().ends_with(".bson") {
+                    if let Ok(data) = std::fs::read(entry.path()) {
+                        if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
+                            let key = meta.object_key;
+                             if let Err(pos) = collected_keys.binary_search(&key) {
+                                 collected_keys.insert(pos, key);
+                             }
                         }
-
-                        if entry.file_type().is_dir() {
-                            if let Ok(relative) = entry.path().strip_prefix(&fragment_dir) {
-                                let key = relative.to_string_lossy().replace("\\", "/");
-                                collected_keys.push(key);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Error scanning entry in fragment {}: {}", fragment_dir.display(), e);
                     }
                 }
             }
 
-            collected_keys.sort(); 
             Ok(collected_keys)
         })
         .await
@@ -143,6 +124,7 @@ pub async fn get_metadata_with_cache(
     }
 
     let metadata = find_latest_metadata_on_disk(uid, fragment, object_key).await?;
+    
     cache.insert(cache_key, metadata.clone()).await;
 
     Ok(metadata)
@@ -162,8 +144,7 @@ pub async fn get_version_metadata_with_cache(
     }
 
     let path_manager = ObjectPathManager::new();
-    let version_dir = path_manager.get_version_dir(uid, fragment, object_key, version_id);
-    let meta_path = version_dir.join(OBJECT_META_FILE);
+    let meta_path = path_manager.get_metadata_path(uid, fragment, object_key, version_id);
 
     if !tokio::fs::try_exists(&meta_path).await.unwrap_or(false) {
          return Err(AppError::NotFound);

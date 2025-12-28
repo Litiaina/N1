@@ -6,10 +6,7 @@ use walkdir::WalkDir;
 
 use crate::{
     database::database_constants::DATABASE,
-    object_storage::{
-        constants::OBJECT_META_FILE,
-        quota_manager::{init_quota_file, set_storage_used},
-    },
+    object_storage::quota_manager::{init_quota_file, set_storage_used},
     statics::database_statics::DATABASE_URL,
     structs::object_storage_structs::{ObjectMetadata, ObjectPathManager, UserRecord},
 };
@@ -40,30 +37,37 @@ pub async fn setup_quota() -> Result<(), Box<dyn Error>> {
 
                 let user_dir = path_manager.get_user_dir(&uid);
 
-                if user_dir.exists() {
-                    let calculated_usage = tokio::task::spawn_blocking(move || {
-                        let mut total = 0u64;
-                        for entry in WalkDir::new(&user_dir).into_iter().filter_map(|e| e.ok()) {
-                            if entry.file_name() == OBJECT_META_FILE {
-                                if let Ok(data) = std::fs::read(entry.path()) {
-                                    if let Ok(meta) =
-                                        mongodb::bson::from_slice::<ObjectMetadata>(&data)
-                                    {
-                                        if !meta.is_delete_marker {
-                                            total += meta.total_size_bytes;
+                tokio::spawn(async move {
+                    if user_dir.exists() {
+                        let calculated_usage = tokio::task::spawn_blocking(move || {
+                            let mut total = 0u64;
+                            for entry in WalkDir::new(&user_dir).into_iter().filter_map(|e| e.ok()) {
+                                if entry.file_type().is_file() && entry.file_name().to_string_lossy().ends_with(".bson") {
+                                    if entry.file_name() == "quota.bson" { continue; }
+                                    
+                                    if let Ok(data) = std::fs::read(entry.path()) {
+                                        if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
+                                            if !meta.is_delete_marker {
+                                                total += meta.total_size_bytes;
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
-                        total
-                    })
-                    .await?;
+                            total
+                        })
+                        .await;
 
-                    if let Err(e) = set_storage_used(&uid, calculated_usage).await {
-                        warn!("Failed to update usage stats for {}: {}", uid, e);
+                        match calculated_usage {
+                            Ok(usage) => {
+                                if let Err(e) = set_storage_used(&uid, usage).await {
+                                    warn!("Failed to update usage stats for {}: {}", uid, e);
+                                }
+                            }
+                            Err(e) => error!("Failed to calc usage for {}: {}", uid, e),
+                        }
                     }
-                }
+                });
 
                 count += 1;
             }
@@ -74,7 +78,7 @@ pub async fn setup_quota() -> Result<(), Box<dyn Error>> {
     }
 
     info!(
-        "Background Task: Consistency check complete. Verified {} users.",
+        "Background Task: Consistency check initiated for {} users (running in background).",
         count
     );
 

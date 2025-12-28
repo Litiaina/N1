@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::{invalidate_cache, invalidate_list_cache, rename_key_in_list_cache};
-use crate::object_storage::constants::{OBJECT_DATA_ROOT, OBJECT_META_FILE};
+use crate::object_storage::constants::OBJECT_DATA_ROOT;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
@@ -11,6 +11,7 @@ use crate::structs::object_storage_structs::{
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::extract::{Query, State};
 use axum::{Json as AxumJson, http::StatusCode, response::IntoResponse};
+use sha2::{Digest, Sha256};
 use tokio::fs;
 use tracing::{error, info};
 
@@ -22,77 +23,76 @@ pub async fn rename_object(
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
 
-    let source_dir =
-        path_manager.get_object_dir(&uid, &payload.source_fragment, &payload.source_key);
-    let dest_dir = path_manager.get_object_dir(
-        &uid,
-        &payload.destination_fragment,
-        &payload.destination_key,
-    );
+    let mut hasher = Sha256::new();
+    hasher.update(payload.source_key.as_bytes());
+    let src_hash = hex::encode(hasher.finalize());
+    let src_shard = path_manager.get_index_dir(&uid, &payload.source_fragment)
+        .join(&src_hash[0..2])
+        .join(&src_hash[2..4]);
 
-    if !fs::try_exists(&source_dir).await.unwrap_or(false) {
+    let mut hasher = Sha256::new();
+    hasher.update(payload.destination_key.as_bytes());
+    let dst_hash = hex::encode(hasher.finalize());
+    let dst_shard = path_manager.get_index_dir(&uid, &payload.destination_fragment)
+        .join(&dst_hash[0..2])
+        .join(&dst_hash[2..4]);
+
+    if !fs::try_exists(&src_shard).await.unwrap_or(false) {
         return Err(AppError::NotFound);
     }
 
-    if fs::try_exists(&dest_dir).await.unwrap_or(false) {
-        return Err(AppError::Conflict(
-            "An object with the destination name already exists.".to_string(),
-        ));
-    }
-
-    if let Some(parent) = dest_dir.parent() {
-        if !fs::try_exists(parent).await.unwrap_or(false) {
-            fs::create_dir_all(parent).await.map_err(|e| {
-                error!("Failed to create destination fragment directory: {}", e);
-                AppError::InternalServerError(
-                    "Failed to prepare destination directory.".to_string(),
-                )
-            })?;
+    if fs::try_exists(&dst_shard).await.unwrap_or(false) {
+        let prefix = format!("{}#", dst_hash);
+        let mut entries = fs::read_dir(&dst_shard).await.map_err(|e| AppError::Io(e, "read dest shard".into()))?;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                return Err(AppError::Conflict("Destination object already exists".into()));
+            }
         }
     }
 
-    fs::rename(&source_dir, &dest_dir).await.map_err(|e| {
-        error!(
-            "Failed to move object directory from {:?} to {:?}: {}",
-            source_dir, dest_dir, e
-        );
-        AppError::InternalServerError("Failed to rename object.".to_string())
+    fs::create_dir_all(&dst_shard).await.map_err(|e| {
+        error!("Failed to create dest shard: {}", e);
+        AppError::InternalServerError("Failed to prepare rename.".into())
     })?;
+
+    let src_prefix = format!("{}#", src_hash);
+    let mut entries = fs::read_dir(&src_shard).await.map_err(|e| AppError::Io(e, "read src shard".into()))?;
     
-    let dest_key_bg = payload.destination_key.clone();
-    let dest_frag_bg = payload.destination_fragment.clone();
+    let mut found = false;
 
-    tokio::spawn(async move {
-        let mut read_dir = match fs::read_dir(&dest_dir).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                error!("Background Rename Task: Failed to read dir {:?}: {}", dest_dir, e);
-                return;
-            }
-        };
-
-        while let Ok(Some(entry)) = read_dir.next_entry().await {
-            if let Ok(ft) = entry.file_type().await {
-                if ft.is_dir() {
-                    let version_path = entry.path();
-                    let meta_path = version_path.join(OBJECT_META_FILE);
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(&src_prefix) && name.ends_with(".bson") {
+            found = true;
+            if let Some((_, version_ext)) = name.split_once('#') {
+                if let Some(version_id) = version_ext.strip_suffix(".bson") {
                     
-                    if fs::try_exists(&meta_path).await.unwrap_or(false) {
-                        if let Ok(data) = fs::read(&meta_path).await {
-                            if let Ok(mut meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
-                                meta.object_key = dest_key_bg.clone();
-                                meta.fragment = dest_frag_bg.clone();
-                                
-                                if let Ok(bytes) = mongodb::bson::to_vec(&meta) {
-                                    let _ = fs::write(&meta_path, bytes).await;
+                    let new_filename = format!("{}#{}.bson", dst_hash, version_id);
+                    let dest_path = dst_shard.join(&new_filename);
+                    
+                    if let Ok(data) = fs::read(entry.path()).await {
+                        if let Ok(mut meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
+                            meta.object_key = payload.destination_key.clone();
+                            meta.fragment = payload.destination_fragment.clone();
+                            
+                            if let Ok(bytes) = mongodb::bson::to_vec(&meta) {
+                                if let Err(e) = fs::write(&dest_path, bytes).await {
+                                     error!("Failed to write new meta during rename: {}", e);
+                                     continue;
                                 }
+                                let _ = fs::remove_file(entry.path()).await;
                             }
                         }
                     }
                 }
             }
         }
-    });
+    }
+
+    if !found {
+        return Err(AppError::NotFound);
+    }
 
     invalidate_cache(&payload.source_fragment, &payload.source_key, &uid).await;
     invalidate_cache(&payload.destination_fragment, &payload.destination_key, &uid).await;

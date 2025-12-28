@@ -1,6 +1,5 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::get_metadata_with_cache;
-use crate::object_storage::metadata_parser::find_latest_metadata_on_disk;
 use crate::object_storage::object_parser::stream_object_logic;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
@@ -50,7 +49,7 @@ pub async fn create_signed_url(
     let uid = claims.uid;
     let clean_key = payload.object_key.trim_start_matches('/');
 
-    let metadata = find_latest_metadata_on_disk(&uid, &payload.fragment, clean_key).await?;
+    let metadata = get_metadata_with_cache(&payload.fragment, clean_key, &uid).await?;
 
     if payload.expires_in as i64 > MAX_EXPIRATION_SECONDS {
         return Err(AppError::BadRequest(format!(

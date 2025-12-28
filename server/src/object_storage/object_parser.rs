@@ -40,8 +40,9 @@ pub async fn stream_object_logic(
     } = metadata;
 
     let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
-    let (start, end) =
-        parse_range_header(range_header, file_size).unwrap_or((0, file_size.saturating_sub(1)));
+    let parsed_range = parse_range_header(range_header, file_size);
+    let (start, end) = parsed_range.unwrap_or((0, file_size.saturating_sub(1)));
+    let is_explicit_range = parsed_range.is_some();
 
     if start >= file_size {
         return Err(AppError::RangeNotSatisfiable);
@@ -51,7 +52,8 @@ pub async fn stream_object_logic(
     let clean_stored_key = object_key.trim_start_matches('/');
 
     let path_manager = ObjectPathManager::new();
-    let version_dir = path_manager.get_version_dir(&owner_uid, &fragment, clean_stored_key, &version_id);
+    
+    let version_dir = path_manager.get_blob_dir(&owner_uid, &fragment, &version_id);
 
     let filename = std::path::Path::new(clean_stored_key)
         .file_name()
@@ -162,7 +164,7 @@ pub async fn stream_object_logic(
         .header(header::CONTENT_DISPOSITION, format!("{}; filename=\"{}\"", disposition_type, filename))
         .header(header::CACHE_CONTROL, "public, max-age=3600");
 
-    if content_length < file_size {
+    if is_explicit_range || content_length < file_size {
         builder = builder
             .status(StatusCode::PARTIAL_CONTENT)
             .header(header::CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, file_size))

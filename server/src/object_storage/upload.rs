@@ -2,7 +2,7 @@ use crate::database::database_constants::DATABASE;
 use crate::enums::app_error_enum::AppError;
 use crate::fs::fragmented_upload::with_io_timeout;
 use crate::object_storage::caching::{add_key_to_list_cache, invalidate_cache};
-use crate::object_storage::constants::{OBJECT_META_FILE, PART_META_SUFFIX, PART_SUFFIX};
+use crate::object_storage::constants::{PART_META_SUFFIX, PART_SUFFIX};
 use crate::object_storage::quota_manager::{init_quota_file, try_reserve_quota, update_quota};
 use crate::object_storage::storage_capacity_parser::calculate_storage_usage;
 use crate::routes::storage_routes::AppState;
@@ -93,11 +93,11 @@ pub async fn initiate_object_upload(
     let session_id = Ulid::new().to_string();
 
     let path_manager = ObjectPathManager::new();
-    let version_dir = path_manager.get_version_dir(&uid, &fragment, &object_key, &version_id);
+    let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
 
     if let Err(e) = with_io_timeout(
         "creating upload directory",
-        fs::create_dir_all(&version_dir),
+        fs::create_dir_all(&blob_dir),
     )
     .await
     {
@@ -117,7 +117,7 @@ pub async fn initiate_object_upload(
     };
 
     if let Ok(bytes) = mongodb::bson::to_vec(&receipt) {
-        let receipt_path = version_dir.join("reservation.bson");
+        let receipt_path = blob_dir.join("reservation.bson");
         if let Err(e) = fs::write(&receipt_path, bytes).await {
             warn!("Failed to write reservation receipt for {}: {}", uid, e);
         }
@@ -138,16 +138,16 @@ pub async fn get_upload_status(
     Query(key_query): Query<ObjectKeyQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
-    let object_key = key_query.object_key;
+    let _object_key = key_query.object_key;
     let path_manager = ObjectPathManager::new();
-    let version_dir = path_manager.get_version_dir(&uid, &fragment, &object_key, &version_id);
+    let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
 
-    if !fs::try_exists(&version_dir).await.unwrap_or(false) {
+    if !fs::try_exists(&blob_dir).await.unwrap_or(false) {
         return Err(AppError::NotFound);
     }
 
     let mut uploaded_parts = Vec::new();
-    let mut entries = fs::read_dir(&version_dir)
+    let mut entries = fs::read_dir(&blob_dir)
         .await
         .map_err(|e| AppError::Io(e, "read dir".into()))?;
 
@@ -177,7 +177,7 @@ pub async fn object_upload_part(
     Query(query): Query<UploadPartQuery>,
     body: Body,
 ) -> Result<impl IntoResponse, AppError> {
-    let object_key = query.object_key;
+    let _object_key = query.object_key;
     let buffer_size = query.buffer_size.unwrap_or(128 * 1024).max(4096);
 
     let _permit = CHUNK_UPLOAD_SEMAPHORE
@@ -187,17 +187,17 @@ pub async fn object_upload_part(
 
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
-    let version_dir = path_manager.get_version_dir(&uid, &fragment, &object_key, &version_id);
+    let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
 
-    if !fs::try_exists(&version_dir).await.unwrap_or(false) {
+    if !fs::try_exists(&blob_dir).await.unwrap_or(false) {
         return Err(AppError::NotFound);
     }
 
     let part_filename = format!("part_{}{}", part_index, PART_SUFFIX);
     let meta_filename = format!("part_{}{}", part_index, PART_META_SUFFIX);
 
-    let part_path = version_dir.join(&part_filename);
-    let meta_path = version_dir.join(&meta_filename);
+    let part_path = blob_dir.join(&part_filename);
+    let meta_path = blob_dir.join(&meta_filename);
 
     let file = File::create(&part_path)
         .await
@@ -252,14 +252,13 @@ pub async fn finalize_object_upload(
     let uid = claims.uid;
 
     let path_manager = ObjectPathManager::new();
-    let version_dir = path_manager.get_version_dir(&uid, &fragment, &object_key, &version_id);
-
-    let version_dir_clone = version_dir.clone();
+    let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
+    let blob_dir_clone = blob_dir.clone();
 
     let part_meta_paths =
         tokio::task::spawn_blocking(move || -> Result<Vec<std::path::PathBuf>, AppError> {
             let mut paths = Vec::new();
-            for entry in WalkDir::new(&version_dir_clone)
+            for entry in WalkDir::new(&blob_dir_clone)
                 .max_depth(1)
                 .into_iter()
                 .filter_map(|e| e.ok())
@@ -331,8 +330,17 @@ pub async fn finalize_object_upload(
         AppError::InternalServerError(format!("Failed to serialize object metadata: {}", e))
     })?;
 
-    let meta_path = version_dir.join(OBJECT_META_FILE);
-    let mut final_meta_file = File::create(&meta_path)
+    let index_path = path_manager.get_metadata_path(&uid, &fragment, &object_key, &version_id);
+    
+    if let Some(parent) = index_path.parent() {
+        if !fs::try_exists(parent).await.unwrap_or(false) {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| AppError::Io(e, "create index shard dir".into()))?;
+        }
+    }
+
+    let mut final_meta_file = File::create(&index_path)
         .await
         .map_err(|e| AppError::Io(e, "create object meta".into()))?;
 
@@ -355,10 +363,10 @@ pub async fn finalize_object_upload(
         .buffer_unordered(20);
 
     cleanup_futures.collect::<Vec<_>>().await;
-    let receipt_path = version_dir.join("reservation.bson");
+    let receipt_path = blob_dir.join("reservation.bson");
     let _ = fs::remove_file(receipt_path).await;
 
-    sync_dir(&version_dir).await?;
+    sync_dir(&blob_dir).await?;
 
     let reserved_size = params.total_size_bytes as i64;
     let actual_size = total_size_calculated as i64;

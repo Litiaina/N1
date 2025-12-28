@@ -1,7 +1,7 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::OBJECT_META_FILE;
 use crate::structs::object_storage_structs::{ObjectMetadata, ObjectPathManager};
 use std::path::PathBuf;
+use sha2::{Digest, Sha256};
 use tokio::fs;
 use tracing::error;
 
@@ -11,42 +11,47 @@ pub async fn find_latest_metadata_on_disk(
     object_key: &str,
 ) -> Result<ObjectMetadata, AppError> {
     let path_manager = ObjectPathManager::new();
-    let object_dir = path_manager.get_object_dir(uid, fragment, object_key);
+    
+    let mut hasher = Sha256::new();
+    hasher.update(object_key.as_bytes());
+    let hash = hex::encode(hasher.finalize());
 
-    if !fs::try_exists(&object_dir).await.unwrap_or(false) {
+    let shard_dir = path_manager.get_index_dir(uid, fragment)
+        .join(&hash[0..2])
+        .join(&hash[2..4]);
+
+    if !fs::try_exists(&shard_dir).await.unwrap_or(false) {
         return Err(AppError::NotFound);
     }
 
-    let mut entries = fs::read_dir(&object_dir).await.map_err(|e| {
-        error!("Failed to read object directory: {}", e);
-        AppError::InternalServerError("Failed to read storage directory.".to_string())
+    let prefix = format!("{}#", hash);
+    let mut latest_meta: Option<ObjectMetadata> = None;
+
+    let mut entries = fs::read_dir(&shard_dir).await.map_err(|e| {
+        error!("Failed to read index shard directory: {}", e);
+        AppError::InternalServerError("Failed to read storage index.".to_string())
     })?;
 
-    let mut versions = Vec::new();
-
     while let Ok(Some(entry)) = entries.next_entry().await {
-        if let Ok(file_type) = entry.file_type().await {
-            if file_type.is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    versions.push(name.to_string());
+        let name = entry.file_name().to_string_lossy().to_string();
+        
+        if name.starts_with(&prefix) && name.ends_with(".bson") {
+            if let Ok(data) = fs::read(entry.path()).await {
+                if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
+                    match &latest_meta {
+                        None => latest_meta = Some(meta),
+                        Some(current) => {
+                            if meta.created_at > current.created_at {
+                                latest_meta = Some(meta);
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
-    versions.sort();
-
-    for version in versions.iter().rev() {
-        let meta_path = object_dir.join(version).join(OBJECT_META_FILE);
-        if fs::try_exists(&meta_path).await.unwrap_or(false) {
-            match read_bson_metadata(&meta_path).await {
-                Ok(meta) => return Ok(meta),
-                Err(_) => continue,
-            }
-        }
-    }
-
-    Err(AppError::NotFound)
+    latest_meta.ok_or(AppError::NotFound)
 }
 
 pub async fn read_bson_metadata(path: &PathBuf) -> Result<ObjectMetadata, AppError> {
