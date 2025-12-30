@@ -199,9 +199,13 @@ pub async fn object_upload_part(
     let part_path = blob_dir.join(&part_filename);
     let meta_path = blob_dir.join(&meta_filename);
 
-    let file = File::create(&part_path)
-        .await
-        .map_err(|e| AppError::Io(e, "create part file".into()))?;
+    let file = match File::create(&part_path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((StatusCode::GONE, "Upload cancelled").into_response());
+        }
+        Err(e) => return Err(AppError::Io(e, "create part file".into())),
+    };
 
     let mut writer = BufWriter::with_capacity(buffer_size, file);
     let mut size_bytes = 0;
@@ -209,19 +213,27 @@ pub async fn object_upload_part(
     let mut stream = body.into_data_stream();
 
     while let Some(chunk_res) = stream.next().await {
-        let data =
-            chunk_res.map_err(|e| AppError::BadRequest(format!("Stream read failed: {}", e)))?;
+        let data = match chunk_res {
+            Ok(d) => d,
+            Err(_) => return Ok((StatusCode::GONE, "Stream interrupted").into_response()),
+        };
+        
         size_bytes += data.len() as u64;
-        writer
-            .write_all(&data)
-            .await
-            .map_err(|e| AppError::Io(e, "write part".into()))?;
+        
+        if let Err(e) = writer.write_all(&data).await {
+             if e.kind() == std::io::ErrorKind::BrokenPipe || e.kind() == std::io::ErrorKind::NotFound {
+                 return Ok((StatusCode::GONE, "Write interrupted").into_response());
+             }
+             return Err(AppError::Io(e, "write part".into()));
+        }
     }
 
-    writer
-        .flush()
-        .await
-        .map_err(|e| AppError::Io(e, "flush part".into()))?;
+    if let Err(e) = writer.flush().await {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return Ok((StatusCode::GONE, "Upload cancelled").into_response());
+        }
+        return Err(AppError::Io(e, "flush part".into()));
+    }
 
     let part_meta = PartMetadata {
         part_index,
@@ -234,11 +246,14 @@ pub async fn object_upload_part(
         AppError::InternalServerError(format!("Failed to serialize part metadata: {}", e))
     })?;
 
-    fs::write(&meta_path, bson_data)
-        .await
-        .map_err(|e| AppError::Io(e, "write part meta".into()))?;
+    if let Err(e) = fs::write(&meta_path, bson_data).await {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return Ok((StatusCode::GONE, "Upload cancelled").into_response());
+        }
+        return Err(AppError::Io(e, "write part meta".into()));
+    }
 
-    Ok((StatusCode::OK, "Part uploaded."))
+    Ok((StatusCode::OK, "Part uploaded.").into_response())
 }
 
 pub async fn finalize_object_upload(
@@ -390,6 +405,52 @@ pub async fn finalize_object_upload(
     );
 
     Ok((StatusCode::OK, "Upload finalized."))
+}
+
+pub async fn cancel_upload_session(
+    claims: Claims,
+    AxumPath((fragment, version_id)): AxumPath<(String, String)>,
+    Query(query): Query<ObjectKeyQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let uid = claims.uid;
+    let path_manager = ObjectPathManager::new();
+    let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
+
+    if !fs::try_exists(&blob_dir).await.unwrap_or(false) {
+        return Err(AppError::NotFound);
+    }
+
+    let index_path = path_manager.get_metadata_path(&uid, &fragment, &query.object_key, &version_id);
+    if fs::try_exists(&index_path).await.unwrap_or(false) {
+        return Err(AppError::Conflict("Cannot cancel: Object is already finalized.".to_string()));
+    }
+
+    let receipt_path = blob_dir.join("reservation.bson");
+    let mut refund_amount = 0;
+
+    if let Ok(data) = fs::read(&receipt_path).await {
+        if let Ok(receipt) = mongodb::bson::from_slice::<ReservationReceipt>(&data) {
+            refund_amount = receipt.amount;
+        }
+    }
+
+    fs::remove_dir_all(&blob_dir).await.map_err(|e| {
+        error!("Failed to cancel upload session {}: {}", version_id, e);
+        AppError::InternalServerError("Failed to cleanup upload session.".to_string())
+    })?;
+
+    if refund_amount > 0 {
+        if let Err(e) = update_quota(&uid, -(refund_amount as i64)).await {
+            error!("Failed to refund quota for cancelled upload {}: {}", uid, e);
+        }
+    }
+
+    info!(
+        "Cancelled upload session: {}/{} (Refunded: {} bytes)",
+        fragment, version_id, refund_amount
+    );
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn get_capacity_usage(claims: Claims) -> Result<impl IntoResponse, AppError> {

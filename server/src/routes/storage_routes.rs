@@ -19,6 +19,7 @@ use crate::object_storage::delete::{
 };
 use crate::object_storage::download::{download_object, download_object_chunk};
 use crate::object_storage::garbage_collector::run_lifecycle_manager;
+use crate::object_storage::maintenance::sync_user_metadata;
 use crate::object_storage::modify::{rename_fragment, rename_object};
 use crate::object_storage::retrieve::{
     get_object, get_object_metadata, list_fragments, list_object_versions, list_objects,
@@ -26,8 +27,7 @@ use crate::object_storage::retrieve::{
 };
 use crate::object_storage::sharing::{create_signed_url, get_shared_object};
 use crate::object_storage::upload::{
-    finalize_object_upload, get_capacity_usage, get_upload_status, initiate_object_upload,
-    object_upload_part,
+    cancel_upload_session, finalize_object_upload, get_capacity_usage, get_upload_status, initiate_object_upload, object_upload_part
 };
 use crate::statics::database_statics::DATABASE_URL;
 use crate::websocket::handler::{system_broadcast_handler, ws_handler};
@@ -125,7 +125,9 @@ pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
             .route("/v4/fragment/object/upload/init/{:fragment}/{*object_key}", post(initiate_object_upload))
             .route("/v4/fragment/object/upload/status/{:fragment}/{:version_id}", get(get_upload_status))
             .route("/v4/fragment/object/upload/chunk/{:fragment}/{:version_id}/{:part_index}", put(object_upload_part))
-            .route("/v4/fragment/object/upload/finalize/{:fragment}/{:version_id}/{:session_id}", post(finalize_object_upload));
+            .route("/v4/fragment/object/upload/finalize/{:fragment}/{:version_id}/{:session_id}", post(finalize_object_upload))
+            .route("/v4/fragment/object/upload/cancel/{:fragment}/{:version_id}", delete(cancel_upload_session))
+            .route("/v4/maintenance/sync/user", post(sync_user_metadata));
 
         let write_ops = layers.layer_upload(write_ops);
 

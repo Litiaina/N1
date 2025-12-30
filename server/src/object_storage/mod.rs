@@ -14,3 +14,4 @@ pub mod garbage_collector;
 pub mod setup;
 pub mod caching;
 pub mod quota_manager;
+pub mod maintenance;
