@@ -2,6 +2,18 @@
 members = ["server", "server_cli"]
 resolver = "2"
 
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = 'abort'
+strip = true
+
+[profile.release-windows]
+inherits = "release"
+panic = 'unwind'
+strip = false
+
 [workspace.dependencies]
 axum = { version = "0.8.4", features = ["ws", "multipart"] }
 chrono = { version = "0.4.41", features = ["serde"] }

@@ -37,24 +37,17 @@ use ulid::Ulid;
 use walkdir::WalkDir;
 
 #[cfg(target_os = "linux")]
-const O_DIRECT: u32 = 0x4000;
+const O_DIRECT: i32 = 0x4000;
 
 #[cfg(unix)]
 pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use tokio::fs::OpenOptions;
-
     let dir = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY)
         .open(path)
         .await
         .map_err(|e| AppError::Io(e, "open dir for sync".into()))?;
-
-    dir.sync_all()
-        .await
-        .map_err(|e| AppError::Io(e, "sync dir".into()))?;
-
+    dir.sync_all().await.map_err(|e| AppError::Io(e, "sync dir".into()))?;
     Ok(())
 }
 
