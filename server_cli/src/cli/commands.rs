@@ -1,5 +1,5 @@
 use axum_server::Handle;
-use std::{process, sync::Arc, time::Duration};
+use std::{net::SocketAddr, process, sync::Arc, time::Duration};
 use sysinfo::{Pid, System};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -9,7 +9,7 @@ use crate::cli::parser::{CliCommand, clear_screen};
 
 pub async fn handle_command<F, Fut>(
     cmd: CliCommand,
-    shutdown_handle: Arc<Mutex<Option<(Arc<Handle>, JoinHandle<()>)>>>,
+    shutdown_handle: Arc<Mutex<Option<(Arc<Handle<SocketAddr>>, JoinHandle<()>)>>>,
     clean_callback: F,
 ) -> bool
 where

@@ -7,7 +7,6 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
     //Server configuration
     conf.with_section(Some("server"))
         .set("host", "127.0.0.1")
-        .set("http_port", "51000")
         .set("https_port", "50001")
         .set("cert_path", "certificates/cert.pem")
         .set("key_path", "certificates/key.pem")

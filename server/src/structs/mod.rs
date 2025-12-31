@@ -6,7 +6,6 @@ pub mod file_detail_params_struct;
 pub mod file_metadata_struct;
 pub mod metadata_params_struct;
 pub mod path_manager_struct;
-pub mod port_struct;
 pub mod rename_params_struct;
 pub mod resumable_upload_status_struct;
 pub mod stateless_fragment_upload_structs;

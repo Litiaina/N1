@@ -31,11 +31,11 @@ walkdir = "2.5.0"
 futures-util = "0.3.31"
 hex = "0.4.3"
 sha2 = "0.10.9"
-axum-server = { version = "0.7.2", features = ["tls-rustls"] }
-axum-extra = { version = "0.10.1", features = ["typed-header"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+axum-extra = { version = "0.12.5", features = ["typed-header"] }
 dotenv = "0.15.0"
 headers = "0.4.0"
-jsonwebtoken = "9.3.1"
+jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 mongodb = "3.2.4"
 uuid = { version = "1.18.0", features = ["v4"] }
 tower = "0.5.2"

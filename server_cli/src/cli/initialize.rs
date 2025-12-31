@@ -1,4 +1,5 @@
 use axum_server::Handle;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{self, AsyncBufReadExt};
 use tokio::sync::Mutex;
@@ -8,7 +9,7 @@ use crate::cli::commands::handle_command;
 use crate::cli::parser::CliCommand;
 
 pub async fn start_cli<F, Fut>(
-    shutdown_handle: Arc<Mutex<Option<(Arc<Handle>, tokio::task::JoinHandle<()>)>>>,
+    shutdown_handle: Arc<Mutex<Option<(Arc<Handle<SocketAddr>>, tokio::task::JoinHandle<()>)>>>,
     clean_callback: F,
 ) 
 where
