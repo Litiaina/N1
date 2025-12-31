@@ -69,6 +69,8 @@ pub struct PartMetadata {
     pub size_bytes: u64,
     pub file_name: String,
     pub created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -155,8 +157,9 @@ pub struct ChunkQuery {
 
 #[derive(Deserialize)]
 pub struct UploadPartQuery {
-    pub object_key: String,
     pub buffer_size: Option<usize>,
+    pub enable_checksum: Option<bool>, 
+    pub checksum: Option<String>, 
 }
 
 #[derive(Deserialize)]

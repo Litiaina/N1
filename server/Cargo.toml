@@ -51,3 +51,4 @@ governor.workspace = true
 moka.workspace = true
 ulid.workspace = true
 libc.workspace = true
+crc32fast.workspace = true

@@ -64,6 +64,7 @@ pub async fn download_object_chunk(
 
     let mut result_buffer = Vec::with_capacity(params.chunk_size);
     let mut current_pos = 0u64;
+    let mut checksum_header: Option<&str> = None;
 
     for part in &metadata.parts {
         let part_len = part.size_bytes;
@@ -71,6 +72,10 @@ pub async fn download_object_chunk(
 
         let req_start = params.offset;
         let req_end = params.offset + params.chunk_size as u64;
+
+        if req_start == current_pos && params.chunk_size as u64 == part_len {
+            checksum_header = part.checksum.as_deref();
+        }
 
         if req_end > current_pos && req_start < part_end {
             let rel_start = if req_start > current_pos {
@@ -115,8 +120,15 @@ pub async fn download_object_chunk(
     }
 
     let body = Body::from(result_buffer);
-    Ok(Response::builder()
-        .header(header::CONTENT_TYPE, "application/octet-stream")
+    
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream");
+        
+    if let Some(crc) = checksum_header {
+        builder = builder.header("x-litiaina-checksum", crc);
+    }
+
+    Ok(builder
         .body(body)
         .unwrap()
         .into_response())

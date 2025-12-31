@@ -15,6 +15,7 @@ use crate::structs::object_storage_structs::{
 };
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::body::Body;
+use axum::http::HeaderMap;
 use axum::{
     Json as AxumJson,
     extract::{Path as AxumPath, Query, State},
@@ -22,19 +23,24 @@ use axum::{
     response::IntoResponse,
 };
 use chrono::Utc;
+use crc32fast::Hasher;
 use futures_util::{StreamExt, stream};
 use mongodb::bson::doc;
+use std::io::SeekFrom;
 #[cfg(not(unix))]
 use std::path::Path;
 use std::sync::Arc;
-use tokio::fs::{self, File};
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::fs::{self, File, OpenOptions};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tracing::{error, info, warn};
 use ulid::Ulid;
 use walkdir::WalkDir;
 
+#[cfg(target_os = "linux")]
+const O_DIRECT: u32 = 0x4000;
+
 #[cfg(unix)]
-pub async fn sync_dir(path: &Path) -> Result<(), AppError> {
+pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
     use std::os::unix::fs::OpenOptionsExt;
     use tokio::fs::OpenOptions;
 
@@ -173,12 +179,14 @@ pub async fn get_upload_status(
 
 pub async fn object_upload_part(
     claims: Claims,
+    headers: HeaderMap,
     AxumPath((fragment, version_id, part_index)): AxumPath<(String, String, u64)>,
     Query(query): Query<UploadPartQuery>,
     body: Body,
 ) -> Result<impl IntoResponse, AppError> {
-    let _object_key = query.object_key;
-    let buffer_size = query.buffer_size.unwrap_or(128 * 1024).max(4096);
+    let requested_size = query.buffer_size.unwrap_or(131_072).max(4096);
+    let align = 4096;
+    let buffer_size = (requested_size / align) * align;
 
     let _permit = CHUNK_UPLOAD_SEMAPHORE
         .acquire()
@@ -189,69 +197,119 @@ pub async fn object_upload_part(
     let path_manager = ObjectPathManager::new();
     let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
 
-    if !fs::try_exists(&blob_dir).await.unwrap_or(false) {
-        return Err(AppError::NotFound);
+    let part_filename = format!("part_{}{}", part_index, PART_SUFFIX);
+    let part_path = blob_dir.join(&part_filename);
+
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+
+    #[cfg(target_os = "linux")]
+    {
+        options.custom_flags(O_DIRECT);
     }
 
-    let part_filename = format!("part_{}{}", part_index, PART_SUFFIX);
-    let meta_filename = format!("part_{}{}", part_index, PART_META_SUFFIX);
-
-    let part_path = blob_dir.join(&part_filename);
-    let meta_path = blob_dir.join(&meta_filename);
-
-    let file = match File::create(&part_path).await {
+    let mut file = match options.open(&part_path).await {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((StatusCode::GONE, "Upload cancelled").into_response());
+            return Ok((StatusCode::GONE, "Upload cancelled (Dir missing)").into_response());
         }
         Err(e) => return Err(AppError::Io(e, "create part file".into())),
     };
 
-    let mut writer = BufWriter::with_capacity(buffer_size, file);
-    let mut size_bytes = 0;
+    if let Some(content_length) = headers.get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok()) 
+    {
+        if content_length > 0 {
+            let _ = file.set_len(content_length).await;
+        }
+    }
 
+    let calc_checksum = query.enable_checksum.unwrap_or(false);
+    let verify_checksum = query.checksum.as_ref();
+    let mut hasher = if calc_checksum || verify_checksum.is_some() { Some(Hasher::new()) } else { None };
+
+    let mut size_bytes = 0;
     let mut stream = body.into_data_stream();
+
+    let mut raw_buffer = vec![0u8; buffer_size + align];
+    let ptr_addr = raw_buffer.as_ptr() as usize;
+    let align_offset = (align - (ptr_addr % align)) % align;
+    let mut buffer_len = 0;
 
     while let Some(chunk_res) = stream.next().await {
         let data = match chunk_res {
             Ok(d) => d,
             Err(_) => return Ok((StatusCode::GONE, "Stream interrupted").into_response()),
         };
-        
-        size_bytes += data.len() as u64;
-        
-        if let Err(e) = writer.write_all(&data).await {
-             if e.kind() == std::io::ErrorKind::BrokenPipe || e.kind() == std::io::ErrorKind::NotFound {
-                 return Ok((StatusCode::GONE, "Write interrupted").into_response());
-             }
-             return Err(AppError::Io(e, "write part".into()));
+
+        let mut data_slice = &data[..];
+        while !data_slice.is_empty() {
+            let window_start = align_offset + buffer_len;
+            let available = buffer_size - buffer_len;
+            let to_copy = std::cmp::min(available, data_slice.len());
+
+            raw_buffer[window_start..window_start + to_copy].copy_from_slice(&data_slice[..to_copy]);
+            
+            if let Some(h) = &mut hasher {
+                h.update(&data_slice[..to_copy]);
+            }
+
+            buffer_len += to_copy;
+            data_slice = &data_slice[to_copy..];
+
+            if buffer_len == buffer_size {
+                let aligned_slice = &raw_buffer[align_offset..align_offset + buffer_size];
+                
+                file.write_all(aligned_slice).await
+                    .map_err(|e| AppError::Io(e, "write part aligned".into()))?;
+
+                size_bytes += buffer_len as u64;
+                buffer_len = 0;
+            }
         }
     }
 
-    if let Err(e) = writer.flush().await {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            return Ok((StatusCode::GONE, "Upload cancelled").into_response());
+    if buffer_len > 0 {
+        drop(file);
+        let mut tail_file = OpenOptions::new().write(true).open(&part_path).await
+            .map_err(|e| AppError::Io(e, "open part for tail".into()))?;
+        
+        tail_file.seek(SeekFrom::Start(size_bytes)).await
+            .map_err(|e| AppError::Io(e, "seek tail".into()))?;
+            
+        tail_file.write_all(&raw_buffer[align_offset..align_offset + buffer_len]).await
+            .map_err(|e| AppError::Io(e, "write tail unaligned".into()))?;
+            
+        size_bytes += buffer_len as u64;
+    }
+
+    let checksum_hex = hasher.map(|h| format!("{:08x}", h.finalize()));
+
+    if let Some(expected) = verify_checksum {
+        if let Some(calculated) = &checksum_hex {
+            if calculated.to_lowercase() != expected.to_lowercase() {
+                let _ = fs::remove_file(&part_path).await;
+                return Ok((StatusCode::BAD_REQUEST, "Checksum mismatch").into_response());
+            }
         }
-        return Err(AppError::Io(e, "flush part".into()));
     }
 
     let part_meta = PartMetadata {
         part_index,
         size_bytes,
-        file_name: part_filename,
+        file_name: part_filename.clone(),
         created_at: Utc::now().timestamp(),
+        checksum: checksum_hex,
     };
 
-    let bson_data = mongodb::bson::to_vec(&part_meta).map_err(|e| {
+    let meta_data = mongodb::bson::to_vec(&part_meta).map_err(|e| {
         AppError::InternalServerError(format!("Failed to serialize part metadata: {}", e))
     })?;
 
-    if let Err(e) = fs::write(&meta_path, bson_data).await {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            return Ok((StatusCode::GONE, "Upload cancelled").into_response());
-        }
-        return Err(AppError::Io(e, "write part meta".into()));
-    }
+    let meta_path = blob_dir.join(format!("part_{}{}", part_index, PART_META_SUFFIX));
+    fs::write(&meta_path, meta_data).await
+        .map_err(|e| AppError::Io(e, "write part meta".into()))?;
 
     Ok((StatusCode::OK, "Part uploaded.").into_response())
 }
@@ -267,38 +325,35 @@ pub async fn finalize_object_upload(
     let uid = claims.uid;
 
     let path_manager = ObjectPathManager::new();
-    let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
-    let blob_dir_clone = blob_dir.clone();
+    let blob_dir: Arc<std::path::Path> = Arc::from(path_manager.get_blob_dir(&uid, &fragment, &version_id));
+    let blob_dir_for_task = Arc::clone(&blob_dir);
 
-    let part_meta_paths =
-        tokio::task::spawn_blocking(move || -> Result<Vec<std::path::PathBuf>, AppError> {
-            let mut paths = Vec::new();
-            for entry in WalkDir::new(&blob_dir_clone)
-                .max_depth(1)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                let path = entry.path();
-                if path.is_file() {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.ends_with(PART_META_SUFFIX) {
-                            paths.push(path.to_owned());
-                        }
+    let part_meta_paths = tokio::task::spawn_blocking(move || -> Result<Vec<std::path::PathBuf>, AppError> {
+        let mut paths = Vec::new();
+        for entry in WalkDir::new(blob_dir_for_task.as_ref())
+            .max_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.ends_with(PART_META_SUFFIX) {
+                        paths.push(path.to_owned());
                     }
                 }
             }
-            Ok(paths)
-        })
-        .await
-        .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
+        }
+        Ok(paths)
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
 
     if part_meta_paths.is_empty() {
-        return Err(AppError::BadRequest(
-            "No parts found to finalize.".to_string(),
-        ));
+        return Err(AppError::BadRequest("No parts found to finalize.".to_string()));
     }
 
-    let parts_result: Result<Vec<PartMetadata>, AppError> = stream::iter(part_meta_paths.clone())
+    let results: Vec<(PartMetadata, std::path::PathBuf)> = stream::iter(part_meta_paths)
         .map(|path| async move {
             let data = fs::read(&path)
                 .await
@@ -307,15 +362,16 @@ pub async fn finalize_object_upload(
             let part: PartMetadata = mongodb::bson::from_slice(&data)
                 .map_err(|_| AppError::InternalServerError("Corrupt part meta".into()))?;
 
-            Ok(part)
+            Ok::<_, AppError>((part, path))
         })
         .buffer_unordered(50)
-        .collect::<Vec<_>>()
+        .collect::<Vec<Result<_, _>>>()
         .await
         .into_iter()
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
-    let mut parts = parts_result?;
+    let (mut parts, paths_for_cleanup): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+    
     parts.sort_by_key(|p| p.part_index);
 
     let mut total_size_calculated = 0;
@@ -334,7 +390,7 @@ pub async fn finalize_object_upload(
         owner_uid: uid.clone(),
         content_type: params
             .content_type
-            .unwrap_or("application/octet-stream".to_string()),
+            .unwrap_or_else(|| "application/octet-stream".to_string()),
         total_size_bytes: total_size_calculated,
         created_at: Utc::now().timestamp(),
         parts,
@@ -369,7 +425,7 @@ pub async fn finalize_object_upload(
         .await
         .map_err(|e| AppError::Io(e, "sync object meta".into()))?;
 
-    let cleanup_futures = stream::iter(part_meta_paths)
+    let cleanup_futures = stream::iter(paths_for_cleanup)
         .map(|path| async move {
             if let Err(e) = fs::remove_file(&path).await {
                 error!("Failed to cleanup part meta file {:?}: {}", path, e);
@@ -378,10 +434,11 @@ pub async fn finalize_object_upload(
         .buffer_unordered(20);
 
     cleanup_futures.collect::<Vec<_>>().await;
+    
     let receipt_path = blob_dir.join("reservation.bson");
     let _ = fs::remove_file(receipt_path).await;
 
-    sync_dir(&blob_dir).await?;
+    sync_dir(blob_dir.as_ref()).await?;
 
     let reserved_size = params.total_size_bytes as i64;
     let actual_size = total_size_calculated as i64;
@@ -389,20 +446,14 @@ pub async fn finalize_object_upload(
 
     if delta != 0 {
         update_quota(&uid, delta).await?;
-        info!(
-            "Quota adjustment for {}: {} bytes (Reserved: {}, Actual: {})",
-            uid, delta, reserved_size, actual_size
-        );
+        info!("Quota adjustment for {}: {} bytes (Reserved: {}, Actual: {})", uid, delta, reserved_size, actual_size);
     }
 
     invalidate_cache(&fragment, &object_key, &uid).await;
 
     state.emit(&uid, StorageEventPayload::FileUploaded(object_meta.clone()));
 
-    info!(
-        "Finalized object: {}/{} (Size: {})",
-        fragment, object_key, total_size_calculated
-    );
+    info!("Finalized object: {}/{} (Size: {})", fragment, object_key, total_size_calculated);
 
     Ok((StatusCode::OK, "Upload finalized."))
 }

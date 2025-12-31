@@ -30,7 +30,7 @@ pub async fn stream_object_logic(
 
     let ObjectMetadata {
         content_type,
-        parts,
+        mut parts,
         owner_uid,
         fragment,
         object_key,
@@ -84,6 +84,12 @@ pub async fn stream_object_logic(
         }
         current_offset = part_end;
     }
+
+    let checksum_header = if parts.len() == 1 {
+        parts[0].checksum.take()
+    } else {
+        None
+    };
 
     let initial_state = StreamState {
         pos: start,
@@ -163,6 +169,10 @@ pub async fn stream_object_logic(
         .header(header::LAST_MODIFIED, last_modified)
         .header(header::CONTENT_DISPOSITION, format!("{}; filename=\"{}\"", disposition_type, filename))
         .header(header::CACHE_CONTROL, "public, max-age=3600");
+
+    if let Some(crc) = checksum_header {
+        builder = builder.header("x-litiaina-checksum", crc);
+    }
 
     if is_explicit_range || content_length < file_size {
         builder = builder
