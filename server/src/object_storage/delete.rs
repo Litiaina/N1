@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::caching::{invalidate_cache, invalidate_list_cache, remove_key_from_list_cache};
+use crate::object_storage::caching::invalidate_cache;
 use crate::object_storage::constants::OBJECT_DATA_ROOT;
 use crate::object_storage::quota_manager::update_quota;
 use crate::routes::storage_routes::AppState;
@@ -171,7 +171,6 @@ pub async fn delete_object_permanently(
         }
     }
 
-    remove_key_from_list_cache(&uid, &fragment, &object_key).await;
     invalidate_cache(&fragment, &object_key, &uid).await;
 
     info!(
@@ -299,8 +298,6 @@ pub async fn delete_fragment(
     })
     .await
     .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
-
-    invalidate_list_cache(&uid, &fragment).await;
 
     info!("Deleted fragment '{}' for user {}", fragment, uid);
 

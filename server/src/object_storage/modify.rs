@@ -1,15 +1,14 @@
 use std::sync::Arc;
 
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::caching::{invalidate_cache, invalidate_list_cache, rename_key_in_list_cache};
-use crate::object_storage::constants::OBJECT_DATA_ROOT;
+use crate::object_storage::caching::invalidate_cache;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
-    ObjectMetadata, ObjectPathManager, RenameFragmentQuery, RenameObjectRequest
+    ObjectMetadata, ObjectPathManager, RenameObjectRequest
 };
 use crate::websocket::ws_structs::StorageEventPayload;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::{Json as AxumJson, http::StatusCode, response::IntoResponse};
 use sha2::{Digest, Sha256};
 use tokio::fs;
@@ -97,14 +96,6 @@ pub async fn rename_object(
     invalidate_cache(&payload.source_fragment, &payload.source_key, &uid).await;
     invalidate_cache(&payload.destination_fragment, &payload.destination_key, &uid).await;
 
-    rename_key_in_list_cache(
-        &uid,
-        &payload.source_fragment,
-        &payload.source_key,
-        &payload.destination_fragment,
-        &payload.destination_key
-    ).await;
-
     info!(
         "Renamed object from {}/{} to {}/{}",
         payload.source_fragment,
@@ -121,58 +112,4 @@ pub async fn rename_object(
     });
 
     Ok(StatusCode::OK)
-}
-
-pub async fn rename_fragment(
-    claims: Claims,
-    Query(query): Query<RenameFragmentQuery>,
-) -> Result<impl IntoResponse, AppError> {
-    let uid = claims.uid;
-    let path_manager = ObjectPathManager::new();
-
-    let user_storage_root = path_manager.root.join(OBJECT_DATA_ROOT).join(&uid);
-
-    let (query, uid) = tokio::task::spawn_blocking(move || -> Result<(RenameFragmentQuery, String), AppError> {
-        let source_path = user_storage_root.join(&query.fragment_to_rename);
-        let dest_path = user_storage_root.join(&query.new_name);
-
-        if !source_path.exists() {
-            return Err(AppError::NotFound);
-        }
-
-        if dest_path.exists() {
-            return Err(AppError::Conflict(format!(
-                "Destination fragment '{}' already exists.",
-                query.new_name
-            )));
-        }
-
-        std::fs::rename(&source_path, &dest_path).map_err(|e| {
-            error!(
-                "Failed to rename fragment from {:?} to {:?}: {}",
-                source_path, dest_path, e
-            );
-            AppError::InternalServerError("Failed to rename fragment.".to_string())
-        })?;
-
-        info!(
-            "Renamed fragment '{}' to '{}' for user {}",
-            query.fragment_to_rename, query.new_name, uid
-        );
-
-        Ok((query, uid))
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
-
-    invalidate_list_cache(&uid, &query.fragment_to_rename).await;
-    invalidate_list_cache(&uid, &query.new_name).await;
-
-    Ok((
-        StatusCode::OK,
-        AxumJson(serde_json::json!({
-            "status": "success",
-            "message": "Fragment renamed successfully"
-        })),
-    ))
 }

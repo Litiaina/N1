@@ -1,9 +1,9 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::caching::{get_metadata_with_cache, get_object_keys_with_cache};
+use crate::object_storage::caching::get_metadata_with_cache;
 use crate::object_storage::constants::{BROWSER_CACHE_MAX_AGE, OBJECT_DATA_ROOT};
 use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
 use crate::structs::auth_structs::Claims;
-use crate::structs::object_storage_structs::{ObjectMetadata, ObjectPathManager};
+use crate::structs::object_storage_structs::{ListObjectsResult, ObjectMetadata, ObjectPathManager};
 use axum::{
     Json as AxumJson,
     body::Body,
@@ -11,11 +11,27 @@ use axum::{
     http::{HeaderMap, HeaderValue, header},
     response::{IntoResponse, Response},
 };
-use futures_util::{StreamExt, stream};
+use base64::Engine;
+use base64::engine::general_purpose;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio::fs;
 use walkdir::WalkDir;
+
+fn parse_continuation_token(token: &str) -> Option<(String, String, String)> {
+    let bytes = general_purpose::STANDARD.decode(token).ok()?;
+    let s = String::from_utf8(bytes).ok()?;
+    let parts: Vec<&str> = s.split('/').collect();
+    if parts.len() == 3 {
+        Some((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()))
+    } else {
+        None
+    }
+}
+
+fn create_continuation_token(shard1: &str, shard2: &str, filename: &str) -> String {
+    general_purpose::STANDARD.encode(format!("{}/{}/{}", shard1, shard2, filename))
+}
 
 pub async fn list_objects(
     claims: Claims,
@@ -23,17 +39,8 @@ pub async fn list_objects(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
-    let keys_arc = get_object_keys_with_cache(&uid, &fragment).await?;
-    let keys = keys_arc.as_ref(); 
-
-    let start_index = if let Some(marker) = params.get("marker") {
-        match keys.binary_search(marker) {
-            Ok(i) => i + 1,
-            Err(i) => i,
-        }
-    } else {
-        0
-    };
+    let path_manager = ObjectPathManager::new();
+    let index_root = path_manager.get_index_dir(&uid, &fragment);
 
     let limit: usize = params
         .get("limit")
@@ -41,40 +48,120 @@ pub async fn list_objects(
         .unwrap_or(100)
         .min(1000);
 
-    let target_keys = keys
-        .iter()
-        .skip(start_index)
-        .take(limit)
-        .cloned()
-        .collect::<Vec<_>>();
-
     let include_deleted = params.get("include_deleted").map(|v| v == "true").unwrap_or(false);
 
-    let mut objects = stream::iter(target_keys)
-        .map(|key| {
-            let frag = &fragment;
-            let u = &uid;
-            async move { get_metadata_with_cache(&frag, &key, &u).await }
-        })
-        .buffer_unordered(64)
-        .filter_map(|res| async move {
-            match res {
-                Ok(meta) => {
-                    if !include_deleted && meta.is_delete_marker {
-                        None
-                    } else {
-                        Some(meta)
+    let continuation_token = params.get("continuation_token").cloned();
+    let (start_s1, start_s2, start_file) = match continuation_token.as_deref() {
+        Some(token) => parse_continuation_token(token).unwrap_or_default(),
+        None => ("".to_string(), "".to_string(), "".to_string()),
+    };
+
+    if !index_root.exists() {
+        return Ok(AxumJson(ListObjectsResult {
+            objects: Vec::new(),
+            continuation_token: None,
+        }));
+    }
+
+    let mut s1_entries = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&index_root) {
+        for entry in entries.flatten() {
+            if let Ok(fname) = entry.file_name().into_string() {
+                if fname >= start_s1 {
+                    s1_entries.push(fname);
+                }
+            }
+        }
+    }
+    s1_entries.sort();
+
+    let mut results = Vec::new();
+    let mut next_token = None;
+    let mut reached_limit = false;
+
+    'outer: for s1 in s1_entries {
+        let s1_path = index_root.join(&s1);
+        
+        let mut s2_entries = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&s1_path) {
+            for entry in entries.flatten() {
+                if let Ok(fname) = entry.file_name().into_string() {
+                    if s1 == start_s1 && fname < start_s2 {
+                        continue;
+                    }
+                    s2_entries.push(fname);
+                }
+            }
+        }
+        s2_entries.sort();
+
+        for s2 in s2_entries {
+            let s2_path = s1_path.join(&s2);
+
+            let mut file_entries = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&s2_path) {
+                for entry in entries.flatten() {
+                    if let Ok(fname) = entry.file_name().into_string() {
+                        if fname.ends_with(".bson") {
+                            if s1 == start_s1 && s2 == start_s2 && fname <= start_file {
+                                continue;
+                            }
+                            file_entries.push(fname);
+                        }
                     }
                 }
-                Err(_) => None,
             }
-        })
-        .collect::<Vec<_>>()
-        .await;
+            file_entries.sort(); 
+            
+            let mut current_hash_prefix = String::new();
+            let mut pending_meta: Option<ObjectMetadata> = None;
+            let mut last_fname_processed = String::new();
 
-    objects.sort_by(|a, b| a.object_key.cmp(&b.object_key));
+            for fname in file_entries {
 
-    Ok(AxumJson(objects))
+                let hash_part = fname.split('#').next().unwrap_or("").to_string();
+
+                if hash_part != current_hash_prefix {
+                    if let Some(meta) = pending_meta.take() {
+                        if !meta.is_delete_marker || include_deleted {
+                            results.push(meta);
+                        }
+                        
+                        if results.len() >= limit {
+                            next_token = Some(create_continuation_token(&s1, &s2, &last_fname_processed));
+                            reached_limit = true;
+                            break 'outer;
+                        }
+                    }
+                    current_hash_prefix = hash_part;
+                }
+
+                let file_path = s2_path.join(&fname);
+                if let Ok(data) = tokio::fs::read(&file_path).await {
+                     if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
+                        pending_meta = Some(meta);
+                     }
+                }
+                last_fname_processed = fname;
+            }
+
+            if let Some(meta) = pending_meta {
+                if !meta.is_delete_marker || include_deleted {
+                    results.push(meta);
+                }
+                if results.len() >= limit {
+                    next_token = Some(create_continuation_token(&s1, &s2, &last_fname_processed));
+                    reached_limit = true;
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    Ok(AxumJson(ListObjectsResult {
+        objects: results,
+        continuation_token: if reached_limit { next_token } else { None },
+    }))
 }
 
 pub async fn list_object_versions(

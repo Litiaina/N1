@@ -1,7 +1,7 @@
 use crate::database::database_constants::DATABASE;
 use crate::enums::app_error_enum::AppError;
 use crate::fs::fragmented_upload::with_io_timeout;
-use crate::object_storage::caching::{add_key_to_list_cache, invalidate_cache};
+use crate::object_storage::caching::invalidate_cache;
 use crate::object_storage::constants::{PART_META_SUFFIX, PART_SUFFIX};
 use crate::object_storage::quota_manager::{init_quota_file, try_reserve_quota, update_quota};
 use crate::object_storage::storage_capacity_parser::calculate_storage_usage;
@@ -108,8 +108,6 @@ pub async fn initiate_object_upload(
         "Initiated upload: {}/{} (v: {}) [Reserved: {} bytes]",
         fragment, object_key, version_id, params.total_size_bytes
     );
-
-    add_key_to_list_cache(&uid, &fragment, object_key).await;
 
     let receipt = ReservationReceipt {
         amount: params.total_size_bytes,

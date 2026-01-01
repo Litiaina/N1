@@ -20,7 +20,7 @@ use crate::object_storage::delete::{
 use crate::object_storage::download::{download_object, download_object_chunk};
 use crate::object_storage::garbage_collector::run_lifecycle_manager;
 use crate::object_storage::maintenance::sync_user_metadata;
-use crate::object_storage::modify::{rename_fragment, rename_object};
+use crate::object_storage::modify::rename_object;
 use crate::object_storage::retrieve::{
     get_object, get_object_metadata, list_fragments, list_object_versions, list_objects,
     stream_object,
@@ -121,7 +121,6 @@ pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
             .route("/v4/fragment/object/delete/{:fragment}/{*object_key}", delete(delete_object))
             .route("/v4/fragment/object/delete/version/{:fragment}/{:version_id}/{*object_key}", delete(delete_object_version))
             .route("/v4/fragment/object/delete/permanent/{:fragment}/{*object_key}", delete(delete_object_permanently))
-            .route("/v4/fragment/rename", patch(rename_fragment))
             .route("/v4/fragment/object/upload/init/{:fragment}/{*object_key}", post(initiate_object_upload))
             .route("/v4/fragment/object/upload/status/{:fragment}/{:version_id}", get(get_upload_status))
             .route("/v4/fragment/object/upload/chunk/{:fragment}/{:version_id}/{:part_index}", put(object_upload_part))

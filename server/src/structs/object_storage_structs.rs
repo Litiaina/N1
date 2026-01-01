@@ -58,6 +58,12 @@ impl ObjectPathManager {
     }
 }
 
+#[derive(Debug, Serialize)]
+pub struct ListObjectsResult {
+    pub objects: Vec<ObjectMetadata>,
+    pub continuation_token: Option<String>,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct ReservationReceipt {
     pub amount: u64,
@@ -160,12 +166,6 @@ pub struct UploadPartQuery {
     pub buffer_size: Option<usize>,
     pub enable_checksum: Option<bool>, 
     pub checksum: Option<String>, 
-}
-
-#[derive(Deserialize)]
-pub struct RenameFragmentQuery {
-    pub fragment_to_rename: String,
-    pub new_name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
