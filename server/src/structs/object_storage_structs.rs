@@ -95,6 +95,37 @@ pub struct ObjectMetadata {
 }
 
 #[derive(Deserialize)]
+pub struct ObjectSummary {
+    pub object_key: String,
+    pub fragment: String,
+    pub version_id: String,
+    pub upload_session_id: String,
+    pub owner_uid: String,
+    pub content_type: String,
+    pub total_size_bytes: u64,
+    pub created_at: i64,
+    #[serde(default)]
+    pub is_delete_marker: bool,
+}
+
+impl From<ObjectSummary> for ObjectMetadata {
+    fn from(summary: ObjectSummary) -> Self {
+        ObjectMetadata {
+            object_key: summary.object_key,
+            fragment: summary.fragment,
+            version_id: summary.version_id,
+            upload_session_id: summary.upload_session_id,
+            owner_uid: summary.owner_uid,
+            content_type: summary.content_type,
+            total_size_bytes: summary.total_size_bytes,
+            created_at: summary.created_at,
+            parts: Vec::new(),
+            is_delete_marker: summary.is_delete_marker,
+        }
+    }
+}
+
+#[derive(Deserialize)]
 pub struct InitiateUploadParams {
     pub content_type: Option<String>,
     pub total_size_bytes: u64,

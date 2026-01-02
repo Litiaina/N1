@@ -3,7 +3,7 @@ use crate::object_storage::caching::get_metadata_with_cache;
 use crate::object_storage::constants::{BROWSER_CACHE_MAX_AGE, OBJECT_DATA_ROOT};
 use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
 use crate::structs::auth_structs::Claims;
-use crate::structs::object_storage_structs::{ListObjectsResult, ObjectMetadata, ObjectPathManager};
+use crate::structs::object_storage_structs::{ListObjectsResult, ObjectMetadata, ObjectPathManager, ObjectSummary};
 use axum::{
     Json as AxumJson,
     body::Body,
@@ -13,6 +13,7 @@ use axum::{
 };
 use base64::Engine;
 use base64::engine::general_purpose;
+use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio::fs;
@@ -42,13 +43,14 @@ pub async fn list_objects(
     let path_manager = ObjectPathManager::new();
     let index_root = path_manager.get_index_dir(&uid, &fragment);
 
-    let limit: usize = params
-        .get("limit")
+    let limit: usize = params.get("limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(100)
         .min(1000);
-
-    let include_deleted = params.get("include_deleted").map(|v| v == "true").unwrap_or(false);
+        
+    let include_deleted = params.get("include_deleted")
+        .map(|v| v == "true")
+        .unwrap_or(false);
 
     let continuation_token = params.get("continuation_token").cloned();
     let (start_s1, start_s2, start_file) = match continuation_token.as_deref() {
@@ -56,69 +58,85 @@ pub async fn list_objects(
         None => ("".to_string(), "".to_string(), "".to_string()),
     };
 
-    if !index_root.exists() {
-        return Ok(AxumJson(ListObjectsResult {
-            objects: Vec::new(),
-            continuation_token: None,
-        }));
+    if !fs::try_exists(&index_root).await.unwrap_or(false) {
+        return Ok(AxumJson(ListObjectsResult { objects: Vec::new(), continuation_token: None }));
     }
 
     let mut s1_entries = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&index_root) {
-        for entry in entries.flatten() {
-            if let Ok(fname) = entry.file_name().into_string() {
-                if fname >= start_s1 {
-                    s1_entries.push(fname);
-                }
-            }
-        }
+    let mut entries = fs::read_dir(&index_root).await.map_err(|e| AppError::Io(e, "read index".into()))?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        s1_entries.push(entry.file_name().to_string_lossy().to_string());
     }
     s1_entries.sort();
+
+    let s1_start_idx = if !start_s1.is_empty() {
+        s1_entries.binary_search(&start_s1).unwrap_or_else(|x| x)
+    } else { 0 };
 
     let mut results = Vec::new();
     let mut next_token = None;
     let mut reached_limit = false;
 
-    'outer: for s1 in s1_entries {
+    'outer: for s1 in s1_entries.into_iter().skip(s1_start_idx) {
         let s1_path = index_root.join(&s1);
         
         let mut s2_entries = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&s1_path) {
-            for entry in entries.flatten() {
-                if let Ok(fname) = entry.file_name().into_string() {
-                    if s1 == start_s1 && fname < start_s2 {
-                        continue;
-                    }
-                    s2_entries.push(fname);
-                }
-            }
+        let mut entries = match fs::read_dir(&s1_path).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            s2_entries.push(entry.file_name().to_string_lossy().to_string());
         }
         s2_entries.sort();
 
-        for s2 in s2_entries {
-            let s2_path = s1_path.join(&s2);
+        let s2_start_idx = if s1 == start_s1 && !start_s2.is_empty() {
+            s2_entries.binary_search(&start_s2).unwrap_or_else(|x| x)
+        } else { 0 };
 
-            let mut file_entries = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(&s2_path) {
-                for entry in entries.flatten() {
-                    if let Ok(fname) = entry.file_name().into_string() {
-                        if fname.ends_with(".bson") {
-                            if s1 == start_s1 && s2 == start_s2 && fname <= start_file {
-                                continue;
-                            }
-                            file_entries.push(fname);
-                        }
-                    }
+        for s2 in s2_entries.into_iter().skip(s2_start_idx) {
+            let s2_path = s1_path.join(&s2);
+            
+            let mut file_names = Vec::new();
+            let mut entries = match fs::read_dir(&s2_path).await {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let fname = entry.file_name().to_string_lossy().to_string();
+                if fname.ends_with(".bson") {
+                    file_names.push(fname);
                 }
             }
-            file_entries.sort(); 
+
+            file_names.sort();
+
+            let file_start_idx = if s1 == start_s1 && s2 == start_s2 && !start_file.is_empty() {
+                match file_names.binary_search(&start_file) {
+                    Ok(i) => i + 1,
+                    Err(i) => i,
+                }
+            } else { 0 };
+
+            let stream_iter = file_names.into_iter().skip(file_start_idx);
             
+            let mut stream = futures_util::stream::iter(stream_iter)
+                .map(|fname| {
+                    let path = s2_path.join(&fname);
+                    async move {
+                        let data = fs::read(&path).await;
+                        (fname, data)
+                    }
+                })
+                .buffered(20);
+
             let mut current_hash_prefix = String::new();
             let mut pending_meta: Option<ObjectMetadata> = None;
             let mut last_fname_processed = String::new();
 
-            for fname in file_entries {
-
+            while let Some((fname, read_result)) = stream.next().await {
                 let hash_part = fname.split('#').next().unwrap_or("").to_string();
 
                 if hash_part != current_hash_prefix {
@@ -136,17 +154,16 @@ pub async fn list_objects(
                     current_hash_prefix = hash_part;
                 }
 
-                let file_path = s2_path.join(&fname);
-                if let Ok(data) = tokio::fs::read(&file_path).await {
-                     if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
-                        pending_meta = Some(meta);
-                     }
+                if let Ok(data) = read_result {
+                    if let Ok(summary) = mongodb::bson::from_slice::<ObjectSummary>(&data) {
+                        pending_meta = Some(summary.into()); 
+                    }
                 }
                 last_fname_processed = fname;
             }
 
             if let Some(meta) = pending_meta {
-                if !meta.is_delete_marker || include_deleted {
+                 if !meta.is_delete_marker || include_deleted {
                     results.push(meta);
                 }
                 if results.len() >= limit {
