@@ -110,7 +110,7 @@ pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
             .route("/v4/fragment/object/stream/{:fragment}/{*object_key}", get(stream_object))
             .route("/v4/fragment/object/get/metadata/{:fragment}/{*object_key}", get(get_object_metadata))
             .route("/v4/fragment/object/download/{:fragment}", get(download_object))
-            .route("/v4/fragment/object/chunk/{:fragment}", get(download_object_chunk))
+            .route("/v4/fragment/object/download/chunk/{:fragment}", get(download_object_chunk))
             .route("/v4/fragment/object/share", post(create_signed_url));
 
         let read_ops = layers.layer_view(read_ops);
