@@ -15,3 +15,4 @@ pub mod setup;
 pub mod caching;
 pub mod quota_manager;
 pub mod maintenance;
+pub mod archive;

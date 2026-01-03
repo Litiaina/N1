@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use crate::object_storage::archive::default_format;
 use crate::object_storage::constants::OBJECT_DATA_ROOT;
 
 pub static OBJECT_STORAGE_ROOT: OnceLock<String> = OnceLock::new();
@@ -216,4 +217,13 @@ pub struct UserRecord {
     pub allocated_storage: u64,
     #[serde(default)]
     pub created_at: i64,
+}
+
+#[derive(serde::Deserialize)]
+pub struct DownloadArchiveRequest {
+    pub keys: Vec<String>,
+    #[serde(default = "default_format")]
+    pub format: String,
+    #[serde(default)]
+    pub filename: Option<String>,
 }

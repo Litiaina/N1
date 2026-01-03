@@ -52,3 +52,6 @@ moka.workspace = true
 ulid.workspace = true
 libc.workspace = true
 crc32fast.workspace = true
+tokio-stream.workspace = true
+async_zip = { workspace = true, features = ["tokio", "deflate"] }
+tokio-tar.workspace = true

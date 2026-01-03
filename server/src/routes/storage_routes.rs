@@ -14,6 +14,7 @@ use crate::handlers::transcoder_handler::{transcode_status_handler, transcode_vi
 use crate::middleware::auth_middleware::{auth, authorize};
 use crate::middleware::rate_limiter_middleware::RateLimitLayers;
 use crate::middleware::storage_middleware::enforce_storage_limit;
+use crate::object_storage::archive::download_selected_archive;
 use crate::object_storage::delete::{
     delete_fragment, delete_object, delete_object_permanently, delete_object_version,
 };
@@ -111,6 +112,7 @@ pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
             .route("/v4/fragment/object/get/metadata/{:fragment}/{*object_key}", get(get_object_metadata))
             .route("/v4/fragment/object/download/{:fragment}", get(download_object))
             .route("/v4/fragment/object/download/chunk/{:fragment}", get(download_object_chunk))
+            .route("/v4/fragment/object/download/archive/{fragment}", post(download_selected_archive))
             .route("/v4/fragment/object/share", post(create_signed_url));
 
         let read_ops = layers.layer_view(read_ops);
