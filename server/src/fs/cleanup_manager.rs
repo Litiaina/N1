@@ -42,19 +42,19 @@ async fn cleanup(source_path: &str, file_ttl: Duration) {
         match is_unfinished_upload(&dir_path, file_ttl).await {
             Ok(true) => {
                 if let Err(e) = fs::remove_dir_all(&dir_path).await {
-                    warn!("⚠️ Failed to delete {:?}: {:?}", dir_path, e);
+                    warn!("Failed to delete {:?}: {:?}", dir_path, e);
                 } else {
-                    info!("✅ Deleted stale unfinished upload: {:?}", dir_path);
+                    info!("Deleted stale unfinished upload: {:?}", dir_path);
                 }
             }
             Ok(false) => {
                 info!(
-                    "ℹ️ Skipping directory (no chunks or metadata.json, or not stale): {:?}",
+                    "ℹSkipping directory (no chunks or metadata.json, or not stale): {:?}",
                     dir_path
                 );
             }
             Err(e) => {
-                warn!("⚠️ Could not check directory {:?}: {:?}", dir_path, e);
+                warn!("Could not check directory {:?}: {:?}", dir_path, e);
             }
         }
     }

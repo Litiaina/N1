@@ -20,3 +20,7 @@ bson.workspace = true
 chrono.workspace = true
 hostname.workspace = true
 sysinfo.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+reqwest.workspace = true

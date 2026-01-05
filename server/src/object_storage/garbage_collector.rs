@@ -5,7 +5,7 @@ use crate::object_storage::constants::OBJECT_DATA_ROOT;
 use crate::object_storage::quota_manager::update_quota;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
-use crate::structs::object_storage_structs::OBJECT_STORAGE_ROOT;
+use crate::structs::object_storage_structs::{FS_STORAGE_ROOT, OBJECT_STORAGE_ROOT};
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -25,9 +25,8 @@ pub async fn run_lifecycle_manager(state: Arc<AppState>) {
     let cleanup_interval = Duration::from_secs(CONFIG.garbage_collector.cleanup_interval_seconds);
     
     loop {
-        info!("GC & Lifecycle: Starting cycle...");
-        if let Err(e) = perform_gc_scan(state.clone(), false).await {
-             error!("GC Scan Failed: {}", e);
+        if let Err(err) = perform_gc_scan(state.clone(), false).await {
+             error!("Scan failed: {}", err);
         }
 
         sleep(cleanup_interval).await;
@@ -36,17 +35,17 @@ pub async fn run_lifecycle_manager(state: Arc<AppState>) {
 
 pub async fn run_garbage_collector(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     tokio::spawn(async move {
-        if let Err(e) = perform_gc_scan(state.clone(), true).await {
-        error!("Manual GC Failed: {}", e);
-    } else {
-        info!("Manual GC completed successfully.");
+
+    if let Err(err) = perform_gc_scan(state.clone(), true).await {
+        error!("Scan failed: {}", err);
     }
 
     start_cleanup(
-        OBJECT_STORAGE_ROOT
+        FS_STORAGE_ROOT
             .get()
             .unwrap_or(&STORAGE_ROOT.to_string()),
     ).await;
+
     });
 
     StatusCode::ACCEPTED
@@ -58,9 +57,9 @@ fn refund_quota_async(uid: String, amount: u64, state: Arc<AppState>) {
     let handle = Handle::current();
     handle.spawn(async move {
         if let Err(e) = update_quota(&uid, -(amount as i64)).await {
-            warn!("GC: Failed to refund quota for user {}: {}", uid, e);
+            warn!("Failed to refund quota for user {}: {}", uid, e);
         } else {
-            info!("GC: Refunded {} bytes to user {}", amount, uid);
+            info!("Refunded {} bytes to user {}", amount, uid);
             state.emit(&uid, StorageEventPayload::StateInvalidated);
         }
     });
@@ -140,7 +139,7 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
                                     let age = SystemTime::now().duration_since(version.modified).unwrap_or(Duration::ZERO);
                                     
                                     if age > retention_duration {
-                                        info!("♻️ Lifecycle: Expired version {}/{} (Age: {:?}). Deleting index entry...", hash, version.version_id, age);
+                                        info!("Expired version {}/{} (Age: {:?}). Deleting index entry...", hash, version.version_id, age);
                                         
                                         if let Err(e) = fs::remove_file(&version.path) {
                                             error!("Failed to delete expired index file: {}", e);
@@ -192,7 +191,7 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
                                     }
                                 }
 
-                                info!("🗑️ GC: Deleting orphaned/expired blob version: {}/blobs/{} (Refunding {} bytes)", uid, version_id, size_to_refund);
+                                info!("Deleting orphaned/expired blob version: {}/blobs/{} (Refunding {} bytes)", uid, version_id, size_to_refund);
                                 
                                 if fs::remove_dir_all(&blob_path).is_ok() {
                                     if size_to_refund > 0 {

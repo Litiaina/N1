@@ -9,8 +9,11 @@ use crate::validation::enforce_init_settings::{ensure_config_file, ensure_env_fi
 use axum::Router;
 use axum_server::tls_rustls::RustlsConfig;
 use chrono::Local;
+use clap::Parser;
 use dotenv::dotenv;
 use ini::Ini;
+use server_cli::cli::args::{Cli, Commands};
+use server_cli::cli::client::execute_command;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, fmt};
 use std::net::{IpAddr, SocketAddr};
@@ -66,6 +69,42 @@ async fn main() {
         .expect("Failed to install 'ring' as the default TLS provider.");
 
     let _guard = init_tracing().expect("Failed to initialize tracing subscriber");
+
+    let args = Cli::parse();
+
+    match args.command {
+        Some(cmd) if matches!(cmd, Commands::Gc | Commands::Sync) => {
+            dotenv().ok();
+
+            let target_url = args.url.or_else(|| {
+                Ini::load_from_file("config.ini").ok().and_then(|conf| {
+                    conf.section(Some("server")).map(|section| {
+                        let host = section.get("host").unwrap_or("127.0.0.1");
+                        let port = section.get("https_port").unwrap_or("50001");
+                        let effective_host = if host == "0.0.0.0" { "127.0.0.1" } else { host };
+                        format!("https://{}:{}", effective_host, port)
+                    })
+                })
+            });
+            
+            let result = execute_command(
+                &cmd,          
+                args.email,    
+                args.password, 
+                target_url,   
+                args.insecure  
+            ).await;
+
+            drop(_guard);
+
+            if let Err(e) = result {
+                eprintln!("CLI Execution Error: {}", e);
+                std::process::exit(1);
+            }
+            return;
+        },
+        _ => {}
+    }
 
     if let Err(e) = ensure_env_file() {
         tracing::error!("Failed to ensure .env file: {}", e);
@@ -187,9 +226,13 @@ pub async fn shutdown_signal(handle: Arc<axum_server::Handle<SocketAddr>>) {
     #[cfg(unix)]
     let terminator = async {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut terminate =
-            signal(SignalKind::terminate()).expect("failed to install signal handler");
-        terminate.recv().await;
+        let mut terminate = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let mut interrupt = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+        
+        tokio::select! {
+            _ = terminate.recv() => {},
+            _ = interrupt.recv() => {},
+        }
     };
 
     #[cfg(not(unix))]
