@@ -2,7 +2,7 @@ use crate::fs::cleanup_manager::{interval_cleanup, start_cleanup};
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
 use crate::object_storage::garbage_collector::run_garbage_collector;
-use crate::object_storage::setup::setup_quota;
+use crate::object_storage::sync::sync_quota;
 use crate::routes::storage_routes::serve_storage_routes;
 use crate::structs::object_storage_structs::OBJECT_STORAGE_ROOT;
 use crate::utils::date_time_formatter::LocalTimer;
@@ -161,7 +161,7 @@ pub async fn run_server() {
 
     let shutdown_handle_clone = Arc::clone(&shutdown_handle);
 
-    setup_quota()
+    sync_quota()
         .await
         .expect("Failed to setup database locks");
 

@@ -27,6 +27,7 @@ use crate::object_storage::retrieve::{
     stream_object,
 };
 use crate::object_storage::sharing::{create_signed_url, get_shared_object};
+use crate::object_storage::sync::sync_quota_api;
 use crate::object_storage::upload::{
     cancel_upload_session, finalize_object_upload, get_capacity_usage, get_upload_status, initiate_object_upload, object_upload_part
 };
@@ -219,6 +220,17 @@ pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
             .merge(broadcast_route)
     };
 
+    let sync_data_routes = {
+        let sync_routes = Router::new()
+            .route("/v4/storage/sync", post(sync_quota_api));
+
+        let sync_routes = layers.layer_upload(sync_routes);
+
+        Router::new()
+            .merge(sync_routes)
+            .layer(from_fn(auth))
+    };
+
     let auth_route = Router::new()
         .route("/authenticate", post(authorize));
     let auth_route = layers.layer_auth(auth_route);
@@ -229,6 +241,7 @@ pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
 
     let router = Router::new()
         .merge(ping_route)
+        .merge(sync_data_routes)
         .merge(auth_route)
         .merge(object_storage_routes)
         .merge(legacy_fs_routes)

@@ -1,3 +1,4 @@
+use axum::{http::StatusCode, response::IntoResponse};
 use futures_util::StreamExt;
 use mongodb::{Client, bson::doc, options::ClientOptions};
 use std::error::Error;
@@ -5,13 +6,10 @@ use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
 use crate::{
-    database::database_constants::DATABASE,
-    object_storage::quota_manager::{init_quota_file, set_storage_used},
-    statics::database_statics::DATABASE_URL,
-    structs::object_storage_structs::{ObjectMetadata, ObjectPathManager, UserRecord},
+    database::database_constants::DATABASE, enums::app_error_enum::AppError, object_storage::quota_manager::{init_quota_file, set_storage_used}, statics::database_statics::DATABASE_URL, structs::object_storage_structs::{ObjectMetadata, ObjectPathManager, UserRecord}
 };
 
-pub async fn setup_quota() -> Result<(), Box<dyn Error>> {
+pub async fn sync_quota() -> Result<(), Box<dyn Error>> {
     info!("Background Task: Connecting to MongoDB for Quota Sync...");
 
     let client_options = ClientOptions::parse(&*DATABASE_URL).await?;
@@ -83,4 +81,13 @@ pub async fn setup_quota() -> Result<(), Box<dyn Error>> {
     );
 
     Ok(())
+}
+
+pub async fn sync_quota_api() -> Result<impl IntoResponse, AppError> {
+    match sync_quota().await {
+        Ok(_) => Ok(
+            StatusCode::PROCESSING
+        ),
+        Err(err) => Err(AppError::InternalServerError(format!("Sync error: {}", err))),
+    }
 }
