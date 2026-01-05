@@ -16,7 +16,7 @@
 
 ---
 
-## 🧭 What Is N1?
+## What Is N1?
 
 **Litiaina N1** is a purpose-built storage engine that pushes a *single machine* to its physical limits.
 
@@ -30,9 +30,9 @@ N1 treats the local filesystem (RAID 10 + XFS) as a trusted, high-speed substrat
 
 ---
 
-## ⚡ Core Capabilities
+## Core Capabilities
 
-### 🚀 Lockless, Linear Scalability
+### Lockless, Linear Scalability
 
 - Fully lockless write path for uploads
 - Scales linearly with CPU cores
@@ -41,7 +41,7 @@ N1 treats the local filesystem (RAID 10 + XFS) as a trusted, high-speed substrat
 
 ---
 
-### 🔁 Zero-Copy Streaming I/O
+### Zero-Copy Streaming I/O
 
 - Direct streaming from network socket to disk buffers
 - No intermediate buffering layers
@@ -50,7 +50,7 @@ N1 treats the local filesystem (RAID 10 + XFS) as a trusted, high-speed substrat
 
 ---
 
-### 🧱 Filesystem-Aware Design
+### Filesystem-Aware Design
 
 - Aggressive cleanup of temporary metadata files
 - Minimal inode footprint even at massive object counts
@@ -59,7 +59,7 @@ N1 treats the local filesystem (RAID 10 + XFS) as a trusted, high-speed substrat
 
 ---
 
-### 💾 Strong Write Safety
+### Strong Write Safety
 
 - Atomic object finalization
 - Objects become visible only after durable `sync_all()`
@@ -68,7 +68,7 @@ N1 treats the local filesystem (RAID 10 + XFS) as a trusted, high-speed substrat
 
 ---
 
-### 📦 High-Throughput Object Ingestion
+### High-Throughput Object Ingestion
 
 - Designed for sustained sequential writes
 - Parallel part ingestion with fast finalization
@@ -77,7 +77,7 @@ N1 treats the local filesystem (RAID 10 + XFS) as a trusted, high-speed substrat
 
 ---
 
-### 🔄 Native Versioning & Lifecycle Control
+### Native Versioning & Lifecycle Control
 
 - Immutable version IDs per upload
 - Soft delete with instant rollback
@@ -86,7 +86,7 @@ N1 treats the local filesystem (RAID 10 + XFS) as a trusted, high-speed substrat
 
 ---
 
-### 🔍 Efficient Reads & Seeking
+### Efficient Reads & Seeking
 
 - Metadata cached in-memory (Moka)
 - Range reads open only the required chunk files
@@ -95,7 +95,7 @@ N1 treats the local filesystem (RAID 10 + XFS) as a trusted, high-speed substrat
 
 ---
 
-## 🧠 Internal Architecture (N1)
+## Internal Architecture (N1)
 
 ### Write Path
 
@@ -124,7 +124,7 @@ N1 treats the local filesystem (RAID 10 + XFS) as a trusted, high-speed substrat
 
 ---
 
-## 🔄 End-to-End Data Flow
+## End-to-End Data Flow
 
 - Upload begins → quota validated
 - Data streams → lockless chunk writes
@@ -133,26 +133,26 @@ N1 treats the local filesystem (RAID 10 + XFS) as a trusted, high-speed substrat
 
 ---
 
-## 💡 Where N1 Excels
+## Where N1 Excels
 
-- 🏎️ **High-Bitrate Media Pipelines**  
+- **High-Bitrate Media Pipelines**  
   Raw 4K / 8K video ingest, post-production, and streaming
 
-- 🧠 **AI / ML Training Storage**  
+- **AI / ML Training Storage**  
   Feeding GPUs with massive datasets at disk-speed
 
-- 🧪 **Scientific & Research Workloads**  
+- **Scientific & Research Workloads**  
   Simulation outputs, sensor data, and experimental results
 
-- 🏢 **On-Premise Performance Storage**  
+- **On-Premise Performance Storage**  
   Predictable, high-throughput object storage without cluster overhead
 
-- ⚡ **Edge & Ingest Nodes**  
+- **Edge & Ingest Nodes**  
   Ultra-fast front-line storage ahead of slower distributed systems
 
 ---
 
-## 🔮 Roadmap: N2 (Distributed Evolution)
+## Roadmap: N2 (Distributed Evolution)
 
 - Multi-node scaling using per-part erasure coding
 - Automatic data rebalancing across nodes
@@ -161,7 +161,7 @@ N1 treats the local filesystem (RAID 10 + XFS) as a trusted, high-speed substrat
 
 ---
 
-## 🚀 Why Litiaina N1?
+## Why Litiaina N1?
 
 Most storage systems are designed to survive failure across hundreds of machines.
 
