@@ -6,7 +6,7 @@ use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
 use crate::{
-    database::database_constants::DATABASE, enums::app_error_enum::AppError, object_storage::quota_manager::{init_quota_file, set_storage_used}, statics::database_statics::DATABASE_URL, structs::object_storage_structs::{ObjectMetadata, ObjectPathManager, UserRecord}
+    database::database_constants::DATABASE, object_storage::quota_manager::{init_quota_file, set_storage_used}, statics::database_statics::DATABASE_URL, structs::object_storage_structs::{ObjectMetadata, ObjectPathManager, UserRecord}
 };
 
 pub async fn sync_quota() -> Result<(), Box<dyn Error>> {
@@ -83,11 +83,14 @@ pub async fn sync_quota() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub async fn sync_quota_api() -> Result<impl IntoResponse, AppError> {
-    match sync_quota().await {
-        Ok(_) => Ok(
-            StatusCode::PROCESSING
-        ),
-        Err(err) => Err(AppError::InternalServerError(format!("Sync error: {}", err))),
-    }
+pub async fn sync_quota_api() -> impl IntoResponse {
+    tokio::spawn(async move {
+        match sync_quota().await {
+            Ok(_) => info!("Full quota sync cycle completed successfully."),
+            Err(e) => error!("Full quota sync cycle failed: {}", e),
+        }
+    });
+
+    
+    StatusCode::ACCEPTED
 }
