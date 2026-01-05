@@ -88,14 +88,8 @@ async fn main() {
     tracing::info!("│ Status         : ONLINE");
     tracing::info!("│ Start Time     : {}", current_time);
     tracing::info!("│ PID            : {}", std::process::id());
-    tracing::info!(
-        "│ Hostname       : {}",
-        hostname::get().unwrap_or_default().to_string_lossy()
-    );
-    tracing::info!(
-        "│ Working Dir    : {}",
-        std::env::current_dir().unwrap_or_default().display()
-    );
+    tracing::info!("│ Hostname       : {}", hostname::get().unwrap_or_default().to_string_lossy());
+    tracing::info!("│ Working Dir    : {}", std::env::current_dir().unwrap_or_default().display());
     tracing::info!("╞═════════ ACTIVE CONNECTIONS ═════════╡");
 
     run_server().await
@@ -155,20 +149,19 @@ pub async fn run_server() {
     let (storage_router, app_state) = serve_storage_routes().await;
     let serve_storage = storage_router.fallback(handler_404);
 
+    let fs_root = FS_STORAGE_ROOT.get().unwrap_or(&STORAGE_ROOT.to_string()).to_string();
     tokio::spawn(async move {
-            serve(storage_addr, serve_storage, cert).await;
-            sync_quota(Arc::clone(&app_state.db_client))
-                .await
-                .expect("Failed to setup database locks");
-            interval_cleanup(FS_STORAGE_ROOT
-                .get()
-                .unwrap_or(&STORAGE_ROOT.to_string()))
-                .await;
-        });
+        interval_cleanup(&fs_root).await;
+    });
 
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to listen for CTRL+C");
+    let db_client = Arc::clone(&app_state.db_client);
+    tokio::spawn(async move {
+        if let Err(e) = sync_quota(db_client).await {
+            tracing::error!("Failed to setup database locks/quota: {}", e);
+        }
+    });
+
+    serve(storage_addr, serve_storage, cert).await;
 }
 
 async fn serve(
@@ -178,6 +171,9 @@ async fn serve(
 ) {
     tracing::info!("Secured port => {} type: https", socket);
     let handle = Arc::new(axum_server::Handle::new());
+    
+    tokio::spawn(shutdown_signal(handle.clone()));
+    
     let mut server = axum_server::bind_rustls(socket, cert).handle((*handle).clone());
     server.http_builder().http2().enable_connect_protocol();
 
@@ -189,21 +185,22 @@ async fn serve(
 
 pub async fn shutdown_signal(handle: Arc<axum_server::Handle<SocketAddr>>) {
     #[cfg(unix)]
-    {
+    let terminator = async {
         use tokio::signal::unix::{SignalKind, signal};
-
         let mut terminate =
             signal(SignalKind::terminate()).expect("failed to install signal handler");
-
         terminate.recv().await;
-    }
+    };
 
     #[cfg(not(unix))]
-    {
+    let terminator = async {
         tokio::signal::ctrl_c()
             .await
             .expect("failed to listen for ctrl+c event");
-    }
+    };
 
+    terminator.await;
+    
+    tracing::info!("Shutdown signal received. Stopping server...");
     handle.graceful_shutdown(Some(Duration::from_secs(10)));
 }
