@@ -97,10 +97,10 @@ async fn main() {
 
             drop(_guard);
 
-            if let Err(e) = result {
-                eprintln!("CLI Execution Error: {}", e);
+            if let Err(_) = result {
                 std::process::exit(1);
             }
+            
             return;
         },
         _ => {}
