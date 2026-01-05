@@ -1,10 +1,15 @@
 use crate::enums::app_error_enum::AppError;
+use crate::fs::cleanup_manager::start_cleanup;
+use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::object_storage::constants::OBJECT_DATA_ROOT;
 use crate::object_storage::quota_manager::update_quota;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
 use crate::structs::object_storage_structs::OBJECT_STORAGE_ROOT;
 use crate::websocket::ws_structs::StorageEventPayload;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use tokio::runtime::Handle;
 use std::collections::HashMap;
 use std::{collections::HashSet, time::SystemTime};
@@ -20,7 +25,7 @@ pub async fn run_lifecycle_manager(state: Arc<AppState>) {
     let cleanup_interval = Duration::from_secs(CONFIG.garbage_collector.cleanup_interval_seconds);
     
     loop {
-        info!("⏳ GC & Lifecycle: Starting cycle...");
+        info!("GC & Lifecycle: Starting cycle...");
         if let Err(e) = perform_gc_scan(state.clone(), false).await {
              error!("GC Scan Failed: {}", e);
         }
@@ -29,13 +34,22 @@ pub async fn run_lifecycle_manager(state: Arc<AppState>) {
     }
 }
 
-pub async fn run_garbage_collector(state: Arc<AppState>) {
-    info!("🗑️ Manual GC executing...");
-    if let Err(e) = perform_gc_scan(state.clone(), true).await {
-        error!("🗑️ Manual GC Failed: {}", e);
+pub async fn run_garbage_collector(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    tokio::spawn(async move {
+        if let Err(e) = perform_gc_scan(state.clone(), true).await {
+        error!("Manual GC Failed: {}", e);
     } else {
-        info!("🗑️ Manual GC completed successfully.");
+        info!("Manual GC completed successfully.");
     }
+
+    start_cleanup(
+        OBJECT_STORAGE_ROOT
+            .get()
+            .unwrap_or(&STORAGE_ROOT.to_string()),
+    ).await;
+    });
+
+    StatusCode::ACCEPTED
 }
 
 fn refund_quota_async(uid: String, amount: u64, state: Arc<AppState>) {

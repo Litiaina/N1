@@ -7,6 +7,7 @@ use crate::object_storage::archive::default_format;
 use crate::object_storage::constants::OBJECT_DATA_ROOT;
 
 pub static OBJECT_STORAGE_ROOT: OnceLock<String> = OnceLock::new();
+pub static FS_STORAGE_ROOT: OnceLock<String> = OnceLock::new();
 
 pub struct ObjectPathManager {
     pub root: PathBuf,

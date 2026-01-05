@@ -15,7 +15,8 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
     //Storage disk configuration
     conf.with_section(Some("disk_config"))
         //Root storage path
-        .set("storage_path", "object-storage-array");
+        .set("object_storage_path", "object-storage-path")
+        .set("fs_storage_path", "fs-storage-path");
 
     //Garbage collector
     conf.with_section(Some("garbage_collector"))

@@ -19,7 +19,7 @@ use crate::object_storage::delete::{
     delete_fragment, delete_object, delete_object_permanently, delete_object_version,
 };
 use crate::object_storage::download::{download_object, download_object_chunk};
-use crate::object_storage::garbage_collector::run_lifecycle_manager;
+use crate::object_storage::garbage_collector::{run_garbage_collector, run_lifecycle_manager};
 use crate::object_storage::maintenance::sync_user_metadata;
 use crate::object_storage::modify::rename_object;
 use crate::object_storage::retrieve::{
@@ -27,7 +27,7 @@ use crate::object_storage::retrieve::{
     stream_object,
 };
 use crate::object_storage::sharing::{create_signed_url, get_shared_object};
-use crate::object_storage::sync::sync_quota_api;
+use crate::object_storage::sync::{sync_quota_api, sync_user_quota_api};
 use crate::object_storage::upload::{
     cancel_upload_session, finalize_object_upload, get_capacity_usage, get_upload_status, initiate_object_upload, object_upload_part
 };
@@ -220,9 +220,21 @@ pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
             .merge(broadcast_route)
     };
 
+    let gc_routes = {
+        let gc_routes = Router::new()
+            .route("/v4/storage/gc/run", post(run_garbage_collector));
+
+        let gc_routes = layers.layer_transcode(gc_routes);
+
+        Router::new()
+            .merge(gc_routes)
+            .layer(from_fn(auth))
+    };
+
     let sync_data_routes = {
         let sync_routes = Router::new()
-            .route("/v4/storage/sync", post(sync_quota_api));
+            .route("/v4/storage/sync", post(sync_quota_api))
+            .route("/v4/user/storage/sync", post(sync_user_quota_api));
 
         let sync_routes = layers.layer_upload(sync_routes);
 
@@ -241,6 +253,7 @@ pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
 
     let router = Router::new()
         .merge(ping_route)
+        .merge(gc_routes)
         .merge(sync_data_routes)
         .merge(auth_route)
         .merge(object_storage_routes)

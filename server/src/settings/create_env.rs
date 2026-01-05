@@ -18,11 +18,6 @@ pub fn create_env_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     writeln!(file, "# Edit these values before starting the server.")?;
     writeln!(file)?;
 
-    writeln!(file, "# ─── Security & Access ───")?;
-    writeln!(file, "# Set to 'true' to require login on startup, 'false' to bypass (Dev mode)")?;
-    writeln!(file, "ENABLE_LOCK=true")?;
-    writeln!(file)?;
-
     writeln!(file, "# Secret key used for signing JWT tokens")?;
     writeln!(file, "JWT_SECRET=enter_jwt_secret_here")?;
     writeln!(file)?;
