@@ -2,16 +2,14 @@ use crate::database::database_constants::DATABASE;
 use crate::enums::app_error_enum::AppError;
 use crate::fs::fragmented_upload::with_io_timeout;
 use crate::object_storage::caching::invalidate_cache;
-use crate::object_storage::constants::{PART_META_SUFFIX, PART_SUFFIX};
+use crate::object_storage::constants::{PART_META_SUFFIX, SHARD_SUFFIX};
 use crate::object_storage::quota_manager::{init_quota_file, try_reserve_quota, update_quota};
 use crate::object_storage::storage_capacity_parser::calculate_storage_usage;
 use crate::routes::storage_routes::AppState;
 use crate::statics::merge_semaphore_static::CHUNK_UPLOAD_SEMAPHORE;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
-    CapacityUsageResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery,
-    ObjectMetadata, ObjectPathManager, PartMetadata, ReservationReceipt, UploadPartQuery,
-    UploadStatusResponse, UserRecord,
+    CapacityUsageResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery, ObjectMetadata, ObjectPathManager, PartMetadata, ReservationReceipt, ShardInfo, UploadPartQuery, UploadStatusResponse, UserRecord
 };
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::body::Body;
@@ -24,20 +22,25 @@ use axum::{
 };
 use chrono::Utc;
 use crc32fast::Hasher;
+use futures_util::future::try_join_all;
 use futures_util::{StreamExt, stream};
 use mongodb::bson::doc;
-use std::io::SeekFrom;
+use reed_solomon_simd::ReedSolomonEncoder;
 #[cfg(not(unix))]
 use std::path::Path;
-use std::sync::Arc;
-use tokio::fs::{self, File, OpenOptions};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use std::sync::{Arc, OnceLock};
+use tokio::fs::{self, File};
+use tokio::io::AsyncWriteExt;
 use tracing::{error, info, warn};
 use ulid::Ulid;
 use walkdir::WalkDir;
 
 #[cfg(target_os = "linux")]
 const O_DIRECT: i32 = 0x4000;
+
+pub static MAX_PART_SIZE: OnceLock<u64> = OnceLock::new();
+pub static DATA_SHARDS: OnceLock<usize> = OnceLock::new();
+pub static PARITY_SHARDS: OnceLock<usize> = OnceLock::new();
 
 #[cfg(unix)]
 pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
@@ -175,10 +178,6 @@ pub async fn object_upload_part(
     Query(query): Query<UploadPartQuery>,
     body: Body,
 ) -> Result<impl IntoResponse, AppError> {
-    let requested_size = query.buffer_size.unwrap_or(131_072).max(4096);
-    let align = 4096;
-    let buffer_size = (requested_size / align) * align;
-
     let _permit = CHUNK_UPLOAD_SEMAPHORE
         .acquire()
         .await
@@ -187,46 +186,26 @@ pub async fn object_upload_part(
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
     let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
-
-    let part_filename = format!("part_{}{}", part_index, PART_SUFFIX);
-    let part_path = blob_dir.join(&part_filename);
-
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-
-    #[cfg(target_os = "linux")]
-    {
-        options.custom_flags(O_DIRECT);
-    }
-
-    let mut file = match options.open(&part_path).await {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((StatusCode::GONE, "Upload cancelled (Dir missing)").into_response());
-        }
-        Err(e) => return Err(AppError::Io(e, "create part file".into())),
-    };
+    let max_part_size = *MAX_PART_SIZE.get().expect("Config not initialized!");
+    let data_shards = *DATA_SHARDS.get().expect("Config not initialized!");
+    let parity_shards = *PARITY_SHARDS.get().expect("Config not initialized!");
 
     if let Some(content_length) = headers.get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok()) 
     {
-        if content_length > 0 {
-            let _ = file.set_len(content_length).await;
+        if content_length > max_part_size {
+            return Ok((StatusCode::PAYLOAD_TOO_LARGE, "Part exceeds 50MB limit").into_response());
         }
     }
+
+    let mut file_data = Vec::with_capacity(1024 * 1024);
+    let mut stream = body.into_data_stream();
+    let mut total_uploaded_bytes = 0u64;
 
     let calc_checksum = query.enable_checksum.unwrap_or(false);
     let verify_checksum = query.checksum.as_ref();
     let mut hasher = if calc_checksum || verify_checksum.is_some() { Some(Hasher::new()) } else { None };
-
-    let mut size_bytes = 0;
-    let mut stream = body.into_data_stream();
-
-    let mut raw_buffer = vec![0u8; buffer_size + align];
-    let ptr_addr = raw_buffer.as_ptr() as usize;
-    let align_offset = (align - (ptr_addr % align)) % align;
-    let mut buffer_len = 0;
 
     while let Some(chunk_res) = stream.next().await {
         let data = match chunk_res {
@@ -234,45 +213,18 @@ pub async fn object_upload_part(
             Err(_) => return Ok((StatusCode::GONE, "Stream interrupted").into_response()),
         };
 
-        let mut data_slice = &data[..];
-        while !data_slice.is_empty() {
-            let window_start = align_offset + buffer_len;
-            let available = buffer_size - buffer_len;
-            let to_copy = std::cmp::min(available, data_slice.len());
+        let chunk_len = data.len() as u64;
+        total_uploaded_bytes += chunk_len;
 
-            raw_buffer[window_start..window_start + to_copy].copy_from_slice(&data_slice[..to_copy]);
-            
-            if let Some(h) = &mut hasher {
-                h.update(&data_slice[..to_copy]);
-            }
-
-            buffer_len += to_copy;
-            data_slice = &data_slice[to_copy..];
-
-            if buffer_len == buffer_size {
-                let aligned_slice = &raw_buffer[align_offset..align_offset + buffer_size];
-                
-                file.write_all(aligned_slice).await
-                    .map_err(|e| AppError::Io(e, "write part aligned".into()))?;
-
-                size_bytes += buffer_len as u64;
-                buffer_len = 0;
-            }
+        if total_uploaded_bytes > max_part_size {
+            return Ok((StatusCode::PAYLOAD_TOO_LARGE, "Part exceeds 50MB limit").into_response());
         }
-    }
 
-    if buffer_len > 0 {
-        drop(file);
-        let mut tail_file = OpenOptions::new().write(true).open(&part_path).await
-            .map_err(|e| AppError::Io(e, "open part for tail".into()))?;
-        
-        tail_file.seek(SeekFrom::Start(size_bytes)).await
-            .map_err(|e| AppError::Io(e, "seek tail".into()))?;
-            
-        tail_file.write_all(&raw_buffer[align_offset..align_offset + buffer_len]).await
-            .map_err(|e| AppError::Io(e, "write tail unaligned".into()))?;
-            
-        size_bytes += buffer_len as u64;
+        if let Some(h) = &mut hasher {
+            h.update(&data);
+        }
+
+        file_data.extend_from_slice(&data);
     }
 
     let checksum_hex = hasher.map(|h| format!("{:08x}", h.finalize()));
@@ -280,18 +232,77 @@ pub async fn object_upload_part(
     if let Some(expected) = verify_checksum {
         if let Some(calculated) = &checksum_hex {
             if calculated.to_lowercase() != expected.to_lowercase() {
-                let _ = fs::remove_file(&part_path).await;
                 return Ok((StatusCode::BAD_REQUEST, "Checksum mismatch").into_response());
             }
         }
     }
 
+    let original_len = file_data.len();
+    
+    let mut shard_len = if original_len == 0 {
+        2
+    } else {
+        (original_len + data_shards - 1) / data_shards
+    };
+    
+    if shard_len % 2 != 0 {
+        shard_len += 1;
+    }
+    
+    let padded_len = shard_len * data_shards;
+
+    file_data.resize(padded_len, 0);
+
+    let mut r = ReedSolomonEncoder::new(data_shards, parity_shards, shard_len)
+        .map_err(|e| AppError::InternalServerError(format!("Failed to init erasure coding: {}", e)))?;
+    
+    let mut shards: Vec<Vec<u8>> = Vec::with_capacity(data_shards + parity_shards);
+
+    for chunk in file_data.chunks(shard_len) {
+        r.add_original_shard(chunk)
+            .map_err(|e| AppError::InternalServerError(format!("Failed to add shard: {}", e)))?;
+        shards.push(chunk.to_vec());
+    }
+
+    let result = r.encode()
+        .map_err(|e| AppError::InternalServerError(format!("Erasure coding failed: {}", e)))?;
+
+    for parity_shard in result.recovery_iter() {
+        shards.push(parity_shard.to_vec());
+    }
+
+    let write_futures = shards.into_iter().enumerate().map(|(idx, shard_data)| {
+        let is_parity = idx >= data_shards;
+        let shard_filename = format!("part_{}_shard_{}{}", part_index, idx, SHARD_SUFFIX);
+        let shard_path = blob_dir.join(&shard_filename);
+        
+        async move {
+            fs::write(&shard_path, &shard_data).await
+                .map_err(|e| AppError::Io(e, format!("write shard {}", idx).into()))?;
+            
+            let mut shard_hasher = Hasher::new();
+            shard_hasher.update(&shard_data);
+            let shard_checksum = format!("{:08x}", shard_hasher.finalize());
+
+            Ok::<ShardInfo, AppError>(ShardInfo {
+                shard_index: idx,
+                file_name: shard_filename,
+                absolute_path: shard_path.to_string_lossy().to_string(),
+                size_bytes: shard_data.len() as u64,
+                checksum: shard_checksum,
+                is_parity,
+            })
+        }
+    });
+
+    let shard_infos = try_join_all(write_futures).await?;
+
     let part_meta = PartMetadata {
         part_index,
-        size_bytes,
-        file_name: part_filename.clone(),
+        size_bytes: original_len as u64,
         created_at: Utc::now().timestamp(),
         checksum: checksum_hex,
+        shards: shard_infos,
     };
 
     let meta_data = mongodb::bson::to_vec(&part_meta).map_err(|e| {
@@ -302,7 +313,7 @@ pub async fn object_upload_part(
     fs::write(&meta_path, meta_data).await
         .map_err(|e| AppError::Io(e, "write part meta".into()))?;
 
-    Ok((StatusCode::OK, "Part uploaded.").into_response())
+    Ok((StatusCode::OK, "Part uploaded and erasure coded.").into_response())
 }
 
 pub async fn finalize_object_upload(

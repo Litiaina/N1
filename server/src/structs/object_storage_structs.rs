@@ -72,11 +72,21 @@ pub struct ReservationReceipt {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ShardInfo {
+    pub shard_index: usize,
+    pub file_name: String,
+    pub absolute_path: String,
+    pub size_bytes: u64,
+    pub checksum: String,
+    pub is_parity: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PartMetadata {
     pub part_index: u64,
     pub size_bytes: u64,
-    pub file_name: String,
     pub created_at: i64,
+    pub shards: Vec<ShardInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum: Option<String>
 }
@@ -196,7 +206,6 @@ pub struct ChunkQuery {
 
 #[derive(Deserialize)]
 pub struct UploadPartQuery {
-    pub buffer_size: Option<usize>,
     pub enable_checksum: Option<bool>, 
     pub checksum: Option<String>, 
 }

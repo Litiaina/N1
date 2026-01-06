@@ -17,15 +17,18 @@ use tokio_util::compat::FuturesAsyncWriteCompatExt;
 
 use async_zip::{tokio::write::ZipFileWriter, Compression, ZipEntryBuilder};
 use tokio_tar::{Builder as TarBuilder, Header as TarHeader};
+use std::io::Cursor;
+use std::path::PathBuf;
 
 use crate::{
     enums::app_error_enum::AppError,
     object_storage::caching::get_metadata_with_cache,
+    object_storage::object_parser::reconstruct_shard,
     structs::{
         auth_structs::Claims,
         object_storage_structs::{
              DownloadArchiveRequest, 
-            ObjectMetadata, ObjectPathManager
+            ObjectMetadata, ObjectPathManager, PartMetadata
         },
     },
 };
@@ -204,40 +207,102 @@ fn create_multipart_reader(metadata: &ObjectMetadata) -> StreamReader<impl Strea
     let blob_dir = pm.get_blob_dir(&metadata.owner_uid, &metadata.fragment, &metadata.version_id);
     let parts = metadata.parts.clone();
 
+    struct ReaderState {
+        parts_iter: std::vec::IntoIter<PartMetadata>,
+        current_part: Option<PartMetadata>,
+        current_shard_idx: usize,
+        current_file: Option<File>,
+        current_cursor: Option<Cursor<Vec<u8>>>,
+        blob_dir: PathBuf,
+    }
+
+    let initial_state = ReaderState {
+        parts_iter: parts.into_iter(),
+        current_part: None,
+        current_shard_idx: 0,
+        current_file: None,
+        current_cursor: None,
+        blob_dir,
+    };
+
     let stream = futures_util::stream::unfold(
-        (parts.into_iter(), None::<File>, blob_dir),
-        move |(mut parts, mut current_file, blob_dir)| async move {
+        initial_state,
+        move |mut state| async move {
             loop {
-                if let Some(mut file) = current_file.take() {
-                    let mut buf = vec![0u8; 64 * 1024];
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut bytes_read = 0;
+                let mut has_active_reader = false;
+
+                if let Some(file) = state.current_file.as_mut() {
                     match file.read(&mut buf).await {
-                        Ok(0) => {
-                        }
                         Ok(n) => {
-                            buf.truncate(n);
-                            return Some((
-                                Ok::<Bytes, std::io::Error>(Bytes::from(buf)), 
-                                (parts, Some(file), blob_dir)
-                            ));
-                        }
-                        Err(e) => {
-                            return Some((Err(e), (parts, None, blob_dir)));
-                        }
+                            bytes_read = n;
+                            has_active_reader = true;
+                        },
+                        Err(e) => return Some((Err(e), state)),
+                    }
+                } else if let Some(cursor) = state.current_cursor.as_mut() {
+                    match cursor.read(&mut buf).await {
+                        Ok(n) => {
+                            bytes_read = n;
+                            has_active_reader = true;
+                        },
+                        Err(e) => return Some((Err(e), state)),
                     }
                 }
 
-                match parts.next() {
-                    Some(part) => {
-                        let path = blob_dir.join(part.file_name);
-                        match File::open(path).await {
-                            Ok(f) => {
-                                current_file = Some(f);
-                                continue;
-                            }
-                            Err(e) => return Some((Err(e), (parts, None, blob_dir))),
-                        }
+                if has_active_reader {
+                    if bytes_read > 0 {
+                        buf.truncate(bytes_read);
+                        return Some((Ok(Bytes::from(buf)), state));
+                    } else {
+                        state.current_file = None;
+                        state.current_cursor = None;
+                        state.current_shard_idx += 1;
                     }
+                }
+
+                if state.current_part.is_none() {
+                    state.current_part = state.parts_iter.next();
+                    state.current_shard_idx = 0;
+                }
+
+                let part = match state.current_part.as_ref() {
+                    Some(p) => p,
                     None => return None,
+                };
+
+                let shard_info_opt = part.shards.iter().find(|s| s.shard_index == state.current_shard_idx && !s.is_parity);
+
+                match shard_info_opt {
+                    Some(shard_info) => {
+                        let path = if !shard_info.absolute_path.is_empty() {
+                            PathBuf::from(&shard_info.absolute_path)
+                        } else {
+                            state.blob_dir.join(&shard_info.file_name)
+                        };
+
+                        match File::open(&path).await {
+                            Ok(f) => {
+                                state.current_file = Some(f);
+                            }
+                            Err(_) => {
+                                match reconstruct_shard(part, shard_info.shard_index, &state.blob_dir).await {
+                                    Ok(data) => {
+                                        state.current_cursor = Some(Cursor::new(data));
+                                    }
+                                    Err(e) => {
+                                        return Some((Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())), state));
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    None => {
+                        state.current_part = None;
+                        continue;
+                    }
                 }
             }
         }

@@ -57,3 +57,4 @@ async_zip = { workspace = true, features = ["tokio", "deflate"] }
 tokio-tar.workspace = true
 tracing-appender.workspace = true
 clap.workspace = true
+reed-solomon-simd.workspace = true

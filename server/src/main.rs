@@ -2,7 +2,9 @@ use crate::fs::cleanup_manager::interval_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
 use crate::object_storage::sync::sync_quota;
+use crate::object_storage::upload::{DATA_SHARDS, MAX_PART_SIZE, PARITY_SHARDS};
 use crate::routes::storage_routes::serve_storage_routes;
+use crate::statics::merge_semaphore_static::MAX_CONCURRENT_UPLOADS;
 use crate::structs::object_storage_structs::{FS_STORAGE_ROOT, OBJECT_STORAGE_ROOT};
 use crate::utils::date_time_formatter::LocalTimer;
 use crate::validation::enforce_init_settings::{ensure_config_file, ensure_env_file};
@@ -167,18 +169,70 @@ pub async fn run_server() {
         .and_then(|s| s.get("object_storage_path"))
         .unwrap_or("object-storage-path");
 
+    OBJECT_STORAGE_ROOT
+        .set(object_storage_path.to_string())
+        .expect("Double initialization of OBJECT_STORAGE_ROOT!");
+
     let fs_storage_path = config
         .section(Some("disk_config"))
         .and_then(|s| s.get("fs_storage_path"))
         .unwrap_or("fs-storage-path");
 
-    OBJECT_STORAGE_ROOT
-        .set(object_storage_path.to_string())
-        .expect("Double initialization of config!");
-
     FS_STORAGE_ROOT
         .set(fs_storage_path.to_string())
         .expect("Double initialization of STORAGE_ROOT!");
+
+    let max_concurrent_uploads = config
+        .section(Some("upload_config"))
+        .and_then(|s| s.get("max_concurrent_uploads"))
+        .unwrap_or("10");
+
+    let max_concurrent_uploads: usize = max_concurrent_uploads
+        .parse()
+        .expect("max_part_size does not fit into u64");
+    
+    MAX_CONCURRENT_UPLOADS
+        .set(max_concurrent_uploads)
+        .expect("Double initialization of MAX_PART_SIZE!");
+
+    let max_part_size = config
+        .section(Some("upload_config"))
+        .and_then(|s| s.get("max_part_size"))
+        .unwrap_or("52428800");
+
+    let max_part_size: u64 = max_part_size
+        .parse()
+        .expect("max_part_size does not fit into u64");
+    
+    MAX_PART_SIZE
+        .set(max_part_size)
+        .expect("Double initialization of MAX_PART_SIZE!");
+    
+    let data_shards = config
+        .section(Some("upload_config"))
+        .and_then(|s| s.get("data_shards"))
+        .unwrap_or("4");
+
+    let data_shards: usize = data_shards
+        .parse()
+        .expect("data_shards does not fit into usize");
+
+    DATA_SHARDS
+        .set(data_shards)
+        .expect("Double initialization of DATA_SHARDS!");
+    
+    let parity_shards = config
+        .section(Some("upload_config"))
+        .and_then(|s| s.get("parity_shards"))
+        .unwrap_or("2");
+
+    let parity_shards: usize = parity_shards
+        .parse()
+        .expect("parity_shards does not fit into usize");
+
+    PARITY_SHARDS
+        .set(parity_shards)
+        .expect("Double initialization of PARITY_SHARDS!");
 
     let cert = RustlsConfig::from_pem_file(&cert_path, &key_path)
         .await

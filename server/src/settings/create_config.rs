@@ -55,6 +55,17 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("global_limit_per_second", "200") 
         .set("global_limit_burst_size", "300");
 
+    //Upload erasure coding config
+    conf.with_section(Some("upload_config"))
+        // Max concurrent upload value
+        .set("max_concurrent_uploads", "10")
+        // Max part size of an object
+        .set("max_part_size", "52428800")
+        // Total data shards during erasure coding
+        .set("data_shards", "4")
+        // Total parity shards during erasure coding
+        .set("parity_shards", "2");
+
     //Write config file
     conf.write_to_file(path)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
