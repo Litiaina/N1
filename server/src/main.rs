@@ -2,9 +2,8 @@ use crate::fs::cleanup_manager::interval_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
 use crate::object_storage::sync::sync_quota;
-use crate::object_storage::upload::{DATA_SHARDS, MAX_PART_SIZE, PARITY_SHARDS};
+use crate::object_storage::upload::{DATA_SHARDS_ATOMIC, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC};
 use crate::routes::storage_routes::serve_storage_routes;
-use crate::statics::merge_semaphore_static::MAX_CONCURRENT_UPLOADS;
 use crate::structs::object_storage_structs::{FS_STORAGE_ROOT, OBJECT_STORAGE_ROOT};
 use crate::utils::date_time_formatter::LocalTimer;
 use crate::validation::enforce_init_settings::{ensure_config_file, ensure_env_file};
@@ -21,6 +20,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::Duration;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -182,29 +182,18 @@ pub async fn run_server() {
         .set(fs_storage_path.to_string())
         .expect("Double initialization of STORAGE_ROOT!");
 
-    let max_concurrent_uploads = config
-        .section(Some("upload_config"))
-        .and_then(|s| s.get("max_concurrent_uploads"))
-        .unwrap_or("10");
-
-    let max_concurrent_uploads: usize = max_concurrent_uploads
-        .parse()
-        .expect("max_part_size does not fit into u64");
-    
-    MAX_CONCURRENT_UPLOADS
-        .set(max_concurrent_uploads)
-        .expect("Double initialization of MAX_PART_SIZE!");
-
     let max_part_size = config
         .section(Some("upload_config"))
         .and_then(|s| s.get("max_part_size"))
         .unwrap_or("52428800");
 
-    let max_part_size: u64 = max_part_size
-        .parse()
-        .expect("max_part_size does not fit into u64");
+    let max_part_size: AtomicU64 = AtomicU64::new(
+        max_part_size
+            .parse::<u64>()
+            .expect("max_part_size does not fit into u64")
+    );
     
-    MAX_PART_SIZE
+    MAX_PART_SIZE_ATOMIC
         .set(max_part_size)
         .expect("Double initialization of MAX_PART_SIZE!");
     
@@ -213,11 +202,13 @@ pub async fn run_server() {
         .and_then(|s| s.get("data_shards"))
         .unwrap_or("4");
 
-    let data_shards: usize = data_shards
-        .parse()
-        .expect("data_shards does not fit into usize");
+    let data_shards: AtomicUsize = AtomicUsize::new(
+        data_shards
+            .parse::<usize>()
+            .expect("max_part_size does not fit into u64")
+    );
 
-    DATA_SHARDS
+    DATA_SHARDS_ATOMIC
         .set(data_shards)
         .expect("Double initialization of DATA_SHARDS!");
     
@@ -226,11 +217,13 @@ pub async fn run_server() {
         .and_then(|s| s.get("parity_shards"))
         .unwrap_or("2");
 
-    let parity_shards: usize = parity_shards
-        .parse()
-        .expect("parity_shards does not fit into usize");
+    let parity_shards: AtomicUsize = AtomicUsize::new(
+        parity_shards
+            .parse::<usize>()
+            .expect("max_part_size does not fit into u64")
+    );
 
-    PARITY_SHARDS
+    PARITY_SHARDS_ATOMIC
         .set(parity_shards)
         .expect("Double initialization of PARITY_SHARDS!");
 

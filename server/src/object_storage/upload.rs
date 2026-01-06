@@ -3,13 +3,16 @@ use crate::enums::app_error_enum::AppError;
 use crate::fs::fragmented_upload::with_io_timeout;
 use crate::object_storage::caching::invalidate_cache;
 use crate::object_storage::constants::{PART_META_SUFFIX, SHARD_SUFFIX};
+use crate::object_storage::ec::{EcJob, init_ec_workers};
 use crate::object_storage::quota_manager::{init_quota_file, try_reserve_quota, update_quota};
+use crate::object_storage::shard_parser::AsyncShardWriter;
 use crate::object_storage::storage_capacity_parser::calculate_storage_usage;
 use crate::routes::storage_routes::AppState;
-use crate::statics::merge_semaphore_static::CHUNK_UPLOAD_SEMAPHORE;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
-    CapacityUsageResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery, ObjectMetadata, ObjectPathManager, PartMetadata, ReservationReceipt, ShardInfo, UploadPartQuery, UploadStatusResponse, UserRecord
+    CapacityUsageResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery,
+    ObjectMetadata, ObjectPathManager, PartMetadata, ReservationReceipt, ShardInfo,
+    UploadPartQuery, UploadStatusResponse, UserRecord,
 };
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::body::Body;
@@ -22,25 +25,26 @@ use axum::{
 };
 use chrono::Utc;
 use crc32fast::Hasher;
-use futures_util::future::try_join_all;
 use futures_util::{StreamExt, stream};
 use mongodb::bson::doc;
-use reed_solomon_simd::ReedSolomonEncoder;
+use once_cell::sync::{Lazy, OnceCell};
 #[cfg(not(unix))]
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::fs::{self, File};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{error, info, warn};
 use ulid::Ulid;
 use walkdir::WalkDir;
 
-#[cfg(target_os = "linux")]
-const O_DIRECT: i32 = 0x4000;
+pub static MAX_PART_SIZE_ATOMIC: OnceCell<AtomicU64> = OnceCell::new();
+pub static DATA_SHARDS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
+pub static PARITY_SHARDS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 
-pub static MAX_PART_SIZE: OnceLock<u64> = OnceLock::new();
-pub static DATA_SHARDS: OnceLock<usize> = OnceLock::new();
-pub static PARITY_SHARDS: OnceLock<usize> = OnceLock::new();
+static IO_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(16_384));
+static EC_QUEUE: Lazy<mpsc::Sender<EcJob>> = Lazy::new(init_ec_workers);
 
 #[cfg(unix)]
 pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
@@ -50,7 +54,9 @@ pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
         .open(path)
         .await
         .map_err(|e| AppError::Io(e, "open dir for sync".into()))?;
-    dir.sync_all().await.map_err(|e| AppError::Io(e, "sync dir".into()))?;
+    dir.sync_all()
+        .await
+        .map_err(|e| AppError::Io(e, "sync dir".into()))?;
     Ok(())
 }
 
@@ -97,11 +103,8 @@ pub async fn initiate_object_upload(
     let path_manager = ObjectPathManager::new();
     let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
 
-    if let Err(e) = with_io_timeout(
-        "creating upload directory",
-        fs::create_dir_all(&blob_dir),
-    )
-    .await
+    if let Err(e) =
+        with_io_timeout("creating upload directory", fs::create_dir_all(&blob_dir)).await
     {
         let _ = update_quota(&uid, -(params.total_size_bytes as i64)).await;
         return Err(e);
@@ -178,142 +181,201 @@ pub async fn object_upload_part(
     Query(query): Query<UploadPartQuery>,
     body: Body,
 ) -> Result<impl IntoResponse, AppError> {
-    let _permit = CHUNK_UPLOAD_SEMAPHORE
+    let _io_guard = IO_SEMAPHORE
         .acquire()
         .await
-        .map_err(|_| AppError::InternalServerError("Server busy.".to_string()))?;
+        .map_err(|_| AppError::InternalServerError("Server busy".into()))?;
 
     let uid = claims.uid;
+
+    let max_part_size = MAX_PART_SIZE_ATOMIC
+        .get()
+        .expect("Config not initialized!")
+        .load(Ordering::Relaxed);
+    let data_shards = DATA_SHARDS_ATOMIC
+        .get()
+        .expect("Config not initialized!")
+        .load(Ordering::Relaxed);
+    let parity_shards = PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("Config not initialized!")
+        .load(Ordering::Relaxed);
+
+    let content_length = headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or(AppError::BadRequest("Content-Length header required".into()))?;
+
+    if content_length > max_part_size {
+        return Ok((StatusCode::PAYLOAD_TOO_LARGE, "Part too large").into_response());
+    }
+
     let path_manager = ObjectPathManager::new();
     let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
-    let max_part_size = *MAX_PART_SIZE.get().expect("Config not initialized!");
-    let data_shards = *DATA_SHARDS.get().expect("Config not initialized!");
-    let parity_shards = *PARITY_SHARDS.get().expect("Config not initialized!");
+    fs::create_dir_all(&blob_dir)
+        .await
+        .map_err(|e| AppError::Io(e, "create blob dir".into()))?;
 
-    if let Some(content_length) = headers.get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok()) 
-    {
-        if content_length > max_part_size {
-            return Ok((StatusCode::PAYLOAD_TOO_LARGE, "Part exceeds 50MB limit").into_response());
-        }
+    let mut shard_len = (content_length + data_shards as u64 - 1) / data_shards as u64;
+    if shard_len % 2 != 0 {
+        shard_len += 1;
+    }
+    let shard_len = shard_len as usize;
+
+    let mut writers = Vec::with_capacity(data_shards);
+
+    let checksum_enabled = query.enable_checksum.unwrap_or(false);
+
+    let mut shard_hashers = if checksum_enabled {
+        Some((0..data_shards).map(|_| Hasher::new()).collect::<Vec<_>>())
+    } else {
+        None
+    };
+
+    let mut total_hasher = if checksum_enabled {
+        Some(Hasher::new())
+    } else {
+        None
+    };
+
+    for i in 0..data_shards {
+        let path = blob_dir.join(format!("part_{}_shard_{}{}", part_index, i, SHARD_SUFFIX));
+        let file = fs::File::create(path)
+            .await
+            .map_err(|e| AppError::Io(e, "create shard".into()))?;
+        writers.push(BufWriter::new(file));
     }
 
-    let mut file_data = Vec::with_capacity(1024 * 1024);
+    let mut shard_writer = AsyncShardWriter {
+        writers,
+        shard_len,
+        shard_index: 0,
+        offset: 0,
+    };
+
+    let mut total_bytes = 0u64;
     let mut stream = body.into_data_stream();
-    let mut total_uploaded_bytes = 0u64;
-
-    let calc_checksum = query.enable_checksum.unwrap_or(false);
-    let verify_checksum = query.checksum.as_ref();
-    let mut hasher = if calc_checksum || verify_checksum.is_some() { Some(Hasher::new()) } else { None };
-
-    while let Some(chunk_res) = stream.next().await {
-        let data = match chunk_res {
-            Ok(d) => d,
-            Err(_) => return Ok((StatusCode::GONE, "Stream interrupted").into_response()),
-        };
-
-        let chunk_len = data.len() as u64;
-        total_uploaded_bytes += chunk_len;
-
-        if total_uploaded_bytes > max_part_size {
-            return Ok((StatusCode::PAYLOAD_TOO_LARGE, "Part exceeds 50MB limit").into_response());
+    while let Some(chunk) = stream.next().await {
+        let data = chunk.map_err(|_| AppError::InternalServerError("Stream failed".into()))?;
+        total_bytes += data.len() as u64;
+        if total_bytes > content_length {
+            return Ok((StatusCode::PAYLOAD_TOO_LARGE, "Body exceeds Content-Length").into_response());
         }
 
-        if let Some(h) = &mut hasher {
-            h.update(&data);
+        if let Some(total_h) = total_hasher.as_mut() {
+            total_h.update(&data);
         }
 
-        file_data.extend_from_slice(&data);
+        if let Some(hashers) = shard_hashers.as_mut() {
+            let mut temp_idx = shard_writer.shard_index;
+            let mut temp_offset = shard_writer.offset;
+            let mut written = 0;
+            
+            while written < data.len() {
+                if temp_idx >= data_shards { break; } 
+                
+                let remain = shard_len - temp_offset;
+                let n = remain.min(data.len() - written);
+                
+                hashers[temp_idx].update(&data[written..written + n]);
+                
+                temp_offset += n;
+                written += n;
+                
+                if temp_offset == shard_len {
+                    temp_idx += 1;
+                    temp_offset = 0;
+                }
+            }
+        }
+
+        shard_writer.write_data(&data).await?;
     }
 
-    let checksum_hex = hasher.map(|h| format!("{:08x}", h.finalize()));
+    shard_writer.flush_all().await?;
 
-    if let Some(expected) = verify_checksum {
-        if let Some(calculated) = &checksum_hex {
-            if calculated.to_lowercase() != expected.to_lowercase() {
+    if checksum_enabled {
+        if let (Some(expected), Some(total_h)) = (query.checksum.as_ref(), total_hasher.as_ref()) {
+            let calculated = format!("{:08x}", total_h.clone().finalize());
+            if expected.to_lowercase() != calculated.to_lowercase() {
+                drop(shard_writer);
+                for i in 0..data_shards {
+                    let path = blob_dir.join(format!("part_{}_shard_{}{}", part_index, i, SHARD_SUFFIX));
+                    let _ = fs::remove_file(path).await;
+                }
                 return Ok((StatusCode::BAD_REQUEST, "Checksum mismatch").into_response());
             }
         }
     }
 
-    let original_len = file_data.len();
-    
-    let mut shard_len = if original_len == 0 {
-        2
+    let mut shards_info = Vec::with_capacity(data_shards + parity_shards);
+    let final_shard_hashes: Vec<String> = if let Some(hashers) = shard_hashers {
+        hashers.into_iter().map(|h| format!("{:08x}", h.finalize())).collect()
     } else {
-        (original_len + data_shards - 1) / data_shards
+        vec![String::new(); data_shards]
     };
-    
-    if shard_len % 2 != 0 {
-        shard_len += 1;
-    }
-    
-    let padded_len = shard_len * data_shards;
 
-    file_data.resize(padded_len, 0);
+    for i in 0..data_shards {
+        let file_name = format!("part_{}_shard_{}{}", part_index, i, SHARD_SUFFIX);
+        let absolute_path = blob_dir.join(&file_name).to_string_lossy().to_string();
+        let size_bytes = if i == data_shards - 1 {
+            total_bytes - shard_len as u64 * (data_shards as u64 - 1)
+        } else {
+            shard_len as u64
+        };
 
-    let mut r = ReedSolomonEncoder::new(data_shards, parity_shards, shard_len)
-        .map_err(|e| AppError::InternalServerError(format!("Failed to init erasure coding: {}", e)))?;
-    
-    let mut shards: Vec<Vec<u8>> = Vec::with_capacity(data_shards + parity_shards);
-
-    for chunk in file_data.chunks(shard_len) {
-        r.add_original_shard(chunk)
-            .map_err(|e| AppError::InternalServerError(format!("Failed to add shard: {}", e)))?;
-        shards.push(chunk.to_vec());
-    }
-
-    let result = r.encode()
-        .map_err(|e| AppError::InternalServerError(format!("Erasure coding failed: {}", e)))?;
-
-    for parity_shard in result.recovery_iter() {
-        shards.push(parity_shard.to_vec());
+        shards_info.push(ShardInfo {
+            shard_index: i,
+            file_name,
+            absolute_path,
+            size_bytes,
+            checksum: final_shard_hashes[i].clone(),
+            is_parity: false,
+        });
     }
 
-    let write_futures = shards.into_iter().enumerate().map(|(idx, shard_data)| {
-        let is_parity = idx >= data_shards;
-        let shard_filename = format!("part_{}_shard_{}{}", part_index, idx, SHARD_SUFFIX);
-        let shard_path = blob_dir.join(&shard_filename);
+    for i in 0..parity_shards {
+        let shard_idx = data_shards + i;
+        let file_name = format!("part_{}_shard_{}{}", part_index, shard_idx, SHARD_SUFFIX);
+        let absolute_path = blob_dir.join(&file_name).to_string_lossy().to_string();
         
-        async move {
-            fs::write(&shard_path, &shard_data).await
-                .map_err(|e| AppError::Io(e, format!("write shard {}", idx).into()))?;
-            
-            let mut shard_hasher = Hasher::new();
-            shard_hasher.update(&shard_data);
-            let shard_checksum = format!("{:08x}", shard_hasher.finalize());
-
-            Ok::<ShardInfo, AppError>(ShardInfo {
-                shard_index: idx,
-                file_name: shard_filename,
-                absolute_path: shard_path.to_string_lossy().to_string(),
-                size_bytes: shard_data.len() as u64,
-                checksum: shard_checksum,
-                is_parity,
-            })
-        }
-    });
-
-    let shard_infos = try_join_all(write_futures).await?;
+        shards_info.push(ShardInfo {
+            shard_index: shard_idx,
+            file_name,
+            absolute_path,
+            size_bytes: shard_len as u64,
+            checksum: String::new(),
+            is_parity: true,
+        });
+    }
 
     let part_meta = PartMetadata {
         part_index,
-        size_bytes: original_len as u64,
+        size_bytes: total_bytes,
         created_at: Utc::now().timestamp(),
-        checksum: checksum_hex,
-        shards: shard_infos,
+        checksum: total_hasher.map(|h| format!("{:08x}", h.finalize())),
+        shards: shards_info,
     };
-
-    let meta_data = mongodb::bson::to_vec(&part_meta).map_err(|e| {
-        AppError::InternalServerError(format!("Failed to serialize part metadata: {}", e))
-    })?;
-
     let meta_path = blob_dir.join(format!("part_{}{}", part_index, PART_META_SUFFIX));
-    fs::write(&meta_path, meta_data).await
+    let meta_bytes = mongodb::bson::to_vec(&part_meta)
+        .map_err(|e| AppError::InternalServerError(format!("Serialize meta: {}", e)))?;
+    fs::write(&meta_path, meta_bytes)
+        .await
         .map_err(|e| AppError::Io(e, "write part meta".into()))?;
 
-    Ok((StatusCode::OK, "Part uploaded and erasure coded.").into_response())
+    EC_QUEUE
+        .send(EcJob {
+            blob_dir: blob_dir.clone(),
+            part_index,
+            shard_len,
+            data_shards,
+            parity_shards,
+        })
+        .await
+        .map_err(|_| AppError::InternalServerError("EC queue full".into()))?;
+
+    Ok((StatusCode::OK, "Part uploaded").into_response())
 }
 
 pub async fn finalize_object_upload(
@@ -327,32 +389,36 @@ pub async fn finalize_object_upload(
     let uid = claims.uid;
 
     let path_manager = ObjectPathManager::new();
-    let blob_dir: Arc<std::path::Path> = Arc::from(path_manager.get_blob_dir(&uid, &fragment, &version_id));
+    let blob_dir: Arc<std::path::Path> =
+        Arc::from(path_manager.get_blob_dir(&uid, &fragment, &version_id));
     let blob_dir_for_task = Arc::clone(&blob_dir);
 
-    let part_meta_paths = tokio::task::spawn_blocking(move || -> Result<Vec<std::path::PathBuf>, AppError> {
-        let mut paths = Vec::new();
-        for entry in WalkDir::new(blob_dir_for_task.as_ref())
-            .max_depth(1)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.ends_with(PART_META_SUFFIX) {
-                        paths.push(path.to_owned());
+    let part_meta_paths =
+        tokio::task::spawn_blocking(move || -> Result<Vec<std::path::PathBuf>, AppError> {
+            let mut paths = Vec::new();
+            for entry in WalkDir::new(blob_dir_for_task.as_ref())
+                .max_depth(1)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if name.ends_with(PART_META_SUFFIX) {
+                            paths.push(path.to_owned());
+                        }
                     }
                 }
             }
-        }
-        Ok(paths)
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
+            Ok(paths)
+        })
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
 
     if part_meta_paths.is_empty() {
-        return Err(AppError::BadRequest("No parts found to finalize.".to_string()));
+        return Err(AppError::BadRequest(
+            "No parts found to finalize.".to_string(),
+        ));
     }
 
     let results: Vec<(PartMetadata, std::path::PathBuf)> = stream::iter(part_meta_paths)
@@ -373,7 +439,7 @@ pub async fn finalize_object_upload(
         .collect::<Result<Vec<_>, _>>()?;
 
     let (mut parts, paths_for_cleanup): (Vec<_>, Vec<_>) = results.into_iter().unzip();
-    
+
     parts.sort_by_key(|p| p.part_index);
 
     let mut total_size_calculated = 0;
@@ -404,7 +470,7 @@ pub async fn finalize_object_upload(
     })?;
 
     let index_path = path_manager.get_metadata_path(&uid, &fragment, &object_key, &version_id);
-    
+
     if let Some(parent) = index_path.parent() {
         if !fs::try_exists(parent).await.unwrap_or(false) {
             fs::create_dir_all(parent)
@@ -436,7 +502,7 @@ pub async fn finalize_object_upload(
         .buffer_unordered(20);
 
     cleanup_futures.collect::<Vec<_>>().await;
-    
+
     let receipt_path = blob_dir.join("reservation.bson");
     let _ = fs::remove_file(receipt_path).await;
 
@@ -448,14 +514,20 @@ pub async fn finalize_object_upload(
 
     if delta != 0 {
         update_quota(&uid, delta).await?;
-        info!("Quota adjustment for {}: {} bytes (Reserved: {}, Actual: {})", uid, delta, reserved_size, actual_size);
+        info!(
+            "Quota adjustment for {}: {} bytes (Reserved: {}, Actual: {})",
+            uid, delta, reserved_size, actual_size
+        );
     }
 
     invalidate_cache(&fragment, &object_key, &uid).await;
 
     state.emit(&uid, StorageEventPayload::FileUploaded(object_meta.clone()));
 
-    info!("Finalized object: {}/{} (Size: {})", fragment, object_key, total_size_calculated);
+    info!(
+        "Finalized object: {}/{} (Size: {})",
+        fragment, object_key, total_size_calculated
+    );
 
     Ok((StatusCode::OK, "Upload finalized."))
 }
@@ -473,9 +545,12 @@ pub async fn cancel_upload_session(
         return Err(AppError::NotFound);
     }
 
-    let index_path = path_manager.get_metadata_path(&uid, &fragment, &query.object_key, &version_id);
+    let index_path =
+        path_manager.get_metadata_path(&uid, &fragment, &query.object_key, &version_id);
     if fs::try_exists(&index_path).await.unwrap_or(false) {
-        return Err(AppError::Conflict("Cannot cancel: Object is already finalized.".to_string()));
+        return Err(AppError::Conflict(
+            "Cannot cancel: Object is already finalized.".to_string(),
+        ));
     }
 
     let receipt_path = blob_dir.join("reservation.bson");
