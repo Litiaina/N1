@@ -23,6 +23,7 @@ use axum::{
     response::IntoResponse,
 };
 use chrono::Utc;
+use futures_util::future::join_all;
 use futures_util::{StreamExt, stream};
 use mongodb::bson::doc;
 use once_cell::sync::{Lazy, OnceCell};
@@ -31,7 +32,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::fs::{self, File};
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use ulid::Ulid;
@@ -187,19 +188,13 @@ pub async fn object_upload_part(
     let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
     let data_shards = DATA_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
     let parity_shards = PARITY_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
-    let writer_buf_size = WRITER_BUFFER_SIZE_ATOMIC
-        .get()
-        .unwrap()
-        .load(Ordering::Relaxed);
     let total_shards = data_shards + parity_shards;
 
     let content_length = headers
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
-        .ok_or(AppError::BadRequest(
-            "Content-Length header required".into(),
-        ))?;
+        .ok_or(AppError::BadRequest("Content-Length header required".into()))?;
 
     if content_length > max_part_size {
         return Ok((StatusCode::PAYLOAD_TOO_LARGE, "Part too large").into_response());
@@ -208,32 +203,46 @@ pub async fn object_upload_part(
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
     let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
-
+    
     if !blob_dir.exists() {
         fs::create_dir_all(&blob_dir)
             .await
             .map_err(|e| AppError::Io(e, "create blob dir".into()))?;
     }
 
-    let mut writers = Vec::with_capacity(total_shards);
-
-    for i in 0..total_shards {
-        let is_parity = i >= data_shards;
-        let ext = if is_parity { "parity" } else { "shard" };
-
-        let file_name = format!("part_{}_shard_{}.{}", part_index, i, ext);
-        let path = blob_dir.join(&file_name);
-
-        let file = fs::File::create(path)
-            .await
-            .map_err(|e| AppError::Io(e, "create shard".into()))?;
-
-        writers.push(BufWriter::with_capacity(writer_buf_size, file));
-    }
-
     let stripe_data_width = STRIPE_BLOCK_SIZE as u64 * data_shards as u64;
     let stripe_count = (content_length + stripe_data_width - 1) / stripe_data_width;
     let final_shard_len = stripe_count * STRIPE_BLOCK_SIZE as u64;
+
+    let mut creation_futures = Vec::with_capacity(total_shards);
+    
+    for i in 0..total_shards {
+        let blob_dir = blob_dir.clone();
+        
+        creation_futures.push(async move {
+            let is_parity = i >= data_shards;
+            let ext = if is_parity { PARITY_SUFFIX } else { SHARD_SUFFIX};
+            
+            let file_name = format!("part_{}_shard_{}{}", part_index, i, ext);
+            let path = blob_dir.join(&file_name);
+            
+            let file = fs::File::create(&path)
+                .await
+                .map_err(|e| AppError::Io(e, "create shard".into()))?;
+            
+            file.set_len(final_shard_len).await
+                .map_err(|e| AppError::Io(e, "pre-allocate shard".into()))?;
+                
+            Ok::<_, AppError>(file)
+        });
+    }
+
+    let writers_results = join_all(creation_futures).await;
+    
+    let mut writers = Vec::with_capacity(total_shards);
+    for res in writers_results {
+        writers.push(res?);
+    }
 
     let mut stream_writer = ErasureStreamWriter::new(
         writers,
@@ -247,22 +256,13 @@ pub async fn object_upload_part(
     let mut total_bytes_read = 0u64;
 
     while let Some(chunk_result) = body_stream.next().await {
-        let chunk = chunk_result.map_err(|e| {
-            AppError::Io(
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-                "stream read".into(),
-            )
-        })?;
-
-        if chunk.is_empty() {
-            continue;
-        }
-
+        let chunk = chunk_result.map_err(|e| AppError::Io(std::io::Error::new(std::io::ErrorKind::Other, e), "stream read".into()))?;
+        
+        if chunk.is_empty() { continue; }
+        
         total_bytes_read += chunk.len() as u64;
         if total_bytes_read > content_length {
-            return Ok(
-                (StatusCode::PAYLOAD_TOO_LARGE, "Body exceeds Content-Length").into_response(),
-            );
+             return Ok((StatusCode::PAYLOAD_TOO_LARGE, "Body exceeds Content-Length").into_response());
         }
 
         stream_writer.write(&chunk).await?;
@@ -284,20 +284,16 @@ pub async fn object_upload_part(
 
     for i in 0..total_shards {
         let is_parity = i >= data_shards;
-        let ext = if is_parity {
-            PARITY_SUFFIX
-        } else {
-            SHARD_SUFFIX
-        };
-
-        let file_name = format!("part_{}_shard_{}{}", part_index, i, ext);
+        let ext = if is_parity { "parity" } else { "shard" };
+        
+        let file_name = format!("part_{}_shard_{}.{}", part_index, i, ext);
         let absolute_path = blob_dir.join(&file_name).to_string_lossy().to_string();
-
+        
         shards_info.push(ShardInfo {
             shard_index: i,
             file_name,
             absolute_path,
-            size_bytes: final_shard_len,
+            size_bytes: final_shard_len, 
             checksum: shard_checksums.get(i).cloned().unwrap_or_default(),
             is_parity,
         });
@@ -314,7 +310,7 @@ pub async fn object_upload_part(
     let meta_path = blob_dir.join(format!("part_{}{}", part_index, PART_META_SUFFIX));
     let meta_bytes = mongodb::bson::to_vec(&part_meta)
         .map_err(|e| AppError::InternalServerError(format!("Serialize meta: {}", e)))?;
-
+        
     fs::write(&meta_path, meta_bytes)
         .await
         .map_err(|e| AppError::Io(e, "write part meta".into()))?;

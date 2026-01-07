@@ -11,6 +11,7 @@ use axum::extract::{Path, Query};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use reed_solomon_simd::ReedSolomonDecoder;
+use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::Path as StdPath;
 use tokio::fs::File;
@@ -22,12 +23,10 @@ pub async fn download_object(
     Query(query): Query<ObjectKeyQuery>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
-    let clean_key = query.object_key.trim_start_matches('/');
-
     let metadata = if let Some(version_id) = &query.version_id {
-        get_version_metadata_with_cache(&fragment, clean_key, version_id, &claims.uid).await?
+        get_version_metadata_with_cache(&fragment, &query.object_key, version_id, &claims.uid).await?
     } else {
-        get_metadata_with_cache(&fragment, clean_key, &claims.uid).await?
+        get_metadata_with_cache(&fragment, &query.object_key, &claims.uid).await?
     };
 
     if metadata.is_delete_marker {
@@ -42,8 +41,7 @@ pub async fn download_object_chunk(
     Path(fragment): Path<String>,
     Query(params): Query<ChunkQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let clean_key = params.object_key.trim_start_matches('/');
-    let metadata = get_metadata_with_cache(&fragment, clean_key, &claims.uid).await?;
+    let metadata = get_metadata_with_cache(&fragment, &params.object_key, &claims.uid).await?;
 
     if metadata.is_delete_marker {
         return Err(AppError::NotFound);
@@ -67,6 +65,7 @@ pub async fn download_object_chunk(
     let mut result_buffer = Vec::with_capacity(params.chunk_size);
     let mut current_global_pos = 0u64;
     let mut checksum_header: Option<&str> = None;
+    let mut file_cache: HashMap<String, File> = HashMap::new();
 
     for part in &metadata.parts {
         let part_len = part.size_bytes;
@@ -115,6 +114,7 @@ pub async fn download_object_chunk(
                     .ok_or(AppError::InternalServerError("Shard index out of bounds".into()))?;
 
                 let chunk_data = read_stripe_chunk_internal(
+                    &mut file_cache,
                     &version_dir,
                     part,
                     shard_info,
@@ -151,6 +151,7 @@ pub async fn download_object_chunk(
 }
 
 async fn read_stripe_chunk_internal(
+    file_cache: &mut HashMap<String, File>,
     version_dir: &StdPath,
     part: &PartMetadata,
     target_shard: &ShardInfo,
@@ -158,15 +159,33 @@ async fn read_stripe_chunk_internal(
     len: usize,
     data_shards_count: usize,
 ) -> Result<Vec<u8>, AppError> {
-    let path = version_dir.join(&target_shard.file_name);
+    
+    let mut direct_success = false;
+    let mut buf = vec![0u8; len];
 
-    if let Ok(mut file) = File::open(&path).await {
-        if file.seek(SeekFrom::Start(offset)).await.is_ok() {
-            let mut buf = vec![0u8; len];
-            if file.read_exact(&mut buf).await.is_ok() {
-                return Ok(buf);
+    {
+        if !file_cache.contains_key(&target_shard.file_name) {
+             let path = version_dir.join(&target_shard.file_name);
+             if let Ok(f) = File::open(&path).await {
+                 file_cache.insert(target_shard.file_name.clone(), f);
+             }
+        }
+
+        if let Some(file) = file_cache.get_mut(&target_shard.file_name) {
+            if let Ok(metadata) = file.metadata().await {
+                if metadata.len() >= (offset + len as u64) {
+                    if file.seek(SeekFrom::Start(offset)).await.is_ok() {
+                        if file.read_exact(&mut buf).await.is_ok() {
+                            direct_success = true;
+                        }
+                    }
+                }
             }
         }
+    }
+
+    if direct_success {
+        return Ok(buf);
     }
 
     let parity_count = part.shards.len() - data_shards_count;
@@ -179,8 +198,14 @@ async fn read_stripe_chunk_internal(
         if shards_found >= data_shards_count { break; }
         if s_info.shard_index == target_shard.shard_index { continue; }
 
-        let s_path = version_dir.join(&s_info.file_name);
-        if let Ok(mut f) = File::open(&s_path).await {
+        if !file_cache.contains_key(&s_info.file_name) {
+             let s_path = version_dir.join(&s_info.file_name);
+             if let Ok(f) = File::open(&s_path).await {
+                 file_cache.insert(s_info.file_name.clone(), f);
+             }
+        }
+
+        if let Some(f) = file_cache.get_mut(&s_info.file_name) {
             if let Ok(metadata) = f.metadata().await {
                 if metadata.len() < (offset + len as u64) {
                     continue; 
@@ -188,12 +213,12 @@ async fn read_stripe_chunk_internal(
             }
 
             if f.seek(SeekFrom::Start(offset)).await.is_ok() {
-                let mut buf = vec![0u8; len];
-                if f.read_exact(&mut buf).await.is_ok() {
+                let mut chunk = vec![0u8; len];
+                if f.read_exact(&mut chunk).await.is_ok() {
                     let res = if s_info.is_parity {
-                        decoder.add_recovery_shard(s_info.shard_index - data_shards_count, buf)
+                        decoder.add_recovery_shard(s_info.shard_index - data_shards_count, chunk)
                     } else {
-                        decoder.add_original_shard(s_info.shard_index, buf)
+                        decoder.add_original_shard(s_info.shard_index, chunk)
                     };
                     
                     if res.is_ok() {

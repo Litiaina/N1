@@ -1,5 +1,5 @@
 use crc32fast::Hasher;
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::AsyncWriteExt;
 use tokio::fs::File;
 use reed_solomon_simd::ReedSolomonEncoder;
 use futures_util::future::join_all;
@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use crate::enums::app_error_enum::AppError;
 
-pub const STRIPE_BLOCK_SIZE: usize = 16 * 1024; 
+pub const STRIPE_BLOCK_SIZE: usize = 1024 * 1024;
 
 pub struct ErasureStreamWriter {
-    writers: Vec<BufWriter<File>>,
+    writers: Vec<File>,
     data_shards: usize,
     parity_shards: usize,
     shard_len_limit: usize,
@@ -24,7 +24,7 @@ pub struct ErasureStreamWriter {
 
 impl ErasureStreamWriter {
     pub fn new(
-        writers: Vec<BufWriter<File>>,
+        writers: Vec<File>,
         data_shards: usize,
         parity_shards: usize,
         shard_len_limit: usize,
@@ -110,7 +110,7 @@ impl ErasureStreamWriter {
             
             let results: Vec<std::io::Result<()>> = join_all(futures).await;
             self.writers = writers;
-            
+
             for res in results {
                  res.map_err(|e| AppError::Io(e, "pad shard".into()))?;
             }
@@ -118,12 +118,12 @@ impl ErasureStreamWriter {
 
         let mut flush_futures = Vec::new();
         for w in self.writers.iter_mut() {
-            flush_futures.push(w.flush());
+            flush_futures.push(w.sync_all());
         }
         
         let results: Vec<std::io::Result<()>> = join_all(flush_futures).await;
         for res in results {
-            res.map_err(|e| AppError::Io(e, "flush shard".into()))?;
+            res.map_err(|e| AppError::Io(e, "sync shard".into()))?;
         }
 
         Ok(())

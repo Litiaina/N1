@@ -1,5 +1,4 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::CHUNK_SIZE;
 use crate::object_storage::ec::STRIPE_BLOCK_SIZE;
 use crate::object_storage::header_parser::parse_range_header;
 use crate::structs::object_storage_structs::{
@@ -17,7 +16,9 @@ use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tracing::{info, warn, error};
+use tracing::{info, error};
+
+pub const STREAM_BATCH_SIZE: usize = STRIPE_BLOCK_SIZE;
 
 pub async fn get_object_logic(
     metadata: ObjectMetadata,
@@ -64,12 +65,11 @@ pub async fn stream_object_logic(
     }
 
     let content_length = end - start + 1;
-    let clean_stored_key = object_key.trim_start_matches('/');
 
     let path_manager = ObjectPathManager::new();
     let version_dir = path_manager.get_blob_dir(&owner_uid, &fragment, &version_id);
 
-    let filename = std::path::Path::new(clean_stored_key)
+    let filename = std::path::Path::new(&object_key)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("download")
@@ -116,86 +116,100 @@ pub async fn stream_object_logic(
     };
 
     let stream = stream::unfold(initial_state, move |mut state| async move {
-        if state.pos > state.end {
-            return None;
-        }
+        let mut batch_buffer = Vec::with_capacity(STREAM_BATCH_SIZE);
 
-        if state.current_part_idx >= state.parts.len() {
-            return None;
-        }
-
-        let mut part = &state.parts[state.current_part_idx];
-        let part_end_global = state.current_part_offset + part.size_bytes;
-
-        if state.pos >= part_end_global {
-            state.current_part_idx += 1;
-            if state.current_part_idx >= state.parts.len() {
-                return None;
+        loop {
+            if state.pos > state.end {
+                break;
             }
-            state.current_part_offset = part_end_global;
-            state.file_cache.clear();
-            part = &state.parts[state.current_part_idx];
-        }
 
-        let data_shards_info: Vec<&ShardInfo> = part
-            .shards
-            .iter()
-            .filter(|s| !s.is_parity)
-            .collect();
+            if batch_buffer.len() >= STREAM_BATCH_SIZE {
+                break;
+            }
+
+            if state.current_part_idx >= state.parts.len() {
+                break;
+            }
+
+            let mut part = &state.parts[state.current_part_idx];
+            let part_end_global = state.current_part_offset + part.size_bytes;
+
+            if state.pos >= part_end_global {
+                state.current_part_idx += 1;
+                if state.current_part_idx >= state.parts.len() {
+                    break;
+                }
+                state.current_part_offset = part_end_global;
+                state.file_cache.clear();
+                part = &state.parts[state.current_part_idx];
+            }
+
+            let data_shards_info: Vec<&ShardInfo> = part
+                .shards
+                .iter()
+                .filter(|s| !s.is_parity)
+                .collect();
+                
+            let data_shards_count = data_shards_info.len() as u64;
+            if data_shards_count == 0 {
+                return Some((Err(AppError::InternalServerError("No data shards".into())), state));
+            }
+
+            let relative_pos = state.pos - state.current_part_offset;
             
-        let data_shards_count = data_shards_info.len() as u64;
-        if data_shards_count == 0 {
-            return Some((Err(AppError::InternalServerError("No data shards".into())), state));
+            let stripe_block_size = STRIPE_BLOCK_SIZE as u64;
+            let stripe_size = stripe_block_size * data_shards_count;
+            
+            let stripe_index = relative_pos / stripe_size;
+            let offset_in_stripe = relative_pos % stripe_size;
+            
+            let shard_index = (offset_in_stripe / stripe_block_size) as usize;
+            let offset_in_shard_block = offset_in_stripe % stripe_block_size;
+            let file_offset = (stripe_index * stripe_block_size) + offset_in_shard_block;
+
+            let target_shard_info = data_shards_info.get(shard_index);
+
+            if target_shard_info.is_none() {
+                 return Some((Err(AppError::InternalServerError("Shard index out of bounds".into())), state));
+            }
+
+            let bytes_remaining_in_block = stripe_block_size - offset_in_shard_block;
+            let bytes_remaining_in_req = state.end - state.pos + 1;
+            let bytes_remaining_in_part = part.size_bytes - relative_pos;
+            let bytes_remaining_in_buffer = (STREAM_BATCH_SIZE - batch_buffer.len()) as u64;
+
+            let to_read = bytes_remaining_in_block
+                .min(bytes_remaining_in_req)
+                .min(bytes_remaining_in_part)
+                .min(bytes_remaining_in_buffer) as usize;
+
+            if to_read == 0 {
+                 break;
+            }
+
+            let data_result = read_or_recover_chunk(
+                &mut state.file_cache,
+                &state.version_dir,
+                part,
+                shard_index,
+                file_offset,
+                to_read
+            ).await;
+
+            match data_result {
+                Ok(bytes) => {
+                    batch_buffer.extend_from_slice(&bytes);
+                    state.pos += to_read as u64;
+                },
+                Err(e) => return Some((Err(e), state))
+            }
         }
 
-        let relative_pos = state.pos - state.current_part_offset;
-        
-        let stripe_block_size = STRIPE_BLOCK_SIZE as u64;
-        let stripe_size = stripe_block_size * data_shards_count;
-        
-        let stripe_index = relative_pos / stripe_size;
-        let offset_in_stripe = relative_pos % stripe_size;
-        
-        let shard_index = (offset_in_stripe / stripe_block_size) as usize;
-        let offset_in_shard_block = offset_in_stripe % stripe_block_size;
-        let file_offset = (stripe_index * stripe_block_size) + offset_in_shard_block;
-
-        let target_shard_info = data_shards_info.get(shard_index);
-
-        if target_shard_info.is_none() {
-             return Some((Err(AppError::InternalServerError("Shard index out of bounds".into())), state));
+        if batch_buffer.is_empty() {
+            return None;
         }
 
-        let bytes_remaining_in_block = stripe_block_size - offset_in_shard_block;
-        let bytes_remaining_in_req = state.end - state.pos + 1;
-        let bytes_remaining_in_part = part.size_bytes - relative_pos;
-
-        let to_read = (CHUNK_SIZE as u64)
-            .min(bytes_remaining_in_block)
-            .min(bytes_remaining_in_req)
-            .min(bytes_remaining_in_part) as usize;
-
-        if to_read == 0 {
-             return None;
-        }
-
-        let data_result = read_or_recover_chunk(
-            &mut state.file_cache,
-            &state.version_dir,
-            part,
-            shard_index,
-            file_offset,
-            to_read
-        ).await;
-
-        match data_result {
-            Ok(bytes) => {
-                let chunk = Bytes::from(bytes);
-                state.pos += to_read as u64;
-                Some((Ok(chunk), state))
-            },
-            Err(e) => Some((Err(e), state))
-        }
+        Some((Ok(Bytes::from(batch_buffer)), state))
     });
 
     let body = Body::from_stream(stream);
@@ -240,37 +254,36 @@ async fn read_or_recover_chunk(
     offset: u64,
     len: usize
 ) -> Result<Vec<u8>, AppError> {
-    async fn get_handle(
-        cache: &mut HashMap<String, File>, 
-        dir: &Path, 
-        name: &str
-    ) -> Result<File, AppError> {
-        if let Some(f) = cache.get(name) {
-            return f.try_clone().await.map_err(|e| AppError::Io(e, "clone handle".into()));
+    
+    let mut direct_success = false;
+    let mut buf = vec![0u8; len];
+
+    {
+        let target_shard = &part.shards[shard_idx];
+        
+        if !file_cache.contains_key(&target_shard.file_name) {
+             let path = version_dir.join(&target_shard.file_name);
+             if let Ok(f) = File::open(&path).await {
+                 file_cache.insert(target_shard.file_name.clone(), f);
+             }
         }
-        let path = dir.join(name);
-        let f = File::open(&path).await.map_err(|e| AppError::Io(e, "open shard".into()))?;
-        cache.insert(name.to_string(), f.try_clone().await.map_err(|e| AppError::Io(e, "clone handle".into()))?);
-        Ok(f)
+
+        if let Some(file) = file_cache.get_mut(&target_shard.file_name) {
+            // Optimistic read
+            if file.seek(SeekFrom::Start(offset)).await.is_ok() {
+                if file.read_exact(&mut buf).await.is_ok() {
+                    direct_success = true;
+                }
+            }
+        }
+    }
+
+    if direct_success {
+        return Ok(buf);
     }
 
     let data_shards: Vec<&ShardInfo> = part.shards.iter().filter(|s| !s.is_parity).collect();
     let target_shard = data_shards.get(shard_idx).ok_or(AppError::InternalServerError("Bad shard idx".into()))?;
-
-    match get_handle(file_cache, version_dir, &target_shard.file_name).await {
-        Ok(mut file) => {
-            if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
-                warn!("Seek failed for {}: {}", target_shard.file_name, e);
-            } else {
-                let mut buf = vec![0u8; len];
-                match file.read_exact(&mut buf).await {
-                    Ok(_) => return Ok(buf),
-                    Err(e) => warn!("Read failed for {}: {}", target_shard.file_name, e),
-                }
-            }
-        }
-        Err(e) => warn!("Open failed for {}: {}", target_shard.file_name, e),
-    }
 
     info!("Attempting reconstruction for shard {} at offset {}", shard_idx, offset);
     
@@ -286,21 +299,27 @@ async fn read_or_recover_chunk(
         if shards_found >= data_count { break; }
         if s_info.shard_index == target_shard.shard_index { continue; }
 
-        let path = version_dir.join(&s_info.file_name);
-        if let Ok(mut f) = File::open(&path).await {
+        if !file_cache.contains_key(&s_info.file_name) {
+             let s_path = version_dir.join(&s_info.file_name);
+             if let Ok(f) = File::open(&s_path).await {
+                 file_cache.insert(s_info.file_name.clone(), f);
+             }
+        }
+
+        if let Some(f) = file_cache.get_mut(&s_info.file_name) {
             if let Ok(metadata) = f.metadata().await {
                 if metadata.len() < (offset + len as u64) {
-                    continue;
+                    continue; 
                 }
             }
 
             if f.seek(SeekFrom::Start(offset)).await.is_ok() {
-                let mut buf = vec![0u8; len];
-                if f.read_exact(&mut buf).await.is_ok() {
+                let mut chunk = vec![0u8; len];
+                if f.read_exact(&mut chunk).await.is_ok() {
                     let res = if s_info.is_parity {
-                         decoder.add_recovery_shard(s_info.shard_index - data_count, buf)
+                        decoder.add_recovery_shard(s_info.shard_index - data_count, chunk)
                     } else {
-                         decoder.add_original_shard(s_info.shard_index, buf)
+                        decoder.add_original_shard(s_info.shard_index, chunk)
                     };
                     
                     if res.is_ok() {
@@ -315,9 +334,10 @@ async fn read_or_recover_chunk(
         return Err(AppError::InternalServerError("Data lost: Insufficient shards for recovery".into()));
     }
 
-    let result = decoder.decode().map_err(|e| AppError::InternalServerError(format!("Decode: {}", e)))?;
+    let result = decoder.decode().map_err(|e| AppError::InternalServerError(format!("RS Decode: {}", e)))?;
     
     if let Some(restored) = result.restored_original_iter().find(|(id, _)| *id == target_shard.shard_index) {
+        
         let shard_path = version_dir.join(&target_shard.file_name);
         if !shard_path.exists() {
              let v_dir = version_dir.to_path_buf();
@@ -326,7 +346,6 @@ async fn read_or_recover_chunk(
              let t_name = target_shard.file_name.clone();
              
              tokio::spawn(async move {
-                 info!("Starting background repair for {}", t_name);
                  if let Err(e) = repair_entire_shard(&v_dir, &p_meta, t_idx).await {
                      error!("Background repair failed for {}: {}", t_name, e);
                  } else {
