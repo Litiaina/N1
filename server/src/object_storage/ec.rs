@@ -1,6 +1,6 @@
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 
-use crate::{enums::app_error_enum::AppError, object_storage::constants::SHARD_SUFFIX};
+use crate::{enums::app_error_enum::AppError, object_storage::{constants::SHARD_SUFFIX, upload::WRITER_BUFFER_SIZE_ATOMIC}};
 use reed_solomon_simd::ReedSolomonEncoder;
 use tokio::{fs::File, io::{AsyncReadExt, AsyncWriteExt, BufWriter}, sync::{Semaphore, mpsc}};
 
@@ -30,6 +30,11 @@ pub fn init_ec_workers() -> mpsc::Sender<EcJob> {
 }
 
 pub async fn run_ec_job_async(job: EcJob) -> Result<(), AppError> {
+    let max_buffer_size = WRITER_BUFFER_SIZE_ATOMIC
+        .get()
+        .expect("Config not initialized!")
+        .load(Ordering::Relaxed);
+
     let EcJob {
         blob_dir,
         part_index,
@@ -58,7 +63,7 @@ pub async fn run_ec_job_async(job: EcJob) -> Result<(), AppError> {
         let f = File::create(path)
             .await
             .map_err(|e| AppError::Io(e, "create parity shard".into()))?;
-        parity_files.push(BufWriter::new(f));
+        parity_files.push(BufWriter::with_capacity(max_buffer_size, f));
     }
 
     const STRIPE_SIZE: usize = 1024 * 1024;

@@ -2,7 +2,7 @@ use crate::fs::cleanup_manager::interval_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
 use crate::object_storage::sync::sync_quota;
-use crate::object_storage::upload::{DATA_SHARDS_ATOMIC, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC};
+use crate::object_storage::upload::{DATA_SHARDS_ATOMIC, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC};
 use crate::routes::storage_routes::serve_storage_routes;
 use crate::structs::object_storage_structs::{FS_STORAGE_ROOT, OBJECT_STORAGE_ROOT};
 use crate::utils::date_time_formatter::LocalTimer;
@@ -226,6 +226,21 @@ pub async fn run_server() {
     PARITY_SHARDS_ATOMIC
         .set(parity_shards)
         .expect("Double initialization of PARITY_SHARDS!");
+
+    let writer_buffer_size = config
+        .section(Some("upload_config"))
+        .and_then(|s| s.get("writer_buffer_size"))
+        .unwrap_or("262144");
+
+    let writer_buffer_size: AtomicUsize = AtomicUsize::new(
+        writer_buffer_size
+            .parse::<usize>()
+            .expect("max_part_size does not fit into u64")
+    );
+    
+    WRITER_BUFFER_SIZE_ATOMIC
+        .set(writer_buffer_size)
+        .expect("Double initialization of MAX_PART_SIZE!");
 
     let cert = RustlsConfig::from_pem_file(&cert_path, &key_path)
         .await

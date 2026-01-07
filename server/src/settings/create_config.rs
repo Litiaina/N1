@@ -57,6 +57,7 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
 
     //Upload erasure coding config
     conf.with_section(Some("upload_config"))
+        .set("writer_buffer_size", "262144")
         // Max part size of an object
         .set("max_part_size", "52428800")
         // Total data shards during erasure coding

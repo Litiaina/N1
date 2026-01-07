@@ -42,6 +42,7 @@ use walkdir::WalkDir;
 pub static MAX_PART_SIZE_ATOMIC: OnceCell<AtomicU64> = OnceCell::new();
 pub static DATA_SHARDS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static PARITY_SHARDS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
+pub static WRITER_BUFFER_SIZE_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 
 static IO_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(16_384));
 static EC_QUEUE: Lazy<mpsc::Sender<EcJob>> = Lazy::new(init_ec_workers);
@@ -200,6 +201,10 @@ pub async fn object_upload_part(
         .get()
         .expect("Config not initialized!")
         .load(Ordering::Relaxed);
+    let max_buffer_size = WRITER_BUFFER_SIZE_ATOMIC
+        .get()
+        .expect("Config not initialized!")
+        .load(Ordering::Relaxed);
 
     let content_length = headers
         .get("content-length")
@@ -224,7 +229,7 @@ pub async fn object_upload_part(
     let shard_len = shard_len as usize;
 
     let mut writers = Vec::with_capacity(data_shards);
-
+    
     let checksum_enabled = query.enable_checksum.unwrap_or(false);
 
     let mut shard_hashers = if checksum_enabled {
@@ -244,7 +249,7 @@ pub async fn object_upload_part(
         let file = fs::File::create(path)
             .await
             .map_err(|e| AppError::Io(e, "create shard".into()))?;
-        writers.push(BufWriter::new(file));
+        writers.push(BufWriter::with_capacity(max_buffer_size, file));
     }
 
     let mut shard_writer = AsyncShardWriter {
