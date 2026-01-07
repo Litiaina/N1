@@ -16,5 +16,4 @@ pub mod caching;
 pub mod quota_manager;
 pub mod maintenance;
 pub mod archive;
-pub mod shard_parser;
 pub mod ec;

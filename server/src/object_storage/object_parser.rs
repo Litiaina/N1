@@ -1,19 +1,23 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::CHUNK_SIZE;
+use crate::object_storage::ec::STRIPE_BLOCK_SIZE;
 use crate::object_storage::header_parser::parse_range_header;
-use crate::structs::object_storage_structs::{ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo};
+use crate::structs::object_storage_structs::{
+    ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo,
+};
 use axum::body::Body;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use chrono::{TimeZone, Utc};
 use futures_util::stream;
-use reed_solomon_simd::ReedSolomonDecoder;
-use std::io::{Cursor, SeekFrom};
+use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
+use std::collections::HashMap;
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use tokio::fs::{self, File};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tracing::{info, warn};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tracing::{info, warn, error};
 
 pub async fn get_object_logic(
     metadata: ObjectMetadata,
@@ -29,7 +33,6 @@ pub async fn stream_object_logic(
     disposition_type: &str,
 ) -> Result<impl IntoResponse, AppError> {
     let file_size = metadata.total_size_bytes;
-
     let ObjectMetadata {
         content_type,
         parts,
@@ -64,7 +67,6 @@ pub async fn stream_object_logic(
     let clean_stored_key = object_key.trim_start_matches('/');
 
     let path_manager = ObjectPathManager::new();
-    
     let version_dir = path_manager.get_blob_dir(&owner_uid, &fragment, &version_id);
 
     let filename = std::path::Path::new(clean_stored_key)
@@ -78,25 +80,20 @@ pub async fn stream_object_logic(
         end: u64,
         parts: Vec<PartMetadata>,
         version_dir: PathBuf,
-        
-        current_file: Option<File>,
-        current_shard_data: Option<Cursor<Vec<u8>>>, 
-        
-        current_part_index: usize,
-        current_part_start_offset: u64,
-        current_shard_index: usize,
-        current_shard_bytes_read: u64,
+        file_cache: HashMap<String, File>,
+        current_part_idx: usize,
+        current_part_offset: u64,
     }
 
     let mut current_offset = 0;
     let mut start_part_index = 0;
-    let mut start_part_start_offset = 0;
+    let mut start_part_offset = 0;
 
     for (idx, part) in parts.iter().enumerate() {
         let part_end = current_offset + part.size_bytes;
         if start >= current_offset && start < part_end {
             start_part_index = idx;
-            start_part_start_offset = current_offset;
+            start_part_offset = current_offset;
             break;
         }
         current_offset = part_end;
@@ -108,25 +105,14 @@ pub async fn stream_object_logic(
         None
     };
 
-    let start_relative_in_part = start - start_part_start_offset;
-    
-    let first_part_shards: Vec<&ShardInfo> = parts[start_part_index].shards.iter().filter(|s| !s.is_parity).collect();
-    let shard_size = if !first_part_shards.is_empty() { first_part_shards[0].size_bytes } else { 0 };
-
-    let start_shard_index = if shard_size > 0 { (start_relative_in_part / shard_size) as usize } else { 0 };
-    let start_offset_in_shard = if shard_size > 0 { start_relative_in_part % shard_size } else { 0 };
-
     let initial_state = StreamState {
         pos: start,
         end,
         parts,
         version_dir,
-        current_file: None,
-        current_shard_data: None,
-        current_part_index: start_part_index,
-        current_part_start_offset: start_part_start_offset,
-        current_shard_index: start_shard_index,
-        current_shard_bytes_read: start_offset_in_shard, 
+        file_cache: HashMap::new(),
+        current_part_idx: start_part_index,
+        current_part_offset: start_part_offset,
     };
 
     let stream = stream::unfold(initial_state, move |mut state| async move {
@@ -134,110 +120,81 @@ pub async fn stream_object_logic(
             return None;
         }
 
-        if state.current_part_index >= state.parts.len() {
+        if state.current_part_idx >= state.parts.len() {
+            return None;
+        }
+
+        let mut part = &state.parts[state.current_part_idx];
+        let part_end_global = state.current_part_offset + part.size_bytes;
+
+        if state.pos >= part_end_global {
+            state.current_part_idx += 1;
+            if state.current_part_idx >= state.parts.len() {
+                return None;
+            }
+            state.current_part_offset = part_end_global;
+            state.file_cache.clear();
+            part = &state.parts[state.current_part_idx];
+        }
+
+        let data_shards_info: Vec<&ShardInfo> = part
+            .shards
+            .iter()
+            .filter(|s| !s.is_parity)
+            .collect();
+            
+        let data_shards_count = data_shards_info.len() as u64;
+        if data_shards_count == 0 {
+            return Some((Err(AppError::InternalServerError("No data shards".into())), state));
+        }
+
+        let relative_pos = state.pos - state.current_part_offset;
+        
+        let stripe_block_size = STRIPE_BLOCK_SIZE as u64;
+        let stripe_size = stripe_block_size * data_shards_count;
+        
+        let stripe_index = relative_pos / stripe_size;
+        let offset_in_stripe = relative_pos % stripe_size;
+        
+        let shard_index = (offset_in_stripe / stripe_block_size) as usize;
+        let offset_in_shard_block = offset_in_stripe % stripe_block_size;
+        let file_offset = (stripe_index * stripe_block_size) + offset_in_shard_block;
+
+        let target_shard_info = data_shards_info.get(shard_index);
+
+        if target_shard_info.is_none() {
+             return Some((Err(AppError::InternalServerError("Shard index out of bounds".into())), state));
+        }
+
+        let bytes_remaining_in_block = stripe_block_size - offset_in_shard_block;
+        let bytes_remaining_in_req = state.end - state.pos + 1;
+        let bytes_remaining_in_part = part.size_bytes - relative_pos;
+
+        let to_read = (CHUNK_SIZE as u64)
+            .min(bytes_remaining_in_block)
+            .min(bytes_remaining_in_req)
+            .min(bytes_remaining_in_part) as usize;
+
+        if to_read == 0 {
              return None;
         }
 
-        let mut part = &state.parts[state.current_part_index];
-        let part_end_global = state.current_part_start_offset + part.size_bytes;
+        let data_result = read_or_recover_chunk(
+            &mut state.file_cache,
+            &state.version_dir,
+            part,
+            shard_index,
+            file_offset,
+            to_read
+        ).await;
 
-        if state.pos >= part_end_global {
-            state.current_part_index += 1;
-            if state.current_part_index >= state.parts.len() {
-                return None;
-            }
-            state.current_part_start_offset = part_end_global;
-            state.current_file = None;
-            state.current_shard_data = None;
-            state.current_shard_index = 0;
-            state.current_shard_bytes_read = 0;
-            part = &state.parts[state.current_part_index];
-        }
-
-        let mut data_shards: Vec<&ShardInfo> = part.shards.iter().filter(|s| !s.is_parity).collect();
-        data_shards.sort_by_key(|s| s.shard_index);
-        
-        if data_shards.is_empty() {
-             return Some((Err(AppError::InternalServerError("Missing shards".into())), state));
-        }
-        
-        let current_shard_info = if state.current_shard_index < data_shards.len() {
-            data_shards[state.current_shard_index]
-        } else {
-             state.pos = part_end_global; 
-             return Some((Ok(Bytes::new()), state));
-        };
-
-        if state.current_shard_bytes_read >= current_shard_info.size_bytes {
-            state.current_shard_index += 1;
-            state.current_shard_bytes_read = 0;
-            state.current_file = None;
-            state.current_shard_data = None;
-            return Some((Ok(Bytes::new()), state));
-        }
-
-        if state.current_file.is_none() && state.current_shard_data.is_none() {
-            let part_path = state.version_dir.join(&current_shard_info.file_name);
-            
-            match File::open(&part_path).await {
-                Ok(mut f) => {
-                    if state.current_shard_bytes_read > 0 {
-                        if let Err(e) = f.seek(SeekFrom::Start(state.current_shard_bytes_read)).await {
-                            return Some((Err(AppError::Io(e, "seek shard".into())), state));
-                        }
-                    }
-                    state.current_file = Some(f);
-                }
-                Err(_) => {
-                    match reconstruct_shard(part, state.current_shard_index, &state.version_dir).await {
-                        Ok(data) => {
-                            let mut cursor = Cursor::new(data);
-                             if state.current_shard_bytes_read > 0 {
-                                if let Err(e) = cursor.seek(SeekFrom::Start(state.current_shard_bytes_read)).await {
-                                    return Some((Err(AppError::Io(e, "seek reconstructed shard".into())), state));
-                                }
-                            }
-                            state.current_shard_data = Some(cursor);
-                        }
-                        Err(e) => {
-                            return Some((Err(e), state));
-                        }
-                    }
-                }
-            }
-        }
-
-        let bytes_left_in_shard = current_shard_info.size_bytes - state.current_shard_bytes_read;
-        let bytes_left_in_part_global = part_end_global - state.pos;
-        let bytes_left_in_req = state.end - state.pos + 1;
-        
-        let to_read = (CHUNK_SIZE as u64)
-            .min(bytes_left_in_shard)
-            .min(bytes_left_in_part_global)
-            .min(bytes_left_in_req) as usize;
-
-        if to_read == 0 {
-             return Some((Ok(Bytes::new()), state));
-        }
-
-        let mut buf = vec![0u8; to_read];
-
-        let read_result = if let Some(file) = state.current_file.as_mut() {
-            file.read_exact(&mut buf).await.map_err(|e| AppError::Io(e, "read shard file".into()))
-        } else if let Some(cursor) = state.current_shard_data.as_mut() {
-            cursor.read_exact(&mut buf).await.map_err(|e| AppError::Io(e, "read reconstructed shard".into()))
-        } else {
-            Err(AppError::InternalServerError("No reader available".into()))
-        };
-
-        match read_result {
-            Ok(_) => {
-                let bytes = Bytes::from(buf);
+        match data_result {
+            Ok(bytes) => {
+                let chunk = Bytes::from(bytes);
                 state.pos += to_read as u64;
-                state.current_shard_bytes_read += to_read as u64;
-                Some((Ok(bytes), state))
-            }
-            Err(e) => Some((Err(e), state)),
+                Some((Ok(chunk), state))
+            },
+            Err(e) => Some((Err(e), state))
         }
     });
 
@@ -253,7 +210,7 @@ pub async fn stream_object_logic(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::ETAG, etag) 
+        .header(header::ETAG, etag)
         .header(header::LAST_MODIFIED, last_modified)
         .header(header::CONTENT_DISPOSITION, format!("{}; filename=\"{}\"", disposition_type, filename))
         .header(header::CACHE_CONTROL, "public, max-age=3600");
@@ -275,81 +232,251 @@ pub async fn stream_object_logic(
     Ok(builder.body(body).unwrap())
 }
 
-pub async fn reconstruct_shard(
-    part: &PartMetadata,
-    target_shard_idx: usize,
+async fn read_or_recover_chunk(
+    file_cache: &mut HashMap<String, File>,
     version_dir: &Path,
+    part: &PartMetadata,
+    shard_idx: usize,
+    offset: u64,
+    len: usize
 ) -> Result<Vec<u8>, AppError> {
-    let data_shards_count = part.shards.iter().filter(|s| !s.is_parity).count();
-    let parity_shards_count = part.shards.iter().filter(|s| s.is_parity).count();
-    
-    if data_shards_count == 0 {
-         return Err(AppError::InternalServerError("Invalid metadata: no data shards".into()));
-    }
-
-    let raw_shard_len = part.shards.first().map(|s| s.size_bytes as usize).unwrap_or(0);
-    if raw_shard_len == 0 {
-        return Err(AppError::InternalServerError("Invalid shard length".into()));
-    }
-
-    let decoder_shard_len = if raw_shard_len % 2 == 0 { raw_shard_len } else { raw_shard_len + 1 };
-
-    let mut decoder = ReedSolomonDecoder::new(data_shards_count, parity_shards_count, decoder_shard_len)
-        .map_err(|e| AppError::InternalServerError(format!("RS Init: {}", e)))?;
-
-    let mut shards_present = 0;
-    
-    for shard_info in &part.shards {
-        if shards_present >= data_shards_count {
-             break;
+    async fn get_handle(
+        cache: &mut HashMap<String, File>, 
+        dir: &Path, 
+        name: &str
+    ) -> Result<File, AppError> {
+        if let Some(f) = cache.get(name) {
+            return f.try_clone().await.map_err(|e| AppError::Io(e, "clone handle".into()));
         }
-
-        let path = version_dir.join(&shard_info.file_name);
-        if let Ok(mut data) = fs::read(&path).await {
-             if data.len() < decoder_shard_len {
-                 data.resize(decoder_shard_len, 0);
-             }
-
-             if shard_info.is_parity {
-                 let recovery_idx = shard_info.shard_index - data_shards_count;
-                 decoder.add_recovery_shard(recovery_idx, data)
-                    .map_err(|e| AppError::InternalServerError(format!("Add recovery: {}", e)))?;
-             } else {
-                 decoder.add_original_shard(shard_info.shard_index, data)
-                    .map_err(|e| AppError::InternalServerError(format!("Add original: {}", e)))?;
-             }
-             shards_present += 1;
-        }
-    }
-    
-    if shards_present < data_shards_count {
-        return Err(AppError::InternalServerError("Not enough shards to reconstruct data".into()));
+        let path = dir.join(name);
+        let f = File::open(&path).await.map_err(|e| AppError::Io(e, "open shard".into()))?;
+        cache.insert(name.to_string(), f.try_clone().await.map_err(|e| AppError::Io(e, "clone handle".into()))?);
+        Ok(f)
     }
 
-    let result = decoder.decode()
-        .map_err(|e| AppError::InternalServerError(format!("Reconstruct failed: {}", e)))?;
+    let data_shards: Vec<&ShardInfo> = part.shards.iter().filter(|s| !s.is_parity).collect();
+    let target_shard = data_shards.get(shard_idx).ok_or(AppError::InternalServerError("Bad shard idx".into()))?;
 
-    for (id, data) in result.restored_original_iter() {
-        if let Some(info) = part.shards.iter().find(|s| s.shard_index == id && !s.is_parity) {
-            let path = version_dir.join(&info.file_name);
-            let mut final_data = data.to_vec();
-            final_data.truncate(raw_shard_len);
-            
-            if let Err(e) = tokio::fs::write(&path, final_data).await {
-                warn!("Failed to write-back restored shard {}: {}", info.file_name, e);
+    match get_handle(file_cache, version_dir, &target_shard.file_name).await {
+        Ok(mut file) => {
+            if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
+                warn!("Seek failed for {}: {}", target_shard.file_name, e);
             } else {
-                info!("Self-healed shard {}", info.file_name);
+                let mut buf = vec![0u8; len];
+                match file.read_exact(&mut buf).await {
+                    Ok(_) => return Ok(buf),
+                    Err(e) => warn!("Read failed for {}: {}", target_shard.file_name, e),
+                }
+            }
+        }
+        Err(e) => warn!("Open failed for {}: {}", target_shard.file_name, e),
+    }
+
+    info!("Attempting reconstruction for shard {} at offset {}", shard_idx, offset);
+    
+    let data_count = data_shards.len();
+    let parity_count = part.shards.len() - data_count;
+    
+    let mut decoder = ReedSolomonDecoder::new(data_count, parity_count, len)
+        .map_err(|e| AppError::InternalServerError(format!("RS Decoder: {}", e)))?;
+
+    let mut shards_found = 0;
+    
+    for s_info in &part.shards {
+        if shards_found >= data_count { break; }
+        if s_info.shard_index == target_shard.shard_index { continue; }
+
+        let path = version_dir.join(&s_info.file_name);
+        if let Ok(mut f) = File::open(&path).await {
+            if let Ok(metadata) = f.metadata().await {
+                if metadata.len() < (offset + len as u64) {
+                    continue;
+                }
+            }
+
+            if f.seek(SeekFrom::Start(offset)).await.is_ok() {
+                let mut buf = vec![0u8; len];
+                if f.read_exact(&mut buf).await.is_ok() {
+                    let res = if s_info.is_parity {
+                         decoder.add_recovery_shard(s_info.shard_index - data_count, buf)
+                    } else {
+                         decoder.add_original_shard(s_info.shard_index, buf)
+                    };
+                    
+                    if res.is_ok() {
+                        shards_found += 1;
+                    }
+                }
             }
         }
     }
 
-    for (id, data) in result.restored_original_iter() {
-        if id == target_shard_idx {
-            let mut final_data = data.to_vec();
-            final_data.truncate(raw_shard_len);
-            return Ok(final_data);
+    if shards_found < data_count {
+        return Err(AppError::InternalServerError("Data lost: Insufficient shards for recovery".into()));
+    }
+
+    let result = decoder.decode().map_err(|e| AppError::InternalServerError(format!("Decode: {}", e)))?;
+    
+    if let Some(restored) = result.restored_original_iter().find(|(id, _)| *id == target_shard.shard_index) {
+        let shard_path = version_dir.join(&target_shard.file_name);
+        if !shard_path.exists() {
+             let v_dir = version_dir.to_path_buf();
+             let p_meta = part.clone();
+             let t_idx = target_shard.shard_index;
+             let t_name = target_shard.file_name.clone();
+             
+             tokio::spawn(async move {
+                 info!("Starting background repair for {}", t_name);
+                 if let Err(e) = repair_entire_shard(&v_dir, &p_meta, t_idx).await {
+                     error!("Background repair failed for {}: {}", t_name, e);
+                 } else {
+                     info!("Successfully self-healed {}", t_name);
+                 }
+             });
+        }
+
+        return Ok(restored.1.to_vec());
+    }
+
+    Err(AppError::InternalServerError("Reconstruction failed to produce target".into()))
+}
+
+async fn repair_entire_shard(
+    version_dir: &Path, 
+    part: &PartMetadata, 
+    target_shard_idx: usize
+) -> Result<(), AppError> {
+    let target_shard = part.shards.iter()
+        .find(|s| s.shard_index == target_shard_idx)
+        .ok_or(AppError::InternalServerError("Target shard not found".into()))?;
+
+    let temp_name = format!("{}.repair", target_shard.file_name);
+    let temp_path = version_dir.join(&temp_name);
+    let final_path = version_dir.join(&target_shard.file_name);
+
+    if temp_path.exists() || final_path.exists() {
+        return Ok(()); 
+    }
+
+    let mut temp_file = File::create(&temp_path).await
+        .map_err(|e| AppError::Io(e, "create repair file".into()))?;
+
+    let data_shards: Vec<&ShardInfo> = part.shards.iter().filter(|s| !s.is_parity).collect();
+    let data_count = data_shards.len();
+    let parity_count = part.shards.len() - data_count;
+    let block_size = STRIPE_BLOCK_SIZE;
+
+    let total_shard_size = part.shards.first().map(|s| s.size_bytes).unwrap_or(0);
+    
+    let mut peer_files: Vec<Option<File>> = Vec::new();
+
+    for s_info in &part.shards {
+        if s_info.shard_index == target_shard_idx { 
+            peer_files.push(None);
+            continue; 
+        }
+        
+        let s_path = version_dir.join(&s_info.file_name);
+        match File::open(&s_path).await {
+            Ok(f) => {
+                peer_files.push(Some(f));
+            },
+            Err(_) => peer_files.push(None),
         }
     }
 
-    Err(AppError::InternalServerError("Reconstruction target missing".into()))
+    let mut current_offset = 0u64;
+
+    while current_offset < total_shard_size {
+        let mut decoder = ReedSolomonDecoder::new(data_count, parity_count, block_size)
+            .map_err(|e| AppError::InternalServerError(format!("RS Init: {}", e)))?;
+        
+        let mut original_data_stripe: Vec<Option<Vec<u8>>> = vec![None; data_count];
+        let mut shards_found = 0;
+
+        for (idx, file_opt) in peer_files.iter_mut().enumerate() {
+            let s_info = &part.shards[idx]; 
+            
+            if let Some(f) = file_opt {
+                let mut buf = vec![0u8; block_size];
+                if f.read_exact(&mut buf).await.is_ok() {
+                    if !s_info.is_parity {
+                        if s_info.shard_index < data_count {
+                            original_data_stripe[s_info.shard_index] = Some(buf.clone());
+                        }
+                    }
+
+                    let res = if s_info.is_parity {
+                        decoder.add_recovery_shard(s_info.shard_index - data_count, buf)
+                    } else {
+                        decoder.add_original_shard(s_info.shard_index, buf)
+                    };
+                    if res.is_ok() { shards_found += 1; }
+                }
+            }
+        }
+
+        if shards_found < data_count {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(AppError::InternalServerError("Not enough shards for repair".into()));
+        }
+
+        let result = decoder.decode().map_err(|e| AppError::InternalServerError(format!("Decode: {}", e)))?;
+        
+        for (idx, data) in result.restored_original_iter() {
+            if idx < data_count {
+                original_data_stripe[idx] = Some(data.to_vec());
+            }
+        }
+
+        if target_shard_idx < data_count {
+            if let Some(data) = &original_data_stripe[target_shard_idx] {
+                temp_file.write_all(data).await
+                    .map_err(|e| AppError::Io(e, "write repair chunk".into()))?;
+            } else {
+                return Err(AppError::InternalServerError("Failed to resolve target data shard".into()));
+            }
+        } else {
+            if original_data_stripe.iter().any(|d| d.is_none()) {
+                 return Err(AppError::InternalServerError("Failed to recover all data for parity gen".into()));
+            }
+
+            let mut encoder = ReedSolomonEncoder::new(data_count, parity_count, block_size)
+                .map_err(|e| AppError::InternalServerError(format!("RS Enc Init: {}", e)))?;
+
+            for data in original_data_stripe.iter().flatten() {
+                encoder.add_original_shard(data)
+                    .map_err(|e| AppError::InternalServerError(format!("RS Add: {}", e)))?;
+            }
+
+            let enc_result = encoder.encode()
+                .map_err(|e| AppError::InternalServerError(format!("RS Encode: {}", e)))?;
+
+            let parity_rel_idx = target_shard_idx - data_count;
+            
+            let mut found = false;
+            for (idx, data) in enc_result.recovery_iter().enumerate() {
+                if idx == parity_rel_idx {
+                    temp_file.write_all(data).await
+                        .map_err(|e| AppError::Io(e, "write repair chunk".into()))?;
+                    found = true;
+                    break;
+                }
+            }
+            
+            if !found {
+                 return Err(AppError::InternalServerError("Generated parity index mismatch".into()));
+            }
+        }
+
+        current_offset += block_size as u64;
+    }
+
+    temp_file.flush().await.map_err(|e| AppError::Io(e, "flush repair".into()))?;
+    drop(temp_file); 
+
+    fs::rename(&temp_path, &final_path).await
+        .map_err(|e| AppError::Io(e, "finalize repair".into()))?;
+
+    Ok(())
 }
