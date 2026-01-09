@@ -17,3 +17,4 @@ pub mod quota_manager;
 pub mod maintenance;
 pub mod archive;
 pub mod ec;
+pub mod recovery;

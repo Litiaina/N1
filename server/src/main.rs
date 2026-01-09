@@ -2,7 +2,7 @@ use crate::fs::cleanup_manager::interval_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
 use crate::object_storage::sync::sync_quota;
-use crate::object_storage::upload::{DATA_SHARDS_ATOMIC, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC};
+use crate::object_storage::upload::{DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC};
 use crate::routes::storage_routes::serve_storage_routes;
 use crate::structs::object_storage_structs::{FS_STORAGE_ROOT, OBJECT_STORAGE_ROOT};
 use crate::utils::date_time_formatter::LocalTimer;
@@ -181,6 +181,19 @@ pub async fn run_server() {
     FS_STORAGE_ROOT
         .set(fs_storage_path.to_string())
         .expect("Double initialization of STORAGE_ROOT!");
+
+    let max_io_semaphore = config
+        .section(Some("upload_config"))
+        .and_then(|s| s.get("max_concurrent_io"))
+        .unwrap_or("16384");
+
+    let max_io_semaphore: usize = max_io_semaphore
+        .parse()
+        .expect("max_concurrent_io does not fit into usize");
+
+    MAX_IO_SEMAPHORE
+        .set(max_io_semaphore)
+        .expect("Double initialization of MAX_IO_SEMAPHORE");
 
     let max_part_size = config
         .section(Some("upload_config"))

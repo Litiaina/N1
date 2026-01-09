@@ -23,12 +23,12 @@ use axum::{
     response::IntoResponse,
 };
 use chrono::Utc;
-use futures_util::future::join_all;
 use futures_util::{StreamExt, stream};
 use mongodb::bson::doc;
 use once_cell::sync::{Lazy, OnceCell};
 #[cfg(not(unix))]
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::fs::{self, File};
@@ -42,12 +42,36 @@ pub static MAX_PART_SIZE_ATOMIC: OnceCell<AtomicU64> = OnceCell::new();
 pub static DATA_SHARDS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static PARITY_SHARDS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static WRITER_BUFFER_SIZE_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
+pub static MAX_IO_SEMAPHORE: OnceCell<usize> = OnceCell::new();
 
-static IO_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(16_384));
+static IO_SEMAPHORE: Lazy<Semaphore> =
+    Lazy::new(|| Semaphore::new(*MAX_IO_SEMAPHORE.get().unwrap()));
+
+async fn create_optimized_file(path: &PathBuf) -> Result<fs::File, AppError> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+
+    #[cfg(target_os = "linux")]
+    {
+        options.custom_flags(libc::O_DIRECT);
+    }
+
+    #[cfg(windows)]
+    {
+        const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
+        const FILE_FLAG_WRITE_THROUGH: u32 = 0x80000000;
+        options.custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH);
+    }
+
+    options
+        .open(path)
+        .await
+        .map_err(|e| AppError::Io(e, format!("create {}", path.display())))
+}
 
 #[cfg(unix)]
 pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
-    let dir = OpenOptions::new()
+    let dir = tokio::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY)
         .open(path)
@@ -194,54 +218,50 @@ pub async fn object_upload_part(
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
-        .ok_or(AppError::BadRequest("Content-Length header required".into()))?;
+        .ok_or(AppError::BadRequest(
+            "Content-Length header required".into(),
+        ))?;
 
     if content_length > max_part_size {
         return Ok((StatusCode::PAYLOAD_TOO_LARGE, "Part too large").into_response());
     }
 
-    let uid = claims.uid;
-    let path_manager = ObjectPathManager::new();
-    let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
-    
-    if !blob_dir.exists() {
-        fs::create_dir_all(&blob_dir)
-            .await
-            .map_err(|e| AppError::Io(e, "create blob dir".into()))?;
-    }
+    let uid_arc = Arc::new(claims.uid);
+    let fragment_arc = Arc::new(fragment);
+    let version_id_arc = Arc::new(version_id);
+    let path_manager = Arc::new(ObjectPathManager::new());
 
     let stripe_data_width = STRIPE_BLOCK_SIZE as u64 * data_shards as u64;
     let stripe_count = (content_length + stripe_data_width - 1) / stripe_data_width;
     let final_shard_len = stripe_count * STRIPE_BLOCK_SIZE as u64;
 
-    let mut creation_futures = Vec::with_capacity(total_shards);
-    
-    for i in 0..total_shards {
-        let blob_dir = blob_dir.clone();
-        
-        creation_futures.push(async move {
-            let is_parity = i >= data_shards;
-            let ext = if is_parity { PARITY_SUFFIX } else { SHARD_SUFFIX};
-            
-            let file_name = format!("part_{}_shard_{}{}", part_index, i, ext);
-            let path = blob_dir.join(&file_name);
-            
-            let file = fs::File::create(&path)
-                .await
-                .map_err(|e| AppError::Io(e, "create shard".into()))?;
-            
-            file.set_len(final_shard_len).await
-                .map_err(|e| AppError::Io(e, "pre-allocate shard".into()))?;
-                
-            Ok::<_, AppError>(file)
-        });
+    let mut writers = Vec::with_capacity(total_shards);
+    let mut shard_paths = Vec::with_capacity(total_shards);
+    let mut file_names = Vec::with_capacity(total_shards);
+
+    let shard_dir = path_manager.get_blob_dir(&uid_arc, &fragment_arc, &version_id_arc);
+    if !shard_dir.exists() {
+        with_io_timeout("create shard dir", fs::create_dir_all(&shard_dir)).await?;
     }
 
-    let writers_results = join_all(creation_futures).await;
-    
-    let mut writers = Vec::with_capacity(total_shards);
-    for res in writers_results {
-        writers.push(res?);
+    for i in 0..total_shards {
+        let is_parity = i >= data_shards;
+        let ext = if is_parity {
+            PARITY_SUFFIX
+        } else {
+            SHARD_SUFFIX
+        };
+        let file_name = format!("part_{}_shard_{}{}", part_index, i, ext);
+
+        let path = shard_dir.join(&file_name);
+
+        let file = create_optimized_file(&path).await?;
+
+        with_io_timeout("pre-allocate shard", file.set_len(final_shard_len)).await?;
+
+        shard_paths.push(path.to_string_lossy().to_string());
+        file_names.push(file_name);
+        writers.push(file);
     }
 
     let mut stream_writer = ErasureStreamWriter::new(
@@ -256,14 +276,16 @@ pub async fn object_upload_part(
     let mut total_bytes_read = 0u64;
 
     while let Some(chunk_result) = body_stream.next().await {
-        let chunk = chunk_result.map_err(|e| AppError::Io(std::io::Error::new(std::io::ErrorKind::Other, e), "stream read".into()))?;
-        
-        if chunk.is_empty() { continue; }
-        
-        total_bytes_read += chunk.len() as u64;
-        if total_bytes_read > content_length {
-             return Ok((StatusCode::PAYLOAD_TOO_LARGE, "Body exceeds Content-Length").into_response());
+        let chunk = chunk_result.map_err(|e| {
+            AppError::Io(
+                std::io::Error::new(std::io::ErrorKind::Other, e),
+                "stream read".into(),
+            )
+        })?;
+        if chunk.is_empty() {
+            continue;
         }
+        total_bytes_read += chunk.len() as u64;
 
         stream_writer.write(&chunk).await?;
     }
@@ -283,19 +305,13 @@ pub async fn object_upload_part(
     let mut shards_info = Vec::with_capacity(total_shards);
 
     for i in 0..total_shards {
-        let is_parity = i >= data_shards;
-        let ext = if is_parity { "parity" } else { "shard" };
-        
-        let file_name = format!("part_{}_shard_{}.{}", part_index, i, ext);
-        let absolute_path = blob_dir.join(&file_name).to_string_lossy().to_string();
-        
         shards_info.push(ShardInfo {
             shard_index: i,
-            file_name,
-            absolute_path,
-            size_bytes: final_shard_len, 
+            file_name: file_names[i].clone(),
+            absolute_path: shard_paths[i].clone(),
+            size_bytes: final_shard_len,
             checksum: shard_checksums.get(i).cloned().unwrap_or_default(),
-            is_parity,
+            is_parity: i >= data_shards,
         });
     }
 
@@ -307,10 +323,11 @@ pub async fn object_upload_part(
         shards: shards_info,
     };
 
-    let meta_path = blob_dir.join(format!("part_{}{}", part_index, PART_META_SUFFIX));
+    let meta_dir = path_manager.get_blob_dir(&uid_arc, &fragment_arc, &version_id_arc);
+    let meta_path = meta_dir.join(format!("part_{}{}", part_index, PART_META_SUFFIX));
     let meta_bytes = mongodb::bson::to_vec(&part_meta)
         .map_err(|e| AppError::InternalServerError(format!("Serialize meta: {}", e)))?;
-        
+
     fs::write(&meta_path, meta_bytes)
         .await
         .map_err(|e| AppError::Io(e, "write part meta".into()))?;
@@ -329,14 +346,12 @@ pub async fn finalize_object_upload(
     let uid = claims.uid;
 
     let path_manager = ObjectPathManager::new();
-    let blob_dir: Arc<std::path::Path> =
-        Arc::from(path_manager.get_blob_dir(&uid, &fragment, &version_id));
-    let blob_dir_for_task = Arc::clone(&blob_dir);
+    let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
 
-    let part_meta_paths =
-        tokio::task::spawn_blocking(move || -> Result<Vec<std::path::PathBuf>, AppError> {
+    let (part_meta_paths, blob_dir) = tokio::task::spawn_blocking(
+        move || -> Result<(Vec<std::path::PathBuf>, std::path::PathBuf), AppError> {
             let mut paths = Vec::new();
-            for entry in WalkDir::new(blob_dir_for_task.as_ref())
+            for entry in WalkDir::new(&blob_dir)
                 .max_depth(1)
                 .into_iter()
                 .filter_map(|e| e.ok())
@@ -350,10 +365,11 @@ pub async fn finalize_object_upload(
                     }
                 }
             }
-            Ok(paths)
-        })
-        .await
-        .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
+            Ok((paths, blob_dir))
+        },
+    )
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
 
     if part_meta_paths.is_empty() {
         return Err(AppError::BadRequest(
@@ -391,11 +407,11 @@ pub async fn finalize_object_upload(
     }
 
     let object_meta = ObjectMetadata {
-        object_key: object_key.clone(),
-        fragment: fragment.clone(),
-        version_id: version_id.clone(),
+        object_key,
+        fragment,
+        version_id,
         upload_session_id: session_id,
-        owner_uid: uid.clone(),
+        owner_uid: uid,
         content_type: params
             .content_type
             .unwrap_or_else(|| "application/octet-stream".to_string()),
@@ -409,7 +425,12 @@ pub async fn finalize_object_upload(
         AppError::InternalServerError(format!("Failed to serialize object metadata: {}", e))
     })?;
 
-    let index_path = path_manager.get_metadata_path(&uid, &fragment, &object_key, &version_id);
+    let index_path = path_manager.get_metadata_path(
+        &object_meta.owner_uid,
+        &object_meta.fragment,
+        &object_meta.object_key,
+        &object_meta.version_id,
+    );
 
     if let Some(parent) = index_path.parent() {
         if !fs::try_exists(parent).await.unwrap_or(false) {
@@ -446,28 +467,34 @@ pub async fn finalize_object_upload(
     let receipt_path = blob_dir.join("reservation.bson");
     let _ = fs::remove_file(receipt_path).await;
 
-    sync_dir(blob_dir.as_ref()).await?;
+    sync_dir(&blob_dir).await?;
 
     let reserved_size = params.total_size_bytes as i64;
     let actual_size = total_size_calculated as i64;
     let delta = actual_size - reserved_size;
 
     if delta != 0 {
-        update_quota(&uid, delta).await?;
+        update_quota(&object_meta.owner_uid, delta).await?;
         info!(
             "Quota adjustment for {}: {} bytes (Reserved: {}, Actual: {})",
-            uid, delta, reserved_size, actual_size
+            object_meta.owner_uid, delta, reserved_size, actual_size
         );
     }
 
-    invalidate_cache(&fragment, &object_key, &uid).await;
-
-    state.emit(&uid, StorageEventPayload::FileUploaded(object_meta.clone()));
+    invalidate_cache(
+        &object_meta.fragment,
+        &object_meta.object_key,
+        &object_meta.owner_uid,
+    )
+    .await;
 
     info!(
         "Finalized object: {}/{} (Size: {})",
-        fragment, object_key, total_size_calculated
+        object_meta.fragment, object_meta.object_key, total_size_calculated
     );
+
+    let owner_uid = object_meta.owner_uid.clone();
+    state.emit(&owner_uid, StorageEventPayload::FileUploaded(object_meta));
 
     Ok((StatusCode::OK, "Upload finalized."))
 }
