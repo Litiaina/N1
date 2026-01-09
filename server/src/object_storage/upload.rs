@@ -59,8 +59,7 @@ async fn create_optimized_file(path: &PathBuf) -> Result<fs::File, AppError> {
     #[cfg(windows)]
     {
         const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
-        const FILE_FLAG_WRITE_THROUGH: u32 = 0x80000000;
-        options.custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH);
+        options.custom_flags(FILE_FLAG_NO_BUFFERING);
     }
 
     options
@@ -83,7 +82,46 @@ pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub async fn sync_dir(path: &Path) -> Result<(), AppError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+
+        let result = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&path);
+
+        match result {
+            Ok(file) => {
+                if let Err(e) = file.sync_all() {
+                    warn!(
+                        "Windows: Failed to sync directory (non-fatal): {} - {}",
+                        path.display(),
+                        e
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Windows: Failed to open directory for sync (non-fatal): {} - {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("sync dir task: {}", e)))?
+}
+
+#[cfg(not(any(unix, windows)))]
 pub async fn sync_dir(_path: &Path) -> Result<(), AppError> {
     Ok(())
 }
@@ -124,10 +162,13 @@ pub async fn initiate_object_upload(
     let session_id = Ulid::new().to_string();
 
     let path_manager = ObjectPathManager::new();
-    let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
+    let meta_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
 
-    if let Err(e) =
-        with_io_timeout("creating upload directory", fs::create_dir_all(&blob_dir)).await
+    if let Err(e) = with_io_timeout(
+        "creating upload session directory",
+        fs::create_dir_all(&meta_dir),
+    )
+    .await
     {
         let _ = update_quota(&uid, -(params.total_size_bytes as i64)).await;
         return Err(e);
@@ -143,7 +184,7 @@ pub async fn initiate_object_upload(
     };
 
     if let Ok(bytes) = mongodb::bson::to_vec(&receipt) {
-        let receipt_path = blob_dir.join("reservation.bson");
+        let receipt_path = meta_dir.join("reservation.bson");
         if let Err(e) = fs::write(&receipt_path, bytes).await {
             warn!("Failed to write reservation receipt for {}: {}", uid, e);
         }
@@ -166,14 +207,14 @@ pub async fn get_upload_status(
     let uid = claims.uid;
     let _object_key = key_query.object_key;
     let path_manager = ObjectPathManager::new();
-    let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
+    let meta_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
 
-    if !fs::try_exists(&blob_dir).await.unwrap_or(false) {
+    if !fs::try_exists(&meta_dir).await.unwrap_or(false) {
         return Err(AppError::NotFound);
     }
 
     let mut uploaded_parts = Vec::new();
-    let mut entries = fs::read_dir(&blob_dir)
+    let mut entries = fs::read_dir(&meta_dir)
         .await
         .map_err(|e| AppError::Io(e, "read dir".into()))?;
 
@@ -239,9 +280,13 @@ pub async fn object_upload_part(
     let mut shard_paths = Vec::with_capacity(total_shards);
     let mut file_names = Vec::with_capacity(total_shards);
 
-    let shard_dir = path_manager.get_blob_dir(&uid_arc, &fragment_arc, &version_id_arc);
-    if !shard_dir.exists() {
-        with_io_timeout("create shard dir", fs::create_dir_all(&shard_dir)).await?;
+    let blob_roots = path_manager.get_blob_roots();
+    let num_disks = blob_roots.len();
+
+    if num_disks == 0 {
+        return Err(AppError::InternalServerError(
+            "No blob storage disks configured".into(),
+        ));
     }
 
     for i in 0..total_shards {
@@ -253,10 +298,23 @@ pub async fn object_upload_part(
         };
         let file_name = format!("part_{}_shard_{}{}", part_index, i, ext);
 
+        let disk_idx = (part_index as usize + i) % num_disks;
+        let target_disk = &blob_roots[disk_idx];
+
+        let shard_dir = path_manager.get_shard_dir_on_disk(
+            target_disk,
+            &uid_arc,
+            &fragment_arc,
+            &version_id_arc,
+        );
+
+        if !shard_dir.exists() {
+            with_io_timeout("create shard dir", fs::create_dir_all(&shard_dir)).await?;
+        }
+
         let path = shard_dir.join(&file_name);
 
         let file = create_optimized_file(&path).await?;
-
         with_io_timeout("pre-allocate shard", file.set_len(final_shard_len)).await?;
 
         shard_paths.push(path.to_string_lossy().to_string());
@@ -324,6 +382,12 @@ pub async fn object_upload_part(
     };
 
     let meta_dir = path_manager.get_blob_dir(&uid_arc, &fragment_arc, &version_id_arc);
+    if !meta_dir.exists() {
+        fs::create_dir_all(&meta_dir)
+            .await
+            .map_err(|e| AppError::Io(e, "create meta session dir".into()))?;
+    }
+
     let meta_path = meta_dir.join(format!("part_{}{}", part_index, PART_META_SUFFIX));
     let meta_bytes = mongodb::bson::to_vec(&part_meta)
         .map_err(|e| AppError::InternalServerError(format!("Serialize meta: {}", e)))?;
@@ -346,12 +410,12 @@ pub async fn finalize_object_upload(
     let uid = claims.uid;
 
     let path_manager = ObjectPathManager::new();
-    let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
+    let meta_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
 
-    let (part_meta_paths, blob_dir) = tokio::task::spawn_blocking(
+    let (part_meta_paths, meta_dir) = tokio::task::spawn_blocking(
         move || -> Result<(Vec<std::path::PathBuf>, std::path::PathBuf), AppError> {
             let mut paths = Vec::new();
-            for entry in WalkDir::new(&blob_dir)
+            for entry in WalkDir::new(&meta_dir)
                 .max_depth(1)
                 .into_iter()
                 .filter_map(|e| e.ok())
@@ -365,7 +429,7 @@ pub async fn finalize_object_upload(
                     }
                 }
             }
-            Ok((paths, blob_dir))
+            Ok((paths, meta_dir))
         },
     )
     .await
@@ -454,6 +518,10 @@ pub async fn finalize_object_upload(
         .await
         .map_err(|e| AppError::Io(e, "sync object meta".into()))?;
 
+    if let Some(parent) = index_path.parent() {
+        sync_dir(parent).await?;
+    }
+
     let cleanup_futures = stream::iter(paths_for_cleanup)
         .map(|path| async move {
             if let Err(e) = fs::remove_file(&path).await {
@@ -464,10 +532,12 @@ pub async fn finalize_object_upload(
 
     cleanup_futures.collect::<Vec<_>>().await;
 
-    let receipt_path = blob_dir.join("reservation.bson");
+    let receipt_path = meta_dir.join("reservation.bson");
     let _ = fs::remove_file(receipt_path).await;
 
-    sync_dir(&blob_dir).await?;
+    if let Err(e) = fs::remove_dir(&meta_dir).await {
+        warn!("Failed to remove session dir {:?}: {}", meta_dir, e);
+    }
 
     let reserved_size = params.total_size_bytes as i64;
     let actual_size = total_size_calculated as i64;
@@ -494,7 +564,13 @@ pub async fn finalize_object_upload(
     );
 
     let owner_uid = object_meta.owner_uid.clone();
-    state.emit(&owner_uid, StorageEventPayload::FileUploaded(object_meta));
+    
+    let stripped_meta = ObjectMetadata {
+        parts: Vec::new(),
+        ..object_meta
+    };
+
+    state.emit(&owner_uid, StorageEventPayload::FileUploaded(stripped_meta));
 
     Ok((StatusCode::OK, "Upload finalized."))
 }
@@ -502,25 +578,25 @@ pub async fn finalize_object_upload(
 pub async fn cancel_upload_session(
     claims: Claims,
     AxumPath((fragment, version_id)): AxumPath<(String, String)>,
-    Query(query): Query<ObjectKeyQuery>,
+    Query(key_query): Query<ObjectKeyQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
-    let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
+    let meta_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
 
-    if !fs::try_exists(&blob_dir).await.unwrap_or(false) {
+    if !fs::try_exists(&meta_dir).await.unwrap_or(false) {
         return Err(AppError::NotFound);
     }
 
     let index_path =
-        path_manager.get_metadata_path(&uid, &fragment, &query.object_key, &version_id);
+        path_manager.get_metadata_path(&uid, &fragment, &key_query.object_key, &version_id);
     if fs::try_exists(&index_path).await.unwrap_or(false) {
         return Err(AppError::Conflict(
             "Cannot cancel: Object is already finalized.".to_string(),
         ));
     }
 
-    let receipt_path = blob_dir.join("reservation.bson");
+    let receipt_path = meta_dir.join("reservation.bson");
     let mut refund_amount = 0;
 
     if let Ok(data) = fs::read(&receipt_path).await {
@@ -529,10 +605,20 @@ pub async fn cancel_upload_session(
         }
     }
 
-    fs::remove_dir_all(&blob_dir).await.map_err(|e| {
-        error!("Failed to cancel upload session {}: {}", version_id, e);
-        AppError::InternalServerError("Failed to cleanup upload session.".to_string())
+    fs::remove_dir_all(&meta_dir).await.map_err(|e| {
+        error!("Failed to clean session meta {}: {}", version_id, e);
+        AppError::InternalServerError("Failed to cleanup upload metadata.".to_string())
     })?;
+
+    let blob_roots = path_manager.get_blob_roots();
+    for disk in blob_roots {
+        let shard_dir = path_manager.get_shard_dir_on_disk(&disk, &uid, &fragment, &version_id);
+        if shard_dir.exists() {
+            if let Err(e) = fs::remove_dir_all(&shard_dir).await {
+                warn!("Failed to clean blob disk {:?}: {}", shard_dir, e);
+            }
+        }
+    }
 
     if refund_amount > 0 {
         if let Err(e) = update_quota(&uid, -(refund_amount as i64)).await {

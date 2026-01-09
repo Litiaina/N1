@@ -2,14 +2,60 @@ use crate::enums::app_error_enum::AppError;
 use crate::object_storage::ec::STRIPE_BLOCK_SIZE;
 use crate::structs::object_storage_structs::{PartMetadata, ShardInfo};
 use crc32fast::Hasher;
+use once_cell::sync::Lazy;
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 use std::collections::HashMap;
 use std::io::SeekFrom;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::fs::{self, File};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tracing::{error, info};
+use tokio::sync::Semaphore;
+use tracing::{info, warn};
+
+static RECOVERY_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(4));
+
+static RECOVERY_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+
+    let total_cores = core_ids.len();
+    let recovery_worker_count = (total_cores / 4).max(1);
+
+    let pinned_cores = core_ids
+        .into_iter()
+        .rev()
+        .take(recovery_worker_count)
+        .collect::<Vec<_>>();
+    let pinned_cores_arc = Arc::new(pinned_cores);
+    let next_core_idx = Arc::new(AtomicUsize::new(0));
+
+    info!(
+        "Initializing Recovery Runtime on {} dedicated cores.",
+        recovery_worker_count
+    );
+
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(recovery_worker_count)
+        .thread_name("n1-recovery")
+        .on_thread_start(move || {
+            if !pinned_cores_arc.is_empty() {
+                let idx = next_core_idx.fetch_add(1, Ordering::Relaxed);
+                let core = pinned_cores_arc[idx % pinned_cores_arc.len()];
+                if core_affinity::set_for_current(core) {
+                    info!("Recovery worker thread pinned to CPU core: {:?}", core);
+                } else {
+                    warn!(
+                        "Failed to pin recovery worker thread to CPU core: {:?}",
+                        core
+                    );
+                }
+            }
+        })
+        .enable_all()
+        .build()
+        .expect("Failed to build dedicated recovery runtime")
+});
 
 pub async fn verify_shard_integrity(file: &mut File, expected_checksum: &str) -> bool {
     if expected_checksum.is_empty() {
@@ -31,7 +77,7 @@ pub async fn verify_shard_integrity(file: &mut File, expected_checksum: &str) ->
     }
 
     let mut hasher = Hasher::new();
-    let mut buffer = vec![0u8; 256 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024];
 
     loop {
         match file.read(&mut buffer).await {
@@ -59,9 +105,27 @@ pub async fn verify_shard_integrity(file: &mut File, expected_checksum: &str) ->
     calculated == expected
 }
 
+async fn get_or_open_shard(
+    file_cache: &mut HashMap<String, File>,
+    shard_info: &ShardInfo,
+) -> Option<File> {
+    if let Some(file) = file_cache.get(&shard_info.file_name) {
+        return file.try_clone().await.ok();
+    }
+
+    if let Ok(mut f) = File::open(&shard_info.absolute_path).await {
+        if verify_shard_integrity(&mut f, &shard_info.checksum).await {
+            file_cache.insert(shard_info.file_name.clone(), f.try_clone().await.ok()?);
+            return Some(f);
+        }
+    }
+
+    None
+}
+
 pub async fn read_or_recover_chunk(
     file_cache: &mut HashMap<String, File>,
-    version_dir: &Path,
+    _version_dir: &Path,
     part: Arc<PartMetadata>,
     shard_idx: usize,
     offset: u64,
@@ -74,26 +138,7 @@ pub async fn read_or_recover_chunk(
         .get(shard_idx)
         .ok_or(AppError::InternalServerError("Bad shard index".into()))?;
 
-    let file_name = target_shard.file_name.as_str();
-
-    if let Some(file) = file_cache.get_mut(file_name) {
-        if file.seek(SeekFrom::Start(offset)).await.is_ok()
-            && file.read_exact(&mut buf).await.is_ok()
-        {
-            return Ok(buf);
-        }
-    }
-
-    if !file_cache.contains_key(file_name) {
-        let path = version_dir.join(file_name);
-        if let Ok(mut f) = File::open(&path).await {
-            if verify_shard_integrity(&mut f, &target_shard.checksum).await {
-                file_cache.insert(file_name.to_owned(), f);
-            }
-        }
-    }
-
-    if let Some(file) = file_cache.get_mut(file_name) {
+    if let Some(mut file) = get_or_open_shard(file_cache, target_shard).await {
         if file.seek(SeekFrom::Start(offset)).await.is_ok()
             && file.read_exact(&mut buf).await.is_ok()
         {
@@ -113,21 +158,9 @@ pub async fn read_or_recover_chunk(
             continue;
         }
 
-        let fname = s.file_name.as_str();
-
-        let file = if let Some(f) = file_cache.get_mut(fname) {
-            f
-        } else {
-            let path = version_dir.join(fname);
-            let mut f = match File::open(&path).await {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            if !verify_shard_integrity(&mut f, &s.checksum).await {
-                continue;
-            }
-            file_cache.insert(fname.to_owned(), f);
-            file_cache.get_mut(fname).unwrap()
+        let mut file = match get_or_open_shard(file_cache, s).await {
+            Some(f) => f,
+            None => continue,
         };
 
         if file.seek(SeekFrom::Start(offset)).await.is_err() {
@@ -166,13 +199,15 @@ pub async fn read_or_recover_chunk(
         .1
         .to_vec();
 
-    let version_dir_clone = version_dir.to_path_buf();
     let part_clone = Arc::clone(&part);
     let shard_index = target_shard.shard_index;
 
-    tokio::spawn(async move {
-        if let Err(e) = repair_entire_shard(&version_dir_clone, part_clone, shard_index).await {
-            error!("Background repair failed for shard {}: {}", shard_index, e);
+    RECOVERY_RUNTIME.spawn(async move {
+        if let Err(e) = repair_entire_shard(part_clone, shard_index).await {
+            warn!(
+                "Background repair skipped or failed for shard {}: {}",
+                shard_index, e
+            );
         }
     });
 
@@ -180,10 +215,14 @@ pub async fn read_or_recover_chunk(
 }
 
 pub async fn repair_entire_shard(
-    version_dir: &Path,
     part: Arc<PartMetadata>,
     target_shard_idx: usize,
 ) -> Result<(), AppError> {
+    let _permit = RECOVERY_SEMAPHORE
+        .acquire()
+        .await
+        .map_err(|_| AppError::InternalServerError("Recovery semaphore error".into()))?;
+
     let target_shard = part
         .shards
         .get(target_shard_idx)
@@ -191,14 +230,18 @@ pub async fn repair_entire_shard(
             "Target shard not found".into(),
         ))?;
 
-    let final_path = version_dir.join(&target_shard.file_name);
+    let final_path = PathBuf::from(&target_shard.absolute_path);
 
-    let unique_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros();
+    let parent_dir = final_path
+        .parent()
+        .ok_or(AppError::InternalServerError("Invalid shard path".into()))?;
+    if !parent_dir.exists() {
+        fs::create_dir_all(parent_dir)
+            .await
+            .map_err(|e| AppError::Io(e, "create repair dir".into()))?;
+    }
 
-    let temp_path = version_dir.join(format!("{}.{}.repair", target_shard.file_name, unique_id));
+    let temp_path = parent_dir.join(format!("{}.recovering", target_shard.file_name));
 
     if final_path.exists() {
         if let Ok(mut f) = File::open(&final_path).await {
@@ -208,9 +251,18 @@ pub async fn repair_entire_shard(
         }
     }
 
-    let mut temp_file = File::create(&temp_path)
+    let mut temp_file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
         .await
-        .map_err(|e| AppError::Io(e, "create repair file".into()))?;
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Ok(());
+        }
+        Err(e) => return Err(AppError::Io(e, "create repair file".into())),
+    };
 
     let data_shards: Vec<&ShardInfo> = part.shards.iter().filter(|s| !s.is_parity).collect();
     let data_count = data_shards.len();
@@ -224,8 +276,7 @@ pub async fn repair_entire_shard(
         if s.shard_index == target_shard_idx {
             peer_files.push(None);
         } else {
-            let s_path = version_dir.join(&s.file_name);
-            let f = File::open(&s_path).await.ok();
+            let f = File::open(&s.absolute_path).await.ok();
             peer_files.push(f);
         }
     }
@@ -330,5 +381,9 @@ pub async fn repair_entire_shard(
         return Err(AppError::Io(e, "finalize repair".into()));
     }
 
+    info!(
+        "Successfully repaired shard {} via background task",
+        target_shard.file_name
+    );
     Ok(())
 }

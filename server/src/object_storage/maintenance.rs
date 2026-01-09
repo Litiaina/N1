@@ -15,7 +15,7 @@ use walkdir::WalkDir;
 
 async fn perform_quota_sync(uid: &str) -> Result<u64, AppError> {
     let path_manager = ObjectPathManager::new();
-    let user_dir = path_manager.get_user_dir(uid);
+    let user_dir = path_manager.get_user_index_dir(uid);
 
     if !user_dir.exists() {
         return Err(AppError::NotFound);
@@ -46,9 +46,11 @@ async fn perform_quota_sync(uid: &str) -> Result<u64, AppError> {
                             if let Some((_, ver_ext)) = filename.split_once('#') {
                                 if let Some(ver) = ver_ext.strip_suffix(".bson") {
                                     valid_versions.insert(ver.to_string());
-                                    
+
                                     if let Ok(data) = std::fs::read(entry.path()) {
-                                        if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
+                                        if let Ok(meta) =
+                                            mongodb::bson::from_slice::<ObjectMetadata>(&data)
+                                        {
                                             if !meta.is_delete_marker {
                                                 total_usage += meta.total_size_bytes;
                                             }
@@ -64,13 +66,18 @@ async fn perform_quota_sync(uid: &str) -> Result<u64, AppError> {
                     if let Ok(blob_entries) = std::fs::read_dir(&blobs_dir) {
                         for blob_entry in blob_entries.filter_map(|e| e.ok()) {
                             let path = blob_entry.path();
-                            if !path.is_dir() { continue; }
-                            
+                            if !path.is_dir() {
+                                continue;
+                            }
+
                             let version_id = blob_entry.file_name().to_string_lossy().to_string();
 
                             if !valid_versions.contains(&version_id) {
                                 if let Err(e) = std::fs::remove_dir_all(&path) {
-                                    error!("Sync: Failed to remove orphaned blob {}/{}: {}", uid_for_task, version_id, e);
+                                    error!(
+                                        "Sync: Failed to remove orphaned blob {}/{}: {}",
+                                        uid_for_task, version_id, e
+                                    );
                                 } else {
                                     orphans_removed += 1;
                                 }
@@ -80,11 +87,14 @@ async fn perform_quota_sync(uid: &str) -> Result<u64, AppError> {
                 }
             }
         }
-        
+
         if orphans_removed > 0 {
-            info!("Sync: Cleaned up {} orphaned upload sessions for user {}", orphans_removed, uid_for_task);
+            info!(
+                "Sync: Cleaned up {} orphaned upload sessions for user {}",
+                orphans_removed, uid_for_task
+            );
         }
-        
+
         total_usage
     })
     .await
@@ -105,9 +115,15 @@ pub async fn sync_user_metadata(
     claims: Claims,
 ) -> Result<impl IntoResponse, AppError> {
     let usage = perform_quota_sync(&claims.uid).await?;
-    info!("Self-sync complete for user {}. New Usage: {} bytes", claims.uid, usage);
-    
-    Ok((StatusCode::OK, "Metadata synchronization and cleanup complete."))
+    info!(
+        "Self-sync complete for user {}. New Usage: {} bytes",
+        claims.uid, usage
+    );
+
+    Ok((
+        StatusCode::OK,
+        "Metadata synchronization and cleanup complete.",
+    ))
 }
 
 #[allow(dead_code)]
@@ -117,7 +133,13 @@ pub async fn admin_sync_user_metadata(
     Path(target_uid): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let usage = perform_quota_sync(&target_uid).await?;
-    info!("Admin-sync complete for user {}. New Usage: {} bytes", target_uid, usage);
-    
-    Ok((StatusCode::OK, format!("Metadata synced for user {}.", target_uid)))
+    info!(
+        "Admin-sync complete for user {}. New Usage: {} bytes",
+        target_uid, usage
+    );
+
+    Ok((
+        StatusCode::OK,
+        format!("Metadata synced for user {}.", target_uid),
+    ))
 }

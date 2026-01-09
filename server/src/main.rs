@@ -4,7 +4,7 @@ use crate::handlers::error_handlers::handler_404;
 use crate::object_storage::sync::sync_quota;
 use crate::object_storage::upload::{DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC};
 use crate::routes::storage_routes::serve_storage_routes;
-use crate::structs::object_storage_structs::{FS_STORAGE_ROOT, OBJECT_STORAGE_ROOT};
+use crate::structs::object_storage_structs::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISK};
 use crate::utils::date_time_formatter::LocalTimer;
 use crate::validation::enforce_init_settings::{ensure_config_file, ensure_env_file};
 use axum::Router;
@@ -164,17 +164,9 @@ pub async fn run_server() {
         .map(|v| v.to_string())
         .unwrap_or_else(|| "key.pem".to_string());
 
-    let object_storage_path = config
-        .section(Some("disk_config"))
-        .and_then(|s| s.get("object_storage_path"))
-        .unwrap_or("object-storage-path");
+    let disk_section = config.section(Some("disk_config"));
 
-    OBJECT_STORAGE_ROOT
-        .set(object_storage_path.to_string())
-        .expect("Double initialization of OBJECT_STORAGE_ROOT!");
-
-    let fs_storage_path = config
-        .section(Some("disk_config"))
+    let fs_storage_path = disk_section
         .and_then(|s| s.get("fs_storage_path"))
         .unwrap_or("fs-storage-path");
 
@@ -182,8 +174,35 @@ pub async fn run_server() {
         .set(fs_storage_path.to_string())
         .expect("Double initialization of STORAGE_ROOT!");
 
-    let max_io_semaphore = config
-        .section(Some("upload_config"))
+    let index_store_path = disk_section
+        .and_then(|s| s.get("index_store_disk"))
+        .unwrap_or("index-store-path");
+
+    INDEX_STORE_DISK
+        .set(index_store_path.to_string())
+        .expect("Double initialization of INDEX_STORE_DISK!");
+
+    let blob_store_str = disk_section
+        .and_then(|s| s.get("blob_store_disks"))
+        .expect("Missing blob_store_disks in [disk_config]");
+
+    let blob_disks: Vec<String> = blob_store_str
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if blob_disks.is_empty() {
+        panic!("At least one blob store disk must be configured in blob_store_disks!");
+    }
+
+    BLOB_STORE_DISKS
+        .set(blob_disks)
+        .expect("Double initialization of BLOB_STORE_DISKS!");
+
+    let upload_section = config.section(Some("upload_config"));
+
+    let max_io_semaphore = upload_section
         .and_then(|s| s.get("max_concurrent_io"))
         .unwrap_or("16384");
 
@@ -195,8 +214,7 @@ pub async fn run_server() {
         .set(max_io_semaphore)
         .expect("Double initialization of MAX_IO_SEMAPHORE");
 
-    let max_part_size = config
-        .section(Some("upload_config"))
+    let max_part_size = upload_section
         .and_then(|s| s.get("max_part_size"))
         .unwrap_or("52428800");
 
@@ -210,50 +228,47 @@ pub async fn run_server() {
         .set(max_part_size)
         .expect("Double initialization of MAX_PART_SIZE!");
     
-    let data_shards = config
-        .section(Some("upload_config"))
+    let data_shards = upload_section
         .and_then(|s| s.get("data_shards"))
-        .unwrap_or("4");
+        .unwrap_or("1");
 
     let data_shards: AtomicUsize = AtomicUsize::new(
         data_shards
             .parse::<usize>()
-            .expect("max_part_size does not fit into u64")
+            .expect("data_shards does not fit into usize")
     );
 
     DATA_SHARDS_ATOMIC
         .set(data_shards)
         .expect("Double initialization of DATA_SHARDS!");
     
-    let parity_shards = config
-        .section(Some("upload_config"))
+    let parity_shards = upload_section
         .and_then(|s| s.get("parity_shards"))
-        .unwrap_or("2");
+        .unwrap_or("0");
 
     let parity_shards: AtomicUsize = AtomicUsize::new(
         parity_shards
             .parse::<usize>()
-            .expect("max_part_size does not fit into u64")
+            .expect("parity_shards does not fit into usize")
     );
 
     PARITY_SHARDS_ATOMIC
         .set(parity_shards)
         .expect("Double initialization of PARITY_SHARDS!");
 
-    let writer_buffer_size = config
-        .section(Some("upload_config"))
+    let writer_buffer_size = upload_section
         .and_then(|s| s.get("writer_buffer_size"))
         .unwrap_or("262144");
 
     let writer_buffer_size: AtomicUsize = AtomicUsize::new(
         writer_buffer_size
             .parse::<usize>()
-            .expect("max_part_size does not fit into u64")
+            .expect("writer_buffer_size does not fit into usize")
     );
     
     WRITER_BUFFER_SIZE_ATOMIC
         .set(writer_buffer_size)
-        .expect("Double initialization of MAX_PART_SIZE!");
+        .expect("Double initialization of WRITER_BUFFER_SIZE!");
 
     let cert = RustlsConfig::from_pem_file(&cert_path, &key_path)
         .await

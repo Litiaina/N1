@@ -14,8 +14,10 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
 
     //Storage disk configuration
     conf.with_section(Some("disk_config"))
-        //Root storage path
-        .set("object_storage_path", "object-storage-path")
+        // Root storage path for Index/Metadata
+        .set("index_store_disk", "index-store-path")
+        // Distributed blob storage paths (comma separated)
+        .set("blob_store_disks", "blob-disk-1")
         .set("fs_storage_path", "fs-storage-path");
 
     //Garbage collector
@@ -64,9 +66,9 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         // Max part size of an object
         .set("max_part_size", "52428800")
         // Total data shards during erasure coding
-        .set("data_shards", "4")
+        .set("data_shards", "1")
         // Total parity shards during erasure coding
-        .set("parity_shards", "2");
+        .set("parity_shards", "0");
 
     //Write config file
     conf.write_to_file(path)

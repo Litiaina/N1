@@ -36,7 +36,8 @@ static QUOTA_CACHE: LazyLock<Cache<String, Quota>> = LazyLock::new(|| {
 
 fn get_quota_path(uid: &str) -> PathBuf {
     let path_manager = ObjectPathManager::new();
-    path_manager.get_user_dir(uid).join(QUOTA_FILE)
+    // FIX: Updated to get_user_index_dir
+    path_manager.get_user_index_dir(uid).join(QUOTA_FILE)
 }
 
 pub async fn init_quota_file(uid: &str, allocated: u64) -> Result<(), AppError> {

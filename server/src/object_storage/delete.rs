@@ -15,7 +15,7 @@ use chrono::Utc;
 use futures_util::{StreamExt, stream};
 use sha2::{Digest, Sha256};
 use tokio::fs;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use ulid::Ulid;
 use walkdir::WalkDir;
 
@@ -28,7 +28,7 @@ pub async fn delete_object_version(
     let path_manager = ObjectPathManager::new();
 
     let index_path = path_manager.get_metadata_path(&uid, &fragment, &object_key, &version_id);
-    let blob_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
+    let meta_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
 
     let mut size_to_free = 0;
     if let Ok(data) = fs::read(&index_path).await {
@@ -52,11 +52,18 @@ pub async fn delete_object_version(
         }
     }
 
-    if fs::try_exists(&blob_dir).await.unwrap_or(false) {
-        fs::remove_dir_all(&blob_dir).await.map_err(|e| {
-            error!("Failed to delete blob directory: {}", e);
-            AppError::InternalServerError("Failed to delete blobs.".to_string())
-        })?;
+    if fs::try_exists(&meta_dir).await.unwrap_or(false) {
+        let _ = fs::remove_dir_all(&meta_dir).await;
+    }
+
+    let blob_roots = path_manager.get_blob_roots();
+    for disk in blob_roots {
+        let shard_dir = path_manager.get_shard_dir_on_disk(&disk, &uid, &fragment, &version_id);
+        if shard_dir.exists() {
+            if let Err(e) = fs::remove_dir_all(&shard_dir).await {
+                warn!("Failed to delete blob dir on disk {:?}: {}", shard_dir, e);
+            }
+        }
     }
 
     if size_to_free > 0 {
@@ -122,11 +129,15 @@ pub async fn delete_object_permanently(
         }
     }
 
+    let blob_roots = Arc::new(path_manager.get_blob_roots());
+
     let results: Vec<i64> = stream::iter(version_metadata_files)
         .map(|meta_path| {
-            let pm = &path_manager;
-            let u = &uid;
-            let f = &fragment;
+            let pm = ObjectPathManager::new();
+            let u = uid.clone();
+            let f = fragment.clone();
+            let disks = blob_roots.clone();
+
             async move {
                 let mut freed_bytes = 0;
                 let mut version_id = String::new();
@@ -146,8 +157,13 @@ pub async fn delete_object_permanently(
                 }
 
                 if !version_id.is_empty() {
-                    let blob_dir = pm.get_blob_dir(u, f, &version_id);
-                    let _ = fs::remove_dir_all(&blob_dir).await;
+                    let meta_dir = pm.get_blob_dir(&u, &f, &version_id);
+                    let _ = fs::remove_dir_all(&meta_dir).await;
+
+                    for disk in disks.iter() {
+                        let shard_dir = pm.get_shard_dir_on_disk(disk, &u, &f, &version_id);
+                        let _ = fs::remove_dir_all(&shard_dir).await;
+                    }
                 }
 
                 freed_bytes
@@ -255,7 +271,7 @@ pub async fn delete_fragment(
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
 
-    let user_storage_root = path_manager.root.join(OBJECT_DATA_ROOT).join(&uid);
+    let user_storage_root = path_manager.get_user_index_dir(&uid);
     let fragment_path = user_storage_root.join(&fragment);
 
     let index_dir = fragment_path.join("index");
@@ -267,8 +283,7 @@ pub async fn delete_fragment(
 
         let mut total_size: u64 = 0;
         for entry in WalkDir::new(&index_dir).into_iter().filter_map(|e| e.ok()) {
-            if entry.file_type().is_file()
-                && entry.file_name().to_string_lossy().ends_with(".bson")
+            if entry.file_type().is_file() && entry.file_name().to_string_lossy().ends_with(".bson")
             {
                 if let Ok(data) = std::fs::read(entry.path()) {
                     if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
@@ -284,15 +299,29 @@ pub async fn delete_fragment(
     .await
     .unwrap_or(0);
 
+    let blob_roots = Arc::new(path_manager.get_blob_roots());
+    let uid_owned = uid.clone();
+    let frag_owned = fragment.clone();
+
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         if !fragment_path.exists() {
             return Err(AppError::NotFound);
         }
 
         std::fs::remove_dir_all(&fragment_path).map_err(|e| {
-            error!("Failed to delete fragment {:?}: {}", fragment_path, e);
-            AppError::InternalServerError("Failed to delete fragment.".to_string())
+            error!("Failed to delete fragment index {:?}: {}", fragment_path, e);
+            AppError::InternalServerError("Failed to delete fragment index.".to_string())
         })?;
+
+        for disk in blob_roots.iter() {
+            let blob_frag_dir = disk
+                .join(OBJECT_DATA_ROOT)
+                .join(&uid_owned)
+                .join(&frag_owned);
+            if blob_frag_dir.exists() {
+                let _ = std::fs::remove_dir_all(&blob_frag_dir);
+            }
+        }
 
         Ok(())
     })

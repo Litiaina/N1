@@ -6,41 +6,58 @@ use std::sync::OnceLock;
 use crate::object_storage::archive::default_format;
 use crate::object_storage::constants::OBJECT_DATA_ROOT;
 
-pub static OBJECT_STORAGE_ROOT: OnceLock<String> = OnceLock::new();
+pub static INDEX_STORE_DISK: OnceLock<String> = OnceLock::new();
+pub static BLOB_STORE_DISKS: OnceLock<Vec<String>> = OnceLock::new();
 pub static FS_STORAGE_ROOT: OnceLock<String> = OnceLock::new();
 
-pub struct ObjectPathManager {
-    pub root: PathBuf,
-}
+pub struct ObjectPathManager;
 
 impl ObjectPathManager {
     pub fn new() -> Self {
-        let root = OBJECT_STORAGE_ROOT
-            .get()
-            .expect("Config not initialized!")
-            .clone();
-        Self {
-            root: PathBuf::from(root),
-        }
+        Self
     }
 
-    pub fn get_user_dir(&self, uid: &str) -> PathBuf {
-        self.root
+    pub fn get_index_root(&self) -> PathBuf {
+        let root = INDEX_STORE_DISK
+            .get()
+            .expect("Index Store Config not initialized!")
+            .clone();
+        PathBuf::from(root)
+    }
+
+    pub fn get_blob_roots(&self) -> Vec<PathBuf> {
+        let roots = BLOB_STORE_DISKS
+            .get()
+            .expect("Blob Store Config not initialized!");
+        roots.iter().map(PathBuf::from).collect()
+    }
+
+    pub fn get_user_index_dir(&self, uid: &str) -> PathBuf {
+        self.get_index_root()
             .join(OBJECT_DATA_ROOT)
             .join(uid)
     }
 
     pub fn get_blob_dir(&self, uid: &str, fragment: &str, version_id: &str) -> PathBuf {
-        self.get_user_dir(uid)
+        self.get_user_index_dir(uid)
             .join(fragment)
             .join("blobs")
             .join(version_id)
     }
 
     pub fn get_index_dir(&self, uid: &str, fragment: &str) -> PathBuf {
-        self.get_user_dir(uid)
+        self.get_user_index_dir(uid)
             .join(fragment)
             .join("index")
+    }
+
+    pub fn get_shard_dir_on_disk(&self, disk_root: &PathBuf, uid: &str, fragment: &str, version_id: &str) -> PathBuf {
+        disk_root
+            .join(OBJECT_DATA_ROOT)
+            .join(uid)
+            .join(fragment)
+            .join("blobs")
+            .join(version_id)
     }
 
     pub fn get_metadata_path(&self, uid: &str, fragment: &str, object_key: &str, version_id: &str) -> PathBuf {

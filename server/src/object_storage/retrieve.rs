@@ -1,9 +1,11 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::get_metadata_with_cache;
-use crate::object_storage::constants::{BROWSER_CACHE_MAX_AGE, OBJECT_DATA_ROOT};
+use crate::object_storage::constants::BROWSER_CACHE_MAX_AGE;
 use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
 use crate::structs::auth_structs::Claims;
-use crate::structs::object_storage_structs::{ListObjectsResult, ObjectMetadata, ObjectPathManager, ObjectSummary};
+use crate::structs::object_storage_structs::{
+    ListObjectsResult, ObjectMetadata, ObjectPathManager, ObjectSummary,
+};
 use axum::{
     Json as AxumJson,
     body::Body,
@@ -24,7 +26,11 @@ fn parse_continuation_token(token: &str) -> Option<(String, String, String)> {
     let s = String::from_utf8(bytes).ok()?;
     let parts: Vec<&str> = s.split('/').collect();
     if parts.len() == 3 {
-        Some((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()))
+        Some((
+            parts[0].to_string(),
+            parts[1].to_string(),
+            parts[2].to_string(),
+        ))
     } else {
         None
     }
@@ -43,12 +49,14 @@ pub async fn list_objects(
     let path_manager = ObjectPathManager::new();
     let index_root = path_manager.get_index_dir(&uid, &fragment);
 
-    let limit: usize = params.get("limit")
+    let limit: usize = params
+        .get("limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(100)
         .min(1000);
-        
-    let include_deleted = params.get("include_deleted")
+
+    let include_deleted = params
+        .get("include_deleted")
         .map(|v| v == "true")
         .unwrap_or(false);
 
@@ -59,11 +67,16 @@ pub async fn list_objects(
     };
 
     if !fs::try_exists(&index_root).await.unwrap_or(false) {
-        return Ok(AxumJson(ListObjectsResult { objects: Vec::new(), continuation_token: None }));
+        return Ok(AxumJson(ListObjectsResult {
+            objects: Vec::new(),
+            continuation_token: None,
+        }));
     }
 
     let mut s1_entries = Vec::new();
-    let mut entries = fs::read_dir(&index_root).await.map_err(|e| AppError::Io(e, "read index".into()))?;
+    let mut entries = fs::read_dir(&index_root)
+        .await
+        .map_err(|e| AppError::Io(e, "read index".into()))?;
     while let Ok(Some(entry)) = entries.next_entry().await {
         s1_entries.push(entry.file_name().to_string_lossy().to_string());
     }
@@ -71,7 +84,9 @@ pub async fn list_objects(
 
     let s1_start_idx = if !start_s1.is_empty() {
         s1_entries.binary_search(&start_s1).unwrap_or_else(|x| x)
-    } else { 0 };
+    } else {
+        0
+    };
 
     let mut results = Vec::new();
     let mut next_token = None;
@@ -79,7 +94,7 @@ pub async fn list_objects(
 
     'outer: for s1 in s1_entries.into_iter().skip(s1_start_idx) {
         let s1_path = index_root.join(&s1);
-        
+
         let mut s2_entries = Vec::new();
         let mut entries = match fs::read_dir(&s1_path).await {
             Ok(e) => e,
@@ -93,11 +108,13 @@ pub async fn list_objects(
 
         let s2_start_idx = if s1 == start_s1 && !start_s2.is_empty() {
             s2_entries.binary_search(&start_s2).unwrap_or_else(|x| x)
-        } else { 0 };
+        } else {
+            0
+        };
 
         for s2 in s2_entries.into_iter().skip(s2_start_idx) {
             let s2_path = s1_path.join(&s2);
-            
+
             let mut file_names = Vec::new();
             let mut entries = match fs::read_dir(&s2_path).await {
                 Ok(e) => e,
@@ -118,10 +135,12 @@ pub async fn list_objects(
                     Ok(i) => i + 1,
                     Err(i) => i,
                 }
-            } else { 0 };
+            } else {
+                0
+            };
 
             let stream_iter = file_names.into_iter().skip(file_start_idx);
-            
+
             let mut stream = futures_util::stream::iter(stream_iter)
                 .map(|fname| {
                     let path = s2_path.join(&fname);
@@ -144,9 +163,10 @@ pub async fn list_objects(
                         if !meta.is_delete_marker || include_deleted {
                             results.push(meta);
                         }
-                        
+
                         if results.len() >= limit {
-                            next_token = Some(create_continuation_token(&s1, &s2, &last_fname_processed));
+                            next_token =
+                                Some(create_continuation_token(&s1, &s2, &last_fname_processed));
                             reached_limit = true;
                             break 'outer;
                         }
@@ -156,14 +176,14 @@ pub async fn list_objects(
 
                 if let Ok(data) = read_result {
                     if let Ok(summary) = mongodb::bson::from_slice::<ObjectSummary>(&data) {
-                        pending_meta = Some(summary.into()); 
+                        pending_meta = Some(summary.into());
                     }
                 }
                 last_fname_processed = fname;
             }
 
             if let Some(meta) = pending_meta {
-                 if !meta.is_delete_marker || include_deleted {
+                if !meta.is_delete_marker || include_deleted {
                     results.push(meta);
                 }
                 if results.len() >= limit {
@@ -187,15 +207,16 @@ pub async fn list_object_versions(
 ) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
-    
+
     let mut hasher = Sha256::new();
     hasher.update(object_key.as_bytes());
     let hash = hex::encode(hasher.finalize());
-    
+
     let shard1 = &hash[0..2];
     let shard2 = &hash[2..4];
-    
-    let shard_dir = path_manager.get_index_dir(&uid, &fragment)
+
+    let shard_dir = path_manager
+        .get_index_dir(&uid, &fragment)
         .join(shard1)
         .join(shard2);
 
@@ -205,7 +226,7 @@ pub async fn list_object_versions(
 
     let prefix = format!("{}#", hash);
     let mut versions = Vec::new();
-    
+
     let mut entries = fs::read_dir(&shard_dir)
         .await
         .map_err(|e| AppError::Io(e, "read index shard".into()))?;
@@ -229,7 +250,9 @@ pub async fn list_object_versions(
 pub async fn list_fragments(claims: Claims) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
-    let user_storage_root = path_manager.root.join(OBJECT_DATA_ROOT).join(&uid);
+
+    // Fixed: Use get_user_index_dir instead of accessing missing .root field
+    let user_storage_root = path_manager.get_user_index_dir(&uid);
 
     let fragments = tokio::task::spawn_blocking(move || -> Result<Vec<String>, std::io::Error> {
         if !user_storage_root.exists() {

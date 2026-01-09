@@ -6,7 +6,13 @@ use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
 use crate::{
-    database::database_constants::DATABASE, object_storage::quota_manager::{init_quota_file, set_storage_used}, routes::storage_routes::AppState, structs::{auth_structs::Claims, object_storage_structs::{ObjectMetadata, ObjectPathManager, UserRecord}}
+    database::database_constants::DATABASE,
+    object_storage::quota_manager::{init_quota_file, set_storage_used},
+    routes::storage_routes::AppState,
+    structs::{
+        auth_structs::Claims,
+        object_storage_structs::{ObjectMetadata, ObjectPathManager, UserRecord},
+    },
 };
 
 pub async fn sync_quota(db_client: Arc<Client>) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -26,18 +32,25 @@ pub async fn sync_quota(db_client: Arc<Client>) -> Result<(), Box<dyn Error + Se
                     continue;
                 }
 
-                let user_dir = path_manager.get_user_dir(&uid);
+                let user_dir = path_manager.get_user_index_dir(&uid);
 
                 tokio::spawn(async move {
                     if user_dir.exists() {
                         let calculated_usage = tokio::task::spawn_blocking(move || {
                             let mut total = 0u64;
-                            for entry in WalkDir::new(&user_dir).into_iter().filter_map(|e| e.ok()) {
-                                if entry.file_type().is_file() && entry.file_name().to_string_lossy().ends_with(".bson") {
-                                    if entry.file_name() == "quota.bson" { continue; }
-                                    
+                            for entry in WalkDir::new(&user_dir).into_iter().filter_map(|e| e.ok())
+                            {
+                                if entry.file_type().is_file()
+                                    && entry.file_name().to_string_lossy().ends_with(".bson")
+                                {
+                                    if entry.file_name() == "quota.bson" {
+                                        continue;
+                                    }
+
                                     if let Ok(data) = std::fs::read(entry.path()) {
-                                        if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
+                                        if let Ok(meta) =
+                                            mongodb::bson::from_slice::<ObjectMetadata>(&data)
+                                        {
                                             if !meta.is_delete_marker {
                                                 total += meta.total_size_bytes;
                                             }
@@ -76,29 +89,40 @@ pub async fn sync_quota(db_client: Arc<Client>) -> Result<(), Box<dyn Error + Se
     Ok(())
 }
 
-pub async fn sync_single_user_quota(db_client: Arc<Client>, uid: Arc<String>) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub async fn sync_single_user_quota(
+    db_client: Arc<Client>,
+    uid: Arc<String>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let db = db_client.database(DATABASE);
     let auth_collection = db.collection::<UserRecord>("auth");
     let path_manager = ObjectPathManager::new();
 
-    match auth_collection.find_one(doc! { "uid": &uid.as_str() }).await? {
+    match auth_collection
+        .find_one(doc! { "uid": &uid.as_str() })
+        .await?
+    {
         Some(user) => {
             if let Err(e) = init_quota_file(&uid, user.allocated_storage).await {
                 error!("Failed to sync quota file for {}: {}", &uid, e);
                 return Ok(());
             }
 
-            let user_dir = path_manager.get_user_dir(&uid);
+            let user_dir = path_manager.get_user_index_dir(&uid);
 
             if user_dir.exists() {
                 let calculated_usage = tokio::task::spawn_blocking(move || {
                     let mut total = 0u64;
                     for entry in WalkDir::new(&user_dir).into_iter().filter_map(|e| e.ok()) {
-                        if entry.file_type().is_file() && entry.file_name().to_string_lossy().ends_with(".bson") {
-                            if entry.file_name() == "quota.bson" { continue; }
-                            
+                        if entry.file_type().is_file()
+                            && entry.file_name().to_string_lossy().ends_with(".bson")
+                        {
+                            if entry.file_name() == "quota.bson" {
+                                continue;
+                            }
+
                             if let Ok(data) = std::fs::read(entry.path()) {
-                                if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
+                                if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data)
+                                {
                                     if !meta.is_delete_marker {
                                         total += meta.total_size_bytes;
                                     }
@@ -108,7 +132,7 @@ pub async fn sync_single_user_quota(db_client: Arc<Client>, uid: Arc<String>) ->
                     }
                     total
                 })
-                .await?; 
+                .await?;
 
                 if let Err(e) = set_storage_used(&uid, calculated_usage).await {
                     warn!("Failed to update usage stats for {}: {}", &uid, e);
@@ -116,7 +140,10 @@ pub async fn sync_single_user_quota(db_client: Arc<Client>, uid: Arc<String>) ->
             }
         }
         None => {
-            warn!("User {} not found in database during specific quota sync.", &uid);
+            warn!(
+                "User {} not found in database during specific quota sync.",
+                &uid
+            );
         }
     }
 
@@ -126,7 +153,7 @@ pub async fn sync_single_user_quota(db_client: Arc<Client>, uid: Arc<String>) ->
 
 pub async fn sync_quota_api(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let db_client = state.db_client.clone();
-    
+
     tokio::spawn(async move {
         match sync_quota(db_client).await {
             Ok(_) => info!("Full quota sync cycle completed successfully."),
@@ -137,10 +164,13 @@ pub async fn sync_quota_api(State(state): State<Arc<AppState>>) -> impl IntoResp
     StatusCode::ACCEPTED
 }
 
-pub async fn sync_user_quota_api(State(state): State<Arc<AppState>>, claims: Claims) -> impl IntoResponse {
+pub async fn sync_user_quota_api(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+) -> impl IntoResponse {
     let uid = Arc::new(claims.uid);
     let db_client = Arc::clone(&state.db_client);
-    
+
     tokio::spawn(async move {
         match sync_single_user_quota(db_client, uid.clone()).await {
             Ok(_) => info!("User quota sync completed successfully for {}.", &uid),

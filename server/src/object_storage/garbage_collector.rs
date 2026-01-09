@@ -5,7 +5,7 @@ use crate::object_storage::constants::OBJECT_DATA_ROOT;
 use crate::object_storage::quota_manager::update_quota;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
-use crate::structs::object_storage_structs::{FS_STORAGE_ROOT, OBJECT_STORAGE_ROOT};
+use crate::structs::object_storage_structs::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISK};
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -72,20 +72,25 @@ struct IndexEntry {
 }
 
 async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<(), AppError> {
-    let root_str = OBJECT_STORAGE_ROOT
+    let root_str = INDEX_STORE_DISK
         .get()
-        .ok_or(AppError::InternalServerError("No root".into()))?;
-    let storage_root = PathBuf::from(root_str).join(OBJECT_DATA_ROOT);
+        .ok_or(AppError::InternalServerError("No index root".into()))?;
+    
+    let blob_disks = BLOB_STORE_DISKS
+        .get()
+        .ok_or(AppError::InternalServerError("No blob disks".into()))?;
+
+    let index_storage_root = PathBuf::from(root_str).join(OBJECT_DATA_ROOT);
     
     let retention_duration = Duration::from_secs(CONFIG.garbage_collector.retention_days * 86400);
     let file_ttl = Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds);
 
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-        if !storage_root.exists() {
+        if !index_storage_root.exists() {
             return Ok(());
         }
 
-        for user_entry in fs::read_dir(&storage_root).map_err(|e| AppError::Io(e, "read storage root".into()))? {
+        for user_entry in fs::read_dir(&index_storage_root).map_err(|e| AppError::Io(e, "read index storage root".into()))? {
             let user_entry = match user_entry { Ok(e) => e, Err(_) => continue };
             let uid = user_entry.file_name().to_string_lossy().to_string();
             let user_path = user_entry.path();
@@ -94,13 +99,12 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
 
             for frag_entry in fs::read_dir(&user_path).map_err(|e| AppError::Io(e, "read user root".into()))? {
                 let frag_entry = match frag_entry { Ok(e) => e, Err(_) => continue };
+                let fragment_name = frag_entry.file_name().to_string_lossy().to_string();
                 let fragment_path = frag_entry.path();
                 if !fragment_path.is_dir() { continue; }
 
                 let index_root = fragment_path.join("index");
-                let blobs_root = fragment_path.join("blobs");
-
-                if !blobs_root.exists() && !index_root.exists() { continue; }
+                let session_meta_root = fragment_path.join("blobs"); 
 
                 let mut valid_versions = HashSet::new();
                 let mut expired_versions = HashSet::new();
@@ -156,50 +160,79 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
                     }
                 }
 
-                if blobs_root.exists() {
-                    if let Ok(blob_entries) = fs::read_dir(&blobs_root) {
+                if session_meta_root.exists() {
+                    if let Ok(blob_entries) = fs::read_dir(&session_meta_root) {
                         for blob_entry in blob_entries.flatten() {
                             let blob_path = blob_entry.path();
                             let version_id = blob_entry.file_name().to_string_lossy().to_string();
 
                             if !valid_versions.contains(&version_id) {
-                                let should_skip_grace_period = is_manual_run || expired_versions.contains(&version_id);
-
-                                if !should_skip_grace_period {
-                                    if let Ok(meta) = fs::metadata(&blob_path) {
+                                let mut should_delete = is_manual_run || expired_versions.contains(&version_id);
+                                if !should_delete {
+                                     if let Ok(meta) = fs::metadata(&blob_path) {
                                         if let Ok(modified) = meta.modified() {
                                             if let Ok(age) = std::time::SystemTime::now().duration_since(modified) {
-                                                if age < file_ttl {
-                                                    continue; 
+                                                if age > file_ttl {
+                                                    should_delete = true;
                                                 }
                                             }
                                         }
-                                    }
+                                     }
                                 }
 
-                                let mut size_to_refund = 0;
-                                let receipt_path = blob_path.join("reservation.bson");
-                                if let Ok(data) = fs::read(&receipt_path) {
-                                    if let Ok(receipt) = mongodb::bson::from_slice::<crate::structs::object_storage_structs::ReservationReceipt>(&data) {
-                                        size_to_refund = receipt.amount;
-                                    }
-                                } else {
-                                    for file in WalkDir::new(&blob_path).into_iter().filter_map(|e| e.ok()) {
-                                        if file.file_type().is_file() {
-                                            size_to_refund += file.metadata().map(|m| m.len()).unwrap_or(0);
+                                if should_delete {
+                                    let mut size_to_refund = 0;
+                                    let receipt_path = blob_path.join("reservation.bson");
+                                    if let Ok(data) = fs::read(&receipt_path) {
+                                        if let Ok(receipt) = mongodb::bson::from_slice::<crate::structs::object_storage_structs::ReservationReceipt>(&data) {
+                                            size_to_refund = receipt.amount;
                                         }
                                     }
-                                }
 
-                                info!("Deleting orphaned/expired blob version: {}/blobs/{} (Refunding {} bytes)", uid, version_id, size_to_refund);
-                                
-                                if fs::remove_dir_all(&blob_path).is_ok() {
-                                    if size_to_refund > 0 {
+                                    if fs::remove_dir_all(&blob_path).is_ok() && size_to_refund > 0 {
                                          refund_quota_async(uid.clone(), size_to_refund, state.clone());
                                     }
+
+                                    expired_versions.insert(version_id);
                                 }
                             }
                         }
+                    }
+                }
+                
+                for disk_root_str in blob_disks {
+                    let disk_root = PathBuf::from(disk_root_str);
+                    let blob_fragment_root = disk_root.join(OBJECT_DATA_ROOT).join(&uid).join(&fragment_name).join("blobs");
+                    
+                    if blob_fragment_root.exists() {
+                         if let Ok(entries) = fs::read_dir(&blob_fragment_root) {
+                             for entry in entries.flatten() {
+                                 let path = entry.path();
+                                 if !path.is_dir() { continue; }
+                                 let version_id = entry.file_name().to_string_lossy().to_string();
+                                 
+                                 if !valid_versions.contains(&version_id) {
+                                     let mut should_delete = is_manual_run || expired_versions.contains(&version_id);
+                                     
+                                     if !should_delete {
+                                          if let Ok(meta) = fs::metadata(&path) {
+                                            if let Ok(modified) = meta.modified() {
+                                                if let Ok(age) = std::time::SystemTime::now().duration_since(modified) {
+                                                    if age > file_ttl {
+                                                        should_delete = true;
+                                                    }
+                                                }
+                                            }
+                                         }
+                                     }
+
+                                     if should_delete {
+                                         info!("Deleting orphaned shards on disk {:?}: {}/blobs/{}", disk_root, uid, version_id);
+                                         let _ = fs::remove_dir_all(&path);
+                                     }
+                                 }
+                             }
+                         }
                     }
                 }
 
