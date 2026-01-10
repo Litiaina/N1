@@ -2,7 +2,7 @@ use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::OBJECT_DATA_ROOT;
 use crate::object_storage::recovery::{repair_entire_shard, verify_shard_integrity};
 use crate::structs::object_storage_structs::INDEX_STORE_DISKS;
-use crate::structs::object_storage_structs::{ObjectMetadata, ObjectPathManager};
+use crate::structs::object_storage_structs::{ObjectMetadata, ObjectPathManager, Quota};
 use axum::{extract::Query, http::StatusCode, response::IntoResponse};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -29,6 +29,7 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
     let num_disks = blob_roots.len();
 
     let processed_versions = Arc::new(Mutex::new(HashSet::new()));
+    let processed_users = Arc::new(Mutex::new(HashSet::new()));
 
     info!(
         "Starting Storage Repair Job (Scanning {} index roots)",
@@ -57,7 +58,28 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
                 continue;
             }
 
-            let mut frag_entries = match fs::read_dir(user_path).await {
+            let uid = user_entry.file_name().to_string_lossy().to_string();
+
+            let should_process_quota = {
+                let mut p_users = processed_users.lock().unwrap();
+                if p_users.contains(&uid) {
+                    false
+                } else {
+                    p_users.insert(uid.clone());
+                    true
+                }
+            };
+
+            if should_process_quota {
+                let quota_path = user_path.join("quota.bson");
+                if let Ok(quota_data) = fs::read(&quota_path).await {
+                    if let Err(e) = repair_user_quota(&uid, &quota_data, dry_run).await {
+                        error!("Failed to align quota for user {}: {}", uid, e);
+                    }
+                }
+            }
+
+            let mut frag_entries = match fs::read_dir(&user_path).await {
                 Ok(e) => e,
                 Err(_) => continue,
             };
@@ -82,6 +104,7 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
                 })
                 .await
                 .map_err(|e| AppError::InternalServerError(format!("WalkDir failed: {}", e)))?;
+                
                 let blob_roots_clone = blob_roots.clone();
                 let processed_arc = processed_versions.clone();
 
@@ -117,6 +140,50 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
     }
 
     info!("Storage Repair Job Complete.");
+    Ok(())
+}
+
+async fn repair_user_quota(uid: &str, source_data: &[u8], dry_run: bool) -> Result<(), AppError> {
+    if mongodb::bson::from_slice::<Quota>(source_data).is_err() {
+        warn!("Skipping repair for corrupt/invalid quota file source for user {}", uid);
+        return Ok(());
+    }
+
+    let path_manager = ObjectPathManager::new();
+    let all_user_dirs = path_manager.get_all_user_index_dirs(uid);
+
+    for dir in all_user_dirs {
+        let target_path = dir.join("quota.bson");
+        let mut needs_repair = false;
+
+        match fs::read(&target_path).await {
+            Ok(current_data) => {
+                if current_data != source_data {
+                    warn!("Quota mismatch on mirror: {:?}. Aligning.", target_path);
+                    needs_repair = true;
+                }
+            },
+            Err(_) => {
+                needs_repair = true;
+            }
+        }
+
+        if needs_repair {
+            if !dry_run {
+                if !dir.exists() {
+                    fs::create_dir_all(&dir).await.map_err(|e| AppError::Io(e, "create user index dir".into()))?;
+                }
+                
+                info!("Repairing quota file on mirror: {:?}", target_path);
+                let tmp = target_path.with_extension("tmp");
+                fs::write(&tmp, source_data).await.map_err(|e| AppError::Io(e, "write quota tmp".into()))?;
+                fs::rename(tmp, target_path).await.map_err(|e| AppError::Io(e, "rename quota".into()))?;
+            } else {
+                info!("[DRY RUN] Would repair quota file: {:?}", target_path);
+            }
+        }
+    }
+
     Ok(())
 }
 
