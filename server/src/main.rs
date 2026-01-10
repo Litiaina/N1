@@ -1,7 +1,6 @@
 use crate::fs::cleanup_manager::interval_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
-use crate::object_storage::sync::sync_quota;
 use crate::object_storage::upload::{DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC};
 use crate::routes::storage_routes::serve_storage_routes;
 use crate::structs::object_storage_structs::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
@@ -285,19 +284,12 @@ pub async fn run_server() {
         .expect("Failed to load TLS certificates");
 
     let storage_addr = SocketAddr::from((ip, https_port));
-    let (storage_router, app_state) = serve_storage_routes().await;
+    let storage_router = serve_storage_routes().await;
     let serve_storage = storage_router.fallback(handler_404);
 
     let fs_root = FS_STORAGE_ROOT.get().unwrap_or(&STORAGE_ROOT.to_string()).to_string();
     tokio::spawn(async move {
         interval_cleanup(&fs_root).await;
-    });
-
-    let db_client = Arc::clone(&app_state.db_client);
-    tokio::spawn(async move {
-        if let Err(e) = sync_quota(db_client).await {
-            tracing::error!("Failed to setup database locks/quota: {}", e);
-        }
     });
 
     serve(storage_addr, serve_storage, cert).await;

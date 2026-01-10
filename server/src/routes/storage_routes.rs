@@ -29,7 +29,7 @@ use crate::object_storage::retrieve::{
     stream_object,
 };
 use crate::object_storage::sharing::{create_signed_url, get_shared_object};
-use crate::object_storage::sync::{sync_quota_api, sync_user_quota_api};
+use crate::object_storage::sync::{initialize_user_storage_api, sync_quota_api, sync_user_quota_api};
 use crate::object_storage::upload::{
     cancel_upload_session, finalize_object_upload, get_capacity_usage, get_upload_status, initiate_object_upload, object_upload_part
 };
@@ -58,7 +58,7 @@ impl AppState {
     }
 }
 
-pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
+pub async fn serve_storage_routes() -> Router {
     let layers = RateLimitLayers::new();
 
     let client_options = ClientOptions::parse(&*DATABASE_URL)
@@ -131,7 +131,9 @@ pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
             .route("/v4/fragment/object/upload/chunk/{:fragment}/{:version_id}/{:part_index}", put(object_upload_part))
             .route("/v4/fragment/object/upload/finalize/{:fragment}/{:version_id}/{:session_id}", post(finalize_object_upload))
             .route("/v4/fragment/object/upload/cancel/{:fragment}/{:version_id}", delete(cancel_upload_session))
-            .route("/v4/maintenance/sync/user", post(sync_user_metadata));
+            .route("/v4/maintenance/sync/user", post(sync_user_metadata))
+            .route("/v4/storage/sync/user", post(sync_user_quota_api))
+            .route("/v4/storage/sync/user/initialize", post(initialize_user_storage_api));
 
         let write_ops = layers.layer_upload(write_ops);
 
@@ -209,6 +211,7 @@ pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
 
     let maintenance_routes =  {
         let repair_routes = Router::new()
+            .route("/v4/system/sync", post(sync_quota_api))
             .route("/v4/system/repair", post(trigger_repair_job_api))
             .route("/v4/system/health", get(get_system_health));
 
@@ -245,18 +248,6 @@ pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
             .layer(from_fn(auth))
     };
 
-    let sync_data_routes = {
-        let sync_routes = Router::new()
-            .route("/v4/storage/sync", post(sync_quota_api))
-            .route("/v4/user/storage/sync", post(sync_user_quota_api));
-
-        let sync_routes = layers.layer_upload(sync_routes);
-
-        Router::new()
-            .merge(sync_routes)
-            .layer(from_fn(auth))
-    };
-
     let auth_route = Router::new()
         .route("/authenticate", post(authorize));
     let auth_route = layers.layer_auth(auth_route);
@@ -268,7 +259,6 @@ pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
     let router = Router::new()
         .merge(ping_route)
         .merge(gc_routes)
-        .merge(sync_data_routes)
         .merge(auth_route)
         .merge(object_storage_routes)
         .merge(maintenance_routes)
@@ -278,7 +268,7 @@ pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
         .layer(cors_layer)
         .with_state(Arc::clone(&app_state));
 
-    (router, app_state)
+    router
 }
 
 async fn ping() -> &'static str {

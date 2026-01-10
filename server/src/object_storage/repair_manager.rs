@@ -4,9 +4,9 @@ use crate::object_storage::recovery::{repair_entire_shard, verify_shard_integrit
 use crate::structs::object_storage_structs::INDEX_STORE_DISKS;
 use crate::structs::object_storage_structs::{ObjectMetadata, ObjectPathManager};
 use axum::{extract::Query, http::StatusCode, response::IntoResponse};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::fs::{self, File};
 use tracing::{error, info, warn};
 use walkdir::WalkDir;
@@ -24,73 +24,92 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
         .iter()
         .map(|s| PathBuf::from(s).join(OBJECT_DATA_ROOT))
         .collect();
-    let primary_index_root =
-        index_roots
-            .iter()
-            .find(|p| p.exists())
-            .ok_or(AppError::InternalServerError(
-                "No index disk available".into(),
-            ))?;
 
     let blob_roots = path_manager.get_blob_roots();
     let num_disks = blob_roots.len();
 
+    let processed_versions = Arc::new(Mutex::new(HashSet::new()));
+
     info!(
-        "Starting Storage Repair Job (Source: {:?})",
-        primary_index_root
+        "Starting Storage Repair Job (Scanning {} index roots)",
+        index_roots.len()
     );
 
-    let mut user_entries = fs::read_dir(primary_index_root)
-        .await
-        .map_err(|e| AppError::Io(e, "read index root".into()))?;
-
-    while let Ok(Some(user_entry)) = user_entries.next_entry().await {
-        let user_path = user_entry.path();
-        if !user_path.is_dir() {
+    for index_root in index_roots {
+        if !index_root.exists() {
+            warn!("Index root unreachable, skipping scan: {:?}", index_root);
             continue;
         }
 
-        let mut frag_entries = fs::read_dir(user_path)
-            .await
-            .map_err(|e| AppError::Io(e, "read user root".into()))?;
-        while let Ok(Some(frag_entry)) = frag_entries.next_entry().await {
-            let index_dir = frag_entry.path().join("index");
+        info!("Scanning Index Root: {:?}", index_root);
 
-            if !index_dir.exists() {
+        let mut user_entries = match fs::read_dir(&index_root).await {
+            Ok(e) => e,
+            Err(e) => {
+                error!("Failed to read index root {:?}: {}", index_root, e);
+                continue;
+            }
+        };
+
+        while let Ok(Some(user_entry)) = user_entries.next_entry().await {
+            let user_path = user_entry.path();
+            if !user_path.is_dir() {
                 continue;
             }
 
-            let meta_files: Vec<PathBuf> = tokio::task::spawn_blocking(move || {
-                WalkDir::new(index_dir)
-                    .into_iter()
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.file_type().is_file()
-                            && e.path().extension().map_or(false, |ext| ext == "bson")
-                    })
-                    .map(|e| e.path().to_owned())
-                    .collect()
-            })
-            .await
-            .map_err(|e| AppError::InternalServerError(format!("WalkDir failed: {}", e)))?;
+            let mut frag_entries = match fs::read_dir(user_path).await {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
 
-            let blob_roots_clone = blob_roots.clone();
+            while let Ok(Some(frag_entry)) = frag_entries.next_entry().await {
+                let index_dir = frag_entry.path().join("index");
 
-            for meta_path in meta_files {
-                if let Ok(data) = fs::read(&meta_path).await {
-                    if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
-                        if meta.is_delete_marker {
-                            continue;
+                if !index_dir.exists() {
+                    continue;
+                }
+
+                let meta_files: Vec<PathBuf> = tokio::task::spawn_blocking(move || {
+                    WalkDir::new(index_dir)
+                        .into_iter()
+                        .filter_map(|e| e.ok())
+                        .filter(|e| {
+                            e.file_type().is_file()
+                                && e.path().extension().map_or(false, |ext| ext == "bson")
+                        })
+                        .map(|e| e.path().to_owned())
+                        .collect()
+                })
+                .await
+                .map_err(|e| AppError::InternalServerError(format!("WalkDir failed: {}", e)))?;
+                let blob_roots_clone = blob_roots.clone();
+                let processed_arc = processed_versions.clone();
+
+                for meta_path in meta_files {
+                    if let Ok(data) = fs::read(&meta_path).await {
+                        if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
+                            if meta.is_delete_marker {
+                                continue;
+                            }
+
+                            {
+                                let mut set = processed_arc.lock().unwrap();
+                                if set.contains(&meta.version_id) {
+                                    continue;
+                                }
+                                set.insert(meta.version_id.clone());
+                            }
+
+                            if let Err(e) = repair_metadata_mirrors(&meta, &data, dry_run).await {
+                                error!(
+                                    "Failed to sync metadata mirrors for {}/{}: {}",
+                                    meta.fragment, meta.object_key, e
+                                );
+                            }
+
+                            process_object_repair(meta, &blob_roots_clone, num_disks, dry_run)
+                                .await?;
                         }
-
-                        if let Err(e) = repair_metadata_mirrors(&meta, &data, dry_run).await {
-                            error!(
-                                "Failed to sync metadata mirrors for {}/{}: {}",
-                                meta.fragment, meta.object_key, e
-                            );
-                        }
-
-                        process_object_repair(meta, &blob_roots_clone, num_disks, dry_run).await?;
                     }
                 }
             }
@@ -118,11 +137,11 @@ async fn repair_metadata_mirrors(
     for path in all_paths {
         let mut needs_repair = false;
 
-        match fs::metadata(&path).await {
-            Ok(file_meta) => {
-                if file_meta.len() != data.len() as u64 {
+        match fs::read(&path).await {
+            Ok(mirror_data) => {
+                if mirror_data != data {
                     warn!(
-                        "Metadata mismatch on mirror (size diff): {:?}. Marking for overwrite.",
+                        "Metadata mismatch on mirror (content diff): {:?}. Aligning with source.",
                         path
                     );
                     needs_repair = true;
@@ -134,9 +153,9 @@ async fn repair_metadata_mirrors(
         }
 
         if needs_repair {
-            info!("Repairing metadata on mirror: {:?}", path);
-
             if !dry_run {
+                info!(" repairing metadata mirror: {:?}", path);
+
                 if let Some(parent) = path.parent() {
                     if !parent.exists() {
                         fs::create_dir_all(parent)
@@ -145,9 +164,15 @@ async fn repair_metadata_mirrors(
                     }
                 }
 
-                fs::write(&path, data)
+                let tmp_path = path.with_extension("tmp");
+                fs::write(&tmp_path, data)
                     .await
-                    .map_err(|e| AppError::Io(e, "write meta mirror".into()))?;
+                    .map_err(|e| AppError::Io(e, "write meta mirror tmp".into()))?;
+                fs::rename(tmp_path, &path)
+                    .await
+                    .map_err(|e| AppError::Io(e, "rename meta mirror".into()))?;
+            } else {
+                info!("[DRY RUN] Would repair metadata mirror: {:?}", path);
             }
         }
     }
@@ -210,7 +235,10 @@ async fn process_object_repair(
         );
 
         if dry_run {
-            info!("Dry Run: Skipping actual repair.");
+            info!(
+                "[DRY RUN] Would repair missing shards: {:?}",
+                missing_shards
+            );
             continue;
         }
 
