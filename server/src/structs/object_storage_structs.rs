@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use crate::object_storage::archive::default_format;
 use crate::object_storage::constants::OBJECT_DATA_ROOT;
 
-pub static INDEX_STORE_DISK: OnceLock<String> = OnceLock::new();
+pub static INDEX_STORE_DISKS: OnceLock<Vec<String>> = OnceLock::new();
 pub static BLOB_STORE_DISKS: OnceLock<Vec<String>> = OnceLock::new();
 pub static FS_STORAGE_ROOT: OnceLock<String> = OnceLock::new();
 
@@ -17,12 +17,11 @@ impl ObjectPathManager {
         Self
     }
 
-    pub fn get_index_root(&self) -> PathBuf {
-        let root = INDEX_STORE_DISK
+    pub fn get_all_index_roots(&self) -> Vec<PathBuf> {
+        let roots = INDEX_STORE_DISKS
             .get()
-            .expect("Index Store Config not initialized!")
-            .clone();
-        PathBuf::from(root)
+            .expect("Index Store Config not initialized!");
+        roots.iter().map(PathBuf::from).collect()
     }
 
     pub fn get_blob_roots(&self) -> Vec<PathBuf> {
@@ -32,23 +31,45 @@ impl ObjectPathManager {
         roots.iter().map(PathBuf::from).collect()
     }
 
-    pub fn get_user_index_dir(&self, uid: &str) -> PathBuf {
-        self.get_index_root()
-            .join(OBJECT_DATA_ROOT)
-            .join(uid)
+    pub fn get_all_user_index_dirs(&self, uid: &str) -> Vec<PathBuf> {
+        self.get_all_index_roots()
+            .iter()
+            .map(|root| root.join(OBJECT_DATA_ROOT).join(uid))
+            .collect()
     }
 
-    pub fn get_blob_dir(&self, uid: &str, fragment: &str, version_id: &str) -> PathBuf {
-        self.get_user_index_dir(uid)
-            .join(fragment)
-            .join("blobs")
-            .join(version_id)
+    pub fn get_all_index_dirs(&self, uid: &str, fragment: &str) -> Vec<PathBuf> {
+        self.get_all_user_index_dirs(uid)
+            .iter()
+            .map(|user_dir| user_dir.join(fragment).join("index"))
+            .collect()
     }
 
-    pub fn get_index_dir(&self, uid: &str, fragment: &str) -> PathBuf {
-        self.get_user_index_dir(uid)
-            .join(fragment)
-            .join("index")
+    pub fn get_all_session_dirs(&self, uid: &str, fragment: &str, version_id: &str) -> Vec<PathBuf> {
+        self.get_all_user_index_dirs(uid)
+            .iter()
+            .map(|user_dir| {
+                user_dir
+                    .join(fragment)
+                    .join("blobs")
+                    .join(version_id)
+            })
+            .collect()
+    }
+
+    pub fn get_all_metadata_paths(&self, uid: &str, fragment: &str, object_key: &str, version_id: &str) -> Vec<PathBuf> {
+        let mut hasher = Sha256::new();
+        hasher.update(object_key.as_bytes());
+        let hash = hex::encode(hasher.finalize());
+        
+        let shard1 = &hash[0..2];
+        let shard2 = &hash[2..4];
+        let filename = format!("{}#{}.bson", hash, version_id);
+        
+        self.get_all_index_dirs(uid, fragment)
+            .iter()
+            .map(|index_dir| index_dir.join(shard1).join(shard2).join(&filename))
+            .collect()
     }
 
     pub fn get_shard_dir_on_disk(&self, disk_root: &PathBuf, uid: &str, fragment: &str, version_id: &str) -> PathBuf {
@@ -60,20 +81,10 @@ impl ObjectPathManager {
             .join(version_id)
     }
 
-    pub fn get_metadata_path(&self, uid: &str, fragment: &str, object_key: &str, version_id: &str) -> PathBuf {
-        let mut hasher = Sha256::new();
-        hasher.update(object_key.as_bytes());
-        let hash = hex::encode(hasher.finalize());
-
-        let shard1 = &hash[0..2];
-        let shard2 = &hash[2..4];
-        
-        let filename = format!("{}#{}.bson", hash, version_id);
-        
-        self.get_index_dir(uid, fragment)
-            .join(shard1)
-            .join(shard2)
-            .join(filename)
+    pub fn get_blob_dir(&self, uid: &str, fragment: &str, version_id: &str) -> PathBuf {
+        let roots = self.get_blob_roots();
+        let root = roots.first().expect("No blob disks configured");
+        self.get_shard_dir_on_disk(root, uid, fragment, version_id)
     }
 }
 

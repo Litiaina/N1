@@ -4,6 +4,7 @@ use crate::structs::object_storage_structs::{ObjectMetadata, ObjectPathManager};
 use moka::future::Cache;
 use once_cell::sync::Lazy;
 use std::time::Duration;
+use tokio::fs;
 
 static META_CACHE: Lazy<Cache<String, ObjectMetadata>> = Lazy::new(|| {
     Cache::builder()
@@ -29,7 +30,7 @@ pub async fn get_metadata_with_cache(
     }
 
     let mut metadata = find_latest_metadata_on_disk(uid, fragment, object_key).await?;
-    
+
     if metadata.fragment != fragment {
         metadata.fragment = fragment.to_string();
     }
@@ -53,11 +54,18 @@ pub async fn get_version_metadata_with_cache(
     }
 
     let path_manager = ObjectPathManager::new();
-    let meta_path = path_manager.get_metadata_path(uid, fragment, object_key, version_id);
 
-    if !tokio::fs::try_exists(&meta_path).await.unwrap_or(false) {
-         return Err(AppError::NotFound);
+    let meta_paths = path_manager.get_all_metadata_paths(uid, fragment, object_key, version_id);
+
+    let mut active_path = None;
+    for path in meta_paths {
+        if fs::try_exists(&path).await.unwrap_or(false) {
+            active_path = Some(path);
+            break;
+        }
     }
+
+    let meta_path = active_path.ok_or(AppError::NotFound)?;
 
     let mut metadata = read_bson_metadata(&meta_path).await?;
 

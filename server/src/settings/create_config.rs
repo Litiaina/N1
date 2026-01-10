@@ -15,7 +15,7 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
     //Storage disk configuration
     conf.with_section(Some("disk_config"))
         // Root storage path for Index/Metadata
-        .set("index_store_disk", "index-store-path")
+        .set("index_store_disks", "index-disk-1")
         // Distributed blob storage paths (comma separated)
         .set("blob_store_disks", "blob-disk-1")
         .set("fs_storage_path", "fs-storage-path");

@@ -64,8 +64,8 @@ pub async fn stream_object_logic(
 
     let content_length = end - start + 1;
 
-    let path_manager = ObjectPathManager::new();
-    let version_dir = path_manager.get_blob_dir(&owner_uid, &fragment, &version_id);
+    let path_manager = Arc::new(ObjectPathManager::new());
+    let blob_roots = path_manager.get_blob_roots();
 
     let filename = std::path::Path::new(&object_key)
         .file_name()
@@ -74,12 +74,20 @@ pub async fn stream_object_logic(
         .to_string();
 
     let parts_arc: Vec<Arc<PartMetadata>> = parts.into_iter().map(Arc::new).collect();
+    let owner_uid_arc = Arc::new(owner_uid);
+    let fragment_arc = Arc::new(fragment);
+    let version_id_arc = Arc::new(version_id);
+    let version_id_ref = version_id_arc.clone();
 
     struct StreamState {
         pos: u64,
         end: u64,
         parts: Vec<Arc<PartMetadata>>,
-        version_dir: PathBuf,
+        path_manager: Arc<ObjectPathManager>,
+        blob_roots: Vec<PathBuf>,
+        owner_uid: Arc<String>,
+        fragment: Arc<String>,
+        version_id: Arc<String>,
         file_cache: HashMap<String, File>,
         current_part_idx: usize,
         current_part_offset: u64,
@@ -109,7 +117,11 @@ pub async fn stream_object_logic(
         pos: start,
         end,
         parts: parts_arc,
-        version_dir,
+        path_manager,
+        blob_roots,
+        owner_uid: owner_uid_arc,
+        fragment: fragment_arc,
+        version_id: version_id_arc,
         file_cache: HashMap::new(),
         current_part_idx: start_part_index,
         current_part_offset: start_part_offset,
@@ -192,10 +204,30 @@ pub async fn stream_object_logic(
                 break;
             }
 
+            let num_disks = state.blob_roots.len();
+            if num_disks == 0 {
+                return Some((
+                    Err(AppError::InternalServerError(
+                        "No blob roots configured".into(),
+                    )),
+                    state,
+                ));
+            }
+
+            let disk_idx = (part.part_index as usize + shard_index) % num_disks;
+            let target_disk = &state.blob_roots[disk_idx];
+
+            let shard_dir = state.path_manager.get_shard_dir_on_disk(
+                target_disk,
+                &state.owner_uid,
+                &state.fragment,
+                &state.version_id,
+            );
+
             let part_arc = Arc::clone(part);
             let data_result = read_or_recover_chunk(
                 &mut state.file_cache,
-                &state.version_dir,
+                &shard_dir,
                 part_arc,
                 shard_index,
                 file_offset,
@@ -221,7 +253,7 @@ pub async fn stream_object_logic(
 
     let body = Body::from_stream(stream);
 
-    let etag = format!("\"{}\"", version_id);
+    let etag = format!("\"{}\"", version_id_ref);
     let last_modified = Utc
         .timestamp_opt(created_at, 0)
         .single()

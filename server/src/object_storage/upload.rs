@@ -23,6 +23,7 @@ use axum::{
     response::IntoResponse,
 };
 use chrono::Utc;
+use futures_util::future::join_all;
 use futures_util::{StreamExt, stream};
 use mongodb::bson::doc;
 use once_cell::sync::{Lazy, OnceCell};
@@ -162,16 +163,24 @@ pub async fn initiate_object_upload(
     let session_id = Ulid::new().to_string();
 
     let path_manager = ObjectPathManager::new();
-    let meta_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
+    let meta_dirs = path_manager.get_all_session_dirs(&uid, &fragment, &version_id);
 
-    if let Err(e) = with_io_timeout(
-        "creating upload session directory",
-        fs::create_dir_all(&meta_dir),
-    )
-    .await
-    {
-        let _ = update_quota(&uid, -(params.total_size_bytes as i64)).await;
-        return Err(e);
+    let create_futures = meta_dirs.iter().map(|path| async move {
+        with_io_timeout(
+            "creating upload session directory",
+            fs::create_dir_all(path),
+        )
+        .await
+    });
+
+    let results = join_all(create_futures).await;
+
+    for (i, result) in results.into_iter().enumerate() {
+        if let Err(e) = result {
+            error!("Failed to create session dir on index disk {}: {}", i, e);
+            let _ = update_quota(&uid, -(params.total_size_bytes as i64)).await;
+            return Err(e);
+        }
     }
 
     info!(
@@ -184,9 +193,20 @@ pub async fn initiate_object_upload(
     };
 
     if let Ok(bytes) = mongodb::bson::to_vec(&receipt) {
-        let receipt_path = meta_dir.join("reservation.bson");
-        if let Err(e) = fs::write(&receipt_path, bytes).await {
-            warn!("Failed to write reservation receipt for {}: {}", uid, e);
+        let write_futures = meta_dirs.iter().map(|path| {
+            let receipt_path = path.join("reservation.bson");
+            let data = &bytes;
+            async move { fs::write(&receipt_path, data).await }
+        });
+
+        let write_results = join_all(write_futures).await;
+        for (i, res) in write_results.into_iter().enumerate() {
+            if let Err(e) = res {
+                warn!(
+                    "Failed to write reservation receipt on index disk {}: {}",
+                    i, e
+                );
+            }
         }
     }
 
@@ -207,30 +227,46 @@ pub async fn get_upload_status(
     let uid = claims.uid;
     let _object_key = key_query.object_key;
     let path_manager = ObjectPathManager::new();
-    let meta_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
 
-    if !fs::try_exists(&meta_dir).await.unwrap_or(false) {
-        return Err(AppError::NotFound);
-    }
-
+    let meta_dirs = path_manager.get_all_session_dirs(&uid, &fragment, &version_id);
     let mut uploaded_parts = Vec::new();
-    let mut entries = fs::read_dir(&meta_dir)
-        .await
-        .map_err(|e| AppError::Io(e, "read dir".into()))?;
+    let mut read_success = false;
 
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
+    for meta_dir in meta_dirs {
+        if !fs::try_exists(&meta_dir).await.unwrap_or(false) {
+            continue;
+        }
 
-        if name_str.ends_with(PART_META_SUFFIX) {
-            if let Some(rest) = name_str.strip_prefix("part_") {
-                if let Some(index_str) = rest.strip_suffix(PART_META_SUFFIX) {
-                    if let Ok(index) = index_str.parse::<u64>() {
-                        uploaded_parts.push(index);
+        match fs::read_dir(&meta_dir).await {
+            Ok(mut entries) => {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+
+                    if name_str.ends_with(PART_META_SUFFIX) {
+                        if let Some(rest) = name_str.strip_prefix("part_") {
+                            if let Some(index_str) = rest.strip_suffix(PART_META_SUFFIX) {
+                                if let Ok(index) = index_str.parse::<u64>() {
+                                    uploaded_parts.push(index);
+                                }
+                            }
+                        }
                     }
                 }
+                read_success = true;
+                break;
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to read dir {:?}: {}, trying next mirror",
+                    meta_dir, e
+                );
             }
         }
+    }
+
+    if !read_success {
+        return Err(AppError::NotFound);
     }
 
     uploaded_parts.sort();
@@ -381,20 +417,36 @@ pub async fn object_upload_part(
         shards: shards_info,
     };
 
-    let meta_dir = path_manager.get_blob_dir(&uid_arc, &fragment_arc, &version_id_arc);
-    if !meta_dir.exists() {
-        fs::create_dir_all(&meta_dir)
-            .await
-            .map_err(|e| AppError::Io(e, "create meta session dir".into()))?;
+    let meta_dirs = path_manager.get_all_session_dirs(&uid_arc, &fragment_arc, &version_id_arc);
+
+    let meta_bytes = Arc::new(
+        mongodb::bson::to_vec(&part_meta)
+            .map_err(|e| AppError::InternalServerError(format!("Serialize meta: {}", e)))?,
+    );
+
+    let write_futures = meta_dirs.into_iter().map(|dir| {
+        let bytes = meta_bytes.clone();
+        async move {
+            if !dir.exists() {
+                fs::create_dir_all(&dir)
+                    .await
+                    .map_err(|e| AppError::Io(e, "create meta session dir".into()))?;
+            }
+            let meta_path = dir.join(format!("part_{}{}", part_index, PART_META_SUFFIX));
+            fs::write(&meta_path, &*bytes)
+                .await
+                .map_err(|e| AppError::Io(e, "write part meta".into()))
+        }
+    });
+
+    let results = join_all(write_futures).await;
+
+    for result in results {
+        if let Err(e) = result {
+            error!("Replication failed for part metadata: {}", e);
+            return Err(e);
+        }
     }
-
-    let meta_path = meta_dir.join(format!("part_{}{}", part_index, PART_META_SUFFIX));
-    let meta_bytes = mongodb::bson::to_vec(&part_meta)
-        .map_err(|e| AppError::InternalServerError(format!("Serialize meta: {}", e)))?;
-
-    fs::write(&meta_path, meta_bytes)
-        .await
-        .map_err(|e| AppError::Io(e, "write part meta".into()))?;
 
     Ok((StatusCode::OK, "Part uploaded").into_response())
 }
@@ -410,12 +462,25 @@ pub async fn finalize_object_upload(
     let uid = claims.uid;
 
     let path_manager = ObjectPathManager::new();
-    let meta_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
+    let meta_dirs = Arc::new(path_manager.get_all_session_dirs(&uid, &fragment, &version_id));
 
-    let (part_meta_paths, meta_dir) = tokio::task::spawn_blocking(
-        move || -> Result<(Vec<std::path::PathBuf>, std::path::PathBuf), AppError> {
+    let mut selected_index: Option<usize> = None;
+    for (i, dir) in meta_dirs.iter().enumerate() {
+        if fs::try_exists(dir).await.unwrap_or(false) {
+            selected_index = Some(i);
+            break;
+        }
+    }
+
+    let index = selected_index.ok_or(AppError::NotFound)?;
+
+    let meta_dirs_clone = meta_dirs.clone();
+
+    let part_meta_paths =
+        tokio::task::spawn_blocking(move || -> Result<Vec<std::path::PathBuf>, AppError> {
+            let meta_dir = &meta_dirs_clone[index];
             let mut paths = Vec::new();
-            for entry in WalkDir::new(&meta_dir)
+            for entry in WalkDir::new(meta_dir)
                 .max_depth(1)
                 .into_iter()
                 .filter_map(|e| e.ok())
@@ -429,11 +494,10 @@ pub async fn finalize_object_upload(
                     }
                 }
             }
-            Ok((paths, meta_dir))
-        },
-    )
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
+            Ok(paths)
+        })
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
 
     if part_meta_paths.is_empty() {
         return Err(AppError::BadRequest(
@@ -458,7 +522,7 @@ pub async fn finalize_object_upload(
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
 
-    let (mut parts, paths_for_cleanup): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+    let (mut parts, _): (Vec<_>, Vec<_>) = results.into_iter().unzip();
 
     parts.sort_by_key(|p| p.part_index);
 
@@ -489,55 +553,64 @@ pub async fn finalize_object_upload(
         AppError::InternalServerError(format!("Failed to serialize object metadata: {}", e))
     })?;
 
-    let index_path = path_manager.get_metadata_path(
+    let index_paths = path_manager.get_all_metadata_paths(
         &object_meta.owner_uid,
         &object_meta.fragment,
         &object_meta.object_key,
         &object_meta.version_id,
     );
 
-    if let Some(parent) = index_path.parent() {
-        if !fs::try_exists(parent).await.unwrap_or(false) {
-            fs::create_dir_all(parent)
+    let write_futures = index_paths.into_iter().map(|index_path| {
+        let bson_data = &bson_data;
+        async move {
+            if let Some(parent) = index_path.parent() {
+                if !fs::try_exists(parent).await.unwrap_or(false) {
+                    fs::create_dir_all(parent)
+                        .await
+                        .map_err(|e| AppError::Io(e, "create index shard dir".into()))?;
+                }
+            }
+
+            let mut final_meta_file = File::create(&index_path)
                 .await
-                .map_err(|e| AppError::Io(e, "create index shard dir".into()))?;
+                .map_err(|e| AppError::Io(e, "create object meta".into()))?;
+
+            final_meta_file
+                .write_all(bson_data)
+                .await
+                .map_err(|e| AppError::Io(e, "write object meta".into()))?;
+
+            final_meta_file
+                .sync_all()
+                .await
+                .map_err(|e| AppError::Io(e, "sync object meta".into()))?;
+
+            if let Some(parent) = index_path.parent() {
+                sync_dir(parent).await?;
+            }
+            Ok::<(), AppError>(())
+        }
+    });
+
+    let write_results = join_all(write_futures).await;
+    for result in write_results {
+        if let Err(e) = result {
+            error!(
+                "Failed to write final metadata to one of the index disks: {}",
+                e
+            );
+            return Err(e);
         }
     }
 
-    let mut final_meta_file = File::create(&index_path)
-        .await
-        .map_err(|e| AppError::Io(e, "create object meta".into()))?;
-
-    final_meta_file
-        .write_all(&bson_data)
-        .await
-        .map_err(|e| AppError::Io(e, "write object meta".into()))?;
-
-    final_meta_file
-        .sync_all()
-        .await
-        .map_err(|e| AppError::Io(e, "sync object meta".into()))?;
-
-    if let Some(parent) = index_path.parent() {
-        sync_dir(parent).await?;
-    }
-
-    let cleanup_futures = stream::iter(paths_for_cleanup)
-        .map(|path| async move {
-            if let Err(e) = fs::remove_file(&path).await {
-                error!("Failed to cleanup part meta file {:?}: {}", path, e);
+    let cleanup_futures = meta_dirs.iter().map(|dir| async move {
+        if let Err(e) = fs::remove_dir_all(dir).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("Failed to remove session dir {:?}: {}", dir, e);
             }
-        })
-        .buffer_unordered(20);
-
-    cleanup_futures.collect::<Vec<_>>().await;
-
-    let receipt_path = meta_dir.join("reservation.bson");
-    let _ = fs::remove_file(receipt_path).await;
-
-    if let Err(e) = fs::remove_dir(&meta_dir).await {
-        warn!("Failed to remove session dir {:?}: {}", meta_dir, e);
-    }
+        }
+    });
+    join_all(cleanup_futures).await;
 
     let reserved_size = params.total_size_bytes as i64;
     let actual_size = total_size_calculated as i64;
@@ -564,7 +637,7 @@ pub async fn finalize_object_upload(
     );
 
     let owner_uid = object_meta.owner_uid.clone();
-    
+
     let stripped_meta = ObjectMetadata {
         parts: Vec::new(),
         ..object_meta
@@ -582,33 +655,42 @@ pub async fn cancel_upload_session(
 ) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
-    let meta_dir = path_manager.get_blob_dir(&uid, &fragment, &version_id);
 
-    if !fs::try_exists(&meta_dir).await.unwrap_or(false) {
-        return Err(AppError::NotFound);
-    }
-
-    let index_path =
-        path_manager.get_metadata_path(&uid, &fragment, &key_query.object_key, &version_id);
-    if fs::try_exists(&index_path).await.unwrap_or(false) {
-        return Err(AppError::Conflict(
-            "Cannot cancel: Object is already finalized.".to_string(),
-        ));
-    }
-
-    let receipt_path = meta_dir.join("reservation.bson");
-    let mut refund_amount = 0;
-
-    if let Ok(data) = fs::read(&receipt_path).await {
-        if let Ok(receipt) = mongodb::bson::from_slice::<ReservationReceipt>(&data) {
-            refund_amount = receipt.amount;
+    let index_paths =
+        path_manager.get_all_metadata_paths(&uid, &fragment, &key_query.object_key, &version_id);
+    for index_path in &index_paths {
+        if fs::try_exists(index_path).await.unwrap_or(false) {
+            return Err(AppError::Conflict(
+                "Cannot cancel: Object is already finalized.".to_string(),
+            ));
         }
     }
 
-    fs::remove_dir_all(&meta_dir).await.map_err(|e| {
-        error!("Failed to clean session meta {}: {}", version_id, e);
-        AppError::InternalServerError("Failed to cleanup upload metadata.".to_string())
-    })?;
+    let meta_dirs = path_manager.get_all_session_dirs(&uid, &fragment, &version_id);
+    let mut refund_amount = 0;
+
+    for meta_dir in &meta_dirs {
+        let receipt_path = meta_dir.join("reservation.bson");
+        if let Ok(data) = fs::read(&receipt_path).await {
+            if let Ok(receipt) = mongodb::bson::from_slice::<ReservationReceipt>(&data) {
+                refund_amount = receipt.amount;
+                break;
+            }
+        }
+    }
+
+    let cleanup_meta_futures = meta_dirs.iter().map(|dir| {
+        let dir = dir.clone();
+        let version_id_clone = version_id.clone();
+        async move {
+            if let Err(e) = fs::remove_dir_all(&dir).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    error!("Failed to clean session meta {}: {}", version_id_clone, e);
+                }
+            }
+        }
+    });
+    join_all(cleanup_meta_futures).await;
 
     let blob_roots = path_manager.get_blob_roots();
     for disk in blob_roots {

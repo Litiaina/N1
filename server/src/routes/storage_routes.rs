@@ -22,6 +22,7 @@ use crate::object_storage::download::{download_object, download_object_chunk};
 use crate::object_storage::garbage_collector::{run_garbage_collector, run_lifecycle_manager};
 use crate::object_storage::maintenance::sync_user_metadata;
 use crate::object_storage::modify::rename_object;
+use crate::object_storage::repair_manager::trigger_repair_job_api;
 use crate::object_storage::retrieve::{
     get_object, get_object_metadata, list_fragments, list_object_versions, list_objects,
     stream_object,
@@ -129,7 +130,8 @@ pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
             .route("/v4/fragment/object/upload/chunk/{:fragment}/{:version_id}/{:part_index}", put(object_upload_part))
             .route("/v4/fragment/object/upload/finalize/{:fragment}/{:version_id}/{:session_id}", post(finalize_object_upload))
             .route("/v4/fragment/object/upload/cancel/{:fragment}/{:version_id}", delete(cancel_upload_session))
-            .route("/v4/maintenance/sync/user", post(sync_user_metadata));
+            .route("/v4/maintenance/sync/user", post(sync_user_metadata))
+            .route("/v4/maintenance/repair", post(trigger_repair_job_api));
 
         let write_ops = layers.layer_upload(write_ops);
 

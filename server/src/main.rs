@@ -4,7 +4,7 @@ use crate::handlers::error_handlers::handler_404;
 use crate::object_storage::sync::sync_quota;
 use crate::object_storage::upload::{DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC};
 use crate::routes::storage_routes::serve_storage_routes;
-use crate::structs::object_storage_structs::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISK};
+use crate::structs::object_storage_structs::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
 use crate::utils::date_time_formatter::LocalTimer;
 use crate::validation::enforce_init_settings::{ensure_config_file, ensure_env_file};
 use axum::Router;
@@ -174,13 +174,23 @@ pub async fn run_server() {
         .set(fs_storage_path.to_string())
         .expect("Double initialization of STORAGE_ROOT!");
 
-    let index_store_path = disk_section
-        .and_then(|s| s.get("index_store_disk"))
-        .unwrap_or("index-store-path");
+    let index_store_str = disk_section
+        .and_then(|s| s.get("index_store_disks"))
+        .expect("Missing index_store_disks in [disk_config]");
 
-    INDEX_STORE_DISK
-        .set(index_store_path.to_string())
-        .expect("Double initialization of INDEX_STORE_DISK!");
+    let index_disks: Vec<String> = index_store_str
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if index_disks.is_empty() {
+        panic!("At least one index store disk must be configured in index_store_disks!");
+    }
+
+    INDEX_STORE_DISKS
+        .set(index_disks)
+        .expect("Double initialization of INDEX_STORE_DISKS!");
 
     let blob_store_str = disk_section
         .and_then(|s| s.get("blob_store_disks"))

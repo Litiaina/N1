@@ -32,10 +32,18 @@ pub async fn sync_quota(db_client: Arc<Client>) -> Result<(), Box<dyn Error + Se
                     continue;
                 }
 
-                let user_dir = path_manager.get_user_index_dir(&uid);
+                let user_dirs = path_manager.get_all_user_index_dirs(&uid);
 
                 tokio::spawn(async move {
-                    if user_dir.exists() {
+                    let mut active_dir = None;
+                    for dir in user_dirs {
+                        if dir.exists() {
+                            active_dir = Some(dir);
+                            break;
+                        }
+                    }
+
+                    if let Some(user_dir) = active_dir {
                         let calculated_usage = tokio::task::spawn_blocking(move || {
                             let mut total = 0u64;
                             for entry in WalkDir::new(&user_dir).into_iter().filter_map(|e| e.ok())
@@ -107,9 +115,17 @@ pub async fn sync_single_user_quota(
                 return Ok(());
             }
 
-            let user_dir = path_manager.get_user_index_dir(&uid);
+            let user_dirs = path_manager.get_all_user_index_dirs(&uid);
 
-            if user_dir.exists() {
+            let mut active_dir = None;
+            for dir in user_dirs {
+                if dir.exists() {
+                    active_dir = Some(dir);
+                    break;
+                }
+            }
+
+            if let Some(user_dir) = active_dir {
                 let calculated_usage = tokio::task::spawn_blocking(move || {
                     let mut total = 0u64;
                     for entry in WalkDir::new(&user_dir).into_iter().filter_map(|e| e.ok()) {

@@ -47,7 +47,16 @@ pub async fn list_objects(
 ) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
-    let index_root = path_manager.get_index_dir(&uid, &fragment);
+
+    let index_dirs = path_manager.get_all_index_dirs(&uid, &fragment);
+
+    let mut active_index_root = None;
+    for dir in index_dirs {
+        if fs::try_exists(&dir).await.unwrap_or(false) {
+            active_index_root = Some(dir);
+            break;
+        }
+    }
 
     let limit: usize = params
         .get("limit")
@@ -66,12 +75,15 @@ pub async fn list_objects(
         None => ("".to_string(), "".to_string(), "".to_string()),
     };
 
-    if !fs::try_exists(&index_root).await.unwrap_or(false) {
-        return Ok(AxumJson(ListObjectsResult {
-            objects: Vec::new(),
-            continuation_token: None,
-        }));
-    }
+    let index_root = match active_index_root {
+        Some(root) => root,
+        None => {
+            return Ok(AxumJson(ListObjectsResult {
+                objects: Vec::new(),
+                continuation_token: None,
+            }));
+        }
+    };
 
     let mut s1_entries = Vec::new();
     let mut entries = fs::read_dir(&index_root)
@@ -215,14 +227,18 @@ pub async fn list_object_versions(
     let shard1 = &hash[0..2];
     let shard2 = &hash[2..4];
 
-    let shard_dir = path_manager
-        .get_index_dir(&uid, &fragment)
-        .join(shard1)
-        .join(shard2);
+    let index_dirs = path_manager.get_all_index_dirs(&uid, &fragment);
 
-    if !fs::try_exists(&shard_dir).await.unwrap_or(false) {
-        return Err(AppError::NotFound);
+    let mut active_shard_dir = None;
+    for dir in index_dirs {
+        let candidate = dir.join(shard1).join(shard2);
+        if fs::try_exists(&candidate).await.unwrap_or(false) {
+            active_shard_dir = Some(candidate);
+            break;
+        }
     }
+
+    let shard_dir = active_shard_dir.ok_or(AppError::NotFound)?;
 
     let prefix = format!("{}#", hash);
     let mut versions = Vec::new();
@@ -251,13 +267,21 @@ pub async fn list_fragments(claims: Claims) -> Result<impl IntoResponse, AppErro
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
 
-    // Fixed: Use get_user_index_dir instead of accessing missing .root field
-    let user_storage_root = path_manager.get_user_index_dir(&uid);
+    let user_storage_roots = path_manager.get_all_user_index_dirs(&uid);
 
     let fragments = tokio::task::spawn_blocking(move || -> Result<Vec<String>, std::io::Error> {
-        if !user_storage_root.exists() {
-            return Ok(Vec::new());
+        let mut active_root = None;
+        for root in user_storage_roots {
+            if root.exists() {
+                active_root = Some(root);
+                break;
+            }
         }
+
+        let user_storage_root = match active_root {
+            Some(r) => r,
+            None => return Ok(Vec::new()),
+        };
 
         let mut fragments = Vec::new();
 
