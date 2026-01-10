@@ -22,6 +22,7 @@ use crate::object_storage::download::{download_object, download_object_chunk};
 use crate::object_storage::garbage_collector::{run_garbage_collector, run_lifecycle_manager};
 use crate::object_storage::maintenance::sync_user_metadata;
 use crate::object_storage::modify::rename_object;
+use crate::object_storage::monitoring::get_system_health;
 use crate::object_storage::repair_manager::trigger_repair_job_api;
 use crate::object_storage::retrieve::{
     get_object, get_object_metadata, list_fragments, list_object_versions, list_objects,
@@ -130,8 +131,7 @@ pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
             .route("/v4/fragment/object/upload/chunk/{:fragment}/{:version_id}/{:part_index}", put(object_upload_part))
             .route("/v4/fragment/object/upload/finalize/{:fragment}/{:version_id}/{:session_id}", post(finalize_object_upload))
             .route("/v4/fragment/object/upload/cancel/{:fragment}/{:version_id}", delete(cancel_upload_session))
-            .route("/v4/maintenance/sync/user", post(sync_user_metadata))
-            .route("/v4/maintenance/repair", post(trigger_repair_job_api));
+            .route("/v4/maintenance/sync/user", post(sync_user_metadata));
 
         let write_ops = layers.layer_upload(write_ops);
 
@@ -207,6 +207,18 @@ pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
             .layer(from_fn(auth))
     };
 
+    let maintenance_routes =  {
+        let repair_routes = Router::new()
+            .route("/v4/system/repair", post(trigger_repair_job_api))
+            .route("/v4/system/health", get(get_system_health));
+
+        let repair_ops = layers.layer_transcode(repair_routes);
+
+        Router::new()
+            .merge(repair_ops)
+            .layer(from_fn(auth))
+    };
+
     let ws_routes = {
         let upgrade_route = Router::new()
             .route("/ws", get(ws_handler));
@@ -259,6 +271,7 @@ pub async fn serve_storage_routes() -> (Router, Arc<AppState>) {
         .merge(sync_data_routes)
         .merge(auth_route)
         .merge(object_storage_routes)
+        .merge(maintenance_routes)
         .merge(legacy_fs_routes)
         .merge(ws_routes)
         .layer(DefaultBodyLimit::max(MAX_FILE_SIZE))
