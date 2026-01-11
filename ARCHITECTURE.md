@@ -16,24 +16,24 @@ This design is engineered to saturate disk I/O, eliminate lock contention during
 
 ---
 
-## 1. 🗺️ High-Level Disk Hierarchy
+## 1. High-Level Disk Hierarchy
 
 The storage root follows a strict, predictable hierarchy designed for isolation and performance.
 
 ```text
 
 /storage_root/
-├── {user_uid}/                       # 👤 1. User Isolation Scope
-│   ├── quota.bson                    #    ⚖️ Global User Quota (Single Source of Truth)
+├── {user_uid}/                       # 1. User Isolation Scope
+│   ├── quota.bson                    #    Global User Quota (Single Source of Truth)
 │   │
-│   └── {fragment_name}/              # 🪣 2. Fragment (Logical Bucket)
+│   └── {fragment_name}/              # 2. Fragment (Logical Bucket)
 │       │
-│       ├── index/                    # 📇 3. Metadata Store (Mutable Index)
-│       │   └── {shard_1}/            #    🗂️ Shard L1: First 2 hex chars of SHA256
-│       │       └── {shard_2}/        #    🗂️ Shard L2: Next 2 hex chars of SHA256
+│       ├── index/                    # 3. Metadata Store (Mutable Index)
+│       │   └── {shard_1}/            #    Shard L1: First 2 hex chars of SHA256
+│       │       └── {shard_2}/        #    Shard L2: Next 2 hex chars of SHA256
 │       │           └── {Hash}#{Ver}.bson
 │       │
-│       └── blobs/                    # 📦 4. Data Store (Immutable Content)
+│       └── blobs/                    # 4. Data Store (Immutable Content)
 │           └── {VersionID}/          #    Content-Addressable ID (ULID)
 │               ├── part_0.data       #    Binary Chunk 0
 │               ├── part_1.data       #    Binary Chunk 1
@@ -44,9 +44,9 @@ The storage root follows a strict, predictable hierarchy designed for isolation 
 
 ---
 
-## 2. 🧩 Component Deep Dive
+## 2. Component Deep Dive
 
-### ⚖️ Global User Quota (`quota.bson`)
+### Global User Quota (`quota.bson`)
 
 - **Location:** `storage/{uid}/quota.bson`
 - **Format:** BSON serialization of the `Quota` struct.
@@ -61,7 +61,7 @@ The storage root follows a strict, predictable hierarchy designed for isolation 
 
 ---
 
-### 📇 The Index (`index/`)
+### The Index (`index/`)
 
 The Index acts as filesystem **inodes**, decoupling logical names (keys) from physical data (blobs).
 
@@ -91,7 +91,7 @@ The Index acts as filesystem **inodes**, decoupling logical names (keys) from ph
 
 ---
 
-### 📦 The Blobs (`blobs/`)
+### The Blobs (`blobs/`)
 
 The Blobs directory stores raw payloads. It is **content-addressable and immutable**.
 
@@ -108,9 +108,9 @@ The Blobs directory stores raw payloads. It is **content-addressable and immutab
 
 ---
 
-## 3. ⚙️ Critical I/O Workflows
+## 3. Critical I/O Workflows
 
-### 🚀 Write Path (Upload)
+### Write Path (Upload)
 
 1. **Authorization & Reservation**
    - JWT authentication
@@ -131,7 +131,7 @@ The Blobs directory stores raw payloads. It is **content-addressable and immutab
 
 ---
 
-### ⚡ Read Path (Streaming)
+### Read Path (Streaming)
 
 1. **Index Lookup**
    - Moka cache → shard → BSON read
@@ -143,7 +143,7 @@ The Blobs directory stores raw payloads. It is **content-addressable and immutab
 
 ---
 
-### ♻️ Lifecycle & Garbage Collection
+### Lifecycle & Garbage Collection
 
 **Mark-and-Sweep GC** (non-blocking):
 
@@ -160,7 +160,7 @@ The Blobs directory stores raw payloads. It is **content-addressable and immutab
 
 ---
 
-## 4. 🏆 Architectural Advantages
+## 4. Architectural Advantages
 
 | Feature | Implementation | Benefit |
 |------|--------------|--------|
@@ -172,15 +172,15 @@ The Blobs directory stores raw payloads. It is **content-addressable and immutab
 
 ---
 
-## 5. 👁️ Visual Data Flow
+## 5. Visual Data Flow
 
 **Scenario:** User uploads documents/resume.pdf
 
-1. #️⃣ Hash Key: SHA256("documents/resume.pdf") -> a4c9...
-2. 🆔 Gen Version: 01HQ... (ULID)
-3. 💾 Write Data:
+1.  Hash Key: SHA256("documents/resume.pdf") -> a4c9...
+2.  Gen Version: 01HQ... (ULID)
+3.  Write Data:
    - storage/user_1/main/blobs/01HQ.../part_0.data
-5. 📝 Write Index:
+5.  Write Index:
    - storage/user_1/main/index/a4/c9/a4c9...#01HQ....bson
 
 **Result:** The heavy data sits in an immutable ID-based folder, while the lightweight index provides the directory structure view.
