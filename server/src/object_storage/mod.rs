@@ -20,3 +20,4 @@ pub mod ec;
 pub mod recovery;
 pub mod repair_manager;
 pub mod monitoring;
+pub mod redistribution;

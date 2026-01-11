@@ -23,6 +23,7 @@ use crate::object_storage::garbage_collector::{run_garbage_collector, run_lifecy
 use crate::object_storage::maintenance::sync_user_metadata;
 use crate::object_storage::modify::rename_object;
 use crate::object_storage::monitoring::get_system_health;
+use crate::object_storage::redistribution::trigger_redistribute_job_api;
 use crate::object_storage::repair_manager::trigger_repair_job_api;
 use crate::object_storage::retrieve::{
     get_object, get_object_metadata, list_fragments, list_object_versions, list_objects,
@@ -211,9 +212,10 @@ pub async fn serve_storage_routes() -> Router {
 
     let maintenance_routes =  {
         let repair_routes = Router::new()
-            .route("/v4/system/sync", post(sync_quota_api))
-            .route("/v4/system/repair", post(trigger_repair_job_api))
-            .route("/v4/system/health", get(get_system_health));
+            .route("/v4/system/maintenance/redistribute", post(trigger_redistribute_job_api))
+            .route("/v4/system/maintenance/sync/all", post(sync_quota_api))
+            .route("/v4/system/maintenance/repair", post(trigger_repair_job_api))
+            .route("/v4/system/maintenance/health", get(get_system_health));
 
         let repair_ops = layers.layer_transcode(repair_routes);
 
