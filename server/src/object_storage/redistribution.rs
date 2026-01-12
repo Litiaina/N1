@@ -22,6 +22,10 @@ pub async fn run_redistribute_job(dry_run: bool) -> Result<(), AppError> {
 
     let target_data_shards = DATA_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
     let target_parity_shards = PARITY_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
+    let target_stripe_size = STRIPE_SIZE_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or_else(default_stripe_size);
     let target_blob_roots = path_manager.get_blob_roots();
     let target_num_disks = target_blob_roots.len();
 
@@ -49,8 +53,8 @@ pub async fn run_redistribute_job(dry_run: bool) -> Result<(), AppError> {
     };
 
     info!(
-        "Starting Redistribution Job using source: {:?}. Target: {}D+{}P across {} disks.",
-        index_root, target_data_shards, target_parity_shards, target_num_disks
+        "Starting Redistribution Job. Target: {}D+{}P | Stripe: {} bytes | Disks: {}",
+        target_data_shards, target_parity_shards, target_stripe_size, target_num_disks
     );
 
     let mut user_entries = fs::read_dir(&index_root)
@@ -99,6 +103,7 @@ pub async fn run_redistribute_job(dry_run: bool) -> Result<(), AppError> {
                             &meta,
                             target_data_shards,
                             target_parity_shards,
+                            target_stripe_size,
                             target_num_disks,
                             &target_blob_roots,
                         );
@@ -115,6 +120,7 @@ pub async fn run_redistribute_job(dry_run: bool) -> Result<(), AppError> {
                                     meta,
                                     target_data_shards,
                                     target_parity_shards,
+                                    target_stripe_size,
                                     &target_blob_roots,
                                 )
                                 .await
@@ -130,10 +136,7 @@ pub async fn run_redistribute_job(dry_run: bool) -> Result<(), AppError> {
                         } else {
                             if !dry_run {
                                 if let Err(e) = sync_metadata_to_mirrors(&meta, &data).await {
-                                    error!(
-                                        "Failed to sync metadata mirrors for {}/{}: {}",
-                                        meta.fragment, meta.object_key, e
-                                    );
+                                    error!("Failed to sync metadata mirrors: {}", e);
                                 }
                             }
                         }
@@ -151,11 +154,16 @@ fn check_needs_redistribution(
     meta: &ObjectMetadata,
     target_data: usize,
     target_parity: usize,
+    target_stripe_size: usize,
     target_num_disks: usize,
     target_roots: &[PathBuf],
 ) -> bool {
     if meta.parts.is_empty() {
         return false;
+    }
+
+    if meta.stripe_size_bytes != target_stripe_size {
+        return true;
     }
 
     let part0 = &meta.parts[0];
@@ -189,6 +197,7 @@ async fn redistribute_object(
     mut meta: ObjectMetadata,
     target_data_shards: usize,
     target_parity_shards: usize,
+    target_stripe_size: usize,
     target_blob_roots: &[PathBuf],
 ) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
@@ -196,10 +205,7 @@ async fn redistribute_object(
     let mut file_cache = HashMap::new();
 
     let old_block_size = meta.stripe_size_bytes;
-    let new_block_size = STRIPE_SIZE_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or_else(default_stripe_size);
+    let new_block_size = target_stripe_size;
 
     let old_parts = std::mem::take(&mut meta.parts);
     let mut new_parts = Vec::with_capacity(old_parts.len());
@@ -388,30 +394,20 @@ async fn sync_metadata_to_mirrors(meta: &ObjectMetadata, data: &[u8]) -> Result<
     );
 
     for path in all_paths {
-        let mut needs_write = true;
-
-        if let Ok(existing_data) = fs::read(&path).await {
-            if existing_data == data {
-                needs_write = false;
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| AppError::Io(e, "create meta dir".into()))?;
             }
         }
-
-        if needs_write {
-            if let Some(parent) = path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)
-                        .await
-                        .map_err(|e| AppError::Io(e, "create meta dir".into()))?;
-                }
-            }
-            let tmp = path.with_extension("tmp");
-            fs::write(&tmp, data)
-                .await
-                .map_err(|e| AppError::Io(e, "write meta tmp".into()))?;
-            fs::rename(tmp, path)
-                .await
-                .map_err(|e| AppError::Io(e, "rename meta".into()))?;
-        }
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, data)
+            .await
+            .map_err(|e| AppError::Io(e, "write meta tmp".into()))?;
+        fs::rename(tmp, path)
+            .await
+            .map_err(|e| AppError::Io(e, "rename meta".into()))?;
     }
     Ok(())
 }
