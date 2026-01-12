@@ -104,7 +104,7 @@ Restart the service to load the new configuration.
 Preview planned actions without moving data:
 
 ```bash
-curl -X POST "http://localhost:50001/v4/maintenance/redistribute?dry_run=true" \
+curl -X POST "https://localhost:50001/v4/maintenance/redistribute?dry_run=true" \
      -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
 ```
 
@@ -121,7 +121,7 @@ Logs will show entries such as:
 Start the migration:
 
 ```bash
-curl -X POST "http://localhost:50001/v4/maintenance/redistribute?dry_run=false" \
+curl -X POST "https://localhost:50001/v4/maintenance/redistribute?dry_run=false" \
      -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
 ```
 
