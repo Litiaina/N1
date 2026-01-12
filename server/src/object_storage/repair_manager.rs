@@ -196,7 +196,6 @@ async fn repair_user_quota(uid: &str, source_data: &[u8], dry_run: bool) -> Resu
     Ok(())
 }
 
-// Make public for redistribution.rs
 pub async fn repair_metadata_mirrors(
     meta: &ObjectMetadata,
     data: &[u8],
