@@ -1,5 +1,4 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::ec::STRIPE_BLOCK_SIZE;
 use crate::structs::object_storage_structs::{PartMetadata, ShardInfo};
 use crc32fast::Hasher;
 use once_cell::sync::Lazy;
@@ -130,6 +129,7 @@ pub async fn read_or_recover_chunk(
     shard_idx: usize,
     offset: u64,
     len: usize,
+    block_size: usize,
 ) -> Result<Vec<u8>, AppError> {
     let mut buf = vec![0u8; len];
 
@@ -203,7 +203,7 @@ pub async fn read_or_recover_chunk(
     let shard_index = target_shard.shard_index;
 
     RECOVERY_RUNTIME.spawn(async move {
-        if let Err(e) = repair_entire_shard(part_clone, shard_index).await {
+        if let Err(e) = repair_entire_shard(part_clone, shard_index, block_size).await {
             warn!(
                 "Background repair skipped or failed for shard {}: {}",
                 shard_index, e
@@ -217,6 +217,7 @@ pub async fn read_or_recover_chunk(
 pub async fn repair_entire_shard(
     part: Arc<PartMetadata>,
     target_shard_idx: usize,
+    block_size: usize,
 ) -> Result<(), AppError> {
     let _permit = RECOVERY_SEMAPHORE
         .acquire()
@@ -267,7 +268,6 @@ pub async fn repair_entire_shard(
     let data_shards: Vec<&ShardInfo> = part.shards.iter().filter(|s| !s.is_parity).collect();
     let data_count = data_shards.len();
     let parity_count = part.shards.len() - data_count;
-    let block_size = STRIPE_BLOCK_SIZE;
 
     let total_shard_size = part.shards.first().map(|s| s.size_bytes).unwrap_or(0);
 

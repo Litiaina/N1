@@ -1,12 +1,12 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::invalidate_cache;
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, PARITY_SUFFIX, SHARD_SUFFIX};
-use crate::object_storage::ec::{ErasureStreamWriter, STRIPE_BLOCK_SIZE};
+use crate::object_storage::ec::ErasureStreamWriter;
 use crate::object_storage::recovery::read_or_recover_chunk;
-use crate::object_storage::upload::{DATA_SHARDS_ATOMIC, PARITY_SHARDS_ATOMIC};
+use crate::object_storage::upload::{DATA_SHARDS_ATOMIC, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC};
 use crate::structs::object_storage_structs::INDEX_STORE_DISKS;
 use crate::structs::object_storage_structs::{
-    ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo,
+    ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo, default_stripe_size,
 };
 use axum::{extract::Query, http::StatusCode, response::IntoResponse};
 use std::collections::{HashMap, HashSet};
@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::fs::{self, File};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
 pub async fn run_redistribute_job(dry_run: bool) -> Result<(), AppError> {
@@ -43,13 +43,14 @@ pub async fn run_redistribute_job(dry_run: bool) -> Result<(), AppError> {
     let index_root = match active_index_root {
         Some(path) => path,
         None => {
+            warn!("No accessible index roots found. Redistribution job skipped.");
             return Ok(());
         }
     };
 
     info!(
-        "Starting Redistribution Job. Target: {}D+{}P across {} disks.",
-        target_data_shards, target_parity_shards, target_num_disks
+        "Starting Redistribution Job using source: {:?}. Target: {}D+{}P across {} disks.",
+        index_root, target_data_shards, target_parity_shards, target_num_disks
     );
 
     let mut user_entries = fs::read_dir(&index_root)
@@ -194,6 +195,12 @@ async fn redistribute_object(
     let num_disks = target_blob_roots.len();
     let mut file_cache = HashMap::new();
 
+    let old_block_size = meta.stripe_size_bytes;
+    let new_block_size = STRIPE_SIZE_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or_else(default_stripe_size);
+
     let old_parts = std::mem::take(&mut meta.parts);
     let mut new_parts = Vec::with_capacity(old_parts.len());
     let mut shards_to_cleanup = Vec::new();
@@ -202,11 +209,11 @@ async fn redistribute_object(
         let old_part_arc = Arc::new(old_part);
 
         let old_data_count = old_part_arc.shards.iter().filter(|s| !s.is_parity).count() as u64;
-        let old_stripe_size = (STRIPE_BLOCK_SIZE as u64) * old_data_count;
+        let old_stripe_size = (old_block_size as u64) * old_data_count;
 
-        let new_stripe_width = (STRIPE_BLOCK_SIZE * target_data_shards) as u64;
+        let new_stripe_width = (new_block_size * target_data_shards) as u64;
         let new_stripe_count = (old_part_arc.size_bytes + new_stripe_width - 1) / new_stripe_width;
-        let new_shard_len = new_stripe_count * STRIPE_BLOCK_SIZE as u64;
+        let new_shard_len = new_stripe_count * new_block_size as u64;
 
         let mut writers = Vec::with_capacity(target_data_shards + target_parity_shards);
         let mut new_shard_infos = Vec::new();
@@ -247,7 +254,7 @@ async fn redistribute_object(
                 .await
                 .map_err(|e| AppError::Io(e, "alloc tmp shard".into()))?;
 
-            writers.push(file);
+            writers.push(Some(file));
             temp_paths.push((temp_path, final_path.clone()));
 
             new_shard_infos.push(ShardInfo {
@@ -266,21 +273,22 @@ async fn redistribute_object(
             target_parity_shards,
             new_shard_len as usize,
             true,
+            new_block_size,
         );
 
         let mut pos = 0u64;
-        let mut batch_buffer = Vec::with_capacity(STRIPE_BLOCK_SIZE);
+        let mut batch_buffer = Vec::with_capacity(new_block_size);
 
         while pos < old_part_arc.size_bytes {
             let relative_pos = pos;
             let stripe_index = relative_pos / old_stripe_size;
             let offset_in_stripe = relative_pos % old_stripe_size;
 
-            let shard_index = (offset_in_stripe / (STRIPE_BLOCK_SIZE as u64)) as usize;
-            let offset_in_shard_block = offset_in_stripe % (STRIPE_BLOCK_SIZE as u64);
-            let file_offset = (stripe_index * (STRIPE_BLOCK_SIZE as u64)) + offset_in_shard_block;
+            let shard_index = (offset_in_stripe / (old_block_size as u64)) as usize;
+            let offset_in_shard_block = offset_in_stripe % (old_block_size as u64);
+            let file_offset = (stripe_index * (old_block_size as u64)) + offset_in_shard_block;
 
-            let bytes_remaining_in_block = (STRIPE_BLOCK_SIZE as u64) - offset_in_shard_block;
+            let bytes_remaining_in_block = (old_block_size as u64) - offset_in_shard_block;
             let bytes_remaining_in_part = old_part_arc.size_bytes - pos;
 
             let to_read = bytes_remaining_in_block.min(bytes_remaining_in_part) as usize;
@@ -296,12 +304,13 @@ async fn redistribute_object(
                 shard_index,
                 file_offset,
                 to_read,
+                old_block_size,
             )
             .await?;
 
             batch_buffer.extend_from_slice(&chunk_data);
 
-            if batch_buffer.len() >= STRIPE_BLOCK_SIZE
+            if batch_buffer.len() >= new_block_size
                 || (pos + to_read as u64) >= old_part_arc.size_bytes
             {
                 stream_writer.write(&batch_buffer).await?;
@@ -345,9 +354,12 @@ async fn redistribute_object(
                 shards_to_cleanup.push(old_shard.absolute_path.clone());
             }
         }
+
+        file_cache.clear();
     }
 
     meta.parts = new_parts;
+    meta.stripe_size_bytes = new_block_size;
 
     let bson_data = mongodb::bson::to_vec(&meta)
         .map_err(|_| AppError::InternalServerError("BSON serialization failed".into()))?;
@@ -376,20 +388,30 @@ async fn sync_metadata_to_mirrors(meta: &ObjectMetadata, data: &[u8]) -> Result<
     );
 
     for path in all_paths {
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| AppError::Io(e, "create meta dir".into()))?;
+        let mut needs_write = true;
+
+        if let Ok(existing_data) = fs::read(&path).await {
+            if existing_data == data {
+                needs_write = false;
             }
         }
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, data)
-            .await
-            .map_err(|e| AppError::Io(e, "write meta tmp".into()))?;
-        fs::rename(tmp, path)
-            .await
-            .map_err(|e| AppError::Io(e, "rename meta".into()))?;
+
+        if needs_write {
+            if let Some(parent) = path.parent() {
+                if !parent.exists() {
+                    fs::create_dir_all(parent)
+                        .await
+                        .map_err(|e| AppError::Io(e, "create meta dir".into()))?;
+                }
+            }
+            let tmp = path.with_extension("tmp");
+            fs::write(&tmp, data)
+                .await
+                .map_err(|e| AppError::Io(e, "write meta tmp".into()))?;
+            fs::rename(tmp, path)
+                .await
+                .map_err(|e| AppError::Io(e, "rename meta".into()))?;
+        }
     }
     Ok(())
 }

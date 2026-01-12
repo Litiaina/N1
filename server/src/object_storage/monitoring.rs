@@ -8,22 +8,29 @@ use axum::{
     extract::{Query, State},
     response::IntoResponse,
 };
+use futures_util::future::join_all;
 use mongodb::bson::doc;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::sync::{Semaphore, oneshot};
+use tokio::time::timeout;
+use ulid::Ulid;
 use walkdir::WalkDir;
 
 static DEEP_SCAN_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
+const DISK_CHECK_TIMEOUT: Duration = Duration::from_millis(2000);
 
 #[derive(Serialize)]
 pub struct DiskStatus {
     pub path: String,
     pub role: String,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -32,6 +39,8 @@ pub struct DiskStatus {
 pub struct ConsistencyStats {
     pub total_objects_scanned: u64,
     pub index_mirror_health: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirror_counts: Option<HashMap<String, u64>>,
 }
 
 #[derive(Serialize)]
@@ -43,34 +52,100 @@ pub struct SystemHealthResponse {
     pub summary: String,
 }
 
-async fn check_disk_accessibility(path_str: &str, role: &str) -> DiskStatus {
-    let path = PathBuf::from(path_str);
-    let mut status = "offline";
-    let mut error_msg = None;
+async fn check_disk_accessibility(path_str: String, role: String) -> DiskStatus {
+    let path = PathBuf::from(&path_str);
 
-    if path.exists() {
-        match fs::metadata(&path).await {
-            Ok(meta) => {
-                if meta.permissions().readonly() {
-                    status = "readonly";
-                    error_msg = Some("Disk is mounted read-only".to_string());
-                } else {
-                    status = "online";
+    let (status, latency_ms, error) = if path.exists() {
+        let check_result = timeout(DISK_CHECK_TIMEOUT, async {
+            match fs::metadata(&path).await {
+                Ok(meta) => {
+                    if meta.permissions().readonly() {
+                        return (
+                            "readonly".to_string(),
+                            Some("Disk is mounted read-only".to_string()),
+                            None,
+                        );
+                    }
+
+                    let start_time = Instant::now();
+                    let check_file_name = format!(".n1_health_{}", Ulid::new().to_string());
+                    let check_path = path.join(check_file_name);
+                    let payload = b"n1_io_check";
+
+                    if let Err(e) = fs::write(&check_path, payload).await {
+                        return (
+                            "readonly".to_string(),
+                            Some(format!("Write test failed: {}", e)),
+                            None,
+                        );
+                    }
+
+                    let read_result = fs::read(&check_path).await;
+                    let delete_result = fs::remove_file(&check_path).await;
+
+                    match read_result {
+                        Ok(data) => {
+                            if data == payload {
+                                if let Err(e) = delete_result {
+                                    return (
+                                        "degraded".to_string(),
+                                        Some(format!("Write/Read OK, delete failed: {}", e)),
+                                        None,
+                                    );
+                                }
+                                let latency = start_time.elapsed().as_millis() as u64;
+                                let status = if latency > 500 {
+                                    "slow".to_string()
+                                } else {
+                                    "online".to_string()
+                                };
+                                (status, None, Some(latency))
+                            } else {
+                                (
+                                    "corruption".to_string(),
+                                    Some("Data read mismatch".to_string()),
+                                    None,
+                                )
+                            }
+                        }
+                        Err(e) => (
+                            "write_only".to_string(),
+                            Some(format!("Write OK, Read failed: {}", e)),
+                            None,
+                        ),
+                    }
                 }
+                Err(e) => (
+                    "offline".to_string(),
+                    Some(format!("Failed to read metadata: {}", e)),
+                    None,
+                ),
             }
-            Err(e) => {
-                error_msg = Some(format!("Failed to read metadata: {}", e));
-            }
+        })
+        .await;
+
+        match check_result {
+            Ok((s, e, l)) => (s, l, e),
+            Err(_) => (
+                "timeout".to_string(),
+                None,
+                Some("Disk I/O timed out (>2s)".to_string()),
+            ),
         }
     } else {
-        error_msg = Some("Path does not exist".to_string());
-    }
+        (
+            "offline".to_string(),
+            None,
+            Some("Path does not exist".to_string()),
+        )
+    };
 
     DiskStatus {
-        path: path_str.to_string(),
-        role: role.to_string(),
-        status: status.to_string(),
-        error: error_msg,
+        path: path_str,
+        role,
+        status,
+        latency_ms,
+        error,
     }
 }
 
@@ -94,24 +169,30 @@ pub async fn get_system_health(
         .get()
         .ok_or(AppError::InternalServerError("Blob config missing".into()))?;
 
-    let mut disk_statuses = Vec::new();
+    let mut check_futures = Vec::new();
+
+    for disk in index_disks_config {
+        check_futures.push(check_disk_accessibility(disk.clone(), "index".to_string()));
+    }
+    for disk in blob_disks_config {
+        check_futures.push(check_disk_accessibility(disk.clone(), "blob".to_string()));
+    }
+
+    let disk_results = join_all(check_futures).await;
+
     let mut online_index_count = 0;
     let mut online_blob_count = 0;
     let mut active_index_roots = Vec::new();
+    let mut disk_statuses = Vec::new();
 
-    for disk in index_disks_config {
-        let stat = check_disk_accessibility(disk, "index").await;
-        if stat.status == "online" {
-            online_index_count += 1;
-            active_index_roots.push(PathBuf::from(disk).join(OBJECT_DATA_ROOT));
-        }
-        disk_statuses.push(stat);
-    }
-
-    for disk in blob_disks_config {
-        let stat = check_disk_accessibility(disk, "blob").await;
-        if stat.status == "online" {
-            online_blob_count += 1;
+    for stat in disk_results {
+        if stat.status == "online" || stat.status == "slow" {
+            if stat.role == "index" {
+                online_index_count += 1;
+                active_index_roots.push(PathBuf::from(&stat.path).join(OBJECT_DATA_ROOT));
+            } else {
+                online_blob_count += 1;
+            }
         }
         disk_statuses.push(stat);
     }
@@ -121,6 +202,7 @@ pub async fn get_system_health(
         .map(|v| v == "true")
         .unwrap_or(false);
     let mut object_counts = Vec::new();
+    let mut mirror_map = HashMap::new();
     let mut scan_performed = false;
     let mut scan_busy = false;
 
@@ -139,16 +221,22 @@ pub async fn get_system_health(
 
                 let mut counts = Vec::new();
                 for root in roots_clone {
-                    let count = WalkDir::new(&root)
-                        .into_iter()
-                        .filter_map(|e| e.ok())
-                        .filter(|e| {
-                            e.file_type().is_file()
-                                && e.path().extension().map_or(false, |ext| ext == "bson")
-                        })
-                        .count() as u64;
-                    counts.push(count);
-                    std::thread::yield_now();
+                    let mut current_disk_count = 0u64;
+                    let walker = WalkDir::new(&root).into_iter();
+
+                    for entry in walker.filter_map(|e| e.ok()) {
+                        if entry.file_type().is_file()
+                            && entry.path().extension().map_or(false, |ext| ext == "bson")
+                        {
+                            current_disk_count += 1;
+                        }
+
+                        if current_disk_count % 1000 == 0 {
+                            std::thread::yield_now();
+                        }
+                    }
+
+                    counts.push(current_disk_count);
                 }
 
                 let _ = tx.send(counts);
@@ -157,6 +245,12 @@ pub async fn get_system_health(
             object_counts = rx.await.map_err(|e| {
                 AppError::InternalServerError(format!("Consistency check thread failed: {}", e))
             })?;
+
+            for (i, root) in active_index_roots.iter().enumerate() {
+                if let Some(count) = object_counts.get(i) {
+                    mirror_map.insert(root.to_string_lossy().to_string(), *count);
+                }
+            }
         } else {
             scan_busy = true;
         }
@@ -227,6 +321,11 @@ pub async fn get_system_health(
         consistency: ConsistencyStats {
             total_objects_scanned: total_objects,
             index_mirror_health: index_health,
+            mirror_counts: if !mirror_map.is_empty() {
+                Some(mirror_map)
+            } else {
+                None
+            },
         },
         summary,
     }))

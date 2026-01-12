@@ -1,5 +1,4 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::ec::STRIPE_BLOCK_SIZE;
 use crate::object_storage::header_parser::parse_range_header;
 use crate::object_storage::recovery::read_or_recover_chunk;
 use crate::structs::object_storage_structs::{
@@ -16,8 +15,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::File;
 
-pub const STREAM_BATCH_SIZE: usize = STRIPE_BLOCK_SIZE;
-
 pub async fn get_object_logic(
     metadata: ObjectMetadata,
     req: axum::http::Request<Body>,
@@ -32,6 +29,8 @@ pub async fn stream_object_logic(
     disposition_type: &str,
 ) -> Result<impl IntoResponse, AppError> {
     let file_size = metadata.total_size_bytes;
+    let stripe_size_bytes = metadata.stripe_size_bytes;
+
     let ObjectMetadata {
         content_type,
         parts,
@@ -91,6 +90,7 @@ pub async fn stream_object_logic(
         file_cache: HashMap<String, File>,
         current_part_idx: usize,
         current_part_offset: u64,
+        stripe_size: usize,
     }
 
     let mut current_offset = 0;
@@ -125,17 +125,19 @@ pub async fn stream_object_logic(
         file_cache: HashMap::new(),
         current_part_idx: start_part_index,
         current_part_offset: start_part_offset,
+        stripe_size: stripe_size_bytes,
     };
 
     let stream = stream::unfold(initial_state, move |mut state| async move {
-        let mut batch_buffer = Vec::with_capacity(STREAM_BATCH_SIZE);
+        let batch_size = state.stripe_size;
+        let mut batch_buffer = Vec::with_capacity(batch_size);
 
         loop {
             if state.pos > state.end {
                 break;
             }
 
-            if batch_buffer.len() >= STREAM_BATCH_SIZE {
+            if batch_buffer.len() >= batch_size {
                 break;
             }
 
@@ -169,7 +171,7 @@ pub async fn stream_object_logic(
 
             let relative_pos = state.pos - state.current_part_offset;
 
-            let stripe_block_size = STRIPE_BLOCK_SIZE as u64;
+            let stripe_block_size = state.stripe_size as u64;
             let stripe_size = stripe_block_size * data_shards_count;
 
             let stripe_index = relative_pos / stripe_size;
@@ -193,7 +195,7 @@ pub async fn stream_object_logic(
             let bytes_remaining_in_block = stripe_block_size - offset_in_shard_block;
             let bytes_remaining_in_req = state.end - state.pos + 1;
             let bytes_remaining_in_part = part.size_bytes - relative_pos;
-            let bytes_remaining_in_buffer = (STREAM_BATCH_SIZE - batch_buffer.len()) as u64;
+            let bytes_remaining_in_buffer = (batch_size - batch_buffer.len()) as u64;
 
             let to_read = bytes_remaining_in_block
                 .min(bytes_remaining_in_req)
@@ -232,6 +234,7 @@ pub async fn stream_object_logic(
                 shard_index,
                 file_offset,
                 to_read,
+                state.stripe_size,
             )
             .await;
 

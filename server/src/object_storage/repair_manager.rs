@@ -104,7 +104,7 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
                 })
                 .await
                 .map_err(|e| AppError::InternalServerError(format!("WalkDir failed: {}", e)))?;
-                
+
                 let blob_roots_clone = blob_roots.clone();
                 let processed_arc = processed_versions.clone();
 
@@ -145,7 +145,10 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
 
 async fn repair_user_quota(uid: &str, source_data: &[u8], dry_run: bool) -> Result<(), AppError> {
     if mongodb::bson::from_slice::<Quota>(source_data).is_err() {
-        warn!("Skipping repair for corrupt/invalid quota file source for user {}", uid);
+        warn!(
+            "Skipping repair for corrupt/invalid quota file source for user {}",
+            uid
+        );
         return Ok(());
     }
 
@@ -162,7 +165,7 @@ async fn repair_user_quota(uid: &str, source_data: &[u8], dry_run: bool) -> Resu
                     warn!("Quota mismatch on mirror: {:?}. Aligning.", target_path);
                     needs_repair = true;
                 }
-            },
+            }
             Err(_) => {
                 needs_repair = true;
             }
@@ -171,13 +174,19 @@ async fn repair_user_quota(uid: &str, source_data: &[u8], dry_run: bool) -> Resu
         if needs_repair {
             if !dry_run {
                 if !dir.exists() {
-                    fs::create_dir_all(&dir).await.map_err(|e| AppError::Io(e, "create user index dir".into()))?;
+                    fs::create_dir_all(&dir)
+                        .await
+                        .map_err(|e| AppError::Io(e, "create user index dir".into()))?;
                 }
-                
+
                 info!("Repairing quota file on mirror: {:?}", target_path);
                 let tmp = target_path.with_extension("tmp");
-                fs::write(&tmp, source_data).await.map_err(|e| AppError::Io(e, "write quota tmp".into()))?;
-                fs::rename(tmp, target_path).await.map_err(|e| AppError::Io(e, "rename quota".into()))?;
+                fs::write(&tmp, source_data)
+                    .await
+                    .map_err(|e| AppError::Io(e, "write quota tmp".into()))?;
+                fs::rename(tmp, target_path)
+                    .await
+                    .map_err(|e| AppError::Io(e, "rename quota".into()))?;
             } else {
                 info!("[DRY RUN] Would repair quota file: {:?}", target_path);
             }
@@ -187,7 +196,8 @@ async fn repair_user_quota(uid: &str, source_data: &[u8], dry_run: bool) -> Resu
     Ok(())
 }
 
-async fn repair_metadata_mirrors(
+// Make public for redistribution.rs
+pub async fn repair_metadata_mirrors(
     meta: &ObjectMetadata,
     data: &[u8],
     dry_run: bool,
@@ -312,7 +322,9 @@ async fn process_object_repair(
         for missing_idx in missing_shards {
             let part_for_task = part_arc.clone();
 
-            if let Err(e) = repair_entire_shard(part_for_task, missing_idx).await {
+            if let Err(e) =
+                repair_entire_shard(part_for_task, missing_idx, meta_arc.stripe_size_bytes).await
+            {
                 error!(
                     "Failed to repair shard {} for object {}/{}: {}",
                     missing_idx, meta_arc.fragment, meta_arc.object_key, e

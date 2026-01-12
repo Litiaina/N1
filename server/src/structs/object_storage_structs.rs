@@ -10,6 +10,10 @@ pub static INDEX_STORE_DISKS: OnceLock<Vec<String>> = OnceLock::new();
 pub static BLOB_STORE_DISKS: OnceLock<Vec<String>> = OnceLock::new();
 pub static FS_STORAGE_ROOT: OnceLock<String> = OnceLock::new();
 
+pub fn default_stripe_size() -> usize {
+    2 * 1024 * 1024
+}
+
 pub struct ObjectPathManager;
 
 impl ObjectPathManager {
@@ -45,46 +49,52 @@ impl ObjectPathManager {
             .collect()
     }
 
-    pub fn get_all_session_dirs(&self, uid: &str, fragment: &str, version_id: &str) -> Vec<PathBuf> {
+    pub fn get_all_session_dirs(
+        &self,
+        uid: &str,
+        fragment: &str,
+        version_id: &str,
+    ) -> Vec<PathBuf> {
         self.get_all_user_index_dirs(uid)
             .iter()
-            .map(|user_dir| {
-                user_dir
-                    .join(fragment)
-                    .join("blobs")
-                    .join(version_id)
-            })
+            .map(|user_dir| user_dir.join(fragment).join("blobs").join(version_id))
             .collect()
     }
 
-    pub fn get_all_metadata_paths(&self, uid: &str, fragment: &str, object_key: &str, version_id: &str) -> Vec<PathBuf> {
+    pub fn get_all_metadata_paths(
+        &self,
+        uid: &str,
+        fragment: &str,
+        object_key: &str,
+        version_id: &str,
+    ) -> Vec<PathBuf> {
         let mut hasher = Sha256::new();
         hasher.update(object_key.as_bytes());
         let hash = hex::encode(hasher.finalize());
-        
+
         let shard1 = &hash[0..2];
         let shard2 = &hash[2..4];
         let filename = format!("{}#{}.bson", hash, version_id);
-        
+
         self.get_all_index_dirs(uid, fragment)
             .iter()
             .map(|index_dir| index_dir.join(shard1).join(shard2).join(&filename))
             .collect()
     }
 
-    pub fn get_shard_dir_on_disk(&self, disk_root: &PathBuf, uid: &str, fragment: &str, version_id: &str) -> PathBuf {
+    pub fn get_shard_dir_on_disk(
+        &self,
+        disk_root: &PathBuf,
+        uid: &str,
+        fragment: &str,
+        version_id: &str,
+    ) -> PathBuf {
         disk_root
             .join(OBJECT_DATA_ROOT)
             .join(uid)
             .join(fragment)
             .join("blobs")
             .join(version_id)
-    }
-
-    pub fn get_blob_dir(&self, uid: &str, fragment: &str, version_id: &str) -> PathBuf {
-        let roots = self.get_blob_roots();
-        let root = roots.first().expect("No blob disks configured");
-        self.get_shard_dir_on_disk(root, uid, fragment, version_id)
     }
 }
 
@@ -116,7 +126,7 @@ pub struct PartMetadata {
     pub created_at: i64,
     pub shards: Vec<ShardInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub checksum: Option<String>
+    pub checksum: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -130,8 +140,10 @@ pub struct ObjectMetadata {
     pub total_size_bytes: u64,
     pub created_at: i64,
     pub parts: Vec<PartMetadata>,
-    #[serde(default)] 
-    pub is_delete_marker: bool, 
+    #[serde(default)]
+    pub is_delete_marker: bool,
+    #[serde(default = "default_stripe_size")]
+    pub stripe_size_bytes: usize,
 }
 
 #[derive(Deserialize)]
@@ -146,6 +158,8 @@ pub struct ObjectSummary {
     pub created_at: i64,
     #[serde(default)]
     pub is_delete_marker: bool,
+    #[serde(default = "default_stripe_size")]
+    pub stripe_size_bytes: usize,
 }
 
 impl From<ObjectSummary> for ObjectMetadata {
@@ -161,6 +175,7 @@ impl From<ObjectSummary> for ObjectMetadata {
             created_at: summary.created_at,
             parts: Vec::new(),
             is_delete_marker: summary.is_delete_marker,
+            stripe_size_bytes: summary.stripe_size_bytes,
         }
     }
 }
@@ -234,8 +249,8 @@ pub struct ChunkQuery {
 
 #[derive(Deserialize)]
 pub struct UploadPartQuery {
-    pub enable_checksum: Option<bool>, 
-    pub checksum: Option<String>, 
+    pub enable_checksum: Option<bool>,
+    pub checksum: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -250,8 +265,8 @@ pub struct UserRecord {
     pub id: Option<mongodb::bson::oid::ObjectId>,
     pub uid: String,
     pub email: String,
-    #[serde(rename = "password")] 
-    pub password_hash: String, 
+    #[serde(rename = "password")]
+    pub password_hash: String,
     pub allocated_storage: u64,
     #[serde(default)]
     pub created_at: i64,

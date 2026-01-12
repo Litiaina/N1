@@ -3,7 +3,7 @@ use crate::enums::app_error_enum::AppError;
 use crate::fs::fragmented_upload::with_io_timeout;
 use crate::object_storage::caching::invalidate_cache;
 use crate::object_storage::constants::{PARITY_SUFFIX, PART_META_SUFFIX, SHARD_SUFFIX};
-use crate::object_storage::ec::{ErasureStreamWriter, STRIPE_BLOCK_SIZE};
+use crate::object_storage::ec::ErasureStreamWriter;
 use crate::object_storage::quota_manager::{init_quota_file, try_reserve_quota, update_quota};
 use crate::object_storage::storage_capacity_parser::calculate_storage_usage;
 use crate::routes::storage_routes::AppState;
@@ -11,7 +11,7 @@ use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
     CapacityUsageResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery,
     ObjectMetadata, ObjectPathManager, PartMetadata, ReservationReceipt, ShardInfo,
-    UploadPartQuery, UploadStatusResponse, UserRecord,
+    UploadPartQuery, UploadStatusResponse, UserRecord, default_stripe_size,
 };
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::body::Body;
@@ -43,6 +43,7 @@ pub static MAX_PART_SIZE_ATOMIC: OnceCell<AtomicU64> = OnceCell::new();
 pub static DATA_SHARDS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static PARITY_SHARDS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static WRITER_BUFFER_SIZE_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
+pub static STRIPE_SIZE_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static MAX_IO_SEMAPHORE: OnceCell<usize> = OnceCell::new();
 
 static IO_SEMAPHORE: Lazy<Semaphore> =
@@ -291,6 +292,11 @@ pub async fn object_upload_part(
     let parity_shards = PARITY_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
     let total_shards = data_shards + parity_shards;
 
+    let block_size = STRIPE_SIZE_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or_else(default_stripe_size);
+
     let content_length = headers
         .get("content-length")
         .and_then(|v| v.to_str().ok())
@@ -308,13 +314,14 @@ pub async fn object_upload_part(
     let version_id_arc = Arc::new(version_id);
     let path_manager = Arc::new(ObjectPathManager::new());
 
-    let stripe_data_width = STRIPE_BLOCK_SIZE as u64 * data_shards as u64;
+    let stripe_data_width = block_size as u64 * data_shards as u64;
     let stripe_count = (content_length + stripe_data_width - 1) / stripe_data_width;
-    let final_shard_len = stripe_count * STRIPE_BLOCK_SIZE as u64;
+    let final_shard_len = stripe_count * block_size as u64;
 
-    let mut writers = Vec::with_capacity(total_shards);
+    let mut writers: Vec<Option<File>> = Vec::with_capacity(total_shards);
     let mut shard_paths = Vec::with_capacity(total_shards);
     let mut file_names = Vec::with_capacity(total_shards);
+    let mut successful_opens = 0;
 
     let blob_roots = path_manager.get_blob_roots();
     let num_disks = blob_roots.len();
@@ -345,17 +352,41 @@ pub async fn object_upload_part(
         );
 
         if !shard_dir.exists() {
-            with_io_timeout("create shard dir", fs::create_dir_all(&shard_dir)).await?;
+            let _ = with_io_timeout("create shard dir", fs::create_dir_all(&shard_dir)).await;
         }
 
         let path = shard_dir.join(&file_name);
 
-        let file = create_optimized_file(&path).await?;
-        with_io_timeout("pre-allocate shard", file.set_len(final_shard_len)).await?;
+        match create_optimized_file(&path).await {
+            Ok(file) => {
+                if let Err(e) =
+                    with_io_timeout("pre-allocate shard", file.set_len(final_shard_len)).await
+                {
+                    warn!("Failed to pre-allocate shard on disk {}: {}", disk_idx, e);
+                    writers.push(None);
+                } else {
+                    writers.push(Some(file));
+                    successful_opens += 1;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to open shard file on disk {} ({:?}): {}",
+                    disk_idx, path, e
+                );
+                writers.push(None);
+            }
+        }
 
         shard_paths.push(path.to_string_lossy().to_string());
         file_names.push(file_name);
-        writers.push(file);
+    }
+
+    if successful_opens < data_shards {
+        return Err(AppError::InternalServerError(format!(
+            "Not enough healthy disks to write data. Need {}, got {}.",
+            data_shards, successful_opens
+        )));
     }
 
     let mut stream_writer = ErasureStreamWriter::new(
@@ -364,6 +395,7 @@ pub async fn object_upload_part(
         parity_shards,
         final_shard_len as usize,
         query.enable_checksum.unwrap_or(false),
+        block_size,
     );
 
     let mut body_stream = body.into_data_stream();
@@ -534,6 +566,11 @@ pub async fn finalize_object_upload(
         total_size_calculated += part.size_bytes;
     }
 
+    let stripe_size = STRIPE_SIZE_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or_else(default_stripe_size);
+
     let object_meta = ObjectMetadata {
         object_key,
         fragment,
@@ -547,6 +584,7 @@ pub async fn finalize_object_upload(
         created_at: Utc::now().timestamp(),
         parts,
         is_delete_marker: false,
+        stripe_size_bytes: stripe_size,
     };
 
     let bson_data = mongodb::bson::to_vec(&object_meta).map_err(|e| {

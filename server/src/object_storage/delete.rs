@@ -28,9 +28,6 @@ pub async fn delete_object_version(
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
 
-    // 1. CALCULATE SIZE TO FREE (Read-Any Strategy)
-    // We need to know how much to refund before we delete the metadata.
-    // Try to find the metadata file on any index mirror.
     let index_dirs = path_manager.get_all_metadata_paths(&uid, &fragment, &object_key, &version_id);
     let mut size_to_free = 0;
 
@@ -39,46 +36,39 @@ pub async fn delete_object_version(
             if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
                 if !meta.is_delete_marker {
                     size_to_free = meta.total_size_bytes as i64;
-                    break; // Found it, no need to check other mirrors for size
+                    break;
                 }
             }
         }
     }
 
-    // 2. DELETE METADATA (Write-All / Delete-All Strategy)
-    // We must try to delete from ALL index mirrors to ensure consistency.
-    let index_delete_futures = index_dirs.iter().map(|path| {
-        async move {
-            if let Err(e) = fs::remove_file(path).await {
-                // Ignore NotFound, log others
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    warn!("Failed to delete version metadata at {:?}: {}", path, e);
-                }
-            } else {
-                // Cleanup empty parent directories (shard/hash folders)
-                if let Some(shard_h2) = path.parent() {
-                    if fs::remove_dir(shard_h2).await.is_ok() {
-                        if let Some(shard_h1) = shard_h2.parent() {
-                            let _ = fs::remove_dir(shard_h1).await;
-                        }
+    let index_delete_futures = index_dirs.iter().map(|path| async move {
+        if let Err(e) = fs::remove_file(path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("Failed to delete version metadata at {:?}: {}", path, e);
+            }
+        } else {
+            if let Some(shard_h2) = path.parent() {
+                if fs::remove_dir(shard_h2).await.is_ok() {
+                    if let Some(shard_h1) = shard_h2.parent() {
+                        let _ = fs::remove_dir(shard_h1).await;
                     }
                 }
             }
         }
     });
+
     join_all(index_delete_futures).await;
 
-    // 3. DELETE SESSION BLOB METADATA (Delete-All from Index Mirrors)
-    // The "blobs" folder inside index mirrors usually holds session/temp metadata
     let session_dirs = path_manager.get_all_session_dirs(&uid, &fragment, &version_id);
     let session_delete_futures = session_dirs.iter().map(|dir| async move {
         if fs::try_exists(dir).await.unwrap_or(false) {
             let _ = fs::remove_dir_all(dir).await;
         }
     });
+
     join_all(session_delete_futures).await;
 
-    // 4. DELETE ACTUAL DATA SHARDS (Delete-All from Blob Disks)
     let blob_roots = path_manager.get_blob_roots();
     let blob_delete_futures = blob_roots.iter().map(|disk| {
         let shard_dir = path_manager.get_shard_dir_on_disk(disk, &uid, &fragment, &version_id);
@@ -90,9 +80,9 @@ pub async fn delete_object_version(
             }
         }
     });
+
     join_all(blob_delete_futures).await;
 
-    // 5. UPDATE QUOTA & CACHE
     if size_to_free > 0 {
         if let Err(e) = update_quota(&uid, -size_to_free).await {
             error!("Failed to refund quota for user {}: {}", uid, e);
@@ -261,6 +251,7 @@ pub async fn delete_object(
         created_at: Utc::now().timestamp(),
         parts: vec![],
         is_delete_marker: true,
+        stripe_size_bytes: 0,
     };
 
     let bson_data = mongodb::bson::to_vec(&delete_marker)

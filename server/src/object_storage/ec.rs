@@ -3,10 +3,10 @@ use reed_solomon_simd::ReedSolomonEncoder;
 use std::alloc::{Layout, alloc, dealloc};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
+use tracing::warn;
 
 use crate::enums::app_error_enum::AppError;
 
-pub const STRIPE_BLOCK_SIZE: usize = 2 * 1024 * 1024;
 pub const ALIGNMENT: usize = 4096;
 
 pub struct AlignedBuffer {
@@ -81,7 +81,7 @@ unsafe impl Send for AlignedBuffer {}
 unsafe impl Sync for AlignedBuffer {}
 
 pub struct ErasureStreamWriter {
-    writers: Vec<File>,
+    writers: Vec<Option<File>>,
     data_shards: usize,
     parity_shards: usize,
     shard_len_limit: usize,
@@ -91,15 +91,17 @@ pub struct ErasureStreamWriter {
     calc_checksum: bool,
     total_hasher: Option<Hasher>,
     shard_hashers: Option<Vec<Hasher>>,
+    block_size: usize,
 }
 
 impl ErasureStreamWriter {
     pub fn new(
-        writers: Vec<File>,
+        writers: Vec<Option<File>>,
         data_shards: usize,
         parity_shards: usize,
         shard_len_limit: usize,
         calc_checksum: bool,
+        block_size: usize,
     ) -> Self {
         let total_hasher = if calc_checksum {
             Some(Hasher::new())
@@ -121,12 +123,13 @@ impl ErasureStreamWriter {
             data_shards,
             parity_shards,
             shard_len_limit,
-            buffer: AlignedBuffer::new(STRIPE_BLOCK_SIZE * data_shards),
-            parity_buffer: AlignedBuffer::new(STRIPE_BLOCK_SIZE * parity_shards),
+            buffer: AlignedBuffer::new(block_size * data_shards),
+            parity_buffer: AlignedBuffer::new(block_size * parity_shards),
             bytes_written_to_shards: 0,
             calc_checksum,
             total_hasher,
             shard_hashers,
+            block_size,
         }
     }
 
@@ -149,7 +152,7 @@ impl ErasureStreamWriter {
             offset += to_copy;
 
             if self.buffer.len() == stripe_capacity {
-                self.process_stripe(STRIPE_BLOCK_SIZE).await?;
+                self.process_stripe().await?;
             }
         }
 
@@ -159,7 +162,7 @@ impl ErasureStreamWriter {
     pub async fn finalize(&mut self) -> Result<(), AppError> {
         if self.buffer.len() > 0 {
             self.buffer.fill_zeros();
-            self.process_stripe(STRIPE_BLOCK_SIZE).await?;
+            self.process_stripe().await?;
         }
 
         let current_len = self.bytes_written_to_shards;
@@ -174,24 +177,27 @@ impl ErasureStreamWriter {
                 }
             }
 
-            for writer in self.writers.iter_mut() {
-                writer
-                    .write_all(padding_buf.as_slice())
-                    .await
-                    .map_err(|e| AppError::Io(e, "pad shard".into()))?;
+            for writer_opt in self.writers.iter_mut() {
+                if let Some(writer) = writer_opt {
+                    if let Err(e) = writer.write_all(padding_buf.as_slice()).await {
+                        warn!("Failed to write padding to shard: {}", e);
+                        *writer_opt = None;
+                    }
+                }
             }
         }
 
-        for w in self.writers.iter_mut() {
-            w.sync_all()
-                .await
-                .map_err(|e| AppError::Io(e, "sync shard".into()))?;
+        for w_opt in self.writers.iter_mut() {
+            if let Some(w) = w_opt {
+                let _ = w.sync_all().await;
+            }
         }
 
         Ok(())
     }
 
-    async fn process_stripe(&mut self, block_size: usize) -> Result<(), AppError> {
+    async fn process_stripe(&mut self) -> Result<(), AppError> {
+        let block_size = self.block_size;
         let buffer_slice = self.buffer.as_full_slice();
 
         if self.parity_shards > 0 {
@@ -234,22 +240,34 @@ impl ErasureStreamWriter {
             }
         }
 
-        for (i, writer) in self.writers.iter_mut().enumerate() {
-            let slice = if i < self.data_shards {
-                let start = i * block_size;
-                let end = start + block_size;
-                &self.buffer.as_full_slice()[start..end]
-            } else {
-                let parity_idx = i - self.data_shards;
-                let start = parity_idx * block_size;
-                let end = start + block_size;
-                &self.parity_buffer.as_full_slice()[start..end]
-            };
+        let mut successful_writes = 0;
 
-            writer
-                .write_all(slice)
-                .await
-                .map_err(|e| AppError::Io(e, "write stripe".into()))?;
+        for (i, writer_opt) in self.writers.iter_mut().enumerate() {
+            if let Some(writer) = writer_opt {
+                let slice = if i < self.data_shards {
+                    let start = i * block_size;
+                    let end = start + block_size;
+                    &self.buffer.as_full_slice()[start..end]
+                } else {
+                    let parity_idx = i - self.data_shards;
+                    let start = parity_idx * block_size;
+                    let end = start + block_size;
+                    &self.parity_buffer.as_full_slice()[start..end]
+                };
+
+                if let Err(e) = writer.write_all(slice).await {
+                    warn!("Failed to write stripe to shard: {}", e);
+                    *writer_opt = None;
+                } else {
+                    successful_writes += 1;
+                }
+            }
+        }
+
+        if successful_writes < self.data_shards {
+            return Err(AppError::InternalServerError(
+                "Not enough healthy disks to persist data".into(),
+            ));
         }
 
         self.buffer.clear();
