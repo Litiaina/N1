@@ -281,7 +281,7 @@ pub async fn run_server() {
 
     let stripe_block_size = upload_section
         .and_then(|s| s.get("stripe_block_size"))
-        .unwrap_or("2097152");
+        .unwrap_or("262144");
 
     let stripe_block_size: AtomicUsize = AtomicUsize::new(
         stripe_block_size

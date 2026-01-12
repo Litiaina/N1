@@ -69,8 +69,8 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("data_shards", "1")
         // Total parity shards during erasure coding
         .set("parity_shards", "0")
-        // Stripe block size for EC (Default 2MB)
-        .set("stripe_block_size", "2097152");
+        // Stripe block size for EC (Default 256KB)
+        .set("stripe_block_size", "262144");
 
     //Write config file
     conf.write_to_file(path)

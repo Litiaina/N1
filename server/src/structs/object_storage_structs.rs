@@ -11,7 +11,7 @@ pub static BLOB_STORE_DISKS: OnceLock<Vec<String>> = OnceLock::new();
 pub static FS_STORAGE_ROOT: OnceLock<String> = OnceLock::new();
 
 pub fn default_stripe_size() -> usize {
-    2 * 1024 * 1024
+    256 * 1024
 }
 
 pub struct ObjectPathManager;
