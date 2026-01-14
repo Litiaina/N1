@@ -175,13 +175,25 @@ pub async fn initiate_object_upload(
     });
 
     let results = join_all(create_futures).await;
+    let mut success_count = 0;
 
     for (i, result) in results.into_iter().enumerate() {
         if let Err(e) = result {
-            error!("Failed to create session dir on index disk {}: {}", i, e);
-            let _ = update_quota(&uid, -(params.total_size_bytes as i64)).await;
-            return Err(e);
+            warn!(
+                "Failed to create session dir on index disk {}: {}. Continuing if possible.",
+                i, e
+            );
+        } else {
+            success_count += 1;
         }
+    }
+
+    if success_count == 0 {
+        error!("CRITICAL: Failed to create session directory on ANY index disk.");
+        let _ = update_quota(&uid, -(params.total_size_bytes as i64)).await;
+        return Err(AppError::InternalServerError(
+            "Storage backend unavailable".into(),
+        ));
     }
 
     info!(
@@ -200,15 +212,7 @@ pub async fn initiate_object_upload(
             async move { fs::write(&receipt_path, data).await }
         });
 
-        let write_results = join_all(write_futures).await;
-        for (i, res) in write_results.into_iter().enumerate() {
-            if let Err(e) = res {
-                warn!(
-                    "Failed to write reservation receipt on index disk {}: {}",
-                    i, e
-                );
-            }
-        }
+        let _ = join_all(write_futures).await;
     }
 
     Ok((
@@ -460,9 +464,7 @@ pub async fn object_upload_part(
         let bytes = meta_bytes.clone();
         async move {
             if !dir.exists() {
-                fs::create_dir_all(&dir)
-                    .await
-                    .map_err(|e| AppError::Io(e, "create meta session dir".into()))?;
+                let _ = fs::create_dir_all(&dir).await;
             }
             let meta_path = dir.join(format!("part_{}{}", part_index, PART_META_SUFFIX));
             fs::write(&meta_path, &*bytes)
@@ -472,12 +474,20 @@ pub async fn object_upload_part(
     });
 
     let results = join_all(write_futures).await;
+    let mut meta_success = 0;
 
     for result in results {
         if let Err(e) = result {
-            error!("Replication failed for part metadata: {}", e);
-            return Err(e);
+            warn!("Replication failed for part metadata: {}", e);
+        } else {
+            meta_success += 1;
         }
+    }
+
+    if meta_success == 0 {
+        return Err(AppError::InternalServerError(
+            "Failed to write part metadata to ANY index disk".into(),
+        ));
     }
 
     Ok((StatusCode::OK, "Part uploaded").into_response())
@@ -603,9 +613,7 @@ pub async fn finalize_object_upload(
         async move {
             if let Some(parent) = index_path.parent() {
                 if !fs::try_exists(parent).await.unwrap_or(false) {
-                    fs::create_dir_all(parent)
-                        .await
-                        .map_err(|e| AppError::Io(e, "create index shard dir".into()))?;
+                    let _ = fs::create_dir_all(parent).await;
                 }
             }
 
@@ -624,21 +632,27 @@ pub async fn finalize_object_upload(
                 .map_err(|e| AppError::Io(e, "sync object meta".into()))?;
 
             if let Some(parent) = index_path.parent() {
-                sync_dir(parent).await?;
+                let _ = sync_dir(parent).await;
             }
             Ok::<(), AppError>(())
         }
     });
 
     let write_results = join_all(write_futures).await;
+    let mut success_count = 0;
+
     for result in write_results {
         if let Err(e) = result {
-            error!(
-                "Failed to write final metadata to one of the index disks: {}",
-                e
-            );
-            return Err(e);
+            warn!("Failed to write final metadata to one index disk: {}", e);
+        } else {
+            success_count += 1;
         }
+    }
+
+    if success_count == 0 {
+        return Err(AppError::InternalServerError(
+            "Failed to finalize upload on ANY index disk".into(),
+        ));
     }
 
     let cleanup_futures = meta_dirs.iter().map(|dir| async move {
@@ -696,12 +710,19 @@ pub async fn cancel_upload_session(
 
     let index_paths =
         path_manager.get_all_metadata_paths(&uid, &fragment, &key_query.object_key, &version_id);
+
+    let mut any_finalized = false;
     for index_path in &index_paths {
         if fs::try_exists(index_path).await.unwrap_or(false) {
-            return Err(AppError::Conflict(
-                "Cannot cancel: Object is already finalized.".to_string(),
-            ));
+            any_finalized = true;
+            break;
         }
+    }
+
+    if any_finalized {
+        return Err(AppError::Conflict(
+            "Cannot cancel: Object is already finalized.".to_string(),
+        ));
     }
 
     let meta_dirs = path_manager.get_all_session_dirs(&uid, &fragment, &version_id);
@@ -723,7 +744,7 @@ pub async fn cancel_upload_session(
         async move {
             if let Err(e) = fs::remove_dir_all(&dir).await {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    error!("Failed to clean session meta {}: {}", version_id_clone, e);
+                    warn!("Failed to clean session meta {}: {}", version_id_clone, e);
                 }
             }
         }

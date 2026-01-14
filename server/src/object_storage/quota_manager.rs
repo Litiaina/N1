@@ -11,7 +11,10 @@ use std::time::Duration;
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-use tracing::info;
+use tokio::time::timeout;
+use tracing::{info, warn};
+
+const DISK_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 static QUOTA_LOCKS: LazyLock<Vec<Mutex<()>>> = LazyLock::new(|| {
     let mut locks = Vec::with_capacity(LOCK_SHARD_COUNT);
@@ -55,36 +58,68 @@ async fn write_quota_to_all_disks(uid: &str, quota: &Quota) -> Result<(), AppErr
         let bytes = bytes.clone();
         async move {
             if let Some(parent) = path.parent() {
-                if !fs::try_exists(parent).await.unwrap_or(false) {
-                    fs::create_dir_all(parent)
-                        .await
-                        .map_err(|e| AppError::Io(e, "create user dir".into()))?;
+                let exists_result = timeout(DISK_IO_TIMEOUT, fs::try_exists(parent)).await;
+                match exists_result {
+                    Ok(Ok(true)) => {}
+                    Ok(Ok(false)) => {
+                        if let Err(e) = timeout(DISK_IO_TIMEOUT, fs::create_dir_all(parent)).await {
+                            return Err(AppError::Timeout(format!(
+                                "Create dir {:?} timed out. Error: {:?}",
+                                parent, e
+                            )));
+                        }
+                    }
+                    Ok(Err(e)) => return Err(AppError::Io(e, "check parent existence".into())),
+                    Err(_) => return Err(AppError::Timeout("check parent existence".into())),
                 }
             }
 
             let tmp_path = path.with_extension("tmp");
-            let mut file = File::create(&tmp_path)
-                .await
-                .map_err(|e| AppError::Io(e, "create quota tmp".into()))?;
-            file.write_all(&bytes)
-                .await
-                .map_err(|e| AppError::Io(e, "write quota bytes".into()))?;
-            file.flush()
-                .await
-                .map_err(|e| AppError::Io(e, "flush quota".into()))?;
-            fs::rename(tmp_path, path)
-                .await
-                .map_err(|e| AppError::Io(e, "rename quota".into()))?;
-            Ok::<(), AppError>(())
+            let write_result = timeout(DISK_IO_TIMEOUT, async {
+                let mut file = File::create(&tmp_path)
+                    .await
+                    .map_err(|e| AppError::Io(e, "create quota tmp".into()))?;
+                file.write_all(&bytes)
+                    .await
+                    .map_err(|e| AppError::Io(e, "write quota bytes".into()))?;
+                file.flush()
+                    .await
+                    .map_err(|e| AppError::Io(e, "flush quota".into()))?;
+                Ok::<(), AppError>(())
+            })
+            .await;
+
+            if let Err(_) = write_result {
+                let _ = fs::remove_file(&tmp_path).await;
+                return Err(AppError::Timeout("write quota".into()));
+            } else if let Ok(Err(e)) = write_result {
+                return Err(e);
+            }
+
+            let rename_result = timeout(DISK_IO_TIMEOUT, fs::rename(&tmp_path, &path)).await;
+            match rename_result {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(e)) => Err(AppError::Io(e, "rename quota".into())),
+                Err(_) => Err(AppError::Timeout("rename quota".into())),
+            }
         }
     });
 
     let results = join_all(write_futures).await;
+    let mut success_count = 0;
 
     for result in results {
-        if let Err(e) = result {
-            return Err(e);
+        if result.is_ok() {
+            success_count += 1;
+        } else if let Err(e) = result {
+            warn!("Failed to write quota to one mirror: {}", e);
         }
+    }
+
+    if success_count == 0 {
+        return Err(AppError::InternalServerError(
+            "Failed to write quota to ANY disk".into(),
+        ));
     }
 
     QUOTA_CACHE.insert(uid.to_string(), quota.clone()).await;
@@ -95,13 +130,20 @@ async fn read_quota_from_any_disk(uid: &str) -> Result<Quota, AppError> {
     let paths = get_all_quota_paths(uid);
 
     for path in paths {
-        if path.exists() {
-            let bytes = fs::read(&path)
-                .await
-                .map_err(|e| AppError::Io(e, "read quota".into()))?;
-            let quota = mongodb::bson::from_slice(&bytes)
-                .map_err(|_| AppError::InternalServerError("Corrupt quota file".into()))?;
-            return Ok(quota);
+        let exists_check = timeout(DISK_IO_TIMEOUT, fs::try_exists(&path)).await;
+
+        if let Ok(Ok(true)) = exists_check {
+            let read_result = timeout(DISK_IO_TIMEOUT, fs::read(&path)).await;
+
+            match read_result {
+                Ok(Ok(bytes)) => {
+                    if let Ok(quota) = mongodb::bson::from_slice(&bytes) {
+                        return Ok(quota);
+                    }
+                }
+                Ok(Err(e)) => warn!("Failed to read quota from {:?}: {}", path, e),
+                Err(_) => warn!("Timeout reading quota from {:?}", path),
+            }
         }
     }
 
@@ -158,7 +200,7 @@ pub async fn update_quota(uid: &str, delta_bytes: i64) -> Result<(), AppError> {
         Ok(q) => q,
         Err(_) => {
             return Err(AppError::InternalServerError(
-                "Quota file missing during update".into(),
+                "Quota file missing or unreadable on all mirrors".into(),
             ));
         }
     };
@@ -200,19 +242,23 @@ pub async fn set_storage_used(uid: &str, usage: u64) -> Result<(), AppError> {
     };
 
     for path in &paths {
-        if path.exists() {
-             if let Ok(bytes) = fs::read(path).await {
-                 if let Ok(q) = mongodb::bson::from_slice::<Quota>(&bytes) {
-                     current_quota = q;
-                     quota_found = true;
-                     break;
-                 }
-             }
+        if timeout(DISK_IO_TIMEOUT, fs::try_exists(path))
+            .await
+            .unwrap_or(Ok(false))
+            .unwrap_or(false)
+        {
+            if let Ok(Ok(bytes)) = timeout(DISK_IO_TIMEOUT, fs::read(path)).await {
+                if let Ok(q) = mongodb::bson::from_slice::<Quota>(&bytes) {
+                    current_quota = q;
+                    quota_found = true;
+                    break;
+                }
+            }
         }
     }
 
     if !quota_found {
-         return Ok(());
+        return Ok(());
     }
 
     if current_quota.storage_used != usage {
@@ -221,7 +267,7 @@ pub async fn set_storage_used(uid: &str, usage: u64) -> Result<(), AppError> {
             uid, current_quota.storage_used, usage
         );
         current_quota.storage_used = usage;
-        
+
         write_quota_to_all_disks(uid, &current_quota).await?;
     }
 

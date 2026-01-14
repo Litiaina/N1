@@ -1,7 +1,8 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse};
 use futures_util::StreamExt;
 use mongodb::{Client, bson::doc};
-use std::{error::Error, sync::Arc};
+use std::{error::Error, sync::Arc, time::Duration};
+use tokio::time::timeout;
 use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
@@ -16,15 +17,39 @@ use crate::{
     },
 };
 
+const DISK_OP_TIMEOUT: Duration = Duration::from_secs(2);
+
 async fn ensure_user_blob_directories(uid: &str) {
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
 
     for root in blob_roots {
         let blob_dir = root.join(OBJECT_DATA_ROOT).join(uid);
-        if !tokio::fs::try_exists(&blob_dir).await.unwrap_or(false) {
-            if let Err(e) = tokio::fs::create_dir_all(&blob_dir).await {
-                error!("Failed to initialize blob directory {:?}: {}", blob_dir, e);
+
+        let exists_check = timeout(DISK_OP_TIMEOUT, tokio::fs::try_exists(&blob_dir)).await;
+
+        match exists_check {
+            Ok(Ok(exists)) => {
+                if !exists {
+                    if let Err(_) =
+                        timeout(DISK_OP_TIMEOUT, tokio::fs::create_dir_all(&blob_dir)).await
+                    {
+                        warn!(
+                            "Timeout creating blob dir {:?}. Disk might be slow or dead.",
+                            blob_dir
+                        );
+                        continue;
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "Failed to check existence of {:?}: {}. Skipping disk.",
+                    blob_dir, e
+                );
+            }
+            Err(_) => {
+                warn!("Timeout checking {:?}. Disk might be dead.", blob_dir);
             }
         }
     }
@@ -85,8 +110,7 @@ pub async fn sync_quota(db_client: Arc<Client>) -> Result<(), Box<dyn Error + Se
                 let uid = user.uid;
 
                 if let Err(e) = init_quota_file(&uid, user.allocated_storage).await {
-                    error!("Failed to sync quota file for {}: {}", &uid, e);
-                    continue;
+                    warn!("Partial failure syncing quota file for {}: {}", &uid, e);
                 }
 
                 ensure_user_blob_directories(&uid).await;
@@ -123,8 +147,7 @@ pub async fn sync_single_user_quota(
     {
         Some(user) => {
             if let Err(e) = init_quota_file(&uid, user.allocated_storage).await {
-                error!("Failed to sync quota file for {}: {}", &uid, e);
-                return Ok(());
+                warn!("Partial failure syncing quota file for {}: {}", &uid, e);
             }
 
             ensure_user_blob_directories(&uid).await;
@@ -162,6 +185,7 @@ pub async fn initialize_storage(
         Some(user) => {
             let user_index_dirs = path_manager.get_all_user_index_dirs(&uid);
             let mut quota_exists = false;
+
             for dir in &user_index_dirs {
                 if tokio::fs::try_exists(dir.join("quota.bson"))
                     .await
@@ -174,8 +198,7 @@ pub async fn initialize_storage(
 
             if !quota_exists {
                 if let Err(e) = init_quota_file(&uid, user.allocated_storage).await {
-                    error!("Failed to sync quota file for {}: {}", &uid, e);
-                    return Ok(());
+                    warn!("Partial failure init quota file for {}: {}", &uid, e);
                 }
 
                 let calculated_usage = calculate_usage_across_mirrors(uid.to_string()).await;
