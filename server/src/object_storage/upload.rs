@@ -764,9 +764,16 @@ pub async fn finalize_object_upload(
     }
 
     let cleanup_futures = meta_dirs.iter().map(|dir| async move {
-        if let Err(e) = tokio_fs::remove_dir_all(dir).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!("Failed to remove session dir {:?}: {}", dir, e);
+        let mut entries = match tokio_fs::read_dir(dir).await {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let filename = entry.file_name();
+            let name_str = filename.to_string_lossy();
+            if name_str == "reservation.bson" || name_str.ends_with(PART_META_SUFFIX) {
+                let _ = tokio_fs::remove_file(entry.path()).await;
             }
         }
     });
