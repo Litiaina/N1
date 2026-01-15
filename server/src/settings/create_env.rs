@@ -19,22 +19,18 @@ pub fn create_env_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     writeln!(file)?;
 
     writeln!(file, "# Secret key used for signing JWT tokens")?;
-    writeln!(file, "JWT_SECRET=enter_jwt_secret_here")?;
+    writeln!(file, "JWT_SECRET=")?;
     writeln!(file)?;
 
     writeln!(file, "# Secret key used for URL signing and validation")?;
-    writeln!(file, "URL_SIGNING_SECRET=enter_url_signing_secret_here")?;
+    writeln!(file, "URL_SIGNING_SECRET=")?;
     writeln!(file)?;
 
     writeln!(file, "# Server authentication key (for admin access)")?;
-    writeln!(file, "SERVER_AUTH_KEY=enter_server_auth_key_here")?;
+    writeln!(file, "SERVER_AUTH_KEY=")?;
     writeln!(file)?;
 
-    writeln!(file, "# Path to the server admin key storage")?;
-    writeln!(file, "SERVER_AUTH_PATH=userdata/server/admin/key")?;
-    writeln!(file)?;
-
-    writeln!(file,"# MongoDB connection string (update if remote DB is used)")?;
+    writeln!(file,"# MongoDB connection string (default)")?;
     writeln!(file, "DATABASE_URL=mongodb://localhost:27017")?;
     writeln!(file)?;
 

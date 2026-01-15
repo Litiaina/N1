@@ -1,21 +1,26 @@
 use crate::enums::app_error_enum::AppError;
+use crate::object_storage::upload::DirectWriter; // Import DirectWriter
 use crate::structs::object_storage_structs::{PartMetadata, ShardInfo};
 use crc32fast::Hasher;
-use once_cell::sync::Lazy;
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 use std::collections::HashMap;
+use std::fs::OpenOptions as StdOpenOptions;
 use std::io::SeekFrom;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::fs::{self, File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use std::sync::{Arc, LazyLock};
+use tokio::fs::{self, File};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}; // AsyncWriteExt needed for DirectWriter
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-static RECOVERY_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(4));
+static RECOVERY_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
 
-static RECOVERY_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+static RECOVERY_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
 
     let total_cores = core_ids.len();
@@ -55,6 +60,31 @@ static RECOVERY_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
         .build()
         .expect("Failed to build dedicated recovery runtime")
 });
+
+async fn create_direct_file_for_repair(path: &PathBuf) -> Result<std::fs::File, AppError> {
+    let path_clone = path.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut options = StdOpenOptions::new();
+        options.write(true).create_new(true);
+
+        #[cfg(target_os = "linux")]
+        {
+            options.custom_flags(libc::O_DIRECT);
+        }
+
+        #[cfg(windows)]
+        {
+            const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
+            options.custom_flags(FILE_FLAG_NO_BUFFERING);
+        }
+
+        options
+            .open(&path_clone)
+            .map_err(|e| AppError::Io(e, format!("create repair file {}", path_clone.display())))
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("Spawn blocking failed: {}", e)))?
+}
 
 pub async fn verify_shard_integrity(file: &mut File, expected_checksum: &str) -> bool {
     if expected_checksum.is_empty() {
@@ -252,24 +282,34 @@ pub async fn repair_entire_shard(
         }
     }
 
-    let mut temp_file = match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .await
-    {
+    let std_file = match create_direct_file_for_repair(&temp_path).await {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Ok(());
+        Err(e) => {
+            if let AppError::Io(ref io_err, _) = e {
+                if io_err.kind() == std::io::ErrorKind::AlreadyExists {
+                    return Ok(());
+                }
+            }
+            return Err(e);
         }
-        Err(e) => return Err(AppError::Io(e, "create repair file".into())),
     };
+
+    let total_shard_size = part.shards.first().map(|s| s.size_bytes).unwrap_or(0);
+    let file_clone = std_file
+        .try_clone()
+        .map_err(|e| AppError::Io(e, "clone handle".into()))?;
+
+    tokio::task::spawn_blocking(move || file_clone.set_len(total_shard_size))
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("prealloc failed: {}", e)))? // Unwrap JoinError
+        .map_err(|e| AppError::Io(e, "prealloc set_len".into()))?; // Unwrap io::Error
+
+    // Wrap in DirectWriter
+    let mut temp_file = DirectWriter::new(std_file);
 
     let data_shards: Vec<&ShardInfo> = part.shards.iter().filter(|s| !s.is_parity).collect();
     let data_count = data_shards.len();
     let parity_count = part.shards.len() - data_count;
-
-    let total_shard_size = part.shards.first().map(|s| s.size_bytes).unwrap_or(0);
 
     let mut peer_files: Vec<Option<File>> = Vec::with_capacity(part.shards.len());
     for s in &part.shards {

@@ -1,11 +1,9 @@
+use crate::enums::app_error_enum::AppError;
 use crc32fast::Hasher;
 use reed_solomon_simd::ReedSolomonEncoder;
 use std::alloc::{Layout, alloc, dealloc};
-use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::warn;
-
-use crate::enums::app_error_enum::AppError;
 
 pub const ALIGNMENT: usize = 4096;
 
@@ -80,8 +78,10 @@ impl Drop for AlignedBuffer {
 unsafe impl Send for AlignedBuffer {}
 unsafe impl Sync for AlignedBuffer {}
 
-pub struct ErasureStreamWriter {
-    writers: Vec<Option<File>>,
+// Generic Writer: Works with File (N1) or Network Streams (N2)
+// NOTE: Make sure your on-disk file matches this generic definition!
+pub struct ErasureStreamWriter<W: AsyncWrite + Unpin + Send> {
+    writers: Vec<Option<W>>,
     data_shards: usize,
     parity_shards: usize,
     shard_len_limit: usize,
@@ -94,9 +94,9 @@ pub struct ErasureStreamWriter {
     block_size: usize,
 }
 
-impl ErasureStreamWriter {
+impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
     pub fn new(
-        writers: Vec<Option<File>>,
+        writers: Vec<Option<W>>,
         data_shards: usize,
         parity_shards: usize,
         shard_len_limit: usize,
@@ -189,7 +189,7 @@ impl ErasureStreamWriter {
 
         for w_opt in self.writers.iter_mut() {
             if let Some(w) = w_opt {
-                let _ = w.sync_all().await;
+                let _ = w.flush().await;
             }
         }
 

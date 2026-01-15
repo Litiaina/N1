@@ -3,7 +3,9 @@ use crate::object_storage::caching::invalidate_cache;
 use crate::object_storage::constants::{OBJECT_DATA_ROOT, PARITY_SUFFIX, SHARD_SUFFIX};
 use crate::object_storage::ec::ErasureStreamWriter;
 use crate::object_storage::recovery::read_or_recover_chunk;
-use crate::object_storage::upload::{DATA_SHARDS_ATOMIC, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC};
+use crate::object_storage::upload::{
+    DATA_SHARDS_ATOMIC, DirectWriter, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, create_direct_file,
+};
 use crate::structs::object_storage_structs::INDEX_STORE_DISKS;
 use crate::structs::object_storage_structs::{
     ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo, default_stripe_size,
@@ -13,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tokio::fs::{self, File};
+use tokio::fs as tokio_fs;
 use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
@@ -57,7 +59,7 @@ pub async fn run_redistribute_job(dry_run: bool) -> Result<(), AppError> {
         target_data_shards, target_parity_shards, target_stripe_size, target_num_disks
     );
 
-    let mut user_entries = fs::read_dir(&index_root)
+    let mut user_entries = tokio_fs::read_dir(&index_root)
         .await
         .map_err(|e| AppError::Io(e, "read index root".into()))?;
 
@@ -67,7 +69,7 @@ pub async fn run_redistribute_job(dry_run: bool) -> Result<(), AppError> {
             continue;
         }
 
-        let mut frag_entries = match fs::read_dir(&user_path).await {
+        let mut frag_entries = match tokio_fs::read_dir(&user_path).await {
             Ok(e) => e,
             Err(_) => continue,
         };
@@ -93,7 +95,7 @@ pub async fn run_redistribute_job(dry_run: bool) -> Result<(), AppError> {
             .map_err(|e| AppError::InternalServerError(format!("WalkDir failed: {}", e)))?;
 
             for meta_path in meta_files {
-                if let Ok(data) = fs::read(&meta_path).await {
+                if let Ok(data) = tokio_fs::read(&meta_path).await {
                     if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
                         if meta.is_delete_marker {
                             continue;
@@ -221,7 +223,8 @@ async fn redistribute_object(
         let new_stripe_count = (old_part_arc.size_bytes + new_stripe_width - 1) / new_stripe_width;
         let new_shard_len = new_stripe_count * new_block_size as u64;
 
-        let mut writers = Vec::with_capacity(target_data_shards + target_parity_shards);
+        let mut writers: Vec<Option<DirectWriter>> =
+            Vec::with_capacity(target_data_shards + target_parity_shards);
         let mut new_shard_infos = Vec::new();
         let mut temp_paths = Vec::new();
 
@@ -245,7 +248,7 @@ async fn redistribute_object(
             );
 
             if !shard_dir.exists() {
-                fs::create_dir_all(&shard_dir)
+                tokio_fs::create_dir_all(&shard_dir)
                     .await
                     .map_err(|e| AppError::Io(e, "create shard dir".into()))?;
             }
@@ -253,14 +256,20 @@ async fn redistribute_object(
             let final_path = shard_dir.join(&file_name);
             let temp_path = shard_dir.join(format!("{}.tmp", file_name));
 
-            let file = File::create(&temp_path)
-                .await
-                .map_err(|e| AppError::Io(e, "create tmp shard".into()))?;
-            file.set_len(new_shard_len)
-                .await
-                .map_err(|e| AppError::Io(e, "alloc tmp shard".into()))?;
+            let file = create_direct_file(&temp_path).await?;
 
-            writers.push(Some(file));
+            let file_clone = file
+                .try_clone()
+                .map_err(|e| AppError::Io(e, "clone handle".into()))?;
+
+            tokio::task::spawn_blocking(move || file_clone.set_len(new_shard_len))
+                .await
+                .map_err(|e| {
+                    AppError::InternalServerError(format!("prealloc thread failed: {}", e))
+                })?
+                .map_err(|e| AppError::Io(e, "prealloc set_len".into()))?;
+
+            writers.push(Some(DirectWriter::new(file)));
             temp_paths.push((temp_path, final_path.clone()));
 
             new_shard_infos.push(ShardInfo {
@@ -334,7 +343,7 @@ async fn redistribute_object(
             if let Some(sum) = checksums.get(i) {
                 new_shard_infos[i].checksum = sum.clone();
             }
-            fs::rename(tmp, final_p)
+            tokio_fs::rename(tmp, final_p)
                 .await
                 .map_err(|e| AppError::Io(e, "rename new shard".into()))?;
         }
@@ -378,7 +387,7 @@ async fn redistribute_object(
     invalidate_cache(&meta.fragment, &meta.object_key, &meta.owner_uid).await;
 
     for path in shards_to_cleanup {
-        let _ = fs::remove_file(&path).await;
+        let _ = tokio_fs::remove_file(&path).await;
     }
 
     Ok(())
@@ -396,16 +405,16 @@ async fn sync_metadata_to_mirrors(meta: &ObjectMetadata, data: &[u8]) -> Result<
     for path in all_paths {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
-                fs::create_dir_all(parent)
+                tokio_fs::create_dir_all(parent)
                     .await
                     .map_err(|e| AppError::Io(e, "create meta dir".into()))?;
             }
         }
         let tmp = path.with_extension("tmp");
-        fs::write(&tmp, data)
+        tokio_fs::write(&tmp, data)
             .await
             .map_err(|e| AppError::Io(e, "write meta tmp".into()))?;
-        fs::rename(tmp, path)
+        tokio_fs::rename(tmp, path)
             .await
             .map_err(|e| AppError::Io(e, "rename meta".into()))?;
     }

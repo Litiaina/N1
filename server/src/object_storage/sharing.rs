@@ -1,6 +1,7 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::get_metadata_with_cache;
 use crate::object_storage::object_parser::stream_object_logic;
+use crate::settings::constants::CONFIG_FILE;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
     CreateSignedUrlRequest, SignedUrlDisposition, SignedUrlResponse,
@@ -23,7 +24,7 @@ static URL_SIGNING_SECRET: LazyLock<String> =
     LazyLock::new(|| env::var("URL_SIGNING_SECRET").expect("URL_SIGNING_SECRET must be set"));
 
 static BASE_URL: LazyLock<String> = LazyLock::new(|| {
-    let config = Ini::load_from_file("config.ini").unwrap_or_else(|_| Ini::new());
+    let config = Ini::load_from_file(CONFIG_FILE).unwrap_or_else(|_| Ini::new());
     let server_section = config.section(Some("server"));
 
     server_section

@@ -1,2 +1,2 @@
-pub const ENV_FILE: &str = ".env";
-pub const CONFIG_FILE: &str = "config.ini";
+pub const ENV_FILE: &str = "n1.env";
+pub const CONFIG_FILE: &str = "n1_config.ini";

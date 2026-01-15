@@ -1,6 +1,8 @@
 use ini::Ini;
 use std::sync::LazyLock;
 
+use crate::settings::constants::CONFIG_FILE;
+
 pub struct GarbageCollectorConfig {
     pub cleanup_interval_seconds: u64,
     pub file_ttl_seconds: u64,
@@ -12,7 +14,7 @@ pub struct Config {
 }
 
 pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
-    let conf = Ini::load_from_file("config.ini")
+    let conf = Ini::load_from_file(CONFIG_FILE)
         .expect("Failed to load config.ini. Make sure the file exists and is readable.");
 
     let gc_section = conf.section(Some("garbage_collector"))

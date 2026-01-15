@@ -3,7 +3,7 @@ use crate::enums::app_error_enum::AppError;
 use crate::fs::fragmented_upload::with_io_timeout;
 use crate::object_storage::caching::invalidate_cache;
 use crate::object_storage::constants::{PARITY_SUFFIX, PART_META_SUFFIX, SHARD_SUFFIX};
-use crate::object_storage::ec::ErasureStreamWriter;
+use crate::object_storage::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::object_storage::quota_manager::{init_quota_file, try_reserve_quota, update_quota};
 use crate::object_storage::storage_capacity_parser::calculate_storage_usage;
 use crate::routes::storage_routes::AppState;
@@ -27,13 +27,21 @@ use futures_util::future::join_all;
 use futures_util::{StreamExt, stream};
 use mongodb::bson::doc;
 use once_cell::sync::{Lazy, OnceCell};
+use std::fs::{self, OpenOptions};
+use std::future::Future;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 #[cfg(not(unix))]
 use std::path::Path;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use tokio::fs::{self, File};
-use tokio::io::AsyncWriteExt;
+use std::task::{Context, Poll};
+use tokio::fs as tokio_fs; // Renamed to avoid confusion with std::fs
+use tokio::io::{AsyncWrite, AsyncWriteExt}; // Added AsyncWriteExt
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use ulid::Ulid;
@@ -49,30 +57,119 @@ pub static MAX_IO_SEMAPHORE: OnceCell<usize> = OnceCell::new();
 static IO_SEMAPHORE: Lazy<Semaphore> =
     Lazy::new(|| Semaphore::new(*MAX_IO_SEMAPHORE.get().unwrap()));
 
-async fn create_optimized_file(path: &PathBuf) -> Result<fs::File, AppError> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+pub struct DirectWriter {
+    file: Arc<fs::File>,
+    write_task: Option<tokio::task::JoinHandle<Result<usize, std::io::Error>>>,
+}
 
-    #[cfg(target_os = "linux")]
-    {
-        options.custom_flags(libc::O_DIRECT);
+impl DirectWriter {
+    pub fn new(file: fs::File) -> Self {
+        Self {
+            file: Arc::new(file),
+            write_task: None,
+        }
+    }
+}
+
+impl AsyncWrite for DirectWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        if let Some(task) = &mut self.write_task {
+            match Pin::new(task).poll(cx) {
+                Poll::Ready(Ok(res)) => {
+                    self.write_task = None;
+                    match res {
+                        Ok(_) => {}
+                        Err(e) => return Poll::Ready(Err(e)),
+                    }
+                }
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        let file = self.file.clone();
+
+        let mut aligned = AlignedBuffer::new(buf.len());
+        aligned.extend_from_slice(buf);
+
+        let task = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut f = &*file;
+            f.write_all(aligned.as_slice())?;
+            Ok(aligned.len())
+        });
+
+        self.write_task = Some(task);
+
+        Poll::Ready(Ok(buf.len()))
     }
 
-    #[cfg(windows)]
-    {
-        const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
-        options.custom_flags(FILE_FLAG_NO_BUFFERING);
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        if let Some(task) = &mut self.write_task {
+            match Pin::new(task).poll(cx) {
+                Poll::Ready(Ok(res)) => {
+                    self.write_task = None;
+                    match res {
+                        Ok(_) => Poll::Ready(Ok(())),
+                        Err(e) => Poll::Ready(Err(e)),
+                    }
+                }
+                Poll::Ready(Err(e)) => {
+                    Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            Poll::Ready(Ok(()))
+        }
     }
 
-    options
-        .open(path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("create {}", path.display())))
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        self.poll_flush(cx)
+    }
+}
+
+pub async fn create_direct_file(path: &PathBuf) -> Result<fs::File, AppError> {
+    let path_clone = path.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+
+        #[cfg(target_os = "linux")]
+        {
+            options.custom_flags(libc::O_DIRECT);
+        }
+
+        #[cfg(windows)]
+        {
+            const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
+            options.custom_flags(FILE_FLAG_NO_BUFFERING);
+        }
+
+        options
+            .open(&path_clone)
+            .map_err(|e| AppError::Io(e, format!("create {}", path_clone.display())))
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("Spawn blocking failed: {}", e)))?
 }
 
 #[cfg(unix)]
 pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
-    let dir = tokio::fs::OpenOptions::new()
+    let dir = tokio_fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY)
         .open(path)
@@ -169,7 +266,7 @@ pub async fn initiate_object_upload(
     let create_futures = meta_dirs.iter().map(|path| async move {
         with_io_timeout(
             "creating upload session directory",
-            fs::create_dir_all(path),
+            tokio_fs::create_dir_all(path),
         )
         .await
     });
@@ -180,7 +277,7 @@ pub async fn initiate_object_upload(
     for (i, result) in results.into_iter().enumerate() {
         if let Err(e) = result {
             warn!(
-                "Failed to create session dir on index disk {}: {}. Continuing if possible.",
+                "Failed to create session dir on index disk {}: {}. Continuing.",
                 i, e
             );
         } else {
@@ -209,7 +306,7 @@ pub async fn initiate_object_upload(
         let write_futures = meta_dirs.iter().map(|path| {
             let receipt_path = path.join("reservation.bson");
             let data = &bytes;
-            async move { fs::write(&receipt_path, data).await }
+            async move { tokio_fs::write(&receipt_path, data).await }
         });
 
         let _ = join_all(write_futures).await;
@@ -238,11 +335,11 @@ pub async fn get_upload_status(
     let mut read_success = false;
 
     for meta_dir in meta_dirs {
-        if !fs::try_exists(&meta_dir).await.unwrap_or(false) {
+        if !tokio_fs::try_exists(&meta_dir).await.unwrap_or(false) {
             continue;
         }
 
-        match fs::read_dir(&meta_dir).await {
+        match tokio_fs::read_dir(&meta_dir).await {
             Ok(mut entries) => {
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     let name = entry.file_name();
@@ -322,7 +419,8 @@ pub async fn object_upload_part(
     let stripe_count = (content_length + stripe_data_width - 1) / stripe_data_width;
     let final_shard_len = stripe_count * block_size as u64;
 
-    let mut writers: Vec<Option<File>> = Vec::with_capacity(total_shards);
+    let mut writers: Vec<Option<DirectWriter>> = Vec::with_capacity(total_shards);
+
     let mut shard_paths = Vec::with_capacity(total_shards);
     let mut file_names = Vec::with_capacity(total_shards);
     let mut successful_opens = 0;
@@ -356,26 +454,33 @@ pub async fn object_upload_part(
         );
 
         if !shard_dir.exists() {
-            let _ = with_io_timeout("create shard dir", fs::create_dir_all(&shard_dir)).await;
+            let _ = with_io_timeout("create shard dir", tokio_fs::create_dir_all(&shard_dir)).await;
         }
 
         let path = shard_dir.join(&file_name);
 
-        match create_optimized_file(&path).await {
+        match create_direct_file(&path).await {
             Ok(file) => {
-                if let Err(e) =
-                    with_io_timeout("pre-allocate shard", file.set_len(final_shard_len)).await
-                {
-                    warn!("Failed to pre-allocate shard on disk {}: {}", disk_idx, e);
-                    writers.push(None);
-                } else {
-                    writers.push(Some(file));
+                let file_clone = file
+                    .try_clone()
+                    .map_err(|e| AppError::Io(e, "clone file handle".into()))?;
+                let prealloc_result =
+                    tokio::task::spawn_blocking(move || file_clone.set_len(final_shard_len)).await;
+
+                if let Ok(Ok(_)) = prealloc_result {
+                    writers.push(Some(DirectWriter::new(file)));
                     successful_opens += 1;
+                } else {
+                    warn!(
+                        "Failed to pre-allocate shard on disk {}: {:?}",
+                        disk_idx, prealloc_result
+                    );
+                    writers.push(None);
                 }
             }
             Err(e) => {
                 warn!(
-                    "Failed to open shard file on disk {} ({:?}): {}",
+                    "Failed to open shard file on disk {} ({:?}): {}. Using Degraded Mode.",
                     disk_idx, path, e
                 );
                 writers.push(None);
@@ -464,10 +569,10 @@ pub async fn object_upload_part(
         let bytes = meta_bytes.clone();
         async move {
             if !dir.exists() {
-                let _ = fs::create_dir_all(&dir).await;
+                let _ = tokio_fs::create_dir_all(&dir).await;
             }
             let meta_path = dir.join(format!("part_{}{}", part_index, PART_META_SUFFIX));
-            fs::write(&meta_path, &*bytes)
+            tokio_fs::write(&meta_path, &*bytes)
                 .await
                 .map_err(|e| AppError::Io(e, "write part meta".into()))
         }
@@ -508,7 +613,7 @@ pub async fn finalize_object_upload(
 
     let mut selected_index: Option<usize> = None;
     for (i, dir) in meta_dirs.iter().enumerate() {
-        if fs::try_exists(dir).await.unwrap_or(false) {
+        if tokio_fs::try_exists(dir).await.unwrap_or(false) {
             selected_index = Some(i);
             break;
         }
@@ -549,7 +654,7 @@ pub async fn finalize_object_upload(
 
     let results: Vec<(PartMetadata, std::path::PathBuf)> = stream::iter(part_meta_paths)
         .map(|path| async move {
-            let data = fs::read(&path)
+            let data = tokio_fs::read(&path)
                 .await
                 .map_err(|e| AppError::Io(e, "read part meta".into()))?;
 
@@ -612,12 +717,12 @@ pub async fn finalize_object_upload(
         let bson_data = &bson_data;
         async move {
             if let Some(parent) = index_path.parent() {
-                if !fs::try_exists(parent).await.unwrap_or(false) {
-                    let _ = fs::create_dir_all(parent).await;
+                if !tokio_fs::try_exists(parent).await.unwrap_or(false) {
+                    let _ = tokio_fs::create_dir_all(parent).await;
                 }
             }
 
-            let mut final_meta_file = File::create(&index_path)
+            let mut final_meta_file = tokio_fs::File::create(&index_path)
                 .await
                 .map_err(|e| AppError::Io(e, "create object meta".into()))?;
 
@@ -639,24 +744,27 @@ pub async fn finalize_object_upload(
     });
 
     let write_results = join_all(write_futures).await;
-    let mut success_count = 0;
+    let mut success_final_writes = 0;
 
     for result in write_results {
         if let Err(e) = result {
-            warn!("Failed to write final metadata to one index disk: {}", e);
+            warn!(
+                "Failed to write final metadata to one of the index disks: {}",
+                e
+            );
         } else {
-            success_count += 1;
+            success_final_writes += 1;
         }
     }
 
-    if success_count == 0 {
+    if success_final_writes == 0 {
         return Err(AppError::InternalServerError(
             "Failed to finalize upload on ANY index disk".into(),
         ));
     }
 
     let cleanup_futures = meta_dirs.iter().map(|dir| async move {
-        if let Err(e) = fs::remove_dir_all(dir).await {
+        if let Err(e) = tokio_fs::remove_dir_all(dir).await {
             if e.kind() != std::io::ErrorKind::NotFound {
                 warn!("Failed to remove session dir {:?}: {}", dir, e);
             }
@@ -710,19 +818,12 @@ pub async fn cancel_upload_session(
 
     let index_paths =
         path_manager.get_all_metadata_paths(&uid, &fragment, &key_query.object_key, &version_id);
-
-    let mut any_finalized = false;
     for index_path in &index_paths {
-        if fs::try_exists(index_path).await.unwrap_or(false) {
-            any_finalized = true;
-            break;
+        if tokio_fs::try_exists(index_path).await.unwrap_or(false) {
+            return Err(AppError::Conflict(
+                "Cannot cancel: Object is already finalized.".to_string(),
+            ));
         }
-    }
-
-    if any_finalized {
-        return Err(AppError::Conflict(
-            "Cannot cancel: Object is already finalized.".to_string(),
-        ));
     }
 
     let meta_dirs = path_manager.get_all_session_dirs(&uid, &fragment, &version_id);
@@ -730,7 +831,7 @@ pub async fn cancel_upload_session(
 
     for meta_dir in &meta_dirs {
         let receipt_path = meta_dir.join("reservation.bson");
-        if let Ok(data) = fs::read(&receipt_path).await {
+        if let Ok(data) = tokio_fs::read(&receipt_path).await {
             if let Ok(receipt) = mongodb::bson::from_slice::<ReservationReceipt>(&data) {
                 refund_amount = receipt.amount;
                 break;
@@ -742,9 +843,9 @@ pub async fn cancel_upload_session(
         let dir = dir.clone();
         let version_id_clone = version_id.clone();
         async move {
-            if let Err(e) = fs::remove_dir_all(&dir).await {
+            if let Err(e) = tokio_fs::remove_dir_all(&dir).await {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    warn!("Failed to clean session meta {}: {}", version_id_clone, e);
+                    error!("Failed to clean session meta {}: {}", version_id_clone, e);
                 }
             }
         }
@@ -755,7 +856,7 @@ pub async fn cancel_upload_session(
     for disk in blob_roots {
         let shard_dir = path_manager.get_shard_dir_on_disk(&disk, &uid, &fragment, &version_id);
         if shard_dir.exists() {
-            if let Err(e) = fs::remove_dir_all(&shard_dir).await {
+            if let Err(e) = tokio_fs::remove_dir_all(&shard_dir).await {
                 warn!("Failed to clean blob disk {:?}: {}", shard_dir, e);
             }
         }

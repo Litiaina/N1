@@ -3,6 +3,7 @@ use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
 use crate::object_storage::upload::{DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC};
 use crate::routes::storage_routes::serve_storage_routes;
+use crate::settings::constants::{CONFIG_FILE, ENV_FILE};
 use crate::structs::object_storage_structs::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
 use crate::utils::date_time_formatter::LocalTimer;
 use crate::validation::enforce_init_settings::{ensure_config_file, ensure_env_file};
@@ -50,11 +51,11 @@ pub fn init_tracing() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
         .with(
             fmt::layer()
                 .with_writer(non_blocking)
-                .with_target(false)
-                .with_file(false)
-                .with_line_number(false)
-                .with_thread_ids(false)
-                .with_thread_names(false)
+                .with_target(true)
+                .with_file(true)
+                .with_line_number(true)
+                .with_thread_ids(true)
+                .with_thread_names(true)
                 .with_ansi(true)
                 .with_timer(LocalTimer)
         )
@@ -78,7 +79,7 @@ async fn main() {
             dotenv().ok();
 
             let target_url = args.url.or_else(|| {
-                Ini::load_from_file("config.ini").ok().and_then(|conf| {
+                Ini::load_from_file(CONFIG_FILE).ok().and_then(|conf| {
                     conf.section(Some("server")).map(|section| {
                         let host = section.get("host").unwrap_or("127.0.0.1");
                         let port = section.get("https_port").unwrap_or("50001");
@@ -112,7 +113,7 @@ async fn main() {
         return;
     }
 
-    dotenv().ok();
+    dotenv::from_filename(ENV_FILE).ok();
     tracing::info!("Loaded environment variables from .env file.");
 
     if let Err(e) = ensure_config_file() {
@@ -136,10 +137,10 @@ async fn main() {
 }
 
 pub async fn run_server() {
-    let config = Ini::load_from_file("config.ini").expect("Failed to load config.ini");
+    let config = Ini::load_from_file(CONFIG_FILE).expect(format!("Failed to load {}", CONFIG_FILE).as_str());
 
     let server_section = config.section(Some("server")).unwrap_or_else(|| {
-        panic!("Missing [server] section in config.ini");
+        panic!("Missing [server] section in {}", CONFIG_FILE);
     });
 
     let host = server_section.get("host").unwrap_or("127.0.0.1");

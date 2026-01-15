@@ -11,6 +11,7 @@ use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::key_extractor::SmartIpKeyExtractor;
 use jsonwebtoken::{decode, Validation};
 use tracing::error;
+use crate::settings::constants::CONFIG_FILE;
 use crate::structs::auth_structs::Claims;
 use crate::middleware::auth_middleware::JWT_KEYS;
 
@@ -80,7 +81,7 @@ fn get_rate_limit_config() -> RateLimitSettings {
             global_burst: 300
         };
 
-        let config_result = Ini::load_from_file("config.ini");
+        let config_result = Ini::load_from_file(CONFIG_FILE);
         
         match config_result {
             Ok(config) => {
