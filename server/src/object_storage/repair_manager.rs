@@ -197,19 +197,21 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
                     continue;
                 }
 
-                let meta_files: Vec<PathBuf> = tokio::task::spawn_blocking(move || {
-                    WalkDir::new(index_dir)
-                        .into_iter()
-                        .filter_map(|e| e.ok())
-                        .filter(|e| {
-                            e.file_type().is_file()
-                                && e.path().extension().map_or(false, |ext| ext == "bson")
-                        })
-                        .map(|e| e.path().to_owned())
-                        .collect()
-                })
-                .await
-                .map_err(|e| AppError::InternalServerError(format!("WalkDir failed: {}", e)))?;
+                let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+
+                let index_dir_clone = index_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    let walker = WalkDir::new(index_dir_clone).into_iter();
+                    for entry in walker.filter_map(|e| e.ok()) {
+                        if entry.file_type().is_file()
+                            && entry.path().extension().map_or(false, |ext| ext == "bson")
+                        {
+                            if tx.blocking_send(entry.path().to_owned()).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
 
                 let blob_roots_clone = blob_roots.clone();
                 let processed_arc = processed_versions.clone();
@@ -217,7 +219,7 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
                 let mut batch_scanned_count: u64 = 0;
                 const STATUS_UPDATE_BATCH: u64 = 50;
 
-                for meta_path in meta_files {
+                while let Some(meta_path) = rx.recv().await {
                     if STOP_SIGNAL.load(Ordering::Relaxed) {
                         break;
                     }
@@ -258,7 +260,6 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
                                 process_object_repair(meta, &blob_roots_clone, num_disks, dry_run)
                                     .await
                             {
-                                // Skip individual errors to keep job alive
                                 warn!("Object repair check skipped: {}", e);
                             }
                         }
