@@ -1,5 +1,5 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::upload::DirectWriter; // Import DirectWriter
+use crate::object_storage::upload::DirectWriter;
 use crate::structs::object_storage_structs::{PartMetadata, ShardInfo};
 use crc32fast::Hasher;
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use tokio::fs::{self, File};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}; // AsyncWriteExt needed for DirectWriter
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
@@ -266,10 +266,15 @@ pub async fn repair_entire_shard(
     let parent_dir = final_path
         .parent()
         .ok_or(AppError::InternalServerError("Invalid shard path".into()))?;
+
     if !parent_dir.exists() {
-        fs::create_dir_all(parent_dir)
-            .await
-            .map_err(|e| AppError::Io(e, "create repair dir".into()))?;
+        if let Err(e) = fs::create_dir_all(parent_dir).await {
+            warn!(
+                "Cannot create repair directory at {:?}: {}. Disk may be unmounted or read-only. Skipping repair.",
+                parent_dir, e
+            );
+            return Ok(());
+        }
     }
 
     let temp_path = parent_dir.join(format!("{}.recovering", target_shard.file_name));
@@ -290,6 +295,18 @@ pub async fn repair_entire_shard(
                     return Ok(());
                 }
             }
+
+            if let AppError::Io(ref io_err, _) = e {
+                if io_err.kind() == std::io::ErrorKind::NotFound
+                    || io_err.kind() == std::io::ErrorKind::PermissionDenied
+                {
+                    warn!(
+                        "Disk became unavailable during repair init: {}. Skipping.",
+                        io_err
+                    );
+                    return Ok(());
+                }
+            }
             return Err(e);
         }
     };
@@ -301,10 +318,9 @@ pub async fn repair_entire_shard(
 
     tokio::task::spawn_blocking(move || file_clone.set_len(total_shard_size))
         .await
-        .map_err(|e| AppError::InternalServerError(format!("prealloc failed: {}", e)))? // Unwrap JoinError
-        .map_err(|e| AppError::Io(e, "prealloc set_len".into()))?; // Unwrap io::Error
+        .map_err(|e| AppError::InternalServerError(format!("prealloc failed: {}", e)))?
+        .map_err(|e| AppError::Io(e, "prealloc set_len".into()))?;
 
-    // Wrap in DirectWriter
     let mut temp_file = DirectWriter::new(std_file);
 
     let data_shards: Vec<&ShardInfo> = part.shards.iter().filter(|s| !s.is_parity).collect();

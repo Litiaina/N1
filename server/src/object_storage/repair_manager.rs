@@ -3,15 +3,76 @@ use crate::object_storage::constants::OBJECT_DATA_ROOT;
 use crate::object_storage::recovery::{repair_entire_shard, verify_shard_integrity};
 use crate::structs::object_storage_structs::INDEX_STORE_DISKS;
 use crate::structs::object_storage_structs::{ObjectMetadata, ObjectPathManager, Quota};
+use axum::response::sse::{Event, Sse};
 use axum::{extract::Query, http::StatusCode, response::IntoResponse};
+use futures_util::stream::{self, Stream};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 use tokio::fs::{self, File};
+use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RepairJobStatus {
+    pub is_running: bool,
+    pub phase: String,
+    pub total_scanned: u64,
+    pub total_repaired: u64,
+    pub corrupt_found: u64,
+    pub current_user: String,
+    pub last_error: Option<String>,
+}
+
+static REPAIR_STATUS: LazyLock<Arc<RwLock<RepairJobStatus>>> =
+    LazyLock::new(|| Arc::new(RwLock::new(RepairJobStatus::default())));
+
+pub async fn monitor_repair_job_api() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = stream::unfold((), |()| async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let state = REPAIR_STATUS.read().await.clone();
+        let event = Event::default()
+            .json_data(state)
+            .unwrap_or_else(|_| Event::default().data("serialization error"));
+        Some((Ok(event), ()))
+    });
+
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+}
+
+pub async fn trigger_repair_job_api(
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let dry_run = params.get("dry_run").map(|v| v == "true").unwrap_or(false);
+
+    tokio::spawn(async move {
+        if let Err(e) = run_repair_job(dry_run).await {
+            error!("Manual Repair Job Failed: {}", e);
+            let mut status = REPAIR_STATUS.write().await;
+            status.is_running = false;
+            status.phase = "Failed".to_string();
+            status.last_error = Some(e.to_string());
+        }
+    });
+
+    (StatusCode::ACCEPTED, "Storage repair job initiated.")
+}
+
 pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
+    {
+        let mut status = REPAIR_STATUS.write().await;
+        status.is_running = true;
+        status.phase = "Initializing".to_string();
+        status.total_scanned = 0;
+        status.total_repaired = 0;
+        status.corrupt_found = 0;
+        status.last_error = None;
+    }
+
     let path_manager = ObjectPathManager::new();
 
     let index_roots_config = INDEX_STORE_DISKS
@@ -42,7 +103,10 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
             continue;
         }
 
-        info!("Scanning Index Root: {:?}", index_root);
+        {
+            let mut status = REPAIR_STATUS.write().await;
+            status.phase = format!("Scanning Root {:?}", index_root);
+        }
 
         let mut user_entries = match fs::read_dir(&index_root).await {
             Ok(e) => e,
@@ -59,6 +123,11 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
             }
 
             let uid = user_entry.file_name().to_string_lossy().to_string();
+
+            {
+                let mut status = REPAIR_STATUS.write().await;
+                status.current_user = uid.clone();
+            }
 
             let should_process_quota = {
                 let mut p_users = processed_users.lock().unwrap();
@@ -108,7 +177,18 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
                 let blob_roots_clone = blob_roots.clone();
                 let processed_arc = processed_versions.clone();
 
+                let mut batch_scanned_count: u64 = 0;
+                const STATUS_UPDATE_BATCH: u64 = 100;
+
                 for meta_path in meta_files {
+                    batch_scanned_count += 1;
+
+                    if batch_scanned_count >= STATUS_UPDATE_BATCH {
+                        let mut status = REPAIR_STATUS.write().await;
+                        status.total_scanned += batch_scanned_count;
+                        batch_scanned_count = 0;
+                    }
+
                     if let Ok(data) = fs::read(&meta_path).await {
                         if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
                             if meta.is_delete_marker {
@@ -135,8 +215,19 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
                         }
                     }
                 }
+
+                if batch_scanned_count > 0 {
+                    let mut status = REPAIR_STATUS.write().await;
+                    status.total_scanned += batch_scanned_count;
+                }
             }
         }
+    }
+
+    {
+        let mut status = REPAIR_STATUS.write().await;
+        status.is_running = false;
+        status.phase = "Completed".to_string();
     }
 
     info!("Storage Repair Job Complete.");
@@ -196,6 +287,7 @@ async fn repair_user_quota(uid: &str, source_data: &[u8], dry_run: bool) -> Resu
     Ok(())
 }
 
+// Make public for redistribution.rs
 pub async fn repair_metadata_mirrors(
     meta: &ObjectMetadata,
     data: &[u8],
@@ -277,6 +369,16 @@ async fn process_object_repair(
             }
 
             let disk_root = &blob_roots[disk_idx];
+
+            // FIX: Skip repair if the disk root itself is not mounted/accessible
+            if !disk_root.exists() {
+                warn!(
+                    "Disk root {:?} unreachable (unmounted?). Skipping repair for this shard.",
+                    disk_root
+                );
+                continue;
+            }
+
             let shard_dir = path_manager.get_shard_dir_on_disk(
                 disk_root,
                 &meta_arc.owner_uid,
@@ -292,6 +394,8 @@ async fn process_object_repair(
                         is_healthy = true;
                     } else {
                         warn!("Corrupt shard detected: {:?}", shard_path);
+                        let mut status = REPAIR_STATUS.write().await;
+                        status.corrupt_found += 1;
                     }
                 }
             }
@@ -330,23 +434,11 @@ async fn process_object_repair(
                 );
             } else {
                 info!("Successfully repaired shard index {}", missing_idx);
+                let mut status = REPAIR_STATUS.write().await;
+                status.total_repaired += 1;
             }
         }
     }
 
     Ok(())
-}
-
-pub async fn trigger_repair_job_api(
-    Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
-    let dry_run = params.get("dry_run").map(|v| v == "true").unwrap_or(false);
-
-    tokio::spawn(async move {
-        if let Err(e) = run_repair_job(dry_run).await {
-            error!("Manual Repair Job Failed: {}", e);
-        }
-    });
-
-    (StatusCode::ACCEPTED, "Storage repair job initiated.")
 }

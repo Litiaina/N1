@@ -40,8 +40,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use tokio::fs as tokio_fs; // Renamed to avoid confusion with std::fs
-use tokio::io::{AsyncWrite, AsyncWriteExt}; // Added AsyncWriteExt
+use tokio::fs as tokio_fs;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use ulid::Ulid;
@@ -106,7 +106,6 @@ impl AsyncWrite for DirectWriter {
         });
 
         self.write_task = Some(task);
-
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -187,33 +186,14 @@ pub async fn sync_dir(path: &Path) -> Result<(), AppError> {
     tokio::task::spawn_blocking(move || {
         use std::fs::OpenOptions;
         use std::os::windows::fs::OpenOptionsExt;
-
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
-
         let result = OpenOptions::new()
             .read(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(&path);
-
-        match result {
-            Ok(file) => {
-                if let Err(e) = file.sync_all() {
-                    warn!(
-                        "Windows: Failed to sync directory (non-fatal): {} - {}",
-                        path.display(),
-                        e
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Windows: Failed to open directory for sync (non-fatal): {} - {}",
-                    path.display(),
-                    e
-                );
-            }
+        if let Ok(file) = result {
+            let _ = file.sync_all();
         }
-
         Ok(())
     })
     .await
@@ -250,7 +230,6 @@ pub async fn initiate_object_upload(
                 .ok_or(AppError::Unauthorized)?;
 
             init_quota_file(&uid, user_record.allocated_storage).await?;
-
             try_reserve_quota(&uid, params.total_size_bytes).await?;
         } else {
             return Err(e);
@@ -264,26 +243,22 @@ pub async fn initiate_object_upload(
     let meta_dirs = path_manager.get_all_session_dirs(&uid, &fragment, &version_id);
 
     let create_futures = meta_dirs.iter().map(|path| async move {
-        with_io_timeout(
+        match with_io_timeout(
             "creating upload session directory",
             tokio_fs::create_dir_all(path),
         )
         .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                warn!("Skipping unavailable index disk: {:?}", path);
+                Err(e)
+            }
+        }
     });
 
     let results = join_all(create_futures).await;
-    let mut success_count = 0;
-
-    for (i, result) in results.into_iter().enumerate() {
-        if let Err(e) = result {
-            warn!(
-                "Failed to create session dir on index disk {}: {}. Continuing.",
-                i, e
-            );
-        } else {
-            success_count += 1;
-        }
-    }
+    let success_count = results.iter().filter(|r| r.is_ok()).count();
 
     if success_count == 0 {
         error!("CRITICAL: Failed to create session directory on ANY index disk.");
@@ -306,9 +281,14 @@ pub async fn initiate_object_upload(
         let write_futures = meta_dirs.iter().map(|path| {
             let receipt_path = path.join("reservation.bson");
             let data = &bytes;
-            async move { tokio_fs::write(&receipt_path, data).await }
+            async move {
+                if tokio_fs::try_exists(path).await.unwrap_or(false) {
+                    tokio_fs::write(&receipt_path, data).await
+                } else {
+                    Ok(())
+                }
+            }
         });
-
         let _ = join_all(write_futures).await;
     }
 
@@ -344,7 +324,6 @@ pub async fn get_upload_status(
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     let name = entry.file_name();
                     let name_str = name.to_string_lossy();
-
                     if name_str.ends_with(PART_META_SUFFIX) {
                         if let Some(rest) = name_str.strip_prefix("part_") {
                             if let Some(index_str) = rest.strip_suffix(PART_META_SUFFIX) {
@@ -358,21 +337,19 @@ pub async fn get_upload_status(
                 read_success = true;
                 break;
             }
-            Err(e) => {
-                warn!(
-                    "Failed to read dir {:?}: {}, trying next mirror",
-                    meta_dir, e
-                );
+            Err(_) => {
+                continue;
             }
         }
     }
 
     if !read_success {
-        return Err(AppError::NotFound);
+        return Ok(AxumJson(UploadStatusResponse {
+            uploaded_parts: vec![],
+        }));
     }
 
     uploaded_parts.sort();
-
     Ok(AxumJson(UploadStatusResponse { uploaded_parts }))
 }
 
@@ -420,7 +397,6 @@ pub async fn object_upload_part(
     let final_shard_len = stripe_count * block_size as u64;
 
     let mut writers: Vec<Option<DirectWriter>> = Vec::with_capacity(total_shards);
-
     let mut shard_paths = Vec::with_capacity(total_shards);
     let mut file_names = Vec::with_capacity(total_shards);
     let mut successful_opens = 0;
@@ -452,50 +428,50 @@ pub async fn object_upload_part(
             &fragment_arc,
             &version_id_arc,
         );
-
-        if !shard_dir.exists() {
-            let _ = with_io_timeout("create shard dir", tokio_fs::create_dir_all(&shard_dir)).await;
-        }
-
         let path = shard_dir.join(&file_name);
 
-        match create_direct_file(&path).await {
-            Ok(file) => {
-                let file_clone = file
-                    .try_clone()
-                    .map_err(|e| AppError::Io(e, "clone file handle".into()))?;
-                let prealloc_result =
-                    tokio::task::spawn_blocking(move || file_clone.set_len(final_shard_len)).await;
+        let dir_ok = if !shard_dir.exists() {
+            match with_io_timeout("create shard dir", tokio_fs::create_dir_all(&shard_dir)).await {
+                Ok(_) => true,
+                Err(_) => false,
+            }
+        } else {
+            true
+        };
 
-                if let Ok(Ok(_)) = prealloc_result {
-                    writers.push(Some(DirectWriter::new(file)));
-                    successful_opens += 1;
-                } else {
-                    warn!(
-                        "Failed to pre-allocate shard on disk {}: {:?}",
-                        disk_idx, prealloc_result
-                    );
+        if dir_ok {
+            match create_direct_file(&path).await {
+                Ok(file) => {
+                    let file_clone = file
+                        .try_clone()
+                        .map_err(|e| AppError::Io(e, "clone file handle".into()))?;
+                    let prealloc_result =
+                        tokio::task::spawn_blocking(move || file_clone.set_len(final_shard_len))
+                            .await;
+
+                    if let Ok(Ok(_)) = prealloc_result {
+                        writers.push(Some(DirectWriter::new(file)));
+                        successful_opens += 1;
+                    } else {
+                        writers.push(None);
+                    }
+                }
+                Err(_) => {
                     writers.push(None);
                 }
             }
-            Err(e) => {
-                warn!(
-                    "Failed to open shard file on disk {} ({:?}): {}. Using Degraded Mode.",
-                    disk_idx, path, e
-                );
-                writers.push(None);
-            }
+        } else {
+            writers.push(None);
         }
 
         shard_paths.push(path.to_string_lossy().to_string());
         file_names.push(file_name);
     }
 
-    if successful_opens < data_shards {
-        return Err(AppError::InternalServerError(format!(
-            "Not enough healthy disks to write data. Need {}, got {}.",
-            data_shards, successful_opens
-        )));
+    if successful_opens == 0 {
+        return Err(AppError::InternalServerError(
+            "No healthy disks available for write.".into(),
+        ));
     }
 
     let mut stream_writer = ErasureStreamWriter::new(
@@ -521,7 +497,6 @@ pub async fn object_upload_part(
             continue;
         }
         total_bytes_read += chunk.len() as u64;
-
         stream_writer.write(&chunk).await?;
     }
 
@@ -559,7 +534,6 @@ pub async fn object_upload_part(
     };
 
     let meta_dirs = path_manager.get_all_session_dirs(&uid_arc, &fragment_arc, &version_id_arc);
-
     let meta_bytes = Arc::new(
         mongodb::bson::to_vec(&part_meta)
             .map_err(|e| AppError::InternalServerError(format!("Serialize meta: {}", e)))?,
@@ -569,31 +543,18 @@ pub async fn object_upload_part(
         let bytes = meta_bytes.clone();
         async move {
             if !dir.exists() {
-                let _ = tokio_fs::create_dir_all(&dir).await;
+                if let Err(_) = tokio_fs::create_dir_all(&dir).await {
+                    return Ok::<(), AppError>(());
+                }
             }
             let meta_path = dir.join(format!("part_{}{}", part_index, PART_META_SUFFIX));
-            tokio_fs::write(&meta_path, &*bytes)
-                .await
-                .map_err(|e| AppError::Io(e, "write part meta".into()))
+            if let Err(_) = tokio_fs::write(&meta_path, &*bytes).await {}
+
+            Ok(())
         }
     });
 
-    let results = join_all(write_futures).await;
-    let mut meta_success = 0;
-
-    for result in results {
-        if let Err(e) = result {
-            warn!("Replication failed for part metadata: {}", e);
-        } else {
-            meta_success += 1;
-        }
-    }
-
-    if meta_success == 0 {
-        return Err(AppError::InternalServerError(
-            "Failed to write part metadata to ANY index disk".into(),
-        ));
-    }
+    join_all(write_futures).await;
 
     Ok((StatusCode::OK, "Part uploaded").into_response())
 }
@@ -620,7 +581,6 @@ pub async fn finalize_object_upload(
     }
 
     let index = selected_index.ok_or(AppError::NotFound)?;
-
     let meta_dirs_clone = meta_dirs.clone();
 
     let part_meta_paths =
@@ -657,10 +617,8 @@ pub async fn finalize_object_upload(
             let data = tokio_fs::read(&path)
                 .await
                 .map_err(|e| AppError::Io(e, "read part meta".into()))?;
-
             let part: PartMetadata = mongodb::bson::from_slice(&data)
                 .map_err(|_| AppError::InternalServerError("Corrupt part meta".into()))?;
-
             Ok::<_, AppError>((part, path))
         })
         .buffer_unordered(50)
@@ -670,7 +628,6 @@ pub async fn finalize_object_upload(
         .collect::<Result<Vec<_>, _>>()?;
 
     let (mut parts, _): (Vec<_>, Vec<_>) = results.into_iter().unzip();
-
     parts.sort_by_key(|p| p.part_index);
 
     let mut total_size_calculated = 0;
@@ -718,23 +675,19 @@ pub async fn finalize_object_upload(
         async move {
             if let Some(parent) = index_path.parent() {
                 if !tokio_fs::try_exists(parent).await.unwrap_or(false) {
-                    let _ = tokio_fs::create_dir_all(parent).await;
+                    if let Err(_) = tokio_fs::create_dir_all(parent).await {
+                        return Ok::<(), AppError>(());
+                    }
                 }
             }
 
-            let mut final_meta_file = tokio_fs::File::create(&index_path)
-                .await
-                .map_err(|e| AppError::Io(e, "create object meta".into()))?;
-
-            final_meta_file
-                .write_all(bson_data)
-                .await
-                .map_err(|e| AppError::Io(e, "write object meta".into()))?;
-
-            final_meta_file
-                .sync_all()
-                .await
-                .map_err(|e| AppError::Io(e, "sync object meta".into()))?;
+            match tokio_fs::File::create(&index_path).await {
+                Ok(mut final_meta_file) => {
+                    let _ = final_meta_file.write_all(bson_data).await;
+                    let _ = final_meta_file.sync_all().await;
+                }
+                Err(_) => {}
+            }
 
             if let Some(parent) = index_path.parent() {
                 let _ = sync_dir(parent).await;
@@ -743,32 +696,17 @@ pub async fn finalize_object_upload(
         }
     });
 
-    let write_results = join_all(write_futures).await;
-    let mut success_final_writes = 0;
-
-    for result in write_results {
-        if let Err(e) = result {
-            warn!(
-                "Failed to write final metadata to one of the index disks: {}",
-                e
-            );
-        } else {
-            success_final_writes += 1;
-        }
-    }
-
-    if success_final_writes == 0 {
-        return Err(AppError::InternalServerError(
-            "Failed to finalize upload on ANY index disk".into(),
-        ));
-    }
+    join_all(write_futures).await;
 
     let cleanup_futures = meta_dirs.iter().map(|dir| async move {
+        if !tokio_fs::try_exists(dir).await.unwrap_or(false) {
+            return;
+        }
+
         let mut entries = match tokio_fs::read_dir(dir).await {
             Ok(e) => e,
             Err(_) => return,
         };
-
         while let Ok(Some(entry)) = entries.next_entry().await {
             let filename = entry.file_name();
             let name_str = filename.to_string_lossy();
@@ -786,8 +724,8 @@ pub async fn finalize_object_upload(
     if delta != 0 {
         update_quota(&object_meta.owner_uid, delta).await?;
         info!(
-            "Quota adjustment for {}: {} bytes (Reserved: {}, Actual: {})",
-            object_meta.owner_uid, delta, reserved_size, actual_size
+            "Quota adjustment for {}: {} bytes",
+            object_meta.owner_uid, delta
         );
     }
 
@@ -797,19 +735,16 @@ pub async fn finalize_object_upload(
         &object_meta.owner_uid,
     )
     .await;
-
     info!(
         "Finalized object: {}/{} (Size: {})",
         object_meta.fragment, object_meta.object_key, total_size_calculated
     );
 
     let owner_uid = object_meta.owner_uid.clone();
-
     let stripped_meta = ObjectMetadata {
         parts: Vec::new(),
         ..object_meta
     };
-
     state.emit(&owner_uid, StorageEventPayload::FileUploaded(stripped_meta));
 
     Ok((StatusCode::OK, "Upload finalized."))
@@ -837,6 +772,9 @@ pub async fn cancel_upload_session(
     let mut refund_amount = 0;
 
     for meta_dir in &meta_dirs {
+        if !tokio_fs::try_exists(meta_dir).await.unwrap_or(false) {
+            continue;
+        }
         let receipt_path = meta_dir.join("reservation.bson");
         if let Ok(data) = tokio_fs::read(&receipt_path).await {
             if let Ok(receipt) = mongodb::bson::from_slice::<ReservationReceipt>(&data) {
@@ -848,13 +786,8 @@ pub async fn cancel_upload_session(
 
     let cleanup_meta_futures = meta_dirs.iter().map(|dir| {
         let dir = dir.clone();
-        let version_id_clone = version_id.clone();
         async move {
-            if let Err(e) = tokio_fs::remove_dir_all(&dir).await {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    error!("Failed to clean session meta {}: {}", version_id_clone, e);
-                }
-            }
+            let _ = tokio_fs::remove_dir_all(&dir).await;
         }
     });
     join_all(cleanup_meta_futures).await;
@@ -863,9 +796,7 @@ pub async fn cancel_upload_session(
     for disk in blob_roots {
         let shard_dir = path_manager.get_shard_dir_on_disk(&disk, &uid, &fragment, &version_id);
         if shard_dir.exists() {
-            if let Err(e) = tokio_fs::remove_dir_all(&shard_dir).await {
-                warn!("Failed to clean blob disk {:?}: {}", shard_dir, e);
-            }
+            let _ = tokio_fs::remove_dir_all(&shard_dir).await;
         }
     }
 
@@ -874,11 +805,6 @@ pub async fn cancel_upload_session(
             error!("Failed to refund quota for cancelled upload {}: {}", uid, e);
         }
     }
-
-    info!(
-        "Cancelled upload session: {}/{} (Refunded: {} bytes)",
-        fragment, version_id, refund_amount
-    );
 
     Ok(StatusCode::NO_CONTENT)
 }

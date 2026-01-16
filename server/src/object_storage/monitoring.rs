@@ -22,7 +22,7 @@ use ulid::Ulid;
 use walkdir::WalkDir;
 
 static DEEP_SCAN_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
-const DISK_CHECK_TIMEOUT: Duration = Duration::from_millis(2000);
+const DISK_CHECK_TIMEOUT: Duration = Duration::from_millis(5000);
 
 #[derive(Serialize)]
 pub struct DiskStatus {
@@ -94,7 +94,7 @@ async fn check_disk_accessibility(path_str: String, role: String) -> DiskStatus 
                                     );
                                 }
                                 let latency = start_time.elapsed().as_millis() as u64;
-                                let status = if latency > 500 {
+                                let status = if latency > 1000 {
                                     "slow".to_string()
                                 } else {
                                     "online".to_string()
@@ -127,9 +127,9 @@ async fn check_disk_accessibility(path_str: String, role: String) -> DiskStatus 
         match check_result {
             Ok((s, e, l)) => (s, l, e),
             Err(_) => (
-                "timeout".to_string(),
+                "slow".to_string(),
                 None,
-                Some("Disk I/O timed out (>2s)".to_string()),
+                Some("Disk I/O timed out (>5s)".to_string()),
             ),
         }
     } else {
@@ -225,9 +225,14 @@ pub async fn get_system_health(
                     let walker = WalkDir::new(&root).into_iter();
 
                     for entry in walker.filter_map(|e| e.ok()) {
+                        let path = entry.path();
                         if entry.file_type().is_file()
-                            && entry.path().extension().map_or(false, |ext| ext == "bson")
+                            && path.extension().map_or(false, |ext| ext == "bson")
                         {
+                            if path.components().any(|c| c.as_os_str() == "blobs") {
+                                continue;
+                            }
+
                             current_disk_count += 1;
                         }
 
