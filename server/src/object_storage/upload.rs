@@ -1,6 +1,5 @@
 use crate::database::database_constants::DATABASE;
 use crate::enums::app_error_enum::AppError;
-use crate::fs::fragmented_upload::with_io_timeout;
 use crate::object_storage::caching::invalidate_cache;
 use crate::object_storage::constants::{PARITY_SUFFIX, PART_META_SUFFIX, SHARD_SUFFIX};
 use crate::object_storage::ec::{AlignedBuffer, ErasureStreamWriter};
@@ -27,6 +26,7 @@ use futures_util::future::join_all;
 use futures_util::{StreamExt, stream};
 use mongodb::bson::doc;
 use once_cell::sync::{Lazy, OnceCell};
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
 use std::future::Future;
 #[cfg(unix)]
@@ -45,7 +45,6 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use ulid::Ulid;
-use walkdir::WalkDir;
 
 pub static MAX_PART_SIZE_ATOMIC: OnceCell<AtomicU64> = OnceCell::new();
 pub static DATA_SHARDS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
@@ -143,6 +142,10 @@ impl AsyncWrite for DirectWriter {
 pub async fn create_direct_file(path: &PathBuf) -> Result<fs::File, AppError> {
     let path_clone = path.clone();
 
+    if let Some(parent) = path.parent() {
+        let _ = tokio_fs::create_dir_all(parent).await;
+    }
+
     tokio::task::spawn_blocking(move || {
         let mut options = OpenOptions::new();
         options.write(true).create(true).truncate(true);
@@ -173,10 +176,11 @@ pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
         .custom_flags(libc::O_DIRECTORY)
         .open(path)
         .await
-        .map_err(|e| AppError::Io(e, "open dir for sync".into()))?;
+        .map_err(|e| AppError::Io(e, format!("open dir for sync: {:?}", path)))?;
+
     dir.sync_all()
         .await
-        .map_err(|e| AppError::Io(e, "sync dir".into()))?;
+        .map_err(|e| AppError::Io(e, format!("sync dir: {:?}", path)))?;
     Ok(())
 }
 
@@ -186,14 +190,33 @@ pub async fn sync_dir(path: &Path) -> Result<(), AppError> {
     tokio::task::spawn_blocking(move || {
         use std::fs::OpenOptions;
         use std::os::windows::fs::OpenOptionsExt;
+
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+
         let result = OpenOptions::new()
             .read(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(&path);
-        if let Ok(file) = result {
-            let _ = file.sync_all();
+
+        match result {
+            Ok(file) => {
+                if let Err(e) = file.sync_all() {
+                    warn!(
+                        "Windows: Failed to sync directory (non-fatal): {} - {}",
+                        path.display(),
+                        e
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Windows: Failed to open directory for sync (non-fatal): {} - {}",
+                    path.display(),
+                    e
+                );
+            }
         }
+
         Ok(())
     })
     .await
@@ -243,16 +266,21 @@ pub async fn initiate_object_upload(
     let meta_dirs = path_manager.get_all_session_dirs(&uid, &fragment, &version_id);
 
     let create_futures = meta_dirs.iter().map(|path| async move {
-        match with_io_timeout(
-            "creating upload session directory",
-            tokio_fs::create_dir_all(path),
-        )
-        .await
-        {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                warn!("Skipping unavailable index disk: {:?}", path);
-                Err(e)
+        let mut attempts = 0;
+        loop {
+            match tokio_fs::create_dir_all(path).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= 3 {
+                        warn!(
+                            "Failed to create session dir {:?} after 3 attempts: {}",
+                            path, e
+                        );
+                        return Err(e);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
             }
         }
     });
@@ -267,11 +295,6 @@ pub async fn initiate_object_upload(
             "Storage backend unavailable".into(),
         ));
     }
-
-    info!(
-        "Initiated upload: {}/{} (v: {}) [Reserved: {} bytes]",
-        fragment, object_key, version_id, params.total_size_bytes
-    );
 
     let receipt = ReservationReceipt {
         amount: params.total_size_bytes,
@@ -292,6 +315,11 @@ pub async fn initiate_object_upload(
         let _ = join_all(write_futures).await;
     }
 
+    info!(
+        "Initiated upload: {}/{} (v: {})",
+        fragment, object_key, version_id
+    );
+
     Ok((
         StatusCode::CREATED,
         AxumJson(InitiateUploadResponse {
@@ -311,46 +339,43 @@ pub async fn get_upload_status(
     let path_manager = ObjectPathManager::new();
 
     let meta_dirs = path_manager.get_all_session_dirs(&uid, &fragment, &version_id);
-    let mut uploaded_parts = Vec::new();
-    let mut read_success = false;
+
+    let mut parts = BTreeSet::<u64>::new();
+    let mut any_read = false;
 
     for meta_dir in meta_dirs {
         if !tokio_fs::try_exists(&meta_dir).await.unwrap_or(false) {
             continue;
         }
+        let mut entries = match tokio_fs::read_dir(&meta_dir).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
 
-        match tokio_fs::read_dir(&meta_dir).await {
-            Ok(mut entries) => {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy();
-                    if name_str.ends_with(PART_META_SUFFIX) {
-                        if let Some(rest) = name_str.strip_prefix("part_") {
-                            if let Some(index_str) = rest.strip_suffix(PART_META_SUFFIX) {
-                                if let Ok(index) = index_str.parse::<u64>() {
-                                    uploaded_parts.push(index);
-                                }
-                            }
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name_str = entry.file_name().to_string_lossy().to_string();
+            if name_str.ends_with(PART_META_SUFFIX) {
+                if let Some(rest) = name_str.strip_prefix("part_") {
+                    if let Some(index_str) = rest.strip_suffix(PART_META_SUFFIX) {
+                        if let Ok(idx) = index_str.parse::<u64>() {
+                            parts.insert(idx);
+                            any_read = true;
                         }
                     }
                 }
-                read_success = true;
-                break;
-            }
-            Err(_) => {
-                continue;
             }
         }
     }
 
-    if !read_success {
+    if !any_read {
         return Ok(AxumJson(UploadStatusResponse {
             uploaded_parts: vec![],
         }));
     }
 
-    uploaded_parts.sort();
-    Ok(AxumJson(UploadStatusResponse { uploaded_parts }))
+    Ok(AxumJson(UploadStatusResponse {
+        uploaded_parts: parts.into_iter().collect(),
+    }))
 }
 
 pub async fn object_upload_part(
@@ -430,48 +455,53 @@ pub async fn object_upload_part(
         );
         let path = shard_dir.join(&file_name);
 
-        let dir_ok = if !shard_dir.exists() {
-            match with_io_timeout("create shard dir", tokio_fs::create_dir_all(&shard_dir)).await {
-                Ok(_) => true,
-                Err(_) => false,
-            }
-        } else {
-            true
-        };
-
-        if dir_ok {
-            match create_direct_file(&path).await {
-                Ok(file) => {
-                    let file_clone = file
-                        .try_clone()
-                        .map_err(|e| AppError::Io(e, "clone file handle".into()))?;
-                    let prealloc_result =
-                        tokio::task::spawn_blocking(move || file_clone.set_len(final_shard_len))
-                            .await;
-
-                    if let Ok(Ok(_)) = prealloc_result {
-                        writers.push(Some(DirectWriter::new(file)));
-                        successful_opens += 1;
-                    } else {
-                        writers.push(None);
+        let mut attempts = 0;
+        loop {
+            match tokio_fs::create_dir_all(&shard_dir).await {
+                Ok(_) => break,
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= 3 {
+                        warn!(
+                            "Failed to create shard dir {:?} after 3 attempts: {}",
+                            shard_dir, e
+                        );
+                        break;
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
-                Err(_) => {
+            }
+        }
+
+        match create_direct_file(&path).await {
+            Ok(file) => {
+                let file_clone = file
+                    .try_clone()
+                    .map_err(|e| AppError::Io(e, "clone file handle".into()))?;
+                let prealloc_result =
+                    tokio::task::spawn_blocking(move || file_clone.set_len(final_shard_len)).await;
+
+                if let Ok(Ok(_)) = prealloc_result {
+                    writers.push(Some(DirectWriter::new(file)));
+                    successful_opens += 1;
+                } else {
                     writers.push(None);
                 }
             }
-        } else {
-            writers.push(None);
+            Err(_) => {
+                writers.push(None);
+            }
         }
 
         shard_paths.push(path.to_string_lossy().to_string());
         file_names.push(file_name);
     }
 
-    if successful_opens == 0 {
-        return Err(AppError::InternalServerError(
-            "No healthy disks available for write.".into(),
-        ));
+    if successful_opens < data_shards {
+        return Err(AppError::InternalServerError(format!(
+            "Insufficient healthy disks for write quorum. Need {}, got {}.",
+            data_shards, successful_opens
+        )));
     }
 
     let mut stream_writer = ErasureStreamWriter::new(
@@ -497,6 +527,7 @@ pub async fn object_upload_part(
             continue;
         }
         total_bytes_read += chunk.len() as u64;
+
         stream_writer.write(&chunk).await?;
     }
 
@@ -542,19 +573,46 @@ pub async fn object_upload_part(
     let write_futures = meta_dirs.into_iter().map(|dir| {
         let bytes = meta_bytes.clone();
         async move {
-            if !dir.exists() {
-                if let Err(_) = tokio_fs::create_dir_all(&dir).await {
-                    return Ok::<(), AppError>(());
+            let mut attempts = 0;
+            let dir_ready = loop {
+                match tokio_fs::create_dir_all(&dir).await {
+                    Ok(_) => break true,
+                    Err(e) => {
+                        attempts += 1;
+                        if attempts >= 3 {
+                            warn!("Failed to create part meta dir {:?}: {}", dir, e);
+                            break false;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+            };
+
+            if !dir_ready {
+                return false;
+            }
+
+            let meta_path = dir.join(format!("part_{}{}", part_index, PART_META_SUFFIX));
+            match tokio_fs::write(&meta_path, &*bytes).await {
+                Ok(_) => {
+                    let _ = sync_dir(&dir).await;
+                    true
+                }
+                Err(e) => {
+                    warn!("Failed to write part meta {:?}: {}", meta_path, e);
+                    false
                 }
             }
-            let meta_path = dir.join(format!("part_{}{}", part_index, PART_META_SUFFIX));
-            if let Err(_) = tokio_fs::write(&meta_path, &*bytes).await {}
-
-            Ok(())
         }
     });
 
-    join_all(write_futures).await;
+    let results = join_all(write_futures).await;
+
+    if !results.into_iter().any(|ok| ok) {
+        return Err(AppError::InternalServerError(
+            "Failed to write part metadata to any index mirror".into(),
+        ));
+    }
 
     Ok((StatusCode::OK, "Part uploaded").into_response())
 }
@@ -572,54 +630,45 @@ pub async fn finalize_object_upload(
     let path_manager = ObjectPathManager::new();
     let meta_dirs = Arc::new(path_manager.get_all_session_dirs(&uid, &fragment, &version_id));
 
-    let mut selected_index: Option<usize> = None;
-    for (i, dir) in meta_dirs.iter().enumerate() {
-        if tokio_fs::try_exists(dir).await.unwrap_or(false) {
-            selected_index = Some(i);
-            break;
+    let mut all_part_paths = Vec::new();
+    for meta_dir in meta_dirs.iter() {
+        if !tokio_fs::try_exists(meta_dir).await.unwrap_or(false) {
+            continue;
         }
-    }
 
-    let index = selected_index.ok_or(AppError::NotFound)?;
-    let meta_dirs_clone = meta_dirs.clone();
-
-    let part_meta_paths =
-        tokio::task::spawn_blocking(move || -> Result<Vec<std::path::PathBuf>, AppError> {
-            let meta_dir = &meta_dirs_clone[index];
-            let mut paths = Vec::new();
-            for entry in WalkDir::new(meta_dir)
-                .max_depth(1)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                let path = entry.path();
-                if path.is_file() {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.ends_with(PART_META_SUFFIX) {
-                            paths.push(path.to_owned());
+        match tokio_fs::read_dir(meta_dir).await {
+            Ok(mut entries) => {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                            if name.ends_with(PART_META_SUFFIX) {
+                                all_part_paths.push(path);
+                            }
                         }
                     }
                 }
             }
-            Ok(paths)
-        })
-        .await
-        .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))??;
+            Err(e) => {
+                warn!("Failed to list session dir {:?}: {}", meta_dir, e);
+            }
+        }
+    }
 
-    if part_meta_paths.is_empty() {
+    if all_part_paths.is_empty() {
         return Err(AppError::BadRequest(
             "No parts found to finalize.".to_string(),
         ));
     }
 
-    let results: Vec<(PartMetadata, std::path::PathBuf)> = stream::iter(part_meta_paths)
+    let results: Vec<PartMetadata> = stream::iter(all_part_paths)
         .map(|path| async move {
             let data = tokio_fs::read(&path)
                 .await
                 .map_err(|e| AppError::Io(e, "read part meta".into()))?;
             let part: PartMetadata = mongodb::bson::from_slice(&data)
                 .map_err(|_| AppError::InternalServerError("Corrupt part meta".into()))?;
-            Ok::<_, AppError>((part, path))
+            Ok::<_, AppError>(part)
         })
         .buffer_unordered(50)
         .collect::<Vec<Result<_, _>>>()
@@ -627,7 +676,12 @@ pub async fn finalize_object_upload(
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
 
-    let (mut parts, _): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+    let mut parts_map: HashMap<u64, PartMetadata> = HashMap::new();
+    for part in results {
+        parts_map.entry(part.part_index).or_insert(part);
+    }
+
+    let mut parts: Vec<PartMetadata> = parts_map.into_values().collect();
     parts.sort_by_key(|p| p.part_index);
 
     let mut total_size_calculated = 0;
@@ -675,18 +729,22 @@ pub async fn finalize_object_upload(
         async move {
             if let Some(parent) = index_path.parent() {
                 if !tokio_fs::try_exists(parent).await.unwrap_or(false) {
-                    if let Err(_) = tokio_fs::create_dir_all(parent).await {
-                        return Ok::<(), AppError>(());
-                    }
+                    let _ = tokio_fs::create_dir_all(parent).await;
                 }
             }
 
+            // CRITICAL FIX: Use standard buffered File creation for metadata.
+            // O_DIRECT fails on variable length writes (metadata is small BSON).
             match tokio_fs::File::create(&index_path).await {
                 Ok(mut final_meta_file) => {
-                    let _ = final_meta_file.write_all(bson_data).await;
+                    if let Err(e) = final_meta_file.write_all(bson_data).await {
+                        warn!("Failed to write metadata {:?}: {}", index_path, e);
+                    }
                     let _ = final_meta_file.sync_all().await;
                 }
-                Err(_) => {}
+                Err(e) => {
+                    warn!("Failed to create metadata file {:?}: {}", index_path, e);
+                }
             }
 
             if let Some(parent) = index_path.parent() {
@@ -723,10 +781,6 @@ pub async fn finalize_object_upload(
 
     if delta != 0 {
         update_quota(&object_meta.owner_uid, delta).await?;
-        info!(
-            "Quota adjustment for {}: {} bytes",
-            object_meta.owner_uid, delta
-        );
     }
 
     invalidate_cache(
@@ -735,10 +789,6 @@ pub async fn finalize_object_upload(
         &object_meta.owner_uid,
     )
     .await;
-    info!(
-        "Finalized object: {}/{} (Size: {})",
-        object_meta.fragment, object_meta.object_key, total_size_calculated
-    );
 
     let owner_uid = object_meta.owner_uid.clone();
     let stripped_meta = ObjectMetadata {
@@ -791,14 +841,6 @@ pub async fn cancel_upload_session(
         }
     });
     join_all(cleanup_meta_futures).await;
-
-    let blob_roots = path_manager.get_blob_roots();
-    for disk in blob_roots {
-        let shard_dir = path_manager.get_shard_dir_on_disk(&disk, &uid, &fragment, &version_id);
-        if shard_dir.exists() {
-            let _ = tokio_fs::remove_dir_all(&shard_dir).await;
-        }
-    }
 
     if refund_amount > 0 {
         if let Err(e) = update_quota(&uid, -(refund_amount as i64)).await {

@@ -5,13 +5,15 @@ use crate::structs::object_storage_structs::INDEX_STORE_DISKS;
 use crate::structs::object_storage_structs::{ObjectMetadata, ObjectPathManager, Quota};
 use axum::response::sse::{Event, Sse};
 use axum::{extract::Query, http::StatusCode, response::IntoResponse};
+use chrono::Utc;
 use futures_util::stream::{self, Stream};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs::{self, File};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -25,15 +27,22 @@ pub struct RepairJobStatus {
     pub total_repaired: u64,
     pub corrupt_found: u64,
     pub current_user: String,
+    pub last_repaired: Option<String>,
     pub last_error: Option<String>,
+
+    pub start_timestamp: i64,
+    pub duration_seconds: u64,
+    pub scan_rate_per_sec: f64,
 }
 
 static REPAIR_STATUS: LazyLock<Arc<RwLock<RepairJobStatus>>> =
     LazyLock::new(|| Arc::new(RwLock::new(RepairJobStatus::default())));
 
+static STOP_SIGNAL: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
+
 pub async fn monitor_repair_job_api() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = stream::unfold((), |()| async move {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         let state = REPAIR_STATUS.read().await.clone();
         let event = Event::default()
             .json_data(state)
@@ -47,6 +56,13 @@ pub async fn monitor_repair_job_api() -> Sse<impl Stream<Item = Result<Event, In
 pub async fn trigger_repair_job_api(
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    {
+        let status = REPAIR_STATUS.read().await;
+        if status.is_running {
+            return (StatusCode::CONFLICT, "Job already running").into_response();
+        }
+    }
+
     let dry_run = params.get("dry_run").map(|v| v == "true").unwrap_or(false);
 
     tokio::spawn(async move {
@@ -59,10 +75,22 @@ pub async fn trigger_repair_job_api(
         }
     });
 
-    (StatusCode::ACCEPTED, "Storage repair job initiated.")
+    (StatusCode::ACCEPTED, "Storage repair job initiated.").into_response()
+}
+
+pub async fn stop_repair_job_api() -> impl IntoResponse {
+    STOP_SIGNAL.store(true, Ordering::Relaxed);
+    let mut status = REPAIR_STATUS.write().await;
+    if status.is_running {
+        status.phase = "Stopping...".to_string();
+    }
+    (StatusCode::OK, "Stop signal sent to repair manager.")
 }
 
 pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
+    STOP_SIGNAL.store(false, Ordering::Relaxed);
+    let start_time = Instant::now();
+
     {
         let mut status = REPAIR_STATUS.write().await;
         status.is_running = true;
@@ -71,24 +99,23 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
         status.total_repaired = 0;
         status.corrupt_found = 0;
         status.last_error = None;
+        status.start_timestamp = Utc::now().timestamp();
+        status.duration_seconds = 0;
+        status.scan_rate_per_sec = 0.0;
     }
 
     let path_manager = ObjectPathManager::new();
-
     let index_roots_config = INDEX_STORE_DISKS
         .get()
         .ok_or(AppError::InternalServerError(
             "Index Store Config not initialized".into(),
         ))?;
-
     let index_roots: Vec<PathBuf> = index_roots_config
         .iter()
         .map(|s| PathBuf::from(s).join(OBJECT_DATA_ROOT))
         .collect();
-
     let blob_roots = path_manager.get_blob_roots();
     let num_disks = blob_roots.len();
-
     let processed_versions = Arc::new(Mutex::new(HashSet::new()));
     let processed_users = Arc::new(Mutex::new(HashSet::new()));
 
@@ -98,6 +125,9 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
     );
 
     for index_root in index_roots {
+        if STOP_SIGNAL.load(Ordering::Relaxed) {
+            break;
+        }
         if !index_root.exists() {
             warn!("Index root unreachable, skipping scan: {:?}", index_root);
             continue;
@@ -117,13 +147,15 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
         };
 
         while let Ok(Some(user_entry)) = user_entries.next_entry().await {
+            if STOP_SIGNAL.load(Ordering::Relaxed) {
+                break;
+            }
             let user_path = user_entry.path();
             if !user_path.is_dir() {
                 continue;
             }
 
             let uid = user_entry.file_name().to_string_lossy().to_string();
-
             {
                 let mut status = REPAIR_STATUS.write().await;
                 status.current_user = uid.clone();
@@ -143,7 +175,10 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
                 let quota_path = user_path.join("quota.bson");
                 if let Ok(quota_data) = fs::read(&quota_path).await {
                     if let Err(e) = repair_user_quota(&uid, &quota_data, dry_run).await {
-                        error!("Failed to align quota for user {}: {}", uid, e);
+                        warn!(
+                            "Warning: Failed to align quota for user {} (non-fatal): {}",
+                            uid, e
+                        );
                     }
                 }
             }
@@ -154,8 +189,10 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
             };
 
             while let Ok(Some(frag_entry)) = frag_entries.next_entry().await {
+                if STOP_SIGNAL.load(Ordering::Relaxed) {
+                    break;
+                }
                 let index_dir = frag_entry.path().join("index");
-
                 if !index_dir.exists() {
                     continue;
                 }
@@ -178,14 +215,22 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
                 let processed_arc = processed_versions.clone();
 
                 let mut batch_scanned_count: u64 = 0;
-                const STATUS_UPDATE_BATCH: u64 = 100;
+                const STATUS_UPDATE_BATCH: u64 = 50;
 
                 for meta_path in meta_files {
+                    if STOP_SIGNAL.load(Ordering::Relaxed) {
+                        break;
+                    }
                     batch_scanned_count += 1;
 
                     if batch_scanned_count >= STATUS_UPDATE_BATCH {
                         let mut status = REPAIR_STATUS.write().await;
                         status.total_scanned += batch_scanned_count;
+                        let elapsed = start_time.elapsed().as_secs_f64();
+                        status.duration_seconds = elapsed as u64;
+                        if elapsed > 0.0 {
+                            status.scan_rate_per_sec = status.total_scanned as f64 / elapsed;
+                        }
                         batch_scanned_count = 0;
                     }
 
@@ -194,7 +239,6 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
                             if meta.is_delete_marker {
                                 continue;
                             }
-
                             {
                                 let mut set = processed_arc.lock().unwrap();
                                 if set.contains(&meta.version_id) {
@@ -204,14 +248,19 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
                             }
 
                             if let Err(e) = repair_metadata_mirrors(&meta, &data, dry_run).await {
-                                error!(
-                                    "Failed to sync metadata mirrors for {}/{}: {}",
+                                warn!(
+                                    "Warning: Metadata sync issues for {}/{}: {}",
                                     meta.fragment, meta.object_key, e
                                 );
                             }
 
-                            process_object_repair(meta, &blob_roots_clone, num_disks, dry_run)
-                                .await?;
+                            if let Err(e) =
+                                process_object_repair(meta, &blob_roots_clone, num_disks, dry_run)
+                                    .await
+                            {
+                                // Skip individual errors to keep job alive
+                                warn!("Object repair check skipped: {}", e);
+                            }
                         }
                     }
                 }
@@ -219,6 +268,11 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
                 if batch_scanned_count > 0 {
                     let mut status = REPAIR_STATUS.write().await;
                     status.total_scanned += batch_scanned_count;
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    status.duration_seconds = elapsed as u64;
+                    if elapsed > 0.0 {
+                        status.scan_rate_per_sec = status.total_scanned as f64 / elapsed;
+                    }
                 }
             }
         }
@@ -227,33 +281,39 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
     {
         let mut status = REPAIR_STATUS.write().await;
         status.is_running = false;
-        status.phase = "Completed".to_string();
+        status.phase = if STOP_SIGNAL.load(Ordering::Relaxed) {
+            "Stopped by User".to_string()
+        } else {
+            "Completed".to_string()
+        };
+        status.duration_seconds = start_time.elapsed().as_secs();
     }
 
-    info!("Storage Repair Job Complete.");
+    info!("Storage Repair Job Ended.");
     Ok(())
 }
 
 async fn repair_user_quota(uid: &str, source_data: &[u8], dry_run: bool) -> Result<(), AppError> {
     if mongodb::bson::from_slice::<Quota>(source_data).is_err() {
-        warn!(
-            "Skipping repair for corrupt/invalid quota file source for user {}",
-            uid
-        );
         return Ok(());
     }
-
     let path_manager = ObjectPathManager::new();
     let all_user_dirs = path_manager.get_all_user_index_dirs(uid);
 
     for dir in all_user_dirs {
         let target_path = dir.join("quota.bson");
         let mut needs_repair = false;
+        if !dir.exists() {
+            if !dry_run {
+                if let Err(_) = fs::create_dir_all(&dir).await {
+                    continue;
+                }
+            }
+        }
 
         match fs::read(&target_path).await {
             Ok(current_data) => {
                 if current_data != source_data {
-                    warn!("Quota mismatch on mirror: {:?}. Aligning.", target_path);
                     needs_repair = true;
                 }
             }
@@ -262,39 +322,22 @@ async fn repair_user_quota(uid: &str, source_data: &[u8], dry_run: bool) -> Resu
             }
         }
 
-        if needs_repair {
-            if !dry_run {
-                if !dir.exists() {
-                    fs::create_dir_all(&dir)
-                        .await
-                        .map_err(|e| AppError::Io(e, "create user index dir".into()))?;
-                }
-
-                info!("Repairing quota file on mirror: {:?}", target_path);
-                let tmp = target_path.with_extension("tmp");
-                fs::write(&tmp, source_data)
-                    .await
-                    .map_err(|e| AppError::Io(e, "write quota tmp".into()))?;
-                fs::rename(tmp, target_path)
-                    .await
-                    .map_err(|e| AppError::Io(e, "rename quota".into()))?;
-            } else {
-                info!("[DRY RUN] Would repair quota file: {:?}", target_path);
+        if needs_repair && !dry_run {
+            let tmp = target_path.with_extension("tmp");
+            if let Ok(_) = fs::write(&tmp, source_data).await {
+                let _ = fs::rename(&tmp, &target_path).await;
             }
         }
     }
-
     Ok(())
 }
 
-// Make public for redistribution.rs
 pub async fn repair_metadata_mirrors(
     meta: &ObjectMetadata,
     data: &[u8],
     dry_run: bool,
 ) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
-
     let all_paths = path_manager.get_all_metadata_paths(
         &meta.owner_uid,
         &meta.fragment,
@@ -303,15 +346,20 @@ pub async fn repair_metadata_mirrors(
     );
 
     for path in all_paths {
-        let mut needs_repair = false;
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                if !dry_run {
+                    if let Err(_) = fs::create_dir_all(parent).await {
+                        continue;
+                    }
+                }
+            }
+        }
 
+        let mut needs_repair = false;
         match fs::read(&path).await {
             Ok(mirror_data) => {
                 if mirror_data != data {
-                    warn!(
-                        "Metadata mismatch on mirror (content diff): {:?}. Aligning with source.",
-                        path
-                    );
                     needs_repair = true;
                 }
             }
@@ -320,31 +368,13 @@ pub async fn repair_metadata_mirrors(
             }
         }
 
-        if needs_repair {
-            if !dry_run {
-                info!(" repairing metadata mirror: {:?}", path);
-
-                if let Some(parent) = path.parent() {
-                    if !parent.exists() {
-                        fs::create_dir_all(parent)
-                            .await
-                            .map_err(|e| AppError::Io(e, "create meta dir".into()))?;
-                    }
-                }
-
-                let tmp_path = path.with_extension("tmp");
-                fs::write(&tmp_path, data)
-                    .await
-                    .map_err(|e| AppError::Io(e, "write meta mirror tmp".into()))?;
-                fs::rename(tmp_path, &path)
-                    .await
-                    .map_err(|e| AppError::Io(e, "rename meta mirror".into()))?;
-            } else {
-                info!("[DRY RUN] Would repair metadata mirror: {:?}", path);
+        if needs_repair && !dry_run {
+            let tmp_path = path.with_extension("tmp");
+            if let Ok(_) = fs::write(&tmp_path, data).await {
+                let _ = fs::rename(&tmp_path, &path).await;
             }
         }
     }
-
     Ok(())
 }
 
@@ -364,18 +394,10 @@ async fn process_object_repair(
         for shard in &part.shards {
             let disk_idx = (part.part_index as usize + shard.shard_index) % num_disks;
             if disk_idx >= blob_roots.len() {
-                error!("Config Mismatch: Disk index out of bounds.");
                 continue;
             }
-
             let disk_root = &blob_roots[disk_idx];
-
-            // FIX: Skip repair if the disk root itself is not mounted/accessible
             if !disk_root.exists() {
-                warn!(
-                    "Disk root {:?} unreachable (unmounted?). Skipping repair for this shard.",
-                    disk_root
-                );
                 continue;
             }
 
@@ -393,52 +415,33 @@ async fn process_object_repair(
                     if verify_shard_integrity(&mut f, &shard.checksum).await {
                         is_healthy = true;
                     } else {
-                        warn!("Corrupt shard detected: {:?}", shard_path);
                         let mut status = REPAIR_STATUS.write().await;
                         status.corrupt_found += 1;
                     }
                 }
             }
-
             if !is_healthy {
                 missing_shards.push(shard.shard_index);
             }
         }
 
-        if missing_shards.is_empty() {
-            continue;
-        }
-
-        info!(
-            "Object {}/{} Part {} is degraded. Missing shards: {:?}. Initiating repair...",
-            meta_arc.fragment, meta_arc.object_key, part.part_index, missing_shards
-        );
-
-        if dry_run {
-            info!(
-                "[DRY RUN] Would repair missing shards: {:?}",
-                missing_shards
-            );
+        if missing_shards.is_empty() || dry_run {
             continue;
         }
 
         for missing_idx in missing_shards {
             let part_for_task = part_arc.clone();
-
             if let Err(e) =
                 repair_entire_shard(part_for_task, missing_idx, meta_arc.stripe_size_bytes).await
             {
-                error!(
-                    "Failed to repair shard {} for object {}/{}: {}",
-                    missing_idx, meta_arc.fragment, meta_arc.object_key, e
-                );
+                warn!("Shard repair failed (disk might be offline): {}", e);
             } else {
-                info!("Successfully repaired shard index {}", missing_idx);
                 let mut status = REPAIR_STATUS.write().await;
                 status.total_repaired += 1;
+                status.last_repaired =
+                    Some(format!("{}/{}", meta_arc.fragment, meta_arc.object_key));
             }
         }
     }
-
     Ok(())
 }
