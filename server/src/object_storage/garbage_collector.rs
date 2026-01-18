@@ -6,7 +6,7 @@ use crate::object_storage::quota_manager::update_quota;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
 use crate::structs::object_storage_structs::{
-    BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS,
+    BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS, ObjectMetadata,
 };
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::extract::State;
@@ -66,6 +66,7 @@ fn refund_quota_async(uid: String, amount: u64, state: Arc<AppState>) {
 struct IndexEntry {
     version_id: String,
     modified: SystemTime,
+    is_delete_marker: bool,
 }
 
 async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<(), AppError> {
@@ -88,17 +89,18 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
         .map(|s| PathBuf::from(s).join(OBJECT_DATA_ROOT))
         .collect();
 
-    let available_index_roots: Vec<&PathBuf> = index_roots.iter().filter(|p| p.exists()).collect();
-    if available_index_roots.is_empty() {
+    let primary_index_root = index_roots
+        .iter()
+        .find(|p| p.exists())
+        .map(|p| p.to_path_buf());
+
+    if primary_index_root.is_none() {
         return Ok(());
     }
-
-    let primary_index_root = available_index_roots[0].to_path_buf();
+    let primary_index_root = primary_index_root.unwrap();
 
     let retention_duration = Duration::from_secs(CONFIG.garbage_collector.retention_days * 86400);
     let file_ttl = Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds);
-
-    let all_index_roots_clone = index_roots.clone();
 
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         for user_entry in fs::read_dir(primary_index_root)
@@ -134,7 +136,7 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
                 let mut refunded_versions = HashSet::new();
                 let mut object_versions: HashMap<String, Vec<IndexEntry>> = HashMap::new();
 
-                for root in &all_index_roots_clone {
+                for root in &index_roots {
                     let mirror_index_dir = root.join(&uid).join(&fragment_name).join("index");
 
                     if mirror_index_dir.exists() {
@@ -152,9 +154,19 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
                                             .and_then(|m| m.modified().ok())
                                             .unwrap_or(SystemTime::now());
 
+                                        let mut is_delete_marker = false;
+                                        if let Ok(data) = fs::read(entry.path()) {
+                                            if let Ok(meta) =
+                                                mongodb::bson::from_slice::<ObjectMetadata>(&data)
+                                            {
+                                                is_delete_marker = meta.is_delete_marker;
+                                            }
+                                        }
+
                                         let entry = IndexEntry {
                                             version_id: ver.to_string(),
                                             modified,
+                                            is_delete_marker,
                                         };
 
                                         let list =
@@ -172,12 +184,31 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
                 for (hash, mut versions) in object_versions {
                     versions.sort_by(|a, b| a.version_id.cmp(&b.version_id));
 
-                    if let Some(latest) = versions.last() {
-                        valid_versions.insert(latest.version_id.clone());
+                    if let Some(latest) = versions.pop() {
+                        let mut head_kept = true;
+                        let age = SystemTime::now()
+                            .duration_since(latest.modified)
+                            .unwrap_or(Duration::ZERO);
 
-                        let count = versions.len();
-                        if count > 1 {
-                            for version in versions.iter().take(count - 1) {
+                        if latest.is_delete_marker {
+                            if age > retention_duration {
+                                info!(
+                                    "Expired delete marker {}/{} (Age: {:?}). Deleting history.",
+                                    hash, latest.version_id, age
+                                );
+                                expired_versions.insert(latest.version_id);
+                                head_kept = false;
+                            } else {
+                                valid_versions.insert(latest.version_id);
+                            }
+                        } else {
+                            valid_versions.insert(latest.version_id);
+                        }
+
+                        for version in versions {
+                            if !head_kept {
+                                expired_versions.insert(version.version_id);
+                            } else {
                                 let age = SystemTime::now()
                                     .duration_since(version.modified)
                                     .unwrap_or(Duration::ZERO);
@@ -187,16 +218,16 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
                                         "Expired version {}/{} (Age: {:?}). Marking for deletion.",
                                         hash, version.version_id, age
                                     );
-                                    expired_versions.insert(version.version_id.clone());
+                                    expired_versions.insert(version.version_id);
                                 } else {
-                                    valid_versions.insert(version.version_id.clone());
+                                    valid_versions.insert(version.version_id);
                                 }
                             }
                         }
                     }
                 }
 
-                for root in &all_index_roots_clone {
+                for root in &index_roots {
                     let user_frag_root = root.join(&uid).join(&fragment_name);
 
                     let mirror_index = user_frag_root.join("index");
@@ -227,7 +258,7 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
                         is_manual_run,
                         file_ttl,
                         &uid,
-                        state.clone(),
+                        &state,
                     );
                 }
 
@@ -241,7 +272,7 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
                         is_manual_run,
                         file_ttl,
                         &uid,
-                        state.clone(),
+                        &state,
                     );
                 }
             }
@@ -262,7 +293,7 @@ fn cleanup_blobs_in_dir(
     is_manual_run: bool,
     file_ttl: Duration,
     uid: &String,
-    state: Arc<AppState>,
+    state: &Arc<AppState>,
 ) {
     if !blob_dir.exists() {
         return;
@@ -284,6 +315,7 @@ fn cleanup_blobs_in_dir(
                 true
             } else {
                 if is_manual_run {
+                    attempt_refund = true;
                     true
                 } else {
                     let mut is_stale = false;
@@ -311,7 +343,7 @@ fn cleanup_blobs_in_dir(
                         {
                             if receipt.amount > 0 {
                                 refund_quota_async(uid.clone(), receipt.amount, state.clone());
-                                refunded_versions.insert(version_id.clone());
+                                refunded_versions.insert(version_id);
                             }
                         }
                     }
