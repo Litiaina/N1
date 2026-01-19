@@ -8,9 +8,10 @@ use crate::object_storage::storage_capacity_parser::calculate_storage_usage;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
-    CapacityUsageResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery,
-    ObjectMetadata, ObjectPathManager, PartMetadata, ReservationReceipt, ShardInfo,
-    UploadPartQuery, UploadStatusResponse, UserRecord, default_stripe_size,
+    CapacityUsageResponse, FinalizeIncompleteResponse, InitiateUploadParams,
+    InitiateUploadResponse, ObjectKeyQuery, ObjectMetadata, ObjectPathManager, PartMetadata,
+    ReservationReceipt, ShardInfo, UploadPartQuery, UploadStatusResponse, UserRecord,
+    default_stripe_size,
 };
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::body::Body;
@@ -235,6 +236,10 @@ pub async fn initiate_object_upload(
     AxumJson(params): AxumJson<InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
+
+    if params.expected_parts == 0 {
+        return Err(AppError::BadRequest("expected_parts must be >= 1".into()));
+    }
 
     if let Err(e) = try_reserve_quota(&uid, params.total_size_bytes).await {
         if let AppError::Unauthorized = e {
@@ -627,7 +632,20 @@ pub async fn finalize_object_upload(
     let object_key = key_query.object_key;
     let uid = claims.uid;
 
+    if params.expected_parts == 0 {
+        return Err(AppError::BadRequest("expected_parts must be >= 1".into()));
+    }
+
     let path_manager = ObjectPathManager::new();
+
+    let index_paths =
+        path_manager.get_all_metadata_paths(&uid, &fragment, &object_key, &version_id);
+    for p in &index_paths {
+        if tokio_fs::try_exists(p).await.unwrap_or(false) {
+            return Ok((StatusCode::OK, "Upload finalized.").into_response());
+        }
+    }
+
     let meta_dirs = Arc::new(path_manager.get_all_session_dirs(&uid, &fragment, &version_id));
 
     let mut all_part_paths = Vec::new();
@@ -661,6 +679,32 @@ pub async fn finalize_object_upload(
         ));
     }
 
+    let blob_roots = path_manager.get_blob_roots();
+    let required_data_shards = DATA_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
+    let mut found_data_roots = 0;
+
+    for root in &blob_roots {
+        let shard_dir_check =
+            path_manager.get_shard_dir_on_disk(root, &uid, &fragment, &version_id);
+
+        if tokio_fs::try_exists(&shard_dir_check)
+            .await
+            .unwrap_or(false)
+        {
+            found_data_roots += 1;
+        }
+    }
+
+    if found_data_roots < required_data_shards {
+        error!(
+            "Finalization Aborted: Data directories missing. Found {}/{}. Likely GC collision.",
+            found_data_roots, required_data_shards
+        );
+        return Err(AppError::InternalServerError(
+            "Upload session expired or data missing.".into(),
+        ));
+    }
+
     let results: Vec<PartMetadata> = stream::iter(all_part_paths)
         .map(|path| async move {
             let data = tokio_fs::read(&path)
@@ -684,11 +728,34 @@ pub async fn finalize_object_upload(
     let mut parts: Vec<PartMetadata> = parts_map.into_values().collect();
     parts.sort_by_key(|p| p.part_index);
 
-    let mut total_size_calculated = 0;
-    for (i, part) in parts.iter().enumerate() {
-        if part.part_index != i as u64 {
-            return Err(AppError::BadRequest(format!("Missing part index {}", i)));
+    let expected_parts = params.expected_parts.max(1);
+
+    let mut present = BTreeSet::new();
+    for p in &parts {
+        present.insert(p.part_index);
+    }
+
+    let mut missing = Vec::new();
+    for i in 0..expected_parts {
+        if !present.contains(&i) {
+            missing.push(i);
         }
+    }
+
+    if !missing.is_empty() {
+        return Ok((
+            StatusCode::CONFLICT,
+            AxumJson(FinalizeIncompleteResponse {
+                uploaded_parts: present.into_iter().collect(),
+                missing_parts: missing,
+                expected_parts,
+            }),
+        )
+            .into_response());
+    }
+
+    let mut total_size_calculated = 0;
+    for part in &parts {
         total_size_calculated += part.size_bytes;
     }
 
@@ -733,8 +800,6 @@ pub async fn finalize_object_upload(
                 }
             }
 
-            // CRITICAL FIX: Use standard buffered File creation for metadata.
-            // O_DIRECT fails on variable length writes (metadata is small BSON).
             match tokio_fs::File::create(&index_path).await {
                 Ok(mut final_meta_file) => {
                     if let Err(e) = final_meta_file.write_all(bson_data).await {
@@ -797,7 +862,7 @@ pub async fn finalize_object_upload(
     };
     state.emit(&owner_uid, StorageEventPayload::FileUploaded(stripped_meta));
 
-    Ok((StatusCode::OK, "Upload finalized."))
+    Ok((StatusCode::OK, "Upload finalized.").into_response())
 }
 
 pub async fn cancel_upload_session(

@@ -184,6 +184,7 @@ impl From<ObjectSummary> for ObjectMetadata {
 pub struct InitiateUploadParams {
     pub content_type: Option<String>,
     pub total_size_bytes: u64,
+    pub expected_parts: u64,
 }
 
 #[derive(Serialize)]
@@ -279,4 +280,11 @@ pub struct DownloadArchiveRequest {
     pub format: String,
     #[serde(default)]
     pub filename: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct FinalizeIncompleteResponse {
+    pub uploaded_parts: Vec<u64>,
+    pub missing_parts: Vec<u64>,
+    pub expected_parts: u64,
 }
