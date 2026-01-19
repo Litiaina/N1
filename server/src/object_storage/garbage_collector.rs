@@ -285,7 +285,7 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
     Ok(())
 }
 
-fn sweep_gc_files(version_dir: &PathBuf, file_ttl: Duration) {
+fn sweep_gc_files(version_dir: &PathBuf, file_ttl: Duration, is_manual_run: bool) {
     let now = SystemTime::now();
 
     for entry in WalkDir::new(version_dir)
@@ -299,6 +299,11 @@ fn sweep_gc_files(version_dir: &PathBuf, file_ttl: Duration) {
 
         let name = entry.file_name().to_string_lossy();
         if !name.ends_with(".gc") {
+            continue;
+        }
+
+        if is_manual_run {
+            let _ = fs::remove_file(entry.path());
             continue;
         }
 
@@ -338,7 +343,7 @@ fn cleanup_blobs_in_dir(
 
             let version_id = entry.file_name().to_string_lossy().to_string();
 
-            sweep_gc_files(&path, file_ttl);
+            sweep_gc_files(&path, file_ttl, is_manual_run);
 
             let mut attempt_refund = false;
 

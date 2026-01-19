@@ -55,6 +55,32 @@ async fn ensure_user_blob_directories(uid: &str) {
     }
 }
 
+async fn sweep_user_gc_files(uid: String) {
+    let path_manager = ObjectPathManager::new();
+    let blob_roots = path_manager.get_blob_roots();
+
+    tokio::task::spawn_blocking(move || {
+        for root in blob_roots {
+            let user_root = root.join(OBJECT_DATA_ROOT).join(&uid);
+            if !user_root.exists() {
+                continue;
+            }
+
+            for entry in WalkDir::new(&user_root).into_iter().filter_map(|e| e.ok()) {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy();
+                if name.ends_with(".gc") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    })
+    .await
+    .ok();
+}
+
 async fn calculate_usage_across_mirrors(uid: String) -> u64 {
     let path_manager = ObjectPathManager::new();
     let user_dirs = path_manager.get_all_user_index_dirs(&uid);
@@ -115,6 +141,8 @@ pub async fn sync_quota(db_client: Arc<Client>) -> Result<(), Box<dyn Error + Se
 
                 ensure_user_blob_directories(&uid).await;
 
+                sweep_user_gc_files(uid.clone()).await;
+
                 let calculated_usage = calculate_usage_across_mirrors(uid.clone()).await;
 
                 if let Err(e) = set_storage_used(&uid, calculated_usage).await {
@@ -151,6 +179,8 @@ pub async fn sync_single_user_quota(
             }
 
             ensure_user_blob_directories(&uid).await;
+
+            sweep_user_gc_files(uid.to_string()).await;
 
             let calculated_usage = calculate_usage_across_mirrors(uid.to_string()).await;
 
