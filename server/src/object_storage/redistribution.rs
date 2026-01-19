@@ -1,194 +1,389 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::caching::invalidate_cache;
-use crate::object_storage::constants::{OBJECT_DATA_ROOT, PARITY_SUFFIX, SHARD_SUFFIX};
+use crate::object_storage::constants::{
+    GC_SUFFIX, META_TMP_EXT, OBJECT_DATA_ROOT, PARITY_SUFFIX, PART_META_SUFFIX, QUOTA_FILE,
+    REDIST_TMP_SUFFIX, SHARD_SUFFIX,
+};
 use crate::object_storage::ec::ErasureStreamWriter;
 use crate::object_storage::recovery::read_or_recover_chunk;
 use crate::object_storage::upload::{
     DATA_SHARDS_ATOMIC, DirectWriter, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, create_direct_file,
+    sync_dir,
 };
-use crate::structs::object_storage_structs::INDEX_STORE_DISKS;
 use crate::structs::object_storage_structs::{
-    ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo, default_stripe_size,
+    INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo,
+    default_stripe_size,
 };
-use axum::{extract::Query, http::StatusCode, response::IntoResponse};
+
+use axum::extract::Query;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
+
+use chrono::Utc;
+use futures_util::stream::{self, Stream};
+use serde::Serialize;
+
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::convert::Infallible;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
+
 use tokio::fs as tokio_fs;
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
 use walkdir::WalkDir;
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RedistributionJobStatus {
+    pub is_running: bool,
+    pub phase: String,
+
+    pub total_users_scanned: u64,
+    pub total_objects_scanned: u64,
+    pub total_objects_need_redistribution: u64,
+    pub total_objects_migrated: u64,
+    pub total_errors: u64,
+
+    pub current_user: String,
+    pub last_object: Option<String>,
+    pub last_error: Option<String>,
+
+    pub start_timestamp: i64,
+    pub duration_seconds: u64,
+    pub scan_rate_per_sec: f64,
+}
+
+static REDIST_STATUS: LazyLock<Arc<tokio::sync::RwLock<RedistributionJobStatus>>> =
+    LazyLock::new(|| Arc::new(tokio::sync::RwLock::new(RedistributionJobStatus::default())));
+
+static STOP_SIGNAL: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
+
+#[inline]
+fn should_stop() -> bool {
+    STOP_SIGNAL.load(Ordering::Relaxed)
+}
+
+pub async fn monitor_redistribution_job_api() -> Sse<impl Stream<Item = Result<Event, Infallible>>>
+{
+    let stream = stream::unfold((), |()| async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let state = REDIST_STATUS.read().await.clone();
+
+        let event = Event::default()
+            .json_data(state)
+            .unwrap_or_else(|_| Event::default().data("serialization error"));
+        Some((Ok(event), ()))
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
 
 pub async fn trigger_redistribution_job_api(
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    {
+        let st = REDIST_STATUS.read().await;
+        if st.is_running {
+            return (StatusCode::CONFLICT, "Job already running").into_response();
+        }
+    }
+
     let dry_run = params.get("dry_run").map(|v| v == "true").unwrap_or(false);
 
-    info!(
-        "API received request to trigger redistribution job (dry_run={})",
-        dry_run
-    );
-
     tokio::spawn(async move {
-        if let Err(e) = run_redistribute_job(dry_run).await {
-            error!("Manual Redistribution Job Failed: {}", e);
+        if let Err(e) = run_redistribution_job(dry_run).await {
+            error!("Redistribution job failed: {}", e);
+            let mut st = REDIST_STATUS.write().await;
+            st.is_running = false;
+            st.phase = "Failed".to_string();
+            st.last_error = Some(e.to_string());
         }
     });
 
     (
         StatusCode::ACCEPTED,
-        "Storage redistribution job initiated.",
+        if dry_run {
+            "Redistribution initiated (dry run)."
+        } else {
+            "Redistribution initiated."
+        },
     )
+        .into_response()
 }
 
-pub async fn run_redistribute_job(dry_run: bool) -> Result<(), AppError> {
+pub async fn stop_redistribution_job_api() -> impl IntoResponse {
+    STOP_SIGNAL.store(true, Ordering::Relaxed);
+    let mut st = REDIST_STATUS.write().await;
+    if st.is_running {
+        st.phase = "Stopping...".to_string();
+    }
+    (StatusCode::OK, "Stop signal sent.").into_response()
+}
+
+pub async fn run_redistribution_job(dry_run: bool) -> Result<(), AppError> {
+    STOP_SIGNAL.store(false, Ordering::Relaxed);
     let start_time = Instant::now();
-    let path_manager = ObjectPathManager::new();
-    let target_data_shards = DATA_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
-    let target_parity_shards = PARITY_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
+
+    {
+        let mut st = REDIST_STATUS.write().await;
+        *st = RedistributionJobStatus {
+            is_running: true,
+            phase: "Initializing".to_string(),
+            start_timestamp: Utc::now().timestamp(),
+            ..Default::default()
+        };
+    }
+
+    let target_data_shards = DATA_SHARDS_ATOMIC
+        .get()
+        .ok_or(AppError::InternalServerError("DATA_SHARDS missing".into()))?
+        .load(Ordering::Relaxed) as usize;
+
+    let target_parity_shards = PARITY_SHARDS_ATOMIC
+        .get()
+        .ok_or(AppError::InternalServerError(
+            "PARITY_SHARDS missing".into(),
+        ))?
+        .load(Ordering::Relaxed) as usize;
+
     let target_stripe_size = STRIPE_SIZE_ATOMIC
         .get()
         .map(|v| v.load(Ordering::Relaxed))
         .unwrap_or_else(default_stripe_size);
-    let target_blob_roots = path_manager.get_blob_roots();
-    let target_num_disks = target_blob_roots.len();
+
+    let path_manager = ObjectPathManager::new();
+    let blob_roots = path_manager.get_blob_roots();
+    let num_disks = blob_roots.len();
+
+    if num_disks == 0 {
+        return Err(AppError::InternalServerError(
+            "No blob disks configured".into(),
+        ));
+    }
 
     let index_roots_config = INDEX_STORE_DISKS
         .get()
-        .ok_or(AppError::InternalServerError("Index Config missing".into()))?;
+        .ok_or(AppError::InternalServerError(
+            "Index Store Config not initialized".into(),
+        ))?;
 
-    let mut active_index_root = None;
-    for root in index_roots_config {
-        let path = PathBuf::from(root).join(OBJECT_DATA_ROOT);
-        if path.exists() {
-            active_index_root = Some(path);
-            break;
-        }
-    }
-    let index_root = match active_index_root {
-        Some(path) => path,
-        None => {
-            warn!("No active index root found for redistribution scan.");
-            return Ok(());
-        }
-    };
+    let index_roots: Vec<PathBuf> = index_roots_config
+        .iter()
+        .map(|s| PathBuf::from(s).join(OBJECT_DATA_ROOT))
+        .collect();
 
     info!(
-        "Starting Redistribution Scan. Config: {}D+{}P, Stripe: {} bytes. Index Root: {:?}, Blob Disks: {}",
-        target_data_shards, target_parity_shards, target_stripe_size, index_root, target_num_disks
+        "Starting TRUE Redistribution Job. target={}D+{}P stripe={} bytes blob_disks={} index_roots={} dry_run={}",
+        target_data_shards,
+        target_parity_shards,
+        target_stripe_size,
+        num_disks,
+        index_roots.len(),
+        dry_run
     );
 
-    let mut user_entries = match tokio_fs::read_dir(&index_root).await {
-        Ok(e) => e,
-        Err(e) => {
-            error!("Failed to read index root: {}", e);
-            return Ok(());
+    let mut processed_versions: HashSet<String> = HashSet::new();
+
+    for index_root in index_roots {
+        if should_stop() {
+            break;
         }
-    };
 
-    let mut stats_users = 0;
-    let mut stats_scanned = 0;
-    let mut stats_migrated = 0;
-    let mut stats_errors = 0;
-
-    while let Ok(Some(user_entry)) = user_entries.next_entry().await {
-        let user_path = user_entry.path();
-        if !user_path.is_dir() {
+        if !tokio_fs::try_exists(&index_root).await.unwrap_or(false) {
+            warn!("Index root unreachable, skipping: {:?}", index_root);
             continue;
         }
-        stats_users += 1;
 
-        let mut frag_entries = match tokio_fs::read_dir(&user_path).await {
+        {
+            let mut st = REDIST_STATUS.write().await;
+            st.phase = format!("Scanning Root {:?}", index_root);
+        }
+
+        let mut user_entries = match tokio_fs::read_dir(&index_root).await {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(e) => {
+                warn!("Failed to read index root {:?}: {}", index_root, e);
+                continue;
+            }
         };
 
-        while let Ok(Some(frag_entry)) = frag_entries.next_entry().await {
-            let index_dir = frag_entry.path().join("index");
-            if !index_dir.exists() {
+        while let Ok(Some(user_entry)) = user_entries.next_entry().await {
+            if should_stop() {
+                break;
+            }
+
+            let user_path = user_entry.path();
+            if !user_path.is_dir() {
                 continue;
             }
 
-            let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+            let uid = user_entry.file_name().to_string_lossy().to_string();
 
-            let index_dir_clone = index_dir.clone();
-            tokio::task::spawn_blocking(move || {
-                let walker = WalkDir::new(index_dir_clone).into_iter();
-                for entry in walker.filter_map(|e| e.ok()) {
-                    if entry.file_type().is_file()
-                        && entry.path().extension().map_or(false, |ext| ext == "bson")
+            {
+                let mut st = REDIST_STATUS.write().await;
+                st.current_user = uid.clone();
+                st.total_users_scanned += 1;
+            }
+
+            let mut frag_entries = match tokio_fs::read_dir(&user_path).await {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            while let Ok(Some(frag_entry)) = frag_entries.next_entry().await {
+                if should_stop() {
+                    break;
+                }
+
+                let index_dir = frag_entry.path().join("index");
+                if !tokio_fs::try_exists(&index_dir).await.unwrap_or(false) {
+                    continue;
+                }
+
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<PathBuf>(128);
+                let index_dir_clone = index_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    let walker = WalkDir::new(index_dir_clone).into_iter();
+                    for entry in walker.filter_map(|e| e.ok()) {
+                        if entry.file_type().is_file() {
+                            let p = entry.path();
+                            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+                            if name.ends_with(".bson")
+                                && !name.ends_with(PART_META_SUFFIX)
+                                && name != QUOTA_FILE
+                                && name != "reservation.bson"
+                            {
+                                if tx.blocking_send(p.to_path_buf()).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+
+                let mut batch_scanned: u64 = 0;
+                const STATUS_BATCH: u64 = 50;
+
+                while let Some(meta_path) = rx.recv().await {
+                    if should_stop() {
+                        break;
+                    }
+
+                    let raw = match tokio_fs::read(&meta_path).await {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+                    let mut meta = match mongodb::bson::from_slice::<ObjectMetadata>(&raw) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    if meta.is_delete_marker {
+                        continue;
+                    }
+
+                    if processed_versions.contains(&meta.version_id) {
+                        continue;
+                    }
+                    processed_versions.insert(meta.version_id.clone());
+
+                    batch_scanned += 1;
+                    if batch_scanned >= STATUS_BATCH {
+                        let mut st = REDIST_STATUS.write().await;
+                        st.total_objects_scanned += batch_scanned;
+                        let elapsed = start_time.elapsed().as_secs_f64();
+                        st.duration_seconds = elapsed as u64;
+                        if elapsed > 0.0 {
+                            st.scan_rate_per_sec = st.total_objects_scanned as f64 / elapsed;
+                        }
+                        batch_scanned = 0;
+                    }
+
+                    let needs = check_needs_redistribution(
+                        &meta,
+                        target_data_shards,
+                        target_parity_shards,
+                        target_stripe_size,
+                        num_disks,
+                        &blob_roots,
+                    );
+
+                    if !needs {
+                        continue;
+                    }
+
                     {
-                        if tx.blocking_send(entry.path().to_owned()).is_err() {
-                            break;
+                        let mut st = REDIST_STATUS.write().await;
+                        st.total_objects_need_redistribution += 1;
+                        st.last_object = Some(format!(
+                            "{}/{} (v:{})",
+                            meta.fragment, meta.object_key, meta.version_id
+                        ));
+                    }
+
+                    if dry_run {
+                        info!(
+                            "[DRY RUN] Would redistribute {}/{} (v:{})",
+                            meta.fragment, meta.object_key, meta.version_id
+                        );
+                        let mut st = REDIST_STATUS.write().await;
+                        st.total_objects_migrated += 1;
+                        continue;
+                    }
+
+                    match redistribute_object_streaming(
+                        &mut meta,
+                        target_data_shards,
+                        target_parity_shards,
+                        target_stripe_size,
+                        &blob_roots,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            let mut st = REDIST_STATUS.write().await;
+                            st.total_objects_migrated += 1;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Redistribute failed for {}/{} (v:{}): {}",
+                                meta.fragment, meta.object_key, meta.version_id, e
+                            );
+                            let mut st = REDIST_STATUS.write().await;
+                            st.total_errors += 1;
+                            st.last_error = Some(e.to_string());
                         }
                     }
                 }
-            });
 
-            while let Some(meta_path) = rx.recv().await {
-                if let Ok(data) = tokio_fs::read(&meta_path).await {
-                    if let Ok(mut meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
-                        stats_scanned += 1;
-
-                        if meta.is_delete_marker {
-                            continue;
-                        }
-
-                        let needs = check_needs_redistribution(
-                            &meta,
-                            target_data_shards,
-                            target_parity_shards,
-                            target_stripe_size,
-                            target_num_disks,
-                            &target_blob_roots,
-                        );
-
-                        if needs {
-                            if !dry_run {
-                                info!(
-                                    "Migrating object: {}/{} (v: {})",
-                                    meta.fragment, meta.object_key, meta.version_id
-                                );
-                                if let Err(e) = redistribute_object(
-                                    &mut meta,
-                                    target_data_shards,
-                                    target_parity_shards,
-                                    target_stripe_size,
-                                    &target_blob_roots,
-                                )
-                                .await
-                                {
-                                    error!(
-                                        "Failed to redistribute {}/{}: {}",
-                                        meta.fragment, meta.object_key, e
-                                    );
-                                    stats_errors += 1;
-                                } else {
-                                    stats_migrated += 1;
-                                }
-                            } else {
-                                info!(
-                                    "[DRY RUN] Would redistribute {}/{} (Reason: configuration mismatch)",
-                                    meta.fragment, meta.object_key
-                                );
-                                stats_migrated += 1;
-                            }
-                        }
+                if batch_scanned > 0 {
+                    let mut st = REDIST_STATUS.write().await;
+                    st.total_objects_scanned += batch_scanned;
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    st.duration_seconds = elapsed as u64;
+                    if elapsed > 0.0 {
+                        st.scan_rate_per_sec = st.total_objects_scanned as f64 / elapsed;
                     }
                 }
             }
         }
     }
 
-    info!(
-        "Redistribution Job Completed in {:.2?}. Users: {}, Objects Scanned: {}, Migrated/Pending: {}, Errors: {}",
-        start_time.elapsed(),
-        stats_users,
-        stats_scanned,
-        stats_migrated,
-        stats_errors
-    );
+    {
+        let mut st = REDIST_STATUS.write().await;
+        st.is_running = false;
+        st.phase = if should_stop() {
+            "Stopped by User".to_string()
+        } else {
+            "Completed".to_string()
+        };
+        st.duration_seconds = start_time.elapsed().as_secs();
+    }
+
+    info!("TRUE Redistribution Job Ended.");
     Ok(())
 }
 
@@ -206,155 +401,188 @@ fn check_needs_redistribution(
 
     if meta.stripe_size_bytes != target_stripe_size {
         debug!(
-            "Object {} needs redistribution: Stripe size mismatch (Current: {}, Target: {})",
+            "Needs redistribution: stripe mismatch {} cur={} target={}",
             meta.object_key, meta.stripe_size_bytes, target_stripe_size
         );
         return true;
     }
 
     let part0 = &meta.parts[0];
-    let current_data = part0.shards.iter().filter(|s| !s.is_parity).count();
-    let current_parity = part0.shards.iter().filter(|s| s.is_parity).count();
-
-    if current_data != target_data || current_parity != target_parity {
+    let cur_data = part0.shards.iter().filter(|s| !s.is_parity).count();
+    let cur_parity = part0.shards.iter().filter(|s| s.is_parity).count();
+    if cur_data != target_data || cur_parity != target_parity {
         debug!(
-            "Object {} needs redistribution: EC config mismatch (Current: {}D+{}P, Target: {}D+{}P)",
-            meta.object_key, current_data, current_parity, target_data, target_parity
+            "Needs redistribution: EC mismatch {} cur={}D+{}P target={}D+{}P",
+            meta.object_key, cur_data, cur_parity, target_data, target_parity
         );
         return true;
     }
 
     for part in &meta.parts {
         for shard in &part.shards {
-            let expected_idx = (part.part_index as usize + shard.shard_index) % target_num_disks;
-            if expected_idx >= target_roots.len() {
+            let expected = (part.part_index as usize + shard.shard_index) % target_num_disks;
+            if expected >= target_roots.len() {
                 return true;
             }
-            let expected_root = target_roots[expected_idx].to_string_lossy();
+            let expected_root = target_roots[expected].to_string_lossy();
             if !shard.absolute_path.starts_with(expected_root.as_ref()) {
                 debug!(
-                    "Object {} needs redistribution: Placement mismatch (Shard {} on wrong disk)",
+                    "Needs redistribution: placement mismatch {} shard={}",
                     meta.object_key, shard.shard_index
                 );
                 return true;
             }
         }
     }
+
     false
 }
 
-async fn redistribute_object(
+async fn redistribute_object_streaming(
     meta: &mut ObjectMetadata,
     target_data_shards: usize,
     target_parity_shards: usize,
     target_stripe_size: usize,
     target_blob_roots: &[PathBuf],
 ) -> Result<(), AppError> {
+    if should_stop() {
+        return Err(AppError::InternalServerError("Stopped".into()));
+    }
+
     let start_time = Instant::now();
     let path_manager = ObjectPathManager::new();
+
     let num_disks = target_blob_roots.len();
-    let mut file_cache = HashMap::new();
+    let total_shards = target_data_shards + target_parity_shards;
+
     let old_block_size = meta.stripe_size_bytes;
     let new_block_size = target_stripe_size;
 
+    let mut file_cache: HashMap<String, tokio::fs::File> = HashMap::new();
+
     let old_parts = std::mem::take(&mut meta.parts);
-    let mut new_parts = Vec::with_capacity(old_parts.len());
-    let mut shards_to_cleanup = Vec::new();
+    let mut new_parts: Vec<PartMetadata> = Vec::with_capacity(old_parts.len());
+    let mut old_shards_for_gc: Vec<String> = Vec::new();
 
     for old_part in old_parts {
+        if should_stop() {
+            return Err(AppError::InternalServerError("Stopped".into()));
+        }
+
         let old_part_arc = Arc::new(old_part);
+
         let old_data_count = old_part_arc.shards.iter().filter(|s| !s.is_parity).count() as u64;
-        let old_stripe_size = (old_block_size as u64) * old_data_count;
-        let new_stripe_width = (new_block_size * target_data_shards) as u64;
-        let new_stripe_count = (old_part_arc.size_bytes + new_stripe_width - 1) / new_stripe_width;
-        let new_shard_len = new_stripe_count * new_block_size as u64;
+        let old_stripe_width = old_block_size as u64 * old_data_count;
 
-        let mut writers: Vec<Option<DirectWriter>> =
-            Vec::with_capacity(target_data_shards + target_parity_shards);
-        let mut new_shard_infos = Vec::new();
-        let mut temp_paths = Vec::new();
+        let new_data_width = (new_block_size * target_data_shards) as u64;
+        let new_stripe_count = (old_part_arc.size_bytes + new_data_width - 1) / new_data_width;
+        let final_shard_len = new_stripe_count * new_block_size as u64;
 
-        for i in 0..(target_data_shards + target_parity_shards) {
-            let is_parity = i >= target_data_shards;
+        let mut writers: Vec<Option<DirectWriter>> = Vec::with_capacity(total_shards);
+        let mut commit_list: Vec<(PathBuf, PathBuf, PathBuf)> = Vec::new();
+        let mut new_shards: Vec<ShardInfo> = Vec::with_capacity(total_shards);
+
+        for shard_idx in 0..total_shards {
+            if should_stop() {
+                return Err(AppError::InternalServerError("Stopped".into()));
+            }
+
+            let is_parity = shard_idx >= target_data_shards;
             let ext = if is_parity {
                 PARITY_SUFFIX
             } else {
                 SHARD_SUFFIX
             };
-            let file_name = format!("part_{}_shard_{}{}", old_part_arc.part_index, i, ext);
-            let disk_idx = (old_part_arc.part_index as usize + i) % num_disks;
-            let target_disk = &target_blob_roots[disk_idx];
+            let file_name = format!(
+                "part_{}_shard_{}{}",
+                old_part_arc.part_index, shard_idx, ext
+            );
 
-            if !target_disk.exists() {
+            let disk_idx = (old_part_arc.part_index as usize + shard_idx) % num_disks;
+            let disk_root = &target_blob_roots[disk_idx];
+
+            if !tokio_fs::try_exists(disk_root).await.unwrap_or(false) {
                 writers.push(None);
                 continue;
             }
 
             let shard_dir = path_manager.get_shard_dir_on_disk(
-                target_disk,
+                disk_root,
                 &meta.owner_uid,
                 &meta.fragment,
                 &meta.version_id,
             );
-            if !shard_dir.exists() {
-                let _ = tokio_fs::create_dir_all(&shard_dir).await;
-            }
-            let final_path = shard_dir.join(&file_name);
-            let temp_path = shard_dir.join(format!("{}.tmp", file_name));
+            tokio_fs::create_dir_all(&shard_dir).await.ok();
 
-            match create_direct_file(&temp_path).await {
-                Ok(file) => {
-                    let file_clone = file
-                        .try_clone()
-                        .map_err(|e| AppError::Io(e, "clone".into()))?;
-                    if let Ok(_) =
-                        tokio::task::spawn_blocking(move || file_clone.set_len(new_shard_len)).await
-                    {
-                        writers.push(Some(DirectWriter::new(file)));
-                        temp_paths.push((temp_path, final_path.clone()));
-                        new_shard_infos.push(ShardInfo {
-                            shard_index: i,
-                            file_name,
-                            absolute_path: final_path.to_string_lossy().to_string(),
-                            size_bytes: new_shard_len,
-                            checksum: "".to_string(),
-                            is_parity,
-                        });
-                    } else {
-                        writers.push(None);
-                    }
+            let final_path = shard_dir.join(&file_name);
+            let tmp_path = shard_dir.join(format!("{}{}", file_name, REDIST_TMP_SUFFIX));
+
+            let std_file = match create_direct_file(&tmp_path).await {
+                Ok(f) => f,
+                Err(_) => {
+                    writers.push(None);
+                    continue;
                 }
-                Err(_) => writers.push(None),
+            };
+
+            let file_clone = std_file
+                .try_clone()
+                .map_err(|e| AppError::Io(e, "clone handle".into()))?;
+            let len = final_shard_len;
+            let ok = tokio::task::spawn_blocking(move || file_clone.set_len(len))
+                .await
+                .is_ok();
+            if !ok {
+                writers.push(None);
+                continue;
             }
+
+            writers.push(Some(DirectWriter::new(std_file)));
+            commit_list.push((tmp_path, final_path.clone(), shard_dir.clone()));
+
+            new_shards.push(ShardInfo {
+                shard_index: shard_idx,
+                file_name: file_name.clone(),
+                absolute_path: final_path.to_string_lossy().to_string(),
+                size_bytes: final_shard_len,
+                checksum: String::new(),
+                is_parity,
+            });
         }
 
         let mut stream_writer = ErasureStreamWriter::new(
             writers,
             target_data_shards,
             target_parity_shards,
-            new_shard_len as usize,
+            final_shard_len as usize,
             true,
             new_block_size,
         );
+
         let mut pos = 0u64;
-        let mut batch_buffer = Vec::with_capacity(new_block_size);
+        let mut batch: Vec<u8> = Vec::with_capacity(new_block_size);
 
         while pos < old_part_arc.size_bytes {
-            let relative_pos = pos;
-            let stripe_index = relative_pos / old_stripe_size;
-            let offset_in_stripe = relative_pos % old_stripe_size;
-            let shard_index = (offset_in_stripe / (old_block_size as u64)) as usize;
-            let offset_in_shard_block = offset_in_stripe % (old_block_size as u64);
-            let file_offset = (stripe_index * (old_block_size as u64)) + offset_in_shard_block;
-            let to_read = ((old_block_size as u64 - offset_in_shard_block)
+            if should_stop() {
+                return Err(AppError::InternalServerError("Stopped".into()));
+            }
+
+            let stripe_index = pos / old_stripe_width;
+            let offset_in_stripe = pos % old_stripe_width;
+
+            let shard_index = (offset_in_stripe / old_block_size as u64) as usize;
+            let offset_in_block = offset_in_stripe % old_block_size as u64;
+            let file_offset = (stripe_index * old_block_size as u64) + offset_in_block;
+
+            let to_read = ((old_block_size as u64 - offset_in_block)
                 .min(old_part_arc.size_bytes - pos)) as usize;
             if to_read == 0 {
                 break;
             }
 
-            let chunk_data = read_or_recover_chunk(
+            let chunk = read_or_recover_chunk(
                 &mut file_cache,
-                &PathBuf::new(),
+                Path::new(""),
                 old_part_arc.clone(),
                 shard_index,
                 file_offset,
@@ -362,30 +590,51 @@ async fn redistribute_object(
                 old_block_size,
             )
             .await?;
-            batch_buffer.extend_from_slice(&chunk_data);
-            if batch_buffer.len() >= new_block_size
-                || (pos + to_read as u64) >= old_part_arc.size_bytes
-            {
-                stream_writer.write(&batch_buffer).await?;
-                batch_buffer.clear();
+
+            batch.extend_from_slice(&chunk);
+
+            if batch.len() >= new_block_size || (pos + to_read as u64) >= old_part_arc.size_bytes {
+                stream_writer.write(&batch).await?;
+                batch.clear();
             }
+
             pos += to_read as u64;
         }
 
         stream_writer.finalize().await?;
-        let checksums = stream_writer.get_shard_checksums();
 
-        for (i, (tmp, final_p)) in temp_paths.iter().enumerate() {
-            if let Some(sum) = checksums.get(i) {
-                new_shard_infos[i].checksum = sum.clone();
+        let sums = stream_writer.get_shard_checksums();
+        let mut sum_map: HashMap<usize, String> = HashMap::new();
+        for (i, s) in sums.into_iter().enumerate() {
+            sum_map.insert(i, s);
+        }
+        for s in new_shards.iter_mut() {
+            if let Some(v) = sum_map.get(&s.shard_index) {
+                s.checksum = v.clone();
             }
-            if let Err(e) = tokio_fs::rename(tmp, final_p).await {
-                error!(
-                    "Failed to commit migrated shard {}: {}",
-                    final_p.display(),
-                    e
-                );
-                return Err(AppError::Io(e, "rename migrated shard".into()));
+        }
+
+        for (tmp, final_p, parent) in &commit_list {
+            if should_stop() {
+                return Err(AppError::InternalServerError("Stopped".into()));
+            }
+            if !tokio_fs::try_exists(tmp).await.unwrap_or(false) {
+                continue;
+            }
+
+            match tokio_fs::rename(tmp, final_p).await {
+                Ok(_) => {
+                    let _ = sync_dir(parent).await;
+                }
+                Err(e) => {
+                    warn!(
+                        "Commit shard rename failed (non-fatal, resumable): {} -> {} : {}",
+                        tmp.display(),
+                        final_p.display(),
+                        e
+                    );
+                    return Err(AppError::Io(e, "commit shard rename".into()));
+                }
             }
         }
 
@@ -393,8 +642,8 @@ async fn redistribute_object(
             part_index: old_part_arc.part_index,
             size_bytes: old_part_arc.size_bytes,
             created_at: old_part_arc.created_at,
+            shards: new_shards.clone(),
             checksum: old_part_arc.checksum.clone(),
-            shards: new_shard_infos,
         };
         new_parts.push(new_part);
 
@@ -405,52 +654,97 @@ async fn redistribute_object(
             .iter()
             .map(|s| s.absolute_path.clone())
             .collect();
+
         for old_shard in &old_part_arc.shards {
             if !new_paths.contains(&old_shard.absolute_path) {
-                shards_to_cleanup.push(old_shard.absolute_path.clone());
+                old_shards_for_gc.push(old_shard.absolute_path.clone());
             }
         }
+
         file_cache.clear();
     }
 
     meta.parts = new_parts;
     meta.stripe_size_bytes = new_block_size;
-    let bson_data =
-        mongodb::bson::to_vec(&*meta).map_err(|_| AppError::InternalServerError("BSON".into()))?;
 
-    let all_paths = path_manager.get_all_metadata_paths(
+    let bson_data = mongodb::bson::to_vec(&*meta)?;
+
+    let meta_paths = path_manager.get_all_metadata_paths(
         &meta.owner_uid,
         &meta.fragment,
         &meta.object_key,
         &meta.version_id,
     );
-    for path in all_paths {
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                let _ = tokio_fs::create_dir_all(parent).await;
+
+    for p in meta_paths {
+        if should_stop() {
+            return Err(AppError::InternalServerError("Stopped".into()));
+        }
+
+        if let Some(parent) = p.parent() {
+            if !tokio_fs::try_exists(parent).await.unwrap_or(false) {
+                tokio_fs::create_dir_all(parent).await.ok();
             }
         }
-        let tmp = path.with_extension("tmp");
-        if let Ok(_) = tokio_fs::write(&tmp, &bson_data).await {
-            let _ = tokio_fs::rename(&tmp, &path).await;
+
+        let tmp = p.with_extension(META_TMP_EXT);
+
+        let mut f = tokio_fs::File::create(&tmp)
+            .await
+            .map_err(|e| AppError::Io(e, format!("create meta tmp {}", tmp.display())))?;
+        f.write_all(&bson_data)
+            .await
+            .map_err(|e| AppError::Io(e, "write meta tmp".into()))?;
+        let _ = f.sync_all().await;
+        drop(f);
+
+        tokio_fs::rename(&tmp, &p)
+            .await
+            .map_err(|e| AppError::Io(e, "rename meta".into()))?;
+
+        if let Some(parent) = p.parent() {
+            let _ = sync_dir(parent).await;
         }
     }
 
     invalidate_cache(&meta.fragment, &meta.object_key, &meta.owner_uid).await;
 
-    let mut cleaned_count = 0;
-    for path in shards_to_cleanup {
-        if let Ok(_) = tokio_fs::remove_file(&path).await {
-            cleaned_count += 1;
+    for old in old_shards_for_gc {
+        if should_stop() {
+            return Err(AppError::InternalServerError("Stopped".into()));
+        }
+
+        let old_path = PathBuf::from(&old);
+        if !tokio_fs::try_exists(&old_path).await.unwrap_or(false) {
+            continue;
+        }
+
+        let gc_path = PathBuf::from(format!("{}{}", old, GC_SUFFIX));
+
+        if tokio_fs::try_exists(&gc_path).await.unwrap_or(false) {
+            continue;
+        }
+
+        if let Err(e) = tokio_fs::rename(&old_path, &gc_path).await {
+            debug!(
+                "GC rename failed (non-fatal): {} -> {} : {}",
+                old_path.display(),
+                gc_path.display(),
+                e
+            );
+        } else {
+            if let Some(parent) = gc_path.parent() {
+                let _ = sync_dir(parent).await;
+            }
         }
     }
 
     info!(
-        "Redistributed object {}/{} successfully in {:.2?}. Cleaned {} old shards.",
+        "Redistributed {}/{} (v:{}) in {:.2?}.",
         meta.fragment,
         meta.object_key,
-        start_time.elapsed(),
-        cleaned_count
+        meta.version_id,
+        start_time.elapsed()
     );
 
     Ok(())

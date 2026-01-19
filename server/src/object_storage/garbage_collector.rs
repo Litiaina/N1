@@ -285,6 +285,36 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
     Ok(())
 }
 
+fn sweep_gc_files(version_dir: &PathBuf, file_ttl: Duration) {
+    let now = SystemTime::now();
+
+    for entry in WalkDir::new(version_dir)
+        .max_depth(1)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy();
+        if !name.ends_with(".gc") {
+            continue;
+        }
+
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(now);
+
+        let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+        if age > file_ttl {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn cleanup_blobs_in_dir(
     blob_dir: &PathBuf,
     valid_versions: &HashSet<String>,
@@ -305,7 +335,10 @@ fn cleanup_blobs_in_dir(
             if !path.is_dir() {
                 continue;
             }
+
             let version_id = entry.file_name().to_string_lossy().to_string();
+
+            sweep_gc_files(&path, file_ttl);
 
             let mut attempt_refund = false;
 
