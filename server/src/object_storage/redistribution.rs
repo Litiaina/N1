@@ -1,5 +1,4 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::caching::invalidate_cache;
 use crate::object_storage::constants::{
     GC_SUFFIX, META_TMP_EXT, OBJECT_DATA_ROOT, PARITY_SUFFIX, PART_META_SUFFIX, QUOTA_FILE,
     REDIST_TMP_SUFFIX, SHARD_SUFFIX,
@@ -706,8 +705,6 @@ async fn redistribute_object_streaming(
             let _ = sync_dir(parent).await;
         }
     }
-
-    invalidate_cache(&meta.fragment, &meta.object_key, &meta.owner_uid).await;
 
     for old in old_shards_for_gc {
         if should_stop() {

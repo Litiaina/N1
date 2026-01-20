@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::caching::invalidate_cache;
 use crate::object_storage::constants::OBJECT_DATA_ROOT;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -183,14 +182,6 @@ pub async fn rename_object(
             }
         }
     }
-
-    invalidate_cache(&payload_arc.source_fragment, &payload_arc.source_key, &uid).await;
-    invalidate_cache(
-        &payload_arc.destination_fragment,
-        &payload_arc.destination_key,
-        &uid,
-    )
-    .await;
 
     info!(
         "Renamed object from {}/{} to {}/{}",

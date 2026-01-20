@@ -1,5 +1,5 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::caching::{get_metadata_with_cache, get_version_metadata_with_cache};
+use crate::object_storage::metadata_parser::{get_metadata, get_version_metadata};
 use crate::object_storage::object_parser::stream_object_logic;
 use crate::object_storage::recovery::read_or_recover_chunk;
 use crate::structs::auth_structs::Claims;
@@ -20,10 +20,9 @@ pub async fn download_object(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let metadata = if let Some(version_id) = &query.version_id {
-        get_version_metadata_with_cache(&fragment, &query.object_key, version_id, &claims.uid)
-            .await?
+        get_version_metadata(&fragment, &query.object_key, version_id, &claims.uid).await?
     } else {
-        get_metadata_with_cache(&fragment, &query.object_key, &claims.uid).await?
+        get_metadata(&fragment, &query.object_key, &claims.uid).await?
     };
 
     if metadata.is_delete_marker {
@@ -38,7 +37,7 @@ pub async fn download_object_chunk(
     Path(fragment): Path<String>,
     Query(params): Query<ChunkQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let metadata = get_metadata_with_cache(&fragment, &params.object_key, &claims.uid).await?;
+    let metadata = get_metadata(&fragment, &params.object_key, &claims.uid).await?;
 
     if metadata.is_delete_marker {
         return Err(AppError::NotFound);

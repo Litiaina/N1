@@ -21,7 +21,7 @@ use tokio_tar::{Builder as TarBuilder, Header as TarHeader};
 
 use crate::{
     enums::app_error_enum::AppError,
-    object_storage::{caching::get_metadata_with_cache, recovery::read_or_recover_chunk},
+    object_storage::{metadata_parser::get_metadata, recovery::read_or_recover_chunk},
     structs::{
         auth_structs::Claims,
         object_storage_structs::{DownloadArchiveRequest, ObjectMetadata, PartMetadata, ShardInfo},
@@ -137,7 +137,7 @@ async fn write_zip_archive(
     for key in keys {
         let clean_key = key.trim_start_matches('/');
 
-        let metadata = match get_metadata_with_cache(fragment, clean_key, uid).await {
+        let metadata = match get_metadata(fragment, clean_key, uid).await {
             Ok(m) if !m.is_delete_marker => m,
             _ => continue,
         };
@@ -189,7 +189,7 @@ async fn write_tar_archive(
     for key in keys {
         let clean_key = key.trim_start_matches('/');
 
-        let metadata = match get_metadata_with_cache(fragment, clean_key, uid).await {
+        let metadata = match get_metadata(fragment, clean_key, uid).await {
             Ok(m) if !m.is_delete_marker => m,
             _ => continue,
         };

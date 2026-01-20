@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::caching::invalidate_cache;
 use crate::object_storage::constants::OBJECT_DATA_ROOT;
 use crate::object_storage::quota_manager::update_quota;
 use crate::routes::storage_routes::AppState;
@@ -88,8 +87,6 @@ pub async fn delete_object_version(
             error!("Failed to refund quota for user {}: {}", uid, e);
         }
     }
-
-    invalidate_cache(&fragment, &object_key, &uid).await;
 
     info!(
         "Hard deleted version: {}/{} (v: {})",
@@ -210,8 +207,6 @@ pub async fn delete_object_permanently(
         }
     }
 
-    invalidate_cache(&fragment, &object_key, &uid).await;
-
     info!(
         "Permanently deleted object versions: {}/{} (Freed: {} bytes)",
         fragment, object_key, total_size_to_free
@@ -292,8 +287,6 @@ pub async fn delete_object(
             "Failed to write delete marker to any disk".into(),
         ));
     }
-
-    invalidate_cache(&fragment, &object_key, &uid).await;
 
     info!("Created delete marker: {}/{}", fragment, object_key);
 

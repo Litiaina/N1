@@ -1,6 +1,5 @@
 use crate::database::database_constants::DATABASE;
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::caching::invalidate_cache;
 use crate::object_storage::constants::{PARITY_SUFFIX, PART_META_SUFFIX, SHARD_SUFFIX};
 use crate::object_storage::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::object_storage::quota_manager::{init_quota_file, try_reserve_quota, update_quota};
@@ -847,13 +846,6 @@ pub async fn finalize_object_upload(
     if delta != 0 {
         update_quota(&object_meta.owner_uid, delta).await?;
     }
-
-    invalidate_cache(
-        &object_meta.fragment,
-        &object_meta.object_key,
-        &object_meta.owner_uid,
-    )
-    .await;
 
     let owner_uid = object_meta.owner_uid.clone();
     let stripped_meta = ObjectMetadata {

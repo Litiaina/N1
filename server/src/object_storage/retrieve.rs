@@ -1,6 +1,6 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::caching::get_metadata_with_cache;
 use crate::object_storage::constants::BROWSER_CACHE_MAX_AGE;
+use crate::object_storage::metadata_parser::get_metadata;
 use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
@@ -312,7 +312,7 @@ pub async fn get_object_metadata(
     claims: Claims,
     Path((fragment, object_key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
-    let metadata = get_metadata_with_cache(&fragment, &object_key, &claims.uid).await?;
+    let metadata = get_metadata(&fragment, &object_key, &claims.uid).await?;
 
     if metadata.is_delete_marker {
         return Err(AppError::NotFound);
@@ -328,7 +328,7 @@ pub async fn get_object(
 ) -> Result<Response, AppError> {
     let uid = claims.uid;
 
-    let metadata = get_metadata_with_cache(&fragment, &object_key, &uid).await?;
+    let metadata = get_metadata(&fragment, &object_key, &uid).await?;
 
     if metadata.is_delete_marker {
         return Err(AppError::NotFound);
@@ -353,7 +353,7 @@ pub async fn stream_object(
     Path((fragment, object_key)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
-    let metadata = get_metadata_with_cache(&fragment, &object_key, &uid).await?;
+    let metadata = get_metadata(&fragment, &object_key, &uid).await?;
 
     if metadata.is_delete_marker {
         return Err(AppError::NotFound);
