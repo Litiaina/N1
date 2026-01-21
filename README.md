@@ -7,7 +7,7 @@
   />
   <h1>Litiaina N1</h1>
   <p>
-    A single-node, filesystem-native object storage engine optimized for lockless streaming,
+    A single-node, object storage engine optimized for lockless streaming,
     predictable latency, and durability.
   </p>
 </div>
