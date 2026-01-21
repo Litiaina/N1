@@ -209,7 +209,7 @@ N1 is optimized for **throughput and predictability**:
 - lockless streaming data path
 - low CPU overhead for large objects
 - supports high-bitrate media workloads (range reads / seeks)
-- keeps memory usage bounded (you’ve observed tens of MB under repeated browsing / video streaming)
+- keeps memory usage bounded
 
 N1 is not trying to maximize tiny-object ops/sec at any cost; it’s built to push sustained bandwidth and remain stable under failure.
 
