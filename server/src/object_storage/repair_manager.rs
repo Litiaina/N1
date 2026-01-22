@@ -1,5 +1,6 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::OBJECT_DATA_ROOT;
+use crate::object_storage::directory_index::DirectoryIndexManager;
 use crate::object_storage::recovery::{repair_entire_shard, verify_shard_integrity};
 use crate::routes::storage_routes::AppState;
 use crate::structs::object_storage_structs::INDEX_STORE_DISKS;
@@ -309,6 +310,14 @@ pub async fn run_repair_job(
                                 continue;
                             }
                             set.insert(meta.version_id.clone());
+                        }
+
+                        if !dry_run {
+                            DirectoryIndexManager::trigger_background_insert(
+                                meta.owner_uid.clone(),
+                                meta.fragment.clone(),
+                                meta.object_key.clone(),
+                            );
                         }
 
                         if let Err(e) = repair_metadata_mirrors(&meta, &data, dry_run).await {
