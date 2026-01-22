@@ -70,3 +70,4 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 reed-solomon-simd = "3.1.0"
 num_cpus = "1.17.0"
 core_affinity = "0.8.3"
+async-recursion = "1.1.1"

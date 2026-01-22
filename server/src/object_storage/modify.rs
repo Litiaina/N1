@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::OBJECT_DATA_ROOT;
+use crate::object_storage::directory_index::DirectoryIndexManager;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{
@@ -189,6 +190,18 @@ pub async fn rename_object(
         payload_arc.source_key,
         payload_arc.destination_fragment,
         payload_arc.destination_key
+    );
+
+    DirectoryIndexManager::trigger_background_removal(
+        uid.clone(),
+        payload_arc.source_fragment.clone(),
+        payload_arc.source_key.clone(),
+    );
+
+    DirectoryIndexManager::trigger_background_insert(
+        uid.clone(),
+        payload_arc.destination_fragment.clone(),
+        payload_arc.destination_key.clone(),
     );
 
     state.emit(

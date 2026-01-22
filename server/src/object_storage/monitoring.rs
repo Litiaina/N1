@@ -1,8 +1,13 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::OBJECT_DATA_ROOT;
+use crate::object_storage::redistribution::get_redist_status;
+use crate::object_storage::repair_manager::get_repair_status;
+use crate::object_storage::system::{SystemMetrics, get_system_metrics};
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::structs::object_storage_structs::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
+use crate::websocket::ws_structs::StorageEventPayload;
+
 use axum::{
     Json,
     extract::{Query, State},
@@ -49,6 +54,7 @@ pub struct SystemHealthResponse {
     pub database_connected: bool,
     pub disks: Vec<DiskStatus>,
     pub consistency: ConsistencyStats,
+    pub system: SystemMetrics,
     pub summary: String,
 }
 
@@ -154,6 +160,10 @@ pub async fn get_system_health(
     _claims: Claims,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, AppError> {
+    let system_metrics = get_system_metrics().await;
+    let redist_status = get_redist_status().await;
+    let repair_status = get_repair_status().await;
+
     let db_connected = state
         .db_client
         .database("admin")
@@ -319,6 +329,15 @@ pub async fn get_system_health(
         ("healthy", "All systems operational.".to_string())
     };
 
+    let monitoring_update = StorageEventPayload::MonitoringUpdate {
+        system: serde_json::to_value(&system_metrics).unwrap_or(serde_json::Value::Null),
+        repair_job: serde_json::to_value(&repair_status).ok(),
+        redist_job: serde_json::to_value(&redist_status).ok(),
+        shadow_index_status: index_health.clone(),
+        shadow_index_healthy: index_health == "synchronized",
+    };
+    state.ws_manager.broadcast_system_wide(monitoring_update);
+
     Ok(Json(SystemHealthResponse {
         status: status.to_string(),
         database_connected: db_connected,
@@ -332,6 +351,7 @@ pub async fn get_system_health(
                 None
             },
         },
+        system: system_metrics,
         summary,
     }))
 }

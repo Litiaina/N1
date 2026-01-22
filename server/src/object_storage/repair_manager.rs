@@ -1,19 +1,20 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::OBJECT_DATA_ROOT;
 use crate::object_storage::recovery::{repair_entire_shard, verify_shard_integrity};
+use crate::routes::storage_routes::AppState;
 use crate::structs::object_storage_structs::INDEX_STORE_DISKS;
 use crate::structs::object_storage_structs::{ObjectMetadata, ObjectPathManager, Quota};
-use axum::response::sse::{Event, Sse};
+use crate::websocket::manager::WsConnectionManager;
+use crate::websocket::ws_structs::StorageEventPayload;
+use axum::extract::State;
 use axum::{extract::Query, http::StatusCode, response::IntoResponse};
 use chrono::Utc;
-use futures_util::stream::{self, Stream};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Instant, SystemTime};
 use tokio::fs::{self, File};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -40,20 +41,12 @@ static REPAIR_STATUS: LazyLock<Arc<RwLock<RepairJobStatus>>> =
 
 static STOP_SIGNAL: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
 
-pub async fn monitor_repair_job_api() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = stream::unfold((), |()| async move {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let state = REPAIR_STATUS.read().await.clone();
-        let event = Event::default()
-            .json_data(state)
-            .unwrap_or_else(|_| Event::default().data("serialization error"));
-        Some((Ok(event), ()))
-    });
-
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+pub async fn get_repair_status() -> RepairJobStatus {
+    REPAIR_STATUS.read().await.clone()
 }
 
 pub async fn trigger_repair_job_api(
+    State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     {
@@ -64,30 +57,41 @@ pub async fn trigger_repair_job_api(
     }
 
     let dry_run = params.get("dry_run").map(|v| v == "true").unwrap_or(false);
+    let ws_manager = Arc::new(state.ws_manager.clone());
+    let ws_manager_clone = ws_manager.clone();
 
     tokio::spawn(async move {
-        if let Err(e) = run_repair_job(dry_run).await {
+        if let Err(e) = run_repair_job(dry_run, ws_manager).await {
             error!("Manual Repair Job Failed: {}", e);
             let mut status = REPAIR_STATUS.write().await;
             status.is_running = false;
             status.phase = "Failed".to_string();
             status.last_error = Some(e.to_string());
+
+            ws_manager_clone
+                .broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
     });
 
     (StatusCode::ACCEPTED, "Storage repair job initiated.").into_response()
 }
 
-pub async fn stop_repair_job_api() -> impl IntoResponse {
+pub async fn stop_repair_job_api(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     STOP_SIGNAL.store(true, Ordering::Relaxed);
     let mut status = REPAIR_STATUS.write().await;
     if status.is_running {
         status.phase = "Stopping...".to_string();
+        state
+            .ws_manager
+            .broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
     }
     (StatusCode::OK, "Stop signal sent to repair manager.")
 }
 
-pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
+pub async fn run_repair_job(
+    dry_run: bool,
+    ws_manager: Arc<WsConnectionManager>,
+) -> Result<(), AppError> {
     STOP_SIGNAL.store(false, Ordering::Relaxed);
     let start_time = Instant::now();
 
@@ -102,6 +106,8 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
         status.start_timestamp = Utc::now().timestamp();
         status.duration_seconds = 0;
         status.scan_rate_per_sec = 0.0;
+
+        ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
     }
 
     let path_manager = ObjectPathManager::new();
@@ -124,7 +130,7 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
         index_roots.len()
     );
 
-    for index_root in index_roots {
+    for index_root in &index_roots {
         if STOP_SIGNAL.load(Ordering::Relaxed) {
             break;
         }
@@ -172,14 +178,31 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
             };
 
             if should_process_quota {
-                let quota_path = user_path.join("quota.bson");
-                if let Ok(quota_data) = fs::read(&quota_path).await {
-                    if let Err(e) = repair_user_quota(&uid, &quota_data, dry_run).await {
-                        warn!(
-                            "Warning: Failed to align quota for user {} (non-fatal): {}",
-                            uid, e
-                        );
+                let all_user_index_dirs = path_manager.get_all_user_index_dirs(&uid);
+                let mut best_quota_path: Option<PathBuf> = None;
+                let mut max_mtime = SystemTime::UNIX_EPOCH;
+
+                for mirror_dir in &all_user_index_dirs {
+                    let qp = mirror_dir.join("quota.bson");
+                    if let Ok(meta) = fs::metadata(&qp).await {
+                        if let Ok(mtime) = meta.modified() {
+                            if mtime > max_mtime {
+                                max_mtime = mtime;
+                                best_quota_path = Some(qp);
+                            }
+                        }
                     }
+                }
+
+                if let Some(source_path) = best_quota_path {
+                     if let Ok(quota_data) = fs::read(&source_path).await {
+                        if let Err(e) = repair_user_quota(&uid, &quota_data, dry_run).await {
+                            warn!(
+                                "Warning: Failed to align quota for user {} (non-fatal): {}",
+                                uid, e
+                            );
+                        }
+                     }
                 }
             }
 
@@ -234,34 +257,77 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
                             status.scan_rate_per_sec = status.total_scanned as f64 / elapsed;
                         }
                         batch_scanned_count = 0;
+                        ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
                     }
 
-                    if let Ok(data) = fs::read(&meta_path).await {
-                        if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
-                            if meta.is_delete_marker {
-                                continue;
-                            }
-                            {
-                                let mut set = processed_arc.lock().unwrap();
-                                if set.contains(&meta.version_id) {
+                    let mut data_opt = fs::read(&meta_path).await.ok();
+                    let mut meta_opt = if let Some(ref d) = data_opt {
+                        mongodb::bson::from_slice::<ObjectMetadata>(d).ok()
+                    } else {
+                        None
+                    };
+
+                    if meta_opt.is_none() {
+                        if let Ok(rel) = meta_path.strip_prefix(index_root) {
+                            for peer_root in &index_roots {
+                                if peer_root == index_root {
                                     continue;
                                 }
-                                set.insert(meta.version_id.clone());
+                                let peer_path = peer_root.join(rel);
+                                if let Ok(peer_data) = fs::read(&peer_path).await {
+                                    if let Ok(peer_meta) =
+                                        mongodb::bson::from_slice::<ObjectMetadata>(&peer_data)
+                                    {
+                                        if !dry_run {
+                                            if let Ok(_) = fs::write(&meta_path, &peer_data).await {
+                                                data_opt = Some(peer_data);
+                                                meta_opt = Some(peer_meta);
+                                                let mut status = REPAIR_STATUS.write().await;
+                                                status.total_repaired += 1;
+                                            }
+                                        }
+                                        break; 
+                                    }
+                                }
                             }
+                        }
 
-                            if let Err(e) = repair_metadata_mirrors(&meta, &data, dry_run).await {
-                                warn!(
-                                    "Warning: Metadata sync issues for {}/{}: {}",
-                                    meta.fragment, meta.object_key, e
-                                );
-                            }
+                        if meta_opt.is_none() {
+                             let mut status = REPAIR_STATUS.write().await;
+                             status.corrupt_found += 1;
+                             continue;
+                        }
+                    }
 
-                            if let Err(e) =
-                                process_object_repair(meta, &blob_roots_clone, num_disks, dry_run)
-                                    .await
-                            {
-                                warn!("Object repair check skipped: {}", e);
+                    if let (Some(data), Some(meta)) = (data_opt, meta_opt) {
+                        if meta.is_delete_marker {
+                            continue;
+                        }
+                        {
+                            let mut set = processed_arc.lock().unwrap();
+                            if set.contains(&meta.version_id) {
+                                continue;
                             }
+                            set.insert(meta.version_id.clone());
+                        }
+
+                        if let Err(e) = repair_metadata_mirrors(&meta, &data, dry_run).await {
+                            warn!(
+                                "Warning: Metadata sync issues for {}/{}: {}",
+                                meta.fragment, meta.object_key, e
+                            );
+                        }
+
+                        if let Err(e) = process_object_repair(
+                            meta,
+                            &blob_roots_clone,
+                            num_disks,
+                            dry_run,
+                            ws_manager.clone(),
+                        )
+                        .await
+                        {
+                            warn!("Object repair check skipped: {}", e);
                         }
                     }
                 }
@@ -274,6 +340,7 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
                     if elapsed > 0.0 {
                         status.scan_rate_per_sec = status.total_scanned as f64 / elapsed;
                     }
+                    ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
                 }
             }
         }
@@ -284,10 +351,13 @@ pub async fn run_repair_job(dry_run: bool) -> Result<(), AppError> {
         status.is_running = false;
         status.phase = if STOP_SIGNAL.load(Ordering::Relaxed) {
             "Stopped by User".to_string()
+        } else if dry_run {
+            "Finished scanning".to_string()
         } else {
-            "Completed".to_string()
+            "Finished repair".to_string()
         };
         status.duration_seconds = start_time.elapsed().as_secs();
+        ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
     }
 
     info!("Storage Repair Job Ended.");
@@ -348,7 +418,7 @@ pub async fn repair_metadata_mirrors(
 
     for path in all_paths {
         if let Some(parent) = path.parent() {
-            if !parent.exists() {
+            if !fs::try_exists(parent).await.unwrap_or(false) {
                 if !dry_run {
                     if let Err(_) = fs::create_dir_all(parent).await {
                         continue;
@@ -384,6 +454,7 @@ async fn process_object_repair(
     blob_roots: &[PathBuf],
     num_disks: usize,
     dry_run: bool,
+    ws_manager: Arc<WsConnectionManager>,
 ) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
     let meta_arc = Arc::new(meta);
@@ -441,6 +512,8 @@ async fn process_object_repair(
                 status.total_repaired += 1;
                 status.last_repaired =
                     Some(format!("{}/{}", meta_arc.fragment, meta_arc.object_key));
+
+                ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
             }
         }
     }

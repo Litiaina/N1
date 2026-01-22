@@ -9,26 +9,26 @@ use crate::object_storage::upload::{
     DATA_SHARDS_ATOMIC, DirectWriter, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, create_direct_file,
     sync_dir,
 };
+use crate::routes::storage_routes::AppState;
 use crate::structs::object_storage_structs::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo,
     default_stripe_size,
 };
+use crate::websocket::manager::WsConnectionManager;
+use crate::websocket::ws_structs::StorageEventPayload;
 
-use axum::extract::Query;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::response::sse::{Event, KeepAlive, Sse};
 
 use chrono::Utc;
-use futures_util::stream::{self, Stream};
 use serde::Serialize;
 
 use std::collections::{HashMap, HashSet};
-use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tokio::fs as tokio_fs;
 use tokio::io::AsyncWriteExt;
@@ -65,22 +65,12 @@ fn should_stop() -> bool {
     STOP_SIGNAL.load(Ordering::Relaxed)
 }
 
-pub async fn monitor_redistribution_job_api() -> Sse<impl Stream<Item = Result<Event, Infallible>>>
-{
-    let stream = stream::unfold((), |()| async move {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let state = REDIST_STATUS.read().await.clone();
-
-        let event = Event::default()
-            .json_data(state)
-            .unwrap_or_else(|_| Event::default().data("serialization error"));
-        Some((Ok(event), ()))
-    });
-
-    Sse::new(stream).keep_alive(KeepAlive::default())
+pub async fn get_redist_status() -> RedistributionJobStatus {
+    REDIST_STATUS.read().await.clone()
 }
 
 pub async fn trigger_redistribution_job_api(
+    State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     {
@@ -91,14 +81,19 @@ pub async fn trigger_redistribution_job_api(
     }
 
     let dry_run = params.get("dry_run").map(|v| v == "true").unwrap_or(false);
+    let ws_manager = Arc::new(state.ws_manager.clone());
+    let ws_manger_clone = ws_manager.clone();
 
     tokio::spawn(async move {
-        if let Err(e) = run_redistribution_job(dry_run).await {
+        if let Err(e) = run_redistribution_job(dry_run, ws_manager).await {
             error!("Redistribution job failed: {}", e);
             let mut st = REDIST_STATUS.write().await;
             st.is_running = false;
             st.phase = "Failed".to_string();
             st.last_error = Some(e.to_string());
+
+            ws_manger_clone
+                .broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
         }
     });
 
@@ -113,16 +108,23 @@ pub async fn trigger_redistribution_job_api(
         .into_response()
 }
 
-pub async fn stop_redistribution_job_api() -> impl IntoResponse {
+pub async fn stop_redistribution_job_api(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     STOP_SIGNAL.store(true, Ordering::Relaxed);
     let mut st = REDIST_STATUS.write().await;
     if st.is_running {
         st.phase = "Stopping...".to_string();
+
+        state
+            .ws_manager
+            .broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
     }
     (StatusCode::OK, "Stop signal sent.").into_response()
 }
 
-pub async fn run_redistribution_job(dry_run: bool) -> Result<(), AppError> {
+pub async fn run_redistribution_job(
+    dry_run: bool,
+    ws_manager: Arc<WsConnectionManager>,
+) -> Result<(), AppError> {
     STOP_SIGNAL.store(false, Ordering::Relaxed);
     let start_time = Instant::now();
 
@@ -134,6 +136,7 @@ pub async fn run_redistribution_job(dry_run: bool) -> Result<(), AppError> {
             start_timestamp: Utc::now().timestamp(),
             ..Default::default()
         };
+        ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
     }
 
     let target_data_shards = DATA_SHARDS_ATOMIC
@@ -199,6 +202,7 @@ pub async fn run_redistribution_job(dry_run: bool) -> Result<(), AppError> {
         {
             let mut st = REDIST_STATUS.write().await;
             st.phase = format!("Scanning Root {:?}", index_root);
+            ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
         }
 
         let mut user_entries = match tokio_fs::read_dir(&index_root).await {
@@ -298,6 +302,9 @@ pub async fn run_redistribution_job(dry_run: bool) -> Result<(), AppError> {
                         if elapsed > 0.0 {
                             st.scan_rate_per_sec = st.total_objects_scanned as f64 / elapsed;
                         }
+                        ws_manager.broadcast_system_wide(
+                            StorageEventPayload::RedistributionUpdate(st.clone()),
+                        );
                         batch_scanned = 0;
                     }
 
@@ -330,6 +337,9 @@ pub async fn run_redistribution_job(dry_run: bool) -> Result<(), AppError> {
                         );
                         let mut st = REDIST_STATUS.write().await;
                         st.total_objects_migrated += 1;
+                        ws_manager.broadcast_system_wide(
+                            StorageEventPayload::RedistributionUpdate(st.clone()),
+                        );
                         continue;
                     }
 
@@ -345,6 +355,9 @@ pub async fn run_redistribution_job(dry_run: bool) -> Result<(), AppError> {
                         Ok(_) => {
                             let mut st = REDIST_STATUS.write().await;
                             st.total_objects_migrated += 1;
+                            ws_manager.broadcast_system_wide(
+                                StorageEventPayload::RedistributionUpdate(st.clone()),
+                            );
                         }
                         Err(e) => {
                             warn!(
@@ -354,6 +367,9 @@ pub async fn run_redistribution_job(dry_run: bool) -> Result<(), AppError> {
                             let mut st = REDIST_STATUS.write().await;
                             st.total_errors += 1;
                             st.last_error = Some(e.to_string());
+                            ws_manager.broadcast_system_wide(
+                                StorageEventPayload::RedistributionUpdate(st.clone()),
+                            );
                         }
                     }
                 }
@@ -366,6 +382,9 @@ pub async fn run_redistribution_job(dry_run: bool) -> Result<(), AppError> {
                     if elapsed > 0.0 {
                         st.scan_rate_per_sec = st.total_objects_scanned as f64 / elapsed;
                     }
+                    ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(
+                        st.clone(),
+                    ));
                 }
             }
         }
@@ -380,6 +399,7 @@ pub async fn run_redistribution_job(dry_run: bool) -> Result<(), AppError> {
             "Completed".to_string()
         };
         st.duration_seconds = start_time.elapsed().as_secs();
+        ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
     }
 
     info!("TRUE Redistribution Job Ended.");

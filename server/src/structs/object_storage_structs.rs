@@ -14,6 +14,7 @@ pub fn default_stripe_size() -> usize {
     256 * 1024
 }
 
+#[derive(Clone)]
 pub struct ObjectPathManager;
 
 impl ObjectPathManager {

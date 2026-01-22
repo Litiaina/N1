@@ -20,3 +20,5 @@ pub mod sharing;
 pub mod storage_capacity_parser;
 pub mod sync;
 pub mod upload;
+pub mod directory_index;
+pub mod system;

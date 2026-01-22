@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::OBJECT_DATA_ROOT;
+use crate::object_storage::directory_index::DirectoryIndexManager;
 use crate::object_storage::quota_manager::update_quota;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -118,7 +119,6 @@ pub async fn delete_object_permanently(
     let hash = hex::encode(hasher.finalize());
     let shard1 = &hash[0..2];
     let shard2 = &hash[2..4];
-
     let index_dirs = path_manager.get_all_index_dirs(&uid, &fragment);
 
     let mut active_shard_dir = None;
@@ -215,11 +215,13 @@ pub async fn delete_object_permanently(
     state.emit(
         &uid,
         StorageEventPayload::FileDeleted {
-            fragment,
-            object_key,
+            fragment: fragment.clone(),
+            object_key: object_key.clone(),
             version_id: None,
         },
     );
+
+    DirectoryIndexManager::trigger_background_removal(uid, fragment, object_key);
 
     Ok(StatusCode::NO_CONTENT)
 }

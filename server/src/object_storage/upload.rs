@@ -2,6 +2,7 @@ use crate::database::database_constants::DATABASE;
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::{PARITY_SUFFIX, PART_META_SUFFIX, SHARD_SUFFIX};
 use crate::object_storage::ec::{AlignedBuffer, ErasureStreamWriter};
+use crate::object_storage::directory_index::DirectoryIndexManager;
 use crate::object_storage::quota_manager::{init_quota_file, try_reserve_quota, update_quota};
 use crate::object_storage::storage_capacity_parser::calculate_storage_usage;
 use crate::routes::storage_routes::AppState;
@@ -333,7 +334,7 @@ pub async fn initiate_object_upload(
     ))
 }
 
-pub async fn get_upload_status(
+pub async fn verify_uploaded_part_indices(
     claims: Claims,
     AxumPath((fragment, version_id)): AxumPath<(String, String)>,
     Query(key_query): Query<ObjectKeyQuery>,
@@ -846,6 +847,12 @@ pub async fn finalize_object_upload(
     if delta != 0 {
         update_quota(&object_meta.owner_uid, delta).await?;
     }
+
+    DirectoryIndexManager::trigger_background_insert(
+        object_meta.owner_uid.clone(),
+        object_meta.fragment.clone(),
+        object_meta.object_key.clone(),
+    );
 
     let owner_uid = object_meta.owner_uid.clone();
     let stripped_meta = ObjectMetadata {

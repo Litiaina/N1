@@ -23,8 +23,8 @@ use crate::object_storage::garbage_collector::{run_garbage_collector, run_lifecy
 use crate::object_storage::maintenance::sync_user_metadata;
 use crate::object_storage::modify::rename_object;
 use crate::object_storage::monitoring::get_system_health;
-use crate::object_storage::redistribution::{monitor_redistribution_job_api, stop_redistribution_job_api, trigger_redistribution_job_api};
-use crate::object_storage::repair_manager::{monitor_repair_job_api, stop_repair_job_api, trigger_repair_job_api};
+use crate::object_storage::redistribution::{stop_redistribution_job_api, trigger_redistribution_job_api};
+use crate::object_storage::repair_manager::{stop_repair_job_api, trigger_repair_job_api};
 use crate::object_storage::retrieve::{
     get_object, get_object_metadata, list_fragments, list_object_versions, list_objects,
     stream_object,
@@ -32,7 +32,7 @@ use crate::object_storage::retrieve::{
 use crate::object_storage::sharing::{create_signed_url, get_shared_object};
 use crate::object_storage::sync::{initialize_user_storage_api, sync_quota_api, sync_user_quota_api};
 use crate::object_storage::upload::{
-    cancel_upload_session, finalize_object_upload, get_capacity_usage, get_upload_status, initiate_object_upload, object_upload_part
+    cancel_upload_session, finalize_object_upload, get_capacity_usage, initiate_object_upload, object_upload_part, verify_uploaded_part_indices
 };
 use crate::statics::database_statics::DATABASE_URL;
 use crate::websocket::handler::{system_broadcast_handler, ws_handler};
@@ -128,7 +128,7 @@ pub async fn serve_storage_routes() -> Router {
             .route("/v4/fragment/object/delete/version/{:fragment}/{:version_id}/{*object_key}", delete(delete_object_version))
             .route("/v4/fragment/object/delete/permanent/{:fragment}/{*object_key}", delete(delete_object_permanently))
             .route("/v4/fragment/object/upload/init/{:fragment}/{*object_key}", post(initiate_object_upload))
-            .route("/v4/fragment/object/upload/status/{:fragment}/{:version_id}", get(get_upload_status))
+            .route("/v4/fragment/object/upload/status/{:fragment}/{:version_id}", get(verify_uploaded_part_indices))
             .route("/v4/fragment/object/upload/chunk/{:fragment}/{:version_id}/{:part_index}", put(object_upload_part))
             .route("/v4/fragment/object/upload/finalize/{:fragment}/{:version_id}/{:session_id}", post(finalize_object_upload))
             .route("/v4/fragment/object/upload/cancel/{:fragment}/{:version_id}", delete(cancel_upload_session))
@@ -214,11 +214,9 @@ pub async fn serve_storage_routes() -> Router {
         let repair_routes = Router::new()
             .route("/v4/system/maintenance/redistribute", post(trigger_redistribution_job_api))
             .route("/v4/system/maintenance/redistribute/stop", patch(stop_redistribution_job_api))
-            .route("/v4/system/maintenance/redistribute/monitor", get(monitor_redistribution_job_api))
             .route("/v4/system/maintenance/sync/all", post(sync_quota_api))
             .route("/v4/system/maintenance/repair", post(trigger_repair_job_api))
             .route("/v4/system/maintenance/repair/stop", post(stop_repair_job_api))
-            .route("/v4/maintenance/repair/monitor", get(monitor_repair_job_api))
             .route("/v4/system/maintenance/health", get(get_system_health));
 
         let repair_ops = layers.layer_transcode(repair_routes);

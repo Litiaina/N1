@@ -1,5 +1,6 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::BROWSER_CACHE_MAX_AGE;
+use crate::object_storage::constants::{BROWSER_CACHE_MAX_AGE, PART_META_SUFFIX};
+use crate::object_storage::directory_index::DirectoryIndexManager;
 use crate::object_storage::metadata_parser::get_metadata;
 use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
 use crate::structs::auth_structs::Claims;
@@ -48,16 +49,6 @@ pub async fn list_objects(
     let uid = claims.uid;
     let path_manager = ObjectPathManager::new();
 
-    let index_dirs = path_manager.get_all_index_dirs(&uid, &fragment);
-
-    let mut active_index_root = None;
-    for dir in index_dirs {
-        if fs::try_exists(&dir).await.unwrap_or(false) {
-            active_index_root = Some(dir);
-            break;
-        }
-    }
-
     let limit: usize = params
         .get("limit")
         .and_then(|s| s.parse().ok())
@@ -68,6 +59,50 @@ pub async fn list_objects(
         .get("include_deleted")
         .map(|v| v == "true")
         .unwrap_or(false);
+
+    let prefix = params.get("prefix").cloned().unwrap_or_default();
+
+    if !prefix.is_empty() {
+        let index_mgr = DirectoryIndexManager::new();
+        if let Ok(hashes) = index_mgr
+            .list_hashes_by_prefix(&uid, &fragment, &prefix)
+            .await
+        {
+            if !hashes.is_empty() {
+                let mut results = Vec::new();
+                for hash in hashes {
+                    if let Ok(summary) =
+                        get_metadata_by_hash_direct(&path_manager, &uid, &fragment, &hash).await
+                    {
+                        let meta: ObjectMetadata = summary.into();
+                        let is_visible = !meta.is_delete_marker || include_deleted;
+                        if is_visible {
+                            results.push(meta);
+                        }
+                    }
+                    if results.len() >= limit {
+                        break;
+                    }
+                }
+
+                if !results.is_empty() {
+                    return Ok(AxumJson(ListObjectsResult {
+                        objects: results,
+                        continuation_token: None,
+                    }));
+                }
+            }
+        }
+    }
+
+    let index_dirs = path_manager.get_all_index_dirs(&uid, &fragment);
+    let mut active_index_root = None;
+    for dir in index_dirs {
+        if fs::try_exists(&dir).await.unwrap_or(false) {
+            active_index_root = Some(dir);
+            break;
+        }
+    }
 
     let continuation_token = params.get("continuation_token").cloned();
     let (start_s1, start_s2, start_file) = match continuation_token.as_deref() {
@@ -135,7 +170,7 @@ pub async fn list_objects(
 
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let fname = entry.file_name().to_string_lossy().to_string();
-                if fname.ends_with(".bson") {
+                if fname.ends_with(".bson") && !fname.ends_with(PART_META_SUFFIX) {
                     file_names.push(fname);
                 }
             }
@@ -172,7 +207,11 @@ pub async fn list_objects(
 
                 if hash_part != current_hash_prefix {
                     if let Some(meta) = pending_meta.take() {
-                        if !meta.is_delete_marker || include_deleted {
+                        let matches_prefix =
+                            prefix.is_empty() || meta.object_key.starts_with(&prefix);
+                        let is_visible = !meta.is_delete_marker || include_deleted;
+
+                        if matches_prefix && is_visible {
                             results.push(meta);
                         }
 
@@ -195,9 +234,13 @@ pub async fn list_objects(
             }
 
             if let Some(meta) = pending_meta {
-                if !meta.is_delete_marker || include_deleted {
+                let matches_prefix = prefix.is_empty() || meta.object_key.starts_with(&prefix);
+                let is_visible = !meta.is_delete_marker || include_deleted;
+
+                if matches_prefix && is_visible {
                     results.push(meta);
                 }
+
                 if results.len() >= limit {
                     next_token = Some(create_continuation_token(&s1, &s2, &last_fname_processed));
                     reached_limit = true;
@@ -213,6 +256,47 @@ pub async fn list_objects(
     }))
 }
 
+async fn get_metadata_by_hash_direct(
+    path_mgr: &ObjectPathManager,
+    uid: &str,
+    fragment: &str,
+    hash: &str,
+) -> Result<ObjectSummary, ()> {
+    if hash.len() < 8 {
+        return Err(());
+    }
+    let s1 = &hash[0..2];
+    let s2 = &hash[2..4];
+    let dirs = path_mgr.get_all_index_dirs(uid, fragment);
+    for dir in dirs {
+        let path = dir.join(s1).join(s2);
+
+        if let Ok(mut entries) = fs::read_dir(&path).await {
+            let mut candidates = Vec::new();
+
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let fname = entry.file_name().to_string_lossy().to_string();
+                if fname.starts_with(hash)
+                    && fname.ends_with(".bson")
+                    && !fname.ends_with(PART_META_SUFFIX)
+                {
+                    if let Ok(data) = fs::read(entry.path()).await {
+                        if let Ok(sum) = mongodb::bson::from_slice::<ObjectSummary>(&data) {
+                            candidates.push(sum);
+                        }
+                    }
+                }
+            }
+
+            if !candidates.is_empty() {
+                candidates.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                return Ok(candidates.remove(0));
+            }
+        }
+    }
+    Err(())
+}
+
 pub async fn list_object_versions(
     claims: Claims,
     Path((fragment, object_key)): Path<(String, String)>,
@@ -226,7 +310,6 @@ pub async fn list_object_versions(
 
     let shard1 = &hash[0..2];
     let shard2 = &hash[2..4];
-
     let index_dirs = path_manager.get_all_index_dirs(&uid, &fragment);
 
     let mut active_shard_dir = None;

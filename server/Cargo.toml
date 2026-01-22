@@ -60,3 +60,4 @@ clap.workspace = true
 reed-solomon-simd.workspace = true
 num_cpus.workspace = true
 core_affinity.workspace = true
+async-recursion.workspace = true
