@@ -18,59 +18,50 @@ pub async fn find_latest_metadata_on_disk(
 
     let shard_path_suffix = PathBuf::from(&hash[0..2]).join(&hash[2..4]);
     let index_dirs = path_manager.get_all_index_dirs(uid, fragment);
-
-    let mut active_shard_dir = None;
-    for dir in index_dirs {
-        let candidate = dir.join(&shard_path_suffix);
-        if fs::try_exists(&candidate).await.unwrap_or(false) {
-            active_shard_dir = Some(candidate);
-            break;
-        }
-    }
-
-    let shard_dir = active_shard_dir.ok_or(AppError::NotFound)?;
     let prefix = format!("{}#", hash);
 
-    let mut latest_name: Option<String> = None;
-    let mut latest_ver: Option<String> = None;
+    let mut best_path: Option<PathBuf> = None;
+    let mut best_ver: Option<String> = None;
 
-    let mut entries = fs::read_dir(&shard_dir).await.map_err(|e| {
-        error!("Failed to read index shard directory: {}", e);
-        AppError::InternalServerError("Failed to read storage index.".to_string())
-    })?;
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name().to_string_lossy().to_string();
-
-        if !name.starts_with(&prefix) || !name.ends_with(".bson") {
+    for dir in index_dirs {
+        let shard_dir = dir.join(&shard_path_suffix);
+        if !fs::try_exists(&shard_dir).await.unwrap_or(false) {
             continue;
         }
 
-        let ver_part = match name.strip_prefix(&prefix) {
-            Some(v) => v,
-            None => continue,
-        };
-        let ver = match ver_part.strip_suffix(".bson") {
-            Some(v) => v,
-            None => continue,
+        let mut entries = match fs::read_dir(&shard_dir).await {
+            Ok(e) => e,
+            Err(_) => continue,
         };
 
-        match &latest_ver {
-            None => {
-                latest_ver = Some(ver.to_string());
-                latest_name = Some(name);
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with(&prefix) || !name.ends_with(".bson") {
+                continue;
             }
-            Some(curr) => {
-                if ver > curr.as_str() {
-                    latest_ver = Some(ver.to_string());
-                    latest_name = Some(name);
-                }
+
+            let ver_part = match name.strip_prefix(&prefix) {
+                Some(v) => v,
+                None => continue,
+            };
+            let ver = match ver_part.strip_suffix(".bson") {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let take = match &best_ver {
+                None => true,
+                Some(curr) => ver > curr.as_str(),
+            };
+
+            if take {
+                best_ver = Some(ver.to_string());
+                best_path = Some(shard_dir.join(&name));
             }
         }
     }
 
-    let latest_file = latest_name.ok_or(AppError::NotFound)?;
-    let path = shard_dir.join(latest_file);
+    let path = best_path.ok_or(AppError::NotFound)?;
     read_bson_metadata(&path).await
 }
 

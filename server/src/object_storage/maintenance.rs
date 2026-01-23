@@ -9,10 +9,123 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 use tracing::{error, info};
 use walkdir::WalkDir;
+
+const TRASH_DIR: &str = ".trash";
+
+fn parse_version_from_meta_filename(name: &str) -> Option<&str> {
+    if !name.ends_with(".bson") {
+        return None;
+    }
+    let (_, ver_ext) = name.split_once('#')?;
+    let ver = ver_ext.strip_suffix(".bson")?;
+    if ver.is_empty() {
+        return None;
+    }
+    Some(ver)
+}
+
+#[cfg(unix)]
+fn sync_dir_std(path: &StdPath) {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Ok(f) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(path)
+    {
+        let _ = f.sync_all();
+    }
+}
+
+#[cfg(windows)]
+fn sync_dir_std(path: &StdPath) {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+    if let Ok(f) = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+    {
+        let _ = f.sync_all();
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_dir_std(_path: &StdPath) {}
+
+fn remove_dir_strict(dir: &StdPath) -> bool {
+    if !dir.exists() {
+        return true;
+    }
+    let parent = match dir.parent() {
+        Some(p) => p,
+        None => return false,
+    };
+    let gc_dir = PathBuf::from(format!("{}.gcdir", dir.to_string_lossy()));
+    if !gc_dir.exists() {
+        if std::fs::rename(dir, &gc_dir).is_err() {
+            return false;
+        }
+        sync_dir_std(parent);
+    }
+    let _ = std::fs::remove_dir_all(&gc_dir);
+    sync_dir_std(parent);
+    !dir.exists()
+}
+
+fn scan_index_dir(
+    index_dir: &StdPath,
+    best_meta: &mut HashMap<String, (SystemTime, PathBuf)>,
+    valid_versions: &mut HashSet<String>,
+) {
+    if !index_dir.exists() {
+        return;
+    }
+
+    for entry in WalkDir::new(index_dir).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let filename = entry.file_name().to_string_lossy().to_string();
+        if filename == "quota.bson"
+            || filename == "reservation.bson"
+            || filename.ends_with(".partmeta")
+        {
+            continue;
+        }
+
+        let Some(ver) = parse_version_from_meta_filename(&filename) else {
+            continue;
+        };
+
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+
+        valid_versions.insert(ver.to_string());
+
+        match best_meta.get(ver) {
+            None => {
+                best_meta.insert(ver.to_string(), (modified, entry.path().to_path_buf()));
+            }
+            Some((cur_m, _)) => {
+                if modified > *cur_m {
+                    best_meta.insert(ver.to_string(), (modified, entry.path().to_path_buf()));
+                }
+            }
+        }
+    }
+}
 
 async fn perform_quota_sync(uid: &str) -> Result<u64, AppError> {
     let path_manager = ObjectPathManager::new();
@@ -22,53 +135,52 @@ async fn perform_quota_sync(uid: &str) -> Result<u64, AppError> {
 
     let (total_usage, orphans_removed) =
         tokio::task::spawn_blocking(move || -> Result<(u64, i32), AppError> {
-            let mut valid_versions = HashSet::new();
-            let mut total_usage = 0u64;
-            let mut orphans_count = 0;
+            let mut best_meta: HashMap<String, (SystemTime, PathBuf)> = HashMap::new();
+            let mut valid_versions: HashSet<String> = HashSet::new();
 
-            let source_index_dir = user_index_dirs.iter().find(|d| d.exists());
+            let reachable_index_dirs: Vec<PathBuf> = user_index_dirs
+                .iter()
+                .cloned()
+                .filter(|d| d.exists())
+                .collect();
 
-            if let Some(user_dir) = source_index_dir {
-                if let Ok(fragments) = std::fs::read_dir(user_dir) {
-                    for frag_entry in fragments.filter_map(|e| e.ok()) {
-                        if !frag_entry.path().is_dir() {
-                            continue;
-                        }
-
-                        let index_dir = frag_entry.path().join("index");
-                        if index_dir.exists() {
-                            for entry in WalkDir::new(&index_dir).into_iter().filter_map(|e| e.ok())
-                            {
-                                if entry.file_type().is_file() {
-                                    let filename = entry.file_name().to_string_lossy();
-                                    if let Some((_, ver_ext)) = filename.split_once('#') {
-                                        if let Some(ver) = ver_ext.strip_suffix(".bson") {
-                                            valid_versions.insert(ver.to_string());
-
-                                            if let Ok(data) = std::fs::read(entry.path()) {
-                                                if let Ok(meta) =
-                                                    mongodb::bson::from_slice::<ObjectMetadata>(
-                                                        &data,
-                                                    )
-                                                {
-                                                    if !meta.is_delete_marker {
-                                                        total_usage += meta.total_size_bytes;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
+            if reachable_index_dirs.is_empty() {
                 return Err(AppError::NotFound);
             }
 
-            let mut cleanup_roots = Vec::new();
-            cleanup_roots.extend(user_index_dirs);
+            for user_dir in &reachable_index_dirs {
+                if let Ok(fragments) = std::fs::read_dir(user_dir) {
+                    for frag_entry in fragments.filter_map(|e| e.ok()) {
+                        let frag_path = frag_entry.path();
+                        if !frag_path.is_dir() {
+                            continue;
+                        }
+
+                        let active_index = frag_path.join("index");
+                        scan_index_dir(&active_index, &mut best_meta, &mut valid_versions);
+
+                        let trash_index = frag_path.join(TRASH_DIR).join("index");
+                        scan_index_dir(&trash_index, &mut best_meta, &mut valid_versions);
+                    }
+                }
+            }
+
+            let mut total_usage = 0u64;
+
+            for (_ver, (_mtime, path)) in best_meta {
+                if let Ok(data) = std::fs::read(&path) {
+                    if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
+                        if !meta.is_delete_marker {
+                            total_usage = total_usage.saturating_add(meta.total_size_bytes);
+                        }
+                    }
+                }
+            }
+
+            let mut orphans_count = 0;
+
+            let mut cleanup_roots: Vec<PathBuf> = Vec::new();
+            cleanup_roots.extend(reachable_index_dirs.into_iter());
 
             for root in blob_roots {
                 cleanup_roots.push(root.join(OBJECT_DATA_ROOT).join(&uid_owned));
@@ -81,29 +193,36 @@ async fn perform_quota_sync(uid: &str) -> Result<u64, AppError> {
 
                 if let Ok(fragments) = std::fs::read_dir(&user_root) {
                     for frag_entry in fragments.filter_map(|e| e.ok()) {
+                        if !frag_entry.path().is_dir() {
+                            continue;
+                        }
+
                         let blobs_dir = frag_entry.path().join("blobs");
+                        if !blobs_dir.exists() {
+                            continue;
+                        }
 
-                        if blobs_dir.exists() {
-                            if let Ok(blob_entries) = std::fs::read_dir(&blobs_dir) {
-                                for blob_entry in blob_entries.filter_map(|e| e.ok()) {
-                                    let path = blob_entry.path();
-                                    if !path.is_dir() {
-                                        continue;
-                                    }
+                        if let Ok(blob_entries) = std::fs::read_dir(&blobs_dir) {
+                            for blob_entry in blob_entries.filter_map(|e| e.ok()) {
+                                let path = blob_entry.path();
+                                if !path.is_dir() {
+                                    continue;
+                                }
 
-                                    let version_id =
-                                        blob_entry.file_name().to_string_lossy().to_string();
+                                let version_id =
+                                    blob_entry.file_name().to_string_lossy().to_string();
 
-                                    if !valid_versions.contains(&version_id) {
-                                        if let Err(e) = std::fs::remove_dir_all(&path) {
-                                            error!(
-                                                "Sync: Failed to remove orphaned blob {:?}: {}",
-                                                path, e
-                                            );
-                                        } else {
-                                            orphans_count += 1;
-                                        }
-                                    }
+                                if valid_versions.contains(&version_id) {
+                                    continue;
+                                }
+
+                                let receipt = path.join("reservation.bson");
+                                if !receipt.exists() {
+                                    continue;
+                                }
+
+                                if remove_dir_strict(&path) {
+                                    orphans_count += 1;
                                 }
                             }
                         }

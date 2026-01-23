@@ -22,3 +22,4 @@ pub mod sync;
 pub mod upload;
 pub mod directory_index;
 pub mod system;
+pub mod directory_index_rebuilder;

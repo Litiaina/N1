@@ -95,14 +95,26 @@ pub async fn stream_object_logic(
         .unwrap_or("download")
         .to_string();
 
+    let parts: Vec<std::sync::Arc<PartMetadata>> =
+        parts.into_iter().map(std::sync::Arc::new).collect();
+
+    let disk_shard_dirs: Vec<PathBuf> = blob_roots
+        .iter()
+        .map(|disk_root| {
+            disk_root
+                .join(crate::object_storage::constants::OBJECT_DATA_ROOT)
+                .join(&owner_uid)
+                .join(&fragment)
+                .join("blobs")
+                .join(&version_id)
+        })
+        .collect();
+
     struct StreamState {
         pos: u64,
         end: u64,
-        parts: Vec<PartMetadata>,
-        blob_roots: Vec<PathBuf>,
-        owner_uid: String,
-        fragment: String,
-        version_id: String,
+        parts: Vec<std::sync::Arc<PartMetadata>>,
+        disk_shard_dirs: Vec<PathBuf>,
         file_cache: HashMap<String, File>,
         current_part_idx: usize,
         current_part_offset: u64,
@@ -133,10 +145,7 @@ pub async fn stream_object_logic(
         pos: start,
         end,
         parts,
-        blob_roots,
-        owner_uid,
-        fragment,
-        version_id: version_id.clone(),
+        disk_shard_dirs,
         file_cache: HashMap::new(),
         current_part_idx: start_part_index,
         current_part_offset: start_part_offset,
@@ -159,7 +168,7 @@ pub async fn stream_object_logic(
                 continue;
             }
 
-            let dcount = data_shards_count(part);
+            let dcount = data_shards_count(part.as_ref());
             if dcount == 0 {
                 return Some((
                     Err(AppError::InternalServerError("No data shards".into())),
@@ -175,11 +184,11 @@ pub async fn stream_object_logic(
             let stripe_index = relative_pos / stripe_size;
             let offset_in_stripe = relative_pos % stripe_size;
 
-            let shard_index = (offset_in_stripe / stripe_block_size) as usize;
+            let shard_ordinal = (offset_in_stripe / stripe_block_size) as usize;
             let offset_in_shard_block = offset_in_stripe % stripe_block_size;
             let file_offset = (stripe_index * stripe_block_size) + offset_in_shard_block;
 
-            let _target_shard = match nth_data_shard(part, shard_index) {
+            let target_shard = match nth_data_shard(part.as_ref(), shard_ordinal) {
                 Some(s) => s,
                 None => {
                     return Some((
@@ -190,6 +199,8 @@ pub async fn stream_object_logic(
                     ));
                 }
             };
+
+            let shard_index = target_shard.shard_index;
 
             let bytes_remaining_in_block = stripe_block_size - offset_in_shard_block;
             let bytes_remaining_in_req = state.end - state.pos + 1;
@@ -203,21 +214,14 @@ pub async fn stream_object_logic(
                 return None;
             }
 
-            let num_disks = state.blob_roots.len();
+            let num_disks = state.disk_shard_dirs.len();
             let disk_idx = (part.part_index as usize + shard_index) % num_disks;
-            let target_disk = &state.blob_roots[disk_idx];
-
-            let shard_dir = ObjectPathManager::new().get_shard_dir_on_disk(
-                target_disk,
-                &state.owner_uid,
-                &state.fragment,
-                &state.version_id,
-            );
+            let shard_dir = &state.disk_shard_dirs[disk_idx];
 
             let data_result = read_or_recover_chunk(
                 &mut state.file_cache,
-                &shard_dir,
-                std::sync::Arc::new(part.clone()),
+                shard_dir,
+                part.clone(),
                 shard_index,
                 file_offset,
                 to_read,

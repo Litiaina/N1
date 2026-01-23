@@ -10,19 +10,84 @@ use crate::structs::object_storage_structs::{
     ObjectMetadata, ObjectPathManager, RenameObjectRequest,
 };
 use crate::websocket::ws_structs::StorageEventPayload;
+
 use axum::extract::State;
 use axum::{Json as AxumJson, http::StatusCode, response::IntoResponse};
+
 use futures_util::future::join_all;
 use sha2::{Digest, Sha256};
 use tokio::fs;
 use tracing::{error, info, warn};
 
+const TRASH_DIR: &str = ".trash";
+
+fn normalize_key(key: &str) -> String {
+    key.trim_start_matches('/').to_string()
+}
+
+fn is_trash_root(key: &str) -> bool {
+    let k = key.trim_start_matches('/').trim_end_matches('/');
+    k == TRASH_DIR
+}
+
+fn is_trash_key(key: &str) -> bool {
+    let k = key.trim_start_matches('/');
+    if k == TRASH_DIR {
+        return true;
+    }
+    if !k.starts_with(TRASH_DIR) {
+        return false;
+    }
+    k.as_bytes().get(TRASH_DIR.len()) == Some(&b'/')
+}
+
+fn validate_rename_keys(
+    source_key: &str,
+    destination_key: &str,
+    allow_trash: bool,
+) -> Result<(), AppError> {
+    if allow_trash {
+        if is_trash_root(source_key) || is_trash_root(destination_key) {
+            return Err(AppError::BadRequest(
+                "Invalid trash key. Use '.trash/<path>' (not '.trash').".into(),
+            ));
+        }
+        Ok(())
+    } else {
+        if is_trash_key(source_key) || is_trash_key(destination_key) {
+            return Err(AppError::BadRequest(
+                "'.trash' is reserved and cannot be used directly.".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub async fn rename_object(
     State(state): State<Arc<AppState>>,
     claims: Claims,
-    AxumJson(payload): AxumJson<RenameObjectRequest>,
+    AxumJson(mut payload): AxumJson<RenameObjectRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = claims.uid;
+    payload.source_key = normalize_key(&payload.source_key);
+    payload.destination_key = normalize_key(&payload.destination_key);
+
+    validate_rename_keys(&payload.source_key, &payload.destination_key, false)?;
+
+    rename_object_core(state, claims.uid, payload, false).await?;
+    Ok(StatusCode::OK)
+}
+
+pub async fn rename_object_core(
+    state: Arc<AppState>,
+    uid: String,
+    mut payload: RenameObjectRequest,
+    allow_trash: bool,
+) -> Result<(), AppError> {
+    payload.source_key = normalize_key(&payload.source_key);
+    payload.destination_key = normalize_key(&payload.destination_key);
+
+    validate_rename_keys(&payload.source_key, &payload.destination_key, allow_trash)?;
+
     let path_manager = ObjectPathManager::new();
 
     let mut hasher = Sha256::new();
@@ -66,6 +131,7 @@ pub async fn rename_object(
                 let mut entries = fs::read_dir(&dst_shard)
                     .await
                     .map_err(|e| AppError::Io(e, "read dest shard".into()))?;
+
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     if entry.file_name().to_string_lossy().starts_with(&prefix) {
                         return Err(AppError::Conflict(
@@ -81,6 +147,7 @@ pub async fn rename_object(
             })?;
 
             let src_prefix = format!("{}#", src_hash);
+
             let mut entries = fs::read_dir(&src_shard)
                 .await
                 .map_err(|e| AppError::Io(e, "read src shard".into()))?;
@@ -89,32 +156,56 @@ pub async fn rename_object(
 
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(&src_prefix) && name.ends_with(".bson") {
-                    if let Some((_, version_ext)) = name.split_once('#') {
-                        if let Some(version_id) = version_ext.strip_suffix(".bson") {
-                            let new_filename = format!("{}#{}.bson", dst_hash, version_id);
-                            let dest_path = dst_shard.join(&new_filename);
-
-                            if let Ok(data) = fs::read(entry.path()).await {
-                                if let Ok(mut meta) =
-                                    mongodb::bson::from_slice::<ObjectMetadata>(&data)
-                                {
-                                    meta.object_key = payload.destination_key.clone();
-                                    meta.fragment = payload.destination_fragment.clone();
-
-                                    if let Ok(bytes) = mongodb::bson::to_vec(&meta) {
-                                        if let Err(e) = fs::write(&dest_path, bytes).await {
-                                            error!("Failed to write new meta during rename: {}", e);
-                                            continue;
-                                        }
-                                        let _ = fs::remove_file(entry.path()).await;
-                                        moved_versions.push(version_id.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
+                if !name.starts_with(&src_prefix) || !name.ends_with(".bson") {
+                    continue;
                 }
+
+                let (_, version_ext) = match name.split_once('#') {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let version_id = match version_ext.strip_suffix(".bson") {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                let new_filename = format!("{}#{}.bson", dst_hash, version_id);
+                let dest_path = dst_shard.join(&new_filename);
+
+                let data = match fs::read(entry.path()).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("Failed to read src meta during rename: {}", e);
+                        continue;
+                    }
+                };
+
+                let mut meta = match mongodb::bson::from_slice::<ObjectMetadata>(&data) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("Corrupt meta during rename (skipping): {}", e);
+                        continue;
+                    }
+                };
+
+                meta.object_key = payload.destination_key.clone();
+                meta.fragment = payload.destination_fragment.clone();
+
+                let bytes = match mongodb::bson::to_vec(&meta) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!("Failed to serialize rewritten meta: {}", e);
+                        continue;
+                    }
+                };
+
+                if let Err(e) = fs::write(&dest_path, bytes).await {
+                    warn!("Failed to write dest meta during rename: {}", e);
+                    continue;
+                }
+
+                let _ = fs::remove_file(entry.path()).await;
+                moved_versions.push(version_id.to_string());
             }
 
             Ok(moved_versions)
@@ -214,5 +305,5 @@ pub async fn rename_object(
         },
     );
 
-    Ok(StatusCode::OK)
+    Ok(())
 }

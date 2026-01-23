@@ -1,8 +1,8 @@
 use crate::database::database_constants::DATABASE;
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::{PARITY_SUFFIX, PART_META_SUFFIX, SHARD_SUFFIX};
-use crate::object_storage::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::object_storage::directory_index::DirectoryIndexManager;
+use crate::object_storage::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::object_storage::quota_manager::{init_quota_file, try_reserve_quota, update_quota};
 use crate::object_storage::storage_capacity_parser::calculate_storage_usage;
 use crate::routes::storage_routes::AppState;
@@ -236,6 +236,11 @@ pub async fn initiate_object_upload(
     AxumJson(params): AxumJson<InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
     let uid = claims.uid;
+
+    let object_key = object_key.trim_start_matches('/').to_string();
+    if object_key == ".trash" || object_key.starts_with(".trash/") {
+        return Err(AppError::BadRequest("'.trash' is reserved".into()));
+    }
 
     if params.expected_parts == 0 {
         return Err(AppError::BadRequest("expected_parts must be >= 1".into()));
@@ -629,8 +634,12 @@ pub async fn finalize_object_upload(
     Query(key_query): Query<ObjectKeyQuery>,
     AxumJson(params): AxumJson<InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    let object_key = key_query.object_key;
+    let object_key = key_query.object_key.trim_start_matches('/').to_string();
     let uid = claims.uid;
+
+    if object_key == ".trash" || object_key.starts_with(".trash/") {
+        return Err(AppError::BadRequest("'.trash' is reserved".into()));
+    }
 
     if params.expected_parts == 0 {
         return Err(AppError::BadRequest("expected_parts must be >= 1".into()));
@@ -638,11 +647,22 @@ pub async fn finalize_object_upload(
 
     let path_manager = ObjectPathManager::new();
 
-    let index_paths =
-        path_manager.get_all_metadata_paths(&uid, &fragment, &object_key, &version_id);
+    let index_paths = path_manager.get_all_metadata_paths(&uid, &fragment, &object_key, &version_id);
+
     for p in &index_paths {
         if tokio_fs::try_exists(p).await.unwrap_or(false) {
-            return Ok((StatusCode::OK, "Upload finalized.").into_response());
+            if let Ok(data) = tokio_fs::read(p).await {
+                if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
+                    if meta.owner_uid == uid
+                        && meta.fragment == fragment
+                        && meta.object_key == object_key
+                        && meta.version_id == version_id
+                        && !meta.is_delete_marker
+                    {
+                        return Ok((StatusCode::OK, "Upload finalized.").into_response());
+                    }
+                }
+            }
         }
     }
 
@@ -674,9 +694,7 @@ pub async fn finalize_object_upload(
     }
 
     if all_part_paths.is_empty() {
-        return Err(AppError::BadRequest(
-            "No parts found to finalize.".to_string(),
-        ));
+        return Err(AppError::BadRequest("No parts found to finalize.".to_string()));
     }
 
     let blob_roots = path_manager.get_blob_roots();
@@ -684,13 +702,8 @@ pub async fn finalize_object_upload(
     let mut found_data_roots = 0;
 
     for root in &blob_roots {
-        let shard_dir_check =
-            path_manager.get_shard_dir_on_disk(root, &uid, &fragment, &version_id);
-
-        if tokio_fs::try_exists(&shard_dir_check)
-            .await
-            .unwrap_or(false)
-        {
+        let shard_dir_check = path_manager.get_shard_dir_on_disk(root, &uid, &fragment, &version_id);
+        if tokio_fs::try_exists(&shard_dir_check).await.unwrap_or(false) {
             found_data_roots += 1;
         }
     }
@@ -765,11 +778,11 @@ pub async fn finalize_object_upload(
         .unwrap_or_else(default_stripe_size);
 
     let object_meta = ObjectMetadata {
-        object_key,
-        fragment,
-        version_id,
-        upload_session_id: session_id,
-        owner_uid: uid,
+        object_key: object_key.clone(),
+        fragment: fragment.clone(),
+        version_id: version_id.clone(),
+        upload_session_id: session_id.clone(),
+        owner_uid: uid.clone(),
         content_type: params
             .content_type
             .unwrap_or_else(|| "application/octet-stream".to_string()),
@@ -780,9 +793,9 @@ pub async fn finalize_object_upload(
         stripe_size_bytes: stripe_size,
     };
 
-    let bson_data = mongodb::bson::to_vec(&object_meta).map_err(|e| {
+    let bson_data = Arc::new(mongodb::bson::to_vec(&object_meta).map_err(|e| {
         AppError::InternalServerError(format!("Failed to serialize object metadata: {}", e))
-    })?;
+    })?);
 
     let index_paths = path_manager.get_all_metadata_paths(
         &object_meta.owner_uid,
@@ -792,34 +805,52 @@ pub async fn finalize_object_upload(
     );
 
     let write_futures = index_paths.into_iter().map(|index_path| {
-        let bson_data = &bson_data;
+        let bson_data = bson_data.clone();
         async move {
             if let Some(parent) = index_path.parent() {
                 if !tokio_fs::try_exists(parent).await.unwrap_or(false) {
-                    let _ = tokio_fs::create_dir_all(parent).await;
+                    if tokio_fs::create_dir_all(parent).await.is_err() {
+                        return false;
+                    }
                 }
             }
 
-            match tokio_fs::File::create(&index_path).await {
-                Ok(mut final_meta_file) => {
-                    if let Err(e) = final_meta_file.write_all(bson_data).await {
-                        warn!("Failed to write metadata {:?}: {}", index_path, e);
-                    }
-                    let _ = final_meta_file.sync_all().await;
-                }
-                Err(e) => {
-                    warn!("Failed to create metadata file {:?}: {}", index_path, e);
-                }
+            let tmp = index_path.with_extension("tmp");
+
+            let mut f = match tokio_fs::File::create(&tmp).await {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+
+            if f.write_all(&bson_data).await.is_err() {
+                let _ = tokio_fs::remove_file(&tmp).await;
+                return false;
+            }
+
+            let _ = f.sync_all().await;
+            drop(f);
+
+            if tokio_fs::rename(&tmp, &index_path).await.is_err() {
+                let _ = tokio_fs::remove_file(&tmp).await;
+                return false;
             }
 
             if let Some(parent) = index_path.parent() {
                 let _ = sync_dir(parent).await;
             }
-            Ok::<(), AppError>(())
+
+            true
         }
     });
 
-    join_all(write_futures).await;
+    let results = join_all(write_futures).await;
+    let success_count = results.into_iter().filter(|v| *v).count();
+
+    if success_count == 0 {
+        return Err(AppError::InternalServerError(
+            "No index mirror available to commit metadata".into(),
+        ));
+    }
 
     let cleanup_futures = meta_dirs.iter().map(|dir| async move {
         if !tokio_fs::try_exists(dir).await.unwrap_or(false) {

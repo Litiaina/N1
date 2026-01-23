@@ -2,6 +2,7 @@ use crate::enums::app_error_enum::AppError;
 use crate::structs::object_storage_structs::ObjectPathManager;
 use futures_util::future::join_all;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -83,9 +84,7 @@ impl DirectoryIndexManager {
             let h = hash_arc.clone();
             async move {
                 if let Some(parent) = path.parent() {
-                    if !fs::try_exists(parent).await.unwrap_or(false) {
-                        let _ = fs::create_dir_all(parent).await;
-                    }
+                    let _ = fs::create_dir_all(parent).await;
                 }
 
                 let _ = fs::write(&path, h.as_bytes()).await;
@@ -140,70 +139,95 @@ impl DirectoryIndexManager {
         fragment: &str,
         prefix: &str,
     ) -> Result<Vec<String>, AppError> {
-        let mut hashes = Vec::new();
-
+        let mut out: HashSet<String> = HashSet::new();
         let candidate_paths = self.get_all_structure_paths(uid, fragment, prefix);
 
         for target_path in candidate_paths {
             if let Ok(metadata) = fs::metadata(&target_path).await {
                 if metadata.is_dir() {
-                    self.scan_recursive(&target_path, &mut hashes).await?;
-                } else {
-                    if let Ok(hash) = fs::read_to_string(&target_path).await {
-                        hashes.push(hash.trim().to_string());
+                    self.scan_recursive(&target_path, &mut out).await?;
+                } else if let Ok(hash) = fs::read_to_string(&target_path).await {
+                    let h = hash.trim();
+                    if !h.is_empty() {
+                        out.insert(h.to_string());
                     }
                 }
-                return Ok(hashes);
+                continue;
             }
 
-            if let Some(parent) = target_path.parent() {
-                if fs::try_exists(parent).await.unwrap_or(false) {
-                    let prefix_name = target_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("");
+            let parent = match target_path.parent() {
+                Some(p) => p,
+                None => continue,
+            };
 
-                    if !prefix_name.is_empty() {
-                        if let Ok(mut entries) = fs::read_dir(parent).await {
-                            while let Ok(Some(entry)) = entries.next_entry().await {
-                                let name = entry.file_name().to_string_lossy().to_string();
-                                if name.starts_with(prefix_name) {
-                                    let path = entry.path();
-                                    if path.is_dir() {
-                                        self.scan_recursive(&path, &mut hashes).await?;
-                                    } else {
-                                        if let Ok(hash) = fs::read_to_string(&path).await {
-                                            hashes.push(hash.trim().to_string());
-                                        }
-                                    }
-                                }
-                            }
-                            return Ok(hashes);
+            if !fs::try_exists(parent).await.unwrap_or(false) {
+                continue;
+            }
+
+            let prefix_name = target_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+
+            if prefix_name.is_empty() {
+                continue;
+            }
+
+            let mut entries = match fs::read_dir(parent).await {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.starts_with(prefix_name) {
+                    continue;
+                }
+
+                let path = entry.path();
+                if let Ok(m) = fs::metadata(&path).await {
+                    if m.is_dir() {
+                        self.scan_recursive(&path, &mut out).await?;
+                    } else if let Ok(hash) = fs::read_to_string(&path).await {
+                        let h = hash.trim();
+                        if !h.is_empty() {
+                            out.insert(h.to_string());
                         }
                     }
                 }
             }
         }
 
+        let mut hashes: Vec<String> = out.into_iter().collect();
+        hashes.sort();
         Ok(hashes)
     }
 
     #[async_recursion::async_recursion]
-    async fn scan_recursive(&self, dir: &Path, hashes: &mut Vec<String>) -> Result<(), AppError> {
+    async fn scan_recursive(
+        &self,
+        dir: &Path,
+        hashes: &mut HashSet<String>,
+    ) -> Result<(), AppError> {
         let mut entries = fs::read_dir(dir)
             .await
             .map_err(|e| AppError::Io(e, "read structure".into()))?;
 
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            if path.is_dir() {
-                self.scan_recursive(&path, hashes).await?;
-            } else {
-                if let Ok(hash) = fs::read_to_string(&path).await {
-                    hashes.push(hash.trim().to_string());
+
+            if let Ok(m) = fs::metadata(&path).await {
+                if m.is_dir() {
+                    self.scan_recursive(&path, hashes).await?;
+                } else if let Ok(hash) = fs::read_to_string(&path).await {
+                    let h = hash.trim();
+                    if !h.is_empty() {
+                        hashes.insert(h.to_string());
+                    }
                 }
             }
         }
+
         Ok(())
     }
 }
