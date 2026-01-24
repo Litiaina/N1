@@ -19,7 +19,7 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
     conf.with_section(Some("garbage_collector"))
         .set("cleanup_interval_seconds", "3600")
         .set("file_ttl_seconds", "3600")
-        .set("retention_days", "30");
+        .set("retention_seconds", "2592000");
 
     conf.with_section(Some("set_limits"))
         .set("max_file_size", "5368709120");
