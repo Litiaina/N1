@@ -5,231 +5,492 @@
     width="150"
     height="150"
   />
-  <h1>Litiaina N1 - Standalone</h1>
+  <h1>Litiaina N1</h1>
   <p>
-    A single-node, object storage engine optimized for lockless streaming,
-    predictable latency, and durability.
+    Fragment-centric, filesystem-native object storage engine built for lockless streaming,
+    predictable latency, strict crash safety, and survivable single-node durability.
   </p>
 </div>
 
 ---
 
-## What is N1?
+## Table of Contents
 
-**Litiaina N1** is a *single machine* object storage engine that treats the local filesystem as the truth source and
-pushes the box to its physical limits (disk bandwidth, IOPS, and network throughput) **without turning your storage into an opaque black box**.
-
-N1 is built for environments where:
-- you want **NVMe/JBOD speed** without cluster coordination tax
-- you want **video-grade streaming** and range reads with minimal CPU
-- you want **crash safety** and recoverability even on unstable hardware / networks
-- you want storage that stays **understandable on disk** (inspectable, recoverable, movable)
+- [What is N1 (current architecture)](#what-is-n1-current-architecture)
+- [Design principles](#design-principles)
+- [Core concepts](#core-concepts)
+- [Architecture (Index vs Blob)](#architecture-index-vs-blob)
+- [On-disk layout](#on-disk-layout)
+  - [Index (metadata mirrors)](#index-metadata-mirrors)
+  - [Upload sessions](#upload-sessions)
+  - [Blob (data/parity shards)](#blob-dataparity-shards)
+- [Write path (multipart upload)](#write-path-multipart-upload)
+  - [Initiate upload](#1-initiate-upload)
+  - [Upload part (strict commit discipline)](#2-upload-part-strict-commit-discipline)
+  - [Finalize upload (publish a version)](#3-finalize-upload-publish-a-version)
+  - [Crash matrix (what can exist on disk)](#crash-matrix-what-can-exist-on-disk)
+- [Read path (stream + range reads)](#read-path-stream--range-reads)
+- [Durability model](#durability-model)
+  - [Write quorum](#write-quorum)
+  - [Immutability and visibility](#immutability-and-visibility)
+- [Maintenance jobs](#maintenance-jobs)
+  - [Repair (index + blob)](#repair-index--blob)
+  - [Recovery runtime (background heal)](#recovery-runtime-background-heal)
+  - [Redistribution](#redistribution)
+  - [Garbage collection and trash](#garbage-collection-and-trash)
+- [Operational notes](#operational-notes)
+  - [Linux-first + O_DIRECT](#linux-first--o_direct)
+  - [Preallocation](#preallocation)
+  - [Directory sync](#directory-sync)
+- [Invariants (must always be true)](#invariants-must-always-be-true)
+- [Glossary](#glossary)
 
 ---
 
-## N1 philosophy
+## What is N1 (current architecture)
 
-### 1) Filesystem-native, not “virtualized storage”
-N1 stores data as *real files and directories*. No proprietary block formats. No hidden databases on the hot path.
-If the software disappears, your disks are still mountable and your data is still physically present in a sane layout.
+**Litiaina N1** is a **single-machine, multi-disk** object storage engine that treats the filesystem as the database and
+keeps the on-disk layout as the ultimate source of truth.
 
-### 2) Immutability as a correctness primitive
-A finalized object version is **immutable**:
-- no in-place rewrite of committed shard files
-- updates create a new `version_id`
-- delete is represented as a **delete marker**
-- rename is **metadata-only**
+N1 is designed for environments where you want:
 
-Immutability is what makes N1 safe under power loss and partial failure: the engine never tries to “patch” committed data.
+- **NVMe / JBOD speed** without cluster coordination tax
+- **video-grade streaming** (long sequential reads + range reads) with bounded memory
+- **crash safety** (power-loss safe) and recoverability even on unstable disks/networks
+- storage that remains **inspectable and movable on disk** (no opaque black-box volumes)
 
-### 3) Lockless data path
-N1’s identity is **lockless streaming**. Hot-path operations do not rely on global mutexes for correctness.
-Concurrency is achieved by deterministic layout + atomic commit patterns, not by central locks.
+### Fragment-centric engine (no multitenant UID layout)
 
-(You may still see narrow synchronization in non-hot-path bookkeeping, but the design target is: no locks in the data path.)
+N1 is **not** “user multi-tenant storage” anymore. The isolation boundary is a **Fragment**:
+
+- **Fragment = virtual disk / namespace / tenant boundary**
+- **Quota is per Fragment**
+- **Auth scopes to Fragment**
+- **Maintenance jobs operate per Fragment**
+- N1 is the **CORE** engine: deterministic disk layout + strict commit discipline + repairability
+
+---
+
+## Design principles
+
+### 1) Filesystem-native, not virtualized storage
+
+N1 stores data as normal files and directories. There is no mandatory database on the hot path.
+Metadata is replicated across configured index disks, but still lives as immutable files.
+
+**Result:** if the service disappears, disks remain mountable and the layout remains readable.
+
+### 2) Immutability as correctness
+
+A finalized object version is immutable:
+
+- shards are never edited in-place after commit
+- new writes create a new `version_id`
+- delete is represented safely (marker + trash semantics)
+- rename is metadata-only
+
+**Result:** crash safety becomes a discipline problem (atomic publish), not a “distributed lock” problem.
+
+### 3) Lockless streaming data path
+
+Hot-path I/O relies on:
+
+- deterministic placement rules
+- bounded concurrency (semaphores)
+- atomic rename + directory sync for commits
+
+Correctness does not depend on a global mutex.
 
 ### 4) Crash-first engineering
+
 N1 assumes failures are normal:
-- the server can be stopped mid-upload
-- disks can disappear mid-stream
-- metadata mirrors can desync
-- bytes can corrupt (bitrot / manual edits)
 
-Durability is achieved by commit discipline (atomic rename + directory sync) and by recoverability tools.
+- server stops mid-upload
+- disks disappear mid-stream
+- replicas diverge
+- bitrot happens
 
-### 5) “Readable under chaos” operations
-Maintenance jobs (repair / redistribution / GC) are designed to:
-- be resumable
-- not interrupt streaming downloads
-- not interrupt uploads
-- avoid destructive deletes in the hot path
+N1 stays correct by making partial work non-visible, and recoverable via maintenance tools.
 
 ---
 
-## Architecture overview
+## Core concepts
 
-N1 splits the world into **Index** and **Blob** storage domains.
+### Fragment
+A Fragment is the unit of isolation and operational scope:
 
-### Index vs Blob roots
-- **Index roots** hold metadata files (small, replicated across configured index disks)
-- **Blob roots** hold shard data (large, striped across configured blob disks)
+- “virtual disk” boundary
+- quota boundary
+- auth boundary
+- directory root on disk
 
-The engine can be configured with separate devices for index and blob, or shared devices depending on deployment.
+### Object
+An object is identified by:
 
-### On-disk layout (N1)
+- `fragment`
+- `object_key` (path/name inside the fragment)
 
-#### Index (metadata) layout
-Metadata is stored as BSON files, sharded by hash of `object_key`:
+### Version
+A version is immutable and identified by `version_id`.
+
+Uploads produce a new version, and finalization publishes it.
+
+### Part
+N1 uses multipart uploads: each part has:
+
+- `part_index`
+- `size_bytes`
+- `created_at`
+- checksums
+- `shards[]` (data + parity)
+
+### Shard
+Each part is encoded into:
+
+- `data_shards` originals
+- `parity_shards` recoveries
+
+Each shard is a **real file** on disk, with size and checksum recorded.
+
+---
+
+## Architecture (Index vs Blob)
+
+N1 separates the world into two storage domains:
+
+### Index store (metadata mirrors)
+- immutable metadata files (MessagePack via `rmp-serde`)
+- replicated across configured index roots (mirrors)
+- repaired by reconciling replicas (missing/divergent/corrupt)
+
+### Blob store (data/parity shards)
+- large shard files, striped across configured blob roots
+- placement is deterministic (no database required)
+- read path can degrade and reconstruct missing data using RS decode
+- background repair can regenerate missing/corrupt shards
+
+---
+
+## On-disk layout
+
+> Exact constants and suffixes come from your code:
+> - `METADATA_EXT` (final object metadata file extension)
+> - `PART_META_SUFFIX` (per-part metadata extension)
+> - `SHARD_SUFFIX` and `PARITY_SUFFIX` for shard file types
+> - `SESSION_MANIFEST_FILE`, `RESERVATION_FILE` in the session dir
+
+Your **ObjectPathManager** defines the precise directories, but the *shape* is:
+
+### Index (metadata mirrors)
+
+Finalized object metadata is stored as replicated files under the fragment index:
 
 ```
-{INDEX_ROOT}/{storage}/{uid}/{fragment}/index/{h1}/{h2}/{hash}#{version_id}.bson
+{INDEX_ROOT}/{fragment}/index/objects/{h1}/{h2}/{hash}#{version_id}{METADATA_EXT}
 ```
 
-Where:
 - `hash = sha256(object_key)`
 - `h1 = hash[0..2]`, `h2 = hash[2..4]`
-- the `#{version_id}` suffix enables versioning without rewriting old metadata
+- multiple `{INDEX_ROOT}` contain independent replicas
 
-A delete operation creates a **delete marker** metadata record (a zero-size version with `is_delete_marker=true`).
+### Upload sessions
 
-#### Blob (data) layout
-Each committed version has its own blob directory on each blob disk:
+Uploads create a session directory for resumability:
 
 ```
-{BLOB_ROOT}/{storage}/{uid}/{fragment}/blobs/{version_id}/
+{INDEX_ROOT}/{fragment}/index/sessions/{version_id}/
+  {SESSION_MANIFEST_FILE}
+  {RESERVATION_FILE}
+  part_{p}{PART_META_SUFFIX}
 ```
 
-Inside, each part’s shards live as normal files (data + parity). The exact filenames are recorded in metadata.
+Per-part metadata (`PartMetadata`) is committed locklessly to one healthy index mirror
+(and read across mirrors for resumability/verification).
 
-> This is why N1 remains filesystem-friendly: the “truth” is always the shard files + immutable metadata.
+### Blob (data/parity shards)
 
----
+A version’s shard files live under the fragment’s blob directory:
 
-## Core data model
+```
+{BLOB_ROOT}/{fragment}/blobs/{version_id}/
+  part_{p}_shard_{i}{SHARD_SUFFIX}
+  part_{p}_shard_{i}{PARITY_SUFFIX}
+```
 
-- **Object**: `(fragment, object_key)`
-- **Version**: immutable `version_id` produced on finalize
-- **Parts**: multipart uploads (each part has size, created_at, shards[])
-- **Shards**: per-part data/parity files with checksums and absolute paths recorded in metadata
-- **Stripe block size**: per-object `stripe_size_bytes` controls erasure stripe geometry
+**Deterministic placement rule (typical):**
 
----
-
-## Write path (upload)
-
-N1 is fully streaming: it does not need to buffer whole objects in RAM.
-
-1) **Initiate upload**
-- validates quota (reserve/charge)
-- creates a new `version_id` + upload session id
-
-2) **Stream write**
-- the incoming stream is encoded into data/parity shards (Reed–Solomon)
-- shards are written across blob disks
-- on Linux, writes can use **O_DIRECT** (aligned) to reduce page-cache pressure and improve predictability
-
-3) **Commit discipline (durability)**
-Finalization is a strict, crash-safe sequence:
-- shard files are committed via **rename + fsync(dir)**
-- metadata is published via **rename + fsync(dir)**
-- only after metadata is durable does the version become “visible” to reads/lists
-
-4) **No partial visibility**
-If the process dies mid-upload or mid-finalize, the system never exposes a half-committed version as a successful object.
+- choose disk for each shard as: `(part_index + shard_index) % num_disks`
+- require at least `data_shards` successful writers for the part to be accepted
 
 ---
 
-## Read path (download / stream)
+## Write path (multipart upload)
 
-Reads are optimized for range access and continuous streaming.
+Uploads are strict and crash-safe. A part is not considered uploaded unless it passes verification and is committed into stable filenames.
 
-1) **Resolve latest metadata**
-- N1 finds the latest visible version (or returns NotFound if latest is a delete marker)
-- metadata is read from disk (no mandatory in-memory caching requirement)
+### 1) Initiate upload
 
-2) **Range mapping**
-- the requested byte range is mapped to `(part, stripe_index, shard_index, file_offset)`
-- N1 reads only the required shard chunks
+Initiate does:
 
-3) **Degraded reads + repair**
-If a shard chunk is missing or corrupt:
-- N1 reconstructs the requested bytes using remaining shards (RS decode)
-- in the background, N1 may schedule **repair_entire_shard** on a dedicated recovery runtime
-- repair writes are done as new files (e.g., `*.recovering`) then committed with rename
+- validate auth scopes to fragment
+- reserve quota for the fragment (session receipt)
+- create `version_id` and `session_id`
+- write session manifest to index mirrors (best-effort replication)
 
-This is what keeps streaming stable even when disks disappear: reads degrade gracefully and repair happens out-of-band.
+### 2) Upload part (strict commit discipline)
+
+This is the critical part.
+
+**Goal:** all final shard filenames are stable and referenced by metadata. Temp names never leak into `PartMetadata`.
+
+#### Step A — Write to temp attempt files
+
+For each shard (data + parity), the writer opens:
+
+```
+part_{p}_shard_{i}{ext}.tmp.<attempt>
+```
+
+- `<attempt>` is a ULID
+- `ext` is `SHARD_SUFFIX` for data shards and `PARITY_SUFFIX` for parity shards
+
+Temp files allow safe re-tries and ensure that incomplete work is never treated as committed data.
+
+#### Step B — Stream encode + write (Reed–Solomon)
+
+- N1 streams request bytes directly into an RS encoder
+- stripes are produced at `block_size` (a.k.a. `stripe_size_bytes`)
+- each stripe produces `data_shards` blocks and `parity_shards` blocks
+- blocks are written to each shard writer
+
+#### Step C — Finalize: length, padding, checksum
+
+At end of stream:
+
+- pad the last stripe with zeros so RS geometry is consistent
+- ensure all shard files reach the computed `final_shard_len`
+- optionally validate the overall checksum (`crc32`) against `UploadPartQuery.checksum`
+- compute per-shard checksums for repair verification
+
+#### Step D — Commit: rename temp → stable + dir sync
+
+After successful write/verify, each shard must be committed:
+
+```
+part_{p}_shard_{i}{ext}.tmp.<attempt>  -->  part_{p}_shard_{i}{ext}
+```
+
+Commit rules:
+
+1. rename is the atomic publish step
+2. **sync the parent directory** after renames (durable directory entry)
+3. stable filenames are now canonical (the only names that should be referenced by metadata)
+
+If rename fails on a disk, treat that shard as failed and fail the part if you fall below write quorum.
+
+#### Step E — Persist PartMetadata using stable filenames
+
+Only after commit succeeds do we write `PartMetadata`.
+
+**PartMetadata must store stable names:**
+- `ShardInfo.file_name` must be `part_{p}_shard_{i}{ext}` (no `.tmp.<attempt>`)
+- `ShardInfo.absolute_path` must point to the stable full path
+- `ShardInfo.checksum` is recorded for integrity checks during repair/recovery
+
+The commit pattern is:
+
+- commit stable shard files
+- then commit per-part metadata (`part_{p}{PART_META_SUFFIX}`)
+
+### 3) Finalize upload (publish a version)
+
+Finalization is a publish step:
+
+- verify all expected parts exist by reading `PartMetadata` across index mirrors
+- build `ObjectMetadata` with the full parts + shard maps
+- write final object metadata to index mirrors via atomic write + rename + dir sync
+
+Only after metadata is durable does the version become visible to reads/list.
+
+---
+
+## Crash matrix (what can exist on disk)
+
+This is the mental model N1 is built around.
+
+### Crash during part upload (before rename)
+You may see:
+
+- `*.tmp.<attempt>` shard files (partial or complete)
+
+**But you must not**:
+- reference these in `PartMetadata`
+- treat the part as uploaded
+
+Repair/GC can later clean these temp attempts.
+
+### Crash after rename but before PartMetadata
+You may see:
+
+- stable shard files exist
+- no `part_{p}{PART_META_SUFFIX}`
+
+Finalization will not include that part, because metadata doesn’t claim it.
+A re-upload can detect stable shards and either reuse (if supported) or overwrite via a new attempt.
+
+### Crash after PartMetadata but before final object metadata
+You may see:
+
+- stable shard files exist
+- part metadata exists
+- object metadata for the version does not exist
+
+This is safe and resumable: finalize can be retried until publish succeeds.
+
+### Crash after final object metadata
+The version is fully committed and immutable. Reads must succeed (possibly degraded) as long as quorum exists.
+
+---
+
+## Read path (stream + range reads)
+
+Reads are optimized for long sequential streaming and range access.
+
+1. resolve metadata (latest or requested version) from index mirrors
+2. map requested range → (part, stripe index, shard index, file offset)
+3. read shard chunks directly from disk
+4. if a shard is missing/corrupt:
+   - reconstruct bytes using Reed–Solomon decode
+   - optionally schedule background repair to regenerate the missing shard
+
+---
+
+## Durability model
+
+### Write quorum
+
+A part upload requires at minimum:
+
+- `data_shards` successful writers (healthy disks)
+
+If fewer than `data_shards` shards can be written and committed, the part upload fails.
+
+Parity improves survivability:
+
+- with `parity_shards > 0`, N1 can tolerate missing/corrupt shards up to `parity_shards` (for reads/repair)
+
+### Immutability and visibility
+
+A version becomes visible only after:
+
+- stable shard commit (rename + dir sync)
+- part metadata commit
+- final object metadata publish (atomic write + rename + dir sync)
+
+This prevents partial visibility.
 
 ---
 
 ## Maintenance jobs
 
-### Repair
-A repair scan verifies shard integrity and reconstructs missing/corrupt shards.
-Important properties:
-- IO-bound work is isolated (dedicated runtime / bounded concurrency)
-- repairs are committed via rename (no in-place patching)
+### Repair (index + blob)
 
-### Garbage collection
-N1 avoids immediate destructive deletes in critical workflows.
-A common safe pattern is:
-- rename old data to a `.gc` suffix
-- delete later in a background pass
+Repair is a filesystem reconciliation job:
 
-This keeps operations resilient under crashes and avoids “half-deleted” states.
+- **Index repair:** reconcile missing/divergent object metadata replicas across index roots
+- **Shard verification:** availability checks (size) or checksum scrub mode
+- **Shard repair:** reconstruct missing/corrupt shards from remaining shards (bounded concurrency)
+- **Commit discipline:** repair writes to temp then renames into place (no in-place mutation)
+
+### Recovery runtime (background heal)
+
+Reads can degrade gracefully. When a shard is missing/corrupt:
+
+- serve the requested bytes by reconstructing them
+- schedule a background `repair_entire_shard()` on a dedicated runtime
+- the repair writer creates a temp file, preallocates it, writes reconstructed stripes, then renames into place
+
+This keeps streaming fast while repairs happen out-of-band.
 
 ### Redistribution
-Redistribution moves data from one layout or placement to another **without interrupting CRUD**.
-Correct redistribution is:
-- resumable
-- uses stream read (recover if needed)
-- uses stream write (O_DIRECT-aligned)
-- commits via rename + directory sync
-- marks old shards as `.gc` (no immediate delete)
+
+Redistribution moves shards to new placement rules without interrupting CRUD:
+
+- read from existing layout (recover if needed)
+- write to new target layout as temp
+- commit via rename + dir sync
+- mark old shards for later GC
+
+### Garbage collection and trash
+
+N1 favors safety:
+
+- deletes are represented safely (trash markers / soft delete)
+- destructive deletion is handled by GC, not the hot path
+- temp attempts (`*.tmp.<attempt>`) are safe to GC because they are never canonical
 
 ---
 
-## Failure model
+## Operational notes
 
-N1 is built to survive:
-- **power loss / server stop mid-write**
-- **disk disappears mid-stream**
-- **metadata mirror desync / partial loss**
-- **bitrot / manual corruption**
-- **long soak** with bounded memory usage
+### Linux-first + O_DIRECT
 
-### RFTD — Reconstruction From The Disk
-A last-resort recovery philosophy: if the node is dead, disks can be mounted and reconstructed using the filesystem-visible layout + metadata.
-This is possible because N1 never hides data behind opaque storage layers.
+N1 is Linux-first and supports `O_DIRECT` for predictable latency and reduced page-cache pressure.
 
----
+Implications:
 
-## Performance characteristics
+- writes should be aligned (e.g., 4096 bytes)
+- your `AlignedBuffer` exists specifically for this
+- direct I/O failures must be treated as disk health failures (writer disabled)
 
-N1 is optimized for **throughput and predictability**:
-- lockless streaming data path
-- low CPU overhead for large objects
-- supports high-bitrate media workloads (range reads / seeks)
-- keeps memory usage bounded
+### Preallocation
 
-N1 is not trying to maximize tiny-object ops/sec at any cost; it’s built to push sustained bandwidth and remain stable under failure.
+Shard files are often preallocated via `set_len(final_shard_len)`:
 
----
+- reduces fragmentation
+- makes failure modes clearer
+- enforces deterministic shard size expectations for availability checks
 
-## Where N1 fits
+### Directory sync
 
-N1 is the **node engine**:
-- standalone: a fast, durable single-node object store
-- as a building block: can be used under a clustering layer (e.g., your N2)
+Durable commit requires syncing the directory entry after rename:
 
-N1 does not need a cluster to be correct. It is correct on a single machine.
+- `fsync(file)`
+- `rename(tmp, stable)`
+- `fsync(parent_dir)` (or platform equivalent)
+
+This is why `sync_dir()` exists. Without it, rename can be lost after power loss even if the file contents were flushed.
 
 ---
 
-## Quick glossary
+## Invariants (must always be true)
 
-- **fragment**: namespace / bucket-like partition
+These are the non-negotiables for correctness:
+
+1. **No temp filenames in committed metadata**
+   - `PartMetadata` must reference stable shard names only
+2. **Stable shard commit before part metadata commit**
+3. **Final object metadata publish is the only visibility gate**
+4. **Never mutate committed shards in place**
+5. **Every commit uses rename + directory sync**
+6. **Write quorum must hold**
+   - fail the part if healthy writers < `data_shards`
+7. **Repair writes are also immutable**
+   - repair via temp → rename, never patch
+
+---
+
+## Glossary
+
+- **fragment**: virtual disk / tenant boundary
 - **object_key**: object path/name within a fragment
 - **version_id**: immutable identifier of a committed object version
-- **part**: multipart chunk metadata (contains shard list)
-- **shard**: the on-disk file segment (data or parity)
-- **stripe_size_bytes**: erasure coding stripe block size
+- **session_id**: upload session identifier for resumability
+- **part**: multipart chunk with shard map
+- **shard**: one data/parity file on disk
+- **data_shards / parity_shards**: Reed–Solomon parameters
+- **stripe_size_bytes**: block size used per shard per stripe
+
+---
+
+© Litiaina --- N1 Core Engine
