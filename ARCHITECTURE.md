@@ -5,182 +5,190 @@
     width="150"
     height="150"
   />
-
   <h1>Storage Architecture & Disk Layout</h1>
-  
 </div>
 
-This document details the internal storage engine of **Litiaina N1**. N1 moves away from traditional hierarchical filesystems to a **Content-Addressable Storage (CAS)** model using a decoupled **Index / Blob** architecture.
+This document describes the **current** on-disk architecture of **Litiaina N1 Core** (fragment-centric, database-free, filesystem-as-truth), including **quota-per-fragment**, **multi-root index/blob disks**, **sessions for resumable uploads**, and **strict atomic commits**.
 
-This design is engineered to saturate disk I/O, eliminate lock contention during writes, and bypass operating system limits on file counts and path lengths.
+> **Important correction:** N1’s authoritative index is **4-level sharded** (not 2-level). Each shard directory is **2 hex chars** from `SHA256(object_key)`:
+>
+> `h1 = hash[0..2]`, `h2 = hash[2..4]`, `h3 = hash[4..6]`, `h4 = hash[6..8]`
 
 ---
 
-## 1. High-Level Disk Hierarchy
+## 1) Core layout principles
 
-The storage root follows a strict, predictable hierarchy designed for isolation and performance.
+### Fragment is the isolation boundary
+N1 does **not** treat “users” as an on-disk root. The **fragment** (identified by `fragment_hash`) is the isolation scope for:
+- authorization (JWT claims scoped to fragment)
+- quota accounting
+- trash namespace
+- upload sessions
+- object metadata and version history
+
+### Filesystem is the database
+There is no SQL/NoSQL dependency in the hot path. Correctness comes from:
+- deterministic paths
+- append-only/immutable commits
+- atomic rename + `fsync(dir)` discipline
+- repair tooling that can rebuild from disk truth
+
+---
+
+## 2) Disk roots and top-level hierarchy
+
+N1 is configured with **multiple roots**:
+- **Index roots**: store small metadata + session manifests (replicated / mirrored)
+- **Blob roots**: store large erasure-coded shard files (striped / distributed)
+
+A simplified conceptual view:
 
 ```text
+{INDEX_ROOTS[n]}/
+└── {fragment_hash}/
+    ├── quota.msgpack
+    └── index/
+        ├── objects/      (authoritative object metadata index)
+        ├── trash/        (authoritative trash metadata index)
+        └── sessions/     (upload session manifests + part metas)
 
-/storage_root/
-├── {user_uid}/                       # 1. User Isolation Scope
-│   ├── quota.bson                    #    Global User Quota (Single Source of Truth)
-│   │
-│   └── {fragment_name}/              # 2. Fragment (Logical Bucket)
-│       │
-│       ├── index/                    # 3. Metadata Store (Mutable Index)
-│       │   └── {shard_1}/            #    Shard L1: First 2 hex chars of SHA256
-│       │       └── {shard_2}/        #    Shard L2: Next 2 hex chars of SHA256
-│       │           └── {Hash}#{Ver}.bson
-│       │
-│       └── blobs/                    # 4. Data Store (Immutable Content)
-│           └── {VersionID}/          #    Content-Addressable ID (ULID)
-│               ├── part_0.data       #    Binary Chunk 0
-│               ├── part_1.data       #    Binary Chunk 1
-│               └── reservation.bson  #    Temporary Upload Receipt
-├──
-
+{BLOB_ROOTS[m]}/
+└── {fragment_hash}/
+    └── blobs/
+        └── {version_id}/
+            ├── part_{p}_shard_{i}.data
+            ├── part_{p}_shard_{i}.parity
+            └── ...
 ```
 
----
-
-## 2. Component Deep Dive
-
-### Global User Quota (`quota.bson`)
-
-- **Location:** `storage/{uid}/quota.bson`
-- **Format:** BSON serialization of the `Quota` struct.
-- **Role:** Single source of truth for a user's storage consumption.
-
-**Concurrency Control**
-- Managed via **sharded in-memory mutexes** (`LOCK_SHARD_COUNT = 64`)
-- Operations hash `uid` to select a lock shard
-- Ensures high concurrency across users with strict per-user consistency
-- **Why at User Root?**
-  Allows enforcing limits without scanning millions of objects across fragments.
+> Exact folder names can differ slightly depending on your `ObjectPathManager`, but the invariants above are what matter:
+> - **Index:** mirrored across index roots
+> - **Blobs:** distributed across blob roots
+> - **Version:** blob placement is version-scoped and immutable after commit
 
 ---
 
-### The Index (`index/`)
+## 3) Index layout (authoritative)
 
-The Index acts as filesystem **inodes**, decoupling logical names (keys) from physical data (blobs).
+### 3.1 Object metadata index — **4 shards deep**
+Object metadata is stored as immutable version records. The filename is version-suffixed so old versions are never overwritten.
 
-**Location:** `storage/{uid}/{fragment}/index/`
-
-#### Sharding Strategy
-- **Algorithm:** 2-level hex sharding derived from SHA-256(key)
-- **Structure:** `index/{h1}/{h2}/` (e.g. `index/a4/c9/`)
-- **Fan-out:** `256 × 256 = 65,536` directories
-- **Benefit:** Prevents inode exhaustion and maintains `O(1)` readdir performance
-
-#### Filename Format
+```text
+{INDEX_ROOT}/{fragment_hash}/index/objects/{h1}/{h2}/{h3}/{h4}/{hash}#{version_id}.msgpack
 ```
 
-{SHA256_Hash}#{VersionID}.bson
+Where:
+- `hash = sha256_hex(object_key)` (64 hex chars)
+- `h1..h4` are 2-hex prefix directories (4 levels total)
+- `{version_id}` is a ULID (or your version identifier)
+- the file contains `ObjectMetadata` (msgpack per your build)
 
+**Why 4-level sharding?**
+- prevents pathological directory fan-in as object count grows
+- keeps `readdir()` and lookup behavior stable
+- avoids inode pressure and “giant directory” latency cliffs
+
+### Example
+Object key: `photos/2026/clip.mp4`  
+`sha256(object_key) = a4c9d21f...`
+
+```text
+.../objects/a4/c9/d2/1f/a4c9d21f...#{version_id}.msgpack
 ```
 
-- **SHA256_Hash:** 64-char hex of original key (bypasses path limits)
-- **VersionID:** ULID (time-sortable, unique)
+### 3.2 Trash metadata index
+Trash uses the same index strategy (still authoritative, still sharded):
 
-#### Metadata Contents
-- `object_key` — original user key
-- `total_size_bytes`
-- `parts[]` — byte ranges → `part_N.data`
-- `is_delete_marker` — soft delete flag
+```text
+{INDEX_ROOT}/{fragment_hash}/index/trash/{h1}/{h2}/{h3}/{h4}/{hash}#{version_id}.msgpack
+```
 
----
-
-### The Blobs (`blobs/`)
-
-The Blobs directory stores raw payloads. It is **content-addressable and immutable**.
-
-**Location:** `storage/{uid}/{fragment}/blobs/{VersionID}/`
-
-**Immutability Guarantee**
-- Once finalized, a blob directory is never modified
-- Renames only move index entries
-
-#### Chunked Storage (`part_N.data`)
-- Sequential binary chunks (128KB → multi-GB)
-- Enables parallel uploads without lock contention
-- Supports constant-memory streaming on reads
+Trash is a **namespace**, not a “special object key” clients are allowed to write directly.
+Server-side handlers move versions into/out of trash by manipulating metadata placement.
 
 ---
 
-## 3. Critical I/O Workflows
+## 4) Upload sessions (resumable, strict finalize)
 
-### Write Path (Upload)
+Uploads are tracked via a **session directory** per `{version_id}` on index roots:
 
-1. **Authorization & Reservation**
-   - JWT authentication
-   - Lock `quota.bson`, reserve space
-   - Write `reservation.bson`
+```text
+{INDEX_ROOT}/{fragment_hash}/index/sessions/{version_id}/
+├── session_manifest.msgpack
+├── reservation.msgpack
+├── part_0.partmeta
+├── part_1.partmeta
+└── ...
+```
 
-2. **Lockless Ingest**
-   - Stream directly to `part_N.data`
-   - Unique ULID → zero filesystem contention
-
-3. **Atomic Finalization**
-   - Validate parts
-   - Serialize metadata
-   - Atomic write to index shard
-   - Delete reservation
-
-**Result:** Object becomes instantly visible.
+Key properties:
+- **Session manifests are mirrored** across index roots (best-effort mirror writes; correctness is tolerant to partial mirror loss).
+- Each uploaded part commits a `part_N.partmeta` record via a lockless “first valid wins” strategy.
+- Finalize requires **all expected parts present and valid**, then publishes final `ObjectMetadata` into the authoritative index.
 
 ---
 
-### Read Path (Streaming)
+## 5) Blob layout (erasure-coded shards)
 
-1. **Index Lookup**
-   - Moka cache → shard → BSON read
+Blob roots store the **shards** produced by Reed–Solomon encoding per uploaded part.
+Shard placement is deterministic (e.g., round-robin based on part index and shard index).
 
-2. **Zero-Copy Stitching**
-   - Open only required `part_N.data`
-   - Stream ranges directly to socket
-   - Constant memory usage
+Conceptually:
 
----
+```text
+{BLOB_ROOT}/{fragment_hash}/blobs/{version_id}/
+└── part_{part_index}_shard_{shard_index}.{data|parity}
+```
 
-### Lifecycle & Garbage Collection
+### Temp → stable commit rule
+During `upload_part`, shards are first written as temp names (attempt-scoped), then committed to stable names only after verification:
 
-**Mark-and-Sweep GC** (non-blocking):
+```text
+part_{p}_shard_{i}.data.tmp.{attempt_id}   (write target)
+part_{p}_shard_{i}.data                   (stable committed)
+```
 
-1. **Mark**
-   - Scan index shards
-   - Apply retention policy
-
-2. **Sweep**
-   - Remove orphaned blob folders
-   - Refund quota asynchronously
-
-3. **Shard Cleanup**
-   - Remove empty index directories
+This guarantees:
+- no half-written shard is ever treated as “the real shard”
+- a crash mid-upload leaves only temp files for GC/repair to clean
 
 ---
 
-## 4. Architectural Advantages
+## 6) Durability discipline (atomic + sync)
 
-| Feature | Implementation | Benefit |
-|------|--------------|--------|
-| Atomic Renames | Move index BSON only | `O(1)` renames, crash-safe |
-| Unlimited Paths | SHA-256 hashing | Bypasses OS limits |
-| Linear Scaling | 256² shard fan-out | Stable performance |
-| High Throughput | ULID per upload | Saturates disk |
-| Resumability | Chunked parts | Byte-accurate resume |
+N1 relies on a strict commit ordering:
+
+1) **Write temp shard files**
+2) `fsync(file)`
+3) **rename temp → stable shard names**
+4) `fsync(parent_dir)`
+5) **commit part meta** (`part_N.partmeta`) via create-new + sync
+6) On finalize: **write final object metadata** via atomic write + sync
+
+This is why you can:
+- resume safely after crash
+- run repair tooling without guessing
+- never “expose” partial data as a successful version
 
 ---
 
-## 5. Visual Data Flow
+## 7) Operational notes
 
-**Scenario:** User uploads documents/resume.pdf
+### Repair / recovery and “dir not found” failures
+Repair tooling should:
+- treat recorded `absolute_path` as a hint
+- fall back to deterministic path reconstruction when directories move or temp suffixes exist
+- always `create_dir_all(parent)` before attempting to write repaired shards
 
-1.  Hash Key: SHA256("documents/resume.pdf") -> a4c9...
-2.  Gen Version: 01HQ... (ULID)
-3.  Write Data:
-   - storage/user_1/main/blobs/01HQ.../part_0.data
-5.  Write Index:
-   - storage/user_1/main/index/a4/c9/a4c9...#01HQ....bson
+(Your recovery/repair code should also strip `.tmp.{attempt}` and `.recovering` suffixes when trying to locate stable shards.)
 
-**Result:** The heavy data sits in an immutable ID-based folder, while the lightweight index provides the directory structure view.
+---
+
+## 8) Quick glossary
+
+- **fragment_hash**: stable namespace identifier for isolation and placement
+- **object_key**: user-visible object path/key
+- **version_id**: immutable version identifier (ULID)
+- **part**: upload chunk index (multipart)
+- **shard**: per-part data/parity file stored on blob disks
+- **4-level sharding**: `/{h1}/{h2}/{h3}/{h4}/` from SHA256 prefix (2 hex chars each)
