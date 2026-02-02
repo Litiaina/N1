@@ -6,17 +6,10 @@
     height="150"
   />
   <h1>Litiaina N1 Storage API (v4) — Complete Reference</h1>
+  <p>Routes and behavior aligned to <code>routes.rs</code> (fragment‑centric N1).</p>
 </div>
 
-This README documents the **v4 HTTP + WebSocket APIs** exposed by the Litiaina N1 storage service based on the routes and handlers shown in the latest updates.
-
-> **Key concepts**
-> - **Index store**: metadata mirrors (`*.bson`) for objects/versions, organized by SHA-256 hash prefix (`/aa/bb/<hash>#<version>.bson`).
-> - **Blob store**: erasure-coded shards for each uploaded part, distributed round-robin across configured disks.
-> - **Directory shadow index (“structure”)**: an auxiliary prefix index used to accelerate prefix listings; it is **not** the authoritative object index.
-> - **Trash**: soft deletes move objects/versions into the fragment’s `.trash` namespace.
-> - **Repair / Redistribution**: system maintenance jobs that heal index/blob mirrors (repair) or rebalance shards (redistribute).
-> - **GC**: strict garbage collection. When it deletes, it deletes **fully** (and quickly), not “maybe later”.
+> This document reflects the **current v4 router layout**: fragment-centric object storage (CAS + EC), separate auth endpoints, maintenance jobs, public sharing, and WebSocket events.
 
 ---
 
@@ -24,416 +17,321 @@ This README documents the **v4 HTTP + WebSocket APIs** exposed by the Litiaina N
 
 - [Base URL & Versioning](#base-url--versioning)
 - [Authentication](#authentication)
-- [Common Rules](#common-rules)
+  - [Fragment auth (object storage)](#fragment-auth-object-storage)
+  - [FS auth (legacy fs routes)](#fs-auth-legacy-fs-routes)
+- [Permissions & Common Rules](#permissions--common-rules)
 - [Error Responses](#error-responses)
-- [Data Models](#data-models)
-- [Read APIs](#read-apis)
-- [Write APIs](#write-apis)
+- [Core Data Models](#core-data-models)
+- [Object Storage Read APIs](#object-storage-read-apis)
+- [Object Storage Write APIs](#object-storage-write-apis)
+- [Upload APIs (multipart / resumable)](#upload-apis-multipart--resumable)
 - [Sharing APIs](#sharing-apis)
 - [Maintenance APIs](#maintenance-apis)
-- [Garbage Collector API](#garbage-collector-api)
 - [WebSocket APIs](#websocket-apis)
-- [Compatibility Notes](#compatibility-notes)
+- [Public + Bootstrapping APIs](#public--bootstrapping-apis)
+- [Quick Endpoint Index](#quick-endpoint-index)
 
 ---
 
 ## Base URL & Versioning
 
-All endpoints in this doc are under **v4** unless explicitly stated.
+All endpoints here are under **v4** unless stated otherwise.
 
-- Example base URL:
-  - `https://storage.example.com`
-- Example full endpoint:
-  - `GET https://storage.example.com/v4/fragment/metadata`
+- Example base URL: `https://storage.example.com`
+- Example endpoint: `GET https://storage.example.com/v4/fragment/list`
 
 ---
 
 ## Authentication
 
-### 1) Obtain a JWT
+N1 has **separate auth entry points** for:
+1) **Object Storage v4** (fragment-scoped JWT)  
+2) **Legacy FS routes** (`/dir/...`), which are still present for compatibility
 
-**POST** `/authenticate`
+### Fragment auth (object storage)
 
-Body (form or JSON depending on your implementation; typical is JSON):
+**POST** `/authenticate/fragment`
+
+Purpose:
+- Obtain a **fragment-scoped JWT** used for all `/v4/...` protected object-storage routes.
+- The token typically encodes: `fragment`, and permissions booleans: `read/write/modify/delete`.
+
+Typical request body (shape may vary by your implementation):
 
 ```json
 {
-  "email": "user@example.com",
-  "password": "plain-text-password"
+  "fragment": "my-fragment",
+  "secret": "fragment-secret",
+  "read": true,
+  "write": true,
+  "modify": true,
+  "delete": true
 }
 ```
 
-Response:
+Typical response:
 
 ```json
 {
-  "token": "<JWT>"
+  "access_token": "<JWT>"
 }
 ```
 
-### 2) Use the JWT
-
-Send the token on all protected routes:
+Use it on protected v4 routes:
 
 ```
 Authorization: Bearer <JWT>
 ```
 
-Protected groups:
-- All **Read APIs** except `/v4/public/share`
-- All **Write APIs**
-- All **Maintenance APIs**
-- GC endpoint
-- System broadcast endpoint
+### FS auth (legacy fs routes)
+
+**POST** `/authenticate/fs`
+
+Purpose:
+- Authenticate the legacy FS API under `/dir/...`.
+
+Request/response shape depends on your implementation (often email+password or user+password).
 
 ---
 
-## Common Rules
+## Permissions & Common Rules
 
-### Object Keys
-- The service normalizes keys by stripping a leading slash:
-  - `"/a/b.txt"` → `"a/b.txt"`
-- Object keys can contain slashes to represent “folders”.
-- Endpoints using `{*object_key}` capture the rest of the path; clients should:
-  - keep path slashes as path separators, and
-  - percent-encode special characters (spaces, `#`, `%`, etc).
+### Permission flags (Claims)
+The v4 object-storage routes are wrapped with `validate_access`, and handlers commonly enforce:
 
-### Reserved Namespace
-`.trash` is reserved and cannot be used directly as an object key or prefix.
+- `read`: list, get, stream, metadata, download, status endpoints
+- `write`: upload, delete, recover, create signed URL (varies), etc.
+- `modify`: fragment modify, rename operations
+- `delete`: destructive operations (delete/permanent/trash empty, stop/start jobs depending)
 
-If a client uses:
-- `".trash"` or
-- `".trash/anything"`
+If a token lacks the required permission, the server returns **403 Forbidden**.
 
-the server rejects the request with `400 Bad Request`.
+### Fragment parameter
+Most v4 routes are **fragment-scoped**:
+- the JWT must match the fragment path parameter
+- the server rejects cross-fragment access
 
-### Versioning
-- Objects are stored as versions.
-- Latest version is determined by the metadata selection logic (commonly version id ordering / created_at).
+### Object keys
+Routes using `{*object_key}` capture the rest of the path. Clients should:
+- keep slashes as path separators
+- percent-encode special characters (`#`, `%`, spaces, etc.)
 
-### Range Reads & Streaming
-Endpoints that return object bytes support:
-- `Range: bytes=start-end`
-- `Accept-Ranges: bytes`
+### Range support
+Streaming/download endpoints generally support:
 
-### Checksums
-- For single-part objects, a checksum may be exposed in:
-  - `x-litiaina-checksum: <checksum>`
+```
+Range: bytes=start-end
+```
 
-### Browser Cache
-Some endpoints add browser cache control:
-- `Cache-Control: public, max-age=<BROWSER_CACHE_MAX_AGE>`
+### Upload parts
+`PUT /v4/upload/chunk/...` requires:
+- `Content-Length` header
+- part indices are 0-based unless your client chooses otherwise (server expects consistent indexing)
 
 ---
 
 ## Error Responses
 
-The server uses an internal `AppError` mapping to HTTP status codes.
+Errors are mapped from your `AppError` to HTTP status codes. Typical patterns:
 
-Typical patterns:
-- `400 Bad Request` — invalid parameters, reserved paths, bad signature
+- `400 Bad Request` — invalid input, reserved path, bad signature
 - `401 Unauthorized` — missing/invalid JWT
-- `403 Forbidden` — not allowed
+- `403 Forbidden` — permission denied or fragment mismatch
 - `404 Not Found` — object/version missing, expired share link
-- `409 Conflict` — invalid state (e.g., job already running)
+- `409 Conflict` — invalid state (e.g., missing parts on finalize, job already running)
 - `416 Range Not Satisfiable` — invalid range
-- `500 Internal Server Error` — unexpected failures
+- `500 Internal Server Error` — unexpected failures / storage backend issues
 
-Payload shape depends on your error handler; if you return JSON, a common format is:
+Payload shape depends on your error handler; common JSON format:
 
 ```json
-{
-  "error": "message"
-}
+{ "error": "message" }
 ```
 
 ---
 
-## Data Models
+## Core Data Models
 
-These are the primary request/response models referenced by the endpoints.
+> Model shapes below reflect the **v4 object storage** handlers (upload.rs, retrieve.rs, etc.).  
+> Some admin/fragment manager models may differ if you changed request/response structs.
 
-### ObjectSummary
-Used for listing, lightweight metadata stored in index files.
+### InitiateUploadParams
 
-```json
-{
-  "object_key": "path/to/file.bin",
-  "fragment": "My Files",
-  "version_id": "01H...",
-  "upload_session_id": "01H...",
-  "owner_uid": "28af29a1-cff5-...",
-  "content_type": "application/octet-stream",
-  "total_size_bytes": 123456,
-  "created_at": 1730000000,
-  "is_delete_marker": false,
-  "stripe_size_bytes": 262144
-}
-```
+Used by `POST /v4/upload/init/...` and `POST /v4/upload/finalize/...` (some implementations reuse the same struct).
 
-### ObjectMetadata
-Full metadata including parts and shards.
-
-```json
-{
-  "object_key": "path/to/file.bin",
-  "fragment": "My Files",
-  "version_id": "01H...",
-  "upload_session_id": "01H...",
-  "owner_uid": "28af29a1-cff5-...",
-  "content_type": "application/octet-stream",
-  "total_size_bytes": 123456,
-  "created_at": 1730000000,
-  "parts": [
-    {
-      "part_index": 0,
-      "size_bytes": 123456,
-      "created_at": 1730000000,
-      "shards": [
-        {
-          "shard_index": 0,
-          "file_name": "shard_0.bin",
-          "absolute_path": "/mnt/disk1/.../shard_0.bin",
-          "size_bytes": 65536,
-          "checksum": "hex...",
-          "is_parity": false
-        }
-      ],
-      "checksum": "optional-crc-or-hash"
-    }
-  ],
-  "is_delete_marker": false,
-  "stripe_size_bytes": 262144
-}
-```
-
-### ListObjectsResult
-Used by list endpoints.
-
-```json
-{
-  "objects": [ /* array of ObjectMetadata (often summary-like) */ ],
-  "continuation_token": "base64(s1/s2/filename)" 
-}
-```
-
-If `continuation_token` is `null`, you reached the end.
-
-### CapacityUsageResponse
-```json
-{ "capacity_used": 123456789 }
-```
-
-### Upload API Models
-
-**InitiateUploadParams**
 ```json
 {
   "content_type": "application/octet-stream",
   "total_size_bytes": 123456,
-  "expected_parts": 3
+  "expected_parts": 4
 }
 ```
 
-**InitiateUploadResponse**
+### InitiateUploadResponse
+
 ```json
 {
-  "session_id": "01H...",
-  "version_id": "01H..."
+  "session_id": "01J...",
+  "version_id": "01J..."
 }
 ```
 
-**UploadStatusResponse**
+### UploadStatusResponse
+
 ```json
 {
   "uploaded_parts": [0, 1, 2]
 }
 ```
 
-**UploadPartQuery**
+### FinalizeIncompleteResponse
+
+Returned when finalize is attempted but parts are missing:
+
 ```json
 {
-  "enable_checksum": true,
-  "checksum": "optional"
+  "uploaded_parts": [0, 1],
+  "missing_parts": [2, 3],
+  "expected_parts": 4
 }
 ```
 
-### RenameObjectRequest
+### ListUploadsResponse
+
 ```json
 {
-  "source_fragment": "My Files",
-  "source_key": "a/b.txt",
-  "destination_fragment": "My Files",
-  "destination_key": "a/c.txt"
+  "sessions": [
+    {
+      "session_id": "01J...",
+      "version_id": "01J...",
+      "object_key": "path/to/file.bin",
+      "created_at": 1730000000,
+      "reserved_size": 123456,
+      "total_size_bytes": 123456,
+      "expected_parts": 4
+    }
+  ],
+  "total": 1
 }
 ```
 
-### Signed URL Models
+### ObjectMetadata (high level)
 
-**CreateSignedUrlRequest**
-```json
-{
-  "fragment": "My Files",
-  "object_key": "a/b.txt",
-  "expires_in": 3600,
-  "disposition": "view"
-}
-```
+The server returns object metadata for reads and finalize responses. The exact schema depends on your internal struct,
+but the important stable fields are:
 
-`disposition` values:
-- `view` (default)
-- `stream`
-- `download`
-
-**SignedUrlResponse**
-```json
-{
-  "url": "https://storage.example.com/v4/public/share?owner_uid=...&fragment=...&object_key=...&expires=...&signature=...&disposition=view",
-  "expires_at": "2026-01-23T12:34:56Z"
-}
-```
+- `fragment`, `object_key`, `version_id`
+- `content_type`, `total_size_bytes`
+- `created_at`
+- `parts[]` (each part has shard list, checksums, etc.)
+- `is_delete_marker`
 
 ---
 
-## Read APIs
+## Object Storage Read APIs
 
-All read APIs below require `Authorization: Bearer <JWT>` unless marked **Public**.
+All routes below require `Authorization: Bearer <JWT>` and `read=true` unless stated otherwise.
 
-### Get capacity usage
-**GET** `/v4/capacity/usage`
+### Get capacity usage (per fragment)
+**GET** `/v4/capacity/usage/{fragment}`
 
-Response `200`:
+Returns fragment usage (implementation-defined payload), commonly:
+
 ```json
 { "capacity_used": 123456789 }
 ```
 
 ---
 
-### List fragments
-**GET** `/v4/fragment/metadata`
+### List fragments (private / authenticated)
+**GET** `/v4/fragment/list`
 
-Response `200`:
+Returns fragments visible to this credential (implementation-defined):
+
 ```json
-["My Files", "Photos", "Backups"]
+["fragmentA", "fragmentB"]
 ```
 
 ---
 
-### List objects in a fragment
-**GET** `/v4/fragment/object/metadata/{fragment}`
+### List objects in fragment
+**GET** `/v4/fragment/objects/{fragment}`
 
-Query params:
-- `limit` (optional, default `100`, max `1000`)
-- `prefix` (optional) — returns objects whose keys start with prefix
-- `continuation_token` (optional) — for pagination
+Typical query params (if implemented):
+- `limit`
+- `prefix`
+- `continuation_token`
 
-Response `200`:
-```json
-{
-  "objects": [ /* ObjectMetadata */ ],
-  "continuation_token": "..."
-}
-```
+Returns list + pagination token.
 
-Notes:
-- If `prefix` is provided, the service attempts **DirectoryIndexManager** (shadow index) first for speed.
-- If the shadow index yields nothing, it falls back to scanning the authoritative hashed index layout.
-- `.trash` prefix is rejected (`400`).
+---
 
-Example:
-```bash
-curl -H "Authorization: Bearer $JWT" \
-  "https://storage.example.com/v4/fragment/object/metadata/My%20Files?limit=200&prefix=photos/2026/"
-```
+### List trash objects in fragment
+**GET** `/v4/fragment/trash/{fragment}`
+
+Same listing semantics as normal list, but for `.trash` namespace.
 
 ---
 
 ### List object versions
-**GET** `/v4/fragment/object/versions/{fragment}/{*object_key}`
+**GET** `/v4/fragment/versions/{fragment}/{*object_key}`
 
-Response `200`:
-```json
-[
-  { "object_key":"a/b.txt", "version_id":"...", "...":"..." },
-  { "object_key":"a/b.txt", "version_id":"...", "...":"..." }
-]
-```
-
-Sorted newest-first by `created_at`.
+Returns versions newest-first (implementation-defined array of metadata/summary).
 
 ---
 
 ### Get object bytes (inline)
-**GET** `/v4/fragment/object/get/{fragment}/{*object_key}`
+**GET** `/v4/fragment/get/{fragment}/{*object_key}`
 
-- Returns bytes with `Content-Disposition: inline`
-- Adds browser cache control
-
-Supports `Range`.
+- `Content-Disposition: inline`
+- Supports `Range`
 
 ---
 
-### Stream object bytes (inline)
-**GET** `/v4/fragment/object/stream/{fragment}/{*object_key}`
+### Stream object bytes
+**GET** `/v4/fragment/stream/{fragment}/{*object_key}`
 
-- Returns bytes with `Content-Disposition: inline`
-- Designed for streaming clients
-
-Supports `Range`.
+- Streaming-friendly variant
+- Supports `Range`
 
 ---
 
 ### Get object metadata
-**GET** `/v4/fragment/object/get/metadata/{fragment}/{*object_key}`
+**GET** `/v4/fragment/meta/{fragment}/{*object_key}`
 
-Response `200`:
-```json
-{ /* ObjectMetadata */ }
-```
+Returns full `ObjectMetadata`.
 
 ---
 
-### Download object (attachment)
-**GET** `/v4/fragment/object/download/{fragment}`
+### Download object
+**GET** `/v4/fragment/download/{fragment}`
 
-Query params:
+Typically uses query parameters like:
 - `object_key` (required)
 - `version_id` (optional)
 
 Returns:
-- `Content-Disposition: attachment; filename="..."`
-
-Example:
-```bash
-curl -L -H "Authorization: Bearer $JWT" \
-  "https://storage.example.com/v4/fragment/object/download/My%20Files?object_key=a/b.txt" \
-  -o b.txt
-```
+- `Content-Disposition: attachment`
 
 ---
 
-### Download object chunk (byte window, assembled)
-**GET** `/v4/fragment/object/download/chunk/{fragment}`
+### Download chunk (assembled)
+**GET** `/v4/fragment/download/chunk/{fragment}`
 
-Query params:
+Typically uses query parameters like:
 - `object_key` (required)
-- `offset` (required, u64)
-- `chunk_size` (required, usize)
+- `offset` (required)
+- `chunk_size` (required)
 
-Behavior:
-- Reads the object metadata then assembles a contiguous chunk from the erasure-coded layout by calling `read_or_recover_chunk`.
-- If `offset >= total_size_bytes`, returns `204 No Content`.
-
-Response:
-- `200 OK` with `application/octet-stream`
-- Optional `x-litiaina-checksum` when the request aligns exactly with a full part that has a checksum.
+Reads metadata and reconstructs contiguous bytes from shards if needed.
 
 ---
 
-### Download selected objects as an archive
-**POST** `/v4/fragment/object/download/archive/{fragment}`
+### Download archive of selected objects
+**POST** `/v4/fragment/archive/{fragment}`
 
-Body:
+Body example (implementation-defined; common pattern):
+
 ```json
 {
   "keys": ["a/b.txt", "c/d.png"],
@@ -442,304 +340,249 @@ Body:
 }
 ```
 
-Rules:
-- `keys` must not be empty
-- `keys.len()` must be <= `10000`
+---
 
-Response:
-- `200 OK`
-- `Content-Type: application/zip` or `application/x-tar`
-- `Content-Disposition: attachment; filename="export.zip"` (or `.tar`)
+## Object Storage Write APIs
+
+All routes below require `Authorization: Bearer <JWT>` and `write=true` unless stated otherwise.
+
+### Delete fragment
+**DELETE** `/v4/fragment/delete/{fragment}`
+
+Requires `delete=true` (and sometimes `modify=true` depending on your policy).
 
 ---
 
-### List deleted objects (trash)
-**GET** `/v4/fragment/trash/object/metadata/{fragment}`
+### Modify fragment (metadata/config)
+**PATCH** `/v4/fragment/modify/{fragment}`
 
-Query params:
-- `limit`, `prefix`, `continuation_token` (same behavior as normal list)
-- `.trash` is still reserved as a direct key/prefix input
-
-Response is `ListObjectsResult`.
+Requires `modify=true`.
 
 ---
 
-### List deleted object versions (trash)
-**GET** `/v4/fragment/trash/object/versions/{fragment}/{*object_key}`
+### Empty trash
+**DELETE** `/v4/fragment/trash/empty/{fragment}`
 
-Response is an array of `ObjectMetadata` versions present in trash.
-
----
-
-### Get deleted object metadata (trash)
-**GET** `/v4/fragment/trash/object/get/metadata/{fragment}/{*object_key}`
-
-Response `200`:
-```json
-{ /* ObjectMetadata */ }
-```
+Requires `delete=true`.
 
 ---
-
-## Write APIs
-
-All write APIs require `Authorization: Bearer <JWT>`.
 
 ### Rename object
 **PATCH** `/v4/fragment/object/rename`
 
-Body: `RenameObjectRequest`
+Requires `modify=true`.
 
-Response:
-- `200 OK` on success (payload depends on handler)
+Body example:
 
----
-
-### Delete fragment
-**DELETE** `/v4/fragment/delete/{fragment_name}`
-
-Deletes an entire fragment (implementation-defined safety rules).
-
----
-
-### Soft-delete object (move to trash)
-**DELETE** `/v4/fragment/object/delete/{fragment}/{*object_key}`
-
-Moves object to `.trash` in that fragment (trash index).
-
----
-
-### Delete a specific version
-**DELETE** `/v4/fragment/object/delete/version/{fragment}/{version_id}/{*object_key}`
-
-Soft-deletes only that version.
-
----
-
-### Permanently delete object
-**DELETE** `/v4/fragment/object/delete/permanent/{fragment}/{*object_key}`
-
-Hard deletes object data and index entries.
-
-> Note: There is also a trash permanent delete route; ensure your router maps to the intended handler.
-
----
-
-### Restore object from trash
-**POST** `/v4/fragment/trash/object/restore/{fragment}/{*object_key}`
-
-Restores the latest trashed version to the active namespace.
-
----
-
-### Restore specific version from trash
-**POST** `/v4/fragment/trash/object/restore/version/{fragment}/{version_id}/{*object_key}`
-
-Restores a specific trashed version.
-
----
-
-### Permanently delete from trash
-**DELETE** `/v4/fragment/trash/object/delete/permanent/{fragment}/{*object_key}`
-
-Hard deletes trashed entries (and associated blobs).
-
----
-
-## Upload APIs
-
-All upload APIs require `Authorization: Bearer <JWT>`.
-
-### Initiate upload
-**POST** `/v4/fragment/object/upload/init/{fragment}/{*object_key}`
-
-Body: `InitiateUploadParams`
-
-Response `200`:
 ```json
 {
-  "session_id": "01H...",
-  "version_id": "01H..."
+  "fragment": "my-fragment",
+  "source_key": "a/b.txt",
+  "destination_key": "a/c.txt"
 }
 ```
 
 ---
 
-### Upload status (resume support)
-**GET** `/v4/fragment/object/upload/status/{fragment}/{version_id}`
+### Soft delete object (move to trash)
+**DELETE** `/v4/fragment/object/delete/{fragment}/{*object_key}`
 
-Response `200`:
-```json
-{ "uploaded_parts": [0, 1, 2] }
-```
-
-Use this to resume uploads without re-selecting files on the client.
+Requires `delete=true`.
 
 ---
 
-### Upload part (chunk)
-**PUT** `/v4/fragment/object/upload/chunk/{fragment}/{version_id}/{part_index}`
+### Delete a specific version
+**DELETE** `/v4/fragment/version/delete/{fragment}/{version_id}/{*object_key}`
 
-Query:
-- `enable_checksum` (optional)
-- `checksum` (optional)
+Requires `delete=true`.
+
+---
+
+### Permanent delete object
+**DELETE** `/v4/fragment/permanent/delete/{fragment}/{*object_key}`
+
+Requires `delete=true`. Destroys blobs + metadata.
+
+---
+
+### Recover a specific version from trash
+**POST** `/v4/fragment/recover/version/{fragment}/{version_id}/{*object_key}`
+
+Requires `write=true` (and often `modify=true` depending on your policy).
+
+---
+
+### Recover latest object from trash
+**POST** `/v4/fragment/recover/object/{fragment}/{*object_key}`
+
+---
+
+### Recover ALL trash (bulk restore)
+**POST** `/v4/fragment/recover/trash/all/{fragment}`
+
+---
+
+## Upload APIs (multipart / resumable)
+
+Upload flow:
+1) `init` → returns `(version_id, session_id)`
+2) `chunk` uploads (parts)
+3) `status` can be polled for resumability
+4) `finalize` publishes metadata (object becomes visible)
+5) `cancel` tears down session + quota reservation
+
+### Initiate upload
+**POST** `/v4/upload/init/{fragment}/{*object_key}`
+
+Body: `InitiateUploadParams`  
+Response: `InitiateUploadResponse`
+
+---
+
+### Upload status (for resumable upload)
+**GET** `/v4/upload/status/{fragment}/{version_id}`
+
+Response: `UploadStatusResponse`
+
+---
+
+### List active uploads for fragment
+**GET** `/v4/upload/status/list/{fragment}`
+
+Query params (typical):
+- `limit`
+- `offset`
+
+Response: `ListUploadsResponse`
+
+---
+
+### Upload one part (chunk)
+**PUT** `/v4/upload/chunk/{fragment}/{version_id}/{part_index}`
+
+Query params (if implemented):
+- `enable_checksum=true|false`
+- `checksum=<hex>` (optional)
+
+Headers:
+- `Content-Length: <bytes>`
 
 Body:
-- raw bytes for this part
-
-Response:
-- `200 OK` (implementation-defined), or
-- appropriate error on mismatch/corruption.
+- raw bytes for that part
 
 ---
 
 ### Finalize upload
-**POST** `/v4/fragment/object/upload/finalize/{fragment}/{version_id}/{session_id}`
+**POST** `/v4/upload/finalize/{fragment}/{version_id}/{session_id}`
 
-Completes an upload and writes final object metadata.
+Body: `InitiateUploadParams` (often reused for content_type / expected_parts / total_size_bytes)
 
-Response:
-- `200 OK` on success
-- If incomplete, implementations often return a “missing parts” payload.
+Returns:
+- `200 OK` with object metadata on success
+- `409 Conflict` + `FinalizeIncompleteResponse` if missing parts
 
 ---
 
 ### Cancel upload session
-**DELETE** `/v4/fragment/object/upload/cancel/{fragment}/{version_id}`
+**DELETE** `/v4/upload/cancel/{fragment}/{version_id}`
 
-Cancels an active upload session; server should clean temporary state.
+Cancels an upload that has not been finalized.
 
 ---
 
 ## Sharing APIs
 
 ### Create signed URL (protected)
-**POST** `/v4/fragment/object/share`
+**POST** `/v4/share/create`
 
-Auth: required
+Requires `read=true`.
 
-Body: `CreateSignedUrlRequest`
+Body example (implementation-defined):
 
-Rules:
-- `expires_in` cannot exceed **7 days** (`604800` seconds)
+```json
+{
+  "fragment": "my-fragment",
+  "object_key": "a/b.txt",
+  "expires_in": 3600,
+  "disposition": "download"
+}
+```
 
-Response `200`: `SignedUrlResponse`
+Response:
 
----
+```json
+{
+  "url": "https://storage.example.com/v4/public/share?...",
+  "expires_at": "2026-02-02T12:34:56Z"
+}
+```
 
-### Get shared object (public)
+### Public share (no auth)
 **GET** `/v4/public/share`
 
-Auth: **not required** (public)
-
-Query params:
-- `owner_uid` (required)
-- `fragment` (required)
-- `object_key` (required)
-- `expires` (required, unix timestamp seconds)
-- `signature` (required, hex HMAC)
-- `disposition` (optional: `view|stream|download`)
-
-Behavior:
-- Rejects if current time > `expires` (returns `404 Not Found`)
-- Recomputes signature using `HMAC-SHA256` over:
-  - `owner_uid:fragment:object_key:expires:disposition`
-- If signature matches, streams bytes using `Content-Disposition`:
-  - `inline` for `view|stream`
-  - `attachment` for `download`
-
-Example:
-```bash
-curl -L "https://storage.example.com/v4/public/share?owner_uid=...&fragment=...&object_key=a%2Fb.txt&expires=...&signature=...&disposition=download" -o b.txt
-```
+Query params depend on your signing format (token, signature, expiry, etc.).  
+Returns bytes with disposition controlled by the signed URL.
 
 ---
 
 ## Maintenance APIs
 
-All maintenance APIs require `Authorization: Bearer <JWT>`.
+Maintenance routes require `Authorization: Bearer <JWT>` and generally require `write/modify/delete` depending on risk.
 
-> These endpoints start long-running jobs in the background and return quickly.
-
-### Trigger redistribution job
-**POST** `/v4/system/maintenance/redistribute`
-
-Starts shard redistribution / rebalance job.
+### Sync global quota/health
+**POST** `/v4/maintenance/sync/global`
 
 ---
 
-### Stop redistribution job
-**PATCH** `/v4/system/maintenance/redistribute/stop`
-
-Stops the active redistribution job.
+### Sync fragment quota
+**POST** `/v4/maintenance/sync/fragment`
 
 ---
 
-### Sync quota for all users
-**POST** `/v4/system/maintenance/sync/all`
-
-Scans users in the DB, ensures:
-- quota file exists
-- blob directories exist
-- stale `.gc` files are swept
-- calculated usage is aligned (max across index mirrors)
-
-Returns `202 Accepted` (job started).
+### Cleanup fragment metadata
+**POST** `/v4/maintenance/cleanup/fragment`
 
 ---
 
-### Trigger repair job
-**POST** `/v4/system/maintenance/repair`
+### Initialize fragment storage
+**POST** `/v4/maintenance/init/fragment`
 
-Query params:
-- `dry_run=true|false` (default false)
-- `mode=availability|scrub|strict|checksum` (default `availability`)
-- `meta_concurrency` (default 8, clamp 1..64)
-- `repair_concurrency` (default 2, clamp 1..16)
-- `batch` (default 256, clamp 32..4096)
-
-Behavior:
-- **Availability mode**: checks shard presence + size
-- **Scrub/strict/checksum mode**: verifies shard integrity using stored checksums
-- Repairs:
-  - metadata mirror divergence (index replicas)
-  - missing/corrupt shards via EC reconstruction (`repair_entire_shard`)
-- Sends progress over WebSocket broadcast as `RepairUpdate`
-
-Returns:
-- `202 Accepted` when started
-- `409 Conflict` if a job is already running
+Used to bootstrap required on-disk roots for a fragment.
 
 ---
 
-### Stop repair job
-**POST** `/v4/system/maintenance/repair/stop`
+### Repair job control
+- **POST** `/v4/maintenance/repair/start`
+- **POST** `/v4/maintenance/repair/stop`
+- **GET**  `/v4/maintenance/repair/status`
 
-Signals the repair manager to stop.
-Returns `200 OK`.
+Start query params (as implemented in your repair manager):
+- `dry_run=true|false`
+- `mode=availability|scrub|strict|checksum`
+- `meta_concurrency=<n>`
+- `repair_concurrency=<n>`
+- `batch=<n>`
+
+---
+
+### Garbage collector
+**POST** `/v4/maintenance/gc/start`
+
+Starts GC / lifecycle cleanup.
+
+---
+
+### Redistribution job control
+- **POST**  `/v4/maintenance/redistribution/start`
+- **PATCH** `/v4/maintenance/redistribution/stop`
+- **GET**   `/v4/maintenance/redistribution/monitor`
 
 ---
 
 ### System health
-**GET** `/v4/system/maintenance/health`
+**GET** `/v4/maintenance/health`
 
-Returns a system health payload (implementation-defined).
-
----
-
-## Garbage Collector API
-
-All GC APIs require `Authorization: Bearer <JWT>`.
-
-### Run GC (manual)
-**POST** `/v4/storage/gc/run`
-
-Behavior (strict GC):
-- Performs a full GC scan.
-- Deletes expired versions / stale uploads based on retention and TTL rules.
-- When it deletes, it does so **fully and efficiently** (no leftovers).
-
-Returns `202 Accepted` (GC started in background).
+Returns disk / index mirror / latency / errors summary (implementation-defined).
 
 ---
 
@@ -748,84 +591,102 @@ Returns `202 Accepted` (GC started in background).
 ### WebSocket upgrade
 **GET** `/ws`
 
-Upgrades to WebSocket. Used for real-time events:
-- repair progress broadcasts
-- system broadcast messages
-- other storage events
+Used for real-time events (uploads, repair/redistribution updates, system broadcasts).
 
 ### System broadcast (authenticated)
 **POST** `/v4/system/broadcast`
 
-Sends a system-wide message/event to connected clients (payload depends on handler).
+Protected by `validate_access`.
 
 ---
 
-## Compatibility Notes
+## Public + Bootstrapping APIs
 
-- **Shadow directory index (`structure/`)** is designed for **fast prefix listing** only.
-  - It should be updated asynchronously on write operations (insert/remove).
-  - It is **not** a replacement for repairing the authoritative index/blobs.
-- **Repair manager** targets:
-  - authoritative index mirror divergence
-  - shard availability/integrity
-  - quota mirror alignment
-- **Quota sync** endpoints target:
-  - aligning quota used vs actual metadata
-  - removing orphan upload sessions/shards
-  - ensuring required directory structure exists
+### List public fragments (no auth)
+**GET** `/v4/fragment/list/public`
+
+### Create fragment (auth layer)
+**POST** `/v4/fragment/create`
+
+This route is wrapped by `layer_auth` (not the fragment JWT middleware).
+Used to **create/initialize fragment identity** (implementation-defined).
+
+Common request shape (from older versions):
+
+```json
+{
+  "name": "my-fragment",
+  "quota": 1099511627776,
+  "secret": "fragment-secret"
+}
+```
+
+### Ping
+**GET** `/ping` → `"pong"`
 
 ---
 
 ## Quick Endpoint Index
 
-### Protected Read
-- `GET  /v4/capacity/usage`
-- `GET  /v4/fragment/metadata`
-- `GET  /v4/fragment/object/metadata/{fragment}`
-- `GET  /v4/fragment/object/versions/{fragment}/{*object_key}`
-- `GET  /v4/fragment/object/get/{fragment}/{*object_key}`
-- `GET  /v4/fragment/object/stream/{fragment}/{*object_key}`
-- `GET  /v4/fragment/object/get/metadata/{fragment}/{*object_key}`
-- `GET  /v4/fragment/object/download/{fragment}`
-- `GET  /v4/fragment/object/download/chunk/{fragment}`
-- `POST /v4/fragment/object/download/archive/{fragment}`
-- `POST /v4/fragment/object/share`
-- `GET  /v4/fragment/trash/object/metadata/{fragment}`
-- `GET  /v4/fragment/trash/object/versions/{fragment}/{*object_key}`
-- `GET  /v4/fragment/trash/object/get/metadata/{fragment}/{*object_key}`
+### Object storage (protected: validate_access)
 
-### Protected Write
+**Read**
+- `GET  /v4/capacity/usage/{fragment}`
+- `GET  /v4/fragment/list`
+- `GET  /v4/fragment/objects/{fragment}`
+- `GET  /v4/fragment/trash/{fragment}`
+- `GET  /v4/fragment/versions/{fragment}/{*object_key}`
+- `GET  /v4/fragment/get/{fragment}/{*object_key}`
+- `GET  /v4/fragment/stream/{fragment}/{*object_key}`
+- `GET  /v4/fragment/meta/{fragment}/{*object_key}`
+- `GET  /v4/fragment/download/{fragment}`
+- `GET  /v4/fragment/download/chunk/{fragment}`
+- `POST /v4/fragment/archive/{fragment}`
+- `POST /v4/share/create`
+
+**Write**
+- `DELETE /v4/fragment/delete/{fragment}`
+- `PATCH  /v4/fragment/modify/{fragment}`
+- `DELETE /v4/fragment/trash/empty/{fragment}`
 - `PATCH  /v4/fragment/object/rename`
-- `DELETE /v4/fragment/delete/{fragment_name}`
 - `DELETE /v4/fragment/object/delete/{fragment}/{*object_key}`
-- `DELETE /v4/fragment/object/delete/version/{fragment}/{version_id}/{*object_key}`
-- `DELETE /v4/fragment/object/delete/permanent/{fragment}/{*object_key}`
-- `POST   /v4/fragment/trash/object/restore/{fragment}/{*object_key}`
-- `POST   /v4/fragment/trash/object/restore/version/{fragment}/{version_id}/{*object_key}`
-- `DELETE /v4/fragment/trash/object/delete/permanent/{fragment}/{*object_key}`
-- `POST   /v4/fragment/object/upload/init/{fragment}/{*object_key}`
-- `GET    /v4/fragment/object/upload/status/{fragment}/{version_id}`
-- `PUT    /v4/fragment/object/upload/chunk/{fragment}/{version_id}/{part_index}`
-- `POST   /v4/fragment/object/upload/finalize/{fragment}/{version_id}/{session_id}`
-- `DELETE /v4/fragment/object/upload/cancel/{fragment}/{version_id}`
-- `POST   /v4/maintenance/sync/user`
-- `POST   /v4/storage/sync/user`
-- `POST   /v4/storage/sync/user/initialize`
+- `DELETE /v4/fragment/version/delete/{fragment}/{version_id}/{*object_key}`
+- `DELETE /v4/fragment/permanent/delete/{fragment}/{*object_key}`
+- `POST   /v4/fragment/recover/version/{fragment}/{version_id}/{*object_key}`
+- `POST   /v4/fragment/recover/object/{fragment}/{*object_key}`
+- `POST   /v4/fragment/recover/trash/all/{fragment}`
+
+**Upload**
+- `POST   /v4/upload/init/{fragment}/{*object_key}`
+- `GET    /v4/upload/status/{fragment}/{version_id}`
+- `GET    /v4/upload/status/list/{fragment}`
+- `PUT    /v4/upload/chunk/{fragment}/{version_id}/{part_index}`
+- `POST   /v4/upload/finalize/{fragment}/{version_id}/{session_id}`
+- `DELETE /v4/upload/cancel/{fragment}/{version_id}`
+
+**Maintenance**
+- `POST  /v4/maintenance/sync/global`
+- `POST  /v4/maintenance/sync/fragment`
+- `POST  /v4/maintenance/cleanup/fragment`
+- `POST  /v4/maintenance/init/fragment`
+- `POST  /v4/maintenance/repair/start`
+- `POST  /v4/maintenance/repair/stop`
+- `GET   /v4/maintenance/repair/status`
+- `POST  /v4/maintenance/gc/start`
+- `POST  /v4/maintenance/redistribution/start`
+- `PATCH /v4/maintenance/redistribution/stop`
+- `GET   /v4/maintenance/redistribution/monitor`
+- `GET   /v4/maintenance/health`
 
 ### Public
 - `GET /v4/public/share`
+- `GET /v4/fragment/list/public`
+- `GET /ping`
 
-### System Maintenance
-- `POST  /v4/system/maintenance/redistribute`
-- `PATCH /v4/system/maintenance/redistribute/stop`
-- `POST  /v4/system/maintenance/sync/all`
-- `POST  /v4/system/maintenance/repair`
-- `POST  /v4/system/maintenance/repair/stop`
-- `GET   /v4/system/maintenance/health`
-
-### GC
-- `POST /v4/storage/gc/run`
+### Auth
+- `POST /authenticate/fragment`
+- `POST /authenticate/fs`
 
 ### WebSocket
-- `GET /ws`
+- `GET  /ws`
 - `POST /v4/system/broadcast`
