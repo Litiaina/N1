@@ -1,10 +1,12 @@
+use crate::object_storage::constants::{METADATA_EXT, QUOTA_FILE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use crate::object_storage::archive::default_format;
-use crate::object_storage::constants::OBJECT_DATA_ROOT;
+pub fn default_format() -> String {
+    "zip".to_string()
+}
 
 pub static INDEX_STORE_DISKS: OnceLock<Vec<String>> = OnceLock::new();
 pub static BLOB_STORE_DISKS: OnceLock<Vec<String>> = OnceLock::new();
@@ -14,7 +16,6 @@ pub fn default_stripe_size() -> usize {
     256 * 1024
 }
 
-#[derive(Clone)]
 pub struct ObjectPathManager;
 
 impl ObjectPathManager {
@@ -36,66 +37,69 @@ impl ObjectPathManager {
         roots.iter().map(PathBuf::from).collect()
     }
 
-    pub fn get_all_user_index_dirs(&self, uid: &str) -> Vec<PathBuf> {
+    pub fn get_all_index_dirs(&self, fragment_hash: &str) -> Vec<PathBuf> {
         self.get_all_index_roots()
             .iter()
-            .map(|root| root.join(OBJECT_DATA_ROOT).join(uid))
+            .map(|root| root.join(fragment_hash).join("index"))
             .collect()
     }
 
-    pub fn get_all_index_dirs(&self, uid: &str, fragment: &str) -> Vec<PathBuf> {
-        self.get_all_user_index_dirs(uid)
+    pub fn get_all_session_dirs(&self, fragment_hash: &str, version_id: &str) -> Vec<PathBuf> {
+        self.get_all_index_roots()
             .iter()
-            .map(|user_dir| user_dir.join(fragment).join("index"))
-            .collect()
-    }
-
-    pub fn get_all_session_dirs(
-        &self,
-        uid: &str,
-        fragment: &str,
-        version_id: &str,
-    ) -> Vec<PathBuf> {
-        self.get_all_user_index_dirs(uid)
-            .iter()
-            .map(|user_dir| user_dir.join(fragment).join("blobs").join(version_id))
+            .map(|root| {
+                root.join(fragment_hash)
+                    .join("index")
+                    .join("sessions")
+                    .join(version_id)
+            })
             .collect()
     }
 
     pub fn get_all_metadata_paths(
         &self,
-        uid: &str,
-        fragment: &str,
+        fragment_hash: &str,
         object_key: &str,
         version_id: &str,
     ) -> Vec<PathBuf> {
         let mut hasher = Sha256::new();
         hasher.update(object_key.as_bytes());
-        let hash = hex::encode(hasher.finalize());
+        let key_hash = hex::encode(hasher.finalize());
 
-        let shard1 = &hash[0..2];
-        let shard2 = &hash[2..4];
-        let filename = format!("{}#{}.bson", hash, version_id);
+        let shard1 = &key_hash[0..2];
+        let shard2 = &key_hash[2..4];
+        let shard3 = &key_hash[4..6];
+        let shard4 = &key_hash[6..8];
+        let filename = format!("{}#{}{}", key_hash, version_id, METADATA_EXT);
 
-        self.get_all_index_dirs(uid, fragment)
+        self.get_all_index_roots()
             .iter()
-            .map(|index_dir| index_dir.join(shard1).join(shard2).join(&filename))
+            .map(|root| {
+                root.join(fragment_hash)
+                    .join("index")
+                    .join(shard1)
+                    .join(shard2)
+                    .join(shard3)
+                    .join(shard4)
+                    .join(&filename)
+            })
             .collect()
     }
 
     pub fn get_shard_dir_on_disk(
         &self,
         disk_root: &PathBuf,
-        uid: &str,
-        fragment: &str,
+        fragment_hash: &str,
         version_id: &str,
     ) -> PathBuf {
-        disk_root
-            .join(OBJECT_DATA_ROOT)
-            .join(uid)
-            .join(fragment)
-            .join("blobs")
-            .join(version_id)
+        disk_root.join(fragment_hash).join("blob").join(version_id)
+    }
+
+    pub fn get_all_quota_paths(&self, fragment_hash: &str) -> Vec<PathBuf> {
+        self.get_all_index_roots()
+            .iter()
+            .map(|root| root.join(fragment_hash).join(QUOTA_FILE))
+            .collect()
     }
 }
 
@@ -126,7 +130,7 @@ pub struct PartMetadata {
     pub size_bytes: u64,
     pub created_at: i64,
     pub shards: Vec<ShardInfo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub checksum: Option<String>,
 }
 
@@ -197,6 +201,7 @@ pub struct InitiateUploadResponse {
 #[derive(Serialize)]
 pub struct CapacityUsageResponse {
     pub capacity_used: u64,
+    pub capacity_allocated: u64,
 }
 
 #[derive(Deserialize)]
@@ -259,19 +264,6 @@ pub struct UploadPartQuery {
 pub struct Quota {
     pub allocated_storage: u64,
     pub storage_used: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct UserRecord {
-    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
-    pub id: Option<mongodb::bson::oid::ObjectId>,
-    pub uid: String,
-    pub email: String,
-    #[serde(rename = "password")]
-    pub password_hash: String,
-    pub allocated_storage: u64,
-    #[serde(default)]
-    pub created_at: i64,
 }
 
 #[derive(serde::Deserialize)]

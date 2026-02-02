@@ -1,7 +1,11 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::{
-    GC_SUFFIX, META_TMP_EXT, OBJECT_DATA_ROOT, PARITY_SUFFIX, PART_META_SUFFIX, QUOTA_FILE,
-    REDIST_TMP_SUFFIX, SHARD_SUFFIX,
+    GC_SUFFIX, META_TMP_EXT, METADATA_EXT, PARITY_SUFFIX, PART_META_SUFFIX, QUOTA_FILE,
+    REDIST_TMP_SUFFIX, RESERVATION_FILE, SHARD_SUFFIX,
+};
+use crate::object_storage::disk_manager::{
+    INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo,
+    default_stripe_size,
 };
 use crate::object_storage::ec::ErasureStreamWriter;
 use crate::object_storage::recovery::read_or_recover_chunk;
@@ -10,25 +14,25 @@ use crate::object_storage::upload::{
     sync_dir,
 };
 use crate::routes::storage_routes::AppState;
-use crate::structs::object_storage_structs::{
-    INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo,
-    default_stripe_size,
-};
+use crate::structs::auth_structs::Claims;
 use crate::websocket::manager::WsConnectionManager;
 use crate::websocket::ws_structs::StorageEventPayload;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
 
 use chrono::Utc;
+use futures_util::stream::{self, Stream};
 use serde::Serialize;
 
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::fs as tokio_fs;
 use tokio::io::AsyncWriteExt;
@@ -40,13 +44,13 @@ pub struct RedistributionJobStatus {
     pub is_running: bool,
     pub phase: String,
 
-    pub total_users_scanned: u64,
+    pub total_fragments_scanned: u64,
     pub total_objects_scanned: u64,
     pub total_objects_need_redistribution: u64,
     pub total_objects_migrated: u64,
     pub total_errors: u64,
 
-    pub current_user: String,
+    pub current_fragment: String,
     pub last_object: Option<String>,
     pub last_error: Option<String>,
 
@@ -69,14 +73,41 @@ pub async fn get_redist_status() -> RedistributionJobStatus {
     REDIST_STATUS.read().await.clone()
 }
 
+pub async fn monitor_redistribution_job_api(
+    claims: Claims,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+
+    let stream = stream::unfold((), |()| async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let state = REDIST_STATUS.read().await.clone();
+
+        let event = Event::default()
+            .json_data(state)
+            .unwrap_or_else(|_| Event::default().data("serialization error"));
+        Some((Ok(event), ()))
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
 pub async fn trigger_redistribution_job_api(
+    claims: Claims,
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.write || !claims.modify || !claims.delete {
+        return Err(AppError::Forbidden(
+            "Write, Modify and Delete permissions required".into(),
+        ));
+    }
+
     {
         let st = REDIST_STATUS.read().await;
         if st.is_running {
-            return (StatusCode::CONFLICT, "Job already running").into_response();
+            return Err(AppError::Conflict("Job already running".into()));
         }
     }
 
@@ -97,7 +128,7 @@ pub async fn trigger_redistribution_job_api(
         }
     });
 
-    (
+    Ok((
         StatusCode::ACCEPTED,
         if dry_run {
             "Redistribution initiated (dry run)."
@@ -105,10 +136,16 @@ pub async fn trigger_redistribution_job_api(
             "Redistribution initiated."
         },
     )
-        .into_response()
+        .into_response())
 }
 
-pub async fn stop_redistribution_job_api(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn stop_redistribution_job_api(claims: Claims, State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, AppError> {
+    if !claims.write || !claims.modify || !claims.delete {
+        return Err(AppError::Forbidden(
+            "Write, Modify and Delete permissions required".into(),
+        ));
+    }
+
     STOP_SIGNAL.store(true, Ordering::Relaxed);
     let mut st = REDIST_STATUS.write().await;
     if st.is_running {
@@ -118,7 +155,67 @@ pub async fn stop_redistribution_job_api(State(state): State<Arc<AppState>>) -> 
             .ws_manager
             .broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
     }
-    (StatusCode::OK, "Stop signal sent.").into_response()
+    Ok((StatusCode::OK, "Stop signal sent.").into_response())
+}
+
+fn get_shard_dir_custom(
+    disk_root: &Path,
+    fragment_hash: &str,
+    version_id: &str,
+    is_trash: bool,
+) -> PathBuf {
+    if is_trash {
+        disk_root
+            .join(fragment_hash)
+            .join(".trash")
+            .join("blob")
+            .join(version_id)
+    } else {
+        disk_root.join(fragment_hash).join("blob").join(version_id)
+    }
+}
+
+fn get_all_metadata_paths_custom(
+    index_roots: &[PathBuf],
+    fragment_hash: &str,
+    object_key: &str,
+    version_id: &str,
+    is_trash: bool,
+) -> Vec<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(object_key.as_bytes());
+    let key_hash = hex::encode(hasher.finalize());
+
+    let shard1 = &key_hash[0..2];
+    let shard2 = &key_hash[2..4];
+    let shard3 = &key_hash[4..6];
+    let shard4 = &key_hash[6..8];
+    let filename = format!("{}#{}{}", key_hash, version_id, METADATA_EXT);
+
+    index_roots
+        .iter()
+        .map(|root| {
+            if is_trash {
+                root.join(fragment_hash)
+                    .join(".trash")
+                    .join("index")
+                    .join(shard1)
+                    .join(shard2)
+                    .join(shard3)
+                    .join(shard4)
+                    .join(&filename)
+            } else {
+                root.join(fragment_hash)
+                    .join("index")
+                    .join(shard1)
+                    .join(shard2)
+                    .join(shard3)
+                    .join(shard4)
+                    .join(&filename)
+            }
+        })
+        .collect()
 }
 
 pub async fn run_redistribution_job(
@@ -174,11 +271,11 @@ pub async fn run_redistribution_job(
 
     let index_roots: Vec<PathBuf> = index_roots_config
         .iter()
-        .map(|s| PathBuf::from(s).join(OBJECT_DATA_ROOT))
+        .map(|s| PathBuf::from(s))
         .collect();
 
     info!(
-        "Starting TRUE Redistribution Job. target={}D+{}P stripe={} bytes blob_disks={} index_roots={} dry_run={}",
+        "Starting TRUE Redistribution Job (Active & Trash). target={}D+{}P stripe={} bytes blob_disks={} index_roots={} dry_run={}",
         target_data_shards,
         target_parity_shards,
         target_stripe_size,
@@ -189,7 +286,7 @@ pub async fn run_redistribution_job(
 
     let mut processed_versions: HashSet<String> = HashSet::new();
 
-    for index_root in index_roots {
+    for index_root in &index_roots {
         if should_stop() {
             break;
         }
@@ -205,7 +302,7 @@ pub async fn run_redistribution_job(
             ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
         }
 
-        let mut user_entries = match tokio_fs::read_dir(&index_root).await {
+        let mut frag_entries = match tokio_fs::read_dir(&index_root).await {
             Ok(e) => e,
             Err(e) => {
                 warn!("Failed to read index root {:?}: {}", index_root, e);
@@ -213,41 +310,35 @@ pub async fn run_redistribution_job(
             }
         };
 
-        while let Ok(Some(user_entry)) = user_entries.next_entry().await {
+        while let Ok(Some(frag_entry)) = frag_entries.next_entry().await {
             if should_stop() {
                 break;
             }
 
-            let user_path = user_entry.path();
-            if !user_path.is_dir() {
+            let frag_path = frag_entry.path();
+            if !frag_path.is_dir() {
                 continue;
             }
 
-            let uid = user_entry.file_name().to_string_lossy().to_string();
+            let fragment_hash = frag_entry.file_name().to_string_lossy().to_string();
 
             {
                 let mut st = REDIST_STATUS.write().await;
-                st.current_user = uid.clone();
-                st.total_users_scanned += 1;
+                st.current_fragment = fragment_hash.clone();
+                st.total_fragments_scanned += 1;
             }
 
-            let mut frag_entries = match tokio_fs::read_dir(&user_path).await {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+            let scan_targets = vec![("index", false), (".trash/index", true)];
 
-            while let Ok(Some(frag_entry)) = frag_entries.next_entry().await {
-                if should_stop() {
-                    break;
-                }
-
-                let index_dir = frag_entry.path().join("index");
+            for (sub_dir, is_trash) in scan_targets {
+                let index_dir = frag_path.join(sub_dir);
                 if !tokio_fs::try_exists(&index_dir).await.unwrap_or(false) {
                     continue;
                 }
 
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<PathBuf>(128);
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<(PathBuf, bool)>(128);
                 let index_dir_clone = index_dir.clone();
+
                 tokio::task::spawn_blocking(move || {
                     let walker = WalkDir::new(index_dir_clone).into_iter();
                     for entry in walker.filter_map(|e| e.ok()) {
@@ -255,12 +346,12 @@ pub async fn run_redistribution_job(
                             let p = entry.path();
                             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-                            if name.ends_with(".bson")
+                            if name.ends_with(METADATA_EXT)
                                 && !name.ends_with(PART_META_SUFFIX)
                                 && name != QUOTA_FILE
-                                && name != "reservation.bson"
+                                && name != RESERVATION_FILE
                             {
-                                if tx.blocking_send(p.to_path_buf()).is_err() {
+                                if tx.blocking_send((p.to_path_buf(), is_trash)).is_err() {
                                     break;
                                 }
                             }
@@ -271,7 +362,7 @@ pub async fn run_redistribution_job(
                 let mut batch_scanned: u64 = 0;
                 const STATUS_BATCH: u64 = 50;
 
-                while let Some(meta_path) = rx.recv().await {
+                while let Some((meta_path, is_trash_flag)) = rx.recv().await {
                     if should_stop() {
                         break;
                     }
@@ -280,10 +371,12 @@ pub async fn run_redistribution_job(
                         Ok(d) => d,
                         Err(_) => continue,
                     };
-                    let mut meta = match mongodb::bson::from_slice::<ObjectMetadata>(&raw) {
+
+                    let mut meta = match rmp_serde::from_slice::<ObjectMetadata>(&raw) {
                         Ok(m) => m,
                         Err(_) => continue,
                     };
+
                     if meta.is_delete_marker {
                         continue;
                     }
@@ -315,7 +408,10 @@ pub async fn run_redistribution_job(
                         target_stripe_size,
                         num_disks,
                         &blob_roots,
-                    );
+                        &index_roots,
+                        is_trash_flag,
+                    )
+                    .await;
 
                     if !needs {
                         continue;
@@ -325,15 +421,15 @@ pub async fn run_redistribution_job(
                         let mut st = REDIST_STATUS.write().await;
                         st.total_objects_need_redistribution += 1;
                         st.last_object = Some(format!(
-                            "{}/{} (v:{})",
-                            meta.fragment, meta.object_key, meta.version_id
+                            "{}/{} (v:{}) [Trash:{}]",
+                            meta.fragment, meta.object_key, meta.version_id, is_trash_flag
                         ));
                     }
 
                     if dry_run {
                         info!(
-                            "[DRY RUN] Would redistribute {}/{} (v:{})",
-                            meta.fragment, meta.object_key, meta.version_id
+                            "[DRY RUN] Would redistribute {}/{} (v:{}) Trash:{}",
+                            meta.fragment, meta.object_key, meta.version_id, is_trash_flag
                         );
                         let mut st = REDIST_STATUS.write().await;
                         st.total_objects_migrated += 1;
@@ -349,6 +445,8 @@ pub async fn run_redistribution_job(
                         target_parity_shards,
                         target_stripe_size,
                         &blob_roots,
+                        &index_roots,
+                        is_trash_flag,
                     )
                     .await
                     {
@@ -406,13 +504,15 @@ pub async fn run_redistribution_job(
     Ok(())
 }
 
-fn check_needs_redistribution(
+async fn check_needs_redistribution(
     meta: &ObjectMetadata,
     target_data: usize,
     target_parity: usize,
     target_stripe_size: usize,
     target_num_disks: usize,
-    target_roots: &[PathBuf],
+    target_blob_roots: &[PathBuf],
+    target_index_roots: &[PathBuf],
+    is_trash: bool,
 ) -> bool {
     if meta.parts.is_empty() {
         return false;
@@ -440,17 +540,42 @@ fn check_needs_redistribution(
     for part in &meta.parts {
         for shard in &part.shards {
             let expected = (part.part_index as usize + shard.shard_index) % target_num_disks;
-            if expected >= target_roots.len() {
+            if expected >= target_blob_roots.len() {
                 return true;
             }
-            let expected_root = target_roots[expected].to_string_lossy();
-            if !shard.absolute_path.starts_with(expected_root.as_ref()) {
+
+            let target_disk_path = target_blob_roots[expected].to_string_lossy();
+            if !shard.absolute_path.starts_with(target_disk_path.as_ref()) {
+                debug!("Needs redistribution: Disk mismatch");
+                return true;
+            }
+
+            let in_trash_path = shard.absolute_path.contains(".trash");
+            if is_trash != in_trash_path {
                 debug!(
-                    "Needs redistribution: placement mismatch {} shard={}",
-                    meta.object_key, shard.shard_index
+                    "Needs redistribution: Trash status mismatch. IsTrash:{}, Path has trash:{}",
+                    is_trash, in_trash_path
                 );
                 return true;
             }
+        }
+    }
+
+    let expected_metadata_paths = get_all_metadata_paths_custom(
+        target_index_roots,
+        &meta.fragment,
+        &meta.object_key,
+        &meta.version_id,
+        is_trash,
+    );
+
+    for path in expected_metadata_paths {
+        if !tokio_fs::try_exists(&path).await.unwrap_or(false) {
+            debug!(
+                "Needs redistribution: metadata replica missing at {:?}",
+                path
+            );
+            return true;
         }
     }
 
@@ -463,14 +588,14 @@ async fn redistribute_object_streaming(
     target_parity_shards: usize,
     target_stripe_size: usize,
     target_blob_roots: &[PathBuf],
+    target_index_roots: &[PathBuf],
+    is_trash: bool,
 ) -> Result<(), AppError> {
     if should_stop() {
         return Err(AppError::InternalServerError("Stopped".into()));
     }
 
     let start_time = Instant::now();
-    let path_manager = ObjectPathManager::new();
-
     let num_disks = target_blob_roots.len();
     let total_shards = target_data_shards + target_parity_shards;
 
@@ -525,12 +650,8 @@ async fn redistribute_object_streaming(
                 continue;
             }
 
-            let shard_dir = path_manager.get_shard_dir_on_disk(
-                disk_root,
-                &meta.owner_uid,
-                &meta.fragment,
-                &meta.version_id,
-            );
+            let shard_dir =
+                get_shard_dir_custom(disk_root, &meta.fragment, &meta.version_id, is_trash);
             tokio_fs::create_dir_all(&shard_dir).await.ok();
 
             let final_path = shard_dir.join(&file_name);
@@ -686,13 +807,16 @@ async fn redistribute_object_streaming(
     meta.parts = new_parts;
     meta.stripe_size_bytes = new_block_size;
 
-    let bson_data = mongodb::bson::to_vec(&*meta)?;
+    let bson_data = rmp_serde::to_vec(&*meta).map_err(|e| {
+        AppError::InternalServerError(format!("Failed to serialize metadata: {}", e))
+    })?;
 
-    let meta_paths = path_manager.get_all_metadata_paths(
-        &meta.owner_uid,
+    let meta_paths = get_all_metadata_paths_custom(
+        target_index_roots,
         &meta.fragment,
         &meta.object_key,
         &meta.version_id,
+        is_trash,
     );
 
     for p in meta_paths {
@@ -757,10 +881,11 @@ async fn redistribute_object_streaming(
     }
 
     info!(
-        "Redistributed {}/{} (v:{}) in {:.2?}.",
+        "Redistributed {}/{} (v:{}) [Trash:{}] in {:.2?}.",
         meta.fragment,
         meta.object_key,
         meta.version_id,
+        is_trash,
         start_time.elapsed()
     );
 

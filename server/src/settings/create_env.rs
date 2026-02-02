@@ -26,8 +26,12 @@ pub fn create_env_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     writeln!(file, "URL_SIGNING_SECRET=")?;
     writeln!(file)?;
 
-    writeln!(file, "# Server authentication key (for admin access)")?;
-    writeln!(file, "SERVER_AUTH_KEY=")?;
+    writeln!(file, "# Storage authentication key")?;
+    writeln!(file, "AUTH_KEY=")?;
+    writeln!(file)?;
+
+    writeln!(file, "# Server authentication key")?;
+    writeln!(file, "MASTER_KEY=")?;
     writeln!(file)?;
 
     writeln!(file,"# MongoDB connection string (default)")?;

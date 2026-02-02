@@ -1,4 +1,4 @@
-use crate::structs::auth_structs::Claims;
+use crate::structs::auth_structs::FileSystemClaims;
 use crate::structs::capacity_struct::CapacityDetailParams;
 use crate::validation::directory_validation::{get_allocated_storage, get_dir_size};
 use axum::Json;
@@ -9,7 +9,7 @@ use serde_json::json;
 use std::path::PathBuf;
 
 pub async fn get_storage_capacity(
-    claims: Claims,
+    claims: FileSystemClaims,
     Query(params): Query<CapacityDetailParams>
 ) -> impl IntoResponse {
     let allocated_storage = match get_allocated_storage(claims.uid.as_str()).await {

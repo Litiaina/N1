@@ -1,15 +1,16 @@
 use crate::enums::app_error_enum::AppError;
+use crate::object_storage::disk_manager::{
+    ChunkQuery, ObjectKeyQuery, ObjectPathManager, ShardInfo,
+};
 use crate::object_storage::metadata_parser::{get_metadata, get_version_metadata};
 use crate::object_storage::object_parser::stream_object_logic;
 use crate::object_storage::recovery::read_or_recover_chunk;
 use crate::structs::auth_structs::Claims;
-use crate::structs::object_storage_structs::{ChunkQuery, ObjectKeyQuery, ShardInfo};
 use axum::body::Body;
 use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::File;
 
@@ -19,10 +20,18 @@ pub async fn download_object(
     Query(query): Query<ObjectKeyQuery>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+
     let metadata = if let Some(version_id) = &query.version_id {
-        get_version_metadata(&fragment, &query.object_key, version_id, &claims.uid).await?
+        get_version_metadata(&fragment, &query.object_key, version_id, &claims.fragment).await?
     } else {
-        get_metadata(&fragment, &query.object_key, &claims.uid).await?
+        get_metadata(&fragment, &query.object_key, &claims.fragment).await?
     };
 
     if metadata.is_delete_marker {
@@ -37,7 +46,15 @@ pub async fn download_object_chunk(
     Path(fragment): Path<String>,
     Query(params): Query<ChunkQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let metadata = get_metadata(&fragment, &params.object_key, &claims.uid).await?;
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+
+    let metadata = get_metadata(&fragment, &params.object_key, &claims.fragment).await?;
 
     if metadata.is_delete_marker {
         return Err(AppError::NotFound);
@@ -56,6 +73,15 @@ pub async fn download_object_chunk(
     let mut current_global_pos = 0u64;
     let mut checksum_header: Option<&str> = None;
     let mut file_cache: HashMap<String, File> = HashMap::new();
+    let path_manager = ObjectPathManager::new();
+    let blob_roots = path_manager.get_blob_roots();
+    let num_disks = blob_roots.len();
+
+    if num_disks == 0 {
+        return Err(AppError::InternalServerError(
+            "No blob storage configured".into(),
+        ));
+    }
 
     for part in &metadata.parts {
         let part_len = part.size_bytes;
@@ -104,9 +130,17 @@ pub async fn download_object_chunk(
                 let bytes_left_in_block = (stripe_block_size as u64) - offset_in_block;
                 let chunk_len = std::cmp::min(bytes_to_read as u64, bytes_left_in_block) as usize;
 
+                let disk_idx = (part.part_index as usize + shard_index) % num_disks;
+                let target_disk = &blob_roots[disk_idx];
+                let shard_dir = path_manager.get_shard_dir_on_disk(
+                    target_disk,
+                    &metadata.fragment,
+                    &metadata.version_id,
+                );
+
                 let chunk_data = read_or_recover_chunk(
                     &mut file_cache,
-                    &PathBuf::new(),
+                    &shard_dir,
                     part_arc.clone(),
                     shard_index,
                     file_offset,

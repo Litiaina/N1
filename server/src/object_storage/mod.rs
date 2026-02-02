@@ -20,6 +20,6 @@ pub mod sharing;
 pub mod storage_capacity_parser;
 pub mod sync;
 pub mod upload;
-pub mod directory_index;
 pub mod system;
-pub mod directory_index_rebuilder;
+pub mod disk_manager;
+pub mod fragment_manager;

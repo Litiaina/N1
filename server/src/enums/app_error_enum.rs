@@ -1,6 +1,5 @@
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
-use mongodb::error::Error as MongoDbError;
 use std::io;
 
 use crate::handlers::error_handlers;
@@ -13,23 +12,24 @@ pub enum AppError {
     Conflict(String),
     PayloadTooLarge(String),
     Unauthorized,
+    #[allow(dead_code)]
+    Forbidden(String),
     Multipart(String),
     RangeNotSatisfiable,
     InternalServerError(String),
     InsufficientStorage,
-    MongoDb(MongoDbError),
     NotFound,
 }
 
-impl From<MongoDbError> for AppError {
-    fn from(err: MongoDbError) -> Self {
-        AppError::MongoDb(err)
+impl From<rmp_serde::encode::Error> for AppError {
+    fn from(err: rmp_serde::encode::Error) -> Self {
+        AppError::InternalServerError(format!("MessagePack serialization error: {}", err))
     }
 }
 
-impl From<mongodb::bson::ser::Error> for AppError {
-    fn from(err: mongodb::bson::ser::Error) -> Self {
-        AppError::InternalServerError(format!("BSON serialization error: {}", err))
+impl From<rmp_serde::decode::Error> for AppError {
+    fn from(err: rmp_serde::decode::Error) -> Self {
+        AppError::InternalServerError(format!("MessagePack deserialization error: {}", err))
     }
 }
 
@@ -42,11 +42,11 @@ impl std::fmt::Display for AppError {
             AppError::Conflict(msg) => write!(f, "Conflict: {}", msg),
             AppError::PayloadTooLarge(msg) => write!(f, "Payload too large: {}", msg),
             AppError::Unauthorized => write!(f, "Unauthorized access"),
+            AppError::Forbidden(msg) => write!(f, "Forbidden: {}", msg),
             AppError::Multipart(msg) => write!(f, "Multipart error: {}", msg),
             AppError::RangeNotSatisfiable => write!(f, "Range not satisfiable"),
             AppError::InternalServerError(msg) => write!(f, "Internal server error: {}", msg),
             AppError::InsufficientStorage => write!(f, "Insufficient storage capacity"),
-            AppError::MongoDb(err) => write!(f, "Database error: {}", err),
             AppError::NotFound => write!(f, "Not found"),
         }
     }
@@ -56,7 +56,6 @@ impl std::error::Error for AppError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             AppError::Io(err, _) => Some(err),
-            AppError::MongoDb(err) => Some(err),
             _ => None,
         }
     }
@@ -88,6 +87,7 @@ impl IntoResponse for AppError {
             AppError::Unauthorized => {
                 (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()).into_response()
             }
+            AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg).into_response(),
             AppError::RangeNotSatisfiable => (
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 "Range Not Satisfiable".to_string(),
@@ -106,14 +106,6 @@ impl IntoResponse for AppError {
                 "Insufficient storage capacity.".to_string(),
             )
                 .into_response(),
-            AppError::MongoDb(err) => {
-                tracing::error!("Database Error: {}", err);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "A database error occurred.".to_string(),
-                )
-                    .into_response()
-            }
         }
     }
 }

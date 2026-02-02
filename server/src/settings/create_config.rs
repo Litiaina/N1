@@ -35,8 +35,6 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("view_limit_burst_size", "100") 
         .set("upload_limit_per_second", "300")
         .set("upload_limit_burst_size", "3000")
-        .set("transcode_limit_per_second", "1")
-        .set("transcode_limit_burst_size", "2")
         .set("sharing_limit_per_second", "50")
         .set("sharing_limit_burst_size", "100")
         .set("global_limit_per_second", "200") 

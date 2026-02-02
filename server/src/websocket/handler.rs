@@ -17,9 +17,9 @@ use tokio::time::{MissedTickBehavior, interval};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::middleware::auth_middleware::JWT_KEYS;
 use crate::websocket::ws_structs::{BroadcastReq, StorageEvent};
 use crate::{
-    middleware::auth_middleware::JWT_KEYS,
     routes::storage_routes::AppState,
     structs::auth_structs::Claims,
     websocket::ws_structs::{ClientMessage, ServerMessage, StorageEventPayload, WsAuthParams},
@@ -49,16 +49,16 @@ pub async fn ws_handler(
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) {
-    let uid = claims.uid.clone();
+    let fragment = claims.fragment.clone();
     let conn_id = Uuid::new_v4().to_string();
 
-    info!(uid = %uid, conn_id = %conn_id, "Websocket client connected");
+    info!(fragment = %fragment, conn_id = %conn_id, "Websocket client connected");
 
     let (mut sender, mut receiver) = socket.split();
 
     let (tx, mut rx) = mpsc::channel::<ServerMessage>(100);
 
-    let mut broadcast_rx = state.ws_manager.subscribe(&uid);
+    let mut broadcast_rx = state.ws_manager.subscribe(&fragment);
 
     let _ = tx
         .send(ServerMessage::Hello {
@@ -94,7 +94,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
                             match tx_logic.try_send(ServerMessage::Event(event)) {
                                 Ok(_) => {},
                                 Err(mpsc::error::TrySendError::Full(_)) => {
-                                    warn!("Websocket client {} buffer full (slow consumer). Disconnecting.", uid);
+                                    warn!("Websocket client {} buffer full (slow consumer). Disconnecting.", fragment);
                                     break;
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => break,
@@ -141,7 +141,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
     }
 
     info!("Websocket client disconnected");
-    state.ws_manager.cleanup_connection(&claims.uid);
+    state.ws_manager.cleanup_connection(&claims.fragment);
 }
 
 pub async fn system_broadcast_handler(

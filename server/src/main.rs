@@ -1,10 +1,10 @@
 use crate::fs::cleanup_manager::interval_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
+use crate::object_storage::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
 use crate::object_storage::upload::{DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC};
 use crate::routes::storage_routes::serve_storage_routes;
 use crate::settings::constants::{CONFIG_FILE, ENV_FILE};
-use crate::structs::object_storage_structs::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
 use crate::utils::date_time_formatter::LocalTimer;
 use crate::validation::enforce_init_settings::{ensure_config_file, ensure_env_file};
 use axum::Router;
@@ -74,8 +74,9 @@ async fn main() {
 
     let args = Cli::parse();
 
-    match args.command {
-        Some(cmd) if matches!(cmd, Commands::Gc | Commands::Sync) => {
+    match &args.command {
+        Some(Commands::Server) | None => {}
+        Some(cmd) => {
             dotenv().ok();
 
             let target_url = args.url.or_else(|| {
@@ -90,22 +91,22 @@ async fn main() {
             });
             
             let result = execute_command(
-                &cmd,          
-                args.email,    
-                args.password, 
+                cmd,          
+                args.secret.clone(),    
+                args.fragment.clone(), 
                 target_url,   
                 args.insecure  
             ).await;
 
             drop(_guard);
 
-            if let Err(_) = result {
+            if let Err(e) = result {
+                eprintln!("Command failed: {}", e);
                 std::process::exit(1);
             }
             
             return;
-        },
-        _ => {}
+        }
     }
 
     if let Err(e) = ensure_env_file() {

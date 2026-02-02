@@ -1,6 +1,6 @@
 use crate::fs::fs_constants::INITIAL_CHUNK_SIZE;
 use crate::object_storage::header_parser::parse_range_header;
-use crate::structs::auth_structs::Claims;
+use crate::structs::auth_structs::FileSystemClaims;
 use crate::structs::file_detail_params_struct::FileDetail;
 use crate::validation::directory_validation::sanitize_path;
 use axum::Json;
@@ -21,7 +21,7 @@ use tracing::error;
 use walkdir::WalkDir;
 
 pub async fn view_directory(
-    claims: Claims,
+    claims: FileSystemClaims,
     path: Option<Path<String>>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let validated_uid = claims.uid.clone();
@@ -109,7 +109,7 @@ pub async fn view_directory(
 }
 
 pub async fn view_file(
-    claims: Claims,
+    claims: FileSystemClaims,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let validated_uid = &claims.uid;
@@ -140,7 +140,7 @@ pub async fn view_file(
 }
 
 pub async fn stream_file(
-    claims: Claims,
+    claims: FileSystemClaims,
     headers: HeaderMap,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
@@ -215,7 +215,7 @@ pub async fn stream_file(
 }
 
 pub async fn stream_file_v2(
-    claims: Claims,
+    claims: FileSystemClaims,
     headers: HeaderMap,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, Response> {
@@ -275,7 +275,7 @@ pub async fn stream_file_v2(
 }
 
 pub async fn stream_hls_file(
-    claims: Claims,
+    claims: FileSystemClaims,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, Response> {
     let sanitized_directory = sanitize_path(&path);

@@ -1,6 +1,6 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::{LOCK_SHARD_COUNT, QUOTA_FILE};
-use crate::structs::object_storage_structs::{ObjectPathManager, Quota};
+use crate::object_storage::constants::LOCK_SHARD_COUNT;
+use crate::object_storage::disk_manager::{ObjectPathManager, Quota};
 use futures_util::future::join_all;
 use moka::future::Cache;
 use std::collections::hash_map::DefaultHasher;
@@ -24,9 +24,9 @@ static QUOTA_LOCKS: LazyLock<Vec<Mutex<()>>> = LazyLock::new(|| {
     locks
 });
 
-fn get_quota_lock(uid: &str) -> &Mutex<()> {
+fn get_quota_lock(fragment: &str) -> &Mutex<()> {
     let mut hasher = DefaultHasher::new();
-    uid.hash(&mut hasher);
+    fragment.hash(&mut hasher);
     let idx = (hasher.finish() as usize) % LOCK_SHARD_COUNT;
     &QUOTA_LOCKS[idx]
 }
@@ -38,19 +38,15 @@ static QUOTA_CACHE: LazyLock<Cache<String, Quota>> = LazyLock::new(|| {
         .build()
 });
 
-fn get_all_quota_paths(uid: &str) -> Vec<PathBuf> {
+fn get_all_quota_paths(fragment: &str) -> Vec<PathBuf> {
     let path_manager = ObjectPathManager::new();
-    path_manager
-        .get_all_user_index_dirs(uid)
-        .into_iter()
-        .map(|dir| dir.join(QUOTA_FILE))
-        .collect()
+    path_manager.get_all_quota_paths(fragment)
 }
 
-async fn write_quota_to_all_disks(uid: &str, quota: &Quota) -> Result<(), AppError> {
-    let paths = get_all_quota_paths(uid);
+async fn write_quota_to_all_disks(fragment: &str, quota: &Quota) -> Result<(), AppError> {
+    let paths = get_all_quota_paths(fragment);
     let bytes = Arc::new(
-        mongodb::bson::to_vec(quota)
+        rmp_serde::to_vec(quota)
             .map_err(|_| AppError::InternalServerError("Quota serialize error".into()))?,
     );
 
@@ -122,12 +118,14 @@ async fn write_quota_to_all_disks(uid: &str, quota: &Quota) -> Result<(), AppErr
         ));
     }
 
-    QUOTA_CACHE.insert(uid.to_string(), quota.clone()).await;
+    QUOTA_CACHE
+        .insert(fragment.to_string(), quota.clone())
+        .await;
     Ok(())
 }
 
-async fn read_quota_from_any_disk(uid: &str) -> Result<Quota, AppError> {
-    let paths = get_all_quota_paths(uid);
+async fn read_quota_from_any_disk(fragment: &str) -> Result<Quota, AppError> {
+    let paths = get_all_quota_paths(fragment);
 
     for path in paths {
         let exists_check = timeout(DISK_IO_TIMEOUT, fs::try_exists(&path)).await;
@@ -137,7 +135,7 @@ async fn read_quota_from_any_disk(uid: &str) -> Result<Quota, AppError> {
 
             match read_result {
                 Ok(Ok(bytes)) => {
-                    if let Ok(quota) = mongodb::bson::from_slice(&bytes) {
+                    if let Ok(quota) = rmp_serde::from_slice(&bytes) {
                         return Ok(quota);
                     }
                 }
@@ -150,20 +148,20 @@ async fn read_quota_from_any_disk(uid: &str) -> Result<Quota, AppError> {
     Err(AppError::Unauthorized)
 }
 
-pub async fn init_quota_file(uid: &str, allocated: u64) -> Result<(), AppError> {
-    let _guard = get_quota_lock(uid).lock().await;
+pub async fn init_quota_file(fragment: &str, allocated: u64) -> Result<(), AppError> {
+    let _guard = get_quota_lock(fragment).lock().await;
 
-    match read_quota_from_any_disk(uid).await {
+    match read_quota_from_any_disk(fragment).await {
         Ok(current_quota) => {
             if current_quota.allocated_storage != allocated {
                 let new_quota = Quota {
                     allocated_storage: allocated,
                     storage_used: current_quota.storage_used,
                 };
-                write_quota_to_all_disks(uid, &new_quota).await?;
+                write_quota_to_all_disks(fragment, &new_quota).await?;
                 info!(
-                    "Synced quota allocation for user {}: {} bytes",
-                    uid, allocated
+                    "Synced quota allocation for fragment {}: {} bytes",
+                    fragment, allocated
                 );
             }
         }
@@ -172,35 +170,37 @@ pub async fn init_quota_file(uid: &str, allocated: u64) -> Result<(), AppError> 
                 allocated_storage: allocated,
                 storage_used: 0,
             };
-            write_quota_to_all_disks(uid, &quota).await?;
-            info!("Initialized quota file for user {}", uid);
+            write_quota_to_all_disks(fragment, &quota).await?;
+            info!("Initialized quota file for new fragment {}", fragment);
         }
     }
 
     Ok(())
 }
 
-pub async fn get_quota(uid: &str) -> Result<Quota, AppError> {
-    if let Some(quota) = QUOTA_CACHE.get(uid).await {
+pub async fn get_quota(fragment: &str) -> Result<Quota, AppError> {
+    if let Some(quota) = QUOTA_CACHE.get(fragment).await {
         return Ok(quota);
     }
 
-    let _guard = get_quota_lock(uid).lock().await;
+    let _guard = get_quota_lock(fragment).lock().await;
 
-    let quota = read_quota_from_any_disk(uid).await?;
+    let quota = read_quota_from_any_disk(fragment).await?;
 
-    QUOTA_CACHE.insert(uid.to_string(), quota.clone()).await;
+    QUOTA_CACHE
+        .insert(fragment.to_string(), quota.clone())
+        .await;
     Ok(quota)
 }
 
-pub async fn update_quota(uid: &str, delta_bytes: i64) -> Result<(), AppError> {
-    let _guard = get_quota_lock(uid).lock().await;
+pub async fn update_quota(fragment: &str, delta_bytes: i64) -> Result<(), AppError> {
+    let _guard = get_quota_lock(fragment).lock().await;
 
-    let mut quota = match read_quota_from_any_disk(uid).await {
+    let mut quota = match read_quota_from_any_disk(fragment).await {
         Ok(q) => q,
         Err(_) => {
             return Err(AppError::InternalServerError(
-                "Quota file missing or unreadable on all mirrors".into(),
+                "Quota file missing. Fragment not initialized.".into(),
             ));
         }
     };
@@ -211,14 +211,14 @@ pub async fn update_quota(uid: &str, delta_bytes: i64) -> Result<(), AppError> {
         quota.storage_used = quota.storage_used.saturating_add(delta_bytes as u64);
     }
 
-    write_quota_to_all_disks(uid, &quota).await?;
+    write_quota_to_all_disks(fragment, &quota).await?;
     Ok(())
 }
 
-pub async fn try_reserve_quota(uid: &str, reserve_amount: u64) -> Result<(), AppError> {
-    let _guard = get_quota_lock(uid).lock().await;
+pub async fn try_reserve_quota(fragment: &str, reserve_amount: u64) -> Result<(), AppError> {
+    let _guard = get_quota_lock(fragment).lock().await;
 
-    let mut quota = read_quota_from_any_disk(uid).await?;
+    let mut quota = read_quota_from_any_disk(fragment).await?;
 
     if quota.storage_used.saturating_add(reserve_amount) > quota.allocated_storage {
         return Err(AppError::InsufficientStorage);
@@ -226,15 +226,15 @@ pub async fn try_reserve_quota(uid: &str, reserve_amount: u64) -> Result<(), App
 
     quota.storage_used += reserve_amount;
 
-    write_quota_to_all_disks(uid, &quota).await?;
+    write_quota_to_all_disks(fragment, &quota).await?;
 
     Ok(())
 }
 
-pub async fn set_storage_used(uid: &str, usage: u64) -> Result<(), AppError> {
-    let _guard = get_quota_lock(uid).lock().await;
+pub async fn set_storage_used(fragment: &str, usage: u64) -> Result<(), AppError> {
+    let _guard = get_quota_lock(fragment).lock().await;
 
-    let paths = get_all_quota_paths(uid);
+    let paths = get_all_quota_paths(fragment);
     let mut quota_found = false;
     let mut current_quota = Quota {
         allocated_storage: 0,
@@ -248,7 +248,7 @@ pub async fn set_storage_used(uid: &str, usage: u64) -> Result<(), AppError> {
             .unwrap_or(false)
         {
             if let Ok(Ok(bytes)) = timeout(DISK_IO_TIMEOUT, fs::read(path)).await {
-                if let Ok(q) = mongodb::bson::from_slice::<Quota>(&bytes) {
+                if let Ok(q) = rmp_serde::from_slice::<Quota>(&bytes) {
                     current_quota = q;
                     quota_found = true;
                     break;
@@ -264,11 +264,11 @@ pub async fn set_storage_used(uid: &str, usage: u64) -> Result<(), AppError> {
     if current_quota.storage_used != usage {
         info!(
             "Consistency Fix: Correcting usage for {} (File: {} -> Disk: {})",
-            uid, current_quota.storage_used, usage
+            fragment, current_quota.storage_used, usage
         );
         current_quota.storage_used = usage;
 
-        write_quota_to_all_disks(uid, &current_quota).await?;
+        write_quota_to_all_disks(fragment, &current_quota).await?;
     }
 
     Ok(())

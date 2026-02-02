@@ -1,10 +1,12 @@
-pub const OBJECT_DATA_ROOT: &str = "storage";
-pub const PART_META_SUFFIX: &str = ".meta.bson";
+pub const PART_META_SUFFIX: &str = ".meta.msgpack";
 pub const SHARD_SUFFIX: &str = ".shard";
 pub const PARITY_SUFFIX: &str = ".parity";
-pub const QUOTA_FILE: &str = "quota.bson";
+pub const QUOTA_FILE: &str = "quota.msgpack";
+pub const RESERVATION_FILE: &str = "reservation.msgpack";
+pub const SESSION_MANIFEST_FILE: &str = "session.msgpack";
 pub const REDIST_TMP_SUFFIX: &str = ".redist_tmp";
 pub const META_TMP_EXT: &str = "redist_meta_tmp";
+pub const METADATA_EXT: &str = ".msgpack";
 pub const GC_SUFFIX: &str = ".gc";
 pub const BROWSER_CACHE_MAX_AGE: u64 = 3600;
 pub const LOCK_SHARD_COUNT: usize = 64;

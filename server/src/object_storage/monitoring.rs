@@ -1,20 +1,17 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::OBJECT_DATA_ROOT;
+use crate::object_storage::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
 use crate::object_storage::redistribution::get_redist_status;
 use crate::object_storage::repair_manager::get_repair_status;
 use crate::object_storage::system::{SystemMetrics, get_system_metrics};
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
-use crate::structs::object_storage_structs::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
 use crate::websocket::ws_structs::StorageEventPayload;
-
 use axum::{
     Json,
     extract::{Query, State},
     response::IntoResponse,
 };
 use futures_util::future::join_all;
-use mongodb::bson::doc;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -51,7 +48,6 @@ pub struct ConsistencyStats {
 #[derive(Serialize)]
 pub struct SystemHealthResponse {
     pub status: String,
-    pub database_connected: bool,
     pub disks: Vec<DiskStatus>,
     pub consistency: ConsistencyStats,
     pub system: SystemMetrics,
@@ -157,19 +153,16 @@ async fn check_disk_accessibility(path_str: String, role: String) -> DiskStatus 
 
 pub async fn get_system_health(
     State(state): State<Arc<AppState>>,
-    _claims: Claims,
+    claims: Claims,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+
     let system_metrics = get_system_metrics().await;
     let redist_status = get_redist_status().await;
     let repair_status = get_repair_status().await;
-
-    let db_connected = state
-        .db_client
-        .database("admin")
-        .run_command(doc! { "ping": 1 })
-        .await
-        .is_ok();
 
     let index_disks_config = INDEX_STORE_DISKS
         .get()
@@ -199,7 +192,7 @@ pub async fn get_system_health(
         if stat.status == "online" || stat.status == "slow" {
             if stat.role == "index" {
                 online_index_count += 1;
-                active_index_roots.push(PathBuf::from(&stat.path).join(OBJECT_DATA_ROOT));
+                active_index_roots.push(PathBuf::from(&stat.path));
             } else {
                 online_blob_count += 1;
             }
@@ -237,7 +230,7 @@ pub async fn get_system_health(
                     for entry in walker.filter_map(|e| e.ok()) {
                         let path = entry.path();
                         if entry.file_type().is_file()
-                            && path.extension().map_or(false, |ext| ext == "bson")
+                            && path.extension().map_or(false, |ext| ext == "msgpack")
                         {
                             if path.components().any(|c| c.as_os_str() == "blobs") {
                                 continue;
@@ -292,9 +285,7 @@ pub async fn get_system_health(
     let total_index = index_disks_config.len();
     let total_blob = blob_disks_config.len();
 
-    let (status, summary) = if !db_connected {
-        ("critical", "Database connection lost.".to_string())
-    } else if online_index_count == 0 {
+    let (status, summary) = if online_index_count == 0 {
         (
             "critical",
             "ALL Metadata (Index) disks are offline. System cannot function.".to_string(),
@@ -340,7 +331,6 @@ pub async fn get_system_health(
 
     Ok(Json(SystemHealthResponse {
         status: status.to_string(),
-        database_connected: db_connected,
         disks: disk_statuses,
         consistency: ConsistencyStats {
             total_objects_scanned: total_objects,

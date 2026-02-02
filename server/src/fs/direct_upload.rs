@@ -12,10 +12,10 @@ use tokio::fs;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio_util::io::StreamReader;
 use tracing::{error, info, warn};
-use crate::structs::auth_structs::Claims;
+use crate::structs::auth_structs::FileSystemClaims;
 
 pub async fn upload_file(
-    claims: Claims,
+    claims: FileSystemClaims,
     path: Option<Path<String>>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, StatusCode> {

@@ -24,10 +24,10 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 use crate::fs::stateless_fragmented_upload::determine_final_path;
-use crate::structs::auth_structs::Claims;
+use crate::structs::auth_structs::FileSystemClaims;
 
 pub async fn upload_fragments(
-    claims: Claims,
+    claims: FileSystemClaims,
     path: Option<Path<String>>,
     Query(params): Query<UploadParams>,
     mut multipart: Multipart,
@@ -97,7 +97,7 @@ pub async fn upload_fragments(
 }
 
 pub async fn check_uploaded_fragments(
-    claims: Claims,
+    claims: FileSystemClaims,
     path_params: Option<Path<String>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, AppError> {

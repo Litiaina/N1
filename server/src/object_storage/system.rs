@@ -84,7 +84,7 @@ async fn get_memory_info() -> (u64, u64) {
             if line.starts_with("MemTotal:") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 2 {
-                    total = parts[1].parse::<u64>().unwrap_or(0) * 1024; // KB to Bytes
+                    total = parts[1].parse::<u64>().unwrap_or(0) * 1024;
                 }
             }
             if line.starts_with("MemAvailable:") {

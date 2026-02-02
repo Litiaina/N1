@@ -1,114 +1,43 @@
-use axum::{extract::State, http::StatusCode, response::IntoResponse};
-use futures_util::StreamExt;
-use mongodb::{Client, bson::doc};
-use std::{
-    collections::HashMap,
-    error::Error,
-    path::{Path as StdPath, PathBuf},
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
+use axum::{http::StatusCode, response::IntoResponse};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::{error::Error, time::Duration};
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
 use crate::{
-    database::database_constants::DATABASE,
-    object_storage::constants::OBJECT_DATA_ROOT,
-    object_storage::quota_manager::{init_quota_file, set_storage_used},
-    routes::storage_routes::AppState,
-    structs::{
-        auth_structs::Claims,
-        object_storage_structs::{ObjectMetadata, ObjectPathManager, UserRecord},
+    enums::app_error_enum::AppError,
+    object_storage::constants::{METADATA_EXT, QUOTA_FILE},
+    object_storage::{
+        disk_manager::{ObjectMetadata, ObjectPathManager},
+        quota_manager::set_storage_used,
     },
+    structs::auth_structs::Claims,
 };
 
 const DISK_OP_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn parse_version_from_meta_filename(name: &str) -> Option<&str> {
-    if !name.ends_with(".bson") {
-        return None;
-    }
-    let (_, ver_ext) = name.split_once('#')?;
-    let ver = ver_ext.strip_suffix(".bson")?;
-    if ver.is_empty() {
-        return None;
-    }
-    Some(ver)
+#[derive(Deserialize)]
+pub struct CreateFragmentRequest {
+    pub name: String,
+    pub quota: u64,
+    pub secret: String,
 }
 
-#[cfg(unix)]
-fn sync_dir_std(path: &StdPath) {
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt;
-    if let Ok(f) = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY)
-        .open(path)
-    {
-        let _ = f.sync_all();
-    }
+#[derive(Serialize)]
+pub struct CreateFragmentResponse {
+    pub fragment_hash: String,
+    pub name: String,
+    pub quota: u64,
 }
 
-#[cfg(windows)]
-fn sync_dir_std(path: &StdPath) {
-    use std::fs::OpenOptions;
-    use std::os::windows::fs::OpenOptionsExt;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
-    if let Ok(f) = OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-    {
-        let _ = f.sync_all();
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn sync_dir_std(_path: &StdPath) {}
-
-async fn filter_reachable(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for p in paths {
-        let ok = timeout(DISK_OP_TIMEOUT, tokio::fs::try_exists(&p)).await;
-        match ok {
-            Ok(Ok(true)) => out.push(p),
-            Ok(Ok(false)) => {}
-            Ok(Err(e)) => warn!("Failed try_exists {:?}: {}", p, e),
-            Err(_) => warn!("Timeout try_exists {:?}. Skipping.", p),
-        }
-    }
-    out
-}
-
-fn remove_dir_strict(dir: &StdPath) -> bool {
-    if !dir.exists() {
-        return true;
-    }
-    let parent = match dir.parent() {
-        Some(p) => p,
-        None => return false,
-    };
-
-    let gc_dir = PathBuf::from(format!("{}.gcdir", dir.to_string_lossy()));
-    if !gc_dir.exists() {
-        if std::fs::rename(dir, &gc_dir).is_err() {
-            return false;
-        }
-        sync_dir_std(parent);
-    }
-
-    let _ = std::fs::remove_dir_all(&gc_dir);
-    sync_dir_std(parent);
-    !dir.exists()
-}
-
-async fn ensure_user_blob_directories(uid: &str) {
+pub async fn ensure_fragment_blob_directories(fragment_hash: &str) {
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
 
     for root in blob_roots {
-        let blob_dir = root.join(OBJECT_DATA_ROOT).join(uid);
+        let blob_dir = root.join(fragment_hash).join("blob");
 
         let exists_check = timeout(DISK_OP_TIMEOUT, tokio::fs::try_exists(&blob_dir)).await;
 
@@ -118,7 +47,10 @@ async fn ensure_user_blob_directories(uid: &str) {
                     if let Err(_) =
                         timeout(DISK_OP_TIMEOUT, tokio::fs::create_dir_all(&blob_dir)).await
                     {
-                        warn!("Timeout creating blob dir {:?}. Skipping disk.", blob_dir);
+                        warn!(
+                            "Timeout creating blob dir {:?}. Disk might be slow or dead.",
+                            blob_dir
+                        );
                         continue;
                     }
                 }
@@ -130,341 +62,203 @@ async fn ensure_user_blob_directories(uid: &str) {
                 );
             }
             Err(_) => {
-                warn!("Timeout checking {:?}. Skipping disk.", blob_dir);
+                warn!("Timeout checking {:?}. Disk might be dead.", blob_dir);
             }
         }
     }
 }
 
-async fn calculate_usage_across_mirrors(uid: String) -> u64 {
+async fn sweep_fragment_gc_files(fragment_hash: String) {
     let path_manager = ObjectPathManager::new();
-    let user_dirs = path_manager.get_all_user_index_dirs(&uid);
-    let reachable_user_dirs = filter_reachable(user_dirs).await;
-
-    tokio::task::spawn_blocking(move || {
-        let mut version_candidates: HashMap<String, Vec<(SystemTime, PathBuf)>> = HashMap::new();
-
-        for user_dir in reachable_user_dirs {
-            if !user_dir.exists() {
-                continue;
-            }
-
-            let fragments = match std::fs::read_dir(&user_dir) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-
-            for frag_entry in fragments.filter_map(|e| e.ok()) {
-                if !frag_entry.path().is_dir() {
-                    continue;
-                }
-
-                let index_dir = frag_entry.path().join("index");
-                if !index_dir.exists() {
-                    continue;
-                }
-
-                for entry in WalkDir::new(&index_dir).into_iter().filter_map(|e| e.ok()) {
-                    if !entry.file_type().is_file() {
-                        continue;
-                    }
-
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if name == "quota.bson"
-                        || name == "reservation.bson"
-                        || name.ends_with(".partmeta")
-                    {
-                        continue;
-                    }
-
-                    let Some(ver) = parse_version_from_meta_filename(&name) else {
-                        continue;
-                    };
-
-                    let modified = entry
-                        .metadata()
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .unwrap_or(SystemTime::UNIX_EPOCH);
-
-                    let v = version_candidates.entry(ver.to_string()).or_default();
-                    v.push((modified, entry.path().to_path_buf()));
-                    v.sort_by(|a, b| b.0.cmp(&a.0));
-                    if v.len() > 3 {
-                        v.truncate(3);
-                    }
-                }
-            }
-        }
-
-        let mut total = 0u64;
-
-        for (_ver, paths) in version_candidates {
-            let mut added = false;
-            for (_mtime, p) in paths {
-                if let Ok(data) = std::fs::read(&p) {
-                    if let Ok(meta) = mongodb::bson::from_slice::<ObjectMetadata>(&data) {
-                        total = total.saturating_add(meta.total_size_bytes);
-                        added = true;
-                        break;
-                    }
-                }
-            }
-            if !added {
-                continue;
-            }
-        }
-
-        total
-    })
-    .await
-    .unwrap_or(0)
-}
-
-async fn cleanup_orphan_upload_sessions(uid: String) {
-    let path_manager = ObjectPathManager::new();
-    let user_index_dirs = path_manager.get_all_user_index_dirs(&uid);
-    let reachable_index_dirs = filter_reachable(user_index_dirs).await;
-
     let blob_roots = path_manager.get_blob_roots();
-    let mut blob_user_roots = Vec::new();
-    for root in blob_roots {
-        blob_user_roots.push(root.join(OBJECT_DATA_ROOT).join(&uid));
-    }
-    let reachable_blob_roots = filter_reachable(blob_user_roots).await;
-
-    let uid_clone = uid.clone();
-
-    let valid_versions = tokio::task::spawn_blocking(move || -> HashMap<String, ()> {
-        let mut seen: HashMap<String, ()> = HashMap::new();
-
-        for user_dir in reachable_index_dirs {
-            if !user_dir.exists() {
-                continue;
-            }
-            let fragments = match std::fs::read_dir(&user_dir) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            for frag_entry in fragments.filter_map(|e| e.ok()) {
-                if !frag_entry.path().is_dir() {
-                    continue;
-                }
-                let index_dir = frag_entry.path().join("index");
-                if !index_dir.exists() {
-                    continue;
-                }
-                for entry in WalkDir::new(&index_dir).into_iter().filter_map(|e| e.ok()) {
-                    if !entry.file_type().is_file() {
-                        continue;
-                    }
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    let Some(ver) = parse_version_from_meta_filename(&name) else {
-                        continue;
-                    };
-                    seen.insert(ver.to_string(), ());
-                }
-            }
-        }
-
-        seen
-    })
-    .await
-    .unwrap_or_default();
 
     tokio::task::spawn_blocking(move || {
-        let mut roots = Vec::new();
-        roots.extend(reachable_blob_roots);
-
-        for user_root in roots {
-            if !user_root.exists() {
+        for root in blob_roots {
+            let fragment_root = root.join(&fragment_hash);
+            if !fragment_root.exists() {
                 continue;
             }
 
-            let fragments = match std::fs::read_dir(&user_root) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-
-            for frag_entry in fragments.filter_map(|e| e.ok()) {
-                if !frag_entry.path().is_dir() {
+            for entry in WalkDir::new(&fragment_root)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                if !entry.file_type().is_file() {
                     continue;
                 }
-
-                let blobs_dir = frag_entry.path().join("blobs");
-                if !blobs_dir.exists() {
-                    continue;
-                }
-
-                let blob_entries = match std::fs::read_dir(&blobs_dir) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-
-                for blob_entry in blob_entries.filter_map(|e| e.ok()) {
-                    let path = blob_entry.path();
-                    if !path.is_dir() {
-                        continue;
-                    }
-
-                    let version_id = blob_entry.file_name().to_string_lossy().to_string();
-                    if valid_versions.contains_key(&version_id) {
-                        continue;
-                    }
-
-                    let receipt = path.join("reservation.bson");
-                    if !receipt.exists() {
-                        continue;
-                    }
-
-                    let _ = remove_dir_strict(&path);
+                let name = entry.file_name().to_string_lossy();
+                if name.ends_with(".gc") {
+                    let _ = std::fs::remove_file(entry.path());
                 }
             }
         }
-
-        let _ = uid_clone;
     })
     .await
     .ok();
 }
 
-pub async fn sync_quota(db_client: Arc<Client>) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let db = db_client.database(DATABASE);
-    let auth_collection = db.collection::<UserRecord>("auth");
-    let mut cursor = auth_collection.find(doc! {}).await?;
+async fn calculate_usage_across_mirrors(fragment_hash: String) -> u64 {
+    let path_manager = ObjectPathManager::new();
+    let index_dirs = path_manager.get_all_index_dirs(&fragment_hash);
+
+    tokio::task::spawn_blocking(move || {
+        let mut max_total_usage = 0u64;
+
+        for index_dir in index_dirs {
+            if !index_dir.exists() {
+                continue;
+            }
+
+            let mut current_disk_usage = 0u64;
+
+            for entry in WalkDir::new(&index_dir).into_iter().filter_map(|e| e.ok()) {
+                if entry.file_type().is_file()
+                    && entry.file_name().to_string_lossy().ends_with(METADATA_EXT)
+                {
+                    if entry.file_name() == QUOTA_FILE {
+                        continue;
+                    }
+
+                    if let Ok(data) = std::fs::read(entry.path()) {
+                        if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
+                            if !meta.is_delete_marker {
+                                current_disk_usage += meta.total_size_bytes;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if current_disk_usage > max_total_usage {
+                max_total_usage = current_disk_usage;
+            }
+        }
+
+        max_total_usage
+    })
+    .await
+    .unwrap_or(0)
+}
+
+async fn recover_fragment_name_from_disk(fragment_hash: String) -> Option<String> {
+    let path_manager = ObjectPathManager::new();
+    let index_roots = path_manager.get_all_index_roots();
+
+    tokio::task::spawn_blocking(move || {
+        for root in index_roots {
+            let index_dir = root.join(&fragment_hash).join("index");
+            if !index_dir.exists() {
+                continue;
+            }
+
+            for entry in WalkDir::new(&index_dir).into_iter().filter_map(|e| e.ok()) {
+                if entry.file_type().is_file()
+                    && entry.file_name().to_string_lossy().ends_with(METADATA_EXT)
+                    && entry.file_name() != QUOTA_FILE
+                {
+                    if let Ok(data) = std::fs::read(entry.path()) {
+                        if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
+                            return Some(meta.fragment);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    })
+    .await
+    .unwrap_or(None)
+}
+
+pub async fn sync_quota() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let path_manager = ObjectPathManager::new();
+    let index_roots = path_manager.get_all_index_roots();
+
+    let mut processed_hashes = HashSet::new();
     let mut count = 0;
 
-    while let Some(result) = cursor.next().await {
-        match result {
-            Ok(user) => {
-                let uid = user.uid;
+    for root in index_roots {
+        let mut entries = match tokio::fs::read_dir(&root).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
 
-                if let Err(e) = init_quota_file(&uid, user.allocated_storage).await {
-                    warn!("Partial failure syncing quota file for {}: {}", &uid, e);
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Ok(file_type) = entry.file_type().await {
+                if file_type.is_dir() {
+                    let fragment_hash = entry.file_name().to_string_lossy().to_string();
+
+                    if processed_hashes.contains(&fragment_hash) {
+                        continue;
+                    }
+                    processed_hashes.insert(fragment_hash.clone());
+
+                    let readable_name = recover_fragment_name_from_disk(fragment_hash.clone())
+                        .await
+                        .unwrap_or_else(|| "Unknown/Empty".to_string());
+
+                    ensure_fragment_blob_directories(&fragment_hash).await;
+                    sweep_fragment_gc_files(fragment_hash.clone()).await;
+
+                    let usage = calculate_usage_across_mirrors(fragment_hash.clone()).await;
+
+                    if let Err(e) = set_storage_used(&fragment_hash, usage).await {
+                        warn!(
+                            "Failed to update usage for Fragment '{}' (Hash: {}): {}",
+                            readable_name, fragment_hash, e
+                        );
+                    } else {
+                        info!(
+                            "Synced quota for Fragment '{}' (Hash: {}). Usage: {} bytes",
+                            readable_name, fragment_hash, usage
+                        );
+                    }
+                    count += 1;
                 }
-
-                ensure_user_blob_directories(&uid).await;
-
-                cleanup_orphan_upload_sessions(uid.clone()).await;
-
-                let calculated_usage = calculate_usage_across_mirrors(uid.clone()).await;
-
-                if let Err(e) = set_storage_used(&uid, calculated_usage).await {
-                    warn!("Failed to update usage stats for {}: {}", &uid, e);
-                }
-
-                count += 1;
-            }
-            Err(e) => {
-                error!("Failed to retrieve user document during sync: {}", e);
             }
         }
     }
 
-    info!("Consistency check completed for {} users.", count);
-
+    info!(
+        "Consistency check completed. Synced {} active fragments.",
+        count
+    );
     Ok(())
 }
 
-pub async fn sync_single_user_quota(
-    db_client: Arc<Client>,
-    uid: Arc<String>,
+pub async fn sync_single_fragment_quota(
+    fragment: String,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let db = db_client.database(DATABASE);
-    let auth_collection = db.collection::<UserRecord>("auth");
+    ensure_fragment_blob_directories(&fragment).await;
 
-    match auth_collection
-        .find_one(doc! { "uid": &uid.as_str() })
-        .await?
-    {
-        Some(user) => {
-            if let Err(e) = init_quota_file(&uid, user.allocated_storage).await {
-                warn!("Partial failure syncing quota file for {}: {}", &uid, e);
-            }
+    sweep_fragment_gc_files(fragment.clone()).await;
 
-            ensure_user_blob_directories(&uid).await;
+    let calculated_usage = calculate_usage_across_mirrors(fragment.clone()).await;
 
-            cleanup_orphan_upload_sessions(uid.to_string()).await;
-
-            let calculated_usage = calculate_usage_across_mirrors(uid.to_string()).await;
-
-            if let Err(e) = set_storage_used(&uid, calculated_usage).await {
-                warn!("Failed to update usage stats for {}: {}", &uid, e);
-            }
-        }
-        None => {
-            warn!(
-                "User {} not found in database during specific quota sync.",
-                &uid
-            );
-        }
+    if let Err(e) = set_storage_used(&fragment, calculated_usage).await {
+        warn!("Failed to update usage stats for {}: {}", fragment, e);
     }
 
-    info!("User-specific quota sync completed for {}", &uid);
+    info!("Fragment-specific quota sync completed for {}", fragment);
     Ok(())
 }
 
-pub async fn initialize_storage(
-    db_client: Arc<Client>,
-    uid: Arc<String>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let db = db_client.database(DATABASE);
-    let auth_collection = db.collection::<UserRecord>("auth");
-    let path_manager = ObjectPathManager::new();
+pub async fn initialize_storage(fragment_hash: String) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ensure_fragment_blob_directories(&fragment_hash).await;
 
-    match auth_collection
-        .find_one(doc! { "uid": &uid.as_str() })
-        .await?
-    {
-        Some(user) => {
-            let user_index_dirs = path_manager.get_all_user_index_dirs(&uid);
-            let mut quota_exists = false;
+    let calculated_usage = calculate_usage_across_mirrors(fragment_hash.clone()).await;
+    let _ = set_storage_used(&fragment_hash, calculated_usage).await;
 
-            for dir in &user_index_dirs {
-                if timeout(
-                    DISK_OP_TIMEOUT,
-                    tokio::fs::try_exists(dir.join("quota.bson")),
-                )
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .unwrap_or(false)
-                {
-                    quota_exists = true;
-                    break;
-                }
-            }
-
-            if !quota_exists {
-                if let Err(e) = init_quota_file(&uid, user.allocated_storage).await {
-                    warn!("Partial failure init quota file for {}: {}", &uid, e);
-                }
-
-                let calculated_usage = calculate_usage_across_mirrors(uid.to_string()).await;
-                if let Err(e) = set_storage_used(&uid, calculated_usage).await {
-                    warn!("Failed to update usage stats for {}: {}", &uid, e);
-                }
-            }
-
-            ensure_user_blob_directories(&uid).await;
-        }
-        None => {
-            warn!(
-                "User {} not found in database during specific quota sync.",
-                &uid
-            );
-        }
-    }
-
-    info!("Initialized storage for {}", &uid);
+    info!(
+        "Initialized storage structure for fragment {}",
+        &fragment_hash
+    );
     Ok(())
 }
 
-pub async fn sync_quota_api(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let db_client = state.db_client.clone();
-
+pub async fn sync_quota_api() -> impl IntoResponse {
     tokio::spawn(async move {
-        match sync_quota(db_client).await {
+        match sync_quota().await {
             Ok(_) => info!("Manual global quota sync completed."),
             Err(e) => error!("Manual global quota sync failed: {}", e),
         }
@@ -476,35 +270,44 @@ pub async fn sync_quota_api(State(state): State<Arc<AppState>>) -> impl IntoResp
     )
 }
 
-pub async fn sync_user_quota_api(
-    State(state): State<Arc<AppState>>,
-    claims: Claims,
-) -> impl IntoResponse {
-    let uid = Arc::new(claims.uid);
-    let db_client = Arc::clone(&state.db_client);
+pub async fn sync_fragment_quota_api(claims: Claims) -> Result<impl IntoResponse, AppError> {
+    if !claims.modify {
+        return Err(AppError::Forbidden(
+            "Modify permission required to sync quota".into(),
+        ));
+    }
+
+    let fragment = claims.fragment.clone();
 
     tokio::spawn(async move {
-        match sync_single_user_quota(db_client, uid.clone()).await {
-            Ok(_) => info!("User quota sync completed successfully for {}.", &uid),
-            Err(e) => error!("User quota sync failed for {}: {}", &uid, e),
+        match sync_single_fragment_quota(fragment.clone()).await {
+            Ok(_) => info!(
+                "Fragment quota sync completed successfully for {}.",
+                fragment
+            ),
+            Err(e) => error!("Fragment quota sync failed for {}: {}", fragment, e),
         }
     });
 
-    StatusCode::ACCEPTED
+    Ok(StatusCode::ACCEPTED)
 }
 
-pub async fn initialize_user_storage_api(
-    State(state): State<Arc<AppState>>,
+pub async fn initialize_fragment_storage_api(
     claims: Claims,
-) -> impl IntoResponse {
-    let uid = Arc::new(claims.uid);
-    let db_client = Arc::clone(&state.db_client);
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.write {
+        return Err(AppError::Forbidden(
+            "Write permission required to initialize storage".into(),
+        ));
+    }
+
+    let fragment = claims.fragment.clone();
 
     tokio::spawn(async move {
-        if let Err(e) = initialize_storage(db_client, uid.clone()).await {
-            error!("Storage initialization failed for {}: {}", uid, e);
+        if let Err(e) = initialize_storage(fragment.clone()).await {
+            error!("Storage initialization failed for {}: {}", fragment, e);
         }
     });
 
-    StatusCode::ACCEPTED
+    Ok(StatusCode::ACCEPTED)
 }

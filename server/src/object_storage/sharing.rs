@@ -1,11 +1,11 @@
 use crate::enums::app_error_enum::AppError;
+use crate::object_storage::disk_manager::{
+    CreateSignedUrlRequest, SignedUrlDisposition, SignedUrlResponse,
+};
 use crate::object_storage::metadata_parser::get_metadata;
 use crate::object_storage::object_parser::stream_object_logic;
 use crate::settings::constants::CONFIG_FILE;
 use crate::structs::auth_structs::Claims;
-use crate::structs::object_storage_structs::{
-    CreateSignedUrlRequest, SignedUrlDisposition, SignedUrlResponse,
-};
 use axum::Json as AxumJson;
 use axum::body::Body;
 use axum::extract::Query;
@@ -47,10 +47,19 @@ pub async fn create_signed_url(
     claims: Claims,
     AxumJson(payload): AxumJson<CreateSignedUrlRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = claims.uid;
+    if !claims.read {
+        return Err(AppError::Forbidden(
+            "Read permission required to share objects".into(),
+        ));
+    }
+
+    if claims.fragment != payload.fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+
     let clean_key = payload.object_key.trim_start_matches('/');
 
-    let metadata = get_metadata(&payload.fragment, clean_key, &uid).await?;
+    let metadata = get_metadata(&payload.fragment, clean_key, &claims.fragment).await?;
 
     if payload.expires_in as i64 > MAX_EXPIRATION_SECONDS {
         return Err(AppError::BadRequest(format!(
@@ -70,12 +79,8 @@ pub async fn create_signed_url(
     };
 
     let data_to_sign = format!(
-        "{}:{}:{}:{}:{}",
-        metadata.owner_uid,
-        metadata.fragment,
-        metadata.object_key,
-        expires_timestamp,
-        disposition_str
+        "{}:{}:{}:{}",
+        metadata.fragment, metadata.object_key, expires_timestamp, disposition_str
     );
 
     type HmacSha256 = Hmac<Sha256>;
@@ -85,9 +90,8 @@ pub async fn create_signed_url(
     let signature = hex::encode(mac.finalize().into_bytes());
 
     let url = format!(
-        "{}/v4/public/share?owner_uid={}&fragment={}&object_key={}&expires={}&signature={}&disposition={}",
+        "{}/v4/public/share?fragment={}&object_key={}&expires={}&signature={}&disposition={}",
         BASE_URL.to_string(),
-        utf8_percent_encode(&metadata.owner_uid, QUERY_ENCODE_SET),
         utf8_percent_encode(&payload.fragment, QUERY_ENCODE_SET),
         utf8_percent_encode(&metadata.object_key, QUERY_ENCODE_SET),
         expires_timestamp,
@@ -102,7 +106,6 @@ pub async fn create_signed_url(
 }
 
 struct SignedUrlQuery {
-    owner_uid: String,
     fragment: String,
     object_key: String,
     expires_timestamp: i64,
@@ -112,11 +115,6 @@ struct SignedUrlQuery {
 
 impl SignedUrlQuery {
     fn from_params(params: &Query<HashMap<String, String>>) -> Result<Self, AppError> {
-        let owner_uid = params
-            .get("owner_uid")
-            .ok_or_else(|| AppError::BadRequest("Missing owner_uid.".to_string()))?
-            .to_string();
-
         let fragment = params
             .get("fragment")
             .ok_or_else(|| AppError::BadRequest("Missing fragment.".to_string()))?
@@ -146,7 +144,6 @@ impl SignedUrlQuery {
             .unwrap_or_else(|| "view".to_string());
 
         Ok(Self {
-            owner_uid,
             fragment,
             object_key,
             expires_timestamp,
@@ -169,15 +166,11 @@ pub async fn get_shared_object(
 
     let clean_key = query.object_key.trim_start_matches('/');
 
-    let metadata = get_metadata(&query.fragment, clean_key, &query.owner_uid).await?;
+    let metadata = get_metadata(&query.fragment, clean_key, &query.fragment).await?;
 
     let data_to_sign = format!(
-        "{}:{}:{}:{}:{}",
-        metadata.owner_uid,
-        metadata.fragment,
-        metadata.object_key,
-        query.expires_timestamp,
-        query.disposition
+        "{}:{}:{}:{}",
+        metadata.fragment, metadata.object_key, query.expires_timestamp, query.disposition
     );
 
     type HmacSha256 = Hmac<Sha256>;

@@ -78,8 +78,6 @@ impl Drop for AlignedBuffer {
 unsafe impl Send for AlignedBuffer {}
 unsafe impl Sync for AlignedBuffer {}
 
-// Generic Writer: Works with File (N1) or Network Streams (N2)
-// NOTE: Make sure your on-disk file matches this generic definition!
 pub struct ErasureStreamWriter<W: AsyncWrite + Unpin + Send> {
     writers: Vec<Option<W>>,
     data_shards: usize,

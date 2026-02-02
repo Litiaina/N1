@@ -35,7 +35,7 @@ impl KeyExtractor for UserKeyExtractor {
              let validation = Validation::default();
              
              if let Ok(token_data) = decode::<Claims>(token, &JWT_KEYS.decoding, &validation) {
-                 return Ok(token_data.claims.uid.to_string());
+                 return Ok(token_data.claims.fragment.to_string());
              }
         }
         
@@ -139,7 +139,6 @@ pub struct RateLimitLayers {
     pub auth: Option<GovernorLayer<SmartIpKeyExtractor, NoOpMiddleware, Body>>,
     pub view: Option<GovernorLayer<UserKeyExtractor, NoOpMiddleware, Body>>,
     pub upload: Option<GovernorLayer<UserKeyExtractor, NoOpMiddleware, Body>>,
-    pub transcode: Option<GovernorLayer<UserKeyExtractor, NoOpMiddleware, Body>>,
     pub sharing: Option<GovernorLayer<SmartIpKeyExtractor, NoOpMiddleware, Body>>,
     pub global: Option<GovernorLayer<SmartIpKeyExtractor, NoOpMiddleware, Body>>
 }
@@ -150,7 +149,7 @@ impl RateLimitLayers {
 
         if !limits.enabled {
             return Self {
-                auth: None, view: None, upload: None, transcode: None, sharing: None, global: None
+                auth: None, view: None, upload: None, sharing: None, global: None
             };
         }
 
@@ -176,7 +175,6 @@ impl RateLimitLayers {
             auth: Some(GovernorLayer::new(build_ip_conf(limits.auth_per_sec, limits.auth_burst))),
             view: Some(GovernorLayer::new(build_user_conf(limits.view_per_sec, limits.view_burst))),
             upload: Some(GovernorLayer::new(build_user_conf(limits.upload_per_sec, limits.upload_burst))),
-            transcode: Some(GovernorLayer::new(build_user_conf(limits.transcode_per_sec, limits.transcode_burst))),
             sharing: Some(GovernorLayer::new(build_ip_conf(limits.sharing_per_sec, limits.sharing_burst))),
             global: Some(GovernorLayer::new(build_ip_conf(limits.global_per_sec, limits.global_burst))),
         }
@@ -198,12 +196,6 @@ impl RateLimitLayers {
     where S: Clone + Send + Sync + 'static 
     {
         if let Some(layer) = &self.upload { router.layer(layer.clone()) } else { router }
-    }
-
-    pub fn layer_transcode<S>(&self, router: Router<S>) -> Router<S> 
-    where S: Clone + Send + Sync + 'static 
-    {
-        if let Some(layer) = &self.transcode { router.layer(layer.clone()) } else { router }
     }
 
     pub fn layer_sharing<S>(&self, router: Router<S>) -> Router<S> 

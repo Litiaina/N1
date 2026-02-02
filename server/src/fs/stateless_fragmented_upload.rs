@@ -9,7 +9,7 @@ use crate::validation::directory_validation::sanitize_fragmented_path;
 use crate::fs::file_path_parser::find_unique_path;
 use crate::fs::fragmented_upload::with_io_timeout;
 use crate::object_storage::part_parser::parse_uploaded_parts;
-use crate::structs::auth_structs::Claims;
+use crate::structs::auth_structs::FileSystemClaims;
 use crate::structs::stateless_fragment_upload_structs::{
     InitiateUploadParams, InitiateUploadResponse, PathManager, UploadMetadata, UploadStatusResponse,
 };
@@ -41,7 +41,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 pub async fn initiate_upload_session(
-    claims: Claims,
+    claims: FileSystemClaims,
     path: Option<Path<String>>,
     AxumJson(params): AxumJson<InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {

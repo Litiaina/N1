@@ -8,10 +8,10 @@ use std::io::SeekFrom;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use crate::fs::file_path_parser::file_path;
-use crate::structs::auth_structs::Claims;
+use crate::structs::auth_structs::FileSystemClaims;
 
 pub async fn download_file(
-    claims: Claims,
+    claims: FileSystemClaims,
     Query(params): Query<DownloadParams>,
     path: Option<Path<String>>,
 ) -> impl IntoResponse {

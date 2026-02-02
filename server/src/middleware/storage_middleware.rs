@@ -1,4 +1,4 @@
-use crate::structs::auth_structs::Claims;
+use crate::structs::auth_structs::FileSystemClaims;
 use crate::validation::directory_validation::{get_allocated_storage, get_dir_size};
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
@@ -6,7 +6,7 @@ use axum::middleware::Next;
 use axum::response::IntoResponse;
 use std::path::PathBuf;
 
-pub async fn enforce_storage_limit(claims: Claims, req: Request, next: Next) -> impl IntoResponse {
+pub async fn enforce_storage_limit(claims: FileSystemClaims, req: Request, next: Next) -> impl IntoResponse {
     let method = req.method();
 
     if matches!(method, &Method::OPTIONS | &Method::HEAD) {

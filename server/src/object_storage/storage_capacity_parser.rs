@@ -1,6 +1,27 @@
-use crate::{enums::app_error_enum::AppError, object_storage::quota_manager::get_quota};
+use axum::{Json, extract::Path as AxumPath, response::IntoResponse};
 
-pub async fn calculate_storage_usage(uid: &str) -> Result<u64, AppError> {
-    let quota = get_quota(uid).await?;
-    Ok(quota.storage_used)
+use crate::{
+    enums::app_error_enum::AppError,
+    object_storage::{disk_manager::CapacityUsageResponse, quota_manager::get_quota},
+    structs::auth_structs::Claims,
+};
+
+pub async fn get_capacity_usage(
+    claims: Claims,
+    AxumPath(fragment): AxumPath<String>,
+) -> Result<impl IntoResponse, AppError> {
+    if claims.read == false {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+
+    let quota = get_quota(&fragment).await?;
+
+    Ok(Json(CapacityUsageResponse {
+        capacity_used: quota.storage_used,
+        capacity_allocated: quota.allocated_storage,
+    }))
 }

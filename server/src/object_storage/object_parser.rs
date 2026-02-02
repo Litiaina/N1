@@ -1,9 +1,9 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::header_parser::parse_range_header;
-use crate::object_storage::recovery::read_or_recover_chunk;
-use crate::structs::object_storage_structs::{
+use crate::object_storage::disk_manager::{
     ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo,
 };
+use crate::object_storage::header_parser::parse_range_header;
+use crate::object_storage::recovery::read_or_recover_chunk;
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -50,7 +50,6 @@ pub async fn stream_object_logic(
     let ObjectMetadata {
         content_type,
         parts,
-        owner_uid,
         fragment,
         object_key,
         version_id,
@@ -95,26 +94,13 @@ pub async fn stream_object_logic(
         .unwrap_or("download")
         .to_string();
 
-    let parts: Vec<std::sync::Arc<PartMetadata>> =
-        parts.into_iter().map(std::sync::Arc::new).collect();
-
-    let disk_shard_dirs: Vec<PathBuf> = blob_roots
-        .iter()
-        .map(|disk_root| {
-            disk_root
-                .join(crate::object_storage::constants::OBJECT_DATA_ROOT)
-                .join(&owner_uid)
-                .join(&fragment)
-                .join("blobs")
-                .join(&version_id)
-        })
-        .collect();
-
     struct StreamState {
         pos: u64,
         end: u64,
-        parts: Vec<std::sync::Arc<PartMetadata>>,
-        disk_shard_dirs: Vec<PathBuf>,
+        parts: Vec<PartMetadata>,
+        blob_roots: Vec<PathBuf>,
+        fragment: String,
+        version_id: String,
         file_cache: HashMap<String, File>,
         current_part_idx: usize,
         current_part_offset: u64,
@@ -145,7 +131,9 @@ pub async fn stream_object_logic(
         pos: start,
         end,
         parts,
-        disk_shard_dirs,
+        blob_roots,
+        fragment,
+        version_id: version_id.clone(),
         file_cache: HashMap::new(),
         current_part_idx: start_part_index,
         current_part_offset: start_part_offset,
@@ -168,7 +156,7 @@ pub async fn stream_object_logic(
                 continue;
             }
 
-            let dcount = data_shards_count(part.as_ref());
+            let dcount = data_shards_count(part);
             if dcount == 0 {
                 return Some((
                     Err(AppError::InternalServerError("No data shards".into())),
@@ -184,11 +172,11 @@ pub async fn stream_object_logic(
             let stripe_index = relative_pos / stripe_size;
             let offset_in_stripe = relative_pos % stripe_size;
 
-            let shard_ordinal = (offset_in_stripe / stripe_block_size) as usize;
+            let shard_index = (offset_in_stripe / stripe_block_size) as usize;
             let offset_in_shard_block = offset_in_stripe % stripe_block_size;
             let file_offset = (stripe_index * stripe_block_size) + offset_in_shard_block;
 
-            let target_shard = match nth_data_shard(part.as_ref(), shard_ordinal) {
+            let _target_shard = match nth_data_shard(part, shard_index) {
                 Some(s) => s,
                 None => {
                     return Some((
@@ -199,8 +187,6 @@ pub async fn stream_object_logic(
                     ));
                 }
             };
-
-            let shard_index = target_shard.shard_index;
 
             let bytes_remaining_in_block = stripe_block_size - offset_in_shard_block;
             let bytes_remaining_in_req = state.end - state.pos + 1;
@@ -214,14 +200,20 @@ pub async fn stream_object_logic(
                 return None;
             }
 
-            let num_disks = state.disk_shard_dirs.len();
+            let num_disks = state.blob_roots.len();
             let disk_idx = (part.part_index as usize + shard_index) % num_disks;
-            let shard_dir = &state.disk_shard_dirs[disk_idx];
+            let target_disk = &state.blob_roots[disk_idx];
+
+            let shard_dir = ObjectPathManager::new().get_shard_dir_on_disk(
+                target_disk,
+                &state.fragment,
+                &state.version_id,
+            );
 
             let data_result = read_or_recover_chunk(
                 &mut state.file_cache,
-                shard_dir,
-                part.clone(),
+                &shard_dir,
+                std::sync::Arc::new(part.clone()),
                 shard_index,
                 file_offset,
                 to_read,

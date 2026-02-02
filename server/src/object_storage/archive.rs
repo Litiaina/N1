@@ -21,49 +21,51 @@ use tokio_tar::{Builder as TarBuilder, Header as TarHeader};
 
 use crate::{
     enums::app_error_enum::AppError,
-    object_storage::{metadata_parser::get_metadata, recovery::read_or_recover_chunk},
-    structs::{
-        auth_structs::Claims,
-        object_storage_structs::{DownloadArchiveRequest, ObjectMetadata, PartMetadata, ShardInfo},
+    object_storage::disk_manager::{
+        DownloadArchiveRequest, ObjectMetadata, PartMetadata, ShardInfo,
     },
+    object_storage::{metadata_parser::get_metadata, recovery::read_or_recover_chunk},
+    structs::auth_structs::Claims,
 };
-
-pub fn default_format() -> String {
-    "zip".to_string()
-}
 
 pub async fn download_selected_archive(
     claims: Claims,
     Path(fragment): Path<String>,
     Json(req): Json<DownloadArchiveRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+
     if req.keys.is_empty() {
         return Err(AppError::BadRequest("No object keys provided".into()));
     }
 
-    if req.keys.len() > 10_000 {
-        return Err(AppError::BadRequest("Too many objects requested".into()));
-    }
-
     let filename = req.filename.clone().unwrap_or_else(|| "export".to_string());
 
-    let stream = stream_selected_objects(
-        claims.uid.clone(),
-        fragment,
-        req.keys.clone(),
-        req.format.clone(),
-    )
-    .await?;
-
-    let content_type = match req.format.as_str() {
-        "tar" => "application/x-tar",
-        _ => "application/zip",
+    let (effective_format, content_type, disposition) = if req.keys.len() > 1000 {
+        (
+            "tar",
+            "application/x-tar",
+            format!("attachment; filename=\"{}.tar\"", filename),
+        )
+    } else {
+        match req.format.as_str() {
+            "tar" => (
+                "tar",
+                "application/x-tar",
+                format!("attachment; filename=\"{}.tar\"", filename),
+            ),
+            _ => (
+                "zip",
+                "application/zip",
+                format!("attachment; filename=\"{}.zip\"", filename),
+            ),
+        }
     };
 
-    let disposition = match req.format.as_str() {
-        "tar" => format!("attachment; filename=\"{}.tar\"", filename),
-        _ => format!("attachment; filename=\"{}.zip\"", filename),
-    };
+    let stream =
+        stream_selected_objects(fragment, req.keys.clone(), effective_format.to_string()).await?;
 
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, content_type)
@@ -73,7 +75,6 @@ pub async fn download_selected_archive(
 }
 
 async fn stream_selected_objects(
-    uid: String,
     fragment: String,
     keys: Vec<String>,
     format: String,
@@ -81,7 +82,7 @@ async fn stream_selected_objects(
     let (tx, rx) = mpsc::channel::<Result<Bytes, AppError>>(8);
 
     tokio::spawn(async move {
-        if let Err(e) = write_archive_stream(uid, fragment, keys, format, tx.clone()).await {
+        if let Err(e) = write_archive_stream(fragment, keys, format, tx.clone()).await {
             let _ = tx.send(Err(e)).await;
         }
     });
@@ -90,7 +91,6 @@ async fn stream_selected_objects(
 }
 
 async fn write_archive_stream(
-    uid: String,
     fragment: String,
     keys: Vec<String>,
     format: String,
@@ -119,15 +119,14 @@ async fn write_archive_stream(
     });
 
     match format.as_str() {
-        "tar" => write_tar_archive(&uid, &fragment, keys, writer).await?,
-        _ => write_zip_archive(&uid, &fragment, keys, writer).await?,
+        "tar" => write_tar_archive(&fragment, keys, writer).await?,
+        _ => write_zip_archive(&fragment, keys, writer).await?,
     }
 
     Ok(())
 }
 
 async fn write_zip_archive(
-    uid: &str,
     fragment: &str,
     keys: Vec<String>,
     writer: DuplexStream,
@@ -137,7 +136,7 @@ async fn write_zip_archive(
     for key in keys {
         let clean_key = key.trim_start_matches('/');
 
-        let metadata = match get_metadata(fragment, clean_key, uid).await {
+        let metadata = match get_metadata(fragment, clean_key, fragment).await {
             Ok(m) if !m.is_delete_marker => m,
             _ => continue,
         };
@@ -179,7 +178,6 @@ async fn write_zip_archive(
 }
 
 async fn write_tar_archive(
-    uid: &str,
     fragment: &str,
     keys: Vec<String>,
     writer: DuplexStream,
@@ -189,7 +187,7 @@ async fn write_tar_archive(
     for key in keys {
         let clean_key = key.trim_start_matches('/');
 
-        let metadata = match get_metadata(fragment, clean_key, uid).await {
+        let metadata = match get_metadata(fragment, clean_key, fragment).await {
             Ok(m) if !m.is_delete_marker => m,
             _ => continue,
         };
@@ -288,12 +286,12 @@ fn create_multipart_reader(
             while temp_bytes_read < bytes_to_read {
                 let stripe_block_size = state.stripe_size as u64;
                 let stripe_size = stripe_block_size * data_shards_count;
-                let stripe_index = state.cursor_in_part / stripe_size;
-                let offset_in_stripe = state.cursor_in_part % stripe_size;
 
+                let offset_in_stripe = state.cursor_in_part % stripe_size;
                 let shard_index = (offset_in_stripe / stripe_block_size) as usize;
                 let offset_in_block = offset_in_stripe % stripe_block_size;
 
+                let stripe_index = state.cursor_in_part / stripe_size;
                 let file_offset = (stripe_index * stripe_block_size) + offset_in_block;
 
                 let bytes_left_in_block = stripe_block_size - offset_in_block;

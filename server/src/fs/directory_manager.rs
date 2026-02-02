@@ -14,10 +14,10 @@ use std::time::UNIX_EPOCH;
 use tokio::fs;
 use tracing::error;
 use crate::fs::file_path_parser::file_path;
-use crate::structs::auth_structs::Claims;
+use crate::structs::auth_structs::FileSystemClaims;
 
 pub async fn rename_file_query(
-    claims: Claims,
+    claims: FileSystemClaims,
     path: Option<Path<String>>,
     Query(params): Query<RenameParams>,
 ) -> Result<impl IntoResponse, StatusCode> {
@@ -68,7 +68,7 @@ pub async fn rename_file_query(
 }
 
 pub async fn delete_file(
-    claims: Claims,
+    claims: FileSystemClaims,
     path: Option<Path<String>>,
     Query(params): Query<DeleteFileParams>,
 ) -> Result<impl IntoResponse, StatusCode> {
@@ -101,7 +101,7 @@ pub async fn delete_file(
 }
 
 pub async fn create_directory(
-    claims: Claims,
+    claims: FileSystemClaims,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let validated_uid = &claims.uid;
@@ -124,7 +124,7 @@ pub async fn create_directory(
 }
 
 pub async fn delete_directory(
-    claims: Claims,
+    claims: FileSystemClaims,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let validated_uid = &claims.uid;
@@ -147,7 +147,7 @@ pub async fn delete_directory(
 }
 
 pub async fn get_file_metadata(
-    claims: Claims,
+    claims: FileSystemClaims,
     Query(params): Query<MetadataParams>,
     path: Option<Path<String>>,
 ) -> impl IntoResponse {
