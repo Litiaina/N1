@@ -81,7 +81,6 @@ pub async fn stream_object_logic(
 
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
-
     if blob_roots.is_empty() {
         return Err(AppError::InternalServerError(
             "No blob roots configured".into(),
@@ -176,17 +175,14 @@ pub async fn stream_object_logic(
             let offset_in_shard_block = offset_in_stripe % stripe_block_size;
             let file_offset = (stripe_index * stripe_block_size) + offset_in_shard_block;
 
-            let _target_shard = match nth_data_shard(part, shard_index) {
-                Some(s) => s,
-                None => {
-                    return Some((
-                        Err(AppError::InternalServerError(
-                            "Shard index out of bounds".into(),
-                        )),
-                        state,
-                    ));
-                }
-            };
+            if nth_data_shard(part, shard_index).is_none() {
+                return Some((
+                    Err(AppError::InternalServerError(
+                        "Shard index out of bounds".into(),
+                    )),
+                    state,
+                ));
+            }
 
             let bytes_remaining_in_block = stripe_block_size - offset_in_shard_block;
             let bytes_remaining_in_req = state.end - state.pos + 1;

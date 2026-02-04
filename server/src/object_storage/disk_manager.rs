@@ -1,4 +1,4 @@
-use crate::object_storage::constants::{METADATA_EXT, QUOTA_FILE};
+use crate::object_storage::constants::{METADATA_EXT, PREFIX_INDEX_DIR, PREFIX_INDEX_NAMESPACE, PREFIX_INDEX_VERSION, PREFIX_SEGMENT_EXT, QUOTA_FILE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -15,7 +15,6 @@ pub static FS_STORAGE_ROOT: OnceLock<String> = OnceLock::new();
 pub fn default_stripe_size() -> usize {
     256 * 1024
 }
-
 pub struct ObjectPathManager;
 
 impl ObjectPathManager {
@@ -56,15 +55,30 @@ impl ObjectPathManager {
             .collect()
     }
 
+    pub fn object_key_hash(object_key: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(object_key.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    pub fn canonical_prefix(prefix: &str) -> String {
+        prefix.trim_start_matches('/').to_string()
+    }
+
+    pub fn prefix_hash(prefix: &str) -> String {
+        let p = Self::canonical_prefix(prefix);
+        let mut hasher = Sha256::new();
+        hasher.update(p.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
     pub fn get_all_metadata_paths(
         &self,
         fragment_hash: &str,
         object_key: &str,
         version_id: &str,
     ) -> Vec<PathBuf> {
-        let mut hasher = Sha256::new();
-        hasher.update(object_key.as_bytes());
-        let key_hash = hex::encode(hasher.finalize());
+        let key_hash = Self::object_key_hash(object_key);
 
         let shard1 = &key_hash[0..2];
         let shard2 = &key_hash[2..4];
@@ -83,6 +97,50 @@ impl ObjectPathManager {
                     .join(shard4)
                     .join(&filename)
             })
+            .collect()
+    }
+
+    pub fn get_all_prefix_bucket_dirs(&self, fragment_hash: &str, prefix: &str) -> Vec<PathBuf> {
+        let ph = Self::prefix_hash(prefix);
+        let p1 = &ph[0..2];
+        let p2 = &ph[2..4];
+
+        self.get_all_index_roots()
+            .iter()
+            .map(|root| {
+                root.join(fragment_hash)
+                    .join("index")
+                    .join(PREFIX_INDEX_DIR)
+                    .join(PREFIX_INDEX_VERSION)
+                    .join(PREFIX_INDEX_NAMESPACE)
+                    .join(p1)
+                    .join(p2)
+                    .join(&ph)
+            })
+            .collect()
+    }
+
+    pub fn get_all_prefix_segment_paths(
+        &self,
+        fragment_hash: &str,
+        prefix: &str,
+        segment_id: &str,
+    ) -> Vec<PathBuf> {
+        let file = format!("seg_{}{}", segment_id, PREFIX_SEGMENT_EXT);
+        self.get_all_prefix_bucket_dirs(fragment_hash, prefix)
+            .into_iter()
+            .map(|d| d.join(&file))
+            .collect()
+    }
+
+    pub fn get_all_prefix_compacted_paths(
+        &self,
+        fragment_hash: &str,
+        prefix: &str,
+    ) -> Vec<PathBuf> {
+        self.get_all_prefix_bucket_dirs(fragment_hash, prefix)
+            .into_iter()
+            .map(|d| d.join(format!("compacted{}", PREFIX_SEGMENT_EXT)))
             .collect()
     }
 
@@ -183,6 +241,19 @@ impl From<ObjectSummary> for ObjectMetadata {
             stripe_size_bytes: summary.stripe_size_bytes,
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PrefixIndexEntry {
+    pub object_key: String,
+    pub version_id: String,
+    pub created_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PrefixIndexSegment {
+    pub prefix: String,
+    pub entries: Vec<PrefixIndexEntry>,
 }
 
 #[derive(Deserialize)]

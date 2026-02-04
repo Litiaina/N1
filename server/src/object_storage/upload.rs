@@ -1,6 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -10,8 +9,7 @@ use std::task::{Context, Poll};
 use axum::Json as AxumJson;
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::HeaderMap;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
 use chrono::Utc;
@@ -38,8 +36,8 @@ use crate::object_storage::constants::{
 };
 use crate::object_storage::disk_manager::{
     FinalizeIncompleteResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery,
-    ObjectMetadata, ObjectPathManager, PartMetadata, ReservationReceipt, ShardInfo,
-    UploadPartQuery, UploadStatusResponse, default_stripe_size,
+    ObjectMetadata, ObjectPathManager, PartMetadata, PrefixIndexEntry, PrefixIndexSegment,
+    ReservationReceipt, ShardInfo, UploadPartQuery, UploadStatusResponse, default_stripe_size,
 };
 use crate::object_storage::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::object_storage::quota_manager::{try_reserve_quota, update_quota};
@@ -169,11 +167,86 @@ impl AsyncWrite for DirectWriter {
     }
 
     fn poll_shutdown(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        self.poll_flush(cx)
+        self.as_mut().poll_flush(cx)
     }
+}
+
+fn prefixes_for_key(object_key: &str) -> BTreeSet<String> {
+    let key = ObjectPathManager::canonical_prefix(object_key);
+    let mut out = BTreeSet::new();
+    out.insert(String::new());
+
+    if key.is_empty() {
+        return out;
+    }
+
+    let parts: Vec<&str> = key.split('/').filter(|p| !p.is_empty()).collect();
+    let mut cur = String::new();
+
+    for (i, p) in parts.iter().enumerate() {
+        if i == 0 {
+            cur.push_str(p);
+        } else {
+            cur.push('/');
+            cur.push_str(p);
+        }
+        out.insert(cur.clone());
+    }
+
+    out
+}
+
+async fn write_prefix_segments(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    object_key: &str,
+    version_id: &str,
+    created_at: i64,
+) -> Result<(), AppError> {
+    let prefixes = prefixes_for_key(object_key);
+    let mut any_ok = false;
+
+    for prefix in prefixes {
+        let seg = PrefixIndexSegment {
+            prefix: prefix.clone(),
+            entries: vec![PrefixIndexEntry {
+                object_key: object_key.to_string(),
+                version_id: version_id.to_string(),
+                created_at,
+            }],
+        };
+
+        let bytes = rmp_serde::to_vec(&seg).map_err(|e| {
+            AppError::InternalServerError(format!("Serialize prefix segment: {}", e))
+        })?;
+
+        let paths = path_manager.get_all_prefix_segment_paths(fragment, &prefix, version_id);
+
+        let mut wrote_this_prefix = false;
+        for p in paths {
+            if let Some(parent) = p.parent() {
+                let _ = tokio_fs::create_dir_all(parent).await;
+            }
+            if write_atomic(&p, &bytes).await.is_ok() {
+                wrote_this_prefix = true;
+            }
+        }
+
+        if wrote_this_prefix {
+            any_ok = true;
+        }
+    }
+
+    if !any_ok {
+        return Err(AppError::InternalServerError(
+            "Failed to write prefix index to any mirror".into(),
+        ));
+    }
+
+    Ok(())
 }
 
 pub async fn create_direct_file(path: &PathBuf) -> Result<fs::File, AppError> {
@@ -234,13 +307,7 @@ pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
 
         match result {
             Ok(file) => {
-                if let Err(e) = file.sync_all() {
-                    warn!(
-                        "Windows: Failed to sync directory (non-fatal): {} - {}",
-                        path.display(),
-                        e
-                    );
-                }
+                let _ = file.sync_all();
             }
             Err(e) => {
                 warn!(
@@ -301,53 +368,6 @@ pub async fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<(), App
     Ok(())
 }
 
-fn is_tmp_attempt_shard(name: &str) -> bool {
-    if !name.starts_with("part_") || !name.contains("_shard_") || !name.contains(".tmp.") {
-        return false;
-    }
-
-    name.contains(&format!("{}.tmp.", SHARD_SUFFIX))
-        || name.contains(&format!("{}.tmp.", PARITY_SUFFIX))
-}
-
-async fn cleanup_blob_tmp_attempt_files_for_version(
-    path_manager: &ObjectPathManager,
-    fragment: &str,
-    version_id: &str,
-) {
-    let blob_roots = path_manager.get_blob_roots();
-
-    let futs = blob_roots.into_iter().map(|root| {
-        let dir = path_manager.get_shard_dir_on_disk(&root, fragment, version_id);
-        async move {
-            if !tokio_fs::try_exists(&dir).await.unwrap_or(false) {
-                return;
-            }
-
-            let mut entries = match tokio_fs::read_dir(&dir).await {
-                Ok(e) => e,
-                Err(_) => return,
-            };
-
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let p = entry.path();
-                if !p.is_file() {
-                    continue;
-                }
-
-                let name = entry.file_name().to_string_lossy().to_string();
-                if is_tmp_attempt_shard(&name) {
-                    let _ = tokio_fs::remove_file(&p).await;
-                }
-            }
-
-            let _ = sync_dir(&dir).await;
-        }
-    });
-
-    let _ = join_all(futs).await;
-}
-
 async fn read_manifest_any(
     path_manager: &ObjectPathManager,
     fragment: &str,
@@ -388,8 +408,6 @@ async fn read_part_meta_any(
         if let Ok(bytes) = tokio_fs::read(&p).await {
             if let Ok(pm) = rmp_serde::from_slice::<PartMetadata>(&bytes) {
                 return Some(pm);
-            } else {
-                continue;
             }
         }
     }
@@ -556,6 +574,53 @@ async fn publish_one_shard(
     Ok(())
 }
 
+fn is_tmp_attempt_shard(name: &str) -> bool {
+    if !name.starts_with("part_") || !name.contains("_shard_") || !name.contains(".tmp.") {
+        return false;
+    }
+
+    name.contains(&format!("{}.tmp.", SHARD_SUFFIX))
+        || name.contains(&format!("{}.tmp.", PARITY_SUFFIX))
+}
+
+async fn cleanup_blob_tmp_attempt_files_for_version(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    version_id: &str,
+) {
+    let blob_roots = path_manager.get_blob_roots();
+
+    let futs = blob_roots.into_iter().map(|root| {
+        let dir = path_manager.get_shard_dir_on_disk(&root, fragment, version_id);
+        async move {
+            if !tokio_fs::try_exists(&dir).await.unwrap_or(false) {
+                return;
+            }
+
+            let mut entries = match tokio_fs::read_dir(&dir).await {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let p = entry.path();
+                if !p.is_file() {
+                    continue;
+                }
+
+                let name = entry.file_name().to_string_lossy().to_string();
+                if is_tmp_attempt_shard(&name) {
+                    let _ = tokio_fs::remove_file(&p).await;
+                }
+            }
+
+            let _ = sync_dir(&dir).await;
+        }
+    });
+
+    let _ = join_all(futs).await;
+}
+
 pub async fn initiate_object_upload(
     claims: Claims,
     AxumPath((fragment, object_key)): AxumPath<(String, String)>,
@@ -596,10 +661,6 @@ pub async fn initiate_object_upload(
                 Err(e) => {
                     attempts += 1;
                     if attempts >= 3 {
-                        warn!(
-                            "Failed to create session dir {:?} after 3 attempts: {}",
-                            path, e
-                        );
                         return Err(e);
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -612,7 +673,7 @@ pub async fn initiate_object_upload(
     let success_count = results.iter().filter(|r| r.is_ok()).count();
 
     if success_count == 0 {
-        error!("CRITICAL: Failed to create session directory on ANY index disk.");
+        error!("Failed to create session directory on any index disk.");
         let _ = update_quota(&fragment, -(params.total_size_bytes as i64)).await;
         return Err(AppError::InternalServerError(
             "Storage backend unavailable".into(),
@@ -979,23 +1040,7 @@ pub async fn object_upload_part(
         let shard_dir =
             path_manager.get_shard_dir_on_disk(target_disk, &fragment_arc, &version_id_arc);
 
-        let mut attempts = 0;
-        loop {
-            match tokio_fs::create_dir_all(&shard_dir).await {
-                Ok(_) => break,
-                Err(e) => {
-                    attempts += 1;
-                    if attempts >= 3 {
-                        warn!(
-                            "Failed to create shard dir {:?} after 3 attempts: {}",
-                            shard_dir, e
-                        );
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-            }
-        }
+        let _ = tokio_fs::create_dir_all(&shard_dir).await;
 
         let tmp_path = shard_dir.join(&tmp_name);
         let stable_path = shard_dir.join(&stable_name);
@@ -1082,7 +1127,7 @@ pub async fn object_upload_part(
     if let Some(expected) = query.checksum.as_ref() {
         let calculated = stream_writer.get_total_checksum();
         if let Some(calc_str) = calculated.as_ref() {
-            if expected.eq_ignore_ascii_case(calc_str) == false {
+            if !expected.eq_ignore_ascii_case(calc_str) {
                 cleanup_files_best_effort(&tmp_paths).await;
                 return Ok((StatusCode::BAD_REQUEST, "Checksum mismatch").into_response());
             }
@@ -1094,16 +1139,11 @@ pub async fn object_upload_part(
 
     drop(stream_writer);
 
-    {
-        let futs = tmp_paths
-            .iter()
-            .map(|p| async move { fsync_file_path(p.as_path()).await });
-        let results = join_all(futs).await;
-        for r in results {
-            if let Err(e) = r {
-                cleanup_files_best_effort(&tmp_paths).await;
-                return Err(e);
-            }
+    let fsync_results = join_all(tmp_paths.iter().map(|p| fsync_file_path(p.as_path()))).await;
+    for r in fsync_results {
+        if let Err(e) = r {
+            cleanup_files_best_effort(&tmp_paths).await;
+            return Err(e);
         }
     }
 
@@ -1131,12 +1171,8 @@ pub async fn object_upload_part(
 
     dirs_to_sync.sort();
     dirs_to_sync.dedup();
-    {
-        let futs = dirs_to_sync.iter().map(|d| async move {
-            let _ = sync_dir(d.as_path()).await;
-        });
-        let _ = join_all(futs).await;
-    }
+
+    let _ = join_all(dirs_to_sync.iter().map(|d| sync_dir(d.as_path()))).await;
 
     let mut shards_info = Vec::with_capacity(total_shards);
     for i in 0..total_shards {
@@ -1237,7 +1273,7 @@ pub async fn finalize_object_upload(
 
     if found_data_roots < required_data_shards {
         error!(
-            "Finalization Aborted: Data directories missing. Found {}/{}. Likely GC collision.",
+            "Finalization aborted: data directories missing. Found {}/{}.",
             found_data_roots, required_data_shards
         );
         return Err(AppError::InternalServerError(
@@ -1339,6 +1375,15 @@ pub async fn finalize_object_upload(
         ));
     }
 
+    write_prefix_segments(
+        &path_manager,
+        &fragment,
+        &object_key,
+        &version_id,
+        object_meta.created_at,
+    )
+    .await?;
+
     let meta_dirs = path_manager.get_all_session_dirs(&fragment, &version_id);
     let cleanup_futures = meta_dirs.iter().map(|dir| async move {
         if !tokio_fs::try_exists(dir).await.unwrap_or(false) {
@@ -1349,8 +1394,7 @@ pub async fn finalize_object_upload(
             Err(_) => return,
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
-            let filename = entry.file_name();
-            let name_str = filename.to_string_lossy();
+            let name_str = entry.file_name().to_string_lossy().to_string();
             if name_str == RESERVATION_FILE
                 || name_str == SESSION_MANIFEST_FILE
                 || name_str.ends_with(PART_META_SUFFIX)
@@ -1360,7 +1404,7 @@ pub async fn finalize_object_upload(
         }
         let _ = sync_dir(dir).await;
     });
-    join_all(cleanup_futures).await;
+    let _ = join_all(cleanup_futures).await;
 
     let reserved_size = manifest
         .as_ref()
@@ -1431,7 +1475,7 @@ pub async fn cancel_upload_session(
             let _ = tokio_fs::remove_dir_all(&dir).await;
         }
     });
-    join_all(cleanup_meta_futures).await;
+    let _ = join_all(cleanup_meta_futures).await;
 
     if refund_amount > 0 {
         if let Err(e) = update_quota(&fragment, -(refund_amount as i64)).await {
