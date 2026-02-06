@@ -1,5 +1,8 @@
-use crate::structs::auth_structs::{AuthBody, AuthorizationRequest, Claims, FileSystemClaims, LoginRequest};
+use crate::structs::auth_structs::{
+    AuthBody, AuthorizationRequest, Claims, FileSystemClaims, LoginRequest,
+};
 use crate::validation::auth_validation::validate_auth;
+use crate::validation::fragment_validation::does_fragment_exist;
 use axum::body::Body;
 use axum::extract::{FromRequestParts, Request};
 use axum::http::request::Parts;
@@ -64,27 +67,32 @@ pub async fn authorize_fragment(
         return Err(AuthError::WrongCredentials);
     }
 
-    let duration = payload.expires_in.unwrap_or(24 * 60 * 60);
+    match does_fragment_exist(&payload.fragment).await {
+        true => {
+            let duration = payload.expires_in.unwrap_or(24 * 60 * 60);
 
-    let exp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + duration;
+            let exp = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + duration;
 
-    let claims = Claims {
-        fragment: payload.fragment,
-        read: payload.read,
-        write: payload.write,
-        modify: payload.modify,
-        delete: payload.delete,
-        exp: exp as usize,
-    };
+            let claims = Claims {
+                fragment: payload.fragment,
+                read: payload.read,
+                write: payload.write,
+                modify: payload.modify,
+                delete: payload.delete,
+                exp: exp as usize,
+            };
 
-    let token = encode(&Header::default(), &claims, &JWT_KEYS.encoding)
-        .map_err(|_| AuthError::InternalError)?;
+            let token = encode(&Header::default(), &claims, &JWT_KEYS.encoding)
+                .map_err(|_| AuthError::InternalError)?;
 
-    Ok(Json(AuthBody::new(token)))
+            Ok(Json(AuthBody::new(token)))
+        }
+        false => Err(AuthError::FragmentNotFound),
+    }
 }
 
 pub async fn auth(req: Request<Body>, next: Next) -> Result<Response, AuthError> {
@@ -214,6 +222,7 @@ impl IntoResponse for AuthError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "An internal error occurred",
             ),
+            AuthError::FragmentNotFound => (StatusCode::BAD_REQUEST, "Fragment not found"),
         };
         let body = Json(json!({
             "error": error_message,
@@ -241,4 +250,5 @@ pub enum AuthError {
     MissingCredentials,
     InvalidToken,
     InternalError,
+    FragmentNotFound,
 }

@@ -18,7 +18,7 @@ use crate::object_storage::delete::{
     delete_object, delete_object_permanently, delete_object_version, empty_trash, recover_all_trash, recover_object, recover_object_version
 };
 use crate::object_storage::download::{download_object, download_object_chunk};
-use crate::object_storage::fragment_manager::{create_fragment, delete_fragment, list_public_fragments, update_fragment};
+use crate::object_storage::fragment_manager::{create_fragment, delete_fragment, get_fragment_hash, list_public_fragments, update_fragment, verify_fragment_existence};
 use crate::object_storage::garbage_collector::{run_garbage_collector, run_lifecycle_manager};
 use crate::object_storage::maintenance::sync_fragment_metadata;
 use crate::object_storage::modify::rename_object;
@@ -110,7 +110,7 @@ pub async fn serve_storage_routes() -> Router {
             .route("/v4/fragment/download/chunk/{:fragment}",get(download_object_chunk))
             .route("/v4/fragment/archive/{:fragment}", post(download_selected_archive))
             .route("/v4/share/create", post(create_signed_url));
-
+            
         let read_ops = layers.layer_view(read_ops);
 
         let write_ops = Router::new()
@@ -226,6 +226,11 @@ pub async fn serve_storage_routes() -> Router {
     let list_fragments_route = Router::new().route("/v4/fragment/list/public", get(list_public_fragments));
     let list_fragments_route = layers.layer_global(list_fragments_route);
 
+    let global_routes = Router::new()
+            .route("/v4/fragment/check", get(verify_fragment_existence))
+            .route("/v4/fragment/get/hash", get(get_fragment_hash));
+    let global_routes = layers.layer_global(global_routes);
+
     let create_fragment_route = Router::new().route("/v4/fragment/create", post(create_fragment));
     let create_fragment_route = layers.layer_auth(create_fragment_route);
 
@@ -243,6 +248,7 @@ pub async fn serve_storage_routes() -> Router {
         .merge(fragment_auth_route)
         .merge(fs_auth_route)
         .merge(list_fragments_route)
+        .merge(global_routes)
         .merge(create_fragment_route)
         .merge(object_storage_routes)
         .merge(legacy_fs_routes)

@@ -21,6 +21,7 @@ use crate::{
     },
     routes::storage_routes::AppState,
     structs::auth_structs::Claims,
+    validation::fragment_validation::does_fragment_exist,
     websocket::ws_structs::StorageEventPayload,
 };
 
@@ -294,4 +295,44 @@ pub async fn delete_fragment(
             "message": "Fragment deleted successfully"
         })),
     ))
+}
+
+#[derive(Deserialize)]
+pub struct FragmentCheckRequest {
+    pub fragment: String,
+}
+
+pub async fn get_fragment_hash(
+    Json(request): Json<FragmentCheckRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let mut hasher = Sha256::new();
+    hasher.update(&request.fragment.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+
+    if !does_fragment_exist(&hash).await {
+        return Err(AppError::NotFound);
+    };
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!(
+            {
+                "fragment": format!("{}", &request.fragment),
+                "fragment_hash": hash
+            }
+        )),
+    ))
+}
+
+pub async fn verify_fragment_existence(
+    Json(request): Json<FragmentCheckRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if does_fragment_exist(&request.fragment).await {
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({ "fragment": &request.fragment })),
+        ));
+    }
+
+    Err(AppError::NotFound)
 }
