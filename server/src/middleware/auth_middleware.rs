@@ -17,6 +17,7 @@ use headers::Authorization;
 use headers::authorization::Bearer;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde_json::json;
+use tracing::info;
 use std::env;
 use std::fmt::Display;
 use std::sync::LazyLock;
@@ -32,6 +33,9 @@ pub static AUTH_KEY: LazyLock<String> =
 
 pub static MASTER_KEY: LazyLock<String> =
     LazyLock::new(|| env::var("MASTER_KEY").expect("MASTER_KEY must be set for authentication"));
+
+pub static ADMIN_KEY: LazyLock<String> =
+    LazyLock::new(|| env::var("ADMIN_KEY").expect("ADMIN_KEY must be set for authentication"));
 
 pub async fn validate_access(req: Request<Body>, next: Next) -> Result<Response, AuthError> {
     let header = req.headers().get("authorization");
@@ -67,32 +71,34 @@ pub async fn authorize_fragment(
         return Err(AuthError::WrongCredentials);
     }
 
-    match does_fragment_exist(&payload.fragment).await {
-        true => {
-            let duration = payload.expires_in.unwrap_or(24 * 60 * 60);
-
-            let exp = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                + duration;
-
-            let claims = Claims {
-                fragment: payload.fragment,
-                read: payload.read,
-                write: payload.write,
-                modify: payload.modify,
-                delete: payload.delete,
-                exp: exp as usize,
-            };
-
-            let token = encode(&Header::default(), &claims, &JWT_KEYS.encoding)
-                .map_err(|_| AuthError::InternalError)?;
-
-            Ok(Json(AuthBody::new(token)))
+    if payload.fragment != *ADMIN_KEY {
+        match does_fragment_exist(&payload.fragment).await {
+            true => { info!("Access granted on fragment: {}", &payload.fragment) }
+            false => return Err(AuthError::FragmentNotFound),
         }
-        false => Err(AuthError::FragmentNotFound),
     }
+
+    let duration = payload.expires_in.unwrap_or(24 * 60 * 60);
+
+    let exp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + duration;
+
+    let claims = Claims {
+        fragment: payload.fragment,
+        read: payload.read,
+        write: payload.write,
+        modify: payload.modify,
+        delete: payload.delete,
+        exp: exp as usize,
+    };
+
+    let token = encode(&Header::default(), &claims, &JWT_KEYS.encoding)
+        .map_err(|_| AuthError::InternalError)?;
+
+    Ok(Json(AuthBody::new(token)))
 }
 
 pub async fn auth(req: Request<Body>, next: Next) -> Result<Response, AuthError> {

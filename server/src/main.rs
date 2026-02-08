@@ -2,7 +2,10 @@ use crate::fs::cleanup_manager::interval_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
 use crate::object_storage::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
-use crate::object_storage::upload::{DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC};
+use crate::object_storage::upload::{
+    DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC,
+    STRIPE_SIZE_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
+};
 use crate::routes::storage_routes::serve_storage_routes;
 use crate::settings::constants::{CONFIG_FILE, ENV_FILE};
 use crate::utils::date_time_formatter::LocalTimer;
@@ -15,15 +18,15 @@ use dotenv::dotenv;
 use ini::Ini;
 use server_cli::cli::args::{Cli, Commands};
 use server_cli::cli::client::execute_command;
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{EnvFilter, fmt};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::Duration;
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, fmt};
 
 mod database;
 mod enums;
@@ -43,11 +46,9 @@ pub fn init_tracing() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
     let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stderr());
 
     tracing_subscriber::registry()
-        .with(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "info,litiaina_n1=trace,server_cli=trace,axum=info,hyper=info".into()
-            }),
-        )
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            "info,litiaina_n1=trace,server_cli=trace,axum=info,hyper=info".into()
+        }))
         .with(
             fmt::layer()
                 .with_writer(non_blocking)
@@ -57,7 +58,7 @@ pub fn init_tracing() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
                 .with_thread_ids(false)
                 .with_thread_names(false)
                 .with_ansi(true)
-                .with_timer(LocalTimer)
+                .with_timer(LocalTimer),
         )
         .try_init()?;
 
@@ -69,6 +70,19 @@ async fn main() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install 'ring' as the default TLS provider.");
+
+    if let Err(e) = ensure_env_file() {
+        tracing::error!("Failed to ensure .env file: {}", e);
+        return;
+    }
+
+    dotenv::from_filename(ENV_FILE).ok();
+    tracing::info!("Loaded environment variables from .env file.");
+
+    if let Err(e) = ensure_config_file() {
+        tracing::error!("Failed to ensure config file: {}", e);
+        return;
+    }
 
     let _guard = init_tracing().expect("Failed to initialize tracing subscriber");
 
@@ -89,14 +103,15 @@ async fn main() {
                     })
                 })
             });
-            
+
             let result = execute_command(
-                cmd,          
-                args.secret.clone(),    
-                args.fragment.clone(), 
-                target_url,   
-                args.insecure  
-            ).await;
+                cmd,
+                args.secret.clone(),
+                args.fragment.clone(),
+                target_url,
+                args.insecure,
+            )
+            .await;
 
             drop(_guard);
 
@@ -104,22 +119,9 @@ async fn main() {
                 eprintln!("Command failed: {}", e);
                 std::process::exit(1);
             }
-            
+
             return;
         }
-    }
-
-    if let Err(e) = ensure_env_file() {
-        tracing::error!("Failed to ensure .env file: {}", e);
-        return;
-    }
-
-    dotenv::from_filename(ENV_FILE).ok();
-    tracing::info!("Loaded environment variables from .env file.");
-
-    if let Err(e) = ensure_config_file() {
-        tracing::error!("Failed to ensure config file: {}", e);
-        return;
     }
 
     let current_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -130,15 +132,22 @@ async fn main() {
     tracing::info!("│ Status         : ONLINE");
     tracing::info!("│ Start Time     : {}", current_time);
     tracing::info!("│ PID            : {}", std::process::id());
-    tracing::info!("│ Hostname       : {}", hostname::get().unwrap_or_default().to_string_lossy());
-    tracing::info!("│ Working Dir    : {}", std::env::current_dir().unwrap_or_default().display());
+    tracing::info!(
+        "│ Hostname       : {}",
+        hostname::get().unwrap_or_default().to_string_lossy()
+    );
+    tracing::info!(
+        "│ Working Dir    : {}",
+        std::env::current_dir().unwrap_or_default().display()
+    );
     tracing::info!("╞═════════ ACTIVE CONNECTIONS ═════════╡");
 
     run_server().await
 }
 
 pub async fn run_server() {
-    let config = Ini::load_from_file(CONFIG_FILE).expect(format!("Failed to load {}", CONFIG_FILE).as_str());
+    let config =
+        Ini::load_from_file(CONFIG_FILE).expect(format!("Failed to load {}", CONFIG_FILE).as_str());
 
     let server_section = config.section(Some("server")).unwrap_or_else(|| {
         panic!("Missing [server] section in {}", CONFIG_FILE);
@@ -232,13 +241,13 @@ pub async fn run_server() {
     let max_part_size: AtomicU64 = AtomicU64::new(
         max_part_size
             .parse::<u64>()
-            .expect("max_part_size does not fit into u64")
+            .expect("max_part_size does not fit into u64"),
     );
-    
+
     MAX_PART_SIZE_ATOMIC
         .set(max_part_size)
         .expect("Double initialization of MAX_PART_SIZE!");
-    
+
     let data_shards = upload_section
         .and_then(|s| s.get("data_shards"))
         .unwrap_or("1");
@@ -246,13 +255,13 @@ pub async fn run_server() {
     let data_shards: AtomicUsize = AtomicUsize::new(
         data_shards
             .parse::<usize>()
-            .expect("data_shards does not fit into usize")
+            .expect("data_shards does not fit into usize"),
     );
 
     DATA_SHARDS_ATOMIC
         .set(data_shards)
         .expect("Double initialization of DATA_SHARDS!");
-    
+
     let parity_shards = upload_section
         .and_then(|s| s.get("parity_shards"))
         .unwrap_or("0");
@@ -260,7 +269,7 @@ pub async fn run_server() {
     let parity_shards: AtomicUsize = AtomicUsize::new(
         parity_shards
             .parse::<usize>()
-            .expect("parity_shards does not fit into usize")
+            .expect("parity_shards does not fit into usize"),
     );
 
     PARITY_SHARDS_ATOMIC
@@ -274,9 +283,9 @@ pub async fn run_server() {
     let writer_buffer_size: AtomicUsize = AtomicUsize::new(
         writer_buffer_size
             .parse::<usize>()
-            .expect("writer_buffer_size does not fit into usize")
+            .expect("writer_buffer_size does not fit into usize"),
     );
-    
+
     WRITER_BUFFER_SIZE_ATOMIC
         .set(writer_buffer_size)
         .expect("Double initialization of WRITER_BUFFER_SIZE!");
@@ -303,7 +312,10 @@ pub async fn run_server() {
     let storage_router = serve_storage_routes().await;
     let serve_storage = storage_router.fallback(handler_404);
 
-    let fs_root = FS_STORAGE_ROOT.get().unwrap_or(&STORAGE_ROOT.to_string()).to_string();
+    let fs_root = FS_STORAGE_ROOT
+        .get()
+        .unwrap_or(&STORAGE_ROOT.to_string())
+        .to_string();
     tokio::spawn(async move {
         interval_cleanup(&fs_root).await;
     });
@@ -311,32 +323,30 @@ pub async fn run_server() {
     serve(storage_addr, serve_storage, cert).await;
 }
 
-async fn serve(
-    socket: SocketAddr,
-    app: Router,
-    cert: RustlsConfig,
-) {
+async fn serve(socket: SocketAddr, app: Router, cert: RustlsConfig) {
     tracing::info!("Secured port => {} type: https", socket);
     let handle = Arc::new(axum_server::Handle::new());
-    
+
     tokio::spawn(shutdown_signal(handle.clone()));
-    
+
     let mut server = axum_server::bind_rustls(socket, cert).handle((*handle).clone());
     server.http_builder().http2().enable_connect_protocol();
 
     server
-            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-            .await
-            .unwrap();
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .unwrap();
 }
 
 pub async fn shutdown_signal(handle: Arc<axum_server::Handle<SocketAddr>>) {
     #[cfg(unix)]
     let terminator = async {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut terminate = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-        let mut interrupt = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
-        
+        let mut terminate =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let mut interrupt =
+            signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+
         tokio::select! {
             _ = terminate.recv() => {},
             _ = interrupt.recv() => {},
@@ -351,7 +361,7 @@ pub async fn shutdown_signal(handle: Arc<axum_server::Handle<SocketAddr>>) {
     };
 
     terminator.await;
-    
+
     tracing::info!("Shutdown signal received. Stopping server...");
     handle.graceful_shutdown(Some(Duration::from_secs(10)));
 }

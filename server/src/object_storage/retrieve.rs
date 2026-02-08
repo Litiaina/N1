@@ -1,8 +1,9 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::{BROWSER_CACHE_MAX_AGE, METADATA_EXT, PREFIX_SEGMENT_EXT, QUOTA_FILE};
+use crate::object_storage::constants::{
+    BROWSER_CACHE_MAX_AGE, METADATA_EXT, PREFIX_SEGMENT_EXT, QUOTA_FILE,
+};
 use crate::object_storage::disk_manager::{
-    ListObjectsResult, ObjectMetadata, ObjectPathManager, PrefixIndexSegment,
-    Quota,
+    ListObjectsResult, ObjectMetadata, ObjectPathManager, PrefixIndexSegment, Quota,
 };
 use crate::object_storage::metadata_parser::get_metadata;
 use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
@@ -83,7 +84,7 @@ fn is_hex2(s: &str) -> bool {
 }
 
 fn canonical_prefix(prefix: &str) -> String {
-    prefix.trim_start_matches('/').to_string()
+    prefix.trim_matches('/').to_string()
 }
 
 fn canonical_key(key: &str) -> String {
@@ -113,10 +114,13 @@ async fn read_metadata_any(
 async fn try_list_by_prefix_index(
     fragment: &str,
     prefix: &str,
+    delimiter: Option<&str>,
     limit: usize,
     continuation_token: Option<String>,
 ) -> Result<Option<ListObjectsResult>, AppError> {
     let pfx = canonical_prefix(prefix);
+    let want_delim = delimiter == Some("/");
+
     let path_manager = ObjectPathManager::new();
 
     let bucket_dirs = path_manager.get_all_prefix_bucket_dirs(fragment, &pfx);
@@ -135,7 +139,7 @@ async fn try_list_by_prefix_index(
 
     let mut segments: Vec<PrefixIndexSegment> = Vec::new();
 
-    for compacted_path in path_manager.get_all_prefix_compacted_paths(fragment, prefix) {
+    for compacted_path in path_manager.get_all_prefix_compacted_paths(fragment, &pfx) {
         if fs::try_exists(&compacted_path).await.unwrap_or(false) {
             if let Ok(data) = fs::read(&compacted_path).await {
                 if let Ok(seg) = rmp_serde::from_slice::<PrefixIndexSegment>(&data) {
@@ -178,17 +182,20 @@ async fn try_list_by_prefix_index(
     }
 
     let mut latest: HashMap<String, (String, i64)> = HashMap::new();
+
     for seg in segments {
         if canonical_prefix(&seg.prefix) != pfx {
             continue;
         }
         for e in seg.entries {
             let ck = canonical_key(&e.object_key);
+
             if !pfx.is_empty() {
                 if ck != pfx && !ck.starts_with(&(pfx.clone() + "/")) {
                     continue;
                 }
             }
+
             match latest.get(&e.object_key) {
                 None => {
                     latest.insert(e.object_key.clone(), (e.version_id.clone(), e.created_at));
@@ -207,6 +214,7 @@ async fn try_list_by_prefix_index(
     if latest.is_empty() {
         return Ok(Some(ListObjectsResult {
             objects: Vec::new(),
+            common_prefixes: Vec::new(),
             continuation_token: None,
         }));
     }
@@ -242,23 +250,76 @@ async fn try_list_by_prefix_index(
         0
     };
 
-    let mut out = Vec::new();
+    let mut out_objects: Vec<ObjectMetadata> = Vec::new();
+    let mut out_prefixes: Vec<String> = Vec::new();
+    let mut seen_prefixes: HashSet<String> = HashSet::new();
+
     let mut last_pair: Option<(String, String)> = None;
+    let mut reached_limit = false;
 
     for (k, v, _ts) in entries.into_iter().skip(start_idx) {
-        if out.len() >= limit {
+        if out_objects.len() + out_prefixes.len() >= limit {
             break;
         }
-        if let Some(meta) = read_metadata_any(&path_manager, fragment, &k, &v).await {
-            if meta.is_delete_marker {
+
+        let Some(meta) = read_metadata_any(&path_manager, fragment, &k, &v).await else {
+            continue;
+        };
+
+        if meta.is_delete_marker {
+            continue;
+        }
+
+        let ck = canonical_key(&meta.object_key);
+
+        if !pfx.is_empty() {
+            if ck != pfx && !ck.starts_with(&(pfx.clone() + "/")) {
                 continue;
             }
-            last_pair = Some((k.clone(), v.clone()));
-            out.push(meta);
+        }
+
+        if want_delim {
+            let rel = if pfx.is_empty() {
+                ck.clone()
+            } else if ck == pfx {
+                ck.clone()
+            } else if ck.len() > pfx.len() + 1 {
+                ck[(pfx.len() + 1)..].to_string()
+            } else {
+                String::new()
+            };
+
+            if !pfx.is_empty() && ck == pfx {
+                out_objects.push(meta);
+                last_pair = Some((k, v));
+            } else if let Some((first, _rest)) = rel.split_once('/') {
+                if !first.is_empty() {
+                    let folder = if pfx.is_empty() {
+                        format!("{}/", first)
+                    } else {
+                        format!("{}/{}/", pfx, first)
+                    };
+                    if seen_prefixes.insert(folder.clone()) {
+                        out_prefixes.push(folder);
+                        last_pair = Some((k, v));
+                    }
+                }
+            } else {
+                out_objects.push(meta);
+                last_pair = Some((k, v));
+            }
+        } else {
+            out_objects.push(meta);
+            last_pair = Some((k, v));
+        }
+
+        if out_objects.len() + out_prefixes.len() >= limit {
+            reached_limit = true;
+            break;
         }
     }
 
-    let next_token = if out.len() >= limit {
+    let next_token = if reached_limit {
         last_pair
             .as_ref()
             .map(|(k, v)| create_prefix_continuation_token(k, v))
@@ -267,7 +328,8 @@ async fn try_list_by_prefix_index(
     };
 
     Ok(Some(ListObjectsResult {
-        objects: out,
+        objects: out_objects,
+        common_prefixes: out_prefixes,
         continuation_token: next_token,
     }))
 }
@@ -317,13 +379,31 @@ async fn list_objects_internal(
 
     let continuation_token = params.get("continuation_token").cloned();
     let prefix = params.get("prefix").cloned().unwrap_or_default();
+    let delimiter = params
+        .get("delimiter")
+        .map(|s| s.as_str())
+        .filter(|d| *d == "/");
 
-    if !scan_trash && !prefix.is_empty() {
-        if let Some(res) =
-            try_list_by_prefix_index(&fragment, &prefix, limit, continuation_token.clone()).await?
+    if !scan_trash && (delimiter.is_some() || !prefix.is_empty()) {
+        if let Some(res) = try_list_by_prefix_index(
+            &fragment,
+            &prefix,
+            delimiter,
+            limit,
+            continuation_token.clone(),
+        )
+        .await?
         {
             return Ok(AxumJson(res));
         }
+    }
+
+    if delimiter.is_some() {
+        return Ok(AxumJson(ListObjectsResult {
+            objects: Vec::new(),
+            common_prefixes: Vec::new(),
+            continuation_token: None,
+        }));
     }
 
     let path_manager = ObjectPathManager::new();
@@ -361,6 +441,7 @@ async fn list_objects_internal(
             debug!("No active index root found for fragment {}", fragment);
             return Ok(AxumJson(ListObjectsResult {
                 objects: Vec::new(),
+                common_prefixes: Vec::new(),
                 continuation_token: None,
             }));
         }
@@ -536,6 +617,7 @@ async fn list_objects_internal(
 
     Ok(AxumJson(ListObjectsResult {
         objects: results,
+        common_prefixes: Vec::new(),
         continuation_token: if reached_limit { next_token } else { None },
     }))
 }

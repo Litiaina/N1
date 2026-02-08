@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 use ulid::Ulid;
 
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::METADATA_EXT;
+use crate::object_storage::constants::{METADATA_EXT, PREFIX_SEGMENT_EXT};
 use crate::object_storage::disk_manager::{
     ObjectMetadata, ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment, RenameObjectRequest,
 };
@@ -127,39 +127,63 @@ async fn write_atomic_if_missing(path: &Path, data: &[u8]) -> Result<bool, AppEr
     Ok(true)
 }
 
-fn prefixes_for_object_key(object_key: &str) -> Vec<String> {
-    let key = object_key.trim_start_matches('/');
+fn canonical_prefix(prefix: &str) -> String {
+    prefix.trim_start_matches('/').to_string()
+}
+
+fn prefixes_for_key(object_key: &str) -> BTreeSet<String> {
+    let key = canonical_prefix(object_key);
+    let mut out = BTreeSet::new();
+    out.insert(String::new());
+
     if key.is_empty() {
-        return vec!["".to_string()];
+        return out;
     }
 
-    let parts: Vec<&str> = key.split('/').collect();
-    if parts.len() <= 1 {
-        return vec!["".to_string()];
-    }
-
-    let mut out = Vec::with_capacity(parts.len());
-    out.push("".to_string());
-
+    let parts: Vec<&str> = key.split('/').filter(|p| !p.is_empty()).collect();
     let mut cur = String::new();
-    for i in 0..(parts.len() - 1) {
-        if i > 0 {
+
+    for (i, p) in parts.iter().enumerate() {
+        if i == 0 {
+            cur.push_str(p);
+        } else {
             cur.push('/');
+            cur.push_str(p);
         }
-        cur.push_str(parts[i]);
-        out.push(cur.clone());
+        out.insert(cur.clone());
     }
+
     out
 }
 
-async fn write_prefix_segments_for_object(
+async fn read_metadata_any(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    object_key: &str,
+    version_id: &str,
+) -> Option<ObjectMetadata> {
+    let paths = path_manager.get_all_metadata_paths(fragment, object_key, version_id);
+    for p in paths {
+        if !fs::try_exists(&p).await.unwrap_or(false) {
+            continue;
+        }
+        if let Ok(data) = fs::read(&p).await {
+            if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
+                return Some(meta);
+            }
+        }
+    }
+    None
+}
+
+async fn write_prefix_segments_for_meta(
     path_manager: &ObjectPathManager,
     fragment: &str,
     object_key: &str,
     version_id: &str,
     created_at: i64,
 ) -> Result<(), AppError> {
-    let prefixes = prefixes_for_object_key(object_key);
+    let prefixes = prefixes_for_key(object_key);
     let mut failures = Vec::new();
 
     for prefix in prefixes {
@@ -206,6 +230,199 @@ async fn write_prefix_segments_for_object(
         )));
     }
 
+    Ok(())
+}
+
+async fn remove_all_prefix_segments(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    prefix: &str,
+) {
+    let pfx = canonical_prefix(prefix);
+
+    for dir in path_manager.get_all_prefix_bucket_dirs(fragment, &pfx) {
+        if !fs::try_exists(&dir).await.unwrap_or(false) {
+            continue;
+        }
+        if let Ok(mut entries) = fs::read_dir(&dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("seg_") && name.ends_with(PREFIX_SEGMENT_EXT) {
+                    let _ = fs::remove_file(entry.path()).await;
+                }
+            }
+        }
+    }
+
+    for p in path_manager.get_all_prefix_compacted_paths(fragment, &pfx) {
+        let _ = fs::remove_file(&p).await;
+    }
+}
+
+async fn rebuild_prefix_bucket_for_prefix(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    prefix: &str,
+) -> Result<(), AppError> {
+    let pfx = canonical_prefix(prefix);
+
+    let bucket_dirs = path_manager.get_all_prefix_bucket_dirs(fragment, &pfx);
+    let mut bucket_dir = None;
+    for d in bucket_dirs {
+        if fs::try_exists(&d).await.unwrap_or(false) {
+            bucket_dir = Some(d);
+            break;
+        }
+    }
+
+    let mut segments: Vec<PrefixIndexSegment> = Vec::new();
+
+    for cp in path_manager.get_all_prefix_compacted_paths(fragment, &pfx) {
+        if fs::try_exists(&cp).await.unwrap_or(false) {
+            if let Ok(data) = fs::read(&cp).await {
+                if let Ok(seg) = rmp_serde::from_slice::<PrefixIndexSegment>(&data) {
+                    segments.push(seg);
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(bucket_dir) = bucket_dir.as_ref() {
+        let mut seg_files = Vec::new();
+        if let Ok(mut entries) = fs::read_dir(bucket_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if !entry
+                    .file_type()
+                    .await
+                    .map(|t| t.is_file())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("seg_") && name.ends_with(PREFIX_SEGMENT_EXT) {
+                    seg_files.push((name, entry.path()));
+                }
+            }
+        }
+        seg_files.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (_name, path) in seg_files {
+            if let Ok(data) = fs::read(&path).await {
+                if let Ok(seg) = rmp_serde::from_slice::<PrefixIndexSegment>(&data) {
+                    segments.push(seg);
+                }
+            }
+        }
+    }
+
+    if segments.is_empty() {
+        return Ok(());
+    }
+
+    let mut all_entries: Vec<(String, String, i64)> = Vec::new();
+    for seg in segments {
+        if canonical_prefix(&seg.prefix) != pfx {
+            continue;
+        }
+        for e in seg.entries {
+            all_entries.push((e.object_key, e.version_id, e.created_at));
+        }
+    }
+
+    if all_entries.is_empty() {
+        return Ok(());
+    }
+
+    all_entries.sort_by(|a, b| {
+        let (_ak, av, ats) = a;
+        let (_bk, bv, bts) = b;
+        match bts.cmp(ats) {
+            std::cmp::Ordering::Equal => bv.cmp(av),
+            other => other,
+        }
+    });
+
+    let mut chosen: HashMap<String, (String, i64)> = HashMap::new();
+
+    for (k, v, _ts) in all_entries {
+        if chosen.contains_key(&k) {
+            continue;
+        }
+
+        if let Some(meta) = read_metadata_any(path_manager, fragment, &k, &v).await {
+            if meta.is_delete_marker {
+                continue;
+            }
+            let ck = canonical_prefix(&meta.object_key);
+            if !pfx.is_empty() && ck != pfx && !ck.starts_with(&(pfx.clone() + "/")) {
+                continue;
+            }
+            chosen.insert(k, (v, meta.created_at));
+        }
+    }
+
+    let mut out_entries: Vec<PrefixIndexEntry> = chosen
+        .into_iter()
+        .map(|(object_key, (version_id, created_at))| PrefixIndexEntry {
+            object_key,
+            version_id,
+            created_at,
+        })
+        .collect();
+
+    out_entries.sort_by(|a, b| match a.object_key.cmp(&b.object_key) {
+        std::cmp::Ordering::Equal => a.version_id.cmp(&b.version_id),
+        other => other,
+    });
+
+    let compacted = PrefixIndexSegment {
+        prefix: pfx.clone(),
+        entries: out_entries,
+    };
+
+    let bytes = rmp_serde::to_vec(&compacted)
+        .map_err(|e| AppError::InternalServerError(format!("Serialize prefix compacted: {}", e)))?;
+
+    let mut any_ok = false;
+    for p in path_manager.get_all_prefix_compacted_paths(fragment, &pfx) {
+        if write_atomic(&p, &bytes).await.is_ok() {
+            any_ok = true;
+        }
+    }
+
+    if !any_ok {
+        remove_all_prefix_segments(path_manager, fragment, &pfx).await;
+        return Ok(());
+    }
+
+    for dir in path_manager.get_all_prefix_bucket_dirs(fragment, &pfx) {
+        if !fs::try_exists(&dir).await.unwrap_or(false) {
+            continue;
+        }
+        if let Ok(mut entries) = fs::read_dir(&dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("seg_") && name.ends_with(PREFIX_SEGMENT_EXT) {
+                    let _ = fs::remove_file(entry.path()).await;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn rebuild_prefix_indexes_for_key(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    object_key: &str,
+) -> Result<(), AppError> {
+    let prefixes = prefixes_for_key(object_key);
+    for pfx in prefixes {
+        let _ = rebuild_prefix_bucket_for_prefix(path_manager, fragment, &pfx).await;
+    }
     Ok(())
 }
 
@@ -438,7 +655,7 @@ pub async fn rename_object(
             .copied()
             .unwrap_or_else(|| Utc::now().timestamp());
 
-        write_prefix_segments_for_object(
+        write_prefix_segments_for_meta(
             &path_manager,
             &payload_arc.destination_fragment,
             &payload_arc.destination_key,
@@ -447,6 +664,20 @@ pub async fn rename_object(
         )
         .await?;
     }
+
+    let _ = rebuild_prefix_indexes_for_key(
+        &path_manager,
+        &payload_arc.source_fragment,
+        &payload_arc.source_key,
+    )
+    .await;
+
+    let _ = rebuild_prefix_indexes_for_key(
+        &path_manager,
+        &payload_arc.destination_fragment,
+        &payload_arc.destination_key,
+    )
+    .await;
 
     info!(
         "Renamed object from {}/{} to {}/{}",

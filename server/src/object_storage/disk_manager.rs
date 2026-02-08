@@ -164,6 +164,8 @@ impl ObjectPathManager {
 #[derive(Debug, Serialize)]
 pub struct ListObjectsResult {
     pub objects: Vec<ObjectMetadata>,
+    #[serde(default)]
+    pub common_prefixes: Vec<String>,
     pub continuation_token: Option<String>,
 }
 

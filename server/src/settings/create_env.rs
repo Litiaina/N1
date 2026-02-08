@@ -34,6 +34,10 @@ pub fn create_env_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     writeln!(file, "MASTER_KEY=")?;
     writeln!(file)?;
 
+    writeln!(file, "# Admin access key")?;
+    writeln!(file, "ADMIN_KEY=")?;
+    writeln!(file)?;
+
     writeln!(file,"# MongoDB connection string (default)")?;
     writeln!(file, "DATABASE_URL=mongodb://localhost:27017")?;
     writeln!(file)?;

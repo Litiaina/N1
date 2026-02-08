@@ -5,8 +5,10 @@ use ini::Ini;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::env;
 use std::error::Error;
 use std::io::{self, Write};
+use std::sync::LazyLock;
 use std::time::Duration;
 use tracing::{error, info};
 
@@ -68,6 +70,9 @@ pub struct HealthResponse {
     pub summary: String,
 }
 
+pub static ADMIN_KEY: LazyLock<String> =
+    LazyLock::new(|| env::var("ADMIN_KEY").expect("ADMIN_KEY must be set for authentication"));
+
 fn get_base_url(url_opt: Option<String>) -> String {
     if let Some(u) = url_opt {
         return u;
@@ -105,10 +110,15 @@ async fn authenticate(
     secret: &str,
     fragment: &str,
 ) -> Result<String, Box<dyn Error>> {
-    let mut hasher = sha2::Sha256::new();
-    use sha2::Digest;
-    hasher.update(fragment.as_bytes());
-    let fragment_hash = format!("{:x}", hasher.finalize());
+    let fragment_hash = if fragment != *ADMIN_KEY {
+        let mut hasher = sha2::Sha256::new();
+        use sha2::Digest;
+        hasher.update(fragment.as_bytes());
+
+        format!("{:x}", hasher.finalize())
+    } else {
+        ADMIN_KEY.as_str().to_string()
+    };
 
     let resp = client
         .post(format!("{}/authenticate/fragment", base_url))
