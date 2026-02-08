@@ -1,3 +1,4 @@
+
 <div align="center">
   <img
     src="https://github.com/Litiaina/litiaina-admin-webpage/blob/master/images/litiaina_icon.png?raw=true"
@@ -623,6 +624,46 @@ Common request shape (from older versions):
 }
 ```
 
+### Check fragment existence
+
+**GET** `/v4/fragment/check`
+
+This endpoint verifies whether a fragment exists. It is considered a **global** route (no fragment JWT required).
+Although it is a `GET` route, clients must send a small JSON body:
+
+```json
+{ "fragment": "your-fragment-name" }
+```
+
+If the fragment exists, the server responds with `200 OK` and echoes the fragment name:
+
+```json
+{ "fragment": "your-fragment-name" }
+```
+
+If the fragment does not exist, it returns `404 Not Found`.
+
+### Get fragment hash
+
+**GET** `/v4/fragment/get/hash`
+
+This endpoint returns the cryptographic hash associated with a fragment. Like `fragment/check`, it does not require a fragment JWT but expects a JSON body:
+
+```json
+{ "fragment": "your-fragment-name" }
+```
+
+On success (`200 OK`), the response contains the fragment name and its hash:
+
+```json
+{
+  "fragment": "your-fragment-name",
+  "fragment_hash": "<hash>"
+}
+```
+
+If the fragment does not exist or a hash has not yet been computed, the server returns `404 Not Found`.
+
 ### Ping
 **GET** `/ping` → `"pong"`
 
@@ -683,6 +724,8 @@ Common request shape (from older versions):
 ### Public
 - `GET /v4/public/share`
 - `GET /v4/fragment/list/public`
+- `GET /v4/fragment/check`
+- `GET /v4/fragment/get/hash`
 - `GET /ping`
 
 ### Auth
