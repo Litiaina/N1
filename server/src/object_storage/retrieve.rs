@@ -5,6 +5,7 @@ use crate::object_storage::constants::{
 use crate::object_storage::disk_manager::{
     ListObjectsResult, ObjectMetadata, ObjectPathManager, PrefixIndexSegment, Quota,
 };
+use crate::object_storage::fragment_manager::is_fragment_hash;
 use crate::object_storage::metadata_parser::get_metadata;
 use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
 use crate::object_storage::quota_manager::get_quota;
@@ -809,7 +810,9 @@ pub async fn list_fragments(claims: Claims) -> Result<impl IntoResponse, AppErro
             {
                 if entry.file_type().is_dir() {
                     if let Some(name) = entry.file_name().to_str() {
-                        fragment_hashes.insert(name.to_string());
+                        if is_fragment_hash(name) {
+                            fragment_hashes.insert(name.to_string());
+                        }
                     }
                 }
             }

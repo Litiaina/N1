@@ -14,10 +14,9 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::runtime::Handle;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
@@ -45,12 +44,7 @@ pub async fn run_garbage_collector(State(state): State<Arc<AppState>>) -> impl I
             error!("Manual GC Scan failed: {}", err);
         }
 
-        let root = FS_STORAGE_ROOT
-            .get()
-            .cloned()
-            .unwrap_or_else(|| STORAGE_ROOT.to_string());
-
-        start_cleanup(&root).await;
+        start_cleanup(FS_STORAGE_ROOT.get().unwrap_or(&STORAGE_ROOT.to_string())).await;
     });
 
     StatusCode::ACCEPTED
@@ -74,6 +68,126 @@ fn refund_quota_async(fragment: String, amount: u64, state: Arc<AppState>) {
 
 fn get_trash_root(disk_root: &std::path::Path, fragment_hash: &str) -> PathBuf {
     disk_root.join(fragment_hash).join(".trash")
+}
+
+#[cfg(unix)]
+fn gc_cleanup_version_dir_unix(
+    version_dir: &Path,
+    now: SystemTime,
+    gc_ttl: Duration,
+    is_manual: bool,
+) {
+    let rd = match fs::read_dir(version_dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    let mut gc_files: Vec<(String, PathBuf)> = Vec::new();
+    let mut preexisting_files: Vec<PathBuf> = Vec::new();
+    let mut symlinks: Vec<PathBuf> = Vec::new();
+
+    for ent in rd.filter_map(|e| e.ok()) {
+        let p = ent.path();
+        let name = match p.file_name().and_then(|n| n.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+
+        let md = match fs::symlink_metadata(&p) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        if md.file_type().is_symlink() {
+            symlinks.push(p);
+            continue;
+        }
+
+        let modified = md.modified().unwrap_or(now);
+        let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+        if !(is_manual || age > gc_ttl) {
+            continue;
+        }
+
+        if name.ends_with(GC_SUFFIX) {
+            gc_files.push((name, p));
+            continue;
+        }
+
+        if name.contains(".preexisting.") {
+            preexisting_files.push(p);
+            continue;
+        }
+    }
+
+    for (gc_name, gc_path) in gc_files {
+        let base = gc_name.strip_suffix(GC_SUFFIX).unwrap_or(&gc_name);
+        let link_path = version_dir.join(base);
+
+        let removed_gc = fs::remove_file(&gc_path).is_ok();
+
+        if removed_gc {
+            if let Ok(lmd) = fs::symlink_metadata(&link_path) {
+                if lmd.file_type().is_symlink() {
+                    if let Ok(tgt) = fs::read_link(&link_path) {
+                        let tgt_name = tgt.file_name().and_then(|v| v.to_str()).unwrap_or("");
+                        if tgt_name == gc_name {
+                            let _ = fs::remove_file(&link_path);
+                        }
+                    } else {
+                        let _ = fs::remove_file(&link_path);
+                    }
+                }
+            }
+        }
+    }
+
+    for p in preexisting_files {
+        let _ = fs::remove_file(&p);
+    }
+
+    for sp in symlinks {
+        let md = match fs::symlink_metadata(&sp) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !md.file_type().is_symlink() {
+            continue;
+        }
+
+        let modified = md.modified().unwrap_or(now);
+        let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+        if !(is_manual || age > gc_ttl) {
+            continue;
+        }
+
+        let tgt = match fs::read_link(&sp) {
+            Ok(t) => t,
+            Err(_) => {
+                let _ = fs::remove_file(&sp);
+                continue;
+            }
+        };
+
+        let tgt_name = tgt.file_name().and_then(|v| v.to_str()).unwrap_or("");
+        if !tgt_name.ends_with(GC_SUFFIX) {
+            continue;
+        }
+
+        let tgt_path = sp.parent().unwrap_or(Path::new("")).join(tgt_name);
+        if !tgt_path.exists() {
+            let _ = fs::remove_file(&sp);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn gc_cleanup_version_dir_unix(
+    _version_dir: &Path,
+    _now: SystemTime,
+    _gc_ttl: Duration,
+    _is_manual: bool,
+) {
 }
 
 async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<(), AppError> {
@@ -143,8 +257,9 @@ async fn process_fragment_gc(
 
         for entry in WalkDir::new(&index_dir).into_iter().filter_map(|e| e.ok()) {
             if entry.file_type().is_file() {
-                let fname = entry.file_name().to_string_lossy().into_owned();
-                if fname.ends_with(METADATA_EXT) && fname != QUOTA_FILE {
+                let fname = entry.file_name().to_string_lossy();
+                if fname.ends_with(METADATA_EXT) && fname != QUOTA_FILE && fname != RESERVATION_FILE
+                {
                     if let Some((_, rest)) = fname.split_once('#') {
                         if let Some(ver) = rest.strip_suffix(METADATA_EXT) {
                             live_versions.insert(ver.to_string());
@@ -152,6 +267,9 @@ async fn process_fragment_gc(
                     }
                 }
             }
+        }
+        if !live_versions.is_empty() {
+            break;
         }
     }
 
@@ -168,13 +286,9 @@ async fn process_fragment_gc(
             .filter_map(|e| e.ok())
         {
             if entry.file_type().is_file()
-                && entry
-                    .file_name()
-                    .to_string_lossy()
-                    .as_ref()
-                    .ends_with(METADATA_EXT)
+                && entry.file_name().to_string_lossy().ends_with(METADATA_EXT)
             {
-                let fname = entry.file_name().to_string_lossy().into_owned();
+                let fname = entry.file_name().to_string_lossy().to_string();
 
                 let modified = entry
                     .metadata()
@@ -210,6 +324,9 @@ async fn process_fragment_gc(
                 }
             }
         }
+        if !expired_versions.is_empty() || !trash_versions.is_empty() {
+            break;
+        }
     }
 
     refund_quota_async(fragment.to_string(), expired_trash_refund, state.clone());
@@ -224,7 +341,7 @@ async fn process_fragment_gc(
                 let trash_idx = get_trash_root(&root_path, &frag).join("index");
                 if trash_idx.exists() {
                     for entry in WalkDir::new(&trash_idx).into_iter().filter_map(|e| e.ok()) {
-                        let fname = entry.file_name().to_string_lossy().into_owned();
+                        let fname = entry.file_name().to_string_lossy();
                         if fname.ends_with(METADATA_EXT) {
                             if let Some((_, rest)) = fname.split_once('#') {
                                 if let Some(ver) = rest.strip_suffix(METADATA_EXT) {
@@ -265,7 +382,7 @@ async fn process_fragment_gc(
                     continue;
                 }
 
-                let session_id = entry.file_name().to_string_lossy().into_owned();
+                let session_id = entry.file_name().to_string_lossy().to_string();
 
                 if sessions_to_delete.contains(&session_id) {
                     if !session_amounts.contains_key(&session_id) {
@@ -339,18 +456,9 @@ async fn process_fragment_gc(
                     continue;
                 }
 
-                if let Ok(shard_files) = std::fs::read_dir(&path) {
-                    for shard_file in shard_files.filter_map(|e| e.ok()) {
-                        let s_path = shard_file.path();
-                        if let Some(name) = s_path.file_name().and_then(|n| n.to_str()) {
-                            if name.ends_with(GC_SUFFIX) {
-                                let _ = std::fs::remove_file(s_path);
-                            }
-                        }
-                    }
-                }
+                gc_cleanup_version_dir_unix(&path, now, file_ttl, is_manual_run);
 
-                let ver_id = entry.file_name().to_string_lossy().into_owned();
+                let ver_id = entry.file_name().to_string_lossy().to_string();
 
                 if !live_versions.contains(&ver_id)
                     && !trash_versions.contains(&ver_id)

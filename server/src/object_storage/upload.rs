@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -437,19 +437,29 @@ async fn commit_part_meta_lockless(
     let meta_dirs = path_manager.get_all_session_dirs(fragment, version_id);
     let file_name = format!("part_{}{}", part_index, PART_META_SUFFIX);
 
+    let mut any_valid = false;
     for d in &meta_dirs {
         let p = d.join(&file_name);
         if tokio_fs::try_exists(&p).await.unwrap_or(false) {
             if let Ok(bytes) = tokio_fs::read(&p).await {
                 if rmp_serde::from_slice::<PartMetadata>(&bytes).is_ok() {
-                    return Ok(false);
+                    any_valid = true;
+                    break;
                 }
             }
         }
     }
 
-    for d in meta_dirs {
-        if !tokio_fs::try_exists(&d).await.unwrap_or(false) {
+    if any_valid {
+        return Ok(false);
+    }
+
+    let mut wrote_any = false;
+
+    for d in &meta_dirs {
+        let _ = tokio_fs::create_dir_all(d).await;
+
+        if !tokio_fs::try_exists(d).await.unwrap_or(false) {
             continue;
         }
 
@@ -461,7 +471,8 @@ async fn commit_part_meta_lockless(
                 valid = rmp_serde::from_slice::<PartMetadata>(&bytes).is_ok();
             }
             if valid {
-                return Ok(false);
+                wrote_any = true;
+                continue;
             } else {
                 let _ = tokio_fs::remove_file(&p).await;
             }
@@ -482,13 +493,14 @@ async fn commit_part_meta_lockless(
                 }
                 let _ = f.sync_all().await;
                 drop(f);
-                let _ = sync_dir(&d).await;
-                return Ok(true);
+                let _ = sync_dir(d).await;
+                wrote_any = true;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if let Ok(bytes) = tokio_fs::read(&p).await {
                     if rmp_serde::from_slice::<PartMetadata>(&bytes).is_ok() {
-                        return Ok(false);
+                        wrote_any = true;
+                        continue;
                     }
                 }
                 let _ = tokio_fs::remove_file(&p).await;
@@ -501,8 +513,23 @@ async fn commit_part_meta_lockless(
         }
     }
 
+    if wrote_any {
+        return Ok(true);
+    }
+
+    for d in &meta_dirs {
+        let p = d.join(&file_name);
+        if tokio_fs::try_exists(&p).await.unwrap_or(false) {
+            if let Ok(bytes) = tokio_fs::read(&p).await {
+                if rmp_serde::from_slice::<PartMetadata>(&bytes).is_ok() {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+
     Err(AppError::InternalServerError(
-        "Failed to commit part metadata to any index mirror".into(),
+        "Failed to commit part metadata to any session mirror".into(),
     ))
 }
 
@@ -774,76 +801,127 @@ pub async fn list_active_uploads(
     let path_manager = ObjectPathManager::new();
     let index_roots = path_manager.get_all_index_roots();
 
-    let mut session_root = None;
-    for root in index_roots {
-        let p = root.join(&fragment).join("index").join("sessions");
-        if tokio_fs::try_exists(&p).await.unwrap_or(false) {
-            session_root = Some(p);
-            break;
-        }
-    }
+    let mut version_ids: HashSet<String> = HashSet::new();
 
-    let root = match session_root {
-        Some(r) => r,
-        None => {
-            return Ok(AxumJson(ListUploadsResponse {
-                sessions: vec![],
-                total: 0,
-            }));
-        }
-    };
-
-    let mut sessions = Vec::new();
-    let mut entries = tokio_fs::read_dir(root)
-        .await
-        .map_err(|e| AppError::Io(e, "read sessions".into()))?;
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if !path.is_dir() {
+    for root in &index_roots {
+        let sessions_root = root.join(&fragment).join("index").join("sessions");
+        if !tokio_fs::try_exists(&sessions_root).await.unwrap_or(false) {
             continue;
         }
 
-        let version_id = entry.file_name().to_string_lossy().to_string();
+        let mut entries = match tokio_fs::read_dir(&sessions_root).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
 
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let vid = entry.file_name().to_string_lossy().to_string();
+            if !vid.is_empty() {
+                version_ids.insert(vid);
+            }
+        }
+    }
+
+    if version_ids.is_empty() {
+        return Ok(AxumJson(ListUploadsResponse {
+            sessions: vec![],
+            total: 0,
+        }));
+    }
+
+    async fn read_receipt_any(pm: &ObjectPathManager, fragment: &str, version_id: &str) -> u64 {
+        let meta_dirs = pm.get_all_session_dirs(fragment, version_id);
+        for d in meta_dirs {
+            let p = d.join(RESERVATION_FILE);
+            if !tokio_fs::try_exists(&p).await.unwrap_or(false) {
+                continue;
+            }
+            if let Ok(data) = tokio_fs::read(&p).await {
+                if let Ok(r) = rmp_serde::from_slice::<ReservationReceipt>(&data) {
+                    return r.amount;
+                }
+            }
+        }
+        0
+    }
+
+    let mut sessions: Vec<ActiveSessionInfo> = Vec::new();
+    let mut vids: Vec<String> = version_ids.into_iter().collect();
+    vids.sort();
+
+    for version_id in vids {
         let mut created_at = 0i64;
-        if let Ok(meta) = entry.metadata().await {
-            if let Ok(created) = meta.created() {
-                created_at = created
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-            } else if let Ok(modified) = meta.modified() {
-                created_at = modified
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
+
+        for root in &index_roots {
+            let p = root
+                .join(&fragment)
+                .join("index")
+                .join("sessions")
+                .join(&version_id);
+
+            if !tokio_fs::try_exists(&p).await.unwrap_or(false) {
+                continue;
+            }
+
+            if let Ok(meta) = tokio_fs::metadata(&p).await {
+                let ts = meta
+                    .created()
+                    .or_else(|_| meta.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+
+                if ts > created_at {
+                    created_at = ts;
+                }
             }
         }
 
-        let mut reserved_size = 0u64;
-        let res_path = path.join(RESERVATION_FILE);
-        if let Ok(data) = tokio_fs::read(&res_path).await {
-            if let Ok(receipt) = rmp_serde::from_slice::<ReservationReceipt>(&data) {
-                reserved_size = receipt.amount;
-            }
-        }
+        let reserved_size = read_receipt_any(&path_manager, &fragment, &version_id).await;
 
         let mut session_id = version_id.clone();
         let mut object_key: Option<String> = None;
         let mut total_size_bytes: Option<u64> = None;
         let mut expected_parts: Option<u64> = None;
 
-        let man_path = path.join(SESSION_MANIFEST_FILE);
-        if let Ok(data) = tokio_fs::read(&man_path).await {
-            if let Ok(m) = rmp_serde::from_slice::<UploadSessionManifest>(&data) {
-                session_id = m.session_id;
-                object_key = Some(m.object_key);
-                total_size_bytes = Some(m.total_size_bytes);
-                expected_parts = Some(m.expected_parts);
-                if m.created_at > 0 {
-                    created_at = m.created_at;
+        let man = read_manifest_any(&path_manager, &fragment, &version_id).await?;
+        if let Some(m) = man {
+            session_id = m.session_id.clone();
+            object_key = Some(m.object_key.clone());
+            total_size_bytes = Some(m.total_size_bytes);
+            expected_parts = Some(m.expected_parts);
+            if m.created_at > 0 {
+                created_at = m.created_at;
+            }
+        } else {
+            let meta_dirs = path_manager.get_all_session_dirs(&fragment, &version_id);
+            let mut any_part = false;
+            for d in meta_dirs {
+                if !tokio_fs::try_exists(&d).await.unwrap_or(false) {
+                    continue;
                 }
+                let mut entries = match tokio_fs::read_dir(&d).await {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let n = entry.file_name().to_string_lossy().to_string();
+                    if n.ends_with(PART_META_SUFFIX) {
+                        any_part = true;
+                        break;
+                    }
+                }
+                if any_part {
+                    break;
+                }
+            }
+            if !any_part && reserved_size == 0 {
+                continue;
             }
         }
 

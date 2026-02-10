@@ -424,6 +424,10 @@ pub async fn rename_object(
                 meta.object_key = payload.destination_key.clone();
                 meta.fragment = payload.destination_fragment.clone();
                 meta.owner_uid = payload.destination_fragment.clone();
+                // Update created_at to now, treating rename as a new object creation (Copy+Delete).
+                // This ensures that the new prefix index segment has a later timestamp than
+                // any stale compacted entry captured by a concurrent rebuild.
+                meta.created_at = Utc::now().timestamp();
 
                 let bytes = match rmp_serde::to_vec(&meta) {
                     Ok(b) => b,

@@ -1,16 +1,13 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::disk_manager::{PartMetadata, ShardInfo};
+use crate::object_storage::constants::GC_SUFFIX;
+use crate::object_storage::disk_manager::{ObjectPathManager, PartMetadata, ShardInfo};
 use crate::object_storage::upload::DirectWriter;
 
 use crc32fast::Hasher;
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions as StdOpenOptions;
 use std::io::SeekFrom;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-#[cfg(windows)]
-use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -19,6 +16,11 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use ulid::Ulid;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 
 static RECOVERY_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
 
@@ -50,6 +52,9 @@ static RECOVERY_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         .expect("Failed to build dedicated recovery runtime")
 });
 
+static BLOB_ROOTS: LazyLock<Vec<PathBuf>> =
+    LazyLock::new(|| ObjectPathManager::new().get_blob_roots());
+
 #[inline]
 fn strip_tmp_attempt_suffix(s: &str) -> &str {
     if let Some(pos) = s.find(".tmp.") {
@@ -68,7 +73,7 @@ fn stable_abs_candidates(abs: &str) -> Vec<String> {
 
     let stable = strip_tmp_attempt_suffix(abs).to_string();
     if stable != abs {
-        out.push(stable);
+        out.push(stable.clone());
     }
 
     out.push(abs.to_string());
@@ -78,9 +83,74 @@ fn stable_abs_candidates(abs: &str) -> Vec<String> {
         out.push(strip_tmp_attempt_suffix(stripped).to_string());
     }
 
-    let mut seen = std::collections::HashSet::new();
+    // Include GC candidates for finding shards that might have been marked for deletion but are valid
+    if !stable.is_empty() {
+        out.push(format!("{}{}", stable, GC_SUFFIX));
+    }
+
+    let mut seen = HashSet::<String>::new();
     out.retain(|p| seen.insert(p.clone()));
     out
+}
+
+fn extract_fragment_version_from_abs(abs: &str) -> Option<(String, String, bool)> {
+    if abs.is_empty() {
+        return None;
+    }
+    let norm = abs.replace('\\', "/");
+    let parts: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+    let blob_pos = parts.iter().position(|p| *p == "blob")?;
+    if blob_pos == 0 || blob_pos + 1 >= parts.len() {
+        return None;
+    }
+
+    let is_trash = blob_pos >= 2 && parts[blob_pos - 1] == ".trash";
+    let fragment = if is_trash {
+        if blob_pos < 2 {
+            return None;
+        }
+        parts[blob_pos - 2]
+    } else {
+        parts[blob_pos - 1]
+    };
+
+    let version_id = parts[blob_pos + 1];
+    Some((fragment.to_string(), version_id.to_string(), is_trash))
+}
+
+fn parse_version_dir_hint(version_dir: &Path) -> Option<(String, String, bool)> {
+    let version_id = version_dir.file_name()?.to_string_lossy().to_string();
+    let blob_dir = version_dir.parent()?;
+    if blob_dir.file_name()?.to_string_lossy() != "blob" {
+        return None;
+    }
+
+    let up = blob_dir.parent()?;
+    let name = up.file_name()?.to_string_lossy();
+
+    if name == ".trash" {
+        let frag = up.parent()?.file_name()?.to_string_lossy().to_string();
+        return Some((frag, version_id, true));
+    }
+
+    Some((name.to_string(), version_id, false))
+}
+
+fn shard_dir_on_root(
+    disk_root: &Path,
+    fragment: &str,
+    version_id: &str,
+    is_trash: bool,
+) -> PathBuf {
+    if is_trash {
+        disk_root
+            .join(fragment)
+            .join(".trash")
+            .join("blob")
+            .join(version_id)
+    } else {
+        disk_root.join(fragment).join("blob").join(version_id)
+    }
 }
 
 async fn create_direct_file_for_repair(path: &PathBuf) -> Result<std::fs::File, AppError> {
@@ -156,27 +226,75 @@ pub async fn verify_shard_integrity(file: &mut File, expected_checksum: &str) ->
     calculated == expected
 }
 
+/// Re-instated verified opening from OLD code to prevent using corrupt shards
 async fn try_open_verified(path: &str, checksum: &str) -> Option<File> {
     if path.is_empty() {
         return None;
     }
+    // No timeouts here - relying on OS to handle disk IO naturally
     if let Ok(mut f) = File::open(path).await {
         if verify_shard_integrity(&mut f, checksum).await {
             return Some(f);
+        } else {
+            warn!("Shard failed integrity check: {}", path);
         }
     }
     None
 }
 
-async fn get_or_open_shard(
+/// Robustly finds a shard on any disk, verifies it, and caches the handle.
+/// Combines the path-hunting logic of NEW with the reliability of OLD.
+async fn get_or_open_shard_ha(
     file_cache: &mut HashMap<String, File>,
     shard_info: &ShardInfo,
+    version_dir_hint: Option<&Path>,
 ) -> Option<File> {
     if let Some(file) = file_cache.get(&shard_info.file_name) {
         return file.try_clone().await.ok();
     }
 
-    for cand in stable_abs_candidates(&shard_info.absolute_path) {
+    let mut candidates: Vec<String> = stable_abs_candidates(&shard_info.absolute_path);
+
+    // Smart path reconstruction (from NEW code)
+    if let Some(vdir) = version_dir_hint {
+        candidates.push(
+            vdir.join(&shard_info.file_name)
+                .to_string_lossy()
+                .to_string(),
+        );
+
+        if let Some((fragment, version_id, is_trash)) = parse_version_dir_hint(vdir) {
+            for root in BLOB_ROOTS.iter() {
+                let dir = shard_dir_on_root(root.as_path(), &fragment, &version_id, is_trash);
+                candidates.push(
+                    dir.join(&shard_info.file_name)
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    if let Some((fragment, version_id, is_trash)) =
+        extract_fragment_version_from_abs(&shard_info.absolute_path)
+    {
+        for root in BLOB_ROOTS.iter() {
+            let dir = shard_dir_on_root(root.as_path(), &fragment, &version_id, is_trash);
+            candidates.push(
+                dir.join(&shard_info.file_name)
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+    }
+
+    let mut tried = HashSet::<String>::new();
+    for cand in candidates {
+        if cand.is_empty() || !tried.insert(cand.clone()) {
+            continue;
+        }
+
+        // Use strict verification (from OLD code) to ensure no silent corruption
         if let Some(f) = try_open_verified(&cand, &shard_info.checksum).await {
             if let Ok(cloned) = f.try_clone().await {
                 file_cache.insert(shard_info.file_name.clone(), cloned);
@@ -185,16 +303,30 @@ async fn get_or_open_shard(
         }
     }
 
-    warn!(
-        "Failed to open/verify shard for read: {}",
-        shard_info.absolute_path
-    );
+    None
+}
+
+fn data_shards_count(part: &PartMetadata) -> usize {
+    part.shards.iter().filter(|s| !s.is_parity).count()
+}
+
+fn nth_data_shard<'a>(part: &'a PartMetadata, nth: usize) -> Option<&'a ShardInfo> {
+    let mut i = 0usize;
+    for s in &part.shards {
+        if s.is_parity {
+            continue;
+        }
+        if i == nth {
+            return Some(s);
+        }
+        i += 1;
+    }
     None
 }
 
 pub async fn read_or_recover_chunk(
     file_cache: &mut HashMap<String, File>,
-    _version_dir: &Path,
+    version_dir: &Path,
     part: Arc<PartMetadata>,
     shard_idx: usize,
     offset: u64,
@@ -202,33 +334,46 @@ pub async fn read_or_recover_chunk(
     block_size: usize,
 ) -> Result<Vec<u8>, AppError> {
     let mut buf = vec![0u8; len];
-    let target_shard = part
-        .shards
-        .get(shard_idx)
+
+    let target_shard = nth_data_shard(&part, shard_idx)
         .ok_or(AppError::InternalServerError("Bad shard index".into()))?;
 
-    if let Some(mut file) = get_or_open_shard(file_cache, target_shard).await {
-        if file.seek(SeekFrom::Start(offset)).await.is_ok()
-            && file.read_exact(&mut buf).await.is_ok()
-        {
-            return Ok(buf);
+    let vdir_hint = if version_dir.as_os_str().is_empty() {
+        None
+    } else {
+        Some(version_dir)
+    };
+
+    // Attempt to read primary shard with full integrity check
+    if let Some(mut file) = get_or_open_shard_ha(file_cache, target_shard, vdir_hint).await {
+        if file.seek(SeekFrom::Start(offset)).await.is_ok() {
+            if file.read_exact(&mut buf).await.is_ok() {
+                return Ok(buf);
+            }
         }
+        warn!("Read failed for validated shard, attempting recovery.");
     }
 
-    let data_count = part.shards.iter().filter(|s| !s.is_parity).count();
-    let parity_count = part.shards.len() - data_count;
+    // Fallback to Erasure Coding Recovery
+    let data_count = data_shards_count(&part);
+    let parity_count = part.shards.len().saturating_sub(data_count);
 
+    if data_count == 0 {
+        return Err(AppError::InternalServerError("No data shards".into()));
+    }
+
+    // Using standard ReedSolomonDecoder for all cases (including k=1) for robustness
     let mut decoder = ReedSolomonDecoder::new(data_count, parity_count, len)
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
-    let mut shards_added = 0;
+    let mut shards_added = 0usize;
 
     for s in &part.shards {
-        if s.shard_index == shard_idx {
+        if s.shard_index == target_shard.shard_index {
             continue;
         }
 
-        let mut file = match get_or_open_shard(file_cache, s).await {
+        let mut file = match get_or_open_shard_ha(file_cache, s, vdir_hint).await {
             Some(f) => f,
             None => continue,
         };
@@ -236,6 +381,7 @@ pub async fn read_or_recover_chunk(
         if file.seek(SeekFrom::Start(offset)).await.is_err() {
             continue;
         }
+
         let mut chunk = vec![0u8; len];
         if file.read_exact(&mut chunk).await.is_err() {
             continue;
@@ -266,13 +412,14 @@ pub async fn read_or_recover_chunk(
         .decode()
         .map_err(|e| AppError::InternalServerError(e.to_string()))?
         .restored_original_iter()
-        .find(|(idx, _)| *idx == shard_idx)
+        .find(|(idx, _)| *idx == target_shard.shard_index)
         .ok_or(AppError::InternalServerError(
             "Reconstruction failed for target shard".into(),
         ))?
         .1
         .to_vec();
 
+    // Trigger background repair to fix the corrupted/missing primary shard
     let part_clone = Arc::clone(&part);
     let target_idx = target_shard.shard_index;
 
@@ -297,10 +444,13 @@ pub async fn repair_entire_shard(
 
     let target_shard = part
         .shards
-        .get(target_shard_idx)
+        .iter()
+        .find(|s| s.shard_index == target_shard_idx)
+        .or_else(|| part.shards.get(target_shard_idx))
         .ok_or(AppError::InternalServerError(
             "Target shard not found in metadata".into(),
-        ))?;
+        ))?
+        .clone();
 
     let final_path_str = strip_tmp_attempt_suffix(&target_shard.absolute_path).to_string();
     if final_path_str.is_empty() {
@@ -325,6 +475,7 @@ pub async fn repair_entire_shard(
         Ulid::new().to_string()
     ));
 
+    // If file exists and is valid, no need to repair
     if fs::try_exists(&final_path).await.unwrap_or(false) {
         if let Ok(mut f) = File::open(&final_path).await {
             if verify_shard_integrity(&mut f, &target_shard.checksum).await {
@@ -358,56 +509,75 @@ pub async fn repair_entire_shard(
 
     let mut temp_file = DirectWriter::new(std_file);
 
-    let data_count = part.shards.iter().filter(|s| !s.is_parity).count();
-    let parity_count = part.shards.len() - data_count;
+    let data_count = data_shards_count(&part);
+    let parity_count = part.shards.len().saturating_sub(data_count);
+
+    if data_count == 0 {
+        drop(temp_file);
+        let _ = fs::remove_file(&temp_path).await;
+        return Err(AppError::InternalServerError("No data shards".into()));
+    }
 
     let mut peer_files: Vec<Option<File>> = Vec::with_capacity(part.shards.len());
+    let mut peer_cache: HashMap<String, File> = HashMap::new();
+
+    // Open peers using the robust HA logic
     for s in &part.shards {
-        if s.shard_index == target_shard_idx {
+        if s.shard_index == target_shard.shard_index {
             peer_files.push(None);
         } else {
-            let mut opened: Option<File> = None;
-            for cand in stable_abs_candidates(&s.absolute_path) {
-                if let Ok(f) = File::open(&cand).await {
-                    opened = Some(f);
-                    break;
-                }
-            }
-            peer_files.push(opened);
+            peer_files.push(get_or_open_shard_ha(&mut peer_cache, s, None).await);
         }
     }
 
     let mut offset = 0u64;
     while offset < total_shard_size {
-        let mut decoder = ReedSolomonDecoder::new(data_count, parity_count, block_size)
+        let remaining = (total_shard_size - offset) as usize;
+        let cur = remaining.min(block_size);
+
+        let mut decoder = ReedSolomonDecoder::new(data_count, parity_count, cur)
             .map_err(|e| AppError::InternalServerError(format!("RS Init: {}", e)))?;
 
         let mut stripe_data: Vec<Option<Vec<u8>>> = vec![None; data_count];
-        let mut shards_found = 0;
+        let mut shards_found = 0usize;
 
         for (idx, file_opt) in peer_files.iter_mut().enumerate() {
             let s_info = &part.shards[idx];
 
+            if s_info.shard_index == target_shard.shard_index {
+                continue;
+            }
+
+            let mut need_reopen = false;
+
             if let Some(f) = file_opt {
                 if f.seek(SeekFrom::Start(offset)).await.is_err() {
-                    continue;
-                }
+                    need_reopen = true;
+                } else {
+                    let mut buf = vec![0u8; cur];
+                    if f.read_exact(&mut buf).await.is_ok() {
+                        let res = if s_info.is_parity {
+                            decoder.add_recovery_shard(s_info.shard_index - data_count, buf.clone())
+                        } else {
+                            if s_info.shard_index < data_count {
+                                stripe_data[s_info.shard_index] = Some(buf.clone());
+                            }
+                            decoder.add_original_shard(s_info.shard_index, buf)
+                        };
 
-                let mut buf = vec![0u8; block_size];
-                if f.read_exact(&mut buf).await.is_ok() {
-                    let res = if s_info.is_parity {
-                        decoder.add_recovery_shard(s_info.shard_index - data_count, buf.clone())
-                    } else {
-                        if s_info.shard_index < data_count {
-                            stripe_data[s_info.shard_index] = Some(buf.clone());
+                        if res.is_ok() {
+                            shards_found += 1;
                         }
-                        decoder.add_original_shard(s_info.shard_index, buf)
-                    };
-
-                    if res.is_ok() {
-                        shards_found += 1;
+                    } else {
+                        need_reopen = true;
                     }
                 }
+            } else {
+                need_reopen = true;
+            }
+
+            if need_reopen {
+                *file_opt = None;
             }
         }
 
@@ -429,15 +599,18 @@ pub async fn repair_entire_shard(
             }
         }
 
-        if target_shard_idx < data_count {
-            if let Some(data) = &stripe_data[target_shard_idx] {
-                temp_file
-                    .write_all(data)
-                    .await
-                    .map_err(|e| AppError::Io(e, "write repair data".into()))?;
-            }
+        if target_shard.shard_index < data_count {
+            let data = stripe_data[target_shard.shard_index]
+                .as_ref()
+                .ok_or_else(|| {
+                    AppError::InternalServerError("Missing restored data shard".into())
+                })?;
+            temp_file
+                .write_all(data)
+                .await
+                .map_err(|e| AppError::Io(e, "write repair data".into()))?;
         } else {
-            let mut encoder = ReedSolomonEncoder::new(data_count, parity_count, block_size)
+            let mut encoder = ReedSolomonEncoder::new(data_count, parity_count, cur)
                 .map_err(|e| AppError::InternalServerError(format!("RS Enc Init: {}", e)))?;
 
             for data in stripe_data.iter().flatten() {
@@ -450,15 +623,19 @@ pub async fn repair_entire_shard(
                 .encode()
                 .map_err(|e| AppError::InternalServerError(format!("RS Encode: {}", e)))?;
 
-            if let Some(data) = enc.recovery_iter().nth(target_shard_idx - data_count) {
-                temp_file
-                    .write_all(data)
-                    .await
-                    .map_err(|e| AppError::Io(e, "write repair parity".into()))?;
-            }
+            let ridx = target_shard.shard_index - data_count;
+            let data = enc
+                .recovery_iter()
+                .nth(ridx)
+                .ok_or_else(|| AppError::InternalServerError("Missing parity output".into()))?;
+
+            temp_file
+                .write_all(data)
+                .await
+                .map_err(|e| AppError::Io(e, "write repair parity".into()))?;
         }
 
-        offset += block_size as u64;
+        offset += cur as u64;
     }
 
     temp_file
@@ -482,5 +659,6 @@ pub async fn repair_entire_shard(
         target_shard.file_name,
         final_path.display()
     );
+
     Ok(())
 }

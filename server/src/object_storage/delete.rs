@@ -14,7 +14,7 @@ use ulid::Ulid;
 use walkdir::WalkDir;
 
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::{METADATA_EXT, PREFIX_SEGMENT_EXT, QUOTA_FILE};
+use crate::object_storage::constants::{METADATA_EXT, QUOTA_FILE};
 use crate::object_storage::disk_manager::{
     ObjectMetadata, ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment,
 };
@@ -133,6 +133,66 @@ async fn move_dir_or_copy(src: &std::path::Path, dst: &std::path::Path) -> Resul
     }
 }
 
+#[cfg(unix)]
+pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let f = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(&path)
+            .map_err(|e| AppError::Io(e, format!("open dir for sync: {:?}", path)))?;
+
+        f.sync_all()
+            .map_err(|e| AppError::Io(e, format!("sync dir: {:?}", path)))?;
+
+        Ok::<(), AppError>(())
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("sync dir task: {}", e)))?
+}
+
+#[cfg(windows)]
+pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+
+        let result = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&path);
+
+        match result {
+            Ok(file) => {
+                let _ = file.sync_all();
+            }
+            Err(e) => {
+                warn!(
+                    "Windows: Failed to open directory for sync (non-fatal): {} - {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+
+        Ok::<(), AppError>(())
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("sync dir task: {}", e)))?
+}
+
+#[cfg(not(any(unix, windows)))]
+pub async fn sync_dir(_path: &std::path::Path) -> Result<(), AppError> {
+    Ok(())
+}
+
 fn canonical_prefix(prefix: &str) -> String {
     prefix.trim_start_matches('/').to_string()
 }
@@ -180,6 +240,10 @@ async fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<(), AppErro
     fs::rename(&tmp, path)
         .await
         .map_err(|e| AppError::Io(e, format!("rename tmp -> {}", path.display())))?;
+
+    if let Some(parent) = path.parent() {
+        let _ = sync_dir(parent).await;
+    }
 
     Ok(())
 }
@@ -262,197 +326,21 @@ async fn write_prefix_segments_for_meta(
     Ok(())
 }
 
-async fn remove_all_prefix_segments(
-    path_manager: &ObjectPathManager,
-    fragment: &str,
-    prefix: &str,
-) {
-    let pfx = canonical_prefix(prefix);
-
-    for dir in path_manager.get_all_prefix_bucket_dirs(fragment, &pfx) {
-        if !fs::try_exists(&dir).await.unwrap_or(false) {
-            continue;
-        }
-        if let Ok(mut entries) = fs::read_dir(&dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("seg_") && name.ends_with(PREFIX_SEGMENT_EXT) {
-                    let _ = fs::remove_file(entry.path()).await;
-                }
-            }
-        }
-    }
-
-    for p in path_manager.get_all_prefix_compacted_paths(fragment, &pfx) {
-        let _ = fs::remove_file(&p).await;
-    }
-}
-
-async fn rebuild_prefix_bucket_for_prefix(
-    path_manager: &ObjectPathManager,
-    fragment: &str,
-    prefix: &str,
-) -> Result<(), AppError> {
-    let pfx = canonical_prefix(prefix);
-
-    let bucket_dirs = path_manager.get_all_prefix_bucket_dirs(fragment, &pfx);
-    let mut bucket_dir = None;
-    for d in bucket_dirs {
-        if fs::try_exists(&d).await.unwrap_or(false) {
-            bucket_dir = Some(d);
-            break;
-        }
-    }
-
-    let mut segments: Vec<PrefixIndexSegment> = Vec::new();
-
-    for cp in path_manager.get_all_prefix_compacted_paths(fragment, &pfx) {
-        if fs::try_exists(&cp).await.unwrap_or(false) {
-            if let Ok(data) = fs::read(&cp).await {
-                if let Ok(seg) = rmp_serde::from_slice::<PrefixIndexSegment>(&data) {
-                    segments.push(seg);
-                    break;
-                }
-            }
-        }
-    }
-
-    if let Some(bucket_dir) = bucket_dir.as_ref() {
-        let mut seg_files = Vec::new();
-        if let Ok(mut entries) = fs::read_dir(bucket_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if !entry
-                    .file_type()
-                    .await
-                    .map(|t| t.is_file())
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("seg_") && name.ends_with(PREFIX_SEGMENT_EXT) {
-                    seg_files.push((name, entry.path()));
-                }
-            }
-        }
-        seg_files.sort_by(|a, b| a.0.cmp(&b.0));
-
-        for (_name, path) in seg_files {
-            if let Ok(data) = fs::read(&path).await {
-                if let Ok(seg) = rmp_serde::from_slice::<PrefixIndexSegment>(&data) {
-                    segments.push(seg);
-                }
-            }
-        }
-    }
-
-    if segments.is_empty() {
-        return Ok(());
-    }
-
-    let mut all_entries: Vec<(String, String, i64)> = Vec::new();
-    for seg in segments {
-        if canonical_prefix(&seg.prefix) != pfx {
-            continue;
-        }
-        for e in seg.entries {
-            all_entries.push((e.object_key, e.version_id, e.created_at));
-        }
-    }
-
-    if all_entries.is_empty() {
-        return Ok(());
-    }
-
-    all_entries.sort_by(|a, b| {
-        let (_ak, av, ats) = a;
-        let (_bk, bv, bts) = b;
-        match bts.cmp(ats) {
-            std::cmp::Ordering::Equal => bv.cmp(av),
-            other => other,
-        }
-    });
-
-    let mut chosen: HashMap<String, (String, i64)> = HashMap::new();
-
-    for (k, v, _ts) in all_entries {
-        if chosen.contains_key(&k) {
-            continue;
-        }
-
-        if let Some(meta) = read_metadata_any(path_manager, fragment, &k, &v).await {
-            if meta.is_delete_marker {
-                continue;
-            }
-            let ck = canonical_prefix(&meta.object_key);
-            if !pfx.is_empty() && ck != pfx && !ck.starts_with(&(pfx.clone() + "/")) {
-                continue;
-            }
-            chosen.insert(k, (v, meta.created_at));
-        }
-    }
-
-    let mut out_entries: Vec<PrefixIndexEntry> = chosen
-        .into_iter()
-        .map(|(object_key, (version_id, created_at))| PrefixIndexEntry {
-            object_key,
-            version_id,
-            created_at,
-        })
-        .collect();
-
-    out_entries.sort_by(|a, b| match a.object_key.cmp(&b.object_key) {
-        std::cmp::Ordering::Equal => a.version_id.cmp(&b.version_id),
-        other => other,
-    });
-
-    let compacted = PrefixIndexSegment {
-        prefix: pfx.clone(),
-        entries: out_entries,
-    };
-
-    let bytes = rmp_serde::to_vec(&compacted)
-        .map_err(|e| AppError::InternalServerError(format!("Serialize prefix compacted: {}", e)))?;
-
-    let mut any_ok = false;
-    for p in path_manager.get_all_prefix_compacted_paths(fragment, &pfx) {
-        if write_atomic(&p, &bytes).await.is_ok() {
-            any_ok = true;
-        }
-    }
-
-    if !any_ok {
-        remove_all_prefix_segments(path_manager, fragment, &pfx).await;
-        return Ok(());
-    }
-
-    for dir in path_manager.get_all_prefix_bucket_dirs(fragment, &pfx) {
-        if !fs::try_exists(&dir).await.unwrap_or(false) {
-            continue;
-        }
-        if let Ok(mut entries) = fs::read_dir(&dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("seg_") && name.ends_with(PREFIX_SEGMENT_EXT) {
-                    let _ = fs::remove_file(entry.path()).await;
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn rebuild_prefix_indexes_for_key(
+async fn invalidate_compacted_for_key(
     path_manager: &ObjectPathManager,
     fragment: &str,
     object_key: &str,
-) -> Result<(), AppError> {
+) {
     let prefixes = prefixes_for_key(object_key);
     for pfx in prefixes {
-        let _ = rebuild_prefix_bucket_for_prefix(path_manager, fragment, &pfx).await;
+        let cpfx = canonical_prefix(&pfx);
+        for p in path_manager.get_all_prefix_compacted_paths(fragment, &cpfx) {
+            let _ = fs::remove_file(&p).await;
+            if let Some(parent) = p.parent() {
+                let _ = sync_dir(parent).await;
+            }
+        }
     }
-    Ok(())
 }
 
 async fn list_object_versions_any(
@@ -603,7 +491,7 @@ pub async fn delete_object_version(
         }
     }
 
-    let _ = rebuild_prefix_indexes_for_key(&path_manager, &fragment, &object_key).await;
+    invalidate_compacted_for_key(&path_manager, &fragment, &object_key).await;
 
     info!(
         "Soft deleted (moved to trash) version: {}/{} (v: {})",
@@ -705,7 +593,7 @@ pub async fn delete_object(
         success_count += 1;
     }
 
-    let _ = rebuild_prefix_indexes_for_key(&path_manager, &fragment, &object_key).await;
+    invalidate_compacted_for_key(&path_manager, &fragment, &object_key).await;
 
     info!(
         "Soft deleted {} versions for object {}/{}",
@@ -985,7 +873,8 @@ pub async fn delete_object_permanently(
     }
 
     let pm = ObjectPathManager::new();
-    let _ = rebuild_prefix_indexes_for_key(&pm, &fragment, &object_key).await;
+
+    invalidate_compacted_for_key(&pm, &fragment, &object_key).await;
 
     info!(
         "Permanently deleted {} bytes for {}/{}",
@@ -1117,7 +1006,7 @@ pub async fn recover_object_version(
         .await;
     }
 
-    let _ = rebuild_prefix_indexes_for_key(&path_manager, &fragment, &object_key).await;
+    invalidate_compacted_for_key(&path_manager, &fragment, &object_key).await;
 
     info!(
         "Recovered object version: {}/{} (v: {})",
@@ -1275,7 +1164,7 @@ pub async fn recover_object(
         recovered_count += 1;
     }
 
-    let _ = rebuild_prefix_indexes_for_key(&path_manager, &fragment, &object_key).await;
+    invalidate_compacted_for_key(&path_manager, &fragment, &object_key).await;
 
     info!(
         "Recovered {} versions for object {}/{}",
@@ -1410,7 +1299,7 @@ pub async fn recover_all_trash(
     }
 
     for pfx in affected_prefixes {
-        let _ = rebuild_prefix_bucket_for_prefix(&path_manager, &fragment, &pfx).await;
+        invalidate_compacted_for_key(&path_manager, &fragment, &pfx).await;
     }
 
     info!("Recovered all items from trash for fragment {}", fragment);

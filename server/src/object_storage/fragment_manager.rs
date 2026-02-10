@@ -16,6 +16,10 @@ use crate::{
     middleware::auth_middleware::MASTER_KEY,
     object_storage::{
         disk_manager::ObjectPathManager,
+        fragment_metadata::{
+            init_fragment_metadata, read_fragment_metadata, rotate_fragment_key,
+            write_fragment_metadata,
+        },
         quota_manager::init_quota_file,
         sync::{CreateFragmentRequest, CreateFragmentResponse, ensure_fragment_blob_directories},
     },
@@ -29,6 +33,7 @@ use crate::{
 pub struct UpdateFragmentRequest {
     pub new_name: Option<String>,
     pub new_quota: Option<u64>,
+    pub new_key: Option<String>,
     pub secret: Option<String>,
 }
 
@@ -37,6 +42,13 @@ pub struct UpdateFragmentResponse {
     pub fragment_hash: String,
     pub name: Option<String>,
     pub message: String,
+}
+
+pub fn is_fragment_hash(name: &str) -> bool {
+    if name.len() != 64 {
+        return false;
+    }
+    name.as_bytes().iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
 }
 
 pub async fn list_public_fragments() -> Result<impl IntoResponse, AppError> {
@@ -56,7 +68,7 @@ pub async fn list_public_fragments() -> Result<impl IntoResponse, AppError> {
                     if let Ok(file_type) = entry.file_type() {
                         if file_type.is_dir() {
                             if let Some(name) = entry.file_name().to_str() {
-                                if !name.starts_with('.') {
+                                if is_fragment_hash(name) {
                                     fragment_hashes.insert(name.to_string());
                                 }
                             }
@@ -99,12 +111,24 @@ pub async fn create_fragment(
         return Err(AppError::Unauthorized);
     }
 
+    if payload.key.is_empty() {
+        return Err(AppError::BadRequest("key must not be empty".into()));
+    }
+
     let mut hasher = Sha256::new();
     hasher.update(payload.name.as_bytes());
     let hash = hex::encode(hasher.finalize());
 
+    if does_fragment_exist(&hash).await {
+        return Err(AppError::Conflict(format!(
+            "Fragment already exists: {}",
+            hash
+        )));
+    }
+
     init_quota_file(&hash, payload.quota).await?;
     ensure_fragment_blob_directories(&hash).await;
+    let _ = init_fragment_metadata(&hash, &payload.key).await?;
 
     info!(
         "Created new fragment '{}' with hash: {}",
@@ -127,11 +151,15 @@ pub async fn update_fragment(
     Path(fragment_hash): Path<String>,
     Json(payload): Json<UpdateFragmentRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let is_admin = if let Some(s) = &payload.secret {
-        s == &*MASTER_KEY
-    } else {
-        false
-    };
+    let is_admin = payload
+        .secret
+        .as_ref()
+        .map(|s| s == &*MASTER_KEY)
+        .unwrap_or(false);
+
+    if !is_admin && claims.fragment != fragment_hash {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
 
     if payload.new_name.is_some() && !is_admin {
         return Err(AppError::Forbidden(
@@ -139,14 +167,13 @@ pub async fn update_fragment(
         ));
     }
 
-    if payload.new_name.is_none() && payload.new_quota.is_some() && !claims.modify && !is_admin {
-        return Err(AppError::Forbidden(
-            "Modify permission required to update quota".into(),
-        ));
-    }
+    let wants_quota = payload.new_quota.is_some();
+    let wants_key = payload.new_key.is_some();
 
-    if !is_admin && claims.fragment != fragment_hash {
-        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    if (wants_quota || wants_key) && !is_admin && !claims.modify {
+        return Err(AppError::Forbidden(
+            "Modify permission required to update fragment settings".into(),
+        ));
     }
 
     let path_manager = ObjectPathManager::new();
@@ -161,9 +188,7 @@ pub async fn update_fragment(
         hasher.update(new_name.as_bytes());
         let new_hash = hex::encode(hasher.finalize());
 
-        if new_hash == current_hash {
-            info!("New fragment name is the same as current name; no rename performed.");
-        } else {
+        if new_hash != current_hash {
             for root in &index_roots {
                 if root.join(&new_hash).exists() {
                     return Err(AppError::Conflict(format!(
@@ -196,6 +221,25 @@ pub async fn update_fragment(
                 }
             }
 
+            let mut meta = match read_fragment_metadata(&new_hash).await {
+                Ok(m) => m,
+                Err(_) => {
+                    let old_meta = read_fragment_metadata(&current_hash).await.ok();
+                    old_meta.unwrap_or_else(|| {
+                        crate::object_storage::fragment_metadata::FragmentMetadata {
+                            fragment: new_hash.clone(),
+                            key_phc: String::new(),
+                            created: chrono::Utc::now()
+                                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            updated: None,
+                        }
+                    })
+                }
+            };
+
+            meta.fragment = new_hash.clone();
+            write_fragment_metadata(&meta).await.ok();
+
             info!(
                 "Renamed fragment {} -> {} ({})",
                 current_hash, new_name, new_hash
@@ -219,7 +263,11 @@ pub async fn update_fragment(
             "Updated quota for fragment {} to {} bytes",
             current_hash, quota
         );
+        state.emit(&current_hash, StorageEventPayload::StateInvalidated);
+    }
 
+    if let Some(new_key) = payload.new_key {
+        rotate_fragment_key(&current_hash, &new_key).await?;
         state.emit(&current_hash, StorageEventPayload::StateInvalidated);
     }
 

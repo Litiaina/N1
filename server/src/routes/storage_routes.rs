@@ -25,7 +25,7 @@ use crate::object_storage::modify::rename_object;
 use crate::object_storage::monitoring::get_system_health;
 use crate::object_storage::prefix_rebuilder::{get_prefix_rebuild_status_api, stop_prefix_rebuild_job_api, trigger_prefix_rebuild_job_api};
 use crate::object_storage::redistribution::{
-    monitor_redistribution_job_api, stop_redistribution_job_api, trigger_redistribution_job_api,
+    get_redist_status_api, stop_redistribution_job_api, trigger_redistribution_job_api
 };
 use crate::object_storage::repair_manager::{get_repair_status_api, stop_repair_job_api, trigger_repair_job_api};
 use crate::object_storage::retrieve::{
@@ -143,7 +143,7 @@ pub async fn serve_storage_routes() -> Router {
             .route("/v4/maintenance/gc/start", post(run_garbage_collector))
             .route("/v4/maintenance/redistribution/start", post(trigger_redistribution_job_api))
             .route("/v4/maintenance/redistribution/stop", patch(stop_redistribution_job_api))
-            .route("/v4/maintenance/redistribution/monitor", get(monitor_redistribution_job_api))
+            .route("/v4/maintenance/redistribution/monitor", get(get_redist_status_api))
             .route("/v4/maintenance/prefix/rebuild/start", post(trigger_prefix_rebuild_job_api))
             .route("/v4/maintenance/prefix/rebuild/stop", post(stop_prefix_rebuild_job_api))
             .route("/v4/maintenance/prefix/rebuild/status", get(get_prefix_rebuild_status_api))

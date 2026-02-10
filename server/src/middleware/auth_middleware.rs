@@ -1,3 +1,4 @@
+use crate::object_storage::fragment_metadata::verify_fragment_key;
 use crate::structs::auth_structs::{
     AuthBody, AuthorizationRequest, Claims, FileSystemClaims, LoginRequest,
 };
@@ -17,7 +18,6 @@ use headers::Authorization;
 use headers::authorization::Bearer;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde_json::json;
-use tracing::info;
 use std::env;
 use std::fmt::Display;
 use std::sync::LazyLock;
@@ -67,14 +67,22 @@ pub async fn authorize_fragment(
         return Err(AuthError::MissingCredentials);
     }
 
-    if payload.secret != *AUTH_KEY {
-        return Err(AuthError::WrongCredentials);
-    }
-
-    if payload.fragment != *ADMIN_KEY {
+    if payload.fragment == *ADMIN_KEY {
+        if payload.secret != *AUTH_KEY {
+            return Err(AuthError::WrongCredentials);
+        }
+    } else {
         match does_fragment_exist(&payload.fragment).await {
-            true => { info!("Access granted on fragment: {}", &payload.fragment) }
+            true => {}
             false => return Err(AuthError::FragmentNotFound),
+        }
+
+        let ok = verify_fragment_key(&payload.fragment, &payload.secret)
+            .await
+            .map_err(|_| AuthError::InternalError)?;
+
+        if !ok {
+            return Err(AuthError::WrongCredentials);
         }
     }
 

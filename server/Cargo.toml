@@ -62,3 +62,5 @@ num_cpus.workspace = true
 core_affinity.workspace = true
 async-recursion.workspace = true
 rmp-serde.workspace = true
+argon2.workspace = true
+rand.workspace = true

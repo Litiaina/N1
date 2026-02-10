@@ -2,13 +2,12 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use chrono::Utc;
-use futures_util::future::join_all;
 use serde::Serialize;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -18,7 +17,8 @@ use walkdir::WalkDir;
 
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::{
-    METADATA_EXT, PART_META_SUFFIX, PREFIX_INDEX_DIR, QUOTA_FILE, RESERVATION_FILE,
+    METADATA_EXT, PART_META_SUFFIX, PREFIX_INDEX_DIR, PREFIX_SEGMENT_EXT, QUOTA_FILE,
+    RESERVATION_FILE,
 };
 use crate::object_storage::disk_manager::{
     ObjectMetadata, ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment,
@@ -340,22 +340,6 @@ async fn choose_best_index_dir_for_fragment(
     best.map(|(p, _, _)| p)
 }
 
-async fn nuke_prefix_index_for_fragment(index_roots: &[PathBuf], fragment: &str) {
-    let tasks = index_roots.iter().cloned().map(|root| {
-        let frag = fragment.to_string();
-        async move {
-            let base = root.join(&frag).join("index");
-            let pdir = base.join(PREFIX_INDEX_DIR);
-            let _ = fs::remove_dir_all(&pdir).await;
-            let _ = fs::create_dir_all(&pdir).await;
-            if let Some(parent) = pdir.parent() {
-                let _ = sync_dir(parent).await;
-            }
-        }
-    });
-    let _ = join_all(tasks).await;
-}
-
 async fn scan_latest_by_key(
     scan_index_dir: &Path,
     fragment: &str,
@@ -471,6 +455,7 @@ async fn write_compacted_prefixes(
     path_manager: &ObjectPathManager,
     fragment: &str,
     per_prefix: HashMap<String, Vec<PrefixIndexEntry>>,
+    job_start_time: SystemTime,
 ) -> Result<(u64, u64), AppError> {
     let mut prefixes_written = 0u64;
     let mut entries_written = 0u64;
@@ -494,6 +479,8 @@ async fn write_compacted_prefixes(
         })?;
 
         let mut wrote_any = false;
+        let bucket_dirs = path_manager.get_all_prefix_bucket_dirs(fragment, &prefix);
+
         for p in path_manager.get_all_prefix_compacted_paths(fragment, &prefix) {
             if let Some(parent) = p.parent() {
                 let _ = fs::create_dir_all(parent).await;
@@ -510,6 +497,29 @@ async fn write_compacted_prefixes(
             )));
         }
 
+        // Cleanup old segments to ensure consistency without nuking the world
+        for dir in &bucket_dirs {
+            if !fs::try_exists(dir).await.unwrap_or(false) {
+                continue;
+            }
+            if let Ok(mut rd) = fs::read_dir(dir).await {
+                while let Ok(Some(entry)) = rd.next_entry().await {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with("seg_") && name.ends_with(PREFIX_SEGMENT_EXT) {
+                        if let Ok(md) = entry.metadata().await {
+                            if let Ok(mtime) = md.modified() {
+                                // Only delete segments older than the start of our scan.
+                                // Newer segments might be valid concurrent writes.
+                                if mtime < job_start_time {
+                                    let _ = fs::remove_file(entry.path()).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         prefixes_written += 1;
         entries_written += seg.entries.len() as u64;
     }
@@ -523,6 +533,7 @@ pub async fn run_prefix_rebuild_job(
 ) -> Result<(), AppError> {
     STOP_SIGNAL.store(false, Ordering::Relaxed);
     let start_time = Instant::now();
+    let sys_start_time = SystemTime::now();
 
     {
         let mut st = PR_STATUS.write().await;
@@ -559,12 +570,10 @@ pub async fn run_prefix_rebuild_job(
         {
             let mut st = PR_STATUS.write().await;
             st.current_fragment = frag.clone();
-            st.phase = "Clearing __p__".to_string();
             st.total_fragments_scanned += 1;
+            // Removed destructive nuke phase
             push_update(&ws, &st);
         }
-
-        nuke_prefix_index_for_fragment(&index_roots, &frag).await;
 
         let scan_index_dir = match choose_best_index_dir_for_fragment(&index_roots, &frag).await {
             Some(p) => p,
@@ -615,7 +624,7 @@ pub async fn run_prefix_rebuild_job(
             push_update(&ws, &st);
         }
 
-        match write_compacted_prefixes(&path_manager, &frag, per_prefix).await {
+        match write_compacted_prefixes(&path_manager, &frag, per_prefix, sys_start_time).await {
             Ok((pfx_written, ent_written)) => {
                 let mut st = PR_STATUS.write().await;
                 st.total_prefixes_written += pfx_written;
