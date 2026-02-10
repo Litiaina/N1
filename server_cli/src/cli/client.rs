@@ -114,7 +114,6 @@ async fn authenticate(
         let mut hasher = sha2::Sha256::new();
         use sha2::Digest;
         hasher.update(fragment.as_bytes());
-
         format!("{:x}", hasher.finalize())
     } else {
         ADMIN_KEY.as_str().to_string()
@@ -200,7 +199,7 @@ pub async fn execute_command(
                     if resp.status().is_success() {
                         info!("GC Started.");
                     } else {
-                        error!("GC Start Failed: {}", resp.status());
+                        error!("GC Start Failed: {}", resp.text().await?);
                     }
                 }
                 Commands::Repair { dry_run } => {
@@ -213,7 +212,7 @@ pub async fn execute_command(
                         .await?;
 
                     if resp.status().is_success() {
-                        info!("Repair Job Started. Check server logs/status.");
+                        info!("Repair Job Started. Check server logs/ws updates.");
                     } else {
                         error!("Repair Start Failed: {}", resp.text().await?);
                     }
@@ -228,9 +227,25 @@ pub async fn execute_command(
                         .await?;
 
                     if resp.status().is_success() {
-                        info!("Redistribution Job Started. Check server logs/status.");
+                        info!("Redistribution Job Started. Check server logs/ws updates.");
                     } else {
                         error!("Redistribution Start Failed: {}", resp.text().await?);
+                    }
+                }
+                Commands::PrefixRebuild => {
+                    info!("Triggering Prefix Rebuild...");
+                    let resp = client
+                        .post(format!("{}/v4/maintenance/prefix/rebuild/start", base_url))
+                        .bearer_auth(&token)
+                        .send()
+                        .await?;
+
+                    if resp.status().is_success() {
+                        info!(
+                            "Prefix Rebuild Started. Watch websocket MONITORING_UPDATE/STATE_INVALIDATED events."
+                        );
+                    } else {
+                        error!("Prefix Rebuild Start Failed: {}", resp.text().await?);
                     }
                 }
                 Commands::Health => {
@@ -244,7 +259,7 @@ pub async fn execute_command(
                         let health: HealthResponse = resp.json().await?;
                         print_health_report(&health);
                     } else {
-                        error!("Health check failed: {}", resp.status());
+                        error!("Health check failed: {}", resp.text().await?);
                     }
                 }
                 _ => {}

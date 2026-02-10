@@ -21,7 +21,10 @@ use base64::engine::general_purpose;
 use futures_util::StreamExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 use tokio::fs;
 use tracing::{debug, warn};
 use walkdir::WalkDir;
@@ -91,24 +94,49 @@ fn canonical_key(key: &str) -> String {
     key.trim_start_matches('/').to_string()
 }
 
-async fn read_metadata_any(
+async fn read_metadata_best(
     path_manager: &ObjectPathManager,
     fragment: &str,
     object_key: &str,
     version_id: &str,
 ) -> Option<ObjectMetadata> {
     let paths = path_manager.get_all_metadata_paths(fragment, object_key, version_id);
+
+    let mut best: Option<ObjectMetadata> = None;
+
     for p in paths {
         if !fs::try_exists(&p).await.unwrap_or(false) {
             continue;
         }
-        if let Ok(data) = fs::read(&p).await {
-            if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
-                return Some(meta);
+
+        let Ok(data) = fs::read(&p).await else {
+            continue;
+        };
+
+        let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) else {
+            continue;
+        };
+
+        if meta.fragment != fragment
+            || meta.object_key != object_key
+            || meta.version_id != version_id
+        {
+            continue;
+        }
+
+        match &best {
+            None => best = Some(meta),
+            Some(cur) => {
+                if meta.created_at > cur.created_at
+                    || (meta.created_at == cur.created_at && meta.version_id > cur.version_id)
+                {
+                    best = Some(meta);
+                }
             }
         }
     }
-    None
+
+    best
 }
 
 async fn try_list_by_prefix_index(
@@ -123,56 +151,47 @@ async fn try_list_by_prefix_index(
 
     let path_manager = ObjectPathManager::new();
 
-    let bucket_dirs = path_manager.get_all_prefix_bucket_dirs(fragment, &pfx);
-    let mut bucket_dir = None;
-    for d in bucket_dirs {
-        if fs::try_exists(&d).await.unwrap_or(false) {
-            bucket_dir = Some(d);
-            break;
-        }
-    }
-
-    let bucket_dir = match bucket_dir {
-        Some(d) => d,
-        None => return Ok(None),
-    };
-
     let mut segments: Vec<PrefixIndexSegment> = Vec::new();
 
-    for compacted_path in path_manager.get_all_prefix_compacted_paths(fragment, &pfx) {
+    let bucket_dirs = path_manager.get_all_prefix_bucket_dirs(fragment, &pfx);
+    for d in bucket_dirs {
+        if !fs::try_exists(&d).await.unwrap_or(false) {
+            continue;
+        }
+
+        let compacted_path = d.join(format!("compacted{}", PREFIX_SEGMENT_EXT));
         if fs::try_exists(&compacted_path).await.unwrap_or(false) {
             if let Ok(data) = fs::read(&compacted_path).await {
                 if let Ok(seg) = rmp_serde::from_slice::<PrefixIndexSegment>(&data) {
                     segments.push(seg);
-                    break;
                 }
             }
         }
-    }
 
-    let mut seg_files = Vec::new();
-    if let Ok(mut entries) = fs::read_dir(&bucket_dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if !entry
-                .file_type()
-                .await
-                .map(|t| t.is_file())
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("seg_") && name.ends_with(PREFIX_SEGMENT_EXT) {
-                seg_files.push((name, entry.path()));
+        let mut seg_files = Vec::new();
+        if let Ok(mut entries) = fs::read_dir(&d).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if !entry
+                    .file_type()
+                    .await
+                    .map(|t| t.is_file())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("seg_") && name.ends_with(PREFIX_SEGMENT_EXT) {
+                    seg_files.push((name, entry.path()));
+                }
             }
         }
-    }
-    seg_files.sort_by(|a, b| a.0.cmp(&b.0));
+        seg_files.sort_by(|a, b| a.0.cmp(&b.0));
 
-    for (_name, path) in seg_files {
-        if let Ok(data) = fs::read(&path).await {
-            if let Ok(seg) = rmp_serde::from_slice::<PrefixIndexSegment>(&data) {
-                segments.push(seg);
+        for (_name, path) in seg_files {
+            if let Ok(data) = fs::read(&path).await {
+                if let Ok(seg) = rmp_serde::from_slice::<PrefixIndexSegment>(&data) {
+                    segments.push(seg);
+                }
             }
         }
     }
@@ -196,15 +215,15 @@ async fn try_list_by_prefix_index(
                 }
             }
 
-            match latest.get(&e.object_key) {
+            match latest.get(&ck) {
                 None => {
-                    latest.insert(e.object_key.clone(), (e.version_id.clone(), e.created_at));
+                    latest.insert(ck, (e.version_id.clone(), e.created_at));
                 }
                 Some((cur_vid, cur_ts)) => {
                     if e.created_at > *cur_ts
                         || (e.created_at == *cur_ts && e.version_id > *cur_vid)
                     {
-                        latest.insert(e.object_key.clone(), (e.version_id.clone(), e.created_at));
+                        latest.insert(ck, (e.version_id.clone(), e.created_at));
                     }
                 }
             }
@@ -234,7 +253,7 @@ async fn try_list_by_prefix_index(
     let mut start_after: Option<(String, String)> = None;
     if let Some(tok) = continuation_token.as_deref() {
         if let Some((k, v)) = parse_prefix_continuation_token(tok) {
-            start_after = Some((k, v));
+            start_after = Some((canonical_key(&k), v));
         }
     }
 
@@ -262,7 +281,7 @@ async fn try_list_by_prefix_index(
             break;
         }
 
-        let Some(meta) = read_metadata_any(&path_manager, fragment, &k, &v).await else {
+        let Some(meta) = read_metadata_best(&path_manager, fragment, &k, &v).await else {
             continue;
         };
 
@@ -332,6 +351,72 @@ async fn try_list_by_prefix_index(
         common_prefixes: out_prefixes,
         continuation_token: next_token,
     }))
+}
+
+async fn choose_best_index_root(fragment: &str, scan_trash: bool) -> Option<PathBuf> {
+    let path_manager = ObjectPathManager::new();
+    let index_roots = path_manager.get_all_index_roots();
+
+    let mut best: Option<(PathBuf, u64, i64)> = None;
+
+    for root in index_roots {
+        let candidate = if scan_trash {
+            root.join(fragment).join(".trash").join("index")
+        } else {
+            root.join(fragment).join("index")
+        };
+
+        if !fs::try_exists(&candidate).await.unwrap_or(false) {
+            continue;
+        }
+
+        let mut count = 0u64;
+        let mut access_ok = false;
+
+        if let Ok(mut rd) = fs::read_dir(&candidate).await {
+            access_ok = true;
+            while let Ok(Some(ent)) = rd.next_entry().await {
+                let name = ent.file_name().to_string_lossy().to_string();
+                if is_hex2(&name) {
+                    count += 1;
+                }
+            }
+        }
+
+        if !access_ok {
+            continue;
+        }
+
+        let mut ts = 0i64;
+        if let Ok(meta) = fs::metadata(&candidate).await {
+            if let Ok(m) = meta.modified() {
+                ts = m
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+            }
+        }
+
+        match &best {
+            None => best = Some((candidate, count, ts)),
+            Some((_p, best_count, best_ts)) => {
+                if count > *best_count || (count == *best_count && ts > *best_ts) {
+                    best = Some((candidate, count, ts));
+                }
+            }
+        }
+    }
+
+    if let Some((p, count, _)) = &best {
+        debug!(
+            "Chose best index root: {:?} (shard_count={}) for fragment {}",
+            p, count, fragment
+        );
+    } else {
+        warn!("No readable index root found for fragment {}", fragment);
+    }
+
+    best.map(|(p, _, _)| p)
 }
 
 pub async fn list_objects(
@@ -406,24 +491,6 @@ async fn list_objects_internal(
         }));
     }
 
-    let path_manager = ObjectPathManager::new();
-    let index_roots = path_manager.get_all_index_roots();
-
-    let mut active_index_root = None;
-
-    for root in index_roots {
-        let candidate = if scan_trash {
-            root.join(&fragment).join(".trash").join("index")
-        } else {
-            root.join(&fragment).join("index")
-        };
-
-        if fs::try_exists(&candidate).await.unwrap_or(false) {
-            active_index_root = Some(candidate);
-            break;
-        }
-    }
-
     let (start_s1, start_s2, start_s3, start_s4, start_file) = match continuation_token.as_deref() {
         Some(token) => parse_continuation_token(token).unwrap_or_default(),
         None => (
@@ -435,7 +502,7 @@ async fn list_objects_internal(
         ),
     };
 
-    let index_root = match active_index_root {
+    let index_root = match choose_best_index_root(&fragment, scan_trash).await {
         Some(root) => root,
         None => {
             debug!("No active index root found for fragment {}", fragment);
@@ -542,14 +609,14 @@ async fn list_objects_internal(
                         .buffered(20);
 
                     let mut current_hash_prefix = String::new();
-                    let mut pending_meta: Option<ObjectMetadata> = None;
-                    let mut last_fname = String::new();
+                    let mut best_meta: Option<ObjectMetadata> = None;
+                    let mut best_fname: String = String::new();
 
                     while let Some((fname, read_res)) = stream.next().await {
                         let hash_part = fname.split('#').next().unwrap_or("").to_string();
 
                         if hash_part != current_hash_prefix {
-                            if let Some(meta) = pending_meta.take() {
+                            if let Some(meta) = best_meta.take() {
                                 let ok_prefix = if pfx.is_empty() {
                                     true
                                 } else {
@@ -567,32 +634,42 @@ async fn list_objects_internal(
                                         &s2,
                                         &s3,
                                         &s4,
-                                        &last_fname,
+                                        &best_fname,
                                     ));
                                     reached_limit = true;
                                     break 'outer;
                                 }
                             }
+
                             current_hash_prefix = hash_part;
+                            best_meta = None;
+                            best_fname.clear();
                         }
 
                         match read_res {
-                            Ok(data) => match rmp_serde::from_slice::<ObjectMetadata>(&data) {
-                                Ok(meta) => {
-                                    pending_meta = Some(meta);
+                            Ok(data) => {
+                                if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
+                                    let take = match &best_meta {
+                                        None => true,
+                                        Some(cur) => {
+                                            meta.created_at > cur.created_at
+                                                || (meta.created_at == cur.created_at
+                                                    && meta.version_id > cur.version_id)
+                                        }
+                                    };
+                                    if take {
+                                        best_fname = fname.clone();
+                                        best_meta = Some(meta);
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!("Failed to deserialize metadata file {}: {}", fname, e);
-                                }
-                            },
+                            }
                             Err(e) => {
                                 warn!("Failed to read metadata file {}: {}", fname, e);
                             }
                         }
-                        last_fname = fname;
                     }
 
-                    if let Some(meta) = pending_meta {
+                    if let Some(meta) = best_meta {
                         let ok_prefix = if pfx.is_empty() {
                             true
                         } else {
@@ -605,7 +682,7 @@ async fn list_objects_internal(
                         }
                         if results.len() >= limit {
                             next_token =
-                                Some(create_continuation_token(&s1, &s2, &s3, &s4, &last_fname));
+                                Some(create_continuation_token(&s1, &s2, &s3, &s4, &best_fname));
                             reached_limit = true;
                             break 'outer;
                         }
@@ -659,30 +736,38 @@ pub async fn list_object_versions(
 
     let index_dirs = path_manager.get_all_index_dirs(&fragment);
 
-    let mut active_shard_dir = None;
+    let mut versions = Vec::new();
+    let mut seen_versions = HashSet::new();
+
     for dir in index_dirs {
         let candidate = dir.join(shard1).join(shard2).join(shard3).join(shard4);
-        if fs::try_exists(&candidate).await.unwrap_or(false) {
-            active_shard_dir = Some(candidate);
-            break;
+        if !fs::try_exists(&candidate).await.unwrap_or(false) {
+            continue;
         }
-    }
 
-    let shard_dir = active_shard_dir.ok_or(AppError::NotFound)?;
+        let prefix = format!("{}#", hash);
+        let mut entries = match fs::read_dir(&candidate).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
 
-    let prefix = format!("{}#", hash);
-    let mut versions = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&prefix) && name.ends_with(METADATA_EXT) {
+                if let Some(rest) = name.strip_prefix(&prefix) {
+                    if let Some(ver_id) = rest.strip_suffix(METADATA_EXT) {
+                        if seen_versions.contains(ver_id) {
+                            continue;
+                        }
 
-    let mut entries = fs::read_dir(&shard_dir)
-        .await
-        .map_err(|e| AppError::Io(e, "read index shard".into()))?;
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with(&prefix) && name.ends_with(METADATA_EXT) {
-            if let Ok(data) = fs::read(entry.path()).await {
-                if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
-                    versions.push(meta);
+                        if let Ok(data) = fs::read(entry.path()).await {
+                            if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
+                                if seen_versions.insert(meta.version_id.clone()) {
+                                    versions.push(meta);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

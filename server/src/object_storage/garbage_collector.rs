@@ -45,7 +45,12 @@ pub async fn run_garbage_collector(State(state): State<Arc<AppState>>) -> impl I
             error!("Manual GC Scan failed: {}", err);
         }
 
-        start_cleanup(FS_STORAGE_ROOT.get().unwrap_or(&STORAGE_ROOT.to_string())).await;
+        let root = FS_STORAGE_ROOT
+            .get()
+            .cloned()
+            .unwrap_or_else(|| STORAGE_ROOT.to_string());
+
+        start_cleanup(&root).await;
     });
 
     StatusCode::ACCEPTED
@@ -138,7 +143,7 @@ async fn process_fragment_gc(
 
         for entry in WalkDir::new(&index_dir).into_iter().filter_map(|e| e.ok()) {
             if entry.file_type().is_file() {
-                let fname = entry.file_name().to_string_lossy();
+                let fname = entry.file_name().to_string_lossy().into_owned();
                 if fname.ends_with(METADATA_EXT) && fname != QUOTA_FILE {
                     if let Some((_, rest)) = fname.split_once('#') {
                         if let Some(ver) = rest.strip_suffix(METADATA_EXT) {
@@ -147,9 +152,6 @@ async fn process_fragment_gc(
                     }
                 }
             }
-        }
-        if !live_versions.is_empty() {
-            break;
         }
     }
 
@@ -166,9 +168,13 @@ async fn process_fragment_gc(
             .filter_map(|e| e.ok())
         {
             if entry.file_type().is_file()
-                && entry.file_name().to_string_lossy().ends_with(METADATA_EXT)
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .as_ref()
+                    .ends_with(METADATA_EXT)
             {
-                let fname = entry.file_name().to_string_lossy().to_string();
+                let fname = entry.file_name().to_string_lossy().into_owned();
 
                 let modified = entry
                     .metadata()
@@ -204,9 +210,6 @@ async fn process_fragment_gc(
                 }
             }
         }
-        if !expired_versions.is_empty() || !trash_versions.is_empty() {
-            break;
-        }
     }
 
     refund_quota_async(fragment.to_string(), expired_trash_refund, state.clone());
@@ -221,7 +224,7 @@ async fn process_fragment_gc(
                 let trash_idx = get_trash_root(&root_path, &frag).join("index");
                 if trash_idx.exists() {
                     for entry in WalkDir::new(&trash_idx).into_iter().filter_map(|e| e.ok()) {
-                        let fname = entry.file_name().to_string_lossy();
+                        let fname = entry.file_name().to_string_lossy().into_owned();
                         if fname.ends_with(METADATA_EXT) {
                             if let Some((_, rest)) = fname.split_once('#') {
                                 if let Some(ver) = rest.strip_suffix(METADATA_EXT) {
@@ -262,7 +265,7 @@ async fn process_fragment_gc(
                     continue;
                 }
 
-                let session_id = entry.file_name().to_string_lossy().to_string();
+                let session_id = entry.file_name().to_string_lossy().into_owned();
 
                 if sessions_to_delete.contains(&session_id) {
                     if !session_amounts.contains_key(&session_id) {
@@ -347,7 +350,7 @@ async fn process_fragment_gc(
                     }
                 }
 
-                let ver_id = entry.file_name().to_string_lossy().to_string();
+                let ver_id = entry.file_name().to_string_lossy().into_owned();
 
                 if !live_versions.contains(&ver_id)
                     && !trash_versions.contains(&ver_id)

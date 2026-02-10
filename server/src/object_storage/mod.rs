@@ -23,3 +23,4 @@ pub mod upload;
 pub mod system;
 pub mod disk_manager;
 pub mod fragment_manager;
+pub mod prefix_rebuilder;

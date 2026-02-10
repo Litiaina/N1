@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::object_storage::{disk_manager::ObjectMetadata, redistribution::RedistributionJobStatus, repair_manager::RepairJobStatus};
+use crate::object_storage::{disk_manager::ObjectMetadata, prefix_rebuilder::PrefixRebuildJobStatus, redistribution::RedistributionJobStatus, repair_manager::RepairJobStatus};
 
 #[derive(Deserialize)]
 pub struct WsAuthParams {
@@ -71,6 +71,9 @@ pub enum StorageEventPayload {
 
     #[serde(rename = "REPAIR_UPDATE")]
     RepairUpdate(RepairJobStatus),
+
+    #[serde(rename = "PREFIX_REBUILD_UPDATE")]
+    PrefixRebuildUpdate(PrefixRebuildJobStatus),
 }
 
 #[derive(Debug, Clone, Serialize)]

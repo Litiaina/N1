@@ -25,6 +25,11 @@ use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
+use crate::object_storage::constants::{
+    METADATA_EXT, PREFIX_INDEX_DIR, PREFIX_INDEX_NAMESPACE, PREFIX_INDEX_VERSION,
+    PREFIX_SEGMENT_EXT,
+};
+
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
@@ -199,6 +204,7 @@ fn prefixes_for_key(object_key: &str) -> BTreeSet<String> {
     out
 }
 
+#[allow(dead_code)]
 async fn write_prefix_segments(
     path_manager: &ObjectPathManager,
     fragment: &str,
@@ -1213,6 +1219,72 @@ pub async fn object_upload_part(
     Ok((StatusCode::OK, "Part uploaded").into_response())
 }
 
+async fn write_prefix_segments_on_roots(
+    index_roots: &[PathBuf],
+    fragment: &str,
+    object_key: &str,
+    version_id: &str,
+    created_at: i64,
+) -> Result<(), AppError> {
+    let prefixes = prefixes_for_key(object_key);
+    let mut any_ok = false;
+
+    for prefix in prefixes {
+        let seg = PrefixIndexSegment {
+            prefix: prefix.clone(),
+            entries: vec![PrefixIndexEntry {
+                object_key: object_key.to_string(),
+                version_id: version_id.to_string(),
+                created_at,
+            }],
+        };
+
+        let bytes = rmp_serde::to_vec(&seg).map_err(|e| {
+            AppError::InternalServerError(format!("Serialize prefix segment: {}", e))
+        })?;
+
+        let ph = ObjectPathManager::prefix_hash(&prefix);
+        let p1 = &ph[0..2];
+        let p2 = &ph[2..4];
+        let file = format!("seg_{}{}", version_id, PREFIX_SEGMENT_EXT);
+
+        let mut wrote_this_prefix = false;
+
+        for root in index_roots {
+            let p = root
+                .join(fragment)
+                .join("index")
+                .join(PREFIX_INDEX_DIR)
+                .join(PREFIX_INDEX_VERSION)
+                .join(PREFIX_INDEX_NAMESPACE)
+                .join(p1)
+                .join(p2)
+                .join(&ph)
+                .join(&file);
+
+            if let Some(parent) = p.parent() {
+                let _ = tokio_fs::create_dir_all(parent).await;
+            }
+
+            if write_atomic(&p, &bytes).await.is_ok() {
+                wrote_this_prefix = true;
+            }
+        }
+
+        if wrote_this_prefix {
+            any_ok = true;
+        }
+    }
+
+    if !any_ok {
+        return Err(AppError::InternalServerError(
+            "Failed to write prefix index to any mirror".into(),
+        ));
+    }
+
+    Ok(())
+}
+
 pub async fn finalize_object_upload(
     State(state): State<Arc<AppState>>,
     claims: Claims,
@@ -1230,8 +1302,8 @@ pub async fn finalize_object_upload(
     let object_key = key_query.object_key;
     let path_manager = ObjectPathManager::new();
 
-    let index_paths = path_manager.get_all_metadata_paths(&fragment, &object_key, &version_id);
-    for p in &index_paths {
+    let existing_paths = path_manager.get_all_metadata_paths(&fragment, &object_key, &version_id);
+    for p in &existing_paths {
         if tokio_fs::try_exists(p).await.unwrap_or(false) {
             return Ok((StatusCode::OK, "Upload finalized.").into_response());
         }
@@ -1346,37 +1418,51 @@ pub async fn finalize_object_upload(
         AppError::InternalServerError(format!("Failed to serialize object metadata: {}", e))
     })?;
 
-    let index_paths = path_manager.get_all_metadata_paths(
-        &object_meta.fragment,
-        &object_meta.object_key,
-        &object_meta.version_id,
-    );
+    let index_roots = path_manager.get_all_index_roots();
 
-    let write_futures = index_paths.into_iter().map(|index_path| {
-        let data = rmp_data.clone();
-        async move {
-            if let Some(parent) = index_path.parent() {
-                let _ = tokio_fs::create_dir_all(parent).await;
-            }
-            match write_atomic(&index_path, &data).await {
-                Ok(_) => true,
-                Err(e) => {
-                    warn!("Failed to write metadata {:?}: {}", index_path, e);
-                    false
-                }
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(object_key.as_bytes());
+    let key_hash = hex::encode(hasher.finalize());
+
+    let shard1 = &key_hash[0..2];
+    let shard2 = &key_hash[2..4];
+    let shard3 = &key_hash[4..6];
+    let shard4 = &key_hash[6..8];
+    let filename = format!("{}#{}{}", key_hash, version_id, METADATA_EXT);
+
+    let mut ok_roots: Vec<PathBuf> = Vec::new();
+
+    for root in &index_roots {
+        let index_path = root
+            .join(&fragment)
+            .join("index")
+            .join(shard1)
+            .join(shard2)
+            .join(shard3)
+            .join(shard4)
+            .join(&filename);
+
+        if let Some(parent) = index_path.parent() {
+            let _ = tokio_fs::create_dir_all(parent).await;
+        }
+
+        match write_atomic(&index_path, &rmp_data).await {
+            Ok(_) => ok_roots.push(root.clone()),
+            Err(e) => {
+                warn!("Failed to write metadata {:?}: {}", index_path, e);
             }
         }
-    });
+    }
 
-    let results = join_all(write_futures).await;
-    if !results.into_iter().any(|ok| ok) {
+    if ok_roots.is_empty() {
         return Err(AppError::InternalServerError(
             "Failed to write final metadata to any index mirror".into(),
         ));
     }
 
-    write_prefix_segments(
-        &path_manager,
+    write_prefix_segments_on_roots(
+        &ok_roots,
         &fragment,
         &object_key,
         &version_id,

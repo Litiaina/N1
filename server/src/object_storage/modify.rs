@@ -128,7 +128,7 @@ async fn write_atomic_if_missing(path: &Path, data: &[u8]) -> Result<bool, AppEr
 }
 
 fn canonical_prefix(prefix: &str) -> String {
-    prefix.trim_start_matches('/').to_string()
+    prefix.trim_matches('/').to_string()
 }
 
 fn prefixes_for_key(object_key: &str) -> BTreeSet<String> {
@@ -426,6 +426,65 @@ async fn rebuild_prefix_indexes_for_key(
     Ok(())
 }
 
+async fn write_delete_marker_for_key(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    object_key: &str,
+    template: &ObjectMetadata,
+) -> Result<(String, i64), AppError> {
+    let now = Utc::now().timestamp();
+    let delete_version_id = Ulid::new().to_string();
+
+    let mut dm = template.clone();
+    dm.fragment = fragment.to_string();
+    dm.owner_uid = fragment.to_string();
+    dm.object_key = object_key.to_string();
+    dm.version_id = delete_version_id.clone();
+    dm.created_at = now;
+    dm.is_delete_marker = true;
+    dm.parts.clear();
+    dm.total_size_bytes = 0;
+
+    let bytes = rmp_serde::to_vec(&dm)
+        .map_err(|e| AppError::InternalServerError(format!("Serialize delete marker: {}", e)))?;
+
+    let paths = path_manager.get_all_metadata_paths(fragment, object_key, &delete_version_id);
+
+    let mut wrote_any = false;
+    for p in paths {
+        if let Some(parent) = p.parent() {
+            let _ = fs::create_dir_all(parent).await;
+        }
+        if write_atomic(&p, &bytes).await.is_ok() {
+            wrote_any = true;
+        }
+    }
+
+    if !wrote_any {
+        return Err(AppError::InternalServerError(
+            "Failed to write delete marker metadata to any index root".into(),
+        ));
+    }
+
+    Ok((delete_version_id, now))
+}
+
+async fn delete_source_metadata_versions(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    object_key: &str,
+    versions: &HashSet<String>,
+) {
+    for v in versions {
+        for p in path_manager.get_all_metadata_paths(fragment, object_key, v) {
+            let _ = fs::remove_file(&p).await;
+            if let Some(parent) = p.parent() {
+                let _ = sync_dir(parent).await;
+            }
+        }
+    }
+}
+
 pub async fn rename_object(
     State(state): State<Arc<AppState>>,
     claims: Claims,
@@ -482,7 +541,7 @@ pub async fn rename_object(
                 .join(&dst_key_hash[6..8]);
 
             if !fs::try_exists(&src_shard).await.unwrap_or(false) {
-                return Ok::<Vec<(String, i64)>, AppError>(Vec::new());
+                return Ok::<Vec<(String, i64, ObjectMetadata)>, AppError>(Vec::new());
             }
 
             if fs::try_exists(&dst_shard).await.unwrap_or(false) {
@@ -510,7 +569,7 @@ pub async fn rename_object(
                 .await
                 .map_err(|e| AppError::Io(e, "read src shard".into()))?;
 
-            let mut moved_versions: Vec<(String, i64)> = Vec::new();
+            let mut moved_versions: Vec<(String, i64, ObjectMetadata)> = Vec::new();
 
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -569,23 +628,14 @@ pub async fn rename_object(
                     continue;
                 }
 
-                if let Err(e) = fs::remove_file(&src_path).await {
-                    warn!(
-                        "Failed to remove src meta during rename {:?}: {}",
-                        src_path, e
-                    );
-                } else if let Some(parent) = src_path.parent() {
-                    let _ = sync_dir(parent).await;
-                }
-
                 if let Some(parent) = dest_path.parent() {
                     let _ = sync_dir(parent).await;
                 }
 
-                moved_versions.push((version_id.to_string(), meta.created_at));
+                moved_versions.push((version_id.to_string(), meta.created_at, meta));
             }
 
-            Ok::<Vec<(String, i64)>, AppError>(moved_versions)
+            Ok::<Vec<(String, i64, ObjectMetadata)>, AppError>(moved_versions)
         }
     });
 
@@ -593,6 +643,7 @@ pub async fn rename_object(
 
     let mut affected_versions: HashSet<String> = HashSet::new();
     let mut created_at_by_version: HashMap<String, i64> = HashMap::new();
+    let mut template_meta: Option<ObjectMetadata> = None;
     let mut success = false;
 
     for result in results {
@@ -600,9 +651,12 @@ pub async fn rename_object(
             Ok(versions) => {
                 if !versions.is_empty() {
                     success = true;
-                    for (v, created_at) in versions {
+                    for (v, created_at, meta) in versions {
                         affected_versions.insert(v.clone());
                         created_at_by_version.entry(v).or_insert(created_at);
+                        if template_meta.is_none() {
+                            template_meta = Some(meta);
+                        }
                     }
                 }
             }
@@ -612,6 +666,41 @@ pub async fn rename_object(
 
     if !success {
         return Err(AppError::NotFound);
+    }
+
+    for version_id in &affected_versions {
+        let created_at = created_at_by_version
+            .get(version_id)
+            .copied()
+            .unwrap_or_else(|| Utc::now().timestamp());
+
+        write_prefix_segments_for_meta(
+            &path_manager,
+            &payload_arc.destination_fragment,
+            &payload_arc.destination_key,
+            version_id,
+            created_at,
+        )
+        .await?;
+    }
+
+    if let Some(tmpl) = template_meta.as_ref() {
+        let (del_vid, del_created_at) = write_delete_marker_for_key(
+            &path_manager,
+            &payload_arc.source_fragment,
+            &payload_arc.source_key,
+            tmpl,
+        )
+        .await?;
+
+        write_prefix_segments_for_meta(
+            &path_manager,
+            &payload_arc.source_fragment,
+            &payload_arc.source_key,
+            &del_vid,
+            del_created_at,
+        )
+        .await?;
     }
 
     if payload_arc.source_fragment != payload_arc.destination_fragment {
@@ -649,21 +738,13 @@ pub async fn rename_object(
         }
     }
 
-    for version_id in &affected_versions {
-        let created_at = created_at_by_version
-            .get(version_id)
-            .copied()
-            .unwrap_or_else(|| Utc::now().timestamp());
-
-        write_prefix_segments_for_meta(
-            &path_manager,
-            &payload_arc.destination_fragment,
-            &payload_arc.destination_key,
-            version_id,
-            created_at,
-        )
-        .await?;
-    }
+    delete_source_metadata_versions(
+        &path_manager,
+        &payload_arc.source_fragment,
+        &payload_arc.source_key,
+        &affected_versions,
+    )
+    .await;
 
     let _ = rebuild_prefix_indexes_for_key(
         &path_manager,
