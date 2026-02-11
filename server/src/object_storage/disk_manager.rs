@@ -1,4 +1,8 @@
-use crate::object_storage::constants::{METADATA_EXT, PREFIX_INDEX_DIR, PREFIX_INDEX_NAMESPACE, PREFIX_INDEX_VERSION, PREFIX_SEGMENT_EXT, QUOTA_FILE};
+use crate::object_storage::constants::{
+    METADATA_EXT, PREFIX_INDEX_DIR, PREFIX_INDEX_NAMESPACE, PREFIX_INDEX_VERSION,
+    PREFIX_SEGMENT_EXT, QUOTA_FILE,
+};
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -221,6 +225,8 @@ pub struct ObjectSummary {
     pub content_type: String,
     pub total_size_bytes: u64,
     pub created_at: i64,
+    #[serde(rename = "parts")]
+    pub _parts_ignored: IgnoredAny,
     #[serde(default)]
     pub is_delete_marker: bool,
     #[serde(default = "default_stripe_size")]

@@ -3,7 +3,7 @@ use crate::object_storage::constants::{
     BROWSER_CACHE_MAX_AGE, METADATA_EXT, PREFIX_SEGMENT_EXT, QUOTA_FILE,
 };
 use crate::object_storage::disk_manager::{
-    ListObjectsResult, ObjectMetadata, ObjectPathManager, PrefixIndexSegment, Quota,
+    ListObjectsResult, ObjectMetadata, ObjectPathManager, ObjectSummary, PrefixIndexSegment, Quota,
 };
 use crate::object_storage::fragment_manager::is_fragment_hash;
 use crate::object_storage::metadata_parser::get_metadata;
@@ -95,15 +95,17 @@ fn canonical_key(key: &str) -> String {
     key.trim_start_matches('/').to_string()
 }
 
+// Optimized: Returns ObjectSummary instead of full ObjectMetadata
+// This prevents loading heavy 'parts' vectors into memory during listing.
 async fn read_metadata_best(
     path_manager: &ObjectPathManager,
     fragment: &str,
     object_key: &str,
     version_id: &str,
-) -> Option<ObjectMetadata> {
+) -> Option<ObjectSummary> {
     let paths = path_manager.get_all_metadata_paths(fragment, object_key, version_id);
 
-    let mut best: Option<ObjectMetadata> = None;
+    let mut best: Option<ObjectSummary> = None;
 
     for p in paths {
         if !fs::try_exists(&p).await.unwrap_or(false) {
@@ -114,7 +116,8 @@ async fn read_metadata_best(
             continue;
         };
 
-        let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) else {
+        // Efficiently deserialize only the summary fields
+        let Ok(meta) = rmp_serde::from_slice::<ObjectSummary>(&data) else {
             continue;
         };
 
@@ -270,7 +273,7 @@ async fn try_list_by_prefix_index(
         0
     };
 
-    let mut out_objects: Vec<ObjectMetadata> = Vec::new();
+    let mut out_objects: Vec<ObjectSummary> = Vec::new();
     let mut out_prefixes: Vec<String> = Vec::new();
     let mut seen_prefixes: HashSet<String> = HashSet::new();
 
@@ -348,7 +351,8 @@ async fn try_list_by_prefix_index(
     };
 
     Ok(Some(ListObjectsResult {
-        objects: out_objects,
+        // Convert ObjectSummary back to ObjectMetadata (empty parts) for API response
+        objects: out_objects.into_iter().map(ObjectMetadata::from).collect(),
         common_prefixes: out_prefixes,
         continuation_token: next_token,
     }))
@@ -515,11 +519,11 @@ async fn list_objects_internal(
         }
     };
 
-    debug!("Listing objects in root: {:?}", index_root);
-
     let pfx = canonical_prefix(&prefix);
 
-    let mut results = Vec::new();
+    let mut results: Vec<ObjectSummary> = Vec::new(); // Changed to Vec<ObjectSummary>
+    let mut out_prefixes: Vec<String> = Vec::new();
+    let mut seen_prefixes: HashSet<String> = HashSet::new();
     let mut next_token = None;
     let mut reached_limit = false;
 
@@ -610,7 +614,7 @@ async fn list_objects_internal(
                         .buffered(20);
 
                     let mut current_hash_prefix = String::new();
-                    let mut best_meta: Option<ObjectMetadata> = None;
+                    let mut best_meta: Option<ObjectSummary> = None; // Optimized: Option<ObjectSummary>
                     let mut best_fname: String = String::new();
 
                     while let Some((fname, read_res)) = stream.next().await {
@@ -618,18 +622,47 @@ async fn list_objects_internal(
 
                         if hash_part != current_hash_prefix {
                             if let Some(meta) = best_meta.take() {
+                                let ck = canonical_key(&meta.object_key);
                                 let ok_prefix = if pfx.is_empty() {
                                     true
                                 } else {
-                                    let ck = canonical_key(&meta.object_key);
                                     ck == pfx || ck.starts_with(&(pfx.clone() + "/"))
                                 };
 
                                 if ok_prefix && (!meta.is_delete_marker || scan_trash) {
-                                    results.push(meta);
+                                    if delimiter.is_some() {
+                                        let rel = if pfx.is_empty() {
+                                            ck.clone()
+                                        } else if ck == pfx {
+                                            ck.clone()
+                                        } else if ck.len() > pfx.len() + 1 {
+                                            ck[(pfx.len() + 1)..].to_string()
+                                        } else {
+                                            String::new()
+                                        };
+
+                                        if !pfx.is_empty() && ck == pfx {
+                                            results.push(meta);
+                                        } else if let Some((first, _rest)) = rel.split_once('/') {
+                                            if !first.is_empty() {
+                                                let folder = if pfx.is_empty() {
+                                                    format!("{}/", first)
+                                                } else {
+                                                    format!("{}/{}/", pfx, first)
+                                                };
+                                                if seen_prefixes.insert(folder.clone()) {
+                                                    out_prefixes.push(folder);
+                                                }
+                                            }
+                                        } else {
+                                            results.push(meta);
+                                        }
+                                    } else {
+                                        results.push(meta);
+                                    }
                                 }
 
-                                if results.len() >= limit {
+                                if results.len() + out_prefixes.len() >= limit {
                                     next_token = Some(create_continuation_token(
                                         &s1,
                                         &s2,
@@ -649,7 +682,8 @@ async fn list_objects_internal(
 
                         match read_res {
                             Ok(data) => {
-                                if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
+                                // Efficiently deserialize only summary fields
+                                if let Ok(meta) = rmp_serde::from_slice::<ObjectSummary>(&data) {
                                     let take = match &best_meta {
                                         None => true,
                                         Some(cur) => {
@@ -671,17 +705,46 @@ async fn list_objects_internal(
                     }
 
                     if let Some(meta) = best_meta {
+                        let ck = canonical_key(&meta.object_key);
                         let ok_prefix = if pfx.is_empty() {
                             true
                         } else {
-                            let ck = canonical_key(&meta.object_key);
                             ck == pfx || ck.starts_with(&(pfx.clone() + "/"))
                         };
 
                         if ok_prefix && (!meta.is_delete_marker || scan_trash) {
-                            results.push(meta);
+                            if delimiter.is_some() {
+                                let rel = if pfx.is_empty() {
+                                    ck.clone()
+                                } else if ck == pfx {
+                                    ck.clone()
+                                } else if ck.len() > pfx.len() + 1 {
+                                    ck[(pfx.len() + 1)..].to_string()
+                                } else {
+                                    String::new()
+                                };
+
+                                if !pfx.is_empty() && ck == pfx {
+                                    results.push(meta);
+                                } else if let Some((first, _rest)) = rel.split_once('/') {
+                                    if !first.is_empty() {
+                                        let folder = if pfx.is_empty() {
+                                            format!("{}/", first)
+                                        } else {
+                                            format!("{}/{}/", pfx, first)
+                                        };
+                                        if seen_prefixes.insert(folder.clone()) {
+                                            out_prefixes.push(folder);
+                                        }
+                                    }
+                                } else {
+                                    results.push(meta);
+                                }
+                            } else {
+                                results.push(meta);
+                            }
                         }
-                        if results.len() >= limit {
+                        if results.len() + out_prefixes.len() >= limit {
                             next_token =
                                 Some(create_continuation_token(&s1, &s2, &s3, &s4, &best_fname));
                             reached_limit = true;
@@ -694,8 +757,9 @@ async fn list_objects_internal(
     }
 
     Ok(AxumJson(ListObjectsResult {
-        objects: results,
-        common_prefixes: Vec::new(),
+        // Convert ObjectSummary back to ObjectMetadata (empty parts) for API response
+        objects: results.into_iter().map(ObjectMetadata::from).collect(),
+        common_prefixes: out_prefixes,
         continuation_token: if reached_limit { next_token } else { None },
     }))
 }
