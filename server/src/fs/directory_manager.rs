@@ -1,3 +1,5 @@
+use crate::fs::file_path_parser::file_path;
+use crate::structs::auth_structs::FileSystemClaims;
 use crate::structs::delete_file_params_struct::DeleteFileParams;
 use crate::structs::file_metadata_struct::FileMetadata;
 use crate::structs::metadata_params_struct::MetadataParams;
@@ -13,15 +15,17 @@ use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 use tokio::fs;
 use tracing::error;
-use crate::fs::file_path_parser::file_path;
-use crate::structs::auth_structs::FileSystemClaims;
 
 pub async fn rename_file_query(
     claims: FileSystemClaims,
     path: Option<Path<String>>,
     Query(params): Query<RenameParams>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = &claims.uid;
+    if !&claims.modify {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let validated_fs_path = &claims.path;
 
     let relative_path = path
         .as_ref()
@@ -29,9 +33,9 @@ pub async fn rename_file_query(
         .unwrap_or_default();
 
     let full_dir_path = if relative_path.is_empty() {
-        PathBuf::from(format!("storage-files/{}", validated_uid))
+        PathBuf::from(format!("{}", validated_fs_path))
     } else {
-        PathBuf::from(format!("storage-files/{}/{}", validated_uid, relative_path))
+        PathBuf::from(format!("{}/{}", validated_fs_path, relative_path))
     };
 
     if !full_dir_path.exists() {
@@ -72,7 +76,11 @@ pub async fn delete_file(
     path: Option<Path<String>>,
     Query(params): Query<DeleteFileParams>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = &claims.uid;
+    if !&claims.delete {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let validated_fs_path = &claims.path;
 
     let relative_path = path
         .as_ref()
@@ -80,9 +88,9 @@ pub async fn delete_file(
         .unwrap_or_default();
 
     let base_dir = if relative_path.is_empty() {
-        format!("storage-files/{}", validated_uid)
+        format!("{}", validated_fs_path)
     } else {
-        format!("storage-files/{}/{}", validated_uid, relative_path)
+        format!("{}/{}", validated_fs_path, relative_path)
     };
 
     let file_path = PathBuf::from(base_dir).join(&params.file_to_delete);
@@ -104,12 +112,16 @@ pub async fn create_directory(
     claims: FileSystemClaims,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = &claims.uid;
+    if !&claims.write {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let validated_fs_path = &claims.path;
     let decoded_path = percent_decode_str(&path)
         .decode_utf8()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let directory_path = PathBuf::from(format!("storage-files/{}/{}", validated_uid, decoded_path));
+    let directory_path = PathBuf::from(format!("{}/{}", validated_fs_path, decoded_path));
 
     if directory_path.exists() {
         return Ok(Json(json!({"message": "Folder already exists"})).into_response());
@@ -127,12 +139,16 @@ pub async fn delete_directory(
     claims: FileSystemClaims,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = &claims.uid;
+    if !&claims.delete {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let validated_fs_path = &claims.path;
     let decoded_path = percent_decode_str(&path)
         .decode_utf8()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let directory_path = PathBuf::from(format!("storage-files/{}/{}", validated_uid, decoded_path));
+    let directory_path = PathBuf::from(format!("{}/{}", validated_fs_path, decoded_path));
 
     if !directory_path.exists() {
         return Ok(Json(json!({"message": "Folder does not exist"})).into_response());
@@ -151,14 +167,18 @@ pub async fn get_file_metadata(
     Query(params): Query<MetadataParams>,
     path: Option<Path<String>>,
 ) -> impl IntoResponse {
-    let validated_uid = &claims.uid;
+    if !&claims.read {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let validated_fs_path = &claims.path;
 
     let relative_path = path
         .as_ref()
         .map(|Path(p)| p.trim_matches('/').to_string())
         .unwrap_or_default();
 
-    let file_path = file_path(validated_uid, &relative_path, &params.file_name).await;
+    let file_path = file_path(validated_fs_path, &relative_path, &params.file_name).await;
 
     let metadata = match fs::metadata(&file_path).await {
         Ok(meta) => meta,

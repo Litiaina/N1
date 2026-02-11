@@ -10,9 +10,9 @@ use std::path::PathBuf;
 
 pub async fn get_storage_capacity(
     claims: FileSystemClaims,
-    Query(params): Query<CapacityDetailParams>
+    Query(params): Query<CapacityDetailParams>,
 ) -> impl IntoResponse {
-    let allocated_storage = match get_allocated_storage(claims.uid.as_str()).await {
+    let allocated_storage = match get_allocated_storage(claims.path.as_str()).await {
         Ok(Some(level)) => level,
         Ok(None) => {
             return (
@@ -30,7 +30,7 @@ pub async fn get_storage_capacity(
         }
     };
 
-    let path = PathBuf::from(format!("storage-files/{}", params.uid));
+    let path = PathBuf::from(format!("{}", params.uid));
     let total_storage = get_dir_size(&path).await;
 
     Json(json!({ "uid": params.uid, "capacity": allocated_storage, "used": total_storage }))

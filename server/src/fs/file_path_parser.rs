@@ -1,13 +1,10 @@
+use crate::enums::app_error_enum::AppError;
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use crate::enums::app_error_enum::AppError;
 
 pub async fn file_path(uid: &String, relative_path: &String, file_name: &String) -> PathBuf {
     if relative_path.is_empty() {
-        PathBuf::from(format!(
-            "storage-files/{}/{}",
-            uid, file_name
-        ))
+        PathBuf::from(format!("storage-files/{}/{}", uid, file_name))
     } else {
         PathBuf::from(format!(
             "storage-files/{}/{}/{}",

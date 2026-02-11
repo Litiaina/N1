@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 pub const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
-pub const AUTH_COLLECTION: &str = "auth";
 pub const INITIAL_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
 pub const CHUNK_PREFIX: &str = "chunk_";
 pub const IO_TIMEOUT: Duration = Duration::from_secs(120);

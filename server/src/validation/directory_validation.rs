@@ -1,26 +1,59 @@
-use crate::database::api::get_collection;
-use crate::fs::fs_constants::AUTH_COLLECTION;
-use mongodb::bson::doc;
-use mongodb::error::Error;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use tokio::fs;
 use walkdir::WalkDir;
 
-pub async fn get_allocated_storage(uid: &str) -> Result<Option<u64>, Error> {
-    let user_doc = get_collection(AUTH_COLLECTION)
-        .await
-        .find_one(doc! { "uid": uid })
-        .await?;
+#[cfg(unix)]
+fn capacity_total_bytes_sync(path: &Path) -> io::Result<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
 
-    if let Some(doc) = user_doc {
-        if let Ok(allocated) = doc.get_i64("allocated_storage") {
-            if let Ok(value) = u64::try_from(allocated) {
-                return Ok(Some(value));
-            }
-        }
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut vfs) } != 0 {
+        return Err(io::Error::last_os_error());
     }
 
-    Ok(None)
+    Ok((vfs.f_frsize as u64).saturating_mul(vfs.f_blocks as u64))
+}
+
+#[cfg(windows)]
+fn capacity_total_bytes_sync(path: &Path) -> io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+
+    let mut total: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            &mut total,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(total)
+}
+
+pub async fn get_allocated_storage(path: &str) -> Result<Option<u64>, io::Error> {
+    let p = Path::new(path);
+    if !p.exists() {
+        return Ok(None);
+    }
+
+    let p = p.to_path_buf();
+    let total = tokio::task::spawn_blocking(move || capacity_total_bytes_sync(&p))
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn_blocking: {e}")))??;
+
+    Ok(Some(total))
 }
 
 pub fn sanitize_path(path: &str) -> String {

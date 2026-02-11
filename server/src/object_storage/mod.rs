@@ -10,7 +10,6 @@ pub mod metadata_parser;
 pub mod modify;
 pub mod monitoring;
 pub mod object_parser;
-pub mod part_parser;
 pub mod quota_manager;
 pub mod recovery;
 pub mod redistribution;

@@ -3,12 +3,12 @@ use crate::fs::fs_constants::{
     IO_TIMEOUT, MAX_BUFFER_SIZE, MAX_CHUNK_SIZE, MERGE_CONCURRENCY, MIN_BUFFER_SIZE, STORAGE_ROOT,
     TMP_EXT,
 };
+use crate::fs::part_parser::parse_uploaded_parts;
 use crate::statics::merge_semaphore_static::MERGE_SEMAPHORE;
 use crate::validation::directory_validation::sanitize_fragmented_path;
 
 use crate::fs::file_path_parser::find_unique_path;
 use crate::fs::fragmented_upload::with_io_timeout;
-use crate::object_storage::part_parser::parse_uploaded_parts;
 use crate::structs::auth_structs::FileSystemClaims;
 use crate::structs::stateless_fragment_upload_structs::{
     InitiateUploadParams, InitiateUploadResponse, PathManager, UploadMetadata, UploadStatusResponse,
@@ -45,7 +45,7 @@ pub async fn initiate_upload_session(
     path: Option<Path<String>>,
     AxumJson(params): AxumJson<InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = claims.uid;
+    let fs_path = claims.path;
     let file_id = Uuid::new_v4().to_string();
     let paths = PathManager::new(&file_id);
 
@@ -59,7 +59,7 @@ pub async fn initiate_upload_session(
 
     let metadata = UploadMetadata {
         file_id: file_id.clone(),
-        uid,
+        uid: fs_path,
         original_filename: params.original_filename,
         final_relative_path,
         total_size_bytes: params.total_size_bytes,

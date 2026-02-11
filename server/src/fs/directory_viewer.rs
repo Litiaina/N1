@@ -24,14 +24,18 @@ pub async fn view_directory(
     claims: FileSystemClaims,
     path: Option<Path<String>>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = claims.uid.clone();
+    if !&claims.read {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let validated_fs_path = claims.path.clone();
 
     let relative_path = path
         .as_ref()
         .map(|Path(p)| sanitize_path(p))
         .unwrap_or_default();
 
-    let user_storage_root = PathBuf::from(format!("storage-files/{}", validated_uid));
+    let user_storage_root = PathBuf::from(format!("{}", validated_fs_path));
 
     let full_path = if relative_path.is_empty() {
         user_storage_root.clone()
@@ -112,12 +116,13 @@ pub async fn view_file(
     claims: FileSystemClaims,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = &claims.uid;
+    if !&claims.read {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let validated_fs_path = &claims.path;
     let sanitized_directory = sanitize_path(&path);
-    let file_path = PathBuf::from(format!(
-        "storage-files/{}/{}",
-        validated_uid, sanitized_directory
-    ));
+    let file_path = PathBuf::from(format!("{}/{}", validated_fs_path, sanitized_directory));
     let mut file = fs::File::open(&file_path)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
@@ -144,12 +149,13 @@ pub async fn stream_file(
     headers: HeaderMap,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = claims.uid;
+    if !&claims.read {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let validated_fs_path = claims.path;
     let sanitized_directory = sanitize_path(&path);
-    let file_path = PathBuf::from(format!(
-        "storage-files/{}/{}",
-        validated_uid, sanitized_directory
-    ));
+    let file_path = PathBuf::from(format!("{}/{}", validated_fs_path, sanitized_directory));
 
     let mime_type = from_path(&file_path).first_or_octet_stream();
 
@@ -219,11 +225,12 @@ pub async fn stream_file_v2(
     headers: HeaderMap,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, Response> {
+    if !&claims.read {
+        return Err((StatusCode::UNAUTHORIZED, "Read permission required").into_response());
+    }
+
     let sanitized_directory = sanitize_path(&path);
-    let file_path = PathBuf::from(format!(
-        "storage-files/{}/{}",
-        &claims.uid, sanitized_directory
-    ));
+    let file_path = PathBuf::from(format!("{}/{}", &claims.path, sanitized_directory));
 
     let metadata = fs::metadata(&file_path)
         .await
@@ -278,11 +285,12 @@ pub async fn stream_hls_file(
     claims: FileSystemClaims,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, Response> {
+    if !&claims.read {
+        return Err((StatusCode::UNAUTHORIZED, "Read permission required").into_response());
+    }
+
     let sanitized_directory = sanitize_path(&path);
-    let file_path = PathBuf::from(format!(
-        "storage-files/{}/{}",
-        &claims.uid, sanitized_directory
-    ));
+    let file_path = PathBuf::from(format!("{}/{}", &claims.path, sanitized_directory));
 
     let file_name = match std::path::Path::new(&path)
         .file_name()

@@ -1,4 +1,5 @@
 use crate::fs::fs_constants::DEFAULT_BUFFER_SIZE;
+use crate::structs::auth_structs::FileSystemClaims;
 use crate::utils::file_extension_util::get_file_extension;
 use crate::validation::directory_validation::sanitize_path;
 use axum::Json;
@@ -12,14 +13,17 @@ use tokio::fs;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio_util::io::StreamReader;
 use tracing::{error, info, warn};
-use crate::structs::auth_structs::FileSystemClaims;
 
 pub async fn upload_file(
     claims: FileSystemClaims,
     path: Option<Path<String>>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let validated_uid = &claims.uid;
+    if !&claims.write {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let validated_fs_path = &claims.path;
 
     let relative_path = path
         .as_ref()
@@ -27,9 +31,9 @@ pub async fn upload_file(
         .unwrap_or_default();
 
     let directory_path = if relative_path.is_empty() {
-        PathBuf::from(format!("storage-files/{}", validated_uid))
+        PathBuf::from(format!("{}", validated_fs_path))
     } else {
-        PathBuf::from(format!("storage-files/{}/{}", validated_uid, relative_path))
+        PathBuf::from(format!("{}/{}", validated_fs_path, relative_path))
     };
 
     fs::create_dir_all(&directory_path).await.map_err(|err| {
@@ -119,12 +123,12 @@ pub async fn upload_file(
         if relative_path.is_empty() {
             info!(
                 "Uploaded '{}' to '{}', total bytes: {}",
-                final_filename, validated_uid, bytes_copied
+                final_filename, validated_fs_path, bytes_copied
             );
         } else {
             info!(
                 "Uploaded '{}' to '{}/{}', total bytes: {}",
-                final_filename, validated_uid, relative_path, bytes_copied
+                final_filename, validated_fs_path, relative_path, bytes_copied
             );
         }
     }

@@ -36,7 +36,6 @@ axum-extra = { version = "0.12.5", features = ["typed-header"] }
 dotenv = "0.15.0"
 headers = "0.4.0"
 jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
-mongodb = "3.2.4"
 uuid = { version = "1.18.0", features = ["v4"] }
 tower = "0.5.2"
 hmac = "0.12.1"

@@ -33,7 +33,6 @@ axum-extra.workspace = true
 dotenv.workspace = true
 headers.workspace = true
 jsonwebtoken.workspace = true
-mongodb.workspace = true
 uuid.workspace = true
 tower.workspace = true
 hmac.workspace = true

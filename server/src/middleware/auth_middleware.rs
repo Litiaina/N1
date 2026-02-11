@@ -2,7 +2,6 @@ use crate::object_storage::fragment_metadata::verify_fragment_key;
 use crate::structs::auth_structs::{
     AuthBody, AuthorizationRequest, Claims, FileSystemClaims, LoginRequest,
 };
-use crate::validation::auth_validation::validate_auth;
 use crate::validation::fragment_validation::does_fragment_exist;
 use axum::body::Body;
 use axum::extract::{FromRequestParts, Request};
@@ -133,32 +132,35 @@ pub async fn auth(req: Request<Body>, next: Next) -> Result<Response, AuthError>
 }
 
 pub async fn authorize(Json(payload): Json<LoginRequest>) -> Result<Json<AuthBody>, AuthError> {
-    if payload.email.is_empty() || payload.password.is_empty() {
+    if payload.secret.is_empty() || payload.path.is_empty() {
         return Err(AuthError::MissingCredentials);
     }
 
-    match validate_auth(&payload.email, &payload.password).await {
-        Ok(Some(uid)) => {
-            let exp = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                + 24 * 60 * 60;
-
-            let claims = FileSystemClaims {
-                email: payload.email.to_owned(),
-                uid,
-                exp: exp as usize,
-            };
-
-            let token = encode(&Header::default(), &claims, &JWT_KEYS.encoding)
-                .map_err(|_| AuthError::InternalError)?;
-
-            Ok(Json(AuthBody::new(token)))
-        }
-        Ok(None) => Err(AuthError::WrongCredentials),
-        Err(_) => Err(AuthError::InternalError),
+    if payload.secret != *AUTH_KEY {
+        return Err(AuthError::WrongCredentials);
     }
+
+    let duration = payload.expires_in.unwrap_or(24 * 60 * 60);
+
+    let exp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + duration;
+
+    let claims = FileSystemClaims {
+        path: payload.path,
+        write: payload.write,
+        modify: payload.modify,
+        read: payload.read,
+        delete: payload.delete,
+        exp: exp as usize,
+    };
+
+    let token = encode(&Header::default(), &claims, &JWT_KEYS.encoding)
+        .map_err(|_| AuthError::InternalError)?;
+
+    Ok(Json(AuthBody::new(token)))
 }
 
 impl Display for Claims {
@@ -173,7 +175,11 @@ impl Display for Claims {
 
 impl Display for FileSystemClaims {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "email: {}, uid: {}", self.email, self.uid)
+        write!(
+            f,
+            "path: {}, read: {}, write: {}, modify: {}, delete: {},  exp: {}",
+            self.path, self.read, self.write, self.modify, self.delete, self.exp
+        )
     }
 }
 

@@ -1,6 +1,8 @@
 use crate::enums::app_error_enum::AppError;
 use crate::fs::fs_constants::{IO_TIMEOUT, MAX_CHUNK_SIZE, MERGE_CONCURRENCY, TMP_EXT};
+use crate::fs::stateless_fragmented_upload::determine_final_path;
 use crate::statics::merge_semaphore_static::{FILE_UPLOAD_LOCKS, MERGE_SEMAPHORE};
+use crate::structs::auth_structs::FileSystemClaims;
 use crate::structs::path_manager_struct::PathManager;
 use crate::structs::resumable_upload_status_struct::ResumableUploadStatus;
 use crate::structs::upload_params_struct::UploadParams;
@@ -12,10 +14,7 @@ use axum::{
 };
 use futures_util::stream::TryStreamExt;
 use sha2::{Digest, Sha256};
-use std::{
-    collections::HashMap,
-    future::Future,
-};
+use std::{collections::HashMap, future::Future};
 use tokio::{
     fs::{self, File},
     io::{self, AsyncWriteExt, BufReader, BufWriter},
@@ -23,8 +22,6 @@ use tokio::{
     time::timeout,
 };
 use tracing::{error, info, warn};
-use crate::fs::stateless_fragmented_upload::determine_final_path;
-use crate::structs::auth_structs::FileSystemClaims;
 
 pub async fn upload_fragments(
     claims: FileSystemClaims,
@@ -32,14 +29,18 @@ pub async fn upload_fragments(
     Query(params): Query<UploadParams>,
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = claims.uid;
+    if !&claims.write {
+        return Err(AppError::Unauthorized);
+    }
+
+    let fs_path = claims.path;
 
     if params.chunk_index >= params.total_chunks {
         return Err(AppError::BadRequest("Invalid chunk index.".to_string()));
     }
 
     let paths = PathManager::new(
-        uid,
+        fs_path,
         path.map_or_else(String::new, |p| p.0),
         params.file_id.clone(),
     );
@@ -101,13 +102,13 @@ pub async fn check_uploaded_fragments(
     path_params: Option<Path<String>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, AppError> {
-    let uid = claims.uid;
+    let fs_path = claims.path;
     let file_id = params
         .get("file_id")
         .ok_or_else(|| AppError::BadRequest("Query param 'file_id' is required.".to_string()))?;
 
     let paths = PathManager::new(
-        uid,
+        fs_path,
         path_params.map_or_else(String::new, |p| p.0),
         file_id.clone(),
     );
