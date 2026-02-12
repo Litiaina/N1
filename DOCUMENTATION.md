@@ -14,7 +14,7 @@
 
 ---
 
-`this is subject to change and is not stable.`
+`This is subject to change and is not stable. Needs further testing.`
 
 ## Table of Contents
 
