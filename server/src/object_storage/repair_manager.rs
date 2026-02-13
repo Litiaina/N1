@@ -1316,7 +1316,7 @@ async fn apply_meta_batch(
         return Ok(BatchDelta::default());
     }
 
-    let results = stream::iter(batch.iter().cloned())
+    let mut stream = stream::iter(batch.iter().cloned())
         .map(|meta_path| {
             let blob_roots = blob_roots.clone();
             let shard_repair_sem = shard_repair_sem.clone();
@@ -1326,48 +1326,98 @@ async fn apply_meta_batch(
                 process_one_meta_path(meta_path, blob_roots, num_disks, cfg, shard_repair_sem).await
             }
         })
-        .buffer_unordered(cfg.meta_concurrency)
-        .collect::<Vec<Result<BatchDelta, AppError>>>()
-        .await;
+        .buffer_unordered(cfg.meta_concurrency);
 
-    let mut agg = BatchDelta::default();
+    let mut batch_agg = BatchDelta::default();
+    let mut pending_update = BatchDelta::default();
+    let mut last_update = Instant::now();
 
-    for r in results {
-        match r {
-            Ok(d) => {
-                agg.scanned += d.scanned;
-                agg.repaired_shards += d.repaired_shards;
-                agg.corrupt_found += d.corrupt_found;
-                agg.missing_meta_repaired += d.missing_meta_repaired;
-                agg.divergent_meta_repaired += d.divergent_meta_repaired;
-                if d.last_repaired.is_some() {
-                    agg.last_repaired = d.last_repaired;
-                }
-                if d.last_disagreement.is_some() {
-                    agg.last_disagreement = d.last_disagreement;
-                }
-            }
+    while let Some(res) = stream.next().await {
+        let delta = match res {
+            Ok(d) => d,
             Err(e) => {
                 warn!("Meta batch item failed (non-fatal): {}", e);
+                continue;
             }
+        };
+
+        batch_agg.scanned += delta.scanned;
+        batch_agg.repaired_shards += delta.repaired_shards;
+        batch_agg.corrupt_found += delta.corrupt_found;
+        batch_agg.missing_meta_repaired += delta.missing_meta_repaired;
+        batch_agg.divergent_meta_repaired += delta.divergent_meta_repaired;
+        if delta.last_repaired.is_some() {
+            batch_agg.last_repaired = delta.last_repaired.clone();
+        }
+        if delta.last_disagreement.is_some() {
+            batch_agg.last_disagreement = delta.last_disagreement.clone();
+        }
+
+        pending_update.scanned += delta.scanned;
+        pending_update.repaired_shards += delta.repaired_shards;
+        pending_update.corrupt_found += delta.corrupt_found;
+        pending_update.missing_meta_repaired += delta.missing_meta_repaired;
+        pending_update.divergent_meta_repaired += delta.divergent_meta_repaired;
+        if delta.last_repaired.is_some() {
+            pending_update.last_repaired = delta.last_repaired.clone();
+        }
+        if delta.last_disagreement.is_some() {
+            pending_update.last_disagreement = delta.last_disagreement.clone();
+        }
+
+        let significant_change = delta.repaired_shards > 0
+            || delta.missing_meta_repaired > 0
+            || delta.divergent_meta_repaired > 0
+            || delta.corrupt_found > 0;
+
+        if significant_change
+            || pending_update.scanned >= 10
+            || last_update.elapsed().as_millis() > 200
+        {
+            let mut status = REPAIR_STATUS.write().await;
+            status.total_scanned += pending_update.scanned;
+            status.total_repaired += pending_update.repaired_shards
+                + pending_update.missing_meta_repaired
+                + pending_update.divergent_meta_repaired;
+            status.corrupt_found += pending_update.corrupt_found;
+            status.missing_meta_repaired += pending_update.missing_meta_repaired;
+            status.divergent_meta_repaired += pending_update.divergent_meta_repaired;
+
+            if let Some(s) = &pending_update.last_repaired {
+                status.last_repaired = Some(s.clone());
+            }
+            if let Some(s) = &pending_update.last_disagreement {
+                status.last_disagreement = Some(s.clone());
+            }
+
+            let elapsed = start_time.elapsed().as_secs_f64();
+            status.duration_seconds = elapsed as u64;
+            if elapsed > 0.0 {
+                status.scan_rate_per_sec = status.total_scanned as f64 / elapsed;
+            }
+
+            ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
+
+            pending_update = BatchDelta::default();
+            last_update = Instant::now();
         }
     }
 
-    {
+    if pending_update.scanned > 0 {
         let mut status = REPAIR_STATUS.write().await;
-        status.total_scanned += agg.scanned;
-        status.corrupt_found += agg.corrupt_found;
-        status.missing_meta_repaired += agg.missing_meta_repaired;
-        status.divergent_meta_repaired += agg.divergent_meta_repaired;
+        status.total_scanned += pending_update.scanned;
+        status.total_repaired += pending_update.repaired_shards
+            + pending_update.missing_meta_repaired
+            + pending_update.divergent_meta_repaired;
+        status.corrupt_found += pending_update.corrupt_found;
+        status.missing_meta_repaired += pending_update.missing_meta_repaired;
+        status.divergent_meta_repaired += pending_update.divergent_meta_repaired;
 
-        status.total_repaired +=
-            agg.repaired_shards + agg.missing_meta_repaired + agg.divergent_meta_repaired;
-
-        if agg.last_repaired.is_some() {
-            status.last_repaired = agg.last_repaired.clone();
+        if let Some(s) = &pending_update.last_repaired {
+            status.last_repaired = Some(s.clone());
         }
-        if agg.last_disagreement.is_some() {
-            status.last_disagreement = agg.last_disagreement.clone();
+        if let Some(s) = &pending_update.last_disagreement {
+            status.last_disagreement = Some(s.clone());
         }
 
         let elapsed = start_time.elapsed().as_secs_f64();
@@ -1379,7 +1429,7 @@ async fn apply_meta_batch(
         ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
     }
 
-    Ok(agg)
+    Ok(batch_agg)
 }
 
 async fn process_one_meta_path(

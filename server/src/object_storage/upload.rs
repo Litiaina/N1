@@ -102,6 +102,11 @@ impl DirectWriter {
             write_task: None,
         }
     }
+
+    pub async fn sync_data(&self) -> Result<(), std::io::Error> {
+        let file = self.file.clone();
+        tokio::task::spawn_blocking(move || file.sync_all()).await?
+    }
 }
 
 impl AsyncWrite for DirectWriter {
@@ -531,16 +536,6 @@ async fn commit_part_meta_lockless(
     Err(AppError::InternalServerError(
         "Failed to commit part metadata to any session mirror".into(),
     ))
-}
-
-async fn fsync_file_path(path: &Path) -> Result<(), AppError> {
-    let f = tokio_fs::File::open(path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("open for fsync {}", path.display())))?;
-    f.sync_all()
-        .await
-        .map_err(|e| AppError::Io(e, format!("fsync {}", path.display())))?;
-    Ok(())
 }
 
 async fn crc32_file_hex(path: &Path) -> Result<String, AppError> {
@@ -1162,7 +1157,7 @@ pub async fn object_upload_part(
         )));
     }
 
-    let calc_checksum = query.enable_checksum.unwrap_or(false);
+    let calc_checksum = true;
 
     let mut stream_writer = ErasureStreamWriter::new(
         writers,
@@ -1171,7 +1166,7 @@ pub async fn object_upload_part(
         final_shard_len as usize,
         calc_checksum,
         block_size,
-    );
+    )?;
 
     let mut body_stream = body.into_data_stream();
     let mut total_bytes_read = 0u64;
@@ -1220,11 +1215,20 @@ pub async fn object_upload_part(
 
     let shard_checksums = stream_writer.get_shard_checksums();
     let total_checksum = stream_writer.get_total_checksum();
+    let writers = stream_writer.into_writers();
 
-    drop(stream_writer);
+    let sync_futs = writers.into_iter().filter_map(|w_opt| {
+        w_opt.map(|w| async move {
+            if let Err(e) = w.sync_data().await {
+                warn!("Failed to fsync shard: {}", e);
+                return Err(AppError::Io(e, "fsync shard".into()));
+            }
+            Ok(())
+        })
+    });
 
-    let fsync_results = join_all(tmp_paths.iter().map(|p| fsync_file_path(p.as_path()))).await;
-    for r in fsync_results {
+    let sync_results = join_all(sync_futs).await;
+    for r in sync_results {
         if let Err(e) = r {
             cleanup_files_best_effort(&tmp_paths).await;
             return Err(e);

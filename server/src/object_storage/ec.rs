@@ -100,7 +100,7 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
         shard_len_limit: usize,
         calc_checksum: bool,
         block_size: usize,
-    ) -> Self {
+    ) -> Result<Self, AppError> {
         let total_hasher = if calc_checksum {
             Some(Hasher::new())
         } else {
@@ -116,7 +116,14 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
             None
         };
 
-        Self {
+        if parity_shards > 0 {
+            let _ =
+                ReedSolomonEncoder::new(data_shards, parity_shards, block_size).map_err(|e| {
+                    AppError::InternalServerError(format!("RS init check failed: {:?}", e))
+                })?;
+        }
+
+        Ok(Self {
             writers,
             data_shards,
             parity_shards,
@@ -128,7 +135,7 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
             total_hasher,
             shard_hashers,
             block_size,
-        }
+        })
     }
 
     pub async fn write(&mut self, data: &[u8]) -> Result<(), AppError> {
@@ -289,5 +296,9 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
         } else {
             Vec::new()
         }
+    }
+
+    pub fn into_writers(self) -> Vec<Option<W>> {
+        self.writers
     }
 }

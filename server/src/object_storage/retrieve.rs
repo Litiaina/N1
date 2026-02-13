@@ -95,8 +95,6 @@ fn canonical_key(key: &str) -> String {
     key.trim_start_matches('/').to_string()
 }
 
-// Optimized: Returns ObjectSummary instead of full ObjectMetadata
-// This prevents loading heavy 'parts' vectors into memory during listing.
 async fn read_metadata_best(
     path_manager: &ObjectPathManager,
     fragment: &str,
@@ -116,7 +114,6 @@ async fn read_metadata_best(
             continue;
         };
 
-        // Efficiently deserialize only the summary fields
         let Ok(meta) = rmp_serde::from_slice::<ObjectSummary>(&data) else {
             continue;
         };
@@ -351,7 +348,6 @@ async fn try_list_by_prefix_index(
     };
 
     Ok(Some(ListObjectsResult {
-        // Convert ObjectSummary back to ObjectMetadata (empty parts) for API response
         objects: out_objects.into_iter().map(ObjectMetadata::from).collect(),
         common_prefixes: out_prefixes,
         continuation_token: next_token,
@@ -521,7 +517,7 @@ async fn list_objects_internal(
 
     let pfx = canonical_prefix(&prefix);
 
-    let mut results: Vec<ObjectSummary> = Vec::new(); // Changed to Vec<ObjectSummary>
+    let mut results: Vec<ObjectSummary> = Vec::new();
     let mut out_prefixes: Vec<String> = Vec::new();
     let mut seen_prefixes: HashSet<String> = HashSet::new();
     let mut next_token = None;
@@ -614,7 +610,7 @@ async fn list_objects_internal(
                         .buffered(20);
 
                     let mut current_hash_prefix = String::new();
-                    let mut best_meta: Option<ObjectSummary> = None; // Optimized: Option<ObjectSummary>
+                    let mut best_meta: Option<ObjectSummary> = None;
                     let mut best_fname: String = String::new();
 
                     while let Some((fname, read_res)) = stream.next().await {
@@ -682,7 +678,6 @@ async fn list_objects_internal(
 
                         match read_res {
                             Ok(data) => {
-                                // Efficiently deserialize only summary fields
                                 if let Ok(meta) = rmp_serde::from_slice::<ObjectSummary>(&data) {
                                     let take = match &best_meta {
                                         None => true,
@@ -757,7 +752,6 @@ async fn list_objects_internal(
     }
 
     Ok(AxumJson(ListObjectsResult {
-        // Convert ObjectSummary back to ObjectMetadata (empty parts) for API response
         objects: results.into_iter().map(ObjectMetadata::from).collect(),
         common_prefixes: out_prefixes,
         continuation_token: if reached_limit { next_token } else { None },
@@ -801,7 +795,7 @@ pub async fn list_object_versions(
 
     let index_dirs = path_manager.get_all_index_dirs(&fragment);
 
-    let mut versions = Vec::new();
+    let mut versions: Vec<ObjectSummary> = Vec::new();
     let mut seen_versions = HashSet::new();
 
     for dir in index_dirs {
@@ -826,7 +820,7 @@ pub async fn list_object_versions(
                         }
 
                         if let Ok(data) = fs::read(entry.path()).await {
-                            if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
+                            if let Ok(meta) = rmp_serde::from_slice::<ObjectSummary>(&data) {
                                 if seen_versions.insert(meta.version_id.clone()) {
                                     versions.push(meta);
                                 }
@@ -840,7 +834,10 @@ pub async fn list_object_versions(
 
     versions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-    Ok(AxumJson(versions))
+    let response_objects: Vec<ObjectMetadata> =
+        versions.into_iter().map(ObjectMetadata::from).collect();
+
+    Ok(AxumJson(response_objects))
 }
 
 #[derive(Serialize)]

@@ -335,7 +335,6 @@ pub struct ChunkQuery {
 
 #[derive(Deserialize)]
 pub struct UploadPartQuery {
-    pub enable_checksum: Option<bool>,
     pub checksum: Option<String>,
 }
 

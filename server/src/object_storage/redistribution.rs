@@ -665,7 +665,7 @@ pub async fn run_redistribution_job(
             });
 
             let mut batch_scanned: u64 = 0;
-            const STATUS_BATCH: u64 = 100;
+            const STATUS_BATCH: u64 = 10;
 
             while let Some((meta_path, is_trash_flag)) = rx.recv().await {
                 if should_stop() {
@@ -1047,7 +1047,7 @@ async fn redistribute_object_streaming(
             final_shard_len as usize,
             true,
             new_block_size,
-        );
+        )?;
 
         let mut pos = 0u64;
         let mut batch: Vec<u8> = Vec::with_capacity(new_block_size);
