@@ -83,7 +83,6 @@ fn stable_abs_candidates(abs: &str) -> Vec<String> {
         out.push(strip_tmp_attempt_suffix(stripped).to_string());
     }
 
-    // Include GC candidates for finding shards that might have been marked for deletion but are valid
     if !stable.is_empty() {
         out.push(format!("{}{}", stable, GC_SUFFIX));
     }
@@ -226,12 +225,11 @@ pub async fn verify_shard_integrity(file: &mut File, expected_checksum: &str) ->
     calculated == expected
 }
 
-/// Re-instated verified opening from OLD code to prevent using corrupt shards
 async fn try_open_verified(path: &str, checksum: &str) -> Option<File> {
     if path.is_empty() {
         return None;
     }
-    // No timeouts here - relying on OS to handle disk IO naturally
+
     if let Ok(mut f) = File::open(path).await {
         if verify_shard_integrity(&mut f, checksum).await {
             return Some(f);
@@ -242,8 +240,6 @@ async fn try_open_verified(path: &str, checksum: &str) -> Option<File> {
     None
 }
 
-/// Robustly finds a shard on any disk, verifies it, and caches the handle.
-/// Combines the path-hunting logic of NEW with the reliability of OLD.
 async fn get_or_open_shard_ha(
     file_cache: &mut HashMap<String, File>,
     shard_info: &ShardInfo,
@@ -255,7 +251,6 @@ async fn get_or_open_shard_ha(
 
     let mut candidates: Vec<String> = stable_abs_candidates(&shard_info.absolute_path);
 
-    // Smart path reconstruction (from NEW code)
     if let Some(vdir) = version_dir_hint {
         candidates.push(
             vdir.join(&shard_info.file_name)
@@ -294,7 +289,6 @@ async fn get_or_open_shard_ha(
             continue;
         }
 
-        // Use strict verification (from OLD code) to ensure no silent corruption
         if let Some(f) = try_open_verified(&cand, &shard_info.checksum).await {
             if let Ok(cloned) = f.try_clone().await {
                 file_cache.insert(shard_info.file_name.clone(), cloned);
@@ -344,7 +338,6 @@ pub async fn read_or_recover_chunk(
         Some(version_dir)
     };
 
-    // Attempt to read primary shard with full integrity check
     if let Some(mut file) = get_or_open_shard_ha(file_cache, target_shard, vdir_hint).await {
         if file.seek(SeekFrom::Start(offset)).await.is_ok() {
             if file.read_exact(&mut buf).await.is_ok() {
@@ -354,7 +347,6 @@ pub async fn read_or_recover_chunk(
         warn!("Read failed for validated shard, attempting recovery.");
     }
 
-    // Fallback to Erasure Coding Recovery
     let data_count = data_shards_count(&part);
     let parity_count = part.shards.len().saturating_sub(data_count);
 
@@ -362,7 +354,6 @@ pub async fn read_or_recover_chunk(
         return Err(AppError::InternalServerError("No data shards".into()));
     }
 
-    // Using standard ReedSolomonDecoder for all cases (including k=1) for robustness
     let mut decoder = ReedSolomonDecoder::new(data_count, parity_count, len)
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
@@ -419,7 +410,6 @@ pub async fn read_or_recover_chunk(
         .1
         .to_vec();
 
-    // Trigger background repair to fix the corrupted/missing primary shard
     let part_clone = Arc::clone(&part);
     let target_idx = target_shard.shard_index;
 
@@ -475,7 +465,6 @@ pub async fn repair_entire_shard(
         Ulid::new().to_string()
     ));
 
-    // If file exists and is valid, no need to repair
     if fs::try_exists(&final_path).await.unwrap_or(false) {
         if let Ok(mut f) = File::open(&final_path).await {
             if verify_shard_integrity(&mut f, &target_shard.checksum).await {
@@ -521,7 +510,6 @@ pub async fn repair_entire_shard(
     let mut peer_files: Vec<Option<File>> = Vec::with_capacity(part.shards.len());
     let mut peer_cache: HashMap<String, File> = HashMap::new();
 
-    // Open peers using the robust HA logic
     for s in &part.shards {
         if s.shard_index == target_shard.shard_index {
             peer_files.push(None);
