@@ -2,20 +2,20 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use axum::Json as AxumJson;
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
+use axum::Json as AxumJson;
 
 use chrono::Utc;
 use crc32fast::Hasher;
-use futures_util::StreamExt;
 use futures_util::future::join_all;
+use futures_util::StreamExt;
 use once_cell::sync::{Lazy, OnceCell};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -40,9 +40,9 @@ use crate::object_storage::constants::{
     PARITY_SUFFIX, PART_META_SUFFIX, RESERVATION_FILE, SESSION_MANIFEST_FILE, SHARD_SUFFIX,
 };
 use crate::object_storage::disk_manager::{
-    FinalizeIncompleteResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery,
-    ObjectMetadata, ObjectPathManager, PartMetadata, PrefixIndexEntry, PrefixIndexSegment,
-    ReservationReceipt, ShardInfo, UploadPartQuery, UploadStatusResponse, default_stripe_size,
+    default_stripe_size, FinalizeIncompleteResponse, InitiateUploadParams, InitiateUploadResponse,
+    ObjectKeyQuery, ObjectMetadata, ObjectPathManager, PartMetadata, PrefixIndexEntry,
+    PrefixIndexSegment, ReservationReceipt, ShardInfo, UploadPartQuery, UploadStatusResponse,
 };
 use crate::object_storage::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::object_storage::quota_manager::{try_reserve_quota, update_quota};
@@ -92,15 +92,63 @@ pub struct ListUploadsResponse {
 
 pub struct DirectWriter {
     file: Arc<fs::File>,
+    write_buffer: AlignedBuffer,
     write_task: Option<tokio::task::JoinHandle<Result<usize, std::io::Error>>>,
 }
 
 impl DirectWriter {
     pub fn new(file: fs::File) -> Self {
+        let configured = WRITER_BUFFER_SIZE_ATOMIC
+            .get()
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(256 * 1024);
+        let aligned = ((configured.max(4096) + 4095) / 4096) * 4096;
         Self {
             file: Arc::new(file),
+            write_buffer: AlignedBuffer::new(aligned),
             write_task: None,
         }
+    }
+
+    fn poll_write_task(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        if let Some(task) = &mut self.write_task {
+            match Pin::new(task).poll(cx) {
+                Poll::Ready(Ok(Ok(_))) => {
+                    self.write_task = None;
+                }
+                Poll::Ready(Ok(Err(e))) => {
+                    self.write_task = None;
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Ready(Err(e)) => {
+                    self.write_task = None;
+                    return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn spawn_buffer_flush(&mut self) {
+        if self.write_buffer.len() == 0 || self.write_task.is_some() {
+            return;
+        }
+
+        let file = self.file.clone();
+        let buffer_capacity = self.write_buffer.capacity();
+        let to_write =
+            std::mem::replace(&mut self.write_buffer, AlignedBuffer::new(buffer_capacity));
+        let bytes = to_write.len();
+
+        let task = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut f = &*file;
+            f.write_all(to_write.as_slice())?;
+            Ok::<usize, std::io::Error>(bytes)
+        });
+
+        self.write_task = Some(task);
     }
 
     pub async fn sync_data(&self) -> Result<(), std::io::Error> {
@@ -115,64 +163,39 @@ impl AsyncWrite for DirectWriter {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
-        if let Some(task) = &mut self.write_task {
-            match Pin::new(task).poll(cx) {
-                Poll::Ready(Ok(Ok(n))) => {
-                    self.write_task = None;
-                    return Poll::Ready(Ok(n));
-                }
-                Poll::Ready(Ok(Err(e))) => {
-                    self.write_task = None;
-                    return Poll::Ready(Err(e));
-                }
-                Poll::Ready(Err(e)) => {
-                    self.write_task = None;
-                    return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
-                }
-                Poll::Pending => return Poll::Pending,
-            }
+        if matches!(self.poll_write_task(cx), Poll::Pending) {
+            return Poll::Pending;
         }
 
-        let file = self.file.clone();
+        if self.write_buffer.len() == self.write_buffer.capacity() {
+            self.spawn_buffer_flush();
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
 
-        let mut aligned = AlignedBuffer::new(buf.len());
-        aligned.extend_from_slice(buf);
-        let n = aligned.len();
+        let remaining = self.write_buffer.capacity() - self.write_buffer.len();
+        let to_copy = std::cmp::min(remaining, buf.len());
+        self.write_buffer.extend_from_slice(&buf[..to_copy]);
 
-        let task = tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-            let mut f = &*file;
-            f.write_all(aligned.as_slice())?;
-            Ok::<usize, std::io::Error>(n)
-        });
+        if self.write_buffer.len() == self.write_buffer.capacity() {
+            self.spawn_buffer_flush();
+        }
 
-        self.write_task = Some(task);
-        cx.waker().wake_by_ref();
-        Poll::Pending
+        Poll::Ready(Ok(to_copy))
     }
 
     fn poll_flush(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        if let Some(task) = &mut self.write_task {
-            match Pin::new(task).poll(cx) {
-                Poll::Ready(Ok(Ok(_))) => {
-                    self.write_task = None;
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(Ok(Err(e))) => {
-                    self.write_task = None;
-                    Poll::Ready(Err(e))
-                }
-                Poll::Ready(Err(e)) => {
-                    self.write_task = None;
-                    Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
-                }
-                Poll::Pending => Poll::Pending,
-            }
-        } else {
+        if self.write_buffer.len() > 0 && self.write_task.is_none() {
+            self.spawn_buffer_flush();
+        }
+
+        if matches!(self.poll_write_task(cx), Poll::Ready(Ok(()))) {
             Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
         }
     }
 
