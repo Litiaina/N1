@@ -1,233 +1,183 @@
-<div align="center">
-  <img
-    src="https://github.com/Litiaina/litiaina-admin-webpage/blob/master/images/litiaina_icon.png?raw=true"
-    alt="Litiaina Icon"
-    width="150"
-    height="150"
-  />
+# N1 Redistribution Guide
 
-  <h1>N1 Storage Redistribution Guide</h1>
-</div>
+This document reflects the current redistribution engine and API behavior in N1.
 
-This guide describes how **N1 safely re-stripes and realigns data** when storage topology changes occur, including:
+Redistribution is the online maintenance job that realigns existing objects to the
+current runtime storage topology:
 
-- Adding or removing data disks
-- Changing Erasure Coding (EC) ratios
-- Adding Index Mirrors for metadata redundancy
+- target EC layout (`data_shards`, `parity_shards`, `stripe_block_size`)
+- target blob disk set and placement
+- target index mirror set
 
-Redistribution is designed to be **online, deterministic, and crash-safe**, allowing the system to evolve without downtime.
+It runs without requiring a database and is designed to keep CRUD available while it
+migrates data in the background.
 
----
+## Current API Surface
 
-## Concept Overview
+- `POST /v4/maintenance/redistribution/start?dry_run=true|false`
+- `PATCH /v4/maintenance/redistribution/stop`
+- `GET /v4/maintenance/redistribution/monitor`
 
-Redistribution in N1 is a **background migration process** that ensures the physical storage layout matches the desired state defined in `config.ini`.
+Important differences from older docs:
 
-The system operates in three phases:
+- endpoint is `redistribution/start` (not `/v4/maintenance/redistribute`)
+- status endpoint is `redistribution/monitor`
+- stop is `PATCH`, not `POST`
 
-### 1. Discovery
-- Reads the **Target Configuration** from `config.ini`
-- Scans the primary metadata index
+## Authentication and Permissions
 
-### 2. Diagnosis
-Each object is evaluated for alignment:
+Redistribution endpoints require a valid bearer token from:
 
-**Data Alignment**
-- Do shards match the configured EC ratio (e.g., `7+3`)?
-- Do shard placements match the expected disk mapping (modulo-based)?
+- `POST /authenticate/fragment`
 
-**Metadata Alignment**
-- Does the metadata file (`.bson`) exist on *all* configured Index Disks?
+Required claims:
 
-### 3. Migration
-Depending on what is misaligned:
+- `start`: `write=true`, `modify=true`, `delete=true`
+- `stop`: `write=true`, `modify=true`, `delete=true`
+- `monitor`: `read=true`
 
-**Data Redistribution**
-- Reads existing shards (reconstructing data if required)
-- Re-encodes data using the new EC layout
-- Writes shards to target disks
-- Updates metadata and invalidates caches
-- Deletes obsolete shards after verification
+Admin bypass behavior:
 
-**Index Mirroring**
-- Copies existing metadata files to newly added Index Disks
-- Does not touch data blobs unless the blob layout also changed
+- when `fragment == ADMIN_KEY`, server validates `secret == MASTER_KEY`
+- otherwise fragment must exist and secret must match that fragment key
 
----
+## CLI Usage
 
-## Scenario A: Scaling Blob Storage (Adding Disks)
-
-**Goal:** Scale from **2 data disks (1+1 EC)** to **10 data disks (7+3 EC)**.
-
-### 1. Preparation
-
-Mount the new disks:
+Preferred commands:
 
 ```bash
-/mnt/data/disk2 ... /mnt/data/disk9
+# Start redistribution
+cargo run -p server -- ops redistribute start --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+
+# Dry-run (plan only, no writes)
+cargo run -p server -- ops redistribute start --dry-run --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+
+# Watch monitor
+cargo run -p server -- ops redistribute watch --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+
+# One-shot status
+cargo run -p server -- ops redistribute status --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+
+# Stop job (cooperative)
+cargo run -p server -- ops redistribute stop --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
 ```
 
-Verify ownership and permissions:
+Notes:
+
+- `ops redistribute start` only submits the job.
+- `ops redistribute watch` attaches a live terminal monitor.
+- monitor polling uses `--poll-ms` (global CLI flag).
+
+## HTTP Usage
 
 ```bash
-chown -R n1user:n1group /mnt/data
+# 1) Authenticate
+TOKEN="$(
+  curl -k -sS -X POST https://127.0.0.1:50001/authenticate/fragment \
+    -H 'Content-Type: application/json' \
+    -d '{"fragment":"'"$ADMIN_KEY"'","secret":"'"$MASTER_KEY"'","read":true,"write":true,"modify":true,"delete":true}' \
+  | jq -r .access_token
+)"
+
+# 2) Start full redistribution
+curl -k -sS -X POST \
+  "https://127.0.0.1:50001/v4/maintenance/redistribution/start?dry_run=false" \
+  -H "Authorization: Bearer $TOKEN"
+
+# 3) Monitor
+curl -k -sS https://127.0.0.1:50001/v4/maintenance/redistribution/monitor \
+  -H "Authorization: Bearer $TOKEN"
+
+# 4) Stop
+curl -k -sS -X PATCH https://127.0.0.1:50001/v4/maintenance/redistribution/stop \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
----
+## What the Engine Actually Does
 
-### 2. Update Configuration
+At job start:
 
-Edit `config.ini` to define the **new desired state**:
+- reads target topology from runtime config atomics
+- resolves currently reachable blob/index roots
+- rejects run if no reachable blob or index roots
 
-```ini
-[disk_config]
-# Add ALL paths. Order matters.
-blob_store_disks = /mnt/data/disk0,/mnt/data/disk1,...,/mnt/data/disk9
+Scan scope:
 
-[upload_config]
-data_shards = 7
-parity_shards = 3
-```
+- scans both live `index/` and trash `.trash/index/`
+- skips delete-marker metadata (`is_delete_marker = true`)
 
----
+For each object version, redistribution is needed when any of these are true:
 
-### 3. Restart N1
+- stripe size differs from target
+- current data/parity shard counts differ from target
+- shard absolute paths do not match expected target placement
+- live/trash path class is inconsistent
+- metadata file is missing on any reachable target index root
 
-Restart the service to load the new configuration.
+Migration path (non-dry-run):
 
-> **Note:** The API remains fully functional. Existing objects are read using absolute paths stored in metadata until redistribution completes.
+- streams old shards and re-encodes to new EC layout
+- writes new shards through direct I/O writer path
+- verifies shard length and checksum before publish
+- atomically publishes shard files
+- atomically writes updated metadata to reachable index mirrors
+- stages old shards for GC cleanup
+- tracks touched fragments for post-job prefix rebuild
 
----
+Post phase:
 
-### 4. Verify with Dry Run
+- if non-dry-run and fragments were touched, triggers prefix rebuild per touched fragment
+- marks final phase as `Completed`, `Stopped by User`, or `Failed`
 
-Preview planned actions without moving data:
+Dry-run behavior:
 
-```bash
-curl -X POST "https://localhost:50001/v4/maintenance/redistribute?dry_run=true" \
-     -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
-```
+- performs full scan and need-detection
+- increments migration counters for planned objects
+- does not write shards or metadata
 
-Logs will show entries such as:
+## Status Fields (`/monitor`)
 
-```text
-[DRY RUN] Would redistribute uid/fragment/object_key
-```
+The monitor payload includes:
 
----
+- `is_running`
+- `phase`
+- `total_fragments_scanned`
+- `total_objects_scanned`
+- `total_objects_need_redistribution`
+- `total_objects_migrated`
+- `total_errors`
+- `current_fragment`
+- `last_object`
+- `last_error`
+- `start_timestamp`
+- `duration_seconds`
+- `scan_rate_per_sec`
 
-### 5. Execute Redistribution
+## Operational Guidance
 
-Start the migration:
+Before running:
 
-```bash
-curl -X POST "https://localhost:50001/v4/maintenance/redistribute?dry_run=false" \
-     -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
-```
+- apply new disk/EC configuration and ensure server has loaded it
+- verify target disks are mounted and writable
+- run dry-run first to estimate impact
 
-- Operations run sequentially to avoid system lockup
-- CPU and disk I/O usage will increase
+During run:
 
-Completion is indicated by:
+- expect increased disk I/O and CPU
+- CRUD remains available, but throughput can dip under load
+- use `ops redistribute watch` for real-time visibility
 
-```text
-Redistribution Job Complete
-```
+After run:
 
----
+- check `phase == Completed`
+- ensure `total_errors == 0`
+- run health and consistency checks
+- only then decommission removed disks
 
-## Scenario B: Scaling Down (Removing Disks)
+## Known Constraints
 
-**Goal:** Scale from **10 disks down to 5**.
-
-> **CRITICAL:** Do **not** unmount or remove disks before redistribution completes.
-
-### 1. Update Configuration
-
-Remove disks to be decommissioned:
-
-```ini
-[disk_config]
-blob_store_disks = /mnt/data/disk0,/mnt/data/disk1,/mnt/data/disk2,/mnt/data/disk3,/mnt/data/disk4
-
-[upload_config]
-data_shards = 3
-parity_shards = 2
-```
-
----
-
-### 2. Restart and Redistribute
-
-Restart N1 and run the redistribution job.
-
-N1 will:
-- Read shards from excluded disks using absolute metadata paths
-- Re-encode and write data to remaining disks
-- Automatically delete old shards as migration completes
-
----
-
-### 3. Decommission Disks
-
-After completion:
-- Verify excluded disks are empty (or nearly empty)
-- Safely unmount and physically remove the drives
-
----
-
-## Scenario C: Adding Index Mirrors (Metadata)
-
-**Goal:** Add a third Index Disk for triple metadata redundancy.
-
-### 1. Update Configuration
-
-```ini
-[disk_config]
-index_store_disks = /mnt/index/disk0,/mnt/index/disk1,/mnt/index/disk2
-```
-
----
-
-### 2. Run Redistribution
-
-```http
-POST /v4/maintenance/redistribute?dry_run=false
-```
-
-**Logic**
-- Existing metadata on `disk0` and `disk1` is detected as missing on `disk2`
-
-**Action**
-- `.bson` files are copied to the new Index Disk
-- Data blobs remain untouched unless blob configuration also changed
-
----
-
-## Operational Notes
-
-### Zero-Downtime Guarantee
-
-- Streaming continues uninterrupted during redistribution
-- Reads transparently switch to new locations on subsequent requests
-
-**Atomic Transition**
-1. New data is written
-2. Metadata is updated on all Index Mirrors
-3. In-memory caches are invalidated
-4. Old data is deleted
-
----
-
-### Performance Impact
-
-- **CPU:** Increased usage due to Reed-Solomon encoding
-- **I/O:** Sequential processing avoids lockups, but user throughput may temporarily decrease due to contention
-
----
-
-## Summary
-
-N1 redistribution enables **safe, online evolution of storage topology**.
-
-By treating configuration as the desired end state and metadata as the source of truth, N1 guarantees deterministic, recoverable, and zero-downtime migration across data and metadata layouts.
+- stop is cooperative, not instant; current object step may finish first
+- unreachable disks are skipped from live target sets; this can limit migration coverage
+- if target data shard count exceeds reachable blob disks, affected objects fail with
+  `InsufficientStorage`
+- rerunning redistribution is safe and expected for convergence after transient failures
