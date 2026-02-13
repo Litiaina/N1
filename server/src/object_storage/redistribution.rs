@@ -4,28 +4,29 @@ use crate::object_storage::constants::{
     RESERVATION_FILE, SHARD_SUFFIX,
 };
 use crate::object_storage::disk_manager::{
-    INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, Quota, ShardInfo,
-    default_stripe_size,
+    default_stripe_size, ObjectMetadata, ObjectPathManager, PartMetadata, Quota, ShardInfo,
+    INDEX_STORE_DISKS,
 };
 use crate::object_storage::ec::ErasureStreamWriter;
 use crate::object_storage::fragment_metadata::{read_fragment_metadata, write_fragment_metadata};
 use crate::object_storage::prefix_rebuilder::run_prefix_rebuild_job;
 use crate::object_storage::recovery::read_or_recover_chunk;
 use crate::object_storage::upload::{
-    DATA_SHARDS_ATOMIC, DirectWriter, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, create_direct_file,
-    sync_dir,
+    create_direct_file, sync_dir, DirectWriter, DATA_SHARDS_ATOMIC, PARITY_SHARDS_ATOMIC,
+    STRIPE_SIZE_ATOMIC,
 };
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::manager::WsConnectionManager;
 use crate::websocket::ws_structs::StorageEventPayload;
 
-use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::Json;
 
 use chrono::Utc;
+use crc32fast::Hasher as Crc32Hasher;
 use serde::Serialize;
 
 use std::collections::{HashMap, HashSet};
@@ -36,7 +37,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio::fs as tokio_fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, info, warn};
 use ulid::Ulid;
 use walkdir::WalkDir;
@@ -903,6 +904,60 @@ async fn cleanup_tmp_files(files: &[PathBuf]) {
     }
 }
 
+async fn crc32_file_hex(path: &Path) -> Result<String, AppError> {
+    let mut f = tokio_fs::File::open(path)
+        .await
+        .map_err(|e| AppError::Io(e, format!("open for crc32 {}", path.display())))?;
+
+    let mut hasher = Crc32Hasher::new();
+    let mut buf = vec![0u8; 256 * 1024];
+
+    loop {
+        let n = f
+            .read(&mut buf)
+            .await
+            .map_err(|e| AppError::Io(e, format!("read crc32 {}", path.display())))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+
+    Ok(format!("{:08x}", hasher.finalize()))
+}
+
+async fn verify_tmp_shard(
+    tmp_path: &Path,
+    expected_len: u64,
+    expected_crc32: Option<&str>,
+) -> Result<(), AppError> {
+    let len_ok = tokio_fs::metadata(tmp_path)
+        .await
+        .map(|m| m.len() == expected_len)
+        .unwrap_or(false);
+
+    if !len_ok {
+        return Err(AppError::InternalServerError(format!(
+            "Shard length mismatch for {}",
+            tmp_path.display()
+        )));
+    }
+
+    if let Some(exp) = expected_crc32.filter(|s| !s.is_empty()) {
+        let got = crc32_file_hex(tmp_path).await?;
+        if !got.eq_ignore_ascii_case(exp) {
+            return Err(AppError::InternalServerError(format!(
+                "Shard checksum mismatch for {} (expected {}, got {})",
+                tmp_path.display(),
+                exp,
+                got
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 async fn redistribute_object_streaming(
     meta: &mut ObjectMetadata,
     target_data_shards: usize,
@@ -1099,17 +1154,34 @@ async fn redistribute_object_streaming(
         for (i, s) in sums.into_iter().enumerate() {
             sum_map.insert(i, s);
         }
+        let writers = stream_writer.into_writers();
+
+        for w in writers.into_iter().flatten() {
+            if let Err(e) = w.sync_data().await {
+                cleanup_tmp_files(&created_tmps).await;
+                return Err(AppError::Io(e, "fsync redistribution shard".into()));
+            }
+        }
+
         for s in new_shards.iter_mut() {
             if let Some(v) = sum_map.get(&s.shard_index) {
                 s.checksum = v.clone();
             }
         }
+        let checksum_by_name: HashMap<&str, &str> = new_shards
+            .iter()
+            .map(|s| (s.file_name.as_str(), s.checksum.as_str()))
+            .collect();
 
         for (tmp, final_p, parent, fname) in &commit_list {
             if should_stop() {
                 cleanup_tmp_files(&created_tmps).await;
                 return Err(AppError::InternalServerError("Stopped".into()));
             }
+
+            let expected_crc = checksum_by_name.get(fname.as_str()).copied();
+
+            verify_tmp_shard(tmp.as_path(), final_shard_len, expected_crc).await?;
 
             publish_tmp_overwrite(tmp.as_path(), final_p.as_path(), parent.as_path(), fname)
                 .await?;

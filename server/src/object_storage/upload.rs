@@ -45,6 +45,7 @@ use crate::object_storage::disk_manager::{
     PrefixIndexSegment, ReservationReceipt, ShardInfo, UploadPartQuery, UploadStatusResponse,
 };
 use crate::object_storage::ec::{AlignedBuffer, ErasureStreamWriter};
+use crate::object_storage::prefix_compactor::schedule_prefix_compaction;
 use crate::object_storage::quota_manager::{try_reserve_quota, update_quota};
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -56,9 +57,51 @@ pub static PARITY_SHARDS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static WRITER_BUFFER_SIZE_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static STRIPE_SIZE_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static MAX_IO_SEMAPHORE: OnceCell<usize> = OnceCell::new();
+pub static ADAPTIVE_IO_TARGET_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 
 static IO_SEMAPHORE: Lazy<Semaphore> =
     Lazy::new(|| Semaphore::new(*MAX_IO_SEMAPHORE.get().unwrap()));
+static ACTIVE_IO_INFLIGHT: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
+
+struct AdaptiveIoGuard<'a> {
+    _permit: tokio::sync::SemaphorePermit<'a>,
+}
+
+impl Drop for AdaptiveIoGuard<'_> {
+    fn drop(&mut self) {
+        ACTIVE_IO_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+async fn acquire_adaptive_io_guard() -> Result<AdaptiveIoGuard<'static>, AppError> {
+    loop {
+        let target = ADAPTIVE_IO_TARGET_ATOMIC
+            .get()
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or_else(|| *MAX_IO_SEMAPHORE.get().unwrap_or(&128usize))
+            .max(1);
+
+        let active = ACTIVE_IO_INFLIGHT.load(Ordering::Relaxed);
+        if active < target {
+            if ACTIVE_IO_INFLIGHT
+                .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    match IO_SEMAPHORE.acquire().await {
+        Ok(permit) => Ok(AdaptiveIoGuard { _permit: permit }),
+        Err(_) => {
+            ACTIVE_IO_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+            Err(AppError::InternalServerError("Server busy".into()))
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadSessionManifest {
@@ -1043,10 +1086,7 @@ pub async fn object_upload_part(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let _io_guard = IO_SEMAPHORE
-        .acquire()
-        .await
-        .map_err(|_| AppError::InternalServerError("Server busy".into()))?;
+    let _io_guard = acquire_adaptive_io_guard().await?;
 
     let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
     let data_shards = DATA_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
@@ -1574,6 +1614,11 @@ pub async fn finalize_object_upload(
         object_meta.created_at,
     )
     .await?;
+
+    schedule_prefix_compaction(
+        fragment.clone(),
+        prefixes_for_key(&object_key).into_iter().collect(),
+    );
 
     let meta_dirs = path_manager.get_all_session_dirs(&fragment, &version_id);
     let cleanup_futures = meta_dirs.iter().map(|dir| async move {

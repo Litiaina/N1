@@ -8,14 +8,14 @@ use axum::extract::{FromRequestParts, Request};
 use axum::http::request::Parts;
 use axum::middleware::Next;
 use axum::{
-    Json, RequestPartsExt,
     http::StatusCode,
     response::{IntoResponse, Response},
+    Json, RequestPartsExt,
 };
 use axum_extra::TypedHeader;
-use headers::Authorization;
 use headers::authorization::Bearer;
-use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use headers::Authorization;
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde_json::json;
 use std::env;
 use std::fmt::Display;
@@ -67,7 +67,7 @@ pub async fn authorize_fragment(
     }
 
     if payload.fragment == *ADMIN_KEY {
-        if payload.secret != *AUTH_KEY {
+        if payload.secret != *MASTER_KEY {
             return Err(AuthError::WrongCredentials);
         }
     } else {
@@ -271,4 +271,83 @@ pub enum AuthError {
     InvalidToken,
     InternalError,
     FragmentNotFound,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::Validation;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_guard() -> &'static Mutex<()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| Mutex::new(()))
+    }
+
+    fn ensure_test_env() {
+        if std::env::var("JWT_SECRET").is_err() {
+            unsafe { std::env::set_var("JWT_SECRET", "test-jwt-secret") };
+        }
+        if std::env::var("AUTH_KEY").is_err() {
+            unsafe { std::env::set_var("AUTH_KEY", "test-auth-key") };
+        }
+        if std::env::var("MASTER_KEY").is_err() {
+            unsafe { std::env::set_var("MASTER_KEY", "test-master-key") };
+        }
+        if std::env::var("ADMIN_KEY").is_err() {
+            unsafe { std::env::set_var("ADMIN_KEY", "test-admin-fragment") };
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_fragment_accepts_master_key_and_mints_admin_claim() {
+        let _guard = env_guard().lock().expect("env guard");
+        ensure_test_env();
+
+        let payload = AuthorizationRequest {
+            fragment: ADMIN_KEY.clone(),
+            secret: MASTER_KEY.clone(),
+            read: true,
+            write: true,
+            modify: true,
+            delete: true,
+            expires_in: Some(60),
+        };
+
+        let Json(body) = match authorize_fragment(Json(payload)).await {
+            Ok(v) => v,
+            Err(_) => panic!("admin auth should succeed"),
+        };
+
+        let decoded = decode::<Claims>(
+            &body.access_token,
+            &JWT_KEYS.decoding,
+            &Validation::default(),
+        )
+        .expect("decode token");
+        assert_eq!(decoded.claims.fragment, *ADMIN_KEY);
+        assert!(decoded.claims.read);
+        assert!(decoded.claims.write);
+        assert!(decoded.claims.modify);
+        assert!(decoded.claims.delete);
+    }
+
+    #[tokio::test]
+    async fn admin_fragment_rejects_non_master_secret() {
+        let _guard = env_guard().lock().expect("env guard");
+        ensure_test_env();
+
+        let payload = AuthorizationRequest {
+            fragment: ADMIN_KEY.clone(),
+            secret: "not-master".to_string(),
+            read: true,
+            write: true,
+            modify: true,
+            delete: true,
+            expires_in: Some(60),
+        };
+
+        let res = authorize_fragment(Json(payload)).await;
+        assert!(matches!(res, Err(AuthError::WrongCredentials)));
+    }
 }

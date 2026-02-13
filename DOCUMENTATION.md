@@ -1,4 +1,3 @@
-
 <div align="center">
   <img
     src="https://github.com/Litiaina/litiaina-admin-webpage/blob/master/images/litiaina_icon.png?raw=true"
@@ -6,172 +5,97 @@
     width="150"
     height="150"
   />
-  <h1>Litiaina N1 Storage API (v4) — Complete Reference</h1>
-  <p>Routes and behavior aligned to <code>routes.rs</code> (fragment‑centric N1).</p>
+  <h1>Litiaina N1 API Documentation</h1>
+  <p>Complete route reference and usage guide (current implementation).</p>
 </div>
 
-> This document reflects the **current v4 router layout**: fragment-centric object storage (CAS + EC), separate auth endpoints, maintenance jobs, public sharing, and WebSocket events.
+> Source of truth for routing: `server/src/routes/storage_routes.rs`.
+> Source of truth for request/response behavior: the handler files under `server/src/object_storage` and `server/src/fs`.
 
----
+## 1. Base URL And Conventions
+- Base URL example: `https://127.0.0.1:50001`
+- Ping: `GET /ping` -> `pong`
+- Protected v4 APIs require: `Authorization: Bearer <fragment_jwt>`
+- Most fragment-scoped routes enforce `claims.fragment == {fragment}`
+- Object key path captures use `{*object_key}` and support slash-separated keys
+- Range requests use standard `Range: bytes=start-end`
 
-`This is subject to change and is not stable. Needs further testing.`
+## 2. Auth APIs
 
-## Table of Contents
-
-- [Base URL & Versioning](#base-url--versioning)
-- [Authentication](#authentication)
-  - [Fragment auth (object storage)](#fragment-auth-object-storage)
-  - [FS auth (legacy fs routes)](#fs-auth-legacy-fs-routes)
-- [Permissions & Common Rules](#permissions--common-rules)
-- [Error Responses](#error-responses)
-- [Core Data Models](#core-data-models)
-- [Object Storage Read APIs](#object-storage-read-apis)
-- [Object Storage Write APIs](#object-storage-write-apis)
-- [Upload APIs (multipart / resumable)](#upload-apis-multipart--resumable)
-- [Sharing APIs](#sharing-apis)
-- [Maintenance APIs](#maintenance-apis)
-- [WebSocket APIs](#websocket-apis)
-- [Public + Bootstrapping APIs](#public--bootstrapping-apis)
-- [Quick Endpoint Index](#quick-endpoint-index)
-
----
-
-## Base URL & Versioning
-
-All endpoints here are under **v4** unless stated otherwise.
-
-- Example base URL: `https://storage.example.com`
-- Example endpoint: `GET https://storage.example.com/v4/fragment/list`
-
----
-
-## Authentication
-
-N1 has **separate auth entry points** for:
-1) **Object Storage v4** (fragment-scoped JWT)  
-2) **Legacy FS routes** (`/dir/...`), which are still present for compatibility
-
-### Fragment auth (object storage)
-
-**POST** `/authenticate/fragment`
-
+### 2.1 `POST /authenticate/fragment`
 Purpose:
-- Obtain a **fragment-scoped JWT** used for all `/v4/...` protected object-storage routes.
-- The token typically encodes: `fragment`, and permissions booleans: `read/write/modify/delete`.
+- Issues fragment-scoped JWT for `/v4/*` protected APIs.
+- Supports two auth modes:
+  - Fragment mode: `secret=<fragment_secret>` and `fragment=<fragment_hash>`
+  - Admin mode: `fragment=<ADMIN_KEY>` and `secret=<MASTER_KEY>` (admin fragment bypasses fragment existence checks)
 
-Typical request body (shape may vary by your implementation):
-
-```json
-{
-  "fragment": "my-fragment",
-  "secret": "fragment-secret",
-  "read": true,
-  "write": true,
-  "modify": true,
-  "delete": true
-}
+Typical usage:
+```bash
+curl -k -X POST "https://127.0.0.1:50001/authenticate/fragment" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "fragment": "<fragment_hash>",
+    "secret": "<fragment_secret>",
+    "read": true,
+    "write": true,
+    "modify": true,
+    "delete": true
+  }'
 ```
 
-Typical response:
-
-```json
-{
-  "access_token": "<JWT>"
-}
+Admin maintenance usage:
+```bash
+curl -k -X POST "https://127.0.0.1:50001/authenticate/fragment" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "fragment": "admin",
+    "secret": "<MASTER_KEY>",
+    "read": true,
+    "write": true,
+    "modify": true,
+    "delete": true
+  }'
 ```
 
-Use it on protected v4 routes:
+Notes:
+- Admin mode requires exact admin fragment value from `ADMIN_KEY`; any other fragment value follows normal fragment existence validation.
+- For maintenance watches (`ops gc/repair/redistribute/prefix-rebuild`), CLI now prints `Last Error` when status polling fails or times out.
 
-```
-Authorization: Bearer <JWT>
-```
-
-### FS auth (legacy fs routes)
-
-**POST** `/authenticate/fs`
-
+### 2.2 `POST /authenticate/fs`
 Purpose:
-- Authenticate the legacy FS API under `/dir/...`.
+- Issues legacy FS auth context for `/dir/*` routes.
 
-Request/response shape depends on your implementation (often email+password or user+password).
-
----
-
-## Permissions & Common Rules
-
-### Permission flags (Claims)
-The v4 object-storage routes are wrapped with `validate_access`, and handlers commonly enforce:
-
-- `read`: list, get, stream, metadata, download, status endpoints
-- `write`: upload, delete, recover, create signed URL (varies), etc.
-- `modify`: fragment modify, rename operations
-- `delete`: destructive operations (delete/permanent/trash empty, stop/start jobs depending)
-
-If a token lacks the required permission, the server returns **403 Forbidden**.
-
-### Fragment parameter
-Most v4 routes are **fragment-scoped**:
-- the JWT must match the fragment path parameter
-- the server rejects cross-fragment access
-
-### Object keys
-Routes using `{*object_key}` capture the rest of the path. Clients should:
-- keep slashes as path separators
-- percent-encode special characters (`#`, `%`, spaces, etc.)
-
-### Range support
-Streaming/download endpoints generally support:
-
-```
-Range: bytes=start-end
+```bash
+curl -k -X POST "https://127.0.0.1:50001/authenticate/fs" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"...","password":"..."}'
 ```
 
-### Upload parts
-`PUT /v4/upload/chunk/...` requires:
-- `Content-Length` header
-- part indices are 0-based unless your client chooses otherwise (server expects consistent indexing)
+## 3. Permission Model (Protected v4)
+- `read`: listing, metadata, get, stream, download, status endpoints
+- `write`: upload, recover, start maintenance jobs
+- `modify`: rename/fragment updates and maintenance controls
+- `delete`: destructive endpoints and some stop/start controls
 
----
+Common rejections:
+- `401` invalid/missing JWT
+- `403` permission denied or fragment mismatch
+- `404` object/version not found
+- `409` conflicting state (job already running, missing parts, etc.)
 
-## Error Responses
+## 4. Common Request/Response Schemas
 
-Errors are mapped from your `AppError` to HTTP status codes. Typical patterns:
-
-- `400 Bad Request` — invalid input, reserved path, bad signature
-- `401 Unauthorized` — missing/invalid JWT
-- `403 Forbidden` — permission denied or fragment mismatch
-- `404 Not Found` — object/version missing, expired share link
-- `409 Conflict` — invalid state (e.g., missing parts on finalize, job already running)
-- `416 Range Not Satisfiable` — invalid range
-- `500 Internal Server Error` — unexpected failures / storage backend issues
-
-Payload shape depends on your error handler; common JSON format:
-
-```json
-{ "error": "message" }
-```
-
----
-
-## Core Data Models
-
-> Model shapes below reflect the **v4 object storage** handlers (upload.rs, retrieve.rs, etc.).  
-> Some admin/fragment manager models may differ if you changed request/response structs.
-
-### InitiateUploadParams
-
-Used by `POST /v4/upload/init/...` and `POST /v4/upload/finalize/...` (some implementations reuse the same struct).
-
+### 4.1 Initiate Upload
+Request (`InitiateUploadParams`):
 ```json
 {
   "content_type": "application/octet-stream",
-  "total_size_bytes": 123456,
+  "total_size_bytes": 1048576,
   "expected_parts": 4
 }
 ```
 
-### InitiateUploadResponse
-
+Response (`InitiateUploadResponse`):
 ```json
 {
   "session_id": "01J...",
@@ -179,559 +103,841 @@ Used by `POST /v4/upload/init/...` and `POST /v4/upload/finalize/...` (some impl
 }
 ```
 
-### UploadStatusResponse
-
+### 4.2 Upload Status
 ```json
 {
   "uploaded_parts": [0, 1, 2]
 }
 ```
 
-### FinalizeIncompleteResponse
-
-Returned when finalize is attempted but parts are missing:
-
+### 4.3 Archive Request (`DownloadArchiveRequest`)
 ```json
 {
-  "uploaded_parts": [0, 1],
-  "missing_parts": [2, 3],
-  "expected_parts": 4
-}
-```
-
-### ListUploadsResponse
-
-```json
-{
-  "sessions": [
-    {
-      "session_id": "01J...",
-      "version_id": "01J...",
-      "object_key": "path/to/file.bin",
-      "created_at": 1730000000,
-      "reserved_size": 123456,
-      "total_size_bytes": 123456,
-      "expected_parts": 4
-    }
-  ],
-  "total": 1
-}
-```
-
-### ObjectMetadata (high level)
-
-The server returns object metadata for reads and finalize responses. The exact schema depends on your internal struct,
-but the important stable fields are:
-
-- `fragment`, `object_key`, `version_id`
-- `content_type`, `total_size_bytes`
-- `created_at`
-- `parts[]` (each part has shard list, checksums, etc.)
-- `is_delete_marker`
-
----
-
-## Object Storage Read APIs
-
-All routes below require `Authorization: Bearer <JWT>` and `read=true` unless stated otherwise.
-
-### Get capacity usage (per fragment)
-**GET** `/v4/capacity/usage/{fragment}`
-
-Returns fragment usage (implementation-defined payload), commonly:
-
-```json
-{ "capacity_used": 123456789 }
-```
-
----
-
-### List fragments (private / authenticated)
-**GET** `/v4/fragment/list`
-
-Returns fragments visible to this credential (implementation-defined):
-
-```json
-["fragmentA", "fragmentB"]
-```
-
----
-
-### List objects in fragment
-**GET** `/v4/fragment/objects/{fragment}`
-
-Typical query params (if implemented):
-- `limit`
-- `prefix`
-- `continuation_token`
-
-Returns list + pagination token.
-
----
-
-### List trash objects in fragment
-**GET** `/v4/fragment/trash/{fragment}`
-
-Same listing semantics as normal list, but for `.trash` namespace.
-
----
-
-### List object versions
-**GET** `/v4/fragment/versions/{fragment}/{*object_key}`
-
-Returns versions newest-first (implementation-defined array of metadata/summary).
-
----
-
-### Get object bytes (inline)
-**GET** `/v4/fragment/get/{fragment}/{*object_key}`
-
-- `Content-Disposition: inline`
-- Supports `Range`
-
----
-
-### Stream object bytes
-**GET** `/v4/fragment/stream/{fragment}/{*object_key}`
-
-- Streaming-friendly variant
-- Supports `Range`
-
----
-
-### Get object metadata
-**GET** `/v4/fragment/meta/{fragment}/{*object_key}`
-
-Returns full `ObjectMetadata`.
-
----
-
-### Download object
-**GET** `/v4/fragment/download/{fragment}`
-
-Typically uses query parameters like:
-- `object_key` (required)
-- `version_id` (optional)
-
-Returns:
-- `Content-Disposition: attachment`
-
----
-
-### Download chunk (assembled)
-**GET** `/v4/fragment/download/chunk/{fragment}`
-
-Typically uses query parameters like:
-- `object_key` (required)
-- `offset` (required)
-- `chunk_size` (required)
-
-Reads metadata and reconstructs contiguous bytes from shards if needed.
-
----
-
-### Download archive of selected objects
-**POST** `/v4/fragment/archive/{fragment}`
-
-Body example (implementation-defined; common pattern):
-
-```json
-{
-  "keys": ["a/b.txt", "c/d.png"],
-  "format": "zip",
+  "keys": ["reports/a.pdf", "videos/b.mp4"],
+  "prefix": "videos/2026",
+  "delimiter": "/",
+  "max_keys": 10000,
+  "continuation_token": "<token>",
+  "format": "tar",
   "filename": "export"
 }
 ```
+Notes:
+- `keys` can be explicit list.
+- Or resolve by `prefix` with optional `delimiter` (`/` supported).
+- Large archive responses can return header `x-n1-archive-next-token`.
 
----
-
-## Object Storage Write APIs
-
-All routes below require `Authorization: Bearer <JWT>` and `write=true` unless stated otherwise.
-
-### Delete fragment
-**DELETE** `/v4/fragment/delete/{fragment}`
-
-Requires `delete=true` (and sometimes `modify=true` depending on your policy).
-
----
-
-### Modify fragment (metadata/config)
-**PATCH** `/v4/fragment/modify/{fragment}`
-
-Requires `modify=true`.
-
----
-
-### Empty trash
-**DELETE** `/v4/fragment/trash/empty/{fragment}`
-
-Requires `delete=true`.
-
----
-
-### Rename object
-**PATCH** `/v4/fragment/object/rename`
-
-Requires `modify=true`.
-
-Body example:
-
+### 4.4 Signed URL Request
 ```json
 {
-  "fragment": "my-fragment",
-  "source_key": "a/b.txt",
-  "destination_key": "a/c.txt"
-}
-```
-
----
-
-### Soft delete object (move to trash)
-**DELETE** `/v4/fragment/object/delete/{fragment}/{*object_key}`
-
-Requires `delete=true`.
-
----
-
-### Delete a specific version
-**DELETE** `/v4/fragment/version/delete/{fragment}/{version_id}/{*object_key}`
-
-Requires `delete=true`.
-
----
-
-### Permanent delete object
-**DELETE** `/v4/fragment/permanent/delete/{fragment}/{*object_key}`
-
-Requires `delete=true`. Destroys blobs + metadata.
-
----
-
-### Recover a specific version from trash
-**POST** `/v4/fragment/recover/version/{fragment}/{version_id}/{*object_key}`
-
-Requires `write=true` (and often `modify=true` depending on your policy).
-
----
-
-### Recover latest object from trash
-**POST** `/v4/fragment/recover/object/{fragment}/{*object_key}`
-
----
-
-### Recover ALL trash (bulk restore)
-**POST** `/v4/fragment/recover/trash/all/{fragment}`
-
----
-
-## Upload APIs (multipart / resumable)
-
-Upload flow:
-1) `init` → returns `(version_id, session_id)`
-2) `chunk` uploads (parts)
-3) `status` can be polled for resumability
-4) `finalize` publishes metadata (object becomes visible)
-5) `cancel` tears down session + quota reservation
-
-### Initiate upload
-**POST** `/v4/upload/init/{fragment}/{*object_key}`
-
-Body: `InitiateUploadParams`  
-Response: `InitiateUploadResponse`
-
----
-
-### Upload status (for resumable upload)
-**GET** `/v4/upload/status/{fragment}/{version_id}`
-
-Response: `UploadStatusResponse`
-
----
-
-### List active uploads for fragment
-**GET** `/v4/upload/status/list/{fragment}`
-
-Query params (typical):
-- `limit`
-- `offset`
-
-Response: `ListUploadsResponse`
-
----
-
-### Upload one part (chunk)
-**PUT** `/v4/upload/chunk/{fragment}/{version_id}/{part_index}`
-
-Query params (if implemented):
-- `enable_checksum=true|false`
-- `checksum=<hex>` (optional)
-
-Headers:
-- `Content-Length: <bytes>`
-
-Body:
-- raw bytes for that part
-
----
-
-### Finalize upload
-**POST** `/v4/upload/finalize/{fragment}/{version_id}/{session_id}`
-
-Body: `InitiateUploadParams` (often reused for content_type / expected_parts / total_size_bytes)
-
-Returns:
-- `200 OK` with object metadata on success
-- `409 Conflict` + `FinalizeIncompleteResponse` if missing parts
-
----
-
-### Cancel upload session
-**DELETE** `/v4/upload/cancel/{fragment}/{version_id}`
-
-Cancels an upload that has not been finalized.
-
----
-
-## Sharing APIs
-
-### Create signed URL (protected)
-**POST** `/v4/share/create`
-
-Requires `read=true`.
-
-Body example (implementation-defined):
-
-```json
-{
-  "fragment": "my-fragment",
-  "object_key": "a/b.txt",
+  "fragment": "<fragment_hash>",
+  "object_key": "videos/clip.mp4",
   "expires_in": 3600,
-  "disposition": "download"
+  "disposition": "view"
 }
 ```
+`disposition`: `view | stream | download`.
 
-Response:
+## 5. Public And Global APIs
 
+### 5.1 `GET /ping`
+```bash
+curl -k "https://127.0.0.1:50001/ping"
+```
+
+### 5.2 `GET /v4/fragment/list/public`
+Returns public fragment hashes.
+```bash
+curl -k "https://127.0.0.1:50001/v4/fragment/list/public"
+```
+
+### 5.3 `GET /v4/fragment/check`
+Implementation expects JSON body with fragment hash.
+```bash
+curl -k -X GET "https://127.0.0.1:50001/v4/fragment/check" \
+  -H "Content-Type: application/json" \
+  -d '{"fragment":"<fragment_hash>"}'
+```
+
+### 5.4 `GET /v4/fragment/get/hash`
+Implementation expects JSON body with fragment name.
+```bash
+curl -k -X GET "https://127.0.0.1:50001/v4/fragment/get/hash" \
+  -H "Content-Type: application/json" \
+  -d '{"fragment":"tenant-a"}'
+```
+
+### 5.5 `POST /v4/fragment/create`
+Requires master secret.
+```bash
+curl -k -X POST "https://127.0.0.1:50001/v4/fragment/create" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":"tenant-a",
+    "quota":1099511627776,
+    "secret":"<master_key>",
+    "key":"<fragment_key>"
+  }'
+```
+
+### 5.6 `GET /v4/public/share`
+No bearer token required. Query is signature-based.
+Required query params:
+- `fragment`
+- `object_key`
+- `expires`
+- `signature`
+Optional:
+- `disposition=view|stream|download`
+
+```bash
+curl -k "https://127.0.0.1:50001/v4/public/share?fragment=<f>&object_key=<k>&expires=<ts>&signature=<sig>&disposition=view"
+```
+
+## 6. Protected v4 Read APIs
+All endpoints in this section require a valid fragment JWT with `read=true`.
+
+### 6.1 `GET /v4/capacity/usage/{fragment}`
+Returns fragment capacity usage.
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/capacity/usage/<fragment_hash>"
+```
+
+### 6.2 `GET /v4/fragment/list`
+Lists fragment usage objects visible to claims.
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/fragment/list"
+```
+
+### 6.3 `GET /v4/fragment/objects/{fragment}`
+Query:
+- `limit` default `100`, max `1000`
+- `continuation_token` optional
+- `prefix` optional
+- `delimiter` optional (`/`)
+
+Response shape (`ListObjectsResult`):
+- `objects`: array of `ObjectMetadata`
+- `common_prefixes`: array (with delimiter listing)
+- `continuation_token`: optional
+
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/fragment/objects/<fragment_hash>?prefix=videos/2026&delimiter=/&limit=200"
+```
+
+### 6.4 `GET /v4/fragment/trash/{fragment}`
+Trash listing, same pagination style.
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/fragment/trash/<fragment_hash>?limit=100"
+```
+
+### 6.5 `GET /v4/fragment/versions/{fragment}/{*object_key}`
+Lists versions for one object key.
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/fragment/versions/<fragment_hash>/videos/a.mp4"
+```
+
+### 6.6 `GET /v4/fragment/get/{fragment}/{*object_key}`
+Inline object response. Supports range.
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  -H "Range: bytes=0-1048575" \
+  "https://127.0.0.1:50001/v4/fragment/get/<fragment_hash>/videos/a.mp4" \
+  -o part.bin
+```
+
+### 6.7 `GET /v4/fragment/stream/{fragment}/{*object_key}`
+Streaming variant. Supports range.
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  -H "Range: bytes=0-1048575" \
+  "https://127.0.0.1:50001/v4/fragment/stream/<fragment_hash>/videos/a.mp4" \
+  -o stream.bin
+```
+
+### 6.8 `GET /v4/fragment/meta/{fragment}/{*object_key}`
+Returns full object metadata.
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/fragment/meta/<fragment_hash>/videos/a.mp4"
+```
+
+### 6.9 `GET /v4/fragment/download/{fragment}`
+Query:
+- `object_key` required
+- `version_id` optional
+
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/fragment/download/<fragment_hash>?object_key=videos/a.mp4" \
+  -o a.mp4
+```
+
+### 6.10 `GET /v4/fragment/download/chunk/{fragment}`
+Query:
+- `object_key` required
+- `offset` required
+- `chunk_size` required
+
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/fragment/download/chunk/<fragment_hash>?object_key=videos/a.mp4&offset=0&chunk_size=1048576" \
+  -o chunk.bin
+```
+
+### 6.11 `POST /v4/fragment/archive/{fragment}`
+Purpose:
+- Streams selected objects as `tar` or `zip`.
+- Memory bounded; does not materialize whole archive in RAM.
+
+Behavior:
+- If selection is very large (>1000 keys), server forces `tar`.
+- Response may include `x-n1-archive-next-token` for continuation.
+
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://127.0.0.1:50001/v4/fragment/archive/<fragment_hash>" \
+  -d '{
+    "prefix":"videos/2026",
+    "delimiter":"/",
+    "max_keys":5000,
+    "format":"tar",
+    "filename":"videos-export"
+  }' \
+  -o videos-export.tar
+```
+
+### 6.12 `POST /v4/share/create`
+Creates signed public URL for an object.
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://127.0.0.1:50001/v4/share/create" \
+  -d '{
+    "fragment":"<fragment_hash>",
+    "object_key":"videos/a.mp4",
+    "expires_in":3600,
+    "disposition":"view"
+  }'
+```
+
+## 7. Protected v4 Write/Modify/Delete APIs
+
+### 7.1 `DELETE /v4/fragment/delete/{fragment}`
+Deletes fragment data on index/blob roots.
+```bash
+curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/fragment/delete/<fragment_hash>"
+```
+
+### 7.2 `PATCH /v4/fragment/modify/{fragment}`
+Body fields:
+- `new_name` optional
+- `new_quota` optional
+- `new_key` optional
+- `secret` optional (master secret for admin-level actions)
+
+```bash
+curl -k -X PATCH -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://127.0.0.1:50001/v4/fragment/modify/<fragment_hash>" \
+  -d '{"new_quota":2199023255552}'
+```
+
+### 7.3 `DELETE /v4/fragment/trash/empty/{fragment}`
+```bash
+curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/fragment/trash/empty/<fragment_hash>"
+```
+
+### 7.4 `PATCH /v4/fragment/object/rename`
+Body (`RenameObjectRequest`):
 ```json
 {
-  "url": "https://storage.example.com/v4/public/share?...",
-  "expires_at": "2026-02-02T12:34:56Z"
+  "source_fragment": "<fragment_hash>",
+  "source_key": "old/name.bin",
+  "destination_fragment": "<fragment_hash>",
+  "destination_key": "new/name.bin"
 }
 ```
 
-### Public share (no auth)
-**GET** `/v4/public/share`
+```bash
+curl -k -X PATCH -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://127.0.0.1:50001/v4/fragment/object/rename" \
+  -d '{"source_fragment":"<f>","source_key":"a.bin","destination_fragment":"<f>","destination_key":"b.bin"}'
+```
 
-Query params depend on your signing format (token, signature, expiry, etc.).  
-Returns bytes with disposition controlled by the signed URL.
+### 7.5 `DELETE /v4/fragment/object/delete/{fragment}/{*object_key}`
+Soft delete (trash marker flow).
+```bash
+curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/fragment/object/delete/<fragment_hash>/videos/a.mp4"
+```
 
----
+### 7.6 `DELETE /v4/fragment/version/delete/{fragment}/{version_id}/{*object_key}`
+Delete specific version.
+```bash
+curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/fragment/version/delete/<fragment_hash>/<version_id>/videos/a.mp4"
+```
 
-## Maintenance APIs
+### 7.7 `DELETE /v4/fragment/permanent/delete/{fragment}/{*object_key}`
+Permanent delete.
+```bash
+curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/fragment/permanent/delete/<fragment_hash>/videos/a.mp4"
+```
 
-Maintenance routes require `Authorization: Bearer <JWT>` and generally require `write/modify/delete` depending on risk.
+### 7.8 `POST /v4/fragment/recover/version/{fragment}/{version_id}/{*object_key}`
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/fragment/recover/version/<fragment_hash>/<version_id>/videos/a.mp4"
+```
 
-### Sync global quota/health
-**POST** `/v4/maintenance/sync/global`
+### 7.9 `POST /v4/fragment/recover/object/{fragment}/{*object_key}`
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/fragment/recover/object/<fragment_hash>/videos/a.mp4"
+```
 
----
+### 7.10 `POST /v4/fragment/recover/trash/all/{fragment}`
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/fragment/recover/trash/all/<fragment_hash>"
+```
 
-### Sync fragment quota
-**POST** `/v4/maintenance/sync/fragment`
+## 8. Protected v4 Upload APIs (Resumable Object Storage Upload)
 
----
+### Upload flow
+1. Initiate session
+2. Upload parts (`part_index`)
+3. Poll status
+4. Finalize
+5. Optional cancel
 
-### Cleanup fragment metadata
-**POST** `/v4/maintenance/cleanup/fragment`
+### 8.1 `POST /v4/upload/init/{fragment}/{*object_key}`
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://127.0.0.1:50001/v4/upload/init/<fragment_hash>/videos/a.mp4" \
+  -d '{"content_type":"video/mp4","total_size_bytes":1073741824,"expected_parts":256}'
+```
 
----
+### 8.2 `PUT /v4/upload/chunk/{fragment}/{version_id}/{part_index}`
+Requirements:
+- `Content-Length` header required
+- query `checksum` optional
 
-### Initialize fragment storage
-**POST** `/v4/maintenance/init/fragment`
+```bash
+curl -k -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Length: 4194304" \
+  "https://127.0.0.1:50001/v4/upload/chunk/<fragment_hash>/<version_id>/0?checksum=<optional_crc_or_hash>" \
+  --data-binary @part-000.bin
+```
 
-Used to bootstrap required on-disk roots for a fragment.
+### 8.3 `GET /v4/upload/status/{fragment}/{version_id}`
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/upload/status/<fragment_hash>/<version_id>"
+```
 
----
+### 8.4 `GET /v4/upload/status/list/{fragment}`
+Query:
+- `limit` default 50, max 100
+- `offset` default 0
 
-### Repair job control
-- **POST** `/v4/maintenance/repair/start`
-- **POST** `/v4/maintenance/repair/stop`
-- **GET**  `/v4/maintenance/repair/status`
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/upload/status/list/<fragment_hash>?limit=50&offset=0"
+```
 
-Start query params (as implemented in your repair manager):
+### 8.5 `POST /v4/upload/finalize/{fragment}/{version_id}/{session_id}`
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://127.0.0.1:50001/v4/upload/finalize/<fragment_hash>/<version_id>/<session_id>" \
+  -d '{"content_type":"video/mp4","total_size_bytes":1073741824,"expected_parts":256}'
+```
+
+### 8.6 `DELETE /v4/upload/cancel/{fragment}/{version_id}`
+```bash
+curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/upload/cancel/<fragment_hash>/<version_id>"
+```
+
+## 9. Protected v4 Maintenance APIs
+
+### 9.1 Quota/metadata sync endpoints
+- `POST /v4/maintenance/sync/global`
+- `POST /v4/maintenance/sync/fragment`
+- `POST /v4/maintenance/cleanup/fragment`
+- `POST /v4/maintenance/init/fragment`
+
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/sync/global"
+
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/sync/fragment"
+
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/cleanup/fragment"
+
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/init/fragment"
+```
+
+### 9.2 Repair job endpoints
+- `POST /v4/maintenance/repair/start`
+- `POST /v4/maintenance/repair/stop`
+- `GET /v4/maintenance/repair/status`
+
+Start query params:
 - `dry_run=true|false`
 - `mode=availability|scrub|strict|checksum`
-- `meta_concurrency=<n>`
-- `repair_concurrency=<n>`
-- `batch=<n>`
+- `meta_concurrency=1..128`
+- `repair_concurrency=1..64`
+- `batch=32..8192`
 
----
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/repair/start?dry_run=false&mode=availability&meta_concurrency=32&repair_concurrency=8&batch=1024"
 
-### Garbage collector
-**POST** `/v4/maintenance/gc/start`
+curl -k -X GET -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/repair/status"
 
-Starts GC / lifecycle cleanup.
-
----
-
-### Redistribution job control
-- **POST**  `/v4/maintenance/redistribution/start`
-- **PATCH** `/v4/maintenance/redistribution/stop`
-- **GET**   `/v4/maintenance/redistribution/monitor`
-
----
-
-### System health
-**GET** `/v4/maintenance/health`
-
-Returns disk / index mirror / latency / errors summary (implementation-defined).
-
----
-
-## WebSocket APIs
-
-### WebSocket upgrade
-**GET** `/ws`
-
-Used for real-time events (uploads, repair/redistribution updates, system broadcasts).
-
-### System broadcast (authenticated)
-**POST** `/v4/system/broadcast`
-
-Protected by `validate_access`.
-
----
-
-## Public + Bootstrapping APIs
-
-### List public fragments (no auth)
-**GET** `/v4/fragment/list/public`
-
-### Create fragment (auth layer)
-**POST** `/v4/fragment/create`
-
-This route is wrapped by `layer_auth` (not the fragment JWT middleware).
-Used to **create/initialize fragment identity** (implementation-defined).
-
-Common request shape (from older versions):
-
-```json
-{
-  "name": "my-fragment",
-  "quota": 1099511627776,
-  "secret": "fragment-secret"
-}
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/repair/stop"
 ```
 
-### Check fragment existence
+### 9.3 Garbage collector endpoints
+- `POST /v4/maintenance/gc/start`
+- `GET /v4/maintenance/gc/status`
 
-**GET** `/v4/fragment/check`
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/gc/start"
 
-This endpoint verifies whether a fragment exists. It is considered a **global** route (no fragment JWT required).
-Although it is a `GET` route, clients must send a small JSON body:
-
-```json
-{ "fragment": "your-fragment-name" }
+curl -k -X GET -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/gc/status"
 ```
 
-If the fragment exists, the server responds with `200 OK` and echoes the fragment name:
-
-```json
-{ "fragment": "your-fragment-name" }
-```
-
-If the fragment does not exist, it returns `404 Not Found`.
-
-### Get fragment hash
-
-**GET** `/v4/fragment/get/hash`
-
-This endpoint returns the cryptographic hash associated with a fragment. Like `fragment/check`, it does not require a fragment JWT but expects a JSON body:
-
-```json
-{ "fragment": "your-fragment-name" }
-```
-
-On success (`200 OK`), the response contains the fragment name and its hash:
-
-```json
-{
-  "fragment": "your-fragment-name",
-  "fragment_hash": "<hash>"
-}
-```
-
-If the fragment does not exist or a hash has not yet been computed, the server returns `404 Not Found`.
-
-### Ping
-**GET** `/ping` → `"pong"`
-
----
-
-## Quick Endpoint Index
-
-### Object storage (protected: validate_access)
-
-**Read**
-- `GET  /v4/capacity/usage/{fragment}`
-- `GET  /v4/fragment/list`
-- `GET  /v4/fragment/objects/{fragment}`
-- `GET  /v4/fragment/trash/{fragment}`
-- `GET  /v4/fragment/versions/{fragment}/{*object_key}`
-- `GET  /v4/fragment/get/{fragment}/{*object_key}`
-- `GET  /v4/fragment/stream/{fragment}/{*object_key}`
-- `GET  /v4/fragment/meta/{fragment}/{*object_key}`
-- `GET  /v4/fragment/download/{fragment}`
-- `GET  /v4/fragment/download/chunk/{fragment}`
-- `POST /v4/fragment/archive/{fragment}`
-- `POST /v4/share/create`
-
-**Write**
-- `DELETE /v4/fragment/delete/{fragment}`
-- `PATCH  /v4/fragment/modify/{fragment}`
-- `DELETE /v4/fragment/trash/empty/{fragment}`
-- `PATCH  /v4/fragment/object/rename`
-- `DELETE /v4/fragment/object/delete/{fragment}/{*object_key}`
-- `DELETE /v4/fragment/version/delete/{fragment}/{version_id}/{*object_key}`
-- `DELETE /v4/fragment/permanent/delete/{fragment}/{*object_key}`
-- `POST   /v4/fragment/recover/version/{fragment}/{version_id}/{*object_key}`
-- `POST   /v4/fragment/recover/object/{fragment}/{*object_key}`
-- `POST   /v4/fragment/recover/trash/all/{fragment}`
-
-**Upload**
-- `POST   /v4/upload/init/{fragment}/{*object_key}`
-- `GET    /v4/upload/status/{fragment}/{version_id}`
-- `GET    /v4/upload/status/list/{fragment}`
-- `PUT    /v4/upload/chunk/{fragment}/{version_id}/{part_index}`
-- `POST   /v4/upload/finalize/{fragment}/{version_id}/{session_id}`
-- `DELETE /v4/upload/cancel/{fragment}/{version_id}`
-
-**Maintenance**
-- `POST  /v4/maintenance/sync/global`
-- `POST  /v4/maintenance/sync/fragment`
-- `POST  /v4/maintenance/cleanup/fragment`
-- `POST  /v4/maintenance/init/fragment`
-- `POST  /v4/maintenance/repair/start`
-- `POST  /v4/maintenance/repair/stop`
-- `GET   /v4/maintenance/repair/status`
-- `POST  /v4/maintenance/gc/start`
-- `POST  /v4/maintenance/redistribution/start`
+### 9.4 Redistribution endpoints
+- `POST /v4/maintenance/redistribution/start`
 - `PATCH /v4/maintenance/redistribution/stop`
-- `GET   /v4/maintenance/redistribution/monitor`
-- `GET   /v4/maintenance/health`
+- `GET /v4/maintenance/redistribution/monitor`
 
-### Public
-- `GET /v4/public/share`
-- `GET /v4/fragment/list/public`
-- `GET /v4/fragment/check`
-- `GET /v4/fragment/get/hash`
-- `GET /ping`
+Start query params:
+- `dry_run=true|false`
+
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/redistribution/start?dry_run=true"
+
+curl -k -X GET -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/redistribution/monitor"
+
+curl -k -X PATCH -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/redistribution/stop"
+```
+
+### 9.5 Prefix rebuild endpoints
+- `POST /v4/maintenance/prefix/rebuild/start`
+- `POST /v4/maintenance/prefix/rebuild/stop`
+- `GET /v4/maintenance/prefix/rebuild/status`
+
+Start query params:
+- `fragment=<fragment_hash>` optional
+
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/prefix/rebuild/start"
+
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/prefix/rebuild/start?fragment=<fragment_hash>"
+
+curl -k -X GET -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/prefix/rebuild/status"
+
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/prefix/rebuild/stop"
+```
+
+### 9.6 System health endpoint
+`GET /v4/maintenance/health`
+
+Query params:
+- `deep_scan=true` force immediate deep consistency scan
+- `refresh=true` bypass cache and force fresh snapshot
+
+Notes:
+- Default request serves cached health snapshot produced by monitor loop.
+- Background monitor interval is config-driven.
+
+```bash
+curl -k -X GET -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/health"
+
+curl -k -X GET -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/health?refresh=true"
+
+curl -k -X GET -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/health?deep_scan=true"
+```
+
+## 10. WebSocket APIs
+
+### 10.1 `GET /ws?token=<jwt>`
+- Token is passed via query parameter `token`.
+- On connect, server sends `HELLO`.
+- Client heartbeat: send `{"op":"PING"}` and receive `{"op":"PONG"}`.
+- Server pushes event envelopes with `{"op":"EVENT","d":...}`.
+
+Example (`wscat`):
+```bash
+wscat -c "wss://127.0.0.1:50001/ws?token=$TOKEN"
+```
+
+### 10.2 `POST /v4/system/broadcast`
+Broadcasts system message event.
+Body (`BroadcastReq`):
+```json
+{
+  "message": "Maintenance window starts in 10 minutes",
+  "severity": "warning"
+}
+```
+
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://127.0.0.1:50001/v4/system/broadcast" \
+  -d '{"message":"Maintenance starts","severity":"info"}'
+```
+
+## 11. Legacy FS API (`/dir/*`)
+These routes are protected by legacy FS auth middleware.
+
+### 11.1 Directory listing and inspection
+
+#### `GET /dir/` and `GET /dir/{*path}`
+Lists files recursively under scope.
+```bash
+curl -k -H "Authorization: Bearer $FS_TOKEN" "https://127.0.0.1:50001/dir/"
+curl -k -H "Authorization: Bearer $FS_TOKEN" "https://127.0.0.1:50001/dir/media"
+```
+
+#### `GET /dir/capacity`
+Query:
+- `uid` required
+
+```bash
+curl -k -H "Authorization: Bearer $FS_TOKEN" \
+  "https://127.0.0.1:50001/dir/capacity?uid=<uid_path>"
+```
+
+#### `GET /dir/file/metadata/` and `GET /dir/file/metadata/{*path}`
+Query:
+- `file_name` required
+
+```bash
+curl -k -H "Authorization: Bearer $FS_TOKEN" \
+  "https://127.0.0.1:50001/dir/file/metadata/?file_name=movie.mp4"
+
+curl -k -H "Authorization: Bearer $FS_TOKEN" \
+  "https://127.0.0.1:50001/dir/file/metadata/media?file_name=movie.mp4"
+```
+
+### 11.2 File view/stream/download
+
+#### `GET /dir/file/view/{*path}`
+Reads full file response.
+```bash
+curl -k -H "Authorization: Bearer $FS_TOKEN" \
+  "https://127.0.0.1:50001/dir/file/view/media/movie.mp4" -o movie.mp4
+```
+
+#### `GET /dir/file/stream/{*path}`
+Supports optional range.
+```bash
+curl -k -H "Authorization: Bearer $FS_TOKEN" \
+  -H "Range: bytes=0-1048575" \
+  "https://127.0.0.1:50001/dir/file/stream/media/movie.mp4" -o part.bin
+```
+
+#### `GET /dir/file/stream/v2/{*path}`
+Range-optimized partial content behavior.
+```bash
+curl -k -H "Authorization: Bearer $FS_TOKEN" \
+  -H "Range: bytes=0-2097151" \
+  "https://127.0.0.1:50001/dir/file/stream/v2/media/movie.mp4" -o part2.bin
+```
+
+#### `GET /dir/file/transcode/stream/hls/{*path}`
+Only `.m3u8` and `.ts` allowed.
+```bash
+curl -k -H "Authorization: Bearer $FS_TOKEN" \
+  "https://127.0.0.1:50001/dir/file/transcode/stream/hls/hls/index.m3u8"
+```
+
+#### `GET /dir/file/download/` and `GET /dir/file/download/{*path}`
+Query:
+- `file_name` required
+- `offset` required
+- `chunk_size` required
+
+Returns a file chunk per request.
+```bash
+curl -k -H "Authorization: Bearer $FS_TOKEN" \
+  "https://127.0.0.1:50001/dir/file/download/media?file_name=movie.mp4&offset=0&chunk_size=1048576" \
+  -o movie.part0
+```
+
+### 11.3 Directory and file mutations
+
+#### `POST /dir/create/{*path}`
+```bash
+curl -k -X POST -H "Authorization: Bearer $FS_TOKEN" \
+  "https://127.0.0.1:50001/dir/create/media/new-folder"
+```
+
+#### `DELETE /dir/delete/{*path}`
+```bash
+curl -k -X DELETE -H "Authorization: Bearer $FS_TOKEN" \
+  "https://127.0.0.1:50001/dir/delete/media/old-folder"
+```
+
+#### `PUT /dir/file/rename/` and `PUT /dir/file/rename/{*path}`
+Query params:
+- `file_to_modify`
+- `new_file_name`
+
+```bash
+curl -k -X PUT -H "Authorization: Bearer $FS_TOKEN" \
+  "https://127.0.0.1:50001/dir/file/rename/media?file_to_modify=old.mp4&new_file_name=new"
+```
+
+#### `DELETE /dir/file/delete/` and `DELETE /dir/file/delete/{*path}`
+Query params:
+- `file_to_delete`
+
+```bash
+curl -k -X DELETE -H "Authorization: Bearer $FS_TOKEN" \
+  "https://127.0.0.1:50001/dir/file/delete/media?file_to_delete=movie.mp4"
+```
+
+### 11.4 Legacy upload APIs
+
+#### Direct multipart upload
+- `POST /dir/file/upload/`
+- `POST /dir/file/upload/{*path}`
+
+```bash
+curl -k -X POST -H "Authorization: Bearer $FS_TOKEN" \
+  -F "file=@movie.mp4" \
+  "https://127.0.0.1:50001/dir/file/upload/media"
+```
+
+#### Fragmented upload v2
+- `POST /dir/file/upload/v2/`
+- `POST /dir/file/upload/v2/{*path}`
+
+Query params (`UploadParams`):
+- `file_id`
+- `total_chunks`
+- `chunk_index`
+- `original_filename`
+- `mime_type` optional
+- `checksum` optional
+
+```bash
+curl -k -X POST -H "Authorization: Bearer $FS_TOKEN" \
+  -F "file=@chunk_0.bin" \
+  "https://127.0.0.1:50001/dir/file/upload/v2/media?file_id=myupload1&total_chunks=10&chunk_index=0&original_filename=movie.mp4&checksum=<hex>"
+```
+
+#### Check uploaded chunks (v2)
+`GET /dir/file/upload/check/{*path}`
+Query:
+- `file_id`
+
+```bash
+curl -k -H "Authorization: Bearer $FS_TOKEN" \
+  "https://127.0.0.1:50001/dir/file/upload/check/media?file_id=myupload1"
+```
+
+### 11.5 Stateless upload v3
+
+#### Initiate
+- `POST /dir/file/upload/v3/initiate/`
+- `POST /dir/file/upload/v3/initiate/{*path}`
+
+Body:
+```json
+{
+  "original_filename": "movie.mp4",
+  "total_size_bytes": 1073741824,
+  "total_chunks": 256,
+  "mime_type": "video/mp4"
+}
+```
+
+```bash
+curl -k -X POST -H "Authorization: Bearer $FS_TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://127.0.0.1:50001/dir/file/upload/v3/initiate/media" \
+  -d '{"original_filename":"movie.mp4","total_size_bytes":1073741824,"total_chunks":256,"mime_type":"video/mp4"}'
+```
+
+#### Upload chunk (binary)
+`PUT /dir/file/upload/v3/{file_id}/{chunk_index}`
+Headers:
+- `Digest: sha-256=<base64_sha256>` required
+- `Buffer: memory-size=<bytes>` optional
+
+```bash
+curl -k -X PUT -H "Authorization: Bearer $FS_TOKEN" \
+  -H "Digest: sha-256=<base64_digest>" \
+  -H "Buffer: memory-size=262144" \
+  --data-binary @chunk_0.bin \
+  "https://127.0.0.1:50001/dir/file/upload/v3/<file_id>/0"
+```
+
+#### Upload chunk (multipart)
+`PUT /dir/file/upload/multipart/v3/{file_id}/{chunk_index}`
+Query:
+- `checksum=<hex_sha256>` optional
+
+```bash
+curl -k -X PUT -H "Authorization: Bearer $FS_TOKEN" \
+  -F "file=@chunk_0.bin" \
+  "https://127.0.0.1:50001/dir/file/upload/multipart/v3/<file_id>/0?checksum=<hex>"
+```
+
+#### Status and finalize
+- `GET /dir/file/upload/v3/{file_id}/status`
+- `POST /dir/file/upload/v3/{file_id}/finalize`
+
+```bash
+curl -k -H "Authorization: Bearer $FS_TOKEN" \
+  "https://127.0.0.1:50001/dir/file/upload/v3/<file_id>/status"
+
+curl -k -X POST -H "Authorization: Bearer $FS_TOKEN" \
+  "https://127.0.0.1:50001/dir/file/upload/v3/<file_id>/finalize"
+```
+
+## 12. Full Endpoint Index
 
 ### Auth
 - `POST /authenticate/fragment`
 - `POST /authenticate/fs`
 
-### WebSocket
-- `GET  /ws`
+## 13. Streaming Tuning (Config)
+`[upload_config]` keys used by streaming read paths:
+- `stream_chunk_size`: maximum emitted stream chunk per read step (4 KiB..4 MiB after clamp/alignment).
+- `stream_readahead_bytes`: sequential read-ahead window per stream step (64 KiB..8 MiB after clamp/alignment).
+- `stream_locality_bias_enabled`: prefer shard directory inferred from shard absolute path for sequential streaming.
+- `stream_max_concurrency`: global stream semaphore capacity.
+
+Recommended starting points:
+- Low hardware: `stream_chunk_size=131072`, `stream_readahead_bytes=262144`
+- High hardware: `stream_chunk_size=1048576`, `stream_readahead_bytes=2097152`
+
+### Public/global
+- `GET /ping`
+- `GET /v4/fragment/list/public`
+- `GET /v4/fragment/check`
+- `GET /v4/fragment/get/hash`
+- `POST /v4/fragment/create`
+- `GET /v4/public/share`
+
+### Protected v4 read
+- `GET /v4/capacity/usage/{fragment}`
+- `GET /v4/fragment/list`
+- `GET /v4/fragment/objects/{fragment}`
+- `GET /v4/fragment/trash/{fragment}`
+- `GET /v4/fragment/versions/{fragment}/{*object_key}`
+- `GET /v4/fragment/get/{fragment}/{*object_key}`
+- `GET /v4/fragment/stream/{fragment}/{*object_key}`
+- `GET /v4/fragment/meta/{fragment}/{*object_key}`
+- `GET /v4/fragment/download/{fragment}`
+- `GET /v4/fragment/download/chunk/{fragment}`
+- `POST /v4/fragment/archive/{fragment}`
+- `POST /v4/share/create`
+
+### Protected v4 write/upload
+- `DELETE /v4/fragment/delete/{fragment}`
+- `PATCH /v4/fragment/modify/{fragment}`
+- `DELETE /v4/fragment/trash/empty/{fragment}`
+- `PATCH /v4/fragment/object/rename`
+- `DELETE /v4/fragment/object/delete/{fragment}/{*object_key}`
+- `DELETE /v4/fragment/version/delete/{fragment}/{version_id}/{*object_key}`
+- `DELETE /v4/fragment/permanent/delete/{fragment}/{*object_key}`
+- `POST /v4/fragment/recover/version/{fragment}/{version_id}/{*object_key}`
+- `POST /v4/fragment/recover/object/{fragment}/{*object_key}`
+- `POST /v4/fragment/recover/trash/all/{fragment}`
+- `POST /v4/upload/init/{fragment}/{*object_key}`
+- `GET /v4/upload/status/{fragment}/{version_id}`
+- `GET /v4/upload/status/list/{fragment}`
+- `PUT /v4/upload/chunk/{fragment}/{version_id}/{part_index}`
+- `POST /v4/upload/finalize/{fragment}/{version_id}/{session_id}`
+- `DELETE /v4/upload/cancel/{fragment}/{version_id}`
+
+### Protected v4 maintenance
+- `POST /v4/maintenance/sync/global`
+- `POST /v4/maintenance/sync/fragment`
+- `POST /v4/maintenance/cleanup/fragment`
+- `POST /v4/maintenance/init/fragment`
+- `POST /v4/maintenance/repair/start`
+- `POST /v4/maintenance/repair/stop`
+- `GET /v4/maintenance/repair/status`
+- `POST /v4/maintenance/gc/start`
+- `GET /v4/maintenance/gc/status`
+- `POST /v4/maintenance/redistribution/start`
+- `PATCH /v4/maintenance/redistribution/stop`
+- `GET /v4/maintenance/redistribution/monitor`
+- `POST /v4/maintenance/prefix/rebuild/start`
+- `POST /v4/maintenance/prefix/rebuild/stop`
+- `GET /v4/maintenance/prefix/rebuild/status`
+- `GET /v4/maintenance/health`
+
+### Websocket/broadcast
+- `GET /ws`
 - `POST /v4/system/broadcast`
+
+### Legacy FS
+- `POST /dir/file/upload/`
+- `POST /dir/file/upload/{*path}`
+- `POST /dir/file/upload/v2/`
+- `POST /dir/file/upload/v2/{*path}`
+- `POST /dir/file/upload/v3/initiate/`
+- `POST /dir/file/upload/v3/initiate/{*path}`
+- `PUT /dir/file/upload/multipart/v3/{file_id}/{chunk_index}`
+- `PUT /dir/file/upload/v3/{file_id}/{chunk_index}`
+- `GET /dir/file/upload/v3/{file_id}/status`
+- `POST /dir/file/upload/v3/{file_id}/finalize`
+- `POST /dir/create/{*path}`
+- `DELETE /dir/delete/{*path}`
+- `PUT /dir/file/rename/`
+- `PUT /dir/file/rename/{*path}`
+- `DELETE /dir/file/delete/`
+- `DELETE /dir/file/delete/{*path}`
+- `GET /dir/`
+- `GET /dir/{*path}`
+- `GET /dir/capacity`
+- `GET /dir/file/upload/check/{*path}`
+- `GET /dir/file/view/{*path}`
+- `GET /dir/file/stream/{*path}`
+- `GET /dir/file/stream/v2/{*path}`
+- `GET /dir/file/transcode/stream/hls/{*path}`
+- `GET /dir/file/metadata/`
+- `GET /dir/file/metadata/{*path}`
+- `GET /dir/file/download/`
+- `GET /dir/file/download/{*path}`

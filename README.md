@@ -19,6 +19,7 @@
 ## Table of Contents
 
 - [What is N1 (current architecture)](#what-is-n1-current-architecture)
+- [What N1 Is (Truth Statement)](#what-n1-is-truth-statement)
 - [Design principles](#design-principles)
 - [Core concepts](#core-concepts)
 - [Architecture (Index vs Blob)](#architecture-index-vs-blob)
@@ -44,6 +45,11 @@
   - [Linux-first + O_DIRECT](#linux-first--o_direct)
   - [Preallocation](#preallocation)
   - [Directory sync](#directory-sync)
+- [N1 CLI Functions](#n1-cli-functions)
+  - [How to run the CLI](#how-to-run-the-cli)
+  - [Global CLI flags](#global-cli-flags)
+  - [Top-level commands](#top-level-commands)
+  - [Ops subcommands (recommended)](#ops-subcommands-recommended)
 - [Invariants (must always be true)](#invariants-must-always-be-true)
 - [Glossary](#glossary)
 
@@ -60,6 +66,22 @@ N1 is designed for environments where you want:
 - **video-grade streaming** (long sequential reads + range reads) with bounded memory
 - **crash safety** (power-loss safe) and recoverability even on unstable disks/networks
 - storage that remains **inspectable and movable on disk** (no opaque black-box volumes)
+
+## What N1 Is (Truth Statement)
+
+N1 is a **filesystem-native, fragment-scoped object storage engine** for single-machine multi-disk deployments where:
+
+- **high availability** during maintenance matters (CRUD should continue while repair/redistribution run)
+- **durability** matters (index mirrors + shard-level recovery)
+- **bounded resource usage** matters (streaming-first reads/writes with explicit concurrency controls)
+- **no database hot-path dependency** is required (disk layout is the source of truth)
+
+Operationally, “true N1” means:
+
+- fragments are the isolation boundary (quota/auth/maintenance scope)
+- object versions are immutable
+- index mirrors can diverge temporarily but must be repairable and reconverged
+- maintenance is first-class and operator-driven through API + CLI
 
 ### Fragment-centric engine (no multitenant UID layout)
 
@@ -465,6 +487,183 @@ This is why `sync_dir()` exists. Without it, rename can be lost after power loss
 
 ---
 
+## N1 CLI Functions
+
+N1 CLI is embedded in the `server` binary (`server/src/main.rs`) and uses `server_cli` as the command layer.
+
+### How to run the CLI
+
+Use:
+
+```bash
+cargo run -p server -- <command> [flags]
+```
+
+or the built binary:
+
+```bash
+./target/release/litiaina-n1 <command> [flags]
+```
+
+Server mode:
+
+```bash
+cargo run -p server -- server
+```
+
+If no command is given, server mode is the default.
+
+### Global CLI flags
+
+Available on all commands:
+
+- `-s, --secret <SECRET>`: secret input for auth
+- `-f, --fragment <FRAGMENT>`: target fragment (default `admin`)
+- `--url <URL>`: explicit N1 API URL
+- `--insecure <bool>`: TLS cert validation toggle (default `true`)
+- `--poll-ms <N>`: watch polling interval in milliseconds (default `500`)
+- `--json <bool>`: machine-readable output mode (default `false`)
+
+Auth behavior for CLI:
+- Maintenance/admin flows use `MASTER_KEY` as `--secret` and must target `--fragment <ADMIN_KEY>`
+- Fragment-scoped data access uses fragment secret + fragment hash
+
+### Top-level commands
+
+#### `server`
+Starts the N1 service process.
+
+```bash
+cargo run -p server -- server
+```
+
+#### `create-fragment`
+Creates a new fragment.
+
+Flags:
+- `--name <NAME>` required
+- `--quota <BYTES>` optional (default `10737418240`)
+
+```bash
+cargo run -p server -- create-fragment --name imaging-a --quota 1099511627776
+```
+
+#### `gc`
+Starts garbage collection and follows status.
+
+```bash
+cargo run -p server -- gc --fragment <fragment_hash>
+```
+
+#### `repair`
+Starts repair and follows status.
+
+Flags:
+- `--dry-run` optional
+
+```bash
+cargo run -p server -- repair --fragment <fragment_hash> --dry-run
+```
+
+#### `redistribute`
+Starts redistribution and follows status.
+
+Flags:
+- `--dry-run` optional
+
+```bash
+cargo run -p server -- redistribute --fragment <fragment_hash>
+```
+
+#### `prefix-rebuild`
+Starts prefix index rebuild and follows status.
+
+```bash
+cargo run -p server -- prefix-rebuild --fragment <fragment_hash>
+```
+
+#### `health`
+Gets health once, or watches continuously.
+
+Flags:
+- `--watch`
+- `--deep-scan`
+
+```bash
+cargo run -p server -- health --fragment <fragment_hash> --watch --deep-scan
+```
+
+### Ops subcommands (recommended)
+
+`ops` gives explicit lifecycle control with `start|status|stop|watch`.
+
+Pattern:
+
+```bash
+cargo run -p server -- ops <job> <action> [job-flags]
+```
+
+Jobs:
+
+- `ops gc start|status|watch`
+  - `ops gc stop` is currently not supported by server API
+- `ops repair start|status|stop|watch [--dry-run]`
+- `ops redistribute start|status|stop|watch [--dry-run]`
+- `ops prefix-rebuild start|status|stop|watch [--fragment <fragment_hash>]`
+
+Streaming tuning knobs (`[upload_config]`):
+- `stream_chunk_size`
+- `stream_readahead_bytes`
+- `stream_locality_bias_enabled`
+
+Examples:
+
+```bash
+# GC lifecycle (admin context)
+export ADMIN_KEY="<admin_fragment_key>"
+cargo run -p server -- ops gc start --fragment "$ADMIN_KEY" --secret "<MASTER_KEY>"
+cargo run -p server -- ops gc status --fragment "$ADMIN_KEY" --secret "<MASTER_KEY>"
+
+# Repair lifecycle
+cargo run -p server -- ops repair start --fragment <fragment_hash>
+cargo run -p server -- ops repair status --fragment <fragment_hash>
+cargo run -p server -- ops repair watch --fragment <fragment_hash> --poll-ms 250
+cargo run -p server -- ops repair stop --fragment <fragment_hash>
+
+# Redistribution lifecycle
+cargo run -p server -- ops redistribute start --fragment <fragment_hash>
+cargo run -p server -- ops redistribute status --fragment <fragment_hash>
+cargo run -p server -- ops redistribute stop --fragment <fragment_hash>
+
+# Prefix rebuild lifecycle
+cargo run -p server -- ops prefix-rebuild start --fragment <fragment_hash>
+cargo run -p server -- ops prefix-rebuild status --fragment <fragment_hash>
+cargo run -p server -- ops prefix-rebuild watch --fragment <fragment_hash>
+```
+
+Sequential stream probe (readahead/locality):
+```bash
+N1_STREAM_PROBE_OBJECT_BYTES=$((64*1024*1024)) \
+N1_STREAM_PROBE_PART_BYTES=$((4*1024*1024)) \
+N1_STREAM_PROBE_PASSES=2 \
+cargo test -p server matrix_stream_sequential_readahead_locality_probe -- --ignored --nocapture
+```
+
+### General Testing
+
+```bash
+# Core server test suite
+cargo test -p server
+
+# CLI test suite
+cargo test -p server_cli
+
+# Ignored/manual suites
+cargo test -p server -- --ignored --nocapture
+```
+
+---
+
 ## Invariants (must always be true)
 
 These are the non-negotiables for correctness:
@@ -492,6 +691,50 @@ These are the non-negotiables for correctness:
 - **shard**: one data/parity file on disk
 - **data_shards / parity_shards**: Reed–Solomon parameters
 - **stripe_size_bytes**: block size used per shard per stripe
+
+---
+
+## Chaos benchmark harness
+
+N1 includes a dependency-free HA chaos runner at:
+
+`scripts/bench/run_ha_chaos.sh`
+
+It repeatedly runs the ignored test `matrix_ha_chaos_profile_nightly` and writes:
+
+- per-run logs (`run_N.log`)
+- machine-readable CSV summary (`summary.csv`)
+- pass/fail summary (`summary.txt`)
+
+### Quick start
+
+```bash
+scripts/bench/run_ha_chaos.sh
+```
+
+### Custom stress profile
+
+```bash
+RUNS=10 \
+N1_SOAK_ROUNDS=20 \
+N1_SOAK_OPS_PER_ROUND=32 \
+N1_SOAK_CLIENT_CONCURRENCY=12 \
+N1_SOAK_DISK_DOWN=1 \
+scripts/bench/run_ha_chaos.sh
+```
+
+### CI-style gating
+
+Fail if any run fails and average runtime exceeds 600s:
+
+```bash
+RUNS=5 \
+MAX_DURATION_SECS=600 \
+REQUIRE_ALL_PASS=1 \
+scripts/bench/run_ha_chaos.sh
+```
+
+All outputs are written under `.n1-bench/ha-chaos-<timestamp>/` by default.
 
 ---
 

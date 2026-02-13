@@ -3,11 +3,7 @@ use crate::object_storage::constants::{METADATA_EXT, QUOTA_FILE};
 use crate::object_storage::disk_manager::{ObjectMetadata, ObjectPathManager};
 use crate::object_storage::quota_manager::set_storage_used;
 use crate::structs::auth_structs::Claims;
-use axum::{
-    extract::Path,
-    http::StatusCode,
-    response::IntoResponse,
-};
+use axum::{extract::Path, http::StatusCode, response::IntoResponse};
 use std::collections::HashSet;
 use tracing::{error, info};
 use walkdir::WalkDir;
@@ -95,9 +91,7 @@ async fn perform_quota_sync(fragment: &str) -> Result<u64, AppError> {
     Ok(total_usage)
 }
 
-pub async fn sync_fragment_metadata(
-    claims: Claims,
-) -> Result<impl IntoResponse, AppError> {
+pub async fn sync_fragment_metadata(claims: Claims) -> Result<impl IntoResponse, AppError> {
     if !claims.modify {
         return Err(AppError::Forbidden(
             "Modify permissions required to sync quota".into(),

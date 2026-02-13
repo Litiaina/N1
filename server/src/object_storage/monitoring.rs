@@ -2,31 +2,57 @@ use crate::enums::app_error_enum::AppError;
 use crate::object_storage::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
 use crate::object_storage::redistribution::get_redist_status;
 use crate::object_storage::repair_manager::get_repair_status;
-use crate::object_storage::system::{SystemMetrics, get_system_metrics};
+use crate::object_storage::system::{get_system_metrics, SystemMetrics};
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::{
-    Json,
     extract::{Query, State},
     response::IntoResponse,
+    Json,
 };
 use futures_util::future::join_all;
+use once_cell::sync::OnceCell;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::fs;
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{oneshot, Semaphore};
 use tokio::time::timeout;
 use ulid::Ulid;
 use walkdir::WalkDir;
 
 static DEEP_SCAN_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
 const DISK_CHECK_TIMEOUT: Duration = Duration::from_millis(5000);
+pub static MONITOR_INTERVAL_SECS_ATOMIC: OnceCell<AtomicU64> = OnceCell::new();
+pub static MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC: OnceCell<AtomicU64> = OnceCell::new();
+static HEALTH_CACHE: LazyLock<Arc<tokio::sync::RwLock<Option<SystemHealthResponse>>>> =
+    LazyLock::new(|| Arc::new(tokio::sync::RwLock::new(None)));
+static LAST_DEEP_SCAN_AT: LazyLock<Arc<tokio::sync::RwLock<Option<Instant>>>> =
+    LazyLock::new(|| Arc::new(tokio::sync::RwLock::new(None)));
 
-#[derive(Serialize)]
+fn monitor_interval() -> Duration {
+    let secs = MONITOR_INTERVAL_SECS_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or(2)
+        .clamp(1, 3600);
+    Duration::from_secs(secs)
+}
+
+fn deep_scan_interval() -> Duration {
+    let secs = MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or(60)
+        .clamp(5, 24 * 3600);
+    Duration::from_secs(secs)
+}
+
+#[derive(Serialize, Clone)]
 pub struct DiskStatus {
     pub path: String,
     pub role: String,
@@ -37,7 +63,7 @@ pub struct DiskStatus {
     pub error: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct ConsistencyStats {
     pub total_objects_scanned: u64,
     pub index_mirror_health: String,
@@ -45,7 +71,7 @@ pub struct ConsistencyStats {
     pub mirror_counts: Option<HashMap<String, u64>>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct SystemHealthResponse {
     pub status: String,
     pub disks: Vec<DiskStatus>,
@@ -151,15 +177,10 @@ async fn check_disk_accessibility(path_str: String, role: String) -> DiskStatus 
     }
 }
 
-pub async fn get_system_health(
-    State(state): State<Arc<AppState>>,
-    claims: Claims,
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<impl IntoResponse, AppError> {
-    if !claims.read {
-        return Err(AppError::Forbidden("Read permission required".into()));
-    }
-
+async fn collect_system_health(
+    state: &Arc<AppState>,
+    params: &HashMap<String, String>,
+) -> Result<SystemHealthResponse, AppError> {
     let system_metrics = get_system_metrics().await;
     let redist_status = get_redist_status().await;
     let repair_status = get_repair_status().await;
@@ -329,7 +350,7 @@ pub async fn get_system_health(
     };
     state.ws_manager.broadcast_system_wide(monitoring_update);
 
-    Ok(Json(SystemHealthResponse {
+    Ok(SystemHealthResponse {
         status: status.to_string(),
         disks: disk_statuses,
         consistency: ConsistencyStats {
@@ -343,5 +364,74 @@ pub async fn get_system_health(
         },
         system: system_metrics,
         summary,
-    }))
+    })
+}
+
+pub async fn run_system_monitor(state: Arc<AppState>) {
+    let mut ticker = tokio::time::interval(monitor_interval());
+
+    loop {
+        ticker.tick().await;
+
+        let do_deep_scan = {
+            let last = LAST_DEEP_SCAN_AT.read().await;
+            match *last {
+                Some(t) => t.elapsed() >= deep_scan_interval(),
+                None => true,
+            }
+        };
+
+        let mut params = HashMap::new();
+        if do_deep_scan {
+            params.insert("deep_scan".to_string(), "true".to_string());
+        }
+
+        match collect_system_health(&state, &params).await {
+            Ok(snapshot) => {
+                *HEALTH_CACHE.write().await = Some(snapshot);
+                if do_deep_scan {
+                    *LAST_DEEP_SCAN_AT.write().await = Some(Instant::now());
+                }
+            }
+            Err(_) => {
+                // Keep serving the last good snapshot if probe fails.
+            }
+        }
+    }
+}
+
+pub async fn get_system_health(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+
+    let deep_scan = params
+        .get("deep_scan")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    let refresh = params
+        .get("refresh")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    if deep_scan || refresh {
+        let snapshot = collect_system_health(&state, &params).await?;
+        *HEALTH_CACHE.write().await = Some(snapshot.clone());
+        if deep_scan {
+            *LAST_DEEP_SCAN_AT.write().await = Some(Instant::now());
+        }
+        return Ok(Json(snapshot));
+    }
+
+    if let Some(cached) = HEALTH_CACHE.read().await.clone() {
+        return Ok(Json(cached));
+    }
+
+    let snapshot = collect_system_health(&state, &params).await?;
+    *HEALTH_CACHE.write().await = Some(snapshot.clone());
+    Ok(Json(snapshot))
 }

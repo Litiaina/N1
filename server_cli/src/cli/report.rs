@@ -110,7 +110,6 @@ pub fn print_health_report(health: &HealthResponse) {
 
     box_section("STATUS");
     kv("Status", &health.status);
-    kv("DB Connected", health.database_connected);
     kv("Summary", &health.summary);
 
     box_section("METRICS");

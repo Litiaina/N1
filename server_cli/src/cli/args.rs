@@ -14,6 +14,44 @@ pub struct Cli {
     pub url: Option<String>,
     #[arg(long, global = true, default_value_t = true)]
     pub insecure: bool,
+    #[arg(long, global = true, default_value_t = 500)]
+    pub poll_ms: u64,
+    #[arg(long, global = true, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum JobAction {
+    Start,
+    Status,
+    Stop,
+    Watch,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum OpsCommands {
+    Gc {
+        #[command(subcommand)]
+        action: JobAction,
+    },
+    Repair {
+        #[command(subcommand)]
+        action: JobAction,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+    Redistribute {
+        #[command(subcommand)]
+        action: JobAction,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+    PrefixRebuild {
+        #[command(subcommand)]
+        action: JobAction,
+        #[arg(long)]
+        fragment: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -35,5 +73,14 @@ pub enum Commands {
         dry_run: bool,
     },
     PrefixRebuild,
-    Health,
+    Health {
+        #[arg(long, default_value_t = false)]
+        watch: bool,
+        #[arg(long, default_value_t = false)]
+        deep_scan: bool,
+    },
+    Ops {
+        #[command(subcommand)]
+        cmd: OpsCommands,
+    },
 }

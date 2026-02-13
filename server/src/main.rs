@@ -2,9 +2,23 @@ use crate::fs::cleanup_manager::interval_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
 use crate::object_storage::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
+use crate::object_storage::monitoring::{
+    MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC, MONITOR_INTERVAL_SECS_ATOMIC,
+};
+use crate::object_storage::object_parser::{
+    ADAPTIVE_STREAM_TARGET_ATOMIC, STREAM_CHUNK_SIZE_ATOMIC, STREAM_LOCALITY_BIAS_ENABLED_ATOMIC,
+    STREAM_MAX_CONCURRENCY, STREAM_READAHEAD_BYTES_ATOMIC,
+};
+use crate::object_storage::adaptive_concurrency::{
+    ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC, ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC,
+};
+use crate::object_storage::prefix_compactor::{
+    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC, PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC,
+};
+use crate::object_storage::retrieve::PREFIX_MAX_DELTA_SEGMENTS_ATOMIC;
 use crate::object_storage::upload::{
-    DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC,
-    STRIPE_SIZE_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
+    ADAPTIVE_IO_TARGET_ATOMIC, DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC,
+    PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
 };
 use crate::routes::storage_routes::serve_storage_routes;
 use crate::settings::constants::{CONFIG_FILE, ENV_FILE};
@@ -20,13 +34,13 @@ use server_cli::cli::args::{Cli, Commands};
 use server_cli::cli::client::execute_command;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::Duration;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{fmt, EnvFilter};
 
 mod enums;
 mod fs;
@@ -40,6 +54,109 @@ mod structs;
 mod utils;
 mod validation;
 mod websocket;
+
+fn detect_cpu_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+fn align_up_4k(v: usize) -> usize {
+    ((v.max(4096) + 4095) / 4096) * 4096
+}
+
+fn adaptive_max_concurrent_io(cpu_cores: usize) -> usize {
+    (cpu_cores.saturating_mul(16)).clamp(16, 512)
+}
+
+fn adaptive_writer_buffer_size(cpu_cores: usize) -> usize {
+    let bytes = if cpu_cores <= 2 {
+        64 * 1024
+    } else if cpu_cores <= 4 {
+        128 * 1024
+    } else if cpu_cores <= 8 {
+        256 * 1024
+    } else {
+        512 * 1024
+    };
+    align_up_4k(bytes)
+}
+
+fn adaptive_stream_max_concurrency(cpu_cores: usize) -> usize {
+    (cpu_cores.saturating_mul(32)).clamp(64, 2048)
+}
+
+fn adaptive_stream_chunk_size(cpu_cores: usize) -> usize {
+    let bytes = if cpu_cores <= 2 {
+        128 * 1024
+    } else if cpu_cores <= 4 {
+        256 * 1024
+    } else if cpu_cores <= 8 {
+        512 * 1024
+    } else {
+        1024 * 1024
+    };
+    align_up_4k(bytes)
+}
+
+fn adaptive_prefix_max_delta_segments(cpu_cores: usize) -> usize {
+    if cpu_cores <= 2 {
+        256
+    } else if cpu_cores <= 4 {
+        512
+    } else if cpu_cores <= 8 {
+        1024
+    } else {
+        2048
+    }
+}
+
+fn adaptive_prefix_compact_trigger_segments(cpu_cores: usize) -> usize {
+    if cpu_cores <= 2 {
+        64
+    } else if cpu_cores <= 4 {
+        128
+    } else if cpu_cores <= 8 {
+        256
+    } else {
+        512
+    }
+}
+
+fn adaptive_prefix_compact_min_interval_seconds(cpu_cores: usize) -> usize {
+    if cpu_cores <= 2 {
+        60
+    } else if cpu_cores <= 4 {
+        45
+    } else if cpu_cores <= 8 {
+        30
+    } else {
+        15
+    }
+}
+
+fn parse_usize_or_auto(raw: Option<&str>, key: &str, auto_value: usize) -> usize {
+    match raw.map(str::trim) {
+        None => auto_value,
+        Some(v) if v.is_empty() => auto_value,
+        Some(v) if v.eq_ignore_ascii_case("auto") => auto_value,
+        Some(v) => match v.parse::<usize>() {
+            Ok(0) => auto_value,
+            Ok(parsed) => parsed,
+            Err(_) => panic!("{key} must be a positive usize or 'auto'"),
+        },
+    }
+}
+
+fn parse_bool_or_default(raw: Option<&str>, default_value: bool) -> bool {
+    match raw.map(str::trim) {
+        None => default_value,
+        Some(v) if v.is_empty() => default_value,
+        Some(v) if matches!(v, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => true,
+        Some(v) if matches!(v, "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF") => false,
+        Some(_) => default_value,
+    }
+}
 
 pub fn init_tracing() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
     let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stderr());
@@ -109,6 +226,8 @@ async fn main() {
                 args.fragment.clone(),
                 target_url,
                 args.insecure,
+                args.poll_ms,
+                args.json,
             )
             .await;
 
@@ -220,18 +339,20 @@ pub async fn run_server() {
         .expect("Double initialization of BLOB_STORE_DISKS!");
 
     let upload_section = config.section(Some("upload_config"));
+    let cpu_cores = detect_cpu_cores();
 
-    let max_io_semaphore = upload_section
-        .and_then(|s| s.get("max_concurrent_io"))
-        .unwrap_or("16384");
-
-    let max_io_semaphore: usize = max_io_semaphore
-        .parse()
-        .expect("max_concurrent_io does not fit into usize");
+    let max_io_semaphore = parse_usize_or_auto(
+        upload_section.and_then(|s| s.get("max_concurrent_io")),
+        "max_concurrent_io",
+        adaptive_max_concurrent_io(cpu_cores),
+    );
 
     MAX_IO_SEMAPHORE
         .set(max_io_semaphore)
         .expect("Double initialization of MAX_IO_SEMAPHORE");
+    ADAPTIVE_IO_TARGET_ATOMIC
+        .set(AtomicUsize::new(max_io_semaphore))
+        .expect("Double initialization of ADAPTIVE_IO_TARGET_ATOMIC");
 
     let max_part_size = upload_section
         .and_then(|s| s.get("max_part_size"))
@@ -275,19 +396,168 @@ pub async fn run_server() {
         .set(parity_shards)
         .expect("Double initialization of PARITY_SHARDS!");
 
-    let writer_buffer_size = upload_section
-        .and_then(|s| s.get("writer_buffer_size"))
-        .unwrap_or("262144");
+    let writer_buffer_size = align_up_4k(parse_usize_or_auto(
+        upload_section.and_then(|s| s.get("writer_buffer_size")),
+        "writer_buffer_size",
+        adaptive_writer_buffer_size(cpu_cores),
+    ));
 
-    let writer_buffer_size: AtomicUsize = AtomicUsize::new(
+    tracing::info!(
+        "Upload tuning: cpu_cores={}, max_concurrent_io={}, writer_buffer_size={}",
+        cpu_cores,
+        max_io_semaphore,
         writer_buffer_size
-            .parse::<usize>()
-            .expect("writer_buffer_size does not fit into usize"),
     );
+
+    let writer_buffer_size: AtomicUsize = AtomicUsize::new(writer_buffer_size);
 
     WRITER_BUFFER_SIZE_ATOMIC
         .set(writer_buffer_size)
         .expect("Double initialization of WRITER_BUFFER_SIZE!");
+
+    let stream_max_concurrency = parse_usize_or_auto(
+        upload_section.and_then(|s| s.get("stream_max_concurrency")),
+        "stream_max_concurrency",
+        adaptive_stream_max_concurrency(cpu_cores),
+    );
+
+    STREAM_MAX_CONCURRENCY
+        .set(stream_max_concurrency)
+        .expect("Double initialization of STREAM_MAX_CONCURRENCY");
+    ADAPTIVE_STREAM_TARGET_ATOMIC
+        .set(AtomicUsize::new(stream_max_concurrency))
+        .expect("Double initialization of ADAPTIVE_STREAM_TARGET_ATOMIC");
+
+    let stream_chunk_size = align_up_4k(parse_usize_or_auto(
+        upload_section.and_then(|s| s.get("stream_chunk_size")),
+        "stream_chunk_size",
+        adaptive_stream_chunk_size(cpu_cores),
+    ))
+    .clamp(4096, 4 * 1024 * 1024);
+
+    STREAM_CHUNK_SIZE_ATOMIC
+        .set(AtomicUsize::new(stream_chunk_size))
+        .expect("Double initialization of STREAM_CHUNK_SIZE_ATOMIC");
+
+    let stream_readahead_bytes = align_up_4k(parse_usize_or_auto(
+        upload_section.and_then(|s| s.get("stream_readahead_bytes")),
+        "stream_readahead_bytes",
+        (stream_chunk_size * 2).clamp(64 * 1024, 8 * 1024 * 1024),
+    ))
+    .clamp(64 * 1024, 8 * 1024 * 1024);
+    STREAM_READAHEAD_BYTES_ATOMIC
+        .set(AtomicUsize::new(stream_readahead_bytes))
+        .expect("Double initialization of STREAM_READAHEAD_BYTES_ATOMIC");
+
+    let stream_locality_bias_enabled = parse_bool_or_default(
+        upload_section.and_then(|s| s.get("stream_locality_bias_enabled")),
+        true,
+    );
+    STREAM_LOCALITY_BIAS_ENABLED_ATOMIC
+        .set(AtomicBool::new(stream_locality_bias_enabled))
+        .expect("Double initialization of STREAM_LOCALITY_BIAS_ENABLED_ATOMIC");
+
+    tracing::info!(
+        "Stream tuning: max_concurrency={}, chunk_size={}, readahead_bytes={}, locality_bias={}",
+        stream_max_concurrency,
+        stream_chunk_size,
+        stream_readahead_bytes,
+        stream_locality_bias_enabled
+    );
+
+    let adaptive_concurrency_enabled = parse_bool_or_default(
+        upload_section.and_then(|s| s.get("adaptive_concurrency_enabled")),
+        true,
+    );
+    ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC
+        .set(AtomicBool::new(adaptive_concurrency_enabled))
+        .expect("Double initialization of ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC");
+
+    let adaptive_concurrency_interval_ms = parse_usize_or_auto(
+        upload_section.and_then(|s| s.get("adaptive_concurrency_interval_ms")),
+        "adaptive_concurrency_interval_ms",
+        1000,
+    )
+    .clamp(100, 10_000);
+    ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC
+        .set(AtomicU64::new(adaptive_concurrency_interval_ms as u64))
+        .expect("Double initialization of ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC");
+
+    tracing::info!(
+        "Adaptive concurrency: enabled={} interval_ms={}",
+        adaptive_concurrency_enabled,
+        adaptive_concurrency_interval_ms
+    );
+
+    let prefix_max_delta_segments = parse_usize_or_auto(
+        upload_section.and_then(|s| s.get("prefix_max_delta_segments")),
+        "prefix_max_delta_segments",
+        adaptive_prefix_max_delta_segments(cpu_cores),
+    )
+    .clamp(32, 65_536);
+
+    PREFIX_MAX_DELTA_SEGMENTS_ATOMIC
+        .set(AtomicUsize::new(prefix_max_delta_segments))
+        .expect("Double initialization of PREFIX_MAX_DELTA_SEGMENTS_ATOMIC");
+
+    tracing::info!(
+        "Prefix tuning: max_delta_segments={}",
+        prefix_max_delta_segments
+    );
+
+    let prefix_compact_trigger_segments = parse_usize_or_auto(
+        upload_section.and_then(|s| s.get("prefix_compact_trigger_segments")),
+        "prefix_compact_trigger_segments",
+        adaptive_prefix_compact_trigger_segments(cpu_cores),
+    )
+    .clamp(8, 131_072);
+
+    PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
+        .set(AtomicUsize::new(prefix_compact_trigger_segments))
+        .expect("Double initialization of PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC");
+
+    let prefix_compact_min_interval_seconds = parse_usize_or_auto(
+        upload_section.and_then(|s| s.get("prefix_compact_min_interval_seconds")),
+        "prefix_compact_min_interval_seconds",
+        adaptive_prefix_compact_min_interval_seconds(cpu_cores),
+    )
+    .clamp(1, 3600);
+
+    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
+        .set(AtomicU64::new(prefix_compact_min_interval_seconds as u64))
+        .expect("Double initialization of PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC");
+
+    tracing::info!(
+        "Prefix compaction tuning: trigger_segments={} min_interval={}s",
+        prefix_compact_trigger_segments,
+        prefix_compact_min_interval_seconds
+    );
+
+    let monitor_interval_seconds = parse_usize_or_auto(
+        upload_section.and_then(|s| s.get("monitor_interval_seconds")),
+        "monitor_interval_seconds",
+        2,
+    )
+    .clamp(1, 3600);
+    MONITOR_INTERVAL_SECS_ATOMIC
+        .set(AtomicU64::new(monitor_interval_seconds as u64))
+        .expect("Double initialization of MONITOR_INTERVAL_SECS_ATOMIC");
+
+    let monitor_deep_scan_interval_seconds = parse_usize_or_auto(
+        upload_section.and_then(|s| s.get("monitor_deep_scan_interval_seconds")),
+        "monitor_deep_scan_interval_seconds",
+        60,
+    )
+    .clamp(5, 24 * 3600);
+    MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC
+        .set(AtomicU64::new(monitor_deep_scan_interval_seconds as u64))
+        .expect("Double initialization of MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC");
+
+    tracing::info!(
+        "Monitoring tuning: interval={}s deep_scan_interval={}s",
+        monitor_interval_seconds,
+        monitor_deep_scan_interval_seconds
+    );
 
     let stripe_block_size = upload_section
         .and_then(|s| s.get("stripe_block_size"))
@@ -340,7 +610,7 @@ async fn serve(socket: SocketAddr, app: Router, cert: RustlsConfig) {
 pub async fn shutdown_signal(handle: Arc<axum_server::Handle<SocketAddr>>) {
     #[cfg(unix)]
     let terminator = async {
-        use tokio::signal::unix::{SignalKind, signal};
+        use tokio::signal::unix::{signal, SignalKind};
         let mut terminate =
             signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
         let mut interrupt =

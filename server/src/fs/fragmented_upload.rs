@@ -8,7 +8,7 @@ use crate::structs::resumable_upload_status_struct::ResumableUploadStatus;
 use crate::structs::upload_params_struct::UploadParams;
 use crate::structs::upload_session_struct::UploadSession;
 use axum::{
-    extract::{Multipart, Path, Query, multipart::MultipartError},
+    extract::{multipart::MultipartError, Multipart, Path, Query},
     http::StatusCode,
     response::{IntoResponse, Json},
 };

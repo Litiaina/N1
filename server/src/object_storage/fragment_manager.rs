@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use axum::{
-    Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
+    Json,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -21,7 +21,7 @@ use crate::{
             write_fragment_metadata,
         },
         quota_manager::init_quota_file,
-        sync::{CreateFragmentRequest, CreateFragmentResponse, ensure_fragment_blob_directories},
+        sync::{ensure_fragment_blob_directories, CreateFragmentRequest, CreateFragmentResponse},
     },
     routes::storage_routes::AppState,
     structs::auth_structs::Claims,
@@ -48,7 +48,9 @@ pub fn is_fragment_hash(name: &str) -> bool {
     if name.len() != 64 {
         return false;
     }
-    name.as_bytes().iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
+    name.as_bytes()
+        .iter()
+        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
 }
 
 pub async fn list_public_fragments() -> Result<impl IntoResponse, AppError> {

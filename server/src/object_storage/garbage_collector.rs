@@ -3,7 +3,7 @@ use crate::fs::cleanup_manager::start_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::object_storage::constants::{GC_SUFFIX, METADATA_EXT, QUOTA_FILE, RESERVATION_FILE};
 use crate::object_storage::disk_manager::{
-    FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManager, ReservationReceipt,
+    ObjectMetadata, ObjectPathManager, ReservationReceipt, FS_STORAGE_ROOT,
 };
 use crate::object_storage::quota_manager::update_quota;
 use crate::routes::storage_routes::AppState;
@@ -12,15 +12,84 @@ use crate::websocket::ws_structs::StorageEventPayload;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::Json;
+use chrono::Utc;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::runtime::Handle;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 use walkdir::WalkDir;
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct GcJobStatus {
+    pub is_running: bool,
+    pub phase: String,
+    pub is_manual_run: bool,
+    pub total_fragments: u64,
+    pub total_fragments_scanned: u64,
+    pub total_live_versions_seen: u64,
+    pub total_trash_versions_expired: u64,
+    pub total_sessions_deleted: u64,
+    pub total_orphan_blob_dirs_deleted: u64,
+    pub total_refund_bytes: u64,
+    pub total_errors: u64,
+    pub current_fragment: String,
+    pub last_error: Option<String>,
+    pub start_timestamp: i64,
+    pub duration_seconds: u64,
+}
+
+#[derive(Debug, Default)]
+struct FragmentGcStats {
+    live_versions_seen: u64,
+    trash_versions_expired: u64,
+    sessions_deleted: u64,
+    orphan_blob_dirs_deleted: u64,
+    refund_bytes: u64,
+}
+
+static GC_STATUS: std::sync::LazyLock<Arc<RwLock<GcJobStatus>>> =
+    std::sync::LazyLock::new(|| Arc::new(RwLock::new(GcJobStatus::default())));
+static GC_RUNNING: std::sync::LazyLock<AtomicBool> =
+    std::sync::LazyLock::new(|| AtomicBool::new(false));
+
+fn gc_status_read_clone() -> GcJobStatus {
+    GC_STATUS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn with_gc_status_write<F>(f: F)
+where
+    F: FnOnce(&mut GcJobStatus),
+{
+    let mut st = GC_STATUS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut st);
+}
+
+async fn run_gc_scan_offthread(state: Arc<AppState>, is_manual_run: bool) -> Result<(), AppError> {
+    let handle = Handle::current();
+    let join = tokio::task::spawn_blocking(move || handle.block_on(perform_gc_scan(state, is_manual_run)))
+        .await;
+
+    match join {
+        Ok(res) => res,
+        Err(e) => Err(AppError::InternalServerError(format!(
+            "GC worker join error: {}",
+            e
+        ))),
+    }
+}
 
 pub async fn run_lifecycle_manager(state: Arc<AppState>) {
     let interval_secs = if CONFIG.garbage_collector.cleanup_interval_seconds > 0 {
@@ -31,23 +100,83 @@ pub async fn run_lifecycle_manager(state: Arc<AppState>) {
     let cleanup_interval = Duration::from_secs(interval_secs);
 
     loop {
-        if let Err(err) = perform_gc_scan(state.clone(), false).await {
-            error!("Lifecycle Manager Scan failed: {}", err);
+        if GC_RUNNING.swap(true, Ordering::SeqCst) {
+            sleep(cleanup_interval).await;
+            continue;
         }
+
+        if let Err(err) = run_gc_scan_offthread(state.clone(), false).await {
+            error!("Lifecycle Manager Scan failed: {}", err);
+            with_gc_status_write(|st| {
+                st.total_errors += 1;
+                st.last_error = Some(err.to_string());
+                st.phase = "Failed".to_string();
+            });
+        }
+
+        with_gc_status_write(|st| {
+            st.is_running = false;
+            if st.phase != "Failed" {
+                st.phase = "Completed".to_string();
+            }
+        });
+        GC_RUNNING.store(false, Ordering::SeqCst);
+
         sleep(cleanup_interval).await;
     }
 }
 
+pub async fn get_gc_status_api(
+    claims: crate::structs::auth_structs::Claims,
+) -> Result<Json<GcJobStatus>, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+    Ok(Json(gc_status_read_clone()))
+}
+
 pub async fn run_garbage_collector(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if GC_RUNNING.swap(true, Ordering::SeqCst) {
+        return (
+            StatusCode::CONFLICT,
+            "GC is already running. Check /v4/maintenance/gc/status.",
+        );
+    }
+
     tokio::spawn(async move {
-        if let Err(err) = perform_gc_scan(state.clone(), true).await {
+        {
+            with_gc_status_write(|st| {
+                *st = GcJobStatus {
+                is_running: true,
+                phase: "Initializing".to_string(),
+                is_manual_run: true,
+                start_timestamp: Utc::now().timestamp(),
+                ..Default::default()
+                };
+            });
+        }
+
+        if let Err(err) = run_gc_scan_offthread(state.clone(), true).await {
             error!("Manual GC Scan failed: {}", err);
+            with_gc_status_write(|st| {
+                st.total_errors += 1;
+                st.last_error = Some(err.to_string());
+                st.phase = "Failed".to_string();
+            });
         }
 
         start_cleanup(FS_STORAGE_ROOT.get().unwrap_or(&STORAGE_ROOT.to_string())).await;
+
+        with_gc_status_write(|st| {
+            st.is_running = false;
+            if st.phase != "Failed" {
+                st.phase = "Completed".to_string();
+            }
+        });
+        GC_RUNNING.store(false, Ordering::SeqCst);
     });
 
-    StatusCode::ACCEPTED
+    (StatusCode::ACCEPTED, "GC started")
 }
 
 fn refund_quota_async(fragment: String, amount: u64, state: Arc<AppState>) {
@@ -209,6 +338,23 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
     }
 
     info!("GC: Starting scan for {} fragments...", fragments.len());
+    let fragment_count = fragments.len() as u64;
+    let start = std::time::Instant::now();
+    with_gc_status_write(|st| {
+        st.is_running = true;
+        st.phase = "Scanning fragments".to_string();
+        st.is_manual_run = is_manual_run;
+        st.total_fragments = fragment_count;
+        st.total_fragments_scanned = 0;
+        st.total_live_versions_seen = 0;
+        st.total_trash_versions_expired = 0;
+        st.total_sessions_deleted = 0;
+        st.total_orphan_blob_dirs_deleted = 0;
+        st.total_refund_bytes = 0;
+        st.duration_seconds = 0;
+        st.last_error = None;
+        st.start_timestamp = Utc::now().timestamp();
+    });
 
     let retention_duration = Duration::from_secs(CONFIG.garbage_collector.retention_seconds);
 
@@ -219,7 +365,12 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
     };
 
     for fragment in fragments {
-        process_fragment_gc(
+        with_gc_status_write(|st| {
+            st.current_fragment = fragment.clone();
+            st.phase = format!("Processing fragment {}", fragment);
+        });
+
+        let stats = process_fragment_gc(
             &fragment,
             &index_roots,
             &blob_roots,
@@ -229,9 +380,23 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
             &state,
         )
         .await;
+
+        with_gc_status_write(|st| {
+            st.total_fragments_scanned += 1;
+            st.total_live_versions_seen += stats.live_versions_seen;
+            st.total_trash_versions_expired += stats.trash_versions_expired;
+            st.total_sessions_deleted += stats.sessions_deleted;
+            st.total_orphan_blob_dirs_deleted += stats.orphan_blob_dirs_deleted;
+            st.total_refund_bytes += stats.refund_bytes;
+            st.duration_seconds = start.elapsed().as_secs();
+        });
     }
 
     info!("GC: Scan completed.");
+    with_gc_status_write(|st| {
+        st.phase = "Finalizing".to_string();
+        st.duration_seconds = start.elapsed().as_secs();
+    });
     Ok(())
 }
 
@@ -243,7 +408,8 @@ async fn process_fragment_gc(
     file_ttl: Duration,
     is_manual_run: bool,
     state: &Arc<AppState>,
-) {
+) -> FragmentGcStats {
+    let mut stats = FragmentGcStats::default();
     let mut live_versions = HashSet::new();
     let mut trash_versions = HashSet::new();
     let mut expired_trash_refund = 0u64;
@@ -272,6 +438,7 @@ async fn process_fragment_gc(
             break;
         }
     }
+    stats.live_versions_seen = live_versions.len() as u64;
 
     let now = SystemTime::now();
 
@@ -330,6 +497,8 @@ async fn process_fragment_gc(
     }
 
     refund_quota_async(fragment.to_string(), expired_trash_refund, state.clone());
+    stats.refund_bytes += expired_trash_refund;
+    stats.trash_versions_expired += expired_versions.len() as u64;
 
     if !expired_versions.is_empty() {
         let tasks = index_roots.iter().chain(blob_roots.iter()).map(|root| {
@@ -429,6 +598,8 @@ async fn process_fragment_gc(
 
     let total_session_refund: u64 = session_amounts.values().sum();
     refund_quota_async(fragment.to_string(), total_session_refund, state.clone());
+    stats.refund_bytes += total_session_refund;
+    stats.sessions_deleted += sessions_to_delete.len() as u64;
 
     for root in index_roots {
         for sess_id in &sessions_to_delete {
@@ -468,10 +639,14 @@ async fn process_fragment_gc(
                         .and_then(|m| m.modified())
                         .unwrap_or(now);
                     if now.duration_since(modified).unwrap_or(Duration::ZERO) > file_ttl {
-                        let _ = std::fs::remove_dir_all(path);
+                        if std::fs::remove_dir_all(path).is_ok() {
+                            stats.orphan_blob_dirs_deleted += 1;
+                        }
                     }
                 }
             }
         }
     }
+
+    stats
 }

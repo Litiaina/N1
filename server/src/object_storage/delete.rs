@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::extract::{Path as AxumPath, State};
 use axum::{http::StatusCode, response::IntoResponse};
 
-use futures_util::{StreamExt, stream};
+use futures_util::{stream, StreamExt};
 use sha2::{Digest, Sha256};
 use tokio::fs;
 use tracing::{error, info, warn};
@@ -16,8 +16,9 @@ use walkdir::WalkDir;
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::{METADATA_EXT, QUOTA_FILE};
 use crate::object_storage::disk_manager::{
-    ObjectMetadata, ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment,
+    default_stripe_size, ObjectMetadata, ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment,
 };
+use crate::object_storage::prefix_compactor::schedule_prefix_compaction;
 use crate::object_storage::quota_manager::update_quota;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -332,9 +333,96 @@ async fn invalidate_compacted_for_key(
     object_key: &str,
 ) {
     let prefixes = prefixes_for_key(object_key);
+    let mut compact_candidates = Vec::new();
     for pfx in prefixes {
         let cpfx = canonical_prefix(&pfx);
+        compact_candidates.push(cpfx.clone());
         for p in path_manager.get_all_prefix_compacted_paths(fragment, &cpfx) {
+            let _ = fs::remove_file(&p).await;
+            if let Some(parent) = p.parent() {
+                let _ = sync_dir(parent).await;
+            }
+        }
+    }
+    schedule_prefix_compaction(fragment.to_string(), compact_candidates);
+}
+
+async fn write_delete_marker_for_key(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    object_key: &str,
+    template: Option<&ObjectMetadata>,
+) -> Result<(String, i64), AppError> {
+    let now = chrono::Utc::now().timestamp();
+    let delete_version_id = Ulid::new().to_string();
+
+    let mut dm = template.cloned().unwrap_or_else(|| ObjectMetadata {
+        object_key: object_key.to_string(),
+        fragment: fragment.to_string(),
+        version_id: delete_version_id.clone(),
+        upload_session_id: String::new(),
+        owner_uid: fragment.to_string(),
+        content_type: "application/octet-stream".to_string(),
+        total_size_bytes: 0,
+        created_at: now,
+        parts: Vec::new(),
+        is_delete_marker: true,
+        stripe_size_bytes: default_stripe_size(),
+    });
+
+    dm.fragment = fragment.to_string();
+    dm.owner_uid = fragment.to_string();
+    dm.object_key = object_key.to_string();
+    dm.version_id = delete_version_id.clone();
+    dm.created_at = now;
+    dm.is_delete_marker = true;
+    dm.parts.clear();
+    dm.total_size_bytes = 0;
+
+    let bytes = rmp_serde::to_vec(&dm)
+        .map_err(|e| AppError::InternalServerError(format!("Serialize delete marker: {}", e)))?;
+
+    let paths = path_manager.get_all_metadata_paths(fragment, object_key, &delete_version_id);
+    let mut wrote_any = false;
+    for p in paths {
+        if let Some(parent) = p.parent() {
+            let _ = fs::create_dir_all(parent).await;
+        }
+        if write_atomic(&p, &bytes).await.is_ok() {
+            wrote_any = true;
+        }
+    }
+
+    if !wrote_any {
+        return Err(AppError::InternalServerError(
+            "Failed to write delete marker metadata to any index root".into(),
+        ));
+    }
+
+    Ok((delete_version_id, now))
+}
+
+async fn purge_delete_markers_for_key(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    object_key: &str,
+) {
+    let versions = match list_object_versions_any(path_manager, fragment, object_key).await {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    for version_id in versions {
+        let Some(meta) = read_metadata_any(path_manager, fragment, object_key, &version_id).await
+        else {
+            continue;
+        };
+
+        if !meta.is_delete_marker {
+            continue;
+        }
+
+        for p in path_manager.get_all_metadata_paths(fragment, object_key, &version_id) {
             let _ = fs::remove_file(&p).await;
             if let Some(parent) = p.parent() {
                 let _ = sync_dir(parent).await;
@@ -420,6 +508,7 @@ pub async fn delete_object_version(
     let shard3 = &key_hash[4..6];
     let shard4 = &key_hash[6..8];
     let filename = format!("{}#{}{}", key_hash, version_id, METADATA_EXT);
+    let template_meta = read_metadata_any(&path_manager, &fragment, &object_key, &version_id).await;
 
     let mut moved_count = 0usize;
 
@@ -491,6 +580,39 @@ pub async fn delete_object_version(
         }
     }
 
+    let remaining_versions = list_object_versions_any(&path_manager, &fragment, &object_key)
+        .await
+        .unwrap_or_default();
+    let mut has_remaining_non_marker = false;
+    for v in &remaining_versions {
+        if let Some(m) = read_metadata_any(&path_manager, &fragment, &object_key, v).await {
+            if !m.is_delete_marker {
+                has_remaining_non_marker = true;
+                break;
+            }
+        }
+    }
+
+    if !has_remaining_non_marker {
+        if let Ok((del_vid, del_created_at)) = write_delete_marker_for_key(
+            &path_manager,
+            &fragment,
+            &object_key,
+            template_meta.as_ref(),
+        )
+        .await
+        {
+            let _ = write_prefix_segments_for_meta(
+                &path_manager,
+                &fragment,
+                &object_key,
+                &del_vid,
+                del_created_at,
+            )
+            .await;
+        }
+    }
+
     invalidate_compacted_for_key(&path_manager, &fragment, &object_key).await;
 
     info!(
@@ -527,6 +649,14 @@ pub async fn delete_object(
 
     if versions_found.is_empty() {
         return Err(AppError::NotFound);
+    }
+
+    let mut template_meta: Option<ObjectMetadata> = None;
+    for v in &versions_found {
+        if let Some(m) = read_metadata_any(&path_manager, &fragment, &object_key, v).await {
+            template_meta = Some(m);
+            break;
+        }
     }
 
     let index_roots = path_manager.get_all_index_roots();
@@ -591,6 +721,24 @@ pub async fn delete_object(
         }
 
         success_count += 1;
+    }
+
+    if let Ok((del_vid, del_created_at)) = write_delete_marker_for_key(
+        &path_manager,
+        &fragment,
+        &object_key,
+        template_meta.as_ref(),
+    )
+    .await
+    {
+        let _ = write_prefix_segments_for_meta(
+            &path_manager,
+            &fragment,
+            &object_key,
+            &del_vid,
+            del_created_at,
+        )
+        .await;
     }
 
     invalidate_compacted_for_key(&path_manager, &fragment, &object_key).await;
@@ -977,6 +1125,8 @@ pub async fn recover_object_version(
         return Err(AppError::NotFound);
     }
 
+    purge_delete_markers_for_key(&path_manager, &fragment, &object_key).await;
+
     for root in &blob_roots {
         let trash_blob_dir = get_trash_root(root, &fragment)
             .join("blob")
@@ -1082,6 +1232,7 @@ pub async fn recover_object(
 
     found_versions.sort();
     found_versions.dedup();
+    purge_delete_markers_for_key(&path_manager, &fragment, &object_key).await;
 
     let mut recovered_count = 0usize;
 
@@ -1292,6 +1443,7 @@ pub async fn recover_all_trash(
             *created_at,
         )
         .await;
+        purge_delete_markers_for_key(&path_manager, &fragment, object_key).await;
 
         for pfx in prefixes_for_key(object_key) {
             affected_prefixes.insert(pfx);

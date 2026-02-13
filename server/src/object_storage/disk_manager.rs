@@ -346,7 +346,16 @@ pub struct Quota {
 
 #[derive(serde::Deserialize)]
 pub struct DownloadArchiveRequest {
+    #[serde(default)]
     pub keys: Vec<String>,
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub delimiter: Option<String>,
+    #[serde(default)]
+    pub max_keys: Option<usize>,
+    #[serde(default)]
+    pub continuation_token: Option<String>,
     #[serde(default = "default_format")]
     pub format: String,
     #[serde(default)]

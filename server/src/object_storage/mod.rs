@@ -1,8 +1,12 @@
+pub mod adaptive_concurrency;
 pub mod archive;
 pub mod constants;
 pub mod delete;
+pub mod disk_manager;
 pub mod download;
 pub mod ec;
+pub mod fragment_manager;
+pub mod fragment_metadata;
 pub mod garbage_collector;
 pub mod header_parser;
 pub mod maintenance;
@@ -10,6 +14,8 @@ pub mod metadata_parser;
 pub mod modify;
 pub mod monitoring;
 pub mod object_parser;
+pub mod prefix_compactor;
+pub mod prefix_rebuilder;
 pub mod quota_manager;
 pub mod recovery;
 pub mod redistribution;
@@ -18,9 +24,8 @@ pub mod retrieve;
 pub mod sharing;
 pub mod storage_capacity_parser;
 pub mod sync;
-pub mod upload;
 pub mod system;
-pub mod disk_manager;
-pub mod fragment_manager;
-pub mod prefix_rebuilder;
-pub mod fragment_metadata;
+pub mod upload;
+
+#[cfg(test)]
+mod workflow_tests;

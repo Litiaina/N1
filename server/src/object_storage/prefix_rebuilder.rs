@@ -21,14 +21,16 @@ use crate::object_storage::constants::{
     RESERVATION_FILE,
 };
 use crate::object_storage::disk_manager::{
-    ObjectMetadata, ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment,
+    ObjectPathManager, ObjectSummary, PrefixIndexEntry, PrefixIndexSegment,
 };
 use crate::routes::storage_routes::AppState;
+use crate::settings::config::CONFIG;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::manager::WsConnectionManager;
 use crate::websocket::ws_structs::StorageEventPayload;
 
 const MAX_META_BYTES: u64 = 16 * 1024 * 1024;
+const TOMBSTONE_MIN_RETENTION_SECS: i64 = 86_400;
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct PrefixRebuildJobStatus {
@@ -214,8 +216,6 @@ async fn write_atomic_overwrite(path: &Path, data: &[u8]) -> Result<(), AppError
     fs::rename(&tmp, path)
         .await
         .map_err(|e| AppError::Io(e, format!("rename {} -> {}", tmp.display(), path.display())))?;
-
-    sync_dir(parent).await?;
     Ok(())
 }
 
@@ -343,13 +343,20 @@ async fn choose_best_index_dir_for_fragment(
 async fn scan_latest_by_key(
     scan_index_dir: &Path,
     fragment: &str,
-) -> Result<(u64, HashMap<String, (String, i64)>), AppError> {
+) -> Result<(u64, HashMap<String, (String, i64)>, Vec<(String, String)>), AppError> {
     let scan_root = scan_index_dir.to_path_buf();
     let frag = fragment.to_string();
+    let now_ts = Utc::now().timestamp();
+    let retention_secs = std::cmp::max(
+        CONFIG.garbage_collector.retention_seconds as i64,
+        TOMBSTONE_MIN_RETENTION_SECS,
+    );
+    let cutoff_ts = now_ts.saturating_sub(retention_secs);
 
     tokio::task::spawn_blocking(move || {
         let mut scanned = 0u64;
         let mut latest: HashMap<String, (String, i64)> = HashMap::new();
+        let mut latest_tombstone: HashMap<String, (String, i64)> = HashMap::new();
 
         let prefix_dir_os = std::ffi::OsStr::new(PREFIX_INDEX_DIR);
 
@@ -386,7 +393,7 @@ async fn scan_latest_by_key(
                 Err(_) => continue,
             };
 
-            let meta = match rmp_serde::from_slice::<ObjectMetadata>(&raw) {
+            let meta = match rmp_serde::from_slice::<ObjectSummary>(&raw) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
@@ -394,7 +401,21 @@ async fn scan_latest_by_key(
             if meta.fragment != frag {
                 continue;
             }
+
             if meta.is_delete_marker {
+                let key = canonical_key(&meta.object_key);
+                let vid = meta.version_id.clone();
+                let ts = meta.created_at;
+                match latest_tombstone.get(&key) {
+                    None => {
+                        latest_tombstone.insert(key, (vid, ts));
+                    }
+                    Some((cur_vid, cur_ts)) => {
+                        if ts > *cur_ts || (ts == *cur_ts && vid > *cur_vid) {
+                            latest_tombstone.insert(key, (vid, ts));
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -416,7 +437,18 @@ async fn scan_latest_by_key(
             scanned += 1;
         }
 
-        Ok::<_, AppError>((scanned, latest))
+        let mut stale_tombstones: Vec<(String, String)> = Vec::new();
+        for (key, (vid, ts)) in latest_tombstone {
+            let overshadowed = match latest.get(&key) {
+                None => true,
+                Some((_, nts)) => ts >= *nts,
+            };
+            if overshadowed && ts <= cutoff_ts {
+                stale_tombstones.push((key, vid));
+            }
+        }
+
+        Ok::<_, AppError>((scanned, latest, stale_tombstones))
     })
     .await
     .map_err(|e| AppError::InternalServerError(format!("scan task join error: {}", e)))?
@@ -459,6 +491,7 @@ async fn write_compacted_prefixes(
 ) -> Result<(u64, u64), AppError> {
     let mut prefixes_written = 0u64;
     let mut entries_written = 0u64;
+    let mut parent_dirs_to_sync = HashSet::<PathBuf>::new();
 
     for (prefix, entries) in per_prefix {
         if should_stop() {
@@ -486,6 +519,9 @@ async fn write_compacted_prefixes(
                 let _ = fs::create_dir_all(parent).await;
             }
             if write_atomic_overwrite(&p, &bytes).await.is_ok() {
+                if let Some(parent) = p.parent() {
+                    parent_dirs_to_sync.insert(parent.to_path_buf());
+                }
                 wrote_any = true;
             }
         }
@@ -524,7 +560,26 @@ async fn write_compacted_prefixes(
         entries_written += seg.entries.len() as u64;
     }
 
+    for dir in parent_dirs_to_sync {
+        let _ = sync_dir(&dir).await;
+    }
+
     Ok((prefixes_written, entries_written))
+}
+
+async fn cleanup_stale_delete_markers(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    stale_tombstones: &[(String, String)],
+) {
+    for (object_key, version_id) in stale_tombstones {
+        for p in path_manager.get_all_metadata_paths(fragment, object_key, version_id) {
+            let _ = fs::remove_file(&p).await;
+            if let Some(parent) = p.parent() {
+                let _ = sync_dir(parent).await;
+            }
+        }
+    }
 }
 
 pub async fn run_prefix_rebuild_job(
@@ -592,16 +647,17 @@ pub async fn run_prefix_rebuild_job(
             push_update(&ws, &st);
         }
 
-        let (scanned, latest_by_key) = match scan_latest_by_key(&scan_index_dir, &frag).await {
-            Ok(v) => v,
-            Err(e) => {
-                let mut st = PR_STATUS.write().await;
-                st.total_errors += 1;
-                st.last_error = Some(e.to_string());
-                push_update(&ws, &st);
-                continue;
-            }
-        };
+        let (scanned, latest_by_key, stale_tombstones) =
+            match scan_latest_by_key(&scan_index_dir, &frag).await {
+                Ok(v) => v,
+                Err(e) => {
+                    let mut st = PR_STATUS.write().await;
+                    st.total_errors += 1;
+                    st.last_error = Some(e.to_string());
+                    push_update(&ws, &st);
+                    continue;
+                }
+            };
 
         let elapsed = start_time.elapsed().as_secs_f64();
         {
@@ -626,6 +682,7 @@ pub async fn run_prefix_rebuild_job(
 
         match write_compacted_prefixes(&path_manager, &frag, per_prefix, sys_start_time).await {
             Ok((pfx_written, ent_written)) => {
+                cleanup_stale_delete_markers(&path_manager, &frag, &stale_tombstones).await;
                 let mut st = PR_STATUS.write().await;
                 st.total_prefixes_written += pfx_written;
                 st.total_entries_written += ent_written;

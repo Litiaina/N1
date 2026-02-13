@@ -1,19 +1,19 @@
-use std::sync::OnceLock;
-use axum::Router;
-use axum::body::Body;
-use axum::http::Request;
-use governor::middleware::NoOpMiddleware;
-use ini::Ini;
-use tower_governor::key_extractor::KeyExtractor;
-use tower_governor::errors::GovernorError;
-use tower_governor::GovernorLayer;
-use tower_governor::governor::GovernorConfigBuilder;
-use tower_governor::key_extractor::SmartIpKeyExtractor;
-use jsonwebtoken::{decode, Validation};
-use tracing::error;
+use crate::middleware::auth_middleware::JWT_KEYS;
 use crate::settings::constants::CONFIG_FILE;
 use crate::structs::auth_structs::Claims;
-use crate::middleware::auth_middleware::JWT_KEYS;
+use axum::body::Body;
+use axum::http::Request;
+use axum::Router;
+use governor::middleware::NoOpMiddleware;
+use ini::Ini;
+use jsonwebtoken::{decode, Validation};
+use std::sync::OnceLock;
+use tower_governor::errors::GovernorError;
+use tower_governor::governor::GovernorConfigBuilder;
+use tower_governor::key_extractor::KeyExtractor;
+use tower_governor::key_extractor::SmartIpKeyExtractor;
+use tower_governor::GovernorLayer;
+use tracing::error;
 
 #[derive(Clone)]
 pub struct UserKeyExtractor;
@@ -26,23 +26,23 @@ impl KeyExtractor for UserKeyExtractor {
             return Ok("global_options_allow".to_string());
         }
 
-        let auth_header = req.headers()
+        let auth_header = req
+            .headers()
             .get("authorization")
             .and_then(|h| h.to_str().ok())
             .and_then(|s| s.strip_prefix("Bearer "));
 
         if let Some(token) = auth_header {
-             let validation = Validation::default();
-             
-             if let Ok(token_data) = decode::<Claims>(token, &JWT_KEYS.decoding, &validation) {
-                 return Ok(token_data.claims.fragment.to_string());
-             }
+            let validation = Validation::default();
+
+            if let Ok(token_data) = decode::<Claims>(token, &JWT_KEYS.decoding, &validation) {
+                return Ok(token_data.claims.fragment.to_string());
+            }
         }
-        
+
         Err(GovernorError::UnableToExtractKey)
     }
 }
-
 
 #[derive(Clone, Copy, Debug)]
 struct RateLimitSettings {
@@ -58,7 +58,7 @@ struct RateLimitSettings {
     sharing_per_sec: u64,
     sharing_burst: u32,
     global_per_sec: u64,
-    global_burst: u32
+    global_burst: u32,
 }
 
 static RATE_LIMIT_CONFIG: OnceLock<RateLimitSettings> = OnceLock::new();
@@ -140,7 +140,7 @@ pub struct RateLimitLayers {
     pub view: Option<GovernorLayer<UserKeyExtractor, NoOpMiddleware, Body>>,
     pub upload: Option<GovernorLayer<UserKeyExtractor, NoOpMiddleware, Body>>,
     pub sharing: Option<GovernorLayer<SmartIpKeyExtractor, NoOpMiddleware, Body>>,
-    pub global: Option<GovernorLayer<SmartIpKeyExtractor, NoOpMiddleware, Body>>
+    pub global: Option<GovernorLayer<SmartIpKeyExtractor, NoOpMiddleware, Body>>,
 }
 
 impl RateLimitLayers {
@@ -149,12 +149,16 @@ impl RateLimitLayers {
 
         if !limits.enabled {
             return Self {
-                auth: None, view: None, upload: None, sharing: None, global: None
+                auth: None,
+                view: None,
+                upload: None,
+                sharing: None,
+                global: None,
             };
         }
 
         let build_ip_conf = |per_sec, burst| {
-             GovernorConfigBuilder::default()
+            GovernorConfigBuilder::default()
                 .per_second(per_sec)
                 .burst_size(burst)
                 .key_extractor(SmartIpKeyExtractor)
@@ -163,7 +167,7 @@ impl RateLimitLayers {
         };
 
         let build_user_conf = |per_sec, burst| {
-             GovernorConfigBuilder::default()
+            GovernorConfigBuilder::default()
                 .per_second(per_sec)
                 .burst_size(burst)
                 .key_extractor(UserKeyExtractor)
@@ -172,41 +176,81 @@ impl RateLimitLayers {
         };
 
         Self {
-            auth: Some(GovernorLayer::new(build_ip_conf(limits.auth_per_sec, limits.auth_burst))),
-            view: Some(GovernorLayer::new(build_user_conf(limits.view_per_sec, limits.view_burst))),
-            upload: Some(GovernorLayer::new(build_user_conf(limits.upload_per_sec, limits.upload_burst))),
-            sharing: Some(GovernorLayer::new(build_ip_conf(limits.sharing_per_sec, limits.sharing_burst))),
-            global: Some(GovernorLayer::new(build_ip_conf(limits.global_per_sec, limits.global_burst))),
+            auth: Some(GovernorLayer::new(build_ip_conf(
+                limits.auth_per_sec,
+                limits.auth_burst,
+            ))),
+            view: Some(GovernorLayer::new(build_user_conf(
+                limits.view_per_sec,
+                limits.view_burst,
+            ))),
+            upload: Some(GovernorLayer::new(build_user_conf(
+                limits.upload_per_sec,
+                limits.upload_burst,
+            ))),
+            sharing: Some(GovernorLayer::new(build_ip_conf(
+                limits.sharing_per_sec,
+                limits.sharing_burst,
+            ))),
+            global: Some(GovernorLayer::new(build_ip_conf(
+                limits.global_per_sec,
+                limits.global_burst,
+            ))),
         }
     }
 
-    pub fn layer_auth<S>(&self, router: Router<S>) -> Router<S> 
-    where S: Clone + Send + Sync + 'static 
+    pub fn layer_auth<S>(&self, router: Router<S>) -> Router<S>
+    where
+        S: Clone + Send + Sync + 'static,
     {
-        if let Some(layer) = &self.auth { router.layer(layer.clone()) } else { router }
+        if let Some(layer) = &self.auth {
+            router.layer(layer.clone())
+        } else {
+            router
+        }
     }
 
-    pub fn layer_view<S>(&self, router: Router<S>) -> Router<S> 
-    where S: Clone + Send + Sync + 'static 
+    pub fn layer_view<S>(&self, router: Router<S>) -> Router<S>
+    where
+        S: Clone + Send + Sync + 'static,
     {
-        if let Some(layer) = &self.view { router.layer(layer.clone()) } else { router }
+        if let Some(layer) = &self.view {
+            router.layer(layer.clone())
+        } else {
+            router
+        }
     }
 
-    pub fn layer_upload<S>(&self, router: Router<S>) -> Router<S> 
-    where S: Clone + Send + Sync + 'static 
+    pub fn layer_upload<S>(&self, router: Router<S>) -> Router<S>
+    where
+        S: Clone + Send + Sync + 'static,
     {
-        if let Some(layer) = &self.upload { router.layer(layer.clone()) } else { router }
+        if let Some(layer) = &self.upload {
+            router.layer(layer.clone())
+        } else {
+            router
+        }
     }
 
-    pub fn layer_sharing<S>(&self, router: Router<S>) -> Router<S> 
-    where S: Clone + Send + Sync + 'static 
+    pub fn layer_sharing<S>(&self, router: Router<S>) -> Router<S>
+    where
+        S: Clone + Send + Sync + 'static,
     {
-        if let Some(layer) = &self.sharing { router.layer(layer.clone()) } else { router }
+        if let Some(layer) = &self.sharing {
+            router.layer(layer.clone())
+        } else {
+            router
+        }
     }
 
-    pub fn layer_global<S>(&self, router: Router<S>) -> Router<S> 
-    where S: Clone + Send + Sync + 'static 
+    pub fn layer_global<S>(&self, router: Router<S>) -> Router<S>
+    where
+        S: Clone + Send + Sync + 'static,
     {
-        if let Some(layer) = &self.global { router.layer(layer.clone()) } else { router }
+        if let Some(layer) = &self.global {
+            router.layer(layer.clone())
+        } else {
+            router
+        }
     }
 }

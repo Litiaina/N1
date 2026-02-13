@@ -11,24 +11,36 @@ use crate::object_storage::object_parser::{get_object_logic, stream_object_logic
 use crate::object_storage::quota_manager::get_quota;
 use crate::structs::auth_structs::Claims;
 use axum::{
-    Json as AxumJson,
     body::Body,
     extract::{Path, Query},
-    http::{HeaderMap, HeaderValue, header},
+    http::{header, HeaderMap, HeaderValue},
     response::{IntoResponse, Response},
+    Json as AxumJson,
 };
-use base64::Engine;
 use base64::engine::general_purpose;
+use base64::Engine;
 use futures_util::StreamExt;
+use once_cell::sync::OnceCell;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 use tokio::fs;
 use tracing::{debug, warn};
 use walkdir::WalkDir;
+
+pub static PREFIX_MAX_DELTA_SEGMENTS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
+
+fn prefix_max_delta_segments() -> usize {
+    PREFIX_MAX_DELTA_SEGMENTS_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or(512)
+        .clamp(32, 65_536)
+}
 
 fn parse_continuation_token(token: &str) -> Option<(String, String, String, String, String)> {
     let bytes = general_purpose::STANDARD.decode(token).ok()?;
@@ -151,8 +163,8 @@ async fn try_list_by_prefix_index(
     let want_delim = delimiter == Some("/");
 
     let path_manager = ObjectPathManager::new();
-
-    let mut segments: Vec<PrefixIndexSegment> = Vec::new();
+    let mut latest: HashMap<String, (String, i64)> = HashMap::new();
+    let mut had_any_index_data = false;
 
     let bucket_dirs = path_manager.get_all_prefix_bucket_dirs(fragment, &pfx);
     for d in bucket_dirs {
@@ -161,15 +173,40 @@ async fn try_list_by_prefix_index(
         }
 
         let compacted_path = d.join(format!("compacted{}", PREFIX_SEGMENT_EXT));
+        let mut compacted_mtime: Option<std::time::SystemTime> = None;
+
         if fs::try_exists(&compacted_path).await.unwrap_or(false) {
             if let Ok(data) = fs::read(&compacted_path).await {
                 if let Ok(seg) = rmp_serde::from_slice::<PrefixIndexSegment>(&data) {
-                    segments.push(seg);
+                    had_any_index_data = true;
+                    if let Ok(md) = fs::metadata(&compacted_path).await {
+                        compacted_mtime = md.modified().ok();
+                    }
+                    if canonical_prefix(&seg.prefix) == pfx {
+                        for e in seg.entries {
+                            let ck = canonical_key(&e.object_key);
+                            if !pfx.is_empty() && ck != pfx && !ck.starts_with(&(pfx.clone() + "/")) {
+                                continue;
+                            }
+                            match latest.get(&ck) {
+                                None => {
+                                    latest.insert(ck, (e.version_id.clone(), e.created_at));
+                                }
+                                Some((cur_vid, cur_ts)) => {
+                                    if e.created_at > *cur_ts
+                                        || (e.created_at == *cur_ts && e.version_id > *cur_vid)
+                                    {
+                                        latest.insert(ck, (e.version_id.clone(), e.created_at));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        let mut seg_files = Vec::new();
+        let mut seg_files: Vec<(String, std::time::SystemTime, PathBuf)> = Vec::new();
         if let Ok(mut entries) = fs::read_dir(&d).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 if !entry
@@ -182,53 +219,67 @@ async fn try_list_by_prefix_index(
                 }
                 let name = entry.file_name().to_string_lossy().to_string();
                 if name.starts_with("seg_") && name.ends_with(PREFIX_SEGMENT_EXT) {
-                    seg_files.push((name, entry.path()));
+                    let modified = entry
+                        .metadata()
+                        .await
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .unwrap_or(std::time::UNIX_EPOCH);
+                    seg_files.push((name, modified, entry.path()));
                 }
             }
         }
         seg_files.sort_by(|a, b| a.0.cmp(&b.0));
 
-        for (_name, path) in seg_files {
+        let recent_delta_count = if let Some(cmp_ts) = compacted_mtime {
+            seg_files.iter().filter(|(_, ts, _)| *ts > cmp_ts).count()
+        } else {
+            seg_files.len()
+        };
+
+        let max_deltas = prefix_max_delta_segments();
+        if recent_delta_count > max_deltas {
+            debug!(
+                "Prefix delta fan-in too large for fragment={} prefix='{}' bucket={:?} recent_deltas={} (max={}); fallback to full scan",
+                fragment, pfx, d, recent_delta_count, max_deltas
+            );
+            return Ok(None);
+        }
+
+        for (_name, _mtime, path) in seg_files {
             if let Ok(data) = fs::read(&path).await {
                 if let Ok(seg) = rmp_serde::from_slice::<PrefixIndexSegment>(&data) {
-                    segments.push(seg);
-                }
-            }
-        }
-    }
+                    had_any_index_data = true;
+                    if canonical_prefix(&seg.prefix) != pfx {
+                        continue;
+                    }
+                    for e in seg.entries {
+                        let ck = canonical_key(&e.object_key);
 
-    if segments.is_empty() {
-        return Ok(None);
-    }
+                        if !pfx.is_empty() && ck != pfx && !ck.starts_with(&(pfx.clone() + "/")) {
+                            continue;
+                        }
 
-    let mut latest: HashMap<String, (String, i64)> = HashMap::new();
-
-    for seg in segments {
-        if canonical_prefix(&seg.prefix) != pfx {
-            continue;
-        }
-        for e in seg.entries {
-            let ck = canonical_key(&e.object_key);
-
-            if !pfx.is_empty() {
-                if ck != pfx && !ck.starts_with(&(pfx.clone() + "/")) {
-                    continue;
-                }
-            }
-
-            match latest.get(&ck) {
-                None => {
-                    latest.insert(ck, (e.version_id.clone(), e.created_at));
-                }
-                Some((cur_vid, cur_ts)) => {
-                    if e.created_at > *cur_ts
-                        || (e.created_at == *cur_ts && e.version_id > *cur_vid)
-                    {
-                        latest.insert(ck, (e.version_id.clone(), e.created_at));
+                        match latest.get(&ck) {
+                            None => {
+                                latest.insert(ck, (e.version_id.clone(), e.created_at));
+                            }
+                            Some((cur_vid, cur_ts)) => {
+                                if e.created_at > *cur_ts
+                                    || (e.created_at == *cur_ts && e.version_id > *cur_vid)
+                                {
+                                    latest.insert(ck, (e.version_id.clone(), e.created_at));
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+
+    if !had_any_index_data {
+        return Ok(None);
     }
 
     if latest.is_empty() {

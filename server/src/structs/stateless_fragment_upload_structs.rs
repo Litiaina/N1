@@ -1,4 +1,6 @@
-use crate::fs::fs_constants::{CHUNK_PREFIX, METADATA_FILENAME, STORAGE_ROOT, TEMP_UPLOAD_EXTENTION};
+use crate::fs::fs_constants::{
+    CHUNK_PREFIX, METADATA_FILENAME, STORAGE_ROOT, TEMP_UPLOAD_EXTENTION,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

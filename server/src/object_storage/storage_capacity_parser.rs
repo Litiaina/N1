@@ -1,4 +1,4 @@
-use axum::{Json, extract::Path as AxumPath, response::IntoResponse};
+use axum::{extract::Path as AxumPath, response::IntoResponse, Json};
 
 use crate::{
     enums::app_error_enum::AppError,

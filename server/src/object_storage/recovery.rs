@@ -1,7 +1,7 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::GC_SUFFIX;
 use crate::object_storage::disk_manager::{ObjectPathManager, PartMetadata, ShardInfo};
-use crate::object_storage::upload::DirectWriter;
+use crate::object_storage::upload::{sync_dir, DirectWriter};
 
 use crc32fast::Hasher;
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
@@ -487,14 +487,15 @@ pub async fn repair_entire_shard(
         .try_clone()
         .map_err(|e| AppError::Io(e, "clone handle".into()))?;
 
-    if let Err(e) = tokio::task::spawn_blocking(move || file_clone.set_len(total_shard_size)).await
-    {
-        let _ = fs::remove_file(&temp_path).await;
-        return Err(AppError::InternalServerError(format!(
-            "Failed to preallocate repair file: {}",
-            e
-        )));
-    }
+    tokio::task::spawn_blocking(move || file_clone.set_len(total_shard_size))
+        .await
+        .map_err(|e| {
+            AppError::InternalServerError(format!("Failed to preallocate repair file: {}", e))
+        })?
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&temp_path);
+            AppError::Io(e, format!("set_len repair file {}", temp_path.display()))
+        })?;
 
     let mut temp_file = DirectWriter::new(std_file);
 
@@ -613,8 +614,7 @@ pub async fn repair_entire_shard(
 
             let ridx = target_shard.shard_index - data_count;
             let data = enc
-                .recovery_iter()
-                .nth(ridx)
+                .recovery(ridx)
                 .ok_or_else(|| AppError::InternalServerError("Missing parity output".into()))?;
 
             temp_file
@@ -630,6 +630,10 @@ pub async fn repair_entire_shard(
         .flush()
         .await
         .map_err(|e| AppError::Io(e, "flush repair".into()))?;
+    temp_file
+        .sync_data()
+        .await
+        .map_err(|e| AppError::Io(e, "fsync repair".into()))?;
 
     match fs::rename(&temp_path, &final_path).await {
         Ok(_) => {}
@@ -641,6 +645,7 @@ pub async fn repair_entire_shard(
                 .map_err(|e2| AppError::Io(e2, "rename repaired file".into()))?;
         }
     }
+    let _ = sync_dir(&parent_dir).await;
 
     info!(
         "Successfully repaired shard {} -> {}",

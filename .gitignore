@@ -25,7 +25,16 @@ Desktop.ini
 # Environment variables
 .env
 .env.*
+n1.env
+server/n1.env
 
 # Config variables
 config.ini
+n1_config.ini
 .ini.*
+server/n1_config.ini
+server/n1_config.ini.bak.*
+.n1-bench/
+
+# Local runtime/test artifacts
+.n1-local/

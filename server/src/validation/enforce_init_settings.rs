@@ -61,6 +61,6 @@ pub fn ensure_config_file() -> io::Result<()> {
         "Created default '{}' file with standard settings.",
         CONFIG_FILE
     );
-    
+
     Ok(())
 }

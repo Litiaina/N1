@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::object_storage::{disk_manager::ObjectMetadata, prefix_rebuilder::PrefixRebuildJobStatus, redistribution::RedistributionJobStatus, repair_manager::RepairJobStatus};
+use crate::object_storage::{
+    disk_manager::ObjectMetadata, prefix_rebuilder::PrefixRebuildJobStatus,
+    redistribution::RedistributionJobStatus, repair_manager::RepairJobStatus,
+};
 
 #[derive(Deserialize)]
 pub struct WsAuthParams {
@@ -56,7 +59,7 @@ pub enum StorageEventPayload {
 
     #[serde(rename = "STATE_INVALIDATED")]
     StateInvalidated,
-    
+
     #[serde(rename = "MONITORING_UPDATE")]
     MonitoringUpdate {
         system: serde_json::Value,

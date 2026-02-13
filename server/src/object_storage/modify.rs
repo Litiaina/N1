@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::{Json as AxumJson, http::StatusCode, response::IntoResponse};
+use axum::{http::StatusCode, response::IntoResponse, Json as AxumJson};
 use chrono::Utc;
 use futures_util::future::join_all;
 use tokio::fs;
@@ -16,6 +16,7 @@ use crate::object_storage::constants::METADATA_EXT;
 use crate::object_storage::disk_manager::{
     ObjectMetadata, ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment, RenameObjectRequest,
 };
+use crate::object_storage::prefix_compactor::schedule_prefix_compaction;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
@@ -228,8 +229,10 @@ async fn invalidate_compacted_for_key(
     object_key: &str,
 ) {
     let prefixes = prefixes_for_key(object_key);
+    let mut compact_candidates = Vec::new();
     for pfx in prefixes {
         let cpfx = canonical_prefix(&pfx);
+        compact_candidates.push(cpfx.clone());
         for p in path_manager.get_all_prefix_compacted_paths(fragment, &cpfx) {
             let _ = fs::remove_file(&p).await;
             if let Some(parent) = p.parent() {
@@ -237,6 +240,7 @@ async fn invalidate_compacted_for_key(
             }
         }
     }
+    schedule_prefix_compaction(fragment.to_string(), compact_candidates);
 }
 
 async fn write_delete_marker_for_key(

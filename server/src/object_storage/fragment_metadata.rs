@@ -2,8 +2,8 @@ use crate::object_storage::disk_manager::ObjectPathManager;
 use crate::{enums::app_error_enum::AppError, object_storage::constants::FRAGMENT_METADATA_FILE};
 
 use argon2::{
-    Argon2,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
 };
 use chrono::{SecondsFormat, Utc};
 use rand::rngs::OsRng;
