@@ -16,7 +16,8 @@ use walkdir::WalkDir;
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::{METADATA_EXT, QUOTA_FILE};
 use crate::object_storage::disk_manager::{
-    default_stripe_size, ObjectMetadata, ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment,
+    default_stripe_size, ObjectMetadata, ObjectPathManager, ObjectSummary, PrefixIndexEntry,
+    PrefixIndexSegment,
 };
 use crate::object_storage::prefix_compactor::schedule_prefix_compaction;
 use crate::object_storage::quota_manager::update_quota;
@@ -249,14 +250,6 @@ async fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<(), AppErro
     Ok(())
 }
 
-async fn write_atomic_if_missing(path: &std::path::Path, data: &[u8]) -> Result<bool, AppError> {
-    if fs::try_exists(path).await.unwrap_or(false) {
-        return Ok(false);
-    }
-    write_atomic(path, data).await?;
-    Ok(true)
-}
-
 async fn read_metadata_any(
     path_manager: &ObjectPathManager,
     fragment: &str,
@@ -308,7 +301,7 @@ async fn write_prefix_segments_for_meta(
             if let Some(parent) = p.parent() {
                 let _ = fs::create_dir_all(parent).await;
             }
-            if write_atomic_if_missing(&p, &bytes).await.unwrap_or(false) {
+            if write_atomic(&p, &bytes).await.is_ok() {
                 wrote_this_prefix = true;
             }
         }
@@ -328,7 +321,7 @@ async fn write_prefix_segments_for_meta(
 }
 
 async fn invalidate_compacted_for_key(
-    path_manager: &ObjectPathManager,
+    _path_manager: &ObjectPathManager,
     fragment: &str,
     object_key: &str,
 ) {
@@ -337,12 +330,6 @@ async fn invalidate_compacted_for_key(
     for pfx in prefixes {
         let cpfx = canonical_prefix(&pfx);
         compact_candidates.push(cpfx.clone());
-        for p in path_manager.get_all_prefix_compacted_paths(fragment, &cpfx) {
-            let _ = fs::remove_file(&p).await;
-            if let Some(parent) = p.parent() {
-                let _ = sync_dir(parent).await;
-            }
-        }
     }
     schedule_prefix_compaction(fragment.to_string(), compact_candidates);
 }
@@ -794,7 +781,7 @@ pub async fn empty_trash(
                     && entry.file_name().to_string_lossy().ends_with(METADATA_EXT)
                 {
                     if let Ok(data) = std::fs::read(entry.path()) {
-                        if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
+                        if let Ok(meta) = rmp_serde::from_slice::<ObjectSummary>(&data) {
                             mirror_total += meta.total_size_bytes;
                         }
                     }
@@ -908,7 +895,7 @@ pub async fn delete_object_permanently(
 
                     let mut size = 0u64;
                     if let Ok(data) = fs::read(entry.path()).await {
-                        if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
+                        if let Ok(meta) = rmp_serde::from_slice::<ObjectSummary>(&data) {
                             size = meta.total_size_bytes;
                         }
                     }
@@ -1146,12 +1133,13 @@ pub async fn recover_object_version(
 
     if let Some(meta) = read_metadata_any(&path_manager, &fragment, &object_key, &version_id).await
     {
+        let restored_at = chrono::Utc::now().timestamp().saturating_add(1);
         let _ = write_prefix_segments_for_meta(
             &path_manager,
             &fragment,
             &meta.object_key,
             &meta.version_id,
-            meta.created_at,
+            restored_at,
         )
         .await;
     }
@@ -1302,12 +1290,13 @@ pub async fn recover_object(
         if let Some(meta) =
             read_metadata_any(&path_manager, &fragment, &object_key, version_id).await
         {
+            let restored_at = chrono::Utc::now().timestamp().saturating_add(1);
             let _ = write_prefix_segments_for_meta(
                 &path_manager,
                 &fragment,
                 &meta.object_key,
                 &meta.version_id,
-                meta.created_at,
+                restored_at,
             )
             .await;
         }
@@ -1371,7 +1360,7 @@ pub async fn recover_all_trash(
                 Err(_) => continue,
             };
 
-            let meta = match rmp_serde::from_slice::<ObjectMetadata>(&data) {
+            let meta = match rmp_serde::from_slice::<ObjectSummary>(&data) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
@@ -1434,13 +1423,14 @@ pub async fn recover_all_trash(
     futures_util::future::join_all(tasks).await;
 
     let mut affected_prefixes: BTreeSet<String> = BTreeSet::new();
-    for (_k, (object_key, version_id, created_at)) in recovered_meta_entries.iter() {
+    for (_k, (object_key, version_id, _created_at)) in recovered_meta_entries.iter() {
+        let restored_at = chrono::Utc::now().timestamp().saturating_add(1);
         let _ = write_prefix_segments_for_meta(
             &path_manager,
             &fragment,
             object_key,
             version_id,
-            *created_at,
+            restored_at,
         )
         .await;
         purge_delete_markers_for_key(&path_manager, &fragment, object_key).await;

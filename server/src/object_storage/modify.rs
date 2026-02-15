@@ -224,7 +224,7 @@ async fn write_prefix_segments_for_meta(
 }
 
 async fn invalidate_compacted_for_key(
-    path_manager: &ObjectPathManager,
+    _path_manager: &ObjectPathManager,
     fragment: &str,
     object_key: &str,
 ) {
@@ -233,12 +233,6 @@ async fn invalidate_compacted_for_key(
     for pfx in prefixes {
         let cpfx = canonical_prefix(&pfx);
         compact_candidates.push(cpfx.clone());
-        for p in path_manager.get_all_prefix_compacted_paths(fragment, &cpfx) {
-            let _ = fs::remove_file(&p).await;
-            if let Some(parent) = p.parent() {
-                let _ = sync_dir(parent).await;
-            }
-        }
     }
     schedule_prefix_compaction(fragment.to_string(), compact_candidates);
 }
