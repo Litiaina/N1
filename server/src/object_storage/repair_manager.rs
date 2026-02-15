@@ -6,6 +6,7 @@ use crate::object_storage::constants::{
 use crate::object_storage::disk_manager::{
     ObjectMetadata, ObjectPathManager, PartMetadata, Quota, INDEX_STORE_DISKS,
 };
+use crate::object_storage::operation_gate::acquire_read_only_fast_mode;
 use crate::object_storage::prefix_rebuilder::run_prefix_rebuild_job;
 use crate::object_storage::recovery::{repair_entire_shard, verify_shard_integrity};
 use crate::object_storage::upload::UploadSessionManifest;
@@ -21,7 +22,6 @@ use futures_util::{stream, StreamExt};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -36,6 +36,7 @@ use walkdir::WalkDir;
 pub struct RepairJobStatus {
     pub is_running: bool,
     pub phase: String,
+    pub fast_mode: bool,
 
     pub total_scanned: u64,
     pub total_repaired: u64,
@@ -74,6 +75,11 @@ pub struct RepairRunConfig {
     pub meta_batch_size: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RepairRunOptions {
+    pub fast_mode: bool,
+}
+
 #[derive(Default, Clone)]
 struct BatchDelta {
     scanned: u64,
@@ -100,6 +106,102 @@ fn parse_check_mode(params: &HashMap<String, String>) -> RepairCheckMode {
         Some("scrub") | Some("strict") | Some("checksum") => RepairCheckMode::Scrub,
         _ => RepairCheckMode::Availability,
     }
+}
+
+fn parse_bool_param(params: &HashMap<String, String>, key: &str, default: bool) -> bool {
+    match params.get(key).map(|s| s.as_str()) {
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") | Some("on")
+        | Some("ON") => true,
+        Some("0") | Some("false") | Some("FALSE") | Some("no") | Some("NO") | Some("off")
+        | Some("OFF") => false,
+        Some(_) => default,
+        None => default,
+    }
+}
+
+fn detect_total_ram_gib() -> usize {
+    let content = match std::fs::read_to_string("/proc/meminfo") {
+        Ok(v) => v,
+        Err(_) => return 8,
+    };
+
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            if let Some(kib) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                return ((kib / (1024 * 1024)) as usize).max(1);
+            }
+        }
+    }
+
+    8
+}
+
+fn repair_limits_for_ram_gib(ram_gib: usize) -> (usize, usize, usize) {
+    match ram_gib {
+        0..=4 => (8, 2, 256),
+        5..=8 => (16, 4, 512),
+        9..=16 => (24, 8, 1024),
+        17..=32 => (32, 12, 2048),
+        _ => (64, 16, 4096),
+    }
+}
+
+fn repair_defaults_for_runtime(
+    fast_mode: bool,
+    ram_gib: usize,
+    cpu_cores: usize,
+) -> (usize, usize, usize) {
+    let mut meta = if fast_mode {
+        cpu_cores.saturating_mul(2).clamp(2, 16)
+    } else {
+        cpu_cores.clamp(1, 8)
+    };
+    let mut shard = if fast_mode {
+        (cpu_cores / 2).clamp(1, 8)
+    } else {
+        (cpu_cores / 4).clamp(1, 2)
+    };
+    let mut batch = if fast_mode { 512 } else { 256 };
+
+    match ram_gib {
+        0..=2 => {
+            meta = meta.min(2);
+            shard = shard.min(1);
+            batch = batch.min(64);
+        }
+        3..=4 => {
+            meta = meta.min(4);
+            shard = shard.min(1);
+            batch = batch.min(128);
+        }
+        5..=8 => {
+            meta = meta.min(6);
+            shard = shard.min(2);
+            batch = batch.min(192);
+        }
+        9..=16 => {
+            meta = meta.min(8);
+            shard = shard.min(3);
+            batch = batch.min(256);
+        }
+        17..=32 => {
+            meta = meta.min(12);
+            shard = shard.min(4);
+            batch = batch.min(384);
+        }
+        _ => {}
+    }
+
+    let (max_meta, max_shard, max_batch) = repair_limits_for_ram_gib(ram_gib);
+    (
+        clamp_usize(meta, 1, max_meta),
+        clamp_usize(shard, 1, max_shard),
+        clamp_usize(batch, 32, max_batch),
+    )
 }
 
 #[inline]
@@ -242,40 +344,63 @@ pub async fn trigger_repair_job_api(
         }
     }
 
+    let fast_mode = parse_bool_param(&params, "fast_mode", false)
+        || parse_bool_param(&params, "read_only_fast", false);
+    let ram_gib = detect_total_ram_gib();
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let (default_meta_conc, default_repair_conc, default_batch) =
+        repair_defaults_for_runtime(fast_mode, ram_gib, cpu_cores);
+    let (max_meta_conc, max_repair_conc, max_batch_size) = repair_limits_for_ram_gib(ram_gib);
+
     let cfg = RepairRunConfig {
-        dry_run: params.get("dry_run").map(|v| v == "true").unwrap_or(false),
+        dry_run: parse_bool_param(&params, "dry_run", false),
         check_mode: parse_check_mode(&params),
         meta_concurrency: clamp_usize(
             params
                 .get("meta_concurrency")
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(16),
+                .unwrap_or(default_meta_conc),
             1,
-            128,
+            max_meta_conc,
         ),
         shard_repair_concurrency: clamp_usize(
             params
                 .get("repair_concurrency")
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(4),
+                .unwrap_or(default_repair_conc),
             1,
-            64,
+            max_repair_conc,
         ),
         meta_batch_size: clamp_usize(
             params
                 .get("batch")
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(512),
+                .unwrap_or(default_batch),
             32,
-            8192,
+            max_batch_size,
         ),
     };
+    info!(
+        "Repair tuning: ram_gib={} cpu_cores={} fast_mode={} meta_conc={} repair_conc={} batch={} (caps: meta<= {}, repair<= {}, batch<= {})",
+        ram_gib,
+        cpu_cores,
+        fast_mode,
+        cfg.meta_concurrency,
+        cfg.shard_repair_concurrency,
+        cfg.meta_batch_size,
+        max_meta_conc,
+        max_repair_conc,
+        max_batch_size
+    );
+    let run_opts = RepairRunOptions { fast_mode };
 
     let ws_manager = Arc::new(state.ws_manager.clone());
     let ws_manager_clone = ws_manager.clone();
 
     tokio::spawn(async move {
-        if let Err(e) = run_repair_job(cfg, ws_manager.clone()).await {
+        if let Err(e) = run_repair_job_with_options(cfg, run_opts, ws_manager.clone()).await {
             error!("Manual Repair Job Failed: {}", e);
             let mut status = REPAIR_STATUS.write().await;
             status.is_running = false;
@@ -314,16 +439,6 @@ pub async fn stop_repair_job_api(
     Ok((StatusCode::OK, "Stop signal sent to repair manager."))
 }
 
-fn is_hex2(s: &str) -> bool {
-    if s.len() != 2 {
-        return false;
-    }
-    s.as_bytes().iter().all(|b| match b {
-        b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' => true,
-        _ => false,
-    })
-}
-
 async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
     let roots = index_roots.to_vec();
     tokio::task::spawn_blocking(move || {
@@ -350,58 +465,6 @@ async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
     })
     .await
     .unwrap_or_default()
-}
-
-async fn choose_best_index_dir_for_fragment(
-    index_roots: &[PathBuf],
-    fragment: &str,
-) -> Option<PathBuf> {
-    let mut best: Option<(PathBuf, u64, i64)> = None;
-
-    for root in index_roots {
-        let idx = root.join(fragment).join("index");
-        if !fs::try_exists(&idx).await.unwrap_or(false) {
-            continue;
-        }
-
-        let mut shard_count = 0u64;
-        let mut access_ok = false;
-
-        if let Ok(mut rd) = fs::read_dir(&idx).await {
-            access_ok = true;
-            while let Ok(Some(ent)) = rd.next_entry().await {
-                let name = ent.file_name().to_string_lossy().to_string();
-                if is_hex2(&name) {
-                    shard_count += 1;
-                }
-            }
-        }
-
-        if !access_ok {
-            continue;
-        }
-
-        let mut ts = 0i64;
-        if let Ok(meta) = fs::metadata(&idx).await {
-            if let Ok(m) = meta.modified() {
-                ts = m
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-            }
-        }
-
-        match &best {
-            None => best = Some((idx, shard_count, ts)),
-            Some((_p, best_count, best_ts)) => {
-                if shard_count > *best_count || (shard_count == *best_count && ts > *best_ts) {
-                    best = Some((idx, shard_count, ts));
-                }
-            }
-        }
-    }
-
-    best.map(|(p, _, _)| p)
 }
 
 fn sha256_bytes(b: &[u8]) -> [u8; 32] {
@@ -983,7 +1046,7 @@ async fn process_object_repair(
             continue;
         }
 
-        let repairs = stream::iter(missing_shards.into_iter())
+        let mut repairs = stream::iter(missing_shards.into_iter())
             .map(|missing_idx| {
                 let part_for_task = part_arc.clone();
                 let sem = shard_repair_sem.clone();
@@ -996,11 +1059,9 @@ async fn process_object_repair(
                     repair_entire_shard(part_for_task, missing_idx, stripe).await
                 }
             })
-            .buffer_unordered(cfg.shard_repair_concurrency)
-            .collect::<Vec<Result<(), AppError>>>()
-            .await;
+            .buffer_unordered(cfg.shard_repair_concurrency);
 
-        for r in repairs {
+        while let Some(r) = repairs.next().await {
             match r {
                 Ok(_) => {
                     repaired_total += 1;
@@ -1014,16 +1075,6 @@ async fn process_object_repair(
     }
 
     Ok((repaired_total, corrupt_found, last_repaired))
-}
-
-fn dedupe_id_from_meta_path(path: &Path) -> Option<u64> {
-    let name = path.file_name()?.to_str()?;
-    if !name.ends_with(METADATA_EXT) {
-        return None;
-    }
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    name.hash(&mut h);
-    Some(h.finish())
 }
 
 fn should_scan_object_metadata_file(path: &Path) -> bool {
@@ -1052,23 +1103,35 @@ fn should_scan_object_metadata_file(path: &Path) -> bool {
     true
 }
 
+#[cfg(test)]
 pub async fn run_repair_job(
     cfg: RepairRunConfig,
     ws_manager: Arc<WsConnectionManager>,
 ) -> Result<(), AppError> {
+    run_repair_job_with_options(cfg, RepairRunOptions::default(), ws_manager).await
+}
+
+pub async fn run_repair_job_with_options(
+    cfg: RepairRunConfig,
+    opts: RepairRunOptions,
+    ws_manager: Arc<WsConnectionManager>,
+) -> Result<(), AppError> {
     STOP_SIGNAL.store(false, Ordering::Relaxed);
     let start_time = Instant::now();
+    let _write_gate = acquire_read_only_fast_mode(opts.fast_mode);
 
     {
         let mut status = REPAIR_STATUS.write().await;
         status.is_running = true;
+        status.fast_mode = opts.fast_mode;
         status.phase = format!(
-            "Initializing (mode={:?}, meta_conc={}, repair_conc={}, batch={}, dry_run={})",
+            "Initializing (mode={:?}, meta_conc={}, repair_conc={}, batch={}, dry_run={}, fast_mode={})",
             cfg.check_mode,
             cfg.meta_concurrency,
             cfg.shard_repair_concurrency,
             cfg.meta_batch_size,
-            cfg.dry_run
+            cfg.dry_run,
+            opts.fast_mode
         );
         status.total_scanned = 0;
         status.total_repaired = 0;
@@ -1154,17 +1217,20 @@ pub async fn run_repair_job(
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 
-        let scan_index_dir =
-            match choose_best_index_dir_for_fragment(&index_roots, &fragment_hash).await {
-                Some(p) => p,
-                None => {
-                    warn!(
-                        "No readable index dir for fragment {}, skipping",
-                        fragment_hash
-                    );
-                    continue;
-                }
-            };
+        let mut scan_index_dirs: Vec<PathBuf> = Vec::new();
+        for root in &index_roots {
+            let idx = root.join(&fragment_hash).join("index");
+            if fs::try_exists(&idx).await.unwrap_or(false) {
+                scan_index_dirs.push(idx);
+            }
+        }
+        if scan_index_dirs.is_empty() {
+            warn!(
+                "No readable index dirs for fragment {}, skipping",
+                fragment_hash
+            );
+            continue;
+        }
 
         {
             let mut status = REPAIR_STATUS.write().await;
@@ -1184,18 +1250,20 @@ pub async fn run_repair_job(
         }
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<PathBuf>(1024);
-        let scan_dir_clone = scan_index_dir.clone();
+        let scan_dirs_clone = scan_index_dirs.clone();
 
         tokio::task::spawn_blocking(move || {
-            let walker = WalkDir::new(scan_dir_clone).into_iter();
-            for entry in walker.filter_map(|e| e.ok()) {
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                let p = entry.path();
-                if should_scan_object_metadata_file(p) {
-                    if tx.blocking_send(p.to_owned()).is_err() {
-                        break;
+            for scan_dir in scan_dirs_clone {
+                let walker = WalkDir::new(scan_dir).into_iter();
+                for entry in walker.filter_map(|e| e.ok()) {
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    let p = entry.path();
+                    if should_scan_object_metadata_file(p) {
+                        if tx.blocking_send(p.to_owned()).is_err() {
+                            return;
+                        }
                     }
                 }
             }
@@ -1203,17 +1271,10 @@ pub async fn run_repair_job(
 
         let mut pending: Vec<PathBuf> = Vec::with_capacity(cfg.meta_batch_size);
         let mut fragment_touched = false;
-        let mut seen_ids: HashSet<u64> = HashSet::new();
 
         while let Some(meta_path) = rx.recv().await {
             if should_stop() {
                 break;
-            }
-
-            if let Some(id) = dedupe_id_from_meta_path(&meta_path) {
-                if !seen_ids.insert(id) {
-                    continue;
-                }
             }
 
             pending.push(meta_path);
@@ -1282,6 +1343,7 @@ pub async fn run_repair_job(
     {
         let mut status = REPAIR_STATUS.write().await;
         status.is_running = false;
+        status.fast_mode = opts.fast_mode;
         status.phase = if should_stop() {
             "Stopped by User".to_string()
         } else {
@@ -1459,10 +1521,6 @@ async fn process_one_meta_path(
         }
     };
 
-    if meta.is_delete_marker {
-        return Ok(delta);
-    }
-
     let (_canonical_data, canonical_meta, miss_rep, div_rep, report) =
         reconcile_object_metadata_strict(
             &meta.fragment,
@@ -1480,6 +1538,10 @@ async fn process_one_meta_path(
         if cfg.dry_run {
             warn!("{}", r);
         }
+    }
+
+    if canonical_meta.is_delete_marker {
+        return Ok(delta);
     }
 
     let (repaired, corrupt, last_rep) = process_object_repair(

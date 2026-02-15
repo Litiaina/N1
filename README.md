@@ -615,6 +615,8 @@ Streaming tuning knobs (`[upload_config]`):
 - `stream_chunk_size`
 - `stream_readahead_bytes`
 - `stream_locality_bias_enabled`
+- `upload_part_strict_durability_default`
+- `upload_io_gate_enabled`
 
 Examples:
 

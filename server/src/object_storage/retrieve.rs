@@ -19,6 +19,7 @@ use axum::{
 };
 use base64::engine::general_purpose;
 use base64::Engine;
+use dashmap::DashMap;
 use futures_util::StreamExt;
 use once_cell::sync::OnceCell;
 use serde::Serialize;
@@ -27,12 +28,14 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
+    time::{Duration, Instant},
 };
 use tokio::fs;
 use tracing::{debug, warn};
 use walkdir::WalkDir;
 
 pub static PREFIX_MAX_DELTA_SEGMENTS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
+static INDEX_ROOT_CACHE: OnceCell<DashMap<String, (PathBuf, Instant)>> = OnceCell::new();
 
 fn prefix_max_delta_segments() -> usize {
     PREFIX_MAX_DELTA_SEGMENTS_ATOMIC
@@ -107,6 +110,10 @@ fn canonical_key(key: &str) -> String {
     key.trim_start_matches('/').to_string()
 }
 
+fn index_root_cache() -> &'static DashMap<String, (PathBuf, Instant)> {
+    INDEX_ROOT_CACHE.get_or_init(DashMap::new)
+}
+
 async fn read_metadata_best(
     path_manager: &ObjectPathManager,
     fragment: &str,
@@ -160,6 +167,11 @@ async fn try_list_by_prefix_index(
     continuation_token: Option<String>,
 ) -> Result<Option<ListObjectsResult>, AppError> {
     let pfx = canonical_prefix(prefix);
+    let pfx_with_slash = if pfx.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", pfx)
+    };
     let want_delim = delimiter == Some("/");
 
     let path_manager = ObjectPathManager::new();
@@ -185,7 +197,7 @@ async fn try_list_by_prefix_index(
                     if canonical_prefix(&seg.prefix) == pfx {
                         for e in seg.entries {
                             let ck = canonical_key(&e.object_key);
-                            if !pfx.is_empty() && ck != pfx && !ck.starts_with(&(pfx.clone() + "/")) {
+                            if !pfx.is_empty() && ck != pfx && !ck.starts_with(&pfx_with_slash) {
                                 continue;
                             }
                             match latest.get(&ck) {
@@ -256,7 +268,7 @@ async fn try_list_by_prefix_index(
                     for e in seg.entries {
                         let ck = canonical_key(&e.object_key);
 
-                        if !pfx.is_empty() && ck != pfx && !ck.starts_with(&(pfx.clone() + "/")) {
+                        if !pfx.is_empty() && ck != pfx && !ck.starts_with(&pfx_with_slash) {
                             continue;
                         }
 
@@ -290,12 +302,11 @@ async fn try_list_by_prefix_index(
         }));
     }
 
-    let mut entries: Vec<(String, String, i64)> =
-        latest.into_iter().map(|(k, (v, ts))| (k, v, ts)).collect();
+    let mut entries: Vec<(String, String)> = latest.into_iter().map(|(k, (v, _))| (k, v)).collect();
 
     entries.sort_by(|a, b| {
-        let (ak, av, _ats) = a;
-        let (bk, bv, _bts) = b;
+        let (ak, av) = a;
+        let (bk, bv) = b;
         match ak.cmp(bk) {
             std::cmp::Ordering::Equal => av.cmp(bv),
             other => other,
@@ -310,7 +321,7 @@ async fn try_list_by_prefix_index(
     }
 
     let start_idx = if let Some((k, v)) = start_after.as_ref() {
-        match entries.binary_search_by(|(ek, ev, _)| match ek.cmp(k) {
+        match entries.binary_search_by(|(ek, ev)| match ek.cmp(k) {
             std::cmp::Ordering::Equal => ev.cmp(v),
             other => other,
         }) {
@@ -328,7 +339,7 @@ async fn try_list_by_prefix_index(
     let mut last_pair: Option<(String, String)> = None;
     let mut reached_limit = false;
 
-    for (k, v, _ts) in entries.into_iter().skip(start_idx) {
+    for (k, v) in entries.into_iter().skip(start_idx) {
         if out_objects.len() + out_prefixes.len() >= limit {
             break;
         }
@@ -343,10 +354,8 @@ async fn try_list_by_prefix_index(
 
         let ck = canonical_key(&meta.object_key);
 
-        if !pfx.is_empty() {
-            if ck != pfx && !ck.starts_with(&(pfx.clone() + "/")) {
-                continue;
-            }
+        if !pfx.is_empty() && ck != pfx && !ck.starts_with(&pfx_with_slash) {
+            continue;
         }
 
         if want_delim {
@@ -406,6 +415,18 @@ async fn try_list_by_prefix_index(
 }
 
 async fn choose_best_index_root(fragment: &str, scan_trash: bool) -> Option<PathBuf> {
+    let key = format!("{}:{}", if scan_trash { "trash" } else { "live" }, fragment);
+    if let Some(hit) = index_root_cache().get(&key) {
+        let (cached_path, cached_at) = hit.value();
+        let path = cached_path.clone();
+        let fresh = cached_at.elapsed() <= Duration::from_secs(2);
+        drop(hit);
+        if fresh && fs::try_exists(&path).await.unwrap_or(false) {
+            return Some(path);
+        }
+        let _ = index_root_cache().remove(&key);
+    }
+
     let path_manager = ObjectPathManager::new();
     let index_roots = path_manager.get_all_index_roots();
 
@@ -464,6 +485,7 @@ async fn choose_best_index_root(fragment: &str, scan_trash: bool) -> Option<Path
             "Chose best index root: {:?} (shard_count={}) for fragment {}",
             p, count, fragment
         );
+        index_root_cache().insert(key, (p.clone(), Instant::now()));
     } else {
         warn!("No readable index root found for fragment {}", fragment);
     }
@@ -567,6 +589,11 @@ async fn list_objects_internal(
     };
 
     let pfx = canonical_prefix(&prefix);
+    let pfx_with_slash = if pfx.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", pfx)
+    };
 
     let mut results: Vec<ObjectSummary> = Vec::new();
     let mut out_prefixes: Vec<String> = Vec::new();
@@ -673,7 +700,7 @@ async fn list_objects_internal(
                                 let ok_prefix = if pfx.is_empty() {
                                     true
                                 } else {
-                                    ck == pfx || ck.starts_with(&(pfx.clone() + "/"))
+                                    ck == pfx || ck.starts_with(&pfx_with_slash)
                                 };
 
                                 if ok_prefix && (!meta.is_delete_marker || scan_trash) {
@@ -755,7 +782,7 @@ async fn list_objects_internal(
                         let ok_prefix = if pfx.is_empty() {
                             true
                         } else {
-                            ck == pfx || ck.starts_with(&(pfx.clone() + "/"))
+                            ck == pfx || ck.starts_with(&pfx_with_slash)
                         };
 
                         if ok_prefix && (!meta.is_delete_marker || scan_trash) {

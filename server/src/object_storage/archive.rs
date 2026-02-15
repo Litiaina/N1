@@ -152,13 +152,18 @@ async fn resolve_keys_from_prefix_index(
             continue;
         }
 
-        let compacted_path = d.join(format!("compacted{}", crate::object_storage::constants::PREFIX_SEGMENT_EXT));
-        if tokio::fs::try_exists(&compacted_path).await.unwrap_or(false) {
+        let compacted_path = d.join(format!(
+            "compacted{}",
+            crate::object_storage::constants::PREFIX_SEGMENT_EXT
+        ));
+        if tokio::fs::try_exists(&compacted_path)
+            .await
+            .unwrap_or(false)
+        {
             if let Ok(data) = tokio::fs::read(&compacted_path).await {
-                if let Ok(seg) =
-                    rmp_serde::from_slice::<crate::object_storage::disk_manager::PrefixIndexSegment>(
-                        &data,
-                    )
+                if let Ok(seg) = rmp_serde::from_slice::<
+                    crate::object_storage::disk_manager::PrefixIndexSegment,
+                >(&data)
                 {
                     had_any_index_data = true;
                     if canonical_prefix(&seg.prefix) == pfx {
@@ -208,10 +213,9 @@ async fn resolve_keys_from_prefix_index(
 
         for (_name, path) in seg_files {
             if let Ok(data) = tokio::fs::read(&path).await {
-                if let Ok(seg) =
-                    rmp_serde::from_slice::<crate::object_storage::disk_manager::PrefixIndexSegment>(
-                        &data,
-                    )
+                if let Ok(seg) = rmp_serde::from_slice::<
+                    crate::object_storage::disk_manager::PrefixIndexSegment,
+                >(&data)
                 {
                     had_any_index_data = true;
                     if canonical_prefix(&seg.prefix) != pfx {
@@ -434,7 +438,8 @@ async fn resolve_archive_keys(
     let mut keys =
         resolve_keys_from_prefix_index(fragment, &prefix, delimiter, MAX_ARCHIVE_KEYS).await?;
     if keys.is_empty() {
-        keys = resolve_keys_from_prefix_scan(fragment, &prefix, delimiter, MAX_ARCHIVE_KEYS).await?;
+        keys =
+            resolve_keys_from_prefix_scan(fragment, &prefix, delimiter, MAX_ARCHIVE_KEYS).await?;
     }
 
     apply_archive_pagination(keys, max_keys, req.continuation_token.as_deref())

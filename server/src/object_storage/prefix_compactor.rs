@@ -1,6 +1,8 @@
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::PREFIX_SEGMENT_EXT;
-use crate::object_storage::disk_manager::{ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment};
+use crate::object_storage::disk_manager::{
+    ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment,
+};
 use once_cell::sync::OnceCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -16,6 +18,9 @@ pub static PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC: OnceCell<AtomicU64> = OnceCe
 static PREFIX_COMPACTION_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
 static PREFIX_LAST_COMPACTED_AT: LazyLock<Arc<RwLock<HashMap<String, Instant>>>> =
     LazyLock::new(|| Arc::new(RwLock::new(HashMap::new())));
+const PREFIX_LAST_COMPACTED_MAX_ENTRIES: usize = 16_384;
+const PREFIX_LAST_COMPACTED_STALE_MULTIPLIER: u32 = 8;
+const PREFIX_LAST_COMPACTED_MIN_STALE_SECS: u64 = 300;
 
 fn compact_trigger_segments() -> usize {
     PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
@@ -32,6 +37,28 @@ fn compact_min_interval() -> Duration {
         .unwrap_or(30)
         .clamp(1, 3600);
     Duration::from_secs(secs)
+}
+
+fn prune_last_compacted_entries(last: &mut HashMap<String, Instant>, min_interval: Duration) {
+    let stale_after = std::cmp::max(
+        min_interval
+            .checked_mul(PREFIX_LAST_COMPACTED_STALE_MULTIPLIER)
+            .unwrap_or(Duration::from_secs(PREFIX_LAST_COMPACTED_MIN_STALE_SECS)),
+        Duration::from_secs(PREFIX_LAST_COMPACTED_MIN_STALE_SECS),
+    );
+    last.retain(|_, ts| ts.elapsed() <= stale_after);
+
+    if last.len() <= PREFIX_LAST_COMPACTED_MAX_ENTRIES {
+        return;
+    }
+
+    let mut by_age: Vec<(String, Instant)> = last.iter().map(|(k, ts)| (k.clone(), *ts)).collect();
+    by_age.sort_by_key(|(_, ts)| *ts);
+
+    let to_remove = last.len().saturating_sub(PREFIX_LAST_COMPACTED_MAX_ENTRIES);
+    for (k, _) in by_age.into_iter().take(to_remove) {
+        last.remove(&k);
+    }
 }
 
 #[cfg(unix)]
@@ -272,6 +299,7 @@ pub fn schedule_prefix_compaction(fragment: String, prefixes: Vec<String>) {
             {
                 let mut last = PREFIX_LAST_COMPACTED_AT.write().await;
                 last.insert(key, Instant::now());
+                prune_last_compacted_entries(&mut last, min_interval);
             }
         }
     });

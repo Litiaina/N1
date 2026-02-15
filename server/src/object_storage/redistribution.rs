@@ -9,6 +9,7 @@ use crate::object_storage::disk_manager::{
 };
 use crate::object_storage::ec::ErasureStreamWriter;
 use crate::object_storage::fragment_metadata::{read_fragment_metadata, write_fragment_metadata};
+use crate::object_storage::operation_gate::acquire_read_only_fast_mode;
 use crate::object_storage::prefix_rebuilder::run_prefix_rebuild_job;
 use crate::object_storage::recovery::read_or_recover_chunk;
 use crate::object_storage::upload::{
@@ -27,6 +28,7 @@ use axum::Json;
 
 use chrono::Utc;
 use crc32fast::Hasher as Crc32Hasher;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
 
 use std::collections::{HashMap, HashSet};
@@ -46,6 +48,8 @@ use walkdir::WalkDir;
 pub struct RedistributionJobStatus {
     pub is_running: bool,
     pub phase: String,
+    pub fast_mode: bool,
+    pub durability_mode: String,
 
     pub total_fragments_scanned: u64,
     pub total_objects_scanned: u64,
@@ -66,6 +70,248 @@ static REDIST_STATUS: LazyLock<Arc<tokio::sync::RwLock<RedistributionJobStatus>>
     LazyLock::new(|| Arc::new(tokio::sync::RwLock::new(RedistributionJobStatus::default())));
 
 static STOP_SIGNAL: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
+
+#[derive(Clone, Copy, Debug)]
+pub enum RedistributionDurabilityMode {
+    Auto,
+    Strict,
+    Batched,
+}
+
+impl RedistributionDurabilityMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Strict => "strict",
+            Self::Batched => "batched",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RedistributionRunOptions {
+    pub fast_mode: bool,
+    pub durability_mode: RedistributionDurabilityMode,
+    pub object_concurrency: usize,
+    pub status_batch: u64,
+}
+
+fn default_object_concurrency(fast_mode: bool) -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let ram_gib = detect_total_ram_gib();
+    let ram_cap = if fast_mode {
+        match ram_gib {
+            0..=2 => 2,
+            3..=4 => 4,
+            5..=8 => 8,
+            9..=16 => 12,
+            17..=32 => 16,
+            33..=64 => 24,
+            _ => 32,
+        }
+    } else {
+        match ram_gib {
+            0..=2 => 2,
+            3..=4 => 4,
+            5..=8 => 6,
+            9..=16 => 8,
+            17..=32 => 12,
+            33..=64 => 16,
+            _ => 24,
+        }
+    };
+
+    let cpu_default = if fast_mode {
+        (cpus.saturating_mul(2)).clamp(4, 64)
+    } else {
+        cpus.clamp(2, 16)
+    };
+
+    cpu_default.min(ram_cap).max(2)
+}
+
+fn detect_total_ram_gib() -> usize {
+    let content = match std::fs::read_to_string("/proc/meminfo") {
+        Ok(v) => v,
+        Err(_) => return 8,
+    };
+
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            if let Some(kib) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                return ((kib / (1024 * 1024)) as usize).max(1);
+            }
+        }
+    }
+
+    8
+}
+
+fn redistribution_limits_for_ram_gib(ram_gib: usize) -> (usize, u64) {
+    match ram_gib {
+        0..=4 => (8, 512),
+        5..=8 => (16, 1024),
+        9..=16 => (32, 2048),
+        17..=32 => (48, 4096),
+        33..=64 => (64, 8192),
+        _ => (128, 8192),
+    }
+}
+
+fn default_status_batch(fast_mode: bool) -> u64 {
+    let ram_gib = detect_total_ram_gib();
+    if fast_mode {
+        match ram_gib {
+            0..=4 => 32,
+            5..=8 => 64,
+            9..=32 => 128,
+            _ => 256,
+        }
+    } else {
+        match ram_gib {
+            0..=4 => 16,
+            5..=8 => 32,
+            9..=32 => 64,
+            _ => 128,
+        }
+    }
+}
+
+impl Default for RedistributionRunOptions {
+    fn default() -> Self {
+        Self {
+            fast_mode: false,
+            durability_mode: RedistributionDurabilityMode::Auto,
+            object_concurrency: default_object_concurrency(false),
+            status_batch: default_status_batch(false),
+        }
+    }
+}
+
+impl RedistributionRunOptions {
+    #[inline]
+    fn strict_durability(self) -> bool {
+        match self.durability_mode {
+            RedistributionDurabilityMode::Auto => !self.fast_mode,
+            RedistributionDurabilityMode::Strict => true,
+            RedistributionDurabilityMode::Batched => false,
+        }
+    }
+
+    #[inline]
+    fn effective_durability_mode(self) -> &'static str {
+        if self.strict_durability() {
+            "strict"
+        } else {
+            "batched"
+        }
+    }
+}
+
+#[inline]
+fn clamp_usize(v: usize, lo: usize, hi: usize) -> usize {
+    v.max(lo).min(hi)
+}
+
+#[inline]
+fn clamp_u64(v: u64, lo: u64, hi: u64) -> u64 {
+    v.max(lo).min(hi)
+}
+
+fn parse_bool_param(params: &HashMap<String, String>, key: &str, default: bool) -> bool {
+    match params.get(key).map(|s| s.as_str()) {
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") | Some("on")
+        | Some("ON") => true,
+        Some("0") | Some("false") | Some("FALSE") | Some("no") | Some("NO") | Some("off")
+        | Some("OFF") => false,
+        Some(_) => default,
+        None => default,
+    }
+}
+
+fn parse_durability_mode_param(
+    params: &HashMap<String, String>,
+    fast_mode: bool,
+) -> RedistributionDurabilityMode {
+    if let Some(v) = params
+        .get("durability")
+        .or_else(|| params.get("durability_mode"))
+    {
+        let normalized = v.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "strict" | "sync" | "durable" => return RedistributionDurabilityMode::Strict,
+            "batched" | "async" | "fast" | "relaxed" => {
+                return RedistributionDurabilityMode::Batched
+            }
+            "auto" => return RedistributionDurabilityMode::Auto,
+            _ => {}
+        }
+    }
+
+    if params.contains_key("strict_durability") {
+        if parse_bool_param(params, "strict_durability", !fast_mode) {
+            RedistributionDurabilityMode::Strict
+        } else {
+            RedistributionDurabilityMode::Batched
+        }
+    } else {
+        RedistributionDurabilityMode::Auto
+    }
+}
+
+struct StatusDelta {
+    scanned: u64,
+    needs: u64,
+    migrated: u64,
+    errors: u64,
+    last_object: Option<String>,
+    last_error: Option<String>,
+}
+
+async fn flush_status_delta(
+    ws_manager: &Arc<WsConnectionManager>,
+    start_time: Instant,
+    delta: &mut StatusDelta,
+) {
+    if delta.scanned == 0
+        && delta.needs == 0
+        && delta.migrated == 0
+        && delta.errors == 0
+        && delta.last_object.is_none()
+        && delta.last_error.is_none()
+    {
+        return;
+    }
+
+    let mut st = REDIST_STATUS.write().await;
+    st.total_objects_scanned += delta.scanned;
+    st.total_objects_need_redistribution += delta.needs;
+    st.total_objects_migrated += delta.migrated;
+    st.total_errors += delta.errors;
+    if let Some(last) = delta.last_object.take() {
+        st.last_object = Some(last);
+    }
+    if let Some(last_err) = delta.last_error.take() {
+        st.last_error = Some(last_err);
+    }
+    let elapsed = start_time.elapsed().as_secs_f64();
+    st.duration_seconds = elapsed as u64;
+    if elapsed > 0.0 {
+        st.scan_rate_per_sec = st.total_objects_scanned as f64 / elapsed;
+    }
+    ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
+
+    delta.scanned = 0;
+    delta.needs = 0;
+    delta.migrated = 0;
+    delta.errors = 0;
+}
 
 #[inline]
 fn should_stop() -> bool {
@@ -103,12 +349,53 @@ pub async fn trigger_redistribution_job_api(
         }
     }
 
-    let dry_run = params.get("dry_run").map(|v| v == "true").unwrap_or(false);
+    let dry_run = parse_bool_param(&params, "dry_run", false);
+    let fast_mode = parse_bool_param(&params, "fast_mode", false)
+        || parse_bool_param(&params, "read_only_fast", false);
+    let ram_gib = detect_total_ram_gib();
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let (max_object_concurrency, max_status_batch) = redistribution_limits_for_ram_gib(ram_gib);
+    let durability_mode = parse_durability_mode_param(&params, fast_mode);
+    let object_concurrency = clamp_usize(
+        params
+            .get("object_concurrency")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| default_object_concurrency(fast_mode)),
+        1,
+        max_object_concurrency,
+    );
+    let status_batch = clamp_u64(
+        params
+            .get("status_batch")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(|| default_status_batch(fast_mode)),
+        1,
+        max_status_batch,
+    );
+    info!(
+        "Redistribution tuning: ram_gib={} cpu_cores={} fast_mode={} object_concurrency={} status_batch={} (caps: object_concurrency<= {}, status_batch<= {})",
+        ram_gib,
+        cpu_cores,
+        fast_mode,
+        object_concurrency,
+        status_batch,
+        max_object_concurrency,
+        max_status_batch
+    );
+    let run_opts = RedistributionRunOptions {
+        fast_mode,
+        durability_mode,
+        object_concurrency,
+        status_batch,
+    };
+
     let ws_manager = Arc::new(state.ws_manager.clone());
     let ws_manager_clone = ws_manager.clone();
 
     tokio::spawn(async move {
-        if let Err(e) = run_redistribution_job(dry_run, ws_manager).await {
+        if let Err(e) = run_redistribution_job_with_options(dry_run, run_opts, ws_manager).await {
             error!("Redistribution job failed: {}", e);
             let mut st = REDIST_STATUS.write().await;
             st.is_running = false;
@@ -196,7 +483,13 @@ async fn replicate_quota_best_effort(fragment_hash: &str, index_roots: &[PathBuf
         if same || dry_run {
             continue;
         }
-        let _ = durable_atomic_write_bytes(&p, &canon).await;
+        if let Err(e) = durable_atomic_write_bytes(&p, &canon).await {
+            warn!(
+                "Failed to mirror quota file during redistribution {}: {}",
+                p.display(),
+                e
+            );
+        }
     }
 }
 
@@ -277,6 +570,14 @@ async fn replicate_fragment_metadata_best_effort(fragment_hash: &str) {
 }
 
 async fn durable_atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
+    durable_atomic_write_bytes_with_mode(path, bytes, true).await
+}
+
+async fn durable_atomic_write_bytes_with_mode(
+    path: &Path,
+    bytes: &[u8],
+    strict_durability: bool,
+) -> Result<(), AppError> {
     let parent = path.parent().ok_or_else(|| {
         AppError::InternalServerError(format!("missing parent for {}", path.display()))
     })?;
@@ -304,14 +605,18 @@ async fn durable_atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), App
         .await
         .map_err(|e| AppError::Io(e, format!("write tmp {}", tmp.display())))?;
 
-    let _ = f.sync_all().await;
+    if strict_durability {
+        let _ = f.sync_all().await;
+    }
     drop(f);
 
     tokio_fs::rename(&tmp, path)
         .await
         .map_err(|e| AppError::Io(e, format!("rename {} -> {}", tmp.display(), path.display())))?;
 
-    let _ = sync_dir(parent).await;
+    if strict_durability {
+        let _ = sync_dir(parent).await;
+    }
     Ok(())
 }
 
@@ -466,6 +771,7 @@ async fn publish_tmp_overwrite(
     final_p: &Path,
     parent: &Path,
     file_name: &str,
+    sync_parent_immediately: bool,
 ) -> Result<(), AppError> {
     let final_exists = tokio_fs::try_exists(final_p).await.unwrap_or(false);
 
@@ -473,7 +779,9 @@ async fn publish_tmp_overwrite(
         tokio_fs::rename(tmp, final_p)
             .await
             .map_err(|e| AppError::Io(e, "commit rename".into()))?;
-        let _ = sync_dir(parent).await;
+        if sync_parent_immediately {
+            let _ = sync_dir(parent).await;
+        }
         return Ok(());
     }
 
@@ -495,7 +803,9 @@ async fn publish_tmp_overwrite(
             );
             let gc_path = parent.join(gc_name);
             let _ = tokio_fs::rename(tmp, &gc_path).await;
-            let _ = sync_dir(parent).await;
+            if sync_parent_immediately {
+                let _ = sync_dir(parent).await;
+            }
             return Ok(());
         }
     }
@@ -516,22 +826,47 @@ async fn publish_tmp_overwrite(
         .await
         .map_err(|e| AppError::Io(e, "rename tmp->final".into()))?;
 
-    let _ = sync_dir(parent).await;
+    if sync_parent_immediately {
+        let _ = sync_dir(parent).await;
+    }
     Ok(())
 }
 
+#[cfg(test)]
 pub async fn run_redistribution_job(
     dry_run: bool,
     ws_manager: Arc<WsConnectionManager>,
 ) -> Result<(), AppError> {
+    run_redistribution_job_with_options(dry_run, RedistributionRunOptions::default(), ws_manager)
+        .await
+}
+
+pub async fn run_redistribution_job_with_options(
+    dry_run: bool,
+    opts: RedistributionRunOptions,
+    ws_manager: Arc<WsConnectionManager>,
+) -> Result<(), AppError> {
     STOP_SIGNAL.store(false, Ordering::Relaxed);
     let start_time = Instant::now();
+    let _write_gate = acquire_read_only_fast_mode(opts.fast_mode);
+    let strict_durability = opts.strict_durability();
+    let effective_durability = opts.effective_durability_mode();
 
     {
         let mut st = REDIST_STATUS.write().await;
         *st = RedistributionJobStatus {
             is_running: true,
-            phase: "Initializing".to_string(),
+            phase: format!(
+                "Initializing (fast_mode={}, durability={}=>{}, object_concurrency={}, status_batch={}, dry_run={})",
+                opts.fast_mode,
+                opts.durability_mode.as_str(),
+                effective_durability,
+                opts.object_concurrency,
+                opts.status_batch,
+                dry_run
+            ),
+            fast_mode: opts.fast_mode,
+            durability_mode: effective_durability.to_string(),
             start_timestamp: Utc::now().timestamp(),
             ..Default::default()
         };
@@ -581,17 +916,21 @@ pub async fn run_redistribution_job(
     }
 
     info!(
-        "Starting Redistribution Job (Active & Trash). target={}D+{}P stripe={} bytes blob_cfg={} index_cfg={} dry_run={}",
+        "Starting Redistribution Job (Active & Trash). target={}D+{}P stripe={} bytes blob_cfg={} index_cfg={} dry_run={} fast_mode={} durability={}=>{} object_concurrency={} status_batch={}",
         target_data_shards,
         target_parity_shards,
         target_stripe_size,
         blob_roots_cfg.len(),
         index_roots_cfg.len(),
-        dry_run
+        dry_run,
+        opts.fast_mode,
+        opts.durability_mode.as_str(),
+        effective_durability,
+        opts.object_concurrency,
+        opts.status_batch
     );
 
     let mut touched_fragments: HashSet<String> = HashSet::new();
-
     let fragments = list_all_fragments(layout.live_index.as_ref()).await;
 
     {
@@ -599,6 +938,9 @@ pub async fn run_redistribution_job(
         st.phase = format!("Preparing (fragments={})", fragments.len());
         ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
     }
+
+    let object_concurrency = opts.object_concurrency.max(1);
+    let status_batch = opts.status_batch.max(1);
 
     for fragment_hash in fragments {
         if should_stop() {
@@ -665,8 +1007,15 @@ pub async fn run_redistribution_job(
                 }
             });
 
-            let mut batch_scanned: u64 = 0;
-            const STATUS_BATCH: u64 = 10;
+            let mut delta = StatusDelta {
+                scanned: 0,
+                needs: 0,
+                migrated: 0,
+                errors: 0,
+                last_object: None,
+                last_error: None,
+            };
+            let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
 
             while let Some((meta_path, is_trash_flag)) = rx.recv().await {
                 if should_stop() {
@@ -684,7 +1033,7 @@ pub async fn run_redistribution_job(
                     Err(_) => continue,
                 };
 
-                let mut meta = match rmp_serde::from_slice::<ObjectMetadata>(&raw) {
+                let meta = match rmp_serde::from_slice::<ObjectMetadata>(&raw) {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
@@ -693,21 +1042,10 @@ pub async fn run_redistribution_job(
                     continue;
                 }
 
-                batch_scanned += 1;
-                if batch_scanned >= STATUS_BATCH {
+                delta.scanned += 1;
+                if delta.scanned >= status_batch {
                     layout.refresh_if_needed().await;
-
-                    let mut st = REDIST_STATUS.write().await;
-                    st.total_objects_scanned += batch_scanned;
-                    let elapsed = start_time.elapsed().as_secs_f64();
-                    st.duration_seconds = elapsed as u64;
-                    if elapsed > 0.0 {
-                        st.scan_rate_per_sec = st.total_objects_scanned as f64 / elapsed;
-                    }
-                    ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(
-                        st.clone(),
-                    ));
-                    batch_scanned = 0;
+                    flush_status_delta(&ws_manager, start_time, &mut delta).await;
                 }
 
                 let needs = check_needs_redistribution(
@@ -726,72 +1064,99 @@ pub async fn run_redistribution_job(
                     continue;
                 }
 
-                {
-                    let mut st = REDIST_STATUS.write().await;
-                    st.total_objects_need_redistribution += 1;
-                    st.last_object = Some(format!(
-                        "{}/{} (v:{}) [Trash:{}]",
-                        meta.fragment, meta.object_key, meta.version_id, is_trash_flag
-                    ));
-                    ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(
-                        st.clone(),
-                    ));
-                }
+                let object_label = format!(
+                    "{}/{} (v:{}) [Trash:{}]",
+                    meta.fragment, meta.object_key, meta.version_id, is_trash_flag
+                );
+                delta.needs += 1;
+                delta.last_object = Some(object_label.clone());
 
                 if dry_run {
-                    let mut st = REDIST_STATUS.write().await;
-                    st.total_objects_migrated += 1;
-                    ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(
-                        st.clone(),
-                    ));
+                    delta.migrated += 1;
+                    if delta.needs + delta.migrated + delta.errors >= status_batch {
+                        flush_status_delta(&ws_manager, start_time, &mut delta).await;
+                    }
                     continue;
                 }
 
-                match redistribute_object_streaming(
-                    &mut meta,
-                    target_data_shards,
-                    target_parity_shards,
-                    target_stripe_size,
-                    &live_blob,
-                    &live_index,
-                    is_trash_flag,
-                )
-                .await
-                {
-                    Ok(_) => {
-                        touched_fragments.insert(meta.fragment.clone());
-                        let mut st = REDIST_STATUS.write().await;
-                        st.total_objects_migrated += 1;
-                        ws_manager.broadcast_system_wide(
-                            StorageEventPayload::RedistributionUpdate(st.clone()),
-                        );
+                let live_blob_for_task = live_blob.clone();
+                let live_index_for_task = live_index.clone();
+                let task_strict_durability = strict_durability;
+                in_flight.push(async move {
+                    let mut meta = meta;
+                    let fragment = meta.fragment.clone();
+                    let key = meta.object_key.clone();
+                    let version = meta.version_id.clone();
+
+                    match redistribute_object_streaming(
+                        &mut meta,
+                        target_data_shards,
+                        target_parity_shards,
+                        target_stripe_size,
+                        &live_blob_for_task,
+                        &live_index_for_task,
+                        is_trash_flag,
+                        task_strict_durability,
+                    )
+                    .await
+                    {
+                        Ok(_) => Ok((fragment, key, version, is_trash_flag)),
+                        Err(e) => Err((fragment, key, version, is_trash_flag, e.to_string())),
                     }
-                    Err(e) => {
-                        warn!(
-                            "Redistribute failed for {}/{} (v:{}): {}",
-                            meta.fragment, meta.object_key, meta.version_id, e
-                        );
-                        let mut st = REDIST_STATUS.write().await;
-                        st.total_errors += 1;
-                        st.last_error = Some(e.to_string());
-                        ws_manager.broadcast_system_wide(
-                            StorageEventPayload::RedistributionUpdate(st.clone()),
-                        );
+                });
+
+                while in_flight.len() >= object_concurrency {
+                    if let Some(res) = in_flight.next().await {
+                        match res {
+                            Ok((fragment, key, version, task_is_trash)) => {
+                                touched_fragments.insert(fragment.clone());
+                                delta.migrated += 1;
+                                delta.last_object = Some(format!(
+                                    "{}/{} (v:{}) [Trash:{}]",
+                                    fragment, key, version, task_is_trash
+                                ));
+                            }
+                            Err((fragment, key, version, task_is_trash, err)) => {
+                                warn!(
+                                    "Redistribute failed for {}/{} (v:{}) [Trash:{}]: {}",
+                                    fragment, key, version, task_is_trash, err
+                                );
+                                delta.errors += 1;
+                                delta.last_error = Some(err);
+                            }
+                        }
+                    }
+                    if delta.needs + delta.migrated + delta.errors >= status_batch {
+                        flush_status_delta(&ws_manager, start_time, &mut delta).await;
                     }
                 }
             }
 
-            if batch_scanned > 0 {
-                let mut st = REDIST_STATUS.write().await;
-                st.total_objects_scanned += batch_scanned;
-                let elapsed = start_time.elapsed().as_secs_f64();
-                st.duration_seconds = elapsed as u64;
-                if elapsed > 0.0 {
-                    st.scan_rate_per_sec = st.total_objects_scanned as f64 / elapsed;
+            while let Some(res) = in_flight.next().await {
+                match res {
+                    Ok((fragment, key, version, task_is_trash)) => {
+                        touched_fragments.insert(fragment.clone());
+                        delta.migrated += 1;
+                        delta.last_object = Some(format!(
+                            "{}/{} (v:{}) [Trash:{}]",
+                            fragment, key, version, task_is_trash
+                        ));
+                    }
+                    Err((fragment, key, version, task_is_trash, err)) => {
+                        warn!(
+                            "Redistribute failed for {}/{} (v:{}) [Trash:{}]: {}",
+                            fragment, key, version, task_is_trash, err
+                        );
+                        delta.errors += 1;
+                        delta.last_error = Some(err);
+                    }
                 }
-                ws_manager
-                    .broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
+                if delta.needs + delta.migrated + delta.errors >= status_batch {
+                    flush_status_delta(&ws_manager, start_time, &mut delta).await;
+                }
             }
+
+            flush_status_delta(&ws_manager, start_time, &mut delta).await;
         }
     }
 
@@ -819,6 +1184,8 @@ pub async fn run_redistribution_job(
     {
         let mut st = REDIST_STATUS.write().await;
         st.is_running = false;
+        st.fast_mode = opts.fast_mode;
+        st.durability_mode = effective_durability.to_string();
         st.phase = if should_stop() {
             "Stopped by User".to_string()
         } else {
@@ -966,6 +1333,7 @@ async fn redistribute_object_streaming(
     target_blob_roots: &[PathBuf],
     target_index_roots: &[PathBuf],
     is_trash: bool,
+    strict_durability: bool,
 ) -> Result<(), AppError> {
     if should_stop() {
         return Err(AppError::InternalServerError("Stopped".into()));
@@ -981,6 +1349,7 @@ async fn redistribute_object_streaming(
 
     let old_block_size = meta.stripe_size_bytes;
     let new_block_size = target_stripe_size;
+    let verify_tmp_crc = strict_durability;
 
     let mut file_cache: HashMap<String, tokio::fs::File> = HashMap::new();
 
@@ -1100,7 +1469,7 @@ async fn redistribute_object_streaming(
             target_data_shards,
             target_parity_shards,
             final_shard_len as usize,
-            true,
+            false,
             new_block_size,
         )?;
 
@@ -1156,10 +1525,12 @@ async fn redistribute_object_streaming(
         }
         let writers = stream_writer.into_writers();
 
-        for w in writers.into_iter().flatten() {
-            if let Err(e) = w.sync_data().await {
-                cleanup_tmp_files(&created_tmps).await;
-                return Err(AppError::Io(e, "fsync redistribution shard".into()));
+        if strict_durability {
+            for w in writers.into_iter().flatten() {
+                if let Err(e) = w.sync_data().await {
+                    cleanup_tmp_files(&created_tmps).await;
+                    return Err(AppError::Io(e, "fsync redistribution shard".into()));
+                }
             }
         }
 
@@ -1172,6 +1543,7 @@ async fn redistribute_object_streaming(
             .iter()
             .map(|s| (s.file_name.as_str(), s.checksum.as_str()))
             .collect();
+        let mut batched_sync_dirs: HashSet<PathBuf> = HashSet::new();
 
         for (tmp, final_p, parent, fname) in &commit_list {
             if should_stop() {
@@ -1179,12 +1551,32 @@ async fn redistribute_object_streaming(
                 return Err(AppError::InternalServerError("Stopped".into()));
             }
 
-            let expected_crc = checksum_by_name.get(fname.as_str()).copied();
+            let expected_crc = if verify_tmp_crc {
+                checksum_by_name.get(fname.as_str()).copied()
+            } else {
+                None
+            };
 
             verify_tmp_shard(tmp.as_path(), final_shard_len, expected_crc).await?;
 
-            publish_tmp_overwrite(tmp.as_path(), final_p.as_path(), parent.as_path(), fname)
-                .await?;
+            publish_tmp_overwrite(
+                tmp.as_path(),
+                final_p.as_path(),
+                parent.as_path(),
+                fname,
+                strict_durability,
+            )
+            .await?;
+
+            if !strict_durability {
+                batched_sync_dirs.insert(parent.clone());
+            }
+        }
+
+        if !strict_durability {
+            for d in batched_sync_dirs {
+                let _ = sync_dir(&d).await;
+            }
         }
 
         let new_part = PartMetadata {
@@ -1229,12 +1621,33 @@ async fn redistribute_object_streaming(
     );
 
     let mut any_meta_ok = false;
+    let mut meta_sync_dirs: HashSet<PathBuf> = HashSet::new();
     for p in meta_paths {
         if should_stop() {
             return Err(AppError::InternalServerError("Stopped".into()));
         }
-        if durable_atomic_write_bytes(&p, &bytes).await.is_ok() {
-            any_meta_ok = true;
+        match durable_atomic_write_bytes_with_mode(&p, &bytes, strict_durability).await {
+            Ok(_) => {
+                any_meta_ok = true;
+                if !strict_durability {
+                    if let Some(parent) = p.parent() {
+                        meta_sync_dirs.insert(parent.to_path_buf());
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to write redistributed metadata replica {}: {}",
+                    p.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    if !strict_durability {
+        for d in meta_sync_dirs {
+            let _ = sync_dir(&d).await;
         }
     }
 
@@ -1261,4 +1674,88 @@ async fn redistribute_object_streaming(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        parse_durability_mode_param, RedistributionDurabilityMode, RedistributionRunOptions,
+    };
+    use std::collections::HashMap;
+
+    #[test]
+    fn durability_auto_resolves_from_fast_mode() {
+        let opts_slow = RedistributionRunOptions {
+            fast_mode: false,
+            durability_mode: RedistributionDurabilityMode::Auto,
+            ..Default::default()
+        };
+        assert!(opts_slow.strict_durability());
+        assert_eq!(opts_slow.effective_durability_mode(), "strict");
+
+        let opts_fast = RedistributionRunOptions {
+            fast_mode: true,
+            durability_mode: RedistributionDurabilityMode::Auto,
+            ..Default::default()
+        };
+        assert!(!opts_fast.strict_durability());
+        assert_eq!(opts_fast.effective_durability_mode(), "batched");
+    }
+
+    #[test]
+    fn durability_explicit_override_wins_over_fast_mode() {
+        let strict = RedistributionRunOptions {
+            fast_mode: true,
+            durability_mode: RedistributionDurabilityMode::Strict,
+            ..Default::default()
+        };
+        assert!(strict.strict_durability());
+        assert_eq!(strict.effective_durability_mode(), "strict");
+
+        let batched = RedistributionRunOptions {
+            fast_mode: false,
+            durability_mode: RedistributionDurabilityMode::Batched,
+            ..Default::default()
+        };
+        assert!(!batched.strict_durability());
+        assert_eq!(batched.effective_durability_mode(), "batched");
+    }
+
+    #[test]
+    fn parse_durability_mode_from_string_param() {
+        let mut params = HashMap::new();
+        params.insert("durability".to_string(), "strict".to_string());
+        assert!(matches!(
+            parse_durability_mode_param(&params, true),
+            RedistributionDurabilityMode::Strict
+        ));
+
+        params.insert("durability".to_string(), "BATCHED".to_string());
+        assert!(matches!(
+            parse_durability_mode_param(&params, false),
+            RedistributionDurabilityMode::Batched
+        ));
+
+        params.insert("durability".to_string(), "auto".to_string());
+        assert!(matches!(
+            parse_durability_mode_param(&params, false),
+            RedistributionDurabilityMode::Auto
+        ));
+    }
+
+    #[test]
+    fn parse_durability_mode_from_bool_fallback() {
+        let mut params = HashMap::new();
+        params.insert("strict_durability".to_string(), "true".to_string());
+        assert!(matches!(
+            parse_durability_mode_param(&params, true),
+            RedistributionDurabilityMode::Strict
+        ));
+
+        params.insert("strict_durability".to_string(), "false".to_string());
+        assert!(matches!(
+            parse_durability_mode_param(&params, false),
+            RedistributionDurabilityMode::Batched
+        ));
+    }
 }

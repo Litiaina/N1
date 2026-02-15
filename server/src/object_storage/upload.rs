@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -58,6 +58,8 @@ pub static WRITER_BUFFER_SIZE_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static STRIPE_SIZE_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static MAX_IO_SEMAPHORE: OnceCell<usize> = OnceCell::new();
 pub static ADAPTIVE_IO_TARGET_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
+pub static UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC: OnceCell<AtomicBool> = OnceCell::new();
+pub static UPLOAD_IO_GATE_ENABLED_ATOMIC: OnceCell<AtomicBool> = OnceCell::new();
 
 static IO_SEMAPHORE: Lazy<Semaphore> =
     Lazy::new(|| Semaphore::new(*MAX_IO_SEMAPHORE.get().unwrap()));
@@ -103,6 +105,88 @@ async fn acquire_adaptive_io_guard() -> Result<AdaptiveIoGuard<'static>, AppErro
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UploadDurabilityMode {
+    Strict,
+    Batched,
+}
+
+impl UploadDurabilityMode {
+    fn strict(self) -> bool {
+        matches!(self, Self::Strict)
+    }
+}
+
+fn parse_upload_durability_mode(query: &UploadPartQuery) -> UploadDurabilityMode {
+    if let Some(v) = query.durability.as_deref() {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "strict" | "sync" | "durable" => return UploadDurabilityMode::Strict,
+            "batched" | "async" | "fast" | "relaxed" => return UploadDurabilityMode::Batched,
+            _ => {}
+        }
+    }
+    if let Some(strict) = query.strict_durability {
+        if strict {
+            UploadDurabilityMode::Strict
+        } else {
+            UploadDurabilityMode::Batched
+        }
+    } else if UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or(false)
+    {
+        UploadDurabilityMode::Strict
+    } else {
+        UploadDurabilityMode::Batched
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_upload_durability_mode, UploadDurabilityMode};
+    use crate::object_storage::disk_manager::UploadPartQuery;
+
+    #[test]
+    fn upload_durability_defaults_to_batched() {
+        let q = UploadPartQuery {
+            checksum: None,
+            durability: None,
+            strict_durability: None,
+            io_gate: None,
+        };
+        assert!(matches!(
+            parse_upload_durability_mode(&q),
+            UploadDurabilityMode::Batched
+        ));
+    }
+
+    #[test]
+    fn upload_durability_accepts_string_and_bool_override() {
+        let q_batched = UploadPartQuery {
+            checksum: None,
+            durability: Some("batched".to_string()),
+            strict_durability: None,
+            io_gate: None,
+        };
+        assert!(matches!(
+            parse_upload_durability_mode(&q_batched),
+            UploadDurabilityMode::Batched
+        ));
+
+        let q_strict = UploadPartQuery {
+            checksum: None,
+            durability: None,
+            strict_durability: Some(true),
+            io_gate: None,
+        };
+        assert!(matches!(
+            parse_upload_durability_mode(&q_strict),
+            UploadDurabilityMode::Strict
+        ));
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadSessionManifest {
     pub fragment: String,
@@ -136,7 +220,7 @@ pub struct ListUploadsResponse {
 pub struct DirectWriter {
     file: Arc<fs::File>,
     write_buffer: AlignedBuffer,
-    write_task: Option<tokio::task::JoinHandle<Result<usize, std::io::Error>>>,
+    write_task: Option<tokio::task::JoinHandle<Result<AlignedBuffer, std::io::Error>>>,
 }
 
 impl DirectWriter {
@@ -156,7 +240,8 @@ impl DirectWriter {
     fn poll_write_task(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
         if let Some(task) = &mut self.write_task {
             match Pin::new(task).poll(cx) {
-                Poll::Ready(Ok(Ok(_))) => {
+                Poll::Ready(Ok(Ok(returned_buffer))) => {
+                    self.write_buffer = returned_buffer;
                     self.write_task = None;
                 }
                 Poll::Ready(Ok(Err(e))) => {
@@ -179,16 +264,14 @@ impl DirectWriter {
         }
 
         let file = self.file.clone();
-        let buffer_capacity = self.write_buffer.capacity();
-        let to_write =
-            std::mem::replace(&mut self.write_buffer, AlignedBuffer::new(buffer_capacity));
-        let bytes = to_write.len();
+        let mut to_write = std::mem::replace(&mut self.write_buffer, AlignedBuffer::new(0));
 
         let task = tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let mut f = &*file;
             f.write_all(to_write.as_slice())?;
-            Ok::<usize, std::io::Error>(bytes)
+            to_write.clear();
+            Ok::<AlignedBuffer, std::io::Error>(to_write)
         });
 
         self.write_task = Some(task);
@@ -504,6 +587,7 @@ async fn commit_part_meta_lockless(
     version_id: &str,
     part_index: u64,
     meta_bytes: &[u8],
+    strict_durability: bool,
 ) -> Result<bool, AppError> {
     let meta_dirs = path_manager.get_all_session_dirs(fragment, version_id);
     let file_name = format!("part_{}{}", part_index, PART_META_SUFFIX);
@@ -562,9 +646,13 @@ async fn commit_part_meta_lockless(
                     let _ = tokio_fs::remove_file(&p).await;
                     continue;
                 }
-                let _ = f.sync_all().await;
+                if strict_durability {
+                    let _ = f.sync_all().await;
+                }
                 drop(f);
-                let _ = sync_dir(d).await;
+                if strict_durability {
+                    let _ = sync_dir(d).await;
+                }
                 wrote_any = true;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1010,7 +1098,6 @@ pub async fn list_active_uploads(
 pub async fn get_upload_status(
     claims: Claims,
     AxumPath((fragment, version_id)): AxumPath<(String, String)>,
-    Query(_key_query): Query<ObjectKeyQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     if !claims.read {
         return Err(AppError::Forbidden("Read permission required".into()));
@@ -1086,7 +1173,19 @@ pub async fn object_upload_part(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let _io_guard = acquire_adaptive_io_guard().await?;
+    let io_gate_enabled = query.io_gate.unwrap_or_else(|| {
+        UPLOAD_IO_GATE_ENABLED_ATOMIC
+            .get()
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(true)
+    });
+    let _io_guard = if io_gate_enabled {
+        Some(acquire_adaptive_io_guard().await?)
+    } else {
+        None
+    };
+    let durability_mode = parse_upload_durability_mode(&query);
+    let strict_durability = durability_mode.strict();
 
     let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
     let data_shards = DATA_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
@@ -1118,20 +1217,35 @@ pub async fn object_upload_part(
     }
 
     let path_manager = ObjectPathManager::new();
+    let expected_checksum = query
+        .checksum
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
     if let Some(existing) =
         read_part_meta_any(&path_manager, &fragment, &version_id, part_index).await
     {
-        if let Some(expected) = query.checksum.as_ref() {
-            if existing
-                .checksum
-                .as_deref()
-                .unwrap_or("")
-                .eq_ignore_ascii_case(expected)
-                == false
-            {
+        if existing.size_bytes != content_length {
+            return Ok((
+                StatusCode::CONFLICT,
+                "Part already uploaded but size differs",
+            )
+                .into_response());
+        }
+        if let Some(expected) = expected_checksum {
+            if let Some(existing_checksum) = existing.checksum.as_deref() {
+                if !existing_checksum.eq_ignore_ascii_case(expected) {
+                    return Ok((
+                        StatusCode::CONFLICT,
+                        "Part already uploaded but checksum differs",
+                    )
+                        .into_response());
+                }
+            } else {
                 return Ok((
                     StatusCode::CONFLICT,
-                    "Part already uploaded but checksum differs",
+                    "Part already uploaded without checksum metadata",
                 )
                     .into_response());
             }
@@ -1189,17 +1303,23 @@ pub async fn object_upload_part(
 
         match create_direct_file(&tmp_path).await {
             Ok(file) => {
-                let file_clone = file
-                    .try_clone()
-                    .map_err(|e| AppError::Io(e, "clone file handle".into()))?;
-                let prealloc_result =
-                    tokio::task::spawn_blocking(move || file_clone.set_len(final_shard_len)).await;
+                if strict_durability {
+                    let file_clone = file
+                        .try_clone()
+                        .map_err(|e| AppError::Io(e, "clone file handle".into()))?;
+                    let prealloc_result =
+                        tokio::task::spawn_blocking(move || file_clone.set_len(final_shard_len))
+                            .await;
 
-                if let Ok(Ok(_)) = prealloc_result {
+                    if let Ok(Ok(_)) = prealloc_result {
+                        writers.push(Some(DirectWriter::new(file)));
+                        successful_opens += 1;
+                    } else {
+                        writers.push(None);
+                    }
+                } else {
                     writers.push(Some(DirectWriter::new(file)));
                     successful_opens += 1;
-                } else {
-                    writers.push(None);
                 }
             }
             Err(_) => {
@@ -1220,14 +1340,14 @@ pub async fn object_upload_part(
         )));
     }
 
-    let calc_checksum = true;
+    let calc_total_checksum = expected_checksum.is_some();
 
     let mut stream_writer = ErasureStreamWriter::new(
         writers,
         data_shards,
         parity_shards,
         final_shard_len as usize,
-        calc_checksum,
+        calc_total_checksum,
         block_size,
     )?;
 
@@ -1266,7 +1386,7 @@ pub async fn object_upload_part(
 
     stream_writer.finalize().await?;
 
-    if let Some(expected) = query.checksum.as_ref() {
+    if let Some(expected) = expected_checksum {
         let calculated = stream_writer.get_total_checksum();
         if let Some(calc_str) = calculated.as_ref() {
             if !expected.eq_ignore_ascii_case(calc_str) {
@@ -1280,32 +1400,30 @@ pub async fn object_upload_part(
     let total_checksum = stream_writer.get_total_checksum();
     let writers = stream_writer.into_writers();
 
-    let sync_futs = writers.into_iter().filter_map(|w_opt| {
-        w_opt.map(|w| async move {
-            if let Err(e) = w.sync_data().await {
-                warn!("Failed to fsync shard: {}", e);
-                return Err(AppError::Io(e, "fsync shard".into()));
-            }
-            Ok(())
-        })
-    });
+    if strict_durability {
+        let sync_futs = writers.into_iter().filter_map(|w_opt| {
+            w_opt.map(|w| async move {
+                if let Err(e) = w.sync_data().await {
+                    warn!("Failed to fsync shard: {}", e);
+                    return Err(AppError::Io(e, "fsync shard".into()));
+                }
+                Ok(())
+            })
+        });
 
-    let sync_results = join_all(sync_futs).await;
-    for r in sync_results {
-        if let Err(e) = r {
-            cleanup_files_best_effort(&tmp_paths).await;
-            return Err(e);
+        let sync_results = join_all(sync_futs).await;
+        for r in sync_results {
+            if let Err(e) = r {
+                cleanup_files_best_effort(&tmp_paths).await;
+                return Err(e);
+            }
         }
     }
 
     let mut dirs_to_sync: Vec<PathBuf> = Vec::new();
 
     for i in 0..total_shards {
-        let expected_crc = if calc_checksum {
-            shard_checksums.get(i).map(|s| s.as_str())
-        } else {
-            None
-        };
+        let expected_crc = shard_checksums.get(i).map(|s| s.as_str());
 
         publish_one_shard(
             tmp_paths[i].as_path(),
@@ -1323,7 +1441,9 @@ pub async fn object_upload_part(
     dirs_to_sync.sort();
     dirs_to_sync.dedup();
 
-    let _ = join_all(dirs_to_sync.iter().map(|d| sync_dir(d.as_path()))).await;
+    if strict_durability {
+        let _ = join_all(dirs_to_sync.iter().map(|d| sync_dir(d.as_path()))).await;
+    }
 
     let mut shards_info = Vec::with_capacity(total_shards);
     for i in 0..total_shards {
@@ -1341,7 +1461,11 @@ pub async fn object_upload_part(
         part_index,
         size_bytes: total_bytes_read,
         created_at: Utc::now().timestamp(),
-        checksum: total_checksum,
+        checksum: if calc_total_checksum {
+            total_checksum
+        } else {
+            None
+        },
         shards: shards_info,
     };
 
@@ -1354,6 +1478,7 @@ pub async fn object_upload_part(
         &version_id_arc,
         part_index,
         &meta_bytes,
+        strict_durability,
     )
     .await?;
 

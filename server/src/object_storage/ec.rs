@@ -157,9 +157,8 @@ pub struct ErasureStreamWriter<W: AsyncWrite + Unpin + Send> {
     shard_len_limit: usize,
     buffer: AlignedBuffer,
     bytes_written_to_shards: usize,
-    calc_checksum: bool,
     total_hasher: Option<Hasher>,
-    shard_hashers: Option<Vec<Hasher>>,
+    shard_hashers: Vec<Hasher>,
     rs_encoder: Option<ReedSolomonEncoder>,
     block_size: usize,
 }
@@ -170,7 +169,7 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
         data_shards: usize,
         parity_shards: usize,
         shard_len_limit: usize,
-        calc_checksum: bool,
+        calc_total_checksum: bool,
         block_size: usize,
     ) -> Result<Self, AppError> {
         if data_shards == 0 {
@@ -199,20 +198,14 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
             )));
         }
 
-        let total_hasher = if calc_checksum {
+        let total_hasher = if calc_total_checksum {
             Some(Hasher::new())
         } else {
             None
         };
-        let shard_hashers = if calc_checksum {
-            Some(
-                (0..(data_shards + parity_shards))
-                    .map(|_| Hasher::new())
-                    .collect(),
-            )
-        } else {
-            None
-        };
+        let shard_hashers = (0..(data_shards + parity_shards))
+            .map(|_| Hasher::new())
+            .collect();
 
         let rs_encoder = if parity_shards > 0 {
             Some(
@@ -231,7 +224,6 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
             shard_len_limit,
             buffer: AlignedBuffer::new(block_size * data_shards),
             bytes_written_to_shards: 0,
-            calc_checksum,
             total_hasher,
             shard_hashers,
             rs_encoder,
@@ -242,10 +234,8 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
     pub async fn write(&mut self, data: &[u8]) -> Result<(), AppError> {
         EC_BYTES_IN_TOTAL.fetch_add(data.len() as u64, Ordering::Relaxed);
 
-        if self.calc_checksum {
-            if let Some(h) = self.total_hasher.as_mut() {
-                h.update(data);
-            }
+        if let Some(h) = self.total_hasher.as_mut() {
+            h.update(data);
         }
 
         let mut offset = 0;
@@ -279,10 +269,8 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
             let mut padding_buf = AlignedBuffer::new(needed);
             padding_buf.fill_zeros();
 
-            if let Some(hashers) = self.shard_hashers.as_mut() {
-                for h in hashers.iter_mut() {
-                    h.update(padding_buf.as_slice());
-                }
+            for h in self.shard_hashers.iter_mut() {
+                h.update(padding_buf.as_slice());
             }
 
             for writer_opt in self.writers.iter_mut() {
@@ -354,19 +342,17 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
                 .map_err(|e| AppError::InternalServerError(format!("RS encode: {:?}", e)))?;
             EC_RS_NS_TOTAL.fetch_add(rs_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-            if let Some(hashers) = self.shard_hashers.as_mut() {
-                for i in 0..self.data_shards {
-                    let start = i * block_size;
-                    let end = start + block_size;
-                    hashers[i].update(&buffer_slice[start..end]);
-                }
-                for i in 0..self.parity_shards {
-                    let slice = result.recovery(i).ok_or_else(|| {
-                        EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        AppError::InternalServerError("RS parity shard generation mismatch".into())
-                    })?;
-                    hashers[self.data_shards + i].update(slice);
-                }
+            for i in 0..self.data_shards {
+                let start = i * block_size;
+                let end = start + block_size;
+                self.shard_hashers[i].update(&buffer_slice[start..end]);
+            }
+            for i in 0..self.parity_shards {
+                let slice = result.recovery(i).ok_or_else(|| {
+                    EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    AppError::InternalServerError("RS parity shard generation mismatch".into())
+                })?;
+                self.shard_hashers[self.data_shards + i].update(slice);
             }
             let mut successful_writes = 0;
             for (i, writer_opt) in self.writers.iter_mut().enumerate() {
@@ -403,12 +389,10 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
                 ));
             }
         } else {
-            if let Some(hashers) = self.shard_hashers.as_mut() {
-                for i in 0..self.data_shards {
-                    let start = i * block_size;
-                    let end = start + block_size;
-                    hashers[i].update(&buffer_slice[start..end]);
-                }
+            for i in 0..self.data_shards {
+                let start = i * block_size;
+                let end = start + block_size;
+                self.shard_hashers[i].update(&buffer_slice[start..end]);
             }
 
             let mut successful_writes = 0;
@@ -455,14 +439,10 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
     }
 
     pub fn get_shard_checksums(&self) -> Vec<String> {
-        if let Some(hashers) = &self.shard_hashers {
-            hashers
-                .iter()
-                .map(|h| format!("{:08x}", h.clone().finalize()))
-                .collect()
-        } else {
-            Vec::new()
-        }
+        self.shard_hashers
+            .iter()
+            .map(|h| format!("{:08x}", h.clone().finalize()))
+            .collect()
     }
 
     pub fn into_writers(self) -> Vec<Option<W>> {

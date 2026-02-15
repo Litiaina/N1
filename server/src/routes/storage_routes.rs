@@ -16,8 +16,8 @@ use crate::handlers::dir_info_handlers::get_storage_capacity;
 use crate::middleware::auth_middleware::{auth, authorize, authorize_fragment, validate_access};
 use crate::middleware::rate_limiter_middleware::RateLimitLayers;
 use crate::middleware::storage_middleware::enforce_storage_limit;
-use crate::object_storage::archive::download_selected_archive;
 use crate::object_storage::adaptive_concurrency::run_adaptive_concurrency_loop;
+use crate::object_storage::archive::download_selected_archive;
 use crate::object_storage::delete::{
     delete_object, delete_object_permanently, delete_object_version, empty_trash,
     recover_all_trash, recover_object, recover_object_version,
@@ -33,6 +33,7 @@ use crate::object_storage::garbage_collector::{
 use crate::object_storage::maintenance::sync_fragment_metadata;
 use crate::object_storage::modify::rename_object;
 use crate::object_storage::monitoring::{get_system_health, run_system_monitor};
+use crate::object_storage::operation_gate::enforce_read_only_fast_mode_on_mutations;
 use crate::object_storage::prefix_rebuilder::{
     get_prefix_rebuild_status_api, stop_prefix_rebuild_job_api, trigger_prefix_rebuild_job_api,
 };
@@ -258,7 +259,9 @@ pub async fn serve_storage_routes() -> Router {
 
         let maintenance_ops = layers.layer_global(maintenance_ops);
 
-        let write_ops = layers.layer_upload(write_ops);
+        let write_ops = layers
+            .layer_upload(write_ops)
+            .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
 
         let protected_routes = Router::new()
             .merge(read_ops)
@@ -317,7 +320,9 @@ pub async fn serve_storage_routes() -> Router {
             )
             .layer(from_fn(enforce_storage_limit));
 
-        let upload_routes = layers.layer_upload(upload_routes);
+        let upload_routes = layers
+            .layer_upload(upload_routes)
+            .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
 
         let management_ops = Router::new()
             .route("/dir/create/{*path}", post(create_directory))
@@ -327,7 +332,9 @@ pub async fn serve_storage_routes() -> Router {
             .route("/dir/file/delete/", delete(delete_file))
             .route("/dir/file/delete/{*path}", delete(delete_file));
 
-        let management_ops = layers.layer_upload(management_ops);
+        let management_ops = layers
+            .layer_upload(management_ops)
+            .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
 
         let read_ops = Router::new()
             .route("/dir/", get(view_directory))
@@ -368,7 +375,9 @@ pub async fn serve_storage_routes() -> Router {
     let global_routes = layers.layer_global(global_routes);
 
     let create_fragment_route = Router::new().route("/v4/fragment/create", post(create_fragment));
-    let create_fragment_route = layers.layer_auth(create_fragment_route);
+    let create_fragment_route = layers
+        .layer_auth(create_fragment_route)
+        .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
 
     let fragment_auth_route =
         Router::new().route("/authenticate/fragment", post(authorize_fragment));

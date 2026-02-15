@@ -7,7 +7,7 @@ TARGET_CONFIG="${2:-$ROOT_DIR/server/n1_config.ini}"
 PROFILE_DIR="${ROOT_DIR}/profiles/n1"
 
 if [[ -z "${PROFILE_NAME}" ]]; then
-  echo "Usage: $0 <low-hw|balanced|high-hw> [target_config_path]" >&2
+  echo "Usage: $0 <low-hw|balanced|high-hw|raspberry-pi> [target_config_path]" >&2
   exit 1
 fi
 

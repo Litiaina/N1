@@ -3,8 +3,9 @@ use crate::object_storage::constants::METADATA_EXT;
 use crate::object_storage::disk_manager::{ObjectMetadata, ObjectPathManager};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use std::time::SystemTime;
 use tokio::fs;
-use tracing::error;
+use tracing::{error, warn};
 
 pub async fn find_latest_metadata_on_disk(
     fragment: &str,
@@ -22,60 +23,86 @@ pub async fn find_latest_metadata_on_disk(
     let shard4 = &hash[6..8];
 
     let index_dirs = path_manager.get_all_index_dirs(fragment);
-
-    let mut active_shard_dir = None;
-    for dir in index_dirs {
-        let candidate = dir.join(shard1).join(shard2).join(shard3).join(shard4);
-        if fs::try_exists(&candidate).await.unwrap_or(false) {
-            active_shard_dir = Some(candidate);
-            break;
-        }
-    }
-
-    let shard_dir = active_shard_dir.ok_or(AppError::NotFound)?;
     let prefix = format!("{}#", hash);
 
-    let mut latest_name: Option<String> = None;
-    let mut latest_ver: Option<String> = None;
+    #[derive(Clone)]
+    struct Candidate {
+        path: PathBuf,
+        version_id: String,
+        modified: SystemTime,
+    }
 
-    let mut entries = fs::read_dir(&shard_dir).await.map_err(|e| {
-        error!("Failed to read index shard directory: {}", e);
-        AppError::InternalServerError("Failed to read storage index.".to_string())
-    })?;
+    let mut candidates: Vec<Candidate> = Vec::new();
 
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name().to_string_lossy().to_string();
-
-        if !name.starts_with(&prefix) || !name.ends_with(METADATA_EXT) {
+    for dir in index_dirs {
+        let candidate = dir.join(shard1).join(shard2).join(shard3).join(shard4);
+        if !fs::try_exists(&candidate).await.unwrap_or(false) {
             continue;
         }
 
-        let ver_part = match name.strip_prefix(&prefix) {
-            Some(v) => v,
-            None => continue,
-        };
-        let ver = match ver_part.strip_suffix(METADATA_EXT) {
-            Some(v) => v,
-            None => continue,
-        };
+        let mut entries = fs::read_dir(&candidate).await.map_err(|e| {
+            error!("Failed to read index shard directory: {}", e);
+            AppError::InternalServerError("Failed to read storage index.".to_string())
+        })?;
 
-        match &latest_ver {
-            None => {
-                latest_ver = Some(ver.to_string());
-                latest_name = Some(name);
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            if !name.starts_with(&prefix) || !name.ends_with(METADATA_EXT) {
+                continue;
             }
-            Some(curr) => {
-                if ver > curr.as_str() {
-                    latest_ver = Some(ver.to_string());
-                    latest_name = Some(name);
-                }
+
+            let ver_part = match name.strip_prefix(&prefix) {
+                Some(v) => v,
+                None => continue,
+            };
+            let version_id = match ver_part.strip_suffix(METADATA_EXT) {
+                Some(v) if !v.is_empty() => v.to_string(),
+                _ => continue,
+            };
+
+            let path = candidate.join(&name);
+            let modified = entry
+                .metadata()
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+
+            candidates.push(Candidate {
+                path,
+                version_id,
+                modified,
+            });
+        }
+    }
+
+    if candidates.is_empty() {
+        return Err(AppError::NotFound);
+    }
+
+    candidates.sort_by(|a, b| {
+        b.version_id
+            .cmp(&a.version_id)
+            .then_with(|| b.modified.cmp(&a.modified))
+    });
+
+    for candidate in candidates {
+        match read_metadata(&candidate.path).await {
+            Ok(m) => return Ok(m),
+            Err(e) => {
+                warn!(
+                    "Skipping unreadable metadata replica {}: {}",
+                    candidate.path.display(),
+                    e
+                );
             }
         }
     }
 
-    let latest_file = latest_name.ok_or(AppError::NotFound)?;
-    let path = shard_dir.join(latest_file);
-    read_metadata(&path).await
+    Err(AppError::InternalServerError(
+        "Failed to read any valid metadata replica.".to_string(),
+    ))
 }
 
 pub async fn read_metadata(path: &PathBuf) -> Result<ObjectMetadata, AppError> {
@@ -115,20 +142,45 @@ pub async fn get_version_metadata(
     let path_manager = ObjectPathManager::new();
     let meta_paths = path_manager.get_all_metadata_paths(fragment, object_key, version_id);
 
-    let mut active_path = None;
+    let mut replicas: Vec<(PathBuf, SystemTime)> = Vec::new();
     for path in meta_paths {
         if fs::try_exists(&path).await.unwrap_or(false) {
-            active_path = Some(path);
-            break;
+            let modified = fs::metadata(&path)
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            replicas.push((path, modified));
         }
     }
 
-    let meta_path = active_path.ok_or(AppError::NotFound)?;
-    let mut metadata = read_metadata(&meta_path).await?;
-
-    if metadata.fragment != fragment {
-        metadata.fragment = fragment.to_string();
+    if replicas.is_empty() {
+        return Err(AppError::NotFound);
     }
 
-    Ok(metadata)
+    replicas.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut last_err: Option<AppError> = None;
+    for (meta_path, _) in replicas {
+        match read_metadata(&meta_path).await {
+            Ok(mut metadata) => {
+                if metadata.fragment != fragment {
+                    metadata.fragment = fragment.to_string();
+                }
+                return Ok(metadata);
+            }
+            Err(e) => {
+                warn!(
+                    "Skipping unreadable version metadata replica {}: {}",
+                    meta_path.display(),
+                    e
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or(AppError::InternalServerError(
+        "Failed to read any valid version metadata replica.".to_string(),
+    )))
 }

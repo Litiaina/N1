@@ -520,6 +520,7 @@ pub async fn repair_entire_shard(
     }
 
     let mut offset = 0u64;
+    let target_is_parity = target_shard.shard_index >= data_count;
     while offset < total_shard_size {
         let remaining = (total_shard_size - offset) as usize;
         let cur = remaining.min(block_size);
@@ -546,12 +547,13 @@ pub async fn repair_entire_shard(
                     let mut buf = vec![0u8; cur];
                     if f.read_exact(&mut buf).await.is_ok() {
                         let res = if s_info.is_parity {
-                            decoder.add_recovery_shard(s_info.shard_index - data_count, buf.clone())
+                            decoder.add_recovery_shard(s_info.shard_index - data_count, &buf)
                         } else {
-                            if s_info.shard_index < data_count {
-                                stripe_data[s_info.shard_index] = Some(buf.clone());
+                            let add = decoder.add_original_shard(s_info.shard_index, &buf);
+                            if add.is_ok() && target_is_parity && s_info.shard_index < data_count {
+                                stripe_data[s_info.shard_index] = Some(buf);
                             }
-                            decoder.add_original_shard(s_info.shard_index, buf)
+                            add
                         };
 
                         if res.is_ok() {
@@ -582,13 +584,12 @@ pub async fn repair_entire_shard(
             .decode()
             .map_err(|e| AppError::InternalServerError(format!("RS Decode: {}", e)))?;
 
-        for (idx, data) in decoded.restored_original_iter() {
-            if idx < data_count {
-                stripe_data[idx] = Some(data.to_vec());
-            }
-        }
-
         if target_shard.shard_index < data_count {
+            for (idx, data) in decoded.restored_original_iter() {
+                if idx < data_count {
+                    stripe_data[idx] = Some(data.to_vec());
+                }
+            }
             let data = stripe_data[target_shard.shard_index]
                 .as_ref()
                 .ok_or_else(|| {
@@ -599,6 +600,20 @@ pub async fn repair_entire_shard(
                 .await
                 .map_err(|e| AppError::Io(e, "write repair data".into()))?;
         } else {
+            for (idx, data) in decoded.restored_original_iter() {
+                if idx < data_count {
+                    stripe_data[idx] = Some(data.to_vec());
+                }
+            }
+
+            if stripe_data.iter().any(|d| d.is_none()) {
+                drop(temp_file);
+                let _ = fs::remove_file(&temp_path).await;
+                return Err(AppError::InternalServerError(
+                    "Missing data shards required to recompute parity".into(),
+                ));
+            }
+
             let mut encoder = ReedSolomonEncoder::new(data_count, parity_count, cur)
                 .map_err(|e| AppError::InternalServerError(format!("RS Enc Init: {}", e)))?;
 

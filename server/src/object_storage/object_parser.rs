@@ -66,7 +66,9 @@ async fn acquire_adaptive_stream_guard() -> Result<AdaptiveStreamGuard, AppError
         Ok(permit) => Ok(AdaptiveStreamGuard { _permit: permit }),
         Err(_) => {
             ACTIVE_STREAM_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
-            Err(AppError::InternalServerError("stream semaphore closed".into()))
+            Err(AppError::InternalServerError(
+                "stream semaphore closed".into(),
+            ))
         }
     }
 }
@@ -92,6 +94,26 @@ fn stream_locality_bias_enabled() -> bool {
         .get()
         .map(|v| v.load(Ordering::Relaxed))
         .unwrap_or(true)
+}
+
+fn adaptive_emit_bytes() -> usize {
+    let base = stream_chunk_size_bytes().min(stream_readahead_bytes());
+    let target = ADAPTIVE_STREAM_TARGET_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or_else(|| *STREAM_MAX_CONCURRENCY.get().unwrap_or(&128usize))
+        .max(1);
+    let active = ACTIVE_STREAM_INFLIGHT.load(Ordering::Relaxed);
+    let adjusted = if active >= target.saturating_mul(2) {
+        base / 4
+    } else if active >= target {
+        base / 2
+    } else if active.saturating_mul(2) >= target {
+        base.saturating_mul(3) / 4
+    } else {
+        base
+    };
+    adjusted.clamp(16 * 1024, 4 * 1024 * 1024)
 }
 
 pub async fn get_object_logic(
@@ -326,7 +348,7 @@ pub async fn stream_object_logic(
 
             let bytes_remaining_in_req_total = state.end - state.pos + 1;
             let bytes_remaining_in_part_total = part.size_bytes - relative_pos;
-            let max_emit = stream_chunk_size_bytes().min(stream_readahead_bytes()) as u64;
+            let max_emit = adaptive_emit_bytes() as u64;
             let mut budget = bytes_remaining_in_req_total
                 .min(bytes_remaining_in_part_total)
                 .min(max_emit) as usize;
@@ -376,7 +398,9 @@ pub async fn stream_object_logic(
                     shard_dir_with_locality_hint(part, shard_index, &state.shard_dirs)
                 else {
                     return Some((
-                        Err(AppError::InternalServerError("No shard dirs configured".into())),
+                        Err(AppError::InternalServerError(
+                            "No shard dirs configured".into(),
+                        )),
                         state,
                     ));
                 };

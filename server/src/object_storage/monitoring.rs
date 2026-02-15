@@ -1,4 +1,8 @@
 use crate::enums::app_error_enum::AppError;
+use crate::object_storage::constants::{
+    FRAGMENT_METADATA_FILE, METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, RESERVATION_FILE,
+    SESSION_MANIFEST_FILE,
+};
 use crate::object_storage::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
 use crate::object_storage::redistribution::get_redist_status;
 use crate::object_storage::repair_manager::get_repair_status;
@@ -78,6 +82,67 @@ pub struct SystemHealthResponse {
     pub consistency: ConsistencyStats,
     pub system: SystemMetrics,
     pub summary: String,
+}
+
+fn should_count_object_metadata_file(path: &std::path::Path) -> bool {
+    let name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(s) => s,
+        None => return false,
+    };
+
+    let p = path.to_string_lossy();
+    let under_active_index = p.contains("/index/") || p.contains("\\index\\");
+    if !under_active_index {
+        return false;
+    }
+    let under_trash = p.contains("/.trash/") || p.contains("\\.trash\\");
+    if under_trash {
+        return false;
+    }
+
+    if !name.ends_with(METADATA_EXT) {
+        return false;
+    }
+
+    if name.ends_with(PART_META_SUFFIX)
+        || name == QUOTA_FILE
+        || name == RESERVATION_FILE
+        || name == SESSION_MANIFEST_FILE
+        || name == FRAGMENT_METADATA_FILE
+    {
+        return false;
+    }
+
+    // Object metadata filenames are `<object_hash>#<version_id>.msgpack`.
+    name.contains('#')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_count_object_metadata_file;
+    use std::path::Path;
+
+    #[test]
+    fn deep_scan_counts_only_object_metadata_files() {
+        assert!(should_count_object_metadata_file(Path::new(
+            "frag/index/aa/bb/cc/dd/abcd1234#01ABC.msgpack"
+        )));
+        assert!(!should_count_object_metadata_file(Path::new(
+            "sessions/01ABC/session.manifest.msgpack"
+        )));
+        assert!(!should_count_object_metadata_file(Path::new(
+            "sessions/01ABC/part_0.meta.msgpack"
+        )));
+        assert!(!should_count_object_metadata_file(Path::new(
+            "quota.msgpack"
+        )));
+        assert!(!should_count_object_metadata_file(Path::new(
+            "__p__/v1/pfx/aa/bb/hash/seg_01ABC.msgpack"
+        )));
+        assert!(!should_count_object_metadata_file(Path::new(
+            "frag/.trash/index/aa/bb/cc/dd/abcd1234#01ABC.msgpack"
+        )));
+    }
 }
 
 async fn check_disk_accessibility(path_str: String, role: String) -> DiskStatus {
@@ -250,13 +315,7 @@ async fn collect_system_health(
 
                     for entry in walker.filter_map(|e| e.ok()) {
                         let path = entry.path();
-                        if entry.file_type().is_file()
-                            && path.extension().map_or(false, |ext| ext == "msgpack")
-                        {
-                            if path.components().any(|c| c.as_os_str() == "blobs") {
-                                continue;
-                            }
-
+                        if entry.file_type().is_file() && should_count_object_metadata_file(path) {
                             current_disk_count += 1;
                         }
 
@@ -335,7 +394,8 @@ async fn collect_system_health(
     } else if index_health == "desynchronized" {
         (
             "warning",
-            "Index mirrors have mismatched object counts. Run repair job.".to_string(),
+            "Index mirrors have mismatched active object metadata counts. Run repair job."
+                .to_string(),
         )
     } else {
         ("healthy", "All systems operational.".to_string())
@@ -413,10 +473,7 @@ pub async fn get_system_health(
         .get("deep_scan")
         .map(|v| v == "true")
         .unwrap_or(false);
-    let refresh = params
-        .get("refresh")
-        .map(|v| v == "true")
-        .unwrap_or(false);
+    let refresh = params.get("refresh").map(|v| v == "true").unwrap_or(false);
 
     if deep_scan || refresh {
         let snapshot = collect_system_health(&state, &params).await?;

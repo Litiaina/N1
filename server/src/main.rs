@@ -1,6 +1,9 @@
 use crate::fs::cleanup_manager::interval_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
+use crate::object_storage::adaptive_concurrency::{
+    ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC, ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC,
+};
 use crate::object_storage::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
 use crate::object_storage::monitoring::{
     MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC, MONITOR_INTERVAL_SECS_ATOMIC,
@@ -9,16 +12,14 @@ use crate::object_storage::object_parser::{
     ADAPTIVE_STREAM_TARGET_ATOMIC, STREAM_CHUNK_SIZE_ATOMIC, STREAM_LOCALITY_BIAS_ENABLED_ATOMIC,
     STREAM_MAX_CONCURRENCY, STREAM_READAHEAD_BYTES_ATOMIC,
 };
-use crate::object_storage::adaptive_concurrency::{
-    ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC, ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC,
-};
 use crate::object_storage::prefix_compactor::{
     PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC, PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC,
 };
 use crate::object_storage::retrieve::PREFIX_MAX_DELTA_SEGMENTS_ATOMIC;
 use crate::object_storage::upload::{
     ADAPTIVE_IO_TARGET_ATOMIC, DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC,
-    PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
+    PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC,
+    UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
 };
 use crate::routes::storage_routes::serve_storage_routes;
 use crate::settings::constants::{CONFIG_FILE, ENV_FILE};
@@ -32,7 +33,9 @@ use dotenv::dotenv;
 use ini::Ini;
 use server_cli::cli::args::{Cli, Commands};
 use server_cli::cli::client::execute_command;
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::Arc;
@@ -65,38 +68,217 @@ fn align_up_4k(v: usize) -> usize {
     ((v.max(4096) + 4095) / 4096) * 4096
 }
 
-fn adaptive_max_concurrent_io(cpu_cores: usize) -> usize {
-    (cpu_cores.saturating_mul(16)).clamp(16, 512)
+fn ram_gib(ram_bytes: Option<u64>) -> u64 {
+    ram_bytes
+        .map(|b| b / (1024 * 1024 * 1024))
+        .unwrap_or(0)
+        .max(1)
 }
 
-fn adaptive_writer_buffer_size(cpu_cores: usize) -> usize {
-    let bytes = if cpu_cores <= 2 {
-        64 * 1024
-    } else if cpu_cores <= 4 {
-        128 * 1024
-    } else if cpu_cores <= 8 {
-        256 * 1024
-    } else {
-        512 * 1024
+fn adaptive_max_concurrent_io(
+    cpu_cores: usize,
+    blob_disks: usize,
+    ram_bytes: Option<u64>,
+) -> usize {
+    let core_cap = (cpu_cores.saturating_mul(6)).clamp(6, 192);
+    let disk_cap = (blob_disks.max(1).saturating_mul(12)).clamp(6, 192);
+    let ram_cap = match ram_gib(ram_bytes) {
+        0..=4 => 8,
+        5..=8 => 16,
+        9..=16 => 24,
+        17..=32 => 32,
+        33..=64 => 48,
+        _ => 64,
     };
-    align_up_4k(bytes)
+    core_cap.min(disk_cap).min(ram_cap).clamp(4, 192)
 }
 
-fn adaptive_stream_max_concurrency(cpu_cores: usize) -> usize {
-    (cpu_cores.saturating_mul(32)).clamp(64, 2048)
-}
+fn adaptive_writer_buffer_size(
+    cpu_cores: usize,
+    ram_bytes: Option<u64>,
+    blob_disks: usize,
+    total_shards: usize,
+) -> usize {
+    let mut bytes = match ram_gib(ram_bytes) {
+        0..=4 => 256 * 1024,
+        5..=8 => 512 * 1024,
+        9..=64 => 1024 * 1024,
+        _ => 2 * 1024 * 1024,
+    };
 
-fn adaptive_stream_chunk_size(cpu_cores: usize) -> usize {
-    let bytes = if cpu_cores <= 2 {
-        128 * 1024
+    if cpu_cores <= 2 {
+        bytes = bytes.min(256 * 1024);
     } else if cpu_cores <= 4 {
-        256 * 1024
+        bytes = bytes.min(512 * 1024);
     } else if cpu_cores <= 8 {
+        bytes = bytes.min(1024 * 1024);
+    }
+
+    if total_shards >= 8 {
+        bytes = bytes.min(256 * 1024);
+    } else if total_shards >= 6 {
+        bytes = bytes.min(512 * 1024);
+    } else if total_shards >= 4 {
+        bytes = bytes.min(768 * 1024);
+    }
+
+    if blob_disks <= 1 {
+        bytes = bytes.min(256 * 1024);
+    } else if blob_disks == 2 {
+        bytes = bytes.min(512 * 1024);
+    }
+
+    align_up_4k(bytes.clamp(64 * 1024, 4 * 1024 * 1024))
+}
+
+fn detect_total_ram_bytes() -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kib = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())?;
+            return Some(kib.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+fn adaptive_upload_memory_budget_bytes(
+    cpu_cores: usize,
+    ram_bytes: Option<u64>,
+    blob_disks: usize,
+    total_shards: usize,
+) -> usize {
+    let mut budget: usize = match ram_gib(ram_bytes) {
+        0..=4 => 48usize * 1024 * 1024,
+        5..=8 => 64usize * 1024 * 1024,
+        9..=16 => 96usize * 1024 * 1024,
+        17..=32 => 128usize * 1024 * 1024,
+        33..=64 => 192usize * 1024 * 1024,
+        _ => 256usize * 1024 * 1024,
+    };
+
+    if cpu_cores >= 24 {
+        budget = budget.saturating_add(32usize * 1024 * 1024);
+    }
+    if total_shards >= 4 {
+        budget = budget.saturating_add(32usize * 1024 * 1024);
+    }
+
+    if blob_disks <= 1 {
+        budget = budget.min(96usize * 1024 * 1024);
+    } else if blob_disks == 2 {
+        budget = budget.min(160usize * 1024 * 1024);
+    }
+
+    budget.clamp(48usize * 1024 * 1024, 384usize * 1024 * 1024)
+}
+
+fn estimate_upload_part_working_set_bytes(
+    data_shards: usize,
+    parity_shards: usize,
+    writer_buffer_size: usize,
+    stripe_block_size: usize,
+) -> usize {
+    let total_shards = data_shards.saturating_add(parity_shards).max(1);
+    let writer_bytes = total_shards.saturating_mul(writer_buffer_size.max(4096));
+    let ec_ingest = data_shards
+        .max(1)
+        .saturating_mul(stripe_block_size.max(4096));
+    let framing_overhead = 512 * 1024usize;
+    writer_bytes
+        .saturating_add(ec_ingest.saturating_mul(2))
+        .saturating_add(framing_overhead)
+        .max(1)
+}
+
+fn adaptive_stream_chunk_size(cpu_cores: usize, ram_bytes: Option<u64>) -> usize {
+    let bytes = if cpu_cores <= 2 || ram_gib(ram_bytes) <= 4 {
+        128 * 1024
+    } else if cpu_cores <= 4 || ram_gib(ram_bytes) <= 8 {
+        256 * 1024
+    } else if cpu_cores <= 8 || ram_gib(ram_bytes) <= 16 {
         512 * 1024
     } else {
         1024 * 1024
     };
     align_up_4k(bytes)
+}
+
+fn adaptive_stream_readahead_bytes(chunk_size: usize, ram_bytes: Option<u64>) -> usize {
+    let mul = match ram_gib(ram_bytes) {
+        0..=4 => 2,
+        5..=8 => 2,
+        9..=16 => 3,
+        17..=32 => 4,
+        _ => 6,
+    };
+    align_up_4k((chunk_size.saturating_mul(mul)).clamp(64 * 1024, 8 * 1024 * 1024))
+}
+
+fn adaptive_stream_memory_budget_bytes(ram_bytes: Option<u64>) -> usize {
+    match ram_gib(ram_bytes) {
+        0..=4 => 48 * 1024 * 1024,
+        5..=8 => 64 * 1024 * 1024,
+        9..=16 => 96 * 1024 * 1024,
+        17..=32 => 128 * 1024 * 1024,
+        33..=64 => 192 * 1024 * 1024,
+        _ => 256 * 1024 * 1024,
+    }
+}
+
+fn adaptive_stream_max_concurrency(
+    cpu_cores: usize,
+    blob_disks: usize,
+    ram_bytes: Option<u64>,
+    chunk_size: usize,
+    readahead_bytes: usize,
+) -> usize {
+    let core_cap = (cpu_cores.saturating_mul(12)).clamp(12, 768);
+    let disk_cap = (blob_disks.max(1).saturating_mul(64)).clamp(16, 768);
+    let per_stream = chunk_size
+        .saturating_add(readahead_bytes)
+        .saturating_add(64 * 1024)
+        .max(1);
+    let mem_cap = (adaptive_stream_memory_budget_bytes(ram_bytes) / per_stream).clamp(8, 768);
+    core_cap.min(disk_cap).min(mem_cap).clamp(8, 768)
+}
+
+#[cfg(unix)]
+fn detect_unique_storage_devices(paths: &[String]) -> usize {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut dev_ids: HashSet<u64> = HashSet::new();
+    let mut fallback_paths: HashSet<PathBuf> = HashSet::new();
+
+    for raw in paths {
+        let p = PathBuf::from(raw);
+        let resolved = std::fs::canonicalize(&p).unwrap_or(p);
+        fallback_paths.insert(resolved.clone());
+
+        if let Ok(meta) = std::fs::metadata(&resolved) {
+            dev_ids.insert(meta.dev());
+        }
+    }
+
+    if !dev_ids.is_empty() {
+        dev_ids.len().max(1)
+    } else {
+        fallback_paths.len().max(1)
+    }
+}
+
+#[cfg(not(unix))]
+fn detect_unique_storage_devices(paths: &[String]) -> usize {
+    let mut unique: HashSet<PathBuf> = HashSet::new();
+    for raw in paths {
+        let p = PathBuf::from(raw);
+        let resolved = std::fs::canonicalize(&p).unwrap_or(p);
+        unique.insert(resolved);
+    }
+    unique.len().max(1)
 }
 
 fn adaptive_prefix_max_delta_segments(cpu_cores: usize) -> usize {
@@ -135,6 +317,38 @@ fn adaptive_prefix_compact_min_interval_seconds(cpu_cores: usize) -> usize {
     }
 }
 
+fn adaptive_concurrency_interval_ms(cpu_cores: usize, ram_bytes: Option<u64>) -> usize {
+    if cpu_cores <= 2 || ram_gib(ram_bytes) <= 4 {
+        1500
+    } else if cpu_cores <= 4 || ram_gib(ram_bytes) <= 8 {
+        1200
+    } else if cpu_cores <= 8 {
+        1000
+    } else {
+        750
+    }
+}
+
+fn adaptive_monitor_interval_seconds(cpu_cores: usize, ram_bytes: Option<u64>) -> usize {
+    if cpu_cores <= 2 || ram_gib(ram_bytes) <= 4 {
+        5
+    } else if cpu_cores <= 4 || ram_gib(ram_bytes) <= 8 {
+        3
+    } else {
+        2
+    }
+}
+
+fn adaptive_monitor_deep_scan_interval_seconds(cpu_cores: usize, ram_bytes: Option<u64>) -> usize {
+    if cpu_cores <= 2 || ram_gib(ram_bytes) <= 4 {
+        180
+    } else if cpu_cores <= 4 || ram_gib(ram_bytes) <= 8 {
+        120
+    } else {
+        60
+    }
+}
+
 fn parse_usize_or_auto(raw: Option<&str>, key: &str, auto_value: usize) -> usize {
     match raw.map(str::trim) {
         None => auto_value,
@@ -155,6 +369,15 @@ fn parse_bool_or_default(raw: Option<&str>, default_value: bool) -> bool {
         Some(v) if matches!(v, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => true,
         Some(v) if matches!(v, "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF") => false,
         Some(_) => default_value,
+    }
+}
+
+fn is_auto_or_empty(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        None => true,
+        Some(v) if v.is_empty() => true,
+        Some(v) if v.eq_ignore_ascii_case("auto") => true,
+        Some(_) => false,
     }
 }
 
@@ -333,6 +556,17 @@ pub async fn run_server() {
     if blob_disks.is_empty() {
         panic!("At least one blob store disk must be configured in blob_store_disks!");
     }
+    let blob_disk_count = blob_disks.len();
+    let blob_device_count = detect_unique_storage_devices(&blob_disks);
+    let effective_blob_disks_for_auto = blob_device_count.min(blob_disk_count).max(1);
+    if blob_device_count < blob_disk_count {
+        tracing::warn!(
+            "blob_store_disks has {} configured path(s) but only {} unique physical device(s); auto tuning will use {} effective disk(s)",
+            blob_disk_count,
+            blob_device_count,
+            effective_blob_disks_for_auto
+        );
+    }
 
     BLOB_STORE_DISKS
         .set(blob_disks)
@@ -340,12 +574,73 @@ pub async fn run_server() {
 
     let upload_section = config.section(Some("upload_config"));
     let cpu_cores = detect_cpu_cores();
+    let detected_ram_bytes = detect_total_ram_bytes();
+    let detected_ram_gib = ram_gib(detected_ram_bytes);
 
-    let max_io_semaphore = parse_usize_or_auto(
+    let data_shards_value = upload_section
+        .and_then(|s| s.get("data_shards"))
+        .unwrap_or("1")
+        .parse::<usize>()
+        .expect("data_shards does not fit into usize");
+
+    let parity_shards_value = upload_section
+        .and_then(|s| s.get("parity_shards"))
+        .unwrap_or("0")
+        .parse::<usize>()
+        .expect("parity_shards does not fit into usize");
+    let total_shards_value = data_shards_value.saturating_add(parity_shards_value).max(1);
+
+    let stripe_block_size_value = upload_section
+        .and_then(|s| s.get("stripe_block_size"))
+        .unwrap_or("262144")
+        .parse::<usize>()
+        .expect("stripe_block_size does not fit into usize");
+
+    let writer_buffer_raw = upload_section.and_then(|s| s.get("writer_buffer_size"));
+    let mut writer_buffer_size = align_up_4k(parse_usize_or_auto(
+        writer_buffer_raw,
+        "writer_buffer_size",
+        adaptive_writer_buffer_size(
+            cpu_cores,
+            detected_ram_bytes,
+            effective_blob_disks_for_auto,
+            total_shards_value,
+        ),
+    ));
+    if is_auto_or_empty(writer_buffer_raw) {
+        writer_buffer_size = writer_buffer_size.max(stripe_block_size_value.max(4096));
+    }
+
+    let configured_max_io = parse_usize_or_auto(
         upload_section.and_then(|s| s.get("max_concurrent_io")),
         "max_concurrent_io",
-        adaptive_max_concurrent_io(cpu_cores),
+        adaptive_max_concurrent_io(cpu_cores, effective_blob_disks_for_auto, detected_ram_bytes),
     );
+
+    let upload_memory_budget_bytes = parse_usize_or_auto(
+        upload_section.and_then(|s| s.get("upload_memory_budget_bytes")),
+        "upload_memory_budget_bytes",
+        adaptive_upload_memory_budget_bytes(
+            cpu_cores,
+            detected_ram_bytes,
+            effective_blob_disks_for_auto,
+            total_shards_value,
+        ),
+    )
+    .max(8 * 1024 * 1024);
+
+    let per_upload_bytes = estimate_upload_part_working_set_bytes(
+        data_shards_value,
+        parity_shards_value,
+        writer_buffer_size,
+        stripe_block_size_value,
+    );
+
+    let effective_upload_budget_bytes = upload_memory_budget_bytes
+        .saturating_mul(80)
+        .saturating_div(100);
+    let budget_limited_max_io = (effective_upload_budget_bytes / per_upload_bytes).max(1);
+    let max_io_semaphore = configured_max_io.min(budget_limited_max_io);
 
     MAX_IO_SEMAPHORE
         .set(max_io_semaphore)
@@ -368,45 +663,45 @@ pub async fn run_server() {
         .set(max_part_size)
         .expect("Double initialization of MAX_PART_SIZE!");
 
-    let data_shards = upload_section
-        .and_then(|s| s.get("data_shards"))
-        .unwrap_or("1");
-
-    let data_shards: AtomicUsize = AtomicUsize::new(
-        data_shards
-            .parse::<usize>()
-            .expect("data_shards does not fit into usize"),
-    );
-
     DATA_SHARDS_ATOMIC
-        .set(data_shards)
+        .set(AtomicUsize::new(data_shards_value))
         .expect("Double initialization of DATA_SHARDS!");
 
-    let parity_shards = upload_section
-        .and_then(|s| s.get("parity_shards"))
-        .unwrap_or("0");
-
-    let parity_shards: AtomicUsize = AtomicUsize::new(
-        parity_shards
-            .parse::<usize>()
-            .expect("parity_shards does not fit into usize"),
-    );
-
     PARITY_SHARDS_ATOMIC
-        .set(parity_shards)
+        .set(AtomicUsize::new(parity_shards_value))
         .expect("Double initialization of PARITY_SHARDS!");
 
-    let writer_buffer_size = align_up_4k(parse_usize_or_auto(
-        upload_section.and_then(|s| s.get("writer_buffer_size")),
-        "writer_buffer_size",
-        adaptive_writer_buffer_size(cpu_cores),
-    ));
+    STRIPE_SIZE_ATOMIC
+        .set(AtomicUsize::new(stripe_block_size_value))
+        .expect("Double initialization of STRIPE_SIZE!");
+
+    let upload_part_strict_durability_default = parse_bool_or_default(
+        upload_section.and_then(|s| s.get("upload_part_strict_durability_default")),
+        false,
+    );
+    let upload_io_gate_enabled = parse_bool_or_default(
+        upload_section.and_then(|s| s.get("upload_io_gate_enabled")),
+        true,
+    );
 
     tracing::info!(
-        "Upload tuning: cpu_cores={}, max_concurrent_io={}, writer_buffer_size={}",
+        "Upload tuning: cpu_cores={}, ram_gib={}, blob_paths={}, blob_devices={}, auto_effective_disks={}, ec={}D+{}P, max_concurrent_io={} (configured={} budget_cap={} per_upload_est={}KiB budget={}MiB effective_budget={}MiB), writer_buffer_size={}, part_durability_strict_default={}, io_gate_enabled={}",
         cpu_cores,
+        detected_ram_gib,
+        blob_disk_count,
+        blob_device_count,
+        effective_blob_disks_for_auto,
+        data_shards_value,
+        parity_shards_value,
         max_io_semaphore,
-        writer_buffer_size
+        configured_max_io,
+        budget_limited_max_io,
+        per_upload_bytes / 1024,
+        upload_memory_budget_bytes / (1024 * 1024),
+        effective_upload_budget_bytes / (1024 * 1024),
+        writer_buffer_size,
+        upload_part_strict_durability_default,
+        upload_io_gate_enabled
     );
 
     let writer_buffer_size: AtomicUsize = AtomicUsize::new(writer_buffer_size);
@@ -415,10 +710,38 @@ pub async fn run_server() {
         .set(writer_buffer_size)
         .expect("Double initialization of WRITER_BUFFER_SIZE!");
 
+    UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC
+        .set(AtomicBool::new(upload_part_strict_durability_default))
+        .expect("Double initialization of UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC");
+
+    UPLOAD_IO_GATE_ENABLED_ATOMIC
+        .set(AtomicBool::new(upload_io_gate_enabled))
+        .expect("Double initialization of UPLOAD_IO_GATE_ENABLED_ATOMIC");
+
+    let stream_chunk_size = align_up_4k(parse_usize_or_auto(
+        upload_section.and_then(|s| s.get("stream_chunk_size")),
+        "stream_chunk_size",
+        adaptive_stream_chunk_size(cpu_cores, detected_ram_bytes),
+    ))
+    .clamp(4096, 4 * 1024 * 1024);
+
+    let stream_readahead_bytes = align_up_4k(parse_usize_or_auto(
+        upload_section.and_then(|s| s.get("stream_readahead_bytes")),
+        "stream_readahead_bytes",
+        adaptive_stream_readahead_bytes(stream_chunk_size, detected_ram_bytes),
+    ))
+    .clamp(64 * 1024, 8 * 1024 * 1024);
+
     let stream_max_concurrency = parse_usize_or_auto(
         upload_section.and_then(|s| s.get("stream_max_concurrency")),
         "stream_max_concurrency",
-        adaptive_stream_max_concurrency(cpu_cores),
+        adaptive_stream_max_concurrency(
+            cpu_cores,
+            effective_blob_disks_for_auto,
+            detected_ram_bytes,
+            stream_chunk_size,
+            stream_readahead_bytes,
+        ),
     );
 
     STREAM_MAX_CONCURRENCY
@@ -428,23 +751,9 @@ pub async fn run_server() {
         .set(AtomicUsize::new(stream_max_concurrency))
         .expect("Double initialization of ADAPTIVE_STREAM_TARGET_ATOMIC");
 
-    let stream_chunk_size = align_up_4k(parse_usize_or_auto(
-        upload_section.and_then(|s| s.get("stream_chunk_size")),
-        "stream_chunk_size",
-        adaptive_stream_chunk_size(cpu_cores),
-    ))
-    .clamp(4096, 4 * 1024 * 1024);
-
     STREAM_CHUNK_SIZE_ATOMIC
         .set(AtomicUsize::new(stream_chunk_size))
         .expect("Double initialization of STREAM_CHUNK_SIZE_ATOMIC");
-
-    let stream_readahead_bytes = align_up_4k(parse_usize_or_auto(
-        upload_section.and_then(|s| s.get("stream_readahead_bytes")),
-        "stream_readahead_bytes",
-        (stream_chunk_size * 2).clamp(64 * 1024, 8 * 1024 * 1024),
-    ))
-    .clamp(64 * 1024, 8 * 1024 * 1024);
     STREAM_READAHEAD_BYTES_ATOMIC
         .set(AtomicUsize::new(stream_readahead_bytes))
         .expect("Double initialization of STREAM_READAHEAD_BYTES_ATOMIC");
@@ -457,11 +766,19 @@ pub async fn run_server() {
         .set(AtomicBool::new(stream_locality_bias_enabled))
         .expect("Double initialization of STREAM_LOCALITY_BIAS_ENABLED_ATOMIC");
 
+    let stream_per_request_kib = (stream_chunk_size
+        .saturating_add(stream_readahead_bytes)
+        .saturating_add(64 * 1024))
+        / 1024;
+    let stream_auto_budget_mib =
+        adaptive_stream_memory_budget_bytes(detected_ram_bytes) / (1024 * 1024);
     tracing::info!(
-        "Stream tuning: max_concurrency={}, chunk_size={}, readahead_bytes={}, locality_bias={}",
+        "Stream tuning: max_concurrency={}, chunk_size={}, readahead_bytes={}, per_request_est={}KiB, auto_budget={}MiB, locality_bias={}",
         stream_max_concurrency,
         stream_chunk_size,
         stream_readahead_bytes,
+        stream_per_request_kib,
+        stream_auto_budget_mib,
         stream_locality_bias_enabled
     );
 
@@ -476,7 +793,7 @@ pub async fn run_server() {
     let adaptive_concurrency_interval_ms = parse_usize_or_auto(
         upload_section.and_then(|s| s.get("adaptive_concurrency_interval_ms")),
         "adaptive_concurrency_interval_ms",
-        1000,
+        adaptive_concurrency_interval_ms(cpu_cores, detected_ram_bytes),
     )
     .clamp(100, 10_000);
     ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC
@@ -536,7 +853,7 @@ pub async fn run_server() {
     let monitor_interval_seconds = parse_usize_or_auto(
         upload_section.and_then(|s| s.get("monitor_interval_seconds")),
         "monitor_interval_seconds",
-        2,
+        adaptive_monitor_interval_seconds(cpu_cores, detected_ram_bytes),
     )
     .clamp(1, 3600);
     MONITOR_INTERVAL_SECS_ATOMIC
@@ -546,7 +863,7 @@ pub async fn run_server() {
     let monitor_deep_scan_interval_seconds = parse_usize_or_auto(
         upload_section.and_then(|s| s.get("monitor_deep_scan_interval_seconds")),
         "monitor_deep_scan_interval_seconds",
-        60,
+        adaptive_monitor_deep_scan_interval_seconds(cpu_cores, detected_ram_bytes),
     )
     .clamp(5, 24 * 3600);
     MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC
@@ -558,20 +875,6 @@ pub async fn run_server() {
         monitor_interval_seconds,
         monitor_deep_scan_interval_seconds
     );
-
-    let stripe_block_size = upload_section
-        .and_then(|s| s.get("stripe_block_size"))
-        .unwrap_or("262144");
-
-    let stripe_block_size: AtomicUsize = AtomicUsize::new(
-        stripe_block_size
-            .parse::<usize>()
-            .expect("stripe_block_size does not fit into usize"),
-    );
-
-    STRIPE_SIZE_ATOMIC
-        .set(stripe_block_size)
-        .expect("Double initialization of STRIPE_SIZE!");
 
     let cert = RustlsConfig::from_pem_file(&cert_path, &key_path)
         .await

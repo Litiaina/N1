@@ -434,11 +434,18 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
 Requirements:
 - `Content-Length` header required
 - query `checksum` optional
+- query `durability` optional: `strict|sync|durable|batched|async|fast|relaxed`
+- query `strict_durability` optional bool fallback (`true|false`)
+- query `io_gate` optional bool (`true|false`) to force-enable/disable upload I/O gate for that request
+
+Durability default:
+- If query flags are omitted, upload-part durability follows `[upload_config].upload_part_strict_durability_default` (`false` by default).
+- Upload I/O gating follows `[upload_config].upload_io_gate_enabled` (`true` by default) unless overridden by `io_gate`.
 
 ```bash
 curl -k -X PUT -H "Authorization: Bearer $TOKEN" \
   -H "Content-Length: 4194304" \
-  "https://127.0.0.1:50001/v4/upload/chunk/<fragment_hash>/<version_id>/0?checksum=<optional_crc_or_hash>" \
+  "https://127.0.0.1:50001/v4/upload/chunk/<fragment_hash>/<version_id>/0?checksum=<optional_crc_or_hash>&durability=batched&io_gate=false" \
   --data-binary @part-000.bin
 ```
 
@@ -502,13 +509,15 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
 Start query params:
 - `dry_run=true|false`
 - `mode=availability|scrub|strict|checksum`
-- `meta_concurrency=1..128`
-- `repair_concurrency=1..64`
-- `batch=32..8192`
+- `fast_mode=true|false` (enables read-only fast maintenance mode)
+- `read_only_fast=true|false` (alias of `fast_mode`)
+- `meta_concurrency=1..N` (RAM-adaptive cap; low-RAM nodes clamp lower than high-RAM nodes)
+- `repair_concurrency=1..N` (RAM-adaptive cap)
+- `batch=32..N` (RAM-adaptive cap)
 
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/maintenance/repair/start?dry_run=false&mode=availability&meta_concurrency=32&repair_concurrency=8&batch=1024"
+  "https://127.0.0.1:50001/v4/maintenance/repair/start?dry_run=false&mode=availability&fast_mode=true&meta_concurrency=32&repair_concurrency=8&batch=1024"
 
 curl -k -X GET -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/maintenance/repair/status"
@@ -536,10 +545,17 @@ curl -k -X GET -H "Authorization: Bearer $TOKEN" \
 
 Start query params:
 - `dry_run=true|false`
+- `fast_mode=true|false` (enables read-only fast maintenance mode)
+- `read_only_fast=true|false` (alias of `fast_mode`)
+- `durability=auto|strict|batched` (aliases: `sync|durable|async|fast|relaxed`)
+- `durability_mode=auto|strict|batched` (alternate key)
+- `strict_durability=true|false` (boolean fallback for durability)
+- `object_concurrency=1..N` (RAM-adaptive cap; low-RAM nodes clamp lower)
+- `status_batch=1..N` (RAM-adaptive cap)
 
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/maintenance/redistribution/start?dry_run=true"
+  "https://127.0.0.1:50001/v4/maintenance/redistribution/start?dry_run=false&fast_mode=true&durability=batched&object_concurrency=32&status_batch=128"
 
 curl -k -X GET -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/maintenance/redistribution/monitor"
@@ -839,12 +855,20 @@ curl -k -X POST -H "Authorization: Bearer $FS_TOKEN" \
 - `POST /authenticate/fragment`
 - `POST /authenticate/fs`
 
-## 13. Streaming Tuning (Config)
-`[upload_config]` keys used by streaming read paths:
+## 13. Streaming And Upload Tuning (Config)
+`[upload_config]` keys used by streaming read and upload-part paths:
+- `upload_memory_budget_bytes`: caps upload-part in-flight working set by reducing effective `max_concurrent_io` at startup (`auto` derives from RAM, override for strict memory ceilings).
 - `stream_chunk_size`: maximum emitted stream chunk per read step (4 KiB..4 MiB after clamp/alignment).
 - `stream_readahead_bytes`: sequential read-ahead window per stream step (64 KiB..8 MiB after clamp/alignment).
 - `stream_locality_bias_enabled`: prefer shard directory inferred from shard absolute path for sequential streaming.
 - `stream_max_concurrency`: global stream semaphore capacity.
+- `upload_part_strict_durability_default`: default durability for `PUT /v4/upload/chunk` when query override is absent (`true` = strict fsync/dir-sync, `false` = batched, default `false`).
+- `upload_io_gate_enabled`: default for upload I/O gate in `PUT /v4/upload/chunk` when `io_gate` query override is absent.
+
+`auto` preset behavior:
+- `auto` values are hardware-aware (CPU cores + detected RAM + disk count + EC shard layout).
+- Upload and stream auto concurrency are memory-capped so defaults stay safe on low-end nodes while scaling on high-end nodes.
+- Auto disk-count tuning is physical-device aware: if multiple configured blob roots resolve to the same underlying disk, `auto` treats them as one effective disk and clamps upload/stream concurrency and upload buffer/budget more conservatively.
 
 Recommended starting points:
 - Low hardware: `stream_chunk_size=131072`, `stream_readahead_bytes=262144`

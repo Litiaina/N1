@@ -18,9 +18,9 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 use tokio::runtime::Handle;
 use tokio::time::sleep;
@@ -79,8 +79,9 @@ where
 
 async fn run_gc_scan_offthread(state: Arc<AppState>, is_manual_run: bool) -> Result<(), AppError> {
     let handle = Handle::current();
-    let join = tokio::task::spawn_blocking(move || handle.block_on(perform_gc_scan(state, is_manual_run)))
-        .await;
+    let join =
+        tokio::task::spawn_blocking(move || handle.block_on(perform_gc_scan(state, is_manual_run)))
+            .await;
 
     match join {
         Ok(res) => res,
@@ -147,11 +148,11 @@ pub async fn run_garbage_collector(State(state): State<Arc<AppState>>) -> impl I
         {
             with_gc_status_write(|st| {
                 *st = GcJobStatus {
-                is_running: true,
-                phase: "Initializing".to_string(),
-                is_manual_run: true,
-                start_timestamp: Utc::now().timestamp(),
-                ..Default::default()
+                    is_running: true,
+                    phase: "Initializing".to_string(),
+                    is_manual_run: true,
+                    start_timestamp: Utc::now().timestamp(),
+                    ..Default::default()
                 };
             });
         }

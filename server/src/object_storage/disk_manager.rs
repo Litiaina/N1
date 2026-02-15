@@ -336,6 +336,12 @@ pub struct ChunkQuery {
 #[derive(Deserialize)]
 pub struct UploadPartQuery {
     pub checksum: Option<String>,
+    #[serde(default)]
+    pub durability: Option<String>,
+    #[serde(default)]
+    pub strict_durability: Option<bool>,
+    #[serde(default)]
+    pub io_gate: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
