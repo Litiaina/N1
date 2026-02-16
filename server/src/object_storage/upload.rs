@@ -358,57 +358,6 @@ fn prefixes_for_key(object_key: &str) -> BTreeSet<String> {
     out
 }
 
-#[allow(dead_code)]
-async fn write_prefix_segments(
-    path_manager: &ObjectPathManager,
-    fragment: &str,
-    object_key: &str,
-    version_id: &str,
-    created_at: i64,
-) -> Result<(), AppError> {
-    let prefixes = prefixes_for_key(object_key);
-    let mut any_ok = false;
-
-    for prefix in prefixes {
-        let seg = PrefixIndexSegment {
-            prefix: prefix.clone(),
-            entries: vec![PrefixIndexEntry {
-                object_key: object_key.to_string(),
-                version_id: version_id.to_string(),
-                created_at,
-            }],
-        };
-
-        let bytes = rmp_serde::to_vec(&seg).map_err(|e| {
-            AppError::InternalServerError(format!("Serialize prefix segment: {}", e))
-        })?;
-
-        let paths = path_manager.get_all_prefix_segment_paths(fragment, &prefix, version_id);
-
-        let mut wrote_this_prefix = false;
-        for p in paths {
-            if let Some(parent) = p.parent() {
-                let _ = tokio_fs::create_dir_all(parent).await;
-            }
-            if write_atomic(&p, &bytes).await.is_ok() {
-                wrote_this_prefix = true;
-            }
-        }
-
-        if wrote_this_prefix {
-            any_ok = true;
-        }
-    }
-
-    if !any_ok {
-        return Err(AppError::InternalServerError(
-            "Failed to write prefix index to any mirror".into(),
-        ));
-    }
-
-    Ok(())
-}
-
 pub async fn create_direct_file(path: &PathBuf) -> Result<fs::File, AppError> {
     let path_clone = path.clone();
 

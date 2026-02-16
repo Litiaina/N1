@@ -3,7 +3,7 @@ use crate::object_storage::constants::{METADATA_EXT, QUOTA_FILE};
 use crate::object_storage::disk_manager::{ObjectMetadata, ObjectPathManager};
 use crate::object_storage::quota_manager::set_storage_used;
 use crate::structs::auth_structs::Claims;
-use axum::{extract::Path, http::StatusCode, response::IntoResponse};
+use axum::{http::StatusCode, response::IntoResponse};
 use std::collections::HashSet;
 use tracing::{error, info};
 use walkdir::WalkDir;
@@ -107,28 +107,5 @@ pub async fn sync_fragment_metadata(claims: Claims) -> Result<impl IntoResponse,
     Ok((
         StatusCode::OK,
         "Metadata synchronization and cleanup complete.",
-    ))
-}
-
-#[allow(dead_code)]
-pub async fn admin_sync_fragment_metadata(
-    claims: Claims,
-    Path(target_fragment): Path<String>,
-) -> Result<impl IntoResponse, AppError> {
-    if !claims.modify {
-        return Err(AppError::Forbidden(
-            "Modify permissions required for admin sync".into(),
-        ));
-    }
-
-    let usage = perform_quota_sync(&target_fragment).await?;
-    info!(
-        "Admin-sync complete for fragment {}. New Usage: {} bytes",
-        target_fragment, usage
-    );
-
-    Ok((
-        StatusCode::OK,
-        format!("Metadata synced for fragment {}.", target_fragment),
     ))
 }

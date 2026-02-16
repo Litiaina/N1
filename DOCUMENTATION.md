@@ -965,3 +965,50 @@ Recommended starting points:
 - `GET /dir/file/metadata/{*path}`
 - `GET /dir/file/download/`
 - `GET /dir/file/download/{*path}`
+
+## 14. SMB Network Drive (`fsgwd`)
+
+`fsgwd` is N1's native SMB-lite gateway integrated in the server process. It is not part of `/v4/*` HTTP routing.
+
+### 14.1 Config keys (`[fsgwd]`)
+- `enabled=true|false`
+- `bind_addr=<ip_or_host>`
+- `smb_port=<u16>`
+- `max_sessions=<64..65536>`
+- `max_frame_bytes=<4096..67108864>`
+- `auth_username=<string>` optional
+- `auth_password=<string>` optional
+- `auth_domain=<string>` optional
+- `require_signing=true|false`
+
+Behavior:
+- If `auth_username` and `auth_password` are configured, SMB auth is enforced.
+- If `require_signing=true`, SMB signing is required.
+
+### 14.2 Environment overrides
+- `N1_FSGWD_ENABLED`
+- `N1_FSGWD_BIND_ADDR`
+- `N1_FSGWD_SMB_PORT`
+- `N1_FSGWD_MAX_SESSIONS`
+- `N1_FSGWD_MAX_FRAME_BYTES`
+- `N1_FSGWD_AUTH_USERNAME`
+- `N1_FSGWD_AUTH_PASSWORD`
+- `N1_FSGWD_AUTH_DOMAIN`
+- `N1_FSGWD_REQUIRE_SIGNING`
+
+### 14.3 SMB-lite scope
+Implemented:
+- auth + signing
+- `list/read/write/create/rename/delete/mkdir/rmdir`
+- query-directory/query-info/set-info behavior
+- delete-on-close behavior
+- conservative share-mode conflict checks
+- conservative lock ownership handling
+
+Not implemented:
+- oplocks / leases
+- durable or persistent handles
+- multichannel and other enterprise SMB semantics
+
+Deployment guide:
+- `NETWORK_DRIVE.md`

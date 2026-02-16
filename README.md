@@ -55,6 +55,9 @@
 
 ---
 
+For SMB network-drive deployment, see `NETWORK_DRIVE.md`.
+N1 ships with native SMB-lite via `fsgwd`, with `fsd_mount + Samba` kept as fallback.
+
 ## What is N1 (current architecture)
 
 **Litiaina N1** is a **single-machine, multi-disk** object storage engine that treats the filesystem as the database and

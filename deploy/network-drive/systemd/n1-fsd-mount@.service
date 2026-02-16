@@ -1,0 +1,24 @@
+[Unit]
+Description=N1 FSD mount for fragment %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<n1_user>
+Group=<n1_group>
+EnvironmentFile=/etc/n1/fsd/%i.env
+ExecStart=/home/<n1_user>/Development/N1/target/release/fsd_mount \
+  --url ${N1_URL} \
+  --fragment ${N1_FRAGMENT} \
+  --secret ${N1_SECRET} \
+  --mount-point ${N1_MOUNT_POINT} \
+  --no-direct-io \
+  ${N1_MOUNT_FLAGS}
+ExecStop=/bin/fusermount -u ${N1_MOUNT_POINT}
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

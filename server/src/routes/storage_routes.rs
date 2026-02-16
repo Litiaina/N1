@@ -12,6 +12,10 @@ use crate::fs::stateless_fragmented_upload::{
     self, finalize_upload_session, initiate_upload_session, upload_chunk_binary,
     upload_chunk_multipart,
 };
+use crate::fsd::handlers::{
+    fsd_delete, fsd_list_dir, fsd_mkdir, fsd_read, fsd_rename, fsd_rmdir, fsd_stat,
+    fsd_write_abort, fsd_write_begin, fsd_write_chunk, fsd_write_commit,
+};
 use crate::handlers::dir_info_handlers::get_storage_capacity;
 use crate::middleware::auth_middleware::{auth, authorize, authorize_fragment, validate_access};
 use crate::middleware::rate_limiter_middleware::RateLimitLayers;
@@ -154,7 +158,10 @@ pub async fn serve_storage_routes() -> Router {
                 "/v4/fragment/archive/{:fragment}",
                 post(download_selected_archive),
             )
-            .route("/v4/share/create", post(create_signed_url));
+            .route("/v4/share/create", post(create_signed_url))
+            .route("/v4/fsd/list/{*mount_path}", get(fsd_list_dir))
+            .route("/v4/fsd/stat/{*mount_path}", get(fsd_stat))
+            .route("/v4/fsd/read/{*mount_path}", get(fsd_read));
 
         let read_ops = layers.layer_view(read_ops);
 
@@ -210,7 +217,15 @@ pub async fn serve_storage_routes() -> Router {
             .route(
                 "/v4/upload/cancel/{:fragment}/{:version_id}",
                 delete(cancel_upload_session),
-            );
+            )
+            .route("/v4/fsd/write/begin/{*mount_path}", post(fsd_write_begin))
+            .route("/v4/fsd/write/chunk/{:session_id}", put(fsd_write_chunk))
+            .route("/v4/fsd/write/commit/{:session_id}", post(fsd_write_commit))
+            .route("/v4/fsd/write/abort/{:session_id}", post(fsd_write_abort))
+            .route("/v4/fsd/delete/{*mount_path}", delete(fsd_delete))
+            .route("/v4/fsd/mkdir/{*mount_path}", post(fsd_mkdir))
+            .route("/v4/fsd/rmdir/{*mount_path}", delete(fsd_rmdir))
+            .route("/v4/fsd/rename", patch(fsd_rename));
 
         let maintenance_ops = Router::new()
             .route("/v4/maintenance/sync/global", post(sync_quota_api))

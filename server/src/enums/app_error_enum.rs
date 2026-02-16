@@ -12,7 +12,6 @@ pub enum AppError {
     Conflict(String),
     PayloadTooLarge(String),
     Unauthorized,
-    #[allow(dead_code)]
     Forbidden(String),
     Multipart(String),
     RangeNotSatisfiable,
