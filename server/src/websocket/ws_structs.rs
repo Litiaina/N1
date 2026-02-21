@@ -31,6 +31,21 @@ pub enum ClientMessage {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct SmbTransferProgressPayload {
+    pub transfer_id: String,
+    pub fragment: String,
+    pub object_key: String,
+    pub phase: String,
+    pub state: String,
+    pub ingress_bytes: u64,
+    pub expected_bytes: Option<u64>,
+    pub started_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub completed_at_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "data")]
 pub enum StorageEventPayload {
     #[serde(rename = "FILE_UPLOADED")]
@@ -77,6 +92,9 @@ pub enum StorageEventPayload {
 
     #[serde(rename = "PREFIX_REBUILD_UPDATE")]
     PrefixRebuildUpdate(PrefixRebuildJobStatus),
+
+    #[serde(rename = "SMB_TRANSFER_PROGRESS")]
+    SmbTransferProgress(SmbTransferProgressPayload),
 }
 
 #[derive(Debug, Clone, Serialize)]

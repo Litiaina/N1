@@ -12,7 +12,7 @@ use crate::fs::stateless_fragmented_upload::{
     self, finalize_upload_session, initiate_upload_session, upload_chunk_binary,
     upload_chunk_multipart,
 };
-use crate::fsd::handlers::{
+use crate::fuse::handlers::{
     fsd_delete, fsd_list_dir, fsd_mkdir, fsd_read, fsd_rename, fsd_rmdir, fsd_stat,
     fsd_write_abort, fsd_write_begin, fsd_write_chunk, fsd_write_commit,
 };
@@ -60,13 +60,18 @@ use crate::object_storage::upload::{
     cancel_upload_session, finalize_object_upload, get_upload_status, initiate_object_upload,
     list_active_uploads, object_upload_part,
 };
+use crate::smb::server::list_transfer_progress_for_fragment;
+use crate::structs::auth_structs::Claims;
 use crate::websocket::handler::{system_broadcast_handler, ws_handler};
-use crate::websocket::manager::WsConnectionManager;
+use crate::websocket::manager::{register_global_ws_manager, WsConnectionManager};
+use crate::websocket::ws_structs::SmbTransferProgressPayload;
+use crate::enums::app_error_enum::AppError;
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::http::{HeaderName, Method};
 use axum::middleware::from_fn;
 use axum::routing::{delete, get, patch, post, put};
-use axum::{extract::DefaultBodyLimit, Router};
+use axum::{extract::{DefaultBodyLimit, Path, Query}, Json as AxumJson, Router};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
@@ -85,6 +90,7 @@ pub async fn serve_storage_routes() -> Router {
     let layers = RateLimitLayers::new();
 
     let ws_manager = WsConnectionManager::new();
+    register_global_ws_manager(ws_manager.clone());
 
     let app_state = Arc::new(AppState { ws_manager });
 
@@ -159,6 +165,7 @@ pub async fn serve_storage_routes() -> Router {
                 post(download_selected_archive),
             )
             .route("/v4/share/create", post(create_signed_url))
+            .route("/v4/smb/progress/{:fragment}", get(smb_progress))
             .route("/v4/fsd/list/{*mount_path}", get(fsd_list_dir))
             .route("/v4/fsd/stat/{*mount_path}", get(fsd_stat))
             .route("/v4/fsd/read/{*mount_path}", get(fsd_read));
@@ -423,4 +430,34 @@ pub async fn serve_storage_routes() -> Router {
 
 async fn ping() -> &'static str {
     "pong"
+}
+
+async fn smb_progress(
+    claims: Claims,
+    Path(fragment): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<AxumJson<Vec<SmbTransferProgressPayload>>, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+
+    let include_completed = params
+        .get("include_completed")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100)
+        .min(1000);
+
+    Ok(AxumJson(list_transfer_progress_for_fragment(
+        fragment.as_str(),
+        include_completed,
+        limit,
+    )))
 }

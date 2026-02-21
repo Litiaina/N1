@@ -1,8 +1,8 @@
 use crate::enums::app_error_enum::AppError;
-use crate::fsd::backend::{DirEntry, InProcessBackend};
-use crate::fsd::config::FsdConfig;
-use crate::fsd::gateway::FsdGateway;
-use crate::fsd::model::{NodeKind, WriteHandle};
+use crate::fuse::backend::{DirEntry, InProcessBackend};
+use crate::fuse::config::FsdConfig;
+use crate::fuse::gateway::FsdGateway;
+use crate::fuse::model::{NodeKind, WriteHandle};
 use crate::structs::auth_structs::Claims;
 use axum::body::{to_bytes, Body};
 use axum::extract::{Path as AxumPath, Query};
@@ -49,7 +49,7 @@ fn ensure_claims_for_path(
     mount_path: &str,
     permission: &str,
 ) -> Result<(), AppError> {
-    let path = crate::fsd::model::FsdPath::parse(mount_path)?;
+    let path = crate::fuse::model::FsdPath::parse(mount_path)?;
 
     if claims.fragment != path.fragment {
         return Err(AppError::Forbidden(

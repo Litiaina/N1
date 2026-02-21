@@ -217,6 +217,10 @@ Query:
 - `continuation_token` optional
 - `prefix` optional
 - `delimiter` optional (`/`)
+- `include_internal` optional (`true|false`, default `false`)
+
+Notes:
+- Internal marker keys (for example `.n1fsd_dir`, `.n1-trash`) are hidden unless `include_internal=true`.
 
 Response shape (`ListObjectsResult`):
 - `objects`: array of `ObjectMetadata`
@@ -230,6 +234,7 @@ curl -k -H "Authorization: Bearer $TOKEN" \
 
 ### 6.4 `GET /v4/fragment/trash/{fragment}`
 Trash listing, same pagination style.
+- Supports the same `include_internal` query behavior as object listing.
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/trash/<fragment_hash>?limit=100"
@@ -893,6 +898,7 @@ Recommended starting points:
 - `GET /v4/fragment/meta/{fragment}/{*object_key}`
 - `GET /v4/fragment/download/{fragment}`
 - `GET /v4/fragment/download/chunk/{fragment}`
+- `GET /v4/smb/progress/{fragment}`
 - `POST /v4/fragment/archive/{fragment}`
 - `POST /v4/share/create`
 
@@ -966,37 +972,75 @@ Recommended starting points:
 - `GET /dir/file/download/`
 - `GET /dir/file/download/{*path}`
 
-## 14. SMB Network Drive (`fsgwd`)
+## 14. SMB Network Drive (`smb`)
 
-`fsgwd` is N1's native SMB-lite gateway integrated in the server process. It is not part of `/v4/*` HTTP routing.
+`smb` is N1's native SMB-lite gateway integrated in the server process. It is not part of `/v4/*` HTTP routing.
 
-### 14.1 Config keys (`[fsgwd]`)
+### 14.1 Config keys (`[smb]`)
 - `enabled=true|false`
 - `bind_addr=<ip_or_host>`
 - `smb_port=<u16>`
 - `max_sessions=<64..65536>`
 - `max_frame_bytes=<4096..67108864>`
+- `async_close_commit=true|false` (default `false`)
+- `async_close_threshold_bytes=<u64>` (default `67108864`; large writes auto-switch close-finalize to async at/above threshold)
 - `auth_username=<string>` optional
 - `auth_password=<string>` optional
 - `auth_domain=<string>` optional
 - `require_signing=true|false`
 
 Behavior:
-- If `auth_username` and `auth_password` are configured, SMB auth is enforced.
+- Preferred auth mode is fragment-scoped:
+- SMB `username` is fragment identifier (`<fragment_name>` or `<fragment_hash>`).
+- SMB `password` is fragment key.
+- Share `N1` maps to the authenticated fragment for the session.
+- Optional static mode: if `auth_username` and `auth_password` are configured, that static account is also accepted.
 - If `require_signing=true`, SMB signing is required.
+- Large-transfer close handling:
+- SMB tracks two phases: `ingress` (client -> gateway) and `commit` (gateway -> finalized object).
+- For files at/above `async_close_threshold_bytes`, close-finalize runs async to avoid desktop-client timeout.
 
-### 14.2 Environment overrides
-- `N1_FSGWD_ENABLED`
-- `N1_FSGWD_BIND_ADDR`
-- `N1_FSGWD_SMB_PORT`
-- `N1_FSGWD_MAX_SESSIONS`
-- `N1_FSGWD_MAX_FRAME_BYTES`
-- `N1_FSGWD_AUTH_USERNAME`
-- `N1_FSGWD_AUTH_PASSWORD`
-- `N1_FSGWD_AUTH_DOMAIN`
-- `N1_FSGWD_REQUIRE_SIGNING`
+### 14.2 SMB Transfer Progress API
+`GET /v4/smb/progress/{fragment}`
 
-### 14.3 SMB-lite scope
+Query:
+- `include_completed` optional (`true|false`, default `false`)
+- `limit` optional (`1..1000`, default `100`)
+
+Auth:
+- Protected v4 route; requires valid fragment JWT (`read=true`) and matching fragment scope.
+
+Response:
+- Array of `SmbTransferProgressPayload`:
+- `transfer_id`
+- `fragment`
+- `object_key`
+- `phase` (`ingress|commit`)
+- `state` (`running|completed|failed`)
+- `ingress_bytes`
+- `expected_bytes` optional
+- `started_at_ms`
+- `updated_at_ms`
+- `completed_at_ms` optional
+- `error` optional
+
+### 14.3 Environment overrides
+- `N1_SMB_ENABLED`
+- `N1_SMB_BIND_ADDR`
+- `N1_SMB_PORT`
+- `N1_SMB_MAX_SESSIONS`
+- `N1_SMB_MAX_FRAME_BYTES`
+- `N1_SMB_ASYNC_CLOSE_COMMIT`
+- `N1_SMB_ASYNC_CLOSE_THRESHOLD_BYTES`
+- `N1_SMB_AUTH_USERNAME`
+- `N1_SMB_AUTH_PASSWORD`
+- `N1_SMB_AUTH_DOMAIN`
+- `N1_SMB_REQUIRE_SIGNING`
+
+### 14.4 WebSocket Event
+- `SMB_TRANSFER_PROGRESS` with payload shape `SmbTransferProgressPayload`.
+
+### 14.5 SMB-lite scope
 Implemented:
 - auth + signing
 - `list/read/write/create/rename/delete/mkdir/rmdir`
@@ -1012,3 +1056,15 @@ Not implemented:
 
 Deployment guide:
 - `NETWORK_DRIVE.md`
+
+### 14.4 Mount examples
+Linux (`cifs`):
+```bash
+sudo mount -t cifs //127.0.0.1/N1 /mnt/n1 \
+  -o username=<fragment_name>,password='<fragment_key>',domain=N1,sec=ntlmssp,vers=2.1,rw,noperm
+```
+
+GNOME Files:
+- `smb://127.0.0.1/N1`
+- Username = fragment name/hash
+- Password = fragment key

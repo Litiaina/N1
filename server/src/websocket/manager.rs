@@ -1,10 +1,12 @@
 use crate::websocket::ws_structs::{StorageEvent, StorageEventPayload};
 use dashmap::DashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::sync::broadcast;
 use tracing::info;
 
 const CHANNEL_CAPACITY: usize = 10_000;
+static GLOBAL_WS_MANAGER: OnceLock<WsConnectionManager> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct WsConnectionManager {
@@ -82,4 +84,12 @@ impl WsConnectionManager {
             severity: severity.to_string(),
         });
     }
+}
+
+pub fn register_global_ws_manager(manager: WsConnectionManager) {
+    let _ = GLOBAL_WS_MANAGER.set(manager);
+}
+
+pub fn global_ws_manager() -> Option<WsConnectionManager> {
+    GLOBAL_WS_MANAGER.get().cloned()
 }

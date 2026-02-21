@@ -47,8 +47,8 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 mod enums;
 mod fs;
-mod fsd;
-mod fsgwd;
+mod fuse;
+mod smb;
 mod handlers;
 mod middleware;
 mod object_storage;
@@ -894,74 +894,84 @@ pub async fn run_server() {
         interval_cleanup(&fs_root).await;
     });
 
-    let mut fsgwd_config = crate::fsgwd::config::FsgwdConfig::default();
-    if let Some(fsgwd_section) = config.section(Some("fsgwd")) {
-        if let Some(v) = fsgwd_section.get("enabled") {
-            fsgwd_config.enabled = parse_bool_or_default(Some(v), fsgwd_config.enabled);
+    let mut smb_config = crate::smb::config::SmbConfig::default();
+    if let Some(smb_section) = config
+        .section(Some("smb"))
+        .or_else(|| config.section(Some("fsgwd")))
+    {
+        if let Some(v) = smb_section.get("enabled") {
+            smb_config.enabled = parse_bool_or_default(Some(v), smb_config.enabled);
         }
-        if let Some(v) = fsgwd_section.get("bind_addr") {
+        if let Some(v) = smb_section.get("bind_addr") {
             let trimmed = v.trim();
             if !trimmed.is_empty() {
-                fsgwd_config.bind_addr = trimmed.to_string();
+                smb_config.bind_addr = trimmed.to_string();
             }
         }
-        if let Some(v) = fsgwd_section
-            .get("smb_port")
-            .and_then(|v| v.parse::<u16>().ok())
-        {
-            fsgwd_config.smb_port = v;
+        if let Some(v) = smb_section.get("smb_port").and_then(|v| v.parse::<u16>().ok()) {
+            smb_config.smb_port = v;
         }
-        if let Some(v) = fsgwd_section
+        if let Some(v) = smb_section
             .get("max_sessions")
             .and_then(|v| v.parse::<usize>().ok())
         {
-            fsgwd_config.max_sessions = v.clamp(64, 65_536);
+            smb_config.max_sessions = v.clamp(64, 65_536);
         }
-        if let Some(v) = fsgwd_section
+        if let Some(v) = smb_section
             .get("max_frame_bytes")
             .and_then(|v| v.parse::<usize>().ok())
         {
-            fsgwd_config.max_frame_bytes = v.clamp(4 * 1024, 64 * 1024 * 1024);
+            smb_config.max_frame_bytes = v.clamp(4 * 1024, 64 * 1024 * 1024);
         }
-        if let Some(v) = fsgwd_section.get("auth_username") {
+        if let Some(v) = smb_section.get("async_close_commit") {
+            smb_config.async_close_commit =
+                parse_bool_or_default(Some(v), smb_config.async_close_commit);
+        }
+        if let Some(v) = smb_section
+            .get("async_close_threshold_bytes")
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            smb_config.async_close_threshold_bytes =
+                v.clamp(1 * 1024 * 1024, 1024 * 1024 * 1024 * 1024);
+        }
+        if let Some(v) = smb_section.get("auth_username") {
             let trimmed = v.trim();
-            fsgwd_config.auth_username = if trimmed.is_empty() {
+            smb_config.auth_username = if trimmed.is_empty() {
                 None
             } else {
                 Some(trimmed.to_string())
             };
         }
-        if let Some(v) = fsgwd_section.get("auth_password") {
+        if let Some(v) = smb_section.get("auth_password") {
             let trimmed = v.trim();
-            fsgwd_config.auth_password = if trimmed.is_empty() {
+            smb_config.auth_password = if trimmed.is_empty() {
                 None
             } else {
                 Some(trimmed.to_string())
             };
         }
-        if let Some(v) = fsgwd_section.get("auth_domain") {
+        if let Some(v) = smb_section.get("auth_domain") {
             let trimmed = v.trim();
-            fsgwd_config.auth_domain = if trimmed.is_empty() {
+            smb_config.auth_domain = if trimmed.is_empty() {
                 None
             } else {
                 Some(trimmed.to_string())
             };
         }
-        if let Some(v) = fsgwd_section.get("require_signing") {
-            fsgwd_config.require_signing =
-                parse_bool_or_default(Some(v), fsgwd_config.require_signing);
+        if let Some(v) = smb_section.get("require_signing") {
+            smb_config.require_signing = parse_bool_or_default(Some(v), smb_config.require_signing);
         }
     }
 
-    let mut _fsgwd_join = None;
-    match crate::fsgwd::start(fsgwd_config).await {
+    let mut _smb_join = None;
+    match crate::smb::start(smb_config).await {
         Ok(Some(runtime)) => {
-            tracing::info!("fsgwd listener online at {}", runtime.addr);
-            _fsgwd_join = Some(runtime.join);
+            tracing::info!("smb listener online at {}", runtime.addr);
+            _smb_join = Some(runtime.join);
         }
         Ok(None) => {}
         Err(e) => {
-            tracing::warn!("failed to start fsgwd listener: {}", e);
+            tracing::warn!("failed to start smb listener: {}", e);
         }
     }
 

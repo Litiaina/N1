@@ -11,14 +11,14 @@ use crate::object_storage::object_parser::{get_object_logic, stream_object_logic
 use crate::object_storage::quota_manager::get_quota;
 use crate::structs::auth_structs::Claims;
 use axum::{
+    Json as AxumJson,
     body::Body,
     extract::{Path, Query},
-    http::{header, HeaderMap, HeaderValue},
+    http::{HeaderMap, HeaderValue, header},
     response::{IntoResponse, Response},
-    Json as AxumJson,
 };
-use base64::engine::general_purpose;
 use base64::Engine;
+use base64::engine::general_purpose;
 use dashmap::DashMap;
 use futures_util::StreamExt;
 use once_cell::sync::OnceCell;
@@ -165,6 +165,7 @@ async fn try_list_by_prefix_index(
     delimiter: Option<&str>,
     limit: usize,
     continuation_token: Option<String>,
+    include_internal: bool,
 ) -> Result<Option<ListObjectsResult>, AppError> {
     let pfx = canonical_prefix(prefix);
     let pfx_with_slash = if pfx.is_empty() {
@@ -352,6 +353,10 @@ async fn try_list_by_prefix_index(
             continue;
         }
 
+        if !include_internal && is_internal_object_key(meta.object_key.as_str()) {
+            continue;
+        }
+
         let ck = canonical_key(&meta.object_key);
 
         if !pfx.is_empty() && ck != pfx && !ck.starts_with(&pfx_with_slash) {
@@ -487,7 +492,14 @@ async fn choose_best_index_root(fragment: &str, scan_trash: bool) -> Option<Path
         );
         index_root_cache().insert(key, (p.clone(), Instant::now()));
     } else {
-        warn!("No readable index root found for fragment {}", fragment);
+        if scan_trash {
+            debug!(
+                "No readable trash index root found for fragment {}",
+                fragment
+            );
+        } else {
+            warn!("No readable index root found for fragment {}", fragment);
+        }
     }
 
     best.map(|(p, _, _)| p)
@@ -538,6 +550,10 @@ async fn list_objects_internal(
 
     let continuation_token = params.get("continuation_token").cloned();
     let prefix = params.get("prefix").cloned().unwrap_or_default();
+    let include_internal = params
+        .get("include_internal")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
     let delimiter = params
         .get("delimiter")
         .map(|s| s.as_str())
@@ -550,6 +566,7 @@ async fn list_objects_internal(
             delimiter,
             limit,
             continuation_token.clone(),
+            include_internal,
         )
         .await?
         {
@@ -703,7 +720,11 @@ async fn list_objects_internal(
                                     ck == pfx || ck.starts_with(&pfx_with_slash)
                                 };
 
-                                if ok_prefix && (!meta.is_delete_marker || scan_trash) {
+                                if ok_prefix
+                                    && (!meta.is_delete_marker || scan_trash)
+                                    && (include_internal
+                                        || !is_internal_object_key(meta.object_key.as_str()))
+                                {
                                     if delimiter.is_some() {
                                         let rel = if pfx.is_empty() {
                                             ck.clone()
@@ -785,7 +806,11 @@ async fn list_objects_internal(
                             ck == pfx || ck.starts_with(&pfx_with_slash)
                         };
 
-                        if ok_prefix && (!meta.is_delete_marker || scan_trash) {
+                        if ok_prefix
+                            && (!meta.is_delete_marker || scan_trash)
+                            && (include_internal
+                                || !is_internal_object_key(meta.object_key.as_str()))
+                        {
                             if delimiter.is_some() {
                                 let rel = if pfx.is_empty() {
                                     ck.clone()
@@ -834,6 +859,12 @@ async fn list_objects_internal(
         common_prefixes: out_prefixes,
         continuation_token: if reached_limit { next_token } else { None },
     }))
+}
+
+fn is_internal_object_key(object_key: &str) -> bool {
+    let key = canonical_key(object_key);
+    key.split('/')
+        .any(|segment| segment == ".n1fsd_dir" || segment == ".n1-trash")
 }
 
 async fn read_dir_sorted(path: &std::path::Path) -> Result<Vec<String>, AppError> {

@@ -1,6 +1,6 @@
 use crate::enums::app_error_enum::AppError;
-use crate::fsd::backend::{DirEntry, FsdBackend};
-use crate::fsd::model::{FsdPath, NodeMetadata, WriteHandle};
+use crate::fuse::backend::{DirEntry, FsdBackend};
+use crate::fuse::model::{FsdPath, NodeMetadata, WriteHandle};
 use std::sync::Arc;
 
 #[derive(Clone)]

@@ -1,6 +1,8 @@
 use crate::enums::app_error_enum::AppError;
-use crate::fsd::model::{FsdPath, NodeKind, NodeMetadata, WriteHandle};
-use crate::object_storage::delete::{delete_object, delete_object_permanently, recover_object};
+use crate::fuse::model::{FsdPath, NodeKind, NodeMetadata, WriteHandle};
+use crate::object_storage::delete::{
+    delete_object, delete_object_permanently, empty_trash, recover_object,
+};
 use crate::object_storage::disk_manager::{
     ChunkQuery, InitiateUploadParams, ObjectKeyQuery, ObjectMetadata, RenameObjectRequest,
     UploadPartQuery,
@@ -24,6 +26,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
+use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::{self, OpenOptions};
@@ -71,11 +74,31 @@ pub trait FsdBackend: Send + Sync + 'static {
 }
 
 #[derive(Debug, Clone)]
-struct PendingWrite {
+struct StagedPendingWrite {
     path: FsdPath,
     staging_path: PathBuf,
     expected_size_bytes: Option<u64>,
     max_written_end: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DirectPendingWrite {
+    path: FsdPath,
+    expected_size_bytes: u64,
+    expected_parts: u64,
+    upload_session_id: String,
+    upload_version_id: String,
+    part_size_bytes: u64,
+    next_offset: u64,
+    next_part_index: u64,
+    current_part: Vec<u8>,
+    uploaded_parts: HashSet<u64>,
+}
+
+#[derive(Debug, Clone)]
+enum PendingWriteState {
+    Staged(StagedPendingWrite),
+    Direct(DirectPendingWrite),
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,13 +120,13 @@ pub struct InProcessBackend {
     app_state: Arc<AppState>,
     staging_root: PathBuf,
     upload_part_size_bytes: usize,
-    pending_writes: Arc<Mutex<HashMap<String, PendingWrite>>>,
+    pending_writes: Arc<Mutex<HashMap<String, PendingWriteState>>>,
 }
 
 const FSD_CONTROL_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const FSD_MAX_READ_BYTES: usize = 1024 * 1024;
 const FSD_DIR_MARKER_NAME: &str = ".n1fsd_dir";
-const FSD_TRASH_DIR_NAME: &str = ".Trash-1000";
+const FSD_TRASH_DIR_NAME: &str = ".n1-trash";
 
 impl InProcessBackend {
     pub fn new(staging_root: impl Into<PathBuf>, upload_part_size_bytes: usize) -> Self {
@@ -203,6 +226,34 @@ impl InProcessBackend {
         let mut params = HashMap::new();
         params.insert("limit".to_string(), "1000".to_string());
         params.insert("delimiter".to_string(), "/".to_string());
+        params.insert("include_internal".to_string(), "true".to_string());
+        if !prefix.is_empty() {
+            params.insert("prefix".to_string(), prefix.to_string());
+        }
+        if let Some(token) = continuation_token {
+            params.insert("continuation_token".to_string(), token);
+        }
+
+        let response = list_objects(
+            Self::claims_for(fragment),
+            AxumPath(fragment.to_string()),
+            Query(params),
+        )
+        .await?
+        .into_response();
+
+        Self::parse_json_response(response, &[StatusCode::OK]).await
+    }
+
+    async fn list_page_recursive(
+        &self,
+        fragment: &str,
+        prefix: &str,
+        continuation_token: Option<String>,
+    ) -> Result<ListObjectsResponse, AppError> {
+        let mut params = HashMap::new();
+        params.insert("limit".to_string(), "1000".to_string());
+        params.insert("include_internal".to_string(), "true".to_string());
         if !prefix.is_empty() {
             params.insert("prefix".to_string(), prefix.to_string());
         }
@@ -229,6 +280,7 @@ impl InProcessBackend {
     ) -> Result<ListObjectsResponse, AppError> {
         let mut params = HashMap::new();
         params.insert("limit".to_string(), "1000".to_string());
+        params.insert("include_internal".to_string(), "true".to_string());
         if !prefix.is_empty() {
             params.insert("prefix".to_string(), prefix.to_string());
         }
@@ -329,6 +381,11 @@ impl InProcessBackend {
         Ok(!page.objects.is_empty())
     }
 
+    async fn trash_has_entries(&self, fragment: &str) -> Result<bool, AppError> {
+        let page = self.list_trash_page(fragment, "", None).await?;
+        Ok(!page.objects.is_empty())
+    }
+
     async fn directory_exists(&self, path: &FsdPath) -> Result<bool, AppError> {
         if path.is_fragment_root() {
             return Ok(true);
@@ -364,14 +421,14 @@ impl InProcessBackend {
             .map_err(|e| AppError::Io(e, "create fsd directory marker staging file".to_string()))?;
         drop(file);
 
-        let pending = PendingWrite {
+        let pending = StagedPendingWrite {
             path,
             staging_path: staging_path.clone(),
             expected_size_bytes: Some(0),
             max_written_end: 0,
         };
 
-        let result = self.commit_pending_write(&pending).await;
+        let result = self.commit_staged_write(&pending).await;
         let _ = fs::remove_file(&staging_path).await;
         result
     }
@@ -393,7 +450,156 @@ impl InProcessBackend {
         .await;
     }
 
-    async fn commit_pending_write(&self, pending: &PendingWrite) -> Result<(), AppError> {
+    async fn start_remote_upload(
+        &self,
+        path: &FsdPath,
+        total_size: u64,
+    ) -> Result<(InitiateUploadResponseBody, u64), AppError> {
+        let part_size = self.upload_part_size_bytes as u64;
+        let expected_parts = if total_size == 0 {
+            1
+        } else {
+            ((total_size + part_size - 1) / part_size).max(1)
+        };
+
+        let init_response = initiate_object_upload(
+            Self::claims_for(&path.fragment),
+            AxumPath((path.fragment.clone(), path.object_key.clone())),
+            AxumJson(InitiateUploadParams {
+                content_type: Some("application/octet-stream".to_string()),
+                total_size_bytes: total_size,
+                expected_parts,
+            }),
+        )
+        .await?
+        .into_response();
+
+        let init_body = Self::parse_json_response::<InitiateUploadResponseBody>(
+            init_response,
+            &[StatusCode::CREATED],
+        )
+        .await?;
+
+        Ok((init_body, expected_parts))
+    }
+
+    async fn upload_remote_part(
+        &self,
+        fragment: &str,
+        version_id: &str,
+        part_index: u64,
+        chunk: Vec<u8>,
+    ) -> Result<(), AppError> {
+        let chunk_len = chunk.len();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-length",
+            HeaderValue::from_str(&chunk_len.to_string()).map_err(|e| {
+                AppError::InternalServerError(format!(
+                    "fsd invalid content-length header: {}",
+                    e
+                ))
+            })?,
+        );
+
+        let part_response = object_upload_part(
+            Self::claims_for(fragment),
+            headers,
+            AxumPath((fragment.to_string(), version_id.to_string(), part_index)),
+            Query(UploadPartQuery {
+                checksum: None,
+                durability: None,
+                strict_durability: None,
+                io_gate: None,
+            }),
+            Body::from(chunk),
+        )
+        .await?
+        .into_response();
+
+        Self::expect_empty_response(part_response, &[StatusCode::OK]).await
+    }
+
+    async fn finalize_remote_upload(
+        &self,
+        path: &FsdPath,
+        version_id: &str,
+        session_id: &str,
+        total_size: u64,
+        expected_parts: u64,
+    ) -> Result<(), AppError> {
+        let finalize_response = finalize_object_upload(
+            State(Arc::clone(&self.app_state)),
+            Self::claims_for(&path.fragment),
+            AxumPath((
+                path.fragment.clone(),
+                version_id.to_string(),
+                session_id.to_string(),
+            )),
+            Query(ObjectKeyQuery {
+                object_key: path.object_key.clone(),
+                version_id: None,
+            }),
+            AxumJson(InitiateUploadParams {
+                content_type: Some("application/octet-stream".to_string()),
+                total_size_bytes: total_size,
+                expected_parts,
+            }),
+        )
+        .await?
+        .into_response();
+
+        Self::expect_empty_response(finalize_response, &[StatusCode::OK]).await
+    }
+
+    async fn commit_direct_write(&self, pending: &mut DirectPendingWrite) -> Result<(), AppError> {
+        if pending.next_offset != pending.expected_size_bytes {
+            return Err(AppError::BadRequest(
+                "write stream ended before expected size".to_string(),
+            ));
+        }
+
+        if pending.expected_size_bytes == 0 && pending.uploaded_parts.is_empty() {
+            self.upload_remote_part(
+                pending.path.fragment.as_str(),
+                pending.upload_version_id.as_str(),
+                0,
+                Vec::new(),
+            )
+            .await?;
+            pending.uploaded_parts.insert(0);
+            pending.next_part_index = 1;
+        } else if !pending.current_part.is_empty() {
+            let part_bytes = mem::take(&mut pending.current_part);
+            let part_index = pending.next_part_index;
+            self.upload_remote_part(
+                pending.path.fragment.as_str(),
+                pending.upload_version_id.as_str(),
+                part_index,
+                part_bytes,
+            )
+            .await?;
+            pending.uploaded_parts.insert(part_index);
+            pending.next_part_index = pending.next_part_index.saturating_add(1);
+        }
+
+        if pending.uploaded_parts.len() as u64 != pending.expected_parts {
+            return Err(AppError::BadRequest(
+                "incomplete multipart upload parts at close".to_string(),
+            ));
+        }
+
+        self.finalize_remote_upload(
+            &pending.path,
+            pending.upload_version_id.as_str(),
+            pending.upload_session_id.as_str(),
+            pending.expected_size_bytes,
+            pending.expected_parts,
+        )
+        .await
+    }
+
+    async fn commit_staged_write(&self, pending: &StagedPendingWrite) -> Result<(), AppError> {
         let meta = fs::metadata(&pending.staging_path)
             .await
             .map_err(|e| AppError::Io(e, "stat fsd staging file".to_string()))?;
@@ -413,23 +619,9 @@ impl InProcessBackend {
         let fragment = pending.path.fragment.clone();
         let object_key = pending.path.object_key.clone();
 
-        let init_response = initiate_object_upload(
-            Self::claims_for(&fragment),
-            AxumPath((fragment.clone(), object_key.clone())),
-            AxumJson(InitiateUploadParams {
-                content_type: Some("application/octet-stream".to_string()),
-                total_size_bytes: total_size,
-                expected_parts,
-            }),
-        )
-        .await?
-        .into_response();
-
-        let init_body = Self::parse_json_response::<InitiateUploadResponseBody>(
-            init_response,
-            &[StatusCode::CREATED],
-        )
-        .await?;
+        let (init_body, _) = self
+            .start_remote_upload(&pending.path, total_size)
+            .await?;
 
         let mut sent = 0u64;
         let mut part_index = 0u64;
@@ -454,33 +646,15 @@ impl InProcessBackend {
                     .map_err(|e| AppError::Io(e, "read fsd staging part".to_string()))?;
             }
 
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                "content-length",
-                HeaderValue::from_str(&chunk_len.to_string()).map_err(|e| {
-                    AppError::InternalServerError(format!(
-                        "fsd invalid content-length header: {}",
-                        e
-                    ))
-                })?,
-            );
-
-            let part_response = object_upload_part(
-                Self::claims_for(&fragment),
-                headers,
-                AxumPath((fragment.clone(), init_body.version_id.clone(), part_index)),
-                Query(UploadPartQuery {
-                    checksum: None,
-                    durability: None,
-                    strict_durability: None,
-                    io_gate: None,
-                }),
-                Body::from(chunk),
-            )
-            .await?
-            .into_response();
-
-            if let Err(err) = Self::expect_empty_response(part_response, &[StatusCode::OK]).await {
+            if let Err(err) = self
+                .upload_remote_part(
+                    fragment.as_str(),
+                    init_body.version_id.as_str(),
+                    part_index,
+                    chunk,
+                )
+                .await
+            {
                 self.cleanup_remote_upload_session(&fragment, &init_body.version_id, &object_key)
                     .await;
                 return Err(err);
@@ -490,34 +664,111 @@ impl InProcessBackend {
             part_index = part_index.saturating_add(1);
         }
 
-        let finalize_response = finalize_object_upload(
-            State(Arc::clone(&self.app_state)),
-            Self::claims_for(&fragment),
-            AxumPath((
-                fragment.clone(),
-                init_body.version_id.clone(),
-                init_body.session_id.clone(),
-            )),
-            Query(ObjectKeyQuery {
-                object_key: object_key.clone(),
-                version_id: None,
-            }),
-            AxumJson(InitiateUploadParams {
-                content_type: Some("application/octet-stream".to_string()),
-                total_size_bytes: total_size,
+        if let Err(err) = self
+            .finalize_remote_upload(
+                &pending.path,
+                init_body.version_id.as_str(),
+                init_body.session_id.as_str(),
+                total_size,
                 expected_parts,
-            }),
-        )
-        .await?
-        .into_response();
-
-        if let Err(err) = Self::expect_empty_response(finalize_response, &[StatusCode::OK]).await {
+            )
+            .await
+        {
             self.cleanup_remote_upload_session(&fragment, &init_body.version_id, &object_key)
                 .await;
             return Err(err);
         }
 
         Ok(())
+    }
+
+    async fn write_staged_chunk(
+        &self,
+        pending: &mut StagedPendingWrite,
+        offset: u64,
+        bytes: Vec<u8>,
+    ) -> Result<(), AppError> {
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| AppError::BadRequest("write offset overflow".to_string()))?;
+
+        if let Some(expected) = pending.expected_size_bytes {
+            if end > expected {
+                return Err(AppError::BadRequest(
+                    "write exceeds expected object size".to_string(),
+                ));
+            }
+        }
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pending.staging_path)
+            .await
+            .map_err(|e| AppError::Io(e, "open fsd staging file".to_string()))?;
+
+        file.seek(SeekFrom::Start(offset))
+            .await
+            .map_err(|e| AppError::Io(e, "seek fsd staging file".to_string()))?;
+        file.write_all(&bytes)
+            .await
+            .map_err(|e| AppError::Io(e, "write fsd staging file".to_string()))?;
+
+        pending.max_written_end = pending.max_written_end.max(end);
+        Ok(())
+    }
+
+    async fn write_direct_chunk(
+        &self,
+        pending: &mut DirectPendingWrite,
+        offset: u64,
+        bytes: Vec<u8>,
+    ) -> Result<(), AppError> {
+        if offset != pending.next_offset {
+            return Err(AppError::BadRequest(
+                "non-sequential SMB write offsets are not supported for direct multipart path"
+                    .to_string(),
+            ));
+        }
+
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| AppError::BadRequest("write offset overflow".to_string()))?;
+        if end > pending.expected_size_bytes {
+            return Err(AppError::BadRequest(
+                "write exceeds expected object size".to_string(),
+            ));
+        }
+
+        pending.current_part.extend_from_slice(&bytes);
+        pending.next_offset = end;
+
+        let part_size = pending.part_size_bytes as usize;
+        while pending.current_part.len() >= part_size {
+            let remainder = pending.current_part.split_off(part_size);
+            let part_bytes = mem::replace(&mut pending.current_part, remainder);
+            let part_index = pending.next_part_index;
+
+            self.upload_remote_part(
+                pending.path.fragment.as_str(),
+                pending.upload_version_id.as_str(),
+                part_index,
+                part_bytes,
+            )
+            .await?;
+
+            pending.uploaded_parts.insert(part_index);
+            pending.next_part_index = pending.next_part_index.saturating_add(1);
+        }
+
+        Ok(())
+    }
+
+    async fn commit_pending_write(&self, pending: &mut PendingWriteState) -> Result<(), AppError> {
+        match pending {
+            PendingWriteState::Staged(p) => self.commit_staged_write(p).await,
+            PendingWriteState::Direct(p) => self.commit_direct_write(p).await,
+        }
     }
 
     async fn delete_active_object_with_fallback(
@@ -548,6 +799,122 @@ impl InProcessBackend {
             Err(AppError::Conflict(_)) => self.delete_object_permanently(fragment, object_key).await,
             Err(e) => Err(e),
         }
+    }
+
+    async fn rename_live_object(
+        &self,
+        fragment: &str,
+        source_key: &str,
+        destination_key: &str,
+    ) -> Result<(), AppError> {
+        let response = rename_object(
+            State(Arc::clone(&self.app_state)),
+            Self::claims_for(fragment),
+            AxumJson(RenameObjectRequest {
+                source_fragment: fragment.to_string(),
+                source_key: source_key.to_string(),
+                destination_fragment: fragment.to_string(),
+                destination_key: destination_key.to_string(),
+            }),
+        )
+        .await?
+        .into_response();
+
+        Self::expect_empty_response(response, &[StatusCode::OK]).await
+    }
+
+    async fn rename_live_directory_tree(
+        &self,
+        fragment: &str,
+        from_dir: &str,
+        to_dir: &str,
+    ) -> Result<(), AppError> {
+        let from_dir = from_dir.trim_matches('/').to_string();
+        let to_dir = to_dir.trim_matches('/').to_string();
+        if from_dir.is_empty() || to_dir.is_empty() {
+            return Err(AppError::BadRequest(
+                "invalid directory rename path".to_string(),
+            ));
+        }
+        if from_dir == to_dir {
+            return Ok(());
+        }
+        if to_dir.starts_with(format!("{}/", from_dir).as_str()) {
+            return Err(AppError::BadRequest(
+                "cannot move directory into itself".to_string(),
+            ));
+        }
+
+        if self.fetch_object_metadata(fragment, &to_dir).await.is_ok() {
+            return Err(AppError::Conflict(
+                "destination already exists".to_string(),
+            ));
+        }
+        if self
+            .directory_exists(&FsdPath {
+                fragment: fragment.to_string(),
+                object_key: to_dir.clone(),
+            })
+            .await?
+        {
+            return Err(AppError::Conflict(
+                "destination already exists".to_string(),
+            ));
+        }
+
+        if let Some((parent_key, _)) = to_dir.rsplit_once('/') {
+            if !parent_key.is_empty() {
+                if self.fetch_object_metadata(fragment, parent_key).await.is_ok() {
+                    return Err(AppError::BadRequest(
+                        "destination parent is not a directory".to_string(),
+                    ));
+                }
+                if !self
+                    .directory_exists(&FsdPath {
+                        fragment: fragment.to_string(),
+                        object_key: parent_key.to_string(),
+                    })
+                    .await?
+                {
+                    return Err(AppError::NotFound);
+                }
+            }
+        }
+
+        let mut continuation_token: Option<String> = None;
+        let prefix = format!("{}/", from_dir);
+        let mut source_keys: Vec<String> = Vec::new();
+
+        loop {
+            let page = self
+                .list_page_recursive(fragment, &prefix, continuation_token.clone())
+                .await?;
+            source_keys.extend(page.objects.into_iter().map(|o| o.object_key));
+            continuation_token = page.continuation_token;
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+
+        if source_keys.is_empty() {
+            return Err(AppError::NotFound);
+        }
+
+        source_keys.sort_unstable();
+        for source_key in source_keys {
+            let Some(suffix) = source_key.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            let destination_key = if suffix.is_empty() {
+                to_dir.clone()
+            } else {
+                format!("{}/{}", to_dir, suffix)
+            };
+            self.rename_live_object(fragment, &source_key, &destination_key)
+                .await?;
+        }
+
+        Ok(())
     }
 
     async fn delete_object_permanently(
@@ -771,6 +1138,9 @@ impl FsdBackend for InProcessBackend {
                         modified_at_unix: 0,
                     },
                 });
+                if !self.trash_has_entries(&path.fragment).await? {
+                    entries.pop();
+                }
             }
 
             if !path.is_fragment_root() && entries.is_empty() {
@@ -800,11 +1170,14 @@ impl FsdBackend for InProcessBackend {
             }
 
             if Self::is_trash_root_name(path.object_key.as_str()) {
-                return Ok(NodeMetadata {
-                    kind: NodeKind::Directory,
-                    size_bytes: 0,
-                    modified_at_unix: 0,
-                });
+                if self.trash_has_entries(&path.fragment).await? {
+                    return Ok(NodeMetadata {
+                        kind: NodeKind::Directory,
+                        size_bytes: 0,
+                        modified_at_unix: 0,
+                    });
+                }
+                return Err(AppError::NotFound);
             }
 
             if let Some(trash_sub_key) = Self::split_trash_virtual_key(path.object_key.as_str()) {
@@ -932,33 +1305,39 @@ impl FsdBackend for InProcessBackend {
                 ));
             }
 
-            self.ensure_staging_root().await?;
-
             let handle_id = Ulid::new().to_string();
-            let staging_path = self.staging_root.join(format!("{}.fsd.upload", handle_id));
-
-            let file = OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .read(true)
-                .write(true)
-                .open(&staging_path)
-                .await
-                .map_err(|e| AppError::Io(e, "create fsd staging file".to_string()))?;
-
-            if let Some(expected) = expected_size_bytes {
-                file.set_len(expected)
+            let pending = if let Some(expected) = expected_size_bytes {
+                let (init_body, expected_parts) = self.start_remote_upload(path, expected).await?;
+                PendingWriteState::Direct(DirectPendingWrite {
+                    path: path.clone(),
+                    expected_size_bytes: expected,
+                    expected_parts,
+                    upload_session_id: init_body.session_id,
+                    upload_version_id: init_body.version_id,
+                    part_size_bytes: self.upload_part_size_bytes as u64,
+                    next_offset: 0,
+                    next_part_index: 0,
+                    current_part: Vec::new(),
+                    uploaded_parts: HashSet::new(),
+                })
+            } else {
+                self.ensure_staging_root().await?;
+                let staging_path = self.staging_root.join(format!("{}.fsd.upload", handle_id));
+                let file = OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .read(true)
+                    .write(true)
+                    .open(&staging_path)
                     .await
-                    .map_err(|e| AppError::Io(e, "preallocate fsd staging file".to_string()))?;
-            }
-
-            drop(file);
-
-            let pending = PendingWrite {
-                path: path.clone(),
-                staging_path,
-                expected_size_bytes,
-                max_written_end: 0,
+                    .map_err(|e| AppError::Io(e, "create fsd staging file".to_string()))?;
+                drop(file);
+                PendingWriteState::Staged(StagedPendingWrite {
+                    path: path.clone(),
+                    staging_path,
+                    expected_size_bytes: None,
+                    max_written_end: 0,
+                })
             };
 
             self.pending_writes
@@ -986,64 +1365,38 @@ impl FsdBackend for InProcessBackend {
                 return Ok(());
             }
 
-            let (staging_path, expected_size) = {
-                let guard = self.pending_writes.lock().await;
-                let pending = guard
-                    .get(&handle.session_id)
-                    .ok_or_else(|| AppError::NotFound)?;
-                (pending.staging_path.clone(), pending.expected_size_bytes)
+            let mut pending = {
+                let mut guard = self.pending_writes.lock().await;
+                guard.remove(&handle.session_id).ok_or(AppError::NotFound)?
             };
 
-            let end = offset
-                .checked_add(bytes.len() as u64)
-                .ok_or_else(|| AppError::BadRequest("write offset overflow".to_string()))?;
+            let write_result = match &mut pending {
+                PendingWriteState::Staged(p) => self.write_staged_chunk(p, offset, bytes).await,
+                PendingWriteState::Direct(p) => self.write_direct_chunk(p, offset, bytes).await,
+            };
 
-            if let Some(expected) = expected_size {
-                if end > expected {
-                    return Err(AppError::BadRequest(
-                        "write exceeds expected object size".to_string(),
-                    ));
-                }
-            }
-
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&staging_path)
+            self.pending_writes
+                .lock()
                 .await
-                .map_err(|e| AppError::Io(e, "open fsd staging file".to_string()))?;
+                .insert(handle.session_id.clone(), pending);
 
-            file.seek(SeekFrom::Start(offset))
-                .await
-                .map_err(|e| AppError::Io(e, "seek fsd staging file".to_string()))?;
-            file.write_all(&bytes)
-                .await
-                .map_err(|e| AppError::Io(e, "write fsd staging file".to_string()))?;
-            file.flush()
-                .await
-                .map_err(|e| AppError::Io(e, "flush fsd staging file".to_string()))?;
-
-            let mut guard = self.pending_writes.lock().await;
-            let pending = guard
-                .get_mut(&handle.session_id)
-                .ok_or(AppError::NotFound)?;
-            pending.max_written_end = pending.max_written_end.max(end);
-
-            Ok(())
+            write_result
         })
     }
 
     fn commit_write<'a>(&'a self, handle: &'a WriteHandle) -> BoxFuture<'a, Result<(), AppError>> {
         Box::pin(async move {
-            let pending = {
+            let mut pending = {
                 let mut guard = self.pending_writes.lock().await;
                 guard.remove(&handle.session_id)
             }
             .ok_or(AppError::NotFound)?;
 
-            match self.commit_pending_write(&pending).await {
+            match self.commit_pending_write(&mut pending).await {
                 Ok(()) => {
-                    let _ = fs::remove_file(&pending.staging_path).await;
+                    if let PendingWriteState::Staged(staged) = &pending {
+                        let _ = fs::remove_file(&staged.staging_path).await;
+                    }
                     Ok(())
                 }
                 Err(e) => {
@@ -1065,7 +1418,19 @@ impl FsdBackend for InProcessBackend {
             };
 
             if let Some(state) = pending {
-                let _ = fs::remove_file(state.staging_path).await;
+                match state {
+                    PendingWriteState::Staged(staged) => {
+                        let _ = fs::remove_file(staged.staging_path).await;
+                    }
+                    PendingWriteState::Direct(direct) => {
+                        self.cleanup_remote_upload_session(
+                            direct.path.fragment.as_str(),
+                            direct.upload_version_id.as_str(),
+                            direct.path.object_key.as_str(),
+                        )
+                        .await;
+                    }
+                }
             }
 
             Ok(())
@@ -1081,7 +1446,18 @@ impl FsdBackend for InProcessBackend {
             }
 
             if Self::is_trash_root_name(path.object_key.as_str()) {
-                return Err(AppError::BadRequest("cannot delete trash root".to_string()));
+                let response = empty_trash(
+                    State(Arc::clone(&self.app_state)),
+                    Self::claims_for(&path.fragment),
+                    AxumPath(path.fragment.clone()),
+                )
+                .await?
+                .into_response();
+                return Self::expect_empty_response(
+                    response,
+                    &[StatusCode::NO_CONTENT, StatusCode::OK],
+                )
+                .await;
             }
 
             if let Some(trash_sub_key) = Self::split_trash_virtual_key(path.object_key.as_str()) {
@@ -1192,10 +1568,68 @@ impl FsdBackend for InProcessBackend {
                 ));
             }
 
-            if Self::is_trash_virtual_path(path) {
-                return Err(AppError::BadRequest(
-                    "cannot remove directory in trash namespace".to_string(),
-                ));
+            if Self::is_trash_root_name(path.object_key.as_str()) {
+                let response = empty_trash(
+                    State(Arc::clone(&self.app_state)),
+                    Self::claims_for(&path.fragment),
+                    AxumPath(path.fragment.clone()),
+                )
+                .await?
+                .into_response();
+                return Self::expect_empty_response(
+                    response,
+                    &[StatusCode::NO_CONTENT, StatusCode::OK],
+                )
+                .await;
+            }
+
+            if let Some(trash_sub_key) = Self::split_trash_virtual_key(path.object_key.as_str()) {
+                let key = trash_sub_key.trim_matches('/').to_string();
+                if key.is_empty() {
+                    let response = empty_trash(
+                        State(Arc::clone(&self.app_state)),
+                        Self::claims_for(&path.fragment),
+                        AxumPath(path.fragment.clone()),
+                    )
+                    .await?
+                    .into_response();
+                    return Self::expect_empty_response(
+                        response,
+                        &[StatusCode::NO_CONTENT, StatusCode::OK],
+                    )
+                    .await;
+                }
+
+                if self
+                    .trash_exact_object_metadata(&path.fragment, &key)
+                    .await?
+                    .is_some()
+                {
+                    return Err(AppError::BadRequest("path is not a directory".to_string()));
+                }
+
+                if !self.trash_directory_exists(&path.fragment, &key).await? {
+                    return Err(AppError::NotFound);
+                }
+
+                let mut continuation_token: Option<String> = None;
+                let prefix = format!("{}/", key);
+                loop {
+                    let page = self
+                        .list_trash_page(&path.fragment, &prefix, continuation_token.clone())
+                        .await?;
+
+                    if !page.common_prefixes.is_empty() || !page.objects.is_empty() {
+                        return Err(AppError::Conflict("directory is not empty".to_string()));
+                    }
+
+                    continuation_token = page.continuation_token;
+                    if continuation_token.is_none() {
+                        break;
+                    }
+                }
+
+                return Ok(());
             }
 
             let dir_key = path.object_key.trim_matches('/').to_string();
@@ -1347,20 +1781,35 @@ impl FsdBackend for InProcessBackend {
                 (None, None) => {}
             }
 
-            let response = rename_object(
-                State(Arc::clone(&self.app_state)),
-                Self::claims_for(&from.fragment),
-                AxumJson(RenameObjectRequest {
-                    source_fragment: from.fragment.clone(),
-                    source_key: from.object_key.clone(),
-                    destination_fragment: to.fragment.clone(),
-                    destination_key: to.object_key.clone(),
-                }),
-            )
-            .await?
-            .into_response();
+            let from_key = from.object_key.trim_matches('/').to_string();
+            let to_key = to.object_key.trim_matches('/').to_string();
+            if from_key.is_empty() || to_key.is_empty() {
+                return Err(AppError::BadRequest("invalid rename path".to_string()));
+            }
 
-            Self::expect_empty_response(response, &[StatusCode::OK]).await
+            let from_is_file = self
+                .fetch_object_metadata(&from.fragment, &from_key)
+                .await
+                .is_ok();
+            let from_is_dir = if from_is_file {
+                false
+            } else {
+                self.directory_exists(&FsdPath {
+                    fragment: from.fragment.clone(),
+                    object_key: from_key.clone(),
+                })
+                .await?
+            };
+
+            if from_is_file {
+                self.rename_live_object(&from.fragment, &from_key, &to_key)
+                    .await
+            } else if from_is_dir {
+                self.rename_live_directory_tree(&from.fragment, &from_key, &to_key)
+                    .await
+            } else {
+                Err(AppError::NotFound)
+            }
         })
     }
 }
@@ -1376,11 +1825,11 @@ mod tests {
             Some("")
         );
         assert_eq!(
-            InProcessBackend::split_trash_virtual_key(".Trash-1000/a/b.bin"),
+            InProcessBackend::split_trash_virtual_key(".n1-trash/a/b.bin"),
             Some("a/b.bin")
         );
         assert_eq!(
-            InProcessBackend::split_trash_virtual_key(".trash000/a/b.bin"),
+            InProcessBackend::split_trash_virtual_key(".Trash-1000/a/b.bin"),
             None
         );
         assert_eq!(InProcessBackend::split_trash_virtual_key("a/b.bin"), None);
@@ -1390,7 +1839,7 @@ mod tests {
     fn detect_trash_virtual_path() {
         let trash = FsdPath {
             fragment: "f".to_string(),
-            object_key: ".Trash-1000/video.mp4".to_string(),
+            object_key: ".n1-trash/video.mp4".to_string(),
         };
         let live = FsdPath {
             fragment: "f".to_string(),
@@ -1408,6 +1857,6 @@ mod tests {
         };
         let got = InProcessBackend::to_trash_virtual_path(&base, "a/b/c.mp4");
         assert_eq!(got.fragment, "frag");
-        assert_eq!(got.object_key, ".Trash-1000/a/b/c.mp4");
+        assert_eq!(got.object_key, ".n1-trash/a/b/c.mp4");
     }
 }

@@ -231,6 +231,7 @@ pub async fn update_fragment(
                         crate::object_storage::fragment_metadata::FragmentMetadata {
                             fragment: new_hash.clone(),
                             key_phc: String::new(),
+                            nt_hash_hex: None,
                             created: chrono::Utc::now()
                                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                             updated: None,

@@ -488,12 +488,24 @@ async fn list_objects_json(
     prefix: Option<&str>,
     delimiter: Option<&str>,
 ) -> serde_json::Value {
+    list_objects_json_with_internal(fragment, prefix, delimiter, false).await
+}
+
+async fn list_objects_json_with_internal(
+    fragment: &str,
+    prefix: Option<&str>,
+    delimiter: Option<&str>,
+    include_internal: bool,
+) -> serde_json::Value {
     let mut params: HashMap<String, String> = HashMap::new();
     if let Some(p) = prefix {
         params.insert("prefix".to_string(), p.to_string());
     }
     if let Some(d) = delimiter {
         params.insert("delimiter".to_string(), d.to_string());
+    }
+    if include_internal {
+        params.insert("include_internal".to_string(), "true".to_string());
     }
 
     let resp = list_objects(
@@ -1970,6 +1982,83 @@ async fn matrix_recover_object_stays_listed_in_prefix_index() {
         keys.iter().any(|k| k == &key_keep),
         "unaffected key missing from prefix listing: {:?}",
         keys
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_list_objects_hides_internal_keys_unless_requested() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+    put_object(
+        state.clone(),
+        &fragment,
+        "videos/visible.bin",
+        vec![0x11; 1024],
+    )
+    .await;
+    put_object(state, &fragment, "videos/.n1fsd_dir", vec![0x22]).await;
+
+    let listing_default = list_objects_json(&fragment, Some("videos"), None).await;
+    let default_keys = listing_default["objects"]
+        .as_array()
+        .expect("objects array")
+        .iter()
+        .filter_map(|v| v["object_key"].as_str())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+
+    assert!(
+        default_keys.iter().any(|k| k == "videos/visible.bin"),
+        "default listing missing visible object: {:?}",
+        default_keys
+    );
+    assert!(
+        default_keys.iter().all(|k| k != "videos/.n1fsd_dir"),
+        "default listing should hide internal key: {:?}",
+        default_keys
+    );
+
+    let listing_internal =
+        list_objects_json_with_internal(&fragment, Some("videos"), None, true).await;
+    let internal_keys = listing_internal["objects"]
+        .as_array()
+        .expect("objects array")
+        .iter()
+        .filter_map(|v| v["object_key"].as_str())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+
+    assert!(
+        internal_keys.iter().any(|k| k == "videos/.n1fsd_dir"),
+        "include_internal listing should include marker: {:?}",
+        internal_keys
     );
 }
 

@@ -2,14 +2,14 @@
 
 This guide covers both ways to expose N1 as a network drive:
 
-- Native SMB-lite gateway (`fsgwd`) built into `litiaina-n1` (recommended).
+- Native SMB-lite gateway (`smb`) built into `litiaina-n1` (recommended).
 - Fallback bridge (`fsd_mount` + Samba) for environments where you still need it.
 
 ## Current Status
 
-`fsgwd` is SMB-lite, not full enterprise SMB.
+`smb` is SMB-lite, not full enterprise SMB.
 
-Implemented in `server/src/fsgwd/server.rs`:
+Implemented in `server/src/smb/server.rs`:
 - auth + signing
 - `list/read/write/create/rename/delete/mkdir/rmdir`
 - query-directory / query-info / set-info metadata paths
@@ -22,21 +22,21 @@ Not implemented:
 - durable or persistent handles
 - SMB multichannel / advanced enterprise semantics
 
-## Mode A: Native SMB-lite (`fsgwd`) Recommended
+## Mode A: Native SMB-lite (`smb`) Recommended
 
 ### 1) Configure `config.ini`
 
-Add `[fsgwd]`:
+Add `[smb]`:
 
 ```ini
-[fsgwd]
+[smb]
 enabled=true
 bind_addr=0.0.0.0
 smb_port=445
 max_sessions=4096
 max_frame_bytes=16777216
-auth_username=n1smb
-auth_password=change_me
+async_close_commit=false
+async_close_threshold_bytes=67108864
 auth_domain=N1
 require_signing=true
 ```
@@ -47,28 +47,45 @@ Config keys:
 - `smb_port`: SMB TCP port.
 - `max_sessions`: connection/session cap.
 - `max_frame_bytes`: SMB frame size cap.
-- `auth_username`: SMB auth user (optional, but recommended).
-- `auth_password`: SMB auth password (optional, but recommended).
+- `async_close_commit`: if `true`, SMB `CLOSE` acks immediately and finalizes uploads in background.
+- `async_close_threshold_bytes`: when `async_close_commit=false`, files at/above this size still finalize async on close to avoid client timeout.
+- `auth_username`: optional static SMB user.
+- `auth_password`: optional static SMB password.
 - `auth_domain`: SMB auth domain string (optional).
 - `require_signing`: enforce SMB signing.
 
-If `auth_username` + `auth_password` are not set, authentication becomes permissive SMB-lite behavior. Use explicit credentials in production.
+Preferred auth mode is fragment-scoped:
+- SMB `username` is fragment identifier (plain fragment name or 64-hex fragment hash).
+- SMB `password` is that fragment key.
+- `\\<server>\N1` (or `smb://<server>/N1`) binds the SMB session to the authenticated fragment.
+
+Optional static mode:
+- if `auth_username` + `auth_password` are configured, that static account is also accepted.
+
+SMB transfer lifecycle is two-phase:
+- `ingress`: SMB client writes bytes to gateway.
+- `commit`: gateway finalizes multipart/object commit to N1.
+
+Progress API (JWT protected):
+- `GET /v4/smb/progress/{fragment}?include_completed=true&limit=100`
 
 ### 2) Optional env overrides
 
-`fsgwd` also reads:
-- `N1_FSGWD_ENABLED`
-- `N1_FSGWD_BIND_ADDR`
-- `N1_FSGWD_SMB_PORT`
-- `N1_FSGWD_MAX_SESSIONS`
-- `N1_FSGWD_MAX_FRAME_BYTES`
-- `N1_FSGWD_AUTH_USERNAME`
-- `N1_FSGWD_AUTH_PASSWORD`
-- `N1_FSGWD_AUTH_DOMAIN`
-- `N1_FSGWD_REQUIRE_SIGNING`
+`smb` also reads:
+- `N1_SMB_ENABLED`
+- `N1_SMB_BIND_ADDR`
+- `N1_SMB_PORT`
+- `N1_SMB_MAX_SESSIONS`
+- `N1_SMB_MAX_FRAME_BYTES`
+- `N1_SMB_ASYNC_CLOSE_COMMIT`
+- `N1_SMB_ASYNC_CLOSE_THRESHOLD_BYTES`
+- `N1_SMB_AUTH_USERNAME`
+- `N1_SMB_AUTH_PASSWORD`
+- `N1_SMB_AUTH_DOMAIN`
+- `N1_SMB_REQUIRE_SIGNING`
 
 Template:
-- `deploy/network-drive/env/fsgwd.env.example`
+- `deploy/network-drive/env/smb.env.example`
 
 ### 3) Start N1 server
 
@@ -85,23 +102,28 @@ ss -ltnp | rg ':445'
 ```
 
 You should also see startup logs similar to:
-- `fsgwd listener online at ...`
-- `fsgwd smb loop started ...`
+- `smb listener online at ...`
+- `smb loop started ...`
 
 ### 5) Mount from clients
 
 Windows:
-- File Explorer -> Map Network Drive -> `\\<server_ip>\<fragment_or_share_name>`
+- File Explorer -> Map Network Drive -> `\\<server_ip>\N1`
+- Username: fragment name or fragment hash.
+- Password: fragment key.
+- Domain: `N1`.
 
 Linux:
 
 ```bash
-sudo mount -t cifs //<server_ip>/<share> /mnt/n1 \
-  -o username=n1smb,vers=3.1.1
+sudo mount -t cifs //<server_ip>/N1 /mnt/n1 \
+  -o username=<fragment_name>,password='<fragment_key>',domain=N1,sec=ntlmssp,vers=2.1,rw,noperm
 ```
 
 macOS:
-- Finder -> Connect to Server -> `smb://<server_ip>/<share>`
+- Finder -> Connect to Server -> `smb://<server_ip>/N1`
+- Username: fragment name or fragment hash.
+- Password: fragment key.
 
 ## Mode B: Fallback Bridge (`fsd_mount` + Samba)
 
@@ -140,7 +162,7 @@ Use:
 
 - N1 remains object storage core; SMB is an adapter surface.
 - Fragment is still the isolation boundary.
-- Prefer one share scope per fragment boundary.
+- `N1` share alias maps to the fragment authenticated in the SMB session.
 - Keep signing enabled for untrusted networks.
 
 ## Troubleshooting
@@ -162,12 +184,12 @@ This is expected with conservative share-mode handling. Retry after releasing co
 
 ### Client expects advanced SMB features
 
-`fsgwd` is intentionally SMB-lite. Features like oplocks/leases and durable handles are out of scope.
+`smb` is intentionally SMB-lite. Features like oplocks/leases and durable handles are out of scope.
 
 ## Verification Commands
 
 ```bash
 cargo check -p server
-cargo test -p server fsgwd::server::tests -- --nocapture
+cargo test -p server smb::server::tests -- --nocapture
 cargo test -p server -- --nocapture
 ```
