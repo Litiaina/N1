@@ -4,7 +4,7 @@ use crate::object_storage::constants::{
     RESERVATION_FILE, SESSION_MANIFEST_FILE, SHARD_SUFFIX,
 };
 use crate::object_storage::disk_manager::{
-    ObjectMetadata, ObjectPathManager, PartMetadata, Quota, INDEX_STORE_DISKS,
+    INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, Quota,
 };
 use crate::object_storage::operation_gate::acquire_read_only_fast_mode;
 use crate::object_storage::prefix_rebuilder::run_prefix_rebuild_job;
@@ -16,9 +16,9 @@ use crate::websocket::manager::WsConnectionManager;
 use crate::websocket::ws_structs::StorageEventPayload;
 
 use axum::extract::State;
-use axum::{extract::Query, http::StatusCode, response::IntoResponse, Json};
+use axum::{Json, extract::Query, http::StatusCode, response::IntoResponse};
 use chrono::Utc;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};

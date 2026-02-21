@@ -2,20 +2,20 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
+use axum::Json as AxumJson;
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::Json as AxumJson;
 
 use chrono::Utc;
 use crc32fast::Hasher;
-use futures_util::future::join_all;
 use futures_util::StreamExt;
+use futures_util::future::join_all;
 use once_cell::sync::{Lazy, OnceCell};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -40,9 +40,9 @@ use crate::object_storage::constants::{
     PARITY_SUFFIX, PART_META_SUFFIX, RESERVATION_FILE, SESSION_MANIFEST_FILE, SHARD_SUFFIX,
 };
 use crate::object_storage::disk_manager::{
-    default_stripe_size, FinalizeIncompleteResponse, InitiateUploadParams, InitiateUploadResponse,
-    ObjectKeyQuery, ObjectMetadata, ObjectPathManager, PartMetadata, PrefixIndexEntry,
-    PrefixIndexSegment, ReservationReceipt, ShardInfo, UploadPartQuery, UploadStatusResponse,
+    FinalizeIncompleteResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery,
+    ObjectMetadata, ObjectPathManager, PartMetadata, PrefixIndexEntry, PrefixIndexSegment,
+    ReservationReceipt, ShardInfo, UploadPartQuery, UploadStatusResponse, default_stripe_size,
 };
 use crate::object_storage::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::object_storage::prefix_compactor::schedule_prefix_compaction;
@@ -144,7 +144,7 @@ fn parse_upload_durability_mode(query: &UploadPartQuery) -> UploadDurabilityMode
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_upload_durability_mode, UploadDurabilityMode};
+    use super::{UploadDurabilityMode, parse_upload_durability_mode};
     use crate::object_storage::disk_manager::UploadPartQuery;
 
     #[test]

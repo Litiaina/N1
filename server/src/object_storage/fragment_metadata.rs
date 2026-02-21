@@ -2,8 +2,8 @@ use crate::object_storage::disk_manager::ObjectPathManager;
 use crate::{enums::app_error_enum::AppError, object_storage::constants::FRAGMENT_METADATA_FILE};
 
 use argon2::{
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
 use chrono::{SecondsFormat, Utc};
 use md4::{Digest as Md4Digest, Md4};
@@ -258,6 +258,30 @@ pub async fn verify_fragment_key(fragment_hash: &str, key: &str) -> Result<bool,
     Ok(Argon2::default()
         .verify_password(key.as_bytes(), &parsed)
         .is_ok())
+}
+
+pub async fn backfill_fragment_nt_hash_if_missing(
+    fragment_hash: &str,
+    key: &str,
+) -> Result<bool, AppError> {
+    if key.is_empty() {
+        return Ok(false);
+    }
+
+    let mut meta = read_fragment_metadata(fragment_hash).await?;
+    if meta
+        .nt_hash_hex
+        .as_ref()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+
+    meta.nt_hash_hex = Some(hash_key_to_nt_hash_hex(key));
+    meta.updated = Some(now_utc_rfc3339());
+    write_fragment_metadata(&meta).await?;
+    Ok(true)
 }
 
 #[cfg(test)]

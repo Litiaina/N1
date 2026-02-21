@@ -4,8 +4,8 @@ use crate::object_storage::constants::{
     RESERVATION_FILE, SHARD_SUFFIX,
 };
 use crate::object_storage::disk_manager::{
-    default_stripe_size, ObjectMetadata, ObjectPathManager, PartMetadata, Quota, ShardInfo,
-    INDEX_STORE_DISKS,
+    INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, Quota, ShardInfo,
+    default_stripe_size,
 };
 use crate::object_storage::ec::ErasureStreamWriter;
 use crate::object_storage::fragment_metadata::{read_fragment_metadata, write_fragment_metadata};
@@ -13,18 +13,18 @@ use crate::object_storage::operation_gate::acquire_read_only_fast_mode;
 use crate::object_storage::prefix_rebuilder::run_prefix_rebuild_job;
 use crate::object_storage::recovery::read_or_recover_chunk;
 use crate::object_storage::upload::{
-    create_direct_file, sync_dir, DirectWriter, DATA_SHARDS_ATOMIC, PARITY_SHARDS_ATOMIC,
-    STRIPE_SIZE_ATOMIC,
+    DATA_SHARDS_ATOMIC, DirectWriter, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, create_direct_file,
+    sync_dir,
 };
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::manager::WsConnectionManager;
 use crate::websocket::ws_structs::StorageEventPayload;
 
+use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 
 use chrono::Utc;
 use crc32fast::Hasher as Crc32Hasher;
@@ -247,7 +247,7 @@ fn parse_durability_mode_param(
         match normalized.as_str() {
             "strict" | "sync" | "durable" => return RedistributionDurabilityMode::Strict,
             "batched" | "async" | "fast" | "relaxed" => {
-                return RedistributionDurabilityMode::Batched
+                return RedistributionDurabilityMode::Batched;
             }
             "auto" => return RedistributionDurabilityMode::Auto,
             _ => {}
@@ -1679,7 +1679,7 @@ async fn redistribute_object_streaming(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_durability_mode_param, RedistributionDurabilityMode, RedistributionRunOptions,
+        RedistributionDurabilityMode, RedistributionRunOptions, parse_durability_mode_param,
     };
     use std::collections::HashMap;
 

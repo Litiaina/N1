@@ -1,6 +1,6 @@
 use serde::Serialize;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs;
 
 #[derive(Debug, Serialize, Clone, Default)]

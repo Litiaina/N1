@@ -32,6 +32,7 @@ const SMB2_HEADER_LEN: usize = 64;
 const SMB2_MAGIC: [u8; 4] = [0xFE, b'S', b'M', b'B'];
 const SMB1_MAGIC: [u8; 4] = [0xFF, b'S', b'M', b'B'];
 const SMB2_SERVER_TO_REDIR_FLAG: u32 = 0x0000_0001;
+const SMB2_FLAGS_RELATED_OPERATIONS: u32 = 0x0000_0004;
 const SMB2_FLAGS_SIGNED: u32 = 0x0000_0008;
 
 const SMB2_COMMAND_NEGOTIATE: u16 = 0x0000;
@@ -48,6 +49,7 @@ const SMB2_COMMAND_LOCK: u16 = 0x000A;
 const SMB2_COMMAND_IOCTL: u16 = 0x000B;
 const SMB2_COMMAND_ECHO: u16 = 0x000D;
 const SMB2_COMMAND_QUERY_DIRECTORY: u16 = 0x000E;
+const SMB2_COMMAND_CHANGE_NOTIFY: u16 = 0x000F;
 const SMB2_COMMAND_QUERY_INFO: u16 = 0x0010;
 const SMB2_COMMAND_SET_INFO: u16 = 0x0011;
 const SMB1_COMMAND_NEGOTIATE: u8 = 0x72;
@@ -107,6 +109,7 @@ const FILE_CREATE_ACTION_OVERWRITTEN: u32 = 3;
 
 const FILE_INFORMATION_CLASS_DIRECTORY_INFORMATION: u8 = 0x01;
 const FILE_INFORMATION_CLASS_BOTH_DIRECTORY_INFORMATION: u8 = 0x03;
+const FILE_INFORMATION_CLASS_FILE_NAMES_INFORMATION: u8 = 0x0C;
 const FILE_INFORMATION_CLASS_ID_BOTH_DIRECTORY_INFORMATION: u8 = 0x25;
 const SMB2_INFO_TYPE_FILE: u8 = 0x01;
 const SMB2_INFO_TYPE_FILESYSTEM: u8 = 0x02;
@@ -127,6 +130,7 @@ const FS_INFO_CLASS_DEVICE_INFORMATION: u8 = 0x04;
 const FSCTL_VALIDATE_NEGOTIATE_INFO: u32 = 0x0014_0204;
 const FSCTL_QUERY_NETWORK_INTERFACE_INFO: u32 = 0x0014_01FC;
 const FSCTL_DFS_GET_REFERRALS: u32 = 0x0006_0194;
+const FSCTL_PIPE_WAIT: u32 = 0x0011_0018;
 const FS_INFO_CLASS_ATTRIBUTE_INFORMATION: u8 = 0x05;
 const FS_INFO_CLASS_FULL_SIZE_INFORMATION: u8 = 0x07;
 const SMB2_QUERY_DIRECTORY_RESTART_SCANS: u8 = 0x01;
@@ -139,17 +143,15 @@ const SMB2_NEGOTIATE_DIALECT_0302: u16 = 0x0302;
 const SMB2_NEGOTIATE_DIALECT_0311: u16 = 0x0311;
 const SMB2_NEGOTIATE_SIGNING_ENABLED: u16 = 0x0001;
 const SMB2_NEGOTIATE_SIGNING_REQUIRED: u16 = 0x0002;
-const SMB2_SESSION_FLAG_IS_GUEST: u16 = 0x0001;
 const SMB2_NEGOTIATE_RESPONSE_FIXED_LEN: usize = 64;
 const SMB2_SERVER_GUID: [u8; 16] = [
-    0x6A, 0xA2, 0x15, 0x39, 0xB8, 0x04, 0x4A, 0x4F, 0x83, 0xD4, 0x4F, 0x31, 0x8E, 0x10, 0xC2,
-    0x7B,
+    0x6A, 0xA2, 0x15, 0x39, 0xB8, 0x04, 0x4A, 0x4F, 0x83, 0xD4, 0x4F, 0x31, 0x8E, 0x10, 0xC2, 0x7B,
 ];
 const SMB2_GLOBAL_CAP_DFS: u32 = 0x0000_0001;
 const SMB2_GLOBAL_CAP_LARGE_MTU: u32 = 0x0000_0004;
 const SMB2_NEGOTIATE_SPNEGO_NTLM_BLOB: [u8; 30] = [
-    0x60, 0x1C, 0x06, 0x06, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x02, 0xA0, 0x12, 0x30, 0x10, 0xA0,
-    0x0E, 0x30, 0x0C, 0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0A,
+    0x60, 0x1C, 0x06, 0x06, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x02, 0xA0, 0x12, 0x30, 0x10, 0xA0, 0x0E,
+    0x30, 0x0C, 0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0A,
 ];
 const SMB2_NEGOTIATE_CONTEXT_PREAUTH_INTEGRITY_CAPABILITIES: u16 = 0x0001;
 const SMB2_NEGOTIATE_CONTEXT_ENCRYPTION_CAPABILITIES: u16 = 0x0002;
@@ -163,24 +165,29 @@ const SMB2_SIGNING_ALGORITHM_AES_GMAC: u16 = 0x0002;
 const SMB2_SIGNING_ALGORITHM_AES_CMAC: u16 = 0x0001;
 const SMB2_SIGNING_ALGORITHM_HMAC_SHA256: u16 = 0x0000;
 const SMB2_PREAUTH_SALT: [u8; 32] = [
-    0x11, 0x22, 0x31, 0x44, 0x52, 0x61, 0x73, 0x84, 0x95, 0xA6, 0xB1, 0xC2, 0xD3, 0xE4, 0xF5,
-    0x06, 0x17, 0x28, 0x39, 0x4A, 0x5B, 0x6C, 0x7D, 0x8E, 0x9F, 0x10, 0x21, 0x32, 0x43, 0x54,
-    0x65, 0x76,
+    0x11, 0x22, 0x31, 0x44, 0x52, 0x61, 0x73, 0x84, 0x95, 0xA6, 0xB1, 0xC2, 0xD3, 0xE4, 0xF5, 0x06,
+    0x17, 0x28, 0x39, 0x4A, 0x5B, 0x6C, 0x7D, 0x8E, 0x9F, 0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76,
 ];
 const NTLMSSP_SIGNATURE: [u8; 8] = [b'N', b'T', b'L', b'M', b'S', b'S', b'P', 0x00];
 const NTLM_NEGOTIATE_UNICODE: u32 = 0x0000_0001;
+const NTLM_NEGOTIATE_REQUEST_TARGET: u32 = 0x0000_0004;
 const NTLM_NEGOTIATE_SIGN: u32 = 0x0000_0010;
+const NTLM_NEGOTIATE_SEAL: u32 = 0x0000_0020;
 const NTLM_NEGOTIATE_NTLM: u32 = 0x0000_0200;
 const NTLM_NEGOTIATE_ALWAYS_SIGN: u32 = 0x0000_8000;
+const NTLM_NEGOTIATE_TARGET_TYPE_SERVER: u32 = 0x0002_0000;
 const NTLM_NEGOTIATE_EXTENDED_SESSIONSECURITY: u32 = 0x0008_0000;
 const NTLM_NEGOTIATE_TARGET_INFO: u32 = 0x0080_0000;
 const NTLM_NEGOTIATE_VERSION: u32 = 0x0200_0000;
 const NTLM_NEGOTIATE_128: u32 = 0x2000_0000;
 const NTLM_NEGOTIATE_56: u32 = 0x8000_0000;
 const NTLM_CHALLENGE_FLAGS: u32 = NTLM_NEGOTIATE_UNICODE
+    | NTLM_NEGOTIATE_REQUEST_TARGET
     | NTLM_NEGOTIATE_SIGN
+    | NTLM_NEGOTIATE_SEAL
     | NTLM_NEGOTIATE_NTLM
     | NTLM_NEGOTIATE_ALWAYS_SIGN
+    | NTLM_NEGOTIATE_TARGET_TYPE_SERVER
     | NTLM_NEGOTIATE_EXTENDED_SESSIONSECURITY
     | NTLM_NEGOTIATE_TARGET_INFO
     | NTLM_NEGOTIATE_VERSION
@@ -209,12 +216,15 @@ struct OpenHandleContext {
     is_dir: bool,
     writable: bool,
     delete_on_close: bool,
-    dir_query_cursor: usize,
     dir_query_pattern: String,
     dir_query_info_class: u8,
+    dir_query_buffer: Vec<DirEntry>,
+    dir_query_continuation_token: Option<String>,
+    dir_query_exhausted: bool,
     expected_size_bytes: Option<u64>,
     max_written_end: u64,
     transfer_id: Option<String>,
+    allows_replace_write: bool,
     materialize_on_close: bool,
     pending_write: Option<WriteHandle>,
 }
@@ -274,13 +284,23 @@ struct ConnectionState {
     next_handle_id: u64,
     auth_config: Option<ServerAuthConfig>,
     require_signing: bool,
+    query_directory_page_limit: usize,
+    query_directory_max_buffered_entries: usize,
+    query_directory_max_seeded_entries: usize,
+    negotiated_dialect: u16,
     sessions: HashMap<u64, SessionContext>,
     trees: HashMap<u32, TreeContext>,
     handles: HashMap<[u8; 16], OpenHandleContext>,
 }
 
 impl ConnectionState {
-    fn new(auth_config: Option<ServerAuthConfig>, require_signing: bool) -> Self {
+    fn new(
+        auth_config: Option<ServerAuthConfig>,
+        require_signing: bool,
+        query_directory_page_limit: usize,
+        query_directory_max_buffered_entries: usize,
+        query_directory_max_seeded_entries: usize,
+    ) -> Self {
         let mut connection_id_bytes = [0u8; 8];
         rand::thread_rng().fill_bytes(&mut connection_id_bytes);
         Self {
@@ -290,6 +310,10 @@ impl ConnectionState {
             next_handle_id: 1,
             auth_config,
             require_signing,
+            query_directory_page_limit,
+            query_directory_max_buffered_entries,
+            query_directory_max_seeded_entries,
+            negotiated_dialect: SMB2_NEGOTIATE_DIALECT_0311,
             sessions: HashMap::new(),
             trees: HashMap::new(),
             handles: HashMap::new(),
@@ -361,6 +385,7 @@ struct Smb2HeaderView {
     command: u16,
     credit_request: u16,
     flags: u32,
+    next_command: u32,
     message_id: u64,
     tree_id: u32,
     session_id: u64,
@@ -402,6 +427,7 @@ impl Smb2HeaderView {
             command: read_u16(payload, 12)?,
             credit_request: read_u16(payload, 14)?,
             flags: read_u32(payload, 16)?,
+            next_command: read_u32(payload, 20)?,
             message_id: read_u64(payload, 24)?,
             tree_id: read_u32(payload, 36)?,
             session_id: read_u64(payload, 40)?,
@@ -664,20 +690,30 @@ pub async fn spawn_listener(config: SmbConfig) -> io::Result<(SocketAddr, JoinHa
     let async_close_commit = config.async_close_commit;
     let async_close_threshold_bytes = config.async_close_threshold_bytes;
     let auth_config = parse_server_auth_config(&config);
-    let require_signing = config.require_signing || auth_config.is_some();
+    let require_signing = config.require_signing;
+    let query_directory_page_limit = config.query_directory_page_limit;
+    let query_directory_max_buffered_entries = config.query_directory_max_buffered_entries;
+    let query_directory_max_seeded_entries = config.query_directory_max_seeded_entries;
     let shared_smb_state = Arc::new(Mutex::new(GlobalSmbState::default()));
     let semaphore = Arc::new(Semaphore::new(max_sessions));
 
     let join = tokio::spawn(async move {
         info!(
-            "smb loop started on {} (max_sessions={}, max_frame_bytes={}, auth_required={}, require_signing={}, close_ack_mode={}, close_async_threshold_bytes={})",
+            "smb loop started on {} (max_sessions={}, max_frame_bytes={}, auth_required={}, require_signing={}, close_ack_mode={}, close_async_threshold_bytes={}, query_dir_page_limit={}, query_dir_max_buffered_entries={}, query_dir_max_seeded_entries={})",
             local_addr,
             max_sessions,
             max_frame_bytes,
-            auth_config.is_some(),
+            true,
             require_signing,
-            if async_close_commit { "immediate" } else { "after_commit" },
-            async_close_threshold_bytes
+            if async_close_commit {
+                "immediate"
+            } else {
+                "after_commit"
+            },
+            async_close_threshold_bytes,
+            query_directory_page_limit,
+            query_directory_max_buffered_entries,
+            query_directory_max_seeded_entries
         );
         run_accept_loop(
             listener,
@@ -689,6 +725,9 @@ pub async fn spawn_listener(config: SmbConfig) -> io::Result<(SocketAddr, JoinHa
             require_signing,
             async_close_commit,
             async_close_threshold_bytes,
+            query_directory_page_limit,
+            query_directory_max_buffered_entries,
+            query_directory_max_seeded_entries,
         )
         .await;
     });
@@ -706,6 +745,9 @@ async fn run_accept_loop(
     require_signing: bool,
     async_close_commit: bool,
     async_close_threshold_bytes: u64,
+    query_directory_page_limit: usize,
+    query_directory_max_buffered_entries: usize,
+    query_directory_max_seeded_entries: usize,
 ) {
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -740,6 +782,9 @@ async fn run_accept_loop(
                 require_signing,
                 async_close_commit,
                 async_close_threshold_bytes,
+                query_directory_page_limit,
+                query_directory_max_buffered_entries,
+                query_directory_max_seeded_entries,
             )
             .await
             {
@@ -759,8 +804,17 @@ async fn handle_connection(
     require_signing: bool,
     async_close_commit: bool,
     async_close_threshold_bytes: u64,
+    query_directory_page_limit: usize,
+    query_directory_max_buffered_entries: usize,
+    query_directory_max_seeded_entries: usize,
 ) -> io::Result<()> {
-    let mut state = ConnectionState::new(auth_config, require_signing);
+    let mut state = ConnectionState::new(
+        auth_config,
+        require_signing,
+        query_directory_page_limit,
+        query_directory_max_buffered_entries,
+        query_directory_max_seeded_entries,
+    );
 
     loop {
         let mut netbios_header = [0u8; NETBIOS_HEADER_LEN];
@@ -811,16 +865,15 @@ async fn handle_connection(
             debug!("smb {} short frame len={}", peer, smb_payload.len());
         }
 
-        let Some(response) =
-            process_smb2_request(
-                &smb_payload,
-                &mut state,
-                &gateway,
-                &shared_smb_state,
-                async_close_commit,
-                async_close_threshold_bytes,
-            )
-            .await
+        let Some(response) = process_smb2_request(
+            &smb_payload,
+            &mut state,
+            &gateway,
+            &shared_smb_state,
+            async_close_commit,
+            async_close_threshold_bytes,
+        )
+        .await
         else {
             if let Some(response) = process_smb1_negotiate_compat(&smb_payload) {
                 debug!("smb {} smb1 negotiate compat response", peer);
@@ -848,42 +901,175 @@ async fn process_smb2_request(
     async_close_commit: bool,
     async_close_threshold_bytes: u64,
 ) -> Option<Vec<u8>> {
-    let header = Smb2HeaderView::parse(request)?;
+    let first_header = Smb2HeaderView::parse(request)?;
 
-    if should_enforce_signed_request(&header, state) {
-        let Some(session) = state.sessions.get(&header.session_id) else {
+    if should_enforce_signed_request(&first_header, state) {
+        let Some(session) = state.sessions.get(&first_header.session_id) else {
+            debug!(
+                "smb command={}({:#06X}) msg_id={} session_id={} tree_id={} -> status=0x{:08X} (signed request with missing session)",
+                smb2_command_name(first_header.command),
+                first_header.command,
+                first_header.message_id,
+                first_header.session_id,
+                first_header.tree_id,
+                SMB2_STATUS_USER_SESSION_DELETED
+            );
             return Some(build_framed_smb2_response(
-                &header,
+                &first_header,
                 SMB2_STATUS_USER_SESSION_DELETED,
-                header.tree_id,
-                header.session_id,
+                first_header.tree_id,
+                first_header.session_id,
                 &build_not_supported_error_body(),
                 None,
             ));
         };
         let Some(signing_key) = session.signing_key else {
+            debug!(
+                "smb command={}({:#06X}) msg_id={} session_id={} tree_id={} -> status=0x{:08X} (signed request missing signing key)",
+                smb2_command_name(first_header.command),
+                first_header.command,
+                first_header.message_id,
+                first_header.session_id,
+                first_header.tree_id,
+                SMB2_STATUS_ACCESS_DENIED
+            );
             return Some(build_framed_smb2_response(
-                &header,
+                &first_header,
                 SMB2_STATUS_ACCESS_DENIED,
-                header.tree_id,
-                header.session_id,
+                first_header.tree_id,
+                first_header.session_id,
                 &build_not_supported_error_body(),
                 None,
             ));
         };
-        if !verify_smb2_request_signature(request, &header, &signing_key) {
+        if !verify_smb2_request_signature(request, &first_header, &signing_key) {
+            debug!(
+                "smb command={}({:#06X}) msg_id={} session_id={} tree_id={} -> status=0x{:08X} (signature verification failed)",
+                smb2_command_name(first_header.command),
+                first_header.command,
+                first_header.message_id,
+                first_header.session_id,
+                first_header.tree_id,
+                SMB2_STATUS_ACCESS_DENIED
+            );
             return Some(build_framed_smb2_response(
-                &header,
+                &first_header,
                 SMB2_STATUS_ACCESS_DENIED,
-                header.tree_id,
-                header.session_id,
+                first_header.tree_id,
+                first_header.session_id,
                 &build_not_supported_error_body(),
                 None,
             ));
         }
     }
 
-    let (status, tree_id, session_id, body) = match header.command {
+    let mut command_requests = split_compound_smb2_requests(request)?;
+    let mut responses = Vec::new();
+    let mut previous_session_id: Option<u64> = None;
+    let mut previous_tree_id: Option<u32> = None;
+    let mut previous_file_id: Option<[u8; 16]> = None;
+    let all_ones_file_id = [0xFFu8; 16];
+
+    for command_request in &mut command_requests {
+        let mut header = Smb2HeaderView::parse(command_request.as_slice())?;
+        let related = (header.flags & SMB2_FLAGS_RELATED_OPERATIONS) != 0;
+
+        if related {
+            if header.session_id == u64::MAX {
+                if let Some(session_id) = previous_session_id {
+                    header.session_id = session_id;
+                    command_request[40..48].copy_from_slice(&session_id.to_le_bytes());
+                }
+            }
+            if header.tree_id == u32::MAX {
+                if let Some(tree_id) = previous_tree_id {
+                    header.tree_id = tree_id;
+                    command_request[36..40].copy_from_slice(&tree_id.to_le_bytes());
+                }
+            }
+            if let Some(file_id) = previous_file_id {
+                if let Some(offset) = command_file_id_absolute_offset(header.command) {
+                    if matches!(read_file_id(command_request, offset), Some(v) if v == all_ones_file_id)
+                    {
+                        command_request[offset..offset + 16].copy_from_slice(&file_id);
+                    }
+                }
+            }
+        }
+
+        let request_file_id = extract_request_file_id(command_request, header.command)
+            .filter(|fid| *fid != all_ones_file_id);
+
+        let (status, tree_id, session_id, body) = dispatch_smb2_command(
+            command_request,
+            &header,
+            state,
+            gateway,
+            shared_smb_state,
+            async_close_commit,
+            async_close_threshold_bytes,
+        )
+        .await;
+
+        debug!(
+            "smb command={}({:#06X}) msg_id={} session_id={} tree_id={} next_command={} related={} -> status=0x{:08X}",
+            smb2_command_name(header.command),
+            header.command,
+            header.message_id,
+            header.session_id,
+            header.tree_id,
+            header.next_command,
+            related,
+            status
+        );
+
+        let response_signing_key = state
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.signing_key)
+            .filter(|_| should_sign_smb2_response(&header, status, session_id, state));
+
+        let response = build_framed_smb2_response(
+            &header,
+            status,
+            tree_id,
+            session_id,
+            &body,
+            response_signing_key,
+        );
+        if header.command == SMB2_COMMAND_NEGOTIATE {
+            debug!(
+                "smb negotiate response len={} hex={}",
+                response.len(),
+                hex_prefix(&response, 196)
+            );
+        }
+        responses.extend_from_slice(&response);
+
+        previous_session_id = Some(session_id);
+        previous_tree_id = Some(tree_id);
+        if header.command == SMB2_COMMAND_CREATE && status == SMB2_STATUS_SUCCESS {
+            if let Some(file_id) = extract_create_response_file_id(&body) {
+                previous_file_id = Some(file_id);
+            }
+        } else if let Some(file_id) = request_file_id {
+            previous_file_id = Some(file_id);
+        }
+    }
+
+    Some(responses)
+}
+
+async fn dispatch_smb2_command(
+    request: &[u8],
+    header: &Smb2HeaderView,
+    state: &mut ConnectionState,
+    gateway: &SharedGateway,
+    shared_smb_state: &SharedSmbState,
+    async_close_commit: bool,
+    async_close_threshold_bytes: u64,
+) -> (u32, u32, u64, Vec<u8>) {
+    match header.command {
         SMB2_COMMAND_NEGOTIATE => {
             debug!(
                 "smb negotiate raw_len={} ss@64={:?} ss@66={:?}",
@@ -915,25 +1101,19 @@ async fn process_smb2_request(
                     build_not_supported_error_body(),
                 ),
                 Some(dialects) => {
-                    let has_0202 = dialects
-                        .iter()
-                        .any(|d| *d == SMB2_NEGOTIATE_DIALECT_0202);
-                    let has_0210 = dialects
-                        .iter()
-                        .any(|d| *d == SMB2_NEGOTIATE_DIALECT_0210);
-                    let has_0302 = dialects
-                        .iter()
-                        .any(|d| *d == SMB2_NEGOTIATE_DIALECT_0302);
-                    let has_0311 = dialects
-                        .iter()
-                        .any(|d| *d == SMB2_NEGOTIATE_DIALECT_0311);
+                    let has_0202 = dialects.iter().any(|d| *d == SMB2_NEGOTIATE_DIALECT_0202);
+                    let has_0210 = dialects.iter().any(|d| *d == SMB2_NEGOTIATE_DIALECT_0210);
+                    let has_0302 = dialects.iter().any(|d| *d == SMB2_NEGOTIATE_DIALECT_0302);
+                    let has_0311 = dialects.iter().any(|d| *d == SMB2_NEGOTIATE_DIALECT_0311);
                     let selected_dialect = select_supported_dialect(&dialects);
                     if let Some(dialect) = selected_dialect {
                         debug!(
                             "smb negotiate client_dialects={:?} has_0202={} has_0210={} has_0302={} has_0311={} selected=0x{:04X}",
                             dialects, has_0202, has_0210, has_0302, has_0311, dialect
                         );
-                        let selection = negotiate_selection(negotiate_meta.as_ref(), state.require_signing);
+                        state.negotiated_dialect = dialect;
+                        let selection =
+                            negotiate_selection(negotiate_meta.as_ref(), state.require_signing);
                         let body = build_negotiate_response_body(dialect, selection);
                         (SMB2_STATUS_SUCCESS, 0, 0, body)
                     } else {
@@ -953,7 +1133,7 @@ async fn process_smb2_request(
                 ),
             }
         }
-        SMB2_COMMAND_SESSION_SETUP => handle_session_setup_command(request, &header, state).await,
+        SMB2_COMMAND_SESSION_SETUP => handle_session_setup_command(request, header, state).await,
         SMB2_COMMAND_LOGOFF => {
             if !state.has_session(header.session_id) {
                 (
@@ -990,32 +1170,32 @@ async fn process_smb2_request(
                     Some(fragment_candidate) if !fragment_candidate.is_empty() => {
                         let is_ipc_share = fragment_candidate.eq_ignore_ascii_case("IPC$");
                         match resolve_tree_connect_fragment(
-                        fragment_candidate.as_str(),
-                        session_scope.as_deref(),
-                    )
-                    .await
-                    {
-                        Some(fragment_hash) => {
-                            let tree_id = state.create_tree(header.session_id, fragment_hash);
-                            (
-                                SMB2_STATUS_SUCCESS,
-                                tree_id,
+                            fragment_candidate.as_str(),
+                            session_scope.as_deref(),
+                        )
+                        .await
+                        {
+                            Some(fragment_hash) => {
+                                let tree_id = state.create_tree(header.session_id, fragment_hash);
+                                (
+                                    SMB2_STATUS_SUCCESS,
+                                    tree_id,
+                                    header.session_id,
+                                    build_tree_connect_response_body(if is_ipc_share {
+                                        0x02
+                                    } else {
+                                        0x01
+                                    }),
+                                )
+                            }
+                            None => (
+                                SMB2_STATUS_BAD_NETWORK_NAME,
+                                0,
                                 header.session_id,
-                                build_tree_connect_response_body(if is_ipc_share {
-                                    0x02
-                                } else {
-                                    0x01
-                                }),
-                            )
+                                build_tree_connect_response_body(0x01),
+                            ),
                         }
-                        None => (
-                            SMB2_STATUS_BAD_NETWORK_NAME,
-                            0,
-                            header.session_id,
-                            build_tree_connect_response_body(0x01),
-                        ),
                     }
-                }
                     _ => (
                         SMB2_STATUS_BAD_NETWORK_NAME,
                         0,
@@ -1051,30 +1231,29 @@ async fn process_smb2_request(
                 )
             }
         }
-        SMB2_COMMAND_ECHO => {
-            (
-                SMB2_STATUS_SUCCESS,
-                header.tree_id,
-                header.session_id,
-                build_simple_response_body(),
-            )
-        }
+        SMB2_COMMAND_ECHO => (
+            SMB2_STATUS_SUCCESS,
+            header.tree_id,
+            header.session_id,
+            build_simple_response_body(),
+        ),
         SMB2_COMMAND_CREATE => {
-            let (status, body) = handle_create(request, &header, state, gateway, shared_smb_state).await;
+            let (status, body) =
+                handle_create(request, header, state, gateway, shared_smb_state).await;
             (status, header.tree_id, header.session_id, body)
         }
         SMB2_COMMAND_READ => {
-            let (status, body) = handle_read(request, &header, state, gateway).await;
+            let (status, body) = handle_read(request, header, state, gateway).await;
             (status, header.tree_id, header.session_id, body)
         }
         SMB2_COMMAND_WRITE => {
-            let (status, body) = handle_write(request, &header, state, gateway).await;
+            let (status, body) = handle_write(request, header, state, gateway).await;
             (status, header.tree_id, header.session_id, body)
         }
         SMB2_COMMAND_CLOSE => {
             let (status, body) = handle_close(
                 request,
-                &header,
+                header,
                 state,
                 gateway,
                 shared_smb_state,
@@ -1085,29 +1264,32 @@ async fn process_smb2_request(
             (status, header.tree_id, header.session_id, body)
         }
         SMB2_COMMAND_FLUSH => {
-            let (status, body) = handle_flush(request, &header, state).await;
+            let (status, body) = handle_flush(request, header, state).await;
             (status, header.tree_id, header.session_id, body)
         }
         SMB2_COMMAND_LOCK => {
-            let (status, body) =
-                handle_lock(request, &header, state, shared_smb_state).await;
+            let (status, body) = handle_lock(request, header, state, shared_smb_state).await;
             (status, header.tree_id, header.session_id, body)
         }
         SMB2_COMMAND_QUERY_DIRECTORY => {
-            let (status, body) = handle_query_directory(request, &header, state, gateway).await;
+            let (status, body) = handle_query_directory(request, header, state, gateway).await;
+            (status, header.tree_id, header.session_id, body)
+        }
+        SMB2_COMMAND_CHANGE_NOTIFY => {
+            let (status, body) = handle_change_notify(request, header, state);
             (status, header.tree_id, header.session_id, body)
         }
         SMB2_COMMAND_QUERY_INFO => {
-            let (status, body) = handle_query_info(request, &header, state, gateway).await;
+            let (status, body) = handle_query_info(request, header, state, gateway).await;
             (status, header.tree_id, header.session_id, body)
         }
         SMB2_COMMAND_SET_INFO => {
             let (status, body) =
-                handle_set_info(request, &header, state, gateway, shared_smb_state).await;
+                handle_set_info(request, header, state, gateway, shared_smb_state).await;
             (status, header.tree_id, header.session_id, body)
         }
         SMB2_COMMAND_IOCTL => {
-            let (status, body) = handle_ioctl(request).await;
+            let (status, body) = handle_ioctl(request, state).await;
             (status, header.tree_id, header.session_id, body)
         }
         _ => (
@@ -1116,58 +1298,12 @@ async fn process_smb2_request(
             header.session_id,
             build_not_supported_error_body(),
         ),
-    };
-
-    debug!(
-        "smb command={}({:#06X}) msg_id={} session_id={} tree_id={} -> status=0x{:08X}",
-        smb2_command_name(header.command),
-        header.command,
-        header.message_id,
-        header.session_id,
-        header.tree_id,
-        status
-    );
-
-    let response_signing_key = state
-        .sessions
-        .get(&session_id)
-        .and_then(|session| session.signing_key)
-        .filter(|_| should_sign_smb2_response(&header, status, session_id, state));
-
-    let response = build_framed_smb2_response(
-        &header,
-        status,
-        tree_id,
-        session_id,
-        &body,
-        response_signing_key,
-    );
-    if header.command == SMB2_COMMAND_NEGOTIATE {
-        debug!(
-            "smb negotiate response len={} hex={}",
-            response.len(),
-            hex_prefix(&response, 196)
-        );
     }
-    Some(response)
 }
 
 fn parse_server_auth_config(config: &SmbConfig) -> Option<ServerAuthConfig> {
-    let username = config.auth_username.as_ref()?.trim().to_string();
-    let password = config.auth_password.as_ref()?.trim().to_string();
-    if username.is_empty() || password.is_empty() {
-        return None;
-    }
-    let domain = config
-        .auth_domain
-        .as_ref()
-        .map(|v| v.trim().to_string())
-        .unwrap_or_default();
-    Some(ServerAuthConfig {
-        username,
-        password,
-        domain,
-    })
+    let _ = config;
+    None
 }
 
 fn should_enforce_signed_request(header: &Smb2HeaderView, state: &ConnectionState) -> bool {
@@ -1196,7 +1332,8 @@ fn should_sign_smb2_response(
         return false;
     }
     if header.command == SMB2_COMMAND_SESSION_SETUP {
-        return status == SMB2_STATUS_SUCCESS && session.auth_state == SessionAuthState::Established;
+        return status == SMB2_STATUS_SUCCESS
+            && session.auth_state == SessionAuthState::Established;
     }
     session.auth_state == SessionAuthState::Established
 }
@@ -1211,8 +1348,39 @@ fn verify_smb2_request_signature(
     }
     let mut payload = request.to_vec();
     payload[48..64].fill(0);
-    let expected = smb2_hmac_sha256_signature(&payload, signing_key);
-    expected == header.signature
+    let expected_full_first_only = smb2_hmac_sha256_signature(&payload, signing_key);
+    if expected_full_first_only == header.signature {
+        return true;
+    }
+
+    let mut payload_all = request.to_vec();
+    zero_compound_signature_fields(payload_all.as_mut_slice());
+    let expected_full_compound = smb2_hmac_sha256_signature(&payload_all, signing_key);
+    if expected_full_compound == header.signature {
+        return true;
+    }
+
+    let next_command = read_u32(request, 20).unwrap_or(0) as usize;
+    if next_command >= SMB2_HEADER_LEN && next_command <= request.len() {
+        let first_message = &request[..next_command];
+
+        let mut first_payload = first_message.to_vec();
+        first_payload[48..64].fill(0);
+        let expected_first_span = smb2_hmac_sha256_signature(&first_payload, signing_key);
+        if expected_first_span == header.signature {
+            return true;
+        }
+
+        let mut first_payload_compound = first_message.to_vec();
+        zero_compound_signature_fields(first_payload_compound.as_mut_slice());
+        let expected_first_span_compound =
+            smb2_hmac_sha256_signature(&first_payload_compound, signing_key);
+        if expected_first_span_compound == header.signature {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn smb2_hmac_sha256_signature(payload: &[u8], signing_key: &[u8; 16]) -> [u8; 16] {
@@ -1223,6 +1391,94 @@ fn smb2_hmac_sha256_signature(payload: &[u8], signing_key: &[u8; 16]) -> [u8; 16
     let mut out = [0u8; 16];
     out.copy_from_slice(&digest[..16]);
     out
+}
+
+fn zero_compound_signature_fields(payload: &mut [u8]) {
+    let mut command_offset = 0usize;
+    loop {
+        if command_offset + SMB2_HEADER_LEN > payload.len() {
+            break;
+        }
+        if payload[command_offset..command_offset + 4] != SMB2_MAGIC {
+            break;
+        }
+        payload[command_offset + 48..command_offset + 64].fill(0);
+        let next_command = read_u32(payload, command_offset + 20).unwrap_or(0) as usize;
+        if next_command == 0 {
+            break;
+        }
+        if (next_command % 8) != 0 {
+            break;
+        }
+        let next_offset = match command_offset.checked_add(next_command) {
+            Some(v) => v,
+            None => break,
+        };
+        if next_offset >= payload.len() {
+            break;
+        }
+        command_offset = next_offset;
+    }
+}
+
+fn split_compound_smb2_requests(request: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut slices = Vec::new();
+    let mut command_offset = 0usize;
+
+    loop {
+        if command_offset + SMB2_HEADER_LEN > request.len() {
+            return None;
+        }
+        if request[command_offset..command_offset + 4] != SMB2_MAGIC {
+            return None;
+        }
+        let next_command = read_u32(request, command_offset + 20)? as usize;
+        let next_offset = if next_command == 0 {
+            request.len()
+        } else {
+            if (next_command % 8) != 0 {
+                return None;
+            }
+            command_offset.checked_add(next_command)?
+        };
+        if next_offset > request.len() || next_offset <= command_offset {
+            return None;
+        }
+
+        slices.push(request[command_offset..next_offset].to_vec());
+        if next_command == 0 {
+            break;
+        }
+        command_offset = next_offset;
+    }
+
+    Some(slices)
+}
+
+fn command_file_id_absolute_offset(command: u16) -> Option<usize> {
+    let rel = match command {
+        SMB2_COMMAND_READ | SMB2_COMMAND_WRITE | SMB2_COMMAND_SET_INFO => 16usize,
+        SMB2_COMMAND_CLOSE
+        | SMB2_COMMAND_FLUSH
+        | SMB2_COMMAND_LOCK
+        | SMB2_COMMAND_QUERY_DIRECTORY
+        | SMB2_COMMAND_CHANGE_NOTIFY => 8usize,
+        SMB2_COMMAND_QUERY_INFO => 24usize,
+        _ => return None,
+    };
+    Some(SMB2_HEADER_LEN + rel)
+}
+
+fn extract_request_file_id(request: &[u8], command: u16) -> Option<[u8; 16]> {
+    let offset = command_file_id_absolute_offset(command)?;
+    read_file_id(request, offset)
+}
+
+fn extract_create_response_file_id(body: &[u8]) -> Option<[u8; 16]> {
+    if body.len() < 80 {
+        return None;
+    }
+    body.get(64..80)?.try_into().ok()
 }
 
 async fn handle_session_setup_command(
@@ -1249,6 +1505,12 @@ async fn handle_session_setup_command(
     };
 
     let ntlm_message_type = parse_ntlm_message_type(security_blob);
+    debug!(
+        "smb session_setup security_blob_len={} ntlm_type={:?} ntlm_sig_offset={:?}",
+        security_blob.len(),
+        ntlm_message_type,
+        find_ntlmssp_signature(security_blob)
+    );
     let auth_config = state.auth_config.clone();
     let Some(session) = state.sessions.get_mut(&session_id) else {
         return (
@@ -1267,8 +1529,11 @@ async fn handle_session_setup_command(
                     let challenge = random_ntlm_challenge();
                     session.server_challenge = Some(challenge);
                     session.auth_state = SessionAuthState::ChallengeSent;
-                    let challenge_blob =
-                        build_spnego_ntlm_challenge_blob(challenge, auth.domain.as_str());
+                    let challenge_blob = build_spnego_ntlm_challenge_blob(
+                        challenge,
+                        auth.domain.as_str(),
+                        ntlm_challenge_flags_for_request(security_blob),
+                    );
                     (SMB2_STATUS_MORE_PROCESSING_REQUIRED, 0, challenge_blob)
                 } else if ntlm_message_type == Some(3) {
                     let Some(challenge) = session.server_challenge else {
@@ -1338,108 +1603,78 @@ async fn handle_session_setup_command(
     } else {
         match session.auth_state {
             SessionAuthState::Established => (SMB2_STATUS_SUCCESS, 0, Vec::new()),
-            SessionAuthState::Negotiating => {
-                if security_blob.is_empty() {
-                    session.auth_state = SessionAuthState::Established;
-                    session.fragment_scope = None;
-                    (SMB2_STATUS_SUCCESS, SMB2_SESSION_FLAG_IS_GUEST, Vec::new())
-                } else if ntlm_message_type == Some(1) {
+            SessionAuthState::Negotiating | SessionAuthState::ChallengeSent => {
+                if ntlm_message_type == Some(1) {
                     let challenge = random_ntlm_challenge();
                     session.server_challenge = Some(challenge);
                     session.auth_state = SessionAuthState::ChallengeSent;
                     (
                         SMB2_STATUS_MORE_PROCESSING_REQUIRED,
                         0,
-                        build_spnego_ntlm_challenge_blob(challenge, "N1"),
+                        build_spnego_ntlm_challenge_blob(
+                            challenge,
+                            "N1",
+                            ntlm_challenge_flags_for_request(security_blob),
+                        ),
                     )
                 } else if ntlm_message_type == Some(3) {
-                    let hint_scope = match parse_ntlm_type3_auth_data(security_blob) {
-                        Some(t3) => fragment_scope_hint_from_type3(&t3).await,
-                        None => None,
-                    };
-                    session.auth_state = SessionAuthState::Established;
-                    session.fragment_scope = hint_scope;
-                    (
-                        SMB2_STATUS_SUCCESS,
-                        SMB2_SESSION_FLAG_IS_GUEST,
-                        build_spnego_accept_complete_blob(),
-                    )
-                } else {
-                    session.auth_state = SessionAuthState::Established;
-                    session.fragment_scope = None;
-                    (SMB2_STATUS_SUCCESS, SMB2_SESSION_FLAG_IS_GUEST, Vec::new())
-                }
-            }
-            SessionAuthState::ChallengeSent => {
-                if ntlm_message_type == Some(3) {
                     let Some(challenge) = session.server_challenge else {
-                        session.auth_state = SessionAuthState::Established;
+                        session.auth_state = SessionAuthState::Negotiating;
+                        session.signing_key = None;
                         session.fragment_scope = None;
                         return (
-                            SMB2_STATUS_SUCCESS,
+                            SMB2_STATUS_LOGON_FAILURE,
                             0,
                             session_id,
-                            build_session_setup_response_body(
-                                SMB2_SESSION_FLAG_IS_GUEST,
-                                &build_spnego_accept_complete_blob(),
-                            ),
+                            build_session_setup_response_body(0, &[]),
                         );
                     };
-                    let parsed_type3 = parse_ntlm_type3_auth_data(security_blob);
-                    let maybe_verified = match parsed_type3.as_ref() {
-                        Some(t3) => verify_fragment_ntlmv2_auth(&challenge, t3)
+                    let Some(type3) = parse_ntlm_type3_auth_data(security_blob) else {
+                        session.auth_state = SessionAuthState::Negotiating;
+                        session.server_challenge = None;
+                        session.signing_key = None;
+                        session.fragment_scope = None;
+                        return (
+                            SMB2_STATUS_LOGON_FAILURE,
+                            0,
+                            session_id,
+                            build_session_setup_response_body(0, &[]),
+                        );
+                    };
+                    let Some((signing_key, fragment_hash)) =
+                        verify_fragment_ntlmv2_auth(&challenge, &type3)
                             .await
                             .ok()
-                            .flatten(),
-                        None => None,
-                    };
-                    if let Some((signing_key, fragment_hash)) = maybe_verified {
-                        session.auth_state = SessionAuthState::Established;
+                            .flatten()
+                    else {
+                        session.auth_state = SessionAuthState::Negotiating;
                         session.server_challenge = None;
-                        session.signing_required = true;
-                        session.signing_key = Some(signing_key);
-                        session.fragment_scope = Some(fragment_hash);
+                        session.signing_key = None;
+                        session.fragment_scope = None;
                         return (
-                            SMB2_STATUS_SUCCESS,
+                            SMB2_STATUS_LOGON_FAILURE,
                             0,
                             session_id,
-                            build_session_setup_response_body(0, &build_spnego_accept_complete_blob()),
+                            build_session_setup_response_body(0, &[]),
                         );
-                    }
-                    let hint_scope = match parsed_type3.as_ref() {
-                        Some(t3) => fragment_scope_hint_from_type3(t3).await,
-                        None => None,
                     };
+
                     session.auth_state = SessionAuthState::Established;
                     session.server_challenge = None;
-                    session.fragment_scope = hint_scope;
-                    (
-                        SMB2_STATUS_SUCCESS,
-                        SMB2_SESSION_FLAG_IS_GUEST,
-                        build_spnego_accept_complete_blob(),
-                    )
-                } else if security_blob.is_empty() {
-                    session.auth_state = SessionAuthState::Established;
-                    session.server_challenge = None;
-                    session.fragment_scope = None;
-                    (
-                        SMB2_STATUS_SUCCESS,
-                        SMB2_SESSION_FLAG_IS_GUEST,
-                        build_spnego_accept_complete_blob(),
-                    )
-                } else if ntlm_message_type == Some(1) {
-                    let challenge = random_ntlm_challenge();
-                    session.server_challenge = Some(challenge);
-                    (
-                        SMB2_STATUS_MORE_PROCESSING_REQUIRED,
-                        0,
-                        build_spnego_ntlm_challenge_blob(challenge, "N1"),
-                    )
+                    session.signing_required = state.require_signing;
+                    session.signing_key = Some(signing_key);
+                    session.fragment_scope = Some(fragment_hash);
+                    (SMB2_STATUS_SUCCESS, 0, build_spnego_accept_complete_blob())
                 } else {
-                    session.auth_state = SessionAuthState::Established;
+                    session.auth_state = SessionAuthState::Negotiating;
                     session.server_challenge = None;
+                    session.signing_key = None;
                     session.fragment_scope = None;
-                    (SMB2_STATUS_SUCCESS, SMB2_SESSION_FLAG_IS_GUEST, Vec::new())
+                    (
+                        SMB2_STATUS_LOGON_FAILURE,
+                        0,
+                        build_session_setup_response_body(0, &[]),
+                    )
                 }
             }
         }
@@ -1462,14 +1697,31 @@ fn random_ntlm_challenge() -> [u8; 8] {
     challenge
 }
 
-fn build_ntlm_type2_challenge_blob(challenge: [u8; 8], domain: &str) -> Vec<u8> {
+fn build_ntlm_type2_challenge_blob(
+    challenge: [u8; 8],
+    domain: &str,
+    challenge_flags: u32,
+) -> Vec<u8> {
     let target_name_bytes = utf16le_bytes(domain);
     let mut target_info = Vec::new();
     if !target_name_bytes.is_empty() {
+        target_info.extend_from_slice(&1u16.to_le_bytes());
+        target_info.extend_from_slice(&(target_name_bytes.len() as u16).to_le_bytes());
+        target_info.extend_from_slice(&target_name_bytes);
         target_info.extend_from_slice(&2u16.to_le_bytes());
         target_info.extend_from_slice(&(target_name_bytes.len() as u16).to_le_bytes());
         target_info.extend_from_slice(&target_name_bytes);
+        target_info.extend_from_slice(&3u16.to_le_bytes());
+        target_info.extend_from_slice(&(target_name_bytes.len() as u16).to_le_bytes());
+        target_info.extend_from_slice(&target_name_bytes);
+        target_info.extend_from_slice(&4u16.to_le_bytes());
+        target_info.extend_from_slice(&(target_name_bytes.len() as u16).to_le_bytes());
+        target_info.extend_from_slice(&target_name_bytes);
     }
+    let timestamp = current_filetime();
+    target_info.extend_from_slice(&7u16.to_le_bytes());
+    target_info.extend_from_slice(&8u16.to_le_bytes());
+    target_info.extend_from_slice(&timestamp.to_le_bytes());
     target_info.extend_from_slice(&0u16.to_le_bytes());
     target_info.extend_from_slice(&0u16.to_le_bytes());
 
@@ -1480,22 +1732,26 @@ fn build_ntlm_type2_challenge_blob(challenge: [u8; 8], domain: &str) -> Vec<u8> 
     let mut out = vec![0u8; payload_offset + target_name_bytes.len() + target_info.len()];
     out[0..8].copy_from_slice(&NTLMSSP_SIGNATURE);
     out[8..12].copy_from_slice(&2u32.to_le_bytes());
-    write_ntlm_security_buffer(
-        &mut out,
-        12,
-        target_name_bytes.len(),
-        target_name_offset,
-    );
-    out[20..24].copy_from_slice(&NTLM_CHALLENGE_FLAGS.to_le_bytes());
+    write_ntlm_security_buffer(&mut out, 12, target_name_bytes.len(), target_name_offset);
+    out[20..24].copy_from_slice(&challenge_flags.to_le_bytes());
     out[24..32].copy_from_slice(&challenge);
     write_ntlm_security_buffer(&mut out, 40, target_info.len(), target_info_offset);
-    out[payload_offset..payload_offset + target_name_bytes.len()].copy_from_slice(&target_name_bytes);
+    out[48] = 10;
+    out[49] = 0;
+    out[50..52].copy_from_slice(&0u16.to_le_bytes());
+    out[55] = 0x0F;
+    out[payload_offset..payload_offset + target_name_bytes.len()]
+        .copy_from_slice(&target_name_bytes);
     out[target_info_offset..target_info_offset + target_info.len()].copy_from_slice(&target_info);
     out
 }
 
-fn build_spnego_ntlm_challenge_blob(challenge: [u8; 8], domain: &str) -> Vec<u8> {
-    let ntlm = build_ntlm_type2_challenge_blob(challenge, domain);
+fn build_spnego_ntlm_challenge_blob(
+    challenge: [u8; 8],
+    domain: &str,
+    challenge_flags: u32,
+) -> Vec<u8> {
+    let ntlm = build_ntlm_type2_challenge_blob(challenge, domain, challenge_flags);
     let mut response_token = Vec::with_capacity(ntlm.len() + 8);
     der_push_tlv(0x04, &ntlm, &mut response_token);
 
@@ -1509,7 +1765,8 @@ fn build_spnego_ntlm_challenge_blob(challenge: [u8; 8], domain: &str) -> Vec<u8>
         0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0A,
     ]);
 
-    let mut seq_content = Vec::with_capacity(neg_state.len() + supported_mech.len() + response_token.len() + 12);
+    let mut seq_content =
+        Vec::with_capacity(neg_state.len() + supported_mech.len() + response_token.len() + 12);
     der_push_tlv(0xA0, &neg_state, &mut seq_content);
     der_push_tlv(0xA1, &supported_mech, &mut seq_content);
     der_push_tlv(0xA2, &response_token, &mut seq_content);
@@ -1570,9 +1827,12 @@ fn parse_ntlm_type3_auth_data(blob: &[u8]) -> Option<NtlmType3AuthData> {
     }
     let flags = read_u32(blob, base + 60).unwrap_or(NTLM_NEGOTIATE_UNICODE);
     let unicode = (flags & NTLM_NEGOTIATE_UNICODE) != 0;
-    let domain = decode_ntlm_text(read_ntlm_security_buffer(blob, base, base + 28)?, unicode)?;
-    let username = decode_ntlm_text(read_ntlm_security_buffer(blob, base, base + 36)?, unicode)?;
+    let domain_raw = decode_ntlm_text(read_ntlm_security_buffer(blob, base, base + 28)?, unicode)?;
+    let username_raw =
+        decode_ntlm_text(read_ntlm_security_buffer(blob, base, base + 36)?, unicode)?;
     let nt_response = read_ntlm_security_buffer(blob, base, base + 20)?.to_vec();
+    let domain = normalize_ntlm_identity_component(domain_raw.as_str());
+    let username = normalize_ntlm_identity_component(username_raw.as_str());
 
     Some(NtlmType3AuthData {
         username,
@@ -1624,15 +1884,16 @@ fn verify_ntlmv2_auth(
 }
 
 fn is_fragment_hash_identifier(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .as_bytes()
-            .iter()
-            .all(|b| b.is_ascii_hexdigit())
+    value.len() == 64 && value.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
+}
+
+fn normalize_ntlm_identity_component(value: &str) -> String {
+    value.trim_matches('\0').trim().to_string()
 }
 
 fn fragment_identifier_to_hash(identifier: &str) -> Option<String> {
-    let normalized = identifier.trim();
+    let normalized = normalize_ntlm_identity_component(identifier);
+    let normalized = normalized.as_str();
     if normalized.is_empty() {
         return None;
     }
@@ -1642,6 +1903,38 @@ fn fragment_identifier_to_hash(identifier: &str) -> Option<String> {
     let mut hasher = Sha256::new();
     hasher.update(normalized.as_bytes());
     Some(hex::encode(hasher.finalize()))
+}
+
+async fn resolve_fragment_hash_from_principal(principal: &str) -> Option<String> {
+    let normalized = normalize_ntlm_identity_component(principal);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if is_fragment_hash_identifier(normalized.as_str()) {
+        let hash = normalized.to_ascii_lowercase();
+        if does_fragment_exist(hash.as_str()).await {
+            return Some(hash);
+        }
+        return None;
+    }
+
+    let mut aliases = vec![normalized.clone()];
+    let lower = normalized.to_ascii_lowercase();
+    if lower != normalized {
+        aliases.push(lower);
+    }
+
+    for alias in aliases {
+        let Some(hash) = fragment_identifier_to_hash(alias.as_str()) else {
+            continue;
+        };
+        if does_fragment_exist(hash.as_str()).await {
+            return Some(hash);
+        }
+    }
+
+    None
 }
 
 fn parse_nt_hash_hex(value: &str) -> Option<[u8; 16]> {
@@ -1661,16 +1954,18 @@ async fn verify_fragment_ntlmv2_auth(
     if type3.nt_response.len() < 16 {
         return Ok(None);
     }
-    let principal = type3.username.trim();
+    let principal = normalize_ntlm_identity_component(type3.username.as_str());
     if principal.is_empty() {
+        debug!("smb fragment auth rejected: empty principal");
         return Ok(None);
     }
-    let Some(fragment_hash) = fragment_identifier_to_hash(principal) else {
+    let Some(fragment_hash) = resolve_fragment_hash_from_principal(principal.as_str()).await else {
+        debug!(
+            "smb fragment auth rejected: principal '{}' not mapped to fragment",
+            principal
+        );
         return Ok(None);
     };
-    if !does_fragment_exist(fragment_hash.as_str()).await {
-        return Ok(None);
-    }
 
     let metadata = match read_fragment_metadata(fragment_hash.as_str()).await {
         Ok(v) => v,
@@ -1678,9 +1973,17 @@ async fn verify_fragment_ntlmv2_auth(
         Err(e) => return Err(e),
     };
     let Some(stored_nt_hash_hex) = metadata.nt_hash_hex.as_deref() else {
+        debug!(
+            "smb fragment auth rejected: fragment '{}' missing nt_hash_hex",
+            fragment_hash
+        );
         return Ok(None);
     };
     let Some(stored_nt_hash) = parse_nt_hash_hex(stored_nt_hash_hex) else {
+        debug!(
+            "smb fragment auth rejected: fragment '{}' invalid nt_hash_hex",
+            fragment_hash
+        );
         return Ok(None);
     };
 
@@ -1690,8 +1993,13 @@ async fn verify_fragment_ntlmv2_auth(
         return Ok(None);
     }
 
-    let identity = format!("{}{}", principal.to_uppercase(), type3.domain.trim());
+    let identity = format!(
+        "{}{}",
+        principal.to_uppercase(),
+        normalize_ntlm_identity_component(type3.domain.as_str())
+    );
     let Some(ntlm_v2_hash) = hmac_md5(&stored_nt_hash, &utf16le_bytes(identity.as_str())) else {
+        debug!("smb fragment auth rejected: ntlm_v2_hash derivation failed");
         return Ok(None);
     };
 
@@ -1699,9 +2007,16 @@ async fn verify_fragment_ntlmv2_auth(
     proof_input.extend_from_slice(challenge);
     proof_input.extend_from_slice(blob);
     let Some(expected_proof) = hmac_md5(&ntlm_v2_hash, &proof_input) else {
+        debug!("smb fragment auth rejected: expected_proof derivation failed");
         return Ok(None);
     };
     if expected_proof.as_slice() != nt_proof {
+        debug!(
+            "smb fragment auth rejected: nt proof mismatch for principal='{}' domain='{}' fragment='{}'",
+            principal,
+            normalize_ntlm_identity_component(type3.domain.as_str()),
+            fragment_hash
+        );
         return Ok(None);
     }
 
@@ -1710,19 +2025,6 @@ async fn verify_fragment_ntlmv2_auth(
     };
 
     Ok(Some((signing_key, fragment_hash)))
-}
-
-async fn fragment_scope_hint_from_type3(type3: &NtlmType3AuthData) -> Option<String> {
-    let principal = type3.username.trim();
-    if principal.is_empty() {
-        return None;
-    }
-    let fragment_hash = fragment_identifier_to_hash(principal)?;
-    if does_fragment_exist(fragment_hash.as_str()).await {
-        Some(fragment_hash)
-    } else {
-        None
-    }
 }
 
 fn find_ntlmssp_signature(blob: &[u8]) -> Option<usize> {
@@ -1809,6 +2111,7 @@ fn process_smb1_negotiate_compat(request: &[u8]) -> Option<Vec<u8>> {
         command: SMB2_COMMAND_NEGOTIATE,
         credit_request: 1,
         flags: 0,
+        next_command: 0,
         message_id: 0,
         tree_id: 0,
         session_id: 0,
@@ -1850,6 +2153,7 @@ fn smb2_command_name(command: u16) -> &'static str {
         SMB2_COMMAND_IOCTL => "IOCTL",
         SMB2_COMMAND_ECHO => "ECHO",
         SMB2_COMMAND_QUERY_DIRECTORY => "QUERY_DIRECTORY",
+        SMB2_COMMAND_CHANGE_NOTIFY => "CHANGE_NOTIFY",
         SMB2_COMMAND_QUERY_INFO => "QUERY_INFO",
         SMB2_COMMAND_SET_INFO => "SET_INFO",
         _ => "UNKNOWN",
@@ -2116,15 +2420,12 @@ async fn move_open_handle_path(
 
     let mut smb_state = shared_smb_state.lock().await;
 
-    let moving_entry = smb_state
-        .opens
-        .get(old_path.as_str())
-        .and_then(|entries| {
-            entries
-                .iter()
-                .find(|entry| entry.connection_id == connection_id && entry.file_id == file_id)
-                .cloned()
-        });
+    let moving_entry = smb_state.opens.get(old_path.as_str()).and_then(|entries| {
+        entries
+            .iter()
+            .find(|entry| entry.connection_id == connection_id && entry.file_id == file_id)
+            .cloned()
+    });
 
     let Some(entry) = moving_entry else {
         return Ok(());
@@ -2176,9 +2477,7 @@ async fn move_open_handle_path(
             if *owner_connection == connection_id && *owner_file_id == file_id
     ) {
         smb_state.locks.remove(old_path.as_str());
-        smb_state
-            .locks
-            .insert(new_path, (connection_id, file_id));
+        smb_state.locks.insert(new_path, (connection_id, file_id));
     }
 
     Ok(())
@@ -2308,20 +2607,17 @@ async fn handle_create(
     let delete_on_close = (create_options & FILE_DELETE_ON_CLOSE) != 0;
     let writable =
         (desired_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_GENERIC_WRITE)) != 0;
-    let requested_read =
-        (desired_access & (FILE_READ_DATA | FILE_EXECUTE | FILE_GENERIC_READ | FILE_GENERIC_ALL))
-            != 0;
-    let requested_write =
-        (desired_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_GENERIC_WRITE | FILE_GENERIC_ALL))
-            != 0;
+    let requested_read = (desired_access
+        & (FILE_READ_DATA | FILE_EXECUTE | FILE_GENERIC_READ | FILE_GENERIC_ALL))
+        != 0;
+    let requested_write = (desired_access
+        & (FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_GENERIC_WRITE | FILE_GENERIC_ALL))
+        != 0;
     let requested_delete = (desired_access & (FILE_DELETE | FILE_GENERIC_ALL)) != 0;
 
     debug!(
         "smb create path='{}' disposition={} desired_access=0x{:08X} create_options=0x{:08X}",
-        object_key,
-        create_disposition,
-        desired_access,
-        create_options
+        object_key, create_disposition, desired_access, create_options
     );
 
     if !matches!(
@@ -2350,7 +2646,10 @@ async fn handle_create(
         None
     };
     if pending_commit_size.is_some() && (requested_write || writable) {
-        return (SMB2_STATUS_SHARING_VIOLATION, build_not_supported_error_body());
+        return (
+            SMB2_STATUS_SHARING_VIOLATION,
+            build_not_supported_error_body(),
+        );
     }
 
     if object_key.is_empty() {
@@ -2380,12 +2679,15 @@ async fn handle_create(
                 is_dir: true,
                 writable: false,
                 delete_on_close,
-                dir_query_cursor: 0,
                 dir_query_pattern: "*".to_string(),
                 dir_query_info_class: FILE_INFORMATION_CLASS_DIRECTORY_INFORMATION,
+                dir_query_buffer: Vec::new(),
+                dir_query_continuation_token: None,
+                dir_query_exhausted: false,
                 expected_size_bytes: None,
                 max_written_end: 0,
                 transfer_id: None,
+                allows_replace_write: false,
                 materialize_on_close: false,
                 pending_write: None,
             },
@@ -2415,7 +2717,11 @@ async fn handle_create(
         );
     }
 
-    let is_dir = if exists { existing_is_dir } else { requested_dir };
+    let is_dir = if exists {
+        existing_is_dir
+    } else {
+        requested_dir
+    };
 
     if exists && create_disposition == FILE_CREATE_DISPOSITION_CREATE {
         return (
@@ -2517,12 +2823,15 @@ async fn handle_create(
             is_dir,
             writable,
             delete_on_close,
-            dir_query_cursor: 0,
             dir_query_pattern: "*".to_string(),
             dir_query_info_class: FILE_INFORMATION_CLASS_DIRECTORY_INFORMATION,
+            dir_query_buffer: Vec::new(),
+            dir_query_continuation_token: None,
+            dir_query_exhausted: false,
             expected_size_bytes: None,
             max_written_end: 0,
             transfer_id: None,
+            allows_replace_write: writable && materialize_on_close,
             materialize_on_close,
             pending_write: None,
         },
@@ -2601,6 +2910,22 @@ async fn handle_read(
         Ok(bytes) => (SMB2_STATUS_SUCCESS, build_read_response_body(&bytes)),
         Err(e) => (app_error_to_status(e), build_not_supported_error_body()),
     }
+}
+
+fn validate_lite_write_policy(handle: &OpenHandleContext, offset: u64) -> Result<(), u32> {
+    if !handle.allows_replace_write {
+        return Err(SMB2_STATUS_NOT_SUPPORTED);
+    }
+    if handle.pending_write.is_none() {
+        if offset != 0 {
+            return Err(SMB2_STATUS_NOT_SUPPORTED);
+        }
+        return Ok(());
+    }
+    if offset != handle.max_written_end {
+        return Err(SMB2_STATUS_NOT_SUPPORTED);
+    }
+    Ok(())
 }
 
 async fn handle_write(
@@ -2725,16 +3050,29 @@ async fn handle_write(
         if !handle.writable {
             return (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body());
         }
+        if let Err(status) = validate_lite_write_policy(handle, offset) {
+            debug!(
+                "smb write rejected path='{}' allows_replace_write={} offset={} max_written_end={} pending_write={}",
+                handle.object_key,
+                handle.allows_replace_write,
+                offset,
+                handle.max_written_end,
+                handle.pending_write.is_some()
+            );
+            return (status, build_not_supported_error_body());
+        }
 
         if handle.pending_write.is_none() {
             let inferred_expected_size = if remaining_bytes > 0 {
-                write_end_offset
-                    .checked_add(remaining_bytes)
+                write_end_offset.checked_add(remaining_bytes)
             } else {
                 None
             };
             let expected_size = handle.expected_size_bytes.or(inferred_expected_size);
-            begin_write = Some((mount_path(&handle.fragment, &handle.object_key), expected_size));
+            begin_write = Some((
+                mount_path(&handle.fragment, &handle.object_key),
+                expected_size,
+            ));
         }
     }
 
@@ -2778,7 +3116,7 @@ async fn handle_write(
     match gateway.write_chunk(&write_handle, offset, bytes).await {
         Ok(_) => {
             if let Some(handle) = state.handles.get_mut(&file_id) {
-                handle.max_written_end = handle.max_written_end.max(write_end_offset);
+                handle.max_written_end = write_end_offset;
                 if let Some(transfer_id) = handle.transfer_id.as_deref() {
                     transfer_ingress_progress(
                         transfer_id,
@@ -2874,8 +3212,12 @@ async fn handle_close(
     }
 
     if handle.pending_write.is_some() {
-        let write_size_hint = handle.expected_size_bytes.unwrap_or(0).max(handle.max_written_end);
-        let should_async_close = async_close_commit || write_size_hint >= async_close_threshold_bytes;
+        let write_size_hint = handle
+            .expected_size_bytes
+            .unwrap_or(0)
+            .max(handle.max_written_end);
+        let should_async_close =
+            async_close_commit || write_size_hint >= async_close_threshold_bytes;
         if let Some(transfer_id) = handle.transfer_id.as_deref() {
             transfer_commit_started(transfer_id);
         }
@@ -3043,9 +3385,7 @@ async fn handle_lock(
         let unlock = (flags & SMB2_LOCKFLAG_UNLOCK) != 0;
         if unlock {
             match smb_state.locks.get(path.as_str()) {
-                Some((conn_id, fid))
-                    if *conn_id == state.connection_id && *fid == file_id =>
-                {
+                Some((conn_id, fid)) if *conn_id == state.connection_id && *fid == file_id => {
                     smb_state.locks.remove(path.as_str());
                 }
                 _ => {
@@ -3059,8 +3399,7 @@ async fn handle_lock(
         }
 
         match smb_state.locks.get(path.as_str()) {
-            Some((conn_id, fid))
-                if *conn_id == state.connection_id && *fid == file_id => {}
+            Some((conn_id, fid)) if *conn_id == state.connection_id && *fid == file_id => {}
             Some(_) => {
                 return (
                     SMB2_STATUS_LOCK_NOT_GRANTED,
@@ -3361,6 +3700,13 @@ async fn handle_set_info(
                     build_not_supported_error_body(),
                 );
             }
+            if current.is_dir {
+                debug!(
+                    "smb rename rejected for directory '{}' (lite smb mode)",
+                    current.object_key
+                );
+                return (SMB2_STATUS_NOT_SUPPORTED, build_not_supported_error_body());
+            }
             let name_len = match read_u32(info_buf, 16) {
                 Some(v) => v as usize,
                 None => {
@@ -3396,6 +3742,10 @@ async fn handle_set_info(
             let from = mount_path(&current.fragment, &current.object_key);
             let to = mount_path(&current.fragment, &target_key);
             if let Err(e) = gateway.rename(&from, &to).await {
+                debug!(
+                    "smb rename failed from='{}' to='{}': {}",
+                    current.object_key, target_key, e
+                );
                 return (app_error_to_status(e), build_not_supported_error_body());
             }
             if let Err(status) = move_open_handle_path(
@@ -3478,7 +3828,7 @@ async fn handle_set_info(
     }
 }
 
-async fn handle_ioctl(request: &[u8]) -> (u32, Vec<u8>) {
+async fn handle_ioctl(request: &[u8], state: &ConnectionState) -> (u32, Vec<u8>) {
     let base = SMB2_HEADER_LEN;
     if request.len() < base + 57 {
         return (
@@ -3509,8 +3859,13 @@ async fn handle_ioctl(request: &[u8]) -> (u32, Vec<u8>) {
             let mut out = Vec::with_capacity(24);
             out.extend_from_slice(&(SMB2_GLOBAL_CAP_DFS | SMB2_GLOBAL_CAP_LARGE_MTU).to_le_bytes());
             out.extend_from_slice(&SMB2_SERVER_GUID);
-            out.extend_from_slice(&SMB2_NEGOTIATE_SIGNING_ENABLED.to_le_bytes());
-            out.extend_from_slice(&SMB2_NEGOTIATE_DIALECT_0210.to_le_bytes());
+            let signing_mode = if state.require_signing {
+                SMB2_NEGOTIATE_SIGNING_ENABLED | SMB2_NEGOTIATE_SIGNING_REQUIRED
+            } else {
+                SMB2_NEGOTIATE_SIGNING_ENABLED
+            };
+            out.extend_from_slice(&signing_mode.to_le_bytes());
+            out.extend_from_slice(&state.negotiated_dialect.to_le_bytes());
             (
                 SMB2_STATUS_SUCCESS,
                 build_ioctl_response_body(ctl_code, out.as_slice(), 0),
@@ -3524,8 +3879,64 @@ async fn handle_ioctl(request: &[u8]) -> (u32, Vec<u8>) {
             SMB2_STATUS_SUCCESS,
             build_ioctl_response_body(ctl_code, &[], 0),
         ),
+        FSCTL_PIPE_WAIT => (
+            SMB2_STATUS_SUCCESS,
+            build_ioctl_response_body(ctl_code, &[], 0),
+        ),
         _ => (SMB2_STATUS_NOT_SUPPORTED, build_not_supported_error_body()),
     }
+}
+
+fn handle_change_notify(
+    request: &[u8],
+    header: &Smb2HeaderView,
+    state: &mut ConnectionState,
+) -> (u32, Vec<u8>) {
+    if !state.has_session(header.session_id) {
+        return (
+            SMB2_STATUS_USER_SESSION_DELETED,
+            build_not_supported_error_body(),
+        );
+    }
+
+    let base = SMB2_HEADER_LEN;
+    if request.len() < base + 32 {
+        return (
+            SMB2_STATUS_INVALID_PARAMETER,
+            build_not_supported_error_body(),
+        );
+    }
+    if read_u16(request, base).unwrap_or(0) < 32 {
+        return (
+            SMB2_STATUS_INVALID_PARAMETER,
+            build_not_supported_error_body(),
+        );
+    }
+
+    let file_id = match read_file_id(request, base + 8) {
+        Some(v) => v,
+        None => {
+            return (
+                SMB2_STATUS_INVALID_PARAMETER,
+                build_not_supported_error_body(),
+            );
+        }
+    };
+
+    let Some(handle) = state.handles.get(&file_id) else {
+        return (SMB2_STATUS_INVALID_HANDLE, build_not_supported_error_body());
+    };
+    if handle.session_id != header.session_id || handle.tree_id != header.tree_id {
+        return (SMB2_STATUS_INVALID_HANDLE, build_not_supported_error_body());
+    }
+    if !handle.is_dir {
+        return (
+            SMB2_STATUS_NOT_A_DIRECTORY,
+            build_not_supported_error_body(),
+        );
+    }
+
+    (SMB2_STATUS_SUCCESS, build_change_notify_response_body(&[]))
 }
 
 async fn handle_query_directory(
@@ -3553,6 +3964,7 @@ async fn handle_query_directory(
     let flags = request[base + 3];
     if file_info_class != FILE_INFORMATION_CLASS_DIRECTORY_INFORMATION
         && file_info_class != FILE_INFORMATION_CLASS_BOTH_DIRECTORY_INFORMATION
+        && file_info_class != FILE_INFORMATION_CLASS_FILE_NAMES_INFORMATION
         && file_info_class != FILE_INFORMATION_CLASS_ID_BOTH_DIRECTORY_INFORMATION
     {
         debug!(
@@ -3592,10 +4004,17 @@ async fn handle_query_directory(
         "*".to_string()
     };
 
-    let restart_scan =
-        (flags & SMB2_QUERY_DIRECTORY_RESTART_SCANS) != 0 || (flags & SMB2_QUERY_DIRECTORY_REOPEN) != 0;
+    let restart_scan = (flags & SMB2_QUERY_DIRECTORY_RESTART_SCANS) != 0
+        || (flags & SMB2_QUERY_DIRECTORY_REOPEN) != 0;
+    debug!(
+        "smb query_directory class=0x{:02X} flags=0x{:02X} output_limit={} pattern='{}' restart_scan={}",
+        file_info_class, flags, output_limit, pattern, restart_scan
+    );
+    let query_directory_page_limit = state.query_directory_page_limit;
+    let query_directory_max_buffered_entries = state.query_directory_max_buffered_entries;
+    let query_directory_max_seeded_entries = state.query_directory_max_seeded_entries;
 
-    let (fragment, object_key, resume_index) = {
+    let (fragment, object_key, mut buffered_entries, mut continuation_token, mut exhausted) = {
         let Some(handle) = state.handles.get_mut(&file_id) else {
             return (SMB2_STATUS_INVALID_HANDLE, build_not_supported_error_body());
         };
@@ -3614,86 +4033,217 @@ async fn handle_query_directory(
             || handle.dir_query_pattern != pattern
             || handle.dir_query_info_class != file_info_class
         {
-            handle.dir_query_cursor = 0;
             handle.dir_query_pattern = pattern.clone();
             handle.dir_query_info_class = file_info_class;
+            handle.dir_query_buffer = seed_directory_entries_for_query(
+                handle.fragment.as_str(),
+                handle.object_key.as_str(),
+                pattern.as_str(),
+                query_directory_max_seeded_entries,
+            );
+            handle.dir_query_continuation_token = None;
+            handle.dir_query_exhausted = false;
         }
 
         (
             handle.fragment.clone(),
             handle.object_key.clone(),
-            handle.dir_query_cursor,
+            std::mem::take(&mut handle.dir_query_buffer),
+            handle.dir_query_continuation_token.clone(),
+            handle.dir_query_exhausted,
         )
     };
 
     let path = mount_path(&fragment, &object_key);
-    let mut entries = match gateway.list_dir(&path).await {
-        Ok(v) => v,
-        Err(e) => return (app_error_to_status(e), build_not_supported_error_body()),
-    };
+    let initial_buffer_len = buffered_entries.len();
+    let mut pages_fetched = 0usize;
+    while buffered_entries.is_empty() && !exhausted {
+        let page = match gateway
+            .list_dir_page(
+                path.as_str(),
+                continuation_token.clone(),
+                query_directory_page_limit,
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                persist_directory_query_state(
+                    state,
+                    file_id,
+                    header.session_id,
+                    header.tree_id,
+                    buffered_entries,
+                    continuation_token,
+                    exhausted,
+                );
+                return (app_error_to_status(e), build_not_supported_error_body());
+            }
+        };
+        pages_fetched = pages_fetched.saturating_add(1);
+        continuation_token = page.continuation_token;
+        exhausted = continuation_token.is_none();
 
-    entries.insert(
-        0,
-        synthetic_directory_entry(".", fragment.as_str(), object_key.as_str()),
-    );
-    entries.insert(
-        1,
-        synthetic_directory_entry(
-            "..",
-            fragment.as_str(),
-            parent_object_key(object_key.as_str()).as_str(),
-        ),
-    );
-    let mut existing_names = entries
-        .iter()
-        .map(|entry| entry.name.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
-    for pending in pending_commit_entries_for_dir(fragment.as_str(), object_key.as_str()) {
-        let lowered = pending.name.to_ascii_lowercase();
-        if existing_names.insert(lowered) {
-            entries.push(pending);
+        let mut seen_names = buffered_entries
+            .iter()
+            .map(|entry| entry.name.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        for entry in page.entries {
+            if buffered_entries.len() >= query_directory_max_buffered_entries {
+                debug!(
+                    "smb query_directory buffer cap reached class=0x{:02X} pattern='{}' cap={}",
+                    file_info_class, pattern, query_directory_max_buffered_entries
+                );
+                break;
+            }
+            let lowered = entry.name.to_ascii_lowercase();
+            if !seen_names.insert(lowered) {
+                continue;
+            }
+            if matches_pattern(entry.name.as_str(), pattern.as_str()) {
+                buffered_entries.push(entry);
+            }
         }
     }
 
-    let filtered: Vec<DirEntry> = entries
-        .into_iter()
-        .filter(|entry| matches_pattern(entry.name.as_str(), pattern.as_str()))
-        .collect();
-
-    if filtered.is_empty() {
+    if buffered_entries.is_empty() {
+        debug!(
+            "smb query_directory metrics class=0x{:02X} pattern='{}' output_limit={} pages_fetched={} initial_buffer={} emitted=0 remaining_buffer={} exhausted={} continuation={}",
+            file_info_class,
+            pattern,
+            output_limit,
+            pages_fetched,
+            initial_buffer_len,
+            buffered_entries.len(),
+            exhausted,
+            continuation_token.is_some()
+        );
+        persist_directory_query_state(
+            state,
+            file_id,
+            header.session_id,
+            header.tree_id,
+            buffered_entries,
+            continuation_token,
+            exhausted,
+        );
         return (
             SMB2_STATUS_NO_MORE_FILES,
             build_query_directory_response_body(&[]),
         );
     }
 
-    if resume_index >= filtered.len() {
-        return (
-            SMB2_STATUS_NO_MORE_FILES,
-            build_query_directory_response_body(&[]),
-        );
-    }
-
-    let (buffer, emitted_count) = build_directory_information_buffer(
-        &filtered[resume_index..],
-        output_limit,
-        file_info_class,
-    );
+    let (buffer, emitted_count) =
+        build_directory_information_buffer(&buffered_entries, output_limit, file_info_class);
     if emitted_count == 0 {
+        debug!(
+            "smb query_directory metrics class=0x{:02X} pattern='{}' output_limit={} pages_fetched={} initial_buffer={} emitted=0 remaining_buffer={} exhausted={} continuation={}",
+            file_info_class,
+            pattern,
+            output_limit,
+            pages_fetched,
+            initial_buffer_len,
+            buffered_entries.len(),
+            exhausted,
+            continuation_token.is_some()
+        );
+        persist_directory_query_state(
+            state,
+            file_id,
+            header.session_id,
+            header.tree_id,
+            buffered_entries,
+            continuation_token,
+            exhausted,
+        );
         return (
             SMB2_STATUS_NO_MORE_FILES,
             build_query_directory_response_body(&[]),
         );
     }
-
-    if let Some(handle) = state.handles.get_mut(&file_id) {
-        handle.dir_query_cursor = resume_index.saturating_add(emitted_count);
-    }
+    buffered_entries.drain(0..emitted_count);
+    debug!(
+        "smb query_directory metrics class=0x{:02X} pattern='{}' output_limit={} pages_fetched={} initial_buffer={} emitted={} remaining_buffer={} exhausted={} continuation={}",
+        file_info_class,
+        pattern,
+        output_limit,
+        pages_fetched,
+        initial_buffer_len,
+        emitted_count,
+        buffered_entries.len(),
+        exhausted,
+        continuation_token.is_some()
+    );
+    persist_directory_query_state(
+        state,
+        file_id,
+        header.session_id,
+        header.tree_id,
+        buffered_entries,
+        continuation_token,
+        exhausted,
+    );
 
     (
         SMB2_STATUS_SUCCESS,
         build_query_directory_response_body(&buffer),
     )
+}
+
+fn persist_directory_query_state(
+    state: &mut ConnectionState,
+    file_id: [u8; 16],
+    session_id: u64,
+    tree_id: u32,
+    dir_query_buffer: Vec<DirEntry>,
+    dir_query_continuation_token: Option<String>,
+    dir_query_exhausted: bool,
+) {
+    if let Some(handle) = state.handles.get_mut(&file_id) {
+        if handle.session_id == session_id && handle.tree_id == tree_id {
+            handle.dir_query_buffer = dir_query_buffer;
+            handle.dir_query_continuation_token = dir_query_continuation_token;
+            handle.dir_query_exhausted = dir_query_exhausted;
+        }
+    }
+}
+
+fn seed_directory_entries_for_query(
+    fragment: &str,
+    object_key: &str,
+    pattern: &str,
+    max_seeded_entries: usize,
+) -> Vec<DirEntry> {
+    let mut out = Vec::with_capacity(max_seeded_entries);
+    let mut seen = HashSet::new();
+
+    let current = synthetic_directory_entry(".", fragment, object_key);
+    if matches_pattern(current.name.as_str(), pattern)
+        && seen.insert(current.name.to_ascii_lowercase())
+    {
+        out.push(current);
+    }
+    let parent = synthetic_directory_entry("..", fragment, parent_object_key(object_key).as_str());
+    if matches_pattern(parent.name.as_str(), pattern)
+        && seen.insert(parent.name.to_ascii_lowercase())
+    {
+        out.push(parent);
+    }
+
+    for pending in pending_commit_entries_for_dir(fragment, object_key) {
+        if out.len() >= max_seeded_entries {
+            break;
+        }
+        if !matches_pattern(pending.name.as_str(), pattern) {
+            continue;
+        }
+        let lowered = pending.name.to_ascii_lowercase();
+        if seen.insert(lowered) {
+            out.push(pending);
+        }
+    }
+
+    out
 }
 
 fn build_framed_smb2_response(
@@ -3784,11 +4334,8 @@ fn build_session_setup_response_body(session_flags: u16, security_blob: &[u8]) -
     body
 }
 
-fn build_negotiate_response_body(
-    dialect: u16,
-    selection: NegotiateSelection,
-) -> Vec<u8> {
-    let include_security_blob = false;
+fn build_negotiate_response_body(dialect: u16, selection: NegotiateSelection) -> Vec<u8> {
+    let include_security_blob = true;
     let security_blob_len = if include_security_blob {
         SMB2_NEGOTIATE_SPNEGO_NTLM_BLOB.len()
     } else {
@@ -3941,6 +4488,20 @@ fn build_close_response_body(size_bytes: u64, attrs: u32) -> Vec<u8> {
 }
 
 fn build_query_directory_response_body(buffer: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8 + buffer.len());
+    body.extend_from_slice(&9u16.to_le_bytes());
+    let data_offset = if buffer.is_empty() {
+        0u16
+    } else {
+        (SMB2_HEADER_LEN + 8) as u16
+    };
+    body.extend_from_slice(&data_offset.to_le_bytes());
+    body.extend_from_slice(&(buffer.len() as u32).to_le_bytes());
+    body.extend_from_slice(buffer);
+    body
+}
+
+fn build_change_notify_response_body(buffer: &[u8]) -> Vec<u8> {
     let mut body = Vec::with_capacity(8 + buffer.len());
     body.extend_from_slice(&9u16.to_le_bytes());
     let data_offset = if buffer.is_empty() {
@@ -4129,7 +4690,12 @@ fn build_directory_information_buffer(
     output_limit: usize,
     file_info_class: u8,
 ) -> (Vec<u8>, usize) {
-    let max_len = output_limit.max(64);
+    let min_record_len = match file_info_class {
+        FILE_INFORMATION_CLASS_ID_BOTH_DIRECTORY_INFORMATION => 104usize,
+        FILE_INFORMATION_CLASS_FILE_NAMES_INFORMATION => 12usize,
+        _ => 64usize,
+    };
+    let max_len = output_limit.max(min_record_len);
     let mut out = Vec::new();
     let mut record_starts = Vec::new();
     let mut record_lens = Vec::new();
@@ -4142,16 +4708,16 @@ fn build_directory_information_buffer(
             name_bytes.extend_from_slice(&ch.to_le_bytes());
         }
 
-        let fixed_len = if file_info_class == FILE_INFORMATION_CLASS_ID_BOTH_DIRECTORY_INFORMATION {
-            104usize
-        } else {
-            64usize
+        let fixed_len = match file_info_class {
+            FILE_INFORMATION_CLASS_ID_BOTH_DIRECTORY_INFORMATION => 104usize,
+            FILE_INFORMATION_CLASS_FILE_NAMES_INFORMATION => 12usize,
+            _ => 64usize,
         };
         let mut record_len = fixed_len + name_bytes.len();
         let aligned_len = (record_len + 7) & !7;
         record_len = aligned_len;
 
-        if out.len() + record_len > max_len {
+        if !out.is_empty() && out.len() + record_len > max_len {
             break;
         }
 
@@ -4166,16 +4732,18 @@ fn build_directory_information_buffer(
             NodeKind::File => FILE_ATTRIBUTE_NORMAL,
         };
 
-        out[start + 8..start + 16].copy_from_slice(&mtime.to_le_bytes());
-        out[start + 16..start + 24].copy_from_slice(&mtime.to_le_bytes());
-        out[start + 24..start + 32].copy_from_slice(&mtime.to_le_bytes());
-        out[start + 32..start + 40].copy_from_slice(&mtime.to_le_bytes());
-        out[start + 40..start + 48].copy_from_slice(&(eof as i64).to_le_bytes());
-        out[start + 48..start + 56].copy_from_slice(&(alloc as i64).to_le_bytes());
-        out[start + 56..start + 60].copy_from_slice(&attrs.to_le_bytes());
-        out[start + 60..start + 64].copy_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-
-        if file_info_class == FILE_INFORMATION_CLASS_ID_BOTH_DIRECTORY_INFORMATION {
+        if file_info_class == FILE_INFORMATION_CLASS_FILE_NAMES_INFORMATION {
+            out[start + 8..start + 12].copy_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            out[start + 12..start + 12 + name_bytes.len()].copy_from_slice(&name_bytes);
+        } else if file_info_class == FILE_INFORMATION_CLASS_ID_BOTH_DIRECTORY_INFORMATION {
+            out[start + 8..start + 16].copy_from_slice(&mtime.to_le_bytes());
+            out[start + 16..start + 24].copy_from_slice(&mtime.to_le_bytes());
+            out[start + 24..start + 32].copy_from_slice(&mtime.to_le_bytes());
+            out[start + 32..start + 40].copy_from_slice(&mtime.to_le_bytes());
+            out[start + 40..start + 48].copy_from_slice(&(eof as i64).to_le_bytes());
+            out[start + 48..start + 56].copy_from_slice(&(alloc as i64).to_le_bytes());
+            out[start + 56..start + 60].copy_from_slice(&attrs.to_le_bytes());
+            out[start + 60..start + 64].copy_from_slice(&(name_bytes.len() as u32).to_le_bytes());
             out[start + 64..start + 68].copy_from_slice(&0u32.to_le_bytes());
             out[start + 68] = 0;
             out[start + 69] = 0;
@@ -4193,6 +4761,14 @@ fn build_directory_information_buffer(
             out[start + 96..start + 104].copy_from_slice(&file_id.to_le_bytes());
             out[start + 104..start + 104 + name_bytes.len()].copy_from_slice(&name_bytes);
         } else {
+            out[start + 8..start + 16].copy_from_slice(&mtime.to_le_bytes());
+            out[start + 16..start + 24].copy_from_slice(&mtime.to_le_bytes());
+            out[start + 24..start + 32].copy_from_slice(&mtime.to_le_bytes());
+            out[start + 32..start + 40].copy_from_slice(&mtime.to_le_bytes());
+            out[start + 40..start + 48].copy_from_slice(&(eof as i64).to_le_bytes());
+            out[start + 48..start + 56].copy_from_slice(&(alloc as i64).to_le_bytes());
+            out[start + 56..start + 60].copy_from_slice(&attrs.to_le_bytes());
+            out[start + 60..start + 64].copy_from_slice(&(name_bytes.len() as u32).to_le_bytes());
             out[start + 64..start + 64 + name_bytes.len()].copy_from_slice(&name_bytes);
         }
 
@@ -4426,6 +5002,31 @@ fn parse_ntlm_message_type(blob: &[u8]) -> Option<u32> {
     read_u32(blob, base + 8)
 }
 
+fn parse_ntlm_type1_negotiate_flags(blob: &[u8]) -> Option<u32> {
+    let base = find_ntlmssp_signature(blob)?;
+    if read_u32(blob, base + 8)? != 1 {
+        return None;
+    }
+    read_u32(blob, base + 12)
+}
+
+fn ntlm_challenge_flags_for_request(blob: &[u8]) -> u32 {
+    let mandatory = NTLM_NEGOTIATE_UNICODE
+        | NTLM_NEGOTIATE_REQUEST_TARGET
+        | NTLM_NEGOTIATE_SIGN
+        | NTLM_NEGOTIATE_NTLM
+        | NTLM_NEGOTIATE_ALWAYS_SIGN
+        | NTLM_NEGOTIATE_TARGET_TYPE_SERVER
+        | NTLM_NEGOTIATE_EXTENDED_SESSIONSECURITY
+        | NTLM_NEGOTIATE_TARGET_INFO;
+    let negotiable =
+        NTLM_NEGOTIATE_SEAL | NTLM_NEGOTIATE_VERSION | NTLM_NEGOTIATE_128 | NTLM_NEGOTIATE_56;
+    let Some(client_flags) = parse_ntlm_type1_negotiate_flags(blob) else {
+        return NTLM_CHALLENGE_FLAGS;
+    };
+    mandatory | (client_flags & NTLM_CHALLENGE_FLAGS & negotiable)
+}
+
 fn parse_negotiate_request_meta(request: &[u8]) -> Option<NegotiateRequestMeta> {
     if request.len() < SMB2_HEADER_LEN + 36 {
         return None;
@@ -4594,7 +5195,10 @@ fn negotiate_selection(
     };
 
     let preauth_hash = if negotiate_meta
-        .map(|m| m.preauth_algorithms.contains(&SMB2_PREAUTH_HASH_ALGO_SHA512))
+        .map(|m| {
+            m.preauth_algorithms
+                .contains(&SMB2_PREAUTH_HASH_ALGO_SHA512)
+        })
         .unwrap_or(true)
     {
         SMB2_PREAUTH_HASH_ALGO_SHA512
@@ -4620,9 +5224,9 @@ fn negotiate_selection(
         .unwrap_or(SMB2_ENCRYPTION_CIPHER_AES128_GCM);
 
     let signing_preference = [
-        SMB2_SIGNING_ALGORITHM_AES_GMAC,
-        SMB2_SIGNING_ALGORITHM_AES_CMAC,
         SMB2_SIGNING_ALGORITHM_HMAC_SHA256,
+        SMB2_SIGNING_ALGORITHM_AES_CMAC,
+        SMB2_SIGNING_ALGORITHM_AES_GMAC,
     ];
     let signing_algorithm = negotiate_meta
         .and_then(|m| {
@@ -4631,7 +5235,7 @@ fn negotiate_selection(
                 .copied()
                 .find(|a| m.signing_algorithms.contains(a))
         })
-        .unwrap_or(SMB2_SIGNING_ALGORITHM_AES_GMAC);
+        .unwrap_or(SMB2_SIGNING_ALGORITHM_HMAC_SHA256);
 
     NegotiateSelection {
         signing_mode,
@@ -4856,10 +5460,6 @@ mod tests {
         u64::from_le_bytes(response[40..48].try_into().expect("session id bytes"))
     }
 
-    fn response_tree_id(response: &[u8]) -> u32 {
-        u32::from_le_bytes(response[36..40].try_into().expect("tree id bytes"))
-    }
-
     fn tree_connect_body(unc: &str) -> Vec<u8> {
         let encoded: Vec<u16> = unc.encode_utf16().collect();
         let mut name_bytes = Vec::with_capacity(encoded.len() * 2);
@@ -4926,7 +5526,8 @@ mod tests {
     ) -> Vec<u8> {
         let nt_hash = nt_hash(password);
         let identity = format!("{}{}", username.to_uppercase(), domain);
-        let ntlm_v2_hash = hmac_md5(&nt_hash, &utf16le_bytes(identity.as_str())).expect("ntlmv2 hash");
+        let ntlm_v2_hash =
+            hmac_md5(&nt_hash, &utf16le_bytes(identity.as_str())).expect("ntlmv2 hash");
         let mut proof_input = Vec::with_capacity(8 + blob.len());
         proof_input.extend_from_slice(challenge);
         proof_input.extend_from_slice(blob);
@@ -4960,7 +5561,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn smb_loop_supports_negotiate_session_tree_and_echo() {
+    async fn smb_loop_supports_negotiate_and_rejects_unauthenticated_session_setup() {
         let config = SmbConfig {
             enabled: true,
             bind_addr: "127.0.0.1".to_string(),
@@ -4969,10 +5570,10 @@ mod tests {
             max_frame_bytes: 1024 * 1024,
             async_close_commit: false,
             async_close_threshold_bytes: 64 * 1024 * 1024,
-            auth_username: None,
-            auth_password: None,
-            auth_domain: None,
             require_signing: false,
+            query_directory_page_limit: 256,
+            query_directory_max_buffered_entries: 512,
+            query_directory_max_seeded_entries: 128,
         };
 
         let (addr, join) = spawn_listener(config).await.expect("spawn listener");
@@ -4988,28 +5589,7 @@ mod tests {
 
         let session_req = build_smb2_header(SMB2_COMMAND_SESSION_SETUP, 2, 0, 0);
         let session_resp = send_req(&mut stream, &session_req).await;
-        assert_eq!(response_status(&session_resp), SMB2_STATUS_SUCCESS);
-        let session_id = response_session_id(&session_resp);
-        assert!(session_id > 0);
-
-        let mut tree_req = build_smb2_header(SMB2_COMMAND_TREE_CONNECT, 3, 0, session_id);
-        tree_req.extend_from_slice(&tree_connect_body(r"\\127.0.0.1\my-fragment"));
-        let tree_resp = send_req(&mut stream, &tree_req).await;
-        assert_eq!(response_status(&tree_resp), SMB2_STATUS_SUCCESS);
-        let tree_id = response_tree_id(&tree_resp);
-        assert!(tree_id > 0);
-
-        let echo_req = build_smb2_header(SMB2_COMMAND_ECHO, 4, tree_id, session_id);
-        let echo_resp = send_req(&mut stream, &echo_req).await;
-        assert_eq!(response_status(&echo_resp), SMB2_STATUS_SUCCESS);
-
-        let td_req = build_smb2_header(SMB2_COMMAND_TREE_DISCONNECT, 5, tree_id, session_id);
-        let td_resp = send_req(&mut stream, &td_req).await;
-        assert_eq!(response_status(&td_resp), SMB2_STATUS_SUCCESS);
-
-        let logoff_req = build_smb2_header(SMB2_COMMAND_LOGOFF, 6, 0, session_id);
-        let logoff_resp = send_req(&mut stream, &logoff_req).await;
-        assert_eq!(response_status(&logoff_resp), SMB2_STATUS_SUCCESS);
+        assert_eq!(response_status(&session_resp), SMB2_STATUS_LOGON_FAILURE);
 
         join.abort();
     }
@@ -5024,10 +5604,10 @@ mod tests {
             max_frame_bytes: 1024 * 1024,
             async_close_commit: false,
             async_close_threshold_bytes: 64 * 1024 * 1024,
-            auth_username: None,
-            auth_password: None,
-            auth_domain: None,
             require_signing: false,
+            query_directory_page_limit: 256,
+            query_directory_max_buffered_entries: 512,
+            query_directory_max_seeded_entries: 128,
         };
 
         let (addr, join) = spawn_listener(config).await.expect("spawn listener");
@@ -5042,7 +5622,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn smb_session_setup_supports_ntlm_challenge_then_auth_completion() {
+    async fn smb_compound_request_emits_multiple_responses() {
         let config = SmbConfig {
             enabled: true,
             bind_addr: "127.0.0.1".to_string(),
@@ -5051,10 +5631,77 @@ mod tests {
             max_frame_bytes: 1024 * 1024,
             async_close_commit: false,
             async_close_threshold_bytes: 64 * 1024 * 1024,
-            auth_username: None,
-            auth_password: None,
-            auth_domain: None,
             require_signing: false,
+            query_directory_page_limit: 256,
+            query_directory_max_buffered_entries: 512,
+            query_directory_max_seeded_entries: 128,
+        };
+
+        let (addr, join) = spawn_listener(config).await.expect("spawn listener");
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+        let mut first = build_smb2_header(SMB2_COMMAND_ECHO, 1, 5, 7);
+        first[20..24].copy_from_slice(&(SMB2_HEADER_LEN as u32).to_le_bytes());
+
+        let mut second = build_smb2_header(SMB2_COMMAND_ECHO, 2, u32::MAX, u64::MAX);
+        second[16..20].copy_from_slice(&SMB2_FLAGS_RELATED_OPERATIONS.to_le_bytes());
+
+        let mut compound = first;
+        compound.extend_from_slice(&second);
+        stream
+            .write_all(&netbios_frame(&compound))
+            .await
+            .expect("write compound request");
+
+        let mut nb1 = [0u8; 4];
+        stream
+            .read_exact(&mut nb1)
+            .await
+            .expect("read response 1 header");
+        let len1 = ((nb1[1] as usize) << 16) | ((nb1[2] as usize) << 8) | (nb1[3] as usize);
+        let mut resp1 = vec![0u8; len1];
+        stream
+            .read_exact(&mut resp1)
+            .await
+            .expect("read response 1");
+
+        let mut nb2 = [0u8; 4];
+        stream
+            .read_exact(&mut nb2)
+            .await
+            .expect("read response 2 header");
+        let len2 = ((nb2[1] as usize) << 16) | ((nb2[2] as usize) << 8) | (nb2[3] as usize);
+        let mut resp2 = vec![0u8; len2];
+        stream
+            .read_exact(&mut resp2)
+            .await
+            .expect("read response 2");
+
+        assert_eq!(response_status(&resp1), SMB2_STATUS_SUCCESS);
+        assert_eq!(response_status(&resp2), SMB2_STATUS_SUCCESS);
+
+        let tree_id_2 = u32::from_le_bytes(resp2[36..40].try_into().expect("tree id bytes"));
+        let session_id_2 = u64::from_le_bytes(resp2[40..48].try_into().expect("session id bytes"));
+        assert_eq!(tree_id_2, 5);
+        assert_eq!(session_id_2, 7);
+
+        join.abort();
+    }
+
+    #[tokio::test]
+    async fn smb_session_setup_requires_valid_type3_after_challenge() {
+        let config = SmbConfig {
+            enabled: true,
+            bind_addr: "127.0.0.1".to_string(),
+            smb_port: 0,
+            max_sessions: 8,
+            max_frame_bytes: 1024 * 1024,
+            async_close_commit: false,
+            async_close_threshold_bytes: 64 * 1024 * 1024,
+            require_signing: false,
+            query_directory_page_limit: 256,
+            query_directory_max_buffered_entries: 512,
+            query_directory_max_seeded_entries: 128,
         };
 
         let (addr, join) = spawn_listener(config).await.expect("spawn listener");
@@ -5074,15 +5721,14 @@ mod tests {
         let type3 = [b'N', b'T', b'L', b'M', b'S', b'S', b'P', 0, 3, 0, 0, 0];
         let setup2 = session_setup_request(2, session_id, &type3);
         let resp2 = send_req(&mut stream, &setup2).await;
-        assert_eq!(response_status(&resp2), SMB2_STATUS_SUCCESS);
+        assert_eq!(response_status(&resp2), SMB2_STATUS_LOGON_FAILURE);
         assert_eq!(response_session_id(&resp2), session_id);
-        assert!(response_session_setup_security_length(&resp2) > 0);
 
         join.abort();
     }
 
     #[tokio::test]
-    async fn smb_session_setup_without_blob_falls_back_to_guest_success() {
+    async fn smb_session_setup_without_blob_is_rejected() {
         let config = SmbConfig {
             enabled: true,
             bind_addr: "127.0.0.1".to_string(),
@@ -5091,10 +5737,10 @@ mod tests {
             max_frame_bytes: 1024 * 1024,
             async_close_commit: false,
             async_close_threshold_bytes: 64 * 1024 * 1024,
-            auth_username: None,
-            auth_password: None,
-            auth_domain: None,
             require_signing: false,
+            query_directory_page_limit: 256,
+            query_directory_max_buffered_entries: 512,
+            query_directory_max_seeded_entries: 128,
         };
 
         let (addr, join) = spawn_listener(config).await.expect("spawn listener");
@@ -5102,15 +5748,13 @@ mod tests {
 
         let setup = session_setup_request(1, 0, &[]);
         let resp = send_req(&mut stream, &setup).await;
-        assert_eq!(response_status(&resp), SMB2_STATUS_SUCCESS);
-        assert!(response_session_id(&resp) > 0);
-        assert_eq!(response_session_setup_security_length(&resp), 0);
+        assert_eq!(response_status(&resp), SMB2_STATUS_LOGON_FAILURE);
 
         join.abort();
     }
 
     #[tokio::test]
-    async fn smb_session_setup_without_blob_is_rejected_when_auth_is_configured() {
+    async fn smb_session_setup_without_blob_is_rejected_when_signing_required() {
         let config = SmbConfig {
             enabled: true,
             bind_addr: "127.0.0.1".to_string(),
@@ -5119,10 +5763,10 @@ mod tests {
             max_frame_bytes: 1024 * 1024,
             async_close_commit: false,
             async_close_threshold_bytes: 64 * 1024 * 1024,
-            auth_username: Some("n1user".to_string()),
-            auth_password: Some("N1Secret!234".to_string()),
-            auth_domain: Some("N1".to_string()),
             require_signing: true,
+            query_directory_page_limit: 256,
+            query_directory_max_buffered_entries: 512,
+            query_directory_max_seeded_entries: 128,
         };
 
         let (addr, join) = spawn_listener(config).await.expect("spawn listener");
@@ -5144,8 +5788,8 @@ mod tests {
         };
         let challenge = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
         let blob = vec![
-            0x01, 0x01, 0x00, 0x00, 0, 0, 0, 0, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01,
-            0x02, 0x10, 0x20, 0x30, 0x40, 0, 0, 0, 0,
+            0x01, 0x01, 0x00, 0x00, 0, 0, 0, 0, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01, 0x02,
+            0x10, 0x20, 0x30, 0x40, 0, 0, 0, 0,
         ];
         let nt_response = build_test_ntlmv2_response(
             auth.username.as_str(),
@@ -5173,8 +5817,8 @@ mod tests {
         };
         let challenge = [0x21, 0x22, 0x23, 0x24, 0x31, 0x32, 0x33, 0x34];
         let blob = vec![
-            0x01, 0x01, 0x00, 0x00, 0, 0, 0, 0, 0xBA, 0xDB, 0xEE, 0xF0, 0xAB, 0xCD, 0xEF,
-            0x12, 0x05, 0x06, 0x07, 0x08, 0, 0, 0, 0,
+            0x01, 0x01, 0x00, 0x00, 0, 0, 0, 0, 0xBA, 0xDB, 0xEE, 0xF0, 0xAB, 0xCD, 0xEF, 0x12,
+            0x05, 0x06, 0x07, 0x08, 0, 0, 0, 0,
         ];
         let mut nt_response = build_test_ntlmv2_response(
             auth.username.as_str(),
@@ -5396,5 +6040,122 @@ mod tests {
             assert!(rounds < 10);
         }
         assert_eq!(consumed, entries.len());
+    }
+
+    #[test]
+    fn directory_information_buffer_supports_file_names_information() {
+        let entries = vec![DirEntry {
+            name: "sample.txt".to_string(),
+            path: crate::fuse::model::FsdPath {
+                fragment: "frag".to_string(),
+                object_key: "sample.txt".to_string(),
+            },
+            metadata: NodeMetadata {
+                kind: NodeKind::File,
+                size_bytes: 10,
+                modified_at_unix: 1,
+            },
+        }];
+
+        let (chunk, count) = build_directory_information_buffer(
+            &entries,
+            4096,
+            FILE_INFORMATION_CLASS_FILE_NAMES_INFORMATION,
+        );
+        assert_eq!(count, 1);
+        assert!(chunk.len() >= 12);
+        let name_len = u32::from_le_bytes(chunk[8..12].try_into().expect("name len"));
+        assert_eq!(name_len, "sample.txt".encode_utf16().count() as u32 * 2);
+    }
+
+    #[test]
+    fn directory_information_buffer_emits_first_entry_with_small_output_limit() {
+        let entries = vec![DirEntry {
+            name: "tiny".to_string(),
+            path: crate::fuse::model::FsdPath {
+                fragment: "frag".to_string(),
+                object_key: "tiny".to_string(),
+            },
+            metadata: NodeMetadata {
+                kind: NodeKind::Directory,
+                size_bytes: 0,
+                modified_at_unix: 1,
+            },
+        }];
+
+        let (chunk, count) = build_directory_information_buffer(
+            &entries,
+            32,
+            FILE_INFORMATION_CLASS_ID_BOTH_DIRECTORY_INFORMATION,
+        );
+        assert_eq!(count, 1);
+        assert!(chunk.len() >= 104);
+    }
+
+    fn make_test_write_handle(
+        allows_replace_write: bool,
+        pending_write: bool,
+        max_written_end: u64,
+    ) -> OpenHandleContext {
+        OpenHandleContext {
+            session_id: 1,
+            tree_id: 1,
+            fragment: "frag".to_string(),
+            object_key: "file.bin".to_string(),
+            is_dir: false,
+            writable: true,
+            delete_on_close: false,
+            dir_query_pattern: "*".to_string(),
+            dir_query_info_class: FILE_INFORMATION_CLASS_DIRECTORY_INFORMATION,
+            dir_query_buffer: Vec::new(),
+            dir_query_continuation_token: None,
+            dir_query_exhausted: false,
+            expected_size_bytes: None,
+            max_written_end,
+            transfer_id: None,
+            allows_replace_write,
+            materialize_on_close: allows_replace_write,
+            pending_write: if pending_write {
+                Some(WriteHandle {
+                    session_id: "s".to_string(),
+                    version_id: "v".to_string(),
+                    expected_size_bytes: None,
+                    path: crate::fuse::model::FsdPath {
+                        fragment: "frag".to_string(),
+                        object_key: "file.bin".to_string(),
+                    },
+                })
+            } else {
+                None
+            },
+        }
+    }
+
+    #[test]
+    fn lite_write_policy_rejects_in_place_modification_handles() {
+        let handle = make_test_write_handle(false, false, 0);
+        let result = validate_lite_write_policy(&handle, 0);
+        assert_eq!(result, Err(SMB2_STATUS_NOT_SUPPORTED));
+    }
+
+    #[test]
+    fn lite_write_policy_requires_first_write_at_offset_zero() {
+        let handle = make_test_write_handle(true, false, 0);
+        let result = validate_lite_write_policy(&handle, 128);
+        assert_eq!(result, Err(SMB2_STATUS_NOT_SUPPORTED));
+    }
+
+    #[test]
+    fn lite_write_policy_requires_contiguous_offsets_after_start() {
+        let handle = make_test_write_handle(true, true, 4096);
+        let result = validate_lite_write_policy(&handle, 2048);
+        assert_eq!(result, Err(SMB2_STATUS_NOT_SUPPORTED));
+    }
+
+    #[test]
+    fn lite_write_policy_accepts_contiguous_replacement_stream() {
+        let handle = make_test_write_handle(true, true, 4096);
+        let result = validate_lite_write_policy(&handle, 4096);
+        assert!(result.is_ok());
     }
 }

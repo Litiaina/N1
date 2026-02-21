@@ -1,18 +1,18 @@
 use crate::middleware::auth_middleware::JWT_KEYS;
 use crate::settings::constants::CONFIG_FILE;
 use crate::structs::auth_structs::Claims;
+use axum::Router;
 use axum::body::Body;
 use axum::http::Request;
-use axum::Router;
 use governor::middleware::NoOpMiddleware;
 use ini::Ini;
-use jsonwebtoken::{decode, Validation};
+use jsonwebtoken::{Validation, decode};
 use std::sync::OnceLock;
+use tower_governor::GovernorLayer;
 use tower_governor::errors::GovernorError;
 use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::key_extractor::KeyExtractor;
 use tower_governor::key_extractor::SmartIpKeyExtractor;
-use tower_governor::GovernorLayer;
 use tracing::error;
 
 #[derive(Clone)]
@@ -82,7 +82,7 @@ fn get_rate_limit_config() -> RateLimitSettings {
         };
 
         let config_result = Ini::load_from_file(CONFIG_FILE);
-        
+
         match config_result {
             Ok(config) => {
                 let section = config.section(Some("rate_limiter_config"));

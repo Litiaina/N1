@@ -39,6 +39,9 @@ async_close_commit=false
 async_close_threshold_bytes=67108864
 auth_domain=N1
 require_signing=true
+query_directory_page_limit=256
+query_directory_max_buffered_entries=512
+query_directory_max_seeded_entries=128
 ```
 
 Config keys:
@@ -53,6 +56,9 @@ Config keys:
 - `auth_password`: optional static SMB password.
 - `auth_domain`: SMB auth domain string (optional).
 - `require_signing`: enforce SMB signing.
+- `query_directory_page_limit`: backend page size used per SMB `QUERY_DIRECTORY` fetch (`16..1000`).
+- `query_directory_max_buffered_entries`: max filtered directory entries buffered per open handle (`32..8192`).
+- `query_directory_max_seeded_entries`: max initial seeded entries (`.`, `..`, pending-commit entries) per scan (`8..2048`, capped by `query_directory_max_buffered_entries`).
 
 Preferred auth mode is fragment-scoped:
 - SMB `username` is fragment identifier (plain fragment name or 64-hex fragment hash).
@@ -83,6 +89,9 @@ Progress API (JWT protected):
 - `N1_SMB_AUTH_PASSWORD`
 - `N1_SMB_AUTH_DOMAIN`
 - `N1_SMB_REQUIRE_SIGNING`
+- `N1_SMB_QUERY_DIRECTORY_PAGE_LIMIT`
+- `N1_SMB_QUERY_DIRECTORY_MAX_BUFFERED_ENTRIES`
+- `N1_SMB_QUERY_DIRECTORY_MAX_SEEDED_ENTRIES`
 
 Template:
 - `deploy/network-drive/env/smb.env.example`

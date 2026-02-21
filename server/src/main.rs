@@ -37,23 +37,23 @@ use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::time::Duration;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 mod enums;
 mod fs;
 mod fuse;
-mod smb;
 mod handlers;
 mod middleware;
 mod object_storage;
 mod routes;
 mod settings;
+mod smb;
 mod statics;
 mod structs;
 mod utils;
@@ -908,7 +908,10 @@ pub async fn run_server() {
                 smb_config.bind_addr = trimmed.to_string();
             }
         }
-        if let Some(v) = smb_section.get("smb_port").and_then(|v| v.parse::<u16>().ok()) {
+        if let Some(v) = smb_section
+            .get("smb_port")
+            .and_then(|v| v.parse::<u16>().ok())
+        {
             smb_config.smb_port = v;
         }
         if let Some(v) = smb_section
@@ -934,32 +937,32 @@ pub async fn run_server() {
             smb_config.async_close_threshold_bytes =
                 v.clamp(1 * 1024 * 1024, 1024 * 1024 * 1024 * 1024);
         }
-        if let Some(v) = smb_section.get("auth_username") {
-            let trimmed = v.trim();
-            smb_config.auth_username = if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            };
-        }
-        if let Some(v) = smb_section.get("auth_password") {
-            let trimmed = v.trim();
-            smb_config.auth_password = if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            };
-        }
-        if let Some(v) = smb_section.get("auth_domain") {
-            let trimmed = v.trim();
-            smb_config.auth_domain = if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            };
-        }
         if let Some(v) = smb_section.get("require_signing") {
             smb_config.require_signing = parse_bool_or_default(Some(v), smb_config.require_signing);
+        }
+        if let Some(v) = smb_section
+            .get("query_directory_page_limit")
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            smb_config.query_directory_page_limit =
+                crate::smb::config::clamp_query_directory_page_limit(v);
+        }
+        if let Some(v) = smb_section
+            .get("query_directory_max_buffered_entries")
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            smb_config.query_directory_max_buffered_entries =
+                crate::smb::config::clamp_query_directory_max_buffered_entries(v);
+        }
+        if let Some(v) = smb_section
+            .get("query_directory_max_seeded_entries")
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            smb_config.query_directory_max_seeded_entries =
+                crate::smb::config::clamp_query_directory_max_seeded_entries(
+                    v,
+                    smb_config.query_directory_max_buffered_entries,
+                );
         }
     }
 
@@ -996,7 +999,7 @@ async fn serve(socket: SocketAddr, app: Router, cert: RustlsConfig) {
 pub async fn shutdown_signal(handle: Arc<axum_server::Handle<SocketAddr>>) {
     #[cfg(unix)]
     let terminator = async {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut terminate =
             signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
         let mut interrupt =

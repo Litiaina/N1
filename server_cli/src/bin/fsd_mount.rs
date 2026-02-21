@@ -14,9 +14,9 @@ mod linux_mount {
         ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
     };
     use libc::{EACCES, EEXIST, EFBIG, EINVAL, EIO, ENOENT, ENOTEMPTY};
-    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
-    use reqwest::blocking::Client;
+    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
     use reqwest::StatusCode;
+    use reqwest::blocking::Client;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
     use std::ffi::OsStr;

@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -21,7 +21,7 @@ use crate::{
             write_fragment_metadata,
         },
         quota_manager::init_quota_file,
-        sync::{ensure_fragment_blob_directories, CreateFragmentRequest, CreateFragmentResponse},
+        sync::{CreateFragmentRequest, CreateFragmentResponse, ensure_fragment_blob_directories},
     },
     routes::storage_routes::AppState,
     structs::auth_structs::Claims,

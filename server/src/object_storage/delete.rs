@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::extract::{Path as AxumPath, State};
 use axum::{http::StatusCode, response::IntoResponse};
 
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use sha2::{Digest, Sha256};
 use tokio::fs;
 use tracing::{error, info, warn};
@@ -16,8 +16,8 @@ use walkdir::WalkDir;
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::{METADATA_EXT, QUOTA_FILE};
 use crate::object_storage::disk_manager::{
-    default_stripe_size, ObjectMetadata, ObjectPathManager, ObjectSummary, PrefixIndexEntry,
-    PrefixIndexSegment,
+    ObjectMetadata, ObjectPathManager, ObjectSummary, PrefixIndexEntry, PrefixIndexSegment,
+    default_stripe_size,
 };
 use crate::object_storage::prefix_compactor::schedule_prefix_compaction;
 use crate::object_storage::quota_manager::update_quota;

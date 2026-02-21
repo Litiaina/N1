@@ -1,3 +1,4 @@
+use crate::enums::app_error_enum::AppError;
 use crate::fs::direct_upload::upload_file;
 use crate::fs::directory_manager::{
     create_directory, delete_directory, delete_file, get_file_metadata, rename_file_query,
@@ -63,14 +64,16 @@ use crate::object_storage::upload::{
 use crate::smb::server::list_transfer_progress_for_fragment;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::handler::{system_broadcast_handler, ws_handler};
-use crate::websocket::manager::{register_global_ws_manager, WsConnectionManager};
+use crate::websocket::manager::{WsConnectionManager, register_global_ws_manager};
 use crate::websocket::ws_structs::SmbTransferProgressPayload;
-use crate::enums::app_error_enum::AppError;
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::http::{HeaderName, Method};
 use axum::middleware::from_fn;
 use axum::routing::{delete, get, patch, post, put};
-use axum::{extract::{DefaultBodyLimit, Path, Query}, Json as AxumJson, Router};
+use axum::{
+    Json as AxumJson, Router,
+    extract::{DefaultBodyLimit, Path, Query},
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -447,7 +450,12 @@ async fn smb_progress(
 
     let include_completed = params
         .get("include_completed")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false);
     let limit = params
         .get("limit")

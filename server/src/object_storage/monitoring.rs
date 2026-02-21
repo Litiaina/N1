@@ -6,14 +6,14 @@ use crate::object_storage::constants::{
 use crate::object_storage::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
 use crate::object_storage::redistribution::get_redist_status;
 use crate::object_storage::repair_manager::get_repair_status;
-use crate::object_storage::system::{get_system_metrics, SystemMetrics};
+use crate::object_storage::system::{SystemMetrics, get_system_metrics};
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::{
+    Json,
     extract::{Query, State},
     response::IntoResponse,
-    Json,
 };
 use futures_util::future::join_all;
 use once_cell::sync::OnceCell;
@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::fs;
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{Semaphore, oneshot};
 use tokio::time::timeout;
 use ulid::Ulid;
 use walkdir::WalkDir;

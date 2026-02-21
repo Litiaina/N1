@@ -16,14 +16,14 @@ use crate::object_storage::upload::{
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::manager::WsConnectionManager;
-use axum::body::{to_bytes, Body};
+use axum::Json as AxumJson;
+use axum::body::{Body, to_bytes};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json as AxumJson;
 use futures_util::future::BoxFuture;
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::mem;
@@ -41,7 +41,19 @@ pub struct DirEntry {
     pub metadata: NodeMetadata,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirListPage {
+    pub entries: Vec<DirEntry>,
+    pub continuation_token: Option<String>,
+}
+
 pub trait FsdBackend: Send + Sync + 'static {
+    fn list_dir_page<'a>(
+        &'a self,
+        path: &'a FsdPath,
+        continuation_token: Option<String>,
+        page_limit: usize,
+    ) -> BoxFuture<'a, Result<DirListPage, AppError>>;
     fn list_dir<'a>(&'a self, path: &'a FsdPath) -> BoxFuture<'a, Result<Vec<DirEntry>, AppError>>;
     fn stat<'a>(&'a self, path: &'a FsdPath) -> BoxFuture<'a, Result<NodeMetadata, AppError>>;
     fn read_range<'a>(
@@ -125,6 +137,8 @@ pub struct InProcessBackend {
 
 const FSD_CONTROL_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const FSD_MAX_READ_BYTES: usize = 1024 * 1024;
+const FSD_LIST_PAGE_LIMIT_DEFAULT: usize = 1000;
+const FSD_LIST_PAGE_LIMIT_MAX: usize = 1000;
 const FSD_DIR_MARKER_NAME: &str = ".n1fsd_dir";
 const FSD_TRASH_DIR_NAME: &str = ".n1-trash";
 
@@ -223,8 +237,25 @@ impl InProcessBackend {
         prefix: &str,
         continuation_token: Option<String>,
     ) -> Result<ListObjectsResponse, AppError> {
+        self.list_page_with_limit(
+            fragment,
+            prefix,
+            continuation_token,
+            FSD_LIST_PAGE_LIMIT_DEFAULT,
+        )
+        .await
+    }
+
+    async fn list_page_with_limit(
+        &self,
+        fragment: &str,
+        prefix: &str,
+        continuation_token: Option<String>,
+        page_limit: usize,
+    ) -> Result<ListObjectsResponse, AppError> {
+        let limit = page_limit.clamp(1, FSD_LIST_PAGE_LIMIT_MAX);
         let mut params = HashMap::new();
-        params.insert("limit".to_string(), "1000".to_string());
+        params.insert("limit".to_string(), limit.to_string());
         params.insert("delimiter".to_string(), "/".to_string());
         params.insert("include_internal".to_string(), "true".to_string());
         if !prefix.is_empty() {
@@ -278,8 +309,25 @@ impl InProcessBackend {
         prefix: &str,
         continuation_token: Option<String>,
     ) -> Result<ListObjectsResponse, AppError> {
+        self.list_trash_page_with_limit(
+            fragment,
+            prefix,
+            continuation_token,
+            FSD_LIST_PAGE_LIMIT_DEFAULT,
+        )
+        .await
+    }
+
+    async fn list_trash_page_with_limit(
+        &self,
+        fragment: &str,
+        prefix: &str,
+        continuation_token: Option<String>,
+        page_limit: usize,
+    ) -> Result<ListObjectsResponse, AppError> {
+        let limit = page_limit.clamp(1, FSD_LIST_PAGE_LIMIT_MAX);
         let mut params = HashMap::new();
-        params.insert("limit".to_string(), "1000".to_string());
+        params.insert("limit".to_string(), limit.to_string());
         params.insert("include_internal".to_string(), "true".to_string());
         if !prefix.is_empty() {
             params.insert("prefix".to_string(), prefix.to_string());
@@ -495,10 +543,7 @@ impl InProcessBackend {
         headers.insert(
             "content-length",
             HeaderValue::from_str(&chunk_len.to_string()).map_err(|e| {
-                AppError::InternalServerError(format!(
-                    "fsd invalid content-length header: {}",
-                    e
-                ))
+                AppError::InternalServerError(format!("fsd invalid content-length header: {}", e))
             })?,
         );
 
@@ -619,9 +664,7 @@ impl InProcessBackend {
         let fragment = pending.path.fragment.clone();
         let object_key = pending.path.object_key.clone();
 
-        let (init_body, _) = self
-            .start_remote_upload(&pending.path, total_size)
-            .await?;
+        let (init_body, _) = self.start_remote_upload(&pending.path, total_size).await?;
 
         let mut sent = 0u64;
         let mut part_index = 0u64;
@@ -796,7 +839,9 @@ impl InProcessBackend {
                     Err(Self::status_to_error(status, &body))
                 }
             }
-            Err(AppError::Conflict(_)) => self.delete_object_permanently(fragment, object_key).await,
+            Err(AppError::Conflict(_)) => {
+                self.delete_object_permanently(fragment, object_key).await
+            }
             Err(e) => Err(e),
         }
     }
@@ -846,9 +891,7 @@ impl InProcessBackend {
         }
 
         if self.fetch_object_metadata(fragment, &to_dir).await.is_ok() {
-            return Err(AppError::Conflict(
-                "destination already exists".to_string(),
-            ));
+            return Err(AppError::Conflict("destination already exists".to_string()));
         }
         if self
             .directory_exists(&FsdPath {
@@ -857,14 +900,16 @@ impl InProcessBackend {
             })
             .await?
         {
-            return Err(AppError::Conflict(
-                "destination already exists".to_string(),
-            ));
+            return Err(AppError::Conflict("destination already exists".to_string()));
         }
 
         if let Some((parent_key, _)) = to_dir.rsplit_once('/') {
             if !parent_key.is_empty() {
-                if self.fetch_object_metadata(fragment, parent_key).await.is_ok() {
+                if self
+                    .fetch_object_metadata(fragment, parent_key)
+                    .await
+                    .is_ok()
+                {
                     return Err(AppError::BadRequest(
                         "destination parent is not a directory".to_string(),
                     ));
@@ -935,10 +980,14 @@ impl InProcessBackend {
 }
 
 impl FsdBackend for InProcessBackend {
-    fn list_dir<'a>(&'a self, path: &'a FsdPath) -> BoxFuture<'a, Result<Vec<DirEntry>, AppError>> {
+    fn list_dir_page<'a>(
+        &'a self,
+        path: &'a FsdPath,
+        continuation_token: Option<String>,
+        page_limit: usize,
+    ) -> BoxFuture<'a, Result<DirListPage, AppError>> {
         Box::pin(async move {
             if let Some(trash_sub_key) = Self::split_trash_virtual_key(path.object_key.as_str()) {
-                let mut continuation_token: Option<String> = None;
                 let mut entries = Vec::new();
                 let mut seen = HashSet::new();
                 let trash_prefix = trash_sub_key.trim_matches('/').to_string();
@@ -947,78 +996,86 @@ impl FsdBackend for InProcessBackend {
                 } else {
                     format!("{}/", trash_prefix)
                 };
+                let page = self
+                    .list_trash_page_with_limit(
+                        &path.fragment,
+                        &scan_prefix,
+                        continuation_token.clone(),
+                        page_limit,
+                    )
+                    .await?;
+                let ListObjectsResponse {
+                    objects,
+                    continuation_token: next_continuation_token,
+                    ..
+                } = page;
 
-                loop {
-                    let page = self
-                        .list_trash_page(&path.fragment, &scan_prefix, continuation_token.clone())
-                        .await?;
+                for object in objects {
+                    let rel = if scan_prefix.is_empty() {
+                        object.object_key.as_str()
+                    } else {
+                        object
+                            .object_key
+                            .strip_prefix(&scan_prefix)
+                            .unwrap_or(&object.object_key)
+                    };
 
-                    for object in page.objects {
-                        let rel = if scan_prefix.is_empty() {
-                            object.object_key.as_str()
+                    let rel = rel.trim_matches('/');
+                    if rel.is_empty() {
+                        continue;
+                    }
+
+                    if let Some((first, _)) = rel.split_once('/') {
+                        let first = first.trim_matches('/');
+                        if first.is_empty() {
+                            continue;
+                        }
+                        let child_key = if trash_prefix.is_empty() {
+                            first.to_string()
                         } else {
-                            object
-                                .object_key
-                                .strip_prefix(&scan_prefix)
-                                .unwrap_or(&object.object_key)
+                            format!("{}/{}", trash_prefix, first)
                         };
-
-                        let rel = rel.trim_matches('/');
-                        if rel.is_empty() {
+                        if !seen.insert(format!("d:{}", child_key)) {
                             continue;
                         }
-
-                        if let Some((first, _)) = rel.split_once('/') {
-                            let first = first.trim_matches('/');
-                            if first.is_empty() {
-                                continue;
-                            }
-                            let child_key = if trash_prefix.is_empty() {
-                                first.to_string()
-                            } else {
-                                format!("{}/{}", trash_prefix, first)
-                            };
-                            if !seen.insert(format!("d:{}", child_key)) {
-                                continue;
-                            }
-                            entries.push(DirEntry {
-                                name: first.to_string(),
-                                path: Self::to_trash_virtual_path(path, &child_key),
-                                metadata: NodeMetadata {
-                                    kind: NodeKind::Directory,
-                                    size_bytes: 0,
-                                    modified_at_unix: 0,
-                                },
-                            });
-                            continue;
-                        }
-
-                        if !seen.insert(format!("f:{}", object.object_key)) {
-                            continue;
-                        }
-
                         entries.push(DirEntry {
-                            name: rel.to_string(),
-                            path: Self::to_trash_virtual_path(path, &object.object_key),
+                            name: first.to_string(),
+                            path: Self::to_trash_virtual_path(path, &child_key),
                             metadata: NodeMetadata {
-                                kind: NodeKind::File,
-                                size_bytes: object.total_size_bytes,
-                                modified_at_unix: object.created_at,
+                                kind: NodeKind::Directory,
+                                size_bytes: 0,
+                                modified_at_unix: 0,
                             },
                         });
+                        continue;
                     }
 
-                    continuation_token = page.continuation_token;
-                    if continuation_token.is_none() {
-                        break;
+                    if !seen.insert(format!("f:{}", object.object_key)) {
+                        continue;
                     }
+
+                    entries.push(DirEntry {
+                        name: rel.to_string(),
+                        path: Self::to_trash_virtual_path(path, &object.object_key),
+                        metadata: NodeMetadata {
+                            kind: NodeKind::File,
+                            size_bytes: object.total_size_bytes,
+                            modified_at_unix: object.created_at,
+                        },
+                    });
                 }
 
                 if Self::is_trash_root_name(path.object_key.as_str()) {
-                    return Ok(entries);
+                    return Ok(DirListPage {
+                        entries,
+                        continuation_token: next_continuation_token,
+                    });
                 }
 
-                if entries.is_empty() {
+                if continuation_token.is_none()
+                    && next_continuation_token.is_none()
+                    && entries.is_empty()
+                {
                     if self
                         .trash_exact_object_metadata(&path.fragment, &trash_prefix)
                         .await?
@@ -1031,7 +1088,10 @@ impl FsdBackend for InProcessBackend {
                     return Err(AppError::NotFound);
                 }
 
-                return Ok(entries);
+                return Ok(DirListPage {
+                    entries,
+                    continuation_token: next_continuation_token,
+                });
             }
 
             let prefix = if path.object_key.is_empty() {
@@ -1040,92 +1100,91 @@ impl FsdBackend for InProcessBackend {
                 format!("{}/", path.object_key.trim_matches('/'))
             };
 
-            let mut continuation_token: Option<String> = None;
             let mut entries = Vec::new();
             let mut seen = HashSet::new();
+            let page = self
+                .list_page_with_limit(
+                    &path.fragment,
+                    &prefix,
+                    continuation_token.clone(),
+                    page_limit,
+                )
+                .await?;
+            let ListObjectsResponse {
+                objects,
+                common_prefixes,
+                continuation_token: next_continuation_token,
+            } = page;
 
-            loop {
-                let page = self
-                    .list_page(&path.fragment, &prefix, continuation_token.clone())
-                    .await?;
-
-                for common_prefix in page.common_prefixes {
-                    let object_key = common_prefix.trim_end_matches('/').to_string();
-                    if object_key.is_empty() {
-                        continue;
-                    }
-                    if !seen.insert(format!("d:{}", object_key)) {
-                        continue;
-                    }
-
-                    let rel = if prefix.is_empty() {
-                        object_key.as_str()
-                    } else {
-                        object_key.strip_prefix(&prefix).unwrap_or(&object_key)
-                    };
-
-                    let name = rel.trim_matches('/').to_string();
-                    if name.is_empty() {
-                        continue;
-                    }
-
-                    entries.push(DirEntry {
-                        name,
-                        path: FsdPath {
-                            fragment: path.fragment.clone(),
-                            object_key,
-                        },
-                        metadata: NodeMetadata {
-                            kind: NodeKind::Directory,
-                            size_bytes: 0,
-                            modified_at_unix: 0,
-                        },
-                    });
+            for common_prefix in common_prefixes {
+                let object_key = common_prefix.trim_end_matches('/').to_string();
+                if object_key.is_empty() {
+                    continue;
+                }
+                if !seen.insert(format!("d:{}", object_key)) {
+                    continue;
                 }
 
-                for object in page.objects {
-                    if !seen.insert(format!("f:{}", object.object_key)) {
-                        continue;
-                    }
+                let rel = if prefix.is_empty() {
+                    object_key.as_str()
+                } else {
+                    object_key.strip_prefix(&prefix).unwrap_or(&object_key)
+                };
 
-                    let rel = if prefix.is_empty() {
-                        object.object_key.as_str()
-                    } else {
-                        object
-                            .object_key
-                            .strip_prefix(&prefix)
-                            .unwrap_or(&object.object_key)
-                    };
-
-                    let name = rel.trim_matches('/').to_string();
-                    if name.is_empty()
-                        || name.contains('/')
-                        || Self::is_dir_marker_name(name.as_str())
-                    {
-                        continue;
-                    }
-
-                    entries.push(DirEntry {
-                        name,
-                        path: FsdPath {
-                            fragment: path.fragment.clone(),
-                            object_key: object.object_key.clone(),
-                        },
-                        metadata: NodeMetadata {
-                            kind: NodeKind::File,
-                            size_bytes: object.total_size_bytes,
-                            modified_at_unix: object.created_at,
-                        },
-                    });
+                let name = rel.trim_matches('/').to_string();
+                if name.is_empty() {
+                    continue;
                 }
 
-                continuation_token = page.continuation_token;
-                if continuation_token.is_none() {
-                    break;
-                }
+                entries.push(DirEntry {
+                    name,
+                    path: FsdPath {
+                        fragment: path.fragment.clone(),
+                        object_key,
+                    },
+                    metadata: NodeMetadata {
+                        kind: NodeKind::Directory,
+                        size_bytes: 0,
+                        modified_at_unix: 0,
+                    },
+                });
             }
 
-            if path.is_fragment_root() {
+            for object in objects {
+                if !seen.insert(format!("f:{}", object.object_key)) {
+                    continue;
+                }
+
+                let rel = if prefix.is_empty() {
+                    object.object_key.as_str()
+                } else {
+                    object
+                        .object_key
+                        .strip_prefix(&prefix)
+                        .unwrap_or(&object.object_key)
+                };
+
+                let name = rel.trim_matches('/').to_string();
+                if name.is_empty() || name.contains('/') || Self::is_dir_marker_name(name.as_str())
+                {
+                    continue;
+                }
+
+                entries.push(DirEntry {
+                    name,
+                    path: FsdPath {
+                        fragment: path.fragment.clone(),
+                        object_key: object.object_key.clone(),
+                    },
+                    metadata: NodeMetadata {
+                        kind: NodeKind::File,
+                        size_bytes: object.total_size_bytes,
+                        modified_at_unix: object.created_at,
+                    },
+                });
+            }
+
+            if continuation_token.is_none() && path.is_fragment_root() {
                 entries.push(DirEntry {
                     name: FSD_TRASH_DIR_NAME.to_string(),
                     path: FsdPath {
@@ -1143,7 +1202,7 @@ impl FsdBackend for InProcessBackend {
                 }
             }
 
-            if !path.is_fragment_root() && entries.is_empty() {
+            if continuation_token.is_none() && !path.is_fragment_root() && entries.is_empty() {
                 if self
                     .fetch_object_metadata(&path.fragment, &path.object_key)
                     .await
@@ -1155,7 +1214,32 @@ impl FsdBackend for InProcessBackend {
                 }
             }
 
-            Ok(entries)
+            Ok(DirListPage {
+                entries,
+                continuation_token: next_continuation_token,
+            })
+        })
+    }
+
+    fn list_dir<'a>(&'a self, path: &'a FsdPath) -> BoxFuture<'a, Result<Vec<DirEntry>, AppError>> {
+        Box::pin(async move {
+            let mut all_entries = Vec::new();
+            let mut continuation_token: Option<String> = None;
+            loop {
+                let page = self
+                    .list_dir_page(
+                        path,
+                        continuation_token.clone(),
+                        FSD_LIST_PAGE_LIMIT_DEFAULT,
+                    )
+                    .await?;
+                all_entries.extend(page.entries);
+                continuation_token = page.continuation_token;
+                if continuation_token.is_none() {
+                    break;
+                }
+            }
+            Ok(all_entries)
         })
     }
 

@@ -4,16 +4,16 @@ use std::time::{Duration, Instant};
 use axum::Json;
 use axum::{
     extract::{
-        ws::{Message, WebSocket},
         Query, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
     },
     http::StatusCode,
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
-use jsonwebtoken::{decode, Validation};
+use jsonwebtoken::{Validation, decode};
 use tokio::sync::mpsc;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{MissedTickBehavior, interval};
 use tracing::{info, warn};
 use uuid::Uuid;
 

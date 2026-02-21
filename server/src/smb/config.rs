@@ -1,5 +1,38 @@
 use std::env;
 
+const SMB_QUERY_DIRECTORY_PAGE_LIMIT_MIN: usize = 16;
+const SMB_QUERY_DIRECTORY_PAGE_LIMIT_MAX: usize = 1000;
+const SMB_QUERY_DIRECTORY_MAX_BUFFERED_ENTRIES_MIN: usize = 32;
+const SMB_QUERY_DIRECTORY_MAX_BUFFERED_ENTRIES_MAX: usize = 8192;
+const SMB_QUERY_DIRECTORY_MAX_SEEDED_ENTRIES_MIN: usize = 8;
+const SMB_QUERY_DIRECTORY_MAX_SEEDED_ENTRIES_MAX: usize = 2048;
+
+pub fn clamp_query_directory_page_limit(value: usize) -> usize {
+    value.clamp(
+        SMB_QUERY_DIRECTORY_PAGE_LIMIT_MIN,
+        SMB_QUERY_DIRECTORY_PAGE_LIMIT_MAX,
+    )
+}
+
+pub fn clamp_query_directory_max_buffered_entries(value: usize) -> usize {
+    value.clamp(
+        SMB_QUERY_DIRECTORY_MAX_BUFFERED_ENTRIES_MIN,
+        SMB_QUERY_DIRECTORY_MAX_BUFFERED_ENTRIES_MAX,
+    )
+}
+
+pub fn clamp_query_directory_max_seeded_entries(
+    value: usize,
+    max_buffered_entries: usize,
+) -> usize {
+    value
+        .clamp(
+            SMB_QUERY_DIRECTORY_MAX_SEEDED_ENTRIES_MIN,
+            SMB_QUERY_DIRECTORY_MAX_SEEDED_ENTRIES_MAX,
+        )
+        .min(max_buffered_entries)
+}
+
 #[derive(Clone, Debug)]
 pub struct SmbConfig {
     pub enabled: bool,
@@ -9,10 +42,10 @@ pub struct SmbConfig {
     pub max_frame_bytes: usize,
     pub async_close_commit: bool,
     pub async_close_threshold_bytes: u64,
-    pub auth_username: Option<String>,
-    pub auth_password: Option<String>,
-    pub auth_domain: Option<String>,
     pub require_signing: bool,
+    pub query_directory_page_limit: usize,
+    pub query_directory_max_buffered_entries: usize,
+    pub query_directory_max_seeded_entries: usize,
 }
 
 impl Default for SmbConfig {
@@ -52,22 +85,35 @@ impl Default for SmbConfig {
             .unwrap_or(64 * 1024 * 1024)
             .clamp(1 * 1024 * 1024, 1024 * 1024 * 1024 * 1024);
 
-        let auth_username = env::var("N1_SMB_AUTH_USERNAME")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-        let auth_password = env::var("N1_SMB_AUTH_PASSWORD")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-        let auth_domain = env::var("N1_SMB_AUTH_DOMAIN")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
         let require_signing = env::var("N1_SMB_REQUIRE_SIGNING")
             .ok()
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
             .unwrap_or(false);
+
+        let query_directory_page_limit = env::var("N1_SMB_QUERY_DIRECTORY_PAGE_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(clamp_query_directory_page_limit)
+            .unwrap_or(256);
+
+        let query_directory_max_buffered_entries =
+            env::var("N1_SMB_QUERY_DIRECTORY_MAX_BUFFERED_ENTRIES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(clamp_query_directory_max_buffered_entries)
+                .unwrap_or(512);
+
+        let query_directory_max_seeded_entries =
+            env::var("N1_SMB_QUERY_DIRECTORY_MAX_SEEDED_ENTRIES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|v| {
+                    clamp_query_directory_max_seeded_entries(
+                        v,
+                        query_directory_max_buffered_entries,
+                    )
+                })
+                .unwrap_or(128);
 
         Self {
             enabled,
@@ -77,10 +123,10 @@ impl Default for SmbConfig {
             max_frame_bytes,
             async_close_commit,
             async_close_threshold_bytes,
-            auth_username,
-            auth_password,
-            auth_domain,
             require_signing,
+            query_directory_page_limit,
+            query_directory_max_buffered_entries,
+            query_directory_max_seeded_entries,
         }
     }
 }
@@ -88,5 +134,32 @@ impl Default for SmbConfig {
 impl SmbConfig {
     pub fn socket_addr(&self) -> Result<std::net::SocketAddr, std::net::AddrParseError> {
         format!("{}:{}", self.bind_addr, self.smb_port).parse()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_directory_page_limit_is_clamped() {
+        assert_eq!(clamp_query_directory_page_limit(1), 16);
+        assert_eq!(clamp_query_directory_page_limit(256), 256);
+        assert_eq!(clamp_query_directory_page_limit(10_000), 1000);
+    }
+
+    #[test]
+    fn query_directory_max_buffered_entries_is_clamped() {
+        assert_eq!(clamp_query_directory_max_buffered_entries(1), 32);
+        assert_eq!(clamp_query_directory_max_buffered_entries(512), 512);
+        assert_eq!(clamp_query_directory_max_buffered_entries(99_999), 8192);
+    }
+
+    #[test]
+    fn query_directory_max_seeded_entries_is_clamped_and_bounded_by_buffered() {
+        assert_eq!(clamp_query_directory_max_seeded_entries(1, 512), 8);
+        assert_eq!(clamp_query_directory_max_seeded_entries(128, 512), 128);
+        assert_eq!(clamp_query_directory_max_seeded_entries(4000, 512), 512);
+        assert_eq!(clamp_query_directory_max_seeded_entries(200, 64), 64);
     }
 }

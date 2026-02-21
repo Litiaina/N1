@@ -2,7 +2,7 @@ use crate::enums::app_error_enum::AppError;
 use crc32fast::Hasher;
 use once_cell::sync::Lazy;
 use reed_solomon_simd::ReedSolomonEncoder;
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{Layout, alloc, dealloc};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};

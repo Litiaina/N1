@@ -3,8 +3,8 @@ use axum::http::Method;
 use axum::http::Request;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 static READ_ONLY_FAST_MODE_REFCOUNT: LazyLock<AtomicUsize> = LazyLock::new(|| AtomicUsize::new(0));
 
@@ -56,11 +56,11 @@ mod tests {
         acquire_read_only_fast_mode, enforce_read_only_fast_mode_on_mutations,
         is_read_only_fast_mode_active,
     };
+    use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use axum::middleware::from_fn;
     use axum::routing::{get, post};
-    use axum::Router;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tower::ServiceExt;
 

@@ -463,7 +463,9 @@ fn fmt_unix_ts(ts: i64) -> String {
 fn print_gc_status_pretty(st: &GcJobStatus) {
     let elapsed = st.duration_seconds;
     let progress = fmt_pct(st.total_fragments_scanned, st.total_fragments);
-    let remaining = st.total_fragments.saturating_sub(st.total_fragments_scanned);
+    let remaining = st
+        .total_fragments
+        .saturating_sub(st.total_fragments_scanned);
     let frag_rate = if elapsed > 0 {
         st.total_fragments_scanned as f64 / elapsed as f64
     } else {
@@ -479,7 +481,11 @@ fn print_gc_status_pretty(st: &GcJobStatus) {
     draw_row("Phase", &st.phase);
     draw_row(
         "Mode",
-        if st.is_manual_run { "MANUAL" } else { "SCHEDULED" },
+        if st.is_manual_run {
+            "MANUAL"
+        } else {
+            "SCHEDULED"
+        },
     );
     draw_row("Fragment", &st.current_fragment);
     draw_row("Started At", &fmt_unix_ts(st.start_timestamp));
@@ -499,7 +505,10 @@ fn print_gc_status_pretty(st: &GcJobStatus) {
     draw_row("Live Versions", &fmt_num(st.total_live_versions_seen));
     draw_row("Trash Expired", &fmt_num(st.total_trash_versions_expired));
     draw_row("Sessions Deleted", &fmt_num(st.total_sessions_deleted));
-    draw_row("Orphan Blob Dirs", &fmt_num(st.total_orphan_blob_dirs_deleted));
+    draw_row(
+        "Orphan Blob Dirs",
+        &fmt_num(st.total_orphan_blob_dirs_deleted),
+    );
     draw_row_colored("Refunded Bytes", &fmt_num(st.total_refund_bytes), cyan);
     draw_row_colored(
         "Errors",
@@ -553,7 +562,10 @@ fn print_repair_status_pretty(st: &RepairJobStatus) {
 }
 
 fn print_redistribution_status_pretty(st: &RedistributionJobStatus) {
-    let progress = fmt_pct(st.total_objects_migrated, st.total_objects_need_redistribution);
+    let progress = fmt_pct(
+        st.total_objects_migrated,
+        st.total_objects_need_redistribution,
+    );
     let migrate_rate = if st.duration_seconds > 0 {
         st.total_objects_migrated as f64 / st.duration_seconds as f64
     } else {
@@ -643,7 +655,9 @@ fn print_prefix_rebuild_status_pretty(st: &PrefixRebuildJobStatus) {
 fn render_gc_monitor(st: &GcJobStatus, elapsed: Duration) {
     let status_color = if st.is_running { green } else { yellow };
     let progress = fmt_pct(st.total_fragments_scanned, st.total_fragments);
-    let remaining = st.total_fragments.saturating_sub(st.total_fragments_scanned);
+    let remaining = st
+        .total_fragments
+        .saturating_sub(st.total_fragments_scanned);
     let elapsed_secs = elapsed.as_secs().max(st.duration_seconds);
     let frag_rate = if elapsed_secs > 0 {
         st.total_fragments_scanned as f64 / elapsed_secs as f64
@@ -659,7 +673,11 @@ fn render_gc_monitor(st: &GcJobStatus, elapsed: Duration) {
     draw_row("Phase", &st.phase);
     draw_row(
         "Mode",
-        if st.is_manual_run { "MANUAL" } else { "SCHEDULED" },
+        if st.is_manual_run {
+            "MANUAL"
+        } else {
+            "SCHEDULED"
+        },
     );
     draw_row("Fragment", &st.current_fragment);
     draw_row("Started At", &fmt_unix_ts(st.start_timestamp));
@@ -681,7 +699,10 @@ fn render_gc_monitor(st: &GcJobStatus, elapsed: Duration) {
     draw_row("Live Versions", &fmt_num(st.total_live_versions_seen));
     draw_row("Trash Expired", &fmt_num(st.total_trash_versions_expired));
     draw_row("Sessions Deleted", &fmt_num(st.total_sessions_deleted));
-    draw_row("Orphan Blob Dirs", &fmt_num(st.total_orphan_blob_dirs_deleted));
+    draw_row(
+        "Orphan Blob Dirs",
+        &fmt_num(st.total_orphan_blob_dirs_deleted),
+    );
     draw_row_colored("Refunded Bytes", &fmt_num(st.total_refund_bytes), cyan);
     draw_row_colored(
         "Errors",
@@ -742,7 +763,10 @@ fn render_repair_monitor(st: &RepairJobStatus, elapsed: Duration) {
 fn render_redist_monitor(st: &RedistributionJobStatus, elapsed: Duration) {
     let status_color = if st.is_running { green } else { yellow };
     let elapsed_secs = elapsed.as_secs().max(st.duration_seconds);
-    let progress = fmt_pct(st.total_objects_migrated, st.total_objects_need_redistribution);
+    let progress = fmt_pct(
+        st.total_objects_migrated,
+        st.total_objects_need_redistribution,
+    );
     let migrate_rate = if elapsed_secs > 0 {
         st.total_objects_migrated as f64 / elapsed_secs as f64
     } else {
@@ -857,7 +881,14 @@ fn render_health_monitor(st: &HealthResponse, elapsed: Duration, deep_scan: bool
 
     draw_row_colored("Status", &st.status.to_uppercase(), status_color);
     draw_row("Summary", &st.summary);
-    draw_row("Mode", if deep_scan { "DEEP_SCAN" } else { "FAST/CACHED" });
+    draw_row(
+        "Mode",
+        if deep_scan {
+            "DEEP_SCAN"
+        } else {
+            "FAST/CACHED"
+        },
+    );
     draw_divider(Some("SYSTEM"));
     draw_row("CPU", &format!("{:.2}%", st.system.cpu_usage_percent));
     draw_row("RAM", &format!("{:.2}%", st.system.ram_usage_percent));
@@ -879,7 +910,10 @@ fn render_health_monitor(st: &HealthResponse, elapsed: Duration, deep_scan: bool
         "Index Health",
         &st.consistency.index_mirror_health.to_uppercase(),
     );
-    draw_row("Scanned Objects", &fmt_num(st.consistency.total_objects_scanned));
+    draw_row(
+        "Scanned Objects",
+        &fmt_num(st.consistency.total_objects_scanned),
+    );
 
     let mut shown = 0usize;
     for d in st
@@ -1027,8 +1061,12 @@ where
 
             // Keep poll cadence responsive, but allow slow status handlers enough time
             // under heavy maintenance I/O (GC/repair/redistribution).
-            let request_timeout = Duration::from_millis((poll_ms.max(1000) * 6).clamp(10_000, 60_000));
-            let request = client_clone.get(&url_clone).bearer_auth(&token_clone).send();
+            let request_timeout =
+                Duration::from_millis((poll_ms.max(1000) * 6).clamp(10_000, 60_000));
+            let request = client_clone
+                .get(&url_clone)
+                .bearer_auth(&token_clone)
+                .send();
 
             match tokio::time::timeout(request_timeout, request).await {
                 Ok(Ok(resp)) => {
@@ -1073,8 +1111,10 @@ where
                 Err(_) => {
                     let mut lock = state_clone.lock().unwrap();
                     lock.error_count += 1;
-                    lock.last_error =
-                        Some(format!("status request timed out after {:?}", request_timeout));
+                    lock.last_error = Some(format!(
+                        "status request timed out after {:?}",
+                        request_timeout
+                    ));
                 }
             }
             tokio::time::sleep(Duration::from_millis(poll_ms.max(100))).await;
@@ -1285,7 +1325,9 @@ pub async fn execute_command(
                                 token,
                                 "REPAIR JOB MONITOR",
                                 poll_ms,
-                                |st: &RepairJobStatus, _, elapsed| render_repair_monitor(st, elapsed),
+                                |st: &RepairJobStatus, _, elapsed| {
+                                    render_repair_monitor(st, elapsed)
+                                },
                             )
                             .await?;
                         }
@@ -1472,7 +1514,9 @@ pub async fn execute_command(
                         token,
                         "REDISTRIBUTION MONITOR",
                         poll_ms,
-                        |st: &RedistributionJobStatus, _, elapsed| render_redist_monitor(st, elapsed),
+                        |st: &RedistributionJobStatus, _, elapsed| {
+                            render_redist_monitor(st, elapsed)
+                        },
                     )
                     .await?;
                 }
@@ -1497,7 +1541,9 @@ pub async fn execute_command(
                         token,
                         "PREFIX REBUILD MONITOR",
                         poll_ms,
-                        |st: &PrefixRebuildJobStatus, _, elapsed| render_prefix_monitor(st, elapsed),
+                        |st: &PrefixRebuildJobStatus, _, elapsed| {
+                            render_prefix_monitor(st, elapsed)
+                        },
                     )
                     .await?;
                 }

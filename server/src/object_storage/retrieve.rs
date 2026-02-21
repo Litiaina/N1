@@ -28,14 +28,23 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
-    time::{Duration, Instant},
 };
 use tokio::fs;
 use tracing::{debug, warn};
 use walkdir::WalkDir;
 
 pub static PREFIX_MAX_DELTA_SEGMENTS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
-static INDEX_ROOT_CACHE: OnceCell<DashMap<String, (PathBuf, Instant)>> = OnceCell::new();
+static INDEX_ROOT_CURSOR: OnceCell<DashMap<String, AtomicUsize>> = OnceCell::new();
+
+#[derive(Default)]
+struct ContinuationCursor {
+    root_hint: Option<usize>,
+    shard1: String,
+    shard2: String,
+    shard3: String,
+    shard4: String,
+    file: String,
+}
 
 fn prefix_max_delta_segments() -> usize {
     PREFIX_MAX_DELTA_SEGMENTS_ATOMIC
@@ -45,18 +54,32 @@ fn prefix_max_delta_segments() -> usize {
         .clamp(32, 65_536)
 }
 
-fn parse_continuation_token(token: &str) -> Option<(String, String, String, String, String)> {
+fn parse_continuation_token(token: &str) -> Option<ContinuationCursor> {
     let bytes = general_purpose::STANDARD.decode(token).ok()?;
     let s = String::from_utf8(bytes).ok()?;
+
+    let parts_v2: Vec<&str> = s.split('|').collect();
+    if parts_v2.len() == 7 && parts_v2[0] == "v2" {
+        return Some(ContinuationCursor {
+            root_hint: parts_v2[1].parse::<usize>().ok(),
+            shard1: parts_v2[2].to_string(),
+            shard2: parts_v2[3].to_string(),
+            shard3: parts_v2[4].to_string(),
+            shard4: parts_v2[5].to_string(),
+            file: parts_v2[6].to_string(),
+        });
+    }
+
     let parts: Vec<&str> = s.split('/').collect();
     if parts.len() == 5 {
-        Some((
-            parts[0].to_string(),
-            parts[1].to_string(),
-            parts[2].to_string(),
-            parts[3].to_string(),
-            parts[4].to_string(),
-        ))
+        Some(ContinuationCursor {
+            root_hint: None,
+            shard1: parts[0].to_string(),
+            shard2: parts[1].to_string(),
+            shard3: parts[2].to_string(),
+            shard4: parts[3].to_string(),
+            file: parts[4].to_string(),
+        })
     } else {
         None
     }
@@ -68,7 +91,14 @@ fn create_continuation_token(
     shard3: &str,
     shard4: &str,
     filename: &str,
+    root_hint: Option<usize>,
 ) -> String {
+    if let Some(root_hint) = root_hint {
+        return general_purpose::STANDARD.encode(format!(
+            "v2|{}|{}|{}|{}|{}|{}",
+            root_hint, shard1, shard2, shard3, shard4, filename
+        ));
+    }
     general_purpose::STANDARD.encode(format!(
         "{}/{}/{}/{}/{}",
         shard1, shard2, shard3, shard4, filename
@@ -110,8 +140,16 @@ fn canonical_key(key: &str) -> String {
     key.trim_start_matches('/').to_string()
 }
 
-fn index_root_cache() -> &'static DashMap<String, (PathBuf, Instant)> {
-    INDEX_ROOT_CACHE.get_or_init(DashMap::new)
+fn index_root_cursor() -> &'static DashMap<String, AtomicUsize> {
+    INDEX_ROOT_CURSOR.get_or_init(DashMap::new)
+}
+
+fn next_index_root_cursor(key: &str) -> usize {
+    if let Some(entry) = index_root_cursor().get(key) {
+        return entry.value().fetch_add(1, Ordering::Relaxed);
+    }
+    index_root_cursor().insert(key.to_string(), AtomicUsize::new(1));
+    0
 }
 
 async fn read_metadata_best(
@@ -419,25 +457,17 @@ async fn try_list_by_prefix_index(
     }))
 }
 
-async fn choose_best_index_root(fragment: &str, scan_trash: bool) -> Option<PathBuf> {
-    let key = format!("{}:{}", if scan_trash { "trash" } else { "live" }, fragment);
-    if let Some(hit) = index_root_cache().get(&key) {
-        let (cached_path, cached_at) = hit.value();
-        let path = cached_path.clone();
-        let fresh = cached_at.elapsed() <= Duration::from_secs(2);
-        drop(hit);
-        if fresh && fs::try_exists(&path).await.unwrap_or(false) {
-            return Some(path);
-        }
-        let _ = index_root_cache().remove(&key);
-    }
-
+async fn choose_index_root(
+    fragment: &str,
+    scan_trash: bool,
+    preferred_root_hint: Option<usize>,
+) -> Option<(usize, PathBuf)> {
     let path_manager = ObjectPathManager::new();
     let index_roots = path_manager.get_all_index_roots();
 
-    let mut best: Option<(PathBuf, u64, i64)> = None;
+    let mut candidates: Vec<(usize, PathBuf, u64)> = Vec::new();
 
-    for root in index_roots {
+    for (root_idx, root) in index_roots.into_iter().enumerate() {
         let candidate = if scan_trash {
             root.join(fragment).join(".trash").join("index")
         } else {
@@ -465,33 +495,10 @@ async fn choose_best_index_root(fragment: &str, scan_trash: bool) -> Option<Path
             continue;
         }
 
-        let mut ts = 0i64;
-        if let Ok(meta) = fs::metadata(&candidate).await {
-            if let Ok(m) = meta.modified() {
-                ts = m
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-            }
-        }
-
-        match &best {
-            None => best = Some((candidate, count, ts)),
-            Some((_p, best_count, best_ts)) => {
-                if count > *best_count || (count == *best_count && ts > *best_ts) {
-                    best = Some((candidate, count, ts));
-                }
-            }
-        }
+        candidates.push((root_idx, candidate, count));
     }
 
-    if let Some((p, count, _)) = &best {
-        debug!(
-            "Chose best index root: {:?} (shard_count={}) for fragment {}",
-            p, count, fragment
-        );
-        index_root_cache().insert(key, (p.clone(), Instant::now()));
-    } else {
+    if candidates.is_empty() {
         if scan_trash {
             debug!(
                 "No readable trash index root found for fragment {}",
@@ -500,9 +507,33 @@ async fn choose_best_index_root(fragment: &str, scan_trash: bool) -> Option<Path
         } else {
             warn!("No readable index root found for fragment {}", fragment);
         }
+        return None;
     }
 
-    best.map(|(p, _, _)| p)
+    if let Some(preferred) = preferred_root_hint {
+        if let Some((idx, path, count)) = candidates
+            .iter()
+            .find(|(idx, _, _)| *idx == preferred)
+            .cloned()
+        {
+            debug!(
+                "Selected continuation index root: {:?} (root_id={}, shard_count={}) for fragment {}",
+                path, idx, count, fragment
+            );
+            return Some((idx, path));
+        }
+    }
+
+    candidates.sort_by_key(|(idx, _, _)| *idx);
+    let rr_key = format!("{}:{}", if scan_trash { "trash" } else { "live" }, fragment);
+    let pick = next_index_root_cursor(&rr_key) % candidates.len();
+    let (idx, path, count) = candidates[pick].clone();
+
+    debug!(
+        "Selected balanced index root: {:?} (root_id={}, shard_count={}) for fragment {}",
+        path, idx, count, fragment
+    );
+    Some((idx, path))
 }
 
 pub async fn list_objects(
@@ -552,7 +583,12 @@ async fn list_objects_internal(
     let prefix = params.get("prefix").cloned().unwrap_or_default();
     let include_internal = params
         .get("include_internal")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false);
     let delimiter = params
         .get("delimiter")
@@ -582,28 +618,23 @@ async fn list_objects_internal(
         }));
     }
 
-    let (start_s1, start_s2, start_s3, start_s4, start_file) = match continuation_token.as_deref() {
-        Some(token) => parse_continuation_token(token).unwrap_or_default(),
-        None => (
-            "".to_string(),
-            "".to_string(),
-            "".to_string(),
-            "".to_string(),
-            "".to_string(),
-        ),
-    };
+    let continuation_cursor = continuation_token
+        .as_deref()
+        .and_then(parse_continuation_token)
+        .unwrap_or_default();
 
-    let index_root = match choose_best_index_root(&fragment, scan_trash).await {
-        Some(root) => root,
-        None => {
-            debug!("No active index root found for fragment {}", fragment);
-            return Ok(AxumJson(ListObjectsResult {
-                objects: Vec::new(),
-                common_prefixes: Vec::new(),
-                continuation_token: None,
-            }));
-        }
-    };
+    let (selected_root_id, index_root) =
+        match choose_index_root(&fragment, scan_trash, continuation_cursor.root_hint).await {
+            Some(root) => root,
+            None => {
+                debug!("No active index root found for fragment {}", fragment);
+                return Ok(AxumJson(ListObjectsResult {
+                    objects: Vec::new(),
+                    common_prefixes: Vec::new(),
+                    continuation_token: None,
+                }));
+            }
+        };
 
     let pfx = canonical_prefix(&prefix);
     let pfx_with_slash = if pfx.is_empty() {
@@ -621,8 +652,10 @@ async fn list_objects_internal(
     let mut s1_entries = read_dir_sorted(&index_root).await?;
     s1_entries.retain(|s| is_hex2(s));
 
-    let s1_start_idx = if !start_s1.is_empty() {
-        s1_entries.binary_search(&start_s1).unwrap_or_else(|x| x)
+    let s1_start_idx = if !continuation_cursor.shard1.is_empty() {
+        s1_entries
+            .binary_search(&continuation_cursor.shard1)
+            .unwrap_or_else(|x| x)
     } else {
         0
     };
@@ -633,11 +666,14 @@ async fn list_objects_internal(
         let mut s2_entries = read_dir_sorted(&s1_path).await.unwrap_or_default();
         s2_entries.retain(|s| is_hex2(s));
 
-        let s2_start_idx = if s1 == start_s1 && !start_s2.is_empty() {
-            s2_entries.binary_search(&start_s2).unwrap_or_else(|x| x)
-        } else {
-            0
-        };
+        let s2_start_idx =
+            if s1 == continuation_cursor.shard1 && !continuation_cursor.shard2.is_empty() {
+                s2_entries
+                    .binary_search(&continuation_cursor.shard2)
+                    .unwrap_or_else(|x| x)
+            } else {
+                0
+            };
 
         for s2 in s2_entries.into_iter().skip(s2_start_idx) {
             let s2_path = s1_path.join(&s2);
@@ -645,8 +681,13 @@ async fn list_objects_internal(
             let mut s3_entries = read_dir_sorted(&s2_path).await.unwrap_or_default();
             s3_entries.retain(|s| is_hex2(s));
 
-            let s3_start_idx = if s1 == start_s1 && s2 == start_s2 && !start_s3.is_empty() {
-                s3_entries.binary_search(&start_s3).unwrap_or_else(|x| x)
+            let s3_start_idx = if s1 == continuation_cursor.shard1
+                && s2 == continuation_cursor.shard2
+                && !continuation_cursor.shard3.is_empty()
+            {
+                s3_entries
+                    .binary_search(&continuation_cursor.shard3)
+                    .unwrap_or_else(|x| x)
             } else {
                 0
             };
@@ -657,12 +698,17 @@ async fn list_objects_internal(
                 let mut s4_entries = read_dir_sorted(&s3_path).await.unwrap_or_default();
                 s4_entries.retain(|s| is_hex2(s));
 
-                let s4_start_idx =
-                    if s1 == start_s1 && s2 == start_s2 && s3 == start_s3 && !start_s4.is_empty() {
-                        s4_entries.binary_search(&start_s4).unwrap_or_else(|x| x)
-                    } else {
-                        0
-                    };
+                let s4_start_idx = if s1 == continuation_cursor.shard1
+                    && s2 == continuation_cursor.shard2
+                    && s3 == continuation_cursor.shard3
+                    && !continuation_cursor.shard4.is_empty()
+                {
+                    s4_entries
+                        .binary_search(&continuation_cursor.shard4)
+                        .unwrap_or_else(|x| x)
+                } else {
+                    0
+                };
 
                 for s4 in s4_entries.into_iter().skip(s4_start_idx) {
                     let s4_path = s3_path.join(&s4);
@@ -678,13 +724,13 @@ async fn list_objects_internal(
                     }
                     file_names.sort();
 
-                    let file_start_idx = if s1 == start_s1
-                        && s2 == start_s2
-                        && s3 == start_s3
-                        && s4 == start_s4
-                        && !start_file.is_empty()
+                    let file_start_idx = if s1 == continuation_cursor.shard1
+                        && s2 == continuation_cursor.shard2
+                        && s3 == continuation_cursor.shard3
+                        && s4 == continuation_cursor.shard4
+                        && !continuation_cursor.file.is_empty()
                     {
-                        match file_names.binary_search(&start_file) {
+                        match file_names.binary_search(&continuation_cursor.file) {
                             Ok(i) => i + 1,
                             Err(i) => i,
                         }
@@ -764,6 +810,7 @@ async fn list_objects_internal(
                                         &s3,
                                         &s4,
                                         &best_fname,
+                                        Some(selected_root_id),
                                     ));
                                     reached_limit = true;
                                     break 'outer;
@@ -843,8 +890,14 @@ async fn list_objects_internal(
                             }
                         }
                         if results.len() + out_prefixes.len() >= limit {
-                            next_token =
-                                Some(create_continuation_token(&s1, &s2, &s3, &s4, &best_fname));
+                            next_token = Some(create_continuation_token(
+                                &s1,
+                                &s2,
+                                &s3,
+                                &s4,
+                                &best_fname,
+                                Some(selected_root_id),
+                            ));
                             reached_limit = true;
                             break 'outer;
                         }
@@ -859,6 +912,35 @@ async fn list_objects_internal(
         common_prefixes: out_prefixes,
         continuation_token: if reached_limit { next_token } else { None },
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{create_continuation_token, parse_continuation_token};
+
+    #[test]
+    fn continuation_token_v1_round_trip() {
+        let token = create_continuation_token("aa", "bb", "cc", "dd", "file.msgpack", None);
+        let parsed = parse_continuation_token(&token).expect("token should parse");
+        assert_eq!(parsed.root_hint, None);
+        assert_eq!(parsed.shard1, "aa");
+        assert_eq!(parsed.shard2, "bb");
+        assert_eq!(parsed.shard3, "cc");
+        assert_eq!(parsed.shard4, "dd");
+        assert_eq!(parsed.file, "file.msgpack");
+    }
+
+    #[test]
+    fn continuation_token_v2_round_trip() {
+        let token = create_continuation_token("0f", "1a", "2b", "3c", "meta.msgpack", Some(7));
+        let parsed = parse_continuation_token(&token).expect("token should parse");
+        assert_eq!(parsed.root_hint, Some(7));
+        assert_eq!(parsed.shard1, "0f");
+        assert_eq!(parsed.shard2, "1a");
+        assert_eq!(parsed.shard3, "2b");
+        assert_eq!(parsed.shard4, "3c");
+        assert_eq!(parsed.file, "meta.msgpack");
+    }
 }
 
 fn is_internal_object_key(object_key: &str) -> bool {

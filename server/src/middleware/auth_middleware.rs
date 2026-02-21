@@ -1,4 +1,6 @@
-use crate::object_storage::fragment_metadata::verify_fragment_key;
+use crate::object_storage::fragment_metadata::{
+    backfill_fragment_nt_hash_if_missing, verify_fragment_key,
+};
 use crate::structs::auth_structs::{
     AuthBody, AuthorizationRequest, Claims, FileSystemClaims, LoginRequest,
 };
@@ -8,19 +10,20 @@ use axum::extract::{FromRequestParts, Request};
 use axum::http::request::Parts;
 use axum::middleware::Next;
 use axum::{
+    Json, RequestPartsExt,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json, RequestPartsExt,
 };
 use axum_extra::TypedHeader;
-use headers::authorization::Bearer;
 use headers::Authorization;
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use headers::authorization::Bearer;
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde_json::json;
 use std::env;
 use std::fmt::Display;
 use std::sync::LazyLock;
 use std::time::SystemTime;
+use tracing::{info, warn};
 
 pub static JWT_KEYS: LazyLock<Keys> = LazyLock::new(|| {
     let secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
@@ -82,6 +85,22 @@ pub async fn authorize_fragment(
 
         if !ok {
             return Err(AuthError::WrongCredentials);
+        }
+
+        match backfill_fragment_nt_hash_if_missing(&payload.fragment, &payload.secret).await {
+            Ok(true) => {
+                info!(
+                    "backfilled nt_hash_hex for fragment {} after successful auth",
+                    payload.fragment
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    "failed to backfill nt_hash_hex for fragment {} after successful auth: {}",
+                    payload.fragment, e
+                );
+            }
         }
     }
 

@@ -988,6 +988,9 @@ Recommended starting points:
 - `auth_password=<string>` optional
 - `auth_domain=<string>` optional
 - `require_signing=true|false`
+- `query_directory_page_limit=<16..1000>` (default `256`)
+- `query_directory_max_buffered_entries=<32..8192>` (default `512`)
+- `query_directory_max_seeded_entries=<8..2048>` (default `128`, capped by `query_directory_max_buffered_entries`)
 
 Behavior:
 - Preferred auth mode is fragment-scoped:
@@ -1036,6 +1039,9 @@ Response:
 - `N1_SMB_AUTH_PASSWORD`
 - `N1_SMB_AUTH_DOMAIN`
 - `N1_SMB_REQUIRE_SIGNING`
+- `N1_SMB_QUERY_DIRECTORY_PAGE_LIMIT`
+- `N1_SMB_QUERY_DIRECTORY_MAX_BUFFERED_ENTRIES`
+- `N1_SMB_QUERY_DIRECTORY_MAX_SEEDED_ENTRIES`
 
 ### 14.4 WebSocket Event
 - `SMB_TRANSFER_PROGRESS` with payload shape `SmbTransferProgressPayload`.
