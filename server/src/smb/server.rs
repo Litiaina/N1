@@ -5,6 +5,7 @@ use crate::fuse::config::FsdConfig;
 use crate::fuse::gateway::FsdGateway;
 use crate::fuse::model::{NodeKind, NodeMetadata, WriteHandle};
 use crate::object_storage::fragment_metadata::read_fragment_metadata;
+use crate::object_storage::quota_manager::get_quota;
 use crate::validation::fragment_validation::does_fragment_exist;
 use crate::websocket::manager::global_ws_manager;
 use crate::websocket::ws_structs::{SmbTransferProgressPayload, StorageEventPayload};
@@ -14,7 +15,7 @@ use md4::{Digest as Md4Digest, Md4};
 use md5::Md5;
 use rand::RngCore;
 use sha2::Sha256;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -133,6 +134,9 @@ const FSCTL_DFS_GET_REFERRALS: u32 = 0x0006_0194;
 const FSCTL_PIPE_WAIT: u32 = 0x0011_0018;
 const FS_INFO_CLASS_ATTRIBUTE_INFORMATION: u8 = 0x05;
 const FS_INFO_CLASS_FULL_SIZE_INFORMATION: u8 = 0x07;
+const SMB_FS_BYTES_PER_SECTOR: u32 = 512;
+const SMB_FS_SECTORS_PER_ALLOCATION_UNIT: u32 = 8;
+const SMB_FS_DEFAULT_CAPACITY_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const SMB2_QUERY_DIRECTORY_RESTART_SCANS: u8 = 0x01;
 const SMB2_QUERY_DIRECTORY_REOPEN: u8 = 0x10;
 const SMB2_NEGOTIATE_DIALECT_0202: u16 = 0x0202;
@@ -196,6 +200,7 @@ const NTLM_CHALLENGE_FLAGS: u32 = NTLM_NEGOTIATE_UNICODE
 const SMB_TRANSFER_EMIT_INTERVAL_MS: u64 = 500;
 const SMB_TRANSFER_RETENTION_MS: u64 = 30 * 60 * 1000;
 const SMB_TRANSFER_MAX_TRACKED: usize = 10_000;
+const SMB_OUT_OF_ORDER_WRITE_MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024;
 
 type HmacMd5 = Hmac<Md5>;
 type HmacSha256 = Hmac<Sha256>;
@@ -213,6 +218,7 @@ struct OpenHandleContext {
     tree_id: u32,
     fragment: String,
     object_key: String,
+    named_stream: Option<String>,
     is_dir: bool,
     writable: bool,
     delete_on_close: bool,
@@ -227,6 +233,8 @@ struct OpenHandleContext {
     allows_replace_write: bool,
     materialize_on_close: bool,
     pending_write: Option<WriteHandle>,
+    pending_out_of_order_writes: BTreeMap<u64, Vec<u8>>,
+    out_of_order_buffered_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -2189,6 +2197,12 @@ fn spawn_async_close_finalize(
     tokio::spawn(async move {
         if let Some(write_handle) = handle.pending_write.clone() {
             if let Err(e) = gateway.commit_write(&write_handle).await {
+                if let Err(abort_err) = gateway.abort_write(&write_handle).await {
+                    warn!(
+                        "smb async close abort failed for {}/{}: {}",
+                        handle.fragment, handle.object_key, abort_err
+                    );
+                }
                 if let Some(id) = transfer_id.as_deref() {
                     transfer_failed(id, e.to_string().as_str());
                 }
@@ -2244,6 +2258,12 @@ async fn release_session_handles(
                     transfer_commit_started(transfer_id);
                 }
                 if let Err(e) = gateway.commit_write(&write_handle).await {
+                    if let Err(abort_err) = gateway.abort_write(&write_handle).await {
+                        warn!(
+                            "smb session release abort failed for {}/{}: {}",
+                            handle.fragment, handle.object_key, abort_err
+                        );
+                    }
                     if let Some(transfer_id) = handle.transfer_id.as_deref() {
                         transfer_failed(transfer_id, e.to_string().as_str());
                     }
@@ -2291,6 +2311,12 @@ async fn release_tree_handles(
                     transfer_commit_started(transfer_id);
                 }
                 if let Err(e) = gateway.commit_write(&write_handle).await {
+                    if let Err(abort_err) = gateway.abort_write(&write_handle).await {
+                        warn!(
+                            "smb tree release abort failed for {}/{}: {}",
+                            handle.fragment, handle.object_key, abort_err
+                        );
+                    }
                     if let Some(transfer_id) = handle.transfer_id.as_deref() {
                         transfer_failed(transfer_id, e.to_string().as_str());
                     }
@@ -2601,9 +2627,9 @@ async fn handle_create(
         }
     };
 
-    let object_key = normalize_object_key(&name);
-    let requested_dir = object_key.is_empty() || (create_options & FILE_DIRECTORY_FILE) != 0;
-    let requested_non_dir = (create_options & FILE_NON_DIRECTORY_FILE) != 0;
+    let normalized_object_key = normalize_object_key(&name);
+    let (object_key, named_stream) =
+        split_named_stream_from_object_key(normalized_object_key.as_str());
     let delete_on_close = (create_options & FILE_DELETE_ON_CLOSE) != 0;
     let writable =
         (desired_access & (FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_GENERIC_WRITE)) != 0;
@@ -2634,6 +2660,68 @@ async fn handle_create(
             build_not_supported_error_body(),
         );
     }
+
+    if let Some(stream_name) = named_stream {
+        if object_key.is_empty() {
+            return (
+                SMB2_STATUS_INVALID_PARAMETER,
+                build_not_supported_error_body(),
+            );
+        }
+        let file_id = state.new_file_id();
+        let create_action = if matches!(
+            create_disposition,
+            FILE_CREATE_DISPOSITION_CREATE
+                | FILE_CREATE_DISPOSITION_OPEN_IF
+                | FILE_CREATE_DISPOSITION_OVERWRITE_IF
+        ) {
+            FILE_CREATE_ACTION_CREATED
+        } else if matches!(
+            create_disposition,
+            FILE_CREATE_DISPOSITION_SUPERSEDE | FILE_CREATE_DISPOSITION_OVERWRITE
+        ) {
+            FILE_CREATE_ACTION_SUPERSEDED
+        } else {
+            FILE_CREATE_ACTION_OPENED
+        };
+        debug!(
+            "smb create virtual named stream path='{}' stream='{}' disposition={} desired_access=0x{:08X} create_options=0x{:08X}",
+            object_key, stream_name, create_disposition, desired_access, create_options
+        );
+        state.handles.insert(
+            file_id,
+            OpenHandleContext {
+                session_id: header.session_id,
+                tree_id: header.tree_id,
+                fragment,
+                object_key,
+                named_stream: Some(stream_name),
+                is_dir: false,
+                writable: requested_write || writable,
+                delete_on_close: false,
+                dir_query_pattern: "*".to_string(),
+                dir_query_info_class: FILE_INFORMATION_CLASS_DIRECTORY_INFORMATION,
+                dir_query_buffer: Vec::new(),
+                dir_query_continuation_token: None,
+                dir_query_exhausted: false,
+                expected_size_bytes: Some(0),
+                max_written_end: 0,
+                transfer_id: None,
+                allows_replace_write: true,
+                materialize_on_close: false,
+                pending_write: None,
+                pending_out_of_order_writes: BTreeMap::new(),
+                out_of_order_buffered_bytes: 0,
+            },
+        );
+        return (
+            SMB2_STATUS_SUCCESS,
+            build_create_response_body(file_id, false, 0, create_action),
+        );
+    }
+
+    let requested_dir = object_key.is_empty() || (create_options & FILE_DIRECTORY_FILE) != 0;
+    let requested_non_dir = (create_options & FILE_NON_DIRECTORY_FILE) != 0;
 
     let mount_path = mount_path(&fragment, &object_key);
     let existing = match stat_optional(gateway, &mount_path).await {
@@ -2676,6 +2764,7 @@ async fn handle_create(
                 tree_id: header.tree_id,
                 fragment: fragment.clone(),
                 object_key,
+                named_stream: None,
                 is_dir: true,
                 writable: false,
                 delete_on_close,
@@ -2690,6 +2779,8 @@ async fn handle_create(
                 allows_replace_write: false,
                 materialize_on_close: false,
                 pending_write: None,
+                pending_out_of_order_writes: BTreeMap::new(),
+                out_of_order_buffered_bytes: 0,
             },
         );
         return (
@@ -2820,6 +2911,7 @@ async fn handle_create(
             tree_id: header.tree_id,
             fragment,
             object_key,
+            named_stream: None,
             is_dir,
             writable,
             delete_on_close,
@@ -2834,6 +2926,8 @@ async fn handle_create(
             allows_replace_write: writable && materialize_on_close,
             materialize_on_close,
             pending_write: None,
+            pending_out_of_order_writes: BTreeMap::new(),
+            out_of_order_buffered_bytes: 0,
         },
     );
 
@@ -2904,11 +2998,29 @@ async fn handle_read(
             build_not_supported_error_body(),
         );
     }
+    if handle.named_stream.is_some() {
+        return (SMB2_STATUS_SUCCESS, build_read_response_body(&[]));
+    }
 
     let path = mount_path(&handle.fragment, &handle.object_key);
     match gateway.read_range(&path, offset, length).await {
-        Ok(bytes) => (SMB2_STATUS_SUCCESS, build_read_response_body(&bytes)),
-        Err(e) => (app_error_to_status(e), build_not_supported_error_body()),
+        Ok(bytes) => {
+            debug!(
+                "smb read path='{}' offset={} requested={} returned={}",
+                handle.object_key,
+                offset,
+                length,
+                bytes.len()
+            );
+            (SMB2_STATUS_SUCCESS, build_read_response_body(&bytes))
+        }
+        Err(e) => {
+            debug!(
+                "smb read failed path='{}' offset={} requested={} err={}",
+                handle.object_key, offset, length, e
+            );
+            (app_error_to_status(e), build_not_supported_error_body())
+        }
     }
 }
 
@@ -2922,7 +3034,7 @@ fn validate_lite_write_policy(handle: &OpenHandleContext, offset: u64) -> Result
         }
         return Ok(());
     }
-    if offset != handle.max_written_end {
+    if offset < handle.max_written_end {
         return Err(SMB2_STATUS_NOT_SUPPORTED);
     }
     Ok(())
@@ -3033,6 +3145,7 @@ async fn handle_write(
     };
 
     let mut begin_write: Option<(String, Option<u64>)> = None;
+    let mut virtual_named_stream_write = false;
     {
         let Some(handle) = state.handles.get(&file_id) else {
             return (SMB2_STATUS_INVALID_HANDLE, build_not_supported_error_body());
@@ -3050,30 +3163,44 @@ async fn handle_write(
         if !handle.writable {
             return (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body());
         }
-        if let Err(status) = validate_lite_write_policy(handle, offset) {
-            debug!(
-                "smb write rejected path='{}' allows_replace_write={} offset={} max_written_end={} pending_write={}",
-                handle.object_key,
-                handle.allows_replace_write,
-                offset,
-                handle.max_written_end,
-                handle.pending_write.is_some()
-            );
-            return (status, build_not_supported_error_body());
-        }
+        if handle.named_stream.is_some() {
+            virtual_named_stream_write = true;
+        } else {
+            if let Err(status) = validate_lite_write_policy(handle, offset) {
+                debug!(
+                    "smb write rejected path='{}' allows_replace_write={} offset={} max_written_end={} pending_write={}",
+                    handle.object_key,
+                    handle.allows_replace_write,
+                    offset,
+                    handle.max_written_end,
+                    handle.pending_write.is_some()
+                );
+                return (status, build_not_supported_error_body());
+            }
 
-        if handle.pending_write.is_none() {
-            let inferred_expected_size = if remaining_bytes > 0 {
-                write_end_offset.checked_add(remaining_bytes)
-            } else {
-                None
-            };
-            let expected_size = handle.expected_size_bytes.or(inferred_expected_size);
-            begin_write = Some((
-                mount_path(&handle.fragment, &handle.object_key),
-                expected_size,
-            ));
+            if handle.pending_write.is_none() {
+                let inferred_expected_size = if remaining_bytes > 0 {
+                    write_end_offset.checked_add(remaining_bytes)
+                } else {
+                    None
+                };
+                let expected_size = handle.expected_size_bytes.or(inferred_expected_size);
+                begin_write = Some((
+                    mount_path(&handle.fragment, &handle.object_key),
+                    expected_size,
+                ));
+            }
         }
+    }
+
+    if virtual_named_stream_write {
+        if let Some(handle) = state.handles.get_mut(&file_id) {
+            handle.max_written_end = handle.max_written_end.max(write_end_offset);
+        }
+        return (
+            SMB2_STATUS_SUCCESS,
+            build_write_response_body(length as u32),
+        );
     }
 
     if let Some((path, expected_size)) = begin_write {
@@ -3112,11 +3239,100 @@ async fn handle_write(
         None => return (SMB2_STATUS_INVALID_HANDLE, build_not_supported_error_body()),
     };
 
-    let bytes = request[data_offset..end].to_vec();
+    let mut maybe_bytes = Some(request[data_offset..end].to_vec());
+    {
+        let Some(handle) = state.handles.get_mut(&file_id) else {
+            return (SMB2_STATUS_INVALID_HANDLE, build_not_supported_error_body());
+        };
+        if offset > handle.max_written_end {
+            let entry = handle.pending_out_of_order_writes.entry(offset);
+            if let std::collections::btree_map::Entry::Vacant(vacant) = entry {
+                let prospective = handle.out_of_order_buffered_bytes.saturating_add(length);
+                if prospective > SMB_OUT_OF_ORDER_WRITE_MAX_BUFFERED_BYTES {
+                    debug!(
+                        "smb write rejected path='{}' buffered_out_of_order={} incoming={} max_buffer={} offset={} max_written_end={}",
+                        handle.object_key,
+                        handle.out_of_order_buffered_bytes,
+                        length,
+                        SMB_OUT_OF_ORDER_WRITE_MAX_BUFFERED_BYTES,
+                        offset,
+                        handle.max_written_end
+                    );
+                    return (SMB2_STATUS_NOT_SUPPORTED, build_not_supported_error_body());
+                }
+                vacant.insert(maybe_bytes.take().unwrap_or_default());
+                handle.out_of_order_buffered_bytes = prospective;
+                debug!(
+                    "smb write buffered out_of_order path='{}' offset={} max_written_end={} buffered_bytes={}",
+                    handle.object_key,
+                    offset,
+                    handle.max_written_end,
+                    handle.out_of_order_buffered_bytes
+                );
+            } else {
+                debug!(
+                    "smb write duplicate buffered chunk path='{}' offset={} max_written_end={}",
+                    handle.object_key, offset, handle.max_written_end
+                );
+            }
+            if let Some(transfer_id) = handle.transfer_id.as_deref() {
+                transfer_ingress_progress(
+                    transfer_id,
+                    handle.max_written_end,
+                    handle.expected_size_bytes,
+                );
+            }
+            return (
+                SMB2_STATUS_SUCCESS,
+                build_write_response_body(length as u32),
+            );
+        }
+    }
+
+    let bytes = maybe_bytes.unwrap_or_default();
     match gateway.write_chunk(&write_handle, offset, bytes).await {
         Ok(_) => {
             if let Some(handle) = state.handles.get_mut(&file_id) {
                 handle.max_written_end = write_end_offset;
+            }
+
+            loop {
+                let next_chunk = state.handles.get(&file_id).and_then(|handle| {
+                    handle
+                        .pending_out_of_order_writes
+                        .get(&handle.max_written_end)
+                        .cloned()
+                        .map(|chunk| (handle.max_written_end, chunk))
+                });
+
+                let Some((chunk_offset, chunk_bytes)) = next_chunk else {
+                    break;
+                };
+
+                if let Err(e) = gateway
+                    .write_chunk(&write_handle, chunk_offset, chunk_bytes)
+                    .await
+                {
+                    if let Some(handle) = state.handles.get(&file_id) {
+                        if let Some(transfer_id) = handle.transfer_id.as_deref() {
+                            transfer_failed(transfer_id, e.to_string().as_str());
+                        }
+                    }
+                    return (app_error_to_status(e), build_not_supported_error_body());
+                }
+
+                if let Some(handle) = state.handles.get_mut(&file_id) {
+                    if let Some(written) = handle.pending_out_of_order_writes.remove(&chunk_offset)
+                    {
+                        handle.out_of_order_buffered_bytes = handle
+                            .out_of_order_buffered_bytes
+                            .saturating_sub(written.len());
+                        handle.max_written_end = chunk_offset.saturating_add(written.len() as u64);
+                    }
+                }
+            }
+
+            if let Some(handle) = state.handles.get(&file_id) {
                 if let Some(transfer_id) = handle.transfer_id.as_deref() {
                     transfer_ingress_progress(
                         transfer_id,
@@ -3182,6 +3398,12 @@ async fn handle_close(
     if handle.session_id != header.session_id || handle.tree_id != header.tree_id {
         return (SMB2_STATUS_INVALID_HANDLE, build_not_supported_error_body());
     }
+    if handle.named_stream.is_some() {
+        return (
+            SMB2_STATUS_SUCCESS,
+            build_close_response_body(handle.max_written_end, FILE_ATTRIBUTE_NORMAL),
+        );
+    }
 
     unregister_open_handle(
         shared_smb_state,
@@ -3226,6 +3448,12 @@ async fn handle_close(
             spawn_async_close_finalize(gateway.clone(), handle.clone(), handle.transfer_id.clone());
         } else if let Some(write_handle) = handle.pending_write.clone() {
             if let Err(e) = gateway.commit_write(&write_handle).await {
+                if let Err(abort_err) = gateway.abort_write(&write_handle).await {
+                    warn!(
+                        "smb close abort failed for {}/{}: {}",
+                        handle.fragment, handle.object_key, abort_err
+                    );
+                }
                 if let Some(transfer_id) = handle.transfer_id.as_deref() {
                     transfer_failed(transfer_id, e.to_string().as_str());
                 }
@@ -3367,6 +3595,9 @@ async fn handle_lock(
             build_not_supported_error_body(),
         );
     }
+    if handle.named_stream.is_some() {
+        return (SMB2_STATUS_SUCCESS, build_simple_response_body());
+    }
 
     let path = mount_path(handle.fragment.as_str(), handle.object_key.as_str());
     let mut smb_state = shared_smb_state.lock().await;
@@ -3506,9 +3737,37 @@ async fn handle_query_info(
         return (SMB2_STATUS_INVALID_HANDLE, build_not_supported_error_body());
     }
 
-    let metadata = match metadata_for_handle(gateway, &handle).await {
-        Ok(v) => v,
-        Err(e) => return (app_error_to_status(e), build_not_supported_error_body()),
+    let metadata = if handle.named_stream.is_some() {
+        NodeMetadata {
+            kind: NodeKind::File,
+            size_bytes: handle.max_written_end,
+            modified_at_unix: now_unix_secs(),
+        }
+    } else {
+        match metadata_for_handle(gateway, &handle).await {
+            Ok(v) => v,
+            Err(e) => return (app_error_to_status(e), build_not_supported_error_body()),
+        }
+    };
+    let fs_capacity_bytes = if info_type == SMB2_INFO_TYPE_FILESYSTEM {
+        match get_quota(handle.fragment.as_str()).await {
+            Ok(quota) => {
+                let used = quota.storage_used.min(quota.allocated_storage);
+                Some((
+                    quota.allocated_storage,
+                    quota.allocated_storage.saturating_sub(used),
+                ))
+            }
+            Err(e) => {
+                warn!(
+                    "smb query_info quota lookup failed for fragment='{}': {}",
+                    handle.fragment, e
+                );
+                None
+            }
+        }
+    } else {
+        None
     };
 
     let buffer = match info_type {
@@ -3540,10 +3799,18 @@ async fn handle_query_info(
         },
         SMB2_INFO_TYPE_FILESYSTEM => match file_info_class {
             FS_INFO_CLASS_VOLUME_INFORMATION => build_fs_volume_information_buffer("N1"),
-            FS_INFO_CLASS_SIZE_INFORMATION => build_fs_size_information_buffer(),
+            FS_INFO_CLASS_SIZE_INFORMATION => {
+                let (total_bytes, available_bytes) = fs_capacity_bytes
+                    .unwrap_or((SMB_FS_DEFAULT_CAPACITY_BYTES, SMB_FS_DEFAULT_CAPACITY_BYTES));
+                build_fs_size_information_buffer(total_bytes, available_bytes)
+            }
             FS_INFO_CLASS_DEVICE_INFORMATION => build_fs_device_information_buffer(),
             FS_INFO_CLASS_ATTRIBUTE_INFORMATION => build_fs_attribute_information_buffer("N1FS"),
-            FS_INFO_CLASS_FULL_SIZE_INFORMATION => build_fs_full_size_information_buffer(),
+            FS_INFO_CLASS_FULL_SIZE_INFORMATION => {
+                let (total_bytes, available_bytes) = fs_capacity_bytes
+                    .unwrap_or((SMB_FS_DEFAULT_CAPACITY_BYTES, SMB_FS_DEFAULT_CAPACITY_BYTES));
+                build_fs_full_size_information_buffer(total_bytes, available_bytes)
+            }
             _ => {
                 debug!(
                     "smb query_info unsupported fs_info_class=0x{:02X}",
@@ -3655,6 +3922,12 @@ async fn handle_set_info(
 
     if info_type != SMB2_INFO_TYPE_FILE {
         return (SMB2_STATUS_NOT_SUPPORTED, build_not_supported_error_body());
+    }
+    if current.named_stream.is_some() {
+        if file_info_class == FILE_INFO_CLASS_RENAME_INFORMATION {
+            return (SMB2_STATUS_NOT_SUPPORTED, build_not_supported_error_body());
+        }
+        return (SMB2_STATUS_SUCCESS, build_set_info_response_body());
     }
 
     match file_info_class {
@@ -4645,12 +4918,13 @@ fn build_fs_volume_information_buffer(volume_label: &str) -> Vec<u8> {
     out
 }
 
-fn build_fs_size_information_buffer() -> Vec<u8> {
+fn build_fs_size_information_buffer(total_bytes: u64, available_bytes: u64) -> Vec<u8> {
+    let (total_units, available_units) = bytes_to_fs_allocation_units(total_bytes, available_bytes);
     let mut out = vec![0u8; 24];
-    out[0..8].copy_from_slice(&8_388_608u64.to_le_bytes());
-    out[8..16].copy_from_slice(&8_388_608u64.to_le_bytes());
-    out[16..20].copy_from_slice(&8u32.to_le_bytes());
-    out[20..24].copy_from_slice(&512u32.to_le_bytes());
+    out[0..8].copy_from_slice(&total_units.to_le_bytes());
+    out[8..16].copy_from_slice(&available_units.to_le_bytes());
+    out[16..20].copy_from_slice(&SMB_FS_SECTORS_PER_ALLOCATION_UNIT.to_le_bytes());
+    out[20..24].copy_from_slice(&SMB_FS_BYTES_PER_SECTOR.to_le_bytes());
     out
 }
 
@@ -4661,14 +4935,33 @@ fn build_fs_device_information_buffer() -> Vec<u8> {
     out
 }
 
-fn build_fs_full_size_information_buffer() -> Vec<u8> {
+fn build_fs_full_size_information_buffer(total_bytes: u64, available_bytes: u64) -> Vec<u8> {
+    let (total_units, available_units) = bytes_to_fs_allocation_units(total_bytes, available_bytes);
     let mut out = vec![0u8; 32];
-    out[0..8].copy_from_slice(&8_388_608u64.to_le_bytes());
-    out[8..16].copy_from_slice(&8_388_608u64.to_le_bytes());
-    out[16..24].copy_from_slice(&8_388_608u64.to_le_bytes());
-    out[24..28].copy_from_slice(&8u32.to_le_bytes());
-    out[28..32].copy_from_slice(&512u32.to_le_bytes());
+    out[0..8].copy_from_slice(&total_units.to_le_bytes());
+    out[8..16].copy_from_slice(&available_units.to_le_bytes());
+    out[16..24].copy_from_slice(&available_units.to_le_bytes());
+    out[24..28].copy_from_slice(&SMB_FS_SECTORS_PER_ALLOCATION_UNIT.to_le_bytes());
+    out[28..32].copy_from_slice(&SMB_FS_BYTES_PER_SECTOR.to_le_bytes());
     out
+}
+
+fn bytes_to_fs_allocation_units(total_bytes: u64, available_bytes: u64) -> (u64, u64) {
+    let unit_bytes =
+        u64::from(SMB_FS_SECTORS_PER_ALLOCATION_UNIT) * u64::from(SMB_FS_BYTES_PER_SECTOR);
+    if unit_bytes == 0 {
+        return (0, 0);
+    }
+
+    let total_units = if total_bytes == 0 {
+        0
+    } else {
+        total_bytes
+            .saturating_add(unit_bytes.saturating_sub(1))
+            .saturating_div(unit_bytes)
+    };
+    let available_units = available_bytes.min(total_bytes).saturating_div(unit_bytes);
+    (total_units, available_units)
 }
 
 fn build_fs_attribute_information_buffer(name: &str) -> Vec<u8> {
@@ -5295,6 +5588,31 @@ fn decode_utf16_bytes(bytes: &[u8]) -> Option<String> {
 
 fn normalize_object_key(raw: &str) -> String {
     raw.replace('\\', "/").trim_matches('/').to_string()
+}
+
+fn split_named_stream_from_object_key(object_key: &str) -> (String, Option<String>) {
+    if object_key.is_empty() {
+        return (String::new(), None);
+    }
+
+    let (parent, leaf) = match object_key.rsplit_once('/') {
+        Some((p, l)) => (Some(p), l),
+        None => (None, object_key),
+    };
+
+    let Some((base, stream)) = leaf.split_once(':') else {
+        return (object_key.to_string(), None);
+    };
+    if base.is_empty() || stream.is_empty() {
+        return (object_key.to_string(), None);
+    }
+
+    let base_key = if let Some(parent) = parent {
+        format!("{}/{}", parent, base)
+    } else {
+        base.to_string()
+    };
+    (base_key, Some(stream.to_string()))
 }
 
 fn read_u16(buf: &[u8], offset: usize) -> Option<u16> {
@@ -6092,6 +6410,72 @@ mod tests {
         assert!(chunk.len() >= 104);
     }
 
+    #[test]
+    fn fs_size_information_uses_fragment_capacity_values() {
+        let total_bytes = 200u64 * 1024 * 1024 * 1024;
+        let available_bytes = 150u64 * 1024 * 1024 * 1024;
+        let (total_units, available_units) =
+            bytes_to_fs_allocation_units(total_bytes, available_bytes);
+
+        let out = build_fs_size_information_buffer(total_bytes, available_bytes);
+        assert_eq!(out.len(), 24);
+        assert_eq!(
+            u64::from_le_bytes(out[0..8].try_into().expect("total units")),
+            total_units
+        );
+        assert_eq!(
+            u64::from_le_bytes(out[8..16].try_into().expect("available units")),
+            available_units
+        );
+        assert_eq!(
+            u32::from_le_bytes(out[16..20].try_into().expect("sectors per unit")),
+            SMB_FS_SECTORS_PER_ALLOCATION_UNIT
+        );
+        assert_eq!(
+            u32::from_le_bytes(out[20..24].try_into().expect("bytes per sector")),
+            SMB_FS_BYTES_PER_SECTOR
+        );
+    }
+
+    #[test]
+    fn fs_full_size_information_uses_fragment_capacity_values() {
+        let total_bytes = 200u64 * 1024 * 1024 * 1024;
+        let available_bytes = 123u64 * 1024 * 1024 * 1024;
+        let (total_units, available_units) =
+            bytes_to_fs_allocation_units(total_bytes, available_bytes);
+
+        let out = build_fs_full_size_information_buffer(total_bytes, available_bytes);
+        assert_eq!(out.len(), 32);
+        assert_eq!(
+            u64::from_le_bytes(out[0..8].try_into().expect("total units")),
+            total_units
+        );
+        assert_eq!(
+            u64::from_le_bytes(out[8..16].try_into().expect("caller available units")),
+            available_units
+        );
+        assert_eq!(
+            u64::from_le_bytes(out[16..24].try_into().expect("actual available units")),
+            available_units
+        );
+    }
+
+    #[test]
+    fn split_named_stream_extracts_base_path_and_stream_name() {
+        let normalized = normalize_object_key(r"gameplay\video.mp4:Zone.Identifier:$DATA");
+        let (base_key, stream) = split_named_stream_from_object_key(normalized.as_str());
+        assert_eq!(base_key, "gameplay/video.mp4");
+        assert_eq!(stream.as_deref(), Some("Zone.Identifier:$DATA"));
+    }
+
+    #[test]
+    fn split_named_stream_keeps_regular_object_key() {
+        let normalized = normalize_object_key(r"gameplay\video.mp4");
+        let (base_key, stream) = split_named_stream_from_object_key(normalized.as_str());
+        assert_eq!(base_key, "gameplay/video.mp4");
+        assert!(stream.is_none());
+    }
+
     fn make_test_write_handle(
         allows_replace_write: bool,
         pending_write: bool,
@@ -6102,6 +6486,7 @@ mod tests {
             tree_id: 1,
             fragment: "frag".to_string(),
             object_key: "file.bin".to_string(),
+            named_stream: None,
             is_dir: false,
             writable: true,
             delete_on_close: false,
@@ -6128,6 +6513,8 @@ mod tests {
             } else {
                 None
             },
+            pending_out_of_order_writes: BTreeMap::new(),
+            out_of_order_buffered_bytes: 0,
         }
     }
 
@@ -6156,6 +6543,13 @@ mod tests {
     fn lite_write_policy_accepts_contiguous_replacement_stream() {
         let handle = make_test_write_handle(true, true, 4096);
         let result = validate_lite_write_policy(&handle, 4096);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn lite_write_policy_accepts_forward_offset_for_buffering() {
+        let handle = make_test_write_handle(true, true, 4096);
+        let result = validate_lite_write_policy(&handle, 8192);
         assert!(result.is_ok());
     }
 }

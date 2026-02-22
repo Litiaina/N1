@@ -997,6 +997,7 @@ Behavior:
 - SMB `username` is fragment identifier (`<fragment_name>` or `<fragment_hash>`).
 - SMB `password` is fragment key.
 - Share `N1` maps to the authenticated fragment for the session.
+- SMB filesystem capacity reported to clients (for example Windows "Properties") is derived from that fragment's quota (`allocated_storage` / `storage_used`), not a global fixed size.
 - Optional static mode: if `auth_username` and `auth_password` are configured, that static account is also accepted.
 - If `require_signing=true`, SMB signing is required.
 - Large-transfer close handling:

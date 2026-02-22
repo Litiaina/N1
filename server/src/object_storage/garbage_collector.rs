@@ -6,6 +6,7 @@ use crate::object_storage::disk_manager::{
     FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManager, ReservationReceipt,
 };
 use crate::object_storage::quota_manager::update_quota;
+use crate::object_storage::sync::sync_single_fragment_quota;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
 use crate::websocket::ws_structs::StorageEventPayload;
@@ -180,20 +181,17 @@ pub async fn run_garbage_collector(State(state): State<Arc<AppState>>) -> impl I
     (StatusCode::ACCEPTED, "GC started")
 }
 
-fn refund_quota_async(fragment: String, amount: u64, state: Arc<AppState>) {
+async fn refund_quota(fragment: &str, amount: u64, state: &Arc<AppState>) {
     if amount == 0 {
         return;
     }
 
-    let handle = Handle::current();
-    handle.spawn(async move {
-        if let Err(e) = update_quota(&fragment, -(amount as i64)).await {
-            warn!("Failed to refund quota for fragment {}: {}", fragment, e);
-        } else {
-            info!("GC: Refunded {} bytes to fragment {}", amount, fragment);
-            state.emit(&fragment, StorageEventPayload::StateInvalidated);
-        }
-    });
+    if let Err(e) = update_quota(fragment, -(amount as i64)).await {
+        warn!("Failed to refund quota for fragment {}: {}", fragment, e);
+    } else {
+        info!("GC: Refunded {} bytes to fragment {}", amount, fragment);
+        state.emit(fragment, StorageEventPayload::StateInvalidated);
+    }
 }
 
 fn get_trash_root(disk_root: &std::path::Path, fragment_hash: &str) -> PathBuf {
@@ -497,7 +495,7 @@ async fn process_fragment_gc(
         }
     }
 
-    refund_quota_async(fragment.to_string(), expired_trash_refund, state.clone());
+    refund_quota(fragment, expired_trash_refund, state).await;
     stats.refund_bytes += expired_trash_refund;
     stats.trash_versions_expired += expired_versions.len() as u64;
 
@@ -598,7 +596,7 @@ async fn process_fragment_gc(
     }
 
     let total_session_refund: u64 = session_amounts.values().sum();
-    refund_quota_async(fragment.to_string(), total_session_refund, state.clone());
+    refund_quota(fragment, total_session_refund, state).await;
     stats.refund_bytes += total_session_refund;
     stats.sessions_deleted += sessions_to_delete.len() as u64;
 
@@ -647,6 +645,13 @@ async fn process_fragment_gc(
                 }
             }
         }
+    }
+
+    if let Err(e) = sync_single_fragment_quota(fragment.to_string()).await {
+        warn!(
+            "GC: Fragment quota reconciliation failed for {}: {}",
+            fragment, e
+        );
     }
 
     stats
