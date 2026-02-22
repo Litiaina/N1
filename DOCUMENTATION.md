@@ -9,6 +9,8 @@
   <p>Complete route reference and usage guide (current implementation).</p>
 </div>
 
+**Subject to change but overall structure are already stable**
+
 > Source of truth for routing: `server/src/routes/storage_routes.rs`.
 > Source of truth for request/response behavior: the handler files under `server/src/object_storage` and `server/src/fs`.
 
