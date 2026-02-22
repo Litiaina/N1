@@ -47,7 +47,7 @@ use crate::websocket::manager::WsConnectionManager;
 use axum::Json as AxumJson;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::response::IntoResponse;
 use futures_util::{StreamExt, stream};
 use once_cell::sync::Lazy;
@@ -5055,6 +5055,77 @@ async fn matrix_archive_prefix_pagination_continuation_token() {
     let mut names3 = parse_tar_entry_names(&body3);
     names3.sort();
     assert_eq!(names3, vec!["page/e.bin".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_archive_prefix_unbounded_streams_all_pages_as_tar() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let total = 1_201usize;
+    for i in 0..total {
+        let key = format!("bulk-recover/file-{:04}.bin", i);
+        let content = vec![(i % 251) as u8; 128];
+        put_object(state.clone(), &fragment, &key, content).await;
+    }
+
+    let response = download_selected_archive(
+        full_claims(&fragment),
+        AxumPath(fragment.clone()),
+        AxumJson(DownloadArchiveRequest {
+            keys: vec![],
+            prefix: Some("bulk-recover".to_string()),
+            delimiter: None,
+            max_keys: None,
+            continuation_token: None,
+            format: "zip".to_string(),
+            filename: Some("full-recovery".to_string()),
+        }),
+    )
+    .await
+    .expect("unbounded prefix archive")
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/x-tar"),
+        "unbounded prefix mode must force tar"
+    );
+    assert!(
+        response.headers().get("x-n1-archive-next-token").is_none(),
+        "unbounded prefix mode should stream all pages in one response"
+    );
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("archive body");
+    let mut names = parse_tar_entry_names(&body);
+    names.sort();
+    assert_eq!(names.len(), total, "all prefix keys should be archived");
+    assert_eq!(
+        names.first().map(String::as_str),
+        Some("bulk-recover/file-0000.bin")
+    );
+    assert_eq!(
+        names.last().map(String::as_str),
+        Some("bulk-recover/file-1200.bin")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

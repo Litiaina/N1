@@ -1,8 +1,8 @@
 use axum::{
     Json,
-    body::Body,
-    extract::Path,
-    http::header,
+    body::{Body, to_bytes},
+    extract::{Path as AxumPath, Query},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
@@ -26,8 +26,8 @@ use crate::{
     enums::app_error_enum::AppError,
     object_storage::constants::{METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, RESERVATION_FILE},
     object_storage::disk_manager::{
-        DownloadArchiveRequest, ObjectMetadata, ObjectPathManager, ObjectSummary, PartMetadata,
-        ShardInfo,
+        DownloadArchiveRequest, ListObjectsResult, ObjectMetadata, ObjectPathManager,
+        ObjectSummary, PartMetadata, ShardInfo,
     },
     object_storage::{metadata_parser::get_metadata, recovery::read_or_recover_chunk},
     structs::auth_structs::Claims,
@@ -39,14 +39,40 @@ const ARCHIVE_STREAM_CHANNEL: usize = 8;
 const ARCHIVE_DUPLEX_BYTES: usize = 64 * 1024;
 const ARCHIVE_CHUNK_REQ_SIZE: usize = 64 * 1024;
 const ARCHIVE_NEXT_TOKEN_HEADER: &str = "x-n1-archive-next-token";
+const ARCHIVE_LIST_PAGE_LIMIT: usize = 1000;
+const ARCHIVE_LIST_RESPONSE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
 pub async fn download_selected_archive(
     claims: Claims,
-    Path(fragment): Path<String>,
+    AxumPath(fragment): AxumPath<String>,
     Json(req): Json<DownloadArchiveRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     if claims.fragment != fragment {
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+
+    let filename = req.filename.clone().unwrap_or_else(|| "export".to_string());
+    let unbounded_prefix_stream = req.keys.is_empty()
+        && req.max_keys.is_none()
+        && req.continuation_token.is_none()
+        && req
+            .prefix
+            .as_ref()
+            .map(|p| !canonical_prefix(p).is_empty())
+            .unwrap_or(false);
+
+    if unbounded_prefix_stream {
+        let prefix = canonical_prefix(req.prefix.as_deref().unwrap_or_default());
+        let delimiter = normalize_delimiter(req.delimiter.as_deref()).map(|d| d.to_string());
+        let stream = stream_prefix_objects(fragment, prefix, delimiter, "tar".to_string()).await?;
+
+        let builder = Response::builder()
+            .header(header::CONTENT_TYPE, "application/x-tar")
+            .header(
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}.tar\"", filename),
+            );
+        return Ok(builder.body(Body::from_stream(stream)).unwrap());
     }
 
     let selection = resolve_archive_keys(&fragment, &req).await?;
@@ -56,8 +82,6 @@ pub async fn download_selected_archive(
             "No object keys resolved from request".into(),
         ));
     }
-
-    let filename = req.filename.clone().unwrap_or_else(|| "export".to_string());
 
     let (effective_format, content_type, disposition) = if keys.len() > 1000 {
         (
@@ -133,6 +157,59 @@ fn matches_prefix_with_delimiter(key: &str, prefix: &str, delimiter: Option<&str
 
     let rel = &ck[(pfx.len() + 1)..];
     !rel.contains('/')
+}
+
+async fn list_objects_page_for_archive_prefix(
+    fragment: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    continuation_token: Option<String>,
+) -> Result<ListObjectsResult, AppError> {
+    let mut params = HashMap::new();
+    params.insert("limit".to_string(), ARCHIVE_LIST_PAGE_LIMIT.to_string());
+    params.insert("prefix".to_string(), canonical_prefix(prefix));
+    if let Some(d) = delimiter {
+        params.insert("delimiter".to_string(), d.to_string());
+    }
+    if let Some(token) = continuation_token {
+        params.insert("continuation_token".to_string(), token);
+    }
+
+    let claims = Claims {
+        fragment: fragment.to_string(),
+        read: true,
+        write: false,
+        modify: false,
+        delete: false,
+        exp: usize::MAX,
+    };
+    let response = crate::object_storage::retrieve::list_objects(
+        claims,
+        AxumPath(fragment.to_string()),
+        Query(params),
+    )
+    .await?
+    .into_response();
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), ARCHIVE_LIST_RESPONSE_LIMIT_BYTES)
+        .await
+        .map_err(|e| {
+            AppError::Io(
+                std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                "archive prefix list response".into(),
+            )
+        })?;
+    if status != StatusCode::OK {
+        return Err(AppError::InternalServerError(format!(
+            "archive prefix listing failed with status {}",
+            status
+        )));
+    }
+
+    serde_json::from_slice::<ListObjectsResult>(&body).map_err(|e| {
+        AppError::InternalServerError(format!("archive prefix listing decode failed: {}", e))
+    })
 }
 
 async fn resolve_keys_from_prefix_index(
@@ -445,6 +522,25 @@ async fn resolve_archive_keys(
     apply_archive_pagination(keys, max_keys, req.continuation_token.as_deref())
 }
 
+async fn stream_prefix_objects(
+    fragment: String,
+    prefix: String,
+    delimiter: Option<String>,
+    format: String,
+) -> Result<impl Stream<Item = Result<Bytes, AppError>>, AppError> {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, AppError>>(ARCHIVE_STREAM_CHANNEL);
+
+    tokio::spawn(async move {
+        if let Err(e) =
+            write_archive_stream_from_prefix(fragment, prefix, delimiter, format, tx.clone()).await
+        {
+            let _ = tx.send(Err(e)).await;
+        }
+    });
+
+    Ok(ReceiverStream::new(rx))
+}
+
 async fn stream_selected_objects(
     fragment: String,
     keys: Vec<String>,
@@ -459,6 +555,49 @@ async fn stream_selected_objects(
     });
 
     Ok(ReceiverStream::new(rx))
+}
+
+async fn write_archive_stream_from_prefix(
+    fragment: String,
+    prefix: String,
+    delimiter: Option<String>,
+    format: String,
+    tx: mpsc::Sender<Result<Bytes, AppError>>,
+) -> Result<(), AppError> {
+    let (reader, writer) = tokio::io::duplex(ARCHIVE_DUPLEX_BYTES);
+
+    tokio::spawn(async move {
+        let mut rs = ReaderStream::new(reader);
+        use tokio_stream::StreamExt;
+        while let Some(chunk) = rs.next().await {
+            match chunk {
+                Ok(b) => {
+                    if tx.send(Ok(b)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(AppError::Io(e, "streaming archive".into())))
+                        .await;
+                    break;
+                }
+            }
+        }
+    });
+
+    match format.as_str() {
+        "zip" => {
+            write_zip_archive_from_prefix(&fragment, prefix.as_str(), delimiter.as_deref(), writer)
+                .await?
+        }
+        _ => {
+            write_tar_archive_from_prefix(&fragment, prefix.as_str(), delimiter.as_deref(), writer)
+                .await?
+        }
+    }
+
+    Ok(())
 }
 
 async fn write_archive_stream(
@@ -576,6 +715,136 @@ async fn write_tar_archive(
         tar.append_data(&mut header, clean_key, reader)
             .await
             .map_err(|e| AppError::Io(e, "tar append".into()))?;
+    }
+
+    tar.finish()
+        .await
+        .map_err(|e| AppError::Io(e, "tar finish".into()))?;
+    Ok(())
+}
+
+async fn write_zip_archive_from_prefix(
+    fragment: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    writer: DuplexStream,
+) -> Result<(), AppError> {
+    let mut zip = ZipFileWriter::with_tokio(writer);
+    let mut continuation_token: Option<String> = None;
+
+    loop {
+        let page = list_objects_page_for_archive_prefix(
+            fragment,
+            prefix,
+            delimiter,
+            continuation_token.clone(),
+        )
+        .await?;
+
+        for summary in page.objects {
+            let clean_key = canonical_key(summary.object_key.as_str());
+            if clean_key.is_empty() {
+                continue;
+            }
+            if !matches_prefix_with_delimiter(clean_key.as_str(), prefix, delimiter) {
+                continue;
+            }
+
+            let metadata = match get_metadata(fragment, clean_key.as_str(), fragment).await {
+                Ok(m) if !m.is_delete_marker => m,
+                _ => continue,
+            };
+
+            let mut reader = create_multipart_reader(&metadata);
+            let builder = ZipEntryBuilder::new(clean_key.as_str().into(), Compression::Stored);
+            let mut entry_writer = zip.write_entry_stream(builder).await.map_err(|e| {
+                AppError::Io(
+                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                    "zip entry create".into(),
+                )
+            })?;
+            let mut compat_writer = (&mut entry_writer).compat_write();
+
+            tokio::io::copy(&mut reader, &mut compat_writer)
+                .await
+                .map_err(|e| AppError::Io(e, "zip copy".into()))?;
+
+            drop(compat_writer);
+
+            entry_writer.close().await.map_err(|e| {
+                AppError::Io(
+                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                    "zip entry close".into(),
+                )
+            })?;
+        }
+
+        continuation_token = page.continuation_token;
+        if continuation_token.is_none() {
+            break;
+        }
+    }
+
+    zip.close().await.map_err(|e| {
+        AppError::Io(
+            std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+            "zip finish".into(),
+        )
+    })?;
+    Ok(())
+}
+
+async fn write_tar_archive_from_prefix(
+    fragment: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    writer: DuplexStream,
+) -> Result<(), AppError> {
+    let mut tar = TarBuilder::new(writer);
+    let mut continuation_token: Option<String> = None;
+
+    loop {
+        let page = list_objects_page_for_archive_prefix(
+            fragment,
+            prefix,
+            delimiter,
+            continuation_token.clone(),
+        )
+        .await?;
+
+        for summary in page.objects {
+            let clean_key = canonical_key(summary.object_key.as_str());
+            if clean_key.is_empty() {
+                continue;
+            }
+            if !matches_prefix_with_delimiter(clean_key.as_str(), prefix, delimiter) {
+                continue;
+            }
+
+            let metadata = match get_metadata(fragment, clean_key.as_str(), fragment).await {
+                Ok(m) if !m.is_delete_marker => m,
+                _ => continue,
+            };
+
+            let mut header = TarHeader::new_gnu();
+            header
+                .set_path(clean_key.as_str())
+                .map_err(|e| AppError::Io(e, "tar path".into()))?;
+            header.set_size(metadata.total_size_bytes);
+            header.set_mode(0o644);
+            header.set_cksum();
+
+            let reader = create_multipart_reader(&metadata);
+
+            tar.append_data(&mut header, clean_key.as_str(), reader)
+                .await
+                .map_err(|e| AppError::Io(e, "tar append".into()))?;
+        }
+
+        continuation_token = page.continuation_token;
+        if continuation_token.is_none() {
+            break;
+        }
     }
 
     tar.finish()

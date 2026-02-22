@@ -3040,6 +3040,92 @@ fn validate_lite_write_policy(handle: &OpenHandleContext, offset: u64) -> Result
     Ok(())
 }
 
+fn validate_close_write_completion(handle: &OpenHandleContext) -> Result<(), AppError> {
+    let mut contiguous_end = handle.max_written_end;
+    for (offset, bytes) in &handle.pending_out_of_order_writes {
+        if *offset < contiguous_end {
+            continue;
+        }
+        if *offset > contiguous_end {
+            return Err(AppError::BadRequest(format!(
+                "write stream has missing range before close (missing {}..{})",
+                contiguous_end, offset
+            )));
+        }
+        contiguous_end = contiguous_end.saturating_add(bytes.len() as u64);
+    }
+
+    if let Some(expected_size) = handle.expected_size_bytes {
+        if expected_size > contiguous_end {
+            return Err(AppError::BadRequest(format!(
+                "write stream ended before expected size (expected={} received={})",
+                expected_size, contiguous_end
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+async fn flush_buffered_writes_strict(
+    handle: &mut OpenHandleContext,
+    gateway: &SharedGateway,
+) -> Result<(), AppError> {
+    let Some(write_handle) = handle.pending_write.clone() else {
+        return Ok(());
+    };
+    validate_close_write_completion(handle)?;
+
+    while let Some(next_offset) = handle.pending_out_of_order_writes.keys().next().copied() {
+        if next_offset < handle.max_written_end {
+            if let Some(stale) = handle.pending_out_of_order_writes.remove(&next_offset) {
+                handle.out_of_order_buffered_bytes = handle
+                    .out_of_order_buffered_bytes
+                    .saturating_sub(stale.len());
+            }
+            continue;
+        }
+
+        if next_offset > handle.max_written_end {
+            debug!(
+                "smb close rejected missing write gap path='{}' from={} next={}",
+                handle.object_key, handle.max_written_end, next_offset
+            );
+            return Err(AppError::BadRequest(format!(
+                "write stream has missing range before close (missing {}..{})",
+                handle.max_written_end, next_offset
+            )));
+        }
+
+        let Some(bytes) = handle.pending_out_of_order_writes.remove(&next_offset) else {
+            continue;
+        };
+        let bytes_len = bytes.len();
+        gateway
+            .write_chunk(&write_handle, next_offset, bytes)
+            .await?;
+        handle.out_of_order_buffered_bytes =
+            handle.out_of_order_buffered_bytes.saturating_sub(bytes_len);
+        handle.max_written_end = handle.max_written_end.max(next_offset + bytes_len as u64);
+    }
+    handle.out_of_order_buffered_bytes = 0;
+
+    if let Some(expected_size) = handle.expected_size_bytes {
+        if expected_size > handle.max_written_end {
+            debug!(
+                "smb close rejected expected-size tail gap path='{}' expected={} received={}",
+                handle.object_key, expected_size, handle.max_written_end
+            );
+            return Err(AppError::BadRequest(format!(
+                "write stream ended before expected size (expected={} received={})",
+                expected_size, handle.max_written_end
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 async fn handle_write(
     request: &[u8],
     header: &Smb2HeaderView,
@@ -3434,6 +3520,21 @@ async fn handle_close(
     }
 
     if handle.pending_write.is_some() {
+        if let Err(e) = flush_buffered_writes_strict(&mut handle, gateway).await {
+            if let Some(write_handle) = handle.pending_write.clone() {
+                if let Err(abort_err) = gateway.abort_write(&write_handle).await {
+                    warn!(
+                        "smb close abort after flush failure failed for {}/{}: {}",
+                        handle.fragment, handle.object_key, abort_err
+                    );
+                }
+            }
+            if let Some(transfer_id) = handle.transfer_id.as_deref() {
+                transfer_failed(transfer_id, e.to_string().as_str());
+            }
+            return (app_error_to_status(e), build_not_supported_error_body());
+        }
+
         let write_size_hint = handle
             .expected_size_bytes
             .unwrap_or(0)
@@ -6550,6 +6651,50 @@ mod tests {
     fn lite_write_policy_accepts_forward_offset_for_buffering() {
         let handle = make_test_write_handle(true, true, 4096);
         let result = validate_lite_write_policy(&handle, 8192);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn close_write_completion_rejects_internal_gap() {
+        let mut handle = make_test_write_handle(true, true, 4096);
+        handle
+            .pending_out_of_order_writes
+            .insert(8192, vec![1u8; 1024]);
+
+        let result = validate_close_write_completion(&handle);
+        assert!(matches!(
+            result,
+            Err(AppError::BadRequest(msg)) if msg.contains("missing range before close")
+        ));
+    }
+
+    #[test]
+    fn close_write_completion_rejects_tail_shortfall_against_expected_size() {
+        let mut handle = make_test_write_handle(true, true, 4096);
+        handle
+            .pending_out_of_order_writes
+            .insert(4096, vec![2u8; 1024]);
+        handle.expected_size_bytes = Some(8192);
+
+        let result = validate_close_write_completion(&handle);
+        assert!(matches!(
+            result,
+            Err(AppError::BadRequest(msg)) if msg.contains("ended before expected size")
+        ));
+    }
+
+    #[test]
+    fn close_write_completion_accepts_contiguous_stream_to_expected_size() {
+        let mut handle = make_test_write_handle(true, true, 4096);
+        handle
+            .pending_out_of_order_writes
+            .insert(4096, vec![3u8; 1024]);
+        handle
+            .pending_out_of_order_writes
+            .insert(5120, vec![4u8; 1024]);
+        handle.expected_size_bytes = Some(6144);
+
+        let result = validate_close_write_completion(&handle);
         assert!(result.is_ok());
     }
 }

@@ -165,7 +165,7 @@ impl ObjectPathManager {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ListObjectsResult {
     pub objects: Vec<ObjectMetadata>,
     #[serde(default)]

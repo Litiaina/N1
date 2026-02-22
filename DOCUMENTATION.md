@@ -125,6 +125,7 @@ Response (`InitiateUploadResponse`):
 Notes:
 - `keys` can be explicit list.
 - Or resolve by `prefix` with optional `delimiter` (`/` supported).
+- For full prefix recovery at scale, omit `max_keys` to stream the entire prefix in one archive response (server forces `tar`).
 - Large archive responses can return header `x-n1-archive-next-token`.
 
 ### 4.4 Signed URL Request
@@ -302,6 +303,7 @@ Purpose:
 
 Behavior:
 - If selection is very large (>1000 keys), server forces `tar`.
+- If `prefix` is used without `max_keys`, server streams all matching keys (unbounded prefix walk, memory bounded) and forces `tar`.
 - Response may include `x-n1-archive-next-token` for continuation.
 
 ```bash

@@ -224,11 +224,16 @@ impl InProcessBackend {
         response: Response,
         accepted: &[StatusCode],
     ) -> Result<(), AppError> {
-        let (status, body) = Self::response_bytes(response, FSD_CONTROL_BODY_LIMIT_BYTES).await?;
-        if !accepted.contains(&status) {
-            return Err(Self::status_to_error(status, &body));
+        let status = response.status();
+        if accepted.contains(&status) {
+            // Successful control-path responses can legitimately carry large JSON payloads
+            // (e.g. finalize upload returns object metadata for very large multipart files).
+            // The backend does not need that body, so avoid buffering it under control limits.
+            return Ok(());
         }
-        Ok(())
+
+        let (_status, body) = Self::response_bytes(response, FSD_CONTROL_BODY_LIMIT_BYTES).await?;
+        Err(Self::status_to_error(status, &body))
     }
 
     async fn list_page(
@@ -1901,6 +1906,8 @@ impl FsdBackend for InProcessBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::response::Response;
 
     #[test]
     fn split_trash_virtual_key_root_and_child() {
@@ -1942,5 +1949,27 @@ mod tests {
         let got = InProcessBackend::to_trash_virtual_path(&base, "a/b/c.mp4");
         assert_eq!(got.fragment, "frag");
         assert_eq!(got.object_key, ".n1-trash/a/b/c.mp4");
+    }
+
+    #[tokio::test]
+    async fn expect_empty_response_ignores_large_body_for_accepted_status() {
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from(vec![0u8; FSD_CONTROL_BODY_LIMIT_BYTES + 1]))
+            .expect("response");
+
+        let result = InProcessBackend::expect_empty_response(response, &[StatusCode::OK]).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn expect_empty_response_returns_status_error_for_non_accepted_status() {
+        let response = Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("bad request"))
+            .expect("response");
+
+        let result = InProcessBackend::expect_empty_response(response, &[StatusCode::OK]).await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
     }
 }
