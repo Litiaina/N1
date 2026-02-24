@@ -4,7 +4,7 @@ use crate::object_storage::disk_manager::{ObjectPathManager, PartMetadata, Shard
 use crate::object_storage::upload::{DirectWriter, sync_dir};
 
 use crc32fast::Hasher;
-use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
+use simd_erasure_core::{ReedSolomonDecoder, ReedSolomonEncoder};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions as StdOpenOptions;
 use std::io::SeekFrom;

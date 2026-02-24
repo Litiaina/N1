@@ -1,7 +1,7 @@
 use crate::enums::app_error_enum::AppError;
 use crc32fast::Hasher;
 use once_cell::sync::Lazy;
-use reed_solomon_simd::ReedSolomonEncoder;
+use simd_erasure_core::ReedSolomonEncoder;
 use std::alloc::{Layout, alloc, dealloc};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};

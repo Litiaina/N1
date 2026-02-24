@@ -1,5 +1,9 @@
 # Rust build output
 /target/
+**/target/
+
+**/Cargo.lock
+!Cargo.lock
 
 # JetBrains RustRover project files
 .idea/
