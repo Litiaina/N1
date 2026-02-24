@@ -703,12 +703,9 @@ async fn write_tar_archive(
         };
 
         let mut header = TarHeader::new_gnu();
-        header
-            .set_path(clean_key)
-            .map_err(|e| AppError::Io(e, "tar path".into()))?;
+
         header.set_size(metadata.total_size_bytes);
         header.set_mode(0o644);
-        header.set_cksum();
 
         let reader = create_multipart_reader(&metadata);
 
@@ -827,12 +824,9 @@ async fn write_tar_archive_from_prefix(
             };
 
             let mut header = TarHeader::new_gnu();
-            header
-                .set_path(clean_key.as_str())
-                .map_err(|e| AppError::Io(e, "tar path".into()))?;
+
             header.set_size(metadata.total_size_bytes);
             header.set_mode(0o644);
-            header.set_cksum();
 
             let reader = create_multipart_reader(&metadata);
 
