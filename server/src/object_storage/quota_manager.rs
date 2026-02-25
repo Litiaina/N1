@@ -6,6 +6,7 @@ use moka::future::Cache;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::fs::{self, File};
@@ -14,7 +15,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::{info, warn};
 
-const DISK_IO_TIMEOUT: Duration = Duration::from_secs(2);
+const DISK_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 static QUOTA_LOCKS: LazyLock<Vec<Mutex<()>>> = LazyLock::new(|| {
     let mut locks = Vec::with_capacity(LOCK_SHARD_COUNT);
@@ -23,6 +24,8 @@ static QUOTA_LOCKS: LazyLock<Vec<Mutex<()>>> = LazyLock::new(|| {
     }
     locks
 });
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn get_quota_lock(fragment: &str) -> &Mutex<()> {
     let mut hasher = DefaultHasher::new();
@@ -50,6 +53,9 @@ async fn write_quota_to_all_disks(fragment: &str, quota: &Quota) -> Result<(), A
             .map_err(|_| AppError::InternalServerError("Quota serialize error".into()))?,
     );
 
+    let req_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+
     let write_futures = paths.into_iter().map(|path| {
         let bytes = bytes.clone();
         async move {
@@ -58,11 +64,15 @@ async fn write_quota_to_all_disks(fragment: &str, quota: &Quota) -> Result<(), A
                 match exists_result {
                     Ok(Ok(true)) => {}
                     Ok(Ok(false)) => {
-                        if let Err(e) = timeout(DISK_IO_TIMEOUT, fs::create_dir_all(parent)).await {
-                            return Err(AppError::Timeout(format!(
-                                "Create dir {:?} timed out. Error: {:?}",
-                                parent, e
-                            )));
+                        match timeout(DISK_IO_TIMEOUT, fs::create_dir_all(parent)).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => return Err(AppError::Io(e, "create quota dir".into())),
+                            Err(_) => {
+                                return Err(AppError::Timeout(format!(
+                                    "Create dir {:?} timed out",
+                                    parent
+                                )));
+                            }
                         }
                     }
                     Ok(Err(e)) => return Err(AppError::Io(e, "check parent existence".into())),
@@ -70,7 +80,8 @@ async fn write_quota_to_all_disks(fragment: &str, quota: &Quota) -> Result<(), A
                 }
             }
 
-            let tmp_path = path.with_extension("tmp");
+            let tmp_path = path.with_extension(format!("tmp.{}.{}", pid, req_id));
+
             let write_result = timeout(DISK_IO_TIMEOUT, async {
                 let mut file = File::create(&tmp_path)
                     .await
@@ -78,26 +89,58 @@ async fn write_quota_to_all_disks(fragment: &str, quota: &Quota) -> Result<(), A
                 file.write_all(&bytes)
                     .await
                     .map_err(|e| AppError::Io(e, "write quota bytes".into()))?;
-                file.flush()
+                file.sync_data()
                     .await
-                    .map_err(|e| AppError::Io(e, "flush quota".into()))?;
+                    .map_err(|e| AppError::Io(e, "sync quota".into()))?;
                 Ok::<(), AppError>(())
             })
             .await;
 
-            if let Err(_) = write_result {
-                let _ = fs::remove_file(&tmp_path).await;
-                return Err(AppError::Timeout("write quota".into()));
-            } else if let Ok(Err(e)) = write_result {
-                return Err(e);
+            match write_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    let _ = fs::remove_file(&tmp_path).await;
+                    return Err(e);
+                }
+                Err(_) => {
+                    let _ = fs::remove_file(&tmp_path).await;
+                    return Err(AppError::Timeout("write quota".into()));
+                }
             }
 
-            let rename_result = timeout(DISK_IO_TIMEOUT, fs::rename(&tmp_path, &path)).await;
-            match rename_result {
-                Ok(Ok(_)) => Ok(()),
-                Ok(Err(e)) => Err(AppError::Io(e, "rename quota".into())),
-                Err(_) => Err(AppError::Timeout("rename quota".into())),
+            let mut rename_result_final = Ok(());
+            for attempt in 0..3 {
+                let rename_result = timeout(DISK_IO_TIMEOUT, fs::rename(&tmp_path, &path)).await;
+                match rename_result {
+                    Ok(Ok(_)) => {
+                        if let Some(parent) = path.parent() {
+                            if let Ok(dir) = std::fs::File::open(parent) {
+                                let _ = dir.sync_all();
+                            }
+                        }
+                        rename_result_final = Ok(());
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        if attempt == 2 {
+                            rename_result_final = Err(AppError::Io(e, "rename quota".into()));
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                    Err(_) => {
+                        rename_result_final = Err(AppError::Timeout("rename quota".into()));
+                        break;
+                    }
+                }
             }
+
+            if rename_result_final.is_err() {
+                let _ = fs::remove_file(&tmp_path).await;
+                return rename_result_final;
+            }
+
+            Ok(())
         }
     });
 
@@ -126,13 +169,10 @@ async fn write_quota_to_all_disks(fragment: &str, quota: &Quota) -> Result<(), A
 
 async fn read_quota_from_any_disk(fragment: &str) -> Result<Quota, AppError> {
     let paths = get_all_quota_paths(fragment);
-
     for path in paths {
         let exists_check = timeout(DISK_IO_TIMEOUT, fs::try_exists(&path)).await;
-
         if let Ok(Ok(true)) = exists_check {
             let read_result = timeout(DISK_IO_TIMEOUT, fs::read(&path)).await;
-
             match read_result {
                 Ok(Ok(bytes)) => {
                     if let Ok(quota) = rmp_serde::from_slice(&bytes) {
@@ -144,13 +184,11 @@ async fn read_quota_from_any_disk(fragment: &str) -> Result<Quota, AppError> {
             }
         }
     }
-
     Err(AppError::Unauthorized)
 }
 
 pub async fn init_quota_file(fragment: &str, allocated: u64) -> Result<(), AppError> {
     let _guard = get_quota_lock(fragment).lock().await;
-
     match read_quota_from_any_disk(fragment).await {
         Ok(current_quota) => {
             if current_quota.allocated_storage != allocated {
@@ -174,7 +212,6 @@ pub async fn init_quota_file(fragment: &str, allocated: u64) -> Result<(), AppEr
             info!("Initialized quota file for new fragment {}", fragment);
         }
     }
-
     Ok(())
 }
 
@@ -182,11 +219,8 @@ pub async fn get_quota(fragment: &str) -> Result<Quota, AppError> {
     if let Some(quota) = QUOTA_CACHE.get(fragment).await {
         return Ok(quota);
     }
-
     let _guard = get_quota_lock(fragment).lock().await;
-
     let quota = read_quota_from_any_disk(fragment).await?;
-
     QUOTA_CACHE
         .insert(fragment.to_string(), quota.clone())
         .await;
@@ -195,7 +229,6 @@ pub async fn get_quota(fragment: &str) -> Result<Quota, AppError> {
 
 pub async fn update_quota(fragment: &str, delta_bytes: i64) -> Result<(), AppError> {
     let _guard = get_quota_lock(fragment).lock().await;
-
     let mut quota = match read_quota_from_any_disk(fragment).await {
         Ok(q) => q,
         Err(_) => {
@@ -204,43 +237,36 @@ pub async fn update_quota(fragment: &str, delta_bytes: i64) -> Result<(), AppErr
             ));
         }
     };
-
     if delta_bytes < 0 {
-        quota.storage_used = quota.storage_used.saturating_sub(delta_bytes.abs() as u64);
+        quota.storage_used = quota
+            .storage_used
+            .saturating_sub(delta_bytes.unsigned_abs());
     } else {
         quota.storage_used = quota.storage_used.saturating_add(delta_bytes as u64);
     }
-
     write_quota_to_all_disks(fragment, &quota).await?;
     Ok(())
 }
 
 pub async fn try_reserve_quota(fragment: &str, reserve_amount: u64) -> Result<(), AppError> {
     let _guard = get_quota_lock(fragment).lock().await;
-
     let mut quota = read_quota_from_any_disk(fragment).await?;
-
     if quota.storage_used.saturating_add(reserve_amount) > quota.allocated_storage {
         return Err(AppError::InsufficientStorage);
     }
-
     quota.storage_used += reserve_amount;
-
     write_quota_to_all_disks(fragment, &quota).await?;
-
     Ok(())
 }
 
 pub async fn set_storage_used(fragment: &str, usage: u64) -> Result<(), AppError> {
     let _guard = get_quota_lock(fragment).lock().await;
-
     let paths = get_all_quota_paths(fragment);
     let mut quota_found = false;
     let mut current_quota = Quota {
         allocated_storage: 0,
         storage_used: 0,
     };
-
     for path in &paths {
         if timeout(DISK_IO_TIMEOUT, fs::try_exists(path))
             .await
@@ -256,20 +282,16 @@ pub async fn set_storage_used(fragment: &str, usage: u64) -> Result<(), AppError
             }
         }
     }
-
     if !quota_found {
         return Ok(());
     }
-
     if current_quota.storage_used != usage {
         info!(
             "Consistency Fix: Correcting usage for {} (File: {} -> Disk: {})",
             fragment, current_quota.storage_used, usage
         );
         current_quota.storage_used = usage;
-
         write_quota_to_all_disks(fragment, &current_quota).await?;
     }
-
     Ok(())
 }
