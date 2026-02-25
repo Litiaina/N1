@@ -21,7 +21,7 @@ use crate::object_storage::constants::{
     RESERVATION_FILE,
 };
 use crate::object_storage::disk_manager::{
-    ObjectPathManager, ObjectSummary, PrefixIndexEntry, PrefixIndexSegment,
+    ObjectMetadata, ObjectPathManager, ObjectSummary, PrefixIndexEntry, PrefixIndexSegment,
 };
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
@@ -273,9 +273,15 @@ async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
             if let Ok(rd) = std::fs::read_dir(&root) {
                 for ent in rd.filter_map(|e| e.ok()) {
                     if ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                        if let Some(name) = ent.file_name().to_str() {
-                            out.insert(name.to_string());
+                        let name = ent.file_name().to_string_lossy().to_string();
+                        if name.starts_with('.')
+                            || name == "System Volume Information"
+                            || name == "$RECYCLE.BIN"
+                            || name == "lost+found"
+                        {
+                            continue;
                         }
+                        out.insert(name);
                     }
                 }
             }
@@ -393,43 +399,57 @@ async fn scan_latest_by_key(
                 Err(_) => continue,
             };
 
-            let meta = match rmp_serde::from_slice::<ObjectSummary>(&raw) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
+            let (meta_frag, is_del, obj_key, ver_id, cr_at) =
+                match rmp_serde::from_slice::<ObjectSummary>(&raw) {
+                    Ok(m) => (
+                        m.fragment,
+                        m.is_delete_marker,
+                        m.object_key,
+                        m.version_id,
+                        m.created_at,
+                    ),
+                    Err(_) => match rmp_serde::from_slice::<ObjectMetadata>(&raw) {
+                        Ok(m) => (
+                            m.fragment,
+                            m.is_delete_marker,
+                            m.object_key,
+                            m.version_id,
+                            m.created_at,
+                        ),
+                        Err(_) => continue,
+                    },
+                };
 
-            if meta.fragment != frag {
+            if meta_frag != frag {
                 continue;
             }
 
-            if meta.is_delete_marker {
-                let key = canonical_key(&meta.object_key);
-                let vid = meta.version_id.clone();
-                let ts = meta.created_at;
+            if is_del {
+                let key = canonical_key(&obj_key);
+                let ts = cr_at;
                 match latest_tombstone.get(&key) {
                     None => {
-                        latest_tombstone.insert(key, (vid, ts));
+                        latest_tombstone.insert(key, (ver_id, ts));
                     }
                     Some((cur_vid, cur_ts)) => {
-                        if ts > *cur_ts || (ts == *cur_ts && vid > *cur_vid) {
-                            latest_tombstone.insert(key, (vid, ts));
+                        if ts > *cur_ts || (ts == *cur_ts && &ver_id > cur_vid) {
+                            latest_tombstone.insert(key, (ver_id, ts));
                         }
                     }
                 }
                 continue;
             }
 
-            let key = canonical_key(&meta.object_key);
-            let vid = meta.version_id.clone();
-            let ts = meta.created_at;
+            let key = canonical_key(&obj_key);
+            let ts = cr_at;
 
             match latest.get(&key) {
                 None => {
-                    latest.insert(key, (vid, ts));
+                    latest.insert(key, (ver_id, ts));
                 }
                 Some((cur_vid, cur_ts)) => {
-                    if ts > *cur_ts || (ts == *cur_ts && vid > *cur_vid) {
-                        latest.insert(key, (vid, ts));
+                    if ts > *cur_ts || (ts == *cur_ts && &ver_id > cur_vid) {
+                        latest.insert(key, (ver_id, ts));
                     }
                 }
             }
@@ -533,7 +553,6 @@ async fn write_compacted_prefixes(
             )));
         }
 
-        // Cleanup old segments to ensure consistency without nuking the world
         for dir in &bucket_dirs {
             if !fs::try_exists(dir).await.unwrap_or(false) {
                 continue;
@@ -544,8 +563,6 @@ async fn write_compacted_prefixes(
                     if name.starts_with("seg_") && name.ends_with(PREFIX_SEGMENT_EXT) {
                         if let Ok(md) = entry.metadata().await {
                             if let Ok(mtime) = md.modified() {
-                                // Only delete segments older than the start of our scan.
-                                // Newer segments might be valid concurrent writes.
                                 if mtime < job_start_time {
                                     let _ = fs::remove_file(entry.path()).await;
                                 }
@@ -626,17 +643,13 @@ pub async fn run_prefix_rebuild_job(
             let mut st = PR_STATUS.write().await;
             st.current_fragment = frag.clone();
             st.total_fragments_scanned += 1;
-            // Removed destructive nuke phase
             push_update(&ws, &st);
         }
 
         let scan_index_dir = match choose_best_index_dir_for_fragment(&index_roots, &frag).await {
             Some(p) => p,
             None => {
-                let mut st = PR_STATUS.write().await;
-                st.total_errors += 1;
-                st.last_error = Some(format!("No readable index dir for fragment {}", frag));
-                push_update(&ws, &st);
+                info!("Skipping directory '{}' - no valid N1 index found.", frag);
                 continue;
             }
         };

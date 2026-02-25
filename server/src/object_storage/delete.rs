@@ -783,6 +783,8 @@ pub async fn empty_trash(
                     if let Ok(data) = std::fs::read(entry.path()) {
                         if let Ok(meta) = rmp_serde::from_slice::<ObjectSummary>(&data) {
                             mirror_total += meta.total_size_bytes;
+                        } else if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
+                            mirror_total += meta.total_size_bytes;
                         }
                     }
                 }
@@ -896,6 +898,8 @@ pub async fn delete_object_permanently(
                     let mut size = 0u64;
                     if let Ok(data) = fs::read(entry.path()).await {
                         if let Ok(meta) = rmp_serde::from_slice::<ObjectSummary>(&data) {
+                            size = meta.total_size_bytes;
+                        } else if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
                             size = meta.total_size_bytes;
                         }
                     }
@@ -1360,13 +1364,19 @@ pub async fn recover_all_trash(
                 Err(_) => continue,
             };
 
-            let meta = match rmp_serde::from_slice::<ObjectSummary>(&data) {
-                Ok(m) => m,
-                Err(_) => continue,
+            let (obj_key, ver_id, cr_at) = match rmp_serde::from_slice::<ObjectSummary>(&data) {
+                Ok(m) => (m.object_key, m.version_id, m.created_at),
+                Err(_) => match rmp_serde::from_slice::<ObjectMetadata>(&data) {
+                    Ok(m) => (m.object_key, m.version_id, m.created_at),
+                    Err(e) => {
+                        warn!("Failed to deserialize metadata during recover all: {}", e);
+                        continue;
+                    }
+                },
             };
 
-            let k = format!("{}\n{}", meta.object_key, meta.version_id);
-            recovered_meta_entries.insert(k, (meta.object_key, meta.version_id, meta.created_at));
+            let k = format!("{}\n{}", obj_key, ver_id);
+            recovered_meta_entries.insert(k, (obj_key, ver_id, cr_at));
         }
     }
 
@@ -1440,9 +1450,11 @@ pub async fn recover_all_trash(
         }
     }
 
+    let mut compact_candidates = Vec::new();
     for pfx in affected_prefixes {
-        invalidate_compacted_for_key(&path_manager, &fragment, &pfx).await;
+        compact_candidates.push(canonical_prefix(&pfx));
     }
+    schedule_prefix_compaction(fragment.clone(), compact_candidates);
 
     info!("Recovered all items from trash for fragment {}", fragment);
     state.emit(&fragment, StorageEventPayload::StateInvalidated);
