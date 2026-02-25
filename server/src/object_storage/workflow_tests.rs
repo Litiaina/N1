@@ -5237,3 +5237,90 @@ async fn matrix_index_mirror_ha_soak_down_recover() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_repro_delete_multiple_restore_all_listing_blank() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let prefix = "repro-blank";
+    let count = 5;
+    let mut keys = Vec::new();
+
+    for i in 0..count {
+        let key = format!("{}/obj-{}.bin", prefix, i);
+        put_object(state.clone(), &fragment, &key, vec![0xAA; 10]).await;
+        keys.push(key);
+    }
+
+    let initial = list_objects_json(&fragment, Some(prefix), None).await;
+    let initial_keys = initial["objects"]
+        .as_array()
+        .expect("objects array")
+        .len();
+    assert_eq!(initial_keys, count, "initial listing mismatch");
+
+    for key in &keys {
+        let resp = delete_object(
+            State(state.clone()),
+            full_claims(&fragment),
+            AxumPath((fragment.clone(), key.clone())),
+        )
+        .await
+        .expect("delete object")
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let empty = list_objects_json(&fragment, Some(prefix), None).await;
+    let empty_keys = empty["objects"]
+        .as_array()
+        .map(|v| v.len())
+        .unwrap_or(0);
+    assert_eq!(empty_keys, 0, "listing should be empty after delete");
+
+    for key in &keys {
+        let resp = recover_object(
+            State(state.clone()),
+            full_claims(&fragment),
+            AxumPath((fragment.clone(), key.clone())),
+        )
+        .await
+        .expect("recover object")
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let restored = list_objects_json(&fragment, Some(prefix), None).await;
+    let restored_keys = restored["objects"]
+        .as_array()
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    assert_eq!(
+        restored_keys, count,
+        "listing should be restored after recover"
+    );
+
+    let restored_delim = list_objects_json(&fragment, Some(prefix), Some("/")).await;
+    let restored_delim_keys = restored_delim["objects"]
+        .as_array()
+        .map(|v| v.len())
+        .unwrap_or(0);
+    assert_eq!(
+        restored_delim_keys, count,
+        "listing with delimiter should be restored after recover"
+    );
+}

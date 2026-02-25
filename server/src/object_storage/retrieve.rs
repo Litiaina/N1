@@ -384,7 +384,7 @@ async fn try_list_by_prefix_index(
         }
 
         let Some(meta) = read_metadata_best(&path_manager, fragment, &k, &v).await else {
-            continue;
+            return Ok(None);
         };
 
         if meta.is_delete_marker {
@@ -608,14 +608,6 @@ async fn list_objects_internal(
         {
             return Ok(AxumJson(res));
         }
-    }
-
-    if delimiter.is_some() {
-        return Ok(AxumJson(ListObjectsResult {
-            objects: Vec::new(),
-            common_prefixes: Vec::new(),
-            continuation_token: None,
-        }));
     }
 
     let continuation_cursor = continuation_token
