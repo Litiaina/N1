@@ -89,7 +89,3 @@ impl WsConnectionManager {
 pub fn register_global_ws_manager(manager: WsConnectionManager) {
     let _ = GLOBAL_WS_MANAGER.set(manager);
 }
-
-pub fn global_ws_manager() -> Option<WsConnectionManager> {
-    GLOBAL_WS_MANAGER.get().cloned()
-}

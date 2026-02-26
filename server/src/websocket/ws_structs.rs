@@ -92,9 +92,6 @@ pub enum StorageEventPayload {
 
     #[serde(rename = "PREFIX_REBUILD_UPDATE")]
     PrefixRebuildUpdate(PrefixRebuildJobStatus),
-
-    #[serde(rename = "SMB_TRANSFER_PROGRESS")]
-    SmbTransferProgress(SmbTransferProgressPayload),
 }
 
 #[derive(Debug, Clone, Serialize)]
