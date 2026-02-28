@@ -17,12 +17,14 @@ use walkdir::WalkDir;
 
 use crate::enums::app_error_enum::AppError;
 use crate::object_storage::constants::{
-    METADATA_EXT, PART_META_SUFFIX, PREFIX_INDEX_DIR, PREFIX_SEGMENT_EXT, QUOTA_FILE,
+    METADATA_EXT, PART_META_SUFFIX, PREFIX_DELIMITER_COMPACTED_FILE,
+    PREFIX_DELIMITER_SEGMENT_PREFIX, PREFIX_INDEX_DIR, PREFIX_SEGMENT_EXT, QUOTA_FILE,
     RESERVATION_FILE,
 };
 use crate::object_storage::disk_manager::{
     ObjectMetadata, ObjectPathManager, ObjectSummary, PrefixIndexEntry, PrefixIndexSegment,
 };
+use crate::object_storage::prefix_delimiter::build_delimiter_compacted_from_entries;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
 use crate::structs::auth_structs::Claims;
@@ -488,6 +490,7 @@ fn build_per_prefix(
                     object_key: object_key.clone(),
                     version_id: version_id.clone(),
                     created_at,
+                    is_delete_marker: false,
                 });
         }
     }
@@ -530,8 +533,13 @@ async fn write_compacted_prefixes(
         let bytes = rmp_serde::to_vec(&seg).map_err(|e| {
             AppError::InternalServerError(format!("serialize prefix compacted: {}", e))
         })?;
+        let delimiter_compacted = build_delimiter_compacted_from_entries(&prefix, &seg.entries);
+        let delimiter_bytes = rmp_serde::to_vec(&delimiter_compacted).map_err(|e| {
+            AppError::InternalServerError(format!("serialize delimiter prefix compacted: {}", e))
+        })?;
 
-        let mut wrote_any = false;
+        let mut wrote_prefix_any = false;
+        let mut wrote_delimiter_any = false;
         let bucket_dirs = path_manager.get_all_prefix_bucket_dirs(fragment, &prefix);
 
         for p in path_manager.get_all_prefix_compacted_paths(fragment, &prefix) {
@@ -542,11 +550,23 @@ async fn write_compacted_prefixes(
                 if let Some(parent) = p.parent() {
                     parent_dirs_to_sync.insert(parent.to_path_buf());
                 }
-                wrote_any = true;
+                wrote_prefix_any = true;
             }
         }
 
-        if !wrote_any {
+        for p in path_manager.get_all_prefix_delimiter_compacted_paths(fragment, &prefix) {
+            if let Some(parent) = p.parent() {
+                let _ = fs::create_dir_all(parent).await;
+            }
+            if write_atomic_overwrite(&p, &delimiter_bytes).await.is_ok() {
+                if let Some(parent) = p.parent() {
+                    parent_dirs_to_sync.insert(parent.to_path_buf());
+                }
+                wrote_delimiter_any = true;
+            }
+        }
+
+        if !wrote_prefix_any || !wrote_delimiter_any {
             return Err(AppError::InternalServerError(format!(
                 "failed to write compacted for prefix {}",
                 prefix
@@ -560,7 +580,10 @@ async fn write_compacted_prefixes(
             if let Ok(mut rd) = fs::read_dir(dir).await {
                 while let Ok(Some(entry)) = rd.next_entry().await {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if name.starts_with("seg_") && name.ends_with(PREFIX_SEGMENT_EXT) {
+                    if (name.starts_with("seg_")
+                        || name.starts_with(PREFIX_DELIMITER_SEGMENT_PREFIX))
+                        && name.ends_with(PREFIX_SEGMENT_EXT)
+                    {
                         if let Ok(md) = entry.metadata().await {
                             if let Ok(mtime) = md.modified() {
                                 if mtime < job_start_time {
@@ -570,6 +593,18 @@ async fn write_compacted_prefixes(
                         }
                     }
                 }
+            }
+        }
+
+        for dir in &bucket_dirs {
+            if !fs::try_exists(dir).await.unwrap_or(false) {
+                continue;
+            }
+            if fs::try_exists(&dir.join(PREFIX_DELIMITER_COMPACTED_FILE))
+                .await
+                .unwrap_or(false)
+            {
+                parent_dirs_to_sync.insert(dir.clone());
             }
         }
 

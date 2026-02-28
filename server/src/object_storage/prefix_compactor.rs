@@ -1,8 +1,11 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::PREFIX_SEGMENT_EXT;
+use crate::object_storage::constants::{
+    PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_DELIMITER_SEGMENT_PREFIX, PREFIX_SEGMENT_EXT,
+};
 use crate::object_storage::disk_manager::{
     ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment,
 };
+use crate::object_storage::prefix_delimiter::build_delimiter_compacted_from_entries;
 use once_cell::sync::OnceCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -144,14 +147,20 @@ async fn write_atomic_overwrite(path: &Path, data: &[u8]) -> Result<(), AppError
     Ok(())
 }
 
-fn merge_entry(latest: &mut HashMap<String, (String, i64)>, e: PrefixIndexEntry) {
+fn merge_entry(latest: &mut HashMap<String, (String, i64, bool)>, e: PrefixIndexEntry) {
     match latest.get(&e.object_key) {
         None => {
-            latest.insert(e.object_key, (e.version_id, e.created_at));
+            latest.insert(
+                e.object_key,
+                (e.version_id, e.created_at, e.is_delete_marker),
+            );
         }
-        Some((cur_vid, cur_ts)) => {
+        Some((cur_vid, cur_ts, _)) => {
             if e.created_at > *cur_ts || (e.created_at == *cur_ts && e.version_id > *cur_vid) {
-                latest.insert(e.object_key, (e.version_id, e.created_at));
+                latest.insert(
+                    e.object_key,
+                    (e.version_id, e.created_at, e.is_delete_marker),
+                );
             }
         }
     }
@@ -164,8 +173,10 @@ async fn compact_prefix_if_needed(
 ) -> Result<(), AppError> {
     let bucket_dirs = path_manager.get_all_prefix_bucket_dirs(fragment, prefix);
     let mut all_seg_paths: Vec<(String, PathBuf)> = Vec::new();
-    let mut latest: HashMap<String, (String, i64)> = HashMap::new();
+    let mut all_delim_seg_paths: Vec<PathBuf> = Vec::new();
+    let mut latest: HashMap<String, (String, i64, bool)> = HashMap::new();
     let mut had_any_data = false;
+    let mut needs_delimiter_bootstrap = false;
 
     for d in &bucket_dirs {
         if !fs::try_exists(d).await.unwrap_or(false) {
@@ -177,6 +188,12 @@ async fn compact_prefix_if_needed(
             if let Ok(data) = fs::read(&compacted_path).await {
                 if let Ok(seg) = rmp_serde::from_slice::<PrefixIndexSegment>(&data) {
                     had_any_data = true;
+                    if !fs::try_exists(&d.join(PREFIX_DELIMITER_COMPACTED_FILE))
+                        .await
+                        .unwrap_or(false)
+                    {
+                        needs_delimiter_bootstrap = true;
+                    }
                     for e in seg.entries {
                         merge_entry(&mut latest, e);
                     }
@@ -189,12 +206,19 @@ async fn compact_prefix_if_needed(
                 let name = entry.file_name().to_string_lossy().to_string();
                 if name.starts_with("seg_") && name.ends_with(PREFIX_SEGMENT_EXT) {
                     all_seg_paths.push((name, entry.path()));
+                } else if name.starts_with(PREFIX_DELIMITER_SEGMENT_PREFIX)
+                    && name.ends_with(PREFIX_SEGMENT_EXT)
+                {
+                    all_delim_seg_paths.push(entry.path());
+                    needs_delimiter_bootstrap = true;
                 }
             }
         }
     }
 
-    if all_seg_paths.len() < compact_trigger_segments() {
+    if all_seg_paths.len() < compact_trigger_segments()
+        && !(had_any_data && needs_delimiter_bootstrap)
+    {
         return Ok(());
     }
 
@@ -216,10 +240,13 @@ async fn compact_prefix_if_needed(
 
     let mut entries: Vec<PrefixIndexEntry> = latest
         .into_iter()
-        .map(|(object_key, (version_id, created_at))| PrefixIndexEntry {
-            object_key,
-            version_id,
-            created_at,
+        .filter_map(|(object_key, (version_id, created_at, is_delete_marker))| {
+            (!is_delete_marker).then_some(PrefixIndexEntry {
+                object_key,
+                version_id,
+                created_at,
+                is_delete_marker: false,
+            })
         })
         .collect();
     entries.sort_by(|a, b| match a.object_key.cmp(&b.object_key) {
@@ -234,9 +261,14 @@ async fn compact_prefix_if_needed(
     let compacted_bytes = rmp_serde::to_vec(&compacted).map_err(|e| {
         AppError::InternalServerError(format!("serialize compacted prefix segment: {}", e))
     })?;
+    let delimiter_compacted = build_delimiter_compacted_from_entries(prefix, &compacted.entries);
+    let delimiter_compacted_bytes = rmp_serde::to_vec(&delimiter_compacted).map_err(|e| {
+        AppError::InternalServerError(format!("serialize compacted delimiter segment: {}", e))
+    })?;
 
     let mut parent_dirs_to_sync: HashSet<PathBuf> = HashSet::new();
     let mut wrote_any = false;
+    let mut wrote_delimiter_any = false;
 
     for p in path_manager.get_all_prefix_compacted_paths(fragment, prefix) {
         if let Some(parent) = p.parent() {
@@ -247,14 +279,32 @@ async fn compact_prefix_if_needed(
             wrote_any = true;
         }
     }
+    for p in path_manager.get_all_prefix_delimiter_compacted_paths(fragment, prefix) {
+        if let Some(parent) = p.parent() {
+            let _ = fs::create_dir_all(parent).await;
+            parent_dirs_to_sync.insert(parent.to_path_buf());
+        }
+        if write_atomic_overwrite(&p, &delimiter_compacted_bytes)
+            .await
+            .is_ok()
+        {
+            wrote_delimiter_any = true;
+        }
+    }
 
-    if !wrote_any {
+    if !wrote_any || !wrote_delimiter_any {
         return Err(AppError::InternalServerError(
-            "failed to write compacted prefix to any mirror".into(),
+            "failed to write compacted prefix index to any mirror".into(),
         ));
     }
 
     for (_name, p) in all_seg_paths {
+        let _ = fs::remove_file(&p).await;
+        if let Some(parent) = p.parent() {
+            parent_dirs_to_sync.insert(parent.to_path_buf());
+        }
+    }
+    for p in all_delim_seg_paths {
         let _ = fs::remove_file(&p).await;
         if let Some(parent) = p.parent() {
             parent_dirs_to_sync.insert(parent.to_path_buf());

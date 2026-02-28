@@ -45,7 +45,9 @@ use crate::object_storage::disk_manager::{
     ReservationReceipt, ShardInfo, UploadPartQuery, UploadStatusResponse, default_stripe_size,
 };
 use crate::object_storage::ec::{AlignedBuffer, ErasureStreamWriter};
+use crate::object_storage::metadata_parser::get_metadata;
 use crate::object_storage::prefix_compactor::schedule_prefix_compaction;
+use crate::object_storage::prefix_delimiter::write_delimiter_delta;
 use crate::object_storage::quota_manager::{try_reserve_quota, update_quota};
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -1444,6 +1446,7 @@ async fn write_prefix_segments_on_roots(
     object_key: &str,
     version_id: &str,
     created_at: i64,
+    child_count_delta: i64,
 ) -> Result<(), AppError> {
     let prefixes = prefixes_for_key(object_key);
     let mut any_ok = false;
@@ -1455,6 +1458,7 @@ async fn write_prefix_segments_on_roots(
                 object_key: object_key.to_string(),
                 version_id: version_id.to_string(),
                 created_at,
+                is_delete_marker: false,
             }],
         };
 
@@ -1501,6 +1505,22 @@ async fn write_prefix_segments_on_roots(
         ));
     }
 
+    let path_manager = ObjectPathManager::new();
+    write_delimiter_delta(
+        &path_manager,
+        fragment,
+        object_key,
+        version_id,
+        Some(PrefixIndexEntry {
+            object_key: object_key.to_string(),
+            version_id: version_id.to_string(),
+            created_at,
+            is_delete_marker: false,
+        }),
+        child_count_delta,
+    )
+    .await?;
+
     Ok(())
 }
 
@@ -1520,6 +1540,7 @@ pub async fn finalize_object_upload(
 
     let object_key = key_query.object_key;
     let path_manager = ObjectPathManager::new();
+    let had_live_before = matches!(get_metadata(&fragment, &object_key, &fragment).await, Ok(meta) if !meta.is_delete_marker);
 
     let existing_paths = path_manager.get_all_metadata_paths(&fragment, &object_key, &version_id);
     for p in &existing_paths {
@@ -1686,6 +1707,7 @@ pub async fn finalize_object_upload(
         &object_key,
         &version_id,
         object_meta.created_at,
+        if had_live_before { 0 } else { 1 },
     )
     .await?;
 

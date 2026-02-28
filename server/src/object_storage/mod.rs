@@ -16,6 +16,7 @@ pub mod monitoring;
 pub mod object_parser;
 pub mod operation_gate;
 pub mod prefix_compactor;
+pub mod prefix_delimiter;
 pub mod prefix_rebuilder;
 pub mod quota_manager;
 pub mod recovery;

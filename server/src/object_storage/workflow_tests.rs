@@ -1406,6 +1406,53 @@ async fn matrix_prefix_listing_survives_rename_delete_after_compaction() {
         keys
     );
 
+    let listing_delim = list_objects_json(&fragment, Some("ward"), Some("/")).await;
+    let delim_keys = listing_delim["objects"]
+        .as_array()
+        .expect("delimiter objects array")
+        .iter()
+        .filter_map(|v| v["object_key"].as_str())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    let delim_prefixes = listing_delim["common_prefixes"]
+        .as_array()
+        .expect("delimiter prefixes array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+
+    assert!(
+        delim_keys.iter().any(|k| k == &key_b),
+        "delimiter listing should keep unaffected key, got {:?}",
+        delim_keys
+    );
+    assert!(
+        delim_keys.iter().all(|k| k != &key_a_renamed),
+        "delimiter listing should exclude deleted key: {:?}",
+        delim_keys
+    );
+    assert!(
+        delim_prefixes.is_empty(),
+        "ward delimiter listing should not emit child prefixes: {:?}",
+        delim_prefixes
+    );
+
+    let root_listing_delim = list_objects_json(&fragment, None, Some("/")).await;
+    let root_prefixes = root_listing_delim["common_prefixes"]
+        .as_array()
+        .expect("root prefixes array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        root_prefixes,
+        vec!["ward/".to_string()],
+        "root delimiter listing should retain only the live ward prefix"
+    );
+
     PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
         .get()
         .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
@@ -5266,10 +5313,7 @@ async fn matrix_repro_delete_multiple_restore_all_listing_blank() {
     }
 
     let initial = list_objects_json(&fragment, Some(prefix), None).await;
-    let initial_keys = initial["objects"]
-        .as_array()
-        .expect("objects array")
-        .len();
+    let initial_keys = initial["objects"].as_array().expect("objects array").len();
     assert_eq!(initial_keys, count, "initial listing mismatch");
 
     for key in &keys {
@@ -5285,10 +5329,7 @@ async fn matrix_repro_delete_multiple_restore_all_listing_blank() {
     }
 
     let empty = list_objects_json(&fragment, Some(prefix), None).await;
-    let empty_keys = empty["objects"]
-        .as_array()
-        .map(|v| v.len())
-        .unwrap_or(0);
+    let empty_keys = empty["objects"].as_array().map(|v| v.len()).unwrap_or(0);
     assert_eq!(empty_keys, 0, "listing should be empty after delete");
 
     for key in &keys {
@@ -5304,10 +5345,7 @@ async fn matrix_repro_delete_multiple_restore_all_listing_blank() {
     }
 
     let restored = list_objects_json(&fragment, Some(prefix), None).await;
-    let restored_keys = restored["objects"]
-        .as_array()
-        .map(|v| v.len())
-        .unwrap_or(0);
+    let restored_keys = restored["objects"].as_array().map(|v| v.len()).unwrap_or(0);
 
     assert_eq!(
         restored_keys, count,

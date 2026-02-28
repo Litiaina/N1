@@ -19,7 +19,9 @@ use crate::object_storage::disk_manager::{
     ObjectMetadata, ObjectPathManager, ObjectSummary, PrefixIndexEntry, PrefixIndexSegment,
     default_stripe_size,
 };
+use crate::object_storage::metadata_parser::get_metadata;
 use crate::object_storage::prefix_compactor::schedule_prefix_compaction;
+use crate::object_storage::prefix_delimiter::write_delimiter_delta;
 use crate::object_storage::quota_manager::update_quota;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -276,6 +278,8 @@ async fn write_prefix_segments_for_meta(
     object_key: &str,
     version_id: &str,
     created_at: i64,
+    is_delete_marker: bool,
+    child_count_delta: i64,
 ) -> Result<(), AppError> {
     let prefixes = prefixes_for_key(object_key);
     let mut any_ok = false;
@@ -287,6 +291,7 @@ async fn write_prefix_segments_for_meta(
                 object_key: object_key.to_string(),
                 version_id: version_id.to_string(),
                 created_at,
+                is_delete_marker,
             }],
         };
 
@@ -316,6 +321,21 @@ async fn write_prefix_segments_for_meta(
             "Failed to write prefix index segment to any mirror".into(),
         ));
     }
+
+    write_delimiter_delta(
+        path_manager,
+        fragment,
+        object_key,
+        version_id,
+        Some(PrefixIndexEntry {
+            object_key: object_key.to_string(),
+            version_id: version_id.to_string(),
+            created_at,
+            is_delete_marker,
+        }),
+        child_count_delta,
+    )
+    .await?;
 
     Ok(())
 }
@@ -567,20 +587,24 @@ pub async fn delete_object_version(
         }
     }
 
-    let remaining_versions = list_object_versions_any(&path_manager, &fragment, &object_key)
-        .await
-        .unwrap_or_default();
-    let mut has_remaining_non_marker = false;
-    for v in &remaining_versions {
-        if let Some(m) = read_metadata_any(&path_manager, &fragment, &object_key, v).await {
-            if !m.is_delete_marker {
-                has_remaining_non_marker = true;
-                break;
-            }
-        }
-    }
+    let latest_live = match get_metadata(&fragment, &object_key, &fragment).await {
+        Ok(meta) if !meta.is_delete_marker => Some(meta),
+        _ => None,
+    };
 
-    if !has_remaining_non_marker {
+    if let Some(meta) = latest_live {
+        let relisted_at = chrono::Utc::now().timestamp().saturating_add(1);
+        let _ = write_prefix_segments_for_meta(
+            &path_manager,
+            &fragment,
+            &meta.object_key,
+            &meta.version_id,
+            relisted_at,
+            false,
+            0,
+        )
+        .await;
+    } else {
         if let Ok((del_vid, del_created_at)) = write_delete_marker_for_key(
             &path_manager,
             &fragment,
@@ -595,6 +619,8 @@ pub async fn delete_object_version(
                 &object_key,
                 &del_vid,
                 del_created_at,
+                true,
+                -1,
             )
             .await;
         }
@@ -724,6 +750,8 @@ pub async fn delete_object(
             &object_key,
             &del_vid,
             del_created_at,
+            true,
+            -1,
         )
         .await;
     }
@@ -1058,6 +1086,7 @@ pub async fn recover_object_version(
     let filename = format!("{}#{}{}", key_hash, version_id, METADATA_EXT);
 
     let mut recovered_count = 0usize;
+    let had_live_before = matches!(get_metadata(&fragment, &object_key, &fragment).await, Ok(meta) if !meta.is_delete_marker);
 
     for root in &index_roots {
         let trash_file = get_trash_root(root, &fragment)
@@ -1144,6 +1173,8 @@ pub async fn recover_object_version(
             &meta.object_key,
             &meta.version_id,
             restored_at,
+            false,
+            if had_live_before { 0 } else { 1 },
         )
         .await;
     }
@@ -1227,6 +1258,8 @@ pub async fn recover_object(
     purge_delete_markers_for_key(&path_manager, &fragment, &object_key).await;
 
     let mut recovered_count = 0usize;
+    let had_live_before = matches!(get_metadata(&fragment, &object_key, &fragment).await, Ok(meta) if !meta.is_delete_marker);
+    let mut wrote_presence_delta = false;
 
     for version_id in &found_versions {
         let filename = format!("{}#{}{}", key_hash, version_id, METADATA_EXT);
@@ -1301,6 +1334,13 @@ pub async fn recover_object(
                 &meta.object_key,
                 &meta.version_id,
                 restored_at,
+                false,
+                if !had_live_before && !wrote_presence_delta {
+                    wrote_presence_delta = true;
+                    1
+                } else {
+                    0
+                },
             )
             .await;
         }
@@ -1339,6 +1379,7 @@ pub async fn recover_all_trash(
     let blob_roots = path_manager.get_blob_roots();
 
     let mut recovered_meta_entries: HashMap<String, (String, String, i64)> = HashMap::new();
+    let mut had_live_before: HashMap<String, bool> = HashMap::new();
 
     for root in &index_roots {
         let trash_index_root = get_trash_root(root, &fragment).join("index");
@@ -1376,8 +1417,16 @@ pub async fn recover_all_trash(
             };
 
             let k = format!("{}\n{}", obj_key, ver_id);
+            had_live_before.entry(obj_key.clone()).or_insert(false);
             recovered_meta_entries.insert(k, (obj_key, ver_id, cr_at));
         }
+    }
+
+    for key in had_live_before.keys().cloned().collect::<Vec<_>>() {
+        had_live_before.insert(
+            key.clone(),
+            matches!(get_metadata(&fragment, &key, &fragment).await, Ok(meta) if !meta.is_delete_marker),
+        );
     }
 
     let mut tasks: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
@@ -1433,14 +1482,28 @@ pub async fn recover_all_trash(
     futures_util::future::join_all(tasks).await;
 
     let mut affected_prefixes: BTreeSet<String> = BTreeSet::new();
+    let mut wrote_presence_delta: HashMap<String, bool> = HashMap::new();
     for (_k, (object_key, version_id, _created_at)) in recovered_meta_entries.iter() {
         let restored_at = chrono::Utc::now().timestamp().saturating_add(1);
+        let child_count_delta = if !had_live_before.get(object_key).copied().unwrap_or(false)
+            && !wrote_presence_delta
+                .get(object_key)
+                .copied()
+                .unwrap_or(false)
+        {
+            wrote_presence_delta.insert(object_key.clone(), true);
+            1
+        } else {
+            0
+        };
         let _ = write_prefix_segments_for_meta(
             &path_manager,
             &fragment,
             object_key,
             version_id,
             restored_at,
+            false,
+            child_count_delta,
         )
         .await;
         purge_delete_markers_for_key(&path_manager, &fragment, object_key).await;

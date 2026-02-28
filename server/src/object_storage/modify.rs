@@ -17,6 +17,7 @@ use crate::object_storage::disk_manager::{
     ObjectMetadata, ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment, RenameObjectRequest,
 };
 use crate::object_storage::prefix_compactor::schedule_prefix_compaction;
+use crate::object_storage::prefix_delimiter::write_delimiter_delta;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
@@ -171,6 +172,8 @@ async fn write_prefix_segments_for_meta(
     object_key: &str,
     version_id: &str,
     created_at: i64,
+    is_delete_marker: bool,
+    child_count_delta: i64,
 ) -> Result<(), AppError> {
     let prefixes = prefixes_for_key(object_key);
     let mut failures = Vec::new();
@@ -182,6 +185,7 @@ async fn write_prefix_segments_for_meta(
                 object_key: object_key.to_string(),
                 version_id: version_id.to_string(),
                 created_at,
+                is_delete_marker,
             }],
         };
 
@@ -219,6 +223,21 @@ async fn write_prefix_segments_for_meta(
             failures
         )));
     }
+
+    write_delimiter_delta(
+        path_manager,
+        fragment,
+        object_key,
+        version_id,
+        Some(PrefixIndexEntry {
+            object_key: object_key.to_string(),
+            version_id: version_id.to_string(),
+            created_at,
+            is_delete_marker,
+        }),
+        child_count_delta,
+    )
+    .await?;
 
     Ok(())
 }
@@ -495,6 +514,8 @@ pub async fn rename_object(
             &payload_arc.destination_key,
             version_id,
             created_at,
+            false,
+            1,
         )
         .await?;
     }
@@ -514,6 +535,8 @@ pub async fn rename_object(
             &payload_arc.source_key,
             &del_vid,
             del_created_at,
+            true,
+            -1,
         )
         .await?;
     }
