@@ -2017,6 +2017,52 @@ async fn unregister_connection_state(shared_smb_state: &SharedSmbState, connecti
         .retain(|_, (owner_connection, _)| *owner_connection != connection_id);
 }
 
+fn read_only_create_access_status(
+    create_disposition: u32,
+    requested_write: bool,
+    requested_delete: bool,
+    delete_on_close: bool,
+) -> Result<(), u32> {
+    if requested_write
+        || requested_delete
+        || delete_on_close
+        || create_disposition != FILE_CREATE_DISPOSITION_OPEN
+    {
+        return Err(SMB2_STATUS_ACCESS_DENIED);
+    }
+    Ok(())
+}
+
+fn read_only_write_status() -> u32 {
+    SMB2_STATUS_ACCESS_DENIED
+}
+
+fn read_only_set_info_status(file_info_class: u8, is_dir: bool, named_stream: bool) -> Option<u32> {
+    if named_stream {
+        return Some(if file_info_class == FILE_INFO_CLASS_RENAME_INFORMATION {
+            SMB2_STATUS_NOT_SUPPORTED
+        } else {
+            SMB2_STATUS_SUCCESS
+        });
+    }
+
+    match file_info_class {
+        FILE_INFO_CLASS_DISPOSITION_INFORMATION
+        | FILE_INFO_CLASS_DISPOSITION_INFORMATION_EX
+        | FILE_INFO_CLASS_RENAME_INFORMATION
+        | FILE_INFO_CLASS_ALLOCATION_INFORMATION
+        | FILE_INFO_CLASS_END_OF_FILE_INFORMATION
+        | FILE_INFO_CLASS_BASIC_INFORMATION => Some(SMB2_STATUS_ACCESS_DENIED),
+        FILE_INFO_CLASS_POSITION_INFORMATION => Some(if is_dir {
+            SMB2_STATUS_ACCESS_DENIED
+        } else {
+            SMB2_STATUS_SUCCESS
+        }),
+        FILE_INFO_CLASS_MODE_INFORMATION => Some(SMB2_STATUS_SUCCESS),
+        _ => None,
+    }
+}
+
 async fn handle_create(
     request: &[u8],
     header: &Smb2HeaderView,
@@ -2133,12 +2179,13 @@ async fn handle_create(
         object_key, create_disposition, desired_access, create_options
     );
 
-    if requested_write
-        || requested_delete
-        || delete_on_close
-        || create_disposition != FILE_CREATE_DISPOSITION_OPEN
-    {
-        return (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body());
+    if let Err(status) = read_only_create_access_status(
+        create_disposition,
+        requested_write,
+        requested_delete,
+        delete_on_close,
+    ) {
+        return (status, build_not_supported_error_body());
     }
 
     if !matches!(
@@ -2150,10 +2197,7 @@ async fn handle_create(
             | FILE_CREATE_DISPOSITION_OVERWRITE
             | FILE_CREATE_DISPOSITION_OVERWRITE_IF
     ) {
-        return (
-            SMB2_STATUS_INVALID_PARAMETER,
-            build_not_supported_error_body(),
-        );
+        return (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body());
     }
 
     if let Some(stream_name) = named_stream {
@@ -2444,7 +2488,7 @@ async fn handle_write(
             build_not_supported_error_body(),
         );
     }
-    (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body())
+    (read_only_write_status(), build_not_supported_error_body())
 }
 
 async fn handle_close(
@@ -2875,41 +2919,18 @@ async fn handle_set_info(
     if info_type != SMB2_INFO_TYPE_FILE {
         return (SMB2_STATUS_NOT_SUPPORTED, build_not_supported_error_body());
     }
-    if current.named_stream.is_some() {
-        if file_info_class == FILE_INFO_CLASS_RENAME_INFORMATION {
-            return (SMB2_STATUS_NOT_SUPPORTED, build_not_supported_error_body());
+    if let Some(status) = read_only_set_info_status(
+        file_info_class,
+        current.is_dir,
+        current.named_stream.is_some(),
+    ) {
+        if status == SMB2_STATUS_SUCCESS {
+            return (status, build_set_info_response_body());
         }
-        return (SMB2_STATUS_SUCCESS, build_set_info_response_body());
+        return (status, build_not_supported_error_body());
     }
 
-    match file_info_class {
-        FILE_INFO_CLASS_DISPOSITION_INFORMATION => {
-            return (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body());
-        }
-        FILE_INFO_CLASS_DISPOSITION_INFORMATION_EX => {
-            return (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body());
-        }
-        FILE_INFO_CLASS_RENAME_INFORMATION => {
-            return (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body());
-        }
-        FILE_INFO_CLASS_POSITION_INFORMATION => {
-            if current.is_dir {
-                return (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body());
-            }
-            (SMB2_STATUS_SUCCESS, build_set_info_response_body())
-        }
-        FILE_INFO_CLASS_MODE_INFORMATION => (SMB2_STATUS_SUCCESS, build_set_info_response_body()),
-        FILE_INFO_CLASS_ALLOCATION_INFORMATION => {
-            return (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body());
-        }
-        FILE_INFO_CLASS_END_OF_FILE_INFORMATION => {
-            return (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body());
-        }
-        FILE_INFO_CLASS_BASIC_INFORMATION => {
-            return (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body());
-        }
-        _ => (SMB2_STATUS_NOT_SUPPORTED, build_not_supported_error_body()),
-    }
+    (SMB2_STATUS_NOT_SUPPORTED, build_not_supported_error_body())
 }
 
 async fn handle_ioctl(request: &[u8], state: &ConnectionState) -> (u32, Vec<u8>) {
@@ -5184,5 +5205,37 @@ mod tests {
         let (base_key, stream) = split_named_stream_from_object_key(normalized.as_str());
         assert_eq!(base_key, "gameplay/video.mp4");
         assert!(stream.is_none());
+    }
+
+    #[test]
+    fn read_only_create_policy_denies_write_access() {
+        let result =
+            read_only_create_access_status(FILE_CREATE_DISPOSITION_OPEN, true, false, false);
+        assert_eq!(result, Err(SMB2_STATUS_ACCESS_DENIED));
+    }
+
+    #[test]
+    fn read_only_create_policy_denies_non_open_disposition() {
+        let result =
+            read_only_create_access_status(FILE_CREATE_DISPOSITION_OPEN_IF, false, false, false);
+        assert_eq!(result, Err(SMB2_STATUS_ACCESS_DENIED));
+    }
+
+    #[test]
+    fn read_only_write_policy_denies_write_command() {
+        assert_eq!(read_only_write_status(), SMB2_STATUS_ACCESS_DENIED);
+    }
+
+    #[test]
+    fn read_only_set_info_policy_denies_rename() {
+        let result = read_only_set_info_status(FILE_INFO_CLASS_RENAME_INFORMATION, false, false);
+        assert_eq!(result, Some(SMB2_STATUS_ACCESS_DENIED));
+    }
+
+    #[test]
+    fn read_only_set_info_policy_denies_allocation_change() {
+        let result =
+            read_only_set_info_status(FILE_INFO_CLASS_ALLOCATION_INFORMATION, false, false);
+        assert_eq!(result, Some(SMB2_STATUS_ACCESS_DENIED));
     }
 }

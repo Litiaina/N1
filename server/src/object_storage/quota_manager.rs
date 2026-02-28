@@ -14,11 +14,11 @@ use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{sleep, timeout};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
-const RENAME_TIMEOUT: Duration = Duration::from_secs(30);
+const RENAME_TIMEOUT: Duration = Duration::from_secs(120);
 const CREATE_DIR_TIMEOUT: Duration = Duration::from_secs(5);
 
 const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
@@ -59,6 +59,12 @@ fn get_all_quota_paths(fragment: &str) -> Vec<PathBuf> {
 
 static FLUSHER_TX: LazyLock<Mutex<Option<mpsc::Sender<String>>>> =
     LazyLock::new(|| Mutex::new(None));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QuotaWriteSummary {
+    success_count: usize,
+    failure_count: usize,
+}
 
 async fn ensure_flusher_tx() -> mpsc::Sender<String> {
     let mut guard = FLUSHER_TX.lock().await;
@@ -117,11 +123,22 @@ async fn ensure_flusher_tx() -> mpsc::Sender<String> {
                             let _ = cleanup_stale_quota_tmps(&frag).await;
                         }
 
-                        if write_quota_to_all_disks(&frag, &q).await.is_err() {
-                            if dirty.insert(frag.clone()) {
-                                rr.push_back(frag);
-                            } else {
-                                rr.push_back(frag);
+                        match write_quota_to_all_disks(&frag, &q).await {
+                            Ok(summary) if summary.failure_count == 0 => {}
+                            Ok(summary) => {
+                                debug!(
+                                    "Quota mirror flush incomplete for fragment {}: {} succeeded, {} failed; retrying",
+                                    frag, summary.success_count, summary.failure_count
+                                );
+                                if dirty.insert(frag.clone()) {
+                                    rr.push_back(frag);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Quota mirror flush failed for fragment {}: {}", frag, e);
+                                if dirty.insert(frag.clone()) {
+                                    rr.push_back(frag);
+                                }
                             }
                         }
                     }
@@ -231,7 +248,10 @@ async fn ensure_parent_dir(path: &Path) -> Result<(), AppError> {
     }
 }
 
-async fn write_quota_to_all_disks(fragment: &str, quota: &Quota) -> Result<(), AppError> {
+async fn write_quota_to_all_disks(
+    fragment: &str,
+    quota: &Quota,
+) -> Result<QuotaWriteSummary, AppError> {
     let paths = get_all_quota_paths(fragment);
     let bytes = Arc::new(
         rmp_serde::to_vec(quota)
@@ -274,6 +294,7 @@ async fn write_quota_to_all_disks(fragment: &str, quota: &Quota) -> Result<(), A
             }
 
             let mut rename_result_final = Ok(());
+            let mut remove_tmp_on_failure = true;
             for attempt in 0..3 {
                 let rename_result = timeout(RENAME_TIMEOUT, fs::rename(&tmp_path, &path)).await;
                 match rename_result {
@@ -289,6 +310,7 @@ async fn write_quota_to_all_disks(fragment: &str, quota: &Quota) -> Result<(), A
                         }
                     }
                     Err(_) => {
+                        remove_tmp_on_failure = false;
                         rename_result_final = Err(AppError::Timeout("rename quota".into()));
                         break;
                     }
@@ -296,7 +318,9 @@ async fn write_quota_to_all_disks(fragment: &str, quota: &Quota) -> Result<(), A
             }
 
             if rename_result_final.is_err() {
-                let _ = fs::remove_file(&tmp_path).await;
+                if remove_tmp_on_failure {
+                    let _ = fs::remove_file(&tmp_path).await;
+                }
                 return rename_result_final;
             }
 
@@ -305,13 +329,18 @@ async fn write_quota_to_all_disks(fragment: &str, quota: &Quota) -> Result<(), A
     });
 
     let results = join_all(write_futures).await;
-    let mut success_count = 0;
+    let mut success_count = 0usize;
+    let mut failure_count = 0usize;
 
     for result in results {
         if result.is_ok() {
             success_count += 1;
         } else if let Err(e) = result {
-            warn!("Failed to write quota to one mirror: {}", e);
+            failure_count += 1;
+            debug!(
+                "Failed to write quota to one mirror for {}: {}",
+                fragment, e
+            );
         }
     }
 
@@ -321,7 +350,10 @@ async fn write_quota_to_all_disks(fragment: &str, quota: &Quota) -> Result<(), A
         ));
     }
 
-    Ok(())
+    Ok(QuotaWriteSummary {
+        success_count,
+        failure_count,
+    })
 }
 
 async fn read_quota_from_any_disk(fragment: &str) -> Result<Quota, AppError> {
@@ -353,11 +385,14 @@ pub async fn init_quota_file(fragment: &str, allocated: u64) -> Result<(), AppEr
         Ok(mut current_quota) => {
             if current_quota.allocated_storage != allocated {
                 current_quota.allocated_storage = allocated;
-                write_quota_to_all_disks(fragment, &current_quota).await?;
+                let summary = write_quota_to_all_disks(fragment, &current_quota).await?;
                 info!(
                     "Synced quota allocation for fragment {}: {} bytes",
                     fragment, allocated
                 );
+                if summary.failure_count > 0 {
+                    let _ = enqueue_dirty(fragment).await;
+                }
             }
             QUOTA_CACHE
                 .insert(fragment.to_string(), current_quota)
@@ -368,9 +403,12 @@ pub async fn init_quota_file(fragment: &str, allocated: u64) -> Result<(), AppEr
                 allocated_storage: allocated,
                 storage_used: 0,
             };
-            write_quota_to_all_disks(fragment, &quota).await?;
+            let summary = write_quota_to_all_disks(fragment, &quota).await?;
             info!("Initialized quota file for new fragment {}", fragment);
             QUOTA_CACHE.insert(fragment.to_string(), quota).await;
+            if summary.failure_count > 0 {
+                let _ = enqueue_dirty(fragment).await;
+            }
         }
     }
 

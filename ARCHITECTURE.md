@@ -56,6 +56,7 @@ Notes:
 - Object metadata index is **4-level sharded** from SHA256(object_key).
 - Current authoritative object metadata is under `index/{h1}/{h2}/{h3}/{h4}/...` (no extra `objects/` level).
 - Prefix index namespace is under `index/__p__/v1/pfx/...`.
+- Fragment quota state remains mirrored on index roots, with cache-backed updates flushed asynchronously to `quota.msgpack` and retried until mirrors converge.
 
 ### 3.2 Blob root layout
 

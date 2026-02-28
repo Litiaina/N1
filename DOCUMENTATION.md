@@ -984,8 +984,8 @@ Recommended starting points:
 - `smb_port=<u16>`
 - `max_sessions=<64..65536>`
 - `max_frame_bytes=<4096..67108864>`
-- `async_close_commit=true|false` (default `false`)
-- `async_close_threshold_bytes=<u64>` (default `67108864`; large writes auto-switch close-finalize to async at/above threshold)
+- `async_close_commit=true|false` (default `false`; retained for compatibility, ignored in read-only SMB mode)
+- `async_close_threshold_bytes=<u64>` (default `67108864`; retained for compatibility, ignored in read-only SMB mode)
 - `auth_username=<string>` optional
 - `auth_password=<string>` optional
 - `auth_domain=<string>` optional
@@ -1000,11 +1000,11 @@ Behavior:
 - SMB `password` is fragment key.
 - Share `N1` maps to the authenticated fragment for the session.
 - SMB filesystem capacity reported to clients (for example Windows "Properties") is derived from that fragment's quota (`allocated_storage` / `storage_used`), not a global fixed size.
+- SMB is read-only: browse/list/open/read/query operations are supported, while write/create/rename/delete/truncate and other mutating requests are denied with `STATUS_ACCESS_DENIED`.
 - Optional static mode: if `auth_username` and `auth_password` are configured, that static account is also accepted.
 - If `require_signing=true`, SMB signing is required.
-- Large-transfer close handling:
-- SMB tracks two phases: `ingress` (client -> gateway) and `commit` (gateway -> finalized object).
-- For files at/above `async_close_threshold_bytes`, close-finalize runs async to avoid desktop-client timeout.
+- Quota mutations are applied to the in-memory quota cache first and flushed asynchronously to mirrored `quota.msgpack` files.
+- If one quota mirror lags during disk saturation, the background flusher keeps retrying until mirrors converge; warnings are reserved for full flush failure, not transient partial lag.
 
 ### 14.2 SMB Transfer Progress API
 `GET /v4/smb/progress/{fragment}`
@@ -1017,18 +1017,8 @@ Auth:
 - Protected v4 route; requires valid fragment JWT (`read=true`) and matching fragment scope.
 
 Response:
-- Array of `SmbTransferProgressPayload`:
-- `transfer_id`
-- `fragment`
-- `object_key`
-- `phase` (`ingress|commit`)
-- `state` (`running|completed|failed`)
-- `ingress_bytes`
-- `expected_bytes` optional
-- `started_at_ms`
-- `updated_at_ms`
-- `completed_at_ms` optional
-- `error` optional
+- Array of `SmbTransferProgressPayload`.
+- In the current read-only SMB mode this endpoint normally returns no active rows, because SMB uploads are disabled.
 
 ### 14.3 Environment overrides
 - `N1_SMB_ENABLED`
@@ -1052,13 +1042,14 @@ Response:
 ### 14.5 SMB-lite scope
 Implemented:
 - auth + signing
-- `list/read/write/create/rename/delete/mkdir/rmdir`
-- query-directory/query-info/set-info behavior
-- delete-on-close behavior
+- `list/read/open`
+- query-directory/query-info behavior
+- non-mutating `SET_INFO` classes needed for client compatibility
 - conservative share-mode conflict checks
 - conservative lock ownership handling
 
 Not implemented:
+- write/create/rename/delete/mkdir/rmdir/truncate/delete-on-close mutation flows
 - oplocks / leases
 - durable or persistent handles
 - multichannel and other enterprise SMB semantics
@@ -1070,7 +1061,7 @@ Deployment guide:
 Linux (`cifs`):
 ```bash
 sudo mount -t cifs //127.0.0.1/N1 /mnt/n1 \
-  -o username=<fragment_name>,password='<fragment_key>',domain=N1,sec=ntlmssp,vers=2.1,rw,noperm
+  -o username=<fragment_name>,password='<fragment_key>',domain=N1,sec=ntlmssp,vers=2.1,ro,noperm
 ```
 
 GNOME Files:

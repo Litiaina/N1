@@ -11,13 +11,14 @@ This guide covers both ways to expose N1 as a network drive:
 
 Implemented in `server/src/smb/server.rs`:
 - auth + signing
-- `list/read/write/create/rename/delete/mkdir/rmdir`
-- query-directory / query-info / set-info metadata paths
-- delete-on-close behavior
+- `list/read/open`
+- query-directory / query-info metadata paths
+- non-mutating `SET_INFO` compatibility paths
 - conservative share-mode conflict handling
 - conservative SMB2 lock ownership handling
 
 Not implemented:
+- write/create/rename/delete/mkdir/rmdir/truncate/delete-on-close mutation flows
 - oplocks / leases
 - durable or persistent handles
 - SMB multichannel / advanced enterprise semantics
@@ -50,8 +51,8 @@ Config keys:
 - `smb_port`: SMB TCP port.
 - `max_sessions`: connection/session cap.
 - `max_frame_bytes`: SMB frame size cap.
-- `async_close_commit`: if `true`, SMB `CLOSE` acks immediately and finalizes uploads in background.
-- `async_close_threshold_bytes`: when `async_close_commit=false`, files at/above this size still finalize async on close to avoid client timeout.
+- `async_close_commit`: retained for compatibility, ignored in read-only SMB mode.
+- `async_close_threshold_bytes`: retained for compatibility, ignored in read-only SMB mode.
 - `auth_username`: optional static SMB user.
 - `auth_password`: optional static SMB password.
 - `auth_domain`: SMB auth domain string (optional).
@@ -68,12 +69,9 @@ Preferred auth mode is fragment-scoped:
 Optional static mode:
 - if `auth_username` + `auth_password` are configured, that static account is also accepted.
 
-SMB transfer lifecycle is two-phase:
-- `ingress`: SMB client writes bytes to gateway.
-- `commit`: gateway finalizes multipart/object commit to N1.
-
 Progress API (JWT protected):
 - `GET /v4/smb/progress/{fragment}?include_completed=true&limit=100`
+- In the current read-only SMB mode this normally stays empty because SMB uploads are disabled.
 
 ### 2) Optional env overrides
 
@@ -126,7 +124,7 @@ Linux:
 
 ```bash
 sudo mount -t cifs //<server_ip>/N1 /mnt/n1 \
-  -o username=<fragment_name>,password='<fragment_key>',domain=N1,sec=ntlmssp,vers=2.1,rw,noperm
+  -o username=<fragment_name>,password='<fragment_key>',domain=N1,sec=ntlmssp,vers=2.1,ro,noperm
 ```
 
 macOS:
@@ -172,6 +170,7 @@ Use:
 - N1 remains object storage core; SMB is an adapter surface.
 - Fragment is still the isolation boundary.
 - `N1` share alias maps to the fragment authenticated in the SMB session.
+- Native SMB is intentionally read-only to avoid fighting object-storage semantics with desktop filesystem mutation behavior.
 - Keep signing enabled for untrusted networks.
 
 ## Troubleshooting
