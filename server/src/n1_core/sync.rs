@@ -1,14 +1,12 @@
 use axum::{http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::{error::Error, time::Duration};
-use tokio::time::timeout;
+use std::error::Error;
 use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
 use crate::{
     enums::app_error_enum::AppError,
-    n1_core::blob_store::configured_filesystem_blob_roots,
     n1_core::constants::{METADATA_EXT, QUOTA_FILE},
     n1_core::{
         disk_manager::{ObjectMetadata, ObjectPathManager},
@@ -16,8 +14,6 @@ use crate::{
     },
     structs::auth_structs::Claims,
 };
-
-const DISK_OP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Deserialize)]
 pub struct CreateFragmentRequest {
@@ -35,41 +31,7 @@ pub struct CreateFragmentResponse {
 }
 
 pub async fn ensure_fragment_blob_directories(fragment_hash: &str) {
-    let blob_roots = match configured_filesystem_blob_roots() {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    for root in blob_roots {
-        let blob_dir = root.join(fragment_hash).join("blob");
-
-        let exists_check = timeout(DISK_OP_TIMEOUT, tokio::fs::try_exists(&blob_dir)).await;
-
-        match exists_check {
-            Ok(Ok(exists)) => {
-                if !exists {
-                    if let Err(_) =
-                        timeout(DISK_OP_TIMEOUT, tokio::fs::create_dir_all(&blob_dir)).await
-                    {
-                        warn!(
-                            "Timeout creating blob dir {:?}. Disk might be slow or dead.",
-                            blob_dir
-                        );
-                        continue;
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                warn!(
-                    "Failed to check existence of {:?}: {}. Skipping disk.",
-                    blob_dir, e
-                );
-            }
-            Err(_) => {
-                warn!("Timeout checking {:?}. Disk might be dead.", blob_dir);
-            }
-        }
-    }
+    let _ = fragment_hash;
 }
 
 async fn sweep_fragment_gc_files(fragment_hash: String) {

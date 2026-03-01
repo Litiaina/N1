@@ -1,4 +1,5 @@
 use crate::enums::app_error_enum::AppError;
+use crate::n1_core::blob_store::{RawBlobDeviceStatus, raw_blob_device_statuses};
 use crate::n1_core::constants::{
     FRAGMENT_METADATA_FILE, METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, RESERVATION_FILE,
     SESSION_MANIFEST_FILE,
@@ -65,6 +66,8 @@ pub struct DiskStatus {
     pub latency_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_backend: Option<RawBlobDeviceStatus>,
 }
 
 #[derive(Serialize, Clone)]
@@ -145,7 +148,7 @@ mod tests {
     }
 }
 
-async fn check_disk_accessibility(path_str: String, role: String) -> DiskStatus {
+async fn check_index_disk_accessibility(path_str: String) -> DiskStatus {
     let path = PathBuf::from(&path_str);
 
     let (status, latency_ms, error) = if path.exists() {
@@ -235,10 +238,26 @@ async fn check_disk_accessibility(path_str: String, role: String) -> DiskStatus 
 
     DiskStatus {
         path: path_str,
-        role,
+        role: "index".to_string(),
         status,
         latency_ms,
         error,
+        raw_backend: None,
+    }
+}
+
+fn map_raw_blob_status_to_disk_status(raw: RawBlobDeviceStatus) -> DiskStatus {
+    let mut status = raw.status.clone();
+    if status == "managed" {
+        status = "online".to_string();
+    }
+    DiskStatus {
+        path: raw.path.clone(),
+        role: "blob".to_string(),
+        status,
+        latency_ms: None,
+        error: raw.error.clone(),
+        raw_backend: Some(raw),
     }
 }
 
@@ -254,15 +273,15 @@ async fn collect_system_health(
     let blob_disks_config = configured_blob_store_disks()?;
 
     let mut check_futures = Vec::new();
-
     for disk in &index_disks_config {
-        check_futures.push(check_disk_accessibility(disk.clone(), "index".to_string()));
+        check_futures.push(check_index_disk_accessibility(disk.clone()));
     }
-    for disk in &blob_disks_config {
-        check_futures.push(check_disk_accessibility(disk.clone(), "blob".to_string()));
-    }
-
-    let disk_results = join_all(check_futures).await;
+    let mut disk_results = join_all(check_futures).await;
+    let raw_blob_results = raw_blob_device_statuses()?
+        .into_iter()
+        .map(map_raw_blob_status_to_disk_status)
+        .collect::<Vec<_>>();
+    disk_results.extend(raw_blob_results);
 
     let mut online_index_count = 0;
     let mut online_blob_count = 0;
@@ -274,7 +293,7 @@ async fn collect_system_health(
             if stat.role == "index" {
                 online_index_count += 1;
                 active_index_roots.push(PathBuf::from(&stat.path));
-            } else {
+            } else if stat.status == "online" || stat.status == "unformatted" {
                 online_blob_count += 1;
             }
         }
@@ -486,4 +505,13 @@ pub async fn get_system_health(
     let snapshot = collect_system_health(&state, &params).await?;
     *HEALTH_CACHE.write().await = Some(snapshot.clone());
     Ok(Json(snapshot))
+}
+
+pub async fn get_raw_blob_backend_status(
+    claims: Claims,
+) -> Result<Json<Vec<RawBlobDeviceStatus>>, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+    Ok(Json(raw_blob_device_statuses()?))
 }

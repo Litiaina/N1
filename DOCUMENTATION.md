@@ -14,8 +14,7 @@
 
 > Storage backend note:
 > - `index_store_disks` must be mounted filesystem paths.
-> - `blob_store_disks` may be mounted directories for compatibility, but the preferred deployment
->   model is raw, unformatted device paths managed directly by N1.
+> - `blob_store_disks` are raw, unformatted, unmounted device paths managed directly by N1.
 > - Blob payload I/O uses `O_DIRECT`; metadata and control files stay filesystem-backed.
 
 ## 1. Base URL And Conventions
@@ -551,7 +550,25 @@ curl -k -X GET -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/maintenance/gc/status"
 ```
 
-### 9.4 Redistribution endpoints
+### 9.4 Scrub endpoints
+- `POST /v4/maintenance/scrub/start`
+- `POST /v4/maintenance/scrub/stop`
+- `GET /v4/maintenance/scrub/status`
+
+Scrub runs the repair engine in checksum-verification mode against committed raw shards.
+
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/scrub/start"
+
+curl -k -X GET -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/scrub/status"
+
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/scrub/stop"
+```
+
+### 9.5 Redistribution endpoints
 - `POST /v4/maintenance/redistribution/start`
 - `PATCH /v4/maintenance/redistribution/stop`
 - `GET /v4/maintenance/redistribution/monitor`
@@ -577,7 +594,28 @@ curl -k -X PATCH -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/maintenance/redistribution/stop"
 ```
 
-### 9.5 Prefix rebuild endpoints
+### 9.6 Raw blob status endpoint
+`GET /v4/maintenance/blob/raw/status`
+
+Reports one row per configured blob device:
+
+- path
+- device id
+- status
+- mounted flag
+- total bytes
+- used bytes
+- free bytes
+- used block count
+- journal cursor
+- detected foreign signature
+
+```bash
+curl -k -X GET -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/blob/raw/status"
+```
+
+### 9.7 Prefix rebuild endpoints
 - `POST /v4/maintenance/prefix/rebuild/start`
 - `POST /v4/maintenance/prefix/rebuild/stop`
 - `GET /v4/maintenance/prefix/rebuild/status`
@@ -599,7 +637,7 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/maintenance/prefix/rebuild/stop"
 ```
 
-### 9.6 System health endpoint
+### 9.8 System health endpoint
 `GET /v4/maintenance/health`
 
 Query params:

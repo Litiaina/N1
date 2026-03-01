@@ -37,7 +37,9 @@ use crate::n1_core::garbage_collector::{
 };
 use crate::n1_core::maintenance::sync_fragment_metadata;
 use crate::n1_core::modify::rename_object;
-use crate::n1_core::monitoring::{get_system_health, run_system_monitor};
+use crate::n1_core::monitoring::{
+    get_raw_blob_backend_status, get_system_health, run_system_monitor,
+};
 use crate::n1_core::operation_gate::enforce_read_only_fast_mode_on_mutations;
 use crate::n1_core::prefix_rebuilder::{
     get_prefix_rebuild_status_api, stop_prefix_rebuild_job_api, trigger_prefix_rebuild_job_api,
@@ -46,7 +48,8 @@ use crate::n1_core::redistribution::{
     get_redist_status_api, stop_redistribution_job_api, trigger_redistribution_job_api,
 };
 use crate::n1_core::repair_manager::{
-    get_repair_status_api, stop_repair_job_api, trigger_repair_job_api,
+    get_repair_status_api, get_scrub_status_api, stop_repair_job_api, stop_scrub_job_api,
+    trigger_repair_job_api, trigger_scrub_job_api,
 };
 use crate::n1_core::retrieve::{
     get_object, get_object_metadata, list_fragments, list_object_versions, list_objects,
@@ -254,6 +257,9 @@ pub async fn serve_storage_routes() -> Router {
             .route("/v4/maintenance/repair/start", post(trigger_repair_job_api))
             .route("/v4/maintenance/repair/stop", post(stop_repair_job_api))
             .route("/v4/maintenance/repair/status", get(get_repair_status_api))
+            .route("/v4/maintenance/scrub/start", post(trigger_scrub_job_api))
+            .route("/v4/maintenance/scrub/stop", post(stop_scrub_job_api))
+            .route("/v4/maintenance/scrub/status", get(get_scrub_status_api))
             .route("/v4/maintenance/gc/start", post(run_garbage_collector))
             .route("/v4/maintenance/gc/status", get(get_gc_status_api))
             .route(
@@ -279,6 +285,10 @@ pub async fn serve_storage_routes() -> Router {
             .route(
                 "/v4/maintenance/prefix/rebuild/status",
                 get(get_prefix_rebuild_status_api),
+            )
+            .route(
+                "/v4/maintenance/blob/raw/status",
+                get(get_raw_blob_backend_status),
             )
             .route("/v4/maintenance/health", get(get_system_health));
 

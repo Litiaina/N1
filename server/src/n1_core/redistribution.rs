@@ -4,7 +4,7 @@ use crate::n1_core::blob_store::{
     resolve_blob_disk_path, stable_shard_file_name, write_raw_gc_markers,
 };
 use crate::n1_core::constants::{
-    GC_SUFFIX, METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, REDIST_TMP_SUFFIX, RESERVATION_FILE,
+    GC_SUFFIX, METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, RESERVATION_FILE,
 };
 use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, PartMetadata, Quota, ShardInfo,
@@ -496,23 +496,6 @@ async fn replicate_quota_best_effort(fragment_hash: &str, index_roots: &[PathBuf
     }
 }
 
-fn get_shard_dir_custom(
-    disk_root: &Path,
-    fragment_hash: &str,
-    version_id: &str,
-    is_trash: bool,
-) -> PathBuf {
-    if is_trash {
-        disk_root
-            .join(fragment_hash)
-            .join(".trash")
-            .join("blob")
-            .join(version_id)
-    } else {
-        disk_root.join(fragment_hash).join("blob").join(version_id)
-    }
-}
-
 fn get_all_metadata_paths_custom(
     index_roots: &[PathBuf],
     fragment_hash: &str,
@@ -745,98 +728,8 @@ impl LiveLayout {
 }
 
 #[cfg(target_os = "linux")]
-fn rename_exchange(a: &Path, b: &Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let a_c = CString::new(a.as_os_str().as_bytes()).unwrap();
-    let b_c = CString::new(b.as_os_str().as_bytes()).unwrap();
-
-    let rc = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            a_c.as_ptr(),
-            libc::AT_FDCWD,
-            b_c.as_ptr(),
-            libc::RENAME_EXCHANGE,
-        )
-    };
-
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-async fn publish_tmp_overwrite(
-    tmp: &Path,
-    final_p: &Path,
-    parent: &Path,
-    file_name: &str,
-    sync_parent_immediately: bool,
-) -> Result<(), AppError> {
-    let final_exists = tokio_fs::try_exists(final_p).await.unwrap_or(false);
-
-    if !final_exists {
-        tokio_fs::rename(tmp, final_p)
-            .await
-            .map_err(|e| AppError::Io(e, "commit rename".into()))?;
-        if sync_parent_immediately {
-            let _ = sync_dir(parent).await;
-        }
-        return Ok(());
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let a = tmp.to_path_buf();
-        let b = final_p.to_path_buf();
-
-        let ex = tokio::task::spawn_blocking(move || rename_exchange(&a, &b))
-            .await
-            .map_err(|e| AppError::InternalServerError(format!("rename_exchange join: {}", e)))?;
-
-        if ex.is_ok() {
-            let gc_name = format!(
-                "{}.preexisting.{}{}",
-                file_name,
-                Ulid::new().to_string(),
-                GC_SUFFIX
-            );
-            let gc_path = parent.join(gc_name);
-            let _ = tokio_fs::rename(tmp, &gc_path).await;
-            if sync_parent_immediately {
-                let _ = sync_dir(parent).await;
-            }
-            return Ok(());
-        }
-    }
-
-    let gc_name = format!(
-        "{}.preexisting.{}{}",
-        file_name,
-        Ulid::new().to_string(),
-        GC_SUFFIX
-    );
-    let gc_path = parent.join(gc_name);
-
-    tokio_fs::rename(final_p, &gc_path)
-        .await
-        .map_err(|e| AppError::Io(e, "rename final->gc".into()))?;
-
-    tokio_fs::rename(tmp, final_p)
-        .await
-        .map_err(|e| AppError::Io(e, "rename tmp->final".into()))?;
-
-    if sync_parent_immediately {
-        let _ = sync_dir(parent).await;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
-pub async fn run_redistribution_job(
+pub(crate) async fn run_redistribution_job(
     dry_run: bool,
     ws_manager: Arc<WsConnectionManager>,
 ) -> Result<(), AppError> {
@@ -1236,19 +1129,6 @@ async fn check_needs_redistribution(
             }
 
             match resolve_blob_disk_path(target_blob_roots[expected].as_path()) {
-                Ok(BlobDiskHandle::Filesystem { root }) => {
-                    let target_disk_path = root.to_string_lossy();
-                    if shard.raw_blob_address.is_some()
-                        || !shard.absolute_path.starts_with(target_disk_path.as_ref())
-                    {
-                        return true;
-                    }
-
-                    let in_trash_path = shard.absolute_path.contains(".trash");
-                    if is_trash != in_trash_path {
-                        return true;
-                    }
-                }
                 Ok(BlobDiskHandle::Raw { device_id, .. }) => {
                     let Some(raw) = shard.raw_blob_address.as_ref() else {
                         return true;
@@ -1420,33 +1300,18 @@ async fn redistribute_object_streaming(
                 ));
             }
 
-            let (tmp_path, final_path, shard_dir, is_raw_target) =
-                match resolve_blob_disk_path(disk_root.as_path())? {
-                    BlobDiskHandle::Filesystem { root } => {
-                        let shard_dir =
-                            get_shard_dir_custom(&root, &meta.fragment, &meta.version_id, is_trash);
-                        let _ = tokio_fs::create_dir_all(&shard_dir).await;
-                        let final_path = shard_dir.join(&file_name);
-                        let tmp_path = shard_dir.join(format!(
-                            "{}{}{}",
-                            file_name,
-                            REDIST_TMP_SUFFIX,
-                            Ulid::new().to_string()
-                        ));
-                        (tmp_path, final_path, shard_dir, false)
-                    }
-                    BlobDiskHandle::Raw { .. } => {
-                        let tmp_path = raw_stage_path_for_shard(
-                            disk_idx,
-                            meta.fragment.as_str(),
-                            meta.version_id.as_str(),
-                            Ulid::new().to_string().as_str(),
-                            file_name.as_str(),
-                        )
-                        .await?;
-                        (tmp_path, PathBuf::new(), PathBuf::new(), true)
-                    }
-                };
+            let tmp_path = match resolve_blob_disk_path(disk_root.as_path())? {
+                BlobDiskHandle::Raw { .. } => {
+                    raw_stage_path_for_shard(
+                        disk_idx,
+                        meta.fragment.as_str(),
+                        meta.version_id.as_str(),
+                        Ulid::new().to_string().as_str(),
+                        file_name.as_str(),
+                    )
+                    .await?
+                }
+            };
             created_tmps.push(tmp_path.clone());
 
             let std_file = create_direct_file(&tmp_path).await.map_err(|e| {
@@ -1470,17 +1335,17 @@ async fn redistribute_object_streaming(
             writers.push(Some(DirectWriter::new(std_file)));
             commit_list.push((
                 tmp_path,
-                final_path.clone(),
-                shard_dir.clone(),
+                PathBuf::new(),
+                PathBuf::new(),
                 file_name.clone(),
-                is_raw_target,
+                true,
                 disk_idx,
             ));
 
             new_shards.push(ShardInfo {
                 shard_index: shard_idx,
                 file_name: file_name.clone(),
-                absolute_path: final_path.to_string_lossy().to_string(),
+                absolute_path: String::new(),
                 raw_blob_address: None,
                 size_bytes: final_shard_len,
                 checksum: String::new(),
@@ -1563,9 +1428,7 @@ async fn redistribute_object_streaming(
                 s.checksum = v.clone();
             }
         }
-        let mut batched_sync_dirs: HashSet<PathBuf> = HashSet::new();
-
-        for ((tmp, final_p, parent, fname, is_raw_target, disk_idx), shard_meta) in
+        for ((tmp, _final_p, _parent, _fname, is_raw_target, disk_idx), shard_meta) in
             commit_list.iter().zip(new_shards.iter_mut())
         {
             if should_stop() {
@@ -1582,25 +1445,6 @@ async fn redistribute_object_streaming(
                     commit_staged_raw_shard(*disk_idx, tmp.as_path(), final_shard_len).await?;
                 shard_meta.raw_blob_address = Some(raw_addr.clone());
                 shard_meta.absolute_path = raw_blob_debug_path(&raw_addr);
-            } else {
-                publish_tmp_overwrite(
-                    tmp.as_path(),
-                    final_p.as_path(),
-                    parent.as_path(),
-                    fname,
-                    strict_durability,
-                )
-                .await?;
-
-                if !strict_durability {
-                    batched_sync_dirs.insert(parent.clone());
-                }
-            }
-        }
-
-        if !strict_durability {
-            for d in batched_sync_dirs {
-                let _ = sync_dir(&d).await;
             }
         }
 

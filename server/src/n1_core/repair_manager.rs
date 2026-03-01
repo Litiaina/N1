@@ -1,5 +1,7 @@
 use crate::enums::app_error_enum::AppError;
-use crate::n1_core::blob_store::{stable_shard_file_name, verify_shard_checksum};
+use crate::n1_core::blob_store::{
+    RawGcMarker, raw_blob_address_exists, stable_shard_file_name, verify_shard_checksum,
+};
 use crate::n1_core::constants::{
     FRAGMENT_METADATA_FILE, METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, RESERVATION_FILE,
     SESSION_MANIFEST_FILE,
@@ -118,6 +120,74 @@ fn parse_bool_param(params: &HashMap<String, String>, key: &str, default: bool) 
         Some(_) => default,
         None => default,
     }
+}
+
+fn build_repair_config_from_params(
+    params: &HashMap<String, String>,
+    forced_mode: Option<RepairCheckMode>,
+) -> (RepairRunConfig, RepairRunOptions) {
+    let fast_mode = parse_bool_param(params, "fast_mode", false)
+        || parse_bool_param(params, "read_only_fast", false);
+    let ram_gib = detect_total_ram_gib();
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let (default_meta_conc, default_repair_conc, default_batch) =
+        repair_defaults_for_runtime(fast_mode, ram_gib, cpu_cores);
+    let (max_meta_conc, max_repair_conc, max_batch_size) = repair_limits_for_ram_gib(ram_gib);
+
+    let cfg = RepairRunConfig {
+        dry_run: parse_bool_param(params, "dry_run", false),
+        check_mode: forced_mode.unwrap_or_else(|| parse_check_mode(params)),
+        meta_concurrency: clamp_usize(
+            params
+                .get("meta_concurrency")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(default_meta_conc),
+            1,
+            max_meta_conc,
+        ),
+        shard_repair_concurrency: clamp_usize(
+            params
+                .get("repair_concurrency")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(default_repair_conc),
+            1,
+            max_repair_conc,
+        ),
+        meta_batch_size: clamp_usize(
+            params
+                .get("batch")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(default_batch),
+            32,
+            max_batch_size,
+        ),
+    };
+    info!(
+        "Repair tuning: ram_gib={} cpu_cores={} fast_mode={} mode={:?} meta_conc={} repair_conc={} batch={} (caps: meta<= {}, repair<= {}, batch<= {})",
+        ram_gib,
+        cpu_cores,
+        fast_mode,
+        cfg.check_mode,
+        cfg.meta_concurrency,
+        cfg.shard_repair_concurrency,
+        cfg.meta_batch_size,
+        max_meta_conc,
+        max_repair_conc,
+        max_batch_size
+    );
+
+    (cfg, RepairRunOptions { fast_mode })
+}
+
+fn ensure_repair_job_idle(status: &RepairJobStatus) -> Result<(), AppError> {
+    if status.is_running {
+        return Err(AppError::Conflict(
+            "A repair job is already running.".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn detect_total_ram_gib() -> usize {
@@ -313,6 +383,10 @@ pub async fn get_repair_status_api(claims: Claims) -> Result<Json<RepairJobStatu
     Ok(Json(REPAIR_STATUS.read().await.clone()))
 }
 
+pub async fn get_scrub_status_api(claims: Claims) -> Result<Json<RepairJobStatus>, AppError> {
+    get_repair_status_api(claims).await
+}
+
 pub async fn trigger_repair_job_api(
     claims: Claims,
     State(state): State<Arc<AppState>>,
@@ -326,64 +400,9 @@ pub async fn trigger_repair_job_api(
 
     {
         let status = REPAIR_STATUS.read().await;
-        if status.is_running {
-            return Err(AppError::Conflict(
-                "A repair job is already running.".into(),
-            ));
-        }
+        ensure_repair_job_idle(&status)?;
     }
-
-    let fast_mode = parse_bool_param(&params, "fast_mode", false)
-        || parse_bool_param(&params, "read_only_fast", false);
-    let ram_gib = detect_total_ram_gib();
-    let cpu_cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let (default_meta_conc, default_repair_conc, default_batch) =
-        repair_defaults_for_runtime(fast_mode, ram_gib, cpu_cores);
-    let (max_meta_conc, max_repair_conc, max_batch_size) = repair_limits_for_ram_gib(ram_gib);
-
-    let cfg = RepairRunConfig {
-        dry_run: parse_bool_param(&params, "dry_run", false),
-        check_mode: parse_check_mode(&params),
-        meta_concurrency: clamp_usize(
-            params
-                .get("meta_concurrency")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(default_meta_conc),
-            1,
-            max_meta_conc,
-        ),
-        shard_repair_concurrency: clamp_usize(
-            params
-                .get("repair_concurrency")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(default_repair_conc),
-            1,
-            max_repair_conc,
-        ),
-        meta_batch_size: clamp_usize(
-            params
-                .get("batch")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(default_batch),
-            32,
-            max_batch_size,
-        ),
-    };
-    info!(
-        "Repair tuning: ram_gib={} cpu_cores={} fast_mode={} meta_conc={} repair_conc={} batch={} (caps: meta<= {}, repair<= {}, batch<= {})",
-        ram_gib,
-        cpu_cores,
-        fast_mode,
-        cfg.meta_concurrency,
-        cfg.shard_repair_concurrency,
-        cfg.meta_batch_size,
-        max_meta_conc,
-        max_repair_conc,
-        max_batch_size
-    );
-    let run_opts = RepairRunOptions { fast_mode };
+    let (cfg, run_opts) = build_repair_config_from_params(&params, None);
 
     let ws_manager = Arc::new(state.ws_manager.clone());
     let ws_manager_clone = ws_manager.clone();
@@ -407,6 +426,45 @@ pub async fn trigger_repair_job_api(
         .into_response())
 }
 
+pub async fn trigger_scrub_job_api(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.write || !claims.modify || !claims.delete {
+        return Err(AppError::Forbidden(
+            "Write, Modify and Delete permission required".into(),
+        ));
+    }
+
+    {
+        let status = REPAIR_STATUS.read().await;
+        ensure_repair_job_idle(&status)?;
+    }
+
+    let (cfg, run_opts) = build_repair_config_from_params(&params, Some(RepairCheckMode::Scrub));
+    let ws_manager = Arc::new(state.ws_manager.clone());
+    let ws_manager_clone = ws_manager.clone();
+
+    tokio::spawn(async move {
+        if let Err(e) = run_repair_job_with_options(cfg, run_opts, ws_manager.clone()).await {
+            error!("Manual Scrub Job Failed: {}", e);
+            let mut status = REPAIR_STATUS.write().await;
+            status.is_running = false;
+            status.phase = "Failed".to_string();
+            status.last_error = Some(e.to_string());
+            ws_manager_clone
+                .broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        "Storage scrub initiated. Check logs or poll /status/scrub.",
+    )
+        .into_response())
+}
+
 pub async fn stop_repair_job_api(
     claims: Claims,
     State(state): State<Arc<AppState>>,
@@ -426,6 +484,13 @@ pub async fn stop_repair_job_api(
             .broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
     }
     Ok((StatusCode::OK, "Stop signal sent to repair manager."))
+}
+
+pub async fn stop_scrub_job_api(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    stop_repair_job_api(claims, State(state)).await
 }
 
 async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
@@ -762,6 +827,106 @@ async fn repair_fragment_sessions_strict(
             let (m3, d3) = replicate_bytes_strict(&paths, &canon_part, dry_run).await?;
             miss += m3;
             div += d3;
+        }
+    }
+
+    Ok((miss, div, corrupt))
+}
+
+async fn list_all_raw_gc_marker_names(index_roots: &[PathBuf], fragment: &str) -> HashSet<String> {
+    let mut out = HashSet::<String>::new();
+
+    for root in index_roots {
+        let base = root.join(fragment).join("index").join(".raw_gc");
+        if !fs::try_exists(&base).await.unwrap_or(false) {
+            continue;
+        }
+
+        let mut rd = match fs::read_dir(&base).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        while let Ok(Some(ent)) = rd.next_entry().await {
+            if !ent.path().is_file() {
+                continue;
+            }
+            let name = ent.file_name().to_string_lossy().to_string();
+            if !name.is_empty() {
+                out.insert(name);
+            }
+        }
+    }
+
+    out
+}
+
+async fn repair_fragment_raw_gc_markers(
+    fragment: &str,
+    index_roots: &[PathBuf],
+    dry_run: bool,
+) -> Result<(u64, u64, u64), AppError> {
+    let marker_names = list_all_raw_gc_marker_names(index_roots, fragment).await;
+
+    let mut miss = 0u64;
+    let mut div = 0u64;
+    let mut corrupt = 0u64;
+
+    for name in marker_names {
+        if should_stop() {
+            break;
+        }
+
+        let paths: Vec<PathBuf> = index_roots
+            .iter()
+            .map(|root| {
+                root.join(fragment)
+                    .join("index")
+                    .join(".raw_gc")
+                    .join(&name)
+            })
+            .collect();
+
+        let valid = |b: &[u8]| -> bool {
+            if let Ok(marker) = rmp_serde::from_slice::<RawGcMarker>(b) {
+                marker.fragment == fragment
+            } else {
+                false
+            }
+        };
+
+        let mut reps = Vec::with_capacity(paths.len());
+        for p in &paths {
+            reps.push(read_raw_replica(p, &valid).await);
+        }
+
+        let Some(best) = choose_best_raw_replica(&reps) else {
+            let any_exists = reps.iter().any(|r| r.bytes.is_some());
+            if any_exists {
+                corrupt += 1;
+            }
+            continue;
+        };
+
+        let canon = reps[best].bytes.clone().unwrap();
+        let marker = rmp_serde::from_slice::<RawGcMarker>(&canon).map_err(|e| {
+            AppError::InternalServerError(format!("decode raw gc marker {}: {}", name, e))
+        })?;
+
+        if raw_blob_address_exists(&marker.address).await? {
+            let (m, d) = replicate_bytes_strict(&paths, &canon, dry_run).await?;
+            miss += m;
+            div += d;
+            continue;
+        }
+
+        for p in &paths {
+            if fs::try_exists(p).await.unwrap_or(false) {
+                div += 1;
+                if !dry_run {
+                    let _ = fs::remove_file(p).await;
+                }
+            }
         }
     }
 
@@ -1251,6 +1416,23 @@ pub async fn run_repair_job_with_options(
             status.missing_meta_repaired += qmiss;
             status.divergent_meta_repaired += qdiv;
             status.corrupt_found += qcorrupt;
+            ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
+        }
+
+        {
+            let mut status = REPAIR_STATUS.write().await;
+            status.phase = format!("Repairing raw GC markers {}", fragment_hash);
+            ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
+        }
+
+        let (rgmiss, rgdiv, rgcorrupt) =
+            repair_fragment_raw_gc_markers(&fragment_hash, &index_roots, cfg.dry_run).await?;
+
+        {
+            let mut status = REPAIR_STATUS.write().await;
+            status.missing_meta_repaired += rgmiss;
+            status.divergent_meta_repaired += rgdiv;
+            status.corrupt_found += rgcorrupt;
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 

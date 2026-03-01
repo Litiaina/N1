@@ -1,9 +1,7 @@
 use crate::enums::app_error_enum::AppError;
 use crate::fs::cleanup_manager::start_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
-use crate::n1_core::blob_store::{
-    RawGcMarker, configured_filesystem_blob_roots, free_raw_address, free_raw_shards_for_metadata,
-};
+use crate::n1_core::blob_store::{RawGcMarker, free_raw_address, free_raw_shards_for_metadata};
 use crate::n1_core::constants::{GC_SUFFIX, METADATA_EXT, QUOTA_FILE, RESERVATION_FILE};
 use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, ReservationReceipt, configured_fs_storage_root,
@@ -325,7 +323,7 @@ fn gc_cleanup_version_dir_unix(
 async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
     let index_roots = path_manager.get_all_index_roots();
-    let blob_roots = configured_filesystem_blob_roots().unwrap_or_default();
+    let blob_roots: Vec<PathBuf> = Vec::new();
 
     let mut fragments = HashSet::new();
     for root in &index_roots {

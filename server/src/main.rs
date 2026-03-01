@@ -4,6 +4,7 @@ use crate::handlers::error_handlers::handler_404;
 use crate::n1_core::adaptive_concurrency::{
     ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC, ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC,
 };
+use crate::n1_core::blob_store::validate_configured_raw_blob_disks;
 use crate::n1_core::disk_manager::{configured_fs_storage_root, initialize_storage_roots};
 use crate::n1_core::monitoring::{
     MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC, MONITOR_INTERVAL_SECS_ATOMIC,
@@ -549,6 +550,22 @@ pub async fn run_server() {
 
     if blob_disks.is_empty() {
         panic!("At least one blob store disk must be configured in blob_store_disks!");
+    }
+    let raw_blob_statuses =
+        validate_configured_raw_blob_disks().expect("raw blob device validation");
+    for status in &raw_blob_statuses {
+        if let Some(warning) = status.path_warning.as_deref() {
+            tracing::warn!("blob disk {}: {}", status.path, warning);
+        }
+        tracing::info!(
+            "Blob disk {} kind={:?} status={} mounted={} total_bytes={} signature={}",
+            status.path,
+            status.kind,
+            status.status,
+            status.mounted,
+            status.total_bytes.unwrap_or(0),
+            status.detected_signature.as_deref().unwrap_or("none")
+        );
     }
     let blob_disk_count = blob_disks.len();
     let blob_device_count = detect_unique_storage_devices(&blob_disks);

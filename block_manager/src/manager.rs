@@ -134,6 +134,22 @@ impl BlockManager {
         self.allocations.len()
     }
 
+    pub fn used_blocks(&self) -> u64 {
+        self.header
+            .total_blocks
+            .saturating_sub(self.header.data_start_block)
+            .saturating_sub(self.available_blocks())
+    }
+
+    pub fn used_bytes(&self) -> u64 {
+        self.used_blocks()
+            .saturating_mul(u64::from(self.header.block_size))
+    }
+
+    pub fn journal_cursor(&self) -> u64 {
+        self.journal_cursor
+    }
+
     pub fn allocate_bytes(
         &mut self,
         size_bytes: u64,
@@ -449,6 +465,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_loopback(name: &str) -> PathBuf {
@@ -654,6 +671,128 @@ mod tests {
         let flags = unsafe { libc::fcntl(mgr.direct_file.as_raw_fd(), libc::F_GETFL) };
         assert!(flags >= 0, "fcntl(F_GETFL) should succeed");
         assert_ne!(flags & libc::O_DIRECT, 0, "raw data fd should use O_DIRECT");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_rejects_corrupt_superblock_checksum() {
+        let path = temp_loopback("corrupt-superblock");
+        let mgr = BlockManager::format(
+            &path,
+            FormatOptions {
+                block_size: 4096,
+                journal_blocks: 16,
+                total_bytes: Some(4 * 1024 * 1024),
+            },
+        )
+        .expect("format device");
+        drop(mgr);
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open loopback");
+        file.write_at(&[0xFF], 20)
+            .expect("corrupt checksummed header byte");
+        file.sync_all().expect("sync corruption");
+
+        let err = match BlockManager::open(&path) {
+            Ok(_) => panic!("expected corrupt superblock error"),
+            Err(err) => err,
+        };
+        match err {
+            BlockManagerError::Corrupt(msg) => {
+                assert!(
+                    msg.contains("superblock checksum mismatch"),
+                    "unexpected error: {}",
+                    msg
+                );
+            }
+            _ => panic!("expected corrupt superblock error"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_rejects_corrupt_journal_record_checksum() {
+        let path = temp_loopback("corrupt-journal");
+        let mut mgr = BlockManager::format(
+            &path,
+            FormatOptions {
+                block_size: 4096,
+                journal_blocks: 16,
+                total_bytes: Some(4 * 1024 * 1024),
+            },
+        )
+        .expect("format device");
+
+        let handle = mgr.allocate_bytes(12 * 1024).expect("allocate");
+        mgr.write(handle, 0, b"journal-corruption")
+            .expect("write payload");
+        mgr.flush().expect("flush");
+        drop(mgr);
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open loopback");
+        let corrupt_offset = 4096 + 32;
+        file.write_at(&[0x00], corrupt_offset)
+            .expect("corrupt journal crc");
+        file.sync_all().expect("sync corruption");
+
+        let err = match BlockManager::open(&path) {
+            Ok(_) => panic!("expected corrupt journal error"),
+            Err(err) => err,
+        };
+        match err {
+            BlockManagerError::Corrupt(msg) => {
+                assert!(
+                    msg.contains("journal record checksum mismatch"),
+                    "unexpected error: {}",
+                    msg
+                );
+            }
+            _ => panic!("expected corrupt journal error"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_raw_address_is_rejected_after_free_and_reopen() {
+        let path = temp_loopback("stale-address");
+        let address = {
+            let mut mgr = BlockManager::format(
+                &path,
+                FormatOptions {
+                    block_size: 4096,
+                    journal_blocks: 16,
+                    total_bytes: Some(4 * 1024 * 1024),
+                },
+            )
+            .expect("format device");
+
+            let handle = mgr.allocate_bytes(16 * 1024).expect("allocate");
+            let address = mgr.raw_extent_address(handle, 16 * 1024).expect("address");
+            mgr.write_address(&address, 0, b"live-bytes")
+                .expect("write via address");
+            mgr.free_address(&address).expect("free address");
+            mgr.flush().expect("flush");
+            address
+        };
+
+        let reopened = BlockManager::open(&path).expect("reopen");
+        match reopened.read_address(&address, 0, 8) {
+            Err(BlockManagerError::UnknownAllocation(id)) => {
+                assert_eq!(id, address.allocation_id);
+            }
+            other => panic!("expected stale address rejection, got {:?}", other),
+        }
 
         let _ = fs::remove_file(path);
     }

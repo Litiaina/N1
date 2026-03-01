@@ -25,8 +25,8 @@ N1 is a **fragment-scoped object storage engine with a filesystem-backed metadat
 N1 uses two disk pools:
 
 - **Index roots** (`INDEX_STORE_DISKS`): metadata, sessions, quota, fragment metadata
-- **Blob disks** (`BLOB_STORE_DISKS`): direct-I/O shard storage. Raw, unformatted devices are the
-  preferred deployment model; mounted directories remain supported as a compatibility backend.
+- **Blob disks** (`BLOB_STORE_DISKS`): direct-I/O shard storage on raw, unformatted, unmounted
+  devices managed by `block_manager`
 
 Fragment is the isolation boundary for auth, quota, maintenance, and layout.
 
@@ -59,25 +59,16 @@ Notes:
 - Prefix index namespace is under `index/__p__/v1/pfx/...`.
 - Fragment quota state remains mirrored on index roots, with cache-backed updates flushed asynchronously to `quota.msgpack` and retried until mirrors converge.
 
-### 3.2 Blob root layout
+### 3.2 Blob extent layout
 
-Compatibility filesystem backend:
+Blob payloads live in raw extents managed by `block_manager` on the configured blob devices.
 
-```text
-{BLOB_ROOT}/{fragment_hash}/
-├── blob/{version_id}/
-│   ├── part_{p}_shard_{i}.shard
-│   └── part_{p}_shard_{i}.parity
-└── .trash/
-    └── blob/{version_id}/...
-```
+Metadata stores:
 
-Notes:
-- Blob directory name is currently `blob`.
-- Trash mirrors this under `.trash/blob/...`.
-- In raw blob mode, payloads live in `block_manager` extents on the blob device rather than under
-  mounted blob directories; metadata carries `raw_blob_address` values and debug paths like
-  `raw://<device_id>/<allocation_id>`.
+- `raw_blob_address`
+- logical shard name
+- checksum
+- debug path like `raw://<device_id>/<allocation_id>`
 
 ### 3.3 Direct-I/O split
 
@@ -112,7 +103,8 @@ Notes:
 
 - bounded by IO semaphore and configured limits
 - encodes data to `data_shards + parity_shards`
-- writes to temp attempt files, fsyncs, then atomically renames to stable shard names
+- writes to staged shard files under the raw staging area
+- commits staged shards into raw extents through `O_DIRECT`
 - writes `part_{index}.meta.msgpack` to session mirrors
 
 ### 5.3 Finalize
@@ -147,13 +139,13 @@ Read APIs (`get`, `stream`, `download`, `meta`) resolve metadata from index mirr
 
 ## 7. Delete and Trash Semantics
 
-Soft delete operations move metadata/shards/sessions into `.trash` namespaces.
+Soft delete operations move metadata and sessions into `.trash` namespaces.
 
 - live index path -> `.trash/index/...`
-- live blob path -> `.trash/blob/...`
 - sessions -> `.trash/index/sessions/...`
 
-Recovery moves entries back; permanent delete removes both index and blob artifacts.
+Raw blob extents remain referenced by metadata until recovery or permanent deletion decides their
+fate. Permanent delete and GC reclaim those raw extents.
 
 ## 8. Maintenance Architecture
 
@@ -178,8 +170,9 @@ Redistribution realigns shard placement to current EC and disk topology, while k
 GC handles:
 
 - expired trash versions
-- orphan sessions/blob dirs
+- orphan sessions/raw stage files
 - quota refunds
+- reclaiming unreachable raw extents
 
 ### 8.4 Prefix rebuild
 

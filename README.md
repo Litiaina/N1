@@ -56,6 +56,7 @@
 
 For SMB network-drive deployment, see `NETWORK_DRIVE.md`.
 N1 ships with native SMB-lite via `fsgwd`, with `fsd_mount + Samba` kept as fallback.
+For raw blob device setup and operator steps, see `DEPLOYMENT.md`.
 
 ## What is N1 (current architecture)
 
@@ -103,8 +104,8 @@ N1 is **not** “user multi-tenant storage” anymore. The isolation boundary is
 ### 1) Filesystem-backed control plane, direct-I/O blob plane
 
 N1 keeps metadata and control state as normal files on configured index disks. The blob plane is
-separate: `blob_store_disks` can still be mounted directories for compatibility, but the preferred
-deployment model is raw, unformatted blob devices managed directly by N1 via `block_manager`.
+separate: `blob_store_disks` are raw, unformatted, unmounted blob devices managed directly by N1
+via `block_manager`. If a configured blob device is mounted, N1 rejects startup.
 
 **Result:** if the service disappears, disks remain mountable and the layout remains readable.
 
@@ -237,20 +238,11 @@ Per-part metadata (`PartMetadata`) is committed locklessly to one healthy index 
 
 ### Blob (data/parity shards)
 
-Compatibility filesystem backend:
-
-```
-{BLOB_ROOT}/{fragment}/blobs/{version_id}/
-  part_{p}_shard_{i}{SHARD_SUFFIX}
-  part_{p}_shard_{i}{PARITY_SUFFIX}
-```
-
-Preferred raw blob backend:
-
 - `blob_store_disks` points at raw, unformatted device paths such as `/dev/nvme1n1`
 - N1 formats and manages those devices through `block_manager`
 - committed shard metadata stores `raw://<device_id>/<allocation_id>` style addresses instead of
   depending on shard files under mounted blob directories
+- startup rejects mounted blob devices and warns on unstable names like `/dev/sdb`
 
 **Deterministic placement rule (typical):**
 
@@ -261,7 +253,8 @@ Preferred raw blob backend:
 
 ## Write path (multipart upload)
 
-Uploads are strict and crash-safe. A part is not considered uploaded unless it passes verification and is committed into stable filenames.
+Uploads are strict and crash-safe. A part is not considered uploaded unless it passes verification
+and is committed into durable raw extents.
 
 ### 1) Initiate upload
 
@@ -307,20 +300,21 @@ At end of stream:
 - optionally validate the overall checksum (`crc32`) against `UploadPartQuery.checksum`
 - compute per-shard checksums for repair verification
 
-#### Step D — Commit to the target blob backend
+#### Step D — Commit to the raw blob backend
 
-After successful write/verify, each shard must be committed to its target backend:
+After successful write/verify, each shard is committed to its target raw device:
 
 ```
-part_{p}_shard_{i}{ext}.tmp.<attempt>  -->  part_{p}_shard_{i}{ext}
+part_{p}_shard_{i}{ext}.stage.<attempt>  -->  raw://<device_id>/<allocation_id>
 ```
 
 Commit rules:
 
-1. compatibility filesystem backend: rename temp -> stable and sync the parent directory
-2. raw blob backend: allocate a raw extent, write through `O_DIRECT`, flush, then store the raw
-   extent address in metadata
-3. only committed backend addresses (stable file path or raw extent address) may be referenced by metadata
+1. stage the encoded shard under the filesystem-backed raw staging area
+2. allocate a raw extent on the target blob device
+3. copy the staged shard into that extent through `O_DIRECT`
+4. flush the raw device and store the raw extent address in metadata
+5. only committed raw extent addresses may be referenced by metadata
 
 If backend commit fails on a disk, treat that shard as failed and fail the part if you fall below write quorum.
 
@@ -329,13 +323,14 @@ If backend commit fails on a disk, treat that shard as failed and fail the part 
 Only after commit succeeds do we write `PartMetadata`.
 
 **PartMetadata must store stable names:**
-- `ShardInfo.file_name` must be `part_{p}_shard_{i}{ext}` (no `.tmp.<attempt>`)
-- `ShardInfo.absolute_path` must point to the stable full path
+- `ShardInfo.file_name` remains the logical shard name `part_{p}_shard_{i}{ext}`
+- `ShardInfo.absolute_path` stores a debug-only raw address path
+- `ShardInfo.raw_blob_address` stores the authoritative raw extent address
 - `ShardInfo.checksum` is recorded for integrity checks during repair/recovery
 
 The commit pattern is:
 
-- commit stable blob addresses
+- commit raw blob addresses
 - then commit per-part metadata (`part_{p}{PART_META_SUFFIX}`)
 
 ### 3) Finalize upload (publish a version)
@@ -357,8 +352,7 @@ This is the mental model N1 is built around.
 ### Crash during part upload (before commit)
 You may see:
 
-- compatibility backend: `*.tmp.<attempt>` shard files
-- raw backend: staged temporary raw shard files under the raw staging area
+- staged temporary raw shard files under the raw staging area
 
 **But you must not**:
 - reference these in `PartMetadata`
@@ -369,8 +363,7 @@ Repair/GC can later clean these temp attempts.
 ### Crash after backend commit but before PartMetadata
 You may see:
 
-- committed blob addresses exist (stable shard files on the compatibility backend, or raw extent
-  addresses on the raw backend)
+- committed raw extent addresses exist
 - no `part_{p}{PART_META_SUFFIX}`
 
 Finalization will not include that part, because metadata doesn’t claim it.
@@ -433,12 +426,12 @@ This prevents partial visibility.
 
 ### Repair (index + blob)
 
-Repair is a filesystem reconciliation job:
+Repair is a metadata-and-raw-blob reconciliation job:
 
 - **Index repair:** reconcile missing/divergent object metadata replicas across index roots
 - **Shard verification:** availability checks (size) or checksum scrub mode
 - **Shard repair:** reconstruct missing/corrupt shards from remaining shards (bounded concurrency)
-- **Commit discipline:** repair writes to temp then renames into place (no in-place mutation)
+- **Commit discipline:** repair writes to staged files, commits into raw extents, then updates metadata
 
 ### Recovery runtime (background heal)
 
@@ -446,7 +439,7 @@ Reads can degrade gracefully. When a shard is missing/corrupt:
 
 - serve the requested bytes by reconstructing them
 - schedule a background `repair_entire_shard()` on a dedicated runtime
-- the repair writer creates a temp file, preallocates it, writes reconstructed stripes, then renames into place
+- the repair writer stages a shard, writes reconstructed stripes, then commits into a new raw extent
 
 This keeps streaming fast while repairs happen out-of-band.
 
@@ -455,9 +448,9 @@ This keeps streaming fast while repairs happen out-of-band.
 Redistribution moves shards to new placement rules without interrupting CRUD:
 
 - read from existing layout (recover if needed)
-- write to new target layout as temp
-- commit via rename + dir sync
-- mark old shards for later GC
+- write to a new target raw extent
+- publish updated metadata
+- mark old raw extents for later GC
 
 ### Garbage collection and trash
 
@@ -466,6 +459,15 @@ N1 favors safety:
 - deletes are represented safely (trash markers / soft delete)
 - destructive deletion is handled by GC, not the hot path
 - temp attempts (`*.tmp.<attempt>`) are safe to GC because they are never canonical
+
+### Raw blob operations
+
+- `GET /v4/maintenance/blob/raw/status` reports raw blob device state and allocator usage
+- `POST /v4/maintenance/scrub/start`
+- `POST /v4/maintenance/scrub/stop`
+- `GET /v4/maintenance/scrub/status`
+
+Scrub runs the repair engine in checksum-verification mode across committed raw shards.
 
 ---
 

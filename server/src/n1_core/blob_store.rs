@@ -1,10 +1,9 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::constants::{PARITY_SUFFIX, SHARD_SUFFIX};
 use crate::n1_core::disk_manager::{
-    ObjectMetadata, RawBlobAddress, ShardInfo, configured_blob_store_disks, configured_fs_storage_root,
+    ObjectMetadata, RawBlobAddress, ShardInfo, configured_blob_store_disks,
+    configured_fs_storage_root,
 };
-#[cfg(test)]
-use crate::n1_core::disk_manager::ObjectPathManager;
 use block_manager::{BlockManager, BlockManagerError, FormatOptions, RawExtentAddress};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
@@ -20,13 +19,69 @@ use std::os::unix::fs::FileTypeExt;
 
 #[derive(Clone)]
 pub enum BlobDiskHandle {
-    Filesystem {
-        root: PathBuf,
-    },
     Raw {
         device_id: String,
         manager: Arc<Mutex<BlockManager>>,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RawBlobPathKind {
+    BlockDevice,
+    LoopbackFile,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RawBlobDeviceStatus {
+    pub path: String,
+    pub canonical_path: String,
+    pub kind: RawBlobPathKind,
+    pub status: String,
+    pub direct_io: bool,
+    pub mounted: bool,
+    pub mount_points: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_warning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_size_bytes: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocation_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub journal_cursor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawBlobDiskState {
+    Managed,
+    Unformatted,
+    ForeignSignature,
+    DirtyUnknown,
+}
+
+#[derive(Debug, Clone)]
+struct RawBlobDiskInspection {
+    path: PathBuf,
+    canonical_path: PathBuf,
+    kind: RawBlobPathKind,
+    mounted: bool,
+    mount_points: Vec<String>,
+    path_warning: Option<String>,
+    total_bytes: u64,
+    state: RawBlobDiskState,
+    detected_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,20 +101,6 @@ pub fn stable_shard_file_name(part_index: u64, shard_index: usize, is_parity: bo
         SHARD_SUFFIX
     };
     format!("part_{}_shard_{}{}", part_index, shard_index, ext)
-}
-
-#[cfg(test)]
-pub fn filesystem_shard_address(
-    path_manager: &ObjectPathManager,
-    disk_root: &PathBuf,
-    fragment_hash: &str,
-    version_id: &str,
-    part_index: u64,
-    shard_index: usize,
-    is_parity: bool,
-) -> PathBuf {
-    let shard_dir = path_manager.get_shard_dir_on_disk(disk_root, fragment_hash, version_id);
-    shard_dir.join(stable_shard_file_name(part_index, shard_index, is_parity))
 }
 
 pub fn raw_blob_address_from_extent(extent: &RawExtentAddress) -> RawBlobAddress {
@@ -85,16 +126,17 @@ pub fn configured_blob_disk_count() -> Result<usize, AppError> {
     Ok(disks.len())
 }
 
-pub fn configured_filesystem_blob_roots() -> Result<Vec<PathBuf>, AppError> {
+pub fn validate_configured_raw_blob_disks() -> Result<Vec<RawBlobDeviceStatus>, AppError> {
     let disks = configured_blob_store_disks()?;
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(disks.len());
     for disk in &disks {
-        let path = PathBuf::from(disk);
-        if fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false) {
-            out.push(path);
-        }
+        out.push(inspect_raw_blob_device(Path::new(disk), false)?);
     }
-    Ok(out)
+    Ok(out.into_iter().map(status_from_inspection).collect())
+}
+
+pub fn raw_blob_device_statuses() -> Result<Vec<RawBlobDeviceStatus>, AppError> {
+    validate_configured_raw_blob_disks()
 }
 
 pub fn resolve_blob_disk(disk_idx: usize) -> Result<BlobDiskHandle, AppError> {
@@ -103,14 +145,8 @@ pub fn resolve_blob_disk(disk_idx: usize) -> Result<BlobDiskHandle, AppError> {
         AppError::InternalServerError(format!("Blob disk index {} out of bounds", disk_idx))
     })?;
     let path = PathBuf::from(raw_path);
-    let meta = fs::metadata(&path)
-        .map_err(|e| AppError::Io(e, format!("stat blob store path {}", path.display())))?;
-
-    if meta.is_dir() {
-        return Ok(BlobDiskHandle::Filesystem { root: path });
-    }
-
-    let manager = open_or_format_raw_manager(&path)?;
+    let inspection = inspect_raw_blob_device(&path, true)?;
+    let manager = open_or_format_raw_manager(&inspection.canonical_path)?;
     let device_id = manager
         .lock()
         .map_err(|_| AppError::InternalServerError("Raw blob manager lock poisoned".into()))?
@@ -120,11 +156,6 @@ pub fn resolve_blob_disk(disk_idx: usize) -> Result<BlobDiskHandle, AppError> {
     Ok(BlobDiskHandle::Raw { device_id, manager })
 }
 
-pub fn raw_backend_present() -> Result<bool, AppError> {
-    Ok((0..configured_blob_disk_count()?)
-        .any(|idx| matches!(resolve_blob_disk(idx), Ok(BlobDiskHandle::Raw { .. }))))
-}
-
 pub fn resolve_blob_disk_path(path: &Path) -> Result<BlobDiskHandle, AppError> {
     let disks = configured_blob_store_disks()?;
     let wanted = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -132,13 +163,8 @@ pub fn resolve_blob_disk_path(path: &Path) -> Result<BlobDiskHandle, AppError> {
         let candidate = PathBuf::from(raw);
         let canonical = fs::canonicalize(&candidate).unwrap_or(candidate.clone());
         if canonical == wanted {
-            let meta = fs::metadata(&candidate).map_err(|e| {
-                AppError::Io(e, format!("stat blob store path {}", candidate.display()))
-            })?;
-            if meta.is_dir() {
-                return Ok(BlobDiskHandle::Filesystem { root: candidate });
-            }
-            let manager = open_or_format_raw_manager(&candidate)?;
+            let inspection = inspect_raw_blob_device(&candidate, true)?;
+            let manager = open_or_format_raw_manager(&inspection.canonical_path)?;
             let device_id = manager
                 .lock()
                 .map_err(|_| {
@@ -187,12 +213,7 @@ pub async fn commit_staged_raw_shard(
     let staged_path = staged_path.to_path_buf();
     let staged_for_task = staged_path.clone();
     let handle = tokio::task::spawn_blocking(move || -> Result<RawBlobAddress, AppError> {
-        let BlobDiskHandle::Raw { manager, .. } = resolve_blob_disk(disk_idx)? else {
-            return Err(AppError::InternalServerError(format!(
-                "blob disk {} is not a raw device",
-                disk_idx
-            )));
-        };
+        let BlobDiskHandle::Raw { manager, .. } = resolve_blob_disk(disk_idx)?;
 
         let mut src = File::open(&staged_for_task).map_err(|e| {
             AppError::Io(
@@ -430,6 +451,33 @@ pub async fn free_raw_address(raw: &RawBlobAddress) -> Result<(), AppError> {
     .map_err(|e| AppError::InternalServerError(format!("raw free task failed: {}", e)))?
 }
 
+pub async fn raw_blob_address_exists(raw: &RawBlobAddress) -> Result<bool, AppError> {
+    let manager = raw_manager_by_device_id(raw.device_id.as_str())?;
+    let address = RawExtentAddress {
+        device_id: manager
+            .lock()
+            .map_err(|_| AppError::InternalServerError("raw manager lock poisoned".into()))?
+            .header()
+            .device_id,
+        allocation_id: raw.allocation_id,
+        offset_bytes: raw.offset_bytes,
+        size_bytes: raw.size_bytes,
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let mgr = manager
+            .lock()
+            .map_err(|_| AppError::InternalServerError("raw manager lock poisoned".into()))?;
+        match mgr.read_address(&address, 0, 0) {
+            Ok(_) => Ok(true),
+            Err(BlockManagerError::UnknownAllocation(_)) => Ok(false),
+            Err(err) => Err(block_manager_error_to_app(err)),
+        }
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("raw exists task failed: {}", e)))?
+}
+
 pub async fn write_raw_gc_markers(
     index_roots: &[PathBuf],
     fragment: &str,
@@ -489,15 +537,13 @@ pub fn raw_gc_marker_file_name(raw: &RawBlobAddress) -> String {
 fn raw_manager_by_device_id(device_id: &str) -> Result<Arc<Mutex<BlockManager>>, AppError> {
     let disk_count = configured_blob_disk_count()?;
     for idx in 0..disk_count {
-        if let BlobDiskHandle::Raw {
+        let BlobDiskHandle::Raw {
             device_id: raw_device_id,
             manager,
             ..
-        } = resolve_blob_disk(idx)?
-        {
-            if raw_device_id == device_id {
-                return Ok(manager);
-            }
+        } = resolve_blob_disk(idx)?;
+        if raw_device_id == device_id {
+            return Ok(manager);
         }
     }
     Err(AppError::InternalServerError(format!(
@@ -508,23 +554,26 @@ fn raw_manager_by_device_id(device_id: &str) -> Result<Arc<Mutex<BlockManager>>,
 
 fn open_or_format_raw_manager(path: &Path) -> Result<Arc<Mutex<BlockManager>>, AppError> {
     let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let inspection = inspect_raw_blob_device(&canonical, true)?;
     if let Some(existing) = RAW_MANAGER_CACHE
         .lock()
         .map_err(|_| AppError::InternalServerError("Raw manager cache lock poisoned".into()))?
-        .get(&canonical)
+        .get(&inspection.canonical_path)
         .cloned()
     {
         return Ok(existing);
     }
 
-    let manager = match BlockManager::open(&canonical) {
+    let manager = match BlockManager::open(&inspection.canonical_path) {
         Ok(mgr) => mgr,
         Err(BlockManagerError::InvalidDevice(_)) => {
-            let total_bytes = probe_raw_device_size_bytes(&canonical)?;
+            if inspection.state != RawBlobDiskState::Unformatted {
+                return Err(raw_blob_validation_error(&inspection));
+            }
             BlockManager::format(
-                &canonical,
+                &inspection.canonical_path,
                 FormatOptions {
-                    total_bytes: Some(total_bytes),
+                    total_bytes: Some(inspection.total_bytes),
                     ..Default::default()
                 },
             )
@@ -537,8 +586,348 @@ fn open_or_format_raw_manager(path: &Path) -> Result<Arc<Mutex<BlockManager>>, A
     RAW_MANAGER_CACHE
         .lock()
         .map_err(|_| AppError::InternalServerError("Raw manager cache lock poisoned".into()))?
-        .insert(canonical, manager.clone());
+        .insert(inspection.canonical_path, manager.clone());
     Ok(manager)
+}
+
+fn inspect_raw_blob_device(path: &Path, strict: bool) -> Result<RawBlobDiskInspection, AppError> {
+    let meta = fs::metadata(path)
+        .map_err(|e| AppError::Io(e, format!("stat raw blob path {}", path.display())))?;
+    if meta.is_dir() {
+        return Err(AppError::BadRequest(format!(
+            "blob_store_disks entry {} is a mounted directory; N1 blob disks must be raw block devices or loopback files",
+            path.display()
+        )));
+    }
+
+    let kind = raw_blob_path_kind(&meta, path)?;
+    let canonical_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mount_points = mount_points_for_path(path, &canonical_path);
+    let mounted = !mount_points.is_empty();
+    let path_warning = raw_path_warning(path, kind);
+    let total_bytes = probe_raw_device_size_bytes(&canonical_path)?;
+
+    if mounted && strict {
+        return Err(AppError::BadRequest(format!(
+            "blob device {} is mounted at {}; raw blob disks must stay unmounted",
+            path.display(),
+            mount_points.join(", ")
+        )));
+    }
+
+    match BlockManager::open(&canonical_path) {
+        Ok(_) => Ok(RawBlobDiskInspection {
+            path: path.to_path_buf(),
+            canonical_path,
+            kind,
+            mounted,
+            mount_points,
+            path_warning,
+            total_bytes,
+            state: RawBlobDiskState::Managed,
+            detected_signature: Some("n1_block_manager".to_string()),
+        }),
+        Err(BlockManagerError::InvalidDevice(_)) => {
+            let detected_signature = detect_foreign_signature(&canonical_path, total_bytes)?;
+            let looks_empty = looks_zeroed_or_empty(&canonical_path, total_bytes)?;
+            let state = if let Some(_) = detected_signature {
+                RawBlobDiskState::ForeignSignature
+            } else if looks_empty {
+                RawBlobDiskState::Unformatted
+            } else {
+                RawBlobDiskState::DirtyUnknown
+            };
+
+            let inspection = RawBlobDiskInspection {
+                path: path.to_path_buf(),
+                canonical_path,
+                kind,
+                mounted,
+                mount_points,
+                path_warning,
+                total_bytes,
+                state,
+                detected_signature,
+            };
+            if strict && inspection.state != RawBlobDiskState::Unformatted {
+                return Err(raw_blob_validation_error(&inspection));
+            }
+            Ok(inspection)
+        }
+        Err(err) => Err(block_manager_error_to_app(err)),
+    }
+}
+
+fn raw_blob_validation_error(inspection: &RawBlobDiskInspection) -> AppError {
+    match inspection.state {
+        RawBlobDiskState::Managed => AppError::InternalServerError(format!(
+            "unexpected validation state for managed blob device {}",
+            inspection.path.display()
+        )),
+        RawBlobDiskState::Unformatted => AppError::InternalServerError(format!(
+            "unexpected validation state for unformatted blob device {}",
+            inspection.path.display()
+        )),
+        RawBlobDiskState::ForeignSignature => AppError::BadRequest(format!(
+            "blob device {} contains foreign on-disk data ({}) and is not safe for N1 to format",
+            inspection.path.display(),
+            inspection
+                .detected_signature
+                .as_deref()
+                .unwrap_or("unknown signature")
+        )),
+        RawBlobDiskState::DirtyUnknown => AppError::BadRequest(format!(
+            "blob device {} is neither zeroed nor N1-formatted; refusing to claim unknown data",
+            inspection.path.display()
+        )),
+    }
+}
+
+fn status_from_inspection(inspection: RawBlobDiskInspection) -> RawBlobDeviceStatus {
+    match BlockManager::open(&inspection.canonical_path) {
+        Ok(mgr) => RawBlobDeviceStatus {
+            path: inspection.path.to_string_lossy().to_string(),
+            canonical_path: inspection.canonical_path.to_string_lossy().to_string(),
+            kind: inspection.kind,
+            status: if inspection.mounted {
+                "misconfigured".to_string()
+            } else {
+                "managed".to_string()
+            },
+            direct_io: true,
+            mounted: inspection.mounted,
+            mount_points: inspection.mount_points,
+            path_warning: inspection.path_warning,
+            detected_signature: inspection.detected_signature,
+            device_id: Some(mgr.header().device_id.to_string()),
+            block_size_bytes: Some(mgr.header().block_size),
+            allocation_count: Some(mgr.allocation_count()),
+            journal_cursor: Some(mgr.journal_cursor()),
+            total_bytes: Some(inspection.total_bytes),
+            used_bytes: Some(mgr.used_bytes()),
+            available_bytes: Some(mgr.available_bytes()),
+            error: None,
+        },
+        Err(BlockManagerError::InvalidDevice(_)) => {
+            let detected_signature = inspection.detected_signature.clone();
+            RawBlobDeviceStatus {
+                path: inspection.path.to_string_lossy().to_string(),
+                canonical_path: inspection.canonical_path.to_string_lossy().to_string(),
+                kind: inspection.kind,
+                status: match inspection.state {
+                    RawBlobDiskState::Managed => "managed".to_string(),
+                    RawBlobDiskState::Unformatted => "unformatted".to_string(),
+                    RawBlobDiskState::ForeignSignature | RawBlobDiskState::DirtyUnknown => {
+                        "misconfigured".to_string()
+                    }
+                },
+                direct_io: true,
+                mounted: inspection.mounted,
+                mount_points: inspection.mount_points,
+                path_warning: inspection.path_warning,
+                detected_signature,
+                device_id: None,
+                block_size_bytes: None,
+                allocation_count: None,
+                journal_cursor: None,
+                total_bytes: Some(inspection.total_bytes),
+                used_bytes: None,
+                available_bytes: None,
+                error: if inspection.mounted {
+                    Some("blob device is mounted".to_string())
+                } else {
+                    match inspection.state {
+                        RawBlobDiskState::Unformatted => None,
+                        RawBlobDiskState::ForeignSignature => Some(format!(
+                            "foreign signature detected: {}",
+                            inspection
+                                .detected_signature
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string())
+                        )),
+                        RawBlobDiskState::DirtyUnknown => {
+                            Some("device contains unknown non-zero data".to_string())
+                        }
+                        RawBlobDiskState::Managed => None,
+                    }
+                },
+            }
+        }
+        Err(err) => RawBlobDeviceStatus {
+            path: inspection.path.to_string_lossy().to_string(),
+            canonical_path: inspection.canonical_path.to_string_lossy().to_string(),
+            kind: inspection.kind,
+            status: "error".to_string(),
+            direct_io: true,
+            mounted: inspection.mounted,
+            mount_points: inspection.mount_points,
+            path_warning: inspection.path_warning,
+            detected_signature: inspection.detected_signature,
+            device_id: None,
+            block_size_bytes: None,
+            allocation_count: None,
+            journal_cursor: None,
+            total_bytes: Some(inspection.total_bytes),
+            used_bytes: None,
+            available_bytes: None,
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+fn raw_blob_path_kind(meta: &fs::Metadata, path: &Path) -> Result<RawBlobPathKind, AppError> {
+    #[cfg(unix)]
+    if meta.file_type().is_block_device() {
+        return Ok(RawBlobPathKind::BlockDevice);
+    }
+    if meta.is_file() {
+        return Ok(RawBlobPathKind::LoopbackFile);
+    }
+    Err(AppError::BadRequest(format!(
+        "blob_store_disks entry {} must be a raw block device or regular loopback file",
+        path.display()
+    )))
+}
+
+fn raw_path_warning(path: &Path, kind: RawBlobPathKind) -> Option<String> {
+    if kind == RawBlobPathKind::BlockDevice {
+        let rendered = path.to_string_lossy();
+        if rendered.starts_with("/dev/sd")
+            || rendered.starts_with("/dev/vd")
+            || rendered.starts_with("/dev/nvme")
+        {
+            return Some(
+                "prefer /dev/disk/by-id/* for stable blob device naming across reboots".to_string(),
+            );
+        }
+    }
+    None
+}
+
+fn mount_points_for_path(original: &Path, canonical: &Path) -> Vec<String> {
+    let Ok(contents) = fs::read_to_string("/proc/self/mountinfo") else {
+        return Vec::new();
+    };
+    let original_str = original.to_string_lossy().to_string();
+    let canonical_str = canonical.to_string_lossy().to_string();
+    parse_mountinfo_sources(contents.as_str())
+        .into_iter()
+        .filter_map(|(source, mount_point)| {
+            let source_path = PathBuf::from(&source);
+            let source_canonical = fs::canonicalize(&source_path).unwrap_or(source_path);
+            let source_canonical_str = source_canonical.to_string_lossy().to_string();
+            if source == original_str
+                || source == canonical_str
+                || source_canonical_str == original_str
+                || source_canonical_str == canonical_str
+            {
+                Some(mount_point)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn parse_mountinfo_sources(contents: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in contents.lines() {
+        let Some((left, right)) = line.split_once(" - ") else {
+            continue;
+        };
+        let mut left_parts = left.split_whitespace();
+        let _mount_id = left_parts.next();
+        let _parent_id = left_parts.next();
+        let _major_minor = left_parts.next();
+        let _root = left_parts.next();
+        let mount_point = match left_parts.next() {
+            Some(v) => v.to_string(),
+            None => continue,
+        };
+        let mut right_parts = right.split_whitespace();
+        let _fstype = right_parts.next();
+        let source = match right_parts.next() {
+            Some(v) => v.to_string(),
+            None => continue,
+        };
+        out.push((source, mount_point));
+    }
+    out
+}
+
+fn detect_foreign_signature(path: &Path, total_bytes: u64) -> Result<Option<String>, AppError> {
+    let mut file = File::open(path)
+        .map_err(|e| AppError::Io(e, format!("open raw blob device {}", path.display())))?;
+    let probe_len = (128 * 1024).min(total_bytes as usize);
+    let mut prefix = vec![0u8; probe_len];
+    file.read_exact(&mut prefix)
+        .map_err(|e| AppError::Io(e, format!("read raw blob header {}", path.display())))?;
+
+    if prefix.get(0..16) == Some(block_manager_superblock_magic().as_slice()) {
+        return Ok(Some("n1_block_manager".to_string()));
+    }
+    if prefix.get(0..4) == Some(b"XFSB".as_slice()) {
+        return Ok(Some("xfs".to_string()));
+    }
+    if prefix.get(0..6) == Some(b"LUKS\xba\xbe".as_slice()) {
+        return Ok(Some("luks".to_string()));
+    }
+    if prefix.get(3..11) == Some(b"NTFS    ".as_slice()) {
+        return Ok(Some("ntfs".to_string()));
+    }
+    if prefix.get(3..11) == Some(b"EXFAT   ".as_slice()) {
+        return Ok(Some("exfat".to_string()));
+    }
+    if prefix.get(1080..1082) == Some([0x53, 0xEF].as_slice()) {
+        return Ok(Some("ext4".to_string()));
+    }
+    if prefix.get(512..520) == Some(b"EFI PART".as_slice()) {
+        return Ok(Some("gpt".to_string()));
+    }
+    if prefix.len() > 512
+        && prefix[510] == 0x55
+        && prefix[511] == 0xAA
+        && prefix.iter().take(440).any(|b| *b != 0)
+    {
+        return Ok(Some("mbr".to_string()));
+    }
+    if prefix.len() > 0x10048 && prefix.get(0x10040..0x10048) == Some(b"_BHRfS_M".as_slice()) {
+        return Ok(Some("btrfs".to_string()));
+    }
+
+    Ok(None)
+}
+
+fn block_manager_superblock_magic() -> [u8; 16] {
+    *b"LITIAINA-BM-V1\0\0"
+}
+
+fn looks_zeroed_or_empty(path: &Path, total_bytes: u64) -> Result<bool, AppError> {
+    if total_bytes == 0 {
+        return Ok(true);
+    }
+    let mut file = File::open(path)
+        .map_err(|e| AppError::Io(e, format!("open raw blob device {}", path.display())))?;
+    let sample = (64 * 1024).min(total_bytes as usize);
+    let mut buf = vec![0u8; sample];
+    file.read_exact(&mut buf)
+        .map_err(|e| AppError::Io(e, format!("read raw blob device {}", path.display())))?;
+    if buf.iter().any(|b| *b != 0) {
+        return Ok(false);
+    }
+
+    if total_bytes > sample as u64 {
+        file.seek(SeekFrom::Start(total_bytes.saturating_sub(sample as u64)))
+            .map_err(|e| AppError::Io(e, format!("seek raw blob device {}", path.display())))?;
+        file.read_exact(&mut buf).map_err(|e| {
+            AppError::Io(e, format!("tail read raw blob device {}", path.display()))
+        })?;
+        if buf.iter().any(|b| *b != 0) {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 fn probe_raw_device_size_bytes(path: &Path) -> Result<u64, AppError> {
@@ -585,8 +974,8 @@ const BLKGETSIZE64_IOCTL: libc::c_ulong = 0x8008_1272;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::n1_core::disk_manager::ObjectPathManager;
     use std::fs::OpenOptions;
+    use std::os::unix::fs::FileExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_loopback(name: &str) -> PathBuf {
@@ -606,17 +995,6 @@ mod tests {
     fn stable_shard_file_name_uses_expected_suffixes() {
         assert_eq!(stable_shard_file_name(7, 1, false), "part_7_shard_1.shard");
         assert_eq!(stable_shard_file_name(7, 2, true), "part_7_shard_2.parity");
-    }
-
-    #[test]
-    fn filesystem_shard_address_builds_expected_path() {
-        let pm = ObjectPathManager::new();
-        let disk = PathBuf::from("/disk0");
-        let addr = filesystem_shard_address(&pm, &disk, "frag", "ver", 3, 1, false);
-        assert_eq!(
-            addr,
-            PathBuf::from("/disk0/frag/blob/ver/part_3_shard_1.shard")
-        );
     }
 
     #[test]
@@ -650,6 +1028,90 @@ mod tests {
     }
 
     #[test]
+    fn parse_mountinfo_sources_extracts_source_and_mountpoint() {
+        let parsed = parse_mountinfo_sources(
+            "52 38 8:17 / /mnt/blob rw,relatime - ext4 /dev/sdb1 rw\n\
+             53 38 8:18 / /mnt/index rw,relatime - xfs /dev/disk/by-id/idx rw",
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                ("/dev/sdb1".to_string(), "/mnt/blob".to_string()),
+                ("/dev/disk/by-id/idx".to_string(), "/mnt/index".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn detect_foreign_signature_recognizes_ext4_magic() {
+        let path = temp_loopback("ext4-magic");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .expect("create loopback file");
+        file.set_len(4 * 1024 * 1024).expect("size loopback");
+        file.write_at(&[0x53, 0xEF], 1080)
+            .expect("write ext4 magic");
+        file.sync_all().expect("sync loopback");
+        drop(file);
+
+        let signature = detect_foreign_signature(&path, 4 * 1024 * 1024).expect("signature");
+        assert_eq!(signature.as_deref(), Some("ext4"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn zeroed_loopback_is_treated_as_unformatted() {
+        let path = temp_loopback("zeroed");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .expect("create loopback file");
+        file.set_len(4 * 1024 * 1024).expect("size loopback");
+        drop(file);
+
+        let inspection = inspect_raw_blob_device(&path, false).expect("inspect");
+        assert_eq!(inspection.state, RawBlobDiskState::Unformatted);
+        assert_eq!(inspection.kind, RawBlobPathKind::LoopbackFile);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dirty_unknown_loopback_is_rejected() {
+        let path = temp_loopback("dirty");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .expect("create loopback file");
+        file.set_len(4 * 1024 * 1024).expect("size loopback");
+        file.write_at(b"opaque-random-data", 0)
+            .expect("write dirty bytes");
+        file.sync_all().expect("sync loopback");
+        drop(file);
+
+        let err = inspect_raw_blob_device(&path, true).expect_err("dirty device rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("neither zeroed nor N1-formatted"),
+            "unexpected error: {}",
+            msg
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn open_or_format_raw_manager_initializes_unformatted_loopback() {
         let path = temp_loopback("format");
         let file = OpenOptions::new()
@@ -666,6 +1128,31 @@ mod tests {
         let header = manager.lock().expect("lock manager").header().clone();
         assert_eq!(header.block_size, 4096);
         assert!(header.total_blocks > header.data_start_block);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn managed_loopback_reports_observability_fields() {
+        let path = temp_loopback("status");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .expect("create loopback file");
+        file.set_len(4 * 1024 * 1024).expect("size loopback");
+        drop(file);
+
+        let _ = open_or_format_raw_manager(&path).expect("format manager");
+        let status =
+            status_from_inspection(inspect_raw_blob_device(&path, false).expect("inspect"));
+        assert_eq!(status.status, "managed");
+        assert_eq!(status.kind, RawBlobPathKind::LoopbackFile);
+        assert_eq!(status.direct_io, true);
+        assert!(status.device_id.is_some());
+        assert!(status.total_bytes.unwrap_or(0) > 0);
 
         let _ = std::fs::remove_file(path);
     }

@@ -23,7 +23,6 @@ use super::prefix_compactor::{
 };
 use super::prefix_rebuilder::run_prefix_rebuild_job;
 use super::quota_manager::init_quota_file;
-use super::recovery::verify_shard_integrity;
 use super::redistribution::{
     RedistributionDurabilityMode, RedistributionRunOptions, run_redistribution_job,
     run_redistribution_job_with_options,
@@ -60,7 +59,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::fs;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
 use ulid::Ulid;
@@ -88,31 +86,7 @@ fn full_claims(fragment: &str) -> Claims {
 }
 
 async fn ensure_global_storage_config(base: &std::path::Path) {
-    ensure_test_config_file();
-
-    let index_1 = base.join("index_1");
-    let index_2 = base.join("index_2");
-    let blob_1 = base.join("blob_1");
-    let blob_2 = base.join("blob_2");
-    let blob_3 = base.join("blob_3");
-
-    let _ = fs::create_dir_all(&index_1).await;
-    let _ = fs::create_dir_all(&index_2).await;
-    let _ = fs::create_dir_all(&blob_1).await;
-    let _ = fs::create_dir_all(&blob_2).await;
-    let _ = fs::create_dir_all(&blob_3).await;
-
-    let index_roots = vec![
-        index_1.to_string_lossy().to_string(),
-        index_2.to_string_lossy().to_string(),
-    ];
-    let blob_roots = vec![
-        blob_1.to_string_lossy().to_string(),
-        blob_2.to_string_lossy().to_string(),
-        blob_3.to_string_lossy().to_string(),
-    ];
-
-    replace_storage_roots_for_tests(index_roots, blob_roots, base.to_string_lossy().to_string());
+    let _ = ensure_raw_storage_config(base, 3, 256 * 1024 * 1024).await;
 }
 
 async fn ensure_raw_storage_config(
@@ -163,6 +137,18 @@ async fn ensure_raw_storage_config(
     );
 
     raw_paths
+}
+
+async fn corrupt_shard_bytes(shard: &super::disk_manager::ShardInfo, offset: u64, data: &[u8]) {
+    write_shard_range(shard, offset, data)
+        .await
+        .expect("corrupt shard bytes");
+}
+
+async fn shard_checksum_ok(shard: &super::disk_manager::ShardInfo) -> bool {
+    verify_shard_checksum(shard)
+        .await
+        .expect("verify shard checksum")
 }
 
 fn ensure_upload_runtime_config() {
@@ -1340,27 +1326,9 @@ async fn workflow_upload_read_modify_delete_redistribute_repair() {
         .expect("data shard to corrupt")
         .clone();
 
-    let mut damaged_file = fs::OpenOptions::new()
-        .write(true)
-        .open(&target_shard.absolute_path)
-        .await
-        .expect("open shard for corruption");
-    damaged_file
-        .seek(std::io::SeekFrom::Start(0))
-        .await
-        .expect("seek shard");
-    damaged_file
-        .write_all(&vec![0xA5; 4096])
-        .await
-        .expect("corrupt shard");
-    damaged_file.flush().await.expect("flush corruption");
-    drop(damaged_file);
-
-    let mut before_repair = fs::File::open(&target_shard.absolute_path)
-        .await
-        .expect("open shard for verify");
+    corrupt_shard_bytes(&target_shard, 0, &vec![0xA5; 4096]).await;
     assert!(
-        !verify_shard_integrity(&mut before_repair, &target_shard.checksum).await,
+        !shard_checksum_ok(&target_shard).await,
         "corruption should break checksum before repair"
     );
 
@@ -1377,11 +1345,8 @@ async fn workflow_upload_read_modify_delete_redistribute_repair() {
     .await
     .expect("run repair");
 
-    let mut after_repair = fs::File::open(&target_shard.absolute_path)
-        .await
-        .expect("open repaired shard");
     assert!(
-        verify_shard_integrity(&mut after_repair, &target_shard.checksum).await,
+        shard_checksum_ok(&target_shard).await,
         "repair should restore shard checksum"
     );
 
@@ -2675,8 +2640,8 @@ async fn matrix_redistribution_with_one_disk_down() {
         .expect("STRIPE_SIZE_ATOMIC")
         .store(4096, Ordering::Relaxed);
 
-    let blob3 = base.join("blob_3");
-    let blob3_down = base.join("blob_3.down");
+    let blob3 = base.join("blob_3.raw");
+    let blob3_down = base.join("blob_3.raw.down");
     if fs::try_exists(&blob3).await.unwrap_or(false) {
         fs::rename(&blob3, &blob3_down)
             .await
@@ -2865,27 +2830,9 @@ async fn matrix_bitrot_parity_then_repair() {
         .expect("parity shard")
         .clone();
 
-    let mut parity_file = fs::OpenOptions::new()
-        .write(true)
-        .open(&parity_shard.absolute_path)
-        .await
-        .expect("open parity shard");
-    parity_file
-        .seek(std::io::SeekFrom::Start(0))
-        .await
-        .expect("seek parity");
-    parity_file
-        .write_all(&vec![0x6E; 4096])
-        .await
-        .expect("corrupt parity shard");
-    parity_file.flush().await.expect("flush parity corruption");
-    drop(parity_file);
-
-    let mut before = fs::File::open(&parity_shard.absolute_path)
-        .await
-        .expect("open parity for verify");
+    corrupt_shard_bytes(&parity_shard, 0, &vec![0x6E; 4096]).await;
     assert!(
-        !verify_shard_integrity(&mut before, &parity_shard.checksum).await,
+        !shard_checksum_ok(&parity_shard).await,
         "parity checksum should fail before repair"
     );
 
@@ -2902,11 +2849,8 @@ async fn matrix_bitrot_parity_then_repair() {
     .await
     .expect("repair after parity bitrot");
 
-    let mut after = fs::File::open(&parity_shard.absolute_path)
-        .await
-        .expect("open repaired parity");
     assert!(
-        verify_shard_integrity(&mut after, &parity_shard.checksum).await,
+        shard_checksum_ok(&parity_shard).await,
         "parity checksum should pass after repair"
     );
 
@@ -3570,21 +3514,7 @@ async fn matrix_ha_crud_during_redistribution_and_repair() {
         .expect("data shard")
         .clone();
 
-    let mut damaged = fs::OpenOptions::new()
-        .write(true)
-        .open(&target_shard.absolute_path)
-        .await
-        .expect("open shard for corruption");
-    damaged
-        .seek(std::io::SeekFrom::Start(0))
-        .await
-        .expect("seek corrupted shard");
-    damaged
-        .write_all(&vec![0x3C; 4096])
-        .await
-        .expect("corrupt shard");
-    damaged.flush().await.expect("flush shard corruption");
-    drop(damaged);
+    corrupt_shard_bytes(&target_shard, 0, &vec![0x3C; 4096]).await;
 
     let repair_task = tokio::spawn(run_repair_job(
         RepairRunConfig {
@@ -3629,11 +3559,8 @@ async fn matrix_ha_crud_during_redistribution_and_repair() {
         .expect("repair task join")
         .expect("repair should succeed");
 
-    let mut repaired = fs::File::open(&target_shard.absolute_path)
-        .await
-        .expect("open repaired shard");
     assert!(
-        verify_shard_integrity(&mut repaired, &target_shard.checksum).await,
+        shard_checksum_ok(&target_shard).await,
         "repair should restore corrupted shard checksum"
     );
 
@@ -3789,21 +3716,7 @@ async fn matrix_ha_repair_permanent_delete_no_index_desync() {
         .expect("repair hot data shard")
         .clone();
 
-    let mut damaged = fs::OpenOptions::new()
-        .write(true)
-        .open(&repair_hot_shard.absolute_path)
-        .await
-        .expect("open repair-hot shard for corruption");
-    damaged
-        .seek(std::io::SeekFrom::Start(0))
-        .await
-        .expect("seek repair-hot shard");
-    damaged
-        .write_all(&vec![0x6D; 4096])
-        .await
-        .expect("corrupt repair-hot shard");
-    damaged.flush().await.expect("flush repair-hot corruption");
-    drop(damaged);
+    corrupt_shard_bytes(&repair_hot_shard, 0, &vec![0x6D; 4096]).await;
 
     let repair_task = tokio::spawn(run_repair_job(
         RepairRunConfig {
@@ -3849,11 +3762,8 @@ async fn matrix_ha_repair_permanent_delete_no_index_desync() {
         "permanently deleted key should stay absent after repair"
     );
 
-    let mut repaired = fs::File::open(&repair_hot_shard.absolute_path)
-        .await
-        .expect("open repaired hot shard");
     assert!(
-        verify_shard_integrity(&mut repaired, &repair_hot_shard.checksum).await,
+        shard_checksum_ok(&repair_hot_shard).await,
         "repair should still restore corrupted survivor shard"
     );
 
@@ -4164,27 +4074,9 @@ async fn matrix_ha_concurrent_clients_with_failure_injection() {
         .expect("target data shard to corrupt")
         .clone();
 
-    let mut damaged = fs::OpenOptions::new()
-        .write(true)
-        .open(&target_shard.absolute_path)
-        .await
-        .expect("open target shard for corruption");
-    damaged
-        .seek(std::io::SeekFrom::Start(0))
-        .await
-        .expect("seek target shard");
-    damaged
-        .write_all(&vec![0x9A; 4096])
-        .await
-        .expect("inject corruption into target shard");
-    damaged.flush().await.expect("flush target corruption");
-    drop(damaged);
-
-    let mut before = fs::File::open(&target_shard.absolute_path)
-        .await
-        .expect("open corrupted shard for verify");
+    corrupt_shard_bytes(&target_shard, 0, &vec![0x9A; 4096]).await;
     assert!(
-        !verify_shard_integrity(&mut before, &target_shard.checksum).await,
+        !shard_checksum_ok(&target_shard).await,
         "failure injection should break shard checksum before repair"
     );
 
@@ -4209,11 +4101,8 @@ async fn matrix_ha_concurrent_clients_with_failure_injection() {
         .expect("repair join")
         .expect("repair should succeed after failure injection");
 
-    let mut after = fs::File::open(&target_shard.absolute_path)
-        .await
-        .expect("open repaired target shard");
     assert!(
-        verify_shard_integrity(&mut after, &target_shard.checksum).await,
+        shard_checksum_ok(&target_shard).await,
         "repair should restore shard checksum after failure injection"
     );
 
@@ -4368,8 +4257,8 @@ async fn run_ha_soak_rounds_under_maintenance(profile: SoakProfile) {
             .expect("redistribution should succeed in soak round");
 
         if inject_disk_down {
-            let blob3 = base.join("blob_3");
-            let blob3_down = base.join("blob_3.down");
+            let blob3 = base.join("blob_3.raw");
+            let blob3_down = base.join("blob_3.raw.down");
 
             if fs::try_exists(&blob3).await.unwrap_or(false) {
                 fs::rename(&blob3, &blob3_down)
@@ -4398,24 +4287,7 @@ async fn run_ha_soak_rounds_under_maintenance(profile: SoakProfile) {
             .expect("target data shard in soak round")
             .clone();
 
-        let mut damaged = fs::OpenOptions::new()
-            .write(true)
-            .open(&target_shard.absolute_path)
-            .await
-            .expect("open target shard in soak round");
-        damaged
-            .seek(std::io::SeekFrom::Start(0))
-            .await
-            .expect("seek target shard in soak round");
-        damaged
-            .write_all(&vec![0x55; 4096])
-            .await
-            .expect("inject corruption in soak round");
-        damaged
-            .flush()
-            .await
-            .expect("flush corruption in soak round");
-        drop(damaged);
+        corrupt_shard_bytes(&target_shard, 0, &vec![0x55; 4096]).await;
 
         let repair_task = tokio::spawn(run_repair_job(
             RepairRunConfig {
@@ -4443,11 +4315,8 @@ async fn run_ha_soak_rounds_under_maintenance(profile: SoakProfile) {
             .expect("repair join")
             .expect("repair should succeed in soak round");
 
-        let mut repaired = fs::File::open(&target_shard.absolute_path)
-            .await
-            .expect("open repaired shard in soak round");
         assert!(
-            verify_shard_integrity(&mut repaired, &target_shard.checksum).await,
+            shard_checksum_ok(&target_shard).await,
             "round {} repair should restore shard checksum",
             round
         );
@@ -4860,21 +4729,8 @@ async fn matrix_crud_cpu_ram_probe() {
                 let Some(shard) = shard else {
                     continue;
                 };
-                let mut damaged = fs::OpenOptions::new()
-                    .write(true)
-                    .open(&shard.absolute_path)
-                    .await
-                    .expect("open shard for bitrot");
-                damaged
-                    .seek(std::io::SeekFrom::Start(0))
-                    .await
-                    .expect("seek shard for bitrot");
                 let overwrite = vec![0x5A; std::cmp::min(4096, shard.size_bytes as usize).max(1)];
-                damaged
-                    .write_all(&overwrite)
-                    .await
-                    .expect("write bitrot bytes");
-                damaged.flush().await.expect("flush bitrot bytes");
+                corrupt_shard_bytes(shard, 0, &overwrite).await;
                 update_rss_peak(&mut rss_peak);
             }
             stages.push(finish_perf_stage(
