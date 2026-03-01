@@ -1,17 +1,20 @@
 use crate::enums::app_error_enum::AppError;
+use crate::n1_core::blob_store::{
+    BlobDiskHandle, commit_staged_raw_shard, raw_blob_debug_path, raw_stage_path_for_shard,
+    resolve_blob_disk_path, stable_shard_file_name, write_raw_gc_markers,
+};
 use crate::n1_core::constants::{
-    GC_SUFFIX, METADATA_EXT, PARITY_SUFFIX, PART_META_SUFFIX, QUOTA_FILE, REDIST_TMP_SUFFIX,
-    RESERVATION_FILE, SHARD_SUFFIX,
+    GC_SUFFIX, METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, REDIST_TMP_SUFFIX, RESERVATION_FILE,
 };
 use crate::n1_core::disk_manager::{
-    INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, Quota, ShardInfo,
-    default_stripe_size,
+    ObjectMetadata, ObjectPathManager, PartMetadata, Quota, ShardInfo,
+    configured_index_store_disks, default_stripe_size,
 };
 use crate::n1_core::ec::ErasureStreamWriter;
 use crate::n1_core::fragment_metadata::{read_fragment_metadata, write_fragment_metadata};
 use crate::n1_core::operation_gate::acquire_read_only_fast_mode;
 use crate::n1_core::prefix_rebuilder::run_prefix_rebuild_job;
-use crate::n1_core::recovery::read_or_recover_chunk;
+use crate::n1_core::recovery::{ShardFileCache, read_or_recover_chunk};
 use crate::n1_core::upload::{
     DATA_SHARDS_ATOMIC, DirectWriter, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, create_direct_file,
     sync_dir,
@@ -893,11 +896,7 @@ pub async fn run_redistribution_job_with_options(
     let pm = ObjectPathManager::new();
     let blob_roots_cfg = pm.get_blob_roots();
 
-    let index_roots_cfg: Vec<PathBuf> = INDEX_STORE_DISKS
-        .get()
-        .ok_or(AppError::InternalServerError(
-            "Index Store Config not initialized".into(),
-        ))?
+    let index_roots_cfg: Vec<PathBuf> = configured_index_store_disks()?
         .iter()
         .map(PathBuf::from)
         .collect();
@@ -1236,14 +1235,29 @@ async fn check_needs_redistribution(
                 return true;
             }
 
-            let target_disk_path = target_blob_roots[expected].to_string_lossy();
-            if !shard.absolute_path.starts_with(target_disk_path.as_ref()) {
-                return true;
-            }
+            match resolve_blob_disk_path(target_blob_roots[expected].as_path()) {
+                Ok(BlobDiskHandle::Filesystem { root }) => {
+                    let target_disk_path = root.to_string_lossy();
+                    if shard.raw_blob_address.is_some()
+                        || !shard.absolute_path.starts_with(target_disk_path.as_ref())
+                    {
+                        return true;
+                    }
 
-            let in_trash_path = shard.absolute_path.contains(".trash");
-            if is_trash != in_trash_path {
-                return true;
+                    let in_trash_path = shard.absolute_path.contains(".trash");
+                    if is_trash != in_trash_path {
+                        return true;
+                    }
+                }
+                Ok(BlobDiskHandle::Raw { device_id, .. }) => {
+                    let Some(raw) = shard.raw_blob_address.as_ref() else {
+                        return true;
+                    };
+                    if raw.device_id != device_id {
+                        return true;
+                    }
+                }
+                Err(_) => return true,
             }
         }
     }
@@ -1351,11 +1365,12 @@ async fn redistribute_object_streaming(
     let new_block_size = target_stripe_size;
     let verify_tmp_crc = strict_durability;
 
-    let mut file_cache: HashMap<String, tokio::fs::File> = HashMap::new();
+    let mut file_cache: ShardFileCache = ShardFileCache::new();
 
     let old_parts = std::mem::take(&mut meta.parts);
     let mut new_parts: Vec<PartMetadata> = Vec::with_capacity(old_parts.len());
     let mut old_shards_for_gc: Vec<String> = Vec::new();
+    let mut old_raw_shards_for_gc = Vec::new();
 
     for old_part in old_parts {
         if should_stop() {
@@ -1382,7 +1397,7 @@ async fn redistribute_object_streaming(
         let final_shard_len = new_stripe_count * new_block_size as u64;
 
         let mut writers: Vec<Option<DirectWriter>> = Vec::with_capacity(total_shards);
-        let mut commit_list: Vec<(PathBuf, PathBuf, PathBuf, String)> = Vec::new();
+        let mut commit_list: Vec<(PathBuf, PathBuf, PathBuf, String, bool, usize)> = Vec::new();
         let mut new_shards: Vec<ShardInfo> = Vec::with_capacity(total_shards);
         let mut created_tmps: Vec<PathBuf> = Vec::new();
 
@@ -1393,16 +1408,7 @@ async fn redistribute_object_streaming(
             }
 
             let is_parity = shard_idx >= target_data_shards;
-            let ext = if is_parity {
-                PARITY_SUFFIX
-            } else {
-                SHARD_SUFFIX
-            };
-
-            let file_name = format!(
-                "part_{}_shard_{}{}",
-                old_part_arc.part_index, shard_idx, ext
-            );
+            let file_name = stable_shard_file_name(old_part_arc.part_index, shard_idx, is_parity);
 
             let disk_idx = (old_part_arc.part_index as usize + shard_idx) % num_disks;
             let disk_root = &target_blob_roots[disk_idx];
@@ -1414,18 +1420,33 @@ async fn redistribute_object_streaming(
                 ));
             }
 
-            let shard_dir =
-                get_shard_dir_custom(disk_root, &meta.fragment, &meta.version_id, is_trash);
-            let _ = tokio_fs::create_dir_all(&shard_dir).await;
-
-            let final_path = shard_dir.join(&file_name);
-
-            let tmp_path = shard_dir.join(format!(
-                "{}{}{}",
-                file_name,
-                REDIST_TMP_SUFFIX,
-                Ulid::new().to_string()
-            ));
+            let (tmp_path, final_path, shard_dir, is_raw_target) =
+                match resolve_blob_disk_path(disk_root.as_path())? {
+                    BlobDiskHandle::Filesystem { root } => {
+                        let shard_dir =
+                            get_shard_dir_custom(&root, &meta.fragment, &meta.version_id, is_trash);
+                        let _ = tokio_fs::create_dir_all(&shard_dir).await;
+                        let final_path = shard_dir.join(&file_name);
+                        let tmp_path = shard_dir.join(format!(
+                            "{}{}{}",
+                            file_name,
+                            REDIST_TMP_SUFFIX,
+                            Ulid::new().to_string()
+                        ));
+                        (tmp_path, final_path, shard_dir, false)
+                    }
+                    BlobDiskHandle::Raw { .. } => {
+                        let tmp_path = raw_stage_path_for_shard(
+                            disk_idx,
+                            meta.fragment.as_str(),
+                            meta.version_id.as_str(),
+                            Ulid::new().to_string().as_str(),
+                            file_name.as_str(),
+                        )
+                        .await?;
+                        (tmp_path, PathBuf::new(), PathBuf::new(), true)
+                    }
+                };
             created_tmps.push(tmp_path.clone());
 
             let std_file = create_direct_file(&tmp_path).await.map_err(|e| {
@@ -1452,12 +1473,15 @@ async fn redistribute_object_streaming(
                 final_path.clone(),
                 shard_dir.clone(),
                 file_name.clone(),
+                is_raw_target,
+                disk_idx,
             ));
 
             new_shards.push(ShardInfo {
                 shard_index: shard_idx,
                 file_name: file_name.clone(),
                 absolute_path: final_path.to_string_lossy().to_string(),
+                raw_blob_address: None,
                 size_bytes: final_shard_len,
                 checksum: String::new(),
                 is_parity,
@@ -1539,37 +1563,38 @@ async fn redistribute_object_streaming(
                 s.checksum = v.clone();
             }
         }
-        let checksum_by_name: HashMap<&str, &str> = new_shards
-            .iter()
-            .map(|s| (s.file_name.as_str(), s.checksum.as_str()))
-            .collect();
         let mut batched_sync_dirs: HashSet<PathBuf> = HashSet::new();
 
-        for (tmp, final_p, parent, fname) in &commit_list {
+        for ((tmp, final_p, parent, fname, is_raw_target, disk_idx), shard_meta) in
+            commit_list.iter().zip(new_shards.iter_mut())
+        {
             if should_stop() {
                 cleanup_tmp_files(&created_tmps).await;
                 return Err(AppError::InternalServerError("Stopped".into()));
             }
 
-            let expected_crc = if verify_tmp_crc {
-                checksum_by_name.get(fname.as_str()).copied()
-            } else {
-                None
-            };
+            let expected_crc = verify_tmp_crc.then_some(shard_meta.checksum.as_str());
 
             verify_tmp_shard(tmp.as_path(), final_shard_len, expected_crc).await?;
 
-            publish_tmp_overwrite(
-                tmp.as_path(),
-                final_p.as_path(),
-                parent.as_path(),
-                fname,
-                strict_durability,
-            )
-            .await?;
+            if *is_raw_target {
+                let raw_addr =
+                    commit_staged_raw_shard(*disk_idx, tmp.as_path(), final_shard_len).await?;
+                shard_meta.raw_blob_address = Some(raw_addr.clone());
+                shard_meta.absolute_path = raw_blob_debug_path(&raw_addr);
+            } else {
+                publish_tmp_overwrite(
+                    tmp.as_path(),
+                    final_p.as_path(),
+                    parent.as_path(),
+                    fname,
+                    strict_durability,
+                )
+                .await?;
 
-            if !strict_durability {
-                batched_sync_dirs.insert(parent.clone());
+                if !strict_durability {
+                    batched_sync_dirs.insert(parent.clone());
+                }
             }
         }
 
@@ -1598,7 +1623,11 @@ async fn redistribute_object_streaming(
 
         for old_shard in &old_part_arc.shards {
             if !new_paths.contains(&old_shard.absolute_path) {
-                old_shards_for_gc.push(old_shard.absolute_path.clone());
+                if let Some(raw) = old_shard.raw_blob_address.clone() {
+                    old_raw_shards_for_gc.push(raw);
+                } else {
+                    old_shards_for_gc.push(old_shard.absolute_path.clone());
+                }
             }
         }
 
@@ -1662,6 +1691,22 @@ async fn redistribute_object_streaming(
             return Err(AppError::InternalServerError("Stopped".into()));
         }
         let _ = stage_old_shard_gc_with_symlink(&old).await;
+    }
+
+    if !old_raw_shards_for_gc.is_empty() {
+        let mut deduped = HashMap::new();
+        for raw in old_raw_shards_for_gc {
+            deduped
+                .entry((
+                    raw.device_id.clone(),
+                    raw.allocation_id,
+                    raw.offset_bytes,
+                    raw.size_bytes,
+                ))
+                .or_insert(raw);
+        }
+        let values: Vec<_> = deduped.into_values().collect();
+        write_raw_gc_markers(target_index_roots, &meta.fragment, &values).await?;
     }
 
     info!(

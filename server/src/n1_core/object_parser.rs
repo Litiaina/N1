@@ -1,7 +1,7 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::disk_manager::{ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo};
 use crate::n1_core::header_parser::parse_range_header;
-use crate::n1_core::recovery::read_or_recover_chunk;
+use crate::n1_core::recovery::{ShardFileCache, read_or_recover_chunk};
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -9,11 +9,9 @@ use bytes::Bytes;
 use chrono::{TimeZone, Utc};
 use futures_util::stream;
 use once_cell::sync::{Lazy, OnceCell};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tokio::fs::File;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Duration;
 
@@ -165,7 +163,7 @@ fn shard_dir_with_locality_hint<'a>(
 }
 
 async fn read_chunk_with_retries(
-    file_cache: &mut HashMap<String, File>,
+    file_cache: &mut ShardFileCache,
     shard_dir: &PathBuf,
     part: Arc<PartMetadata>,
     shard_index: usize,
@@ -259,7 +257,7 @@ pub async fn stream_object_logic(
         end: u64,
         parts: Vec<Arc<PartMetadata>>,
         shard_dirs: Vec<PathBuf>,
-        file_cache: HashMap<String, File>,
+        file_cache: ShardFileCache,
         current_part_idx: usize,
         current_part_offset: u64,
         stripe_size: usize,
@@ -296,7 +294,7 @@ pub async fn stream_object_logic(
         end,
         parts,
         shard_dirs,
-        file_cache: HashMap::new(),
+        file_cache: ShardFileCache::new(),
         current_part_idx: start_part_index,
         current_part_offset: start_part_offset,
         stripe_size: stripe_size_bytes,
@@ -489,6 +487,7 @@ mod tests {
             shards: vec![ShardInfo {
                 file_name: "a.shard".into(),
                 absolute_path: "/missing/root/a.shard".into(),
+                raw_blob_address: None,
                 checksum: "x".into(),
                 size_bytes: 1,
                 shard_index: 0,
@@ -510,6 +509,7 @@ mod tests {
             shards: vec![ShardInfo {
                 file_name: "a.shard".into(),
                 absolute_path: "/d1/frag/blob/ver/a.shard".into(),
+                raw_blob_address: None,
                 checksum: "x".into(),
                 size_bytes: 1,
                 shard_index: 0,

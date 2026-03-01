@@ -8,6 +8,7 @@ use walkdir::WalkDir;
 
 use crate::{
     enums::app_error_enum::AppError,
+    n1_core::blob_store::configured_filesystem_blob_roots,
     n1_core::constants::{METADATA_EXT, QUOTA_FILE},
     n1_core::{
         disk_manager::{ObjectMetadata, ObjectPathManager},
@@ -34,8 +35,10 @@ pub struct CreateFragmentResponse {
 }
 
 pub async fn ensure_fragment_blob_directories(fragment_hash: &str) {
-    let path_manager = ObjectPathManager::new();
-    let blob_roots = path_manager.get_blob_roots();
+    let blob_roots = match configured_filesystem_blob_roots() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
 
     for root in blob_roots {
         let blob_dir = root.join(fragment_hash).join("blob");

@@ -12,6 +12,12 @@
 > Source of truth for routing: `server/src/routes/storage_routes.rs`.
 > Source of truth for request/response behavior: the handler files under `server/src/n1_core` and `server/src/fs`.
 
+> Storage backend note:
+> - `index_store_disks` must be mounted filesystem paths.
+> - `blob_store_disks` may be mounted directories for compatibility, but the preferred deployment
+>   model is raw, unformatted device paths managed directly by N1.
+> - Blob payload I/O uses `O_DIRECT`; metadata and control files stay filesystem-backed.
+
 ## 1. Base URL And Conventions
 - Base URL example: `https://127.0.0.1:50001`
 - Ping: `GET /ping` -> `pong`
@@ -337,7 +343,7 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
 ## 7. Protected v4 Write/Modify/Delete APIs
 
 ### 7.1 `DELETE /v4/fragment/delete/{fragment}`
-Deletes fragment data on index/blob roots.
+Deletes fragment data on index disks and blob storage backends.
 ```bash
 curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/delete/<fragment_hash>"

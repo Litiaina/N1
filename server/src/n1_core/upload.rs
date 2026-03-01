@@ -36,6 +36,11 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::windows::fs::OpenOptionsExt;
 
 use crate::enums::app_error_enum::AppError;
+use crate::n1_core::blob_store::{
+    BlobDiskHandle, commit_staged_raw_shard, configured_blob_disk_count,
+    configured_filesystem_blob_roots, raw_backend_present, raw_blob_debug_path,
+    raw_stage_path_for_shard, resolve_blob_disk, stable_shard_file_name,
+};
 use crate::n1_core::constants::{
     PARITY_SUFFIX, PART_META_SUFFIX, RESERVATION_FILE, SESSION_MANIFEST_FILE, SHARD_SUFFIX,
 };
@@ -721,7 +726,10 @@ async fn cleanup_blob_tmp_attempt_files_for_version(
     fragment: &str,
     version_id: &str,
 ) {
-    let blob_roots = path_manager.get_blob_roots();
+    let blob_roots = match configured_filesystem_blob_roots() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
 
     let futs = blob_roots.into_iter().map(|root| {
         let dir = path_manager.get_shard_dir_on_disk(&root, fragment, version_id);
@@ -1214,8 +1222,7 @@ pub async fn object_upload_part(
     let stripe_count = (content_length + stripe_data_width - 1) / stripe_data_width;
     let final_shard_len = stripe_count * block_size as u64;
 
-    let blob_roots = path_manager.get_blob_roots();
-    let num_disks = blob_roots.len();
+    let num_disks = configured_blob_disk_count()?;
     if num_disks == 0 {
         return Err(AppError::InternalServerError(
             "No blob storage disks configured".into(),
@@ -1227,30 +1234,35 @@ pub async fn object_upload_part(
     let mut tmp_paths: Vec<PathBuf> = Vec::with_capacity(total_shards);
     let mut stable_paths: Vec<PathBuf> = Vec::with_capacity(total_shards);
     let mut stable_names: Vec<String> = Vec::with_capacity(total_shards);
+    let mut disk_indices: Vec<usize> = Vec::with_capacity(total_shards);
 
     let mut successful_opens = 0usize;
 
     for i in 0..total_shards {
         let is_parity = i >= data_shards;
-        let ext = if is_parity {
-            PARITY_SUFFIX
-        } else {
-            SHARD_SUFFIX
-        };
-
-        let stable_name = format!("part_{}_shard_{}{}", part_index, i, ext);
+        let stable_name = stable_shard_file_name(part_index, i, is_parity);
         let tmp_name = format!("{}.tmp.{}", stable_name, attempt_id);
 
         let disk_idx = (part_index as usize + i) % num_disks;
-        let target_disk = &blob_roots[disk_idx];
-
-        let shard_dir =
-            path_manager.get_shard_dir_on_disk(target_disk, &fragment_arc, &version_id_arc);
-
-        let _ = tokio_fs::create_dir_all(&shard_dir).await;
-
-        let tmp_path = shard_dir.join(&tmp_name);
-        let stable_path = shard_dir.join(&stable_name);
+        let (tmp_path, stable_path) = match resolve_blob_disk(disk_idx)? {
+            BlobDiskHandle::Filesystem { root } => {
+                let shard_dir =
+                    path_manager.get_shard_dir_on_disk(&root, &fragment_arc, &version_id_arc);
+                let _ = tokio_fs::create_dir_all(&shard_dir).await;
+                (shard_dir.join(&tmp_name), shard_dir.join(&stable_name))
+            }
+            BlobDiskHandle::Raw { .. } => {
+                let stage_path = raw_stage_path_for_shard(
+                    disk_idx,
+                    fragment_arc.as_str(),
+                    version_id_arc.as_str(),
+                    attempt_id.as_str(),
+                    stable_name.as_str(),
+                )
+                .await?;
+                (stage_path, PathBuf::new())
+            }
+        };
 
         match create_direct_file(&tmp_path).await {
             Ok(file) => {
@@ -1281,6 +1293,7 @@ pub async fn object_upload_part(
         tmp_paths.push(tmp_path);
         stable_paths.push(stable_path);
         stable_names.push(stable_name);
+        disk_indices.push(disk_idx);
     }
 
     if successful_opens < data_shards {
@@ -1372,20 +1385,51 @@ pub async fn object_upload_part(
     }
 
     let mut dirs_to_sync: Vec<PathBuf> = Vec::new();
+    let mut shards_info = Vec::with_capacity(total_shards);
 
     for i in 0..total_shards {
         let expected_crc = shard_checksums.get(i).map(|s| s.as_str());
+        match resolve_blob_disk(disk_indices[i])? {
+            BlobDiskHandle::Filesystem { .. } => {
+                publish_one_shard(
+                    tmp_paths[i].as_path(),
+                    stable_paths[i].as_path(),
+                    final_shard_len,
+                    expected_crc,
+                )
+                .await?;
 
-        publish_one_shard(
-            tmp_paths[i].as_path(),
-            stable_paths[i].as_path(),
-            final_shard_len,
-            expected_crc,
-        )
-        .await?;
+                if let Some(parent) = stable_paths[i].parent() {
+                    dirs_to_sync.push(parent.to_path_buf());
+                }
 
-        if let Some(parent) = stable_paths[i].parent() {
-            dirs_to_sync.push(parent.to_path_buf());
+                shards_info.push(ShardInfo {
+                    shard_index: i,
+                    file_name: stable_names[i].clone(),
+                    absolute_path: stable_paths[i].to_string_lossy().to_string(),
+                    raw_blob_address: None,
+                    size_bytes: final_shard_len,
+                    checksum: shard_checksums.get(i).cloned().unwrap_or_default(),
+                    is_parity: i >= data_shards,
+                });
+            }
+            BlobDiskHandle::Raw { .. } => {
+                let raw_addr = commit_staged_raw_shard(
+                    disk_indices[i],
+                    tmp_paths[i].as_path(),
+                    final_shard_len,
+                )
+                .await?;
+                shards_info.push(ShardInfo {
+                    shard_index: i,
+                    file_name: stable_names[i].clone(),
+                    absolute_path: raw_blob_debug_path(&raw_addr),
+                    raw_blob_address: Some(raw_addr),
+                    size_bytes: final_shard_len,
+                    checksum: shard_checksums.get(i).cloned().unwrap_or_default(),
+                    is_parity: i >= data_shards,
+                });
+            }
         }
     }
 
@@ -1394,18 +1438,6 @@ pub async fn object_upload_part(
 
     if strict_durability {
         let _ = join_all(dirs_to_sync.iter().map(|d| sync_dir(d.as_path()))).await;
-    }
-
-    let mut shards_info = Vec::with_capacity(total_shards);
-    for i in 0..total_shards {
-        shards_info.push(ShardInfo {
-            shard_index: i,
-            file_name: stable_names[i].clone(),
-            absolute_path: stable_paths[i].to_string_lossy().to_string(),
-            size_bytes: final_shard_len,
-            checksum: shard_checksums.get(i).cloned().unwrap_or_default(),
-            is_parity: i >= data_shards,
-        });
     }
 
     let part_meta = PartMetadata {
@@ -1569,11 +1601,10 @@ pub async fn finalize_object_upload(
         return Err(AppError::BadRequest("expected_parts must be >= 1".into()));
     }
 
-    let blob_roots = path_manager.get_blob_roots();
     let required_data_shards = DATA_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
     let mut found_data_roots = 0usize;
 
-    for root in &blob_roots {
+    for root in configured_filesystem_blob_roots()?.iter() {
         let shard_dir_check = path_manager.get_shard_dir_on_disk(root, &fragment, &version_id);
         if tokio_fs::try_exists(&shard_dir_check)
             .await
@@ -1583,7 +1614,7 @@ pub async fn finalize_object_upload(
         }
     }
 
-    if found_data_roots < required_data_shards {
+    if found_data_roots < required_data_shards && !raw_backend_present()? {
         error!(
             "Finalization aborted: data directories missing. Found {}/{}.",
             found_data_roots, required_data_shards

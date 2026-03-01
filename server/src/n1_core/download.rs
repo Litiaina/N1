@@ -2,15 +2,13 @@ use crate::enums::app_error_enum::AppError;
 use crate::n1_core::disk_manager::{ChunkQuery, ObjectKeyQuery, ObjectPathManager, ShardInfo};
 use crate::n1_core::metadata_parser::{get_metadata, get_version_metadata};
 use crate::n1_core::object_parser::stream_object_logic;
-use crate::n1_core::recovery::read_or_recover_chunk;
+use crate::n1_core::recovery::{ShardFileCache, read_or_recover_chunk};
 use crate::structs::auth_structs::Claims;
 use axum::body::Body;
 use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::fs::File;
 
 pub async fn download_object(
     claims: Claims,
@@ -70,7 +68,7 @@ pub async fn download_object_chunk(
     let mut result_buffer = Vec::with_capacity(params.chunk_size);
     let mut current_global_pos = 0u64;
     let mut checksum_header: Option<&str> = None;
-    let mut file_cache: HashMap<String, File> = HashMap::new();
+    let mut file_cache: ShardFileCache = ShardFileCache::new();
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
     let num_disks = blob_roots.len();

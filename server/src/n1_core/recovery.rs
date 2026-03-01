@@ -1,4 +1,5 @@
 use crate::enums::app_error_enum::AppError;
+use crate::n1_core::blob_store::{read_shard_range, verify_shard_checksum, write_shard_range};
 use crate::n1_core::constants::GC_SUFFIX;
 use crate::n1_core::disk_manager::{ObjectPathManager, PartMetadata, ShardInfo};
 use crate::n1_core::upload::{DirectWriter, sync_dir};
@@ -54,6 +55,13 @@ static RECOVERY_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 
 static BLOB_ROOTS: LazyLock<Vec<PathBuf>> =
     LazyLock::new(|| ObjectPathManager::new().get_blob_roots());
+
+pub enum CachedShardHandle {
+    File(File),
+    RawVerified,
+}
+
+pub type ShardFileCache = HashMap<String, CachedShardHandle>;
 
 #[inline]
 fn strip_tmp_attempt_suffix(s: &str) -> &str {
@@ -241,11 +249,15 @@ async fn try_open_verified(path: &str, checksum: &str) -> Option<File> {
 }
 
 async fn get_or_open_shard_ha(
-    file_cache: &mut HashMap<String, File>,
+    file_cache: &mut ShardFileCache,
     shard_info: &ShardInfo,
     version_dir_hint: Option<&Path>,
 ) -> Option<File> {
-    if let Some(file) = file_cache.get(&shard_info.file_name) {
+    if shard_info.raw_blob_address.is_some() {
+        return None;
+    }
+
+    if let Some(CachedShardHandle::File(file)) = file_cache.get(&shard_info.file_name) {
         return file.try_clone().await.ok();
     }
 
@@ -291,13 +303,49 @@ async fn get_or_open_shard_ha(
 
         if let Some(f) = try_open_verified(&cand, &shard_info.checksum).await {
             if let Ok(cloned) = f.try_clone().await {
-                file_cache.insert(shard_info.file_name.clone(), cloned);
+                file_cache.insert(
+                    shard_info.file_name.clone(),
+                    CachedShardHandle::File(cloned),
+                );
                 return Some(f);
             }
         }
     }
 
     None
+}
+
+async fn read_shard_chunk_cached(
+    file_cache: &mut ShardFileCache,
+    shard_info: &ShardInfo,
+    version_dir_hint: Option<&Path>,
+    offset: u64,
+    len: usize,
+) -> Option<Vec<u8>> {
+    if shard_info.raw_blob_address.is_some() {
+        let verified = matches!(
+            file_cache.get(&shard_info.file_name),
+            Some(CachedShardHandle::RawVerified)
+        );
+        if !verified {
+            if !verify_shard_checksum(shard_info).await.ok()? {
+                return None;
+            }
+            file_cache.insert(shard_info.file_name.clone(), CachedShardHandle::RawVerified);
+        }
+        return read_shard_range(shard_info, offset, len).await.ok();
+    }
+
+    let mut file = get_or_open_shard_ha(file_cache, shard_info, version_dir_hint).await?;
+    if file.seek(SeekFrom::Start(offset)).await.is_err() {
+        return None;
+    }
+
+    let mut chunk = vec![0u8; len];
+    if file.read_exact(&mut chunk).await.is_err() {
+        return None;
+    }
+    Some(chunk)
 }
 
 fn data_shards_count(part: &PartMetadata) -> usize {
@@ -319,7 +367,7 @@ fn nth_data_shard<'a>(part: &'a PartMetadata, nth: usize) -> Option<&'a ShardInf
 }
 
 pub async fn read_or_recover_chunk(
-    file_cache: &mut HashMap<String, File>,
+    file_cache: &mut ShardFileCache,
     version_dir: &Path,
     part: Arc<PartMetadata>,
     shard_idx: usize,
@@ -327,8 +375,6 @@ pub async fn read_or_recover_chunk(
     len: usize,
     block_size: usize,
 ) -> Result<Vec<u8>, AppError> {
-    let mut buf = vec![0u8; len];
-
     let target_shard = nth_data_shard(&part, shard_idx)
         .ok_or(AppError::InternalServerError("Bad shard index".into()))?;
 
@@ -338,14 +384,12 @@ pub async fn read_or_recover_chunk(
         Some(version_dir)
     };
 
-    if let Some(mut file) = get_or_open_shard_ha(file_cache, target_shard, vdir_hint).await {
-        if file.seek(SeekFrom::Start(offset)).await.is_ok() {
-            if file.read_exact(&mut buf).await.is_ok() {
-                return Ok(buf);
-            }
-        }
-        warn!("Read failed for validated shard, attempting recovery.");
+    if let Some(chunk) =
+        read_shard_chunk_cached(file_cache, target_shard, vdir_hint, offset, len).await
+    {
+        return Ok(chunk);
     }
+    warn!("Read failed for validated shard, attempting recovery.");
 
     let data_count = data_shards_count(&part);
     let parity_count = part.shards.len().saturating_sub(data_count);
@@ -364,19 +408,10 @@ pub async fn read_or_recover_chunk(
             continue;
         }
 
-        let mut file = match get_or_open_shard_ha(file_cache, s, vdir_hint).await {
-            Some(f) => f,
-            None => continue,
+        let Some(chunk) = read_shard_chunk_cached(file_cache, s, vdir_hint, offset, len).await
+        else {
+            continue;
         };
-
-        if file.seek(SeekFrom::Start(offset)).await.is_err() {
-            continue;
-        }
-
-        let mut chunk = vec![0u8; len];
-        if file.read_exact(&mut chunk).await.is_err() {
-            continue;
-        }
 
         let res = if s.is_parity {
             decoder.add_recovery_shard(s.shard_index - data_count, chunk)
@@ -442,62 +477,71 @@ pub async fn repair_entire_shard(
         ))?
         .clone();
 
-    let final_path_str = strip_tmp_attempt_suffix(&target_shard.absolute_path).to_string();
-    if final_path_str.is_empty() {
-        return Err(AppError::InternalServerError(
-            "Target shard has empty absolute_path".into(),
+    let total_shard_size = target_shard.size_bytes;
+    let raw_target = target_shard.raw_blob_address.is_some();
+
+    let (final_path, parent_dir, temp_path, mut temp_file) = if raw_target {
+        if verify_shard_checksum(&target_shard).await? {
+            return Ok(());
+        }
+        (PathBuf::new(), PathBuf::new(), PathBuf::new(), None)
+    } else {
+        let final_path_str = strip_tmp_attempt_suffix(&target_shard.absolute_path).to_string();
+        if final_path_str.is_empty() {
+            return Err(AppError::InternalServerError(
+                "Target shard has empty absolute_path".into(),
+            ));
+        }
+        let final_path = PathBuf::from(final_path_str);
+
+        let parent_dir = final_path
+            .parent()
+            .ok_or(AppError::InternalServerError("Invalid shard path".into()))?
+            .to_path_buf();
+
+        if !fs::try_exists(&parent_dir).await.unwrap_or(false) {
+            let _ = fs::create_dir_all(&parent_dir).await;
+        }
+
+        let temp_path = parent_dir.join(format!(
+            "{}.tmp.repair.{}",
+            strip_tmp_attempt_suffix(&target_shard.file_name),
+            Ulid::new().to_string()
         ));
-    }
-    let final_path = PathBuf::from(final_path_str);
 
-    let parent_dir = final_path
-        .parent()
-        .ok_or(AppError::InternalServerError("Invalid shard path".into()))?
-        .to_path_buf();
-
-    if !fs::try_exists(&parent_dir).await.unwrap_or(false) {
-        let _ = fs::create_dir_all(&parent_dir).await;
-    }
-
-    let temp_path = parent_dir.join(format!(
-        "{}.tmp.repair.{}",
-        strip_tmp_attempt_suffix(&target_shard.file_name),
-        Ulid::new().to_string()
-    ));
-
-    if fs::try_exists(&final_path).await.unwrap_or(false) {
-        if let Ok(mut f) = File::open(&final_path).await {
-            if verify_shard_integrity(&mut f, &target_shard.checksum).await {
-                return Ok(());
+        if fs::try_exists(&final_path).await.unwrap_or(false) {
+            if let Ok(mut f) = File::open(&final_path).await {
+                if verify_shard_integrity(&mut f, &target_shard.checksum).await {
+                    return Ok(());
+                }
             }
         }
-    }
 
-    let std_file = match create_direct_file_for_repair(&temp_path).await {
-        Ok(f) => f,
-        Err(e) => {
-            warn!("Failed to create repair file: {}", e);
-            return Err(e);
-        }
+        let std_file = match create_direct_file_for_repair(&temp_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("Failed to create repair file: {}", e);
+                return Err(e);
+            }
+        };
+
+        let file_clone = std_file
+            .try_clone()
+            .map_err(|e| AppError::Io(e, "clone handle".into()))?;
+
+        tokio::task::spawn_blocking(move || file_clone.set_len(total_shard_size))
+            .await
+            .map_err(|e| {
+                AppError::InternalServerError(format!("Failed to preallocate repair file: {}", e))
+            })?
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&temp_path);
+                AppError::Io(e, format!("set_len repair file {}", temp_path.display()))
+            })?;
+
+        let temp_file = Some(DirectWriter::new(std_file));
+        (final_path, parent_dir, temp_path, temp_file)
     };
-
-    let total_shard_size = target_shard.size_bytes;
-
-    let file_clone = std_file
-        .try_clone()
-        .map_err(|e| AppError::Io(e, "clone handle".into()))?;
-
-    tokio::task::spawn_blocking(move || file_clone.set_len(total_shard_size))
-        .await
-        .map_err(|e| {
-            AppError::InternalServerError(format!("Failed to preallocate repair file: {}", e))
-        })?
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&temp_path);
-            AppError::Io(e, format!("set_len repair file {}", temp_path.display()))
-        })?;
-
-    let mut temp_file = DirectWriter::new(std_file);
 
     let data_count = data_shards_count(&part);
     let parity_count = part.shards.len().saturating_sub(data_count);
@@ -509,7 +553,7 @@ pub async fn repair_entire_shard(
     }
 
     let mut peer_files: Vec<Option<File>> = Vec::with_capacity(part.shards.len());
-    let mut peer_cache: HashMap<String, File> = HashMap::new();
+    let mut peer_cache: ShardFileCache = HashMap::new();
 
     for s in &part.shards {
         if s.shard_index == target_shard.shard_index {
@@ -535,6 +579,25 @@ pub async fn repair_entire_shard(
             let s_info = &part.shards[idx];
 
             if s_info.shard_index == target_shard.shard_index {
+                continue;
+            }
+
+            if s_info.raw_blob_address.is_some() {
+                if let Ok(buf) = read_shard_range(s_info, offset, cur).await {
+                    let res = if s_info.is_parity {
+                        decoder.add_recovery_shard(s_info.shard_index - data_count, &buf)
+                    } else {
+                        let add = decoder.add_original_shard(s_info.shard_index, &buf);
+                        if add.is_ok() && target_is_parity && s_info.shard_index < data_count {
+                            stripe_data[s_info.shard_index] = Some(buf);
+                        }
+                        add
+                    };
+
+                    if res.is_ok() {
+                        shards_found += 1;
+                    }
+                }
                 continue;
             }
 
@@ -573,8 +636,10 @@ pub async fn repair_entire_shard(
         }
 
         if shards_found < data_count {
-            drop(temp_file);
-            let _ = fs::remove_file(&temp_path).await;
+            drop(temp_file.take());
+            if !raw_target {
+                let _ = fs::remove_file(&temp_path).await;
+            }
             return Err(AppError::InternalServerError(
                 "Not enough healthy shards to repair on disk".into(),
             ));
@@ -595,10 +660,14 @@ pub async fn repair_entire_shard(
                 .ok_or_else(|| {
                     AppError::InternalServerError("Missing restored data shard".into())
                 })?;
-            temp_file
-                .write_all(data)
-                .await
-                .map_err(|e| AppError::Io(e, "write repair data".into()))?;
+            if raw_target {
+                write_shard_range(&target_shard, offset, data).await?;
+            } else if let Some(writer) = temp_file.as_mut() {
+                writer
+                    .write_all(data)
+                    .await
+                    .map_err(|e| AppError::Io(e, "write repair data".into()))?;
+            }
         } else {
             for (idx, data) in decoded.restored_original_iter() {
                 if idx < data_count {
@@ -607,8 +676,10 @@ pub async fn repair_entire_shard(
             }
 
             if stripe_data.iter().any(|d| d.is_none()) {
-                drop(temp_file);
-                let _ = fs::remove_file(&temp_path).await;
+                drop(temp_file.take());
+                if !raw_target {
+                    let _ = fs::remove_file(&temp_path).await;
+                }
                 return Err(AppError::InternalServerError(
                     "Missing data shards required to recompute parity".into(),
                 ));
@@ -632,41 +703,57 @@ pub async fn repair_entire_shard(
                 .recovery(ridx)
                 .ok_or_else(|| AppError::InternalServerError("Missing parity output".into()))?;
 
-            temp_file
-                .write_all(data)
-                .await
-                .map_err(|e| AppError::Io(e, "write repair parity".into()))?;
+            if raw_target {
+                write_shard_range(&target_shard, offset, data).await?;
+            } else if let Some(writer) = temp_file.as_mut() {
+                writer
+                    .write_all(data)
+                    .await
+                    .map_err(|e| AppError::Io(e, "write repair parity".into()))?;
+            }
         }
 
         offset += cur as u64;
     }
 
-    temp_file
-        .flush()
-        .await
-        .map_err(|e| AppError::Io(e, "flush repair".into()))?;
-    temp_file
-        .sync_data()
-        .await
-        .map_err(|e| AppError::Io(e, "fsync repair".into()))?;
-
-    match fs::rename(&temp_path, &final_path).await {
-        Ok(_) => {}
-        Err(e) => {
-            warn!("Rename failed (will retry after mkdir): {}", e);
-            let _ = fs::create_dir_all(&parent_dir).await;
-            fs::rename(&temp_path, &final_path)
-                .await
-                .map_err(|e2| AppError::Io(e2, "rename repaired file".into()))?;
+    if raw_target {
+        if !verify_shard_checksum(&target_shard).await? {
+            return Err(AppError::InternalServerError(
+                "Repaired raw shard failed checksum verification".into(),
+            ));
         }
-    }
-    let _ = sync_dir(&parent_dir).await;
+        info!("Successfully repaired raw shard {}", target_shard.file_name);
+    } else {
+        let mut writer = temp_file
+            .take()
+            .ok_or_else(|| AppError::InternalServerError("repair temp writer missing".into()))?;
+        writer
+            .flush()
+            .await
+            .map_err(|e| AppError::Io(e, "flush repair".into()))?;
+        writer
+            .sync_data()
+            .await
+            .map_err(|e| AppError::Io(e, "fsync repair".into()))?;
 
-    info!(
-        "Successfully repaired shard {} -> {}",
-        target_shard.file_name,
-        final_path.display()
-    );
+        match fs::rename(&temp_path, &final_path).await {
+            Ok(_) => {}
+            Err(e) => {
+                warn!("Rename failed (will retry after mkdir): {}", e);
+                let _ = fs::create_dir_all(&parent_dir).await;
+                fs::rename(&temp_path, &final_path)
+                    .await
+                    .map_err(|e2| AppError::Io(e2, "rename repaired file".into()))?;
+            }
+        }
+        let _ = sync_dir(&parent_dir).await;
+
+        info!(
+            "Successfully repaired shard {} -> {}",
+            target_shard.file_name,
+            final_path.display()
+        );
+    }
 
     Ok(())
 }

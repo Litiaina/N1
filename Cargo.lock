@@ -358,6 +358,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block_manager"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "libc",
+ "uuid",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3074,6 +3083,7 @@ dependencies = [
  "axum-extra",
  "axum-server",
  "base64",
+ "block_manager",
  "bytes",
  "chrono",
  "clap",

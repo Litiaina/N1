@@ -6,19 +6,111 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 pub fn default_format() -> String {
     "zip".to_string()
 }
 
-pub static INDEX_STORE_DISKS: OnceLock<Vec<String>> = OnceLock::new();
-pub static BLOB_STORE_DISKS: OnceLock<Vec<String>> = OnceLock::new();
-pub static FS_STORAGE_ROOT: OnceLock<String> = OnceLock::new();
+pub static INDEX_STORE_DISKS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
+pub static BLOB_STORE_DISKS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
+pub static FS_STORAGE_ROOT: OnceLock<RwLock<String>> = OnceLock::new();
+
+fn rwlock_poisoned(label: &str) -> crate::enums::app_error_enum::AppError {
+    crate::enums::app_error_enum::AppError::InternalServerError(format!(
+        "{} config lock poisoned",
+        label
+    ))
+}
+
+pub fn configured_index_store_disks() -> Result<Vec<String>, crate::enums::app_error_enum::AppError>
+{
+    let roots = INDEX_STORE_DISKS
+        .get()
+        .ok_or_else(|| {
+            crate::enums::app_error_enum::AppError::InternalServerError(
+                "Index Store Config not initialized!".into(),
+            )
+        })?
+        .read()
+        .map_err(|_| rwlock_poisoned("index"))?
+        .clone();
+    Ok(roots)
+}
+
+pub fn configured_blob_store_disks() -> Result<Vec<String>, crate::enums::app_error_enum::AppError>
+{
+    let roots = BLOB_STORE_DISKS
+        .get()
+        .ok_or_else(|| {
+            crate::enums::app_error_enum::AppError::InternalServerError(
+                "Blob Store Config not initialized!".into(),
+            )
+        })?
+        .read()
+        .map_err(|_| rwlock_poisoned("blob"))?
+        .clone();
+    Ok(roots)
+}
+
+pub fn configured_fs_storage_root() -> Option<String> {
+    FS_STORAGE_ROOT
+        .get()
+        .and_then(|lock| lock.read().ok().map(|value| value.clone()))
+}
+
+pub fn initialize_storage_roots(
+    index_roots: Vec<String>,
+    blob_roots: Vec<String>,
+    fs_root: String,
+) -> Result<(), String> {
+    INDEX_STORE_DISKS
+        .set(RwLock::new(index_roots))
+        .map_err(|_| "Double initialization of INDEX_STORE_DISKS!".to_string())?;
+    BLOB_STORE_DISKS
+        .set(RwLock::new(blob_roots))
+        .map_err(|_| "Double initialization of BLOB_STORE_DISKS!".to_string())?;
+    FS_STORAGE_ROOT
+        .set(RwLock::new(fs_root))
+        .map_err(|_| "Double initialization of STORAGE_ROOT!".to_string())?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub fn replace_storage_roots_for_tests(
+    index_roots: Vec<String>,
+    blob_roots: Vec<String>,
+    fs_root: String,
+) {
+    if let Some(lock) = INDEX_STORE_DISKS.get() {
+        *lock.write().expect("write INDEX_STORE_DISKS") = index_roots;
+    } else {
+        INDEX_STORE_DISKS
+            .set(RwLock::new(index_roots))
+            .expect("set INDEX_STORE_DISKS");
+    }
+
+    if let Some(lock) = BLOB_STORE_DISKS.get() {
+        *lock.write().expect("write BLOB_STORE_DISKS") = blob_roots;
+    } else {
+        BLOB_STORE_DISKS
+            .set(RwLock::new(blob_roots))
+            .expect("set BLOB_STORE_DISKS");
+    }
+
+    if let Some(lock) = FS_STORAGE_ROOT.get() {
+        *lock.write().expect("write FS_STORAGE_ROOT") = fs_root;
+    } else {
+        FS_STORAGE_ROOT
+            .set(RwLock::new(fs_root))
+            .expect("set FS_STORAGE_ROOT");
+    }
+}
 
 pub fn default_stripe_size() -> usize {
     256 * 1024
 }
+
 pub struct ObjectPathManager;
 
 impl ObjectPathManager {
@@ -27,17 +119,19 @@ impl ObjectPathManager {
     }
 
     pub fn get_all_index_roots(&self) -> Vec<PathBuf> {
-        let roots = INDEX_STORE_DISKS
-            .get()
-            .expect("Index Store Config not initialized!");
-        roots.iter().map(PathBuf::from).collect()
+        configured_index_store_disks()
+            .expect("Index Store Config not initialized!")
+            .into_iter()
+            .map(PathBuf::from)
+            .collect()
     }
 
     pub fn get_blob_roots(&self) -> Vec<PathBuf> {
-        let roots = BLOB_STORE_DISKS
-            .get()
-            .expect("Blob Store Config not initialized!");
-        roots.iter().map(PathBuf::from).collect()
+        configured_blob_store_disks()
+            .expect("Blob Store Config not initialized!")
+            .into_iter()
+            .map(PathBuf::from)
+            .collect()
     }
 
     pub fn get_all_index_dirs(&self, fragment_hash: &str) -> Vec<PathBuf> {
@@ -205,11 +299,21 @@ pub struct ReservationReceipt {
     pub amount: u64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RawBlobAddress {
+    pub device_id: String,
+    pub allocation_id: u64,
+    pub offset_bytes: u64,
+    pub size_bytes: u64,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ShardInfo {
     pub shard_index: usize,
     pub file_name: String,
     pub absolute_path: String,
+    #[serde(default)]
+    pub raw_blob_address: Option<RawBlobAddress>,
     pub size_bytes: u64,
     pub checksum: String,
     pub is_parity: bool,

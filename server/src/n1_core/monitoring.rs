@@ -3,7 +3,7 @@ use crate::n1_core::constants::{
     FRAGMENT_METADATA_FILE, METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, RESERVATION_FILE,
     SESSION_MANIFEST_FILE,
 };
-use crate::n1_core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
+use crate::n1_core::disk_manager::{configured_blob_store_disks, configured_index_store_disks};
 use crate::n1_core::redistribution::get_redist_status;
 use crate::n1_core::repair_manager::get_repair_status;
 use crate::n1_core::system::{SystemMetrics, get_system_metrics};
@@ -250,20 +250,15 @@ async fn collect_system_health(
     let redist_status = get_redist_status().await;
     let repair_status = get_repair_status().await;
 
-    let index_disks_config = INDEX_STORE_DISKS
-        .get()
-        .ok_or(AppError::InternalServerError("Index config missing".into()))?;
-
-    let blob_disks_config = BLOB_STORE_DISKS
-        .get()
-        .ok_or(AppError::InternalServerError("Blob config missing".into()))?;
+    let index_disks_config = configured_index_store_disks()?;
+    let blob_disks_config = configured_blob_store_disks()?;
 
     let mut check_futures = Vec::new();
 
-    for disk in index_disks_config {
+    for disk in &index_disks_config {
         check_futures.push(check_disk_accessibility(disk.clone(), "index".to_string()));
     }
-    for disk in blob_disks_config {
+    for disk in &blob_disks_config {
         check_futures.push(check_disk_accessibility(disk.clone(), "blob".to_string()));
     }
 

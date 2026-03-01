@@ -119,7 +119,7 @@ Migration path (non-dry-run):
 - streams old shards and re-encodes to new EC layout
 - writes new shards through direct I/O writer path
 - verifies shard length and checksum before publish
-- atomically publishes shard files
+- atomically publishes new blob placements (stable shard files on compatibility blob roots or raw extent addresses on raw blob devices)
 - atomically writes updated metadata to reachable index mirrors
 - stages old shards for GC cleanup
 - tracks touched fragments for post-job prefix rebuild

@@ -1,9 +1,12 @@
 use crate::enums::app_error_enum::AppError;
 use crate::fs::cleanup_manager::start_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
+use crate::n1_core::blob_store::{
+    RawGcMarker, configured_filesystem_blob_roots, free_raw_address, free_raw_shards_for_metadata,
+};
 use crate::n1_core::constants::{GC_SUFFIX, METADATA_EXT, QUOTA_FILE, RESERVATION_FILE};
 use crate::n1_core::disk_manager::{
-    FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManager, ReservationReceipt,
+    ObjectMetadata, ObjectPathManager, ReservationReceipt, configured_fs_storage_root,
 };
 use crate::n1_core::quota_manager::update_quota;
 use crate::n1_core::sync::sync_single_fragment_quota;
@@ -167,7 +170,8 @@ pub async fn run_garbage_collector(State(state): State<Arc<AppState>>) -> impl I
             });
         }
 
-        start_cleanup(FS_STORAGE_ROOT.get().unwrap_or(&STORAGE_ROOT.to_string())).await;
+        start_cleanup(&configured_fs_storage_root().unwrap_or_else(|| STORAGE_ROOT.to_string()))
+            .await;
 
         with_gc_status_write(|st| {
             st.is_running = false;
@@ -321,7 +325,7 @@ fn gc_cleanup_version_dir_unix(
 async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
     let index_roots = path_manager.get_all_index_roots();
-    let blob_roots = path_manager.get_blob_roots();
+    let blob_roots = configured_filesystem_blob_roots().unwrap_or_default();
 
     let mut fragments = HashSet::new();
     for root in &index_roots {
@@ -413,6 +417,11 @@ async fn process_fragment_gc(
     let mut trash_versions = HashSet::new();
     let mut expired_trash_refund = 0u64;
     let mut expired_versions = HashSet::new();
+    let mut expired_raw_metas: Vec<ObjectMetadata> = Vec::new();
+    let mut eligible_raw_gc_markers: HashMap<
+        String,
+        (crate::n1_core::disk_manager::RawBlobAddress, Vec<PathBuf>),
+    > = HashMap::new();
 
     for root in index_roots {
         let index_dir = root.join(fragment).join("index");
@@ -440,6 +449,49 @@ async fn process_fragment_gc(
     stats.live_versions_seen = live_versions.len() as u64;
 
     let now = SystemTime::now();
+
+    for root in index_roots {
+        let raw_gc_dir = root.join(fragment).join("index").join(".raw_gc");
+        if !raw_gc_dir.exists() {
+            continue;
+        }
+
+        for entry in WalkDir::new(&raw_gc_dir).into_iter().filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(now);
+            let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+            if !(is_manual_run || age > file_ttl) {
+                continue;
+            }
+
+            let Ok(bytes) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let Ok(marker) = rmp_serde::from_slice::<RawGcMarker>(&bytes) else {
+                continue;
+            };
+
+            let key = format!(
+                "{}:{}:{}:{}",
+                marker.address.device_id,
+                marker.address.allocation_id,
+                marker.address.offset_bytes,
+                marker.address.size_bytes
+            );
+            let entry_path = entry.path().to_path_buf();
+            eligible_raw_gc_markers
+                .entry(key)
+                .and_modify(|(_, paths)| paths.push(entry_path.clone()))
+                .or_insert((marker.address, vec![entry_path]));
+        }
+    }
 
     for root in index_roots {
         let trash_index = get_trash_root(root, fragment).join("index");
@@ -483,6 +535,13 @@ async fn process_fragment_gc(
                                 expired_trash_refund += meta.total_size_bytes;
                                 expired_versions.insert(ver_id.clone());
                             }
+                            if meta.parts.iter().any(|part| {
+                                part.shards
+                                    .iter()
+                                    .any(|shard| shard.raw_blob_address.is_some())
+                            }) {
+                                expired_raw_metas.push(meta);
+                            }
                         }
                     }
                 } else {
@@ -498,6 +557,26 @@ async fn process_fragment_gc(
     refund_quota(fragment, expired_trash_refund, state).await;
     stats.refund_bytes += expired_trash_refund;
     stats.trash_versions_expired += expired_versions.len() as u64;
+
+    for meta in &expired_raw_metas {
+        let _ = free_raw_shards_for_metadata(meta).await;
+    }
+
+    for (_, (raw, marker_paths)) in eligible_raw_gc_markers {
+        match free_raw_address(&raw).await {
+            Ok(_) => {
+                for marker_path in marker_paths {
+                    let _ = std::fs::remove_file(&marker_path);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "GC: Failed to free redistributed raw extent {}:{}:{}:{}: {}",
+                    raw.device_id, raw.allocation_id, raw.offset_bytes, raw.size_bytes, e
+                );
+            }
+        }
+    }
 
     if !expired_versions.is_empty() {
         let tasks = index_roots.iter().chain(blob_roots.iter()).map(|root| {

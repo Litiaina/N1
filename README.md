@@ -7,8 +7,9 @@
   />
   <h1>Litiaina N1</h1>
   <p>
-    Fragment-centric, filesystem-native object storage engine built for lockless streaming,
-    predictable latency, strict crash safety, and survivable single-node durability.
+    Fragment-centric object storage engine with a filesystem-backed metadata plane and
+    a direct-I/O blob plane, built for lockless streaming, strict crash safety, and
+    survivable single-node durability.
   </p>
 </div>
 
@@ -58,8 +59,9 @@ N1 ships with native SMB-lite via `fsgwd`, with `fsd_mount + Samba` kept as fall
 
 ## What is N1 (current architecture)
 
-**Litiaina N1** is a **single-machine, multi-disk** object storage engine that treats the filesystem as the database and
-keeps the on-disk layout as the ultimate source of truth.
+**Litiaina N1** is a **single-machine, multi-disk** object storage engine that keeps the
+metadata/index plane on mounted filesystems while driving the blob plane through direct I/O.
+The on-disk metadata layout remains the source of truth.
 
 N1 is designed for environments where you want:
 
@@ -70,7 +72,7 @@ N1 is designed for environments where you want:
 
 ## What N1 Is (Truth Statement)
 
-N1 is a **filesystem-native, fragment-scoped object storage engine** for single-machine multi-disk deployments where:
+N1 is a **fragment-scoped object storage engine with filesystem-backed metadata and a direct-I/O blob backend** for single-machine multi-disk deployments where:
 
 - **high availability** during maintenance matters (CRUD should continue while repair/redistribution run)
 - **durability** matters (index mirrors + shard-level recovery)
@@ -98,10 +100,11 @@ N1 is **not** “user multi-tenant storage” anymore. The isolation boundary is
 
 ## Design principles
 
-### 1) Filesystem-native, not virtualized storage
+### 1) Filesystem-backed control plane, direct-I/O blob plane
 
-N1 stores data as normal files and directories. There is no mandatory database on the hot path.
-Metadata is replicated across configured index disks, but still lives as immutable files.
+N1 keeps metadata and control state as normal files on configured index disks. The blob plane is
+separate: `blob_store_disks` can still be mounted directories for compatibility, but the preferred
+deployment model is raw, unformatted blob devices managed directly by N1 via `block_manager`.
 
 **Result:** if the service disappears, disks remain mountable and the layout remains readable.
 
@@ -189,7 +192,7 @@ N1 separates the world into two storage domains:
 - repaired by reconciling replicas (missing/divergent/corrupt)
 
 ### Blob store (data/parity shards)
-- large shard files, striped across configured blob roots
+- direct-I/O shard payload storage across configured blob disks
 - placement is deterministic (no database required)
 - read path can degrade and reconstruct missing data using RS decode
 - background repair can regenerate missing/corrupt shards
@@ -234,13 +237,20 @@ Per-part metadata (`PartMetadata`) is committed locklessly to one healthy index 
 
 ### Blob (data/parity shards)
 
-A version’s shard files live under the fragment’s blob directory:
+Compatibility filesystem backend:
 
 ```
 {BLOB_ROOT}/{fragment}/blobs/{version_id}/
   part_{p}_shard_{i}{SHARD_SUFFIX}
   part_{p}_shard_{i}{PARITY_SUFFIX}
 ```
+
+Preferred raw blob backend:
+
+- `blob_store_disks` points at raw, unformatted device paths such as `/dev/nvme1n1`
+- N1 formats and manages those devices through `block_manager`
+- committed shard metadata stores `raw://<device_id>/<allocation_id>` style addresses instead of
+  depending on shard files under mounted blob directories
 
 **Deterministic placement rule (typical):**
 
@@ -293,13 +303,13 @@ Temp files allow safe re-tries and ensure that incomplete work is never treated 
 At end of stream:
 
 - pad the last stripe with zeros so RS geometry is consistent
-- ensure all shard files reach the computed `final_shard_len`
+- ensure all shard outputs reach the computed `final_shard_len`
 - optionally validate the overall checksum (`crc32`) against `UploadPartQuery.checksum`
 - compute per-shard checksums for repair verification
 
-#### Step D — Commit: rename temp → stable + dir sync
+#### Step D — Commit to the target blob backend
 
-After successful write/verify, each shard must be committed:
+After successful write/verify, each shard must be committed to its target backend:
 
 ```
 part_{p}_shard_{i}{ext}.tmp.<attempt>  -->  part_{p}_shard_{i}{ext}
@@ -307,11 +317,12 @@ part_{p}_shard_{i}{ext}.tmp.<attempt>  -->  part_{p}_shard_{i}{ext}
 
 Commit rules:
 
-1. rename is the atomic publish step
-2. **sync the parent directory** after renames (durable directory entry)
-3. stable filenames are now canonical (the only names that should be referenced by metadata)
+1. compatibility filesystem backend: rename temp -> stable and sync the parent directory
+2. raw blob backend: allocate a raw extent, write through `O_DIRECT`, flush, then store the raw
+   extent address in metadata
+3. only committed backend addresses (stable file path or raw extent address) may be referenced by metadata
 
-If rename fails on a disk, treat that shard as failed and fail the part if you fall below write quorum.
+If backend commit fails on a disk, treat that shard as failed and fail the part if you fall below write quorum.
 
 #### Step E — Persist PartMetadata using stable filenames
 
@@ -324,7 +335,7 @@ Only after commit succeeds do we write `PartMetadata`.
 
 The commit pattern is:
 
-- commit stable shard files
+- commit stable blob addresses
 - then commit per-part metadata (`part_{p}{PART_META_SUFFIX}`)
 
 ### 3) Finalize upload (publish a version)
@@ -343,10 +354,11 @@ Only after metadata is durable does the version become visible to reads/list.
 
 This is the mental model N1 is built around.
 
-### Crash during part upload (before rename)
+### Crash during part upload (before commit)
 You may see:
 
-- `*.tmp.<attempt>` shard files (partial or complete)
+- compatibility backend: `*.tmp.<attempt>` shard files
+- raw backend: staged temporary raw shard files under the raw staging area
 
 **But you must not**:
 - reference these in `PartMetadata`
@@ -354,19 +366,20 @@ You may see:
 
 Repair/GC can later clean these temp attempts.
 
-### Crash after rename but before PartMetadata
+### Crash after backend commit but before PartMetadata
 You may see:
 
-- stable shard files exist
+- committed blob addresses exist (stable shard files on the compatibility backend, or raw extent
+  addresses on the raw backend)
 - no `part_{p}{PART_META_SUFFIX}`
 
 Finalization will not include that part, because metadata doesn’t claim it.
-A re-upload can detect stable shards and either reuse (if supported) or overwrite via a new attempt.
+A re-upload can detect committed shard state and either reuse (if supported) or overwrite via a new attempt.
 
 ### Crash after PartMetadata but before final object metadata
 You may see:
 
-- stable shard files exist
+- committed blob addresses exist
 - part metadata exists
 - object metadata for the version does not exist
 
@@ -460,7 +473,13 @@ N1 favors safety:
 
 ### Linux-first + O_DIRECT
 
-N1 is Linux-first and supports `O_DIRECT` for predictable latency and reduced page-cache pressure.
+N1 is Linux-first and uses `O_DIRECT` on the blob data path for predictable latency and reduced
+page-cache pressure. This applies to both:
+
+- filesystem-backed blob shard files
+- raw blob devices managed directly by `block_manager`
+
+Metadata, quota, prefix indexes, and other control files remain filesystem-backed and buffered by design.
 
 Implications:
 

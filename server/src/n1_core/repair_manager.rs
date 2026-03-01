@@ -1,10 +1,11 @@
 use crate::enums::app_error_enum::AppError;
+use crate::n1_core::blob_store::{stable_shard_file_name, verify_shard_checksum};
 use crate::n1_core::constants::{
-    FRAGMENT_METADATA_FILE, METADATA_EXT, PARITY_SUFFIX, PART_META_SUFFIX, QUOTA_FILE,
-    RESERVATION_FILE, SESSION_MANIFEST_FILE, SHARD_SUFFIX,
+    FRAGMENT_METADATA_FILE, METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, RESERVATION_FILE,
+    SESSION_MANIFEST_FILE,
 };
 use crate::n1_core::disk_manager::{
-    INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, Quota,
+    ObjectMetadata, ObjectPathManager, PartMetadata, Quota, configured_index_store_disks,
 };
 use crate::n1_core::operation_gate::acquire_read_only_fast_mode;
 use crate::n1_core::prefix_rebuilder::run_prefix_rebuild_job;
@@ -213,25 +214,6 @@ fn strip_tmp_attempt_suffix(s: &str) -> &str {
     }
 }
 
-#[inline]
-fn shard_ext(is_parity: bool) -> &'static str {
-    if is_parity {
-        PARITY_SUFFIX
-    } else {
-        SHARD_SUFFIX
-    }
-}
-
-#[inline]
-fn stable_shard_file_name(part_index: u64, shard_index: usize, is_parity: bool) -> String {
-    format!(
-        "part_{}_shard_{}{}",
-        part_index,
-        shard_index,
-        shard_ext(is_parity)
-    )
-}
-
 fn expected_shard_path(
     path_manager: &ObjectPathManager,
     blob_roots: &[PathBuf],
@@ -250,6 +232,9 @@ fn expected_shard_path(
         return None;
     }
     let disk_root = &blob_roots[disk_idx];
+    if !disk_root.is_dir() {
+        return None;
+    }
     let shard_dir = path_manager.get_shard_dir_on_disk(disk_root, fragment, version_id);
     let name = stable_shard_file_name(part_index, shard_index, is_parity);
     Some(shard_dir.join(name))
@@ -266,6 +251,10 @@ async fn normalize_part_paths_for_repair(
         let stable_name =
             stable_shard_file_name(part.part_index, shard.shard_index, shard.is_parity);
         shard.file_name = stable_name;
+
+        if shard.raw_blob_address.is_some() {
+            continue;
+        }
 
         let abs = shard.absolute_path.clone();
         let abs_norm = strip_tmp_attempt_suffix(abs.as_str()).to_string();
@@ -1010,19 +999,40 @@ async fn process_object_repair(
         let mut missing_shards: Vec<usize> = Vec::new();
 
         for shard in &part_arc.shards {
-            let shard_path = PathBuf::from(strip_tmp_attempt_suffix(&shard.absolute_path));
             let mut healthy = false;
 
-            match fs::metadata(&shard_path).await {
-                Ok(m) => {
-                    if cfg.check_mode == RepairCheckMode::Availability {
-                        healthy = m.len() == shard.size_bytes;
-                        if !healthy {
-                            corrupt_found += 1;
-                            warn!("Size mismatch shard (availability): {:?}", shard_path);
-                        }
-                    } else {
-                        if let Ok(mut f) = File::open(&shard_path).await {
+            if shard.raw_blob_address.is_some() {
+                if cfg.check_mode == RepairCheckMode::Availability {
+                    healthy = shard
+                        .raw_blob_address
+                        .as_ref()
+                        .map(|raw| raw.size_bytes == shard.size_bytes)
+                        .unwrap_or(false);
+                    if !healthy {
+                        corrupt_found += 1;
+                        warn!(
+                            "Size mismatch raw shard (availability): {}",
+                            shard.absolute_path
+                        );
+                    }
+                } else {
+                    healthy = verify_shard_checksum(shard).await.unwrap_or(false);
+                    if !healthy {
+                        corrupt_found += 1;
+                        warn!("Corrupt raw shard found: {}", shard.absolute_path);
+                    }
+                }
+            } else {
+                let shard_path = PathBuf::from(strip_tmp_attempt_suffix(&shard.absolute_path));
+                match fs::metadata(&shard_path).await {
+                    Ok(m) => {
+                        if cfg.check_mode == RepairCheckMode::Availability {
+                            healthy = m.len() == shard.size_bytes;
+                            if !healthy {
+                                corrupt_found += 1;
+                                warn!("Size mismatch shard (availability): {:?}", shard_path);
+                            }
+                        } else if let Ok(mut f) = File::open(&shard_path).await {
                             healthy = verify_shard_integrity(&mut f, &shard.checksum).await;
                             if !healthy {
                                 corrupt_found += 1;
@@ -1030,9 +1040,9 @@ async fn process_object_repair(
                             }
                         }
                     }
-                }
-                Err(_) => {
-                    healthy = false;
+                    Err(_) => {
+                        healthy = false;
+                    }
                 }
             }
 
@@ -1149,11 +1159,7 @@ pub async fn run_repair_job_with_options(
     }
 
     let path_manager = ObjectPathManager::new();
-    let _index_roots_config = INDEX_STORE_DISKS
-        .get()
-        .ok_or(AppError::InternalServerError(
-            "Index Store Config not initialized".into(),
-        ))?;
+    let _index_roots_config = configured_index_store_disks()?;
 
     let index_roots: Vec<PathBuf> = path_manager.get_all_index_roots().into_iter().collect();
     let blob_roots = Arc::new(path_manager.get_blob_roots());
@@ -1252,14 +1258,21 @@ pub async fn run_repair_job_with_options(
         let scan_dirs_clone = scan_index_dirs.clone();
 
         tokio::task::spawn_blocking(move || {
+            let mut seen_rel_paths: HashSet<PathBuf> = HashSet::new();
             for scan_dir in scan_dirs_clone {
-                let walker = WalkDir::new(scan_dir).into_iter();
+                let walker = WalkDir::new(&scan_dir).into_iter();
                 for entry in walker.filter_map(|e| e.ok()) {
                     if !entry.file_type().is_file() {
                         continue;
                     }
                     let p = entry.path();
                     if should_scan_object_metadata_file(p) {
+                        let Ok(rel) = p.strip_prefix(&scan_dir) else {
+                            continue;
+                        };
+                        if !seen_rel_paths.insert(rel.to_path_buf()) {
+                            continue;
+                        }
                         if tx.blocking_send(p.to_owned()).is_err() {
                             return;
                         }

@@ -1,5 +1,6 @@
 pub mod adaptive_concurrency;
 pub mod archive;
+pub mod blob_store;
 pub mod constants;
 pub mod delete;
 pub mod disk_manager;

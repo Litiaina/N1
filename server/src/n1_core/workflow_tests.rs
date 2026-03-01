@@ -1,4 +1,5 @@
 use super::archive::download_selected_archive;
+use super::blob_store::{read_shard_range, verify_shard_checksum, write_shard_range};
 use super::constants::{PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_SEGMENT_EXT};
 use super::delete::delete_object;
 use super::delete::{
@@ -9,6 +10,7 @@ use super::disk_manager::{
     PrefixIndexSegment, RenameObjectRequest, UploadPartQuery,
 };
 use super::fragment_metadata::init_fragment_metadata;
+use super::garbage_collector::{get_gc_status_api, run_garbage_collector};
 use super::metadata_parser::get_metadata;
 use super::modify::rename_object;
 use super::object_parser::{
@@ -38,7 +40,7 @@ use super::upload::{
     WRITER_BUFFER_SIZE_ATOMIC, finalize_object_upload, get_upload_status, initiate_object_upload,
     object_upload_part,
 };
-use crate::n1_core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
+use crate::n1_core::disk_manager::replace_storage_roots_for_tests;
 use crate::routes::storage_routes::AppState;
 use crate::settings::constants::CONFIG_FILE;
 use crate::settings::create_config::create_default_config_ini;
@@ -60,6 +62,7 @@ use std::time::Instant;
 use tokio::fs;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
+use tokio::time::{Duration, sleep};
 use ulid::Ulid;
 
 static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
@@ -109,21 +112,57 @@ async fn ensure_global_storage_config(base: &std::path::Path) {
         blob_3.to_string_lossy().to_string(),
     ];
 
-    if INDEX_STORE_DISKS.get().is_none() {
-        INDEX_STORE_DISKS
-            .set(index_roots)
-            .expect("set INDEX_STORE_DISKS");
+    replace_storage_roots_for_tests(index_roots, blob_roots, base.to_string_lossy().to_string());
+}
+
+async fn ensure_raw_storage_config(
+    base: &std::path::Path,
+    raw_disk_count: usize,
+    raw_disk_bytes: u64,
+) -> Vec<std::path::PathBuf> {
+    ensure_test_config_file();
+
+    let _ = fs::remove_dir_all(base).await;
+    fs::create_dir_all(base)
+        .await
+        .expect("create raw test base");
+
+    let index_1 = base.join("index_1");
+    let index_2 = base.join("index_2");
+    fs::create_dir_all(&index_1).await.expect("create index_1");
+    fs::create_dir_all(&index_2).await.expect("create index_2");
+
+    let mut blob_roots = Vec::with_capacity(raw_disk_count);
+    let mut raw_paths = Vec::with_capacity(raw_disk_count);
+    for idx in 0..raw_disk_count {
+        let raw_path = base.join(format!("blob_{}.raw", idx + 1));
+        let raw_path_clone = raw_path.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&raw_path_clone)?;
+            file.set_len(raw_disk_bytes)
+        })
+        .await
+        .expect("raw file task")
+        .expect("initialize raw file");
+        blob_roots.push(raw_path.to_string_lossy().to_string());
+        raw_paths.push(raw_path);
     }
-    if BLOB_STORE_DISKS.get().is_none() {
-        BLOB_STORE_DISKS
-            .set(blob_roots)
-            .expect("set BLOB_STORE_DISKS");
-    }
-    if FS_STORAGE_ROOT.get().is_none() {
-        FS_STORAGE_ROOT
-            .set(base.to_string_lossy().to_string())
-            .expect("set FS_STORAGE_ROOT");
-    }
+
+    replace_storage_roots_for_tests(
+        vec![
+            index_1.to_string_lossy().to_string(),
+            index_2.to_string_lossy().to_string(),
+        ],
+        blob_roots,
+        base.to_string_lossy().to_string(),
+    );
+
+    raw_paths
 }
 
 fn ensure_upload_runtime_config() {
@@ -853,6 +892,50 @@ async fn assert_all_index_disks_synchronized(fragment: &str) {
             base_root, root
         );
     }
+}
+
+async fn count_raw_gc_markers(fragment: &str) -> usize {
+    let path_manager = ObjectPathManager::new();
+    let mut count = 0usize;
+    for root in path_manager.get_all_index_roots() {
+        let marker_dir = root.join(fragment).join("index").join(".raw_gc");
+        if !fs::try_exists(&marker_dir).await.unwrap_or(false) {
+            continue;
+        }
+        let mut rd = match fs::read_dir(&marker_dir).await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            if entry
+                .file_type()
+                .await
+                .map(|t| t.is_file())
+                .unwrap_or(false)
+            {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+async fn wait_for_gc_to_finish(fragment: &str, previous_start: i64) {
+    let mut saw_new_run = false;
+    for _ in 0..400 {
+        let status = get_gc_status_api(full_claims(fragment))
+            .await
+            .expect("gc status")
+            .0;
+        if status.start_timestamp > previous_start {
+            saw_new_run = true;
+        }
+        if saw_new_run && !status.is_running {
+            return;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("gc did not finish in time for fragment {}", fragment);
 }
 
 fn parse_tar_entry_names(tar_bytes: &[u8]) -> Vec<String> {
@@ -2350,6 +2433,102 @@ async fn matrix_recover_object_stays_listed_in_prefix_index() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_raw_blob_crud_delete_recover_and_permanent_delete() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.join(format!("raw-crud-{}", Ulid::new()));
+    let _raw_disks = ensure_raw_storage_config(&base, 3, 64 * 1024 * 1024).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(2, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "raw/delete-flow.bin".to_string();
+    let content = (0..(80 * 1024 + 123))
+        .map(|i| (i % 233) as u8)
+        .collect::<Vec<u8>>();
+
+    setup_fragment(&fragment).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    put_object(state.clone(), &fragment, &key, content.clone()).await;
+    let meta_before = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("raw metadata before delete");
+    assert!(
+        meta_before
+            .parts
+            .iter()
+            .flat_map(|part| part.shards.iter())
+            .all(|shard| shard.raw_blob_address.is_some()),
+        "expected all raw blob addresses to be populated"
+    );
+
+    let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+    assert_eq!(got, content);
+
+    let soft_del = delete_object(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), key.clone())),
+    )
+    .await
+    .expect("soft delete raw object")
+    .into_response();
+    assert_eq!(soft_del.status(), StatusCode::OK);
+
+    let rec_obj = recover_object(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), key.clone())),
+    )
+    .await
+    .expect("recover raw object")
+    .into_response();
+    assert_eq!(rec_obj.status(), StatusCode::OK);
+
+    let recovered = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+    assert_eq!(recovered, content);
+
+    let perm_del = delete_object_permanently(
+        State(state),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), key.clone())),
+    )
+    .await
+    .expect("permanent delete raw object")
+    .into_response();
+    assert_eq!(perm_del.status(), StatusCode::NO_CONTENT);
+
+    assert!(
+        get_metadata(&fragment, &key, &fragment).await.is_err(),
+        "metadata should be gone after permanent delete"
+    );
+
+    for shard in meta_before.parts.iter().flat_map(|part| part.shards.iter()) {
+        assert!(
+            read_shard_range(shard, 0, 1).await.is_err(),
+            "raw extent should be freed after permanent delete: {}",
+            shard.file_name
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_list_objects_hides_internal_keys_unless_requested() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -2844,6 +3023,142 @@ async fn matrix_repair_synchronizes_all_index_disks() {
     assert_eq!(pending_status_resp.status(), StatusCode::OK);
     let pending_status_json = read_response_json(pending_status_resp).await;
     assert_eq!(pending_status_json["uploaded_parts"][0].as_u64(), Some(0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_raw_blob_redistribution_repair_recovered_read_and_gc_markers() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.join(format!("raw-maint-{}", Ulid::new()));
+    let _raw_disks = ensure_raw_storage_config(&base, 3, 96 * 1024 * 1024).await;
+    ensure_upload_runtime_config();
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "raw/redistribute-repair.bin".to_string();
+    let content = (0..(96 * 1024 + 777))
+        .map(|i| (i % 211) as u8)
+        .collect::<Vec<u8>>();
+
+    setup_fragment(&fragment).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+    put_object(state.clone(), &fragment, &key, content.clone()).await;
+
+    let initial_meta = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("initial raw metadata");
+    assert_eq!(initial_meta.parts[0].shards.len(), 1);
+    assert!(
+        initial_meta.parts[0].shards[0].raw_blob_address.is_some(),
+        "expected initial object to live on raw extent"
+    );
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(2, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+
+    run_redistribution_job(false, Arc::new(WsConnectionManager::new()))
+        .await
+        .expect("raw redistribution");
+
+    let marker_count = count_raw_gc_markers(&fragment).await;
+    assert!(
+        marker_count > 0,
+        "expected raw GC markers after redistribution, got {}",
+        marker_count
+    );
+
+    let redistributed_meta = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("redistributed raw metadata");
+    assert_eq!(redistributed_meta.parts[0].shards.len(), 3);
+    assert!(
+        redistributed_meta
+            .parts
+            .iter()
+            .flat_map(|part| part.shards.iter())
+            .all(|shard| shard.raw_blob_address.is_some()),
+        "expected redistributed shards to remain raw-backed"
+    );
+
+    let damaged_shard = redistributed_meta.parts[0]
+        .shards
+        .iter()
+        .find(|shard| !shard.is_parity)
+        .expect("raw data shard")
+        .clone();
+    let overwrite = vec![0x5A; std::cmp::min(4096, damaged_shard.size_bytes as usize).max(1)];
+    write_shard_range(&damaged_shard, 0, &overwrite)
+        .await
+        .expect("corrupt raw shard");
+    assert!(
+        !verify_shard_checksum(&damaged_shard)
+            .await
+            .expect("verify corrupted raw shard"),
+        "raw shard checksum should fail after corruption"
+    );
+
+    let recovered = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+    assert_eq!(
+        recovered, content,
+        "recovered read mismatch after raw corruption"
+    );
+
+    run_repair_job(
+        RepairRunConfig {
+            dry_run: false,
+            check_mode: RepairCheckMode::Scrub,
+            meta_concurrency: 2,
+            shard_repair_concurrency: 2,
+            meta_batch_size: 128,
+        },
+        Arc::new(WsConnectionManager::new()),
+    )
+    .await
+    .expect("raw repair job");
+
+    assert!(
+        verify_shard_checksum(&damaged_shard)
+            .await
+            .expect("verify repaired raw shard"),
+        "raw shard checksum should pass after repair"
+    );
+
+    let previous_gc_start = get_gc_status_api(full_claims(&fragment))
+        .await
+        .expect("gc status before run")
+        .0
+        .start_timestamp;
+    let gc_resp = run_garbage_collector(State(state.clone()))
+        .await
+        .into_response();
+    assert_eq!(gc_resp.status(), StatusCode::ACCEPTED);
+    wait_for_gc_to_finish(&fragment, previous_gc_start).await;
+    assert_eq!(count_raw_gc_markers(&fragment).await, 0);
+
+    let final_read = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+    assert_eq!(final_read, content);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

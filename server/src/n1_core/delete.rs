@@ -14,6 +14,7 @@ use ulid::Ulid;
 use walkdir::WalkDir;
 
 use crate::enums::app_error_enum::AppError;
+use crate::n1_core::blob_store::{free_raw_shards_for_metadata, metadata_contains_raw_shards};
 use crate::n1_core::constants::{METADATA_EXT, QUOTA_FILE};
 use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, ObjectSummary, PrefixIndexEntry, PrefixIndexSegment,
@@ -552,18 +553,25 @@ pub async fn delete_object_version(
         return Err(AppError::NotFound);
     }
 
-    for root in &blob_roots {
-        let src_blob_dir = path_manager.get_shard_dir_on_disk(root, &fragment, &version_id);
-        if !fs::try_exists(&src_blob_dir).await.unwrap_or(false) {
-            continue;
-        }
+    let raw_blob_version = template_meta
+        .as_ref()
+        .map(metadata_contains_raw_shards)
+        .unwrap_or(false);
 
-        let trash_root = get_trash_root(root, &fragment);
-        let dest_blob_dir = trash_root.join("blob").join(&version_id);
+    if !raw_blob_version {
+        for root in &blob_roots {
+            let src_blob_dir = path_manager.get_shard_dir_on_disk(root, &fragment, &version_id);
+            if !fs::try_exists(&src_blob_dir).await.unwrap_or(false) {
+                continue;
+            }
 
-        match move_dir_or_copy(&src_blob_dir, &dest_blob_dir).await {
-            Ok(_) => {}
-            Err(e) => warn!("Failed to move blob to trash: {}", e),
+            let trash_root = get_trash_root(root, &fragment);
+            let dest_blob_dir = trash_root.join("blob").join(&version_id);
+
+            match move_dir_or_copy(&src_blob_dir, &dest_blob_dir).await {
+                Ok(_) => {}
+                Err(e) => warn!("Failed to move blob to trash: {}", e),
+            }
         }
     }
 
@@ -684,6 +692,10 @@ pub async fn delete_object(
     let shard4 = key_hash[6..8].to_string();
 
     let mut success_count = 0usize;
+    let raw_blob_versions = template_meta
+        .as_ref()
+        .map(metadata_contains_raw_shards)
+        .unwrap_or(false);
 
     for version_id in &versions_found {
         let filename = format!("{}#{}{}", key_hash, version_id, METADATA_EXT);
@@ -724,12 +736,14 @@ pub async fn delete_object(
             }
         }
 
-        for root in &blob_roots {
-            let src_blob = path_manager.get_shard_dir_on_disk(root, &fragment, version_id);
-            if fs::try_exists(&src_blob).await.unwrap_or(false) {
-                let trash_root = get_trash_root(root, &fragment);
-                let dst_blob = trash_root.join("blob").join(version_id);
-                let _ = move_dir_or_copy(&src_blob, &dst_blob).await;
+        if !raw_blob_versions {
+            for root in &blob_roots {
+                let src_blob = path_manager.get_shard_dir_on_disk(root, &fragment, version_id);
+                if fs::try_exists(&src_blob).await.unwrap_or(false) {
+                    let trash_root = get_trash_root(root, &fragment);
+                    let dst_blob = trash_root.join("blob").join(version_id);
+                    let _ = move_dir_or_copy(&src_blob, &dst_blob).await;
+                }
             }
         }
 
@@ -793,6 +807,7 @@ pub async fn empty_trash(
 
     let mut total_refund_size: u64 = 0;
     let mut calculated = false;
+    let mut raw_trash_metas: Vec<ObjectMetadata> = Vec::new();
 
     for root in &index_roots {
         if calculated {
@@ -813,6 +828,9 @@ pub async fn empty_trash(
                             mirror_total += meta.total_size_bytes;
                         } else if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
                             mirror_total += meta.total_size_bytes;
+                            if metadata_contains_raw_shards(&meta) {
+                                raw_trash_metas.push(meta);
+                            }
                         }
                     }
                 }
@@ -820,6 +838,10 @@ pub async fn empty_trash(
             total_refund_size = mirror_total;
             calculated = true;
         }
+    }
+
+    for meta in &raw_trash_metas {
+        let _ = free_raw_shards_for_metadata(meta).await;
     }
 
     let mut delete_tasks: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
@@ -977,6 +999,7 @@ pub async fn delete_object_permanently(
             async move {
                 let filename = format!("{}#{}{}", *key_hash, version_id, METADATA_EXT);
 
+                let mut raw_meta: Option<ObjectMetadata> = None;
                 for root in idxs.iter() {
                     let live_path = root
                         .join(&f)
@@ -994,6 +1017,17 @@ pub async fn delete_object_permanently(
                         .join(&*s3)
                         .join(&*s4)
                         .join(&filename);
+
+                    if raw_meta.is_none() {
+                        for candidate in [&live_path, &trash_path] {
+                            if let Ok(data) = fs::read(candidate).await {
+                                if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
+                                    raw_meta = Some(meta);
+                                    break;
+                                }
+                            }
+                        }
+                    }
 
                     let _ = fs::remove_file(&live_path).await;
                     let _ = fs::remove_file(&trash_path).await;
@@ -1013,12 +1047,27 @@ pub async fn delete_object_permanently(
                     let _ = fs::remove_dir_all(&trash_session).await;
                 }
 
-                for disk in blobs.iter() {
-                    let live_shard = pm.get_shard_dir_on_disk(disk, &f, &version_id);
-                    let _ = fs::remove_dir_all(&live_shard).await;
+                if let Some(meta) = raw_meta.as_ref() {
+                    if metadata_contains_raw_shards(meta) {
+                        let _ = free_raw_shards_for_metadata(meta).await;
+                    } else {
+                        for disk in blobs.iter() {
+                            let live_shard = pm.get_shard_dir_on_disk(disk, &f, &version_id);
+                            let _ = fs::remove_dir_all(&live_shard).await;
 
-                    let trash_shard = get_trash_root(disk, &f).join("blob").join(&version_id);
-                    let _ = fs::remove_dir_all(&trash_shard).await;
+                            let trash_shard =
+                                get_trash_root(disk, &f).join("blob").join(&version_id);
+                            let _ = fs::remove_dir_all(&trash_shard).await;
+                        }
+                    }
+                } else {
+                    for disk in blobs.iter() {
+                        let live_shard = pm.get_shard_dir_on_disk(disk, &f, &version_id);
+                        let _ = fs::remove_dir_all(&live_shard).await;
+
+                        let trash_shard = get_trash_root(disk, &f).join("blob").join(&version_id);
+                        let _ = fs::remove_dir_all(&trash_shard).await;
+                    }
                 }
 
                 size

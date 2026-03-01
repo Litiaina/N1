@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Internal dependencies
+block_manager = { path = "../block_manager" }
 server_cli = { path = "../server_cli" }
 
 # External workspace dependencies

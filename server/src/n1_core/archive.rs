@@ -18,7 +18,6 @@ use base64::engine::general_purpose;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::fs::File;
 use tokio_tar::{Builder as TarBuilder, Header as TarHeader};
 use walkdir::WalkDir;
 
@@ -29,7 +28,10 @@ use crate::{
         DownloadArchiveRequest, ListObjectsResult, ObjectMetadata, ObjectPathManager,
         ObjectSummary, PartMetadata, ShardInfo,
     },
-    n1_core::{metadata_parser::get_metadata, recovery::read_or_recover_chunk},
+    n1_core::{
+        metadata_parser::get_metadata,
+        recovery::{ShardFileCache, read_or_recover_chunk},
+    },
     structs::auth_structs::Claims,
 };
 
@@ -855,7 +857,7 @@ fn create_multipart_reader(
         parts_queue: std::collections::VecDeque<PartMetadata>,
         blob_dir: PathBuf,
         cursor_in_part: u64,
-        file_cache: HashMap<String, File>,
+        file_cache: ShardFileCache,
         stripe_size: usize,
     }
 
@@ -863,7 +865,7 @@ fn create_multipart_reader(
         parts_queue: parts,
         blob_dir: PathBuf::new(),
         cursor_in_part: 0,
-        file_cache: HashMap::new(),
+        file_cache: ShardFileCache::new(),
         stripe_size: stripe_size_bytes,
     };
 

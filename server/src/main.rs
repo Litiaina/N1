@@ -4,7 +4,7 @@ use crate::handlers::error_handlers::handler_404;
 use crate::n1_core::adaptive_concurrency::{
     ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC, ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC,
 };
-use crate::n1_core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
+use crate::n1_core::disk_manager::{configured_fs_storage_root, initialize_storage_roots};
 use crate::n1_core::monitoring::{
     MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC, MONITOR_INTERVAL_SECS_ATOMIC,
 };
@@ -523,10 +523,6 @@ pub async fn run_server() {
         .and_then(|s| s.get("fs_storage_path"))
         .unwrap_or("fs-storage-path");
 
-    FS_STORAGE_ROOT
-        .set(fs_storage_path.to_string())
-        .expect("Double initialization of STORAGE_ROOT!");
-
     let index_store_str = disk_section
         .and_then(|s| s.get("index_store_disks"))
         .expect("Missing index_store_disks in [disk_config]");
@@ -540,10 +536,6 @@ pub async fn run_server() {
     if index_disks.is_empty() {
         panic!("At least one index store disk must be configured in index_store_disks!");
     }
-
-    INDEX_STORE_DISKS
-        .set(index_disks)
-        .expect("Double initialization of INDEX_STORE_DISKS!");
 
     let blob_store_str = disk_section
         .and_then(|s| s.get("blob_store_disks"))
@@ -569,10 +561,8 @@ pub async fn run_server() {
             effective_blob_disks_for_auto
         );
     }
-
-    BLOB_STORE_DISKS
-        .set(blob_disks)
-        .expect("Double initialization of BLOB_STORE_DISKS!");
+    initialize_storage_roots(index_disks, blob_disks, fs_storage_path.to_string())
+        .expect("storage root initialization");
 
     let upload_section = config.section(Some("upload_config"));
     let cpu_cores = detect_cpu_cores();
@@ -886,10 +876,7 @@ pub async fn run_server() {
     let storage_router = serve_storage_routes().await;
     let serve_storage = storage_router.fallback(handler_404);
 
-    let fs_root = FS_STORAGE_ROOT
-        .get()
-        .unwrap_or(&STORAGE_ROOT.to_string())
-        .to_string();
+    let fs_root = configured_fs_storage_root().unwrap_or_else(|| STORAGE_ROOT.to_string());
     tokio::spawn(async move {
         interval_cleanup(&fs_root).await;
     });

@@ -12,11 +12,11 @@ This document reflects the current N1 storage architecture as implemented in `se
 
 ## 1. Architecture Truth
 
-N1 is a **fragment-scoped, filesystem-native object storage engine**:
+N1 is a **fragment-scoped object storage engine with a filesystem-backed metadata plane and a direct-I/O blob plane**:
 
 - no database in the object hot path
 - metadata authority lives on disk (mirrored index roots)
-- data/parity shards live on blob roots
+- data/parity shards live on blob disks
 - upload visibility is controlled by atomic metadata publish
 - repair/redistribution/prefix rebuild are first-class maintenance pipelines
 
@@ -25,7 +25,8 @@ N1 is a **fragment-scoped, filesystem-native object storage engine**:
 N1 uses two disk pools:
 
 - **Index roots** (`INDEX_STORE_DISKS`): metadata, sessions, quota, fragment metadata
-- **Blob roots** (`BLOB_STORE_DISKS`): shard files (`.shard`, `.parity`)
+- **Blob disks** (`BLOB_STORE_DISKS`): direct-I/O shard storage. Raw, unformatted devices are the
+  preferred deployment model; mounted directories remain supported as a compatibility backend.
 
 Fragment is the isolation boundary for auth, quota, maintenance, and layout.
 
@@ -60,6 +61,8 @@ Notes:
 
 ### 3.2 Blob root layout
 
+Compatibility filesystem backend:
+
 ```text
 {BLOB_ROOT}/{fragment_hash}/
 ├── blob/{version_id}/
@@ -72,6 +75,15 @@ Notes:
 Notes:
 - Blob directory name is currently `blob`.
 - Trash mirrors this under `.trash/blob/...`.
+- In raw blob mode, payloads live in `block_manager` extents on the blob device rather than under
+  mounted blob directories; metadata carries `raw_blob_address` values and debug paths like
+  `raw://<device_id>/<allocation_id>`.
+
+### 3.3 Direct-I/O split
+
+- Blob payload writes and reads use `O_DIRECT`.
+- Block-manager metadata (superblock/journal) is flushed explicitly but remains buffered.
+- Index, quota, prefix indexes, fragment metadata, and other control files remain filesystem-backed.
 
 ## 4. Object Model
 
