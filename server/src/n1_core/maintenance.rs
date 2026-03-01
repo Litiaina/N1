@@ -1,7 +1,7 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::{METADATA_EXT, QUOTA_FILE};
-use crate::object_storage::disk_manager::{ObjectMetadata, ObjectPathManager};
-use crate::object_storage::quota_manager::set_storage_used;
+use crate::n1_core::constants::{METADATA_EXT, QUOTA_FILE};
+use crate::n1_core::disk_manager::{ObjectMetadata, ObjectPathManager};
+use crate::n1_core::quota_manager::set_storage_used;
 use crate::structs::auth_structs::Claims;
 use axum::{http::StatusCode, response::IntoResponse};
 use std::collections::HashSet;

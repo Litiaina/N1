@@ -1,9 +1,7 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::disk_manager::{
-    ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo,
-};
-use crate::object_storage::header_parser::parse_range_header;
-use crate::object_storage::recovery::read_or_recover_chunk;
+use crate::n1_core::disk_manager::{ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo};
+use crate::n1_core::header_parser::parse_range_header;
+use crate::n1_core::recovery::read_or_recover_chunk;
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};

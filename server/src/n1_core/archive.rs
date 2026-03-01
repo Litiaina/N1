@@ -24,12 +24,12 @@ use walkdir::WalkDir;
 
 use crate::{
     enums::app_error_enum::AppError,
-    object_storage::constants::{METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, RESERVATION_FILE},
-    object_storage::disk_manager::{
+    n1_core::constants::{METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, RESERVATION_FILE},
+    n1_core::disk_manager::{
         DownloadArchiveRequest, ListObjectsResult, ObjectMetadata, ObjectPathManager,
         ObjectSummary, PartMetadata, ShardInfo,
     },
-    object_storage::{metadata_parser::get_metadata, recovery::read_or_recover_chunk},
+    n1_core::{metadata_parser::get_metadata, recovery::read_or_recover_chunk},
     structs::auth_structs::Claims,
 };
 
@@ -183,7 +183,7 @@ async fn list_objects_page_for_archive_prefix(
         delete: false,
         exp: usize::MAX,
     };
-    let response = crate::object_storage::retrieve::list_objects(
+    let response = crate::n1_core::retrieve::list_objects(
         claims,
         AxumPath(fragment.to_string()),
         Query(params),
@@ -231,16 +231,15 @@ async fn resolve_keys_from_prefix_index(
 
         let compacted_path = d.join(format!(
             "compacted{}",
-            crate::object_storage::constants::PREFIX_SEGMENT_EXT
+            crate::n1_core::constants::PREFIX_SEGMENT_EXT
         ));
         if tokio::fs::try_exists(&compacted_path)
             .await
             .unwrap_or(false)
         {
             if let Ok(data) = tokio::fs::read(&compacted_path).await {
-                if let Ok(seg) = rmp_serde::from_slice::<
-                    crate::object_storage::disk_manager::PrefixIndexSegment,
-                >(&data)
+                if let Ok(seg) =
+                    rmp_serde::from_slice::<crate::n1_core::disk_manager::PrefixIndexSegment>(&data)
                 {
                     had_any_index_data = true;
                     if canonical_prefix(&seg.prefix) == pfx {
@@ -280,7 +279,7 @@ async fn resolve_keys_from_prefix_index(
                 }
                 let name = entry.file_name().to_string_lossy().to_string();
                 if name.starts_with("seg_")
-                    && name.ends_with(crate::object_storage::constants::PREFIX_SEGMENT_EXT)
+                    && name.ends_with(crate::n1_core::constants::PREFIX_SEGMENT_EXT)
                 {
                     seg_files.push((name, entry.path()));
                 }
@@ -290,9 +289,8 @@ async fn resolve_keys_from_prefix_index(
 
         for (_name, path) in seg_files {
             if let Ok(data) = tokio::fs::read(&path).await {
-                if let Ok(seg) = rmp_serde::from_slice::<
-                    crate::object_storage::disk_manager::PrefixIndexSegment,
-                >(&data)
+                if let Ok(seg) =
+                    rmp_serde::from_slice::<crate::n1_core::disk_manager::PrefixIndexSegment>(&data)
                 {
                     had_any_index_data = true;
                     if canonical_prefix(&seg.prefix) != pfx {

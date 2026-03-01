@@ -1,15 +1,15 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::{
+use crate::n1_core::constants::{
     FRAGMENT_METADATA_FILE, METADATA_EXT, PARITY_SUFFIX, PART_META_SUFFIX, QUOTA_FILE,
     RESERVATION_FILE, SESSION_MANIFEST_FILE, SHARD_SUFFIX,
 };
-use crate::object_storage::disk_manager::{
+use crate::n1_core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, Quota,
 };
-use crate::object_storage::operation_gate::acquire_read_only_fast_mode;
-use crate::object_storage::prefix_rebuilder::run_prefix_rebuild_job;
-use crate::object_storage::recovery::{repair_entire_shard, verify_shard_integrity};
-use crate::object_storage::upload::UploadSessionManifest;
+use crate::n1_core::operation_gate::acquire_read_only_fast_mode;
+use crate::n1_core::prefix_rebuilder::run_prefix_rebuild_job;
+use crate::n1_core::recovery::{repair_entire_shard, verify_shard_integrity};
+use crate::n1_core::upload::UploadSessionManifest;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::manager::WsConnectionManager;
@@ -731,8 +731,7 @@ async fn repair_fragment_sessions_strict(
             .map(|d| d.join(RESERVATION_FILE))
             .collect();
         let receipt_valid = |b: &[u8]| -> bool {
-            rmp_serde::from_slice::<crate::object_storage::disk_manager::ReservationReceipt>(b)
-                .is_ok()
+            rmp_serde::from_slice::<crate::n1_core::disk_manager::ReservationReceipt>(b).is_ok()
         };
 
         let mut reps = Vec::with_capacity(receipt_paths.len());

@@ -1,18 +1,18 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::{
+use crate::n1_core::constants::{
     GC_SUFFIX, METADATA_EXT, PARITY_SUFFIX, PART_META_SUFFIX, QUOTA_FILE, REDIST_TMP_SUFFIX,
     RESERVATION_FILE, SHARD_SUFFIX,
 };
-use crate::object_storage::disk_manager::{
+use crate::n1_core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, Quota, ShardInfo,
     default_stripe_size,
 };
-use crate::object_storage::ec::ErasureStreamWriter;
-use crate::object_storage::fragment_metadata::{read_fragment_metadata, write_fragment_metadata};
-use crate::object_storage::operation_gate::acquire_read_only_fast_mode;
-use crate::object_storage::prefix_rebuilder::run_prefix_rebuild_job;
-use crate::object_storage::recovery::read_or_recover_chunk;
-use crate::object_storage::upload::{
+use crate::n1_core::ec::ErasureStreamWriter;
+use crate::n1_core::fragment_metadata::{read_fragment_metadata, write_fragment_metadata};
+use crate::n1_core::operation_gate::acquire_read_only_fast_mode;
+use crate::n1_core::prefix_rebuilder::run_prefix_rebuild_job;
+use crate::n1_core::recovery::read_or_recover_chunk;
+use crate::n1_core::upload::{
     DATA_SHARDS_ATOMIC, DirectWriter, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, create_direct_file,
     sync_dir,
 };

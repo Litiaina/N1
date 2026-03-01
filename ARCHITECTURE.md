@@ -8,7 +8,7 @@
   <h1>N1 Architecture (Current)</h1>
 </div>
 
-This document reflects the current N1 storage architecture as implemented in `server/src/object_storage`.
+This document reflects the current N1 storage architecture as implemented in `server/src/n1_core`.
 
 ## 1. Architecture Truth
 

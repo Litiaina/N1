@@ -1,6 +1,6 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::LOCK_SHARD_COUNT;
-use crate::object_storage::disk_manager::{ObjectPathManager, Quota};
+use crate::n1_core::constants::LOCK_SHARD_COUNT;
+use crate::n1_core::disk_manager::{ObjectPathManager, Quota};
 use futures_util::future::join_all;
 use moka::future::Cache;
 use std::collections::hash_map::DefaultHasher;

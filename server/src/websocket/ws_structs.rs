@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::object_storage::{
+use crate::n1_core::{
     disk_manager::ObjectMetadata, prefix_rebuilder::PrefixRebuildJobStatus,
     redistribution::RedistributionJobStatus, repair_manager::RepairJobStatus,
 };

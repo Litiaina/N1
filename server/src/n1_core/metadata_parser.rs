@@ -1,6 +1,6 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::METADATA_EXT;
-use crate::object_storage::disk_manager::{ObjectMetadata, ObjectPathManager};
+use crate::n1_core::constants::METADATA_EXT;
+use crate::n1_core::disk_manager::{ObjectMetadata, ObjectPathManager};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::time::SystemTime;

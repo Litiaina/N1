@@ -16,15 +16,15 @@ use ulid::Ulid;
 use walkdir::WalkDir;
 
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::{
+use crate::n1_core::constants::{
     METADATA_EXT, PART_META_SUFFIX, PREFIX_DELIMITER_COMPACTED_FILE,
     PREFIX_DELIMITER_SEGMENT_PREFIX, PREFIX_INDEX_DIR, PREFIX_SEGMENT_EXT, QUOTA_FILE,
     RESERVATION_FILE,
 };
-use crate::object_storage::disk_manager::{
+use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, ObjectSummary, PrefixIndexEntry, PrefixIndexSegment,
 };
-use crate::object_storage::prefix_delimiter::build_delimiter_compacted_from_entries;
+use crate::n1_core::prefix_delimiter::build_delimiter_compacted_from_entries;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
 use crate::structs::auth_structs::Claims;

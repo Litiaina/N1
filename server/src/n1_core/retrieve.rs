@@ -1,16 +1,16 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::{
+use crate::n1_core::constants::{
     BROWSER_CACHE_MAX_AGE, METADATA_EXT, PREFIX_DELIMITER_COMPACTED_FILE,
     PREFIX_DELIMITER_SEGMENT_PREFIX, PREFIX_SEGMENT_EXT, QUOTA_FILE,
 };
-use crate::object_storage::disk_manager::{
+use crate::n1_core::disk_manager::{
     ListObjectsResult, ObjectMetadata, ObjectPathManager, ObjectSummary,
     PrefixDelimiterCompactedSegment, PrefixDelimiterSegment, PrefixIndexSegment, Quota,
 };
-use crate::object_storage::fragment_manager::is_fragment_hash;
-use crate::object_storage::metadata_parser::get_metadata;
-use crate::object_storage::object_parser::{get_object_logic, stream_object_logic};
-use crate::object_storage::quota_manager::get_quota;
+use crate::n1_core::fragment_manager::is_fragment_hash;
+use crate::n1_core::metadata_parser::get_metadata;
+use crate::n1_core::object_parser::{get_object_logic, stream_object_logic};
+use crate::n1_core::quota_manager::get_quota;
 use crate::structs::auth_structs::Claims;
 use axum::{
     Json as AxumJson,

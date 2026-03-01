@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 use crate::{
     enums::app_error_enum::AppError,
     middleware::auth_middleware::MASTER_KEY,
-    object_storage::{
+    n1_core::{
         disk_manager::ObjectPathManager,
         fragment_metadata::{
             init_fragment_metadata, read_fragment_metadata, rotate_fragment_key,
@@ -228,7 +228,7 @@ pub async fn update_fragment(
                 Err(_) => {
                     let old_meta = read_fragment_metadata(&current_hash).await.ok();
                     old_meta.unwrap_or_else(|| {
-                        crate::object_storage::fragment_metadata::FragmentMetadata {
+                        crate::n1_core::fragment_metadata::FragmentMetadata {
                             fragment: new_hash.clone(),
                             key_phc: String::new(),
                             nt_hash_hex: None,

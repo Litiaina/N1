@@ -10,7 +10,7 @@
 </div>
 
 > Source of truth for routing: `server/src/routes/storage_routes.rs`.
-> Source of truth for request/response behavior: the handler files under `server/src/object_storage` and `server/src/fs`.
+> Source of truth for request/response behavior: the handler files under `server/src/n1_core` and `server/src/fs`.
 
 ## 1. Base URL And Conventions
 - Base URL example: `https://127.0.0.1:50001`

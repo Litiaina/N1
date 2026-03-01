@@ -1,22 +1,22 @@
 use crate::fs::cleanup_manager::interval_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
-use crate::object_storage::adaptive_concurrency::{
+use crate::n1_core::adaptive_concurrency::{
     ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC, ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC,
 };
-use crate::object_storage::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
-use crate::object_storage::monitoring::{
+use crate::n1_core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
+use crate::n1_core::monitoring::{
     MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC, MONITOR_INTERVAL_SECS_ATOMIC,
 };
-use crate::object_storage::object_parser::{
+use crate::n1_core::object_parser::{
     ADAPTIVE_STREAM_TARGET_ATOMIC, STREAM_CHUNK_SIZE_ATOMIC, STREAM_LOCALITY_BIAS_ENABLED_ATOMIC,
     STREAM_MAX_CONCURRENCY, STREAM_READAHEAD_BYTES_ATOMIC,
 };
-use crate::object_storage::prefix_compactor::{
+use crate::n1_core::prefix_compactor::{
     PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC, PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC,
 };
-use crate::object_storage::retrieve::PREFIX_MAX_DELTA_SEGMENTS_ATOMIC;
-use crate::object_storage::upload::{
+use crate::n1_core::retrieve::PREFIX_MAX_DELTA_SEGMENTS_ATOMIC;
+use crate::n1_core::upload::{
     ADAPTIVE_IO_TARGET_ATOMIC, DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC,
     PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC,
     UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
@@ -50,7 +50,7 @@ mod fs;
 mod fuse;
 mod handlers;
 mod middleware;
-mod object_storage;
+mod n1_core;
 mod routes;
 mod settings;
 mod smb;

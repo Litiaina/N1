@@ -1,9 +1,9 @@
-use crate::object_storage::object_parser::{
+use crate::n1_core::object_parser::{
     ADAPTIVE_STREAM_TARGET_ATOMIC, STREAM_CHUNK_SIZE_ATOMIC, STREAM_MAX_CONCURRENCY,
     STREAM_READAHEAD_BYTES_ATOMIC,
 };
-use crate::object_storage::system::get_system_metrics;
-use crate::object_storage::upload::{ADAPTIVE_IO_TARGET_ATOMIC, MAX_IO_SEMAPHORE};
+use crate::n1_core::system::get_system_metrics;
+use crate::n1_core::upload::{ADAPTIVE_IO_TARGET_ATOMIC, MAX_IO_SEMAPHORE};
 use once_cell::sync::OnceCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;

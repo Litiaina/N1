@@ -1,5 +1,5 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::disk_manager::{
+use crate::n1_core::disk_manager::{
     ObjectPathManager, PrefixDelimiterChildDelta, PrefixDelimiterChildEntry,
     PrefixDelimiterCompactedSegment, PrefixDelimiterSegment, PrefixIndexEntry,
 };

@@ -8,8 +8,8 @@ use walkdir::WalkDir;
 
 use crate::{
     enums::app_error_enum::AppError,
-    object_storage::constants::{METADATA_EXT, QUOTA_FILE},
-    object_storage::{
+    n1_core::constants::{METADATA_EXT, QUOTA_FILE},
+    n1_core::{
         disk_manager::{ObjectMetadata, ObjectPathManager},
         quota_manager::set_storage_used,
     },

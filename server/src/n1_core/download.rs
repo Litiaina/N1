@@ -1,10 +1,8 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::disk_manager::{
-    ChunkQuery, ObjectKeyQuery, ObjectPathManager, ShardInfo,
-};
-use crate::object_storage::metadata_parser::{get_metadata, get_version_metadata};
-use crate::object_storage::object_parser::stream_object_logic;
-use crate::object_storage::recovery::read_or_recover_chunk;
+use crate::n1_core::disk_manager::{ChunkQuery, ObjectKeyQuery, ObjectPathManager, ShardInfo};
+use crate::n1_core::metadata_parser::{get_metadata, get_version_metadata};
+use crate::n1_core::object_parser::stream_object_logic;
+use crate::n1_core::recovery::read_or_recover_chunk;
 use crate::structs::auth_structs::Claims;
 use axum::body::Body;
 use axum::extract::{Path, Query};

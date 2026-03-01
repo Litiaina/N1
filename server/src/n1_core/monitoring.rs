@@ -1,12 +1,12 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::{
+use crate::n1_core::constants::{
     FRAGMENT_METADATA_FILE, METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, RESERVATION_FILE,
     SESSION_MANIFEST_FILE,
 };
-use crate::object_storage::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
-use crate::object_storage::redistribution::get_redist_status;
-use crate::object_storage::repair_manager::get_repair_status;
-use crate::object_storage::system::{SystemMetrics, get_system_metrics};
+use crate::n1_core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
+use crate::n1_core::redistribution::get_redist_status;
+use crate::n1_core::repair_manager::get_repair_status;
+use crate::n1_core::system::{SystemMetrics, get_system_metrics};
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;

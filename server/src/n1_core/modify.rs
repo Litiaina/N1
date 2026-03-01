@@ -12,12 +12,12 @@ use tracing::{error, info, warn};
 use ulid::Ulid;
 
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::METADATA_EXT;
-use crate::object_storage::disk_manager::{
+use crate::n1_core::constants::METADATA_EXT;
+use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment, RenameObjectRequest,
 };
-use crate::object_storage::prefix_compactor::schedule_prefix_compaction;
-use crate::object_storage::prefix_delimiter::write_delimiter_delta;
+use crate::n1_core::prefix_compactor::schedule_prefix_compaction;
+use crate::n1_core::prefix_delimiter::write_delimiter_delta;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;

@@ -1,5 +1,5 @@
 use super::archive::download_selected_archive;
-use super::constants::PREFIX_SEGMENT_EXT;
+use super::constants::{PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_SEGMENT_EXT};
 use super::delete::delete_object;
 use super::delete::{
     delete_object_permanently, delete_object_version, recover_object, recover_object_version,
@@ -35,9 +35,10 @@ use super::sync::ensure_fragment_blob_directories;
 use super::upload::{
     DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC,
     STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC, UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC,
-    WRITER_BUFFER_SIZE_ATOMIC, finalize_object_upload, initiate_object_upload, object_upload_part,
+    WRITER_BUFFER_SIZE_ATOMIC, finalize_object_upload, get_upload_status, initiate_object_upload,
+    object_upload_part,
 };
-use crate::object_storage::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
+use crate::n1_core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
 use crate::routes::storage_routes::AppState;
 use crate::settings::constants::CONFIG_FILE;
 use crate::settings::create_config::create_default_config_ini;
@@ -519,6 +520,37 @@ async fn list_objects_json_with_internal(
     read_response_json(resp).await
 }
 
+async fn list_objects_json_page(
+    fragment: &str,
+    prefix: Option<&str>,
+    delimiter: Option<&str>,
+    limit: usize,
+    continuation_token: Option<String>,
+) -> serde_json::Value {
+    let mut params: HashMap<String, String> = HashMap::new();
+    if let Some(p) = prefix {
+        params.insert("prefix".to_string(), p.to_string());
+    }
+    if let Some(d) = delimiter {
+        params.insert("delimiter".to_string(), d.to_string());
+    }
+    params.insert("limit".to_string(), limit.to_string());
+    if let Some(tok) = continuation_token {
+        params.insert("continuation_token".to_string(), tok);
+    }
+
+    let resp = list_objects(
+        full_claims(fragment),
+        AxumPath(fragment.to_string()),
+        Query(params),
+    )
+    .await
+    .expect("list objects page")
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    read_response_json(resp).await
+}
+
 async fn wait_until_prefix_compacted(fragment: &str, prefix: &str, timeout_ms: u64) -> bool {
     let path_manager = ObjectPathManager::new();
     let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
@@ -565,6 +597,41 @@ async fn wait_until_prefix_compacted(fragment: &str, prefix: &str, timeout_ms: u
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_until_delimiter_compacted(fragment: &str, prefix: &str, timeout_ms: u64) -> bool {
+    let path_manager = ObjectPathManager::new();
+    let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+    loop {
+        let mut any_bucket = false;
+        let mut all_buckets_compacted = true;
+
+        for bucket in path_manager.get_all_prefix_bucket_dirs(fragment, prefix) {
+            if !fs::try_exists(&bucket).await.unwrap_or(false) {
+                continue;
+            }
+            any_bucket = true;
+
+            if !fs::try_exists(&bucket.join(PREFIX_DELIMITER_COMPACTED_FILE))
+                .await
+                .unwrap_or(false)
+            {
+                all_buckets_compacted = false;
+                break;
+            }
+        }
+
+        if any_bucket && all_buckets_compacted {
+            return true;
+        }
+
+        if Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 
@@ -1476,6 +1543,257 @@ async fn matrix_prefix_listing_survives_rename_delete_after_compaction() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_delimiter_listing_keeps_exact_prefix_object_and_child_prefixes() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let prev_compact_trigger = PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or(128);
+    let prev_compact_min_interval = PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or(30);
+
+    if PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC.get().is_none() {
+        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
+            .set(AtomicUsize::new(1))
+            .expect("set PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC");
+    } else {
+        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
+            .get()
+            .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
+            .store(1, Ordering::Relaxed);
+    }
+    if PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC.get().is_none() {
+        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
+            .set(AtomicU64::new(1))
+            .expect("set PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC");
+    } else {
+        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
+            .get()
+            .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
+            .store(1, Ordering::Relaxed);
+    }
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    for (key, fill) in [
+        ("study", 1u8),
+        ("study/root.bin", 2u8),
+        ("study/reports/q1.bin", 3u8),
+        ("study/series/a.bin", 4u8),
+        ("study/series/b.bin", 5u8),
+        ("study-extra.bin", 6u8),
+    ] {
+        put_object(state.clone(), &fragment, key, vec![fill; 4096]).await;
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    schedule_prefix_compaction(fragment.clone(), vec!["study".to_string()]);
+    run_prefix_rebuild_job(Some(fragment.clone()), Arc::new(WsConnectionManager::new()))
+        .await
+        .expect("run prefix rebuild");
+
+    assert!(
+        wait_until_prefix_compacted(&fragment, "study", 5000).await,
+        "study prefix should compact during test setup"
+    );
+    assert!(
+        wait_until_delimiter_compacted(&fragment, "study", 5000).await,
+        "study delimiter prefix should compact during test setup"
+    );
+
+    let listing = list_objects_json(&fragment, Some("study"), Some("/")).await;
+    let mut object_keys = listing["objects"]
+        .as_array()
+        .expect("objects array")
+        .iter()
+        .filter_map(|v| v["object_key"].as_str())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    object_keys.sort();
+    let mut common_prefixes = listing["common_prefixes"]
+        .as_array()
+        .expect("common prefixes array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    common_prefixes.sort();
+
+    assert_eq!(
+        object_keys,
+        vec!["study".to_string(), "study/root.bin".to_string()]
+    );
+    assert_eq!(
+        common_prefixes,
+        vec!["study/reports/".to_string(), "study/series/".to_string()]
+    );
+    assert!(listing["continuation_token"].is_null());
+
+    PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
+        .get()
+        .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
+        .store(prev_compact_trigger, Ordering::Relaxed);
+    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
+        .get()
+        .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
+        .store(prev_compact_min_interval, Ordering::Relaxed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_delimiter_listing_paginates_without_skipping_rows() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let prev_compact_trigger = PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or(128);
+    let prev_compact_min_interval = PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or(30);
+
+    if PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC.get().is_none() {
+        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
+            .set(AtomicUsize::new(1))
+            .expect("set PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC");
+    } else {
+        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
+            .get()
+            .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
+            .store(1, Ordering::Relaxed);
+    }
+    if PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC.get().is_none() {
+        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
+            .set(AtomicU64::new(1))
+            .expect("set PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC");
+    } else {
+        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
+            .get()
+            .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
+            .store(1, Ordering::Relaxed);
+    }
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    for (key, fill) in [
+        ("page", 1u8),
+        ("page/a.bin", 2u8),
+        ("page/b.bin", 3u8),
+        ("page/sub-a/x.bin", 4u8),
+        ("page/sub-b/y.bin", 5u8),
+    ] {
+        put_object(state.clone(), &fragment, key, vec![fill; 2048]).await;
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    schedule_prefix_compaction(fragment.clone(), vec!["page".to_string()]);
+    run_prefix_rebuild_job(Some(fragment.clone()), Arc::new(WsConnectionManager::new()))
+        .await
+        .expect("run prefix rebuild");
+
+    assert!(
+        wait_until_prefix_compacted(&fragment, "page", 5000).await,
+        "page prefix should compact during test setup"
+    );
+    assert!(
+        wait_until_delimiter_compacted(&fragment, "page", 5000).await,
+        "page delimiter prefix should compact during test setup"
+    );
+
+    let page1 = list_objects_json_page(&fragment, Some("page"), Some("/"), 2, None).await;
+    let token1 = page1["continuation_token"]
+        .as_str()
+        .expect("page1 continuation token")
+        .to_string();
+
+    let page2 = list_objects_json_page(&fragment, Some("page"), Some("/"), 2, Some(token1)).await;
+    let token2 = page2["continuation_token"]
+        .as_str()
+        .expect("page2 continuation token")
+        .to_string();
+
+    let page3 = list_objects_json_page(&fragment, Some("page"), Some("/"), 2, Some(token2)).await;
+
+    let mut rows = Vec::new();
+    for page in [&page1, &page2, &page3] {
+        rows.extend(
+            page["objects"]
+                .as_array()
+                .expect("objects array")
+                .iter()
+                .filter_map(|v| v["object_key"].as_str())
+                .map(|s| format!("object:{s}")),
+        );
+        rows.extend(
+            page["common_prefixes"]
+                .as_array()
+                .expect("common prefixes array")
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| format!("prefix:{s}")),
+        );
+    }
+
+    assert_eq!(
+        rows,
+        vec![
+            "object:page".to_string(),
+            "object:page/a.bin".to_string(),
+            "object:page/b.bin".to_string(),
+            "prefix:page/sub-a/".to_string(),
+            "prefix:page/sub-b/".to_string(),
+        ]
+    );
+    assert!(page3["continuation_token"].is_null());
+
+    PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
+        .get()
+        .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
+        .store(prev_compact_trigger, Ordering::Relaxed);
+    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
+        .get()
+        .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
+        .store(prev_compact_min_interval, Ordering::Relaxed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_multipart_finalize_conflict_then_success() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -1600,7 +1918,7 @@ async fn matrix_upload_resume_status_then_finalize_success() {
         StatusCode::OK
     );
 
-    let status_resp = super::upload::get_upload_status(
+    let status_resp = get_upload_status(
         full_claims(&fragment),
         AxumPath((fragment.clone(), version_id.clone())),
     )
@@ -2458,7 +2776,7 @@ async fn matrix_repair_synchronizes_all_index_disks() {
     let _v1 = put_object(state.clone(), &fragment, &k1, c1.clone()).await;
     let _v2 = put_object(state.clone(), &fragment, &k2, c2.clone()).await;
 
-    let pm = super::disk_manager::ObjectPathManager::new();
+    let pm = ObjectPathManager::new();
     let quota_paths = pm.get_all_quota_paths(&fragment);
     assert!(quota_paths.len() >= 2);
 
@@ -2516,7 +2834,7 @@ async fn matrix_repair_synchronizes_all_index_disks() {
     assert_eq!(got1, c1);
     assert_eq!(got2, c2);
 
-    let pending_status_resp = super::upload::get_upload_status(
+    let pending_status_resp = get_upload_status(
         full_claims(&fragment),
         AxumPath((fragment.clone(), pending_vid.clone())),
     )

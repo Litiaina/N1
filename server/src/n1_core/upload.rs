@@ -25,7 +25,7 @@ use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
-use crate::object_storage::constants::{
+use crate::n1_core::constants::{
     METADATA_EXT, PREFIX_INDEX_DIR, PREFIX_INDEX_NAMESPACE, PREFIX_INDEX_VERSION,
     PREFIX_SEGMENT_EXT,
 };
@@ -36,19 +36,19 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::windows::fs::OpenOptionsExt;
 
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::{
+use crate::n1_core::constants::{
     PARITY_SUFFIX, PART_META_SUFFIX, RESERVATION_FILE, SESSION_MANIFEST_FILE, SHARD_SUFFIX,
 };
-use crate::object_storage::disk_manager::{
+use crate::n1_core::disk_manager::{
     FinalizeIncompleteResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery,
     ObjectMetadata, ObjectPathManager, PartMetadata, PrefixIndexEntry, PrefixIndexSegment,
     ReservationReceipt, ShardInfo, UploadPartQuery, UploadStatusResponse, default_stripe_size,
 };
-use crate::object_storage::ec::{AlignedBuffer, ErasureStreamWriter};
-use crate::object_storage::metadata_parser::get_metadata;
-use crate::object_storage::prefix_compactor::schedule_prefix_compaction;
-use crate::object_storage::prefix_delimiter::write_delimiter_delta;
-use crate::object_storage::quota_manager::{try_reserve_quota, update_quota};
+use crate::n1_core::ec::{AlignedBuffer, ErasureStreamWriter};
+use crate::n1_core::metadata_parser::get_metadata;
+use crate::n1_core::prefix_compactor::schedule_prefix_compaction;
+use crate::n1_core::prefix_delimiter::write_delimiter_delta;
+use crate::n1_core::quota_manager::{try_reserve_quota, update_quota};
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
@@ -147,7 +147,7 @@ fn parse_upload_durability_mode(query: &UploadPartQuery) -> UploadDurabilityMode
 #[cfg(test)]
 mod tests {
     use super::{UploadDurabilityMode, parse_upload_durability_mode};
-    use crate::object_storage::disk_manager::UploadPartQuery;
+    use crate::n1_core::disk_manager::UploadPartQuery;
 
     #[test]
     fn upload_durability_defaults_to_batched() {

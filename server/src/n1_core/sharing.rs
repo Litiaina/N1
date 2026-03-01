@@ -1,9 +1,9 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::disk_manager::{
+use crate::n1_core::disk_manager::{
     CreateSignedUrlRequest, SignedUrlDisposition, SignedUrlResponse,
 };
-use crate::object_storage::metadata_parser::get_metadata;
-use crate::object_storage::object_parser::stream_object_logic;
+use crate::n1_core::metadata_parser::get_metadata;
+use crate::n1_core::object_parser::stream_object_logic;
 use crate::settings::constants::CONFIG_FILE;
 use crate::structs::auth_structs::Claims;
 use axum::Json as AxumJson;

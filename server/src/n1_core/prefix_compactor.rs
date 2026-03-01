@@ -1,11 +1,9 @@
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::{
+use crate::n1_core::constants::{
     PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_DELIMITER_SEGMENT_PREFIX, PREFIX_SEGMENT_EXT,
 };
-use crate::object_storage::disk_manager::{
-    ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment,
-};
-use crate::object_storage::prefix_delimiter::build_delimiter_compacted_from_entries;
+use crate::n1_core::disk_manager::{ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment};
+use crate::n1_core::prefix_delimiter::build_delimiter_compacted_from_entries;
 use once_cell::sync::OnceCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};

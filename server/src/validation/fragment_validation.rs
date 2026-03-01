@@ -1,4 +1,4 @@
-use crate::object_storage::disk_manager::ObjectPathManager;
+use crate::n1_core::disk_manager::ObjectPathManager;
 
 pub async fn does_fragment_exist(fragment: &str) -> bool {
     let path_manager = ObjectPathManager::new();

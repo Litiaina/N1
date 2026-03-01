@@ -14,15 +14,15 @@ use ulid::Ulid;
 use walkdir::WalkDir;
 
 use crate::enums::app_error_enum::AppError;
-use crate::object_storage::constants::{METADATA_EXT, QUOTA_FILE};
-use crate::object_storage::disk_manager::{
+use crate::n1_core::constants::{METADATA_EXT, QUOTA_FILE};
+use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, ObjectSummary, PrefixIndexEntry, PrefixIndexSegment,
     default_stripe_size,
 };
-use crate::object_storage::metadata_parser::get_metadata;
-use crate::object_storage::prefix_compactor::schedule_prefix_compaction;
-use crate::object_storage::prefix_delimiter::write_delimiter_delta;
-use crate::object_storage::quota_manager::update_quota;
+use crate::n1_core::metadata_parser::get_metadata;
+use crate::n1_core::prefix_compactor::schedule_prefix_compaction;
+use crate::n1_core::prefix_delimiter::write_delimiter_delta;
+use crate::n1_core::quota_manager::update_quota;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;

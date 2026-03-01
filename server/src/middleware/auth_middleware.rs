@@ -1,4 +1,4 @@
-use crate::object_storage::fragment_metadata::{
+use crate::n1_core::fragment_metadata::{
     backfill_fragment_nt_hash_if_missing, verify_fragment_key,
 };
 use crate::structs::auth_structs::{

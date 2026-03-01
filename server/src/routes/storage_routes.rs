@@ -21,43 +21,43 @@ use crate::handlers::dir_info_handlers::get_storage_capacity;
 use crate::middleware::auth_middleware::{auth, authorize, authorize_fragment, validate_access};
 use crate::middleware::rate_limiter_middleware::RateLimitLayers;
 use crate::middleware::storage_middleware::enforce_storage_limit;
-use crate::object_storage::adaptive_concurrency::run_adaptive_concurrency_loop;
-use crate::object_storage::archive::download_selected_archive;
-use crate::object_storage::delete::{
+use crate::n1_core::adaptive_concurrency::run_adaptive_concurrency_loop;
+use crate::n1_core::archive::download_selected_archive;
+use crate::n1_core::delete::{
     delete_object, delete_object_permanently, delete_object_version, empty_trash,
     recover_all_trash, recover_object, recover_object_version,
 };
-use crate::object_storage::download::{download_object, download_object_chunk};
-use crate::object_storage::fragment_manager::{
+use crate::n1_core::download::{download_object, download_object_chunk};
+use crate::n1_core::fragment_manager::{
     create_fragment, delete_fragment, get_fragment_hash, list_public_fragments, update_fragment,
     verify_fragment_existence,
 };
-use crate::object_storage::garbage_collector::{
+use crate::n1_core::garbage_collector::{
     get_gc_status_api, run_garbage_collector, run_lifecycle_manager,
 };
-use crate::object_storage::maintenance::sync_fragment_metadata;
-use crate::object_storage::modify::rename_object;
-use crate::object_storage::monitoring::{get_system_health, run_system_monitor};
-use crate::object_storage::operation_gate::enforce_read_only_fast_mode_on_mutations;
-use crate::object_storage::prefix_rebuilder::{
+use crate::n1_core::maintenance::sync_fragment_metadata;
+use crate::n1_core::modify::rename_object;
+use crate::n1_core::monitoring::{get_system_health, run_system_monitor};
+use crate::n1_core::operation_gate::enforce_read_only_fast_mode_on_mutations;
+use crate::n1_core::prefix_rebuilder::{
     get_prefix_rebuild_status_api, stop_prefix_rebuild_job_api, trigger_prefix_rebuild_job_api,
 };
-use crate::object_storage::redistribution::{
+use crate::n1_core::redistribution::{
     get_redist_status_api, stop_redistribution_job_api, trigger_redistribution_job_api,
 };
-use crate::object_storage::repair_manager::{
+use crate::n1_core::repair_manager::{
     get_repair_status_api, stop_repair_job_api, trigger_repair_job_api,
 };
-use crate::object_storage::retrieve::{
+use crate::n1_core::retrieve::{
     get_object, get_object_metadata, list_fragments, list_object_versions, list_objects,
     list_trash_objects, stream_object,
 };
-use crate::object_storage::sharing::{create_signed_url, get_shared_object};
-use crate::object_storage::storage_capacity_parser::get_capacity_usage;
-use crate::object_storage::sync::{
+use crate::n1_core::sharing::{create_signed_url, get_shared_object};
+use crate::n1_core::storage_capacity_parser::get_capacity_usage;
+use crate::n1_core::sync::{
     initialize_fragment_storage_api, sync_fragment_quota_api, sync_quota_api,
 };
-use crate::object_storage::upload::{
+use crate::n1_core::upload::{
     cancel_upload_session, finalize_object_upload, get_upload_status, initiate_object_upload,
     list_active_uploads, object_upload_part,
 };

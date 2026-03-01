@@ -1,5 +1,5 @@
-use crate::object_storage::disk_manager::ObjectPathManager;
-use crate::{enums::app_error_enum::AppError, object_storage::constants::FRAGMENT_METADATA_FILE};
+use crate::n1_core::disk_manager::ObjectPathManager;
+use crate::{enums::app_error_enum::AppError, n1_core::constants::FRAGMENT_METADATA_FILE};
 
 use argon2::{
     Argon2,

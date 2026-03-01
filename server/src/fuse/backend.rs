@@ -1,16 +1,16 @@
 use crate::enums::app_error_enum::AppError;
 use crate::fuse::model::{FsdPath, NodeKind, NodeMetadata, WriteHandle};
-use crate::object_storage::delete::{
+use crate::n1_core::delete::{
     delete_object, delete_object_permanently, empty_trash, recover_object,
 };
-use crate::object_storage::disk_manager::{
+use crate::n1_core::disk_manager::{
     ChunkQuery, InitiateUploadParams, ObjectKeyQuery, ObjectMetadata, RenameObjectRequest,
     UploadPartQuery,
 };
-use crate::object_storage::download::download_object_chunk;
-use crate::object_storage::modify::rename_object;
-use crate::object_storage::retrieve::{get_object_metadata, list_objects, list_trash_objects};
-use crate::object_storage::upload::{
+use crate::n1_core::download::download_object_chunk;
+use crate::n1_core::modify::rename_object;
+use crate::n1_core::retrieve::{get_object_metadata, list_objects, list_trash_objects};
+use crate::n1_core::upload::{
     cancel_upload_session, finalize_object_upload, initiate_object_upload, object_upload_part,
 };
 use crate::routes::storage_routes::AppState;

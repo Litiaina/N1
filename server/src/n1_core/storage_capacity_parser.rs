@@ -2,7 +2,7 @@ use axum::{Json, extract::Path as AxumPath, response::IntoResponse};
 
 use crate::{
     enums::app_error_enum::AppError,
-    object_storage::{disk_manager::CapacityUsageResponse, quota_manager::get_quota},
+    n1_core::{disk_manager::CapacityUsageResponse, quota_manager::get_quota},
     structs::auth_structs::Claims,
 };
 

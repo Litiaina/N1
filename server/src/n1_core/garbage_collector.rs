@@ -1,12 +1,12 @@
 use crate::enums::app_error_enum::AppError;
 use crate::fs::cleanup_manager::start_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
-use crate::object_storage::constants::{GC_SUFFIX, METADATA_EXT, QUOTA_FILE, RESERVATION_FILE};
-use crate::object_storage::disk_manager::{
+use crate::n1_core::constants::{GC_SUFFIX, METADATA_EXT, QUOTA_FILE, RESERVATION_FILE};
+use crate::n1_core::disk_manager::{
     FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManager, ReservationReceipt,
 };
-use crate::object_storage::quota_manager::update_quota;
-use crate::object_storage::sync::sync_single_fragment_quota;
+use crate::n1_core::quota_manager::update_quota;
+use crate::n1_core::sync::sync_single_fragment_quota;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
 use crate::websocket::ws_structs::StorageEventPayload;
