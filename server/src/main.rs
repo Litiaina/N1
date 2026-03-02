@@ -4,7 +4,7 @@ use crate::handlers::error_handlers::handler_404;
 use crate::n1_core::adaptive_concurrency::{
     ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC, ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC,
 };
-use crate::n1_core::blob_store::validate_configured_raw_blob_disks;
+use crate::n1_core::blob_store::{format_raw_blob_device, validate_configured_raw_blob_disks};
 use crate::n1_core::disk_manager::{configured_fs_storage_root, initialize_storage_roots};
 use crate::n1_core::monitoring::{
     MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC, MONITOR_INTERVAL_SECS_ATOMIC,
@@ -19,8 +19,9 @@ use crate::n1_core::prefix_compactor::{
 use crate::n1_core::retrieve::PREFIX_MAX_DELTA_SEGMENTS_ATOMIC;
 use crate::n1_core::upload::{
     ADAPTIVE_IO_TARGET_ATOMIC, DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC,
-    PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC,
-    UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
+    PARITY_SHARDS_ATOMIC, RAW_WRITER_INFLIGHT_LIMIT_ATOMIC, STRIPE_SIZE_ATOMIC,
+    UPLOAD_IO_GATE_ENABLED_ATOMIC, UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC,
+    WRITER_BUFFER_SIZE_ATOMIC,
 };
 use crate::routes::storage_routes::serve_storage_routes;
 use crate::settings::constants::{CONFIG_FILE, ENV_FILE};
@@ -36,6 +37,7 @@ use server_cli::cli::args::{Cli, Commands};
 use server_cli::cli::client::execute_command;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -102,6 +104,7 @@ fn adaptive_writer_buffer_size(
     blob_disks: usize,
     total_shards: usize,
 ) -> usize {
+    let ram = ram_gib(ram_bytes);
     let mut bytes = match ram_gib(ram_bytes) {
         0..=4 => 256 * 1024,
         5..=8 => 512 * 1024,
@@ -126,12 +129,79 @@ fn adaptive_writer_buffer_size(
     }
 
     if blob_disks <= 1 {
-        bytes = bytes.min(256 * 1024);
+        let single_disk_cap = if cpu_cores <= 2 || ram <= 4 {
+            512 * 1024
+        } else if cpu_cores <= 4 || ram <= 8 {
+            1024 * 1024
+        } else if cpu_cores <= 8 || ram <= 16 {
+            2 * 1024 * 1024
+        } else {
+            4 * 1024 * 1024
+        };
+        bytes = bytes.min(single_disk_cap);
     } else if blob_disks == 2 {
         bytes = bytes.min(512 * 1024);
     }
 
     align_up_4k(bytes.clamp(64 * 1024, 4 * 1024 * 1024))
+}
+
+fn adaptive_raw_writer_inflight_limit(
+    cpu_cores: usize,
+    ram_bytes: Option<u64>,
+    blob_disks: usize,
+    max_concurrent_io: usize,
+    writer_buffer_size: usize,
+    total_shards: usize,
+) -> usize {
+    let ram = ram_gib(ram_bytes);
+    let mut limit = match ram {
+        0..=4 => 2,
+        5..=8 => 4,
+        9..=16 => 8,
+        17..=32 => 12,
+        33..=64 => 16,
+        _ => 24,
+    };
+
+    if cpu_cores <= 2 {
+        limit = limit.min(2);
+    } else if cpu_cores <= 4 {
+        limit = limit.min(4);
+    } else if cpu_cores <= 8 {
+        limit = limit.min(8);
+    } else if cpu_cores <= 16 {
+        limit = limit.min(16);
+    } else {
+        limit = limit.min(24);
+    }
+
+    if writer_buffer_size >= 4 * 1024 * 1024 {
+        limit = limit.min(8);
+    } else if writer_buffer_size >= 2 * 1024 * 1024 {
+        limit = limit.min(12);
+    } else if writer_buffer_size >= 1024 * 1024 {
+        limit = limit.min(16);
+    }
+
+    if blob_disks <= 1 {
+        limit = limit.min(match ram {
+            0..=8 => 4,
+            9..=16 => 8,
+            17..=32 => 12,
+            _ => 16,
+        });
+    } else if blob_disks == 2 {
+        limit = limit.min(16);
+    } else {
+        limit = limit.min(24);
+    }
+
+    let per_upload_cap = max_concurrent_io
+        .saturating_mul(2)
+        .saturating_div(total_shards.max(1))
+        .clamp(4, 32);
+    limit.min(per_upload_cap).clamp(2, 32)
 }
 
 fn detect_total_ram_bytes() -> Option<u64> {
@@ -183,10 +253,14 @@ fn estimate_upload_part_working_set_bytes(
     data_shards: usize,
     parity_shards: usize,
     writer_buffer_size: usize,
+    raw_writer_inflight_limit: usize,
     stripe_block_size: usize,
 ) -> usize {
     let total_shards = data_shards.saturating_add(parity_shards).max(1);
-    let writer_bytes = total_shards.saturating_mul(writer_buffer_size.max(4096));
+    let writer_buffers_per_shard = raw_writer_inflight_limit.saturating_add(1).max(1);
+    let writer_bytes = total_shards
+        .saturating_mul(writer_buffer_size.max(4096))
+        .saturating_mul(writer_buffers_per_shard);
     let ec_ingest = data_shards
         .max(1)
         .saturating_mul(stripe_block_size.max(4096));
@@ -352,6 +426,66 @@ fn adaptive_monitor_deep_scan_interval_seconds(cpu_cores: usize, ram_bytes: Opti
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{
+        adaptive_raw_writer_inflight_limit, adaptive_writer_buffer_size,
+        estimate_upload_part_working_set_bytes,
+    };
+
+    #[test]
+    fn single_disk_writer_buffer_size_is_not_artificially_tiny() {
+        let bytes = adaptive_writer_buffer_size(8, Some(16 * 1024 * 1024 * 1024), 1, 1);
+        assert!(bytes >= 1024 * 1024);
+    }
+
+    #[test]
+    fn raw_writer_inflight_limit_stays_conservative_on_low_ram() {
+        let limit = adaptive_raw_writer_inflight_limit(
+            2,
+            Some(4 * 1024 * 1024 * 1024),
+            1,
+            32,
+            512 * 1024,
+            1,
+        );
+        assert_eq!(limit, 2);
+    }
+
+    #[test]
+    fn raw_writer_inflight_limit_scales_for_better_hardware() {
+        let limit = adaptive_raw_writer_inflight_limit(
+            16,
+            Some(32 * 1024 * 1024 * 1024),
+            1,
+            64,
+            1024 * 1024,
+            1,
+        );
+        assert!(limit >= 12);
+    }
+
+    #[test]
+    fn raw_writer_inflight_limit_goes_deeper_on_large_single_disk_nodes() {
+        let limit = adaptive_raw_writer_inflight_limit(
+            24,
+            Some(64 * 1024 * 1024 * 1024),
+            1,
+            128,
+            1024 * 1024,
+            1,
+        );
+        assert!(limit >= 16);
+    }
+
+    #[test]
+    fn upload_working_set_accounts_for_raw_writer_queueing() {
+        let shallow = estimate_upload_part_working_set_bytes(1, 0, 1024 * 1024, 2, 1024 * 1024);
+        let deep = estimate_upload_part_working_set_bytes(1, 0, 1024 * 1024, 8, 1024 * 1024);
+        assert!(deep > shallow);
+    }
+}
+
 fn parse_usize_or_auto(raw: Option<&str>, key: &str, auto_value: usize) -> usize {
     match raw.map(str::trim) {
         None => auto_value,
@@ -432,6 +566,62 @@ async fn main() {
 
     match &args.command {
         Some(Commands::Server) | None => {}
+        Some(Commands::FormatBlobDevice { path, force }) => {
+            let result = format_raw_blob_device(Path::new(path), *force);
+
+            drop(_guard);
+
+            match result {
+                Ok(status) => {
+                    if args.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&status)
+                                .expect("serialize blob device status")
+                        );
+                    } else {
+                        println!("Formatted raw blob device:");
+                        println!("  path: {}", status.path);
+                        println!("  canonical_path: {}", status.canonical_path);
+                        println!("  status: {}", status.status);
+                        println!(
+                            "  device_id: {}",
+                            status.device_id.unwrap_or_else(|| "<none>".to_string())
+                        );
+                        println!(
+                            "  block_size_bytes: {}",
+                            status
+                                .block_size_bytes
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "<unknown>".to_string())
+                        );
+                        println!(
+                            "  total_bytes: {}",
+                            status
+                                .total_bytes
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "<unknown>".to_string())
+                        );
+                        println!(
+                            "  available_bytes: {}",
+                            status
+                                .available_bytes
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "<unknown>".to_string())
+                        );
+                        if let Some(warning) = status.path_warning {
+                            println!("  warning: {}", warning);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Command failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+
+            return;
+        }
         Some(cmd) => {
             dotenv().ok();
 
@@ -551,6 +741,12 @@ pub async fn run_server() {
     if blob_disks.is_empty() {
         panic!("At least one blob store disk must be configured in blob_store_disks!");
     }
+    initialize_storage_roots(
+        index_disks.clone(),
+        blob_disks.clone(),
+        fs_storage_path.to_string(),
+    )
+    .expect("storage root initialization");
     let raw_blob_statuses =
         validate_configured_raw_blob_disks().expect("raw blob device validation");
     for status in &raw_blob_statuses {
@@ -578,8 +774,6 @@ pub async fn run_server() {
             effective_blob_disks_for_auto
         );
     }
-    initialize_storage_roots(index_disks, blob_disks, fs_storage_path.to_string())
-        .expect("storage root initialization");
 
     let upload_section = config.section(Some("upload_config"));
     let cpu_cores = detect_cpu_cores();
@@ -626,6 +820,15 @@ pub async fn run_server() {
         adaptive_max_concurrent_io(cpu_cores, effective_blob_disks_for_auto, detected_ram_bytes),
     );
 
+    let raw_writer_inflight_limit = adaptive_raw_writer_inflight_limit(
+        cpu_cores,
+        detected_ram_bytes,
+        effective_blob_disks_for_auto,
+        configured_max_io,
+        writer_buffer_size,
+        total_shards_value,
+    );
+
     let upload_memory_budget_bytes = parse_usize_or_auto(
         upload_section.and_then(|s| s.get("upload_memory_budget_bytes")),
         "upload_memory_budget_bytes",
@@ -642,6 +845,7 @@ pub async fn run_server() {
         data_shards_value,
         parity_shards_value,
         writer_buffer_size,
+        raw_writer_inflight_limit,
         stripe_block_size_value,
     );
 
@@ -694,7 +898,7 @@ pub async fn run_server() {
     );
 
     tracing::info!(
-        "Upload tuning: cpu_cores={}, ram_gib={}, blob_paths={}, blob_devices={}, auto_effective_disks={}, ec={}D+{}P, max_concurrent_io={} (configured={} budget_cap={} per_upload_est={}KiB budget={}MiB effective_budget={}MiB), writer_buffer_size={}, part_durability_strict_default={}, io_gate_enabled={}",
+        "Upload tuning: cpu_cores={}, ram_gib={}, blob_paths={}, blob_devices={}, auto_effective_disks={}, ec={}D+{}P, max_concurrent_io={} (configured={} budget_cap={} per_upload_est={}KiB budget={}MiB effective_budget={}MiB), writer_buffer_size={}, raw_writer_inflight_limit={}, part_durability_strict_default={}, io_gate_enabled={}",
         cpu_cores,
         detected_ram_gib,
         blob_disk_count,
@@ -709,6 +913,7 @@ pub async fn run_server() {
         upload_memory_budget_bytes / (1024 * 1024),
         effective_upload_budget_bytes / (1024 * 1024),
         writer_buffer_size,
+        raw_writer_inflight_limit,
         upload_part_strict_durability_default,
         upload_io_gate_enabled
     );
@@ -718,6 +923,10 @@ pub async fn run_server() {
     WRITER_BUFFER_SIZE_ATOMIC
         .set(writer_buffer_size)
         .expect("Double initialization of WRITER_BUFFER_SIZE!");
+
+    RAW_WRITER_INFLIGHT_LIMIT_ATOMIC
+        .set(AtomicUsize::new(raw_writer_inflight_limit))
+        .expect("Double initialization of RAW_WRITER_INFLIGHT_LIMIT_ATOMIC");
 
     UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC
         .set(AtomicBool::new(upload_part_strict_durability_default))

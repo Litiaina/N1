@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +59,13 @@ pub struct RawExtentAddress {
     pub allocation_id: u64,
     pub offset_bytes: u64,
     pub size_bytes: u64,
+}
+
+#[derive(Clone)]
+pub struct DirectExtentIo {
+    pub(crate) file: Arc<File>,
+    pub(crate) block_size: u32,
+    pub(crate) address: RawExtentAddress,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

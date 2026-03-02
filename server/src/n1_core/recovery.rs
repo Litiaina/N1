@@ -333,7 +333,16 @@ async fn read_shard_chunk_cached(
             }
             file_cache.insert(shard_info.file_name.clone(), CachedShardHandle::RawVerified);
         }
-        return read_shard_range(shard_info, offset, len).await.ok();
+        return match read_shard_range(shard_info, offset, len).await {
+            Ok(chunk) => Some(chunk),
+            Err(err) => {
+                warn!(
+                    "Raw shard read failed file={} path={} offset={} len={} err={}",
+                    shard_info.file_name, shard_info.absolute_path, offset, len, err
+                );
+                None
+            }
+        };
     }
 
     let mut file = get_or_open_shard_ha(file_cache, shard_info, version_dir_hint).await?;
@@ -389,14 +398,21 @@ pub async fn read_or_recover_chunk(
     {
         return Ok(chunk);
     }
-    warn!("Read failed for validated shard, attempting recovery.");
-
     let data_count = data_shards_count(&part);
     let parity_count = part.shards.len().saturating_sub(data_count);
 
     if data_count == 0 {
         return Err(AppError::InternalServerError("No data shards".into()));
     }
+
+    if parity_count == 0 {
+        return Err(AppError::InternalServerError(format!(
+            "Read failed for validated shard {} and no parity shards are available",
+            target_shard.file_name
+        )));
+    }
+
+    warn!("Read failed for validated shard, attempting recovery.");
 
     let mut decoder = ReedSolomonDecoder::new(data_count, parity_count, len)
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;

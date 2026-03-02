@@ -65,30 +65,40 @@ async fn sweep_fragment_gc_files(fragment_hash: String) {
 
 async fn calculate_usage_across_mirrors(fragment_hash: String) -> u64 {
     let path_manager = ObjectPathManager::new();
-    let index_dirs = path_manager.get_all_index_dirs(&fragment_hash);
+    let index_roots = path_manager.get_all_index_roots();
 
     tokio::task::spawn_blocking(move || {
         let mut max_total_usage = 0u64;
 
-        for index_dir in index_dirs {
-            if !index_dir.exists() {
-                continue;
-            }
-
+        for root in index_roots {
+            let live_index_dir = root.join(&fragment_hash).join("index");
+            let trash_index_dir = root.join(&fragment_hash).join(".trash").join("index");
             let mut current_disk_usage = 0u64;
+            let mut seen_versions = HashSet::new();
 
-            for entry in WalkDir::new(&index_dir).into_iter().filter_map(|e| e.ok()) {
-                if entry.file_type().is_file()
-                    && entry.file_name().to_string_lossy().ends_with(METADATA_EXT)
-                {
-                    if entry.file_name() == QUOTA_FILE {
-                        continue;
-                    }
+            for index_dir in [&live_index_dir, &trash_index_dir] {
+                if !index_dir.exists() {
+                    continue;
+                }
 
-                    if let Ok(data) = std::fs::read(entry.path()) {
-                        if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
-                            if !meta.is_delete_marker {
-                                current_disk_usage += meta.total_size_bytes;
+                for entry in WalkDir::new(index_dir).into_iter().filter_map(|e| e.ok()) {
+                    if entry.file_type().is_file()
+                        && entry.file_name().to_string_lossy().ends_with(METADATA_EXT)
+                    {
+                        if entry.file_name() == QUOTA_FILE {
+                            continue;
+                        }
+
+                        let version_key = entry.file_name().to_string_lossy().to_string();
+                        if !seen_versions.insert(version_key) {
+                            continue;
+                        }
+
+                        if let Ok(data) = std::fs::read(entry.path()) {
+                            if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
+                                if !meta.is_delete_marker {
+                                    current_disk_usage += meta.total_size_bytes;
+                                }
                             }
                         }
                     }

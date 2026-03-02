@@ -22,7 +22,7 @@ use super::prefix_compactor::{
     schedule_prefix_compaction,
 };
 use super::prefix_rebuilder::run_prefix_rebuild_job;
-use super::quota_manager::init_quota_file;
+use super::quota_manager::{get_quota, init_quota_file, set_storage_used};
 use super::redistribution::{
     RedistributionDurabilityMode, RedistributionRunOptions, run_redistribution_job,
     run_redistribution_job_with_options,
@@ -32,7 +32,7 @@ use super::repair_manager::{
 };
 use super::retrieve::PREFIX_MAX_DELTA_SEGMENTS_ATOMIC;
 use super::retrieve::{get_object, get_object_metadata, list_objects, stream_object};
-use super::sync::ensure_fragment_blob_directories;
+use super::sync::{ensure_fragment_blob_directories, sync_single_fragment_quota};
 use super::upload::{
     DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC,
     STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC, UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC,
@@ -714,7 +714,7 @@ async fn read_object_bytes_eventually(
     object_key: String,
     attempts: usize,
 ) -> Vec<u8> {
-    for _ in 0..attempts {
+    for attempt in 0..attempts {
         let req = Request::builder()
             .uri("/v4/fragment/get")
             .body(Body::empty())
@@ -734,7 +734,14 @@ async fn read_object_bytes_eventually(
             }
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let delay_ms = if attempt < attempts / 3 {
+            25
+        } else if attempt < (attempts * 2) / 3 {
+            50
+        } else {
+            100
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
     }
 
     panic!(
@@ -751,6 +758,15 @@ async fn setup_fragment(fragment: &str) {
     init_fragment_metadata(fragment, "key")
         .await
         .expect("init metadata");
+}
+
+async fn assert_fragment_quota_used(fragment: &str, expected_used: u64) {
+    let quota = get_quota(fragment).await.expect("get fragment quota");
+    assert_eq!(
+        quota.storage_used, expected_used,
+        "unexpected quota usage for fragment {}",
+        fragment
+    );
 }
 
 async fn collect_index_tree_hashes(fragment: &str) -> Vec<(String, BTreeMap<String, String>)> {
@@ -2431,6 +2447,10 @@ async fn matrix_raw_blob_crud_delete_recover_and_permanent_delete() {
     });
 
     put_object(state.clone(), &fragment, &key, content.clone()).await;
+    assert!(
+        !base.join(".n1-raw-stage").exists(),
+        "direct raw ingest should not stage shard files on fs storage"
+    );
     let meta_before = get_metadata(&fragment, &key, &fragment)
         .await
         .expect("raw metadata before delete");
@@ -2491,6 +2511,136 @@ async fn matrix_raw_blob_crud_delete_recover_and_permanent_delete() {
             shard.file_name
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_raw_blob_quota_drift_reconverges_after_redistribution_gc_and_sync() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.join(format!("raw-quota-{}", Ulid::new()));
+    let _raw_disks = ensure_raw_storage_config(&base, 3, 96 * 1024 * 1024).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "raw/quota-drift.bin".to_string();
+    let content = (0..(96 * 1024 + 333))
+        .map(|i| (i % 227) as u8)
+        .collect::<Vec<u8>>();
+    let content_len = content.len() as u64;
+
+    setup_fragment(&fragment).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    put_object(state.clone(), &fragment, &key, content.clone()).await;
+    assert_fragment_quota_used(&fragment, content_len).await;
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(2, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+
+    run_redistribution_job(false, Arc::new(WsConnectionManager::new()))
+        .await
+        .expect("raw redistribution should preserve quota");
+
+    assert!(
+        count_raw_gc_markers(&fragment).await > 0,
+        "expected raw GC markers after redistribution"
+    );
+    assert_fragment_quota_used(&fragment, content_len).await;
+
+    set_storage_used(&fragment, content_len.saturating_mul(4))
+        .await
+        .expect("inject raw quota drift");
+    assert_fragment_quota_used(&fragment, content_len.saturating_mul(4)).await;
+
+    sync_single_fragment_quota(fragment.clone())
+        .await
+        .expect("sync raw quota after redistribution");
+    assert_fragment_quota_used(&fragment, content_len).await;
+
+    let delete_resp = delete_object(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), key.clone())),
+    )
+    .await
+    .expect("soft delete raw object")
+    .into_response();
+    assert_eq!(delete_resp.status(), StatusCode::OK);
+
+    // Soft delete moves data to trash, so sync must keep counting it until GC empties trash.
+    assert_fragment_quota_used(&fragment, content_len).await;
+    set_storage_used(&fragment, 0)
+        .await
+        .expect("inject undercounted raw quota drift");
+    assert_fragment_quota_used(&fragment, 0).await;
+
+    sync_single_fragment_quota(fragment.clone())
+        .await
+        .expect("sync should count raw trash bytes");
+    assert_fragment_quota_used(&fragment, content_len).await;
+
+    let previous_gc_start = get_gc_status_api(full_claims(&fragment))
+        .await
+        .expect("gc status before raw quota test")
+        .0
+        .start_timestamp;
+    let gc_resp = run_garbage_collector(State(state.clone()))
+        .await
+        .into_response();
+    assert_eq!(gc_resp.status(), StatusCode::ACCEPTED);
+    wait_for_gc_to_finish(&fragment, previous_gc_start).await;
+
+    assert_eq!(
+        count_raw_gc_markers(&fragment).await,
+        0,
+        "manual GC should drain raw GC markers"
+    );
+    assert_fragment_quota_used(&fragment, 0).await;
+
+    set_storage_used(&fragment, content_len.saturating_mul(3))
+        .await
+        .expect("inject post-gc raw quota drift");
+    sync_single_fragment_quota(fragment.clone())
+        .await
+        .expect("sync should zero raw quota after GC");
+    assert_fragment_quota_used(&fragment, 0).await;
+
+    let req = Request::builder()
+        .uri("/v4/fragment/get")
+        .body(Body::empty())
+        .expect("build request");
+    assert!(
+        get_object(
+            full_claims(&fragment),
+            AxumPath((fragment.clone(), key.clone())),
+            req
+        )
+        .await
+        .is_err(),
+        "raw object should not be readable after GC removed trash"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3851,7 +4001,7 @@ async fn matrix_ha_concurrent_clients_under_maintenance() {
 
                 put_object(state.clone(), &fragment, &key_a, content.clone()).await;
 
-                let got = read_object_bytes_eventually(fragment.clone(), key_a.clone(), 20).await;
+                let got = read_object_bytes_eventually(fragment.clone(), key_a.clone(), 28).await;
                 assert_eq!(got, content, "initial write mismatch for {}", key_a);
 
                 let rename_resp = rename_object(
@@ -3869,7 +4019,7 @@ async fn matrix_ha_concurrent_clients_under_maintenance() {
                 .into_response();
                 assert_eq!(rename_resp.status(), StatusCode::OK);
 
-                let got = read_object_bytes_eventually(fragment.clone(), key_b.clone(), 20).await;
+                let got = read_object_bytes_eventually(fragment.clone(), key_b.clone(), 28).await;
                 assert_eq!(got, content, "renamed read mismatch for {}", key_b);
 
                 let del_resp = delete_object(

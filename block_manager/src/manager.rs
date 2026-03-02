@@ -7,13 +7,17 @@ use crate::device_io::{
 use crate::error::BlockManagerError;
 use crate::extent_map::{insert_and_merge_extent, remove_extent};
 use crate::types::{
-    AllocationHandle, DeviceHeader, Extent, FormatOptions, JournalOp, JournalRecord,
-    RawExtentAddress,
+    AllocationHandle, DeviceHeader, DirectExtentIo, Extent, FormatOptions, JournalOp,
+    JournalRecord, RawExtentAddress,
 };
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use uuid::Uuid;
+
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 
 pub struct BlockManager {
     path: PathBuf,
@@ -38,15 +42,18 @@ impl BlockManager {
             .write(true)
             .truncate(false)
             .open(&path)?;
+        let meta = file.metadata()?;
 
         let block_size = validate_block_size(options.block_size)?;
         let total_bytes = match options.total_bytes {
             Some(bytes) => {
-                file.set_len(bytes)?;
+                if should_resize_backing_store(&meta) {
+                    file.set_len(bytes)?;
+                }
                 bytes
             }
             None => {
-                let meta_len = file.metadata()?.len();
+                let meta_len = meta.len();
                 if meta_len == 0 {
                     return Err(BlockManagerError::InvalidArgument(
                         "format requires total_bytes for a new loopback file".to_string(),
@@ -271,6 +278,11 @@ impl BlockManager {
         Ok(())
     }
 
+    pub fn flush_data(&self) -> Result<(), BlockManagerError> {
+        self.direct_file.sync_all()?;
+        Ok(())
+    }
+
     pub fn raw_extent_address(
         &self,
         handle: AllocationHandle,
@@ -379,6 +391,18 @@ impl BlockManager {
         Ok(())
     }
 
+    pub fn direct_extent_io(
+        &self,
+        address: &RawExtentAddress,
+    ) -> Result<DirectExtentIo, BlockManagerError> {
+        let _extent = self.validate_raw_address(address)?;
+        Ok(DirectExtentIo {
+            file: Arc::new(self.direct_file.try_clone()?),
+            block_size: self.header.block_size,
+            address: address.clone(),
+        })
+    }
+
     pub fn free_address(&mut self, address: &RawExtentAddress) -> Result<(), BlockManagerError> {
         let _extent = self.validate_raw_address(address)?;
         self.free(address.allocation_id)
@@ -426,7 +450,8 @@ impl BlockManager {
 
         let buf = encode_record(record);
         write_all_at(&self.meta_file, &buf, offset)?;
-        self.meta_file.sync_data()?;
+        // Raw block devices can reject fdatasync even though fsync is valid.
+        self.meta_file.sync_all()?;
         self.journal_cursor = self.journal_cursor.saturating_add(1);
         Ok(())
     }
@@ -458,6 +483,48 @@ impl BlockManager {
         }
         Ok(())
     }
+}
+
+impl DirectExtentIo {
+    pub fn raw_address(&self) -> &RawExtentAddress {
+        &self.address
+    }
+
+    pub fn write(&self, offset: u64, data: &[u8]) -> Result<(), BlockManagerError> {
+        if offset.saturating_add(data.len() as u64) > self.address.size_bytes {
+            return Err(BlockManagerError::OutOfBounds {
+                allocation_id: self.address.allocation_id,
+                offset,
+                len: data.len(),
+                capacity: self.address.size_bytes,
+            });
+        }
+        write_all_at_direct(
+            self.file.as_ref(),
+            self.block_size,
+            self.address.offset_bytes.saturating_add(offset),
+            data,
+        )?;
+        Ok(())
+    }
+
+    pub fn flush_data(&self) -> Result<(), BlockManagerError> {
+        self.file.sync_all()?;
+        Ok(())
+    }
+}
+
+fn should_resize_backing_store(meta: &std::fs::Metadata) -> bool {
+    if meta.is_file() {
+        return true;
+    }
+
+    #[cfg(unix)]
+    if meta.file_type().is_block_device() {
+        return false;
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -499,6 +566,34 @@ mod tests {
 
         let reopened = BlockManager::open(&path).expect("reopen device");
         assert_eq!(reopened.header(), &header);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn format_resizes_regular_files() {
+        let path = temp_loopback("resize");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("create loopback file");
+        let meta = file.metadata().expect("stat loopback file");
+        assert!(should_resize_backing_store(&meta));
+        drop(file);
+
+        let mgr = BlockManager::format(
+            &path,
+            FormatOptions {
+                block_size: 4096,
+                journal_blocks: 16,
+                total_bytes: Some(4 * 1024 * 1024),
+            },
+        )
+        .expect("format loopback file");
+        assert_eq!(mgr.header().total_blocks * 4096, 4 * 1024 * 1024);
 
         let _ = fs::remove_file(path);
     }

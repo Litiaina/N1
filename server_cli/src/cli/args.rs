@@ -57,6 +57,12 @@ pub enum OpsCommands {
 #[derive(Subcommand, Debug, Clone)]
 pub enum Commands {
     Server,
+    FormatBlobDevice {
+        #[arg(long)]
+        path: String,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
     CreateFragment {
         #[arg(short, long)]
         name: String,

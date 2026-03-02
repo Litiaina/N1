@@ -1196,6 +1196,11 @@ pub async fn execute_command(
 
     match cmd {
         Commands::Server => {}
+        Commands::FormatBlobDevice { .. } => {
+            return Err(
+                "format-blob-device is a local command; run it directly on the N1 node".into(),
+            );
+        }
         Commands::CreateFragment { name, quota } => {
             info!("Creating fragment '{}' on {}...", name, base_url);
             let resp = client

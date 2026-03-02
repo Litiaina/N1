@@ -13,6 +13,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use tokio::fs as tokio_fs;
+use tracing::warn;
 
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
@@ -137,6 +138,67 @@ pub fn validate_configured_raw_blob_disks() -> Result<Vec<RawBlobDeviceStatus>, 
 
 pub fn raw_blob_device_statuses() -> Result<Vec<RawBlobDeviceStatus>, AppError> {
     validate_configured_raw_blob_disks()
+}
+
+pub fn format_raw_blob_device(path: &Path, force: bool) -> Result<RawBlobDeviceStatus, AppError> {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let inspection = inspect_raw_blob_device(&canonical, false)?;
+
+    if inspection.mounted {
+        return Err(AppError::BadRequest(format!(
+            "blob device {} is mounted at {}; raw blob disks must stay unmounted",
+            inspection.path.display(),
+            inspection.mount_points.join(", ")
+        )));
+    }
+
+    match inspection.state {
+        RawBlobDiskState::Unformatted => {}
+        RawBlobDiskState::Managed
+        | RawBlobDiskState::ForeignSignature
+        | RawBlobDiskState::DirtyUnknown
+            if force => {}
+        RawBlobDiskState::Managed => {
+            return Err(AppError::BadRequest(format!(
+                "blob device {} is already N1-formatted; rerun with --force to reinitialize it",
+                inspection.path.display()
+            )));
+        }
+        RawBlobDiskState::ForeignSignature => {
+            return Err(AppError::BadRequest(format!(
+                "blob device {} contains foreign on-disk data ({}); rerun with --force only if you intend to destroy it",
+                inspection.path.display(),
+                inspection
+                    .detected_signature
+                    .as_deref()
+                    .unwrap_or("unknown signature")
+            )));
+        }
+        RawBlobDiskState::DirtyUnknown => {
+            return Err(AppError::BadRequest(format!(
+                "blob device {} contains unknown non-zero data; rerun with --force only if you intend to destroy it",
+                inspection.path.display()
+            )));
+        }
+    }
+
+    RAW_MANAGER_CACHE
+        .lock()
+        .map_err(|_| AppError::InternalServerError("Raw manager cache lock poisoned".into()))?
+        .remove(&inspection.canonical_path);
+
+    BlockManager::format(
+        &inspection.canonical_path,
+        FormatOptions {
+            journal_blocks: recommended_raw_journal_blocks(inspection.total_bytes),
+            total_bytes: Some(inspection.total_bytes),
+            ..Default::default()
+        },
+    )
+    .map_err(block_manager_error_to_app)?;
+
+    let refreshed = inspect_raw_blob_device(&inspection.canonical_path, false)?;
+    Ok(status_from_inspection(refreshed))
 }
 
 pub fn resolve_blob_disk(disk_idx: usize) -> Result<BlobDiskHandle, AppError> {
@@ -565,7 +627,18 @@ fn open_or_format_raw_manager(path: &Path) -> Result<Arc<Mutex<BlockManager>>, A
     }
 
     let manager = match BlockManager::open(&inspection.canonical_path) {
-        Ok(mgr) => mgr,
+        Ok(mgr) => {
+            let recommended = recommended_raw_journal_blocks(inspection.total_bytes);
+            if mgr.header().journal_block_count < recommended {
+                warn!(
+                    "raw blob device {} was formatted with a small journal (current_blocks={}, recommended_blocks={}); high-part-count uploads can exhaust the allocation journal until the device is reinitialized",
+                    inspection.canonical_path.display(),
+                    mgr.header().journal_block_count,
+                    recommended
+                );
+            }
+            mgr
+        }
         Err(BlockManagerError::InvalidDevice(_)) => {
             if inspection.state != RawBlobDiskState::Unformatted {
                 return Err(raw_blob_validation_error(&inspection));
@@ -573,6 +646,7 @@ fn open_or_format_raw_manager(path: &Path) -> Result<Arc<Mutex<BlockManager>>, A
             BlockManager::format(
                 &inspection.canonical_path,
                 FormatOptions {
+                    journal_blocks: recommended_raw_journal_blocks(inspection.total_bytes),
                     total_bytes: Some(inspection.total_bytes),
                     ..Default::default()
                 },
@@ -588,6 +662,22 @@ fn open_or_format_raw_manager(path: &Path) -> Result<Arc<Mutex<BlockManager>>, A
         .map_err(|_| AppError::InternalServerError("Raw manager cache lock poisoned".into()))?
         .insert(inspection.canonical_path, manager.clone());
     Ok(manager)
+}
+
+fn recommended_raw_journal_blocks(total_bytes: u64) -> u64 {
+    const BLOCK_SIZE: u64 = 4096;
+    const MIN_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
+    const MAX_JOURNAL_BYTES: u64 = 256 * 1024 * 1024;
+
+    let target_bytes = (total_bytes / 32_768).clamp(MIN_JOURNAL_BYTES, MAX_JOURNAL_BYTES);
+    let mut blocks = target_bytes.div_ceil(BLOCK_SIZE).max(128);
+
+    let total_blocks = total_bytes / BLOCK_SIZE;
+    let hard_cap = total_blocks.saturating_sub(8).max(1);
+    if blocks > hard_cap {
+        blocks = hard_cap;
+    }
+    blocks
 }
 
 fn inspect_raw_blob_device(path: &Path, strict: bool) -> Result<RawBlobDiskInspection, AppError> {
@@ -1153,6 +1243,72 @@ mod tests {
         assert_eq!(status.direct_io, true);
         assert!(status.device_id.is_some());
         assert!(status.total_bytes.unwrap_or(0) > 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recommended_raw_journal_blocks_scales_for_large_devices() {
+        assert_eq!(recommended_raw_journal_blocks(4 * 1024 * 1024), 1016);
+        assert_eq!(
+            recommended_raw_journal_blocks(1 * 1024 * 1024 * 1024 * 1024),
+            8192
+        );
+        assert_eq!(
+            recommended_raw_journal_blocks(8 * 1024 * 1024 * 1024 * 1024),
+            65536
+        );
+    }
+
+    #[test]
+    fn format_raw_blob_device_initializes_unformatted_loopback() {
+        let path = temp_loopback("format-cli");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .expect("create loopback file");
+        file.set_len(64 * 1024 * 1024).expect("size loopback");
+        drop(file);
+
+        let status = format_raw_blob_device(&path, false).expect("format loopback");
+        assert_eq!(status.status, "managed");
+        assert!(status.device_id.is_some());
+        assert_eq!(
+            status.block_size_bytes,
+            Some(4096),
+            "raw formatter should keep 4 KiB block size"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn format_raw_blob_device_requires_force_for_dirty_unknown() {
+        let path = temp_loopback("format-force");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .expect("create loopback file");
+        file.set_len(4 * 1024 * 1024).expect("size loopback");
+        file.write_at(&[1, 2, 3, 4], 0).expect("dirty bytes");
+        file.sync_all().expect("sync dirty loopback");
+        drop(file);
+
+        let err = format_raw_blob_device(&path, false).expect_err("force required");
+        assert!(
+            err.to_string().contains("rerun with --force"),
+            "unexpected error: {}",
+            err
+        );
+
+        let status = format_raw_blob_device(&path, true).expect("forced format");
+        assert_eq!(status.status, "managed");
 
         let _ = std::fs::remove_file(path);
     }

@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::thread;
 
 use axum::Json as AxumJson;
 use axum::body::Body;
@@ -12,6 +13,7 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
+use block_manager::DirectExtentIo;
 use chrono::Utc;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
@@ -20,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
@@ -36,8 +38,8 @@ use std::os::windows::fs::OpenOptionsExt;
 
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::blob_store::{
-    BlobDiskHandle, commit_staged_raw_shard, configured_blob_disk_count, raw_blob_debug_path,
-    raw_stage_path_for_shard, resolve_blob_disk, stable_shard_file_name,
+    BlobDiskHandle, configured_blob_disk_count, free_raw_address, raw_blob_address_from_extent,
+    raw_blob_debug_path, resolve_blob_disk, stable_shard_file_name,
 };
 use crate::n1_core::constants::{PART_META_SUFFIX, RESERVATION_FILE, SESSION_MANIFEST_FILE};
 use crate::n1_core::disk_manager::{
@@ -59,6 +61,7 @@ pub static MAX_PART_SIZE_ATOMIC: OnceCell<AtomicU64> = OnceCell::new();
 pub static DATA_SHARDS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static PARITY_SHARDS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static WRITER_BUFFER_SIZE_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
+pub static RAW_WRITER_INFLIGHT_LIMIT_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static STRIPE_SIZE_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static MAX_IO_SEMAPHORE: OnceCell<usize> = OnceCell::new();
 pub static ADAPTIVE_IO_TARGET_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
@@ -337,6 +340,335 @@ impl AsyncWrite for DirectWriter {
     }
 }
 
+pub struct RawDirectWriter {
+    io: DirectExtentIo,
+    raw_blob_address: crate::n1_core::disk_manager::RawBlobAddress,
+    write_buffer: AlignedBuffer,
+    spare_buffers: Vec<AlignedBuffer>,
+    worker_tx: mpsc::Sender<RawWriteCommand>,
+    completion_rx: mpsc::UnboundedReceiver<RawWriteCompletion>,
+    write_buffer_size: usize,
+    inflight_limit: usize,
+    inflight_writes: usize,
+    write_error: Option<std::io::Error>,
+    next_offset: u64,
+}
+
+enum RawWriteCommand {
+    Write { offset: u64, buffer: AlignedBuffer },
+}
+
+enum RawWriteCompletion {
+    WriteOk(AlignedBuffer),
+    WriteErr(Option<AlignedBuffer>, std::io::Error),
+}
+
+impl RawDirectWriter {
+    pub fn new(io: DirectExtentIo, minimum_buffer_size: usize) -> Self {
+        let configured = WRITER_BUFFER_SIZE_ATOMIC
+            .get()
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(256 * 1024);
+        let aligned = ((configured
+            .max(minimum_buffer_size)
+            .max(1024 * 1024)
+            .max(4096)
+            + 4095)
+            / 4096)
+            * 4096;
+        let inflight_limit = RAW_WRITER_INFLIGHT_LIMIT_ATOMIC
+            .get()
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(4)
+            .clamp(2, 32);
+        let (worker_tx, mut worker_rx) = mpsc::channel::<RawWriteCommand>(inflight_limit);
+        let (completion_tx, completion_rx) = mpsc::unbounded_channel::<RawWriteCompletion>();
+        let worker_io = io.clone();
+        let completion_tx_for_thread = completion_tx.clone();
+        thread::Builder::new()
+            .name("n1-raw-writer".to_string())
+            .spawn(move || {
+                while let Some(command) = worker_rx.blocking_recv() {
+                    match command {
+                        RawWriteCommand::Write { offset, mut buffer } => {
+                            match worker_io.write(offset, buffer.as_slice()) {
+                                Ok(()) => {
+                                    buffer.clear();
+                                    let _ = completion_tx_for_thread
+                                        .send(RawWriteCompletion::WriteOk(buffer));
+                                }
+                                Err(e) => {
+                                    let _ = completion_tx_for_thread.send(
+                                        RawWriteCompletion::WriteErr(
+                                            Some(buffer),
+                                            std::io::Error::other(format!("block manager: {}", e)),
+                                        ),
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn raw writer thread");
+        let mut writer = Self {
+            raw_blob_address: raw_blob_address_from_extent(io.raw_address()),
+            io,
+            write_buffer: AlignedBuffer::new(aligned),
+            spare_buffers: Vec::new(),
+            worker_tx,
+            completion_rx,
+            write_buffer_size: aligned,
+            inflight_limit,
+            inflight_writes: 0,
+            write_error: None,
+            next_offset: 0,
+        };
+        writer.prefill_spare_buffers();
+        writer
+    }
+
+    fn clone_write_error(&self) -> Option<std::io::Error> {
+        self.write_error
+            .as_ref()
+            .map(|e| std::io::Error::new(e.kind(), e.to_string()))
+    }
+
+    fn poll_write_completions(&mut self, cx: &mut Context<'_>) -> Result<(), std::io::Error> {
+        if let Some(err) = self.clone_write_error() {
+            return Err(err);
+        }
+
+        loop {
+            match self.completion_rx.poll_recv(cx) {
+                Poll::Ready(Some(RawWriteCompletion::WriteOk(mut returned_buffer))) => {
+                    returned_buffer.clear();
+                    self.spare_buffers.push(returned_buffer);
+                    self.inflight_writes = self.inflight_writes.saturating_sub(1);
+                }
+                Poll::Ready(Some(RawWriteCompletion::WriteErr(returned_buffer, e))) => {
+                    if let Some(mut returned_buffer) = returned_buffer {
+                        returned_buffer.clear();
+                        self.spare_buffers.push(returned_buffer);
+                    }
+                    self.inflight_writes = 0;
+                    self.write_error = Some(e);
+                    return Err(self
+                        .clone_write_error()
+                        .expect("write error should be present"));
+                }
+                Poll::Ready(None) => break,
+                Poll::Pending => {
+                    break;
+                }
+            }
+        }
+
+        if let Some(err) = self.clone_write_error() {
+            Err(err)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn prefill_spare_buffers(&mut self) {
+        while self.spare_buffers.len() < self.inflight_limit {
+            self.spare_buffers
+                .push(AlignedBuffer::new(self.write_buffer_size));
+        }
+    }
+
+    fn acquire_spare_buffer(&mut self) -> AlignedBuffer {
+        self.spare_buffers
+            .pop()
+            .unwrap_or_else(|| AlignedBuffer::new(self.write_buffer_size))
+    }
+
+    fn try_submit_buffer_flush(&mut self) -> Result<bool, std::io::Error> {
+        if self.write_buffer.len() == 0 {
+            return Ok(true);
+        }
+        if self.inflight_writes >= self.inflight_limit {
+            return Ok(false);
+        }
+
+        let write_offset = self.next_offset;
+        let write_len = self.write_buffer.len() as u64;
+        let next_buffer = self.acquire_spare_buffer();
+        let to_write = std::mem::replace(&mut self.write_buffer, next_buffer);
+        match self.worker_tx.try_send(RawWriteCommand::Write {
+            offset: write_offset,
+            buffer: to_write,
+        }) {
+            Ok(()) => {
+                self.next_offset = self.next_offset.saturating_add(write_len);
+                self.inflight_writes = self.inflight_writes.saturating_add(1);
+                Ok(true)
+            }
+            Err(mpsc::error::TrySendError::Full(RawWriteCommand::Write { buffer, .. })) => {
+                let mut empty = std::mem::replace(&mut self.write_buffer, buffer);
+                empty.clear();
+                self.spare_buffers.push(empty);
+                Ok(false)
+            }
+            Err(mpsc::error::TrySendError::Closed(RawWriteCommand::Write { buffer, .. })) => {
+                let mut empty = std::mem::replace(&mut self.write_buffer, buffer);
+                empty.clear();
+                self.spare_buffers.push(empty);
+                let err = std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "raw writer worker channel closed",
+                );
+                self.write_error = Some(std::io::Error::new(err.kind(), err.to_string()));
+                Err(err)
+            }
+        }
+    }
+
+    fn consume_from_slice(&mut self, buf: &[u8]) -> usize {
+        let mut consumed = 0usize;
+
+        while consumed < buf.len() {
+            if self.write_buffer.len() == self.write_buffer.capacity() {
+                if self.inflight_writes >= self.inflight_limit {
+                    break;
+                }
+                match self.try_submit_buffer_flush() {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(e) => {
+                        self.write_error = Some(std::io::Error::new(e.kind(), e.to_string()));
+                        break;
+                    }
+                }
+            }
+
+            let remaining = self.write_buffer.capacity() - self.write_buffer.len();
+            if remaining == 0 {
+                break;
+            }
+
+            let to_copy = std::cmp::min(remaining, buf.len() - consumed);
+            self.write_buffer
+                .extend_from_slice(&buf[consumed..consumed + to_copy]);
+            consumed += to_copy;
+
+            if self.write_buffer.len() == self.write_buffer.capacity()
+                && self.inflight_writes < self.inflight_limit
+            {
+                if self.try_submit_buffer_flush().is_err() {
+                    break;
+                }
+            }
+        }
+
+        consumed
+    }
+
+    pub async fn sync_data(&self) -> Result<(), std::io::Error> {
+        let io = self.io.clone();
+        tokio::task::spawn_blocking(move || {
+            io.flush_data()
+                .map_err(|e| std::io::Error::other(format!("block manager: {}", e)))
+        })
+        .await?
+    }
+
+    pub fn raw_blob_address(&self) -> &crate::n1_core::disk_manager::RawBlobAddress {
+        &self.raw_blob_address
+    }
+}
+
+impl AsyncWrite for RawDirectWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        if let Err(e) = self.poll_write_completions(cx) {
+            return Poll::Ready(Err(e));
+        }
+
+        let consumed = self.consume_from_slice(buf);
+
+        if consumed == 0 && self.write_buffer.len() == self.write_buffer.capacity() {
+            match self.try_submit_buffer_flush() {
+                Ok(true) => {}
+                Ok(false) => {
+                    if self.inflight_writes >= self.inflight_limit {
+                        return Poll::Pending;
+                    }
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+            if self.inflight_writes >= self.inflight_limit {
+                return Poll::Pending;
+            }
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
+        if consumed < buf.len() {
+            cx.waker().wake_by_ref();
+        }
+
+        Poll::Ready(Ok(consumed))
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        if let Err(e) = self.poll_write_completions(cx) {
+            return Poll::Ready(Err(e));
+        }
+
+        if self.write_buffer.len() > 0 && self.inflight_writes < self.inflight_limit {
+            match self.try_submit_buffer_flush() {
+                Ok(true) => {}
+                Ok(false) => {}
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+
+        if self.write_buffer.len() == 0 && self.inflight_writes == 0 {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        self.as_mut().poll_flush(cx)
+    }
+}
+
+async fn cleanup_raw_addresses_best_effort(
+    addresses: &[crate::n1_core::disk_manager::RawBlobAddress],
+) {
+    let futs = addresses.iter().cloned().map(|raw| async move {
+        let _ = free_raw_address(&raw).await;
+    });
+    let _ = join_all(futs).await;
+}
+
+fn raw_addresses_from_writers(
+    writers: &[Option<RawDirectWriter>],
+) -> Vec<crate::n1_core::disk_manager::RawBlobAddress> {
+    writers
+        .iter()
+        .filter_map(|writer| {
+            writer
+                .as_ref()
+                .map(|writer| writer.raw_blob_address().clone())
+        })
+        .collect()
+}
+
 fn prefixes_for_key(object_key: &str) -> BTreeSet<String> {
     let key = ObjectPathManager::canonical_prefix(object_key);
     let mut out = BTreeSet::new();
@@ -525,13 +857,6 @@ async fn read_part_meta_any(
         }
     }
     None
-}
-
-async fn cleanup_files_best_effort(paths: &[PathBuf]) {
-    let futs = paths.iter().cloned().map(|p| async move {
-        let _ = tokio_fs::remove_file(&p).await;
-    });
-    let _ = join_all(futs).await;
 }
 
 async fn commit_part_meta_lockless(
@@ -1106,8 +1431,6 @@ pub async fn object_upload_part(
         return Ok((StatusCode::OK, "Part already uploaded").into_response());
     }
 
-    let attempt_id = Ulid::new().to_string();
-
     let fragment_arc = Arc::new(fragment);
     let version_id_arc = Arc::new(version_id);
     let path_manager = Arc::new(path_manager);
@@ -1123,11 +1446,10 @@ pub async fn object_upload_part(
         ));
     }
 
-    let mut writers: Vec<Option<DirectWriter>> = Vec::with_capacity(total_shards);
-
-    let mut tmp_paths: Vec<PathBuf> = Vec::with_capacity(total_shards);
+    let mut writers: Vec<Option<RawDirectWriter>> = Vec::with_capacity(total_shards);
     let mut stable_names: Vec<String> = Vec::with_capacity(total_shards);
-    let mut disk_indices: Vec<usize> = Vec::with_capacity(total_shards);
+    let mut allocated_raw_addrs = Vec::with_capacity(total_shards);
+    let mut disk_handles: HashMap<usize, BlobDiskHandle> = HashMap::new();
 
     let mut successful_opens = 0usize;
 
@@ -1136,52 +1458,62 @@ pub async fn object_upload_part(
         let stable_name = stable_shard_file_name(part_index, i, is_parity);
 
         let disk_idx = (part_index as usize + i) % num_disks;
-        let tmp_path = match resolve_blob_disk(disk_idx)? {
-            BlobDiskHandle::Raw { .. } => {
-                raw_stage_path_for_shard(
-                    disk_idx,
-                    fragment_arc.as_str(),
-                    version_id_arc.as_str(),
-                    attempt_id.as_str(),
-                    stable_name.as_str(),
-                )
-                .await?
-            }
+        let handle = if let Some(existing) = disk_handles.get(&disk_idx).cloned() {
+            existing
+        } else {
+            let resolved = resolve_blob_disk(disk_idx)?;
+            disk_handles.insert(disk_idx, resolved.clone());
+            resolved
         };
 
-        match create_direct_file(&tmp_path).await {
-            Ok(file) => {
-                if strict_durability {
-                    let file_clone = file
-                        .try_clone()
-                        .map_err(|e| AppError::Io(e, "clone file handle".into()))?;
-                    let prealloc_result =
-                        tokio::task::spawn_blocking(move || file_clone.set_len(final_shard_len))
-                            .await;
-
-                    if let Ok(Ok(_)) = prealloc_result {
-                        writers.push(Some(DirectWriter::new(file)));
-                        successful_opens += 1;
-                    } else {
-                        writers.push(None);
+        match handle {
+            BlobDiskHandle::Raw { manager, .. } => {
+                let address_result = {
+                    let mut mgr = manager.lock().map_err(|_| {
+                        AppError::InternalServerError("Raw blob manager lock poisoned".into())
+                    })?;
+                    let alloc = mgr.allocate_bytes(final_shard_len).map_err(|e| {
+                        AppError::InternalServerError(format!("block manager: {}", e))
+                    })?;
+                    match mgr.raw_extent_address(alloc, final_shard_len) {
+                        Ok(address) => match mgr.direct_extent_io(&address) {
+                            Ok(io) => Ok((address, io)),
+                            Err(e) => {
+                                let _ = mgr.free(alloc.allocation_id);
+                                Err(AppError::InternalServerError(format!(
+                                    "block manager: {}",
+                                    e
+                                )))
+                            }
+                        },
+                        Err(e) => {
+                            let _ = mgr.free(alloc.allocation_id);
+                            Err(AppError::InternalServerError(format!(
+                                "block manager: {}",
+                                e
+                            )))
+                        }
                     }
-                } else {
-                    writers.push(Some(DirectWriter::new(file)));
-                    successful_opens += 1;
-                }
-            }
-            Err(_) => {
-                writers.push(None);
+                };
+                let (address, io) = match address_result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        cleanup_raw_addresses_best_effort(&allocated_raw_addrs).await;
+                        return Err(e);
+                    }
+                };
+                let raw_addr = raw_blob_address_from_extent(&address);
+                allocated_raw_addrs.push(raw_addr.clone());
+                writers.push(Some(RawDirectWriter::new(io, block_size)));
+                successful_opens += 1;
             }
         }
 
-        tmp_paths.push(tmp_path);
         stable_names.push(stable_name);
-        disk_indices.push(disk_idx);
     }
 
     if successful_opens < data_shards {
-        cleanup_files_best_effort(&tmp_paths).await;
+        cleanup_raw_addresses_best_effort(&allocated_raw_addrs).await;
         return Err(AppError::InternalServerError(format!(
             "Insufficient healthy disks for write quorum. Need {}, got {}.",
             data_shards, successful_opens
@@ -1217,28 +1549,34 @@ pub async fn object_upload_part(
         total_bytes_read += chunk.len() as u64;
 
         if total_bytes_read > content_length {
-            cleanup_files_best_effort(&tmp_paths).await;
+            cleanup_raw_addresses_best_effort(&allocated_raw_addrs).await;
             return Err(AppError::BadRequest("Body exceeds Content-Length".into()));
         }
 
-        stream_writer.write(&chunk).await?;
+        if let Err(e) = stream_writer.write(&chunk).await {
+            cleanup_raw_addresses_best_effort(&allocated_raw_addrs).await;
+            return Err(e);
+        }
     }
 
     if total_bytes_read != content_length {
-        cleanup_files_best_effort(&tmp_paths).await;
+        cleanup_raw_addresses_best_effort(&allocated_raw_addrs).await;
         return Err(AppError::BadRequest(format!(
             "Incomplete body: got {} bytes, expected {}",
             total_bytes_read, content_length
         )));
     }
 
-    stream_writer.finalize().await?;
+    if let Err(e) = stream_writer.finalize().await {
+        cleanup_raw_addresses_best_effort(&allocated_raw_addrs).await;
+        return Err(e);
+    }
 
     if let Some(expected) = expected_checksum {
         let calculated = stream_writer.get_total_checksum();
         if let Some(calc_str) = calculated.as_ref() {
             if !expected.eq_ignore_ascii_case(calc_str) {
-                cleanup_files_best_effort(&tmp_paths).await;
+                cleanup_raw_addresses_best_effort(&allocated_raw_addrs).await;
                 return Ok((StatusCode::BAD_REQUEST, "Checksum mismatch").into_response());
             }
         }
@@ -1248,9 +1586,10 @@ pub async fn object_upload_part(
     let total_checksum = stream_writer.get_total_checksum();
     let writers = stream_writer.into_writers();
 
+    let raw_addresses = raw_addresses_from_writers(&writers);
     if strict_durability {
-        let sync_futs = writers.into_iter().filter_map(|w_opt| {
-            w_opt.map(|w| async move {
+        let sync_futs = writers.iter().filter_map(|w_opt| {
+            w_opt.as_ref().map(|w| async move {
                 if let Err(e) = w.sync_data().await {
                     warn!("Failed to fsync shard: {}", e);
                     return Err(AppError::Io(e, "fsync shard".into()));
@@ -1262,7 +1601,7 @@ pub async fn object_upload_part(
         let sync_results = join_all(sync_futs).await;
         for r in sync_results {
             if let Err(e) = r {
-                cleanup_files_best_effort(&tmp_paths).await;
+                cleanup_raw_addresses_best_effort(&raw_addresses).await;
                 return Err(e);
             }
         }
@@ -1271,9 +1610,7 @@ pub async fn object_upload_part(
     let mut shards_info = Vec::with_capacity(total_shards);
 
     for i in 0..total_shards {
-        let raw_addr =
-            commit_staged_raw_shard(disk_indices[i], tmp_paths[i].as_path(), final_shard_len)
-                .await?;
+        let raw_addr = raw_addresses[i].clone();
         shards_info.push(ShardInfo {
             shard_index: i,
             file_name: stable_names[i].clone(),
@@ -1300,7 +1637,7 @@ pub async fn object_upload_part(
     let meta_bytes = rmp_serde::to_vec(&part_meta)
         .map_err(|e| AppError::InternalServerError(format!("Serialize part meta: {}", e)))?;
 
-    let committed = commit_part_meta_lockless(
+    let committed = match commit_part_meta_lockless(
         &path_manager,
         &fragment_arc,
         &version_id_arc,
@@ -1308,9 +1645,17 @@ pub async fn object_upload_part(
         &meta_bytes,
         strict_durability,
     )
-    .await?;
+    .await
+    {
+        Ok(committed) => committed,
+        Err(e) => {
+            cleanup_raw_addresses_best_effort(&raw_addresses).await;
+            return Err(e);
+        }
+    };
 
     if !committed {
+        cleanup_raw_addresses_best_effort(&raw_addresses).await;
         return Ok((StatusCode::OK, "Part already uploaded").into_response());
     }
 

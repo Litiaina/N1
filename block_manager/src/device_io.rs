@@ -103,6 +103,13 @@ fn align_up(value: u64, align: u64) -> u64 {
     }
 }
 
+fn is_direct_compatible(block_size: u32, offset: u64, buf: &[u8]) -> bool {
+    let align = block_size as usize;
+    offset % u64::from(block_size) == 0
+        && buf.len() % align == 0
+        && (buf.as_ptr() as usize) % align == 0
+}
+
 pub(crate) fn read_exact_at_direct(
     file: &File,
     block_size: u32,
@@ -111,6 +118,9 @@ pub(crate) fn read_exact_at_direct(
 ) -> Result<(), BlockManagerError> {
     if buf.is_empty() {
         return Ok(());
+    }
+    if is_direct_compatible(block_size, offset, buf) {
+        return read_exact_at(file, buf, offset);
     }
     let align = u64::from(block_size);
     let aligned_offset = align_down(offset, align);
@@ -130,6 +140,9 @@ pub(crate) fn write_all_at_direct(
 ) -> Result<(), BlockManagerError> {
     if buf.is_empty() {
         return Ok(());
+    }
+    if is_direct_compatible(block_size, offset, buf) {
+        return write_all_at(file, buf, offset);
     }
     let align = u64::from(block_size);
     let aligned_offset = align_down(offset, align);
@@ -177,4 +190,21 @@ pub(crate) fn read_exact_at(
         read += n;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_direct_compatible;
+
+    #[test]
+    fn direct_compatibility_requires_offset_len_and_pointer_alignment() {
+        let mut aligned = vec![0u8; 8192 + 4096];
+        let ptr = aligned.as_mut_ptr() as usize;
+        let offset = (4096 - (ptr % 4096)) % 4096;
+        let aligned_slice = &aligned[offset..offset + 4096];
+        assert!(is_direct_compatible(4096, 0, aligned_slice));
+        assert!(!is_direct_compatible(4096, 512, aligned_slice));
+        assert!(!is_direct_compatible(4096, 0, &aligned_slice[..2048]));
+        assert!(!is_direct_compatible(4096, 0, &aligned_slice[1..]));
+    }
 }

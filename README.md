@@ -57,6 +57,15 @@
 For SMB network-drive deployment, see `NETWORK_DRIVE.md`.
 N1 ships with native SMB-lite via `fsgwd`, with `fsd_mount + Samba` kept as fallback.
 For raw blob device setup and operator steps, see `DEPLOYMENT.md`.
+For explicit raw blob initialization, use:
+
+```bash
+sudo target/release/litiaina-n1 format-blob-device --path /dev/disk/by-id/...
+```
+
+Profile note:
+- `profiles/n1/high-hw.ini` is for multi-disk, high-parallelism deployments.
+- `profiles/n1/single-raw-nvme.ini` is the better starting point for one raw Linux-owned NVMe blob device.
 
 ## What is N1 (current architecture)
 
@@ -759,6 +768,72 @@ scripts/bench/run_ha_chaos.sh
 ```
 
 All outputs are written under `.n1-bench/ha-chaos-<timestamp>/` by default.
+
+## Release drill harness
+
+For pre-release hardening on target hardware, use:
+
+`scripts/bench/run_release_drills.sh`
+
+It runs the release-critical raw/repair workflows:
+
+- raw blob CRUD + delete/recover/permanent delete
+- raw blob quota drift reconvergence across redistribution, trash, GC, and sync
+- raw blob redistribution + repair + recovered read + GC marker cleanup
+- index mirror repair convergence
+- HA repair reconvergence with an index disk down
+
+It also optionally chains into the nightly HA chaos harness.
+
+### Quick start
+
+```bash
+scripts/bench/run_release_drills.sh
+```
+
+### Harder gate on real hardware
+
+```bash
+RUNS=3 \
+RUN_CHAOS=1 \
+CHAOS_RUNS=5 \
+CHAOS_MAX_DURATION_SECS=900 \
+scripts/bench/run_release_drills.sh
+```
+
+Outputs are written under `.n1-bench/release-drills-<timestamp>/`.
+
+## Performance probes
+
+N1 also ships a wrapper for the ignored performance probes:
+
+`scripts/bench/run_perf_probes.sh`
+
+This runs:
+
+- `matrix_crud_cpu_ram_probe`
+- `matrix_upload_single_nvme_saturation_probe`
+- `matrix_stream_sequential_readahead_locality_probe`
+
+### Quick start
+
+```bash
+scripts/bench/run_perf_probes.sh
+```
+
+### Example tuned run
+
+```bash
+N1_CRUD_PROBE_ROUNDS=2 \
+N1_CRUD_PROBE_OBJECTS=1024 \
+N1_CRUD_PROBE_CONCURRENCY=24 \
+N1_UPLOAD_PROBE_CONCURRENCY=8 \
+N1_UPLOAD_PROBE_OBJECTS_PER_WORKER=4 \
+N1_STREAM_PROBE_PASSES=3 \
+scripts/bench/run_perf_probes.sh
+```
+
+Outputs are written under `.n1-bench/perf-probes-<timestamp>/`.
 
 ---
 

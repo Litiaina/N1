@@ -8,4 +8,6 @@ mod types;
 
 pub use error::BlockManagerError;
 pub use manager::BlockManager;
-pub use types::{AllocationHandle, DeviceHeader, Extent, FormatOptions, RawExtentAddress};
+pub use types::{
+    AllocationHandle, DeviceHeader, DirectExtentIo, Extent, FormatOptions, RawExtentAddress,
+};
