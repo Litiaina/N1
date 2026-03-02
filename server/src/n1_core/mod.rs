@@ -20,6 +20,7 @@ pub mod prefix_compactor;
 pub mod prefix_delimiter;
 pub mod prefix_rebuilder;
 pub mod quota_manager;
+pub mod raw_io_ring;
 pub mod recovery;
 pub mod redistribution;
 pub mod repair_manager;

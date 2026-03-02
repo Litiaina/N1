@@ -5,7 +5,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use std::thread;
 
 use axum::Json as AxumJson;
 use axum::body::Body;
@@ -22,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
@@ -53,6 +52,7 @@ use crate::n1_core::metadata_parser::get_metadata;
 use crate::n1_core::prefix_compactor::schedule_prefix_compaction;
 use crate::n1_core::prefix_delimiter::write_delimiter_delta;
 use crate::n1_core::quota_manager::{try_reserve_quota, update_quota};
+use crate::n1_core::raw_io_ring::{RawIoCompletion, RawIoRing, RawIoSubmitError};
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
@@ -342,25 +342,15 @@ impl AsyncWrite for DirectWriter {
 
 pub struct RawDirectWriter {
     io: DirectExtentIo,
+    ring: RawIoRing,
     raw_blob_address: crate::n1_core::disk_manager::RawBlobAddress,
     write_buffer: AlignedBuffer,
     spare_buffers: Vec<AlignedBuffer>,
-    worker_tx: mpsc::Sender<RawWriteCommand>,
-    completion_rx: mpsc::UnboundedReceiver<RawWriteCompletion>,
     write_buffer_size: usize,
     inflight_limit: usize,
     inflight_writes: usize,
     write_error: Option<std::io::Error>,
     next_offset: u64,
-}
-
-enum RawWriteCommand {
-    Write { offset: u64, buffer: AlignedBuffer },
-}
-
-enum RawWriteCompletion {
-    WriteOk(AlignedBuffer),
-    WriteErr(Option<AlignedBuffer>, std::io::Error),
 }
 
 impl RawDirectWriter {
@@ -381,44 +371,13 @@ impl RawDirectWriter {
             .map(|v| v.load(Ordering::Relaxed))
             .unwrap_or(4)
             .clamp(2, 32);
-        let (worker_tx, mut worker_rx) = mpsc::channel::<RawWriteCommand>(inflight_limit);
-        let (completion_tx, completion_rx) = mpsc::unbounded_channel::<RawWriteCompletion>();
-        let worker_io = io.clone();
-        let completion_tx_for_thread = completion_tx.clone();
-        thread::Builder::new()
-            .name("n1-raw-writer".to_string())
-            .spawn(move || {
-                while let Some(command) = worker_rx.blocking_recv() {
-                    match command {
-                        RawWriteCommand::Write { offset, mut buffer } => {
-                            match worker_io.write(offset, buffer.as_slice()) {
-                                Ok(()) => {
-                                    buffer.clear();
-                                    let _ = completion_tx_for_thread
-                                        .send(RawWriteCompletion::WriteOk(buffer));
-                                }
-                                Err(e) => {
-                                    let _ = completion_tx_for_thread.send(
-                                        RawWriteCompletion::WriteErr(
-                                            Some(buffer),
-                                            std::io::Error::other(format!("block manager: {}", e)),
-                                        ),
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            })
-            .expect("failed to spawn raw writer thread");
+        let ring = RawIoRing::new(io.clone(), inflight_limit);
         let mut writer = Self {
             raw_blob_address: raw_blob_address_from_extent(io.raw_address()),
             io,
+            ring,
             write_buffer: AlignedBuffer::new(aligned),
             spare_buffers: Vec::new(),
-            worker_tx,
-            completion_rx,
             write_buffer_size: aligned,
             inflight_limit,
             inflight_writes: 0,
@@ -427,6 +386,16 @@ impl RawDirectWriter {
         };
         writer.prefill_spare_buffers();
         writer
+    }
+
+    fn prefill_target(inflight_limit: usize) -> usize {
+        match inflight_limit {
+            0..=2 => 1,
+            3..=4 => 2,
+            5..=8 => 3,
+            9..=16 => 4,
+            _ => 6,
+        }
     }
 
     fn clone_write_error(&self) -> Option<std::io::Error> {
@@ -441,26 +410,48 @@ impl RawDirectWriter {
         }
 
         loop {
-            match self.completion_rx.poll_recv(cx) {
-                Poll::Ready(Some(RawWriteCompletion::WriteOk(mut returned_buffer))) => {
+            let mut completions = self.ring.poll_completions(cx).into_iter();
+            let Some(completion) = completions.next() else {
+                break;
+            };
+
+            match completion {
+                RawIoCompletion::WriteOk(mut returned_buffer) => {
                     returned_buffer.clear();
                     self.spare_buffers.push(returned_buffer);
                     self.inflight_writes = self.inflight_writes.saturating_sub(1);
                 }
-                Poll::Ready(Some(RawWriteCompletion::WriteErr(returned_buffer, e))) => {
+                RawIoCompletion::WriteErr(returned_buffer, e) => {
                     if let Some(mut returned_buffer) = returned_buffer {
                         returned_buffer.clear();
                         self.spare_buffers.push(returned_buffer);
                     }
-                    self.inflight_writes = 0;
+                    self.inflight_writes = self.inflight_writes.saturating_sub(1);
                     self.write_error = Some(e);
                     return Err(self
                         .clone_write_error()
                         .expect("write error should be present"));
                 }
-                Poll::Ready(None) => break,
-                Poll::Pending => {
-                    break;
+            }
+
+            for completion in completions {
+                match completion {
+                    RawIoCompletion::WriteOk(mut returned_buffer) => {
+                        returned_buffer.clear();
+                        self.spare_buffers.push(returned_buffer);
+                        self.inflight_writes = self.inflight_writes.saturating_sub(1);
+                    }
+                    RawIoCompletion::WriteErr(returned_buffer, e) => {
+                        if let Some(mut returned_buffer) = returned_buffer {
+                            returned_buffer.clear();
+                            self.spare_buffers.push(returned_buffer);
+                        }
+                        self.inflight_writes = self.inflight_writes.saturating_sub(1);
+                        self.write_error = Some(e);
+                        return Err(self
+                            .clone_write_error()
+                            .expect("write error should be present"));
+                    }
                 }
             }
         }
@@ -473,7 +464,8 @@ impl RawDirectWriter {
     }
 
     fn prefill_spare_buffers(&mut self) {
-        while self.spare_buffers.len() < self.inflight_limit {
+        let target = Self::prefill_target(self.inflight_limit).min(self.inflight_limit);
+        while self.spare_buffers.len() < target {
             self.spare_buffers
                 .push(AlignedBuffer::new(self.write_buffer_size));
         }
@@ -497,22 +489,19 @@ impl RawDirectWriter {
         let write_len = self.write_buffer.len() as u64;
         let next_buffer = self.acquire_spare_buffer();
         let to_write = std::mem::replace(&mut self.write_buffer, next_buffer);
-        match self.worker_tx.try_send(RawWriteCommand::Write {
-            offset: write_offset,
-            buffer: to_write,
-        }) {
+        match self.ring.submit_write(write_offset, to_write) {
             Ok(()) => {
                 self.next_offset = self.next_offset.saturating_add(write_len);
                 self.inflight_writes = self.inflight_writes.saturating_add(1);
                 Ok(true)
             }
-            Err(mpsc::error::TrySendError::Full(RawWriteCommand::Write { buffer, .. })) => {
+            Err(RawIoSubmitError::Full(buffer)) => {
                 let mut empty = std::mem::replace(&mut self.write_buffer, buffer);
                 empty.clear();
                 self.spare_buffers.push(empty);
                 Ok(false)
             }
-            Err(mpsc::error::TrySendError::Closed(RawWriteCommand::Write { buffer, .. })) => {
+            Err(RawIoSubmitError::Closed(buffer)) => {
                 let mut empty = std::mem::replace(&mut self.write_buffer, buffer);
                 empty.clear();
                 self.spare_buffers.push(empty);

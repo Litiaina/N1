@@ -187,8 +187,9 @@ fn adaptive_raw_writer_inflight_limit(
     if blob_disks <= 1 {
         limit = limit.min(match ram {
             0..=8 => 4,
-            9..=16 => 8,
-            17..=32 => 12,
+            9..=16 => 6,
+            17..=32 => 8,
+            33..=64 => 12,
             _ => 16,
         });
     } else if blob_disks == 2 {
@@ -462,14 +463,14 @@ mod tests {
             1024 * 1024,
             1,
         );
-        assert!(limit >= 12);
+        assert!(limit >= 8);
     }
 
     #[test]
     fn raw_writer_inflight_limit_goes_deeper_on_large_single_disk_nodes() {
         let limit = adaptive_raw_writer_inflight_limit(
             24,
-            Some(64 * 1024 * 1024 * 1024),
+            Some(128 * 1024 * 1024 * 1024),
             1,
             128,
             1024 * 1024,
