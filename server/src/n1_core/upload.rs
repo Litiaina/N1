@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
+use std::future::poll_fn;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -47,7 +48,10 @@ use crate::n1_core::disk_manager::{
     ReservationReceipt, ShardInfo, UploadPartQuery, UploadStatusResponse,
     configured_fs_storage_root, default_stripe_size,
 };
-use crate::n1_core::ec::{AlignedBuffer, ErasureStreamWriter};
+use crate::n1_core::ec::{
+    AlignedBuffer, RawErasureStreamWriter, recycle_pooled_aligned_buffer,
+    take_pooled_aligned_buffer,
+};
 use crate::n1_core::metadata_parser::get_metadata;
 use crate::n1_core::prefix_compactor::schedule_prefix_compaction;
 use crate::n1_core::prefix_delimiter::write_delimiter_delta;
@@ -344,9 +348,8 @@ pub struct RawDirectWriter {
     io: DirectExtentIo,
     ring: RawIoRing,
     raw_blob_address: crate::n1_core::disk_manager::RawBlobAddress,
-    write_buffer: AlignedBuffer,
-    spare_buffers: Vec<AlignedBuffer>,
-    write_buffer_size: usize,
+    block_size: usize,
+    reusable_buffers: Vec<AlignedBuffer>,
     inflight_limit: usize,
     inflight_writes: usize,
     write_error: Option<std::io::Error>,
@@ -354,18 +357,8 @@ pub struct RawDirectWriter {
 }
 
 impl RawDirectWriter {
-    pub fn new(io: DirectExtentIo, minimum_buffer_size: usize) -> Self {
-        let configured = WRITER_BUFFER_SIZE_ATOMIC
-            .get()
-            .map(|v| v.load(Ordering::Relaxed))
-            .unwrap_or(256 * 1024);
-        let aligned = ((configured
-            .max(minimum_buffer_size)
-            .max(1024 * 1024)
-            .max(4096)
-            + 4095)
-            / 4096)
-            * 4096;
+    pub fn new(io: DirectExtentIo, block_size: usize) -> Self {
+        let aligned = ((block_size.max(4096) + 4095) / 4096) * 4096;
         let inflight_limit = RAW_WRITER_INFLIGHT_LIMIT_ATOMIC
             .get()
             .map(|v| v.load(Ordering::Relaxed))
@@ -376,25 +369,22 @@ impl RawDirectWriter {
             raw_blob_address: raw_blob_address_from_extent(io.raw_address()),
             io,
             ring,
-            write_buffer: AlignedBuffer::new(aligned),
-            spare_buffers: Vec::new(),
-            write_buffer_size: aligned,
+            block_size: aligned,
+            reusable_buffers: Vec::new(),
             inflight_limit,
             inflight_writes: 0,
             write_error: None,
             next_offset: 0,
         };
-        writer.prefill_spare_buffers();
+        writer.prefill_reusable_buffers();
         writer
     }
 
     fn prefill_target(inflight_limit: usize) -> usize {
         match inflight_limit {
-            0..=2 => 1,
-            3..=4 => 2,
-            5..=8 => 3,
-            9..=16 => 4,
-            _ => 6,
+            0..=8 => 1,
+            9..=16 => 2,
+            _ => 2,
         }
     }
 
@@ -404,54 +394,31 @@ impl RawDirectWriter {
             .map(|e| std::io::Error::new(e.kind(), e.to_string()))
     }
 
-    fn poll_write_completions(&mut self, cx: &mut Context<'_>) -> Result<(), std::io::Error> {
-        if let Some(err) = self.clone_write_error() {
-            return Err(err);
-        }
-
-        loop {
-            let mut completions = self.ring.poll_completions(cx).into_iter();
-            let Some(completion) = completions.next() else {
-                break;
-            };
-
+    fn handle_write_completions<I>(&mut self, completions: I) -> Result<(), std::io::Error>
+    where
+        I: IntoIterator<Item = RawIoCompletion>,
+    {
+        for completion in completions {
             match completion {
                 RawIoCompletion::WriteOk(mut returned_buffer) => {
                     returned_buffer.clear();
-                    self.spare_buffers.push(returned_buffer);
+                    if returned_buffer.capacity() == self.block_size {
+                        self.reusable_buffers.push(returned_buffer);
+                    }
                     self.inflight_writes = self.inflight_writes.saturating_sub(1);
                 }
                 RawIoCompletion::WriteErr(returned_buffer, e) => {
                     if let Some(mut returned_buffer) = returned_buffer {
                         returned_buffer.clear();
-                        self.spare_buffers.push(returned_buffer);
+                        if returned_buffer.capacity() == self.block_size {
+                            self.reusable_buffers.push(returned_buffer);
+                        }
                     }
                     self.inflight_writes = self.inflight_writes.saturating_sub(1);
                     self.write_error = Some(e);
                     return Err(self
                         .clone_write_error()
                         .expect("write error should be present"));
-                }
-            }
-
-            for completion in completions {
-                match completion {
-                    RawIoCompletion::WriteOk(mut returned_buffer) => {
-                        returned_buffer.clear();
-                        self.spare_buffers.push(returned_buffer);
-                        self.inflight_writes = self.inflight_writes.saturating_sub(1);
-                    }
-                    RawIoCompletion::WriteErr(returned_buffer, e) => {
-                        if let Some(mut returned_buffer) = returned_buffer {
-                            returned_buffer.clear();
-                            self.spare_buffers.push(returned_buffer);
-                        }
-                        self.inflight_writes = self.inflight_writes.saturating_sub(1);
-                        self.write_error = Some(e);
-                        return Err(self
-                            .clone_write_error()
-                            .expect("write error should be present"));
-                    }
                 }
             }
         }
@@ -463,96 +430,115 @@ impl RawDirectWriter {
         }
     }
 
-    fn prefill_spare_buffers(&mut self) {
+    fn poll_write_completions(&mut self, cx: &mut Context<'_>) -> Result<(), std::io::Error> {
+        if let Some(err) = self.clone_write_error() {
+            return Err(err);
+        }
+        self.handle_write_completions(self.ring.poll_completions(cx))
+    }
+
+    fn reclaim_write_completions_now(&mut self) -> Result<(), std::io::Error> {
+        self.handle_write_completions(self.ring.take_completions_now())
+    }
+
+    fn prefill_reusable_buffers(&mut self) {
         let target = Self::prefill_target(self.inflight_limit).min(self.inflight_limit);
-        while self.spare_buffers.len() < target {
-            self.spare_buffers
-                .push(AlignedBuffer::new(self.write_buffer_size));
+        while self.reusable_buffers.len() < target {
+            self.reusable_buffers
+                .push(take_pooled_aligned_buffer(self.block_size));
         }
     }
 
-    fn acquire_spare_buffer(&mut self) -> AlignedBuffer {
-        self.spare_buffers
+    pub fn acquire_block_buffer(&mut self) -> Result<AlignedBuffer, std::io::Error> {
+        self.reclaim_write_completions_now()?;
+        Ok(self
+            .reusable_buffers
             .pop()
-            .unwrap_or_else(|| AlignedBuffer::new(self.write_buffer_size))
+            .unwrap_or_else(|| take_pooled_aligned_buffer(self.block_size)))
     }
 
-    fn try_submit_buffer_flush(&mut self) -> Result<bool, std::io::Error> {
-        if self.write_buffer.len() == 0 {
-            return Ok(true);
-        }
-        if self.inflight_writes >= self.inflight_limit {
-            return Ok(false);
-        }
-
+    fn try_submit_owned_buffer(&mut self, buffer: AlignedBuffer) -> Result<(), RawIoSubmitError> {
         let write_offset = self.next_offset;
-        let write_len = self.write_buffer.len() as u64;
-        let next_buffer = self.acquire_spare_buffer();
-        let to_write = std::mem::replace(&mut self.write_buffer, next_buffer);
-        match self.ring.submit_write(write_offset, to_write) {
+        let write_len = buffer.len() as u64;
+        match self.ring.submit_write(write_offset, buffer) {
             Ok(()) => {
                 self.next_offset = self.next_offset.saturating_add(write_len);
                 self.inflight_writes = self.inflight_writes.saturating_add(1);
-                Ok(true)
+                Ok(())
             }
-            Err(RawIoSubmitError::Full(buffer)) => {
-                let mut empty = std::mem::replace(&mut self.write_buffer, buffer);
-                empty.clear();
-                self.spare_buffers.push(empty);
-                Ok(false)
-            }
-            Err(RawIoSubmitError::Closed(buffer)) => {
-                let mut empty = std::mem::replace(&mut self.write_buffer, buffer);
-                empty.clear();
-                self.spare_buffers.push(empty);
-                let err = std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "raw writer worker channel closed",
-                );
-                self.write_error = Some(std::io::Error::new(err.kind(), err.to_string()));
-                Err(err)
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn wait_for_capacity(&mut self) -> Result<(), std::io::Error> {
+        self.reclaim_write_completions_now()?;
+        if self.inflight_writes < self.inflight_limit {
+            return Ok(());
+        }
+
+        poll_fn(|cx| match self.poll_write_completions(cx) {
+            Ok(()) if self.inflight_writes < self.inflight_limit => Poll::Ready(Ok(())),
+            Ok(()) => Poll::Pending,
+            Err(e) => Poll::Ready(Err(e)),
+        })
+        .await
+    }
+
+    pub async fn write_aligned_block(
+        &mut self,
+        mut buffer: AlignedBuffer,
+    ) -> Result<(), std::io::Error> {
+        if buffer.len() == 0 {
+            return Ok(());
+        }
+        if buffer.len() != self.block_size || buffer.capacity() != self.block_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "raw writer requires full aligned blocks of {} bytes (got len={} capacity={})",
+                    self.block_size,
+                    buffer.len(),
+                    buffer.capacity()
+                ),
+            ));
+        }
+
+        if let Some(err) = self.clone_write_error() {
+            return Err(err);
+        }
+
+        loop {
+            self.wait_for_capacity().await?;
+            match self.try_submit_owned_buffer(buffer) {
+                Ok(()) => return Ok(()),
+                Err(RawIoSubmitError::Full(returned_buffer)) => {
+                    buffer = returned_buffer;
+                }
+                Err(RawIoSubmitError::Closed(returned_buffer)) => {
+                    drop(returned_buffer);
+                    let err = std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "raw writer worker channel closed",
+                    );
+                    self.write_error = Some(std::io::Error::new(err.kind(), err.to_string()));
+                    return Err(err);
+                }
             }
         }
     }
 
-    fn consume_from_slice(&mut self, buf: &[u8]) -> usize {
-        let mut consumed = 0usize;
-
-        while consumed < buf.len() {
-            if self.write_buffer.len() == self.write_buffer.capacity() {
-                if self.inflight_writes >= self.inflight_limit {
-                    break;
-                }
-                match self.try_submit_buffer_flush() {
-                    Ok(true) => {}
-                    Ok(false) => break,
-                    Err(e) => {
-                        self.write_error = Some(std::io::Error::new(e.kind(), e.to_string()));
-                        break;
-                    }
-                }
-            }
-
-            let remaining = self.write_buffer.capacity() - self.write_buffer.len();
-            if remaining == 0 {
-                break;
-            }
-
-            let to_copy = std::cmp::min(remaining, buf.len() - consumed);
-            self.write_buffer
-                .extend_from_slice(&buf[consumed..consumed + to_copy]);
-            consumed += to_copy;
-
-            if self.write_buffer.len() == self.write_buffer.capacity()
-                && self.inflight_writes < self.inflight_limit
-            {
-                if self.try_submit_buffer_flush().is_err() {
-                    break;
-                }
-            }
+    pub async fn flush(&mut self) -> Result<(), std::io::Error> {
+        self.reclaim_write_completions_now()?;
+        if self.inflight_writes == 0 {
+            return Ok(());
         }
 
-        consumed
+        poll_fn(|cx| match self.poll_write_completions(cx) {
+            Ok(()) if self.inflight_writes == 0 => Poll::Ready(Ok(())),
+            Ok(()) => Poll::Pending,
+            Err(e) => Poll::Ready(Err(e)),
+        })
+        .await
     }
 
     pub async fn sync_data(&self) -> Result<(), std::io::Error> {
@@ -569,70 +555,12 @@ impl RawDirectWriter {
     }
 }
 
-impl AsyncWrite for RawDirectWriter {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        if let Err(e) = self.poll_write_completions(cx) {
-            return Poll::Ready(Err(e));
+impl Drop for RawDirectWriter {
+    fn drop(&mut self) {
+        let _ = self.reclaim_write_completions_now();
+        for buffer in self.reusable_buffers.drain(..) {
+            recycle_pooled_aligned_buffer(buffer);
         }
-
-        let consumed = self.consume_from_slice(buf);
-
-        if consumed == 0 && self.write_buffer.len() == self.write_buffer.capacity() {
-            match self.try_submit_buffer_flush() {
-                Ok(true) => {}
-                Ok(false) => {
-                    if self.inflight_writes >= self.inflight_limit {
-                        return Poll::Pending;
-                    }
-                }
-                Err(e) => return Poll::Ready(Err(e)),
-            }
-            if self.inflight_writes >= self.inflight_limit {
-                return Poll::Pending;
-            }
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-
-        if consumed < buf.len() {
-            cx.waker().wake_by_ref();
-        }
-
-        Poll::Ready(Ok(consumed))
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        if let Err(e) = self.poll_write_completions(cx) {
-            return Poll::Ready(Err(e));
-        }
-
-        if self.write_buffer.len() > 0 && self.inflight_writes < self.inflight_limit {
-            match self.try_submit_buffer_flush() {
-                Ok(true) => {}
-                Ok(false) => {}
-                Err(e) => return Poll::Ready(Err(e)),
-            }
-        }
-
-        if self.write_buffer.len() == 0 && self.inflight_writes == 0 {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
-        }
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        self.as_mut().poll_flush(cx)
     }
 }
 
@@ -1511,7 +1439,7 @@ pub async fn object_upload_part(
 
     let calc_total_checksum = expected_checksum.is_some();
 
-    let mut stream_writer = ErasureStreamWriter::new(
+    let mut stream_writer = RawErasureStreamWriter::new(
         writers,
         data_shards,
         parity_shards,

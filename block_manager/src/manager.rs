@@ -490,6 +490,26 @@ impl DirectExtentIo {
         &self.address
     }
 
+    pub fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>, BlockManagerError> {
+        if offset.saturating_add(len as u64) > self.address.size_bytes {
+            return Err(BlockManagerError::OutOfBounds {
+                allocation_id: self.address.allocation_id,
+                offset,
+                len,
+                capacity: self.address.size_bytes,
+            });
+        }
+
+        let mut out = vec![0u8; len];
+        read_exact_at_direct(
+            self.file.as_ref(),
+            self.block_size,
+            self.address.offset_bytes.saturating_add(offset),
+            &mut out,
+        )?;
+        Ok(out)
+    }
+
     pub fn write(&self, offset: u64, data: &[u8]) -> Result<(), BlockManagerError> {
         if offset.saturating_add(data.len() as u64) > self.address.size_bytes {
             return Err(BlockManagerError::OutOfBounds {

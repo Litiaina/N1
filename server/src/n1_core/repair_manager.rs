@@ -11,7 +11,7 @@ use crate::n1_core::disk_manager::{
 };
 use crate::n1_core::operation_gate::acquire_read_only_fast_mode;
 use crate::n1_core::prefix_rebuilder::run_prefix_rebuild_job;
-use crate::n1_core::recovery::{repair_entire_shard, verify_shard_integrity};
+use crate::n1_core::recovery::{ShardRepairContext, repair_entire_shard, verify_shard_integrity};
 use crate::n1_core::upload::UploadSessionManifest;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -1134,6 +1134,7 @@ async fn process_object_repair(
     num_disks: usize,
     cfg: RepairRunConfig,
     shard_repair_sem: Arc<Semaphore>,
+    repair_context: ShardRepairContext,
 ) -> Result<(usize, usize, Option<String>), AppError> {
     if meta.parts.is_empty() || num_disks == 0 {
         return Ok((0, 0, None));
@@ -1168,15 +1169,25 @@ async fn process_object_repair(
 
             if shard.raw_blob_address.is_some() {
                 if cfg.check_mode == RepairCheckMode::Availability {
-                    healthy = shard
-                        .raw_blob_address
-                        .as_ref()
-                        .map(|raw| raw.size_bytes == shard.size_bytes)
-                        .unwrap_or(false);
+                    healthy = match shard.raw_blob_address.as_ref() {
+                        Some(raw) if raw.size_bytes == shard.size_bytes => {
+                            match raw_blob_address_exists(raw).await {
+                                Ok(exists) => exists,
+                                Err(err) => {
+                                    warn!(
+                                        "Raw shard unavailable in availability mode: {} ({})",
+                                        shard.absolute_path, err
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                        _ => false,
+                    };
                     if !healthy {
                         corrupt_found += 1;
                         warn!(
-                            "Size mismatch raw shard (availability): {}",
+                            "Unavailable raw shard (availability): {}",
                             shard.absolute_path
                         );
                     }
@@ -1225,12 +1236,14 @@ async fn process_object_repair(
                 let part_for_task = part_arc.clone();
                 let sem = shard_repair_sem.clone();
                 let stripe = meta_arc.stripe_size_bytes;
+                let repair_context = repair_context.clone();
 
                 async move {
                     let _permit = sem.acquire().await.map_err(|_| {
                         AppError::InternalServerError("Repair semaphore closed".into())
                     })?;
-                    repair_entire_shard(part_for_task, missing_idx, stripe).await
+                    repair_entire_shard(part_for_task, missing_idx, stripe, Some(repair_context))
+                        .await
                 }
             })
             .buffer_unordered(cfg.shard_repair_concurrency);
@@ -1275,6 +1288,11 @@ fn should_scan_object_metadata_file(path: &Path) -> bool {
     }
 
     true
+}
+
+fn metadata_path_is_trash(path: &Path) -> bool {
+    let p = path.to_string_lossy();
+    p.contains("/.trash/") || p.contains("\\.trash\\")
 }
 
 #[cfg(test)]
@@ -1738,12 +1756,20 @@ async fn process_one_meta_path(
         return Ok(delta);
     }
 
+    let repair_context = ShardRepairContext::new(
+        canonical_meta.fragment.clone(),
+        canonical_meta.object_key.clone(),
+        canonical_meta.version_id.clone(),
+        metadata_path_is_trash(&meta_path),
+    );
+
     let (repaired, corrupt, last_rep) = process_object_repair(
         canonical_meta,
         &blob_roots,
         num_disks,
         cfg,
         shard_repair_sem,
+        repair_context,
     )
     .await?;
 

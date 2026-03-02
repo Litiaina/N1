@@ -2,7 +2,7 @@ use crate::enums::app_error_enum::AppError;
 use crate::n1_core::disk_manager::{ChunkQuery, ObjectKeyQuery, ObjectPathManager, ShardInfo};
 use crate::n1_core::metadata_parser::{get_metadata, get_version_metadata};
 use crate::n1_core::object_parser::stream_object_logic;
-use crate::n1_core::recovery::{ShardFileCache, read_or_recover_chunk};
+use crate::n1_core::recovery::{ShardFileCache, ShardRepairContext, read_or_recover_chunk};
 use crate::structs::auth_structs::Claims;
 use axum::body::Body;
 use axum::extract::{Path, Query};
@@ -65,6 +65,12 @@ pub async fn download_object_chunk(
     }
 
     let stripe_block_size = metadata.stripe_size_bytes;
+    let repair_context = ShardRepairContext::new(
+        metadata.fragment.clone(),
+        metadata.object_key.clone(),
+        metadata.version_id.clone(),
+        false,
+    );
     let mut result_buffer = Vec::with_capacity(params.chunk_size);
     let mut current_global_pos = 0u64;
     let mut checksum_header: Option<&str> = None;
@@ -142,6 +148,7 @@ pub async fn download_object_chunk(
                     file_offset,
                     chunk_len,
                     stripe_block_size,
+                    Some(repair_context.clone()),
                 )
                 .await?;
 

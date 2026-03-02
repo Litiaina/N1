@@ -69,7 +69,11 @@ impl RawIoRing {
             workers.push(handle);
         }
 
-        Self { submissions, completions, workers }
+        Self {
+            submissions,
+            completions,
+            workers,
+        }
     }
 
     pub(crate) fn submit_write(
@@ -90,19 +94,12 @@ impl RawIoRing {
         Ok(())
     }
 
-    pub(crate) fn poll_completions(
-        &self,
-        cx: &std::task::Context<'_>,
-    ) -> Vec<RawIoCompletion> {
-        let completions = self.take_completions();
-        if !completions.is_empty() {
-            return completions;
-        }
-
+    pub(crate) fn poll_completions(&self, cx: &std::task::Context<'_>) -> Vec<RawIoCompletion> {
         self.completions.waker.register(cx.waker());
-        self.take_completions()
+        self.take_completions_now()
     }
-    fn take_completions(&self) -> Vec<RawIoCompletion> {
+
+    pub(crate) fn take_completions_now(&self) -> Vec<RawIoCompletion> {
         let mut queue = self
             .completions
             .queue
@@ -209,10 +206,9 @@ fn fail_ring(
 
 fn worker_count_for_depth(queue_depth: usize) -> usize {
     match queue_depth {
-        0..=4 => 1,
-        5..=8 => 2,
-        9..=16 => 3,
-        _ => 4,
+        0..=8 => 1,
+        9..=16 => 2,
+        _ => 3,
     }
 }
 
@@ -223,8 +219,8 @@ mod tests {
     #[test]
     fn worker_count_scales_with_depth_but_stays_bounded() {
         assert_eq!(worker_count_for_depth(4), 1);
-        assert_eq!(worker_count_for_depth(8), 2);
-        assert_eq!(worker_count_for_depth(16), 3);
-        assert_eq!(worker_count_for_depth(32), 4);
+        assert_eq!(worker_count_for_depth(8), 1);
+        assert_eq!(worker_count_for_depth(16), 2);
+        assert_eq!(worker_count_for_depth(32), 3);
     }
 }

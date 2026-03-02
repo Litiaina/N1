@@ -1,5 +1,5 @@
 use super::archive::download_selected_archive;
-use super::blob_store::{read_shard_range, verify_shard_checksum, write_shard_range};
+use super::blob_store::{open_raw_direct_io, verify_shard_checksum, write_shard_range};
 use super::constants::{PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_SEGMENT_EXT};
 use super::delete::delete_object;
 use super::delete::{
@@ -23,6 +23,7 @@ use super::prefix_compactor::{
 };
 use super::prefix_rebuilder::run_prefix_rebuild_job;
 use super::quota_manager::{get_quota, init_quota_file, set_storage_used};
+use super::recovery::{RAW_VERIFY_ON_READ_ATOMIC, ShardRepairContext, repair_entire_shard};
 use super::redistribution::{
     RedistributionDurabilityMode, RedistributionRunOptions, run_redistribution_job,
     run_redistribution_job_with_options,
@@ -219,6 +220,16 @@ fn ensure_upload_runtime_config() {
             .get()
             .expect("STRIPE_SIZE_ATOMIC")
             .store(4096, Ordering::Relaxed);
+    }
+    if RAW_VERIFY_ON_READ_ATOMIC.get().is_none() {
+        RAW_VERIFY_ON_READ_ATOMIC
+            .set(AtomicBool::new(true))
+            .expect("set RAW_VERIFY_ON_READ_ATOMIC");
+    } else {
+        RAW_VERIFY_ON_READ_ATOMIC
+            .get()
+            .expect("RAW_VERIFY_ON_READ_ATOMIC")
+            .store(true, Ordering::Relaxed);
     }
     if STREAM_MAX_CONCURRENCY.get().is_none() {
         STREAM_MAX_CONCURRENCY
@@ -2506,7 +2517,7 @@ async fn matrix_raw_blob_crud_delete_recover_and_permanent_delete() {
 
     for shard in meta_before.parts.iter().flat_map(|part| part.shards.iter()) {
         assert!(
-            read_shard_range(shard, 0, 1).await.is_err(),
+            open_raw_direct_io(shard).is_err(),
             "raw extent should be freed after permanent delete: {}",
             shard.file_name
         );
@@ -3250,6 +3261,503 @@ async fn matrix_raw_blob_redistribution_repair_recovered_read_and_gc_markers() {
     assert_eq!(gc_resp.status(), StatusCode::ACCEPTED);
     wait_for_gc_to_finish(&fragment, previous_gc_start).await;
     assert_eq!(count_raw_gc_markers(&fragment).await, 0);
+
+    let final_read = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+    assert_eq!(final_read, content);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_raw_blob_background_repair_relocates_stale_device_id() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.join(format!("raw-stale-device-{}", Ulid::new()));
+    let _raw_disks = ensure_raw_storage_config(&base, 3, 96 * 1024 * 1024).await;
+    ensure_upload_runtime_config();
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "raw/stale-device-id.bin".to_string();
+    let content = (0..(72 * 1024 + 333))
+        .map(|i| (i % 197) as u8)
+        .collect::<Vec<u8>>();
+
+    setup_fragment(&fragment).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+    put_object(state, &fragment, &key, content.clone()).await;
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(2, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+
+    run_redistribution_job(false, Arc::new(WsConnectionManager::new()))
+        .await
+        .expect("raw redistribution");
+
+    let redistributed_meta = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("redistributed raw metadata");
+    let target_idx = redistributed_meta.parts[0]
+        .shards
+        .iter()
+        .position(|shard| !shard.is_parity)
+        .expect("raw data shard position");
+    let original_shard = redistributed_meta.parts[0].shards[target_idx].clone();
+    let original_raw = original_shard
+        .raw_blob_address
+        .clone()
+        .expect("raw blob address");
+
+    let stale_device_id = format!("stale-{}", Ulid::new());
+    let mut stale_meta = redistributed_meta.clone();
+    let stale_shard = &mut stale_meta.parts[0].shards[target_idx];
+    stale_shard
+        .raw_blob_address
+        .as_mut()
+        .expect("stale raw")
+        .device_id = stale_device_id.clone();
+    stale_shard.absolute_path = format!("raw://{}/{}", stale_device_id, original_raw.allocation_id);
+
+    let stale_bytes =
+        rmp_serde::to_vec(&stale_meta).expect("serialize stale metadata with device mismatch");
+    let path_manager = ObjectPathManager::new();
+    for path in path_manager.get_all_metadata_paths(&fragment, &key, &stale_meta.version_id) {
+        fs::write(&path, &stale_bytes)
+            .await
+            .unwrap_or_else(|e| panic!("write stale metadata {}: {}", path.display(), e));
+    }
+
+    let recovered = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+    assert_eq!(
+        recovered, content,
+        "recovered read mismatch after stale raw device id"
+    );
+
+    let repaired_meta = {
+        let mut latest = None;
+        for _ in 0..60usize {
+            let current = get_metadata(&fragment, &key, &fragment)
+                .await
+                .expect("metadata after stale-device read");
+            let repaired_shard = &current.parts[0].shards[target_idx];
+            if let Some(raw) = repaired_shard.raw_blob_address.as_ref() {
+                if raw.device_id == original_raw.device_id
+                    && raw.allocation_id != original_raw.allocation_id
+                {
+                    latest = Some(current);
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        latest.expect("background repair should rewrite stale raw device metadata")
+    };
+
+    let repaired_shard = repaired_meta.parts[0].shards[target_idx].clone();
+    assert!(
+        verify_shard_checksum(&repaired_shard)
+            .await
+            .expect("verify relocated raw shard"),
+        "relocated raw shard checksum should pass"
+    );
+
+    let final_read = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+    assert_eq!(final_read, content);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_raw_blob_stale_reader_after_relocation_is_idempotent() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.join(format!("raw-stale-reader-{}", Ulid::new()));
+    let _raw_disks = ensure_raw_storage_config(&base, 3, 96 * 1024 * 1024).await;
+    ensure_upload_runtime_config();
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "raw/stale-reader-idempotent.bin".to_string();
+    let content = (0..(96 * 1024 + 777))
+        .map(|i| (i % 211) as u8)
+        .collect::<Vec<u8>>();
+
+    setup_fragment(&fragment).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+    put_object(state, &fragment, &key, content.clone()).await;
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(2, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+
+    run_redistribution_job(false, Arc::new(WsConnectionManager::new()))
+        .await
+        .expect("raw redistribution");
+
+    let redistributed_meta = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("redistributed raw metadata");
+    let target_pos = redistributed_meta.parts[0]
+        .shards
+        .iter()
+        .position(|shard| !shard.is_parity)
+        .expect("raw data shard position");
+    let target_shard_index = redistributed_meta.parts[0].shards[target_pos].shard_index;
+    let original_raw = redistributed_meta.parts[0].shards[target_pos]
+        .raw_blob_address
+        .clone()
+        .expect("raw blob address");
+
+    let stale_device_id = format!("stale-{}", Ulid::new());
+    let mut stale_meta = redistributed_meta.clone();
+    let stale_shard = &mut stale_meta.parts[0].shards[target_pos];
+    stale_shard
+        .raw_blob_address
+        .as_mut()
+        .expect("stale raw")
+        .device_id = stale_device_id.clone();
+    stale_shard.absolute_path = format!("raw://{}/{}", stale_device_id, original_raw.allocation_id);
+
+    let stale_bytes =
+        rmp_serde::to_vec(&stale_meta).expect("serialize stale metadata with device mismatch");
+    let path_manager = ObjectPathManager::new();
+    for path in path_manager.get_all_metadata_paths(&fragment, &key, &stale_meta.version_id) {
+        fs::write(&path, &stale_bytes)
+            .await
+            .unwrap_or_else(|e| panic!("write stale metadata {}: {}", path.display(), e));
+    }
+
+    let recovered = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+    assert_eq!(
+        recovered, content,
+        "recovered read mismatch after stale raw device id"
+    );
+
+    let repaired_meta = {
+        let mut latest = None;
+        for _ in 0..60usize {
+            let current = get_metadata(&fragment, &key, &fragment)
+                .await
+                .expect("metadata after stale-device read");
+            let repaired_shard = &current.parts[0].shards[target_pos];
+            if let Some(raw) = repaired_shard.raw_blob_address.as_ref() {
+                if raw.device_id == original_raw.device_id
+                    && raw.allocation_id != original_raw.allocation_id
+                {
+                    latest = Some(current);
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        latest.expect("background repair should rewrite stale raw device metadata")
+    };
+
+    let relocated_raw = repaired_meta.parts[0].shards[target_pos]
+        .raw_blob_address
+        .clone()
+        .expect("relocated raw blob address");
+    let stale_part = Arc::new(stale_meta.parts[0].clone());
+    let repair_context = ShardRepairContext::new(
+        fragment.clone(),
+        key.clone(),
+        stale_meta.version_id.clone(),
+        false,
+    );
+
+    repair_entire_shard(stale_part, target_shard_index, 4096, Some(repair_context))
+        .await
+        .expect("stale second repair should observe existing relocation");
+
+    let current_meta = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("metadata after stale second repair");
+    let current_raw = current_meta.parts[0].shards[target_pos]
+        .raw_blob_address
+        .clone()
+        .expect("current raw blob address");
+    assert_eq!(
+        current_raw, relocated_raw,
+        "stale second repair should not replace the already relocated raw shard"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_raw_blob_manual_repair_relocates_stale_device_id() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.join(format!("raw-manual-repair-stale-{}", Ulid::new()));
+    let _raw_disks = ensure_raw_storage_config(&base, 3, 96 * 1024 * 1024).await;
+    ensure_upload_runtime_config();
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "raw/manual-repair-stale-device-id.bin".to_string();
+    let content = (0..(88 * 1024 + 99))
+        .map(|i| (i % 193) as u8)
+        .collect::<Vec<u8>>();
+
+    setup_fragment(&fragment).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+    put_object(state, &fragment, &key, content.clone()).await;
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(2, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+
+    run_redistribution_job(false, Arc::new(WsConnectionManager::new()))
+        .await
+        .expect("raw redistribution");
+
+    let redistributed_meta = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("redistributed raw metadata");
+    let target_pos = redistributed_meta.parts[0]
+        .shards
+        .iter()
+        .position(|shard| !shard.is_parity)
+        .expect("raw data shard position");
+    let original_raw = redistributed_meta.parts[0].shards[target_pos]
+        .raw_blob_address
+        .clone()
+        .expect("raw blob address");
+
+    let stale_device_id = format!("stale-{}", Ulid::new());
+    let mut stale_meta = redistributed_meta.clone();
+    let stale_shard = &mut stale_meta.parts[0].shards[target_pos];
+    stale_shard
+        .raw_blob_address
+        .as_mut()
+        .expect("stale raw")
+        .device_id = stale_device_id.clone();
+    stale_shard.absolute_path = format!("raw://{}/{}", stale_device_id, original_raw.allocation_id);
+
+    let stale_bytes =
+        rmp_serde::to_vec(&stale_meta).expect("serialize stale metadata with device mismatch");
+    let path_manager = ObjectPathManager::new();
+    for path in path_manager.get_all_metadata_paths(&fragment, &key, &stale_meta.version_id) {
+        fs::write(&path, &stale_bytes)
+            .await
+            .unwrap_or_else(|e| panic!("write stale metadata {}: {}", path.display(), e));
+    }
+
+    run_repair_job_with_options(
+        RepairRunConfig {
+            dry_run: false,
+            check_mode: RepairCheckMode::Scrub,
+            meta_concurrency: 2,
+            shard_repair_concurrency: 2,
+            meta_batch_size: 64,
+        },
+        RepairRunOptions { fast_mode: false },
+        Arc::new(WsConnectionManager::new()),
+    )
+    .await
+    .expect("manual repair should relocate stale raw shard");
+
+    let repaired_meta = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("metadata after manual repair");
+    let repaired_shard = repaired_meta.parts[0].shards[target_pos].clone();
+    let repaired_raw = repaired_shard
+        .raw_blob_address
+        .clone()
+        .expect("repaired raw blob address");
+    assert_eq!(
+        repaired_raw.device_id, original_raw.device_id,
+        "manual repair should rewrite stale raw device id back to a configured device"
+    );
+    assert_ne!(
+        repaired_raw.allocation_id, original_raw.allocation_id,
+        "manual repair should allocate a fresh raw location after relocation"
+    );
+    assert!(
+        verify_shard_checksum(&repaired_shard)
+            .await
+            .expect("verify manually relocated raw shard"),
+        "manual repair should leave a valid relocated raw shard"
+    );
+
+    let final_read = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+    assert_eq!(final_read, content);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_raw_blob_manual_availability_repair_relocates_stale_device_id() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.join(format!("raw-manual-avail-stale-{}", Ulid::new()));
+    let _raw_disks = ensure_raw_storage_config(&base, 3, 96 * 1024 * 1024).await;
+    ensure_upload_runtime_config();
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "raw/manual-availability-repair-stale-device-id.bin".to_string();
+    let content = (0..(84 * 1024 + 321))
+        .map(|i| (i % 181) as u8)
+        .collect::<Vec<u8>>();
+
+    setup_fragment(&fragment).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+    put_object(state, &fragment, &key, content.clone()).await;
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(2, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+
+    run_redistribution_job(false, Arc::new(WsConnectionManager::new()))
+        .await
+        .expect("raw redistribution");
+
+    let redistributed_meta = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("redistributed raw metadata");
+    let target_pos = redistributed_meta.parts[0]
+        .shards
+        .iter()
+        .position(|shard| !shard.is_parity)
+        .expect("raw data shard position");
+    let original_raw = redistributed_meta.parts[0].shards[target_pos]
+        .raw_blob_address
+        .clone()
+        .expect("raw blob address");
+
+    let stale_device_id = format!("stale-{}", Ulid::new());
+    let mut stale_meta = redistributed_meta.clone();
+    let stale_shard = &mut stale_meta.parts[0].shards[target_pos];
+    stale_shard
+        .raw_blob_address
+        .as_mut()
+        .expect("stale raw")
+        .device_id = stale_device_id.clone();
+    stale_shard.absolute_path = format!("raw://{}/{}", stale_device_id, original_raw.allocation_id);
+
+    let stale_bytes =
+        rmp_serde::to_vec(&stale_meta).expect("serialize stale metadata with device mismatch");
+    let path_manager = ObjectPathManager::new();
+    for path in path_manager.get_all_metadata_paths(&fragment, &key, &stale_meta.version_id) {
+        fs::write(&path, &stale_bytes)
+            .await
+            .unwrap_or_else(|e| panic!("write stale metadata {}: {}", path.display(), e));
+    }
+
+    run_repair_job_with_options(
+        RepairRunConfig {
+            dry_run: false,
+            check_mode: RepairCheckMode::Availability,
+            meta_concurrency: 2,
+            shard_repair_concurrency: 2,
+            meta_batch_size: 64,
+        },
+        RepairRunOptions { fast_mode: false },
+        Arc::new(WsConnectionManager::new()),
+    )
+    .await
+    .expect("manual availability repair should relocate stale raw shard");
+
+    let repaired_meta = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("metadata after manual availability repair");
+    let repaired_shard = repaired_meta.parts[0].shards[target_pos].clone();
+    let repaired_raw = repaired_shard
+        .raw_blob_address
+        .clone()
+        .expect("repaired raw blob address");
+    assert_eq!(
+        repaired_raw.device_id, original_raw.device_id,
+        "availability repair should rewrite stale raw device id back to a configured device"
+    );
+    assert_ne!(
+        repaired_raw.allocation_id, original_raw.allocation_id,
+        "availability repair should allocate a fresh raw location after relocation"
+    );
+    assert!(
+        verify_shard_checksum(&repaired_shard)
+            .await
+            .expect("verify availability relocated raw shard"),
+        "availability repair should leave a valid relocated raw shard"
+    );
 
     let final_read = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
     assert_eq!(final_read, content);

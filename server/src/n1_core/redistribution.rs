@@ -14,7 +14,7 @@ use crate::n1_core::ec::ErasureStreamWriter;
 use crate::n1_core::fragment_metadata::{read_fragment_metadata, write_fragment_metadata};
 use crate::n1_core::operation_gate::acquire_read_only_fast_mode;
 use crate::n1_core::prefix_rebuilder::run_prefix_rebuild_job;
-use crate::n1_core::recovery::{ShardFileCache, read_or_recover_chunk};
+use crate::n1_core::recovery::{ShardFileCache, ShardRepairContext, read_or_recover_chunk};
 use crate::n1_core::upload::{
     DATA_SHARDS_ATOMIC, DirectWriter, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, create_direct_file,
     sync_dir,
@@ -1244,6 +1244,12 @@ async fn redistribute_object_streaming(
     let old_block_size = meta.stripe_size_bytes;
     let new_block_size = target_stripe_size;
     let verify_tmp_crc = strict_durability;
+    let repair_context = ShardRepairContext::new(
+        meta.fragment.clone(),
+        meta.object_key.clone(),
+        meta.version_id.clone(),
+        is_trash,
+    );
 
     let mut file_cache: ShardFileCache = ShardFileCache::new();
 
@@ -1392,6 +1398,7 @@ async fn redistribute_object_streaming(
                 file_offset,
                 to_read,
                 old_block_size,
+                Some(repair_context.clone()),
             )
             .await?;
 

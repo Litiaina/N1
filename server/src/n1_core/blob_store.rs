@@ -4,7 +4,9 @@ use crate::n1_core::disk_manager::{
     ObjectMetadata, RawBlobAddress, ShardInfo, configured_blob_store_disks,
     configured_fs_storage_root,
 };
-use block_manager::{BlockManager, BlockManagerError, FormatOptions, RawExtentAddress};
+use block_manager::{
+    BlockManager, BlockManagerError, DirectExtentIo, FormatOptions, RawExtentAddress,
+};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -332,44 +334,22 @@ pub async fn commit_staged_raw_shard(
     Ok(handle)
 }
 
-pub async fn read_shard_range(
-    shard: &ShardInfo,
-    offset: u64,
-    len: usize,
-) -> Result<Vec<u8>, AppError> {
-    if let Some(raw) = shard.raw_blob_address.as_ref() {
-        let raw = raw.clone();
-        return tokio::task::spawn_blocking(move || {
-            let manager = raw_manager_by_device_id(raw.device_id.as_str())?;
-            let mgr = manager.lock().map_err(|_| {
-                AppError::InternalServerError("Raw blob manager lock poisoned".into())
-            })?;
-            let address = RawExtentAddress {
-                device_id: mgr.header().device_id,
-                allocation_id: raw.allocation_id,
-                offset_bytes: raw.offset_bytes,
-                size_bytes: raw.size_bytes,
-            };
-            mgr.read_address(&address, offset, len)
-                .map_err(block_manager_error_to_app)
-        })
-        .await
-        .map_err(|e| AppError::InternalServerError(format!("raw read task failed: {}", e)))?;
-    }
-
-    let path = PathBuf::from(shard.absolute_path.as_str());
-    let mut file = tokio_fs::File::open(&path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("open shard {}", path.display())))?;
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    file.seek(SeekFrom::Start(offset))
-        .await
-        .map_err(|e| AppError::Io(e, format!("seek shard {}", path.display())))?;
-    let mut out = vec![0u8; len];
-    file.read_exact(&mut out)
-        .await
-        .map_err(|e| AppError::Io(e, format!("read shard {}", path.display())))?;
-    Ok(out)
+pub fn open_raw_direct_io(shard: &ShardInfo) -> Result<DirectExtentIo, AppError> {
+    let raw = shard.raw_blob_address.as_ref().ok_or_else(|| {
+        AppError::InternalServerError("Shard is not backed by raw blob storage".into())
+    })?;
+    let manager = raw_manager_by_device_id(raw.device_id.as_str())?;
+    let mgr = manager
+        .lock()
+        .map_err(|_| AppError::InternalServerError("Raw blob manager lock poisoned".into()))?;
+    let address = RawExtentAddress {
+        device_id: mgr.header().device_id,
+        allocation_id: raw.allocation_id,
+        offset_bytes: raw.offset_bytes,
+        size_bytes: raw.size_bytes,
+    };
+    mgr.direct_extent_io(&address)
+        .map_err(block_manager_error_to_app)
 }
 
 pub async fn write_shard_range(

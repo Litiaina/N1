@@ -1,17 +1,24 @@
 use crate::enums::app_error_enum::AppError;
-use crate::n1_core::blob_store::{read_shard_range, verify_shard_checksum, write_shard_range};
+use crate::n1_core::blob_store::{
+    commit_staged_raw_shard, configured_blob_disk_count, free_raw_address, open_raw_direct_io,
+    raw_blob_debug_path, raw_stage_path_for_shard, verify_shard_checksum, write_shard_range,
+};
 use crate::n1_core::constants::GC_SUFFIX;
-use crate::n1_core::disk_manager::{ObjectPathManager, PartMetadata, ShardInfo};
-use crate::n1_core::upload::{DirectWriter, sync_dir};
+use crate::n1_core::disk_manager::{
+    ObjectMetadata, ObjectPathManager, PartMetadata, RawBlobAddress, ShardInfo,
+};
+use crate::n1_core::upload::{DirectWriter, sync_dir, write_atomic};
 
+use block_manager::DirectExtentIo;
 use crc32fast::Hasher;
+use once_cell::sync::OnceCell;
 use simd_erasure_core::{ReedSolomonDecoder, ReedSolomonEncoder};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions as StdOpenOptions;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
@@ -55,13 +62,65 @@ static RECOVERY_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 
 static BLOB_ROOTS: LazyLock<Vec<PathBuf>> =
     LazyLock::new(|| ObjectPathManager::new().get_blob_roots());
+static INFLIGHT_REPAIRS: LazyLock<StdMutex<HashSet<String>>> =
+    LazyLock::new(|| StdMutex::new(HashSet::new()));
+static RAW_RELOCATIONS: LazyLock<StdMutex<HashMap<String, RawBlobAddress>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+pub static RAW_VERIFY_ON_READ_ATOMIC: OnceCell<AtomicBool> = OnceCell::new();
+
+const MAX_RAW_RELOCATIONS: usize = 8192;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ShardRepairContext {
+    pub fragment: String,
+    pub object_key: String,
+    pub version_id: String,
+    pub is_trash: bool,
+}
+
+impl ShardRepairContext {
+    pub fn new(fragment: String, object_key: String, version_id: String, is_trash: bool) -> Self {
+        Self {
+            fragment,
+            object_key,
+            version_id,
+            is_trash,
+        }
+    }
+}
+
+enum RepairTarget {
+    RawInPlace,
+    TempFile {
+        final_path: PathBuf,
+        parent_dir: PathBuf,
+        temp_path: PathBuf,
+        writer: DirectWriter,
+        raw_commit_disk_idx: Option<usize>,
+    },
+}
+
+enum RelocatedRawMetadataOutcome {
+    Updated,
+    AlreadyRelocated(RawBlobAddress),
+}
 
 pub enum CachedShardHandle {
     File(File),
-    RawVerified,
+    Raw {
+        io: DirectExtentIo,
+        raw_blob_address: RawBlobAddress,
+        verified: bool,
+    },
 }
 
 pub type ShardFileCache = HashMap<String, CachedShardHandle>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawReadValidationMode {
+    Fast,
+    Verified,
+}
 
 #[inline]
 fn strip_tmp_attempt_suffix(s: &str) -> &str {
@@ -158,6 +217,272 @@ fn shard_dir_on_root(
     } else {
         disk_root.join(fragment).join("blob").join(version_id)
     }
+}
+
+fn repair_job_key(
+    part: &PartMetadata,
+    target_shard: &ShardInfo,
+    repair_context: Option<&ShardRepairContext>,
+) -> String {
+    if let Some(ctx) = repair_context {
+        return format!(
+            "{}:{}:{}:{}:{}:{}",
+            ctx.fragment,
+            ctx.object_key,
+            ctx.version_id,
+            ctx.is_trash,
+            part.part_index,
+            target_shard.shard_index
+        );
+    }
+
+    format!(
+        "{}:{}:{}",
+        part.part_index, target_shard.shard_index, target_shard.absolute_path
+    )
+}
+
+fn raw_address_key(raw: &RawBlobAddress) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        raw.device_id, raw.allocation_id, raw.offset_bytes, raw.size_bytes
+    )
+}
+
+fn remember_raw_relocation(old_raw: &RawBlobAddress, new_raw: &RawBlobAddress) {
+    let Ok(mut relocations) = RAW_RELOCATIONS.lock() else {
+        return;
+    };
+    if relocations.len() >= MAX_RAW_RELOCATIONS {
+        relocations.clear();
+    }
+    relocations.insert(raw_address_key(old_raw), new_raw.clone());
+}
+
+fn resolve_raw_relocation(raw: &RawBlobAddress) -> Option<RawBlobAddress> {
+    let Ok(relocations) = RAW_RELOCATIONS.lock() else {
+        return None;
+    };
+
+    let mut current = raw.clone();
+    let mut changed = false;
+    for _ in 0..8 {
+        let Some(next) = relocations.get(&raw_address_key(&current)).cloned() else {
+            break;
+        };
+        if next == current {
+            break;
+        }
+        current = next;
+        changed = true;
+    }
+
+    changed.then_some(current)
+}
+
+fn remap_raw_shard_info(shard_info: &ShardInfo) -> Option<ShardInfo> {
+    let raw = shard_info.raw_blob_address.as_ref()?;
+    let remapped = resolve_raw_relocation(raw)?;
+    let mut relocated = shard_info.clone();
+    relocated.raw_blob_address = Some(remapped.clone());
+    relocated.absolute_path = raw_blob_debug_path(&remapped);
+    Some(relocated)
+}
+
+fn register_inflight_repair(key: &str) -> bool {
+    let Ok(mut inflight) = INFLIGHT_REPAIRS.lock() else {
+        return true;
+    };
+    inflight.insert(key.to_string())
+}
+
+fn raw_verify_on_read_enabled() -> bool {
+    RAW_VERIFY_ON_READ_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or(false)
+}
+
+fn unregister_inflight_repair(key: &str) {
+    if let Ok(mut inflight) = INFLIGHT_REPAIRS.lock() {
+        inflight.remove(key);
+    }
+}
+
+fn metadata_paths_for_context(ctx: &ShardRepairContext) -> Vec<PathBuf> {
+    let path_manager = ObjectPathManager::new();
+    let key_hash = ObjectPathManager::object_key_hash(&ctx.object_key);
+    let shard1 = &key_hash[0..2];
+    let shard2 = &key_hash[2..4];
+    let shard3 = &key_hash[4..6];
+    let shard4 = &key_hash[6..8];
+    let filename = format!(
+        "{}#{}{}",
+        key_hash,
+        ctx.version_id,
+        crate::n1_core::constants::METADATA_EXT
+    );
+
+    path_manager
+        .get_all_index_roots()
+        .iter()
+        .map(|root| {
+            let mut path = root.join(&ctx.fragment);
+            if ctx.is_trash {
+                path = path.join(".trash");
+            }
+            path.join("index")
+                .join(shard1)
+                .join(shard2)
+                .join(shard3)
+                .join(shard4)
+                .join(&filename)
+        })
+        .collect()
+}
+
+async fn load_version_metadata_for_repair(
+    ctx: &ShardRepairContext,
+) -> Result<ObjectMetadata, AppError> {
+    use std::time::SystemTime;
+
+    let mut replicas: Vec<(PathBuf, SystemTime)> = Vec::new();
+    for path in metadata_paths_for_context(ctx) {
+        if fs::try_exists(&path).await.unwrap_or(false) {
+            let modified = fs::metadata(&path)
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            replicas.push((path, modified));
+        }
+    }
+
+    if replicas.is_empty() {
+        return Err(AppError::NotFound);
+    }
+
+    replicas.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut last_err: Option<AppError> = None;
+    for (path, _) in replicas {
+        match fs::read(&path).await {
+            Ok(bytes) => match rmp_serde::from_slice::<ObjectMetadata>(&bytes) {
+                Ok(meta) => return Ok(meta),
+                Err(err) => {
+                    warn!(
+                        "Skipping unreadable repair metadata replica {}: {}",
+                        path.display(),
+                        err
+                    );
+                    last_err = Some(AppError::InternalServerError(
+                        "Invalid metadata format.".to_string(),
+                    ));
+                }
+            },
+            Err(err) => {
+                warn!(
+                    "Skipping unreadable repair metadata replica {}: {}",
+                    path.display(),
+                    err
+                );
+                last_err = Some(AppError::Io(
+                    err,
+                    format!("read metadata {}", path.display()),
+                ));
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or(AppError::InternalServerError(
+        "Failed to read any valid version metadata replica.".to_string(),
+    )))
+}
+
+async fn persist_version_metadata_for_repair(
+    ctx: &ShardRepairContext,
+    metadata: &ObjectMetadata,
+) -> Result<(), AppError> {
+    let bytes = rmp_serde::to_vec(metadata).map_err(|e| {
+        AppError::InternalServerError(format!("Failed to serialize repaired metadata: {}", e))
+    })?;
+
+    let mut any_ok = false;
+    for path in metadata_paths_for_context(ctx) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent).await;
+        }
+
+        match write_atomic(&path, &bytes).await {
+            Ok(_) => any_ok = true,
+            Err(err) => {
+                warn!(
+                    "Failed to write repaired metadata replica {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    if any_ok {
+        Ok(())
+    } else {
+        Err(AppError::InternalServerError(
+            "Failed to write repaired metadata to any index mirror".into(),
+        ))
+    }
+}
+
+async fn persist_relocated_raw_shard_metadata(
+    ctx: &ShardRepairContext,
+    part_index: u64,
+    shard_index: usize,
+    old_raw: Option<&RawBlobAddress>,
+    new_raw: &RawBlobAddress,
+) -> Result<RelocatedRawMetadataOutcome, AppError> {
+    let mut metadata = load_version_metadata_for_repair(ctx).await?;
+    let part = metadata
+        .parts
+        .iter_mut()
+        .find(|part| part.part_index == part_index)
+        .ok_or_else(|| {
+            AppError::InternalServerError(format!(
+                "Failed to locate part {} in repaired metadata",
+                part_index
+            ))
+        })?;
+    let shard = part
+        .shards
+        .iter_mut()
+        .find(|shard| shard.shard_index == shard_index)
+        .ok_or_else(|| {
+            AppError::InternalServerError(format!(
+                "Failed to locate shard {} in repaired metadata",
+                shard_index
+            ))
+        })?;
+
+    if let Some(old) = old_raw {
+        match shard.raw_blob_address.as_ref() {
+            Some(current) if current == old => {}
+            Some(current) => {
+                return Ok(RelocatedRawMetadataOutcome::AlreadyRelocated(
+                    current.clone(),
+                ));
+            }
+            None => {}
+        }
+    } else if shard.raw_blob_address.as_ref() == Some(new_raw) {
+        return Ok(RelocatedRawMetadataOutcome::AlreadyRelocated(
+            new_raw.clone(),
+        ));
+    }
+
+    shard.raw_blob_address = Some(new_raw.clone());
+    shard.absolute_path = raw_blob_debug_path(new_raw);
+    persist_version_metadata_for_repair(ctx, &metadata).await?;
+    Ok(RelocatedRawMetadataOutcome::Updated)
 }
 
 async fn create_direct_file_for_repair(path: &PathBuf) -> Result<std::fs::File, AppError> {
@@ -315,30 +640,92 @@ async fn get_or_open_shard_ha(
     None
 }
 
+fn cached_raw_handle(
+    file_cache: &ShardFileCache,
+    shard_info: &ShardInfo,
+) -> Option<(DirectExtentIo, bool)> {
+    let expected_raw = shard_info.raw_blob_address.as_ref()?;
+    let CachedShardHandle::Raw {
+        io,
+        raw_blob_address,
+        verified,
+    } = file_cache.get(&shard_info.file_name)?
+    else {
+        return None;
+    };
+    if raw_blob_address != expected_raw {
+        return None;
+    }
+    Some((io.clone(), *verified))
+}
+
+async fn get_or_open_raw_shard(
+    file_cache: &mut ShardFileCache,
+    shard_info: &ShardInfo,
+    validation_mode: RawReadValidationMode,
+) -> Option<DirectExtentIo> {
+    if let Some((io, verified)) = cached_raw_handle(file_cache, shard_info) {
+        if validation_mode == RawReadValidationMode::Verified && !verified {
+            if !verify_shard_checksum(shard_info).await.ok()? {
+                return None;
+            }
+            file_cache.insert(
+                shard_info.file_name.clone(),
+                CachedShardHandle::Raw {
+                    io: io.clone(),
+                    raw_blob_address: shard_info.raw_blob_address.clone()?,
+                    verified: true,
+                },
+            );
+        }
+        return Some(io);
+    }
+
+    if validation_mode == RawReadValidationMode::Verified
+        && !verify_shard_checksum(shard_info).await.ok()?
+    {
+        return None;
+    }
+
+    let io = open_raw_direct_io(shard_info).ok()?;
+    file_cache.insert(
+        shard_info.file_name.clone(),
+        CachedShardHandle::Raw {
+            io: io.clone(),
+            raw_blob_address: shard_info.raw_blob_address.clone()?,
+            verified: validation_mode == RawReadValidationMode::Verified,
+        },
+    );
+    Some(io)
+}
+
 async fn read_shard_chunk_cached(
     file_cache: &mut ShardFileCache,
     shard_info: &ShardInfo,
     version_dir_hint: Option<&Path>,
     offset: u64,
     len: usize,
+    validation_mode: RawReadValidationMode,
 ) -> Option<Vec<u8>> {
-    if shard_info.raw_blob_address.is_some() {
-        let verified = matches!(
-            file_cache.get(&shard_info.file_name),
-            Some(CachedShardHandle::RawVerified)
-        );
-        if !verified {
-            if !verify_shard_checksum(shard_info).await.ok()? {
-                return None;
-            }
-            file_cache.insert(shard_info.file_name.clone(), CachedShardHandle::RawVerified);
-        }
-        return match read_shard_range(shard_info, offset, len).await {
+    let remapped_raw_shard;
+    let effective_shard = if let Some(remapped) = remap_raw_shard_info(shard_info) {
+        remapped_raw_shard = Some(remapped);
+        remapped_raw_shard.as_ref().expect("remapped raw shard")
+    } else {
+        shard_info
+    };
+
+    if effective_shard.raw_blob_address.is_some() {
+        let io = get_or_open_raw_shard(file_cache, effective_shard, validation_mode).await?;
+        return match tokio::task::spawn_blocking(move || io.read(offset, len))
+            .await
+            .ok()?
+        {
             Ok(chunk) => Some(chunk),
             Err(err) => {
                 warn!(
                     "Raw shard read failed file={} path={} offset={} len={} err={}",
-                    shard_info.file_name, shard_info.absolute_path, offset, len, err
+                    effective_shard.file_name, effective_shard.absolute_path, offset, len, err
                 );
                 None
             }
@@ -383,6 +770,7 @@ pub async fn read_or_recover_chunk(
     offset: u64,
     len: usize,
     block_size: usize,
+    repair_context: Option<ShardRepairContext>,
 ) -> Result<Vec<u8>, AppError> {
     let target_shard = nth_data_shard(&part, shard_idx)
         .ok_or(AppError::InternalServerError("Bad shard index".into()))?;
@@ -392,9 +780,21 @@ pub async fn read_or_recover_chunk(
     } else {
         Some(version_dir)
     };
+    let target_validation_mode = if raw_verify_on_read_enabled() {
+        RawReadValidationMode::Verified
+    } else {
+        RawReadValidationMode::Fast
+    };
 
-    if let Some(chunk) =
-        read_shard_chunk_cached(file_cache, target_shard, vdir_hint, offset, len).await
+    if let Some(chunk) = read_shard_chunk_cached(
+        file_cache,
+        target_shard,
+        vdir_hint,
+        offset,
+        len,
+        target_validation_mode,
+    )
+    .await
     {
         return Ok(chunk);
     }
@@ -424,7 +824,15 @@ pub async fn read_or_recover_chunk(
             continue;
         }
 
-        let Some(chunk) = read_shard_chunk_cached(file_cache, s, vdir_hint, offset, len).await
+        let Some(chunk) = read_shard_chunk_cached(
+            file_cache,
+            s,
+            vdir_hint,
+            offset,
+            len,
+            RawReadValidationMode::Verified,
+        )
+        .await
         else {
             continue;
         };
@@ -463,12 +871,19 @@ pub async fn read_or_recover_chunk(
 
     let part_clone = Arc::clone(&part);
     let target_idx = target_shard.shard_index;
+    let repair_key = repair_job_key(&part, target_shard, repair_context.as_ref());
 
-    RECOVERY_RUNTIME.spawn(async move {
-        if let Err(e) = repair_entire_shard(part_clone, target_idx, block_size).await {
-            warn!("Background repair failed for shard {}: {}", target_idx, e);
-        }
-    });
+    if register_inflight_repair(&repair_key) {
+        RECOVERY_RUNTIME.spawn(async move {
+            if let Err(e) =
+                repair_entire_shard(part_clone, target_idx, block_size, repair_context.clone())
+                    .await
+            {
+                warn!("Background repair failed for shard {}: {}", target_idx, e);
+            }
+            unregister_inflight_repair(&repair_key);
+        });
+    }
 
     Ok(restored)
 }
@@ -477,13 +892,14 @@ pub async fn repair_entire_shard(
     part: Arc<PartMetadata>,
     target_shard_idx: usize,
     block_size: usize,
+    repair_context: Option<ShardRepairContext>,
 ) -> Result<(), AppError> {
     let _permit = RECOVERY_SEMAPHORE
         .acquire()
         .await
         .map_err(|_| AppError::InternalServerError("Semaphore error".into()))?;
 
-    let target_shard = part
+    let mut target_shard = part
         .shards
         .iter()
         .find(|s| s.shard_index == target_shard_idx)
@@ -493,14 +909,82 @@ pub async fn repair_entire_shard(
         ))?
         .clone();
 
+    if let Some(remapped) = remap_raw_shard_info(&target_shard) {
+        target_shard = remapped;
+    }
+
     let total_shard_size = target_shard.size_bytes;
     let raw_target = target_shard.raw_blob_address.is_some();
 
-    let (final_path, parent_dir, temp_path, mut temp_file) = if raw_target {
-        if verify_shard_checksum(&target_shard).await? {
-            return Ok(());
+    let mut repair_target = if raw_target {
+        match verify_shard_checksum(&target_shard).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => RepairTarget::RawInPlace,
+            Err(err) => {
+                let Some(ctx) = repair_context.as_ref() else {
+                    return Err(err);
+                };
+                let disk_count = configured_blob_disk_count()?;
+                if disk_count == 0 {
+                    return Err(AppError::InternalServerError(
+                        "No blob storage disks configured".into(),
+                    ));
+                }
+                let disk_idx = (part.part_index as usize + target_shard.shard_index) % disk_count;
+                let attempt_id = Ulid::new().to_string();
+                let temp_path = raw_stage_path_for_shard(
+                    disk_idx,
+                    ctx.fragment.as_str(),
+                    ctx.version_id.as_str(),
+                    attempt_id.as_str(),
+                    strip_tmp_attempt_suffix(&target_shard.file_name),
+                )
+                .await?;
+                let parent_dir = temp_path.parent().map(Path::to_path_buf).ok_or(
+                    AppError::InternalServerError("Invalid staged raw repair path".into()),
+                )?;
+                let std_file = match create_direct_file_for_repair(&temp_path).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warn!("Failed to create staged raw repair file: {}", e);
+                        return Err(e);
+                    }
+                };
+                let file_clone = std_file
+                    .try_clone()
+                    .map_err(|e| AppError::Io(e, "clone staged repair handle".into()))?;
+                let temp_path_for_set_len = temp_path.clone();
+                tokio::task::spawn_blocking(move || file_clone.set_len(total_shard_size))
+                    .await
+                    .map_err(|e| {
+                        AppError::InternalServerError(format!(
+                            "Failed to preallocate staged raw repair file: {}",
+                            e
+                        ))
+                    })?
+                    .map_err(|e| {
+                        let _ = std::fs::remove_file(&temp_path_for_set_len);
+                        AppError::Io(
+                            e,
+                            format!(
+                                "set_len staged raw repair file {}",
+                                temp_path_for_set_len.display()
+                            ),
+                        )
+                    })?;
+                warn!(
+                    "Relocating raw shard {} after stale or missing raw device mapping: {}",
+                    target_shard.file_name, err
+                );
+                RepairTarget::TempFile {
+                    final_path: PathBuf::new(),
+                    parent_dir,
+                    temp_path,
+                    writer: DirectWriter::new(std_file),
+                    raw_commit_disk_idx: Some(disk_idx),
+                }
+            }
         }
-        (PathBuf::new(), PathBuf::new(), PathBuf::new(), None)
     } else {
         let final_path_str = strip_tmp_attempt_suffix(&target_shard.absolute_path).to_string();
         if final_path_str.is_empty() {
@@ -544,6 +1028,7 @@ pub async fn repair_entire_shard(
         let file_clone = std_file
             .try_clone()
             .map_err(|e| AppError::Io(e, "clone handle".into()))?;
+        let temp_path_for_set_len = temp_path.clone();
 
         tokio::task::spawn_blocking(move || file_clone.set_len(total_shard_size))
             .await
@@ -551,33 +1036,33 @@ pub async fn repair_entire_shard(
                 AppError::InternalServerError(format!("Failed to preallocate repair file: {}", e))
             })?
             .map_err(|e| {
-                let _ = std::fs::remove_file(&temp_path);
-                AppError::Io(e, format!("set_len repair file {}", temp_path.display()))
+                let _ = std::fs::remove_file(&temp_path_for_set_len);
+                AppError::Io(
+                    e,
+                    format!("set_len repair file {}", temp_path_for_set_len.display()),
+                )
             })?;
 
-        let temp_file = Some(DirectWriter::new(std_file));
-        (final_path, parent_dir, temp_path, temp_file)
+        RepairTarget::TempFile {
+            final_path,
+            parent_dir,
+            temp_path,
+            writer: DirectWriter::new(std_file),
+            raw_commit_disk_idx: None,
+        }
     };
 
     let data_count = data_shards_count(&part);
     let parity_count = part.shards.len().saturating_sub(data_count);
 
     if data_count == 0 {
-        drop(temp_file);
-        let _ = fs::remove_file(&temp_path).await;
+        if let RepairTarget::TempFile { temp_path, .. } = &repair_target {
+            let _ = fs::remove_file(temp_path).await;
+        }
         return Err(AppError::InternalServerError("No data shards".into()));
     }
 
-    let mut peer_files: Vec<Option<File>> = Vec::with_capacity(part.shards.len());
     let mut peer_cache: ShardFileCache = HashMap::new();
-
-    for s in &part.shards {
-        if s.shard_index == target_shard.shard_index {
-            peer_files.push(None);
-        } else {
-            peer_files.push(get_or_open_shard_ha(&mut peer_cache, s, None).await);
-        }
-    }
 
     let mut offset = 0u64;
     let target_is_parity = target_shard.shard_index >= data_count;
@@ -591,70 +1076,42 @@ pub async fn repair_entire_shard(
         let mut stripe_data: Vec<Option<Vec<u8>>> = vec![None; data_count];
         let mut shards_found = 0usize;
 
-        for (idx, file_opt) in peer_files.iter_mut().enumerate() {
-            let s_info = &part.shards[idx];
-
+        for s_info in &part.shards {
             if s_info.shard_index == target_shard.shard_index {
                 continue;
             }
 
-            if s_info.raw_blob_address.is_some() {
-                if let Ok(buf) = read_shard_range(s_info, offset, cur).await {
-                    let res = if s_info.is_parity {
-                        decoder.add_recovery_shard(s_info.shard_index - data_count, &buf)
-                    } else {
-                        let add = decoder.add_original_shard(s_info.shard_index, &buf);
-                        if add.is_ok() && target_is_parity && s_info.shard_index < data_count {
-                            stripe_data[s_info.shard_index] = Some(buf);
-                        }
-                        add
-                    };
-
-                    if res.is_ok() {
-                        shards_found += 1;
-                    }
-                }
+            let Some(buf) = read_shard_chunk_cached(
+                &mut peer_cache,
+                s_info,
+                None,
+                offset,
+                cur,
+                RawReadValidationMode::Verified,
+            )
+            .await
+            else {
                 continue;
-            }
+            };
 
-            let mut need_reopen = false;
-
-            if let Some(f) = file_opt {
-                if f.seek(SeekFrom::Start(offset)).await.is_err() {
-                    need_reopen = true;
-                } else {
-                    let mut buf = vec![0u8; cur];
-                    if f.read_exact(&mut buf).await.is_ok() {
-                        let res = if s_info.is_parity {
-                            decoder.add_recovery_shard(s_info.shard_index - data_count, &buf)
-                        } else {
-                            let add = decoder.add_original_shard(s_info.shard_index, &buf);
-                            if add.is_ok() && target_is_parity && s_info.shard_index < data_count {
-                                stripe_data[s_info.shard_index] = Some(buf);
-                            }
-                            add
-                        };
-
-                        if res.is_ok() {
-                            shards_found += 1;
-                        }
-                    } else {
-                        need_reopen = true;
-                    }
-                }
+            let res = if s_info.is_parity {
+                decoder.add_recovery_shard(s_info.shard_index - data_count, &buf)
             } else {
-                need_reopen = true;
-            }
+                let add = decoder.add_original_shard(s_info.shard_index, &buf);
+                if add.is_ok() && target_is_parity && s_info.shard_index < data_count {
+                    stripe_data[s_info.shard_index] = Some(buf);
+                }
+                add
+            };
 
-            if need_reopen {
-                *file_opt = None;
+            if res.is_ok() {
+                shards_found += 1;
             }
         }
 
         if shards_found < data_count {
-            drop(temp_file.take());
-            if !raw_target {
-                let _ = fs::remove_file(&temp_path).await;
+            if let RepairTarget::TempFile { temp_path, .. } = &repair_target {
+                let _ = fs::remove_file(temp_path).await;
             }
             return Err(AppError::InternalServerError(
                 "Not enough healthy shards to repair on disk".into(),
@@ -676,13 +1133,16 @@ pub async fn repair_entire_shard(
                 .ok_or_else(|| {
                     AppError::InternalServerError("Missing restored data shard".into())
                 })?;
-            if raw_target {
-                write_shard_range(&target_shard, offset, data).await?;
-            } else if let Some(writer) = temp_file.as_mut() {
-                writer
-                    .write_all(data)
-                    .await
-                    .map_err(|e| AppError::Io(e, "write repair data".into()))?;
+            match &mut repair_target {
+                RepairTarget::RawInPlace => {
+                    write_shard_range(&target_shard, offset, data).await?;
+                }
+                RepairTarget::TempFile { writer, .. } => {
+                    writer
+                        .write_all(data)
+                        .await
+                        .map_err(|e| AppError::Io(e, "write repair data".into()))?;
+                }
             }
         } else {
             for (idx, data) in decoded.restored_original_iter() {
@@ -692,9 +1152,8 @@ pub async fn repair_entire_shard(
             }
 
             if stripe_data.iter().any(|d| d.is_none()) {
-                drop(temp_file.take());
-                if !raw_target {
-                    let _ = fs::remove_file(&temp_path).await;
+                if let RepairTarget::TempFile { temp_path, .. } = &repair_target {
+                    let _ = fs::remove_file(temp_path).await;
                 }
                 return Err(AppError::InternalServerError(
                     "Missing data shards required to recompute parity".into(),
@@ -719,56 +1178,132 @@ pub async fn repair_entire_shard(
                 .recovery(ridx)
                 .ok_or_else(|| AppError::InternalServerError("Missing parity output".into()))?;
 
-            if raw_target {
-                write_shard_range(&target_shard, offset, data).await?;
-            } else if let Some(writer) = temp_file.as_mut() {
-                writer
-                    .write_all(data)
-                    .await
-                    .map_err(|e| AppError::Io(e, "write repair parity".into()))?;
+            match &mut repair_target {
+                RepairTarget::RawInPlace => {
+                    write_shard_range(&target_shard, offset, data).await?;
+                }
+                RepairTarget::TempFile { writer, .. } => {
+                    writer
+                        .write_all(data)
+                        .await
+                        .map_err(|e| AppError::Io(e, "write repair parity".into()))?;
+                }
             }
         }
 
         offset += cur as u64;
     }
 
-    if raw_target {
-        if !verify_shard_checksum(&target_shard).await? {
-            return Err(AppError::InternalServerError(
-                "Repaired raw shard failed checksum verification".into(),
-            ));
+    match repair_target {
+        RepairTarget::RawInPlace => {
+            if !verify_shard_checksum(&target_shard).await? {
+                return Err(AppError::InternalServerError(
+                    "Repaired raw shard failed checksum verification".into(),
+                ));
+            }
+            info!("Successfully repaired raw shard {}", target_shard.file_name);
         }
-        info!("Successfully repaired raw shard {}", target_shard.file_name);
-    } else {
-        let mut writer = temp_file
-            .take()
-            .ok_or_else(|| AppError::InternalServerError("repair temp writer missing".into()))?;
-        writer
-            .flush()
-            .await
-            .map_err(|e| AppError::Io(e, "flush repair".into()))?;
-        writer
-            .sync_data()
-            .await
-            .map_err(|e| AppError::Io(e, "fsync repair".into()))?;
+        RepairTarget::TempFile {
+            final_path,
+            parent_dir,
+            temp_path,
+            mut writer,
+            raw_commit_disk_idx,
+        } => {
+            writer
+                .flush()
+                .await
+                .map_err(|e| AppError::Io(e, "flush repair".into()))?;
+            writer
+                .sync_data()
+                .await
+                .map_err(|e| AppError::Io(e, "fsync repair".into()))?;
 
-        match fs::rename(&temp_path, &final_path).await {
-            Ok(_) => {}
-            Err(e) => {
-                warn!("Rename failed (will retry after mkdir): {}", e);
-                let _ = fs::create_dir_all(&parent_dir).await;
-                fs::rename(&temp_path, &final_path)
-                    .await
-                    .map_err(|e2| AppError::Io(e2, "rename repaired file".into()))?;
+            if let Some(disk_idx) = raw_commit_disk_idx {
+                let new_raw =
+                    match commit_staged_raw_shard(disk_idx, &temp_path, total_shard_size).await {
+                        Ok(raw) => raw,
+                        Err(err) => {
+                            let _ = fs::remove_file(&temp_path).await;
+                            return Err(err);
+                        }
+                    };
+
+                let mut repaired_shard = target_shard.clone();
+                repaired_shard.raw_blob_address = Some(new_raw.clone());
+                repaired_shard.absolute_path = raw_blob_debug_path(&new_raw);
+
+                if !verify_shard_checksum(&repaired_shard).await? {
+                    let _ = free_raw_address(&new_raw).await;
+                    return Err(AppError::InternalServerError(
+                        "Relocated raw shard failed checksum verification".into(),
+                    ));
+                }
+
+                let Some(ctx) = repair_context.as_ref() else {
+                    let _ = free_raw_address(&new_raw).await;
+                    return Err(AppError::InternalServerError(
+                        "Missing repair context for relocated raw shard".into(),
+                    ));
+                };
+
+                match persist_relocated_raw_shard_metadata(
+                    ctx,
+                    part.part_index,
+                    target_shard.shard_index,
+                    target_shard.raw_blob_address.as_ref(),
+                    &new_raw,
+                )
+                .await
+                {
+                    Ok(RelocatedRawMetadataOutcome::Updated) => {
+                        if let Some(old_raw) = target_shard.raw_blob_address.as_ref() {
+                            remember_raw_relocation(old_raw, &new_raw);
+                            let _ = free_raw_address(old_raw).await;
+                        }
+
+                        info!(
+                            "Successfully relocated raw shard {} -> {}",
+                            target_shard.file_name,
+                            raw_blob_debug_path(&new_raw)
+                        );
+                    }
+                    Ok(RelocatedRawMetadataOutcome::AlreadyRelocated(existing_raw)) => {
+                        let _ = free_raw_address(&new_raw).await;
+                        if let Some(old_raw) = target_shard.raw_blob_address.as_ref() {
+                            remember_raw_relocation(old_raw, &existing_raw);
+                        }
+                        info!(
+                            "Raw shard {} already relocated to {}",
+                            target_shard.file_name,
+                            raw_blob_debug_path(&existing_raw)
+                        );
+                    }
+                    Err(err) => {
+                        let _ = free_raw_address(&new_raw).await;
+                        return Err(err);
+                    }
+                }
+            } else {
+                match fs::rename(&temp_path, &final_path).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("Rename failed (will retry after mkdir): {}", e);
+                        let _ = fs::create_dir_all(&parent_dir).await;
+                        fs::rename(&temp_path, &final_path)
+                            .await
+                            .map_err(|e2| AppError::Io(e2, "rename repaired file".into()))?;
+                    }
+                }
+                let _ = sync_dir(&parent_dir).await;
+
+                info!(
+                    "Successfully repaired shard {} -> {}",
+                    target_shard.file_name,
+                    final_path.display()
+                );
             }
         }
-        let _ = sync_dir(&parent_dir).await;
-
-        info!(
-            "Successfully repaired shard {} -> {}",
-            target_shard.file_name,
-            final_path.display()
-        );
     }
 
     Ok(())

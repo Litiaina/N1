@@ -1,7 +1,7 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::disk_manager::{ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo};
 use crate::n1_core::header_parser::parse_range_header;
-use crate::n1_core::recovery::{ShardFileCache, read_or_recover_chunk};
+use crate::n1_core::recovery::{ShardFileCache, ShardRepairContext, read_or_recover_chunk};
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -170,6 +170,7 @@ async fn read_chunk_with_retries(
     file_offset: u64,
     to_read: usize,
     stripe_size: usize,
+    repair_context: &ShardRepairContext,
 ) -> Result<Vec<u8>, AppError> {
     let mut last_err: Option<AppError> = None;
     for attempt in 0..3usize {
@@ -181,6 +182,7 @@ async fn read_chunk_with_retries(
             file_offset,
             to_read,
             stripe_size,
+            Some(repair_context.clone()),
         )
         .await
         {
@@ -283,6 +285,12 @@ pub async fn stream_object_logic(
     } else {
         None
     };
+    let repair_context = ShardRepairContext::new(
+        fragment.clone(),
+        object_key.clone(),
+        version_id.clone(),
+        false,
+    );
     let parts = parts.into_iter().map(Arc::new).collect::<Vec<_>>();
     let shard_dirs = blob_roots
         .iter()
@@ -301,74 +309,40 @@ pub async fn stream_object_logic(
         _stream_guard: acquire_adaptive_stream_guard().await?,
     };
 
-    let stream = stream::unfold(initial_state, move |mut state| async move {
-        if state.pos > state.end {
-            return None;
-        }
-
-        while state.current_part_idx < state.parts.len() {
-            let part = &state.parts[state.current_part_idx];
-            let part_end_global = state.current_part_offset + part.size_bytes;
-
-            if state.pos >= part_end_global {
-                state.current_part_idx += 1;
-                state.current_part_offset = part_end_global;
-                state.file_cache.clear();
-                continue;
-            }
-
-            let dcount = data_shards_count(part);
-            if dcount == 0 {
-                return Some((
-                    Err(AppError::InternalServerError("No data shards".into())),
-                    state,
-                ));
-            }
-
-            let relative_pos = state.pos - state.current_part_offset;
-
-            let stripe_block_size = state.stripe_size as u64;
-            let stripe_size = stripe_block_size * (dcount as u64);
-
-            let offset_in_stripe = relative_pos % stripe_size;
-
-            let shard_index = (offset_in_stripe / stripe_block_size) as usize;
-            if nth_data_shard(part, shard_index).is_none() {
-                return Some((
-                    Err(AppError::InternalServerError(
-                        "Shard index out of bounds".into(),
-                    )),
-                    state,
-                ));
-            }
-
-            let bytes_remaining_in_req_total = state.end - state.pos + 1;
-            let bytes_remaining_in_part_total = part.size_bytes - relative_pos;
-            let max_emit = adaptive_emit_bytes() as u64;
-            let mut budget = bytes_remaining_in_req_total
-                .min(bytes_remaining_in_part_total)
-                .min(max_emit) as usize;
-            if budget == 0 {
+    let stream = stream::unfold(initial_state, move |mut state| {
+        let repair_context = repair_context.clone();
+        async move {
+            if state.pos > state.end {
                 return None;
             }
 
-            let mut local_pos = state.pos;
-            let mut out = Vec::with_capacity(budget);
+            while state.current_part_idx < state.parts.len() {
+                let part = &state.parts[state.current_part_idx];
+                let part_end_global = state.current_part_offset + part.size_bytes;
 
-            while budget > 0 && local_pos <= state.end {
-                let rel = local_pos - state.current_part_offset;
-                if rel >= part.size_bytes {
-                    break;
+                if state.pos >= part_end_global {
+                    state.current_part_idx += 1;
+                    state.current_part_offset = part_end_global;
+                    state.file_cache.clear();
+                    continue;
                 }
+
+                let dcount = data_shards_count(part);
+                if dcount == 0 {
+                    return Some((
+                        Err(AppError::InternalServerError("No data shards".into())),
+                        state,
+                    ));
+                }
+
+                let relative_pos = state.pos - state.current_part_offset;
 
                 let stripe_block_size = state.stripe_size as u64;
                 let stripe_size = stripe_block_size * (dcount as u64);
-                let stripe_index = rel / stripe_size;
-                let offset_in_stripe = rel % stripe_size;
-                let shard_index = (offset_in_stripe / stripe_block_size) as usize;
-                let offset_in_shard_block = offset_in_stripe % stripe_block_size;
-                let file_offset = (stripe_index * stripe_block_size) + offset_in_shard_block;
 
+                let offset_in_stripe = relative_pos % stripe_size;
+
+                let shard_index = (offset_in_stripe / stripe_block_size) as usize;
                 if nth_data_shard(part, shard_index).is_none() {
                     return Some((
                         Err(AppError::InternalServerError(
@@ -378,59 +352,97 @@ pub async fn stream_object_logic(
                     ));
                 }
 
-                let bytes_remaining_in_block = stripe_block_size - offset_in_shard_block;
-                let bytes_remaining_in_req = state.end - local_pos + 1;
-                let bytes_remaining_in_part = part.size_bytes - rel;
-                let to_read = bytes_remaining_in_block
-                    .min(bytes_remaining_in_req)
-                    .min(bytes_remaining_in_part)
-                    .min(budget as u64) as usize;
-
-                if to_read == 0 {
-                    break;
+                let bytes_remaining_in_req_total = state.end - state.pos + 1;
+                let bytes_remaining_in_part_total = part.size_bytes - relative_pos;
+                let max_emit = adaptive_emit_bytes() as u64;
+                let mut budget = bytes_remaining_in_req_total
+                    .min(bytes_remaining_in_part_total)
+                    .min(max_emit) as usize;
+                if budget == 0 {
+                    return None;
                 }
 
-                let Some(shard_dir) =
-                    shard_dir_with_locality_hint(part, shard_index, &state.shard_dirs)
-                else {
-                    return Some((
-                        Err(AppError::InternalServerError(
-                            "No shard dirs configured".into(),
-                        )),
-                        state,
-                    ));
-                };
+                let mut local_pos = state.pos;
+                let mut out = Vec::with_capacity(budget);
 
-                let data_result = read_chunk_with_retries(
-                    &mut state.file_cache,
-                    shard_dir,
-                    Arc::clone(part),
-                    shard_index,
-                    file_offset,
-                    to_read,
-                    state.stripe_size,
-                )
-                .await;
-
-                match data_result {
-                    Ok(bytes) => {
-                        out.extend_from_slice(&bytes);
-                        local_pos += to_read as u64;
-                        budget = budget.saturating_sub(to_read);
+                while budget > 0 && local_pos <= state.end {
+                    let rel = local_pos - state.current_part_offset;
+                    if rel >= part.size_bytes {
+                        break;
                     }
-                    Err(e) => return Some((Err(e), state)),
+
+                    let stripe_block_size = state.stripe_size as u64;
+                    let stripe_size = stripe_block_size * (dcount as u64);
+                    let stripe_index = rel / stripe_size;
+                    let offset_in_stripe = rel % stripe_size;
+                    let shard_index = (offset_in_stripe / stripe_block_size) as usize;
+                    let offset_in_shard_block = offset_in_stripe % stripe_block_size;
+                    let file_offset = (stripe_index * stripe_block_size) + offset_in_shard_block;
+
+                    if nth_data_shard(part, shard_index).is_none() {
+                        return Some((
+                            Err(AppError::InternalServerError(
+                                "Shard index out of bounds".into(),
+                            )),
+                            state,
+                        ));
+                    }
+
+                    let bytes_remaining_in_block = stripe_block_size - offset_in_shard_block;
+                    let bytes_remaining_in_req = state.end - local_pos + 1;
+                    let bytes_remaining_in_part = part.size_bytes - rel;
+                    let to_read = bytes_remaining_in_block
+                        .min(bytes_remaining_in_req)
+                        .min(bytes_remaining_in_part)
+                        .min(budget as u64) as usize;
+
+                    if to_read == 0 {
+                        break;
+                    }
+
+                    let Some(shard_dir) =
+                        shard_dir_with_locality_hint(part, shard_index, &state.shard_dirs)
+                    else {
+                        return Some((
+                            Err(AppError::InternalServerError(
+                                "No shard dirs configured".into(),
+                            )),
+                            state,
+                        ));
+                    };
+
+                    let data_result = read_chunk_with_retries(
+                        &mut state.file_cache,
+                        shard_dir,
+                        Arc::clone(part),
+                        shard_index,
+                        file_offset,
+                        to_read,
+                        state.stripe_size,
+                        &repair_context,
+                    )
+                    .await;
+
+                    match data_result {
+                        Ok(bytes) => {
+                            out.extend_from_slice(&bytes);
+                            local_pos += to_read as u64;
+                            budget = budget.saturating_sub(to_read);
+                        }
+                        Err(e) => return Some((Err(e), state)),
+                    }
                 }
+
+                if out.is_empty() {
+                    return None;
+                }
+
+                state.pos = local_pos;
+                return Some((Ok(Bytes::from(out)), state));
             }
 
-            if out.is_empty() {
-                return None;
-            }
-
-            state.pos = local_pos;
-            return Some((Ok(Bytes::from(out)), state));
+            None
         }
-
-        None
     });
 
     let body = Body::from_stream(stream);

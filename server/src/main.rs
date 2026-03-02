@@ -16,6 +16,7 @@ use crate::n1_core::object_parser::{
 use crate::n1_core::prefix_compactor::{
     PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC, PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC,
 };
+use crate::n1_core::recovery::RAW_VERIFY_ON_READ_ATOMIC;
 use crate::n1_core::retrieve::PREFIX_MAX_DELTA_SEGMENTS_ATOMIC;
 use crate::n1_core::upload::{
     ADAPTIVE_IO_TARGET_ATOMIC, DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC,
@@ -258,9 +259,11 @@ fn estimate_upload_part_working_set_bytes(
     stripe_block_size: usize,
 ) -> usize {
     let total_shards = data_shards.saturating_add(parity_shards).max(1);
+    let _ = writer_buffer_size;
+    let raw_block_bytes = stripe_block_size.max(4096);
     let writer_buffers_per_shard = raw_writer_inflight_limit.saturating_add(1).max(1);
     let writer_bytes = total_shards
-        .saturating_mul(writer_buffer_size.max(4096))
+        .saturating_mul(raw_block_bytes)
         .saturating_mul(writer_buffers_per_shard);
     let ec_ingest = data_shards
         .max(1)
@@ -897,9 +900,13 @@ pub async fn run_server() {
         upload_section.and_then(|s| s.get("upload_io_gate_enabled")),
         true,
     );
+    let raw_verify_on_read = parse_bool_or_default(
+        upload_section.and_then(|s| s.get("raw_verify_on_read")),
+        false,
+    );
 
     tracing::info!(
-        "Upload tuning: cpu_cores={}, ram_gib={}, blob_paths={}, blob_devices={}, auto_effective_disks={}, ec={}D+{}P, max_concurrent_io={} (configured={} budget_cap={} per_upload_est={}KiB budget={}MiB effective_budget={}MiB), writer_buffer_size={}, raw_writer_inflight_limit={}, part_durability_strict_default={}, io_gate_enabled={}",
+        "Upload tuning: cpu_cores={}, ram_gib={}, blob_paths={}, blob_devices={}, auto_effective_disks={}, ec={}D+{}P, max_concurrent_io={} (configured={} budget_cap={} per_upload_est={}KiB budget={}MiB effective_budget={}MiB), writer_buffer_size={}, raw_writer_inflight_limit={}, part_durability_strict_default={}, io_gate_enabled={}, raw_verify_on_read={}",
         cpu_cores,
         detected_ram_gib,
         blob_disk_count,
@@ -916,7 +923,8 @@ pub async fn run_server() {
         writer_buffer_size,
         raw_writer_inflight_limit,
         upload_part_strict_durability_default,
-        upload_io_gate_enabled
+        upload_io_gate_enabled,
+        raw_verify_on_read
     );
 
     let writer_buffer_size: AtomicUsize = AtomicUsize::new(writer_buffer_size);
@@ -936,6 +944,9 @@ pub async fn run_server() {
     UPLOAD_IO_GATE_ENABLED_ATOMIC
         .set(AtomicBool::new(upload_io_gate_enabled))
         .expect("Double initialization of UPLOAD_IO_GATE_ENABLED_ATOMIC");
+    RAW_VERIFY_ON_READ_ATOMIC
+        .set(AtomicBool::new(raw_verify_on_read))
+        .expect("Double initialization of RAW_VERIFY_ON_READ_ATOMIC");
 
     let stream_chunk_size = align_up_4k(parse_usize_or_auto(
         upload_section.and_then(|s| s.get("stream_chunk_size")),
