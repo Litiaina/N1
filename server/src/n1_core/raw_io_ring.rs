@@ -18,6 +18,16 @@ pub(crate) enum RawIoSubmitError {
     Closed(AlignedBuffer),
 }
 
+pub(crate) enum RawReadCompletion {
+    ReadOk(Vec<u8>),
+    ReadErr(Option<Vec<u8>>, io::Error),
+}
+
+pub(crate) enum RawReadSubmitError {
+    Full(Vec<u8>),
+    Closed(Vec<u8>),
+}
+
 struct RawIoCommand {
     offset: u64,
     buffer: AlignedBuffer,
@@ -34,9 +44,31 @@ struct CompletionState {
     waker: AtomicWaker,
 }
 
+struct RawReadCommand {
+    offset: u64,
+    buffer: Vec<u8>,
+}
+
+struct RawReadSubmissionState {
+    queue: VecDeque<RawReadCommand>,
+    max_depth: usize,
+    closed: bool,
+}
+
+struct ReadCompletionState {
+    queue: Mutex<VecDeque<RawReadCompletion>>,
+    waker: AtomicWaker,
+}
+
 pub(crate) struct RawIoRing {
     submissions: Arc<(Mutex<SubmissionState>, Condvar)>,
     completions: Arc<CompletionState>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+pub(crate) struct RawReadRing {
+    submissions: Arc<(Mutex<RawReadSubmissionState>, Condvar)>,
+    completions: Arc<ReadCompletionState>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -125,6 +157,91 @@ impl Drop for RawIoRing {
     }
 }
 
+impl RawReadRing {
+    pub(crate) fn new(io: DirectExtentIo, queue_depth: usize) -> Self {
+        let queue_depth = queue_depth.clamp(1, 16);
+        let submissions = Arc::new((
+            Mutex::new(RawReadSubmissionState {
+                queue: VecDeque::with_capacity(queue_depth),
+                max_depth: queue_depth,
+                closed: false,
+            }),
+            Condvar::new(),
+        ));
+        let completions = Arc::new(ReadCompletionState {
+            queue: Mutex::new(VecDeque::with_capacity(queue_depth)),
+            waker: AtomicWaker::new(),
+        });
+
+        let mut workers = Vec::new();
+        let worker_count = read_worker_count_for_depth(queue_depth);
+        for idx in 0..worker_count {
+            let worker_io = io.clone();
+            let worker_submissions = Arc::clone(&submissions);
+            let worker_completions = Arc::clone(&completions);
+            let handle = thread::Builder::new()
+                .name(format!("n1-raw-read-{}", idx))
+                .spawn(move || read_worker_loop(worker_io, worker_submissions, worker_completions))
+                .expect("failed to spawn raw read worker");
+            workers.push(handle);
+        }
+
+        Self {
+            submissions,
+            completions,
+            workers,
+        }
+    }
+
+    pub(crate) fn submit_read(
+        &self,
+        offset: u64,
+        buffer: Vec<u8>,
+    ) -> Result<(), RawReadSubmitError> {
+        let (lock, cvar) = &*self.submissions;
+        let mut state = lock.lock().expect("raw read ring submissions poisoned");
+        if state.closed {
+            return Err(RawReadSubmitError::Closed(buffer));
+        }
+        if state.queue.len() >= state.max_depth {
+            return Err(RawReadSubmitError::Full(buffer));
+        }
+        state.queue.push_back(RawReadCommand { offset, buffer });
+        cvar.notify_one();
+        Ok(())
+    }
+
+    pub(crate) fn poll_completions(&self, cx: &std::task::Context<'_>) -> Vec<RawReadCompletion> {
+        self.completions.waker.register(cx.waker());
+        self.take_completions_now()
+    }
+
+    pub(crate) fn take_completions_now(&self) -> Vec<RawReadCompletion> {
+        let mut queue = self
+            .completions
+            .queue
+            .lock()
+            .expect("raw read ring completions poisoned");
+        queue.drain(..).collect()
+    }
+
+    fn close(&self) {
+        let (lock, cvar) = &*self.submissions;
+        let mut state = lock.lock().expect("raw read ring submissions poisoned");
+        state.closed = true;
+        cvar.notify_all();
+    }
+}
+
+impl Drop for RawReadRing {
+    fn drop(&mut self) {
+        self.close();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
 fn worker_loop(
     io: DirectExtentIo,
     submissions: Arc<(Mutex<SubmissionState>, Condvar)>,
@@ -162,11 +279,54 @@ fn worker_loop(
     }
 }
 
+fn read_worker_loop(
+    io: DirectExtentIo,
+    submissions: Arc<(Mutex<RawReadSubmissionState>, Condvar)>,
+    completions: Arc<ReadCompletionState>,
+) {
+    loop {
+        let command = {
+            let (lock, cvar) = &*submissions;
+            let mut state = lock.lock().expect("raw read ring submissions poisoned");
+            while state.queue.is_empty() && !state.closed {
+                state = cvar.wait(state).expect("raw read ring condvar poisoned");
+            }
+            if state.closed && state.queue.is_empty() {
+                return;
+            }
+            state.queue.pop_front()
+        };
+
+        let Some(mut command) = command else {
+            continue;
+        };
+
+        let result = io.read_into(command.offset, &mut command.buffer);
+        match result {
+            Ok(()) => push_read_completion(&completions, RawReadCompletion::ReadOk(command.buffer)),
+            Err(e) => {
+                let err = io::Error::other(format!("block manager: {}", e));
+                fail_read_ring(&submissions, &completions, Some(command.buffer), err);
+                return;
+            }
+        }
+    }
+}
+
 fn push_completion(completions: &CompletionState, completion: RawIoCompletion) {
     let mut queue = completions
         .queue
         .lock()
         .expect("raw io ring completions poisoned");
+    queue.push_back(completion);
+    completions.waker.wake();
+}
+
+fn push_read_completion(completions: &ReadCompletionState, completion: RawReadCompletion) {
+    let mut queue = completions
+        .queue
+        .lock()
+        .expect("raw read ring completions poisoned");
     queue.push_back(completion);
     completions.waker.wake();
 }
@@ -204,6 +364,39 @@ fn fail_ring(
     completions.waker.wake();
 }
 
+fn fail_read_ring(
+    submissions: &Arc<(Mutex<RawReadSubmissionState>, Condvar)>,
+    completions: &ReadCompletionState,
+    failed_buffer: Option<Vec<u8>>,
+    err: io::Error,
+) {
+    let mut pending = Vec::new();
+    {
+        let (lock, cvar) = &**submissions;
+        let mut state = lock.lock().expect("raw read ring submissions poisoned");
+        state.closed = true;
+        pending.extend(state.queue.drain(..));
+        cvar.notify_all();
+    }
+
+    let err_kind = err.kind();
+    let err_message = err.to_string();
+    {
+        let mut queue = completions
+            .queue
+            .lock()
+            .expect("raw read ring completions poisoned");
+        queue.push_back(RawReadCompletion::ReadErr(failed_buffer, err));
+        for pending_cmd in pending {
+            queue.push_back(RawReadCompletion::ReadErr(
+                Some(pending_cmd.buffer),
+                io::Error::new(err_kind, err_message.clone()),
+            ));
+        }
+    }
+    completions.waker.wake();
+}
+
 fn worker_count_for_depth(queue_depth: usize) -> usize {
     match queue_depth {
         0..=8 => 1,
@@ -212,9 +405,17 @@ fn worker_count_for_depth(queue_depth: usize) -> usize {
     }
 }
 
+fn read_worker_count_for_depth(queue_depth: usize) -> usize {
+    match queue_depth {
+        0..=4 => 1,
+        5..=12 => 2,
+        _ => 3,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::worker_count_for_depth;
+    use super::{read_worker_count_for_depth, worker_count_for_depth};
 
     #[test]
     fn worker_count_scales_with_depth_but_stays_bounded() {
@@ -222,5 +423,12 @@ mod tests {
         assert_eq!(worker_count_for_depth(8), 1);
         assert_eq!(worker_count_for_depth(16), 2);
         assert_eq!(worker_count_for_depth(32), 3);
+    }
+
+    #[test]
+    fn read_worker_count_scales_with_depth_but_stays_bounded() {
+        assert_eq!(read_worker_count_for_depth(2), 1);
+        assert_eq!(read_worker_count_for_depth(8), 2);
+        assert_eq!(read_worker_count_for_depth(16), 3);
     }
 }

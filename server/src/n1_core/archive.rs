@@ -26,11 +26,12 @@ use crate::{
     n1_core::constants::{METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, RESERVATION_FILE},
     n1_core::disk_manager::{
         DownloadArchiveRequest, ListObjectsResult, ObjectMetadata, ObjectPathManager,
-        ObjectSummary, PartMetadata, ShardInfo,
+        ObjectSummary, PartMetadata,
     },
     n1_core::{
         metadata_parser::get_metadata,
-        recovery::{ShardFileCache, ShardRepairContext, read_or_recover_chunk},
+        object_parser::{data_shards_count, shard_dir_with_locality_hint, shard_dirs_for_version},
+        recovery::{ShardFileCache, ShardRepairContext, read_or_recover_chunk_into},
     },
     structs::auth_structs::Claims,
 };
@@ -852,6 +853,14 @@ fn create_multipart_reader(
 ) -> StreamReader<impl Stream<Item = std::io::Result<Bytes>> + Unpin, Bytes> {
     let parts: std::collections::VecDeque<PartMetadata> = metadata.parts.clone().into();
     let stripe_size_bytes = metadata.stripe_size_bytes;
+    let path_manager = ObjectPathManager::new();
+    let blob_roots = path_manager.get_blob_roots();
+    let shard_dirs = shard_dirs_for_version(
+        &path_manager,
+        &blob_roots,
+        &metadata.fragment,
+        &metadata.version_id,
+    );
     let repair_context = ShardRepairContext::new(
         metadata.fragment.clone(),
         metadata.object_key.clone(),
@@ -861,17 +870,19 @@ fn create_multipart_reader(
 
     struct ReaderState {
         parts_queue: std::collections::VecDeque<PartMetadata>,
-        blob_dir: PathBuf,
+        shard_dirs: Vec<PathBuf>,
         cursor_in_part: u64,
         file_cache: ShardFileCache,
+        scratch: Vec<u8>,
         stripe_size: usize,
     }
 
     let initial_state = ReaderState {
         parts_queue: parts,
-        blob_dir: PathBuf::new(),
+        shard_dirs,
         cursor_in_part: 0,
         file_cache: ShardFileCache::new(),
+        scratch: Vec::new(),
         stripe_size: stripe_size_bytes,
     };
 
@@ -911,9 +922,7 @@ fn create_multipart_reader(
                     continue;
                 }
 
-                let data_shards_info: Vec<&ShardInfo> =
-                    part.shards.iter().filter(|s| !s.is_parity).collect();
-                let data_shards_count = data_shards_info.len() as u64;
+                let data_shards_count = data_shards_count(part) as u64;
 
                 if data_shards_count == 0 {
                     return Some((
@@ -943,21 +952,30 @@ fn create_multipart_reader(
                         std::cmp::min(remaining_req as u64, bytes_left_in_block) as usize;
 
                     let part_arc = Arc::new(part.clone());
+                    let Some(shard_dir) =
+                        shard_dir_with_locality_hint(part, shard_index, &state.shard_dirs)
+                    else {
+                        return Some((
+                            Err(std::io::Error::other("No shard dirs configured")),
+                            state,
+                        ));
+                    };
 
-                    match read_or_recover_chunk(
+                    match read_or_recover_chunk_into(
                         &mut state.file_cache,
-                        &state.blob_dir,
+                        shard_dir,
                         part_arc,
                         shard_index,
                         file_offset,
                         chunk_len,
                         state.stripe_size,
                         Some(repair_context.clone()),
+                        &mut state.scratch,
                     )
                     .await
                     {
-                        Ok(data) => {
-                            buf.extend_from_slice(&data);
+                        Ok(()) => {
+                            buf.extend_from_slice(&state.scratch);
                             state.cursor_in_part += chunk_len as u64;
                             temp_bytes_read += chunk_len;
                         }

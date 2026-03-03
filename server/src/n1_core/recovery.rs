@@ -7,14 +7,18 @@ use crate::n1_core::constants::GC_SUFFIX;
 use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, PartMetadata, RawBlobAddress, ShardInfo,
 };
+use crate::n1_core::raw_io_ring::{RawReadCompletion, RawReadRing, RawReadSubmitError};
 use crate::n1_core::upload::{DirectWriter, sync_dir, write_atomic};
 
-use block_manager::DirectExtentIo;
 use crc32fast::Hasher;
+use futures_util::future::{BoxFuture, FutureExt};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use once_cell::sync::OnceCell;
 use simd_erasure_core::{ReedSolomonDecoder, ReedSolomonEncoder};
+use std::future::poll_fn;
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions as StdOpenOptions;
+use std::io;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -108,7 +112,7 @@ enum RelocatedRawMetadataOutcome {
 pub enum CachedShardHandle {
     File(File),
     Raw {
-        io: DirectExtentIo,
+        ring: Arc<RawReadRing>,
         raw_blob_address: RawBlobAddress,
         verified: bool,
     },
@@ -120,6 +124,62 @@ pub type ShardFileCache = HashMap<String, CachedShardHandle>;
 enum RawReadValidationMode {
     Fast,
     Verified,
+}
+
+struct DecoderBufferPool {
+    peer_buffers: Vec<Vec<u8>>,
+    stripe_data: Vec<Vec<u8>>,
+    stripe_present: Vec<bool>,
+    restored_target: Vec<u8>,
+}
+
+impl DecoderBufferPool {
+    fn new(data_count: usize) -> Self {
+        Self {
+            peer_buffers: Vec::new(),
+            stripe_data: (0..data_count).map(|_| Vec::new()).collect(),
+            stripe_present: vec![false; data_count],
+            restored_target: Vec::new(),
+        }
+    }
+
+    fn take_peer_buffer(&mut self, len: usize) -> Vec<u8> {
+        let mut buffer = self.peer_buffers.pop().unwrap_or_default();
+        buffer.clear();
+        buffer.resize(len, 0);
+        buffer
+    }
+
+    fn recycle_peer_buffer(&mut self, mut buffer: Vec<u8>) {
+        buffer.clear();
+        self.peer_buffers.push(buffer);
+    }
+
+    fn reset_for_stripe(&mut self, target_is_parity: bool) {
+        self.restored_target.clear();
+        if target_is_parity {
+            self.stripe_present.fill(false);
+            for shard in &mut self.stripe_data {
+                shard.clear();
+            }
+        }
+    }
+
+    fn store_data_shard(&mut self, idx: usize, data: &[u8]) {
+        let slot = &mut self.stripe_data[idx];
+        slot.clear();
+        slot.extend_from_slice(data);
+        self.stripe_present[idx] = true;
+    }
+}
+
+#[derive(Clone)]
+struct RawPeerReadTask {
+    ring: Arc<RawReadRing>,
+    shard_index: usize,
+    is_parity: bool,
+    file_name: String,
+    absolute_path: String,
 }
 
 #[inline]
@@ -643,10 +703,10 @@ async fn get_or_open_shard_ha(
 fn cached_raw_handle(
     file_cache: &ShardFileCache,
     shard_info: &ShardInfo,
-) -> Option<(DirectExtentIo, bool)> {
+) -> Option<(Arc<RawReadRing>, bool)> {
     let expected_raw = shard_info.raw_blob_address.as_ref()?;
     let CachedShardHandle::Raw {
-        io,
+        ring,
         raw_blob_address,
         verified,
     } = file_cache.get(&shard_info.file_name)?
@@ -656,15 +716,15 @@ fn cached_raw_handle(
     if raw_blob_address != expected_raw {
         return None;
     }
-    Some((io.clone(), *verified))
+    Some((Arc::clone(ring), *verified))
 }
 
 async fn get_or_open_raw_shard(
     file_cache: &mut ShardFileCache,
     shard_info: &ShardInfo,
     validation_mode: RawReadValidationMode,
-) -> Option<DirectExtentIo> {
-    if let Some((io, verified)) = cached_raw_handle(file_cache, shard_info) {
+) -> Option<Arc<RawReadRing>> {
+    if let Some((ring, verified)) = cached_raw_handle(file_cache, shard_info) {
         if validation_mode == RawReadValidationMode::Verified && !verified {
             if !verify_shard_checksum(shard_info).await.ok()? {
                 return None;
@@ -672,13 +732,13 @@ async fn get_or_open_raw_shard(
             file_cache.insert(
                 shard_info.file_name.clone(),
                 CachedShardHandle::Raw {
-                    io: io.clone(),
+                    ring: Arc::clone(&ring),
                     raw_blob_address: shard_info.raw_blob_address.clone()?,
                     verified: true,
                 },
             );
         }
-        return Some(io);
+        return Some(ring);
     }
 
     if validation_mode == RawReadValidationMode::Verified
@@ -688,25 +748,122 @@ async fn get_or_open_raw_shard(
     }
 
     let io = open_raw_direct_io(shard_info).ok()?;
+    let ring = Arc::new(RawReadRing::new(io, 4));
     file_cache.insert(
         shard_info.file_name.clone(),
         CachedShardHandle::Raw {
-            io: io.clone(),
+            ring: Arc::clone(&ring),
             raw_blob_address: shard_info.raw_blob_address.clone()?,
             verified: validation_mode == RawReadValidationMode::Verified,
         },
     );
-    Some(io)
+    Some(ring)
 }
 
-async fn read_shard_chunk_cached(
+async fn wait_for_raw_read_completion(ring: &RawReadRing) -> RawReadCompletion {
+    poll_fn(|cx| {
+        let mut completions = ring.poll_completions(cx);
+        if completions.is_empty() {
+            return std::task::Poll::Pending;
+        }
+        std::task::Poll::Ready(completions.swap_remove(0))
+    })
+    .await
+}
+
+async fn submit_raw_read_via_ring(
+    ring: &Arc<RawReadRing>,
+    offset: u64,
+    buffer: Vec<u8>,
+) -> Result<(), (io::Error, Vec<u8>)> {
+    match ring.submit_read(offset, buffer) {
+        Ok(()) => Ok(()),
+        Err(RawReadSubmitError::Full(returned)) => Err((
+            io::Error::new(io::ErrorKind::WouldBlock, "raw read ring submission queue is full"),
+            returned,
+        )),
+        Err(RawReadSubmitError::Closed(returned)) => Err((
+            io::Error::new(io::ErrorKind::BrokenPipe, "raw read ring is closed"),
+            returned,
+        )),
+    }
+}
+
+async fn await_raw_peer_task(
+    task: RawPeerReadTask,
+) -> (RawPeerReadTask, Result<Vec<u8>, (io::Error, Vec<u8>)>) {
+    let result = match wait_for_raw_read_completion(task.ring.as_ref()).await {
+        RawReadCompletion::ReadOk(buf) => Ok(buf),
+        RawReadCompletion::ReadErr(buf, err) => Err((err, buf.unwrap_or_default())),
+    };
+    (task, result)
+}
+
+fn apply_decoder_shard(
+    decoder: &mut ReedSolomonDecoder,
+    data_count: usize,
+    shard_index: usize,
+    is_parity: bool,
+    buffer: &[u8],
+) -> bool {
+    let result = if is_parity {
+        decoder.add_recovery_shard(shard_index - data_count, buffer)
+    } else {
+        decoder.add_original_shard(shard_index, buffer)
+    };
+    result.is_ok()
+}
+
+async fn prime_raw_peer_reads(
+    pending_raw: &mut FuturesUnordered<
+        BoxFuture<'static, (RawPeerReadTask, Result<Vec<u8>, (io::Error, Vec<u8>)>)>,
+    >,
+    remaining_raw: &mut std::vec::IntoIter<RawPeerReadTask>,
+    buffer_pool: &mut DecoderBufferPool,
+    offset: u64,
+    len: usize,
+    inflight_limit: usize,
+) {
+    while pending_raw.len() < inflight_limit {
+        let Some(task) = remaining_raw.next() else {
+            break;
+        };
+        let buffer = buffer_pool.take_peer_buffer(len);
+        match submit_raw_read_via_ring(&task.ring, offset, buffer).await {
+            Ok(()) => pending_raw.push(await_raw_peer_task(task).boxed()),
+            Err((_err, buffer)) => buffer_pool.recycle_peer_buffer(buffer),
+        }
+    }
+}
+
+async fn read_raw_chunk_via_ring(
+    ring: &Arc<RawReadRing>,
+    offset: u64,
+    len: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), (io::Error, Vec<u8>)> {
+    let mut buffer = std::mem::take(out);
+    buffer.clear();
+    buffer.resize(len, 0);
+    submit_raw_read_via_ring(ring, offset, buffer).await?;
+    match wait_for_raw_read_completion(ring.as_ref()).await {
+        RawReadCompletion::ReadOk(buf) => {
+            *out = buf;
+            Ok(())
+        }
+        RawReadCompletion::ReadErr(buf, err) => Err((err, buf.unwrap_or_default())),
+    }
+}
+
+async fn read_shard_chunk_cached_into(
     file_cache: &mut ShardFileCache,
     shard_info: &ShardInfo,
     version_dir_hint: Option<&Path>,
     offset: u64,
     len: usize,
     validation_mode: RawReadValidationMode,
-) -> Option<Vec<u8>> {
+    out: &mut Vec<u8>,
+) -> Option<()> {
     let remapped_raw_shard;
     let effective_shard = if let Some(remapped) = remap_raw_shard_info(shard_info) {
         remapped_raw_shard = Some(remapped);
@@ -716,13 +873,13 @@ async fn read_shard_chunk_cached(
     };
 
     if effective_shard.raw_blob_address.is_some() {
-        let io = get_or_open_raw_shard(file_cache, effective_shard, validation_mode).await?;
-        return match tokio::task::spawn_blocking(move || io.read(offset, len))
-            .await
-            .ok()?
-        {
-            Ok(chunk) => Some(chunk),
-            Err(err) => {
+        let ring = get_or_open_raw_shard(file_cache, effective_shard, validation_mode).await?;
+        return match read_raw_chunk_via_ring(&ring, offset, len, out).await {
+            Ok(()) => {
+                Some(())
+            }
+            Err((err, returned)) => {
+                *out = returned;
                 warn!(
                     "Raw shard read failed file={} path={} offset={} len={} err={}",
                     effective_shard.file_name, effective_shard.absolute_path, offset, len, err
@@ -737,11 +894,12 @@ async fn read_shard_chunk_cached(
         return None;
     }
 
-    let mut chunk = vec![0u8; len];
-    if file.read_exact(&mut chunk).await.is_err() {
+    out.clear();
+    out.resize(len, 0);
+    if file.read_exact(out).await.is_err() {
         return None;
     }
-    Some(chunk)
+    Some(())
 }
 
 fn data_shards_count(part: &PartMetadata) -> usize {
@@ -762,7 +920,7 @@ fn nth_data_shard<'a>(part: &'a PartMetadata, nth: usize) -> Option<&'a ShardInf
     None
 }
 
-pub async fn read_or_recover_chunk(
+pub async fn read_or_recover_chunk_into(
     file_cache: &mut ShardFileCache,
     version_dir: &Path,
     part: Arc<PartMetadata>,
@@ -771,7 +929,8 @@ pub async fn read_or_recover_chunk(
     len: usize,
     block_size: usize,
     repair_context: Option<ShardRepairContext>,
-) -> Result<Vec<u8>, AppError> {
+    out: &mut Vec<u8>,
+) -> Result<(), AppError> {
     let target_shard = nth_data_shard(&part, shard_idx)
         .ok_or(AppError::InternalServerError("Bad shard index".into()))?;
 
@@ -786,17 +945,19 @@ pub async fn read_or_recover_chunk(
         RawReadValidationMode::Fast
     };
 
-    if let Some(chunk) = read_shard_chunk_cached(
+    if read_shard_chunk_cached_into(
         file_cache,
         target_shard,
         vdir_hint,
         offset,
         len,
         target_validation_mode,
+        out,
     )
     .await
+    .is_some()
     {
-        return Ok(chunk);
+        return Ok(());
     }
     let data_count = data_shards_count(&part);
     let parity_count = part.shards.len().saturating_sub(data_count);
@@ -818,37 +979,117 @@ pub async fn read_or_recover_chunk(
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
     let mut shards_added = 0usize;
+    let mut buffer_pool = DecoderBufferPool::new(data_count);
+    let mut file_peers = Vec::new();
+    let mut raw_peers = Vec::new();
 
     for s in &part.shards {
         if s.shard_index == target_shard.shard_index {
             continue;
         }
 
-        let Some(chunk) = read_shard_chunk_cached(
+        if s.raw_blob_address.is_some() {
+            let Some(ring) = get_or_open_raw_shard(file_cache, s, RawReadValidationMode::Verified).await
+            else {
+                continue;
+            };
+            raw_peers.push(RawPeerReadTask {
+                ring,
+                shard_index: s.shard_index,
+                is_parity: s.is_parity,
+                file_name: s.file_name.clone(),
+                absolute_path: s.absolute_path.clone(),
+            });
+        } else {
+            file_peers.push(s.clone());
+        }
+    }
+
+    let mut pending_raw: FuturesUnordered<
+        BoxFuture<'static, (RawPeerReadTask, Result<Vec<u8>, (io::Error, Vec<u8>)>)>,
+    > = FuturesUnordered::new();
+    let mut remaining_raw = raw_peers.into_iter();
+    let raw_inflight_limit = data_count.clamp(1, 4);
+
+    prime_raw_peer_reads(
+        &mut pending_raw,
+        &mut remaining_raw,
+        &mut buffer_pool,
+        offset,
+        len,
+        raw_inflight_limit,
+    )
+    .await;
+
+    for s in &file_peers {
+        if shards_added >= data_count {
+            break;
+        }
+
+        let mut peer_scratch = buffer_pool.take_peer_buffer(len);
+        let read_ok = read_shard_chunk_cached_into(
             file_cache,
             s,
             vdir_hint,
             offset,
             len,
             RawReadValidationMode::Verified,
+            &mut peer_scratch,
         )
         .await
-        else {
-            continue;
-        };
+        .is_some();
 
-        let res = if s.is_parity {
-            decoder.add_recovery_shard(s.shard_index - data_count, chunk)
-        } else {
-            decoder.add_original_shard(s.shard_index, chunk)
-        };
-
-        if res.is_ok() {
-            shards_added += 1;
-            if shards_added >= data_count {
-                break;
+        if read_ok {
+            if apply_decoder_shard(
+                &mut decoder,
+                data_count,
+                s.shard_index,
+                s.is_parity,
+                &peer_scratch,
+            ) {
+                shards_added += 1;
             }
         }
+
+        buffer_pool.recycle_peer_buffer(peer_scratch);
+    }
+
+    while shards_added < data_count {
+        let Some((task, result)) = pending_raw.next().await else {
+            break;
+        };
+
+        match result {
+            Ok(buffer) => {
+                if apply_decoder_shard(
+                    &mut decoder,
+                    data_count,
+                    task.shard_index,
+                    task.is_parity,
+                    &buffer,
+                ) {
+                    shards_added += 1;
+                }
+                buffer_pool.recycle_peer_buffer(buffer);
+            }
+            Err((err, buffer)) => {
+                warn!(
+                    "Raw shard read failed file={} path={} offset={} len={} err={}",
+                    task.file_name, task.absolute_path, offset, len, err
+                );
+                buffer_pool.recycle_peer_buffer(buffer);
+            }
+        }
+
+        prime_raw_peer_reads(
+            &mut pending_raw,
+            &mut remaining_raw,
+            &mut buffer_pool,
+            offset,
+            len,
+            raw_inflight_limit,
+        )
+        .await;
     }
 
     if shards_added < data_count {
@@ -858,16 +1099,19 @@ pub async fn read_or_recover_chunk(
         )));
     }
 
-    let restored = decoder
+    let decoded = decoder
         .decode()
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    let restored = decoded
         .restored_original_iter()
         .find(|(idx, _)| *idx == target_shard.shard_index)
         .ok_or(AppError::InternalServerError(
             "Reconstruction failed for target shard".into(),
         ))?
-        .1
-        .to_vec();
+        .1;
+
+    out.clear();
+    out.extend_from_slice(restored);
 
     let part_clone = Arc::clone(&part);
     let target_idx = target_shard.shard_index;
@@ -885,7 +1129,7 @@ pub async fn read_or_recover_chunk(
         });
     }
 
-    Ok(restored)
+    Ok(())
 }
 
 pub async fn repair_entire_shard(
@@ -1063,50 +1307,153 @@ pub async fn repair_entire_shard(
     }
 
     let mut peer_cache: ShardFileCache = HashMap::new();
+    let mut file_peers = Vec::new();
+    let mut raw_peer_templates = Vec::new();
+
+    for s_info in &part.shards {
+        if s_info.shard_index == target_shard.shard_index {
+            continue;
+        }
+
+        if s_info.raw_blob_address.is_some() {
+            let Some(ring) =
+                get_or_open_raw_shard(&mut peer_cache, s_info, RawReadValidationMode::Verified)
+                    .await
+            else {
+                continue;
+            };
+            raw_peer_templates.push(RawPeerReadTask {
+                ring,
+                shard_index: s_info.shard_index,
+                is_parity: s_info.is_parity,
+                file_name: s_info.file_name.clone(),
+                absolute_path: s_info.absolute_path.clone(),
+            });
+        } else {
+            file_peers.push(s_info.clone());
+        }
+    }
 
     let mut offset = 0u64;
     let target_is_parity = target_shard.shard_index >= data_count;
+    let raw_inflight_limit = data_count.clamp(1, 4);
+    let mut buffer_pool = DecoderBufferPool::new(data_count);
+    let mut decoder_state: Option<ReedSolomonDecoder> = None;
+    let mut encoder_state: Option<ReedSolomonEncoder> = None;
     while offset < total_shard_size {
         let remaining = (total_shard_size - offset) as usize;
         let cur = remaining.min(block_size);
 
-        let mut decoder = ReedSolomonDecoder::new(data_count, parity_count, cur)
-            .map_err(|e| AppError::InternalServerError(format!("RS Init: {}", e)))?;
+        if let Some(decoder) = decoder_state.as_mut() {
+            decoder
+                .reset(data_count, parity_count, cur)
+                .map_err(|e| AppError::InternalServerError(format!("RS Reset: {}", e)))?;
+        } else {
+            decoder_state = Some(
+                ReedSolomonDecoder::new(data_count, parity_count, cur)
+                    .map_err(|e| AppError::InternalServerError(format!("RS Init: {}", e)))?,
+            );
+        }
+        let decoder = decoder_state
+            .as_mut()
+            .expect("decoder state initialized for repair stripe");
 
-        let mut stripe_data: Vec<Option<Vec<u8>>> = vec![None; data_count];
+        buffer_pool.reset_for_stripe(target_is_parity);
         let mut shards_found = 0usize;
 
-        for s_info in &part.shards {
-            if s_info.shard_index == target_shard.shard_index {
-                continue;
-            }
+        let mut pending_raw: FuturesUnordered<
+            BoxFuture<'static, (RawPeerReadTask, Result<Vec<u8>, (io::Error, Vec<u8>)>)>,
+        > = FuturesUnordered::new();
+        let mut remaining_raw = raw_peer_templates.clone().into_iter();
 
-            let Some(buf) = read_shard_chunk_cached(
+        prime_raw_peer_reads(
+            &mut pending_raw,
+            &mut remaining_raw,
+            &mut buffer_pool,
+            offset,
+            cur,
+            raw_inflight_limit,
+        )
+        .await;
+
+        for s_info in &file_peers {
+            if shards_found >= data_count {
+                break;
+            }
+            let mut peer_scratch = buffer_pool.take_peer_buffer(cur);
+            let Some(()) = read_shard_chunk_cached_into(
                 &mut peer_cache,
                 s_info,
                 None,
                 offset,
                 cur,
                 RawReadValidationMode::Verified,
+                &mut peer_scratch,
             )
             .await
             else {
+                buffer_pool.recycle_peer_buffer(peer_scratch);
                 continue;
             };
 
-            let res = if s_info.is_parity {
-                decoder.add_recovery_shard(s_info.shard_index - data_count, &buf)
+            let added = if s_info.is_parity {
+                decoder.add_recovery_shard(s_info.shard_index - data_count, &peer_scratch)
             } else {
-                let add = decoder.add_original_shard(s_info.shard_index, &buf);
-                if add.is_ok() && target_is_parity && s_info.shard_index < data_count {
-                    stripe_data[s_info.shard_index] = Some(buf);
+                let add = decoder.add_original_shard(s_info.shard_index, &peer_scratch);
+                if add.is_ok() && target_is_parity {
+                    buffer_pool.store_data_shard(s_info.shard_index, &peer_scratch);
                 }
                 add
-            };
+            }
+            .is_ok();
 
-            if res.is_ok() {
+            buffer_pool.recycle_peer_buffer(peer_scratch);
+            if added {
                 shards_found += 1;
             }
+        }
+
+        while shards_found < data_count {
+            let Some((task, result)) = pending_raw.next().await else {
+                break;
+            };
+
+            match result {
+                Ok(buffer) => {
+                    let added = if task.is_parity {
+                        decoder.add_recovery_shard(task.shard_index - data_count, &buffer)
+                    } else {
+                        let add = decoder.add_original_shard(task.shard_index, &buffer);
+                        if add.is_ok() && target_is_parity {
+                            buffer_pool.store_data_shard(task.shard_index, &buffer);
+                        }
+                        add
+                    }
+                    .is_ok();
+
+                    if added {
+                        shards_found += 1;
+                    }
+                    buffer_pool.recycle_peer_buffer(buffer);
+                }
+                Err((err, buffer)) => {
+                    warn!(
+                        "Raw shard read failed file={} path={} offset={} len={} err={}",
+                        task.file_name, task.absolute_path, offset, cur, err
+                    );
+                    buffer_pool.recycle_peer_buffer(buffer);
+                }
+            }
+
+            prime_raw_peer_reads(
+                &mut pending_raw,
+                &mut remaining_raw,
+                &mut buffer_pool,
+                offset,
+                cur,
+                raw_inflight_limit,
+            )
+            .await;
         }
 
         if shards_found < data_count {
@@ -1124,22 +1471,26 @@ pub async fn repair_entire_shard(
 
         if target_shard.shard_index < data_count {
             for (idx, data) in decoded.restored_original_iter() {
-                if idx < data_count {
-                    stripe_data[idx] = Some(data.to_vec());
+                if idx == target_shard.shard_index {
+                    buffer_pool.restored_target.extend_from_slice(data);
+                    break;
                 }
             }
-            let data = stripe_data[target_shard.shard_index]
-                .as_ref()
-                .ok_or_else(|| {
-                    AppError::InternalServerError("Missing restored data shard".into())
-                })?;
+            if buffer_pool.restored_target.is_empty() {
+                if let RepairTarget::TempFile { temp_path, .. } = &repair_target {
+                    let _ = fs::remove_file(temp_path).await;
+                }
+                return Err(AppError::InternalServerError(
+                    "Missing restored data shard".into(),
+                ));
+            }
             match &mut repair_target {
                 RepairTarget::RawInPlace => {
-                    write_shard_range(&target_shard, offset, data).await?;
+                    write_shard_range(&target_shard, offset, &buffer_pool.restored_target).await?;
                 }
                 RepairTarget::TempFile { writer, .. } => {
                     writer
-                        .write_all(data)
+                        .write_all(&buffer_pool.restored_target)
                         .await
                         .map_err(|e| AppError::Io(e, "write repair data".into()))?;
                 }
@@ -1147,11 +1498,11 @@ pub async fn repair_entire_shard(
         } else {
             for (idx, data) in decoded.restored_original_iter() {
                 if idx < data_count {
-                    stripe_data[idx] = Some(data.to_vec());
+                    buffer_pool.store_data_shard(idx, data);
                 }
             }
 
-            if stripe_data.iter().any(|d| d.is_none()) {
+            if buffer_pool.stripe_present.iter().any(|present| !*present) {
                 if let RepairTarget::TempFile { temp_path, .. } = &repair_target {
                     let _ = fs::remove_file(temp_path).await;
                 }
@@ -1160,10 +1511,21 @@ pub async fn repair_entire_shard(
                 ));
             }
 
-            let mut encoder = ReedSolomonEncoder::new(data_count, parity_count, cur)
-                .map_err(|e| AppError::InternalServerError(format!("RS Enc Init: {}", e)))?;
+            if let Some(encoder) = encoder_state.as_mut() {
+                encoder
+                    .reset(data_count, parity_count, cur)
+                    .map_err(|e| AppError::InternalServerError(format!("RS Enc Reset: {}", e)))?;
+            } else {
+                encoder_state = Some(
+                    ReedSolomonEncoder::new(data_count, parity_count, cur)
+                        .map_err(|e| AppError::InternalServerError(format!("RS Enc Init: {}", e)))?,
+                );
+            }
+            let encoder = encoder_state
+                .as_mut()
+                .expect("encoder state initialized for repair stripe");
 
-            for data in stripe_data.iter().flatten() {
+            for data in &buffer_pool.stripe_data {
                 encoder
                     .add_original_shard(data)
                     .map_err(|e| AppError::InternalServerError(format!("RS Add: {}", e)))?;

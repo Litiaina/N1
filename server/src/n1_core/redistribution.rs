@@ -1,7 +1,8 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::blob_store::{
-    BlobDiskHandle, commit_staged_raw_shard, raw_blob_debug_path, raw_stage_path_for_shard,
-    resolve_blob_disk_path, stable_shard_file_name, write_raw_gc_markers,
+    BlobDiskHandle, allocate_raw_direct_io, commit_staged_raw_shard, copy_raw_extent,
+    free_raw_address, open_raw_direct_io, raw_blob_debug_path, raw_stage_path_for_shard,
+    resolve_blob_disk_path, stable_shard_file_name, verify_shard_checksum, write_raw_gc_markers,
 };
 use crate::n1_core::constants::{
     GC_SUFFIX, METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, RESERVATION_FILE,
@@ -14,7 +15,7 @@ use crate::n1_core::ec::ErasureStreamWriter;
 use crate::n1_core::fragment_metadata::{read_fragment_metadata, write_fragment_metadata};
 use crate::n1_core::operation_gate::acquire_read_only_fast_mode;
 use crate::n1_core::prefix_rebuilder::run_prefix_rebuild_job;
-use crate::n1_core::recovery::{ShardFileCache, ShardRepairContext, read_or_recover_chunk};
+use crate::n1_core::recovery::{ShardFileCache, ShardRepairContext, read_or_recover_chunk_into};
 use crate::n1_core::upload::{
     DATA_SHARDS_ATOMIC, DirectWriter, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, create_direct_file,
     sync_dir,
@@ -1282,6 +1283,106 @@ async fn redistribute_object_streaming(
         let new_stripe_count = (old_part_arc.size_bytes + new_data_width - 1) / new_data_width;
         let final_shard_len = new_stripe_count * new_block_size as u64;
 
+        let can_fast_copy_raw = old_block_size == new_block_size
+            && old_part_arc.shards.len() == total_shards
+            && old_part_arc.shards.iter().all(|s| s.raw_blob_address.is_some())
+            && old_part_arc
+                .shards
+                .iter()
+                .all(|s| s.size_bytes == final_shard_len);
+
+        if can_fast_copy_raw {
+            let mut copied_shards: Vec<ShardInfo> = Vec::with_capacity(total_shards);
+            let mut allocated_raw = Vec::with_capacity(total_shards);
+            for shard_idx in 0..total_shards {
+                if should_stop() {
+                    for raw in &allocated_raw {
+                        let _ = free_raw_address(raw).await;
+                    }
+                    return Err(AppError::InternalServerError("Stopped".into()));
+                }
+
+                let old_shard = old_part_arc
+                    .shards
+                    .iter()
+                    .find(|s| s.shard_index == shard_idx)
+                    .ok_or_else(|| {
+                        AppError::InternalServerError(format!(
+                            "missing raw shard {} during redistribution",
+                            shard_idx
+                        ))
+                    })?;
+
+                if !verify_shard_checksum(old_shard).await? {
+                    for raw in &allocated_raw {
+                        let _ = free_raw_address(raw).await;
+                    }
+                    return Err(AppError::InternalServerError(format!(
+                        "raw shard {} failed checksum verification during redistribution",
+                        old_shard.file_name
+                    )));
+                }
+
+                let is_parity = shard_idx >= target_data_shards;
+                let disk_idx = (old_part_arc.part_index as usize + shard_idx) % num_disks;
+                let (raw_addr, target_io) = allocate_raw_direct_io(disk_idx, final_shard_len)?;
+                allocated_raw.push(raw_addr.clone());
+
+                let source_io = open_raw_direct_io(old_shard)?;
+                if let Err(err) = copy_raw_extent(
+                    source_io,
+                    target_io,
+                    final_shard_len,
+                    new_block_size.max(1024 * 1024),
+                    true,
+                )
+                .await
+                {
+                    let _ = free_raw_address(&raw_addr).await;
+                    for raw in &allocated_raw {
+                        if raw != &raw_addr {
+                            let _ = free_raw_address(raw).await;
+                        }
+                    }
+                    return Err(err);
+                }
+
+                copied_shards.push(ShardInfo {
+                    shard_index: shard_idx,
+                    file_name: stable_shard_file_name(old_part_arc.part_index, shard_idx, is_parity),
+                    absolute_path: raw_blob_debug_path(&raw_addr),
+                    raw_blob_address: Some(raw_addr),
+                    size_bytes: final_shard_len,
+                    checksum: old_shard.checksum.clone(),
+                    is_parity,
+                });
+            }
+
+            let new_part = PartMetadata {
+                part_index: old_part_arc.part_index,
+                size_bytes: old_part_arc.size_bytes,
+                created_at: old_part_arc.created_at,
+                shards: copied_shards.clone(),
+                checksum: old_part_arc.checksum.clone(),
+            };
+            new_parts.push(new_part);
+
+            let new_paths: HashSet<String> = copied_shards
+                .iter()
+                .map(|s| s.absolute_path.clone())
+                .collect();
+            for old_shard in &old_part_arc.shards {
+                if !new_paths.contains(&old_shard.absolute_path) {
+                    if let Some(raw) = old_shard.raw_blob_address.clone() {
+                        old_raw_shards_for_gc.push(raw);
+                    } else {
+                        old_shards_for_gc.push(old_shard.absolute_path.clone());
+                    }
+                }
+            }
+            continue;
+        }
+
         let mut writers: Vec<Option<DirectWriter>> = Vec::with_capacity(total_shards);
         let mut commit_list: Vec<(PathBuf, PathBuf, PathBuf, String, bool, usize)> = Vec::new();
         let mut new_shards: Vec<ShardInfo> = Vec::with_capacity(total_shards);
@@ -1370,6 +1471,7 @@ async fn redistribute_object_streaming(
 
         let mut pos = 0u64;
         let mut batch: Vec<u8> = Vec::with_capacity(new_block_size);
+        let mut scratch = Vec::new();
 
         while pos < old_part_arc.size_bytes {
             if should_stop() {
@@ -1390,7 +1492,7 @@ async fn redistribute_object_streaming(
                 break;
             }
 
-            let chunk = read_or_recover_chunk(
+            read_or_recover_chunk_into(
                 &mut file_cache,
                 Path::new(""),
                 old_part_arc.clone(),
@@ -1399,10 +1501,11 @@ async fn redistribute_object_streaming(
                 to_read,
                 old_block_size,
                 Some(repair_context.clone()),
+                &mut scratch,
             )
             .await?;
 
-            batch.extend_from_slice(&chunk);
+            batch.extend_from_slice(&scratch);
 
             if batch.len() >= new_block_size || (pos + to_read as u64) >= old_part_arc.size_bytes {
                 stream_writer.write(&batch).await?;

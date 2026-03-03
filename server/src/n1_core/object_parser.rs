@@ -1,7 +1,7 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::disk_manager::{ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo};
 use crate::n1_core::header_parser::parse_range_header;
-use crate::n1_core::recovery::{ShardFileCache, ShardRepairContext, read_or_recover_chunk};
+use crate::n1_core::recovery::{ShardFileCache, ShardRepairContext, read_or_recover_chunk_into};
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -120,7 +120,7 @@ pub async fn get_object_logic(
     stream_object_logic(parts.headers, metadata, "inline").await
 }
 
-fn data_shards_count(part: &PartMetadata) -> usize {
+pub(crate) fn data_shards_count(part: &PartMetadata) -> usize {
     part.shards.iter().filter(|s| !s.is_parity).count()
 }
 
@@ -138,7 +138,7 @@ fn nth_data_shard<'a>(part: &'a PartMetadata, nth: usize) -> Option<&'a ShardInf
     None
 }
 
-fn shard_dir_with_locality_hint<'a>(
+pub(crate) fn shard_dir_with_locality_hint<'a>(
     part: &PartMetadata,
     shard_index: usize,
     shard_dirs: &'a [PathBuf],
@@ -162,6 +162,18 @@ fn shard_dir_with_locality_hint<'a>(
     shard_dirs.get(disk_idx)
 }
 
+pub(crate) fn shard_dirs_for_version(
+    path_manager: &ObjectPathManager,
+    blob_roots: &[PathBuf],
+    fragment: &str,
+    version_id: &str,
+) -> Vec<PathBuf> {
+    blob_roots
+        .iter()
+        .map(|disk| path_manager.get_shard_dir_on_disk(disk, fragment, version_id))
+        .collect()
+}
+
 async fn read_chunk_with_retries(
     file_cache: &mut ShardFileCache,
     shard_dir: &PathBuf,
@@ -171,10 +183,11 @@ async fn read_chunk_with_retries(
     to_read: usize,
     stripe_size: usize,
     repair_context: &ShardRepairContext,
-) -> Result<Vec<u8>, AppError> {
+    scratch: &mut Vec<u8>,
+) -> Result<(), AppError> {
     let mut last_err: Option<AppError> = None;
     for attempt in 0..3usize {
-        match read_or_recover_chunk(
+        match read_or_recover_chunk_into(
             file_cache,
             shard_dir,
             Arc::clone(&part),
@@ -183,10 +196,11 @@ async fn read_chunk_with_retries(
             to_read,
             stripe_size,
             Some(repair_context.clone()),
+            scratch,
         )
         .await
         {
-            Ok(v) => return Ok(v),
+            Ok(()) => return Ok(()),
             Err(e) => {
                 last_err = Some(e);
                 file_cache.clear();
@@ -260,6 +274,7 @@ pub async fn stream_object_logic(
         parts: Vec<Arc<PartMetadata>>,
         shard_dirs: Vec<PathBuf>,
         file_cache: ShardFileCache,
+        scratch: Vec<u8>,
         current_part_idx: usize,
         current_part_offset: u64,
         stripe_size: usize,
@@ -292,10 +307,7 @@ pub async fn stream_object_logic(
         false,
     );
     let parts = parts.into_iter().map(Arc::new).collect::<Vec<_>>();
-    let shard_dirs = blob_roots
-        .iter()
-        .map(|disk| path_manager.get_shard_dir_on_disk(disk, &fragment, &version_id))
-        .collect::<Vec<_>>();
+    let shard_dirs = shard_dirs_for_version(&path_manager, &blob_roots, &fragment, &version_id);
 
     let initial_state = StreamState {
         pos: start,
@@ -303,6 +315,7 @@ pub async fn stream_object_logic(
         parts,
         shard_dirs,
         file_cache: ShardFileCache::new(),
+        scratch: Vec::new(),
         current_part_idx: start_part_index,
         current_part_offset: start_part_offset,
         stripe_size: stripe_size_bytes,
@@ -420,12 +433,13 @@ pub async fn stream_object_logic(
                         to_read,
                         state.stripe_size,
                         &repair_context,
+                        &mut state.scratch,
                     )
                     .await;
 
                     match data_result {
-                        Ok(bytes) => {
-                            out.extend_from_slice(&bytes);
+                        Ok(()) => {
+                            out.extend_from_slice(&state.scratch);
                             local_pos += to_read as u64;
                             budget = budget.saturating_sub(to_read);
                         }

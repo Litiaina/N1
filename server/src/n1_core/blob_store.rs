@@ -352,6 +352,62 @@ pub fn open_raw_direct_io(shard: &ShardInfo) -> Result<DirectExtentIo, AppError>
         .map_err(block_manager_error_to_app)
 }
 
+pub fn allocate_raw_direct_io(
+    disk_idx: usize,
+    size_bytes: u64,
+) -> Result<(RawBlobAddress, DirectExtentIo), AppError> {
+    let BlobDiskHandle::Raw { manager, .. } = resolve_blob_disk(disk_idx)?;
+    let mut mgr = manager
+        .lock()
+        .map_err(|_| AppError::InternalServerError("Raw blob manager lock poisoned".into()))?;
+    let alloc = mgr
+        .allocate_bytes(size_bytes)
+        .map_err(block_manager_error_to_app)?;
+    let address = match mgr.raw_extent_address(alloc, size_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = mgr.free(alloc.allocation_id);
+            return Err(block_manager_error_to_app(e));
+        }
+    };
+    let io = match mgr.direct_extent_io(&address) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = mgr.free(alloc.allocation_id);
+            return Err(block_manager_error_to_app(e));
+        }
+    };
+    Ok((raw_blob_address_from_extent(&address), io))
+}
+
+pub async fn copy_raw_extent(
+    src: DirectExtentIo,
+    dst: DirectExtentIo,
+    size_bytes: u64,
+    chunk_size: usize,
+    flush: bool,
+) -> Result<(), AppError> {
+    let chunk_size = chunk_size.max(4096);
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        let mut buf = vec![0u8; chunk_size];
+        let mut offset = 0u64;
+        while offset < size_bytes {
+            let take = size_bytes.saturating_sub(offset).min(chunk_size as u64) as usize;
+            src.read_into(offset, &mut buf[..take])
+                .map_err(block_manager_error_to_app)?;
+            dst.write(offset, &buf[..take])
+                .map_err(block_manager_error_to_app)?;
+            offset = offset.saturating_add(take as u64);
+        }
+        if flush {
+            dst.flush_data().map_err(block_manager_error_to_app)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("raw extent copy task failed: {}", e)))?
+}
+
 pub async fn write_shard_range(
     shard: &ShardInfo,
     offset: u64,

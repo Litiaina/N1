@@ -1,8 +1,10 @@
 use crate::enums::app_error_enum::AppError;
-use crate::n1_core::disk_manager::{ChunkQuery, ObjectKeyQuery, ObjectPathManager, ShardInfo};
+use crate::n1_core::disk_manager::{ChunkQuery, ObjectKeyQuery, ObjectPathManager};
 use crate::n1_core::metadata_parser::{get_metadata, get_version_metadata};
-use crate::n1_core::object_parser::stream_object_logic;
-use crate::n1_core::recovery::{ShardFileCache, ShardRepairContext, read_or_recover_chunk};
+use crate::n1_core::object_parser::{
+    data_shards_count, shard_dir_with_locality_hint, shard_dirs_for_version, stream_object_logic,
+};
+use crate::n1_core::recovery::{ShardFileCache, ShardRepairContext, read_or_recover_chunk_into};
 use crate::structs::auth_structs::Claims;
 use axum::body::Body;
 use axum::extract::{Path, Query};
@@ -75,9 +77,16 @@ pub async fn download_object_chunk(
     let mut current_global_pos = 0u64;
     let mut checksum_header: Option<&str> = None;
     let mut file_cache: ShardFileCache = ShardFileCache::new();
+    let mut scratch = Vec::new();
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
-    let num_disks = blob_roots.len();
+    let shard_dirs = shard_dirs_for_version(
+        &path_manager,
+        &blob_roots,
+        &metadata.fragment,
+        &metadata.version_id,
+    );
+    let num_disks = shard_dirs.len();
 
     if num_disks == 0 {
         return Err(AppError::InternalServerError(
@@ -107,9 +116,7 @@ pub async fn download_object_chunk(
             let mut bytes_to_read = (part_rel_end - part_rel_start) as usize;
             let mut cursor_in_part = part_rel_start;
 
-            let data_shards_info: Vec<&ShardInfo> =
-                part.shards.iter().filter(|s| !s.is_parity).collect();
-            let data_shards_count = data_shards_info.len() as u64;
+            let data_shards_count = data_shards_count(part) as u64;
 
             if data_shards_count == 0 {
                 return Err(AppError::InternalServerError(
@@ -132,27 +139,27 @@ pub async fn download_object_chunk(
                 let bytes_left_in_block = (stripe_block_size as u64) - offset_in_block;
                 let chunk_len = std::cmp::min(bytes_to_read as u64, bytes_left_in_block) as usize;
 
-                let disk_idx = (part.part_index as usize + shard_index) % num_disks;
-                let target_disk = &blob_roots[disk_idx];
-                let shard_dir = path_manager.get_shard_dir_on_disk(
-                    target_disk,
-                    &metadata.fragment,
-                    &metadata.version_id,
-                );
+                let Some(shard_dir) = shard_dir_with_locality_hint(part, shard_index, &shard_dirs)
+                else {
+                    return Err(AppError::InternalServerError(
+                        "No shard dirs configured".into(),
+                    ));
+                };
 
-                let chunk_data = read_or_recover_chunk(
+                read_or_recover_chunk_into(
                     &mut file_cache,
-                    &shard_dir,
+                    shard_dir,
                     part_arc.clone(),
                     shard_index,
                     file_offset,
                     chunk_len,
                     stripe_block_size,
                     Some(repair_context.clone()),
+                    &mut scratch,
                 )
                 .await?;
 
-                result_buffer.extend_from_slice(&chunk_data);
+                result_buffer.extend_from_slice(&scratch);
 
                 bytes_to_read -= chunk_len;
                 cursor_in_part += chunk_len as u64;
