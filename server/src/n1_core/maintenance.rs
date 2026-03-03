@@ -1,6 +1,6 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::disk_manager::ObjectPathManager;
-use crate::n1_core::index_v2;
+use crate::n1_core::index;
 use crate::n1_core::quota_manager::set_storage_used;
 use crate::structs::auth_structs::Claims;
 use axum::{http::StatusCode, response::IntoResponse};
@@ -15,22 +15,22 @@ async fn perform_quota_sync(fragment: &str) -> Result<u64, AppError> {
     let mut valid_versions = HashSet::new();
     let mut total_usage = 0u64;
 
-    for meta in index_v2::list_fragment_object_versions(fragment, false).await? {
+    for meta in index::list_fragment_object_versions(fragment, false).await? {
         if meta.is_delete_marker || !valid_versions.insert(meta.version_id.clone()) {
             continue;
         }
         total_usage += meta.total_size_bytes;
     }
 
-    for meta in index_v2::list_fragment_object_versions(fragment, true).await? {
+    for meta in index::list_fragment_object_versions(fragment, true).await? {
         if meta.is_delete_marker || !valid_versions.insert(meta.version_id.clone()) {
             continue;
         }
         total_usage += meta.total_size_bytes;
     }
 
-    let (_valid_versions, orphans_removed) = tokio::task::spawn_blocking(
-        move || -> Result<(HashSet<String>, i32), AppError> {
+    let (_valid_versions, orphans_removed) =
+        tokio::task::spawn_blocking(move || -> Result<(HashSet<String>, i32), AppError> {
             let mut orphans_count = 0;
 
             for root in blob_roots {
@@ -61,10 +61,9 @@ async fn perform_quota_sync(fragment: &str) -> Result<u64, AppError> {
             }
 
             Ok((valid_versions, orphans_count))
-        },
-    )
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("Sync task failed: {}", e)))??;
+        })
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("Sync task failed: {}", e)))??;
 
     if orphans_removed > 0 {
         info!(

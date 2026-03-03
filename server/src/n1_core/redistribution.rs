@@ -11,7 +11,7 @@ use crate::n1_core::disk_manager::{
 };
 use crate::n1_core::ec::ErasureStreamWriter;
 use crate::n1_core::fragment_metadata::{read_fragment_metadata, write_fragment_metadata};
-use crate::n1_core::index_v2;
+use crate::n1_core::index;
 use crate::n1_core::operation_gate::acquire_read_only_fast_mode;
 use crate::n1_core::prefix_rebuilder::run_prefix_rebuild_job;
 use crate::n1_core::recovery::{ShardFileCache, ShardRepairContext, read_or_recover_chunk_into};
@@ -89,12 +89,13 @@ impl RedistributionDurabilityMode {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct RedistributionRunOptions {
     pub fast_mode: bool,
     pub durability_mode: RedistributionDurabilityMode,
     pub object_concurrency: usize,
     pub status_batch: u64,
+    pub fragment_filter: Option<String>,
 }
 
 fn default_object_concurrency(fast_mode: bool) -> usize {
@@ -191,13 +192,14 @@ impl Default for RedistributionRunOptions {
             durability_mode: RedistributionDurabilityMode::Auto,
             object_concurrency: default_object_concurrency(false),
             status_batch: default_status_batch(false),
+            fragment_filter: None,
         }
     }
 }
 
 impl RedistributionRunOptions {
     #[inline]
-    fn strict_durability(self) -> bool {
+    fn strict_durability(&self) -> bool {
         match self.durability_mode {
             RedistributionDurabilityMode::Auto => !self.fast_mode,
             RedistributionDurabilityMode::Strict => true,
@@ -206,7 +208,7 @@ impl RedistributionRunOptions {
     }
 
     #[inline]
-    fn effective_durability_mode(self) -> &'static str {
+    fn effective_durability_mode(&self) -> &'static str {
         if self.strict_durability() {
             "strict"
         } else {
@@ -390,6 +392,12 @@ pub async fn trigger_redistribution_job_api(
         durability_mode,
         object_concurrency,
         status_batch,
+        fragment_filter: params
+            .get("fragment")
+            .or_else(|| params.get("fragment_hash"))
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string()),
     };
 
     let ws_manager = Arc::new(state.ws_manager.clone());
@@ -501,7 +509,7 @@ fn get_all_metadata_paths_custom(
     version_id: &str,
     is_trash: bool,
 ) -> Vec<PathBuf> {
-    index_v2::get_object_version_paths(fragment_hash, object_key, version_id, is_trash)
+    index::get_object_version_paths(fragment_hash, object_key, version_id, is_trash)
         .unwrap_or_default()
 }
 
@@ -702,13 +710,15 @@ pub async fn run_redistribution_job_with_options(
     let _write_gate = acquire_read_only_fast_mode(opts.fast_mode);
     let strict_durability = opts.strict_durability();
     let effective_durability = opts.effective_durability_mode();
+    let scope_label = opts.fragment_filter.as_deref().unwrap_or("all-fragments");
 
     {
         let mut st = REDIST_STATUS.write().await;
         *st = RedistributionJobStatus {
             is_running: true,
             phase: format!(
-                "Initializing (fast_mode={}, durability={}=>{}, object_concurrency={}, status_batch={}, dry_run={})",
+                "Initializing (scope={}, fast_mode={}, durability={}=>{}, object_concurrency={}, status_batch={}, dry_run={})",
+                scope_label,
                 opts.fast_mode,
                 opts.durability_mode.as_str(),
                 effective_durability,
@@ -763,7 +773,8 @@ pub async fn run_redistribution_job_with_options(
     }
 
     info!(
-        "Starting Redistribution Job (Active & Trash). target={}D+{}P stripe={} bytes blob_cfg={} index_cfg={} dry_run={} fast_mode={} durability={}=>{} object_concurrency={} status_batch={}",
+        "Starting Redistribution Job (scope={}, Active & Trash). target={}D+{}P stripe={} bytes blob_cfg={} index_cfg={} dry_run={} fast_mode={} durability={}=>{} object_concurrency={} status_batch={}",
+        scope_label,
         target_data_shards,
         target_parity_shards,
         target_stripe_size,
@@ -778,11 +789,22 @@ pub async fn run_redistribution_job_with_options(
     );
 
     let mut touched_fragments: HashSet<String> = HashSet::new();
-    let fragments = list_all_fragments(layout.live_index.as_ref()).await;
+    let mut fragments = list_all_fragments(layout.live_index.as_ref()).await;
+    if let Some(fragment_filter) = opts.fragment_filter.as_deref() {
+        if !fragments.iter().any(|fragment| fragment == fragment_filter) {
+            warn!("Fragment not found for redistribution: {}", fragment_filter);
+            return Err(AppError::NotFound);
+        }
+        fragments.retain(|fragment| fragment == fragment_filter);
+    }
 
     {
         let mut st = REDIST_STATUS.write().await;
-        st.phase = format!("Preparing (fragments={})", fragments.len());
+        st.phase = format!(
+            "Preparing (scope={}, fragments={})",
+            scope_label,
+            fragments.len()
+        );
         ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
     }
 
@@ -828,8 +850,7 @@ pub async fn run_redistribution_job_with_options(
             };
             let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
 
-            let metas = match index_v2::list_fragment_object_versions(&fragment_hash, is_trash).await
-            {
+            let metas = match index::list_fragment_object_versions(&fragment_hash, is_trash).await {
                 Ok(metas) => metas,
                 Err(e) => {
                     warn!(
@@ -859,13 +880,13 @@ pub async fn run_redistribution_job_with_options(
                     &meta,
                     target_data_shards,
                     target_parity_shards,
-                        target_stripe_size,
-                        live_blob.len(),
-                        &live_blob,
-                        &live_index,
-                        is_trash,
-                    )
-                    .await;
+                    target_stripe_size,
+                    live_blob.len(),
+                    &live_blob,
+                    &live_index,
+                    is_trash,
+                )
+                .await;
 
                 if !needs {
                     continue;
@@ -1199,7 +1220,10 @@ async fn redistribute_object_streaming(
 
         let can_fast_copy_raw = old_block_size == new_block_size
             && old_part_arc.shards.len() == total_shards
-            && old_part_arc.shards.iter().all(|s| s.raw_blob_address.is_some())
+            && old_part_arc
+                .shards
+                .iter()
+                .all(|s| s.raw_blob_address.is_some())
             && old_part_arc
                 .shards
                 .iter()
@@ -1263,7 +1287,11 @@ async fn redistribute_object_streaming(
 
                 copied_shards.push(ShardInfo {
                     shard_index: shard_idx,
-                    file_name: stable_shard_file_name(old_part_arc.part_index, shard_idx, is_parity),
+                    file_name: stable_shard_file_name(
+                        old_part_arc.part_index,
+                        shard_idx,
+                        is_parity,
+                    ),
                     absolute_path: raw_blob_debug_path(&raw_addr),
                     raw_blob_address: Some(raw_addr),
                     size_bytes: final_shard_len,
@@ -1555,9 +1583,9 @@ async fn redistribute_object_streaming(
     }
 
     if is_trash {
-        index_v2::upsert_trashed_object_version(meta).await?;
+        index::upsert_trashed_object_version(meta).await?;
     } else {
-        index_v2::upsert_object_version(meta).await?;
+        index::upsert_object_version(meta).await?;
     }
 
     for old in old_shards_for_gc {

@@ -13,7 +13,7 @@ use super::disk_manager::{
 };
 use super::fragment_metadata::init_fragment_metadata;
 use super::garbage_collector::{get_gc_status_api, run_garbage_collector};
-use super::index_v2;
+use super::index;
 use super::metadata_parser::get_metadata;
 use super::modify::rename_object;
 use super::object_parser::{
@@ -29,7 +29,6 @@ use super::redistribution::{
 use super::repair_manager::{
     RepairCheckMode, RepairRunConfig, RepairRunOptions, run_repair_job, run_repair_job_with_options,
 };
-use super::retrieve::PREFIX_MAX_DELTA_SEGMENTS_ATOMIC;
 use super::retrieve::{get_object, get_object_metadata, list_objects, stream_object};
 use super::sync::{ensure_fragment_blob_directories, sync_single_fragment_quota};
 use super::upload::{
@@ -56,6 +55,7 @@ use futures_util::{StreamExt, stream};
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -264,16 +264,6 @@ fn ensure_upload_runtime_config() {
             .get()
             .expect("STREAM_LOCALITY_BIAS_ENABLED_ATOMIC")
             .store(true, Ordering::Relaxed);
-    }
-    if PREFIX_MAX_DELTA_SEGMENTS_ATOMIC.get().is_none() {
-        PREFIX_MAX_DELTA_SEGMENTS_ATOMIC
-            .set(AtomicUsize::new(512))
-            .expect("set PREFIX_MAX_DELTA_SEGMENTS_ATOMIC");
-    } else {
-        PREFIX_MAX_DELTA_SEGMENTS_ATOMIC
-            .get()
-            .expect("PREFIX_MAX_DELTA_SEGMENTS_ATOMIC")
-            .store(512, Ordering::Relaxed);
     }
 }
 
@@ -601,9 +591,10 @@ async fn wait_until_prefix_snapshot_ready(fragment: &str, prefix: &str, timeout_
             }
             any_bucket = true;
 
-            let compacted_exists = fs::try_exists(&bucket.join(format!("compacted{}", PREFIX_SEGMENT_EXT)))
-                .await
-                .unwrap_or(false);
+            let compacted_exists =
+                fs::try_exists(&bucket.join(format!("compacted{}", PREFIX_SEGMENT_EXT)))
+                    .await
+                    .unwrap_or(false);
             let delimiter_exists = fs::try_exists(&bucket.join(PREFIX_DELIMITER_COMPACTED_FILE))
                 .await
                 .unwrap_or(false);
@@ -634,7 +625,10 @@ async fn read_object_bytes(claims: Claims, fragment: String, object_key: String)
         exp,
     } = claims;
 
-    for attempt in 0..8usize {
+    let mut last_status = None;
+    let mut last_body_err = None;
+    let mut last_err = None;
+    for attempt in 0..80usize {
         let claims = Claims {
             fragment: claim_fragment.clone(),
             read,
@@ -647,29 +641,40 @@ async fn read_object_bytes(claims: Claims, fragment: String, object_key: String)
             .uri("/v4/fragment/get")
             .body(Body::empty())
             .expect("build request");
-        if let Ok(resp) = get_object(
+        match get_object(
             claims,
             AxumPath((fragment.clone(), object_key.clone())),
             req,
         )
         .await
         {
-            if resp.status() == StatusCode::OK {
-                if let Ok(body) = to_bytes(resp.into_body(), usize::MAX).await {
-                    return body.to_vec();
+            Ok(resp) => {
+                last_status = Some(resp.status());
+                if resp.status() == StatusCode::OK {
+                    match to_bytes(resp.into_body(), usize::MAX).await {
+                        Ok(body) => return body.to_vec(),
+                        Err(err) => last_body_err = Some(err.to_string()),
+                    }
                 }
+            }
+            Err(err) => {
+                last_err = Some(format!("{:?}", err));
             }
         }
 
-        if attempt < 7 {
+        if attempt < 79 {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             continue;
         }
     }
 
+    let final_metadata = get_metadata(&fragment, &object_key, &fragment)
+        .await
+        .map(|meta| (meta.version_id, meta.is_delete_marker, meta.parts.len()))
+        .ok();
     panic!(
-        "read object body failed after retries for {}/{}",
-        fragment, object_key
+        "read object body failed after retries for {}/{} status={:?} body_err={:?} err={:?} final_metadata={:?}",
+        fragment, object_key, last_status, last_body_err, last_err, final_metadata
     );
 }
 
@@ -678,24 +683,64 @@ async fn read_object_bytes_eventually(
     object_key: String,
     attempts: usize,
 ) -> Vec<u8> {
+    let mut last_status = None;
+    let mut last_body_err = None;
+    let mut last_err = None;
     for attempt in 0..attempts {
         let req = Request::builder()
             .uri("/v4/fragment/get")
             .body(Body::empty())
             .expect("build request");
 
-        if let Ok(resp) = get_object(
+        match get_object(
             full_claims(&fragment),
             AxumPath((fragment.clone(), object_key.clone())),
             req,
         )
         .await
         {
-            if resp.status() == StatusCode::OK {
-                if let Ok(body) = to_bytes(resp.into_body(), usize::MAX).await {
-                    return body.to_vec();
+            Ok(resp) => {
+                last_status = Some(resp.status());
+                if resp.status() == StatusCode::OK {
+                    match to_bytes(resp.into_body(), usize::MAX).await {
+                        Ok(body) => return body.to_vec(),
+                        Err(err) => last_body_err = Some(err.to_string()),
+                    }
                 }
             }
+            Err(err) => last_err = Some(format!("{:?}", err)),
+        }
+
+        let delay_ms = if attempt < attempts / 3 {
+            25
+        } else if attempt < (attempts * 2) / 3 {
+            50
+        } else {
+            100
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+
+    let final_metadata = get_metadata(&fragment, &object_key, &fragment)
+        .await
+        .map(|meta| (meta.version_id, meta.is_delete_marker, meta.parts.len()))
+        .ok();
+    panic!(
+        "object {} in fragment {} was not readable after {} attempts status={:?} body_err={:?} err={:?} final_metadata={:?}",
+        object_key, fragment, attempts, last_status, last_body_err, last_err, final_metadata
+    );
+}
+
+async fn get_metadata_eventually(
+    fragment: String,
+    object_key: String,
+    attempts: usize,
+) -> super::disk_manager::ObjectMetadata {
+    let mut last_err = None;
+    for attempt in 0..attempts {
+        match get_metadata(&fragment, &object_key, &fragment).await {
+            Ok(meta) => return meta,
+            Err(err) => last_err = Some(format!("{:?}", err)),
         }
 
         let delay_ms = if attempt < attempts / 3 {
@@ -709,8 +754,8 @@ async fn read_object_bytes_eventually(
     }
 
     panic!(
-        "object {} in fragment {} was not readable after {} attempts",
-        object_key, fragment, attempts
+        "metadata {} in fragment {} was not readable after {} attempts err={:?}",
+        object_key, fragment, attempts, last_err
     );
 }
 
@@ -770,9 +815,9 @@ async fn collect_index_tree_hashes(fragment: &str) -> Vec<(String, BTreeMap<Stri
                 .to_string_lossy()
                 .replace('\\', "/");
 
-            // `index_v2` is partitioned with owner/replica placement, so it is no longer
+            // `index` is partitioned with owner/replica placement, so it is no longer
             // expected to be byte-identical on every index root.
-            if rel.starts_with("index_v2/") {
+            if rel.starts_with("index/") {
                 continue;
             }
 
@@ -867,6 +912,43 @@ async fn assert_all_index_disks_synchronized(fragment: &str) {
             base_root, root
         );
     }
+}
+
+fn index_root_for_state_path(path: &std::path::Path) -> PathBuf {
+    ObjectPathManager::new()
+        .get_all_index_roots()
+        .into_iter()
+        .find(|root| path.starts_with(root))
+        .unwrap_or_else(|| panic!("no index root matched {}", path.display()))
+}
+
+async fn simulate_index_root_down(root: &std::path::Path) -> (PathBuf, PathBuf) {
+    let down_path = root.with_file_name(format!(
+        "{}.down.{}",
+        root.file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("index-root"),
+        Ulid::new()
+    ));
+    if fs::try_exists(&down_path).await.unwrap_or(false) {
+        let _ = fs::remove_dir_all(&down_path).await;
+    }
+    fs::rename(root, &down_path)
+        .await
+        .unwrap_or_else(|e| panic!("simulate index root down {}: {}", root.display(), e));
+    fs::write(root, b"n1-index-disk-down-blocker")
+        .await
+        .unwrap_or_else(|e| panic!("create index down blocker {}: {}", root.display(), e));
+    (root.to_path_buf(), down_path)
+}
+
+async fn restore_index_root(root: &std::path::Path, down_path: &std::path::Path) {
+    fs::remove_file(root)
+        .await
+        .unwrap_or_else(|e| panic!("remove index blocker {}: {}", root.display(), e));
+    fs::rename(down_path, root)
+        .await
+        .unwrap_or_else(|e| panic!("restore index root {}: {}", root.display(), e));
 }
 
 async fn count_raw_gc_markers(fragment: &str) -> usize {
@@ -1108,6 +1190,171 @@ async fn finalize_upload(
     .await
     .expect("finalize upload")
     .into_response()
+}
+
+async fn run_active_multipart_resume_with_replica_index_disk_loss(rounds: usize) {
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    for round in 0..rounds {
+        let part0 =
+            chunked_payload_for_seed(8 * 1024 + 3 + round, payload_seed_for_epoch(round, 1));
+        let part1 =
+            chunked_payload_for_seed(9 * 1024 + 5 + round, payload_seed_for_epoch(round, 2));
+        let part2 =
+            chunked_payload_for_seed(10 * 1024 + 7 + round, payload_seed_for_epoch(round, 3));
+        let total_len = (part0.len() + part1.len() + part2.len()) as u64;
+
+        let (key, version_id, session_id, replica_root) = {
+            let mut selected = None;
+            for attempt in 0..16usize {
+                let key = format!("ha-index/session-resume/r{}/object-{}.bin", round, attempt);
+                let (version_id, session_id) = init_upload(&fragment, &key, total_len, 3).await;
+                let session_paths = index::get_session_state_paths(&fragment, &version_id)
+                    .expect("session state paths");
+                let object_paths =
+                    index::get_object_version_paths(&fragment, &key, &version_id, false)
+                        .expect("object state paths");
+                if session_paths.len() >= 2 && object_paths.len() >= 2 {
+                    let session_owner = index_root_for_state_path(&session_paths[0]);
+                    let session_replica = index_root_for_state_path(&session_paths[1]);
+                    let object_owner = index_root_for_state_path(&object_paths[0]);
+                    let object_replica = index_root_for_state_path(&object_paths[1]);
+                    if session_owner == object_owner && session_replica == object_replica {
+                        selected = Some((key, version_id, session_id, session_replica));
+                        break;
+                    }
+                }
+                let _ =
+                    index::remove_session(&fragment, &version_id, "realign multipart owner").await;
+            }
+            selected
+                .expect("failed to align session and object owners for multipart owner-first test")
+        };
+
+        assert_eq!(
+            upload_part(&fragment, &version_id, 0, part0.clone())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+
+        let session_paths =
+            index::get_session_state_paths(&fragment, &version_id).expect("session state paths");
+        assert!(
+            session_paths.len() >= 2,
+            "expected owner + replica session roots for active multipart test"
+        );
+        let owner_root = index_root_for_state_path(&session_paths[0]);
+        assert_ne!(
+            owner_root, replica_root,
+            "replica loss test requires distinct owner and replica roots"
+        );
+
+        let (replica_root, replica_down_path) = simulate_index_root_down(&replica_root).await;
+
+        assert_eq!(
+            upload_part(&fragment, &version_id, 1, part1.clone())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+
+        let status_resp = get_upload_status(
+            full_claims(&fragment),
+            AxumPath((fragment.clone(), version_id.clone())),
+        )
+        .await
+        .expect("upload status with replica down")
+        .into_response();
+        assert_eq!(status_resp.status(), StatusCode::OK);
+        let status_json = read_response_json(status_resp).await;
+        assert_eq!(status_json["uploaded_parts"][0].as_u64(), Some(0));
+        assert_eq!(status_json["uploaded_parts"][1].as_u64(), Some(1));
+
+        let session_state = index::load_session(&fragment, &version_id)
+            .await
+            .expect("load owner-first session state")
+            .expect("active session state");
+        let committed_parts = session_state.parts.keys().copied().collect::<Vec<_>>();
+        assert_eq!(committed_parts, vec![0, 1]);
+
+        let finalize_conflict = finalize_upload(
+            state.clone(),
+            &fragment,
+            &version_id,
+            &session_id,
+            &key,
+            total_len,
+            3,
+        )
+        .await;
+        assert_eq!(finalize_conflict.status(), StatusCode::CONFLICT);
+        let conflict_json = read_response_json(finalize_conflict).await;
+        assert_eq!(conflict_json["missing_parts"][0].as_u64(), Some(2));
+
+        assert_eq!(
+            upload_part(&fragment, &version_id, 2, part2.clone())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+
+        let finalize_ok = finalize_upload(
+            state.clone(),
+            &fragment,
+            &version_id,
+            &session_id,
+            &key,
+            total_len,
+            3,
+        )
+        .await;
+        assert_eq!(finalize_ok.status(), StatusCode::OK);
+
+        let expected = [part0, part1, part2].concat();
+        let got = read_object_bytes_eventually(fragment.clone(), key.clone(), 24).await;
+        assert_eq!(got, expected, "round {} read mismatch", round);
+
+        restore_index_root(&replica_root, &replica_down_path).await;
+
+        run_repair_job(
+            RepairRunConfig {
+                dry_run: false,
+                check_mode: RepairCheckMode::Scrub,
+                meta_concurrency: 8,
+                shard_repair_concurrency: 2,
+                meta_batch_size: 512,
+            },
+            Arc::new(WsConnectionManager::new()),
+        )
+        .await
+        .expect("repair after replica restore");
+
+        assert_all_index_disks_synchronized(&fragment).await;
+    }
 }
 
 async fn put_object(
@@ -1603,7 +1850,6 @@ async fn matrix_delimiter_listing_keeps_exact_prefix_object_and_child_prefixes()
         vec!["study/reports/".to_string(), "study/series/".to_string()]
     );
     assert!(listing["continuation_token"].is_null());
-
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1689,7 +1935,6 @@ async fn matrix_delimiter_listing_paginates_without_skipping_rows() {
         ]
     );
     assert!(page3["continuation_token"].is_null());
-
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1762,7 +2007,7 @@ async fn matrix_multipart_finalize_conflict_then_success() {
     assert_eq!(finalize_ok.status(), StatusCode::OK);
 
     let expected = [part0, part1].concat();
-    let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+    let got = read_object_bytes_eventually(fragment.clone(), key.clone(), 160).await;
     assert_eq!(got, expected);
 }
 
@@ -1795,8 +2040,8 @@ async fn matrix_prefix_listing_serves_from_inline_prefix_rows_without_object_met
     let version_child = put_object(state, &fragment, &key_child, vec![9u8; 2048]).await;
 
     for (key, version_id) in [(&key_exact, &version_exact), (&key_child, &version_child)] {
-        for path in index_v2::get_object_version_paths(&fragment, key, version_id, false)
-            .expect("index_v2 version paths")
+        for path in index::get_object_version_paths(&fragment, key, version_id, false)
+            .expect("index version paths")
         {
             let _ = fs::remove_file(&path).await;
         }
@@ -1816,7 +2061,7 @@ async fn matrix_prefix_listing_serves_from_inline_prefix_rows_without_object_met
                     .unwrap_or(path)
                     .to_string_lossy()
                     .replace('\\', "/");
-                if rel.starts_with("index_v2/")
+                if rel.starts_with("index/")
                     && path.file_name().and_then(|name| name.to_str()) == Some(target_name.as_str())
                 {
                     let _ = fs::remove_file(path).await;
@@ -1946,7 +2191,7 @@ async fn matrix_prefix_projection_writes_compacted_snapshots_without_delta_segme
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_index_v2_object_partition_uses_segmented_wal_and_checkpoints() {
+async fn matrix_index_object_partition_uses_segmented_wal_and_checkpoints() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
     ensure_global_storage_config(&base).await;
@@ -1980,9 +2225,12 @@ async fn matrix_index_v2_object_partition_uses_segmented_wal_and_checkpoints() {
         .await;
     }
 
-    let meta_paths = index_v2::get_object_version_paths(&fragment, &key, &latest_version, false)
+    let meta_paths = index::get_object_version_paths(&fragment, &key, &latest_version, false)
         .expect("object version paths");
-    assert!(!meta_paths.is_empty(), "expected at least one index_v2 replica path");
+    assert!(
+        !meta_paths.is_empty(),
+        "expected at least one index replica path"
+    );
 
     let mut saw_checkpoint = false;
     let mut saw_multiple_segments = false;
@@ -2003,7 +2251,9 @@ async fn matrix_index_v2_object_partition_uses_segmented_wal_and_checkpoints() {
             manifest_path.display()
         );
         assert!(
-            !fs::try_exists(&wal_dir.join("active.wal")).await.unwrap_or(false),
+            !fs::try_exists(&wal_dir.join("active.wal"))
+                .await
+                .unwrap_or(false),
             "legacy single active.wal should not be present"
         );
 
@@ -2013,7 +2263,9 @@ async fn matrix_index_v2_object_partition_uses_segmented_wal_and_checkpoints() {
 
         let mut segment_count = 0usize;
         if fs::try_exists(&segments_dir).await.unwrap_or(false) {
-            let mut entries = fs::read_dir(&segments_dir).await.expect("read wal segments");
+            let mut entries = fs::read_dir(&segments_dir)
+                .await
+                .expect("read wal segments");
             while let Ok(Some(entry)) = entries.next_entry().await {
                 if entry.file_name().to_string_lossy().ends_with(".wal") {
                     segment_count += 1;
@@ -2133,6 +2385,20 @@ async fn matrix_upload_resume_status_then_finalize_success() {
     let expected = [part0, part1, part2].concat();
     let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
     assert_eq!(got, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_active_multipart_resume_survives_replica_index_disk_loss() {
+    let _guard = TEST_LOCK.lock().await;
+    run_active_multipart_resume_with_replica_index_disk_loss(1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "index owner-first multipart soak; run manually with N1_INDEX_OWNER_RESUME_SOAK_ROUNDS"]
+async fn matrix_index_owner_first_multipart_resume_soak() {
+    let _guard = TEST_LOCK.lock().await;
+    let rounds = test_env_usize("N1_INDEX_OWNER_RESUME_SOAK_ROUNDS", 5, 1, 128);
+    run_active_multipart_resume_with_replica_index_disk_loss(rounds).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2587,7 +2853,7 @@ async fn matrix_raw_blob_crud_delete_recover_and_permanent_delete() {
     .into_response();
     assert_eq!(rec_obj.status(), StatusCode::OK);
 
-    let recovered = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+    let recovered = read_object_bytes_eventually(fragment.clone(), key.clone(), 160).await;
     assert_eq!(recovered, content);
 
     let perm_del = delete_object_permanently(
@@ -2911,6 +3177,117 @@ async fn matrix_redistribution_with_one_disk_down() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_fragment_scoped_redistribution_only_touches_requested_fragment() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(262_144, Ordering::Relaxed);
+
+    let fragment_a = {
+        let digest = Sha256::digest(format!("fragment-a-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let fragment_b = {
+        let digest = Sha256::digest(format!("fragment-b-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key_a = "scope/redist-a.bin".to_string();
+    let key_b = "scope/redist-b.bin".to_string();
+    let content_a = (0..(20 * 1024 + 11))
+        .map(|i| ((i * 3) % 251) as u8)
+        .collect::<Vec<u8>>();
+    let content_b = (0..(22 * 1024 + 17))
+        .map(|i| ((i * 5) % 251) as u8)
+        .collect::<Vec<u8>>();
+
+    setup_fragment(&fragment_a).await;
+    setup_fragment(&fragment_b).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+    put_object(state.clone(), &fragment_a, &key_a, content_a.clone()).await;
+    put_object(state, &fragment_b, &key_b, content_b.clone()).await;
+
+    let before_a = get_metadata(&fragment_a, &key_a, &fragment_a)
+        .await
+        .expect("metadata for fragment a before redistribution");
+    let before_b = get_metadata(&fragment_b, &key_b, &fragment_b)
+        .await
+        .expect("metadata for fragment b before redistribution");
+    assert_eq!(before_a.parts[0].shards.len(), 1);
+    assert_eq!(before_b.parts[0].shards.len(), 1);
+    assert_eq!(before_a.stripe_size_bytes, 262_144);
+    assert_eq!(before_b.stripe_size_bytes, 262_144);
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(2, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    run_redistribution_job_with_options(
+        false,
+        RedistributionRunOptions {
+            fast_mode: false,
+            durability_mode: RedistributionDurabilityMode::Auto,
+            object_concurrency: 4,
+            status_batch: 32,
+            fragment_filter: Some(fragment_a.clone()),
+        },
+        Arc::new(WsConnectionManager::new()),
+    )
+    .await
+    .expect("fragment-scoped redistribution");
+
+    let after_a = get_metadata(&fragment_a, &key_a, &fragment_a)
+        .await
+        .expect("metadata for fragment a after redistribution");
+    let after_b = get_metadata(&fragment_b, &key_b, &fragment_b)
+        .await
+        .expect("metadata for fragment b after redistribution");
+
+    assert_eq!(
+        after_a.parts[0].shards.len(),
+        3,
+        "target fragment should be redistributed to the new shard layout"
+    );
+    assert_eq!(after_a.stripe_size_bytes, 4096);
+    assert_eq!(
+        after_b.parts[0].shards.len(),
+        1,
+        "untargeted fragment should keep its old shard layout"
+    );
+    assert_eq!(
+        after_b.stripe_size_bytes, 262_144,
+        "untargeted fragment should keep its old stripe size"
+    );
+
+    let got_a = read_object_bytes(full_claims(&fragment_a), fragment_a, key_a).await;
+    let got_b = read_object_bytes(full_claims(&fragment_b), fragment_b, key_b).await;
+    assert_eq!(got_a, content_a);
+    assert_eq!(got_b, content_b);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_stream_and_metadata_read_paths() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -3110,6 +3487,112 @@ async fn matrix_bitrot_parity_then_repair() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_fragment_scoped_repair_only_touches_requested_fragment() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(2, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let fragment_a = {
+        let digest = Sha256::digest(format!("repair-a-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let fragment_b = {
+        let digest = Sha256::digest(format!("repair-b-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key_a = "scope/repair-a.bin".to_string();
+    let key_b = "scope/repair-b.bin".to_string();
+    let content_a = (0..(64 * 1024 + 9))
+        .map(|i| ((i * 7) % 251) as u8)
+        .collect::<Vec<u8>>();
+    let content_b = (0..(68 * 1024 + 13))
+        .map(|i| ((i * 11) % 251) as u8)
+        .collect::<Vec<u8>>();
+
+    setup_fragment(&fragment_a).await;
+    setup_fragment(&fragment_b).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+    put_object(state.clone(), &fragment_a, &key_a, content_a.clone()).await;
+    put_object(state, &fragment_b, &key_b, content_b.clone()).await;
+
+    let meta_a = get_metadata(&fragment_a, &key_a, &fragment_a)
+        .await
+        .expect("metadata for fragment a");
+    let meta_b = get_metadata(&fragment_b, &key_b, &fragment_b)
+        .await
+        .expect("metadata for fragment b");
+    let parity_a = meta_a.parts[0]
+        .shards
+        .iter()
+        .find(|shard| shard.is_parity)
+        .expect("parity shard for fragment a")
+        .clone();
+    let parity_b = meta_b.parts[0]
+        .shards
+        .iter()
+        .find(|shard| shard.is_parity)
+        .expect("parity shard for fragment b")
+        .clone();
+
+    corrupt_shard_bytes(&parity_a, 0, &vec![0xA3; 4096]).await;
+    corrupt_shard_bytes(&parity_b, 0, &vec![0xB7; 4096]).await;
+    assert!(
+        !shard_checksum_ok(&parity_a).await,
+        "target fragment should start corrupted"
+    );
+    assert!(
+        !shard_checksum_ok(&parity_b).await,
+        "untargeted fragment should start corrupted"
+    );
+
+    run_repair_job_with_options(
+        RepairRunConfig {
+            dry_run: false,
+            check_mode: RepairCheckMode::Scrub,
+            meta_concurrency: 2,
+            shard_repair_concurrency: 2,
+            meta_batch_size: 128,
+        },
+        RepairRunOptions {
+            fast_mode: false,
+            fragment_filter: Some(fragment_a.clone()),
+        },
+        Arc::new(WsConnectionManager::new()),
+    )
+    .await
+    .expect("fragment-scoped repair");
+
+    assert!(
+        shard_checksum_ok(&parity_a).await,
+        "target fragment should be repaired"
+    );
+    assert!(
+        !shard_checksum_ok(&parity_b).await,
+        "untargeted fragment should remain unrepaired"
+    );
+
+    let got_a = read_object_bytes(full_claims(&fragment_a), fragment_a, key_a).await;
+    let got_b = read_object_bytes(full_claims(&fragment_b), fragment_b, key_b).await;
+    assert_eq!(got_a, content_a);
+    assert_eq!(got_b, content_b);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_repair_synchronizes_all_index_disks() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -3164,7 +3647,7 @@ async fn matrix_repair_synchronizes_all_index_disks() {
     assert_eq!(put_pending.status(), StatusCode::OK);
 
     let session_paths =
-        index_v2::get_session_state_paths(&fragment, &pending_vid).expect("session state paths");
+        index::get_session_state_paths(&fragment, &pending_vid).expect("session state paths");
     assert!(
         session_paths.len() >= 2,
         "expected at least two session state replicas"
@@ -3415,8 +3898,8 @@ async fn matrix_raw_blob_background_repair_relocates_stale_device_id() {
 
     let stale_bytes =
         rmp_serde::to_vec(&stale_meta).expect("serialize stale metadata with device mismatch");
-    for path in index_v2::get_object_version_paths(&fragment, &key, &stale_meta.version_id, false)
-        .expect("index_v2 version paths")
+    for path in index::get_object_version_paths(&fragment, &key, &stale_meta.version_id, false)
+        .expect("index version paths")
     {
         fs::write(&path, &stale_bytes)
             .await
@@ -3535,8 +4018,8 @@ async fn matrix_raw_blob_stale_reader_after_relocation_is_idempotent() {
 
     let stale_bytes =
         rmp_serde::to_vec(&stale_meta).expect("serialize stale metadata with device mismatch");
-    for path in index_v2::get_object_version_paths(&fragment, &key, &stale_meta.version_id, false)
-        .expect("index_v2 version paths")
+    for path in index::get_object_version_paths(&fragment, &key, &stale_meta.version_id, false)
+        .expect("index version paths")
     {
         fs::write(&path, &stale_bytes)
             .await
@@ -3671,8 +4154,8 @@ async fn matrix_raw_blob_manual_repair_relocates_stale_device_id() {
 
     let stale_bytes =
         rmp_serde::to_vec(&stale_meta).expect("serialize stale metadata with device mismatch");
-    for path in index_v2::get_object_version_paths(&fragment, &key, &stale_meta.version_id, false)
-        .expect("index_v2 version paths")
+    for path in index::get_object_version_paths(&fragment, &key, &stale_meta.version_id, false)
+        .expect("index version paths")
     {
         fs::write(&path, &stale_bytes)
             .await
@@ -3687,7 +4170,10 @@ async fn matrix_raw_blob_manual_repair_relocates_stale_device_id() {
             shard_repair_concurrency: 2,
             meta_batch_size: 64,
         },
-        RepairRunOptions { fast_mode: false },
+        RepairRunOptions {
+            fast_mode: false,
+            fragment_filter: None,
+        },
         Arc::new(WsConnectionManager::new()),
     )
     .await
@@ -3793,8 +4279,8 @@ async fn matrix_raw_blob_manual_availability_repair_relocates_stale_device_id() 
 
     let stale_bytes =
         rmp_serde::to_vec(&stale_meta).expect("serialize stale metadata with device mismatch");
-    for path in index_v2::get_object_version_paths(&fragment, &key, &stale_meta.version_id, false)
-        .expect("index_v2 version paths")
+    for path in index::get_object_version_paths(&fragment, &key, &stale_meta.version_id, false)
+        .expect("index version paths")
     {
         fs::write(&path, &stale_bytes)
             .await
@@ -3809,7 +4295,10 @@ async fn matrix_raw_blob_manual_availability_repair_relocates_stale_device_id() 
             shard_repair_concurrency: 2,
             meta_batch_size: 64,
         },
-        RepairRunOptions { fast_mode: false },
+        RepairRunOptions {
+            fast_mode: false,
+            fragment_filter: None,
+        },
         Arc::new(WsConnectionManager::new()),
     )
     .await
@@ -3895,8 +4384,9 @@ async fn matrix_repair_restores_delete_marker_mirror() {
         "latest metadata should be a delete marker"
     );
 
-    let marker_paths = index_v2::get_object_version_paths(&fragment, &key, &marker_meta.version_id, false)
-        .expect("delete marker paths");
+    let marker_paths =
+        index::get_object_version_paths(&fragment, &key, &marker_meta.version_id, false)
+            .expect("delete marker paths");
     assert!(
         marker_paths.len() >= 2,
         "expected mirrored marker metadata paths"
@@ -4114,22 +4604,21 @@ async fn matrix_redistribution_read_falls_back_when_primary_index_copy_is_corrup
     let current_meta = get_metadata(&fragment, &key, &fragment)
         .await
         .expect("metadata after redistribution");
-    index_v2::upsert_object_version(&current_meta)
+    index::upsert_object_version(&current_meta)
         .await
-        .expect("restore index_v2 replicas after disk return");
+        .expect("restore index replicas after disk return");
 
-    let meta_paths =
-        index_v2::get_object_version_paths(&fragment, &key, &version_id, false)
-            .expect("index_v2 metadata paths");
-    assert!(meta_paths.len() >= 2, "expected mirrored index_v2 paths");
+    let meta_paths = index::get_object_version_paths(&fragment, &key, &version_id, false)
+        .expect("index metadata paths");
+    assert!(meta_paths.len() >= 2, "expected mirrored index paths");
     assert!(
         fs::try_exists(&meta_paths[1]).await.unwrap_or(false),
-        "secondary index_v2 copy should exist after redistribution"
+        "secondary index copy should exist after redistribution"
     );
 
     fs::write(&meta_paths[0], b"n1-corrupt-metadata-copy")
         .await
-        .expect("corrupt primary index_v2 copy");
+        .expect("corrupt primary index copy");
 
     let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
     assert_eq!(got, content);
@@ -4713,6 +5202,7 @@ async fn matrix_ha_concurrent_clients_with_failure_injection() {
     let state = Arc::new(AppState {
         ws_manager: WsConnectionManager::new(),
     });
+    let read_attempts = test_env_usize("N1_HA_FAILURE_READ_ATTEMPTS", 64, 8, 256);
 
     for i in 0..6usize {
         let key = format!("ha-fi/seed-{}.bin", i);
@@ -4759,7 +5249,9 @@ async fn matrix_ha_concurrent_clients_with_failure_injection() {
                     .collect::<Vec<u8>>();
 
                 put_object(state.clone(), &fragment, &key_a, content.clone()).await;
-                let got = read_object_bytes_eventually(fragment.clone(), key_a.clone(), 24).await;
+                let got =
+                    read_object_bytes_eventually(fragment.clone(), key_a.clone(), read_attempts)
+                        .await;
                 assert_eq!(got, content, "initial write mismatch for {}", key_a);
 
                 let rename_resp = rename_object(
@@ -4797,7 +5289,8 @@ async fn matrix_ha_concurrent_clients_with_failure_injection() {
                 .into_response();
                 assert_eq!(rec_resp.status(), StatusCode::OK);
 
-                let got = read_object_bytes_eventually(fragment, key_b.clone(), 24).await;
+                let got =
+                    read_object_bytes_eventually(fragment, key_b.clone(), read_attempts).await;
                 assert_eq!(got, content, "recovered read mismatch for {}", key_b);
             }
         })
@@ -4809,9 +5302,8 @@ async fn matrix_ha_concurrent_clients_with_failure_injection() {
         .expect("redistribution should succeed during failure-injection CRUD");
 
     let target_key = expected_final[0].0.clone();
-    let target_meta = get_metadata(&fragment, &target_key, &fragment)
-        .await
-        .expect("target metadata after redistribution");
+    let target_meta =
+        get_metadata_eventually(fragment.clone(), target_key.clone(), read_attempts).await;
     let target_shard = target_meta.parts[0]
         .shards
         .iter()
@@ -4837,7 +5329,7 @@ async fn matrix_ha_concurrent_clients_with_failure_injection() {
     ));
 
     for (key, bytes) in &expected_final {
-        let got = read_object_bytes_eventually(fragment.clone(), key.clone(), 24).await;
+        let got = read_object_bytes_eventually(fragment.clone(), key.clone(), read_attempts).await;
         assert_eq!(got, *bytes, "read mismatch during repair for {}", key);
     }
 
@@ -4852,12 +5344,10 @@ async fn matrix_ha_concurrent_clients_with_failure_injection() {
     );
 
     for (key, bytes) in &expected_final {
-        let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+        let got = read_object_bytes_eventually(fragment.clone(), key.clone(), read_attempts).await;
         assert_eq!(got, *bytes, "final data mismatch for {}", key);
 
-        let meta = get_metadata(&fragment, key, &fragment)
-            .await
-            .expect("final metadata should exist");
+        let meta = get_metadata_eventually(fragment.clone(), key.clone(), read_attempts).await;
         assert!(
             !meta.is_delete_marker,
             "final object should not be tombstoned: {}",
@@ -5440,6 +5930,7 @@ async fn matrix_crud_cpu_ram_probe() {
                 durability_mode: redist_durability_mode,
                 object_concurrency: redist_object_concurrency,
                 status_batch: redist_status_batch,
+                fragment_filter: None,
             },
             Arc::new(WsConnectionManager::new()),
         )
@@ -5501,6 +5992,7 @@ async fn matrix_crud_cpu_ram_probe() {
             },
             RepairRunOptions {
                 fast_mode: repair_fast_mode,
+                fragment_filter: None,
             },
             Arc::new(WsConnectionManager::new()),
         )

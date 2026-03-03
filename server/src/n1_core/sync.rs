@@ -7,11 +7,7 @@ use walkdir::WalkDir;
 
 use crate::{
     enums::app_error_enum::AppError,
-    n1_core::{
-        disk_manager::ObjectPathManager,
-        index_v2,
-        quota_manager::set_storage_used,
-    },
+    n1_core::{disk_manager::ObjectPathManager, index, quota_manager::set_storage_used},
     structs::auth_structs::Claims,
 };
 
@@ -67,7 +63,7 @@ async fn calculate_usage_across_mirrors(fragment_hash: String) -> u64 {
     let mut total_usage = 0u64;
     let mut seen_versions = HashSet::new();
 
-    for meta in index_v2::list_fragment_object_versions(&fragment_hash, false)
+    for meta in index::list_fragment_object_versions(&fragment_hash, false)
         .await
         .unwrap_or_default()
     {
@@ -77,7 +73,7 @@ async fn calculate_usage_across_mirrors(fragment_hash: String) -> u64 {
         total_usage += meta.total_size_bytes;
     }
 
-    for meta in index_v2::list_fragment_object_versions(&fragment_hash, true)
+    for meta in index::list_fragment_object_versions(&fragment_hash, true)
         .await
         .unwrap_or_default()
     {

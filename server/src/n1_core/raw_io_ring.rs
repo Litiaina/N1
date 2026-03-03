@@ -1,10 +1,12 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
 use block_manager::DirectExtentIo;
 use futures_util::task::AtomicWaker;
+use tokio::sync::Notify;
 
 use crate::n1_core::ec::AlignedBuffer;
 
@@ -19,8 +21,15 @@ pub(crate) enum RawIoSubmitError {
 }
 
 pub(crate) enum RawReadCompletion {
-    ReadOk(Vec<u8>),
-    ReadErr(Option<Vec<u8>>, io::Error),
+    ReadOk {
+        id: u64,
+        buffer: Vec<u8>,
+    },
+    ReadErr {
+        id: u64,
+        buffer: Option<Vec<u8>>,
+        err: io::Error,
+    },
 }
 
 pub(crate) enum RawReadSubmitError {
@@ -45,6 +54,7 @@ struct CompletionState {
 }
 
 struct RawReadCommand {
+    id: u64,
     offset: u64,
     buffer: Vec<u8>,
 }
@@ -57,7 +67,8 @@ struct RawReadSubmissionState {
 
 struct ReadCompletionState {
     queue: Mutex<VecDeque<RawReadCompletion>>,
-    waker: AtomicWaker,
+    parked: Mutex<HashMap<u64, RawReadCompletion>>,
+    notify: Notify,
 }
 
 pub(crate) struct RawIoRing {
@@ -69,6 +80,7 @@ pub(crate) struct RawIoRing {
 pub(crate) struct RawReadRing {
     submissions: Arc<(Mutex<RawReadSubmissionState>, Condvar)>,
     completions: Arc<ReadCompletionState>,
+    next_id: AtomicU64,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -170,7 +182,8 @@ impl RawReadRing {
         ));
         let completions = Arc::new(ReadCompletionState {
             queue: Mutex::new(VecDeque::with_capacity(queue_depth)),
-            waker: AtomicWaker::new(),
+            parked: Mutex::new(HashMap::with_capacity(queue_depth)),
+            notify: Notify::new(),
         });
 
         let mut workers = Vec::new();
@@ -189,6 +202,7 @@ impl RawReadRing {
         Self {
             submissions,
             completions,
+            next_id: AtomicU64::new(1),
             workers,
         }
     }
@@ -197,7 +211,7 @@ impl RawReadRing {
         &self,
         offset: u64,
         buffer: Vec<u8>,
-    ) -> Result<(), RawReadSubmitError> {
+    ) -> Result<u64, RawReadSubmitError> {
         let (lock, cvar) = &*self.submissions;
         let mut state = lock.lock().expect("raw read ring submissions poisoned");
         if state.closed {
@@ -206,23 +220,59 @@ impl RawReadRing {
         if state.queue.len() >= state.max_depth {
             return Err(RawReadSubmitError::Full(buffer));
         }
-        state.queue.push_back(RawReadCommand { offset, buffer });
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        state.queue.push_back(RawReadCommand { id, offset, buffer });
         cvar.notify_one();
-        Ok(())
+        Ok(id)
     }
 
-    pub(crate) fn poll_completions(&self, cx: &std::task::Context<'_>) -> Vec<RawReadCompletion> {
-        self.completions.waker.register(cx.waker());
-        self.take_completions_now()
-    }
+    pub(crate) fn take_completion_for(&self, id: u64) -> Option<RawReadCompletion> {
+        if let Some(completion) = self
+            .completions
+            .parked
+            .lock()
+            .expect("raw read ring parked completions poisoned")
+            .remove(&id)
+        {
+            return Some(completion);
+        }
 
-    pub(crate) fn take_completions_now(&self) -> Vec<RawReadCompletion> {
         let mut queue = self
             .completions
             .queue
             .lock()
             .expect("raw read ring completions poisoned");
-        queue.drain(..).collect()
+        if queue.is_empty() {
+            return None;
+        }
+
+        let mut parked = self
+            .completions
+            .parked
+            .lock()
+            .expect("raw read ring parked completions poisoned");
+        let mut matched = None;
+        while let Some(completion) = queue.pop_front() {
+            let completion_id = match &completion {
+                RawReadCompletion::ReadOk { id, .. } => *id,
+                RawReadCompletion::ReadErr { id, .. } => *id,
+            };
+            if completion_id == id && matched.is_none() {
+                matched = Some(completion);
+            } else {
+                parked.insert(completion_id, completion);
+            }
+        }
+        matched
+    }
+
+    pub(crate) async fn wait_for_completion(&self, id: u64) -> RawReadCompletion {
+        loop {
+            if let Some(completion) = self.take_completion_for(id) {
+                return completion;
+            }
+            self.completions.notify.notified().await;
+        }
     }
 
     fn close(&self) {
@@ -303,10 +353,22 @@ fn read_worker_loop(
 
         let result = io.read_into(command.offset, &mut command.buffer);
         match result {
-            Ok(()) => push_read_completion(&completions, RawReadCompletion::ReadOk(command.buffer)),
+            Ok(()) => push_read_completion(
+                &completions,
+                RawReadCompletion::ReadOk {
+                    id: command.id,
+                    buffer: command.buffer,
+                },
+            ),
             Err(e) => {
                 let err = io::Error::other(format!("block manager: {}", e));
-                fail_read_ring(&submissions, &completions, Some(command.buffer), err);
+                fail_read_ring(
+                    &submissions,
+                    &completions,
+                    command.id,
+                    Some(command.buffer),
+                    err,
+                );
                 return;
             }
         }
@@ -328,7 +390,7 @@ fn push_read_completion(completions: &ReadCompletionState, completion: RawReadCo
         .lock()
         .expect("raw read ring completions poisoned");
     queue.push_back(completion);
-    completions.waker.wake();
+    completions.notify.notify_waiters();
 }
 
 fn fail_ring(
@@ -367,6 +429,7 @@ fn fail_ring(
 fn fail_read_ring(
     submissions: &Arc<(Mutex<RawReadSubmissionState>, Condvar)>,
     completions: &ReadCompletionState,
+    failed_id: u64,
     failed_buffer: Option<Vec<u8>>,
     err: io::Error,
 ) {
@@ -386,15 +449,20 @@ fn fail_read_ring(
             .queue
             .lock()
             .expect("raw read ring completions poisoned");
-        queue.push_back(RawReadCompletion::ReadErr(failed_buffer, err));
+        queue.push_back(RawReadCompletion::ReadErr {
+            id: failed_id,
+            buffer: failed_buffer,
+            err,
+        });
         for pending_cmd in pending {
-            queue.push_back(RawReadCompletion::ReadErr(
-                Some(pending_cmd.buffer),
-                io::Error::new(err_kind, err_message.clone()),
-            ));
+            queue.push_back(RawReadCompletion::ReadErr {
+                id: pending_cmd.id,
+                buffer: Some(pending_cmd.buffer),
+                err: io::Error::new(err_kind, err_message.clone()),
+            });
         }
     }
-    completions.waker.wake();
+    completions.notify.notify_waiters();
 }
 
 fn worker_count_for_depth(queue_depth: usize) -> usize {

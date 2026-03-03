@@ -45,7 +45,7 @@ use crate::n1_core::ec::{
     AlignedBuffer, RawErasureStreamWriter, recycle_pooled_aligned_buffer,
     take_pooled_aligned_buffer,
 };
-use crate::n1_core::index_v2;
+use crate::n1_core::index;
 use crate::n1_core::quota_manager::{try_reserve_quota, update_quota};
 use crate::n1_core::raw_io_ring::{RawIoCompletion, RawIoRing, RawIoSubmitError};
 use crate::routes::storage_routes::AppState;
@@ -662,7 +662,7 @@ async fn read_manifest_any(
     fragment: &str,
     version_id: &str,
 ) -> Result<Option<UploadSessionManifest>, AppError> {
-    Ok(index_v2::load_session(fragment, version_id)
+    Ok(index::load_session(fragment, version_id)
         .await?
         .map(|state| state.manifest))
 }
@@ -673,7 +673,7 @@ async fn read_part_meta_any(
     version_id: &str,
     part_index: u64,
 ) -> Option<PartMetadata> {
-    index_v2::load_session(fragment, version_id)
+    index::load_session(fragment, version_id)
         .await
         .ok()
         .flatten()
@@ -695,7 +695,7 @@ async fn commit_part_meta_lockless(
             "Part metadata index mismatch during commit".to_string(),
         ));
     }
-    index_v2::commit_part(fragment, version_id, &part_meta).await
+    index::commit_part(fragment, version_id, &part_meta).await
 }
 
 async fn cleanup_blob_tmp_attempt_files_for_version(fragment: &str, version_id: &str) {
@@ -760,8 +760,8 @@ pub async fn initiate_object_upload(
     let receipt = ReservationReceipt {
         amount: params.total_size_bytes,
     };
-    if let Err(e) = index_v2::open_session(&manifest, Some(receipt)).await {
-        error!("Failed to open index_v2 session: {}", e);
+    if let Err(e) = index::open_session(&manifest, Some(receipt)).await {
+        error!("Failed to open index session: {}", e);
         let _ = update_quota(&fragment, -(params.total_size_bytes as i64)).await;
         return Err(AppError::InternalServerError(
             "Storage backend unavailable".into(),
@@ -804,7 +804,7 @@ pub async fn list_active_uploads(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    let states = index_v2::list_active_sessions(&fragment).await?;
+    let states = index::list_active_sessions(&fragment).await?;
     if states.is_empty() {
         return Ok(AxumJson(ListUploadsResponse {
             sessions: vec![],
@@ -845,7 +845,7 @@ pub async fn get_upload_status(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let Some(state) = index_v2::load_session(&fragment, &version_id).await? else {
+    let Some(state) = index::load_session(&fragment, &version_id).await? else {
         return Ok(AxumJson(UploadStatusResponse {
             uploaded_parts: vec![],
         }));
@@ -1198,7 +1198,7 @@ pub async fn finalize_object_upload(
     let object_key = key_query.object_key;
     let path_manager = ObjectPathManager::new();
 
-    if index_v2::read_object_version(&fragment, &object_key, &version_id)
+    if index::read_object_version(&fragment, &object_key, &version_id)
         .await
         .is_ok()
     {
@@ -1291,8 +1291,8 @@ pub async fn finalize_object_upload(
         stripe_size_bytes: stripe_size,
     };
 
-    index_v2::publish_object(&object_meta).await?;
-    let _ = index_v2::remove_session(&fragment, &version_id, "finalized").await;
+    index::publish_object(&object_meta).await?;
+    let _ = index::remove_session(&fragment, &version_id, "finalized").await;
 
     let reserved_size = manifest
         .as_ref()
@@ -1327,7 +1327,7 @@ pub async fn cancel_upload_session(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    if index_v2::read_object_version(&fragment, &key_query.object_key, &version_id)
+    if index::read_object_version(&fragment, &key_query.object_key, &version_id)
         .await
         .is_ok()
     {
@@ -1336,13 +1336,13 @@ pub async fn cancel_upload_session(
         ));
     }
 
-    let refund_amount = index_v2::load_session(&fragment, &version_id)
+    let refund_amount = index::load_session(&fragment, &version_id)
         .await?
         .and_then(|state| state.reservation.map(|r| r.amount))
         .unwrap_or(0);
 
     cleanup_blob_tmp_attempt_files_for_version(&fragment, &version_id).await;
-    let _ = index_v2::remove_session(&fragment, &version_id, "cancelled").await;
+    let _ = index::remove_session(&fragment, &version_id, "cancelled").await;
 
     if refund_amount > 0 {
         if let Err(e) = update_quota(&fragment, -(refund_amount as i64)).await {

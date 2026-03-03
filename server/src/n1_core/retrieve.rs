@@ -1,15 +1,13 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::constants::{
-    BROWSER_CACHE_MAX_AGE, PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_DELIMITER_SEGMENT_PREFIX,
-    PREFIX_SEGMENT_EXT,
+    BROWSER_CACHE_MAX_AGE, PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_SEGMENT_EXT,
 };
 use crate::n1_core::disk_manager::{
-    ListObjectsResult, ObjectMetadata, ObjectPathManager,
-    PrefixDelimiterCompactedSegment, PrefixDelimiterSegment, PrefixIndexEntry, PrefixIndexSegment,
-    Quota, compare_version_recency, version_recency_is_newer,
+    ListObjectsResult, ObjectMetadata, ObjectPathManager, PrefixDelimiterCompactedSegment,
+    PrefixIndexEntry, PrefixIndexSegment, Quota, compare_version_recency, version_recency_is_newer,
 };
 use crate::n1_core::fragment_manager::is_fragment_hash;
-use crate::n1_core::index_v2;
+use crate::n1_core::index;
 use crate::n1_core::metadata_parser::get_metadata;
 use crate::n1_core::object_parser::{get_object_logic, stream_object_logic};
 use crate::n1_core::quota_manager::get_quota;
@@ -23,18 +21,14 @@ use axum::{
 };
 use base64::Engine;
 use base64::engine::general_purpose;
-use once_cell::sync::OnceCell;
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::atomic::{AtomicUsize, Ordering},
 };
 use tokio::fs;
-use tracing::{debug, warn};
+use tracing::warn;
 use walkdir::WalkDir;
-
-pub static PREFIX_MAX_DELTA_SEGMENTS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 
 #[cfg(test)]
 #[derive(Default)]
@@ -45,14 +39,6 @@ struct ContinuationCursor {
     shard3: String,
     shard4: String,
     file: String,
-}
-
-fn prefix_max_delta_segments() -> usize {
-    PREFIX_MAX_DELTA_SEGMENTS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(512)
-        .clamp(32, 65_536)
 }
 
 #[cfg(test)]
@@ -154,7 +140,7 @@ async fn read_metadata_best(
     object_key: &str,
     version_id: &str,
 ) -> Option<ObjectMetadata> {
-    index_v2::read_object_version(fragment, object_key, version_id)
+    index::read_object_version(fragment, object_key, version_id)
         .await
         .ok()
 }
@@ -215,15 +201,10 @@ async fn try_list_by_prefix_index(
         }
 
         let compacted_path = d.join(format!("compacted{}", PREFIX_SEGMENT_EXT));
-        let mut compacted_mtime: Option<std::time::SystemTime> = None;
-
         if fs::try_exists(&compacted_path).await.unwrap_or(false) {
             if let Ok(data) = fs::read(&compacted_path).await {
                 if let Ok(seg) = rmp_serde::from_slice::<PrefixIndexSegment>(&data) {
                     had_any_index_data = true;
-                    if let Ok(md) = fs::metadata(&compacted_path).await {
-                        compacted_mtime = md.modified().ok();
-                    }
                     if canonical_prefix(&seg.prefix) == pfx {
                         for mut e in seg.entries {
                             let ck = canonical_key(&e.object_key);
@@ -233,67 +214,6 @@ async fn try_list_by_prefix_index(
                             e.object_key = ck;
                             merge_prefix_latest(&mut latest, e);
                         }
-                    }
-                }
-            }
-        }
-
-        let mut seg_files: Vec<(String, std::time::SystemTime, PathBuf)> = Vec::new();
-        if let Ok(mut entries) = fs::read_dir(&d).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if !entry
-                    .file_type()
-                    .await
-                    .map(|t| t.is_file())
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("seg_") && name.ends_with(PREFIX_SEGMENT_EXT) {
-                    let modified = entry
-                        .metadata()
-                        .await
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .unwrap_or(std::time::UNIX_EPOCH);
-                    seg_files.push((name, modified, entry.path()));
-                }
-            }
-        }
-        seg_files.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let recent_delta_count = if let Some(cmp_ts) = compacted_mtime {
-            seg_files.iter().filter(|(_, ts, _)| *ts > cmp_ts).count()
-        } else {
-            seg_files.len()
-        };
-
-        let max_deltas = prefix_max_delta_segments();
-        if recent_delta_count > max_deltas {
-            debug!(
-                "Prefix delta fan-in too large for fragment={} prefix='{}' bucket={:?} recent_deltas={} (max={}); fallback to full scan",
-                fragment, pfx, d, recent_delta_count, max_deltas
-            );
-            return Ok(None);
-        }
-
-        for (_name, _mtime, path) in seg_files {
-            if let Ok(data) = fs::read(&path).await {
-                if let Ok(seg) = rmp_serde::from_slice::<PrefixIndexSegment>(&data) {
-                    had_any_index_data = true;
-                    if canonical_prefix(&seg.prefix) != pfx {
-                        continue;
-                    }
-                    for mut e in seg.entries {
-                        let ck = canonical_key(&e.object_key);
-
-                        if !pfx.is_empty() && ck != pfx && !ck.starts_with(&pfx_with_slash) {
-                            continue;
-                        }
-
-                        e.object_key = ck;
-                        merge_prefix_latest(&mut latest, e);
                     }
                 }
             }
@@ -360,7 +280,10 @@ async fn try_list_by_prefix_index(
             continue;
         }
 
-        if !pfx.is_empty() && entry.object_key != pfx && !entry.object_key.starts_with(&pfx_with_slash) {
+        if !pfx.is_empty()
+            && entry.object_key != pfx
+            && !entry.object_key.starts_with(&pfx_with_slash)
+        {
             continue;
         }
 
@@ -376,7 +299,8 @@ async fn try_list_by_prefix_index(
             };
 
             if !pfx.is_empty() && entry.object_key == pfx {
-                let Some(meta) = read_index_entry_best(&path_manager, fragment, &entry).await else {
+                let Some(meta) = read_index_entry_best(&path_manager, fragment, &entry).await
+                else {
                     warn!(
                         "Skipping unreadable prefix-index metadata fragment={} key={} version={}",
                         fragment, entry.object_key, entry.version_id
@@ -401,7 +325,8 @@ async fn try_list_by_prefix_index(
                     }
                 }
             } else {
-                let Some(meta) = read_index_entry_best(&path_manager, fragment, &entry).await else {
+                let Some(meta) = read_index_entry_best(&path_manager, fragment, &entry).await
+                else {
                     warn!(
                         "Skipping unreadable prefix-index metadata fragment={} key={} version={}",
                         fragment, entry.object_key, entry.version_id
@@ -468,8 +393,6 @@ async fn try_list_by_delimiter_index(
     let path_manager = ObjectPathManager::new();
 
     let mut compacted_candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    let mut delta_candidates: HashMap<String, Vec<(std::time::SystemTime, PathBuf)>> =
-        HashMap::new();
 
     for d in path_manager.get_all_prefix_bucket_dirs(fragment, &pfx) {
         if !fs::try_exists(&d).await.unwrap_or(false) {
@@ -484,37 +407,6 @@ async fn try_list_by_delimiter_index(
                 .and_then(|m| m.modified().ok())
                 .unwrap_or(std::time::UNIX_EPOCH);
             compacted_candidates.push((modified, compacted_path));
-        }
-
-        if let Ok(mut entries) = fs::read_dir(&d).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if !entry
-                    .file_type()
-                    .await
-                    .map(|t| t.is_file())
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-
-                let name = entry.file_name().to_string_lossy().to_string();
-                if !name.starts_with(PREFIX_DELIMITER_SEGMENT_PREFIX)
-                    || !name.ends_with(PREFIX_SEGMENT_EXT)
-                {
-                    continue;
-                }
-
-                let modified = entry
-                    .metadata()
-                    .await
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .unwrap_or(std::time::UNIX_EPOCH);
-                delta_candidates
-                    .entry(name)
-                    .or_default()
-                    .push((modified, entry.path()));
-            }
         }
     }
 
@@ -557,76 +449,9 @@ async fn try_list_by_delimiter_index(
         break;
     }
 
-    let Some(compacted_mtime) = compacted_mtime else {
+    let Some(_compacted_mtime) = compacted_mtime else {
         return Ok(None);
     };
-
-    let mut delta_segments: Vec<(String, std::time::SystemTime, PrefixDelimiterSegment)> =
-        Vec::new();
-    for (name, mut candidates) in delta_candidates {
-        candidates.sort_by(|a, b| b.0.cmp(&a.0));
-
-        let mut selected = None;
-        for (mtime, path) in candidates {
-            let Ok(data) = fs::read(&path).await else {
-                continue;
-            };
-            let Ok(seg) = rmp_serde::from_slice::<PrefixDelimiterSegment>(&data) else {
-                continue;
-            };
-            if canonical_prefix(&seg.prefix) != pfx {
-                continue;
-            }
-            selected = Some((mtime, seg));
-            break;
-        }
-
-        let Some((mtime, seg)) = selected else {
-            debug!(
-                "Unreadable delimiter delta segment for fragment={} prefix='{}' name={}",
-                fragment, pfx, name
-            );
-            return Ok(None);
-        };
-
-        delta_segments.push((name, mtime, seg));
-    }
-
-    let recent_delta_count = delta_segments
-        .iter()
-        .filter(|(_, mtime, _)| *mtime > compacted_mtime)
-        .count();
-    let max_deltas = prefix_max_delta_segments();
-    if recent_delta_count > max_deltas {
-        debug!(
-            "Delimiter delta fan-in too large for fragment={} prefix='{}' recent_deltas={} (max={}); fallback to full prefix scan",
-            fragment, pfx, recent_delta_count, max_deltas
-        );
-        return Ok(None);
-    }
-
-    delta_segments.sort_by(|a, b| a.0.cmp(&b.0));
-    for (_name, mtime, seg) in delta_segments {
-        if mtime <= compacted_mtime {
-            continue;
-        }
-
-        for entry in seg.object_entries {
-            let mut entry = entry;
-            entry.object_key = canonical_key(&entry.object_key);
-            merge_prefix_latest(&mut direct_latest, entry);
-        }
-        for child_delta in seg.child_deltas {
-            let common_prefix = child_delta
-                .common_prefix
-                .trim_start_matches('/')
-                .to_string();
-            child_counts
-                .entry(common_prefix)
-                .and_modify(|count| *count = count.saturating_add(child_delta.delta))
-                .or_insert(child_delta.delta);
-        }
-    }
 
     let mut rows: Vec<DelimiterRow> = Vec::new();
     for entry in direct_latest.into_values() {
@@ -729,7 +554,7 @@ async fn try_list_by_delimiter_index(
     }))
 }
 
-async fn list_objects_from_index_v2(
+async fn list_objects_from_index(
     fragment: &str,
     prefix: &str,
     delimiter: Option<&str>,
@@ -755,15 +580,15 @@ async fn list_objects_from_index_v2(
 
     let objects = if scan_trash {
         if pfx.is_empty() {
-            index_v2::list_fragment_trash_objects(fragment).await?
+            index::list_fragment_trash_objects(fragment).await?
         } else {
-            index_v2::list_fragment_trash_objects_for_prefix(fragment, &pfx).await?
+            index::list_fragment_trash_objects_for_prefix(fragment, &pfx).await?
         }
     } else {
         if pfx.is_empty() {
-            index_v2::list_fragment_objects(fragment).await?
+            index::list_fragment_objects(fragment).await?
         } else {
-            index_v2::list_fragment_objects_for_prefix(fragment, &pfx).await?
+            index::list_fragment_objects_for_prefix(fragment, &pfx).await?
         }
     };
 
@@ -990,7 +815,7 @@ async fn list_objects_internal(
     let prefix_projection_pending = if scan_trash {
         false
     } else {
-        index_v2::is_prefix_projection_pending(&fragment).await
+        index::is_prefix_projection_pending(&fragment).await
     };
 
     if !scan_trash && !prefix_projection_pending && delimiter.is_some() {
@@ -1023,7 +848,7 @@ async fn list_objects_internal(
     }
 
     Ok(AxumJson(
-        list_objects_from_index_v2(
+        list_objects_from_index(
             &fragment,
             &prefix,
             delimiter,
@@ -1094,7 +919,7 @@ pub async fn list_object_versions(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let mut versions = index_v2::list_live_object_versions_metadata(&fragment, &object_key).await?;
+    let mut versions = index::list_live_object_versions_metadata(&fragment, &object_key).await?;
     versions.sort_by(|a, b| {
         compare_version_recency(b.created_at, &b.version_id, a.created_at, &a.version_id)
     });

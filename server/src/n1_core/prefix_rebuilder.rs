@@ -21,7 +21,7 @@ use crate::n1_core::constants::{
 use crate::n1_core::disk_manager::{
     ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment, version_recency_is_newer,
 };
-use crate::n1_core::index_v2;
+use crate::n1_core::index;
 use crate::n1_core::prefix_delimiter::build_delimiter_compacted_from_entries;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
@@ -285,7 +285,14 @@ async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
 
 async fn scan_latest_by_key(
     fragment: &str,
-) -> Result<(u64, HashMap<String, PrefixIndexEntry>, Vec<(String, String)>), AppError> {
+) -> Result<
+    (
+        u64,
+        HashMap<String, PrefixIndexEntry>,
+        Vec<(String, String)>,
+    ),
+    AppError,
+> {
     let now_ts = Utc::now().timestamp();
     let retention_secs = std::cmp::max(
         CONFIG.garbage_collector.retention_seconds as i64,
@@ -296,7 +303,7 @@ async fn scan_latest_by_key(
     let mut latest: HashMap<String, PrefixIndexEntry> = HashMap::new();
     let mut latest_tombstone: HashMap<String, (String, i64)> = HashMap::new();
 
-    for meta in index_v2::list_fragment_object_versions(fragment, false).await? {
+    for meta in index::list_fragment_object_versions(fragment, false).await? {
         let entry = PrefixIndexEntry::from_metadata(&meta);
         let key = canonical_key(&entry.object_key);
         let ts = entry.created_at;
@@ -360,7 +367,9 @@ async fn scan_latest_by_key(
     Ok((scanned, latest, stale_tombstones))
 }
 
-fn build_per_prefix(latest_by_key: HashMap<String, PrefixIndexEntry>) -> HashMap<String, Vec<PrefixIndexEntry>> {
+fn build_per_prefix(
+    latest_by_key: HashMap<String, PrefixIndexEntry>,
+) -> HashMap<String, Vec<PrefixIndexEntry>> {
     let mut per_prefix: HashMap<String, Vec<PrefixIndexEntry>> = HashMap::new();
 
     for (object_key, entry) in latest_by_key {
@@ -505,7 +514,7 @@ async fn cleanup_stale_delete_markers(
     stale_tombstones: &[(String, String)],
 ) {
     for (object_key, version_id) in stale_tombstones {
-        let _ = index_v2::delete_object_version(fragment, object_key, version_id).await;
+        let _ = index::delete_object_version(fragment, object_key, version_id).await;
     }
 }
 
@@ -562,17 +571,16 @@ pub async fn run_prefix_rebuild_job(
             push_update(&ws, &st);
         }
 
-        let (scanned, latest_by_key, stale_tombstones) =
-            match scan_latest_by_key(&frag).await {
-                Ok(v) => v,
-                Err(e) => {
-                    let mut st = PR_STATUS.write().await;
-                    st.total_errors += 1;
-                    st.last_error = Some(e.to_string());
-                    push_update(&ws, &st);
-                    continue;
-                }
-            };
+        let (scanned, latest_by_key, stale_tombstones) = match scan_latest_by_key(&frag).await {
+            Ok(v) => v,
+            Err(e) => {
+                let mut st = PR_STATUS.write().await;
+                st.total_errors += 1;
+                st.last_error = Some(e.to_string());
+                push_update(&ws, &st);
+                continue;
+            }
+        };
 
         let elapsed = start_time.elapsed().as_secs_f64();
         {

@@ -11,6 +11,8 @@ RUN_CHAOS="${RUN_CHAOS:-1}"
 CHAOS_RUNS="${CHAOS_RUNS:-3}"
 CHAOS_REQUIRE_ALL_PASS="${CHAOS_REQUIRE_ALL_PASS:-1}"
 CHAOS_MAX_DURATION_SECS="${CHAOS_MAX_DURATION_SECS:-0}"
+RUN_INDEX_OWNER_RESUME_SOAK="${RUN_INDEX_OWNER_RESUME_SOAK:-0}"
+INDEX_OWNER_RESUME_SOAK_ROUNDS="${INDEX_OWNER_RESUME_SOAK_ROUNDS:-5}"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="${OUT_DIR:-.n1-bench/release-drills-${STAMP}}"
@@ -22,6 +24,7 @@ SUMMARY="$OUT_DIR/summary.txt"
 echo "test,run,exit_code,wall_seconds,passed" > "$CSV"
 
 TESTS=(
+  matrix_active_multipart_resume_survives_replica_index_disk_loss
   matrix_raw_blob_crud_delete_recover_and_permanent_delete
   matrix_raw_blob_quota_drift_reconverges_after_redistribution_gc_and_sync
   matrix_raw_blob_redistribution_repair_recovered_read_and_gc_markers
@@ -59,6 +62,22 @@ for test_name in "${TESTS[@]}"; do
   done
 done
 
+index_resume_soak_status="skipped"
+if [[ "$RUN_INDEX_OWNER_RESUME_SOAK" == "1" ]]; then
+  echo "[drill] running owner-first multipart resume soak"
+  set +e
+  N1_INDEX_OWNER_RESUME_SOAK_ROUNDS="$INDEX_OWNER_RESUME_SOAK_ROUNDS" \
+  cargo test -p "$PACKAGE" matrix_index_owner_first_multipart_resume_soak -- --ignored --nocapture \
+    >"$OUT_DIR/index-owner-resume-soak.log" 2>&1
+  index_resume_soak_ec=$?
+  set -e
+  if [[ "$index_resume_soak_ec" -eq 0 ]]; then
+    index_resume_soak_status="pass"
+  else
+    index_resume_soak_status="fail"
+  fi
+fi
+
 chaos_status="skipped"
 if [[ "$RUN_CHAOS" == "1" ]]; then
   echo "[drill] running HA chaos harness"
@@ -92,7 +111,7 @@ read -r pass_count fail_count avg_wall max_wall <<<"$(awk -F, '
   }' "$CSV")"
 
 status="PASS"
-if [[ "$fail_count" -gt 0 || "$chaos_status" == "fail" ]]; then
+if [[ "$fail_count" -gt 0 || "$chaos_status" == "fail" || "$index_resume_soak_status" == "fail" ]]; then
   status="FAIL"
 fi
 
@@ -100,6 +119,7 @@ fi
   echo "status=$status"
   echo "case_runs=$(( ${#TESTS[@]} * RUNS )) pass=$pass_count fail=$fail_count"
   echo "wall_seconds:avg=$avg_wall max=$max_wall"
+  echo "index_owner_resume_soak=$index_resume_soak_status"
   echo "chaos=$chaos_status"
   echo "csv=$CSV"
 } | tee "$SUMMARY"

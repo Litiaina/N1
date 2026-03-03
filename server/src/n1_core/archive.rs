@@ -27,7 +27,7 @@ use crate::{
         version_recency_is_newer,
     },
     n1_core::{
-        index_v2,
+        index,
         metadata_parser::get_metadata,
         object_parser::{data_shards_count, shard_dir_with_locality_hint, shard_dirs_for_version},
         recovery::{ShardFileCache, ShardRepairContext, read_or_recover_chunk_into},
@@ -270,61 +270,6 @@ async fn resolve_keys_from_prefix_index(
                 }
             }
         }
-
-        let mut seg_files = Vec::new();
-        if let Ok(mut entries) = tokio::fs::read_dir(&d).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let is_file = entry
-                    .file_type()
-                    .await
-                    .map(|t| t.is_file())
-                    .unwrap_or(false);
-                if !is_file {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("seg_")
-                    && name.ends_with(crate::n1_core::constants::PREFIX_SEGMENT_EXT)
-                {
-                    seg_files.push((name, entry.path()));
-                }
-            }
-        }
-        seg_files.sort_by(|a, b| a.0.cmp(&b.0));
-
-        for (_name, path) in seg_files {
-            if let Ok(data) = tokio::fs::read(&path).await {
-                if let Ok(seg) =
-                    rmp_serde::from_slice::<crate::n1_core::disk_manager::PrefixIndexSegment>(&data)
-                {
-                    had_any_index_data = true;
-                    if canonical_prefix(&seg.prefix) != pfx {
-                        continue;
-                    }
-                    for e in seg.entries {
-                        let ck = canonical_key(&e.object_key);
-                        if !matches_prefix_with_delimiter(&ck, &pfx, delimiter) {
-                            continue;
-                        }
-                        match latest.get(&ck) {
-                            None => {
-                                latest.insert(ck, (e.version_id.clone(), e.created_at));
-                            }
-                            Some((cur_vid, cur_ts)) => {
-                                if version_recency_is_newer(
-                                    e.created_at,
-                                    &e.version_id,
-                                    *cur_ts,
-                                    cur_vid,
-                                ) {
-                                    latest.insert(ck, (e.version_id.clone(), e.created_at));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 
     if !had_any_index_data {
@@ -359,7 +304,7 @@ async fn resolve_keys_from_prefix_scan(
     max_keys: usize,
 ) -> Result<Vec<String>, AppError> {
     let mut keys = Vec::new();
-    for meta in index_v2::list_fragment_objects(fragment).await? {
+    for meta in index::list_fragment_objects(fragment).await? {
         if meta.is_delete_marker {
             continue;
         }

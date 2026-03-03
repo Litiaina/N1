@@ -13,7 +13,7 @@ use crate::enums::app_error_enum::AppError;
 use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, RenameObjectRequest, compare_version_recency,
 };
-use crate::n1_core::index_v2;
+use crate::n1_core::index;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
@@ -97,7 +97,7 @@ async fn write_delete_marker_for_key(
     dm.parts.clear();
     dm.total_size_bytes = 0;
 
-    index_v2::publish_object(&dm).await?;
+    index::publish_object(&dm).await?;
 
     Ok(dm)
 }
@@ -109,7 +109,7 @@ async fn delete_source_metadata_versions(
     versions: &HashSet<String>,
 ) {
     for v in versions {
-        let _ = index_v2::delete_object_version(fragment, object_key, v).await;
+        let _ = index::delete_object_version(fragment, object_key, v).await;
     }
 }
 
@@ -137,23 +137,23 @@ pub async fn rename_object(
     }
 
     let path_manager = ObjectPathManager::new();
-    let source_versions = index_v2::list_live_object_versions_metadata(
-        &payload.source_fragment,
-        &payload.source_key,
-    )
-    .await?;
+    let source_versions =
+        index::list_live_object_versions_metadata(&payload.source_fragment, &payload.source_key)
+            .await?;
     if source_versions.is_empty() {
         return Err(AppError::NotFound);
     }
 
-    if !index_v2::list_live_object_versions_metadata(
+    if !index::list_live_object_versions_metadata(
         &payload.destination_fragment,
         &payload.destination_key,
     )
     .await?
     .is_empty()
     {
-        return Err(AppError::Conflict("Destination object already exists".into()));
+        return Err(AppError::Conflict(
+            "Destination object already exists".into(),
+        ));
     }
 
     let mut renamed_versions = source_versions;
@@ -176,7 +176,7 @@ pub async fn rename_object(
         renamed.owner_uid = payload.destination_fragment.clone();
         renamed.created_at = Utc::now().timestamp() + idx as i64;
 
-        index_v2::upsert_object_version(&renamed).await?;
+        index::upsert_object_version(&renamed).await?;
         affected_versions.insert(renamed.version_id.clone());
     }
 

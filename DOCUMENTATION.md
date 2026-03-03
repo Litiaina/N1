@@ -18,14 +18,21 @@
 > - Blob payload I/O uses `O_DIRECT`; metadata and control files stay filesystem-backed.
 
 > Metadata architecture note:
-> - `index_v2` is the authoritative object, trash, and upload-session metadata plane.
+> - `index` is the authoritative object, trash, and upload-session metadata plane.
 > - Each object or session hashes to one metadata partition with one owner root plus one replica root when multiple index roots exist.
-> - Prefix and delimiter listing are served from a derived namespace index with inline list payload and are projected from `index_v2` WAL changes into compacted namespace snapshots.
+> - The owner root is the synchronous ACK boundary for object/session writes.
+> - Replica roots are replica-behind durability copies and may lag briefly until repair/replay catches them up.
+> - Prefix and delimiter listing are served from a derived namespace index with inline list payload and are projected from `index` WAL changes into projected namespace snapshots.
 > - Legacy mirrored object/session trees are no longer the hot-path authority.
 > - Same-key upload recency comes from the upload session's `created_at`; finalize does not get to reorder versions.
 > - If two versions share the same second-level timestamp, ULID `version_id` order breaks the tie.
 > - Exact-key reads resolve the latest marker and then rehydrate the referenced immutable version record before serving metadata or bytes.
-> - Prefix-serving state may lag, but it must never override or invent visibility that `index_v2` does not contain.
+> - Prefix-serving state may lag, but it must never override or invent visibility that `index` does not contain.
+
+> Release status note:
+> - N1 `0.9.0` freezes the storage architecture, not the public API surface.
+> - This document describes the current implementation and current routes.
+> - Request/response details and endpoint layout may still change before `1.0.0` even though the underlying storage model is now fixed.
 
 ## 1. Base URL And Conventions
 - Base URL example: `https://127.0.0.1:50001`
@@ -239,7 +246,7 @@ Notes:
 - Internal marker keys (for example `.n1fsd_dir`, `.n1-trash`) are hidden unless `include_internal=true`.
 - Normal serving path uses the prefix namespace index.
 - Prefix projection runs asynchronously and coalesces repeated mutations per fragment.
-- If prefix projection is still pending, or if prefix-serving state is missing or insufficient, the server falls back to authoritative `index_v2` scans for the requested prefix, not a legacy mirrored metadata tree.
+- If prefix projection is still pending, or if prefix-serving state is missing or insufficient, the server falls back to authoritative `index` scans for the requested prefix, not a legacy mirrored metadata tree.
 - Prefix rows carry inline list payload, so successful prefix hits avoid reopening object metadata for every returned row.
 
 Response shape (`ListObjectsResult`):
@@ -255,7 +262,7 @@ curl -k -H "Authorization: Bearer $TOKEN" \
 ### 6.4 `GET /v4/fragment/trash/{fragment}`
 Trash listing, same pagination style.
 - Supports the same `include_internal` query behavior as object listing.
-- Trash visibility comes from `index_v2` trash state.
+- Trash visibility comes from `index` trash state.
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/trash/<fragment_hash>?limit=100"
@@ -288,7 +295,7 @@ curl -k -H "Authorization: Bearer $TOKEN" \
 
 ### 6.8 `GET /v4/fragment/meta/{fragment}/{*object_key}`
 Returns full object metadata.
-- Metadata is resolved from authoritative `index_v2` state.
+- Metadata is resolved from authoritative `index` state.
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/meta/<fragment_hash>/videos/a.mp4"
@@ -471,7 +478,7 @@ Durability default:
 - Upload I/O gating follows `[upload_config].upload_io_gate_enabled` (`true` by default) unless overridden by `io_gate`.
 
 Notes:
-- Part upload commits raw shard payload first, then records the committed part inside the upload session's `index_v2` state.
+- Part upload commits raw shard payload first, then records the committed part inside the upload session's `index` state.
 - A successful part upload does not publish object visibility by itself.
 
 ```bash
@@ -499,10 +506,10 @@ curl -k -H "Authorization: Bearer $TOKEN" \
 
 ### 8.5 `POST /v4/upload/finalize/{fragment}/{version_id}/{session_id}`
 Behavior:
-- Loads the authoritative upload session from `index_v2`.
-- Verifies the committed parts and publishes the immutable object version into the object's `index_v2` partition.
+- Loads the authoritative upload session from `index`.
+- Verifies the committed parts and publishes the immutable object version into the object's `index` partition.
 - Exact-key visibility is gated by this publish step.
-- Prefix listing is serving state layered on top of the publish and may be rebuilt from `index_v2`.
+- Prefix listing is serving state layered on top of the publish and may be rebuilt from `index`.
 
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
@@ -526,7 +533,7 @@ curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
 - `POST /v4/maintenance/init/fragment`
 
 Notes:
-- Sync and cleanup recompute live and trash usage from authoritative `index_v2` state.
+- Sync and cleanup recompute live and trash usage from authoritative `index` state.
 - Quota-file mirrors remain persisted state, but they are no longer the hot-path authority for object truth.
 
 ```bash
@@ -558,7 +565,7 @@ Start query params:
 - `batch=32..N` (RAM-adaptive cap)
 
 Notes:
-- Repair reconciles partition replicas and blob availability from `index_v2`.
+- Repair reconciles partition replicas and blob availability from `index`.
 - Full mirrored equality across every index root is no longer the invariant; owner/replica survivability for each partition is.
 
 ```bash
@@ -577,7 +584,7 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
 - `GET /v4/maintenance/gc/status`
 
 Notes:
-- GC deletes trashed versions and abandoned upload sessions through `index_v2`.
+- GC deletes trashed versions and abandoned upload sessions through `index`.
 - Raw payload without authoritative session or object state is cleanup-candidate data.
 
 ```bash
@@ -622,7 +629,7 @@ Start query params:
 - `status_batch=1..N` (RAM-adaptive cap)
 
 Notes:
-- Redistribution rewrites payload placement first, then republishes updated shard addresses through authoritative `index_v2` metadata.
+- Redistribution rewrites payload placement first, then republishes updated shard addresses through authoritative `index` metadata.
 
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
@@ -662,8 +669,8 @@ curl -k -X GET -H "Authorization: Bearer $TOKEN" \
 - `GET /v4/maintenance/prefix/rebuild/status`
 
 Notes:
-- Prefix rebuild scans authoritative `index_v2` object state and regenerates namespace-serving segments.
-- Normal prefix maintenance is driven asynchronously from `index_v2` WAL changes with coalesced per-fragment projection; rebuild is the full repair path when the serving plane needs a full regeneration.
+- Prefix rebuild scans authoritative `index` object state and regenerates namespace-serving segments.
+- Normal prefix maintenance is driven asynchronously from `index` WAL changes with coalesced per-fragment projection; rebuild is the full repair path when the serving plane needs a full regeneration.
 - Prefix state is rebuildable acceleration, not object truth.
 
 Start query params:
@@ -693,7 +700,7 @@ Query params:
 Notes:
 - Default request serves cached health snapshot produced by monitor loop.
 - Background monitor interval is config-driven.
-- Deep scan reflects the partitioned `index_v2` model; differing per-root object counts are expected outside a partition's owner/replica placements.
+- Deep scan reflects the partitioned `index` model; differing per-root object counts are expected outside a partition's owner/replica placements.
 
 ```bash
 curl -k -X GET -H "Authorization: Bearer $TOKEN" \

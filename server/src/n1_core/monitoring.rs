@@ -1,7 +1,7 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::blob_store::{RawBlobDeviceStatus, raw_blob_device_statuses};
 use crate::n1_core::disk_manager::{configured_blob_store_disks, configured_index_store_disks};
-use crate::n1_core::index_v2;
+use crate::n1_core::index;
 use crate::n1_core::redistribution::get_redist_status;
 use crate::n1_core::repair_manager::get_repair_status;
 use crate::n1_core::system::{SystemMetrics, get_system_metrics};
@@ -273,7 +273,7 @@ async fn collect_system_health(
             })?;
 
             for fragment in fragments {
-                total_objects += index_v2::list_fragment_object_versions(&fragment, false)
+                total_objects += index::list_fragment_object_versions(&fragment, false)
                     .await
                     .map(|versions| versions.len() as u64)
                     .unwrap_or(0);
@@ -288,7 +288,7 @@ async fn collect_system_health(
     } else if !scan_performed {
         "skipped (use ?deep_scan=true)".to_string()
     } else {
-        "partitioned (index_v2 authoritative)".to_string()
+        "partitioned (index authoritative)".to_string()
     };
 
     let total_index = index_disks_config.len();

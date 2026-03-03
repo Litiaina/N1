@@ -3,10 +3,8 @@ use crate::fs::cleanup_manager::start_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::n1_core::blob_store::{RawGcMarker, free_raw_address, free_raw_shards_for_metadata};
 use crate::n1_core::constants::GC_SUFFIX;
-use crate::n1_core::disk_manager::{
-    ObjectMetadata, ObjectPathManager, configured_fs_storage_root,
-};
-use crate::n1_core::index_v2;
+use crate::n1_core::disk_manager::{ObjectMetadata, ObjectPathManager, configured_fs_storage_root};
+use crate::n1_core::index;
 use crate::n1_core::quota_manager::update_quota;
 use crate::n1_core::sync::sync_single_fragment_quota;
 use crate::routes::storage_routes::AppState;
@@ -439,7 +437,7 @@ async fn process_fragment_gc(
         (crate::n1_core::disk_manager::RawBlobAddress, Vec<PathBuf>),
     > = HashMap::new();
 
-    for meta in index_v2::list_fragment_object_versions(fragment, false)
+    for meta in index::list_fragment_object_versions(fragment, false)
         .await
         .unwrap_or_default()
     {
@@ -494,12 +492,12 @@ async fn process_fragment_gc(
         }
     }
 
-    for meta in index_v2::list_fragment_object_versions(fragment, true)
+    for meta in index::list_fragment_object_versions(fragment, true)
         .await
         .unwrap_or_default()
     {
         let Some(modified) = latest_existing_mtime(
-            &index_v2::get_object_version_paths(fragment, &meta.object_key, &meta.version_id, true)
+            &index::get_object_version_paths(fragment, &meta.object_key, &meta.version_id, true)
                 .unwrap_or_default(),
         )
         .await
@@ -550,15 +548,16 @@ async fn process_fragment_gc(
     }
 
     if !expired_versions.is_empty() {
-        for meta in index_v2::list_fragment_object_versions(fragment, true)
+        for meta in index::list_fragment_object_versions(fragment, true)
             .await
             .unwrap_or_default()
         {
             if !expired_versions.contains(&meta.version_id) {
                 continue;
             }
-            let _ = index_v2::delete_trashed_object_version(fragment, &meta.object_key, &meta.version_id)
-                .await;
+            let _ =
+                index::delete_trashed_object_version(fragment, &meta.object_key, &meta.version_id)
+                    .await;
         }
 
         let tasks = index_roots.iter().chain(blob_roots.iter()).map(|root| {
@@ -582,13 +581,22 @@ async fn process_fragment_gc(
     let mut sessions_to_delete = HashSet::new();
     let mut session_amounts: HashMap<String, u64> = HashMap::new();
 
-    for session in index_v2::list_active_sessions(fragment).await.unwrap_or_default() {
-        let version_id = session.manifest.version_id.clone();
-        let modified = latest_existing_mtime(
-            &index_v2::get_session_state_paths(fragment, &version_id).unwrap_or_default(),
-        )
+    for session in index::list_active_sessions(fragment)
         .await
-        .unwrap_or(now);
+        .unwrap_or_default()
+    {
+        let version_id = session.manifest.version_id.clone();
+        let modified = if session.last_activity_at > 0 {
+            SystemTime::UNIX_EPOCH
+                .checked_add(Duration::from_secs(session.last_activity_at as u64))
+                .unwrap_or(now)
+        } else {
+            latest_existing_mtime(
+                &index::get_session_state_paths(fragment, &version_id).unwrap_or_default(),
+            )
+            .await
+            .unwrap_or(now)
+        };
 
         if now.duration_since(modified).unwrap_or(Duration::ZERO) > file_ttl {
             sessions_to_delete.insert(version_id.clone());
@@ -613,7 +621,7 @@ async fn process_fragment_gc(
     stats.sessions_deleted += sessions_to_delete.len() as u64;
 
     for version_id in &sessions_to_delete {
-        let _ = index_v2::remove_session(fragment, version_id, "gc-expired").await;
+        let _ = index::remove_session(fragment, version_id, "gc-expired").await;
     }
 
     for root in blob_roots {

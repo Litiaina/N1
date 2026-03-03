@@ -7,7 +7,7 @@ use crate::n1_core::constants::GC_SUFFIX;
 use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, PartMetadata, RawBlobAddress, ShardInfo,
 };
-use crate::n1_core::index_v2;
+use crate::n1_core::index;
 use crate::n1_core::raw_io_ring::{RawReadCompletion, RawReadRing, RawReadSubmitError};
 use crate::n1_core::upload::{DirectWriter, sync_dir};
 
@@ -16,7 +16,6 @@ use futures_util::future::{BoxFuture, FutureExt};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use once_cell::sync::OnceCell;
 use simd_erasure_core::{ReedSolomonDecoder, ReedSolomonEncoder};
-use std::future::poll_fn;
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions as StdOpenOptions;
 use std::io;
@@ -374,9 +373,9 @@ async fn load_version_metadata_for_repair(
     ctx: &ShardRepairContext,
 ) -> Result<ObjectMetadata, AppError> {
     if ctx.is_trash {
-        index_v2::read_trashed_object_version(&ctx.fragment, &ctx.object_key, &ctx.version_id).await
+        index::read_trashed_object_version(&ctx.fragment, &ctx.object_key, &ctx.version_id).await
     } else {
-        index_v2::read_object_version(&ctx.fragment, &ctx.object_key, &ctx.version_id).await
+        index::read_object_version(&ctx.fragment, &ctx.object_key, &ctx.version_id).await
     }
 }
 
@@ -385,9 +384,9 @@ async fn persist_version_metadata_for_repair(
     metadata: &ObjectMetadata,
 ) -> Result<(), AppError> {
     if ctx.is_trash {
-        index_v2::upsert_trashed_object_version(metadata).await
+        index::upsert_trashed_object_version(metadata).await
     } else {
-        index_v2::upsert_object_version(metadata).await
+        index::upsert_object_version(metadata).await
     }
 }
 
@@ -657,26 +656,18 @@ async fn get_or_open_raw_shard(
     Some(ring)
 }
 
-async fn wait_for_raw_read_completion(ring: &RawReadRing) -> RawReadCompletion {
-    poll_fn(|cx| {
-        let mut completions = ring.poll_completions(cx);
-        if completions.is_empty() {
-            return std::task::Poll::Pending;
-        }
-        std::task::Poll::Ready(completions.swap_remove(0))
-    })
-    .await
-}
-
 async fn submit_raw_read_via_ring(
     ring: &Arc<RawReadRing>,
     offset: u64,
     buffer: Vec<u8>,
-) -> Result<(), (io::Error, Vec<u8>)> {
+) -> Result<u64, (io::Error, Vec<u8>)> {
     match ring.submit_read(offset, buffer) {
-        Ok(()) => Ok(()),
+        Ok(submission_id) => Ok(submission_id),
         Err(RawReadSubmitError::Full(returned)) => Err((
-            io::Error::new(io::ErrorKind::WouldBlock, "raw read ring submission queue is full"),
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "raw read ring submission queue is full",
+            ),
             returned,
         )),
         Err(RawReadSubmitError::Closed(returned)) => Err((
@@ -688,10 +679,11 @@ async fn submit_raw_read_via_ring(
 
 async fn await_raw_peer_task(
     task: RawPeerReadTask,
+    submission_id: u64,
 ) -> (RawPeerReadTask, Result<Vec<u8>, (io::Error, Vec<u8>)>) {
-    let result = match wait_for_raw_read_completion(task.ring.as_ref()).await {
-        RawReadCompletion::ReadOk(buf) => Ok(buf),
-        RawReadCompletion::ReadErr(buf, err) => Err((err, buf.unwrap_or_default())),
+    let result = match task.ring.wait_for_completion(submission_id).await {
+        RawReadCompletion::ReadOk { buffer, .. } => Ok(buffer),
+        RawReadCompletion::ReadErr { buffer, err, .. } => Err((err, buffer.unwrap_or_default())),
     };
     (task, result)
 }
@@ -727,7 +719,7 @@ async fn prime_raw_peer_reads(
         };
         let buffer = buffer_pool.take_peer_buffer(len);
         match submit_raw_read_via_ring(&task.ring, offset, buffer).await {
-            Ok(()) => pending_raw.push(await_raw_peer_task(task).boxed()),
+            Ok(submission_id) => pending_raw.push(await_raw_peer_task(task, submission_id).boxed()),
             Err((_err, buffer)) => buffer_pool.recycle_peer_buffer(buffer),
         }
     }
@@ -742,13 +734,15 @@ async fn read_raw_chunk_via_ring(
     let mut buffer = std::mem::take(out);
     buffer.clear();
     buffer.resize(len, 0);
-    submit_raw_read_via_ring(ring, offset, buffer).await?;
-    match wait_for_raw_read_completion(ring.as_ref()).await {
-        RawReadCompletion::ReadOk(buf) => {
+    let submission_id = submit_raw_read_via_ring(ring, offset, buffer).await?;
+    match ring.wait_for_completion(submission_id).await {
+        RawReadCompletion::ReadOk { buffer: buf, .. } => {
             *out = buf;
             Ok(())
         }
-        RawReadCompletion::ReadErr(buf, err) => Err((err, buf.unwrap_or_default())),
+        RawReadCompletion::ReadErr {
+            buffer: buf, err, ..
+        } => Err((err, buf.unwrap_or_default())),
     }
 }
 
@@ -772,9 +766,7 @@ async fn read_shard_chunk_cached_into(
     if effective_shard.raw_blob_address.is_some() {
         let ring = get_or_open_raw_shard(file_cache, effective_shard, validation_mode).await?;
         return match read_raw_chunk_via_ring(&ring, offset, len, out).await {
-            Ok(()) => {
-                Some(())
-            }
+            Ok(()) => Some(()),
             Err((err, returned)) => {
                 *out = returned;
                 warn!(
@@ -886,7 +878,8 @@ pub async fn read_or_recover_chunk_into(
         }
 
         if s.raw_blob_address.is_some() {
-            let Some(ring) = get_or_open_raw_shard(file_cache, s, RawReadValidationMode::Verified).await
+            let Some(ring) =
+                get_or_open_raw_shard(file_cache, s, RawReadValidationMode::Verified).await
             else {
                 continue;
             };
@@ -1414,8 +1407,9 @@ pub async fn repair_entire_shard(
                     .map_err(|e| AppError::InternalServerError(format!("RS Enc Reset: {}", e)))?;
             } else {
                 encoder_state = Some(
-                    ReedSolomonEncoder::new(data_count, parity_count, cur)
-                        .map_err(|e| AppError::InternalServerError(format!("RS Enc Init: {}", e)))?,
+                    ReedSolomonEncoder::new(data_count, parity_count, cur).map_err(|e| {
+                        AppError::InternalServerError(format!("RS Enc Init: {}", e))
+                    })?,
                 );
             }
             let encoder = encoder_state

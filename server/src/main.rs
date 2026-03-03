@@ -14,7 +14,6 @@ use crate::n1_core::object_parser::{
     STREAM_MAX_CONCURRENCY, STREAM_READAHEAD_BYTES_ATOMIC,
 };
 use crate::n1_core::recovery::RAW_VERIFY_ON_READ_ATOMIC;
-use crate::n1_core::retrieve::PREFIX_MAX_DELTA_SEGMENTS_ATOMIC;
 use crate::n1_core::upload::{
     ADAPTIVE_IO_TARGET_ATOMIC, DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC,
     PARITY_SHARDS_ATOMIC, RAW_WRITER_INFLIGHT_LIMIT_ATOMIC, STRIPE_SIZE_ATOMIC,
@@ -357,18 +356,6 @@ fn detect_unique_storage_devices(paths: &[String]) -> usize {
         unique.insert(resolved);
     }
     unique.len().max(1)
-}
-
-fn adaptive_prefix_max_delta_segments(cpu_cores: usize) -> usize {
-    if cpu_cores <= 2 {
-        256
-    } else if cpu_cores <= 4 {
-        512
-    } else if cpu_cores <= 8 {
-        1024
-    } else {
-        2048
-    }
 }
 
 fn adaptive_concurrency_interval_ms(cpu_cores: usize, ram_bytes: Option<u64>) -> usize {
@@ -1007,22 +994,6 @@ pub async fn run_server() {
         "Adaptive concurrency: enabled={} interval_ms={}",
         adaptive_concurrency_enabled,
         adaptive_concurrency_interval_ms
-    );
-
-    let prefix_max_delta_segments = parse_usize_or_auto(
-        upload_section.and_then(|s| s.get("prefix_max_delta_segments")),
-        "prefix_max_delta_segments",
-        adaptive_prefix_max_delta_segments(cpu_cores),
-    )
-    .clamp(32, 65_536);
-
-    PREFIX_MAX_DELTA_SEGMENTS_ATOMIC
-        .set(AtomicUsize::new(prefix_max_delta_segments))
-        .expect("Double initialization of PREFIX_MAX_DELTA_SEGMENTS_ATOMIC");
-
-    tracing::info!(
-        "Prefix tuning: max_delta_segments={}",
-        prefix_max_delta_segments
     );
 
     let monitor_interval_seconds = parse_usize_or_auto(

@@ -17,7 +17,7 @@ use crate::n1_core::blob_store::{free_raw_shards_for_metadata, metadata_contains
 use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, compare_version_recency, default_stripe_size,
 };
-use crate::n1_core::index_v2;
+use crate::n1_core::index;
 use crate::n1_core::metadata_parser::get_metadata;
 use crate::n1_core::quota_manager::update_quota;
 use crate::routes::storage_routes::AppState;
@@ -189,7 +189,7 @@ async fn write_delete_marker_for_key(
     dm.parts.clear();
     dm.total_size_bytes = 0;
 
-    index_v2::publish_object(&dm).await?;
+    index::publish_object(&dm).await?;
 
     Ok(dm)
 }
@@ -199,7 +199,7 @@ async fn purge_delete_markers_for_key(
     fragment: &str,
     object_key: &str,
 ) {
-    let versions = match index_v2::list_live_object_versions_metadata(fragment, object_key).await {
+    let versions = match index::list_live_object_versions_metadata(fragment, object_key).await {
         Ok(v) => v,
         Err(_) => return,
     };
@@ -208,7 +208,7 @@ async fn purge_delete_markers_for_key(
         if !meta.is_delete_marker {
             continue;
         }
-        let _ = index_v2::delete_object_version(fragment, object_key, &meta.version_id).await;
+        let _ = index::delete_object_version(fragment, object_key, &meta.version_id).await;
     }
 }
 
@@ -226,7 +226,7 @@ pub async fn delete_object_version(
 
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
-    let template_meta = index_v2::move_object_version_to_trash(&fragment, &object_key, &version_id)
+    let template_meta = index::move_object_version_to_trash(&fragment, &object_key, &version_id)
         .await?
         .ok_or(AppError::NotFound)?;
 
@@ -294,7 +294,7 @@ pub async fn delete_object(
     }
 
     let path_manager = ObjectPathManager::new();
-    let versions_found = index_v2::list_live_object_versions_metadata(&fragment, &object_key).await?;
+    let versions_found = index::list_live_object_versions_metadata(&fragment, &object_key).await?;
 
     if versions_found.is_empty() {
         return Err(AppError::NotFound);
@@ -310,15 +310,16 @@ pub async fn delete_object(
             template_meta = Some(meta.clone());
         }
 
-        let moved = index_v2::move_object_version_to_trash(&fragment, &object_key, &meta.version_id)
-            .await?;
+        let moved =
+            index::move_object_version_to_trash(&fragment, &object_key, &meta.version_id).await?;
         if moved.is_none() {
             continue;
         }
 
         if !metadata_contains_raw_shards(meta) {
             for root in &blob_roots {
-                let src_blob = path_manager.get_shard_dir_on_disk(root, &fragment, &meta.version_id);
+                let src_blob =
+                    path_manager.get_shard_dir_on_disk(root, &fragment, &meta.version_id);
                 if fs::try_exists(&src_blob).await.unwrap_or(false) {
                     let trash_root = get_trash_root(root, &fragment);
                     let dst_blob = trash_root.join("blob").join(&meta.version_id);
@@ -369,16 +370,18 @@ pub async fn empty_trash(
 
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
-    let trash_versions = index_v2::list_fragment_object_versions(&fragment, true).await?;
-    let total_refund_size: u64 = trash_versions.iter().map(|meta| meta.total_size_bytes).sum();
+    let trash_versions = index::list_fragment_object_versions(&fragment, true).await?;
+    let total_refund_size: u64 = trash_versions
+        .iter()
+        .map(|meta| meta.total_size_bytes)
+        .sum();
 
     for meta in &trash_versions {
         if metadata_contains_raw_shards(meta) {
             let _ = free_raw_shards_for_metadata(meta).await;
         }
-        let _ =
-            index_v2::delete_trashed_object_version(&fragment, &meta.object_key, &meta.version_id)
-                .await;
+        let _ = index::delete_trashed_object_version(&fragment, &meta.object_key, &meta.version_id)
+            .await;
     }
 
     let mut delete_tasks: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
@@ -425,11 +428,11 @@ pub async fn delete_object_permanently(
 
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
-    let mut versions_to_delete = index_v2::list_live_object_versions_metadata(&fragment, &object_key)
+    let mut versions_to_delete = index::list_live_object_versions_metadata(&fragment, &object_key)
         .await
         .unwrap_or_default();
     versions_to_delete.extend(
-        index_v2::list_trashed_object_versions_metadata(&fragment, &object_key)
+        index::list_trashed_object_versions_metadata(&fragment, &object_key)
             .await
             .unwrap_or_default(),
     );
@@ -460,10 +463,9 @@ pub async fn delete_object_permanently(
                     }
                 }
 
-                let _ = index_v2::delete_object_version(&f, &object_key, &meta.version_id).await;
+                let _ = index::delete_object_version(&f, &object_key, &meta.version_id).await;
                 let _ =
-                    index_v2::delete_trashed_object_version(&f, &object_key, &meta.version_id)
-                        .await;
+                    index::delete_trashed_object_version(&f, &object_key, &meta.version_id).await;
 
                 meta.total_size_bytes
             }
@@ -473,6 +475,8 @@ pub async fn delete_object_permanently(
         .await
         .into_iter()
         .sum();
+
+    let _ = index::clear_object_latest_states(&fragment, &object_key).await;
 
     if total_freed > 0 {
         if let Err(e) = update_quota(&fragment, -(total_freed as i64)).await {
@@ -535,14 +539,9 @@ pub async fn recover_object_version(
         let _ = move_dir_or_copy(&trash_blob_dir, &live_blob_dir).await;
     }
 
-    let meta = index_v2::restore_object_version_from_trash(
-        &fragment,
-        &object_key,
-        &version_id,
-        true,
-    )
-    .await?
-    .ok_or(AppError::NotFound)?;
+    let meta = index::restore_object_version_from_trash(&fragment, &object_key, &version_id, true)
+        .await?
+        .ok_or(AppError::NotFound)?;
 
     info!(
         "Recovered object version: {}/{} (v: {})",
@@ -571,7 +570,7 @@ pub async fn recover_object(
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
     let mut found_versions =
-        index_v2::list_trashed_object_versions_metadata(&fragment, &object_key).await?;
+        index::list_trashed_object_versions_metadata(&fragment, &object_key).await?;
 
     if found_versions.is_empty() {
         return Err(AppError::NotFound);
@@ -604,13 +603,14 @@ pub async fn recover_object(
             }
         }
 
-        let Some(_restored) = index_v2::restore_object_version_from_trash(
+        let Some(_restored) = index::restore_object_version_from_trash(
             &fragment,
             &object_key,
             &meta.version_id,
             false,
         )
-        .await? else {
+        .await?
+        else {
             continue;
         };
 
@@ -643,19 +643,17 @@ pub async fn recover_all_trash(
 
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
-    let recovered_versions = index_v2::list_fragment_object_versions(&fragment, true).await?;
+    let recovered_versions = index::list_fragment_object_versions(&fragment, true).await?;
     let mut sorted_versions = recovered_versions;
     sorted_versions.sort_by(|left, right| {
-        left.object_key
-            .cmp(&right.object_key)
-            .then_with(|| {
-                compare_version_recency(
-                    left.created_at,
-                    &left.version_id,
-                    right.created_at,
-                    &right.version_id,
-                )
-            })
+        left.object_key.cmp(&right.object_key).then_with(|| {
+            compare_version_recency(
+                left.created_at,
+                &left.version_id,
+                right.created_at,
+                &right.version_id,
+            )
+        })
     });
 
     let unique_keys = sorted_versions
@@ -672,7 +670,8 @@ pub async fn recover_all_trash(
                 .join("blob")
                 .join(&meta.version_id);
             if fs::try_exists(&trash_blob).await.unwrap_or(false) {
-                let live_blob = path_manager.get_shard_dir_on_disk(root, &fragment, &meta.version_id);
+                let live_blob =
+                    path_manager.get_shard_dir_on_disk(root, &fragment, &meta.version_id);
                 if let Some(parent) = live_blob.parent() {
                     let _ = fs::create_dir_all(parent).await;
                 }
@@ -680,13 +679,14 @@ pub async fn recover_all_trash(
             }
         }
 
-        let Some(_restored) = index_v2::restore_object_version_from_trash(
+        let Some(_restored) = index::restore_object_version_from_trash(
             &fragment,
             &meta.object_key,
             &meta.version_id,
             false,
         )
-        .await? else {
+        .await?
+        else {
             continue;
         };
     }

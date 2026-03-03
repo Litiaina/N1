@@ -229,10 +229,11 @@ Scrub is the integrity-check pass for committed raw shards.
 - `blob_store_disks` uses stable `/dev/disk/by-id/*` names
 - `GET /v4/maintenance/blob/raw/status` shows all devices healthy
 - scrub can start and report status
+- authoritative `index` writes ACK on the owner root first; replica roots are expected to reconcile behind that ACK path
 
 ## 10. Release Hardening On Target Hardware
 
-Run the release drill harness before cutting a stable build:
+N1 `0.9.0` is the architecture-freeze line. Run the release drill harness before cutting a `1.0.0` stable build:
 
 ```bash
 scripts/bench/run_release_drills.sh
@@ -240,6 +241,7 @@ scripts/bench/run_release_drills.sh
 
 This executes the critical raw-blob workflows plus the quota-drift regression:
 
+- active multipart upload + resume while one replica index disk is down
 - raw CRUD/delete/recover/permanent delete
 - raw redistribution + repair + recovered read
 - raw quota reconvergence after redistribution, trash, GC, and sync
@@ -253,6 +255,14 @@ RUNS=3 \
 RUN_CHAOS=1 \
 CHAOS_RUNS=5 \
 CHAOS_MAX_DURATION_SECS=900 \
+scripts/bench/run_release_drills.sh
+```
+
+Optional owner-first multipart soak:
+
+```bash
+RUN_INDEX_OWNER_RESUME_SOAK=1 \
+INDEX_OWNER_RESUME_SOAK_ROUNDS=10 \
 scripts/bench/run_release_drills.sh
 ```
 

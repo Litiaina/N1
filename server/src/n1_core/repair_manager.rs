@@ -2,13 +2,11 @@ use crate::enums::app_error_enum::AppError;
 use crate::n1_core::blob_store::{
     RawGcMarker, raw_blob_address_exists, stable_shard_file_name, verify_shard_checksum,
 };
-use crate::n1_core::constants::{
-    FRAGMENT_METADATA_FILE, QUOTA_FILE,
-};
+use crate::n1_core::constants::{FRAGMENT_METADATA_FILE, QUOTA_FILE};
 use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, PartMetadata, Quota, configured_index_store_disks,
 };
-use crate::n1_core::index_v2;
+use crate::n1_core::index;
 use crate::n1_core::operation_gate::acquire_read_only_fast_mode;
 use crate::n1_core::prefix_rebuilder::run_prefix_rebuild_job;
 use crate::n1_core::recovery::{ShardRepairContext, repair_entire_shard, verify_shard_integrity};
@@ -76,9 +74,10 @@ pub struct RepairRunConfig {
     pub meta_batch_size: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct RepairRunOptions {
     pub fast_mode: bool,
+    pub fragment_filter: Option<String>,
 }
 
 #[derive(Default, Clone)]
@@ -182,7 +181,20 @@ fn build_repair_config_from_params(
         max_batch_size
     );
 
-    (cfg, RepairRunOptions { fast_mode })
+    let fragment_filter = params
+        .get("fragment")
+        .or_else(|| params.get("fragment_hash"))
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+
+    (
+        cfg,
+        RepairRunOptions {
+            fast_mode,
+            fragment_filter,
+        },
+    )
 }
 
 fn ensure_repair_job_idle(status: &RepairJobStatus) -> Result<(), AppError> {
@@ -682,36 +694,18 @@ async fn repair_fragment_sessions_strict(
 ) -> Result<(u64, u64, u64), AppError> {
     let mut miss = 0u64;
     let mut div = 0u64;
-    let mut corrupt = 0u64;
+    let corrupt = 0u64;
 
-    for state in index_v2::list_active_sessions(fragment).await? {
+    for state in index::list_active_sessions(fragment).await? {
         if should_stop() {
             break;
         }
 
         let version_id = state.manifest.version_id.clone();
-        let paths = index_v2::get_session_state_paths(fragment, &version_id)?;
-        let valid = |b: &[u8]| -> bool {
-            rmp_serde::from_slice::<index_v2::IndexV2SessionState>(b)
-                .map(|session| {
-                    session.manifest.fragment == fragment && session.manifest.version_id == version_id
-                })
-                .unwrap_or(false)
-        };
-
-        let mut reps = Vec::with_capacity(paths.len());
-        for path in &paths {
-            reps.push(read_raw_replica(path, &valid).await);
-        }
-
-        let Some(best) = choose_best_raw_replica(&reps) else {
-            if reps.iter().any(|replica| replica.bytes.is_some()) {
-                corrupt += 1;
-            }
-            continue;
-        };
-
-        let canon_state = reps[best].bytes.clone().unwrap();
+        let paths = index::get_session_state_paths(fragment, &version_id)?;
+        let canon_state = rmp_serde::to_vec(&state).map_err(|e| {
+            AppError::InternalServerError(format!("serialize session repair: {}", e))
+        })?;
         let (m, d) = replicate_bytes_strict(&paths, &canon_state, dry_run).await?;
         miss += m;
         div += d;
@@ -866,7 +860,7 @@ async fn reconcile_object_metadata_strict(
     is_trash: bool,
     dry_run: bool,
 ) -> Result<(Vec<u8>, ObjectMetadata, u64, u64, Option<String>), AppError> {
-    let all_paths = index_v2::get_object_version_paths(
+    let all_paths = index::get_object_version_paths(
         &metadata.fragment,
         &metadata.object_key,
         &metadata.version_id,
@@ -996,8 +990,12 @@ async fn collect_fragment_repair_targets(
     let mut seen = HashSet::new();
     let mut targets = Vec::new();
 
-    for metadata in index_v2::list_fragment_object_versions(fragment, false).await? {
-        let key = (metadata.object_key.clone(), metadata.version_id.clone(), false);
+    for metadata in index::list_fragment_object_versions(fragment, false).await? {
+        let key = (
+            metadata.object_key.clone(),
+            metadata.version_id.clone(),
+            false,
+        );
         if seen.insert(key) {
             targets.push(RepairObjectTarget {
                 metadata,
@@ -1006,8 +1004,12 @@ async fn collect_fragment_repair_targets(
         }
     }
 
-    for metadata in index_v2::list_fragment_object_versions(fragment, true).await? {
-        let key = (metadata.object_key.clone(), metadata.version_id.clone(), true);
+    for metadata in index::list_fragment_object_versions(fragment, true).await? {
+        let key = (
+            metadata.object_key.clone(),
+            metadata.version_id.clone(),
+            true,
+        );
         if seen.insert(key) {
             targets.push(RepairObjectTarget {
                 metadata,
@@ -1208,12 +1210,14 @@ pub async fn run_repair_job_with_options(
     let start_time = Instant::now();
     let _write_gate = acquire_read_only_fast_mode(opts.fast_mode);
 
+    let scope_label = opts.fragment_filter.as_deref().unwrap_or("all-fragments");
     {
         let mut status = REPAIR_STATUS.write().await;
         status.is_running = true;
         status.fast_mode = opts.fast_mode;
         status.phase = format!(
-            "Initializing (mode={:?}, meta_conc={}, repair_conc={}, batch={}, dry_run={}, fast_mode={})",
+            "Initializing (scope={}, mode={:?}, meta_conc={}, repair_conc={}, batch={}, dry_run={}, fast_mode={})",
+            scope_label,
             cfg.check_mode,
             cfg.meta_concurrency,
             cfg.shard_repair_concurrency,
@@ -1245,10 +1249,18 @@ pub async fn run_repair_job_with_options(
     let num_disks = blob_roots.len();
 
     let shard_repair_sem = Arc::new(Semaphore::new(cfg.shard_repair_concurrency));
-    let fragments = list_all_fragments(&index_roots).await;
+    let mut fragments = list_all_fragments(&index_roots).await;
+    if let Some(fragment_filter) = opts.fragment_filter.as_deref() {
+        if !fragments.iter().any(|fragment| fragment == fragment_filter) {
+            warn!("Fragment not found for repair: {}", fragment_filter);
+            return Err(AppError::NotFound);
+        }
+        fragments.retain(|fragment| fragment == fragment_filter);
+    }
 
     info!(
-        "Starting Storage Repair Job (fragments={}, index_roots={}). mode={:?}, dry_run={}",
+        "Starting Storage Repair Job (scope={}, fragments={}, index_roots={}). mode={:?}, dry_run={}",
+        scope_label,
         fragments.len(),
         index_roots.len(),
         cfg.check_mode,

@@ -431,24 +431,9 @@ pub struct PrefixIndexSegment {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PrefixDelimiterChildDelta {
-    pub common_prefix: String,
-    pub delta: i64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PrefixDelimiterChildEntry {
     pub common_prefix: String,
     pub live_count: u64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PrefixDelimiterSegment {
-    pub prefix: String,
-    #[serde(default)]
-    pub object_entries: Vec<PrefixIndexEntry>,
-    #[serde(default)]
-    pub child_deltas: Vec<PrefixDelimiterChildDelta>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
