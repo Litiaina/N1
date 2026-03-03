@@ -13,17 +13,15 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tracing::{error, info};
 use ulid::Ulid;
-use walkdir::WalkDir;
 
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::constants::{
-    METADATA_EXT, PART_META_SUFFIX, PREFIX_DELIMITER_COMPACTED_FILE,
-    PREFIX_DELIMITER_SEGMENT_PREFIX, PREFIX_INDEX_DIR, PREFIX_SEGMENT_EXT, QUOTA_FILE,
-    RESERVATION_FILE,
+    PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_DELIMITER_SEGMENT_PREFIX, PREFIX_SEGMENT_EXT,
 };
 use crate::n1_core::disk_manager::{
-    ObjectMetadata, ObjectPathManager, ObjectSummary, PrefixIndexEntry, PrefixIndexSegment,
+    ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment, version_recency_is_newer,
 };
+use crate::n1_core::index_v2;
 use crate::n1_core::prefix_delimiter::build_delimiter_compacted_from_entries;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
@@ -31,7 +29,6 @@ use crate::structs::auth_structs::Claims;
 use crate::websocket::manager::WsConnectionManager;
 use crate::websocket::ws_structs::StorageEventPayload;
 
-const MAX_META_BYTES: u64 = 16 * 1024 * 1024;
 const TOMBSTONE_MIN_RETENTION_SECS: i64 = 86_400;
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -254,16 +251,6 @@ fn prefixes_for_key(object_key: &str) -> BTreeSet<String> {
     out
 }
 
-fn is_hex2(s: &str) -> bool {
-    if s.len() != 2 {
-        return false;
-    }
-    s.as_bytes().iter().all(|b| match b {
-        b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' => true,
-        _ => false,
-    })
-}
-
 async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
     let roots = index_roots.to_vec();
     tokio::task::spawn_blocking(move || {
@@ -296,201 +283,94 @@ async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
     .unwrap_or_default()
 }
 
-async fn choose_best_index_dir_for_fragment(
-    index_roots: &[PathBuf],
-    fragment: &str,
-) -> Option<PathBuf> {
-    let mut best: Option<(PathBuf, u64, i64)> = None;
-
-    for root in index_roots {
-        let idx = root.join(fragment).join("index");
-        if !fs::try_exists(&idx).await.unwrap_or(false) {
-            continue;
-        }
-
-        let mut shard_count = 0u64;
-        let mut access_ok = false;
-
-        if let Ok(mut rd) = fs::read_dir(&idx).await {
-            access_ok = true;
-            while let Ok(Some(ent)) = rd.next_entry().await {
-                let name = ent.file_name().to_string_lossy().to_string();
-                if is_hex2(&name) {
-                    shard_count += 1;
-                }
-            }
-        }
-
-        if !access_ok {
-            continue;
-        }
-
-        let mut ts = 0i64;
-        if let Ok(meta) = fs::metadata(&idx).await {
-            if let Ok(m) = meta.modified() {
-                ts = m
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-            }
-        }
-
-        match &best {
-            None => best = Some((idx, shard_count, ts)),
-            Some((_p, best_count, best_ts)) => {
-                if shard_count > *best_count || (shard_count == *best_count && ts > *best_ts) {
-                    best = Some((idx, shard_count, ts));
-                }
-            }
-        }
-    }
-
-    best.map(|(p, _, _)| p)
-}
-
 async fn scan_latest_by_key(
-    scan_index_dir: &Path,
     fragment: &str,
-) -> Result<(u64, HashMap<String, (String, i64)>, Vec<(String, String)>), AppError> {
-    let scan_root = scan_index_dir.to_path_buf();
-    let frag = fragment.to_string();
+) -> Result<(u64, HashMap<String, PrefixIndexEntry>, Vec<(String, String)>), AppError> {
     let now_ts = Utc::now().timestamp();
     let retention_secs = std::cmp::max(
         CONFIG.garbage_collector.retention_seconds as i64,
         TOMBSTONE_MIN_RETENTION_SECS,
     );
     let cutoff_ts = now_ts.saturating_sub(retention_secs);
+    let mut scanned = 0u64;
+    let mut latest: HashMap<String, PrefixIndexEntry> = HashMap::new();
+    let mut latest_tombstone: HashMap<String, (String, i64)> = HashMap::new();
 
-    tokio::task::spawn_blocking(move || {
-        let mut scanned = 0u64;
-        let mut latest: HashMap<String, (String, i64)> = HashMap::new();
-        let mut latest_tombstone: HashMap<String, (String, i64)> = HashMap::new();
+    for meta in index_v2::list_fragment_object_versions(fragment, false).await? {
+        let entry = PrefixIndexEntry::from_metadata(&meta);
+        let key = canonical_key(&entry.object_key);
+        let ts = entry.created_at;
 
-        let prefix_dir_os = std::ffi::OsStr::new(PREFIX_INDEX_DIR);
-
-        for entry in WalkDir::new(&scan_root).into_iter().filter_map(|e| e.ok()) {
-            if entry.file_type().is_dir() {
-                continue;
-            }
-
-            let p = entry.path();
-
-            if p.components().any(|c| c.as_os_str() == prefix_dir_os) {
-                continue;
-            }
-
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.ends_with(METADATA_EXT) {
-                continue;
-            }
-            if name == QUOTA_FILE || name == RESERVATION_FILE || name.ends_with(PART_META_SUFFIX) {
-                continue;
-            }
-
-            let md = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let len = md.len();
-            if len == 0 || len > MAX_META_BYTES {
-                continue;
-            }
-
-            let raw = match std::fs::read(p) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-
-            let (meta_frag, is_del, obj_key, ver_id, cr_at) =
-                match rmp_serde::from_slice::<ObjectSummary>(&raw) {
-                    Ok(m) => (
-                        m.fragment,
-                        m.is_delete_marker,
-                        m.object_key,
-                        m.version_id,
-                        m.created_at,
-                    ),
-                    Err(_) => match rmp_serde::from_slice::<ObjectMetadata>(&raw) {
-                        Ok(m) => (
-                            m.fragment,
-                            m.is_delete_marker,
-                            m.object_key,
-                            m.version_id,
-                            m.created_at,
-                        ),
-                        Err(_) => continue,
-                    },
-                };
-
-            if meta_frag != frag {
-                continue;
-            }
-
-            if is_del {
-                let key = canonical_key(&obj_key);
-                let ts = cr_at;
-                match latest_tombstone.get(&key) {
-                    None => {
-                        latest_tombstone.insert(key, (ver_id, ts));
-                    }
-                    Some((cur_vid, cur_ts)) => {
-                        if ts > *cur_ts || (ts == *cur_ts && &ver_id > cur_vid) {
-                            latest_tombstone.insert(key, (ver_id, ts));
-                        }
-                    }
-                }
-                continue;
-            }
-
-            let key = canonical_key(&obj_key);
-            let ts = cr_at;
-
-            match latest.get(&key) {
+        if meta.is_delete_marker {
+            match latest_tombstone.get(&key) {
                 None => {
-                    latest.insert(key, (ver_id, ts));
+                    latest_tombstone.insert(key, (entry.version_id, ts));
                 }
                 Some((cur_vid, cur_ts)) => {
-                    if ts > *cur_ts || (ts == *cur_ts && &ver_id > cur_vid) {
-                        latest.insert(key, (ver_id, ts));
+                    if version_recency_is_newer(ts, &entry.version_id, *cur_ts, cur_vid) {
+                        latest_tombstone.insert(key, (entry.version_id, ts));
                     }
                 }
             }
-
-            scanned += 1;
+            continue;
         }
 
-        let mut stale_tombstones: Vec<(String, String)> = Vec::new();
-        for (key, (vid, ts)) in latest_tombstone {
-            let overshadowed = match latest.get(&key) {
-                None => true,
-                Some((_, nts)) => ts >= *nts,
-            };
-            if overshadowed && ts <= cutoff_ts {
-                stale_tombstones.push((key, vid));
+        match latest.get(&key) {
+            None => {
+                latest.insert(
+                    key.clone(),
+                    PrefixIndexEntry {
+                        object_key: key.clone(),
+                        ..entry
+                    },
+                );
+            }
+            Some(current) => {
+                if version_recency_is_newer(
+                    ts,
+                    &entry.version_id,
+                    current.created_at,
+                    &current.version_id,
+                ) {
+                    latest.insert(
+                        key.clone(),
+                        PrefixIndexEntry {
+                            object_key: key.clone(),
+                            ..entry
+                        },
+                    );
+                }
             }
         }
 
-        Ok::<_, AppError>((scanned, latest, stale_tombstones))
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("scan task join error: {}", e)))?
+        scanned += 1;
+    }
+
+    let mut stale_tombstones: Vec<(String, String)> = Vec::new();
+    for (key, (vid, ts)) in latest_tombstone {
+        let overshadowed = match latest.get(&key) {
+            None => true,
+            Some(entry) => ts >= entry.created_at,
+        };
+        if overshadowed && ts <= cutoff_ts {
+            stale_tombstones.push((key, vid));
+        }
+    }
+
+    Ok((scanned, latest, stale_tombstones))
 }
 
-fn build_per_prefix(
-    latest_by_key: HashMap<String, (String, i64)>,
-) -> HashMap<String, Vec<PrefixIndexEntry>> {
+fn build_per_prefix(latest_by_key: HashMap<String, PrefixIndexEntry>) -> HashMap<String, Vec<PrefixIndexEntry>> {
     let mut per_prefix: HashMap<String, Vec<PrefixIndexEntry>> = HashMap::new();
 
-    for (object_key, (version_id, created_at)) in latest_by_key {
+    for (object_key, entry) in latest_by_key {
         for pfx in prefixes_for_key(&object_key) {
             per_prefix
                 .entry(canonical_prefix(&pfx))
                 .or_insert_with(Vec::new)
                 .push(PrefixIndexEntry {
                     object_key: object_key.clone(),
-                    version_id: version_id.clone(),
-                    created_at,
-                    is_delete_marker: false,
+                    ..entry.clone()
                 });
         }
     }
@@ -620,17 +500,12 @@ async fn write_compacted_prefixes(
 }
 
 async fn cleanup_stale_delete_markers(
-    path_manager: &ObjectPathManager,
+    _path_manager: &ObjectPathManager,
     fragment: &str,
     stale_tombstones: &[(String, String)],
 ) {
     for (object_key, version_id) in stale_tombstones {
-        for p in path_manager.get_all_metadata_paths(fragment, object_key, version_id) {
-            let _ = fs::remove_file(&p).await;
-            if let Some(parent) = p.parent() {
-                let _ = sync_dir(parent).await;
-            }
-        }
+        let _ = index_v2::delete_object_version(fragment, object_key, version_id).await;
     }
 }
 
@@ -681,14 +556,6 @@ pub async fn run_prefix_rebuild_job(
             push_update(&ws, &st);
         }
 
-        let scan_index_dir = match choose_best_index_dir_for_fragment(&index_roots, &frag).await {
-            Some(p) => p,
-            None => {
-                info!("Skipping directory '{}' - no valid N1 index found.", frag);
-                continue;
-            }
-        };
-
         {
             let mut st = PR_STATUS.write().await;
             st.phase = "Scanning metadata".to_string();
@@ -696,7 +563,7 @@ pub async fn run_prefix_rebuild_job(
         }
 
         let (scanned, latest_by_key, stale_tombstones) =
-            match scan_latest_by_key(&scan_index_dir, &frag).await {
+            match scan_latest_by_key(&frag).await {
                 Ok(v) => v,
                 Err(e) => {
                     let mut st = PR_STATUS.write().await;

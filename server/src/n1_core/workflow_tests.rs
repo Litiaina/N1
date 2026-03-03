@@ -1,6 +1,8 @@
 use super::archive::download_selected_archive;
 use super::blob_store::{open_raw_direct_io, verify_shard_checksum, write_shard_range};
-use super::constants::{PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_SEGMENT_EXT};
+use super::constants::{
+    PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_DELIMITER_SEGMENT_PREFIX, PREFIX_SEGMENT_EXT,
+};
 use super::delete::delete_object;
 use super::delete::{
     delete_object_permanently, delete_object_version, recover_object, recover_object_version,
@@ -11,17 +13,13 @@ use super::disk_manager::{
 };
 use super::fragment_metadata::init_fragment_metadata;
 use super::garbage_collector::{get_gc_status_api, run_garbage_collector};
+use super::index_v2;
 use super::metadata_parser::get_metadata;
 use super::modify::rename_object;
 use super::object_parser::{
     STREAM_CHUNK_SIZE_ATOMIC, STREAM_LOCALITY_BIAS_ENABLED_ATOMIC, STREAM_MAX_CONCURRENCY,
     STREAM_READAHEAD_BYTES_ATOMIC,
 };
-use super::prefix_compactor::{
-    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC, PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC,
-    schedule_prefix_compaction,
-};
-use super::prefix_rebuilder::run_prefix_rebuild_job;
 use super::quota_manager::{get_quota, init_quota_file, set_storage_used};
 use super::recovery::{RAW_VERIFY_ON_READ_ATOMIC, ShardRepairContext, repair_entire_shard};
 use super::redistribution::{
@@ -40,7 +38,9 @@ use super::upload::{
     WRITER_BUFFER_SIZE_ATOMIC, finalize_object_upload, get_upload_status, initiate_object_upload,
     object_upload_part,
 };
-use crate::n1_core::disk_manager::replace_storage_roots_for_tests;
+use crate::n1_core::disk_manager::{
+    STORAGE_TEST_LOCK as TEST_LOCK, replace_storage_roots_for_tests, version_recency_is_newer,
+};
 use crate::routes::storage_routes::AppState;
 use crate::settings::constants::CONFIG_FILE;
 use crate::settings::create_config::create_default_config_ini;
@@ -60,11 +60,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::fs;
-use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
 use ulid::Ulid;
+use walkdir::WalkDir;
 
-static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 static TEST_BASE: Lazy<std::path::PathBuf> =
     Lazy::new(|| std::env::temp_dir().join(format!("n1-matrix-{}", std::process::id())));
 
@@ -587,82 +586,36 @@ async fn list_objects_json_page(
     read_response_json(resp).await
 }
 
-async fn wait_until_prefix_compacted(fragment: &str, prefix: &str, timeout_ms: u64) -> bool {
+async fn wait_until_prefix_snapshot_ready(fragment: &str, prefix: &str, timeout_ms: u64) -> bool {
     let path_manager = ObjectPathManager::new();
     let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    let compacted_name = format!("compacted{}", PREFIX_SEGMENT_EXT);
 
     loop {
+        let bucket_dirs = path_manager.get_all_prefix_bucket_dirs(fragment, prefix);
         let mut any_bucket = false;
-        let mut all_buckets_compacted = true;
+        let mut all_ready = true;
 
-        for bucket in path_manager.get_all_prefix_bucket_dirs(fragment, prefix) {
+        for bucket in bucket_dirs {
             if !fs::try_exists(&bucket).await.unwrap_or(false) {
                 continue;
             }
             any_bucket = true;
 
-            let mut has_compacted = false;
-
-            let mut rd = match fs::read_dir(&bucket).await {
-                Ok(v) => v,
-                Err(_) => {
-                    all_buckets_compacted = false;
-                    break;
-                }
-            };
-
-            while let Ok(Some(ent)) = rd.next_entry().await {
-                let name = ent.file_name().to_string_lossy().to_string();
-                if name == compacted_name {
-                    has_compacted = true;
-                }
-            }
-
-            if !has_compacted {
-                all_buckets_compacted = false;
-                break;
-            }
-        }
-
-        if any_bucket && all_buckets_compacted {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-}
-
-async fn wait_until_delimiter_compacted(fragment: &str, prefix: &str, timeout_ms: u64) -> bool {
-    let path_manager = ObjectPathManager::new();
-    let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
-
-    loop {
-        let mut any_bucket = false;
-        let mut all_buckets_compacted = true;
-
-        for bucket in path_manager.get_all_prefix_bucket_dirs(fragment, prefix) {
-            if !fs::try_exists(&bucket).await.unwrap_or(false) {
-                continue;
-            }
-            any_bucket = true;
-
-            if !fs::try_exists(&bucket.join(PREFIX_DELIMITER_COMPACTED_FILE))
+            let compacted_exists = fs::try_exists(&bucket.join(format!("compacted{}", PREFIX_SEGMENT_EXT)))
                 .await
-                .unwrap_or(false)
-            {
-                all_buckets_compacted = false;
+                .unwrap_or(false);
+            let delimiter_exists = fs::try_exists(&bucket.join(PREFIX_DELIMITER_COMPACTED_FILE))
+                .await
+                .unwrap_or(false);
+            if !(compacted_exists && delimiter_exists) {
+                all_ready = false;
                 break;
             }
         }
 
-        if any_bucket && all_buckets_compacted {
+        if any_bucket && all_ready {
             return true;
         }
-
         if Instant::now() >= deadline {
             return false;
         }
@@ -817,6 +770,12 @@ async fn collect_index_tree_hashes(fragment: &str) -> Vec<(String, BTreeMap<Stri
                 .to_string_lossy()
                 .replace('\\', "/");
 
+            // `index_v2` is partitioned with owner/replica placement, so it is no longer
+            // expected to be byte-identical on every index root.
+            if rel.starts_with("index_v2/") {
+                continue;
+            }
+
             if rel.starts_with("index/__p__/v1/pfx/") && rel.ends_with(PREFIX_SEGMENT_EXT) {
                 if let Some(parent) = std::path::Path::new(&rel).parent() {
                     prefix_buckets.insert(parent.to_string_lossy().replace('\\', "/"));
@@ -860,9 +819,12 @@ async fn collect_index_tree_hashes(fragment: &str) -> Vec<(String, BTreeMap<Stri
                             latest.insert(e.object_key, (e.version_id, e.created_at));
                         }
                         Some((cur_vid, cur_ts)) => {
-                            if e.created_at > *cur_ts
-                                || (e.created_at == *cur_ts && e.version_id > *cur_vid)
-                            {
+                            if version_recency_is_newer(
+                                e.created_at,
+                                &e.version_id,
+                                *cur_ts,
+                                cur_vid,
+                            ) {
                                 latest.insert(e.object_key, (e.version_id, e.created_at));
                             }
                         }
@@ -1411,14 +1373,6 @@ async fn matrix_prefix_listing_survives_rename_delete_after_compaction() {
     ensure_global_storage_config(&base).await;
     ensure_upload_runtime_config();
 
-    let prev_compact_trigger = PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(128);
-    let prev_compact_min_interval = PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(30);
     let prev_data_shards = DATA_SHARDS_ATOMIC
         .get()
         .map(|v| v.load(Ordering::Relaxed))
@@ -1432,26 +1386,6 @@ async fn matrix_prefix_listing_survives_rename_delete_after_compaction() {
         .map(|v| v.load(Ordering::Relaxed))
         .unwrap_or(4096);
 
-    if PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC.get().is_none() {
-        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-            .set(AtomicUsize::new(1))
-            .expect("set PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC");
-    } else {
-        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-            .get()
-            .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
-            .store(1, Ordering::Relaxed);
-    }
-    if PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC.get().is_none() {
-        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-            .set(AtomicU64::new(1))
-            .expect("set PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC");
-    } else {
-        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-            .get()
-            .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
-            .store(1, Ordering::Relaxed);
-    }
     DATA_SHARDS_ATOMIC
         .get()
         .expect("DATA_SHARDS_ATOMIC")
@@ -1488,19 +1422,13 @@ async fn matrix_prefix_listing_survives_rename_delete_after_compaction() {
     put_object(state.clone(), &fragment, &key_a, vec![1u8; 8 * 1024]).await;
     put_object(state.clone(), &fragment, &key_b, vec![2u8; 8 * 1024]).await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    schedule_prefix_compaction(fragment.clone(), vec!["".to_string(), "ward".to_string()]);
-    run_prefix_rebuild_job(Some(fragment.clone()), Arc::new(WsConnectionManager::new()))
-        .await
-        .expect("run prefix rebuild");
-
     assert!(
-        wait_until_prefix_compacted(&fragment, "", 5000).await,
-        "root prefix should compact during test setup"
+        wait_until_prefix_snapshot_ready(&fragment, "", 5000).await,
+        "root prefix should project during test setup"
     );
     assert!(
-        wait_until_prefix_compacted(&fragment, "ward", 5000).await,
-        "ward prefix should compact during test setup"
+        wait_until_prefix_snapshot_ready(&fragment, "ward", 5000).await,
+        "ward prefix should project during test setup"
     );
 
     let rename_resp = rename_object(
@@ -1595,14 +1523,6 @@ async fn matrix_prefix_listing_survives_rename_delete_after_compaction() {
         "root delimiter listing should retain only the live ward prefix"
     );
 
-    PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-        .get()
-        .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
-        .store(prev_compact_trigger, Ordering::Relaxed);
-    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-        .get()
-        .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
-        .store(prev_compact_min_interval, Ordering::Relaxed);
     DATA_SHARDS_ATOMIC
         .get()
         .expect("DATA_SHARDS_ATOMIC")
@@ -1623,36 +1543,6 @@ async fn matrix_delimiter_listing_keeps_exact_prefix_object_and_child_prefixes()
     let base = TEST_BASE.clone();
     ensure_global_storage_config(&base).await;
     ensure_upload_runtime_config();
-
-    let prev_compact_trigger = PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(128);
-    let prev_compact_min_interval = PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(30);
-
-    if PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC.get().is_none() {
-        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-            .set(AtomicUsize::new(1))
-            .expect("set PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC");
-    } else {
-        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-            .get()
-            .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
-            .store(1, Ordering::Relaxed);
-    }
-    if PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC.get().is_none() {
-        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-            .set(AtomicU64::new(1))
-            .expect("set PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC");
-    } else {
-        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-            .get()
-            .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
-            .store(1, Ordering::Relaxed);
-    }
 
     let fragment = {
         let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
@@ -1681,19 +1571,9 @@ async fn matrix_delimiter_listing_keeps_exact_prefix_object_and_child_prefixes()
         put_object(state.clone(), &fragment, key, vec![fill; 4096]).await;
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    schedule_prefix_compaction(fragment.clone(), vec!["study".to_string()]);
-    run_prefix_rebuild_job(Some(fragment.clone()), Arc::new(WsConnectionManager::new()))
-        .await
-        .expect("run prefix rebuild");
-
     assert!(
-        wait_until_prefix_compacted(&fragment, "study", 5000).await,
-        "study prefix should compact during test setup"
-    );
-    assert!(
-        wait_until_delimiter_compacted(&fragment, "study", 5000).await,
-        "study delimiter prefix should compact during test setup"
+        wait_until_prefix_snapshot_ready(&fragment, "study", 5000).await,
+        "study prefix should project during test setup"
     );
 
     let listing = list_objects_json(&fragment, Some("study"), Some("/")).await;
@@ -1724,14 +1604,6 @@ async fn matrix_delimiter_listing_keeps_exact_prefix_object_and_child_prefixes()
     );
     assert!(listing["continuation_token"].is_null());
 
-    PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-        .get()
-        .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
-        .store(prev_compact_trigger, Ordering::Relaxed);
-    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-        .get()
-        .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
-        .store(prev_compact_min_interval, Ordering::Relaxed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1740,36 +1612,6 @@ async fn matrix_delimiter_listing_paginates_without_skipping_rows() {
     let base = TEST_BASE.clone();
     ensure_global_storage_config(&base).await;
     ensure_upload_runtime_config();
-
-    let prev_compact_trigger = PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(128);
-    let prev_compact_min_interval = PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(30);
-
-    if PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC.get().is_none() {
-        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-            .set(AtomicUsize::new(1))
-            .expect("set PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC");
-    } else {
-        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-            .get()
-            .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
-            .store(1, Ordering::Relaxed);
-    }
-    if PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC.get().is_none() {
-        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-            .set(AtomicU64::new(1))
-            .expect("set PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC");
-    } else {
-        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-            .get()
-            .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
-            .store(1, Ordering::Relaxed);
-    }
 
     let fragment = {
         let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
@@ -1797,19 +1639,9 @@ async fn matrix_delimiter_listing_paginates_without_skipping_rows() {
         put_object(state.clone(), &fragment, key, vec![fill; 2048]).await;
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    schedule_prefix_compaction(fragment.clone(), vec!["page".to_string()]);
-    run_prefix_rebuild_job(Some(fragment.clone()), Arc::new(WsConnectionManager::new()))
-        .await
-        .expect("run prefix rebuild");
-
     assert!(
-        wait_until_prefix_compacted(&fragment, "page", 5000).await,
-        "page prefix should compact during test setup"
-    );
-    assert!(
-        wait_until_delimiter_compacted(&fragment, "page", 5000).await,
-        "page delimiter prefix should compact during test setup"
+        wait_until_prefix_snapshot_ready(&fragment, "page", 5000).await,
+        "page prefix should project during test setup"
     );
 
     let page1 = list_objects_json_page(&fragment, Some("page"), Some("/"), 2, None).await;
@@ -1858,14 +1690,6 @@ async fn matrix_delimiter_listing_paginates_without_skipping_rows() {
     );
     assert!(page3["continuation_token"].is_null());
 
-    PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-        .get()
-        .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
-        .store(prev_compact_trigger, Ordering::Relaxed);
-    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-        .get()
-        .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
-        .store(prev_compact_min_interval, Ordering::Relaxed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1940,6 +1764,272 @@ async fn matrix_multipart_finalize_conflict_then_success() {
     let expected = [part0, part1].concat();
     let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
     assert_eq!(got, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_prefix_listing_serves_from_inline_prefix_rows_without_object_metadata_reads() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let key_exact = "inline".to_string();
+    let key_child = "inline/item.bin".to_string();
+    let version_exact = put_object(state.clone(), &fragment, &key_exact, vec![7u8; 1024]).await;
+    let version_child = put_object(state, &fragment, &key_child, vec![9u8; 2048]).await;
+
+    for (key, version_id) in [(&key_exact, &version_exact), (&key_child, &version_child)] {
+        for path in index_v2::get_object_version_paths(&fragment, key, version_id, false)
+            .expect("index_v2 version paths")
+        {
+            let _ = fs::remove_file(&path).await;
+        }
+
+        let path_manager = ObjectPathManager::new();
+        let fragment_roots = path_manager.get_all_index_roots();
+        let target_name = format!("{}.msgpack", version_id);
+        for root in fragment_roots {
+            let frag_root = root.join(&fragment);
+            for entry in WalkDir::new(&frag_root).into_iter().filter_map(|e| e.ok()) {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(&frag_root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if rel.starts_with("index_v2/")
+                    && path.file_name().and_then(|name| name.to_str()) == Some(target_name.as_str())
+                {
+                    let _ = fs::remove_file(path).await;
+                }
+            }
+        }
+    }
+
+    let listing = list_objects_json(&fragment, Some("inline"), None).await;
+    let mut keys = listing["objects"]
+        .as_array()
+        .expect("objects array")
+        .iter()
+        .filter_map(|v| v["object_key"].as_str())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    keys.sort();
+
+    assert_eq!(keys, vec![key_exact.clone(), key_child.clone()]);
+
+    let delimiter_listing = list_objects_json(&fragment, Some("inline"), Some("/")).await;
+    let mut delimiter_keys = delimiter_listing["objects"]
+        .as_array()
+        .expect("delimiter objects array")
+        .iter()
+        .filter_map(|v| v["object_key"].as_str())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    delimiter_keys.sort();
+
+    assert_eq!(delimiter_keys, vec![key_exact, key_child]);
+    assert!(
+        delimiter_listing["common_prefixes"]
+            .as_array()
+            .expect("common prefixes array")
+            .is_empty(),
+        "delimiter listing should not require metadata lookups for direct child rows"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_prefix_projection_writes_compacted_snapshots_without_delta_segments() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let key = "projected/path.bin".to_string();
+    put_object(state, &fragment, &key, vec![3u8; 1536]).await;
+
+    assert!(
+        wait_until_prefix_snapshot_ready(&fragment, "", 5000).await,
+        "root prefix snapshot should be ready"
+    );
+    assert!(
+        wait_until_prefix_snapshot_ready(&fragment, "projected", 5000).await,
+        "projected prefix snapshot should be ready"
+    );
+
+    let path_manager = ObjectPathManager::new();
+    for prefix in ["", "projected"] {
+        for bucket in path_manager.get_all_prefix_bucket_dirs(&fragment, prefix) {
+            if !fs::try_exists(&bucket).await.unwrap_or(false) {
+                continue;
+            }
+
+            assert!(
+                fs::try_exists(&bucket.join(format!("compacted{}", PREFIX_SEGMENT_EXT)))
+                    .await
+                    .unwrap_or(false),
+                "expected compacted prefix snapshot for prefix '{}' in {:?}",
+                prefix,
+                bucket
+            );
+            assert!(
+                fs::try_exists(&bucket.join(PREFIX_DELIMITER_COMPACTED_FILE))
+                    .await
+                    .unwrap_or(false),
+                "expected delimiter compacted snapshot for prefix '{}' in {:?}",
+                prefix,
+                bucket
+            );
+
+            let mut entries = fs::read_dir(&bucket).await.expect("read bucket");
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                assert!(
+                    !(name.starts_with("seg_") && name.ends_with(PREFIX_SEGMENT_EXT)),
+                    "delta prefix segments should not be written by the projector: {:?}",
+                    entry.path()
+                );
+                assert!(
+                    !(name.starts_with(PREFIX_DELIMITER_SEGMENT_PREFIX)
+                        && name.ends_with(PREFIX_SEGMENT_EXT)),
+                    "delta delimiter segments should not be written by the projector: {:?}",
+                    entry.path()
+                );
+            }
+        }
+    }
+
+    let listing = list_objects_json(&fragment, Some("projected"), None).await;
+    let keys = listing["objects"]
+        .as_array()
+        .expect("objects array")
+        .iter()
+        .filter_map(|v| v["object_key"].as_str())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(keys, vec![key]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_index_v2_object_partition_uses_segmented_wal_and_checkpoints() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 256 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let key = "wal/repeated.bin".to_string();
+    let mut latest_version = String::new();
+    for idx in 0..64u8 {
+        latest_version = put_object(
+            state.clone(),
+            &fragment,
+            &key,
+            vec![idx; 1024 + usize::from(idx)],
+        )
+        .await;
+    }
+
+    let meta_paths = index_v2::get_object_version_paths(&fragment, &key, &latest_version, false)
+        .expect("object version paths");
+    assert!(!meta_paths.is_empty(), "expected at least one index_v2 replica path");
+
+    let mut saw_checkpoint = false;
+    let mut saw_multiple_segments = false;
+    for meta_path in meta_paths {
+        let partition_dir = meta_path
+            .ancestors()
+            .nth(4)
+            .expect("partition dir ancestor")
+            .to_path_buf();
+        let wal_dir = partition_dir.join("wal");
+        let manifest_path = wal_dir.join("manifest.msgpack");
+        let checkpoint_path = partition_dir.join("checkpoints").join("latest.msgpack");
+        let segments_dir = wal_dir.join("segments");
+
+        assert!(
+            fs::try_exists(&manifest_path).await.unwrap_or(false),
+            "expected wal manifest at {}",
+            manifest_path.display()
+        );
+        assert!(
+            !fs::try_exists(&wal_dir.join("active.wal")).await.unwrap_or(false),
+            "legacy single active.wal should not be present"
+        );
+
+        if fs::try_exists(&checkpoint_path).await.unwrap_or(false) {
+            saw_checkpoint = true;
+        }
+
+        let mut segment_count = 0usize;
+        if fs::try_exists(&segments_dir).await.unwrap_or(false) {
+            let mut entries = fs::read_dir(&segments_dir).await.expect("read wal segments");
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.file_name().to_string_lossy().ends_with(".wal") {
+                    segment_count += 1;
+                }
+            }
+        }
+        if segment_count >= 2 {
+            saw_multiple_segments = true;
+        }
+    }
+
+    assert!(saw_checkpoint, "expected at least one current checkpoint");
+    assert!(
+        saw_multiple_segments,
+        "expected the repeated object partition to rotate into multiple wal segments"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3073,30 +3163,15 @@ async fn matrix_repair_synchronizes_all_index_disks() {
     let put_pending = upload_part(&fragment, &pending_vid, 0, pending_chunk).await;
     assert_eq!(put_pending.status(), StatusCode::OK);
 
-    let session_dirs = pm.get_all_session_dirs(&fragment, &pending_vid);
+    let session_paths =
+        index_v2::get_session_state_paths(&fragment, &pending_vid).expect("session state paths");
     assert!(
-        session_dirs.len() >= 2,
-        "expected at least two session dirs"
+        session_paths.len() >= 2,
+        "expected at least two session state replicas"
     );
-    let manifest0 = session_dirs[0].join("session.manifest.msgpack");
-    let reservation1 = session_dirs[1].join("reservation.msgpack");
-    let part0_1 = session_dirs[1].join("part_0.meta.msgpack");
-
-    fs::write(&manifest0, b"corrupt-session-manifest")
+    fs::write(&session_paths[0], b"corrupt-session-state")
         .await
-        .expect("corrupt one session manifest mirror");
-    fs::remove_file(&reservation1)
-        .await
-        .expect("delete one session reservation mirror");
-    fs::remove_file(&part0_1)
-        .await
-        .expect("delete one session part metadata mirror");
-
-    let before = collect_index_tree_hashes(&fragment).await;
-    assert_ne!(
-        before[0].1, before[1].1,
-        "precondition failed: mirrors should be divergent before repair"
-    );
+        .expect("corrupt one session state replica");
 
     run_repair_job(
         RepairRunConfig {
@@ -3340,8 +3415,9 @@ async fn matrix_raw_blob_background_repair_relocates_stale_device_id() {
 
     let stale_bytes =
         rmp_serde::to_vec(&stale_meta).expect("serialize stale metadata with device mismatch");
-    let path_manager = ObjectPathManager::new();
-    for path in path_manager.get_all_metadata_paths(&fragment, &key, &stale_meta.version_id) {
+    for path in index_v2::get_object_version_paths(&fragment, &key, &stale_meta.version_id, false)
+        .expect("index_v2 version paths")
+    {
         fs::write(&path, &stale_bytes)
             .await
             .unwrap_or_else(|e| panic!("write stale metadata {}: {}", path.display(), e));
@@ -3459,8 +3535,9 @@ async fn matrix_raw_blob_stale_reader_after_relocation_is_idempotent() {
 
     let stale_bytes =
         rmp_serde::to_vec(&stale_meta).expect("serialize stale metadata with device mismatch");
-    let path_manager = ObjectPathManager::new();
-    for path in path_manager.get_all_metadata_paths(&fragment, &key, &stale_meta.version_id) {
+    for path in index_v2::get_object_version_paths(&fragment, &key, &stale_meta.version_id, false)
+        .expect("index_v2 version paths")
+    {
         fs::write(&path, &stale_bytes)
             .await
             .unwrap_or_else(|e| panic!("write stale metadata {}: {}", path.display(), e));
@@ -3594,8 +3671,9 @@ async fn matrix_raw_blob_manual_repair_relocates_stale_device_id() {
 
     let stale_bytes =
         rmp_serde::to_vec(&stale_meta).expect("serialize stale metadata with device mismatch");
-    let path_manager = ObjectPathManager::new();
-    for path in path_manager.get_all_metadata_paths(&fragment, &key, &stale_meta.version_id) {
+    for path in index_v2::get_object_version_paths(&fragment, &key, &stale_meta.version_id, false)
+        .expect("index_v2 version paths")
+    {
         fs::write(&path, &stale_bytes)
             .await
             .unwrap_or_else(|e| panic!("write stale metadata {}: {}", path.display(), e));
@@ -3715,8 +3793,9 @@ async fn matrix_raw_blob_manual_availability_repair_relocates_stale_device_id() 
 
     let stale_bytes =
         rmp_serde::to_vec(&stale_meta).expect("serialize stale metadata with device mismatch");
-    let path_manager = ObjectPathManager::new();
-    for path in path_manager.get_all_metadata_paths(&fragment, &key, &stale_meta.version_id) {
+    for path in index_v2::get_object_version_paths(&fragment, &key, &stale_meta.version_id, false)
+        .expect("index_v2 version paths")
+    {
         fs::write(&path, &stale_bytes)
             .await
             .unwrap_or_else(|e| panic!("write stale metadata {}: {}", path.display(), e));
@@ -3816,8 +3895,8 @@ async fn matrix_repair_restores_delete_marker_mirror() {
         "latest metadata should be a delete marker"
     );
 
-    let pm = ObjectPathManager::new();
-    let marker_paths = pm.get_all_metadata_paths(&fragment, &key, &marker_meta.version_id);
+    let marker_paths = index_v2::get_object_version_paths(&fragment, &key, &marker_meta.version_id, false)
+        .expect("delete marker paths");
     assert!(
         marker_paths.len() >= 2,
         "expected mirrored marker metadata paths"
@@ -4032,17 +4111,25 @@ async fn matrix_redistribution_read_falls_back_when_primary_index_copy_is_corrup
         .await
         .expect("restore primary index disk");
 
-    let path_manager = ObjectPathManager::new();
-    let meta_paths = path_manager.get_all_metadata_paths(&fragment, &key, &version_id);
-    assert!(meta_paths.len() >= 2, "expected mirrored metadata paths");
+    let current_meta = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("metadata after redistribution");
+    index_v2::upsert_object_version(&current_meta)
+        .await
+        .expect("restore index_v2 replicas after disk return");
+
+    let meta_paths =
+        index_v2::get_object_version_paths(&fragment, &key, &version_id, false)
+            .expect("index_v2 metadata paths");
+    assert!(meta_paths.len() >= 2, "expected mirrored index_v2 paths");
     assert!(
         fs::try_exists(&meta_paths[1]).await.unwrap_or(false),
-        "secondary metadata copy should exist after redistribution"
+        "secondary index_v2 copy should exist after redistribution"
     );
 
     fs::write(&meta_paths[0], b"n1-corrupt-metadata-copy")
         .await
-        .expect("corrupt primary metadata copy");
+        .expect("corrupt primary index_v2 copy");
 
     let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
     assert_eq!(got, content);

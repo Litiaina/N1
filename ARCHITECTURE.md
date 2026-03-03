@@ -1,205 +1,226 @@
-<div align="center">
-  <img
-    src="https://github.com/Litiaina/litiaina-admin-webpage/blob/master/images/litiaina_icon.png?raw=true"
-    alt="Litiaina Icon"
-    width="150"
-    height="150"
-  />
-  <h1>N1 Architecture (Current)</h1>
-</div>
+# N1 Architecture
 
-This document reflects the current N1 storage architecture as implemented in `server/src/n1_core`.
+N1 is a single-node object storage engine with three distinct planes:
 
-## 1. Architecture Truth
+- `index_v2` is the authoritative object, session, and trash metadata plane.
+- The prefix namespace index is a derived serving accelerator for `LIST prefix` and `delimiter=/`.
+- The blob plane stores payload shards on raw devices through direct I/O.
 
-N1 is a **fragment-scoped object storage engine with a filesystem-backed metadata plane and a direct-I/O blob plane**:
+This replaces the legacy "full mirrored metadata tree on every index root" model. The node is still single-node, but its metadata authority is now partitioned instead of whole-node mirrored.
 
-- no database in the object hot path
-- metadata authority lives on disk (mirrored index roots)
-- data/parity shards live on blob disks
-- upload visibility is controlled by atomic metadata publish
-- repair/redistribution/prefix rebuild are first-class maintenance pipelines
+## Platform Truth
 
-## 2. Storage Domains
+- Exact-key reads, finalize, delete, recover, GC, repair, and prefix rebuild all resolve against `index_v2`.
+- Each object key hashes to one metadata partition. Each partition selects one owning index root and one replica root when more than one root exists.
+- Session state is partitioned separately by `fragment + version_id`, which keeps resumable upload state bounded to the session's selected roots.
+- The prefix index is not the source of truth. It is a rebuildable namespace-serving structure with inline list payload.
+- Raw blob extents are payload durability only. They do not make an object visible until `index_v2` publishes the version.
 
-N1 uses two disk pools:
+## Why The Legacy Mirrored Index Had To Go
 
-- **Index roots** (`INDEX_STORE_DISKS`): metadata, sessions, quota, fragment metadata
-- **Blob disks** (`BLOB_STORE_DISKS`): direct-I/O shard storage on raw, unformatted, unmounted
-  devices managed by `block_manager`
+The legacy layout made every node-level metadata mutation expensive:
 
-Fragment is the isolation boundary for auth, quota, maintenance, and layout.
+- final publish fanned object metadata out across mirrored roots
+- session and part state lived in a separate mirrored tree
+- prefix listing shared the same metadata surface as exact-key reads
+- repair and GC had to reconcile multiple partially authoritative trees
 
-## 3. Canonical On-Disk Layout
+That model was durable, but once the blob plane became fast enough, the node ceiling moved to the metadata mirrors. The old design improved safety, not write scalability.
 
-### 3.1 Index root layout
+## Storage Domains
+
+### 1. `index_v2` authority plane
+
+`index_v2` stores the canonical object/session/trash state under hashed partitions:
+
+- immutable version files
+- latest markers for exact-key reads
+- resumable upload session state with committed parts
+- WAL records for mutation history and recovery tooling
+
+Writes target the partition's selected roots, not every index root in the node.
+
+### 2. Prefix namespace plane
+
+The prefix subsystem remains filesystem-backed, but it is no longer authoritative. It exists to serve:
+
+- `LIST prefix`
+- `LIST prefix delimiter=/`
+- archive selection by prefix
+
+Prefix rows now carry inline list metadata, and the namespace plane is projected from `index_v2` WAL changes into compacted prefix snapshots. Projection is asynchronous and coalesced per fragment, so repeated writes do not re-run namespace maintenance in the foreground. A prefix hit can serve list results without reopening object metadata per row. If prefix state is pending, missing, or stale, the node falls back to authoritative `index_v2` scans for the requested prefix and can rebuild the namespace plane from there.
+
+### 3. Blob plane
+
+Blob payloads live on raw, unformatted blob devices managed by the node:
+
+- multipart parts are RS-encoded into data and parity shards
+- shard payloads are committed to raw extents
+- repaired or redistributed payloads publish new raw extent addresses through authoritative metadata updates
+
+## On-Disk Layout
+
+### `index_v2` partitions
+
+The authoritative metadata shape is:
 
 ```text
-{INDEX_ROOT}/{fragment_hash}/
-├── quota.msgpack
-├── fragment.metadata.msgpack
-├── index/
-│   ├── {h1}/{h2}/{h3}/{h4}/{sha256(object_key)}#{version_id}.msgpack
-│   ├── sessions/{version_id}/
-│   │   ├── session.manifest.msgpack
-│   │   ├── reservation.msgpack
-│   │   └── part_{part_index}.meta.msgpack
-│   └── __p__/v1/pfx/{p1}/{p2}/{prefix_hash}/
-│       ├── compacted.msgpack
-│       └── seg_{segment_id}.msgpack
-└── .trash/
-    └── index/
-        ├── {h1}/{h2}/{h3}/{h4}/{sha256(object_key)}#{version_id}.msgpack
-        └── sessions/{version_id}/...
+{INDEX_ROOT}/{fragment}/index_v2/partitions/{partition_id}/
+  wal/manifest.msgpack
+  wal/segments/{segment_id}.wal
+  checkpoints/latest.msgpack
+  sessions/
+    {version_id}.session.msgpack
+  objects/{hh}/{object_key_sha256}/
+    latest.latest.msgpack
+    {version_id}.msgpack
+  trash/{hh}/{object_key_sha256}/
+    latest.latest.msgpack
+    {version_id}.msgpack
 ```
 
 Notes:
-- Object metadata index is **4-level sharded** from SHA256(object_key).
-- Current authoritative object metadata is under `index/{h1}/{h2}/{h3}/{h4}/...` (no extra `objects/` level).
-- Prefix index namespace is under `index/__p__/v1/pfx/...`.
-- Fragment quota state remains mirrored on index roots, with cache-backed updates flushed asynchronously to `quota.msgpack` and retried until mirrors converge.
 
-### 3.2 Blob extent layout
+- object partitions are chosen from `hash("object", fragment, object_key)`
+- session partitions are chosen from `hash("session", fragment, version_id)`
+- when multiple index roots exist, a partition writes to one owner root plus one replica root
+- success requires at least one selected root to persist the state
 
-Blob payloads live in raw extents managed by `block_manager` on the configured blob devices.
+### Prefix namespace index
 
-Metadata stores:
+The serving index remains under the `index/prefix/...` tree:
 
-- `raw_blob_address`
-- logical shard name
-- checksum
-- debug path like `raw://<device_id>/<allocation_id>`
+```text
+{INDEX_ROOT}/{fragment}/index/prefix/<version>/<namespace>/{p1}/{p2}/{prefix_hash}/
+  compacted...
+  seg_...
+  delimiter...
+```
 
-### 3.3 Direct-I/O split
+This plane stores compacted and recent namespace segments only. It can be compacted, repaired, or rebuilt from `index_v2`.
 
-- Blob payload writes and reads use `O_DIRECT`.
-- Block-manager metadata (superblock/journal) is flushed explicitly but remains buffered.
-- Index, quota, prefix indexes, fragment metadata, and other control files remain filesystem-backed.
+### Blob storage
 
-## 4. Object Model
+The payload plane remains:
 
-`ObjectMetadata` (msgpack) is the source of truth for a committed version:
+- raw blob devices managed by `block_manager`
+- shard addresses recorded as `raw://<device_id>/<allocation_id>`
+- direct-I/O writes and reads on the blob path
 
-- `fragment`, `object_key`, `version_id`
-- `content_type`, `total_size_bytes`, `created_at`
-- `parts[]` where each part includes shard list and checksums
-- `is_delete_marker` for tombstone semantics
-- `stripe_size_bytes` for streaming/recovery math
+## Write Path
 
-## 5. Write Path (Upload)
+### 1. Initiate upload
 
-### 5.1 Initiate
+Initiate does:
 
-`/v4/upload/init/{fragment}/{object_key}`:
+- validate fragment scope
+- reserve quota
+- generate `version_id` and `session_id`
+- open `index_v2` session state on the session partition
 
-- validates fragment-scoped write claims
-- reserves quota (session receipt)
-- creates `version_id` + `session_id`
-- writes session manifest to session dirs on index mirrors
+At this stage no object is visible.
 
-### 5.2 Upload part
+### 2. Upload part
 
-`/v4/upload/chunk/{fragment}/{version_id}/{part_index}`:
+Part upload is still payload-first:
 
-- bounded by IO semaphore and configured limits
-- encodes data to `data_shards + parity_shards`
-- writes to staged shard files under the raw staging area
-- commits staged shards into raw extents through `O_DIRECT`
-- writes `part_{index}.meta.msgpack` to session mirrors
+1. stream bytes through RS encode
+2. write staged shard data
+3. commit staged shard data into raw blob extents
+4. build `PartMetadata`
+5. update the session's `index_v2` state with the committed part
 
-### 5.3 Finalize
+This keeps metadata small and bounded: blob payload durability and part-session durability are separate from object visibility.
 
-`/v4/upload/finalize/{fragment}/{version_id}/{session_id}`:
+### 3. Finalize upload
 
-- verifies all expected parts exist and are valid
-- assembles final `ObjectMetadata`
-- atomically writes metadata to index mirrors
-- updates prefix index segments
-- object becomes visible to read/list only after metadata publish
+Finalize is now an authoritative publish into `index_v2`:
 
-## 6. Read Path
+1. load session state from the session partition
+2. verify that all required parts exist
+3. build immutable `ObjectMetadata`
+4. write the version file and latest marker on the object partition's selected roots
+5. append the partition WAL record
+6. return success
 
-### 6.1 Metadata resolution
+Exact-key visibility depends on `index_v2` publish, not on legacy mirrored metadata files.
 
-Read APIs (`get`, `stream`, `download`, `meta`) resolve metadata from index mirrors.
+### Crash matrix
 
-### 6.2 Streaming/retrieval behavior
+- Crash before part state commit: raw extents may exist, but no session part state means the part is not complete.
+- Crash after part state commit but before finalize: the upload is resumable and still not visible.
+- Crash after version publish but before prefix maintenance catches up: `GET` and `HEAD` are correct through `index_v2`; `LIST` can serve from existing prefix rows or rebuild from authoritative metadata.
 
-- reads are chunked and bounded by stream config
-- range support is native
-- recovery helpers can reconstruct unavailable shard slices when enough shards exist
+## Read And List Path
 
-### 6.3 Prefix listing
+### Exact-key reads
 
-`list_objects` uses prefix index fast path when applicable:
+`GET`, `HEAD`, metadata lookup, version lookup, delete, recover, and rename resolve through `index_v2`:
 
-- reads `compacted.msgpack` + delta segments
-- merges latest entries per key/version
-- falls back to full index scan if prefix delta fan-in exceeds configured threshold
+- readers probe the selected roots for the partition
+- the freshest readable replica is preferred
+- blob addresses come from the published `ObjectMetadata`
 
-## 7. Delete and Trash Semantics
+### Prefix and delimiter listing
 
-Soft delete operations move metadata and sessions into `.trash` namespaces.
+`LIST` is intentionally separated from exact-key truth:
 
-- live index path -> `.trash/index/...`
-- sessions -> `.trash/index/sessions/...`
+- normal serving path is the prefix namespace index
+- rows include inline list metadata
+- delimiter rows materialize the folder illusion without real directories
+- fallback scans authoritative `index_v2`, not a legacy mirrored object tree
 
-Raw blob extents remain referenced by metadata until recovery or permanent deletion decides their
-fate. Permanent delete and GC reclaim those raw extents.
+That keeps exact-key correctness and namespace serving performance independent.
 
-## 8. Maintenance Architecture
+## Maintenance Path
 
-### 8.1 Repair
+All major maintenance flows now share the same authority source:
 
-Repair reconciles:
+- sync and cleanup recompute fragment usage from `index_v2` live and trash state
+- repair reconciles partition replicas and blob availability from `index_v2`
+- redistribution republishes moved shard addresses through `index_v2`
+- GC expires trash versions and abandoned sessions through `index_v2`
+- prefix rebuild regenerates namespace segments from `index_v2`
+- health reporting reflects partitioned authority instead of expecting full-root mirrored equality
 
-- fragment metadata mirrors
-- session manifests/receipts/part metas across index roots
-- object metadata divergence/missing replicas
-- quota mirror divergence
-- shard corruption/missing shard recovery (availability/scrub modes)
+## Durability Invariants
 
-After meaningful repairs, prefix rebuild is triggered for affected fragments.
+- A version is visible only after its `index_v2` publish succeeds on at least one selected root.
+- Prefix rows must never invent visibility that `index_v2` does not contain.
+- Raw extents without live session or object metadata are cleanup candidates, not visible data.
+- Replica divergence is repairable, but the newest committed `index_v2` state wins.
+- Full-root byte-for-byte metadata equality is no longer an invariant. Partition ownership and replica survivability are the invariant.
 
-### 8.2 Redistribution
+## Current Authority Rules
 
-Redistribution realigns shard placement to current EC and disk topology, while keeping CRUD online.
+- Upload recency is defined by session creation time. Finalize publishes that version; it does not get to redefine which same-key upload is newer.
+- When second-level `created_at` timestamps tie, ULID `version_id` order is the tiebreaker for latest selection.
+- Publish may write an immutable version file for an older version, but it must not advance the `latest` marker unless that version actually wins the recency comparison.
+- Exact-key reads treat the `latest` marker as a routing hint and rehydrate the referenced immutable version record before serving metadata or bytes.
+- Prefix and delimiter rows remain derived serving state. They can lag `index_v2`, but they must never override or invent exact-key truth.
 
-### 8.3 Garbage collector
+## Why This Design Is More Future-Proof
 
-GC handles:
+This architecture gives N1 a better long-term shape than the legacy mirrored tree for five reasons:
 
-- expired trash versions
-- orphan sessions/raw stage files
-- quota refunds
-- reclaiming unreachable raw extents
+1. Metadata write fanout is bounded.
+   Publish and session writes hit the owning partition roots, not every index root on the node.
 
-### 8.4 Prefix rebuild
+2. Exact-key truth is separated from namespace serving.
+   `GET` and `HEAD` no longer depend on the same structure that powers prefix listing.
 
-Rebuild reconstructs prefix index segments from canonical object metadata.
+3. Maintenance has one authority source.
+   Repair, GC, sync, and rebuild no longer need to guess between mirrored object trees and session trees.
 
-### 8.5 Monitoring
+4. The model can evolve without another semantic rewrite.
+   The current segmented WAL plus partition checkpoints already give a clean path to richer replay, compaction, and replica-repair behavior without changing API-visible behavior.
 
-System health endpoint serves cached near-real-time snapshots, with optional deep scan and refresh.
+5. The same node-core model composes cleanly into N2.
+   N2 can keep its distributed control plane while inheriting a cheaper, clearer node-local authority model.
 
-## 9. Durability and Crash Safety Rules
+## HA Model
 
-Core invariants:
-
-1. Temp shard names are never published as committed shard references.
-2. Stable shard commit happens before part metadata commit.
-3. Final object metadata publish is the visibility gate.
-4. Committed versions are immutable; updates create new versions.
-5. Rename/delete/recover are metadata-orchestrated operations with durable sync discipline.
-6. Repair writes are atomic and mirror-safe.
-
-## 10. HA Model (Single-Node Multi-Disk)
-
-N1 HA is not multi-node consensus HA; it is **single-node operational HA**:
-
-- service remains available during repair/redistribution
-- index mirrors allow metadata survivability and reconvergence
-- shard/parity model allows data recovery under disk failures
-- maintenance APIs + CLI provide live control and observability
-
-This is the practical architecture for low-hardware environments that still need continuous CRUD + durability.
+- Losing one selected partition root is survivable if the other selected root is still readable.
+- Reads prefer the freshest available partition replica.
+- Repair restores missing owner/replica copies from surviving authoritative state.
+- Prefix state can lag or be rebuilt without making exact-key reads incorrect.

@@ -1,10 +1,7 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::blob_store::{RawBlobDeviceStatus, raw_blob_device_statuses};
-use crate::n1_core::constants::{
-    FRAGMENT_METADATA_FILE, METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, RESERVATION_FILE,
-    SESSION_MANIFEST_FILE,
-};
 use crate::n1_core::disk_manager::{configured_blob_store_disks, configured_index_store_disks};
+use crate::n1_core::index_v2;
 use crate::n1_core::redistribution::get_redist_status;
 use crate::n1_core::repair_manager::get_repair_status;
 use crate::n1_core::system::{SystemMetrics, get_system_metrics};
@@ -28,7 +25,6 @@ use tokio::fs;
 use tokio::sync::{Semaphore, oneshot};
 use tokio::time::timeout;
 use ulid::Ulid;
-use walkdir::WalkDir;
 
 static DEEP_SCAN_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
 const DISK_CHECK_TIMEOUT: Duration = Duration::from_millis(5000);
@@ -85,67 +81,6 @@ pub struct SystemHealthResponse {
     pub consistency: ConsistencyStats,
     pub system: SystemMetrics,
     pub summary: String,
-}
-
-fn should_count_object_metadata_file(path: &std::path::Path) -> bool {
-    let name = match path.file_name().and_then(|n| n.to_str()) {
-        Some(s) => s,
-        None => return false,
-    };
-
-    let p = path.to_string_lossy();
-    let under_active_index = p.contains("/index/") || p.contains("\\index\\");
-    if !under_active_index {
-        return false;
-    }
-    let under_trash = p.contains("/.trash/") || p.contains("\\.trash\\");
-    if under_trash {
-        return false;
-    }
-
-    if !name.ends_with(METADATA_EXT) {
-        return false;
-    }
-
-    if name.ends_with(PART_META_SUFFIX)
-        || name == QUOTA_FILE
-        || name == RESERVATION_FILE
-        || name == SESSION_MANIFEST_FILE
-        || name == FRAGMENT_METADATA_FILE
-    {
-        return false;
-    }
-
-    // Object metadata filenames are `<object_hash>#<version_id>.msgpack`.
-    name.contains('#')
-}
-
-#[cfg(test)]
-mod tests {
-    use super::should_count_object_metadata_file;
-    use std::path::Path;
-
-    #[test]
-    fn deep_scan_counts_only_object_metadata_files() {
-        assert!(should_count_object_metadata_file(Path::new(
-            "frag/index/aa/bb/cc/dd/abcd1234#01ABC.msgpack"
-        )));
-        assert!(!should_count_object_metadata_file(Path::new(
-            "sessions/01ABC/session.manifest.msgpack"
-        )));
-        assert!(!should_count_object_metadata_file(Path::new(
-            "sessions/01ABC/part_0.meta.msgpack"
-        )));
-        assert!(!should_count_object_metadata_file(Path::new(
-            "quota.msgpack"
-        )));
-        assert!(!should_count_object_metadata_file(Path::new(
-            "__p__/v1/pfx/aa/bb/hash/seg_01ABC.msgpack"
-        )));
-        assert!(!should_count_object_metadata_file(Path::new(
-            "frag/.trash/index/aa/bb/cc/dd/abcd1234#01ABC.msgpack"
-        )));
-    }
 }
 
 async fn check_index_disk_accessibility(path_str: String) -> DiskStatus {
@@ -304,8 +239,7 @@ async fn collect_system_health(
         .get("deep_scan")
         .map(|v| v == "true")
         .unwrap_or(false);
-    let mut object_counts = Vec::new();
-    let mut mirror_map = HashMap::new();
+    let mut total_objects = 0u64;
     let mut scan_performed = false;
     let mut scan_busy = false;
 
@@ -316,64 +250,45 @@ async fn collect_system_health(
             let (tx, rx) = oneshot::channel();
 
             std::thread::spawn(move || {
-                if let Some(core_ids) = core_affinity::get_core_ids() {
-                    if let Some(last_core) = core_ids.last() {
-                        let _ = core_affinity::set_for_current(*last_core);
-                    }
-                }
-
-                let mut counts = Vec::new();
+                let mut fragments = std::collections::BTreeSet::new();
                 for root in roots_clone {
-                    let mut current_disk_count = 0u64;
-                    let walker = WalkDir::new(&root).into_iter();
-
-                    for entry in walker.filter_map(|e| e.ok()) {
-                        let path = entry.path();
-                        if entry.file_type().is_file() && should_count_object_metadata_file(path) {
-                            current_disk_count += 1;
-                        }
-
-                        if current_disk_count % 1000 == 0 {
-                            std::thread::yield_now();
+                    let Ok(entries) = std::fs::read_dir(root) else {
+                        continue;
+                    };
+                    for entry in entries.filter_map(|entry| entry.ok()) {
+                        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                            if let Some(name) = entry.file_name().to_str() {
+                                if !name.starts_with('.') {
+                                    fragments.insert(name.to_string());
+                                }
+                            }
                         }
                     }
-
-                    counts.push(current_disk_count);
                 }
-
-                let _ = tx.send(counts);
+                let _ = tx.send(fragments.into_iter().collect::<Vec<_>>());
             });
 
-            object_counts = rx.await.map_err(|e| {
+            let fragments = rx.await.map_err(|e| {
                 AppError::InternalServerError(format!("Consistency check thread failed: {}", e))
             })?;
 
-            for (i, root) in active_index_roots.iter().enumerate() {
-                if let Some(count) = object_counts.get(i) {
-                    mirror_map.insert(root.to_string_lossy().to_string(), *count);
-                }
+            for fragment in fragments {
+                total_objects += index_v2::list_fragment_object_versions(&fragment, false)
+                    .await
+                    .map(|versions| versions.len() as u64)
+                    .unwrap_or(0);
             }
         } else {
             scan_busy = true;
         }
     }
 
-    let total_objects = object_counts.first().copied().unwrap_or(0);
-
     let index_health = if scan_busy {
         "skipped (scan in progress)".to_string()
     } else if !scan_performed {
         "skipped (use ?deep_scan=true)".to_string()
-    } else if object_counts.is_empty() {
-        "unknown".to_string()
     } else {
-        let first = object_counts[0];
-        let all_match = object_counts.iter().all(|&c| c == first);
-        if all_match {
-            "synchronized".to_string()
-        } else {
-            "desynchronized".to_string()
-        }
+        "partitioned (index_v2 authoritative)".to_string()
     };
 
     let total_index = index_disks_config.len();
@@ -420,7 +335,7 @@ async fn collect_system_health(
         repair_job: serde_json::to_value(&repair_status).ok(),
         redist_job: serde_json::to_value(&redist_status).ok(),
         shadow_index_status: index_health.clone(),
-        shadow_index_healthy: index_health == "synchronized",
+        shadow_index_healthy: index_health != "desynchronized",
     };
     state.ws_manager.broadcast_system_wide(monitoring_update);
 
@@ -430,11 +345,7 @@ async fn collect_system_health(
         consistency: ConsistencyStats {
             total_objects_scanned: total_objects,
             index_mirror_health: index_health,
-            mirror_counts: if !mirror_map.is_empty() {
-                Some(mirror_map)
-            } else {
-                None
-            },
+            mirror_counts: None,
         },
         system: system_metrics,
         summary,

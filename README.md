@@ -7,9 +7,9 @@
   />
   <h1>Litiaina N1</h1>
   <p>
-    Fragment-centric object storage engine with a filesystem-backed metadata plane and
-    a direct-I/O blob plane, built for lockless streaming, strict crash safety, and
-    survivable single-node durability.
+    Fragment-centric object storage engine with partitioned <code>index_v2</code> metadata
+    authority, a derived namespace index, and a direct-I/O blob plane, built for strict crash
+    safety and survivable single-node durability.
   </p>
 </div>
 
@@ -17,29 +17,31 @@
 
 ## Table of Contents
 
-- [What is N1 (current architecture)](#what-is-n1-current-architecture)
+- [What is N1 (index_v2 architecture)](#what-is-n1-index_v2-architecture)
 - [What N1 Is (Truth Statement)](#what-n1-is-truth-statement)
 - [Design principles](#design-principles)
 - [Core concepts](#core-concepts)
-- [Architecture (Index vs Blob)](#architecture-index-vs-blob)
+- [Architecture (Authority vs Namespace vs Blob)](#architecture-authority-vs-namespace-vs-blob)
 - [On-disk layout](#on-disk-layout)
-  - [Index (metadata mirrors)](#index-metadata-mirrors)
-  - [Upload sessions](#upload-sessions)
-  - [Blob (data/parity shards)](#blob-dataparity-shards)
+  - [`index_v2` partitions](#index_v2-partitions)
+  - [Prefix namespace index](#prefix-namespace-index)
+  - [Blob storage](#blob-storage)
 - [Write path (multipart upload)](#write-path-multipart-upload)
   - [Initiate upload](#1-initiate-upload)
-  - [Upload part (strict commit discipline)](#2-upload-part-strict-commit-discipline)
-  - [Finalize upload (publish a version)](#3-finalize-upload-publish-a-version)
+  - [Upload part (payload first, metadata second)](#2-upload-part-payload-first-metadata-second)
+  - [Finalize upload (publish into `index_v2`)](#3-finalize-upload-publish-into-index_v2)
   - [Crash matrix (what can exist on disk)](#crash-matrix-what-can-exist-on-disk)
-- [Read path (stream + range reads)](#read-path-stream--range-reads)
+- [Read path (exact key and list)](#read-path-exact-key-and-list)
 - [Durability model](#durability-model)
   - [Write quorum](#write-quorum)
-  - [Immutability and visibility](#immutability-and-visibility)
+  - [Visibility and list behavior](#visibility-and-list-behavior)
 - [Maintenance jobs](#maintenance-jobs)
-  - [Repair (index + blob)](#repair-index--blob)
+  - [Repair (authoritative metadata + blob)](#repair-authoritative-metadata--blob)
   - [Recovery runtime (background heal)](#recovery-runtime-background-heal)
   - [Redistribution](#redistribution)
   - [Garbage collection and trash](#garbage-collection-and-trash)
+  - [Raw blob operations](#raw-blob-operations)
+- [Why `index_v2` is future-proof](#why-index_v2-is-future-proof)
 - [Operational notes](#operational-notes)
   - [Linux-first + O_DIRECT](#linux-first--o_direct)
   - [Preallocation](#preallocation)
@@ -67,341 +69,308 @@ Profile note:
 - `profiles/n1/high-hw.ini` is for multi-disk, high-parallelism deployments.
 - `profiles/n1/single-raw-nvme.ini` is the better starting point for one raw Linux-owned NVMe blob device.
 
-## What is N1 (current architecture)
+## What is N1 (index_v2 architecture)
 
-**Litiaina N1** is a **single-machine, multi-disk** object storage engine that keeps the
-metadata/index plane on mounted filesystems while driving the blob plane through direct I/O.
-The on-disk metadata layout remains the source of truth.
+**Litiaina N1** is a **single-machine, multi-disk** object storage engine with:
+
+- a partitioned filesystem-backed metadata authority in `index_v2`
+- a derived prefix namespace index for fast `LIST`
+- a direct-I/O blob plane on raw devices
+
+This is the architectural shift from the legacy node: object and session truth are no longer stored as a whole-node mirrored tree on every index root. Instead, metadata authority is partitioned by hash onto a small selected set of roots.
 
 N1 is designed for environments where you want:
 
 - **NVMe / JBOD speed** without cluster coordination tax
-- **video-grade streaming** (long sequential reads + range reads) with bounded memory
-- **crash safety** (power-loss safe) and recoverability even on unstable disks/networks
-- storage that remains **inspectable and movable on disk** (no opaque black-box volumes)
+- **video-grade streaming** with bounded memory
+- **crash safety** and recoverability on unstable disks
+- storage that remains **inspectable and movable on disk** without a database hot path
 
 ## What N1 Is (Truth Statement)
 
-N1 is a **fragment-scoped object storage engine with filesystem-backed metadata and a direct-I/O blob backend** for single-machine multi-disk deployments where:
+N1 is a **fragment-scoped object storage engine with partitioned metadata authority and a direct-I/O blob backend** for single-node multi-disk deployments where:
 
-- **high availability** during maintenance matters (CRUD should continue while repair/redistribution run)
-- **durability** matters (index mirrors + shard-level recovery)
-- **bounded resource usage** matters (streaming-first reads/writes with explicit concurrency controls)
-- **no database hot-path dependency** is required (disk layout is the source of truth)
+- **high availability** during maintenance matters
+- **durability** matters across index-root and blob-device failures
+- **bounded resource usage** matters
+- **no external database hot path** is required
 
-Operationally, “true N1” means:
+Operationally, "true N1" now means:
 
-- fragments are the isolation boundary (quota/auth/maintenance scope)
+- fragments are the isolation boundary
 - object versions are immutable
-- index mirrors can diverge temporarily but must be repairable and reconverged
-- maintenance is first-class and operator-driven through API + CLI
+- `index_v2` is the authoritative source for live objects, trash, and upload sessions
+- prefix and delimiter listing are served from a derived namespace index
+- maintenance jobs reconcile from the same authoritative metadata plane
 
 ### Fragment-centric engine (no multitenant UID layout)
 
-N1 is **not** “user multi-tenant storage” anymore. The isolation boundary is a **Fragment**:
+N1 is **not** "user multi-tenant storage" anymore. The isolation boundary is a **Fragment**:
 
 - **Fragment = virtual disk / namespace / tenant boundary**
 - **Quota is per Fragment**
 - **Auth scopes to Fragment**
 - **Maintenance jobs operate per Fragment**
-- N1 is the **CORE** engine: deterministic disk layout + strict commit discipline + repairability
+- N1 is the **core single-node engine**: partitioned metadata authority, strict publish discipline, and repairable blob durability
 
 ---
 
 ## Design principles
 
-### 1) Filesystem-backed control plane, direct-I/O blob plane
+### 1) Partitioned metadata authority, direct-I/O blob plane
 
-N1 keeps metadata and control state as normal files on configured index disks. The blob plane is
-separate: `blob_store_disks` are raw, unformatted, unmounted blob devices managed directly by N1
-via `block_manager`. If a configured blob device is mounted, N1 rejects startup.
+N1 keeps authoritative metadata on mounted index filesystems, but that authority now lives in `index_v2` partitions instead of a full mirrored tree on every root. Blob payloads remain on raw, unformatted, unmounted devices managed directly by N1.
 
-**Result:** if the service disappears, disks remain mountable and the layout remains readable.
+**Result:** the node keeps an inspectable on-disk layout while bounding metadata write fanout.
 
-### 2) Immutability as correctness
+### 2) Exact-key truth separated from namespace serving
+
+Exact object visibility comes from `index_v2`. Prefix and delimiter listing are served from a derived namespace index with inline list rows.
+
+**Result:** `GET` and `HEAD` do not depend on the same structure that serves `LIST`.
+
+### 3) Immutability as correctness
 
 A finalized object version is immutable:
 
-- shards are never edited in-place after commit
+- shards are never edited in place after commit
 - new writes create a new `version_id`
-- delete is represented safely (marker + trash semantics)
+- delete is represented safely through trash state
 - rename is metadata-only
 
-**Result:** crash safety becomes a discipline problem (atomic publish), not a “distributed lock” problem.
-
-### 3) Lockless streaming data path
-
-Hot-path I/O relies on:
-
-- deterministic placement rules
-- bounded concurrency (semaphores)
-- atomic rename + directory sync for commits
-
-Correctness does not depend on a global mutex.
+**Result:** crash safety is a publish-discipline problem, not a lock-ownership problem.
 
 ### 4) Crash-first engineering
 
 N1 assumes failures are normal:
 
-- server stops mid-upload
-- disks disappear mid-stream
-- replicas diverge
-- bitrot happens
+- process stops mid-upload
+- one index root disappears
+- blob devices return corrupt or missing data
+- namespace-serving state lags behind object truth
 
-N1 stays correct by making partial work non-visible, and recoverable via maintenance tools.
+N1 stays correct by making `index_v2` the only object authority and treating everything else as repairable or rebuildable around it.
 
 ---
 
 ## Core concepts
 
 ### Fragment
+
 A Fragment is the unit of isolation and operational scope:
 
-- “virtual disk” boundary
 - quota boundary
 - auth boundary
-- directory root on disk
+- maintenance boundary
+- namespace boundary
 
 ### Object
+
 An object is identified by:
 
 - `fragment`
-- `object_key` (path/name inside the fragment)
+- `object_key`
 
 ### Version
-A version is immutable and identified by `version_id`.
 
-Uploads produce a new version, and finalization publishes it.
+A version is immutable and identified by `version_id`. Publish makes a version visible.
 
-### Part
-N1 uses multipart uploads: each part has:
+### Session
 
-- `part_index`
-- `size_bytes`
-- `created_at`
-- checksums
-- `shards[]` (data + parity)
+A multipart upload session is authoritative state in `index_v2` keyed by `fragment + version_id`. It holds:
+
+- upload manifest
+- optional reservation receipt
+- committed parts
+- finalized or aborted state
+
+### Partition
+
+A partition is the placement unit for authoritative metadata:
+
+- object partitions hash from `fragment + object_key`
+- session partitions hash from `fragment + version_id`
+- each partition selects one owner root plus one replica root when more than one index root exists
 
 ### Shard
-Each part is encoded into:
 
-- `data_shards` originals
-- `parity_shards` recoveries
-
-Each shard is a **real file** on disk, with size and checksum recorded.
+Each multipart part is encoded into data and parity shards whose payloads are committed to raw blob extents.
 
 ---
 
-## Architecture (Index vs Blob)
+## Architecture (Authority vs Namespace vs Blob)
 
-N1 separates the world into two storage domains:
+### `index_v2` authority plane
 
-### Index store (metadata mirrors)
-- immutable metadata files (MessagePack via `rmp-serde`)
-- replicated across configured index roots (mirrors)
-- repaired by reconciling replicas (missing/divergent/corrupt)
+`index_v2` stores:
 
-### Blob store (data/parity shards)
-- direct-I/O shard payload storage across configured blob disks
-- placement is deterministic (no database required)
-- read path can degrade and reconstruct missing data using RS decode
-- background repair can regenerate missing/corrupt shards
+- live object versions
+- latest markers
+- trash versions
+- upload sessions and committed parts
+- WAL records for mutation history
+
+This is the authoritative plane used by exact-key reads, finalize, delete/recover, sync, repair, GC, redistribution, and prefix rebuild.
+
+### Prefix namespace index
+
+The prefix subsystem is a serving accelerator:
+
+- serves `LIST prefix`
+- serves delimiter-based folder illusion
+- stores inline list payload so successful list hits avoid reopening object metadata per entry
+- is projected from `index_v2` WAL changes into compacted namespace snapshots
+- projects asynchronously and coalesces repeated mutations per fragment
+- can be rebuilt from `index_v2`
+
+It is performance-critical, but not correctness-critical.
+
+### Blob plane
+
+The blob plane stores payload shards on raw devices:
+
+- RS-encoded data + parity shards
+- deterministic placement
+- degraded reads via reconstruction
+- background repair and redistribution
 
 ---
 
 ## On-disk layout
 
-> Exact constants and suffixes come from your code:
-> - `METADATA_EXT` (final object metadata file extension)
-> - `PART_META_SUFFIX` (per-part metadata extension)
-> - `SHARD_SUFFIX` and `PARITY_SUFFIX` for shard file types
-> - `SESSION_MANIFEST_FILE`, `RESERVATION_FILE` in the session dir
+### `index_v2` partitions
 
-Your **ObjectPathManager** defines the precise directories, but the *shape* is:
+The authoritative metadata shape is:
 
-### Index (metadata mirrors)
-
-Finalized object metadata is stored as replicated files under the fragment index:
-
-```
-{INDEX_ROOT}/{fragment}/index/objects/{h1}/{h2}/{hash}#{version_id}{METADATA_EXT}
-```
-
-- `hash = sha256(object_key)`
-- `h1 = hash[0..2]`, `h2 = hash[2..4]`
-- multiple `{INDEX_ROOT}` contain independent replicas
-
-### Upload sessions
-
-Uploads create a session directory for resumability:
-
-```
-{INDEX_ROOT}/{fragment}/index/sessions/{version_id}/
-  {SESSION_MANIFEST_FILE}
-  {RESERVATION_FILE}
-  part_{p}{PART_META_SUFFIX}
+```text
+{INDEX_ROOT}/{fragment}/index_v2/partitions/{partition_id}/
+  wal/manifest.msgpack
+  wal/segments/{segment_id}.wal
+  checkpoints/latest.msgpack
+  sessions/
+    {version_id}.session.msgpack
+  objects/{hh}/{object_key_sha256}/
+    latest.latest.msgpack
+    {version_id}.msgpack
+  trash/{hh}/{object_key_sha256}/
+    latest.latest.msgpack
+    {version_id}.msgpack
 ```
 
-Per-part metadata (`PartMetadata`) is committed locklessly to one healthy index mirror
-(and read across mirrors for resumability/verification).
+Notes:
 
-### Blob (data/parity shards)
+- `partition_id` comes from a stable hash route
+- object and session state are partitioned independently
+- writes target the partition's selected roots, not every index root in the node
+- success requires at least one selected root to persist the update
 
-- `blob_store_disks` points at raw, unformatted device paths such as `/dev/nvme1n1`
-- N1 formats and manages those devices through `block_manager`
-- committed shard metadata stores `raw://<device_id>/<allocation_id>` style addresses instead of
-  depending on shard files under mounted blob directories
+### Prefix namespace index
+
+Prefix-serving state remains under the prefix tree on index disks:
+
+```text
+{INDEX_ROOT}/{fragment}/index/prefix/<version>/<namespace>/{p1}/{p2}/{prefix_hash}/
+  compacted...
+  seg_...
+  delimiter...
+```
+
+These are serving segments only. If they are missing or stale, the node can rebuild them from `index_v2`.
+
+### Blob storage
+
+- `blob_store_disks` point at raw device paths such as `/dev/nvme1n1`
+- committed shard metadata stores `raw://<device_id>/<allocation_id>` addresses
 - startup rejects mounted blob devices and warns on unstable names like `/dev/sdb`
 
 **Deterministic placement rule (typical):**
 
-- choose disk for each shard as: `(part_index + shard_index) % num_disks`
+- choose disk for each shard as `(part_index + shard_index) % num_disks`
 - require at least `data_shards` successful writers for the part to be accepted
 
----
-
 ## Write path (multipart upload)
-
-Uploads are strict and crash-safe. A part is not considered uploaded unless it passes verification
-and is committed into durable raw extents.
 
 ### 1) Initiate upload
 
 Initiate does:
 
-- validate auth scopes to fragment
-- reserve quota for the fragment (session receipt)
+- validate fragment scope
+- reserve quota
 - create `version_id` and `session_id`
-- write session manifest to index mirrors (best-effort replication)
+- open authoritative session state in `index_v2`
 
-### 2) Upload part (strict commit discipline)
+At this point no object version is visible.
 
-This is the critical part.
+### 2) Upload part (payload first, metadata second)
 
-**Goal:** all final shard filenames are stable and referenced by metadata. Temp names never leak into `PartMetadata`.
+Part upload remains strict and payload-first:
 
-#### Step A — Write to temp attempt files
+1. stream request bytes through the RS encoder
+2. write and verify shard payloads
+3. commit shard payloads into raw blob extents
+4. build `PartMetadata`
+5. update the session's authoritative `index_v2` state with the committed part
 
-For each shard (data + parity), the writer opens:
+This keeps raw payload durability separate from namespace visibility.
 
-```
-part_{p}_shard_{i}{ext}.tmp.<attempt>
-```
+### 3) Finalize upload (publish into `index_v2`)
 
-- `<attempt>` is a ULID
-- `ext` is `SHARD_SUFFIX` for data shards and `PARITY_SUFFIX` for parity shards
+Finalization is the publish step:
 
-Temp files allow safe re-tries and ensure that incomplete work is never treated as committed data.
+- load the authoritative session state
+- verify all expected parts exist
+- build immutable `ObjectMetadata`
+- write the object version and latest marker to the selected object-partition roots
+- append the partition WAL record
 
-#### Step B — Stream encode + write (Reed–Solomon)
-
-- N1 streams request bytes directly into an RS encoder
-- stripes are produced at `block_size` (a.k.a. `stripe_size_bytes`)
-- each stripe produces `data_shards` blocks and `parity_shards` blocks
-- blocks are written to each shard writer
-
-#### Step C — Finalize: length, padding, checksum
-
-At end of stream:
-
-- pad the last stripe with zeros so RS geometry is consistent
-- ensure all shard outputs reach the computed `final_shard_len`
-- optionally validate the overall checksum (`crc32`) against `UploadPartQuery.checksum`
-- compute per-shard checksums for repair verification
-
-#### Step D — Commit to the raw blob backend
-
-After successful write/verify, each shard is committed to its target raw device:
-
-```
-part_{p}_shard_{i}{ext}.stage.<attempt>  -->  raw://<device_id>/<allocation_id>
-```
-
-Commit rules:
-
-1. stage the encoded shard under the filesystem-backed raw staging area
-2. allocate a raw extent on the target blob device
-3. copy the staged shard into that extent through `O_DIRECT`
-4. flush the raw device and store the raw extent address in metadata
-5. only committed raw extent addresses may be referenced by metadata
-
-If backend commit fails on a disk, treat that shard as failed and fail the part if you fall below write quorum.
-
-#### Step E — Persist PartMetadata using stable filenames
-
-Only after commit succeeds do we write `PartMetadata`.
-
-**PartMetadata must store stable names:**
-- `ShardInfo.file_name` remains the logical shard name `part_{p}_shard_{i}{ext}`
-- `ShardInfo.absolute_path` stores a debug-only raw address path
-- `ShardInfo.raw_blob_address` stores the authoritative raw extent address
-- `ShardInfo.checksum` is recorded for integrity checks during repair/recovery
-
-The commit pattern is:
-
-- commit raw blob addresses
-- then commit per-part metadata (`part_{p}{PART_META_SUFFIX}`)
-
-### 3) Finalize upload (publish a version)
-
-Finalization is a publish step:
-
-- verify all expected parts exist by reading `PartMetadata` across index mirrors
-- build `ObjectMetadata` with the full parts + shard maps
-- write final object metadata to index mirrors via atomic write + rename + dir sync
-
-Only after metadata is durable does the version become visible to reads/list.
+After this, exact-key reads are visible. Prefix listing is serving state layered on top of that publish.
 
 ---
 
 ## Crash matrix (what can exist on disk)
 
-This is the mental model N1 is built around.
+This is the mental model N1 is built around now.
 
-### Crash during part upload (before commit)
+### Crash during part upload (before session part commit)
+
 You may see:
 
-- staged temporary raw shard files under the raw staging area
+- staged or committed raw extents
+- no committed part in session state
 
-**But you must not**:
-- reference these in `PartMetadata`
-- treat the part as uploaded
+The part is not complete because authoritative session metadata does not claim it.
 
-Repair/GC can later clean these temp attempts.
+### Crash after session part commit but before finalize
 
-### Crash after backend commit but before PartMetadata
 You may see:
 
-- committed raw extent addresses exist
-- no `part_{p}{PART_META_SUFFIX}`
+- committed raw extents
+- committed part state in `index_v2`
+- no published object version
 
-Finalization will not include that part, because metadata doesn’t claim it.
-A re-upload can detect committed shard state and either reuse (if supported) or overwrite via a new attempt.
+This is safe and resumable. Finalize can be retried.
 
-### Crash after PartMetadata but before final object metadata
+### Crash after version publish but before prefix state catches up
+
 You may see:
 
-- committed blob addresses exist
-- part metadata exists
-- object metadata for the version does not exist
+- published object state in `index_v2`
+- stale or missing prefix rows
 
-This is safe and resumable: finalize can be retried until publish succeeds.
-
-### Crash after final object metadata
-The version is fully committed and immutable. Reads must succeed (possibly degraded) as long as quorum exists.
+`GET` and `HEAD` are still correct. `LIST` can use existing namespace rows or fall back to authoritative `index_v2` state and rebuild.
 
 ---
 
-## Read path (stream + range reads)
+## Read path (exact key and list)
 
-Reads are optimized for long sequential streaming and range access.
+Exact-key reads are driven by `index_v2`:
 
-1. resolve metadata (latest or requested version) from index mirrors
-2. map requested range → (part, stripe index, shard index, file offset)
-3. read shard chunks directly from disk
-4. if a shard is missing/corrupt:
-   - reconstruct bytes using Reed–Solomon decode
-   - optionally schedule background repair to regenerate the missing shard
+1. resolve the latest or requested version from the object's partition
+2. map the requested range onto parts and shard extents
+3. read shard chunks directly from raw blob devices
+4. reconstruct missing data when parity allows
+
+Prefix and delimiter listing use the prefix namespace index first. If prefix projection is still pending, or if prefix-serving state is missing or insufficient, the node falls back to authoritative `index_v2` scans for the requested prefix rather than a legacy mirrored object tree.
 
 ---
 
@@ -409,74 +378,105 @@ Reads are optimized for long sequential streaming and range access.
 
 ### Write quorum
 
-A part upload requires at minimum:
+A part upload still requires at minimum:
 
-- `data_shards` successful writers (healthy disks)
+- `data_shards` successful payload writers
 
 If fewer than `data_shards` shards can be written and committed, the part upload fails.
 
-Parity improves survivability:
+For authoritative metadata:
 
-- with `parity_shards > 0`, N1 can tolerate missing/corrupt shards up to `parity_shards` (for reads/repair)
+- `index_v2` writes target the selected owner/replica roots for that partition
+- success requires at least one selected root to durably record the update
 
-### Immutability and visibility
+### Visibility and list behavior
 
-A version becomes visible only after:
+A version becomes exact-key visible only after:
 
-- stable shard commit (rename + dir sync)
-- part metadata commit
-- final object metadata publish (atomic write + rename + dir sync)
+- raw shard commit succeeds
+- session part state is committed
+- `index_v2` publishes the object version
 
-This prevents partial visibility.
+Prefix visibility is intentionally softer:
+
+- prefix rows are serving state
+- they may lag or be rebuilt
+- they must never invent visibility that `index_v2` does not contain
+
+### Authority rules
+
+- Upload recency is defined by the session manifest's `created_at`, not by when finalize returns.
+- If two versions land in the same second-level timestamp bucket, ULID `version_id` order breaks the tie.
+- Publish only advances the latest marker when the candidate is actually newer; a stale finalize must not demote the visible version.
+- Exact-key reads resolve the latest marker and then rehydrate the referenced immutable version record before serving metadata or bytes.
+- Prefix rows are derived serving state only; if they are pending, missing, or stale, `LIST` falls back to authoritative `index_v2` scans for the requested prefix.
 
 ---
 
 ## Maintenance jobs
 
-### Repair (index + blob)
+### Repair (authoritative metadata + blob)
 
-Repair is a metadata-and-raw-blob reconciliation job:
+Repair now reconciles from `index_v2`:
 
-- **Index repair:** reconcile missing/divergent object metadata replicas across index roots
-- **Shard verification:** availability checks (size) or checksum scrub mode
-- **Shard repair:** reconstruct missing/corrupt shards from remaining shards (bounded concurrency)
-- **Commit discipline:** repair writes to staged files, commits into raw extents, then updates metadata
+- heal missing or stale partition replicas
+- verify shard availability or checksum
+- reconstruct missing or corrupt payloads
+- republish repaired metadata through authoritative state
 
 ### Recovery runtime (background heal)
 
-Reads can degrade gracefully. When a shard is missing/corrupt:
+Reads can degrade gracefully. When a shard is missing or corrupt:
 
-- serve the requested bytes by reconstructing them
-- schedule a background `repair_entire_shard()` on a dedicated runtime
-- the repair writer stages a shard, writes reconstructed stripes, then commits into a new raw extent
-
-This keeps streaming fast while repairs happen out-of-band.
+- serve bytes by reconstructing them
+- schedule background shard repair
+- commit repaired payload to a new raw extent
+- preserve authoritative metadata through `index_v2`
 
 ### Redistribution
 
-Redistribution moves shards to new placement rules without interrupting CRUD:
+Redistribution moves payloads to new blob placement without interrupting CRUD:
 
-- read from existing layout (recover if needed)
-- write to a new target raw extent
-- publish updated metadata
-- mark old raw extents for later GC
+- read from current placement
+- write to new raw extents
+- republish shard addresses through `index_v2`
+- leave old extents for later GC
 
 ### Garbage collection and trash
 
-N1 favors safety:
+N1 still favors safety:
 
-- deletes are represented safely (trash markers / soft delete)
-- destructive deletion is handled by GC, not the hot path
-- temp attempts (`*.tmp.<attempt>`) are safe to GC because they are never canonical
+- delete moves versions into trash state
+- destructive deletion is handled by GC
+- abandoned sessions are cleaned through `index_v2`
+- raw payload without authoritative metadata is cleanup candidate data
 
 ### Raw blob operations
 
-- `GET /v4/maintenance/blob/raw/status` reports raw blob device state and allocator usage
-- `POST /v4/maintenance/scrub/start`
-- `POST /v4/maintenance/scrub/stop`
-- `GET /v4/maintenance/scrub/status`
+- `GET /v4/maintenance/blob/raw/status` reports device and allocator state
+- scrub verifies committed raw payload
+- raw blob maintenance remains orthogonal to metadata authority
 
-Scrub runs the repair engine in checksum-verification mode across committed raw shards.
+---
+
+## Why `index_v2` is future-proof
+
+The legacy mirrored tree was safe, but it scaled badly because every publish and every maintenance path wanted to touch the same whole-node metadata surface. `index_v2` is more future-proof because:
+
+1. It bounds write fanout.
+   Metadata writes hit the owning partition roots, not every index disk.
+
+2. It separates correctness from acceleration.
+   Exact-key truth lives in `index_v2`; prefix listing is a derived serving layer.
+
+3. It gives maintenance one source of truth.
+   Repair, GC, sync, archive prefix resolution, and rebuild all converge on the same authority.
+
+4. It provides a clean evolution path.
+   The current segmented WAL plus partition checkpoints already provide a clean base for stronger replay, compaction, and replica-repair behavior without another semantic rewrite.
+
+5. It composes into N2 cleanly.
+   N2 can remain distributed at the cluster layer while inheriting a cheaper and clearer node-local authority model.
 
 ---
 
@@ -484,39 +484,32 @@ Scrub runs the repair engine in checksum-verification mode across committed raw 
 
 ### Linux-first + O_DIRECT
 
-N1 is Linux-first and uses `O_DIRECT` on the blob data path for predictable latency and reduced
-page-cache pressure. This applies to both:
+N1 is Linux-first and uses `O_DIRECT` on the blob data path for predictable latency and reduced page-cache pressure.
 
-- filesystem-backed blob shard files
+This applies to:
+
+- filesystem-backed staging where needed
 - raw blob devices managed directly by `block_manager`
 
-Metadata, quota, prefix indexes, and other control files remain filesystem-backed and buffered by design.
-
-Implications:
-
-- writes should be aligned (e.g., 4096 bytes)
-- your `AlignedBuffer` exists specifically for this
-- direct I/O failures must be treated as disk health failures (writer disabled)
+Metadata, quota state, `index_v2`, and prefix-serving files remain filesystem-backed and buffered by design.
 
 ### Preallocation
 
-Shard files are often preallocated via `set_len(final_shard_len)`:
+Shard payloads are often preallocated to:
 
-- reduces fragmentation
-- makes failure modes clearer
-- enforces deterministic shard size expectations for availability checks
+- reduce fragmentation
+- make failure modes clearer
+- enforce deterministic shard-size expectations
 
 ### Directory sync
 
-Durable commit requires syncing the directory entry after rename:
+Durable metadata publish still relies on atomic file replace plus directory sync:
 
 - `fsync(file)`
 - `rename(tmp, stable)`
-- `fsync(parent_dir)` (or platform equivalent)
+- `fsync(parent_dir)`
 
-This is why `sync_dir()` exists. Without it, rename can be lost after power loss even if the file contents were flushed.
-
----
+That discipline is now applied to partition state rather than a whole mirrored metadata tree.
 
 ## N1 CLI Functions
 
@@ -703,8 +696,8 @@ These are the non-negotiables for correctness:
 
 1. **No temp filenames in committed metadata**
    - `PartMetadata` must reference stable shard names only
-2. **Stable shard commit before part metadata commit**
-3. **Final object metadata publish is the only visibility gate**
+2. **Stable shard commit before session part state commit**
+3. **`index_v2` publish is the only exact-key visibility gate**
 4. **Never mutate committed shards in place**
 5. **Every commit uses rename + directory sync**
 6. **Write quorum must hold**
@@ -721,8 +714,8 @@ These are the non-negotiables for correctness:
 - **version_id**: immutable identifier of a committed object version
 - **session_id**: upload session identifier for resumability
 - **part**: multipart chunk with shard map
-- **shard**: one data/parity file on disk
-- **data_shards / parity_shards**: Reed–Solomon parameters
+- **shard**: one data/parity extent on blob storage
+- **data_shards / parity_shards**: Reed-Solomon parameters
 - **stripe_size_bytes**: block size used per shard per stripe
 
 ---

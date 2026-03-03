@@ -19,16 +19,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_tar::{Builder as TarBuilder, Header as TarHeader};
-use walkdir::WalkDir;
 
 use crate::{
     enums::app_error_enum::AppError,
-    n1_core::constants::{METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, RESERVATION_FILE},
     n1_core::disk_manager::{
-        DownloadArchiveRequest, ListObjectsResult, ObjectMetadata, ObjectPathManager,
-        ObjectSummary, PartMetadata,
+        DownloadArchiveRequest, ListObjectsResult, ObjectMetadata, ObjectPathManager, PartMetadata,
+        version_recency_is_newer,
     },
     n1_core::{
+        index_v2,
         metadata_parser::get_metadata,
         object_parser::{data_shards_count, shard_dir_with_locality_hint, shard_dirs_for_version},
         recovery::{ShardFileCache, ShardRepairContext, read_or_recover_chunk_into},
@@ -256,9 +255,12 @@ async fn resolve_keys_from_prefix_index(
                                     latest.insert(ck, (e.version_id.clone(), e.created_at));
                                 }
                                 Some((cur_vid, cur_ts)) => {
-                                    if e.created_at > *cur_ts
-                                        || (e.created_at == *cur_ts && e.version_id > *cur_vid)
-                                    {
+                                    if version_recency_is_newer(
+                                        e.created_at,
+                                        &e.version_id,
+                                        *cur_ts,
+                                        cur_vid,
+                                    ) {
                                         latest.insert(ck, (e.version_id.clone(), e.created_at));
                                     }
                                 }
@@ -309,9 +311,12 @@ async fn resolve_keys_from_prefix_index(
                                 latest.insert(ck, (e.version_id.clone(), e.created_at));
                             }
                             Some((cur_vid, cur_ts)) => {
-                                if e.created_at > *cur_ts
-                                    || (e.created_at == *cur_ts && e.version_id > *cur_vid)
-                                {
+                                if version_recency_is_newer(
+                                    e.created_at,
+                                    &e.version_id,
+                                    *cur_ts,
+                                    cur_vid,
+                                ) {
                                     latest.insert(ck, (e.version_id.clone(), e.created_at));
                                 }
                             }
@@ -353,60 +358,20 @@ async fn resolve_keys_from_prefix_scan(
     delimiter: Option<&str>,
     max_keys: usize,
 ) -> Result<Vec<String>, AppError> {
-    let path_manager = ObjectPathManager::new();
-    let index_roots = path_manager.get_all_index_roots();
-    let mut latest: HashMap<String, (String, i64)> = HashMap::new();
-
-    for root in index_roots {
-        let idx = root.join(fragment).join("index");
-        if !tokio::fs::try_exists(&idx).await.unwrap_or(false) {
+    let mut keys = Vec::new();
+    for meta in index_v2::list_fragment_objects(fragment).await? {
+        if meta.is_delete_marker {
             continue;
         }
-
-        for entry in WalkDir::new(&idx).into_iter().filter_map(|e| e.ok()) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let p = entry.path();
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.ends_with(METADATA_EXT) {
-                continue;
-            }
-            if name == QUOTA_FILE || name == RESERVATION_FILE || name.ends_with(PART_META_SUFFIX) {
-                continue;
-            }
-
-            let Ok(raw) = std::fs::read(p) else {
-                continue;
-            };
-            let Ok(meta) = rmp_serde::from_slice::<ObjectSummary>(&raw) else {
-                continue;
-            };
-            if meta.fragment != fragment || meta.is_delete_marker {
-                continue;
-            }
-            let ck = canonical_key(&meta.object_key);
-            if !matches_prefix_with_delimiter(&ck, prefix, delimiter) {
-                continue;
-            }
-
-            match latest.get(&ck) {
-                None => {
-                    latest.insert(ck, (meta.version_id, meta.created_at));
-                }
-                Some((cur_vid, cur_ts)) => {
-                    if meta.created_at > *cur_ts
-                        || (meta.created_at == *cur_ts && meta.version_id > *cur_vid)
-                    {
-                        latest.insert(ck, (meta.version_id, meta.created_at));
-                    }
-                }
-            }
+        let ck = canonical_key(&meta.object_key);
+        if !matches_prefix_with_delimiter(&ck, prefix, delimiter) {
+            continue;
         }
+        keys.push(ck);
     }
 
-    let mut keys: Vec<String> = latest.into_keys().collect();
     keys.sort();
+    keys.dedup();
     keys.truncate(max_keys);
     Ok(keys)
 }

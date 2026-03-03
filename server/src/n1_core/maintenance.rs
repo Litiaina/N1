@@ -1,49 +1,37 @@
 use crate::enums::app_error_enum::AppError;
-use crate::n1_core::constants::{METADATA_EXT, QUOTA_FILE};
-use crate::n1_core::disk_manager::{ObjectMetadata, ObjectPathManager};
+use crate::n1_core::disk_manager::ObjectPathManager;
+use crate::n1_core::index_v2;
 use crate::n1_core::quota_manager::set_storage_used;
 use crate::structs::auth_structs::Claims;
 use axum::{http::StatusCode, response::IntoResponse};
 use std::collections::HashSet;
 use tracing::{error, info};
-use walkdir::WalkDir;
 
 async fn perform_quota_sync(fragment: &str) -> Result<u64, AppError> {
     let path_manager = ObjectPathManager::new();
 
-    let index_dirs = path_manager.get_all_index_dirs(fragment);
     let blob_roots = path_manager.get_blob_roots();
     let fragment_owned = fragment.to_string();
+    let mut valid_versions = HashSet::new();
+    let mut total_usage = 0u64;
 
-    let (total_usage, orphans_removed) =
-        tokio::task::spawn_blocking(move || -> Result<(u64, i32), AppError> {
-            let mut valid_versions = HashSet::new();
-            let mut total_usage = 0u64;
+    for meta in index_v2::list_fragment_object_versions(fragment, false).await? {
+        if meta.is_delete_marker || !valid_versions.insert(meta.version_id.clone()) {
+            continue;
+        }
+        total_usage += meta.total_size_bytes;
+    }
+
+    for meta in index_v2::list_fragment_object_versions(fragment, true).await? {
+        if meta.is_delete_marker || !valid_versions.insert(meta.version_id.clone()) {
+            continue;
+        }
+        total_usage += meta.total_size_bytes;
+    }
+
+    let (_valid_versions, orphans_removed) = tokio::task::spawn_blocking(
+        move || -> Result<(HashSet<String>, i32), AppError> {
             let mut orphans_count = 0;
-
-            for index_dir in &index_dirs {
-                if !index_dir.exists() {
-                    continue;
-                }
-
-                for entry in WalkDir::new(index_dir).into_iter().filter_map(|e| e.ok()) {
-                    if entry.file_type().is_file() {
-                        let filename = entry.file_name().to_string_lossy();
-                        if filename.ends_with(METADATA_EXT) && filename != QUOTA_FILE {
-                            if let Ok(data) = std::fs::read(entry.path()) {
-                                if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
-                                    if !valid_versions.contains(&meta.version_id) {
-                                        if !meta.is_delete_marker {
-                                            total_usage += meta.total_size_bytes;
-                                        }
-                                        valid_versions.insert(meta.version_id);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
 
             for root in blob_roots {
                 let blob_root = root.join(&fragment_owned).join("blob");
@@ -72,10 +60,11 @@ async fn perform_quota_sync(fragment: &str) -> Result<u64, AppError> {
                 }
             }
 
-            Ok((total_usage, orphans_count))
-        })
-        .await
-        .map_err(|e| AppError::InternalServerError(format!("Sync task failed: {}", e)))??;
+            Ok((valid_versions, orphans_count))
+        },
+    )
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("Sync task failed: {}", e)))??;
 
     if orphans_removed > 0 {
         info!(

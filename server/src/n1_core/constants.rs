@@ -1,10 +1,6 @@
-pub const PART_META_SUFFIX: &str = ".meta.msgpack";
 pub const SHARD_SUFFIX: &str = ".shard";
 pub const PARITY_SUFFIX: &str = ".parity";
 pub const QUOTA_FILE: &str = "quota.msgpack";
-pub const RESERVATION_FILE: &str = "reservation.msgpack";
-pub const SESSION_MANIFEST_FILE: &str = "session.manifest.msgpack";
-pub const METADATA_EXT: &str = ".msgpack";
 pub const PREFIX_INDEX_DIR: &str = "__p__";
 pub const PREFIX_INDEX_VERSION: &str = "v1";
 pub const PREFIX_INDEX_NAMESPACE: &str = "pfx";

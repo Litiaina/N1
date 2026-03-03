@@ -2,10 +2,11 @@ use crate::enums::app_error_enum::AppError;
 use crate::fs::cleanup_manager::start_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::n1_core::blob_store::{RawGcMarker, free_raw_address, free_raw_shards_for_metadata};
-use crate::n1_core::constants::{GC_SUFFIX, METADATA_EXT, QUOTA_FILE, RESERVATION_FILE};
+use crate::n1_core::constants::GC_SUFFIX;
 use crate::n1_core::disk_manager::{
-    ObjectMetadata, ObjectPathManager, ReservationReceipt, configured_fs_storage_root,
+    ObjectMetadata, ObjectPathManager, configured_fs_storage_root,
 };
+use crate::n1_core::index_v2;
 use crate::n1_core::quota_manager::update_quota;
 use crate::n1_core::sync::sync_single_fragment_quota;
 use crate::routes::storage_routes::AppState;
@@ -200,6 +201,23 @@ fn get_trash_root(disk_root: &std::path::Path, fragment_hash: &str) -> PathBuf {
     disk_root.join(fragment_hash).join(".trash")
 }
 
+async fn latest_existing_mtime(paths: &[PathBuf]) -> Option<SystemTime> {
+    let mut best: Option<SystemTime> = None;
+    for path in paths {
+        let Ok(metadata) = tokio::fs::metadata(path).await else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        best = Some(match best {
+            Some(current) => current.max(modified),
+            None => modified,
+        });
+    }
+    best
+}
+
 #[cfg(unix)]
 fn gc_cleanup_version_dir_unix(
     version_dir: &Path,
@@ -323,7 +341,7 @@ fn gc_cleanup_version_dir_unix(
 async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
     let index_roots = path_manager.get_all_index_roots();
-    let blob_roots: Vec<PathBuf> = Vec::new();
+    let blob_roots = path_manager.get_blob_roots();
 
     let mut fragments = HashSet::new();
     for root in &index_roots {
@@ -421,27 +439,12 @@ async fn process_fragment_gc(
         (crate::n1_core::disk_manager::RawBlobAddress, Vec<PathBuf>),
     > = HashMap::new();
 
-    for root in index_roots {
-        let index_dir = root.join(fragment).join("index");
-        if !index_dir.exists() {
-            continue;
-        }
-
-        for entry in WalkDir::new(&index_dir).into_iter().filter_map(|e| e.ok()) {
-            if entry.file_type().is_file() {
-                let fname = entry.file_name().to_string_lossy();
-                if fname.ends_with(METADATA_EXT) && fname != QUOTA_FILE && fname != RESERVATION_FILE
-                {
-                    if let Some((_, rest)) = fname.split_once('#') {
-                        if let Some(ver) = rest.strip_suffix(METADATA_EXT) {
-                            live_versions.insert(ver.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        if !live_versions.is_empty() {
-            break;
+    for meta in index_v2::list_fragment_object_versions(fragment, false)
+        .await
+        .unwrap_or_default()
+    {
+        if !meta.is_delete_marker {
+            live_versions.insert(meta.version_id);
         }
     }
     stats.live_versions_seen = live_versions.len() as u64;
@@ -491,64 +494,34 @@ async fn process_fragment_gc(
         }
     }
 
-    for root in index_roots {
-        let trash_index = get_trash_root(root, fragment).join("index");
-        if !trash_index.exists() {
+    for meta in index_v2::list_fragment_object_versions(fragment, true)
+        .await
+        .unwrap_or_default()
+    {
+        let Some(modified) = latest_existing_mtime(
+            &index_v2::get_object_version_paths(fragment, &meta.object_key, &meta.version_id, true)
+                .unwrap_or_default(),
+        )
+        .await
+        else {
             continue;
-        }
+        };
+        let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+        let should_expire = age > retention || is_manual_run;
 
-        for entry in WalkDir::new(&trash_index)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if entry.file_type().is_file()
-                && entry.file_name().to_string_lossy().ends_with(METADATA_EXT)
-            {
-                let fname = entry.file_name().to_string_lossy().to_string();
-
-                let modified = entry
-                    .metadata()
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .unwrap_or(now);
-                let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
-
-                let should_expire = age > retention || is_manual_run;
-
-                let mut ver_id = String::new();
-                if let Some((_, rest)) = fname.split_once('#') {
-                    if let Some(ver) = rest.strip_suffix(METADATA_EXT) {
-                        ver_id = ver.to_string();
-                    }
-                }
-
-                if ver_id.is_empty() {
-                    continue;
-                }
-
-                if should_expire {
-                    if let Ok(data) = std::fs::read(entry.path()) {
-                        if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
-                            if !expired_versions.contains(&ver_id) {
-                                expired_trash_refund += meta.total_size_bytes;
-                                expired_versions.insert(ver_id.clone());
-                            }
-                            if meta.parts.iter().any(|part| {
-                                part.shards
-                                    .iter()
-                                    .any(|shard| shard.raw_blob_address.is_some())
-                            }) {
-                                expired_raw_metas.push(meta);
-                            }
-                        }
-                    }
-                } else {
-                    trash_versions.insert(ver_id);
+        if should_expire {
+            if expired_versions.insert(meta.version_id.clone()) {
+                expired_trash_refund += meta.total_size_bytes;
+                if meta.parts.iter().any(|part| {
+                    part.shards
+                        .iter()
+                        .any(|shard| shard.raw_blob_address.is_some())
+                }) {
+                    expired_raw_metas.push(meta);
                 }
             }
-        }
-        if !expired_versions.is_empty() || !trash_versions.is_empty() {
-            break;
+        } else {
+            trash_versions.insert(meta.version_id);
         }
     }
 
@@ -577,28 +550,23 @@ async fn process_fragment_gc(
     }
 
     if !expired_versions.is_empty() {
+        for meta in index_v2::list_fragment_object_versions(fragment, true)
+            .await
+            .unwrap_or_default()
+        {
+            if !expired_versions.contains(&meta.version_id) {
+                continue;
+            }
+            let _ = index_v2::delete_trashed_object_version(fragment, &meta.object_key, &meta.version_id)
+                .await;
+        }
+
         let tasks = index_roots.iter().chain(blob_roots.iter()).map(|root| {
             let frag = fragment.to_string();
             let expired = expired_versions.clone();
             let root_path = root.clone();
 
             tokio::task::spawn_blocking(move || {
-                let trash_idx = get_trash_root(&root_path, &frag).join("index");
-                if trash_idx.exists() {
-                    for entry in WalkDir::new(&trash_idx).into_iter().filter_map(|e| e.ok()) {
-                        let fname = entry.file_name().to_string_lossy();
-                        if fname.ends_with(METADATA_EXT) {
-                            if let Some((_, rest)) = fname.split_once('#') {
-                                if let Some(ver) = rest.strip_suffix(METADATA_EXT) {
-                                    if expired.contains(ver) {
-                                        let _ = std::fs::remove_file(entry.path());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
                 let trash_blob_root = get_trash_root(&root_path, &frag).join("blob");
                 for ver in &expired {
                     let p = trash_blob_root.join(ver);
@@ -614,51 +582,18 @@ async fn process_fragment_gc(
     let mut sessions_to_delete = HashSet::new();
     let mut session_amounts: HashMap<String, u64> = HashMap::new();
 
-    for root in index_roots {
-        let session_root = root.join(fragment).join("index").join("sessions");
-        if !session_root.exists() {
-            continue;
-        }
+    for session in index_v2::list_active_sessions(fragment).await.unwrap_or_default() {
+        let version_id = session.manifest.version_id.clone();
+        let modified = latest_existing_mtime(
+            &index_v2::get_session_state_paths(fragment, &version_id).unwrap_or_default(),
+        )
+        .await
+        .unwrap_or(now);
 
-        if let Ok(entries) = std::fs::read_dir(&session_root) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-
-                let session_id = entry.file_name().to_string_lossy().to_string();
-
-                if sessions_to_delete.contains(&session_id) {
-                    if !session_amounts.contains_key(&session_id) {
-                        let res_file = path.join(RESERVATION_FILE);
-                        if let Ok(data) = std::fs::read(&res_file) {
-                            if let Ok(receipt) = rmp_serde::from_slice::<ReservationReceipt>(&data)
-                            {
-                                session_amounts.insert(session_id.clone(), receipt.amount);
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                let modified = fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .unwrap_or(now);
-
-                if now.duration_since(modified).unwrap_or(Duration::ZERO) > file_ttl {
-                    sessions_to_delete.insert(session_id.clone());
-
-                    let res_file = path.join(RESERVATION_FILE);
-                    if res_file.exists() {
-                        if let Ok(data) = std::fs::read(&res_file) {
-                            if let Ok(receipt) = rmp_serde::from_slice::<ReservationReceipt>(&data)
-                            {
-                                session_amounts.insert(session_id, receipt.amount);
-                            }
-                        }
-                    }
-                }
+        if now.duration_since(modified).unwrap_or(Duration::ZERO) > file_ttl {
+            sessions_to_delete.insert(version_id.clone());
+            if let Some(receipt) = session.reservation {
+                session_amounts.insert(version_id, receipt.amount);
             }
         }
     }
@@ -677,17 +612,8 @@ async fn process_fragment_gc(
     stats.refund_bytes += total_session_refund;
     stats.sessions_deleted += sessions_to_delete.len() as u64;
 
-    for root in index_roots {
-        for sess_id in &sessions_to_delete {
-            let p = root
-                .join(fragment)
-                .join("index")
-                .join("sessions")
-                .join(sess_id);
-            if p.exists() {
-                let _ = std::fs::remove_dir_all(p);
-            }
-        }
+    for version_id in &sessions_to_delete {
+        let _ = index_v2::remove_session(fragment, version_id, "gc-expired").await;
     }
 
     for root in blob_roots {

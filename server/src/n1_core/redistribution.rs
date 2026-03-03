@@ -4,15 +4,14 @@ use crate::n1_core::blob_store::{
     free_raw_address, open_raw_direct_io, raw_blob_debug_path, raw_stage_path_for_shard,
     resolve_blob_disk_path, stable_shard_file_name, verify_shard_checksum, write_raw_gc_markers,
 };
-use crate::n1_core::constants::{
-    GC_SUFFIX, METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, RESERVATION_FILE,
-};
+use crate::n1_core::constants::{GC_SUFFIX, QUOTA_FILE};
 use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, PartMetadata, Quota, ShardInfo,
     configured_index_store_disks, default_stripe_size,
 };
 use crate::n1_core::ec::ErasureStreamWriter;
 use crate::n1_core::fragment_metadata::{read_fragment_metadata, write_fragment_metadata};
+use crate::n1_core::index_v2;
 use crate::n1_core::operation_gate::acquire_read_only_fast_mode;
 use crate::n1_core::prefix_rebuilder::run_prefix_rebuild_job;
 use crate::n1_core::recovery::{ShardFileCache, ShardRepairContext, read_or_recover_chunk_into};
@@ -36,7 +35,6 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -46,7 +44,6 @@ use tokio::fs as tokio_fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, info, warn};
 use ulid::Ulid;
-use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct RedistributionJobStatus {
@@ -498,46 +495,14 @@ async fn replicate_quota_best_effort(fragment_hash: &str, index_roots: &[PathBuf
 }
 
 fn get_all_metadata_paths_custom(
-    index_roots: &[PathBuf],
+    _index_roots: &[PathBuf],
     fragment_hash: &str,
     object_key: &str,
     version_id: &str,
     is_trash: bool,
 ) -> Vec<PathBuf> {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(object_key.as_bytes());
-    let key_hash = hex::encode(hasher.finalize());
-
-    let shard1 = &key_hash[0..2];
-    let shard2 = &key_hash[2..4];
-    let shard3 = &key_hash[4..6];
-    let shard4 = &key_hash[6..8];
-    let filename = format!("{}#{}{}", key_hash, version_id, METADATA_EXT);
-
-    index_roots
-        .iter()
-        .map(|root| {
-            if is_trash {
-                root.join(fragment_hash)
-                    .join(".trash")
-                    .join("index")
-                    .join(shard1)
-                    .join(shard2)
-                    .join(shard3)
-                    .join(shard4)
-                    .join(&filename)
-            } else {
-                root.join(fragment_hash)
-                    .join("index")
-                    .join(shard1)
-                    .join(shard2)
-                    .join(shard3)
-                    .join(shard4)
-                    .join(&filename)
-            }
-        })
-        .collect()
+    index_v2::get_object_version_paths(fragment_hash, object_key, version_id, is_trash)
+        .unwrap_or_default()
 }
 
 async fn reachable_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
@@ -656,17 +621,6 @@ async fn stage_old_shard_gc_with_symlink(old_abs: &str) -> Result<(), AppError> 
 #[cfg(not(unix))]
 async fn stage_old_shard_gc_with_symlink(_old_abs: &str) -> Result<(), AppError> {
     Ok(())
-}
-
-fn dedupe_id_from_meta_path(path: &Path, is_trash: bool) -> Option<u64> {
-    let name = path.file_name()?.to_str()?;
-    if !name.ends_with(METADATA_EXT) {
-        return None;
-    }
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    name.hash(&mut h);
-    is_trash.hash(&mut h);
-    Some(h.finish())
 }
 
 async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
@@ -859,46 +813,10 @@ pub async fn run_redistribution_job_with_options(
             ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
         }
 
-        let mut seen_meta_ids: HashSet<u64> = HashSet::new();
-        let scan_targets = vec![("index", false), (".trash/index", true)];
-
-        for (sub_dir, is_trash) in scan_targets {
+        for is_trash in [false, true] {
             if should_stop() {
                 break;
             }
-
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<(PathBuf, bool)>(256);
-
-            let roots = (*live_index).clone();
-            let frag = fragment_hash.clone();
-            let sub = sub_dir.to_string();
-
-            tokio::task::spawn_blocking(move || {
-                for root in roots {
-                    let index_dir = root.join(&frag).join(&sub);
-                    if !index_dir.exists() {
-                        continue;
-                    }
-                    let walker = WalkDir::new(index_dir).into_iter();
-                    for entry in walker.filter_map(|e| e.ok()) {
-                        if !entry.file_type().is_file() {
-                            continue;
-                        }
-                        let p = entry.path();
-                        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-                        if name.ends_with(METADATA_EXT)
-                            && !name.ends_with(PART_META_SUFFIX)
-                            && name != QUOTA_FILE
-                            && name != RESERVATION_FILE
-                        {
-                            if tx.blocking_send((p.to_path_buf(), is_trash)).is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            });
 
             let mut delta = StatusDelta {
                 scanned: 0,
@@ -910,26 +828,22 @@ pub async fn run_redistribution_job_with_options(
             };
             let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
 
-            while let Some((meta_path, is_trash_flag)) = rx.recv().await {
+            let metas = match index_v2::list_fragment_object_versions(&fragment_hash, is_trash).await
+            {
+                Ok(metas) => metas,
+                Err(e) => {
+                    warn!(
+                        "Redistribution metadata scan failed for fragment {} trash={}: {}",
+                        fragment_hash, is_trash, e
+                    );
+                    continue;
+                }
+            };
+
+            for meta in metas {
                 if should_stop() {
                     break;
                 }
-
-                if let Some(id) = dedupe_id_from_meta_path(&meta_path, is_trash_flag) {
-                    if !seen_meta_ids.insert(id) {
-                        continue;
-                    }
-                }
-
-                let raw = match tokio_fs::read(&meta_path).await {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                };
-
-                let meta = match rmp_serde::from_slice::<ObjectMetadata>(&raw) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
 
                 if meta.is_delete_marker {
                     continue;
@@ -945,13 +859,13 @@ pub async fn run_redistribution_job_with_options(
                     &meta,
                     target_data_shards,
                     target_parity_shards,
-                    target_stripe_size,
-                    live_blob.len(),
-                    &live_blob,
-                    &live_index,
-                    is_trash_flag,
-                )
-                .await;
+                        target_stripe_size,
+                        live_blob.len(),
+                        &live_blob,
+                        &live_index,
+                        is_trash,
+                    )
+                    .await;
 
                 if !needs {
                     continue;
@@ -959,7 +873,7 @@ pub async fn run_redistribution_job_with_options(
 
                 let object_label = format!(
                     "{}/{} (v:{}) [Trash:{}]",
-                    meta.fragment, meta.object_key, meta.version_id, is_trash_flag
+                    meta.fragment, meta.object_key, meta.version_id, is_trash
                 );
                 delta.needs += 1;
                 delta.last_object = Some(object_label.clone());
@@ -988,13 +902,13 @@ pub async fn run_redistribution_job_with_options(
                         target_stripe_size,
                         &live_blob_for_task,
                         &live_index_for_task,
-                        is_trash_flag,
+                        is_trash,
                         task_strict_durability,
                     )
                     .await
                     {
-                        Ok(_) => Ok((fragment, key, version, is_trash_flag)),
-                        Err(e) => Err((fragment, key, version, is_trash_flag, e.to_string())),
+                        Ok(_) => Ok((fragment, key, version, is_trash)),
+                        Err(e) => Err((fragment, key, version, is_trash, e.to_string())),
                     }
                 });
 
@@ -1638,6 +1552,12 @@ async fn redistribute_object_streaming(
         return Err(AppError::InternalServerError(
             "failed to write metadata to any reachable index root".into(),
         ));
+    }
+
+    if is_trash {
+        index_v2::upsert_trashed_object_version(meta).await?;
+    } else {
+        index_v2::upsert_object_version(meta).await?;
     }
 
     for old in old_shards_for_gc {

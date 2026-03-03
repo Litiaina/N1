@@ -1,13 +1,15 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::constants::{
-    BROWSER_CACHE_MAX_AGE, METADATA_EXT, PREFIX_DELIMITER_COMPACTED_FILE,
-    PREFIX_DELIMITER_SEGMENT_PREFIX, PREFIX_SEGMENT_EXT, QUOTA_FILE,
+    BROWSER_CACHE_MAX_AGE, PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_DELIMITER_SEGMENT_PREFIX,
+    PREFIX_SEGMENT_EXT,
 };
 use crate::n1_core::disk_manager::{
-    ListObjectsResult, ObjectMetadata, ObjectPathManager, ObjectSummary,
-    PrefixDelimiterCompactedSegment, PrefixDelimiterSegment, PrefixIndexSegment, Quota,
+    ListObjectsResult, ObjectMetadata, ObjectPathManager,
+    PrefixDelimiterCompactedSegment, PrefixDelimiterSegment, PrefixIndexEntry, PrefixIndexSegment,
+    Quota, compare_version_recency, version_recency_is_newer,
 };
 use crate::n1_core::fragment_manager::is_fragment_hash;
+use crate::n1_core::index_v2;
 use crate::n1_core::metadata_parser::get_metadata;
 use crate::n1_core::object_parser::{get_object_logic, stream_object_logic};
 use crate::n1_core::quota_manager::get_quota;
@@ -21,11 +23,8 @@ use axum::{
 };
 use base64::Engine;
 use base64::engine::general_purpose;
-use dashmap::DashMap;
-use futures_util::StreamExt;
 use once_cell::sync::OnceCell;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -36,8 +35,8 @@ use tracing::{debug, warn};
 use walkdir::WalkDir;
 
 pub static PREFIX_MAX_DELTA_SEGMENTS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
-static INDEX_ROOT_CURSOR: OnceCell<DashMap<String, AtomicUsize>> = OnceCell::new();
 
+#[cfg(test)]
 #[derive(Default)]
 struct ContinuationCursor {
     root_hint: Option<usize>,
@@ -56,6 +55,7 @@ fn prefix_max_delta_segments() -> usize {
         .clamp(32, 65_536)
 }
 
+#[cfg(test)]
 fn parse_continuation_token(token: &str) -> Option<ContinuationCursor> {
     let bytes = general_purpose::STANDARD.decode(token).ok()?;
     let s = String::from_utf8(bytes).ok()?;
@@ -87,6 +87,7 @@ fn parse_continuation_token(token: &str) -> Option<ContinuationCursor> {
     }
 }
 
+#[cfg(test)]
 fn create_continuation_token(
     shard1: &str,
     shard2: &str,
@@ -139,16 +140,6 @@ fn create_delimiter_continuation_token(row_key: &str) -> String {
     general_purpose::STANDARD.encode(format!("pfxd|{}", row_key))
 }
 
-fn is_hex2(s: &str) -> bool {
-    if s.len() != 2 {
-        return false;
-    }
-    s.as_bytes().iter().all(|b| match b {
-        b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' => true,
-        _ => false,
-    })
-}
-
 fn canonical_prefix(prefix: &str) -> String {
     prefix.trim_matches('/').to_string()
 }
@@ -157,77 +148,41 @@ fn canonical_key(key: &str) -> String {
     key.trim_start_matches('/').to_string()
 }
 
-fn index_root_cursor() -> &'static DashMap<String, AtomicUsize> {
-    INDEX_ROOT_CURSOR.get_or_init(DashMap::new)
-}
-
-fn next_index_root_cursor(key: &str) -> usize {
-    if let Some(entry) = index_root_cursor().get(key) {
-        return entry.value().fetch_add(1, Ordering::Relaxed);
-    }
-    index_root_cursor().insert(key.to_string(), AtomicUsize::new(1));
-    0
-}
-
 async fn read_metadata_best(
-    path_manager: &ObjectPathManager,
+    _path_manager: &ObjectPathManager,
     fragment: &str,
     object_key: &str,
     version_id: &str,
-) -> Option<ObjectSummary> {
-    let paths = path_manager.get_all_metadata_paths(fragment, object_key, version_id);
-
-    let mut best: Option<ObjectSummary> = None;
-
-    for p in paths {
-        if !fs::try_exists(&p).await.unwrap_or(false) {
-            continue;
-        }
-
-        let Ok(data) = fs::read(&p).await else {
-            continue;
-        };
-
-        let Ok(meta) = rmp_serde::from_slice::<ObjectSummary>(&data) else {
-            continue;
-        };
-
-        if meta.fragment != fragment
-            || meta.object_key != object_key
-            || meta.version_id != version_id
-        {
-            continue;
-        }
-
-        match &best {
-            None => best = Some(meta),
-            Some(cur) => {
-                if meta.created_at > cur.created_at
-                    || (meta.created_at == cur.created_at && meta.version_id > cur.version_id)
-                {
-                    best = Some(meta);
-                }
-            }
-        }
-    }
-
-    best
+) -> Option<ObjectMetadata> {
+    index_v2::read_object_version(fragment, object_key, version_id)
+        .await
+        .ok()
 }
 
-fn merge_prefix_latest(
-    latest: &mut HashMap<String, (String, i64, bool)>,
-    object_key: String,
-    version_id: String,
-    created_at: i64,
-    is_delete_marker: bool,
-) {
-    match latest.get(&object_key) {
+async fn read_index_entry_best(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    entry: &PrefixIndexEntry,
+) -> Option<ObjectMetadata> {
+    if let Some(metadata) = entry.to_object_metadata(fragment) {
+        return Some(metadata);
+    }
+    read_metadata_best(path_manager, fragment, &entry.object_key, &entry.version_id).await
+}
+
+fn merge_prefix_latest(latest: &mut HashMap<String, PrefixIndexEntry>, entry: PrefixIndexEntry) {
+    match latest.get(&entry.object_key) {
         None => {
-            latest.insert(object_key, (version_id, created_at, is_delete_marker));
+            latest.insert(entry.object_key.clone(), entry);
         }
-        Some((cur_vid, cur_ts, _)) => {
-            if created_at > *cur_ts || (created_at == *cur_ts && version_id > *cur_vid) {
-                latest.insert(object_key, (version_id, created_at, is_delete_marker));
+        Some(current) => {
+            if version_recency_is_newer(
+                entry.created_at,
+                &entry.version_id,
+                current.created_at,
+                &current.version_id,
+            ) {
+                latest.insert(entry.object_key.clone(), entry);
             }
         }
     }
@@ -250,7 +205,7 @@ async fn try_list_by_prefix_index(
     let want_delim = delimiter == Some("/");
 
     let path_manager = ObjectPathManager::new();
-    let mut latest: HashMap<String, (String, i64, bool)> = HashMap::new();
+    let mut latest: HashMap<String, PrefixIndexEntry> = HashMap::new();
     let mut had_any_index_data = false;
 
     let bucket_dirs = path_manager.get_all_prefix_bucket_dirs(fragment, &pfx);
@@ -270,18 +225,13 @@ async fn try_list_by_prefix_index(
                         compacted_mtime = md.modified().ok();
                     }
                     if canonical_prefix(&seg.prefix) == pfx {
-                        for e in seg.entries {
+                        for mut e in seg.entries {
                             let ck = canonical_key(&e.object_key);
                             if !pfx.is_empty() && ck != pfx && !ck.starts_with(&pfx_with_slash) {
                                 continue;
                             }
-                            merge_prefix_latest(
-                                &mut latest,
-                                ck,
-                                e.version_id,
-                                e.created_at,
-                                e.is_delete_marker,
-                            );
+                            e.object_key = ck;
+                            merge_prefix_latest(&mut latest, e);
                         }
                     }
                 }
@@ -335,20 +285,15 @@ async fn try_list_by_prefix_index(
                     if canonical_prefix(&seg.prefix) != pfx {
                         continue;
                     }
-                    for e in seg.entries {
+                    for mut e in seg.entries {
                         let ck = canonical_key(&e.object_key);
 
                         if !pfx.is_empty() && ck != pfx && !ck.starts_with(&pfx_with_slash) {
                             continue;
                         }
 
-                        merge_prefix_latest(
-                            &mut latest,
-                            ck,
-                            e.version_id,
-                            e.created_at,
-                            e.is_delete_marker,
-                        );
+                        e.object_key = ck;
+                        merge_prefix_latest(&mut latest, e);
                     }
                 }
             }
@@ -367,13 +312,10 @@ async fn try_list_by_prefix_index(
         }));
     }
 
-    let mut entries: Vec<(String, String, bool)> = latest
-        .into_iter()
-        .map(|(k, (v, _, is_delete_marker))| (k, v, is_delete_marker))
-        .collect();
+    let mut entries: Vec<PrefixIndexEntry> = latest.into_values().collect();
 
-    entries.sort_by(|a, b| match a.0.cmp(&b.0) {
-        std::cmp::Ordering::Equal => a.1.cmp(&b.1),
+    entries.sort_by(|a, b| match a.object_key.cmp(&b.object_key) {
+        std::cmp::Ordering::Equal => a.version_id.cmp(&b.version_id),
         other => other,
     });
 
@@ -387,8 +329,8 @@ async fn try_list_by_prefix_index(
     };
 
     let start_idx = if let Some((k, v)) = start_after.as_ref() {
-        match entries.binary_search_by(|(ek, ev, _)| match ek.cmp(k) {
-            std::cmp::Ordering::Equal => ev.cmp(v),
+        match entries.binary_search_by(|entry| match entry.object_key.cmp(k) {
+            std::cmp::Ordering::Equal => entry.version_id.cmp(v),
             other => other,
         }) {
             Ok(i) => i + 1,
@@ -398,46 +340,46 @@ async fn try_list_by_prefix_index(
         0
     };
 
-    let mut out_objects: Vec<ObjectSummary> = Vec::new();
+    let mut out_objects: Vec<ObjectMetadata> = Vec::new();
     let mut out_prefixes: Vec<String> = Vec::new();
     let mut seen_prefixes: HashSet<String> = HashSet::new();
 
     let mut last_pair: Option<(String, String)> = None;
     let mut reached_limit = false;
 
-    for (k, v, is_delete_marker) in entries.into_iter().skip(start_idx) {
+    for entry in entries.into_iter().skip(start_idx) {
         if out_objects.len() + out_prefixes.len() >= limit {
             break;
         }
 
-        if is_delete_marker {
+        if entry.is_delete_marker {
             continue;
         }
 
-        if !include_internal && is_internal_object_key(k.as_str()) {
+        if !include_internal && is_internal_object_key(entry.object_key.as_str()) {
             continue;
         }
 
-        if !pfx.is_empty() && k != pfx && !k.starts_with(&pfx_with_slash) {
+        if !pfx.is_empty() && entry.object_key != pfx && !entry.object_key.starts_with(&pfx_with_slash) {
             continue;
         }
 
         if want_delim {
             let rel = if pfx.is_empty() {
-                k.clone()
-            } else if k == pfx {
-                k.clone()
-            } else if k.len() > pfx.len() + 1 {
-                k[(pfx.len() + 1)..].to_string()
+                entry.object_key.clone()
+            } else if entry.object_key == pfx {
+                entry.object_key.clone()
+            } else if entry.object_key.len() > pfx.len() + 1 {
+                entry.object_key[(pfx.len() + 1)..].to_string()
             } else {
                 String::new()
             };
 
-            if !pfx.is_empty() && k == pfx {
-                let Some(meta) = read_metadata_best(&path_manager, fragment, &k, &v).await else {
+            if !pfx.is_empty() && entry.object_key == pfx {
+                let Some(meta) = read_index_entry_best(&path_manager, fragment, &entry).await else {
                     warn!(
                         "Skipping unreadable prefix-index metadata fragment={} key={} version={}",
-                        fragment, k, v
+                        fragment, entry.object_key, entry.version_id
                     );
                     continue;
                 };
@@ -445,7 +387,7 @@ async fn try_list_by_prefix_index(
                     continue;
                 }
                 out_objects.push(meta);
-                last_pair = Some((k, v));
+                last_pair = Some((entry.object_key.clone(), entry.version_id.clone()));
             } else if let Some((first, _rest)) = rel.split_once('/') {
                 if !first.is_empty() {
                     let folder = if pfx.is_empty() {
@@ -455,14 +397,14 @@ async fn try_list_by_prefix_index(
                     };
                     if seen_prefixes.insert(folder.clone()) {
                         out_prefixes.push(folder);
-                        last_pair = Some((k, v));
+                        last_pair = Some((entry.object_key.clone(), entry.version_id.clone()));
                     }
                 }
             } else {
-                let Some(meta) = read_metadata_best(&path_manager, fragment, &k, &v).await else {
+                let Some(meta) = read_index_entry_best(&path_manager, fragment, &entry).await else {
                     warn!(
                         "Skipping unreadable prefix-index metadata fragment={} key={} version={}",
-                        fragment, k, v
+                        fragment, entry.object_key, entry.version_id
                     );
                     continue;
                 };
@@ -470,13 +412,13 @@ async fn try_list_by_prefix_index(
                     continue;
                 }
                 out_objects.push(meta);
-                last_pair = Some((k, v));
+                last_pair = Some((entry.object_key.clone(), entry.version_id.clone()));
             }
         } else {
-            let Some(meta) = read_metadata_best(&path_manager, fragment, &k, &v).await else {
+            let Some(meta) = read_index_entry_best(&path_manager, fragment, &entry).await else {
                 warn!(
                     "Skipping unreadable prefix-index metadata fragment={} key={} version={}",
-                    fragment, k, v
+                    fragment, entry.object_key, entry.version_id
                 );
                 continue;
             };
@@ -484,7 +426,7 @@ async fn try_list_by_prefix_index(
                 continue;
             }
             out_objects.push(meta);
-            last_pair = Some((k, v));
+            last_pair = Some((entry.object_key.clone(), entry.version_id.clone()));
         }
 
         if out_objects.len() + out_prefixes.len() >= limit {
@@ -502,7 +444,7 @@ async fn try_list_by_prefix_index(
     };
 
     Ok(Some(ListObjectsResult {
-        objects: out_objects.into_iter().map(ObjectMetadata::from).collect(),
+        objects: out_objects,
         common_prefixes: out_prefixes,
         continuation_token: next_token,
     }))
@@ -518,8 +460,7 @@ async fn try_list_by_delimiter_index(
     #[derive(Clone)]
     struct DelimiterRow {
         row_key: String,
-        object_key: Option<String>,
-        version_id: Option<String>,
+        object_entry: Option<PrefixIndexEntry>,
         common_prefix: Option<String>,
     }
 
@@ -584,7 +525,7 @@ async fn try_list_by_delimiter_index(
     compacted_candidates.sort_by(|a, b| b.0.cmp(&a.0));
 
     let mut compacted_mtime = None;
-    let mut direct_latest: HashMap<String, (String, i64, bool)> = HashMap::new();
+    let mut direct_latest: HashMap<String, PrefixIndexEntry> = HashMap::new();
     let mut child_counts: HashMap<String, i64> = HashMap::new();
 
     for (mtime, path) in compacted_candidates {
@@ -599,13 +540,9 @@ async fn try_list_by_delimiter_index(
         }
 
         for entry in seg.object_entries {
-            merge_prefix_latest(
-                &mut direct_latest,
-                canonical_key(&entry.object_key),
-                entry.version_id,
-                entry.created_at,
-                entry.is_delete_marker,
-            );
+            let mut entry = entry;
+            entry.object_key = canonical_key(&entry.object_key);
+            merge_prefix_latest(&mut direct_latest, entry);
         }
         for child in seg.child_entries {
             let common_prefix = child.common_prefix.trim_start_matches('/').to_string();
@@ -675,13 +612,9 @@ async fn try_list_by_delimiter_index(
         }
 
         for entry in seg.object_entries {
-            merge_prefix_latest(
-                &mut direct_latest,
-                canonical_key(&entry.object_key),
-                entry.version_id,
-                entry.created_at,
-                entry.is_delete_marker,
-            );
+            let mut entry = entry;
+            entry.object_key = canonical_key(&entry.object_key);
+            merge_prefix_latest(&mut direct_latest, entry);
         }
         for child_delta in seg.child_deltas {
             let common_prefix = child_delta
@@ -696,17 +629,16 @@ async fn try_list_by_delimiter_index(
     }
 
     let mut rows: Vec<DelimiterRow> = Vec::new();
-    for (object_key, (version_id, _created_at, is_delete_marker)) in direct_latest {
-        if is_delete_marker {
+    for entry in direct_latest.into_values() {
+        if entry.is_delete_marker {
             continue;
         }
-        if !include_internal && is_internal_object_key(&object_key) {
+        if !include_internal && is_internal_object_key(&entry.object_key) {
             continue;
         }
         rows.push(DelimiterRow {
-            row_key: object_key.clone(),
-            object_key: Some(object_key),
-            version_id: Some(version_id),
+            row_key: entry.object_key.clone(),
+            object_entry: Some(entry),
             common_prefix: None,
         });
     }
@@ -720,14 +652,13 @@ async fn try_list_by_delimiter_index(
         }
         rows.push(DelimiterRow {
             row_key: common_prefix.clone(),
-            object_key: None,
-            version_id: None,
+            object_entry: None,
             common_prefix: Some(common_prefix),
         });
     }
 
     rows.sort_by(|a, b| match a.row_key.cmp(&b.row_key) {
-        std::cmp::Ordering::Equal => a.object_key.is_none().cmp(&b.object_key.is_none()),
+        std::cmp::Ordering::Equal => a.object_entry.is_none().cmp(&b.object_entry.is_none()),
         other => other,
     });
 
@@ -749,7 +680,7 @@ async fn try_list_by_delimiter_index(
         0
     };
 
-    let mut out_objects: Vec<ObjectSummary> = Vec::new();
+    let mut out_objects: Vec<ObjectMetadata> = Vec::new();
     let mut out_prefixes: Vec<String> = Vec::new();
     let mut last_row_key: Option<String> = None;
     let mut reached_limit = false;
@@ -762,13 +693,11 @@ async fn try_list_by_delimiter_index(
         if let Some(common_prefix) = row.common_prefix {
             out_prefixes.push(common_prefix);
             last_row_key = Some(row.row_key);
-        } else if let (Some(object_key), Some(version_id)) = (row.object_key, row.version_id) {
-            let Some(meta) =
-                read_metadata_best(&path_manager, fragment, &object_key, &version_id).await
-            else {
+        } else if let Some(entry) = row.object_entry {
+            let Some(meta) = read_index_entry_best(&path_manager, fragment, &entry).await else {
                 warn!(
                     "Skipping unreadable delimiter-index metadata fragment={} key={} version={}",
-                    fragment, object_key, version_id
+                    fragment, entry.object_key, entry.version_id
                 );
                 continue;
             };
@@ -794,89 +723,210 @@ async fn try_list_by_delimiter_index(
     };
 
     Ok(Some(ListObjectsResult {
-        objects: out_objects.into_iter().map(ObjectMetadata::from).collect(),
+        objects: out_objects,
         common_prefixes: out_prefixes,
         continuation_token,
     }))
 }
 
-async fn choose_index_root(
+async fn list_objects_from_index_v2(
     fragment: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    limit: usize,
+    continuation_token: Option<String>,
     scan_trash: bool,
-    preferred_root_hint: Option<usize>,
-) -> Option<(usize, PathBuf)> {
-    let path_manager = ObjectPathManager::new();
-    let index_roots = path_manager.get_all_index_roots();
+    include_internal: bool,
+) -> Result<ListObjectsResult, AppError> {
+    #[derive(Clone)]
+    struct DelimiterRow {
+        row_key: String,
+        object: Option<ObjectMetadata>,
+        common_prefix: Option<String>,
+    }
 
-    let mut candidates: Vec<(usize, PathBuf, u64)> = Vec::new();
+    let pfx = canonical_prefix(prefix);
+    let pfx_with_slash = if pfx.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", pfx)
+    };
+    let want_delim = delimiter == Some("/");
 
-    for (root_idx, root) in index_roots.into_iter().enumerate() {
-        let candidate = if scan_trash {
-            root.join(fragment).join(".trash").join("index")
+    let objects = if scan_trash {
+        if pfx.is_empty() {
+            index_v2::list_fragment_trash_objects(fragment).await?
         } else {
-            root.join(fragment).join("index")
-        };
-
-        if !fs::try_exists(&candidate).await.unwrap_or(false) {
-            continue;
+            index_v2::list_fragment_trash_objects_for_prefix(fragment, &pfx).await?
         }
+    } else {
+        if pfx.is_empty() {
+            index_v2::list_fragment_objects(fragment).await?
+        } else {
+            index_v2::list_fragment_objects_for_prefix(fragment, &pfx).await?
+        }
+    };
 
-        let mut count = 0u64;
-        let mut access_ok = false;
+    if want_delim {
+        let mut rows = Vec::<DelimiterRow>::new();
+        let mut seen_prefixes = HashSet::<String>::new();
 
-        if let Ok(mut rd) = fs::read_dir(&candidate).await {
-            access_ok = true;
-            while let Ok(Some(ent)) = rd.next_entry().await {
-                let name = ent.file_name().to_string_lossy().to_string();
-                if is_hex2(&name) {
-                    count += 1;
+        for meta in objects {
+            let ck = canonical_key(&meta.object_key);
+            if !include_internal && is_internal_object_key(&ck) {
+                continue;
+            }
+            if !scan_trash && meta.is_delete_marker {
+                continue;
+            }
+            if !pfx.is_empty() && ck != pfx && !ck.starts_with(&pfx_with_slash) {
+                continue;
+            }
+
+            let rel = if pfx.is_empty() {
+                ck.clone()
+            } else if ck == pfx {
+                ck.clone()
+            } else if ck.len() > pfx.len() + 1 {
+                ck[(pfx.len() + 1)..].to_string()
+            } else {
+                String::new()
+            };
+
+            if !pfx.is_empty() && ck == pfx {
+                rows.push(DelimiterRow {
+                    row_key: ck,
+                    object: Some(meta),
+                    common_prefix: None,
+                });
+            } else if let Some((first, _rest)) = rel.split_once('/') {
+                if !first.is_empty() {
+                    let folder = if pfx.is_empty() {
+                        format!("{}/", first)
+                    } else {
+                        format!("{}/{}/", pfx, first)
+                    };
+                    if seen_prefixes.insert(folder.clone()) {
+                        rows.push(DelimiterRow {
+                            row_key: folder.clone(),
+                            object: None,
+                            common_prefix: Some(folder),
+                        });
+                    }
                 }
+            } else {
+                rows.push(DelimiterRow {
+                    row_key: ck,
+                    object: Some(meta),
+                    common_prefix: None,
+                });
             }
         }
 
-        if !access_ok {
+        rows.sort_by(|left, right| {
+            left.row_key
+                .cmp(&right.row_key)
+                .then(left.object.is_none().cmp(&right.object.is_none()))
+        });
+
+        let start_after = continuation_token
+            .as_deref()
+            .and_then(parse_delimiter_continuation_token);
+        let start_idx = if let Some(row_key) = start_after {
+            match rows.binary_search_by(|row| row.row_key.cmp(&row_key)) {
+                Ok(i) => i + 1,
+                Err(i) => i,
+            }
+        } else {
+            0
+        };
+
+        let mut out_objects = Vec::new();
+        let mut out_prefixes = Vec::new();
+        let mut last_row_key = None;
+        let mut reached_limit = false;
+
+        for row in rows.into_iter().skip(start_idx) {
+            if out_objects.len() + out_prefixes.len() >= limit {
+                break;
+            }
+
+            if let Some(common_prefix) = row.common_prefix {
+                out_prefixes.push(common_prefix);
+                last_row_key = Some(row.row_key);
+            } else if let Some(meta) = row.object {
+                out_objects.push(meta);
+                last_row_key = Some(row.row_key);
+            }
+
+            if out_objects.len() + out_prefixes.len() >= limit {
+                reached_limit = true;
+                break;
+            }
+        }
+
+        return Ok(ListObjectsResult {
+            objects: out_objects,
+            common_prefixes: out_prefixes,
+            continuation_token: if reached_limit {
+                last_row_key
+                    .as_deref()
+                    .map(create_delimiter_continuation_token)
+            } else {
+                None
+            },
+        });
+    }
+
+    let start_after = continuation_token
+        .as_deref()
+        .and_then(parse_prefix_continuation_token);
+    let mut out_objects = Vec::new();
+    let mut last_pair = None;
+    let mut reached_limit = false;
+
+    for meta in objects {
+        if out_objects.len() >= limit {
+            break;
+        }
+
+        let ck = canonical_key(&meta.object_key);
+        if !include_internal && is_internal_object_key(&ck) {
+            continue;
+        }
+        if !scan_trash && meta.is_delete_marker {
+            continue;
+        }
+        if !pfx.is_empty() && ck != pfx && !ck.starts_with(&pfx_with_slash) {
             continue;
         }
 
-        candidates.push((root_idx, candidate, count));
+        if let Some((start_key, start_version)) = start_after.as_ref() {
+            if ck < *start_key || (ck == *start_key && meta.version_id <= *start_version) {
+                continue;
+            }
+        }
+
+        last_pair = Some((ck, meta.version_id.clone()));
+        out_objects.push(meta);
+
+        if out_objects.len() >= limit {
+            reached_limit = true;
+            break;
+        }
     }
 
-    if candidates.is_empty() {
-        if scan_trash {
-            debug!(
-                "No readable trash index root found for fragment {}",
-                fragment
-            );
+    Ok(ListObjectsResult {
+        objects: out_objects,
+        common_prefixes: Vec::new(),
+        continuation_token: if reached_limit {
+            last_pair
+                .as_ref()
+                .map(|(key, version)| create_prefix_continuation_token(key, version))
         } else {
-            warn!("No readable index root found for fragment {}", fragment);
-        }
-        return None;
-    }
-
-    if let Some(preferred) = preferred_root_hint {
-        if let Some((idx, path, count)) = candidates
-            .iter()
-            .find(|(idx, _, _)| *idx == preferred)
-            .cloned()
-        {
-            debug!(
-                "Selected continuation index root: {:?} (root_id={}, shard_count={}) for fragment {}",
-                path, idx, count, fragment
-            );
-            return Some((idx, path));
-        }
-    }
-
-    candidates.sort_by_key(|(idx, _, _)| *idx);
-    let rr_key = format!("{}:{}", if scan_trash { "trash" } else { "live" }, fragment);
-    let pick = next_index_root_cursor(&rr_key) % candidates.len();
-    let (idx, path, count) = candidates[pick].clone();
-
-    debug!(
-        "Selected balanced index root: {:?} (root_id={}, shard_count={}) for fragment {}",
-        path, idx, count, fragment
-    );
-    Some((idx, path))
+            None
+        },
+    })
 }
 
 pub async fn list_objects(
@@ -937,8 +987,13 @@ async fn list_objects_internal(
         .get("delimiter")
         .map(|s| s.as_str())
         .filter(|d| *d == "/");
+    let prefix_projection_pending = if scan_trash {
+        false
+    } else {
+        index_v2::is_prefix_projection_pending(&fragment).await
+    };
 
-    if !scan_trash && delimiter.is_some() {
+    if !scan_trash && !prefix_projection_pending && delimiter.is_some() {
         if let Some(res) = try_list_by_delimiter_index(
             &fragment,
             &prefix,
@@ -952,7 +1007,7 @@ async fn list_objects_internal(
         }
     }
 
-    if !scan_trash && (delimiter.is_some() || !prefix.is_empty()) {
+    if !scan_trash && !prefix_projection_pending && (delimiter.is_some() || !prefix.is_empty()) {
         if let Some(res) = try_list_by_prefix_index(
             &fragment,
             &prefix,
@@ -967,300 +1022,18 @@ async fn list_objects_internal(
         }
     }
 
-    let continuation_cursor = continuation_token
-        .as_deref()
-        .and_then(parse_continuation_token)
-        .unwrap_or_default();
-
-    let (selected_root_id, index_root) =
-        match choose_index_root(&fragment, scan_trash, continuation_cursor.root_hint).await {
-            Some(root) => root,
-            None => {
-                debug!("No active index root found for fragment {}", fragment);
-                return Ok(AxumJson(ListObjectsResult {
-                    objects: Vec::new(),
-                    common_prefixes: Vec::new(),
-                    continuation_token: None,
-                }));
-            }
-        };
-
-    let pfx = canonical_prefix(&prefix);
-    let pfx_with_slash = if pfx.is_empty() {
-        String::new()
-    } else {
-        format!("{}/", pfx)
-    };
-
-    let mut results: Vec<ObjectSummary> = Vec::new();
-    let mut out_prefixes: Vec<String> = Vec::new();
-    let mut seen_prefixes: HashSet<String> = HashSet::new();
-    let mut next_token = None;
-    let mut reached_limit = false;
-
-    let mut s1_entries = read_dir_sorted(&index_root).await?;
-    s1_entries.retain(|s| is_hex2(s));
-
-    let s1_start_idx = if !continuation_cursor.shard1.is_empty() {
-        s1_entries
-            .binary_search(&continuation_cursor.shard1)
-            .unwrap_or_else(|x| x)
-    } else {
-        0
-    };
-
-    'outer: for s1 in s1_entries.into_iter().skip(s1_start_idx) {
-        let s1_path = index_root.join(&s1);
-
-        let mut s2_entries = read_dir_sorted(&s1_path).await.unwrap_or_default();
-        s2_entries.retain(|s| is_hex2(s));
-
-        let s2_start_idx =
-            if s1 == continuation_cursor.shard1 && !continuation_cursor.shard2.is_empty() {
-                s2_entries
-                    .binary_search(&continuation_cursor.shard2)
-                    .unwrap_or_else(|x| x)
-            } else {
-                0
-            };
-
-        for s2 in s2_entries.into_iter().skip(s2_start_idx) {
-            let s2_path = s1_path.join(&s2);
-
-            let mut s3_entries = read_dir_sorted(&s2_path).await.unwrap_or_default();
-            s3_entries.retain(|s| is_hex2(s));
-
-            let s3_start_idx = if s1 == continuation_cursor.shard1
-                && s2 == continuation_cursor.shard2
-                && !continuation_cursor.shard3.is_empty()
-            {
-                s3_entries
-                    .binary_search(&continuation_cursor.shard3)
-                    .unwrap_or_else(|x| x)
-            } else {
-                0
-            };
-
-            for s3 in s3_entries.into_iter().skip(s3_start_idx) {
-                let s3_path = s2_path.join(&s3);
-
-                let mut s4_entries = read_dir_sorted(&s3_path).await.unwrap_or_default();
-                s4_entries.retain(|s| is_hex2(s));
-
-                let s4_start_idx = if s1 == continuation_cursor.shard1
-                    && s2 == continuation_cursor.shard2
-                    && s3 == continuation_cursor.shard3
-                    && !continuation_cursor.shard4.is_empty()
-                {
-                    s4_entries
-                        .binary_search(&continuation_cursor.shard4)
-                        .unwrap_or_else(|x| x)
-                } else {
-                    0
-                };
-
-                for s4 in s4_entries.into_iter().skip(s4_start_idx) {
-                    let s4_path = s3_path.join(&s4);
-
-                    let mut file_names = Vec::new();
-                    if let Ok(mut entries) = fs::read_dir(&s4_path).await {
-                        while let Ok(Some(entry)) = entries.next_entry().await {
-                            let fname = entry.file_name().to_string_lossy().to_string();
-                            if fname.ends_with(METADATA_EXT) && fname != QUOTA_FILE {
-                                file_names.push(fname);
-                            }
-                        }
-                    }
-                    file_names.sort();
-
-                    let file_start_idx = if s1 == continuation_cursor.shard1
-                        && s2 == continuation_cursor.shard2
-                        && s3 == continuation_cursor.shard3
-                        && s4 == continuation_cursor.shard4
-                        && !continuation_cursor.file.is_empty()
-                    {
-                        match file_names.binary_search(&continuation_cursor.file) {
-                            Ok(i) => i + 1,
-                            Err(i) => i,
-                        }
-                    } else {
-                        0
-                    };
-
-                    let stream_iter = file_names.into_iter().skip(file_start_idx);
-
-                    let mut stream = futures_util::stream::iter(stream_iter)
-                        .map(|fname| {
-                            let path = s4_path.join(&fname);
-                            async move {
-                                let data = fs::read(&path).await;
-                                (fname, data)
-                            }
-                        })
-                        .buffered(20);
-
-                    let mut current_hash_prefix = String::new();
-                    let mut best_meta: Option<ObjectSummary> = None;
-                    let mut best_fname: String = String::new();
-
-                    while let Some((fname, read_res)) = stream.next().await {
-                        let hash_part = fname.split('#').next().unwrap_or("").to_string();
-
-                        if hash_part != current_hash_prefix {
-                            if let Some(meta) = best_meta.take() {
-                                let ck = canonical_key(&meta.object_key);
-                                let ok_prefix = if pfx.is_empty() {
-                                    true
-                                } else {
-                                    ck == pfx || ck.starts_with(&pfx_with_slash)
-                                };
-
-                                if ok_prefix
-                                    && (!meta.is_delete_marker || scan_trash)
-                                    && (include_internal
-                                        || !is_internal_object_key(meta.object_key.as_str()))
-                                {
-                                    if delimiter.is_some() {
-                                        let rel = if pfx.is_empty() {
-                                            ck.clone()
-                                        } else if ck == pfx {
-                                            ck.clone()
-                                        } else if ck.len() > pfx.len() + 1 {
-                                            ck[(pfx.len() + 1)..].to_string()
-                                        } else {
-                                            String::new()
-                                        };
-
-                                        if !pfx.is_empty() && ck == pfx {
-                                            results.push(meta);
-                                        } else if let Some((first, _rest)) = rel.split_once('/') {
-                                            if !first.is_empty() {
-                                                let folder = if pfx.is_empty() {
-                                                    format!("{}/", first)
-                                                } else {
-                                                    format!("{}/{}/", pfx, first)
-                                                };
-                                                if seen_prefixes.insert(folder.clone()) {
-                                                    out_prefixes.push(folder);
-                                                }
-                                            }
-                                        } else {
-                                            results.push(meta);
-                                        }
-                                    } else {
-                                        results.push(meta);
-                                    }
-                                }
-
-                                if results.len() + out_prefixes.len() >= limit {
-                                    next_token = Some(create_continuation_token(
-                                        &s1,
-                                        &s2,
-                                        &s3,
-                                        &s4,
-                                        &best_fname,
-                                        Some(selected_root_id),
-                                    ));
-                                    reached_limit = true;
-                                    break 'outer;
-                                }
-                            }
-
-                            current_hash_prefix = hash_part;
-                            best_meta = None;
-                            best_fname.clear();
-                        }
-
-                        match read_res {
-                            Ok(data) => {
-                                if let Ok(meta) = rmp_serde::from_slice::<ObjectSummary>(&data) {
-                                    let take = match &best_meta {
-                                        None => true,
-                                        Some(cur) => {
-                                            meta.created_at > cur.created_at
-                                                || (meta.created_at == cur.created_at
-                                                    && meta.version_id > cur.version_id)
-                                        }
-                                    };
-                                    if take {
-                                        best_fname = fname.clone();
-                                        best_meta = Some(meta);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to read metadata file {}: {}", fname, e);
-                            }
-                        }
-                    }
-
-                    if let Some(meta) = best_meta {
-                        let ck = canonical_key(&meta.object_key);
-                        let ok_prefix = if pfx.is_empty() {
-                            true
-                        } else {
-                            ck == pfx || ck.starts_with(&pfx_with_slash)
-                        };
-
-                        if ok_prefix
-                            && (!meta.is_delete_marker || scan_trash)
-                            && (include_internal
-                                || !is_internal_object_key(meta.object_key.as_str()))
-                        {
-                            if delimiter.is_some() {
-                                let rel = if pfx.is_empty() {
-                                    ck.clone()
-                                } else if ck == pfx {
-                                    ck.clone()
-                                } else if ck.len() > pfx.len() + 1 {
-                                    ck[(pfx.len() + 1)..].to_string()
-                                } else {
-                                    String::new()
-                                };
-
-                                if !pfx.is_empty() && ck == pfx {
-                                    results.push(meta);
-                                } else if let Some((first, _rest)) = rel.split_once('/') {
-                                    if !first.is_empty() {
-                                        let folder = if pfx.is_empty() {
-                                            format!("{}/", first)
-                                        } else {
-                                            format!("{}/{}/", pfx, first)
-                                        };
-                                        if seen_prefixes.insert(folder.clone()) {
-                                            out_prefixes.push(folder);
-                                        }
-                                    }
-                                } else {
-                                    results.push(meta);
-                                }
-                            } else {
-                                results.push(meta);
-                            }
-                        }
-                        if results.len() + out_prefixes.len() >= limit {
-                            next_token = Some(create_continuation_token(
-                                &s1,
-                                &s2,
-                                &s3,
-                                &s4,
-                                &best_fname,
-                                Some(selected_root_id),
-                            ));
-                            reached_limit = true;
-                            break 'outer;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(AxumJson(ListObjectsResult {
-        objects: results.into_iter().map(ObjectMetadata::from).collect(),
-        common_prefixes: out_prefixes,
-        continuation_token: if reached_limit { next_token } else { None },
-    }))
+    Ok(AxumJson(
+        list_objects_from_index_v2(
+            &fragment,
+            &prefix,
+            delimiter,
+            limit,
+            continuation_token,
+            scan_trash,
+            include_internal,
+        )
+        .await?,
+    ))
 }
 
 #[cfg(test)]
@@ -1309,18 +1082,6 @@ fn is_internal_object_key(object_key: &str) -> bool {
         .any(|segment| segment == ".n1fsd_dir" || segment == ".n1-trash")
 }
 
-async fn read_dir_sorted(path: &std::path::Path) -> Result<Vec<String>, AppError> {
-    let mut entries = fs::read_dir(path)
-        .await
-        .map_err(|e| AppError::Io(e, "read dir".into()))?;
-    let mut names = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        names.push(entry.file_name().to_string_lossy().to_string());
-    }
-    names.sort();
-    Ok(names)
-}
-
 pub async fn list_object_versions(
     claims: Claims,
     Path((fragment, object_key)): Path<(String, String)>,
@@ -1333,62 +1094,11 @@ pub async fn list_object_versions(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let path_manager = ObjectPathManager::new();
-
-    let mut hasher = Sha256::new();
-    hasher.update(object_key.as_bytes());
-    let hash = hex::encode(hasher.finalize());
-
-    let shard1 = &hash[0..2];
-    let shard2 = &hash[2..4];
-    let shard3 = &hash[4..6];
-    let shard4 = &hash[6..8];
-
-    let index_dirs = path_manager.get_all_index_dirs(&fragment);
-
-    let mut versions: Vec<ObjectSummary> = Vec::new();
-    let mut seen_versions = HashSet::new();
-
-    for dir in index_dirs {
-        let candidate = dir.join(shard1).join(shard2).join(shard3).join(shard4);
-        if !fs::try_exists(&candidate).await.unwrap_or(false) {
-            continue;
-        }
-
-        let prefix = format!("{}#", hash);
-        let mut entries = match fs::read_dir(&candidate).await {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(&prefix) && name.ends_with(METADATA_EXT) {
-                if let Some(rest) = name.strip_prefix(&prefix) {
-                    if let Some(ver_id) = rest.strip_suffix(METADATA_EXT) {
-                        if seen_versions.contains(ver_id) {
-                            continue;
-                        }
-
-                        if let Ok(data) = fs::read(entry.path()).await {
-                            if let Ok(meta) = rmp_serde::from_slice::<ObjectSummary>(&data) {
-                                if seen_versions.insert(meta.version_id.clone()) {
-                                    versions.push(meta);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    versions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-    let response_objects: Vec<ObjectMetadata> =
-        versions.into_iter().map(ObjectMetadata::from).collect();
-
-    Ok(AxumJson(response_objects))
+    let mut versions = index_v2::list_live_object_versions_metadata(&fragment, &object_key).await?;
+    versions.sort_by(|a, b| {
+        compare_version_recency(b.created_at, &b.version_id, a.created_at, &a.version_id)
+    });
+    Ok(AxumJson(versions))
 }
 
 #[derive(Serialize)]

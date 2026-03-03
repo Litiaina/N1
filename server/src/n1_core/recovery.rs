@@ -7,8 +7,9 @@ use crate::n1_core::constants::GC_SUFFIX;
 use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, PartMetadata, RawBlobAddress, ShardInfo,
 };
+use crate::n1_core::index_v2;
 use crate::n1_core::raw_io_ring::{RawReadCompletion, RawReadRing, RawReadSubmitError};
-use crate::n1_core::upload::{DirectWriter, sync_dir, write_atomic};
+use crate::n1_core::upload::{DirectWriter, sync_dir};
 
 use crc32fast::Hasher;
 use futures_util::future::{BoxFuture, FutureExt};
@@ -369,128 +370,24 @@ fn unregister_inflight_repair(key: &str) {
     }
 }
 
-fn metadata_paths_for_context(ctx: &ShardRepairContext) -> Vec<PathBuf> {
-    let path_manager = ObjectPathManager::new();
-    let key_hash = ObjectPathManager::object_key_hash(&ctx.object_key);
-    let shard1 = &key_hash[0..2];
-    let shard2 = &key_hash[2..4];
-    let shard3 = &key_hash[4..6];
-    let shard4 = &key_hash[6..8];
-    let filename = format!(
-        "{}#{}{}",
-        key_hash,
-        ctx.version_id,
-        crate::n1_core::constants::METADATA_EXT
-    );
-
-    path_manager
-        .get_all_index_roots()
-        .iter()
-        .map(|root| {
-            let mut path = root.join(&ctx.fragment);
-            if ctx.is_trash {
-                path = path.join(".trash");
-            }
-            path.join("index")
-                .join(shard1)
-                .join(shard2)
-                .join(shard3)
-                .join(shard4)
-                .join(&filename)
-        })
-        .collect()
-}
-
 async fn load_version_metadata_for_repair(
     ctx: &ShardRepairContext,
 ) -> Result<ObjectMetadata, AppError> {
-    use std::time::SystemTime;
-
-    let mut replicas: Vec<(PathBuf, SystemTime)> = Vec::new();
-    for path in metadata_paths_for_context(ctx) {
-        if fs::try_exists(&path).await.unwrap_or(false) {
-            let modified = fs::metadata(&path)
-                .await
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            replicas.push((path, modified));
-        }
+    if ctx.is_trash {
+        index_v2::read_trashed_object_version(&ctx.fragment, &ctx.object_key, &ctx.version_id).await
+    } else {
+        index_v2::read_object_version(&ctx.fragment, &ctx.object_key, &ctx.version_id).await
     }
-
-    if replicas.is_empty() {
-        return Err(AppError::NotFound);
-    }
-
-    replicas.sort_by(|a, b| b.1.cmp(&a.1));
-
-    let mut last_err: Option<AppError> = None;
-    for (path, _) in replicas {
-        match fs::read(&path).await {
-            Ok(bytes) => match rmp_serde::from_slice::<ObjectMetadata>(&bytes) {
-                Ok(meta) => return Ok(meta),
-                Err(err) => {
-                    warn!(
-                        "Skipping unreadable repair metadata replica {}: {}",
-                        path.display(),
-                        err
-                    );
-                    last_err = Some(AppError::InternalServerError(
-                        "Invalid metadata format.".to_string(),
-                    ));
-                }
-            },
-            Err(err) => {
-                warn!(
-                    "Skipping unreadable repair metadata replica {}: {}",
-                    path.display(),
-                    err
-                );
-                last_err = Some(AppError::Io(
-                    err,
-                    format!("read metadata {}", path.display()),
-                ));
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or(AppError::InternalServerError(
-        "Failed to read any valid version metadata replica.".to_string(),
-    )))
 }
 
 async fn persist_version_metadata_for_repair(
     ctx: &ShardRepairContext,
     metadata: &ObjectMetadata,
 ) -> Result<(), AppError> {
-    let bytes = rmp_serde::to_vec(metadata).map_err(|e| {
-        AppError::InternalServerError(format!("Failed to serialize repaired metadata: {}", e))
-    })?;
-
-    let mut any_ok = false;
-    for path in metadata_paths_for_context(ctx) {
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent).await;
-        }
-
-        match write_atomic(&path, &bytes).await {
-            Ok(_) => any_ok = true,
-            Err(err) => {
-                warn!(
-                    "Failed to write repaired metadata replica {}: {}",
-                    path.display(),
-                    err
-                );
-            }
-        }
-    }
-
-    if any_ok {
-        Ok(())
+    if ctx.is_trash {
+        index_v2::upsert_trashed_object_version(metadata).await
     } else {
-        Err(AppError::InternalServerError(
-            "Failed to write repaired metadata to any index mirror".into(),
-        ))
+        index_v2::upsert_object_version(metadata).await
     }
 }
 

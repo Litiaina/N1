@@ -1,12 +1,18 @@
 use crate::n1_core::constants::{
-    METADATA_EXT, PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_DELIMITER_SEGMENT_PREFIX,
-    PREFIX_INDEX_DIR, PREFIX_INDEX_NAMESPACE, PREFIX_INDEX_VERSION, PREFIX_SEGMENT_EXT, QUOTA_FILE,
+    PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_INDEX_DIR, PREFIX_INDEX_NAMESPACE,
+    PREFIX_INDEX_VERSION, PREFIX_SEGMENT_EXT, QUOTA_FILE,
 };
+#[cfg(test)]
+use once_cell::sync::Lazy;
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
+#[cfg(test)]
+use tokio::sync::Mutex;
+use ulid::Ulid;
 
 pub fn default_format() -> String {
     "zip".to_string()
@@ -15,7 +21,9 @@ pub fn default_format() -> String {
 pub static INDEX_STORE_DISKS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 pub static BLOB_STORE_DISKS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 pub static FS_STORAGE_ROOT: OnceLock<RwLock<String>> = OnceLock::new();
-
+#[cfg(test)]
+#[allow(dead_code)]
+pub static STORAGE_TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 fn rwlock_poisoned(label: &str) -> crate::enums::app_error_enum::AppError {
     crate::enums::app_error_enum::AppError::InternalServerError(format!(
         "{} config lock poisoned",
@@ -134,25 +142,6 @@ impl ObjectPathManager {
             .collect()
     }
 
-    pub fn get_all_index_dirs(&self, fragment_hash: &str) -> Vec<PathBuf> {
-        self.get_all_index_roots()
-            .iter()
-            .map(|root| root.join(fragment_hash).join("index"))
-            .collect()
-    }
-
-    pub fn get_all_session_dirs(&self, fragment_hash: &str, version_id: &str) -> Vec<PathBuf> {
-        self.get_all_index_roots()
-            .iter()
-            .map(|root| {
-                root.join(fragment_hash)
-                    .join("index")
-                    .join("sessions")
-                    .join(version_id)
-            })
-            .collect()
-    }
-
     pub fn object_key_hash(object_key: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(object_key.as_bytes());
@@ -168,34 +157,6 @@ impl ObjectPathManager {
         let mut hasher = Sha256::new();
         hasher.update(p.as_bytes());
         hex::encode(hasher.finalize())
-    }
-
-    pub fn get_all_metadata_paths(
-        &self,
-        fragment_hash: &str,
-        object_key: &str,
-        version_id: &str,
-    ) -> Vec<PathBuf> {
-        let key_hash = Self::object_key_hash(object_key);
-
-        let shard1 = &key_hash[0..2];
-        let shard2 = &key_hash[2..4];
-        let shard3 = &key_hash[4..6];
-        let shard4 = &key_hash[6..8];
-        let filename = format!("{}#{}{}", key_hash, version_id, METADATA_EXT);
-
-        self.get_all_index_roots()
-            .iter()
-            .map(|root| {
-                root.join(fragment_hash)
-                    .join("index")
-                    .join(shard1)
-                    .join(shard2)
-                    .join(shard3)
-                    .join(shard4)
-                    .join(&filename)
-            })
-            .collect()
     }
 
     pub fn get_all_prefix_bucket_dirs(&self, fragment_hash: &str, prefix: &str) -> Vec<PathBuf> {
@@ -218,19 +179,6 @@ impl ObjectPathManager {
             .collect()
     }
 
-    pub fn get_all_prefix_segment_paths(
-        &self,
-        fragment_hash: &str,
-        prefix: &str,
-        segment_id: &str,
-    ) -> Vec<PathBuf> {
-        let file = format!("seg_{}{}", segment_id, PREFIX_SEGMENT_EXT);
-        self.get_all_prefix_bucket_dirs(fragment_hash, prefix)
-            .into_iter()
-            .map(|d| d.join(&file))
-            .collect()
-    }
-
     pub fn get_all_prefix_compacted_paths(
         &self,
         fragment_hash: &str,
@@ -239,22 +187,6 @@ impl ObjectPathManager {
         self.get_all_prefix_bucket_dirs(fragment_hash, prefix)
             .into_iter()
             .map(|d| d.join(format!("compacted{}", PREFIX_SEGMENT_EXT)))
-            .collect()
-    }
-
-    pub fn get_all_prefix_delimiter_segment_paths(
-        &self,
-        fragment_hash: &str,
-        prefix: &str,
-        segment_id: &str,
-    ) -> Vec<PathBuf> {
-        let file = format!(
-            "{}{}{}",
-            PREFIX_DELIMITER_SEGMENT_PREFIX, segment_id, PREFIX_SEGMENT_EXT
-        );
-        self.get_all_prefix_bucket_dirs(fragment_hash, prefix)
-            .into_iter()
-            .map(|d| d.join(&file))
             .collect()
     }
 
@@ -294,7 +226,7 @@ pub struct ListObjectsResult {
     pub continuation_token: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ReservationReceipt {
     pub amount: u64,
 }
@@ -382,6 +314,24 @@ impl From<ObjectSummary> for ObjectMetadata {
     }
 }
 
+impl From<&ObjectMetadata> for ObjectSummary {
+    fn from(metadata: &ObjectMetadata) -> Self {
+        ObjectSummary {
+            object_key: metadata.object_key.clone(),
+            fragment: metadata.fragment.clone(),
+            version_id: metadata.version_id.clone(),
+            upload_session_id: metadata.upload_session_id.clone(),
+            owner_uid: metadata.owner_uid.clone(),
+            content_type: metadata.content_type.clone(),
+            total_size_bytes: metadata.total_size_bytes,
+            created_at: metadata.created_at,
+            _parts_ignored: IgnoredAny,
+            is_delete_marker: metadata.is_delete_marker,
+            stripe_size_bytes: metadata.stripe_size_bytes,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PrefixIndexEntry {
     pub object_key: String,
@@ -389,6 +339,89 @@ pub struct PrefixIndexEntry {
     pub created_at: i64,
     #[serde(default)]
     pub is_delete_marker: bool,
+    #[serde(default)]
+    pub has_inline_summary: bool,
+    #[serde(default)]
+    pub upload_session_id: String,
+    #[serde(default)]
+    pub owner_uid: String,
+    #[serde(default)]
+    pub content_type: String,
+    #[serde(default)]
+    pub total_size_bytes: u64,
+    #[serde(default = "default_stripe_size")]
+    pub stripe_size_bytes: usize,
+}
+
+impl PrefixIndexEntry {
+    pub fn from_metadata(metadata: &ObjectMetadata) -> Self {
+        Self {
+            object_key: metadata.object_key.clone(),
+            version_id: metadata.version_id.clone(),
+            created_at: metadata.created_at,
+            is_delete_marker: metadata.is_delete_marker,
+            has_inline_summary: true,
+            upload_session_id: metadata.upload_session_id.clone(),
+            owner_uid: metadata.owner_uid.clone(),
+            content_type: metadata.content_type.clone(),
+            total_size_bytes: metadata.total_size_bytes,
+            stripe_size_bytes: metadata.stripe_size_bytes,
+        }
+    }
+
+    pub fn to_object_metadata(&self, fragment: &str) -> Option<ObjectMetadata> {
+        if !self.has_inline_summary {
+            return None;
+        }
+
+        Some(ObjectMetadata {
+            object_key: self.object_key.clone(),
+            fragment: fragment.to_string(),
+            version_id: self.version_id.clone(),
+            upload_session_id: self.upload_session_id.clone(),
+            owner_uid: self.owner_uid.clone(),
+            content_type: self.content_type.clone(),
+            total_size_bytes: self.total_size_bytes,
+            created_at: self.created_at,
+            parts: Vec::new(),
+            is_delete_marker: self.is_delete_marker,
+            stripe_size_bytes: self.stripe_size_bytes,
+        })
+    }
+}
+
+// Version ids are ULIDs, so they carry millisecond ordering when second-level
+// created_at timestamps are too coarse to disambiguate back-to-back uploads.
+pub fn compare_version_id_recency(left: &str, right: &str) -> Ordering {
+    match (Ulid::from_string(left).ok(), Ulid::from_string(right).ok()) {
+        (Some(left_ulid), Some(right_ulid)) => left_ulid.cmp(&right_ulid).then(left.cmp(right)),
+        _ => left.cmp(right),
+    }
+}
+
+pub fn compare_version_recency(
+    left_created_at: i64,
+    left_version_id: &str,
+    right_created_at: i64,
+    right_version_id: &str,
+) -> Ordering {
+    left_created_at
+        .cmp(&right_created_at)
+        .then_with(|| compare_version_id_recency(left_version_id, right_version_id))
+}
+
+pub fn version_recency_is_newer(
+    candidate_created_at: i64,
+    candidate_version_id: &str,
+    current_created_at: i64,
+    current_version_id: &str,
+) -> bool {
+    compare_version_recency(
+        candidate_created_at,
+        candidate_version_id,
+        current_created_at,
+        current_version_id,
+    ) == Ordering::Greater
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

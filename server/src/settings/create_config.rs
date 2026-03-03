@@ -53,8 +53,6 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("stream_readahead_bytes", "auto")
         .set("stream_locality_bias_enabled", "true")
         .set("prefix_max_delta_segments", "auto")
-        .set("prefix_compact_trigger_segments", "auto")
-        .set("prefix_compact_min_interval_seconds", "auto")
         .set("monitor_interval_seconds", "auto")
         .set("monitor_deep_scan_interval_seconds", "auto")
         .set("max_part_size", "52428800")

@@ -13,9 +13,6 @@ use crate::n1_core::object_parser::{
     ADAPTIVE_STREAM_TARGET_ATOMIC, STREAM_CHUNK_SIZE_ATOMIC, STREAM_LOCALITY_BIAS_ENABLED_ATOMIC,
     STREAM_MAX_CONCURRENCY, STREAM_READAHEAD_BYTES_ATOMIC,
 };
-use crate::n1_core::prefix_compactor::{
-    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC, PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC,
-};
 use crate::n1_core::recovery::RAW_VERIFY_ON_READ_ATOMIC;
 use crate::n1_core::retrieve::PREFIX_MAX_DELTA_SEGMENTS_ATOMIC;
 use crate::n1_core::upload::{
@@ -371,30 +368,6 @@ fn adaptive_prefix_max_delta_segments(cpu_cores: usize) -> usize {
         1024
     } else {
         2048
-    }
-}
-
-fn adaptive_prefix_compact_trigger_segments(cpu_cores: usize) -> usize {
-    if cpu_cores <= 2 {
-        64
-    } else if cpu_cores <= 4 {
-        128
-    } else if cpu_cores <= 8 {
-        256
-    } else {
-        512
-    }
-}
-
-fn adaptive_prefix_compact_min_interval_seconds(cpu_cores: usize) -> usize {
-    if cpu_cores <= 2 {
-        60
-    } else if cpu_cores <= 4 {
-        45
-    } else if cpu_cores <= 8 {
-        30
-    } else {
-        15
     }
 }
 
@@ -1050,34 +1023,6 @@ pub async fn run_server() {
     tracing::info!(
         "Prefix tuning: max_delta_segments={}",
         prefix_max_delta_segments
-    );
-
-    let prefix_compact_trigger_segments = parse_usize_or_auto(
-        upload_section.and_then(|s| s.get("prefix_compact_trigger_segments")),
-        "prefix_compact_trigger_segments",
-        adaptive_prefix_compact_trigger_segments(cpu_cores),
-    )
-    .clamp(8, 131_072);
-
-    PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-        .set(AtomicUsize::new(prefix_compact_trigger_segments))
-        .expect("Double initialization of PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC");
-
-    let prefix_compact_min_interval_seconds = parse_usize_or_auto(
-        upload_section.and_then(|s| s.get("prefix_compact_min_interval_seconds")),
-        "prefix_compact_min_interval_seconds",
-        adaptive_prefix_compact_min_interval_seconds(cpu_cores),
-    )
-    .clamp(1, 3600);
-
-    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-        .set(AtomicU64::new(prefix_compact_min_interval_seconds as u64))
-        .expect("Double initialization of PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC");
-
-    tracing::info!(
-        "Prefix compaction tuning: trigger_segments={} min_interval={}s",
-        prefix_compact_trigger_segments,
-        prefix_compact_min_interval_seconds
     );
 
     let monitor_interval_seconds = parse_usize_or_auto(

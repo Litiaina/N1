@@ -7,9 +7,9 @@ use walkdir::WalkDir;
 
 use crate::{
     enums::app_error_enum::AppError,
-    n1_core::constants::{METADATA_EXT, QUOTA_FILE},
     n1_core::{
-        disk_manager::{ObjectMetadata, ObjectPathManager},
+        disk_manager::ObjectPathManager,
+        index_v2,
         quota_manager::set_storage_used,
     },
     structs::auth_structs::Claims,
@@ -64,86 +64,34 @@ async fn sweep_fragment_gc_files(fragment_hash: String) {
 }
 
 async fn calculate_usage_across_mirrors(fragment_hash: String) -> u64 {
-    let path_manager = ObjectPathManager::new();
-    let index_roots = path_manager.get_all_index_roots();
+    let mut total_usage = 0u64;
+    let mut seen_versions = HashSet::new();
 
-    tokio::task::spawn_blocking(move || {
-        let mut max_total_usage = 0u64;
-
-        for root in index_roots {
-            let live_index_dir = root.join(&fragment_hash).join("index");
-            let trash_index_dir = root.join(&fragment_hash).join(".trash").join("index");
-            let mut current_disk_usage = 0u64;
-            let mut seen_versions = HashSet::new();
-
-            for index_dir in [&live_index_dir, &trash_index_dir] {
-                if !index_dir.exists() {
-                    continue;
-                }
-
-                for entry in WalkDir::new(index_dir).into_iter().filter_map(|e| e.ok()) {
-                    if entry.file_type().is_file()
-                        && entry.file_name().to_string_lossy().ends_with(METADATA_EXT)
-                    {
-                        if entry.file_name() == QUOTA_FILE {
-                            continue;
-                        }
-
-                        let version_key = entry.file_name().to_string_lossy().to_string();
-                        if !seen_versions.insert(version_key) {
-                            continue;
-                        }
-
-                        if let Ok(data) = std::fs::read(entry.path()) {
-                            if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
-                                if !meta.is_delete_marker {
-                                    current_disk_usage += meta.total_size_bytes;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if current_disk_usage > max_total_usage {
-                max_total_usage = current_disk_usage;
-            }
+    for meta in index_v2::list_fragment_object_versions(&fragment_hash, false)
+        .await
+        .unwrap_or_default()
+    {
+        if meta.is_delete_marker || !seen_versions.insert(meta.version_id.clone()) {
+            continue;
         }
+        total_usage += meta.total_size_bytes;
+    }
 
-        max_total_usage
-    })
-    .await
-    .unwrap_or(0)
+    for meta in index_v2::list_fragment_object_versions(&fragment_hash, true)
+        .await
+        .unwrap_or_default()
+    {
+        if meta.is_delete_marker || !seen_versions.insert(meta.version_id.clone()) {
+            continue;
+        }
+        total_usage += meta.total_size_bytes;
+    }
+
+    total_usage
 }
 
 async fn recover_fragment_name_from_disk(fragment_hash: String) -> Option<String> {
-    let path_manager = ObjectPathManager::new();
-    let index_roots = path_manager.get_all_index_roots();
-
-    tokio::task::spawn_blocking(move || {
-        for root in index_roots {
-            let index_dir = root.join(&fragment_hash).join("index");
-            if !index_dir.exists() {
-                continue;
-            }
-
-            for entry in WalkDir::new(&index_dir).into_iter().filter_map(|e| e.ok()) {
-                if entry.file_type().is_file()
-                    && entry.file_name().to_string_lossy().ends_with(METADATA_EXT)
-                    && entry.file_name() != QUOTA_FILE
-                {
-                    if let Ok(data) = std::fs::read(entry.path()) {
-                        if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
-                            return Some(meta.fragment);
-                        }
-                    }
-                }
-            }
-        }
-        None
-    })
-    .await
-    .unwrap_or(None)
+    Some(fragment_hash)
 }
 
 pub async fn sync_quota() -> Result<(), Box<dyn Error + Send + Sync>> {
