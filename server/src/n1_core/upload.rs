@@ -205,14 +205,6 @@ pub struct UploadSessionManifest {
     pub stripe_size_bytes: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PendingPartReceipt {
-    pub part_index: u64,
-    pub attempt_id: String,
-    pub created_at: i64,
-    pub raw_addresses: Vec<crate::n1_core::disk_manager::RawBlobAddress>,
-}
-
 #[derive(Serialize)]
 pub struct ActiveSessionInfo {
     pub session_id: String,
@@ -694,18 +686,6 @@ fn session_part_meta_path_from_state_path(
         .join(format!("{:020}.msgpack", part_index))
 }
 
-fn session_part_pending_path_from_state_path(
-    state_path: &std::path::Path,
-    version_id: &str,
-    part_index: u64,
-    attempt_id: &str,
-) -> PathBuf {
-    session_parts_dir_from_state_path(state_path, version_id).join(format!(
-        "{:020}.pending.{}.msgpack",
-        part_index, attempt_id
-    ))
-}
-
 async fn session_part_meta_paths(
     fragment: &str,
     version_id: &str,
@@ -715,20 +695,6 @@ async fn session_part_meta_paths(
         .into_iter()
         .map(|state_path| {
             session_part_meta_path_from_state_path(&state_path, version_id, part_index)
-        })
-        .collect())
-}
-
-async fn session_part_pending_paths(
-    fragment: &str,
-    version_id: &str,
-    part_index: u64,
-    attempt_id: &str,
-) -> Result<Vec<PathBuf>, AppError> {
-    Ok(index::get_session_state_paths(fragment, version_id)?
-        .into_iter()
-        .map(|state_path| {
-            session_part_pending_path_from_state_path(&state_path, version_id, part_index, attempt_id)
         })
         .collect())
 }
@@ -764,55 +730,13 @@ where
     }
 }
 
-fn raw_address_key(
-    raw: &crate::n1_core::disk_manager::RawBlobAddress,
-) -> (String, u64, u64, u64) {
+fn raw_address_key(raw: &crate::n1_core::disk_manager::RawBlobAddress) -> (String, u64, u64, u64) {
     (
         raw.device_id.clone(),
         raw.allocation_id,
         raw.offset_bytes,
         raw.size_bytes,
     )
-}
-
-async fn load_pending_part_receipts_from_disk(
-    fragment: &str,
-    version_id: &str,
-) -> Result<Vec<PendingPartReceipt>, AppError> {
-    let mut receipts = Vec::new();
-    let mut seen = BTreeSet::new();
-    for dir in session_part_meta_dirs(fragment, version_id).await? {
-        let mut entries = match tokio_fs::read_dir(&dir).await {
-            Ok(entries) => entries,
-            Err(e)
-                if e.kind() == std::io::ErrorKind::NotFound
-                    || e.kind() == std::io::ErrorKind::NotADirectory =>
-            {
-                continue;
-            }
-            Err(e) => return Err(AppError::Io(e, format!("read_dir {}", dir.display()))),
-        };
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| AppError::Io(e, format!("read_dir {}", dir.display())))?
-        {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
-                continue;
-            };
-            if !name.contains(".pending.") || !name.ends_with(".msgpack") {
-                continue;
-            }
-            if let Some(receipt) = read_messagepack_if_exists::<PendingPartReceipt>(&path).await? {
-                let key = (receipt.part_index, receipt.attempt_id.clone());
-                if seen.insert(key) {
-                    receipts.push(receipt);
-                }
-            }
-        }
-    }
-    Ok(receipts)
 }
 
 async fn write_atomic_upload_meta(path: &std::path::Path, data: &[u8]) -> Result<(), AppError> {
@@ -938,9 +862,6 @@ pub(crate) async fn cleanup_upload_part_metadata_for_version(
     let part_metas = load_all_part_metas_from_disk(fragment, version_id)
         .await
         .unwrap_or_default();
-    let pending_receipts = load_pending_part_receipts_from_disk(fragment, version_id)
-        .await
-        .unwrap_or_default();
 
     let mut committed_keys = BTreeSet::new();
     let mut committed_addresses = Vec::new();
@@ -955,28 +876,10 @@ pub(crate) async fn cleanup_upload_part_metadata_for_version(
         }
     }
 
-    let mut pending_only_keys = BTreeSet::new();
-    let mut pending_only_addresses = Vec::new();
-    for receipt in &pending_receipts {
-        for raw in &receipt.raw_addresses {
-            let key = raw_address_key(raw);
-            if committed_keys.contains(&key) {
-                continue;
-            }
-            if pending_only_keys.insert(key) {
-                pending_only_addresses.push(raw.clone());
-            }
-        }
-    }
-
     if free_raw_extents {
-        let mut to_free = committed_addresses;
-        to_free.extend(pending_only_addresses);
-        if !to_free.is_empty() {
-            cleanup_raw_addresses_best_effort(&to_free).await;
+        if !committed_addresses.is_empty() {
+            cleanup_raw_addresses_best_effort(&committed_addresses).await;
         }
-    } else if !pending_only_addresses.is_empty() {
-        cleanup_raw_addresses_best_effort(&pending_only_addresses).await;
     }
 
     if let Ok(dirs) = session_part_meta_dirs(fragment, version_id).await {
@@ -988,86 +891,17 @@ pub(crate) async fn cleanup_upload_part_metadata_for_version(
     }
 }
 
-async fn write_pending_part_receipt(
+async fn cleanup_failed_part_attempt(
     fragment: &str,
     version_id: &str,
     part_index: u64,
-    attempt_id: &str,
-    receipt_bytes: &[u8],
-) -> Result<(), AppError> {
-    let paths = session_part_pending_paths(fragment, version_id, part_index, attempt_id).await?;
-    let Some(owner_path) = paths.first() else {
-        return Err(AppError::InternalServerError(
-            "No pending part receipt path resolved".to_string(),
-        ));
-    };
-    write_atomic_upload_meta(owner_path, receipt_bytes).await?;
-    for path in paths.iter().skip(1) {
-        if let Err(e) = write_atomic_upload_meta(path, receipt_bytes).await {
-            warn!(
-                "best-effort replica pending part receipt write failed fragment={} version={} part={} path={}: {}",
-                fragment,
-                version_id,
-                part_index,
-                path.display(),
-                e
-            );
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-pub(crate) async fn write_pending_part_receipt_for_tests(
-    fragment: &str,
-    version_id: &str,
-    part_index: u64,
-    raw_addresses: Vec<crate::n1_core::disk_manager::RawBlobAddress>,
-) -> Result<String, AppError> {
-    let attempt_id = Ulid::new().to_string();
-    let receipt = PendingPartReceipt {
-        part_index,
-        attempt_id: attempt_id.clone(),
-        created_at: Utc::now().timestamp(),
-        raw_addresses,
-    };
-    let bytes = rmp_serde::to_vec(&receipt).map_err(|e| {
-        AppError::InternalServerError(format!("Serialize pending part receipt: {}", e))
-    })?;
-    write_pending_part_receipt(fragment, version_id, part_index, &attempt_id, &bytes).await?;
-    Ok(attempt_id)
-}
-
-async fn remove_pending_part_receipt(
-    fragment: &str,
-    version_id: &str,
-    part_index: u64,
-    attempt_id: &str,
-) {
-    let Ok(paths) = session_part_pending_paths(fragment, version_id, part_index, attempt_id).await else {
-        return;
-    };
-    for path in paths {
-        match tokio_fs::remove_file(&path).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => {}
-            Err(e) => warn!("remove pending part receipt {} failed: {}", path.display(), e),
-        }
-    }
-}
-
-async fn cleanup_failed_pending_part_attempt(
-    fragment: &str,
-    version_id: &str,
-    part_index: u64,
-    attempt_id: &str,
+    _attempt_id: &str,
     raw_addresses: &[crate::n1_core::disk_manager::RawBlobAddress],
 ) {
     if !raw_addresses.is_empty() {
         cleanup_raw_addresses_best_effort(raw_addresses).await;
     }
-    remove_pending_part_receipt(fragment, version_id, part_index, attempt_id).await;
+    let _ = (fragment, version_id, part_index);
 }
 
 pub(crate) async fn cleanup_orphaned_upload_artifacts_for_fragment(
@@ -1091,7 +925,7 @@ pub(crate) async fn cleanup_orphaned_upload_artifacts_for_fragment(
                 return Err(AppError::Io(
                     e,
                     format!("read_dir {}", partitions_root.display()),
-                ))
+                ));
             }
         };
         while let Some(partition_entry) = partition_entries
@@ -1109,7 +943,10 @@ pub(crate) async fn cleanup_orphaned_upload_artifacts_for_fragment(
                     continue;
                 }
                 Err(e) => {
-                    return Err(AppError::Io(e, format!("read_dir {}", sessions_dir.display())))
+                    return Err(AppError::Io(
+                        e,
+                        format!("read_dir {}", sessions_dir.display()),
+                    ));
                 }
             };
             while let Some(entry) = session_entries
@@ -1129,7 +966,11 @@ pub(crate) async fn cleanup_orphaned_upload_artifacts_for_fragment(
                     .await
                     .and_then(|meta| meta.modified())
                     .unwrap_or(now);
-                if now.duration_since(modified).unwrap_or(std::time::Duration::ZERO) <= file_ttl {
+                if now
+                    .duration_since(modified)
+                    .unwrap_or(std::time::Duration::ZERO)
+                    <= file_ttl
+                {
                     continue;
                 }
                 if index::load_session(fragment, version_id).await?.is_none() {
@@ -1548,27 +1389,6 @@ pub async fn object_upload_part(
         )));
     }
 
-    let pending_receipt = PendingPartReceipt {
-        part_index,
-        attempt_id: attempt_id.clone(),
-        created_at: Utc::now().timestamp(),
-        raw_addresses: allocated_raw_addrs.clone(),
-    };
-    let pending_receipt_bytes = rmp_serde::to_vec(&pending_receipt)
-        .map_err(|e| AppError::InternalServerError(format!("Serialize pending part receipt: {}", e)))?;
-    if let Err(e) = write_pending_part_receipt(
-        &fragment_arc,
-        &version_id_arc,
-        part_index,
-        &attempt_id,
-        &pending_receipt_bytes,
-    )
-    .await
-    {
-        cleanup_raw_addresses_best_effort(&allocated_raw_addrs).await;
-        return Err(e);
-    }
-
     let calc_total_checksum = expected_checksum.is_some();
 
     let mut stream_writer = RawErasureStreamWriter::new(
@@ -1598,7 +1418,7 @@ pub async fn object_upload_part(
         total_bytes_read += chunk.len() as u64;
 
         if total_bytes_read > content_length {
-            cleanup_failed_pending_part_attempt(
+            cleanup_failed_part_attempt(
                 &fragment_arc,
                 &version_id_arc,
                 part_index,
@@ -1610,7 +1430,7 @@ pub async fn object_upload_part(
         }
 
         if let Err(e) = stream_writer.write(&chunk).await {
-            cleanup_failed_pending_part_attempt(
+            cleanup_failed_part_attempt(
                 &fragment_arc,
                 &version_id_arc,
                 part_index,
@@ -1623,7 +1443,7 @@ pub async fn object_upload_part(
     }
 
     if total_bytes_read != content_length {
-        cleanup_failed_pending_part_attempt(
+        cleanup_failed_part_attempt(
             &fragment_arc,
             &version_id_arc,
             part_index,
@@ -1638,7 +1458,7 @@ pub async fn object_upload_part(
     }
 
     if let Err(e) = stream_writer.finalize().await {
-        cleanup_failed_pending_part_attempt(
+        cleanup_failed_part_attempt(
             &fragment_arc,
             &version_id_arc,
             part_index,
@@ -1653,7 +1473,7 @@ pub async fn object_upload_part(
         let calculated = stream_writer.get_total_checksum();
         if let Some(calc_str) = calculated.as_ref() {
             if !expected.eq_ignore_ascii_case(calc_str) {
-                cleanup_failed_pending_part_attempt(
+                cleanup_failed_part_attempt(
                     &fragment_arc,
                     &version_id_arc,
                     part_index,
@@ -1672,7 +1492,7 @@ pub async fn object_upload_part(
 
     let raw_addresses = raw_addresses_from_writers(&writers);
     if let Err(e) = flush_raw_metadata_for_addresses(&raw_addresses).await {
-        cleanup_failed_pending_part_attempt(
+        cleanup_failed_part_attempt(
             &fragment_arc,
             &version_id_arc,
             part_index,
@@ -1696,7 +1516,7 @@ pub async fn object_upload_part(
         let sync_results = join_all(sync_futs).await;
         for r in sync_results {
             if let Err(e) = r {
-                cleanup_failed_pending_part_attempt(
+                cleanup_failed_part_attempt(
                     &fragment_arc,
                     &version_id_arc,
                     part_index,
@@ -1751,7 +1571,7 @@ pub async fn object_upload_part(
     {
         Ok(committed) => committed,
         Err(e) => {
-            cleanup_failed_pending_part_attempt(
+            cleanup_failed_part_attempt(
                 &fragment_arc,
                 &version_id_arc,
                 part_index,
@@ -1764,7 +1584,7 @@ pub async fn object_upload_part(
     };
 
     if !committed {
-        cleanup_failed_pending_part_attempt(
+        cleanup_failed_part_attempt(
             &fragment_arc,
             &version_id_arc,
             part_index,
@@ -1774,8 +1594,6 @@ pub async fn object_upload_part(
         .await;
         return Ok((StatusCode::OK, "Part already uploaded").into_response());
     }
-
-    remove_pending_part_receipt(&fragment_arc, &version_id_arc, part_index, &attempt_id).await;
 
     Ok((StatusCode::OK, "Part uploaded").into_response())
 }

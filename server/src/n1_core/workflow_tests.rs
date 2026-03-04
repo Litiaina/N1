@@ -1,6 +1,6 @@
 use super::archive::download_selected_archive;
 use super::blob_store::{
-    allocate_raw_direct_io, free_raw_shards_for_metadatas, open_raw_direct_io, raw_blob_address_exists,
+    free_raw_shards_for_metadatas, open_raw_direct_io, raw_blob_address_exists,
     verify_shard_checksum, write_shard_range,
 };
 use super::constants::{
@@ -38,9 +38,9 @@ use super::sync::{ensure_fragment_blob_directories, sync_single_fragment_quota};
 use super::upload::{
     DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC,
     STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC, UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC,
-    WRITER_BUFFER_SIZE_ATOMIC, cancel_upload_session, finalize_object_upload, get_upload_status,
-    initiate_object_upload, object_upload_part, cleanup_orphaned_upload_artifacts_for_fragment,
-    write_pending_part_receipt_for_tests,
+    WRITER_BUFFER_SIZE_ATOMIC, cancel_upload_session,
+    cleanup_orphaned_upload_artifacts_for_fragment, finalize_object_upload, get_upload_status,
+    initiate_object_upload, object_upload_part,
 };
 use crate::n1_core::disk_manager::{
     STORAGE_TEST_LOCK as TEST_LOCK, replace_storage_roots_for_tests, version_recency_is_newer,
@@ -951,9 +951,9 @@ async fn restore_index_root(root: &std::path::Path, down_path: &std::path::Path)
     if fs::try_exists(root).await.unwrap_or(false) {
         match fs::metadata(root).await {
             Ok(meta) if meta.is_dir() => {
-                fs::remove_dir_all(root)
-                    .await
-                    .unwrap_or_else(|e| panic!("remove recreated index dir {}: {}", root.display(), e));
+                fs::remove_dir_all(root).await.unwrap_or_else(|e| {
+                    panic!("remove recreated index dir {}: {}", root.display(), e)
+                });
             }
             Ok(_) => {
                 fs::remove_file(root)
@@ -2552,7 +2552,7 @@ async fn matrix_cancel_upload_after_part_frees_raw_part_extents() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_gc_orphaned_pending_part_receipt_frees_raw_extent() {
+async fn matrix_gc_orphaned_part_metadata_frees_raw_extent() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
     ensure_global_storage_config(&base).await;
@@ -2570,7 +2570,7 @@ async fn matrix_gc_orphaned_pending_part_receipt_frees_raw_extent() {
         let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
         hex::encode(digest)
     };
-    let key = "matrix/gc-orphan-pending.bin".to_string();
+    let key = "matrix/gc-orphan-part.bin".to_string();
 
     init_quota_file(&fragment, 64 * 1024 * 1024)
         .await
@@ -2581,15 +2581,19 @@ async fn matrix_gc_orphaned_pending_part_receipt_frees_raw_extent() {
         .expect("init metadata");
 
     let (version_id, _session_id) = init_upload(&fragment, &key, 4096, 1).await;
-    let (raw_address, io) = allocate_raw_direct_io(0, 4096).expect("allocate raw io");
-    io.write(0, &[0xAB; 4096]).expect("write pending raw bytes");
-    io.flush_data().expect("flush pending raw bytes");
+    upload_part(&fragment, &version_id, 0, vec![0xAB; 4096]).await;
 
-    write_pending_part_receipt_for_tests(&fragment, &version_id, 0, vec![raw_address.clone()])
-        .await
-        .expect("write pending receipt");
+    let part_meta =
+        super::upload::read_part_meta_any(&ObjectPathManager::new(), &fragment, &version_id, 0)
+            .await
+            .expect("part meta");
+    let raw_address = part_meta
+        .shards
+        .iter()
+        .find_map(|shard| shard.raw_blob_address.clone())
+        .expect("raw address");
 
-    let _ = index::remove_session(&fragment, &version_id, "test-orphaned-pending").await;
+    let _ = index::remove_session(&fragment, &version_id, "test-orphaned-part").await;
 
     let cleaned = cleanup_orphaned_upload_artifacts_for_fragment(
         &fragment,
@@ -2603,7 +2607,7 @@ async fn matrix_gc_orphaned_pending_part_receipt_frees_raw_extent() {
         !raw_blob_address_exists(&raw_address)
             .await
             .expect("raw exists check"),
-        "orphaned pending receipt should be reclaimed by GC helper"
+        "orphaned committed part should be reclaimed by GC helper"
     );
 }
 
