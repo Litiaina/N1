@@ -189,12 +189,16 @@ A version is immutable and identified by `version_id`. Publish makes a version v
 
 ### Session
 
-A multipart upload session is authoritative state in `index` keyed by `fragment + version_id`. It holds:
+A multipart upload session is routed by `fragment + version_id` onto one owner index root plus one replica root when available.
+
+That routed session state holds:
 
 - upload manifest
 - optional reservation receipt
-- committed parts
+- optional deterministic raw-slot plan for each expected part
 - finalized or aborted state
+
+Committed multipart progress is not kept as shared in-memory/session-WAL part state. Each committed part is represented by its own durable part metadata receipt on the routed session roots.
 
 ### Partition
 
@@ -310,6 +314,7 @@ Initiate does:
 - validate fragment scope
 - reserve quota
 - create `version_id` and `session_id`
+- optionally pre-reserve deterministic raw shard slots when the client provides `part_size_bytes` or `part_sizes_bytes`
 - open authoritative session state in `index`
 
 At this point no object version is visible.
@@ -319,13 +324,13 @@ At this point no object version is visible.
 Part upload remains strict and payload-first:
 
 1. stream request bytes through the RS encoder
-2. reserve raw extents and write a durable pending-part receipt
+2. reuse preplanned raw extents when geometry was frozen at init, otherwise reserve raw extents
 3. write and verify shard payloads
 4. commit shard payloads into raw blob extents
 5. build `PartMetadata`
-6. persist committed part metadata on disk
+6. atomically write the independent part metadata receipt on the routed session roots
 
-This keeps raw payload durability separate from namespace visibility and keeps resumability on disk instead of in memory.
+Upload status, resume checks, and finalize read the committed part receipts from disk. The session manifest remains the authoritative upload manifest; per-part truth lives in durable receipt files, not in a shared multipart coordinator.
 
 ### 3) Finalize upload (publish into `index`)
 
@@ -629,8 +634,21 @@ Flags:
 - `--watch`
 - `--deep-scan`
 
+Health now reports:
+- system CPU/RAM plus process RSS/open-FD pressure
+- active upload sessions, reserved bytes, and committed multipart progress
+- index runtime counters and raw/blob storage totals
+
 ```bash
 cargo run -p server -- health --fragment <fragment_hash> --watch --deep-scan
+```
+
+#### `uploads`
+Inspect active multipart sessions and resumable upload progress.
+
+```bash
+cargo run -p server -- uploads list --fragment <fragment_hash>
+cargo run -p server -- uploads status --fragment <fragment_hash> --version-id <version_id>
 ```
 
 ### Ops subcommands (recommended)

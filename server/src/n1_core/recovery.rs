@@ -21,12 +21,12 @@ use std::fs::OpenOptions as StdOpenOptions;
 use std::io;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 #[cfg(unix)]
@@ -35,34 +35,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::windows::fs::OpenOptionsExt;
 
 static RECOVERY_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
-
-static RECOVERY_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
-    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-    let total_cores = core_ids.len();
-    let recovery_worker_count = (total_cores / 4).max(1);
-
-    let pinned_cores = core_ids
-        .into_iter()
-        .rev()
-        .take(recovery_worker_count)
-        .collect::<Vec<_>>();
-    let pinned_cores_arc = Arc::new(pinned_cores);
-    let next_core_idx = Arc::new(AtomicUsize::new(0));
-
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(recovery_worker_count)
-        .thread_name("n1-recovery")
-        .on_thread_start(move || {
-            if !pinned_cores_arc.is_empty() {
-                let idx = next_core_idx.fetch_add(1, Ordering::Relaxed);
-                let core = pinned_cores_arc[idx % pinned_cores_arc.len()];
-                let _ = core_affinity::set_for_current(core);
-            }
-        })
-        .enable_all()
-        .build()
-        .expect("Failed to build dedicated recovery runtime")
-});
 
 static BLOB_ROOTS: LazyLock<Vec<PathBuf>> =
     LazyLock::new(|| ObjectPathManager::new().get_blob_roots());
@@ -73,6 +45,18 @@ static RAW_RELOCATIONS: LazyLock<StdMutex<HashMap<String, RawBlobAddress>>> =
 pub static RAW_VERIFY_ON_READ_ATOMIC: OnceCell<AtomicBool> = OnceCell::new();
 
 const MAX_RAW_RELOCATIONS: usize = 8192;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairLogMode {
+    Verbose,
+    Summary,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RepairShardOutcome {
+    pub relocated_raw_shard: bool,
+    pub stale_mapping_relocated: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ShardRepairContext {
@@ -850,6 +834,7 @@ pub async fn read_or_recover_chunk_into(
     }
     let data_count = data_shards_count(&part);
     let parity_count = part.shards.len().saturating_sub(data_count);
+    let recovery_len = if len % 2 == 0 { len } else { len + 1 };
 
     if data_count == 0 {
         return Err(AppError::InternalServerError("No data shards".into()));
@@ -864,7 +849,7 @@ pub async fn read_or_recover_chunk_into(
 
     warn!("Read failed for validated shard, attempting recovery.");
 
-    let mut decoder = ReedSolomonDecoder::new(data_count, parity_count, len)
+    let mut decoder = ReedSolomonDecoder::new(data_count, parity_count, recovery_len)
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
     let mut shards_added = 0usize;
@@ -906,7 +891,7 @@ pub async fn read_or_recover_chunk_into(
         &mut remaining_raw,
         &mut buffer_pool,
         offset,
-        len,
+        recovery_len,
         raw_inflight_limit,
     )
     .await;
@@ -916,13 +901,13 @@ pub async fn read_or_recover_chunk_into(
             break;
         }
 
-        let mut peer_scratch = buffer_pool.take_peer_buffer(len);
+        let mut peer_scratch = buffer_pool.take_peer_buffer(recovery_len);
         let read_ok = read_shard_chunk_cached_into(
             file_cache,
             s,
             vdir_hint,
             offset,
-            len,
+            recovery_len,
             RawReadValidationMode::Verified,
             &mut peer_scratch,
         )
@@ -965,7 +950,7 @@ pub async fn read_or_recover_chunk_into(
             Err((err, buffer)) => {
                 warn!(
                     "Raw shard read failed file={} path={} offset={} len={} err={}",
-                    task.file_name, task.absolute_path, offset, len, err
+                    task.file_name, task.absolute_path, offset, recovery_len, err
                 );
                 buffer_pool.recycle_peer_buffer(buffer);
             }
@@ -976,7 +961,7 @@ pub async fn read_or_recover_chunk_into(
             &mut remaining_raw,
             &mut buffer_pool,
             offset,
-            len,
+            recovery_len,
             raw_inflight_limit,
         )
         .await;
@@ -1001,22 +986,25 @@ pub async fn read_or_recover_chunk_into(
         .1;
 
     out.clear();
-    out.extend_from_slice(restored);
+    out.extend_from_slice(&restored[..len]);
 
     let part_clone = Arc::clone(&part);
     let target_idx = target_shard.shard_index;
     let repair_key = repair_job_key(&part, target_shard, repair_context.as_ref());
 
     if register_inflight_repair(&repair_key) {
-        RECOVERY_RUNTIME.spawn(async move {
-            if let Err(e) =
-                repair_entire_shard(part_clone, target_idx, block_size, repair_context.clone())
-                    .await
-            {
-                warn!("Background repair failed for shard {}: {}", target_idx, e);
-            }
-            unregister_inflight_repair(&repair_key);
-        });
+        if let Err(e) = repair_entire_shard(
+            part_clone,
+            target_idx,
+            block_size,
+            repair_context.clone(),
+            RepairLogMode::Verbose,
+        )
+        .await
+        {
+            warn!("Read-triggered repair failed for shard {}: {}", target_idx, e);
+        }
+        unregister_inflight_repair(&repair_key);
     }
 
     Ok(())
@@ -1027,7 +1015,8 @@ pub async fn repair_entire_shard(
     target_shard_idx: usize,
     block_size: usize,
     repair_context: Option<ShardRepairContext>,
-) -> Result<(), AppError> {
+    log_mode: RepairLogMode,
+) -> Result<RepairShardOutcome, AppError> {
     let _permit = RECOVERY_SEMAPHORE
         .acquire()
         .await
@@ -1049,10 +1038,11 @@ pub async fn repair_entire_shard(
 
     let total_shard_size = target_shard.size_bytes;
     let raw_target = target_shard.raw_blob_address.is_some();
+    let mut outcome = RepairShardOutcome::default();
 
     let mut repair_target = if raw_target {
         match verify_shard_checksum(&target_shard).await {
-            Ok(true) => return Ok(()),
+            Ok(true) => return Ok(outcome),
             Ok(false) => RepairTarget::RawInPlace,
             Err(err) => {
                 let Some(ctx) = repair_context.as_ref() else {
@@ -1106,10 +1096,16 @@ pub async fn repair_entire_shard(
                             ),
                         )
                     })?;
-                warn!(
-                    "Relocating raw shard {} after stale or missing raw device mapping: {}",
-                    target_shard.file_name, err
-                );
+                match log_mode {
+                    RepairLogMode::Verbose => warn!(
+                        "Relocating raw shard {} after stale or missing raw device mapping: {}",
+                        target_shard.file_name, err
+                    ),
+                    RepairLogMode::Summary => debug!(
+                        "Relocating raw shard {} after stale or missing raw device mapping: {}",
+                        target_shard.file_name, err
+                    ),
+                }
                 RepairTarget::TempFile {
                     final_path: PathBuf::new(),
                     parent_dir,
@@ -1146,7 +1142,7 @@ pub async fn repair_entire_shard(
         if fs::try_exists(&final_path).await.unwrap_or(false) {
             if let Ok(mut f) = File::open(&final_path).await {
                 if verify_shard_integrity(&mut f, &target_shard.checksum).await {
-                    return Ok(());
+                    return Ok(outcome);
                 }
             }
         }
@@ -1193,8 +1189,8 @@ pub async fn repair_entire_shard(
         if let RepairTarget::TempFile { temp_path, .. } = &repair_target {
             let _ = fs::remove_file(temp_path).await;
         }
-        return Err(AppError::InternalServerError("No data shards".into()));
-    }
+            return Err(AppError::InternalServerError("No data shards".into()));
+        }
 
     let mut peer_cache: ShardFileCache = HashMap::new();
     let mut file_peers = Vec::new();
@@ -1454,7 +1450,14 @@ pub async fn repair_entire_shard(
                     "Repaired raw shard failed checksum verification".into(),
                 ));
             }
-            info!("Successfully repaired raw shard {}", target_shard.file_name);
+            match log_mode {
+                RepairLogMode::Verbose => {
+                    info!("Successfully repaired raw shard {}", target_shard.file_name);
+                }
+                RepairLogMode::Summary => {
+                    debug!("Successfully repaired raw shard {}", target_shard.file_name);
+                }
+            }
         }
         RepairTarget::TempFile {
             final_path,
@@ -1515,22 +1518,40 @@ pub async fn repair_entire_shard(
                             let _ = free_raw_address(old_raw).await;
                         }
 
-                        info!(
-                            "Successfully relocated raw shard {} -> {}",
-                            target_shard.file_name,
-                            raw_blob_debug_path(&new_raw)
-                        );
+                        outcome.relocated_raw_shard = true;
+                        outcome.stale_mapping_relocated = true;
+                        match log_mode {
+                            RepairLogMode::Verbose => info!(
+                                "Successfully relocated raw shard {} -> {}",
+                                target_shard.file_name,
+                                raw_blob_debug_path(&new_raw)
+                            ),
+                            RepairLogMode::Summary => debug!(
+                                "Successfully relocated raw shard {} -> {}",
+                                target_shard.file_name,
+                                raw_blob_debug_path(&new_raw)
+                            ),
+                        }
                     }
                     Ok(RelocatedRawMetadataOutcome::AlreadyRelocated(existing_raw)) => {
                         let _ = free_raw_address(&new_raw).await;
                         if let Some(old_raw) = target_shard.raw_blob_address.as_ref() {
                             remember_raw_relocation(old_raw, &existing_raw);
                         }
-                        info!(
-                            "Raw shard {} already relocated to {}",
-                            target_shard.file_name,
-                            raw_blob_debug_path(&existing_raw)
-                        );
+                        outcome.relocated_raw_shard = true;
+                        outcome.stale_mapping_relocated = true;
+                        match log_mode {
+                            RepairLogMode::Verbose => info!(
+                                "Raw shard {} already relocated to {}",
+                                target_shard.file_name,
+                                raw_blob_debug_path(&existing_raw)
+                            ),
+                            RepairLogMode::Summary => debug!(
+                                "Raw shard {} already relocated to {}",
+                                target_shard.file_name,
+                                raw_blob_debug_path(&existing_raw)
+                            ),
+                        }
                     }
                     Err(err) => {
                         let _ = free_raw_address(&new_raw).await;
@@ -1550,14 +1571,21 @@ pub async fn repair_entire_shard(
                 }
                 let _ = sync_dir(&parent_dir).await;
 
-                info!(
-                    "Successfully repaired shard {} -> {}",
-                    target_shard.file_name,
-                    final_path.display()
-                );
+                match log_mode {
+                    RepairLogMode::Verbose => info!(
+                        "Successfully repaired shard {} -> {}",
+                        target_shard.file_name,
+                        final_path.display()
+                    ),
+                    RepairLogMode::Summary => debug!(
+                        "Successfully repaired shard {} -> {}",
+                        target_shard.file_name,
+                        final_path.display()
+                    ),
+                }
             }
         }
     }
 
-    Ok(())
+    Ok(outcome)
 }

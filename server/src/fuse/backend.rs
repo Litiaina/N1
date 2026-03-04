@@ -522,6 +522,8 @@ impl InProcessBackend {
                 content_type: Some("application/octet-stream".to_string()),
                 total_size_bytes: total_size,
                 expected_parts,
+                part_size_bytes: Some(part_size),
+                part_sizes_bytes: None,
             }),
         )
         .await?
@@ -594,6 +596,8 @@ impl InProcessBackend {
                 content_type: Some("application/octet-stream".to_string()),
                 total_size_bytes: total_size,
                 expected_parts,
+                part_size_bytes: None,
+                part_sizes_bytes: None,
             }),
         )
         .await?

@@ -115,7 +115,10 @@ pub fn print_health_report(health: &HealthResponse) {
     box_section("METRICS");
     kv(
         "CPU Usage",
-        format!("{:.2}%", health.system.cpu_usage_percent),
+        format!(
+            "{:.2}% / {} core(s)",
+            health.system.cpu_usage_percent, health.system.cpu_cores
+        ),
     );
     kv(
         "RAM Usage",
@@ -126,7 +129,18 @@ pub fn print_health_report(health: &HealthResponse) {
             human_bytes(health.system.ram_total_bytes),
         ),
     );
+    kv("Process RSS", human_bytes(health.system.process_resident_bytes));
+    kv("Process VMem", human_bytes(health.system.process_virtual_bytes));
     kv("Load Avg (1m)", format!("{:.2}", health.system.load_avg_1m));
+    kv("Uptime", health.system.uptime_seconds);
+    kv(
+        "Open FDs",
+        health
+            .system
+            .process_open_fds
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "N/A".to_string()),
+    );
 
     box_section("CONSISTENCY");
     kv("Scanned Objects", health.consistency.total_objects_scanned);
@@ -140,6 +154,50 @@ pub fn print_health_report(health: &HealthResponse) {
             .map(format_mirror_counts)
             .unwrap_or_else(|| "N/A".to_string()),
     );
+
+    box_section("UPLOADS");
+    kv("Active Sessions", health.uploads.active_sessions);
+    kv("Active Fragments", health.uploads.active_fragments);
+    kv("Reserved Bytes", human_bytes(health.uploads.reserved_bytes));
+    kv("Committed Parts", health.uploads.committed_parts);
+    kv("Committed Bytes", human_bytes(health.uploads.committed_bytes));
+    kv(
+        "Oldest Age (s)",
+        health
+            .uploads
+            .oldest_session_age_seconds
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "N/A".to_string()),
+    );
+
+    box_section("INDEX RUNTIME");
+    kv(
+        "Partition RT",
+        health.index_runtime.loaded_partition_runtimes,
+    );
+    kv("WAL Writers", health.index_runtime.wal_appenders);
+    kv(
+        "Prefix Pending",
+        health.index_runtime.prefix_projection_fragments_pending,
+    );
+
+    box_section("STORAGE");
+    kv(
+        "Index Roots",
+        format!(
+            "{} / {}",
+            health.storage.index_roots_online, health.storage.index_roots_total
+        ),
+    );
+    kv(
+        "Blob Devices",
+        format!(
+            "{} / {}",
+            health.storage.blob_devices_online, health.storage.blob_devices_total
+        ),
+    );
+    kv("Raw Used", human_bytes(health.storage.raw_used_bytes));
+    kv("Raw Free", human_bytes(health.storage.raw_available_bytes));
 
     box_section("DISKS");
     box_line("ROLE       │ STATUS     │ LATENCY    │ PATH");

@@ -176,7 +176,9 @@ pub async fn serve_storage_routes() -> Router {
             .route("/v4/fsd/stat/{*mount_path}", get(fsd_stat))
             .route("/v4/fsd/read/{*mount_path}", get(fsd_read));
 
-        let read_ops = layers.layer_view(read_ops);
+        let read_ops = layers
+            .layer_view(read_ops)
+            .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
 
         let write_ops = Router::new()
             .route("/v4/fragment/delete/{:fragment}", delete(delete_fragment))
@@ -306,7 +308,9 @@ pub async fn serve_storage_routes() -> Router {
 
         let public_routes = Router::new().route("/v4/public/share", get(get_shared_object));
 
-        let public_routes = layers.layer_sharing(public_routes);
+        let public_routes = layers
+            .layer_sharing(public_routes)
+            .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
 
         Router::new().merge(protected_routes).merge(public_routes)
     };
@@ -391,7 +395,9 @@ pub async fn serve_storage_routes() -> Router {
             .route("/dir/file/download/", get(download_file))
             .route("/dir/file/download/{*path}", get(download_file));
 
-        let read_ops = layers.layer_view(read_ops);
+        let read_ops = layers
+            .layer_view(read_ops)
+            .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
 
         Router::new()
             .merge(upload_routes)
@@ -402,12 +408,16 @@ pub async fn serve_storage_routes() -> Router {
 
     let list_fragments_route =
         Router::new().route("/v4/fragment/list/public", get(list_public_fragments));
-    let list_fragments_route = layers.layer_global(list_fragments_route);
+    let list_fragments_route = layers
+        .layer_global(list_fragments_route)
+        .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
 
     let global_routes = Router::new()
         .route("/v4/fragment/check", get(verify_fragment_existence))
         .route("/v4/fragment/get/hash", get(get_fragment_hash));
-    let global_routes = layers.layer_global(global_routes);
+    let global_routes = layers
+        .layer_global(global_routes)
+        .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
 
     let create_fragment_route = Router::new().route("/v4/fragment/create", post(create_fragment));
     let create_fragment_route = layers

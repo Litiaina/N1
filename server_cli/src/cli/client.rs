@@ -1,6 +1,6 @@
 use crate::cli::report::print_health_report;
 
-use super::args::{Commands, JobAction, OpsCommands};
+use super::args::{Commands, JobAction, OpsCommands, UploadCommands};
 use ini::Ini;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
@@ -35,7 +35,7 @@ pub struct CreateFragmentRequest {
     pub secret: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct DiskStatus {
     pub path: String,
     pub role: String,
@@ -44,28 +44,96 @@ pub struct DiskStatus {
     pub error: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ConsistencyStats {
     pub total_objects_scanned: u64,
     pub index_mirror_health: String,
     pub mirror_counts: Option<HashMap<String, u64>>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct SystemMetrics {
     pub cpu_usage_percent: f64,
+    pub cpu_cores: u64,
     pub ram_total_bytes: u64,
     pub ram_used_bytes: u64,
     pub ram_usage_percent: f64,
     pub load_avg_1m: f64,
+    pub uptime_seconds: u64,
+    pub process_resident_bytes: u64,
+    pub process_virtual_bytes: u64,
+    pub process_open_fds: Option<u64>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
+pub struct UploadRuntimeStats {
+    pub active_fragments: u64,
+    pub active_sessions: u64,
+    pub reserved_bytes: u64,
+    pub committed_parts: u64,
+    pub committed_bytes: u64,
+    pub oldest_session_age_seconds: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct IndexRuntimeStats {
+    pub loaded_partition_runtimes: u64,
+    pub wal_appenders: u64,
+    pub prefix_projection_fragments_pending: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct StoragePlaneStats {
+    pub index_roots_total: u64,
+    pub index_roots_online: u64,
+    pub blob_devices_total: u64,
+    pub blob_devices_online: u64,
+    pub raw_total_bytes: u64,
+    pub raw_used_bytes: u64,
+    pub raw_available_bytes: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ActiveSessionInfo {
+    pub session_id: String,
+    pub version_id: String,
+    pub object_key: Option<String>,
+    pub created_at: i64,
+    pub reserved_size: u64,
+    pub total_size_bytes: Option<u64>,
+    pub expected_parts: Option<u64>,
+    pub committed_parts: u64,
+    pub committed_bytes: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ListUploadsResponse {
+    pub sessions: Vec<ActiveSessionInfo>,
+    pub total: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct UploadStatusResponse {
+    pub uploaded_parts: Vec<u64>,
+    pub committed_parts: u64,
+    pub committed_bytes: u64,
+    pub expected_parts: Option<u64>,
+    pub total_size_bytes: Option<u64>,
+    pub created_at: Option<i64>,
+    pub session_id: Option<String>,
+    pub object_key: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 pub struct HealthResponse {
+    pub sampled_at: i64,
     pub status: String,
     pub disks: Vec<DiskStatus>,
     pub consistency: ConsistencyStats,
     pub system: SystemMetrics,
+    pub uploads: UploadRuntimeStats,
+    pub index_runtime: IndexRuntimeStats,
+    pub storage: StoragePlaneStats,
     pub summary: String,
 }
 
@@ -255,6 +323,21 @@ fn fmt_num(n: u64) -> String {
         count += 1;
     }
     result
+}
+
+fn fmt_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut idx = 0usize;
+    while value >= 1024.0 && idx < UNITS.len() - 1 {
+        value /= 1024.0;
+        idx += 1;
+    }
+    if idx == 0 {
+        format!("{bytes} {}", UNITS[idx])
+    } else {
+        format!("{value:.2} {}", UNITS[idx])
+    }
 }
 
 fn fmt_duration(secs: u64) -> String {
@@ -652,6 +735,104 @@ fn print_prefix_rebuild_status_pretty(st: &PrefixRebuildJobStatus) {
     draw_bottom();
 }
 
+fn print_upload_status_pretty(st: &UploadStatusResponse) {
+    let expected_parts = st.expected_parts.unwrap_or(0);
+    let progress = if expected_parts == 0 {
+        "n/a".to_string()
+    } else {
+        fmt_pct(st.committed_parts, expected_parts)
+    };
+
+    draw_top("UPLOAD STATUS", 0);
+    draw_row(
+        "Object",
+        st.object_key
+            .as_deref()
+            .unwrap_or("<unknown object>"),
+    );
+    draw_row(
+        "Session",
+        st.session_id
+            .as_deref()
+            .unwrap_or("<unknown session>"),
+    );
+    draw_row(
+        "Started At",
+        &st.created_at.map(fmt_unix_ts).unwrap_or_else(|| "n/a".to_string()),
+    );
+    draw_divider(Some("PROGRESS"));
+    draw_row("Committed Parts", &fmt_num(st.committed_parts));
+    if expected_parts > 0 {
+        draw_row(
+            "Expected Parts",
+            &format!("{} ({})", fmt_num(expected_parts), progress),
+        );
+    }
+    draw_row("Committed Bytes", &fmt_bytes(st.committed_bytes));
+    if let Some(total_size) = st.total_size_bytes {
+        draw_row("Reserved Bytes", &fmt_bytes(total_size));
+    }
+    draw_divider(Some("PARTS"));
+    draw_row(
+        "Uploaded Parts",
+        &if st.uploaded_parts.is_empty() {
+            "<none>".to_string()
+        } else {
+            st.uploaded_parts
+                .iter()
+                .map(|part| part.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+    );
+    draw_bottom();
+}
+
+fn print_upload_list_pretty(st: &ListUploadsResponse) {
+    draw_top("ACTIVE UPLOADS", 0);
+    draw_row("Total", &fmt_num(st.total as u64));
+    draw_divider(Some("SESSIONS"));
+    if st.sessions.is_empty() {
+        draw_row("Sessions", "<none>");
+    } else {
+        for (idx, session) in st.sessions.iter().enumerate() {
+            let object_key = session
+                .object_key
+                .as_deref()
+                .unwrap_or("<unknown object>");
+            draw_row(
+                &format!("Upload {}", idx + 1),
+                &truncate(object_key, UI_WIDTH - 26),
+            );
+            draw_row("Version", &session.version_id);
+            draw_row("Session", &session.session_id);
+            draw_row("Started At", &fmt_unix_ts(session.created_at));
+            draw_row(
+                "Committed",
+                &format!(
+                    "{} part(s), {}",
+                    fmt_num(session.committed_parts),
+                    fmt_bytes(session.committed_bytes)
+                ),
+            );
+            if let Some(expected_parts) = session.expected_parts {
+                draw_row(
+                    "Expected",
+                    &format!(
+                        "{} ({})",
+                        fmt_num(expected_parts),
+                        fmt_pct(session.committed_parts, expected_parts)
+                    ),
+                );
+            }
+            if idx + 1 < st.sessions.len() {
+                draw_divider(None);
+            }
+        }
+    }
+    draw_bottom();
+}
+
 fn render_gc_monitor(st: &GcJobStatus, elapsed: Duration) {
     let status_color = if st.is_running { green } else { yellow };
     let progress = fmt_pct(st.total_fragments_scanned, st.total_fragments);
@@ -860,19 +1041,6 @@ fn render_prefix_monitor(st: &PrefixRebuildJobStatus, elapsed: Duration) {
 }
 
 fn render_health_monitor(st: &HealthResponse, elapsed: Duration, deep_scan: bool) {
-    let total_index = st.disks.iter().filter(|d| d.role == "index").count() as u64;
-    let total_blob = st.disks.iter().filter(|d| d.role == "blob").count() as u64;
-    let online_index = st
-        .disks
-        .iter()
-        .filter(|d| d.role == "index" && (d.status == "online" || d.status == "slow"))
-        .count() as u64;
-    let online_blob = st
-        .disks
-        .iter()
-        .filter(|d| d.role == "blob" && (d.status == "online" || d.status == "slow"))
-        .count() as u64;
-
     let status_color = match st.status.as_str() {
         "healthy" => green,
         "degraded" | "warning" => yellow,
@@ -890,20 +1058,84 @@ fn render_health_monitor(st: &HealthResponse, elapsed: Duration, deep_scan: bool
         },
     );
     draw_divider(Some("SYSTEM"));
-    draw_row("CPU", &format!("{:.2}%", st.system.cpu_usage_percent));
-    draw_row("RAM", &format!("{:.2}%", st.system.ram_usage_percent));
+    draw_row(
+        "CPU",
+        &format!(
+            "{:.2}% / {} core(s)",
+            st.system.cpu_usage_percent, st.system.cpu_cores
+        ),
+    );
+    draw_row(
+        "RAM",
+        &format!(
+            "{:.2}% ({})",
+            st.system.ram_usage_percent,
+            fmt_bytes(st.system.ram_used_bytes)
+        ),
+    );
+    draw_row("Proc RSS", &fmt_bytes(st.system.process_resident_bytes));
     draw_row("Load 1m", &format!("{:.2}", st.system.load_avg_1m));
+    draw_row("Uptime", &fmt_duration(st.system.uptime_seconds));
     draw_row("Elapsed", &fmt_duration(elapsed.as_secs()));
+    if let Some(fds) = st.system.process_open_fds {
+        draw_row("Open FDs", &fmt_num(fds));
+    }
 
-    draw_divider(Some("DISKS"));
+    draw_divider(Some("UPLOADS"));
     draw_row(
-        "Index Online",
-        &format!("{} / {}", fmt_num(online_index), fmt_num(total_index)),
+        "Sessions",
+        &format!(
+            "{} in {} fragment(s)",
+            fmt_num(st.uploads.active_sessions),
+            fmt_num(st.uploads.active_fragments)
+        ),
     );
     draw_row(
-        "Blob Online",
-        &format!("{} / {}", fmt_num(online_blob), fmt_num(total_blob)),
+        "Reserved",
+        &fmt_bytes(st.uploads.reserved_bytes),
     );
+    draw_row(
+        "Committed",
+        &format!(
+            "{} part(s), {}",
+            fmt_num(st.uploads.committed_parts),
+            fmt_bytes(st.uploads.committed_bytes)
+        ),
+    );
+    if let Some(age) = st.uploads.oldest_session_age_seconds {
+        draw_row("Oldest Age", &fmt_duration(age));
+    }
+
+    draw_divider(Some("INDEX"));
+    draw_row(
+        "Roots Online",
+        &format!(
+            "{} / {}",
+            fmt_num(st.storage.index_roots_online),
+            fmt_num(st.storage.index_roots_total)
+        ),
+    );
+    draw_row(
+        "Partition RT",
+        &fmt_num(st.index_runtime.loaded_partition_runtimes),
+    );
+    draw_row("WAL Writers", &fmt_num(st.index_runtime.wal_appenders));
+    draw_row(
+        "Prefix Pending",
+        &fmt_num(st.index_runtime.prefix_projection_fragments_pending),
+    );
+
+    draw_divider(Some("BLOB"));
+    draw_row(
+        "Devices Online",
+        &format!(
+            "{} / {}",
+            fmt_num(st.storage.blob_devices_online),
+            fmt_num(st.storage.blob_devices_total)
+        ),
+    );
+    draw_row("Raw Used", &fmt_bytes(st.storage.raw_used_bytes));
+    draw_row("Raw Free", &fmt_bytes(st.storage.raw_available_bytes));
 
     draw_divider(Some("CONSISTENCY"));
     draw_row(
@@ -1567,12 +1799,58 @@ pub async fn execute_command(
 
                         if resp.status().is_success() {
                             let health: HealthResponse = resp.json().await?;
-                            print_health_report(&health);
+                            if json_out {
+                                print_status("Health", &health, true)?;
+                            } else {
+                                print_health_report(&health);
+                            }
                         } else {
                             error!("Health check failed: {}", resp.text().await?);
                         }
                     }
                 }
+                Commands::Uploads { cmd } => match cmd {
+                    UploadCommands::List { limit, offset } => {
+                        let resp = client
+                            .get(format!("{}/v4/upload/status/list/{}", base_url, fragment_context))
+                            .query(&[("limit", limit), ("offset", offset)])
+                            .bearer_auth(&token)
+                            .send()
+                            .await?;
+                        if !resp.status().is_success() {
+                            return Err(
+                                format!("Upload list failed: {}", resp.text().await?).into()
+                            );
+                        }
+                        let status: ListUploadsResponse = resp.json().await?;
+                        if json_out {
+                            print_status("Uploads", &status, true)?;
+                        } else {
+                            print_upload_list_pretty(&status);
+                        }
+                    }
+                    UploadCommands::Status { version_id } => {
+                        let resp = client
+                            .get(format!(
+                                "{}/v4/upload/status/{}/{}",
+                                base_url, fragment_context, version_id
+                            ))
+                            .bearer_auth(&token)
+                            .send()
+                            .await?;
+                        if !resp.status().is_success() {
+                            return Err(
+                                format!("Upload status failed: {}", resp.text().await?).into()
+                            );
+                        }
+                        let status: UploadStatusResponse = resp.json().await?;
+                        if json_out {
+                            print_status("Upload Status", &status, true)?;
+                        } else {
+                            print_upload_status_pretty(&status);
+                        }
+                    }
+                },
                 _ => {}
             }
         }

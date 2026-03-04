@@ -338,6 +338,10 @@ pub fn open_raw_direct_io(shard: &ShardInfo) -> Result<DirectExtentIo, AppError>
     let raw = shard.raw_blob_address.as_ref().ok_or_else(|| {
         AppError::InternalServerError("Shard is not backed by raw blob storage".into())
     })?;
+    open_raw_direct_io_for_address(raw)
+}
+
+pub fn open_raw_direct_io_for_address(raw: &RawBlobAddress) -> Result<DirectExtentIo, AppError> {
     let manager = raw_manager_by_device_id(raw.device_id.as_str())?;
     let mgr = manager
         .lock()

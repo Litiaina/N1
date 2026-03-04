@@ -459,11 +459,22 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
 5. Optional cancel
 
 ### 8.1 `POST /v4/upload/init/{fragment}/{*object_key}`
+Body:
+- `content_type` optional
+- `total_size_bytes` required
+- `expected_parts` required
+- `part_size_bytes` optional: freezes deterministic part geometry for fixed-size multipart uploads
+- `part_sizes_bytes` optional: freezes deterministic per-part geometry explicitly
+
+Behavior:
+- Opens the authoritative multipart session in `index`.
+- If geometry is supplied at init, the node pre-reserves deterministic raw shard slots up front so part uploads can reuse them directly.
+
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   "https://127.0.0.1:50001/v4/upload/init/<fragment_hash>/videos/a.mp4" \
-  -d '{"content_type":"video/mp4","total_size_bytes":1073741824,"expected_parts":256}'
+  -d '{"content_type":"video/mp4","total_size_bytes":1073741824,"expected_parts":256,"part_size_bytes":4194304}'
 ```
 
 ### 8.2 `PUT /v4/upload/chunk/{fragment}/{version_id}/{part_index}`
@@ -481,6 +492,9 @@ Durability default:
 Notes:
 - Part upload writes a durable pending-part receipt, commits raw shard payload, then writes durable part metadata on disk.
 - The upload hot path does not rely on in-memory part state for resumability.
+- If init provided geometry, the part path reuses pre-reserved raw shard slots instead of allocating new extents on the hot path.
+- Multipart part commits are unordered across distinct `part_index` values.
+- Client coordination should keep one logical writer per `(version_id, part_index)` and use upload-status checks for stateless resume.
 - A successful part upload does not publish object visibility by itself.
 
 ```bash
@@ -491,6 +505,10 @@ curl -k -X PUT -H "Authorization: Bearer $TOKEN" \
 ```
 
 ### 8.3 `GET /v4/upload/status/{fragment}/{version_id}`
+Behavior:
+- Reads the routed upload manifest from `index` and the committed part receipts from disk.
+- Returns committed part indexes plus committed byte/part counters for resumability checks.
+
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/upload/status/<fragment_hash>/<version_id>"
@@ -500,6 +518,10 @@ curl -k -H "Authorization: Bearer $TOKEN" \
 Query:
 - `limit` default 50, max 100
 - `offset` default 0
+
+Behavior:
+- Lists active routed multipart sessions from `index` and derives committed progress from durable part receipts on disk.
+- Includes committed part/byte progress per session.
 
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
@@ -702,7 +724,9 @@ Query params:
 Notes:
 - Default request serves cached health snapshot produced by monitor loop.
 - Background monitor interval is config-driven.
+- Fast probes are read-oriented and avoid temp-file write/delete churn on every monitor pass.
 - Deep scan reflects the partitioned `index` model; differing per-root object counts are expected outside a partition's owner/replica placements.
+- Health includes system metrics, process RSS/open-FD pressure, active upload/runtime counters, and raw/blob storage totals.
 
 ```bash
 curl -k -X GET -H "Authorization: Bearer $TOKEN" \

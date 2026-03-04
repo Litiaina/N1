@@ -29,6 +29,20 @@ pub enum JobAction {
 }
 
 #[derive(Subcommand, Debug, Clone)]
+pub enum UploadCommands {
+    List {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    Status {
+        #[arg(long)]
+        version_id: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
 pub enum OpsCommands {
     Gc {
         #[command(subcommand)]
@@ -84,6 +98,10 @@ pub enum Commands {
         watch: bool,
         #[arg(long, default_value_t = false)]
         deep_scan: bool,
+    },
+    Uploads {
+        #[command(subcommand)]
+        cmd: UploadCommands,
     },
     Ops {
         #[command(subcommand)]

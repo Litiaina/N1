@@ -5,7 +5,7 @@ use crate::n1_core::disk_manager::{
     ReservationReceipt, compare_version_recency, version_recency_is_newer,
 };
 use crate::n1_core::prefix_delimiter::build_delimiter_compacted_from_entries;
-use crate::n1_core::upload::UploadSessionManifest;
+use crate::n1_core::upload::{PartCommitReceipt, UploadSessionManifest};
 use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,7 @@ const INDEX_LATEST_CHECKPOINT_FILE: &str = "latest.msgpack";
 const INDEX_PREFIX_PROJECTION_CURSOR_FILE: &str = "prefix_projection.cursor.msgpack";
 const INDEX_LATEST_SUFFIX: &str = ".latest.msgpack";
 const INDEX_SESSION_SUFFIX: &str = ".session.msgpack";
+const INDEX_SESSION_REMOVED_SUFFIX: &str = ".removed.msgpack";
 const INDEX_OBJECT_SUFFIX: &str = ".msgpack";
 const INDEX_PARTITION_COUNT: u16 = 256;
 const INDEX_WAL_SEGMENT_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -78,6 +79,13 @@ pub struct IndexSessionState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemovedSessionReceipt {
+    pub state: IndexSessionState,
+    pub removed_at: i64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexLatestState {
     pub version_id: String,
     pub metadata: ObjectMetadata,
@@ -105,7 +113,7 @@ enum IndexWalRecord {
         fragment: String,
         version_id: String,
         part_index: u64,
-        part: PartMetadata,
+        part: SessionPartCommitRecord,
         committed_at: i64,
     },
     VersionPublished {
@@ -131,6 +139,12 @@ enum IndexWalRecord {
         removed_at: i64,
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum SessionPartCommitRecord {
+    Full(PartMetadata),
+    PlannedReceipt(PartCommitReceipt),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +235,29 @@ struct IndexRoute {
     roots: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct UploadRuntimeStats {
+    pub active_fragments: u64,
+    pub active_sessions: u64,
+    pub reserved_bytes: u64,
+    pub committed_parts: u64,
+    pub committed_bytes: u64,
+    pub oldest_session_age_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct IndexRuntimeStats {
+    pub loaded_partition_runtimes: u64,
+    pub wal_appenders: u64,
+    pub prefix_projection_fragments_pending: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexReplicaWriteMode {
+    BackgroundBestEffort,
+    SyncBestEffort,
+}
+
 fn normalize_session_state(mut state: IndexSessionState) -> IndexSessionState {
     if state.last_activity_at == 0 {
         state.last_activity_at = state.manifest.created_at;
@@ -286,8 +323,12 @@ fn apply_wal_record_to_materialized(
         } => {
             if let Some(state) = materialized.sessions.get_mut(version_id) {
                 if state.manifest.fragment == *fragment {
-                    state.parts.insert(*part_index, part.clone());
-                    state.last_activity_at = *committed_at;
+                    if let Some(materialized_part) =
+                        materialize_session_part_record(&state.manifest, *part_index, part)
+                    {
+                        state.parts.insert(*part_index, materialized_part);
+                        state.last_activity_at = *committed_at;
+                    }
                 }
             }
         }
@@ -395,6 +436,19 @@ async fn remove_active_session(fragment: &str, version_id: &str) {
         .insert(fragment.to_string());
 }
 
+fn materialize_session_part_record(
+    manifest: &UploadSessionManifest,
+    part_index: u64,
+    record: &SessionPartCommitRecord,
+) -> Option<PartMetadata> {
+    match record {
+        SessionPartCommitRecord::Full(part) => Some(part.clone()),
+        SessionPartCommitRecord::PlannedReceipt(receipt) => {
+            manifest.materialize_part_from_receipt(part_index, receipt)
+        }
+    }
+}
+
 async fn session_lock(fragment: &str, version_id: &str) -> Arc<Mutex<()>> {
     let key = session_cache_key(fragment, version_id);
     let mut guard = INDEX_SESSION_LOCKS.lock().await;
@@ -486,6 +540,17 @@ fn session_parts_dir(root: &Path, fragment: &str, partition_id: u16, version_id:
     partition_dir(root, fragment, partition_id)
         .join(INDEX_SESSIONS_DIR)
         .join(format!("{}.parts", version_id))
+}
+
+fn session_removed_receipt_path(
+    root: &Path,
+    fragment: &str,
+    partition_id: u16,
+    version_id: &str,
+) -> PathBuf {
+    partition_dir(root, fragment, partition_id)
+        .join(INDEX_SESSIONS_DIR)
+        .join(format!("{}{}", version_id, INDEX_SESSION_REMOVED_SUFFIX))
 }
 
 fn object_prefix_dir_for_state(
@@ -1317,8 +1382,12 @@ fn apply_session_wal_record(
         } => {
             if let Some(state) = sessions.get_mut(version_id) {
                 if state.manifest.fragment == *fragment {
-                    state.parts.insert(*part_index, part.clone());
-                    state.last_activity_at = *committed_at;
+                    if let Some(materialized_part) =
+                        materialize_session_part_record(&state.manifest, *part_index, part)
+                    {
+                        state.parts.insert(*part_index, materialized_part);
+                        state.last_activity_at = *committed_at;
+                    }
                 }
             }
         }
@@ -1338,6 +1407,68 @@ fn apply_session_wal_record(
         }
         _ => {}
     }
+}
+
+async fn load_session_parts_on_root(
+    root: &Path,
+    fragment: &str,
+    partition_id: u16,
+    version_id: &str,
+) -> Result<BTreeMap<u64, PartMetadata>, AppError> {
+    let dir = session_parts_dir(root, fragment, partition_id, version_id);
+    if !fs::try_exists(&dir).await.unwrap_or(false) {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut parts = BTreeMap::new();
+    let mut entries = match fs::read_dir(&dir).await {
+        Ok(entries) => entries,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.kind() == std::io::ErrorKind::NotADirectory =>
+        {
+            return Ok(parts);
+        }
+        Err(e) => return Err(AppError::Io(e, format!("read_dir {}", dir.display()))),
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("msgpack") {
+            continue;
+        }
+        match read_messagepack_if_exists::<PartMetadata>(&path).await {
+            Ok(Some(part)) => {
+                parts.insert(part.part_index, part);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!("index session part decode failed {}: {}", path.display(), e);
+            }
+        }
+    }
+
+    Ok(parts)
+}
+
+async fn enrich_session_state_from_root(
+    root: &Path,
+    fragment: &str,
+    partition_id: u16,
+    state: &mut IndexSessionState,
+) -> Result<(), AppError> {
+    let parts =
+        load_session_parts_on_root(root, fragment, partition_id, &state.manifest.version_id).await?;
+    if !parts.is_empty() {
+        let latest_part_activity = parts
+            .values()
+            .map(|part| part.created_at)
+            .max()
+            .unwrap_or(state.last_activity_at);
+        state.parts.extend(parts);
+        state.last_activity_at = state.last_activity_at.max(latest_part_activity);
+    }
+    Ok(())
 }
 
 async fn materialize_partition_sessions_on_root(
@@ -1368,7 +1499,13 @@ async fn materialize_partition_sessions_on_root(
     for envelope in read_wal_records_since(root, fragment, partition_id, after_sequence).await? {
         apply_session_wal_record(&mut sessions, &envelope);
     }
-    Ok(sessions.into_values().collect())
+
+    let mut out = Vec::with_capacity(sessions.len());
+    for mut state in sessions.into_values() {
+        enrich_session_state_from_root(root, fragment, partition_id, &mut state).await?;
+        out.push(normalize_session_state(state));
+    }
+    Ok(out)
 }
 
 async fn maybe_replicate<F>(label: &'static str, fut: F)
@@ -1390,6 +1527,101 @@ where
             }
         });
     }
+}
+
+async fn persist_session_snapshot_on_roots(
+    route: &IndexRoute,
+    fragment: &str,
+    version_id: &str,
+    state: &IndexSessionState,
+    replica_write_mode: IndexReplicaWriteMode,
+) -> Result<(), AppError> {
+    let bytes = rmp_serde::to_vec(state)
+        .map_err(|e| AppError::InternalServerError(format!("serialize session snapshot: {}", e)))?;
+    let owner_root = route.roots[0].clone();
+    let owner_path = session_state_path(&owner_root, fragment, route.partition_id, version_id);
+    write_atomic(&owner_path, &bytes).await?;
+
+    if route.roots.len() > 1 {
+        let replica_roots = route.roots[1..].to_vec();
+        let fragment_clone = fragment.to_string();
+        let version_clone = version_id.to_string();
+        let bytes_clone = bytes.clone();
+        let partition_id = route.partition_id;
+        let replicate_fut = async move {
+            for root in replica_roots {
+                let path =
+                    session_state_path(&root, &fragment_clone, partition_id, &version_clone);
+                write_atomic(&path, &bytes_clone).await?;
+            }
+            Ok(())
+        };
+        match replica_write_mode {
+            IndexReplicaWriteMode::BackgroundBestEffort => {
+                maybe_replicate("index session snapshot replica sync", replicate_fut).await;
+            }
+            IndexReplicaWriteMode::SyncBestEffort => {
+                if let Err(e) = replicate_fut.await {
+                    warn!(
+                        "index session snapshot replica sync failed fragment={} version={}: {}",
+                        fragment, version_id, e
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn persist_removed_session_receipt_on_roots(
+    route: &IndexRoute,
+    fragment: &str,
+    version_id: &str,
+    receipt: &RemovedSessionReceipt,
+    replica_write_mode: IndexReplicaWriteMode,
+) -> Result<(), AppError> {
+    let bytes = rmp_serde::to_vec(receipt)
+        .map_err(|e| AppError::InternalServerError(format!("serialize removed session receipt: {}", e)))?;
+    let owner_root = route.roots[0].clone();
+    let owner_path =
+        session_removed_receipt_path(&owner_root, fragment, route.partition_id, version_id);
+    write_atomic(&owner_path, &bytes).await?;
+
+    if route.roots.len() > 1 {
+        let replica_roots = route.roots[1..].to_vec();
+        let fragment_clone = fragment.to_string();
+        let version_clone = version_id.to_string();
+        let bytes_clone = bytes.clone();
+        let partition_id = route.partition_id;
+        let replicate_fut = async move {
+            for root in replica_roots {
+                let path = session_removed_receipt_path(
+                    &root,
+                    &fragment_clone,
+                    partition_id,
+                    &version_clone,
+                );
+                write_atomic(&path, &bytes_clone).await?;
+            }
+            Ok(())
+        };
+        match replica_write_mode {
+            IndexReplicaWriteMode::BackgroundBestEffort => {
+                maybe_replicate("index removed session receipt replica sync", replicate_fut).await;
+            }
+            IndexReplicaWriteMode::SyncBestEffort => {
+                if let Err(e) = replicate_fut.await {
+                    warn!(
+                        "index removed session receipt replica sync failed fragment={} version={}: {}",
+                        fragment, version_id, e
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(not(test))]
@@ -2040,11 +2272,36 @@ pub async fn is_prefix_projection_pending(fragment: &str) -> bool {
 }
 
 fn metadata_is_newer(candidate: &ObjectMetadata, current: &ObjectMetadata) -> bool {
-    version_recency_is_newer(
+    if version_recency_is_newer(
         candidate.created_at,
         &candidate.version_id,
         current.created_at,
         &current.version_id,
+    ) {
+        return true;
+    }
+
+    if candidate.created_at == current.created_at && candidate.version_id == current.version_id {
+        return metadata_replica_rank(candidate) > metadata_replica_rank(current);
+    }
+
+    false
+}
+
+fn metadata_replica_rank(metadata: &ObjectMetadata) -> (usize, usize, usize, usize) {
+    let total_shards = metadata.parts.iter().map(|part| part.shards.len()).sum();
+    let raw_shards = metadata
+        .parts
+        .iter()
+        .flat_map(|part| part.shards.iter())
+        .filter(|shard| shard.raw_blob_address.is_some())
+        .count();
+
+    (
+        metadata.parts.len(),
+        total_shards,
+        raw_shards,
+        metadata.stripe_size_bytes,
     )
 }
 
@@ -2122,9 +2379,15 @@ async fn collect_object_versions_for_state(
             let Ok(metadata) = read_messagepack::<ObjectMetadata>(&entry.path()).await else {
                 continue;
             };
-            versions
-                .entry(metadata.version_id.clone())
-                .or_insert(metadata);
+            match versions.get(&metadata.version_id) {
+                None => {
+                    versions.insert(metadata.version_id.clone(), metadata);
+                }
+                Some(current) if metadata_is_newer(&metadata, current) => {
+                    versions.insert(metadata.version_id.clone(), metadata);
+                }
+                _ => {}
+            }
         }
     }
     versions.into_values().collect()
@@ -2198,6 +2461,8 @@ async fn write_object_version_internal(
     metadata: &ObjectMetadata,
     force_latest: bool,
     trashed: bool,
+    replica_write_mode: IndexReplicaWriteMode,
+    allow_owner_failover: bool,
 ) -> Result<(), AppError> {
     let route = object_partition_route(&metadata.fragment, &metadata.object_key)?;
     let current_latest =
@@ -2235,7 +2500,27 @@ async fn write_object_version_internal(
         }
     };
     let partition_id = route.partition_id;
-    let owner_root = route.roots[0].clone();
+    let write_roots = if allow_owner_failover {
+        let mut roots = Vec::new();
+        for root in &route.roots {
+            if fs::metadata(root)
+                .await
+                .map(|meta| meta.is_dir())
+                .unwrap_or(false)
+            {
+                roots.push(root.clone());
+            }
+        }
+        roots
+    } else {
+        route.roots.clone()
+    };
+    if write_roots.is_empty() {
+        return Err(AppError::InternalServerError(
+            "index object write failed: no reachable route roots".into(),
+        ));
+    }
+    let owner_root = write_roots[0].clone();
     let owner_version_path = object_version_path_for_state(
         &owner_root,
         &metadata.fragment,
@@ -2258,8 +2543,8 @@ async fn write_object_version_internal(
     append_wal(&owner_root, &fragment, partition_id, &wal)
         .await
         .map(|_| ())?;
-    if route.roots.len() > 1 {
-        let replica_roots = route.roots[1..].to_vec();
+    if write_roots.len() > 1 {
+        let replica_roots = write_roots[1..].to_vec();
         let metadata_fragment = metadata.fragment.clone();
         let object_key = metadata.object_key.clone();
         let version_id = metadata.version_id.clone();
@@ -2267,7 +2552,7 @@ async fn write_object_version_internal(
         let latest_payload = latest_bytes.clone();
         let wal_clone = wal.clone();
         let fragment_clone = fragment.clone();
-        maybe_replicate("index object replica sync", async move {
+        let replicate_fut = async move {
             for root in replica_roots {
                 let version_path = object_version_path_for_state(
                     &root,
@@ -2293,8 +2578,17 @@ async fn write_object_version_internal(
                     .map(|_| ())?;
             }
             Ok(())
-        })
-        .await;
+        };
+        match replica_write_mode {
+            IndexReplicaWriteMode::BackgroundBestEffort => {
+                maybe_replicate("index object replica sync", replicate_fut).await;
+            }
+            IndexReplicaWriteMode::SyncBestEffort => {
+                if let Err(e) = replicate_fut.await {
+                    warn!("index object replica sync failed: {}", e);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -2560,13 +2854,25 @@ async fn read_object_version_for_state(
         replicas.push((path, modified));
     }
     replicas.sort_by(|left, right| right.1.cmp(&left.1));
-    for (path, _) in replicas {
+    let mut best: Option<(ObjectMetadata, SystemTime)> = None;
+    for (path, modified) in replicas {
         match read_messagepack::<ObjectMetadata>(&path).await {
-            Ok(metadata) => return Ok(metadata),
+            Ok(metadata) => match &best {
+                None => best = Some((metadata, modified)),
+                Some((current, current_modified)) => {
+                    if metadata_is_newer(&metadata, current)
+                        || (metadata.created_at == current.created_at
+                            && metadata.version_id == current.version_id
+                            && modified > *current_modified)
+                    {
+                        best = Some((metadata, modified));
+                    }
+                }
+            },
             Err(e) => warn!("index version read failed {}: {}", path.display(), e),
         }
     }
-    Err(AppError::NotFound)
+    best.map(|(metadata, _)| metadata).ok_or(AppError::NotFound)
 }
 
 fn absorb_latest_state(
@@ -2742,6 +3048,14 @@ pub async fn open_session(
         .await
         .map(|_| ())?;
     cache_active_session(&state).await;
+    persist_session_snapshot_on_roots(
+        &route,
+        &fragment,
+        &manifest.version_id,
+        &state,
+        IndexReplicaWriteMode::BackgroundBestEffort,
+    )
+    .await?;
     if route.roots.len() > 1 {
         let replica_roots = route.roots[1..].to_vec();
         let fragment_clone = fragment.clone();
@@ -2764,75 +3078,83 @@ async fn load_session_uncached(
     version_id: &str,
 ) -> Result<Option<IndexSessionState>, AppError> {
     let route = session_partition_route(fragment, version_id)?;
+    let mut best: Option<IndexSessionState> = None;
     for root in &route.roots {
-        match materialize_partition_sessions_on_root(root, fragment, route.partition_id).await {
-            Ok(states) => {
-                if let Some(state) = states
-                    .into_iter()
-                    .find(|state| state.manifest.version_id == version_id)
-                {
-                    return Ok(Some(normalize_session_state(state)));
+        let runtime_key = runtime_key(root, fragment, route.partition_id);
+        let mut candidate = if let Some(runtime) = INDEX_PARTITION_RUNTIME
+            .lock()
+            .await
+            .get(&runtime_key)
+            .cloned()
+        {
+            let runtime = runtime.lock().await;
+            runtime.materialized.sessions.get(version_id).cloned()
+        } else {
+            None
+        };
+
+        if candidate.is_none() {
+            match materialize_partition_sessions_on_root(root, fragment, route.partition_id).await {
+                Ok(states) => {
+                    candidate = states
+                        .into_iter()
+                        .find(|state| state.manifest.version_id == version_id);
+                }
+                Err(e) => {
+                    warn!(
+                        "index session materialize failed fragment={} version={} root={}: {}",
+                        fragment,
+                        version_id,
+                        root.display(),
+                        e
+                    );
                 }
             }
-            Err(e) => {
+        }
+
+        if let Some(mut state) = candidate {
+            if let Err(e) =
+                enrich_session_state_from_root(root, fragment, route.partition_id, &mut state).await
+            {
                 warn!(
-                    "index session materialize failed fragment={} version={} root={}: {}",
+                    "index session part materialize failed fragment={} version={} root={}: {}",
                     fragment,
                     version_id,
                     root.display(),
                     e
                 );
             }
-        }
-    }
-    Ok(None)
-}
-
-async fn load_session_parts_from_disk(
-    fragment: &str,
-    version_id: &str,
-) -> Result<BTreeMap<u64, PartMetadata>, AppError> {
-    let route = session_partition_route(fragment, version_id)?;
-    let mut parts = BTreeMap::new();
-    for root in &route.roots {
-        let dir = session_parts_dir(root, fragment, route.partition_id, version_id);
-        let mut entries = match fs::read_dir(&dir).await {
-            Ok(entries) => entries,
-            Err(e)
-                if e.kind() == std::io::ErrorKind::NotFound
-                    || e.kind() == std::io::ErrorKind::NotADirectory =>
-            {
-                continue;
-            }
-            Err(e) => return Err(AppError::Io(e, format!("read_dir {}", dir.display()))),
-        };
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| AppError::Io(e, format!("read_dir {}", dir.display())))?
-        {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("msgpack") {
-                continue;
-            }
-            if let Ok(Some(meta)) = read_messagepack_if_exists::<PartMetadata>(&path).await {
-                parts.entry(meta.part_index).or_insert(meta);
+            let replace = best
+                .as_ref()
+                .map(|current| {
+                    state.parts.len() > current.parts.len()
+                        || (state.parts.len() == current.parts.len()
+                            && state.last_activity_at > current.last_activity_at)
+                })
+                .unwrap_or(true);
+            if replace {
+                best = Some(normalize_session_state(state));
             }
         }
     }
-    Ok(parts)
+    Ok(best)
 }
 
 pub async fn load_session(
     fragment: &str,
     version_id: &str,
 ) -> Result<Option<IndexSessionState>, AppError> {
-    let mut state = match load_session_uncached(fragment, version_id).await? {
-        Some(state) => normalize_session_state(state),
-        None => return Ok(None),
-    };
-    state.parts = load_session_parts_from_disk(fragment, version_id).await?;
-    Ok(Some(state))
+    Ok(load_session_uncached(fragment, version_id)
+        .await?
+        .map(normalize_session_state))
+}
+
+#[cfg(test)]
+pub async fn clear_runtime_caches_for_tests() {
+    INDEX_ACTIVE_SESSIONS.lock().await.clear();
+    INDEX_ACTIVE_SESSION_FRAGMENTS_SCANNED.lock().await.clear();
+    INDEX_PARTITION_RUNTIME.lock().await.clear();
+    INDEX_WAL_MANIFEST_CACHE.lock().await.clear();
 }
 
 pub async fn remove_session(
@@ -2843,13 +3165,34 @@ pub async fn remove_session(
     let session_guard = session_lock(fragment, version_id).await;
     let _session_guard = session_guard.lock().await;
     let route = session_partition_route(fragment, version_id)?;
-    let existed = load_session_uncached(fragment, version_id).await?.is_some();
+    let session_state = load_session_uncached(fragment, version_id).await?;
+    let existed = session_state.is_some();
     let wal = IndexWalRecord::SessionRemoved {
         fragment: fragment.to_string(),
         version_id: version_id.to_string(),
         removed_at: Utc::now().timestamp(),
         reason: reason.to_string(),
     };
+    if let Some(state) = session_state.as_ref().filter(|state| {
+        !state.parts.is_empty() || !state.manifest.planned_parts.is_empty()
+    }) {
+        let receipt = RemovedSessionReceipt {
+            state: state.clone(),
+            removed_at: match &wal {
+                IndexWalRecord::SessionRemoved { removed_at, .. } => *removed_at,
+                _ => 0,
+            },
+            reason: reason.to_string(),
+        };
+        persist_removed_session_receipt_on_roots(
+            &route,
+            fragment,
+            version_id,
+            &receipt,
+            IndexReplicaWriteMode::BackgroundBestEffort,
+        )
+        .await?;
+    }
     let owner_root = route.roots[0].clone();
     let owner_path = session_state_path(&owner_root, fragment, route.partition_id, version_id);
     if fs::try_exists(&owner_path).await.unwrap_or(false) {
@@ -2941,6 +3284,60 @@ pub async fn list_active_sessions(fragment: &str) -> Result<Vec<IndexSessionStat
     Ok(sessions.into_values().collect())
 }
 
+pub async fn collect_runtime_upload_stats() -> UploadRuntimeStats {
+    let now = Utc::now().timestamp();
+    let guard = INDEX_ACTIVE_SESSIONS.lock().await;
+    let mut stats = UploadRuntimeStats {
+        active_fragments: guard.len() as u64,
+        ..UploadRuntimeStats::default()
+    };
+    for sessions in guard.values() {
+        for session in sessions.values() {
+            stats.active_sessions += 1;
+            stats.reserved_bytes = stats
+                .reserved_bytes
+                .saturating_add(session.reservation.as_ref().map(|r| r.amount).unwrap_or(0));
+            stats.committed_parts = stats
+                .committed_parts
+                .saturating_add(session.parts.len() as u64);
+            stats.committed_bytes = stats.committed_bytes.saturating_add(
+                session
+                    .parts
+                    .values()
+                    .map(|part| part.size_bytes)
+                    .sum::<u64>(),
+            );
+            let age_seconds = now.saturating_sub(session.manifest.created_at).max(0) as u64;
+            stats.oldest_session_age_seconds = Some(
+                stats
+                    .oldest_session_age_seconds
+                    .map(|current| current.max(age_seconds))
+                    .unwrap_or(age_seconds),
+            );
+        }
+    }
+    stats
+}
+
+pub async fn collect_index_runtime_stats() -> IndexRuntimeStats {
+    let prefix_pending = PREFIX_PROJECTION_TASKS
+        .lock()
+        .await
+        .values()
+        .filter(|state| state.task.running || state.task.rerun_requested)
+        .count() as u64;
+
+    IndexRuntimeStats {
+        loaded_partition_runtimes: INDEX_PARTITION_RUNTIME.lock().await.len() as u64,
+        wal_appenders: INDEX_WAL_APPENDERS.lock().await.len() as u64,
+        prefix_projection_fragments_pending: prefix_pending,
+    }
+}
+
+pub async fn count_fragment_latest_objects(fragment: &str, trashed: bool) -> Result<u64, AppError> {
+    Ok(scan_fragment_latest_states(fragment, trashed).await?.len() as u64)
+}
+
 pub fn get_session_state_paths(fragment: &str, version_id: &str) -> Result<Vec<PathBuf>, AppError> {
     let route = session_partition_route(fragment, version_id)?;
     Ok(route
@@ -2950,20 +3347,132 @@ pub fn get_session_state_paths(fragment: &str, version_id: &str) -> Result<Vec<P
         .collect())
 }
 
+pub fn get_removed_session_receipt_paths(
+    fragment: &str,
+    version_id: &str,
+) -> Result<Vec<PathBuf>, AppError> {
+    let route = session_partition_route(fragment, version_id)?;
+    Ok(route
+        .roots
+        .iter()
+        .map(|root| session_removed_receipt_path(root, fragment, route.partition_id, version_id))
+        .collect())
+}
+
+pub async fn read_removed_session_receipt(
+    fragment: &str,
+    version_id: &str,
+) -> Result<Option<RemovedSessionReceipt>, AppError> {
+    let mut best: Option<(RemovedSessionReceipt, SystemTime)> = None;
+    for path in get_removed_session_receipt_paths(fragment, version_id)? {
+        let modified = match fs::metadata(&path).await {
+            Ok(meta) => meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.kind() == std::io::ErrorKind::NotADirectory =>
+            {
+                continue;
+            }
+            Err(e) => return Err(AppError::Io(e, format!("metadata {}", path.display()))),
+        };
+        let Some(receipt) = read_messagepack_if_exists::<RemovedSessionReceipt>(&path).await? else {
+            continue;
+        };
+        match &best {
+            None => best = Some((receipt, modified)),
+            Some((current, current_modified)) => {
+                if receipt.removed_at > current.removed_at
+                    || (receipt.removed_at == current.removed_at && modified > *current_modified)
+                {
+                    best = Some((receipt, modified));
+                }
+            }
+        }
+    }
+    Ok(best.map(|(receipt, _)| receipt))
+}
+
+pub async fn delete_removed_session_receipt(
+    fragment: &str,
+    version_id: &str,
+) -> Result<(), AppError> {
+    for path in get_removed_session_receipt_paths(fragment, version_id)? {
+        match fs::remove_file(&path).await {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    let _ = sync_dir(parent).await;
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.kind() == std::io::ErrorKind::NotADirectory => {}
+            Err(e) => return Err(AppError::Io(e, format!("remove {}", path.display()))),
+        }
+    }
+    Ok(())
+}
+
 pub async fn publish_object(metadata: &ObjectMetadata) -> Result<(), AppError> {
-    write_object_version_internal(metadata, false, false).await?;
+    write_object_version_internal(
+        metadata,
+        false,
+        false,
+        IndexReplicaWriteMode::BackgroundBestEffort,
+        false,
+    )
+    .await?;
     schedule_prefix_projection_for_key(metadata.fragment.clone(), metadata.object_key.clone());
     Ok(())
 }
 
 pub async fn upsert_object_version(metadata: &ObjectMetadata) -> Result<(), AppError> {
-    write_object_version_internal(metadata, false, false).await?;
+    upsert_object_version_with_replica_mode(
+        metadata,
+        IndexReplicaWriteMode::BackgroundBestEffort,
+    )
+    .await
+}
+
+pub async fn upsert_object_version_with_replica_mode(
+    metadata: &ObjectMetadata,
+    replica_write_mode: IndexReplicaWriteMode,
+) -> Result<(), AppError> {
+    write_object_version_internal(metadata, false, false, replica_write_mode, false).await?;
+    schedule_prefix_projection_for_key(metadata.fragment.clone(), metadata.object_key.clone());
+    Ok(())
+}
+
+pub async fn upsert_object_version_on_available_roots_with_replica_mode(
+    metadata: &ObjectMetadata,
+    replica_write_mode: IndexReplicaWriteMode,
+) -> Result<(), AppError> {
+    write_object_version_internal(metadata, false, false, replica_write_mode, true).await?;
     schedule_prefix_projection_for_key(metadata.fragment.clone(), metadata.object_key.clone());
     Ok(())
 }
 
 pub async fn upsert_trashed_object_version(metadata: &ObjectMetadata) -> Result<(), AppError> {
-    write_object_version_internal(metadata, false, true).await?;
+    upsert_trashed_object_version_with_replica_mode(
+        metadata,
+        IndexReplicaWriteMode::BackgroundBestEffort,
+    )
+    .await
+}
+
+pub async fn upsert_trashed_object_version_with_replica_mode(
+    metadata: &ObjectMetadata,
+    replica_write_mode: IndexReplicaWriteMode,
+) -> Result<(), AppError> {
+    write_object_version_internal(metadata, false, true, replica_write_mode, false).await?;
+    schedule_prefix_projection_for_key(metadata.fragment.clone(), metadata.object_key.clone());
+    Ok(())
+}
+
+pub async fn upsert_trashed_object_version_on_available_roots_with_replica_mode(
+    metadata: &ObjectMetadata,
+    replica_write_mode: IndexReplicaWriteMode,
+) -> Result<(), AppError> {
+    write_object_version_internal(metadata, false, true, replica_write_mode, true).await?;
     schedule_prefix_projection_for_key(metadata.fragment.clone(), metadata.object_key.clone());
     Ok(())
 }
@@ -3112,7 +3621,14 @@ pub async fn move_object_version_to_trash(
         Err(e) => return Err(e),
     };
 
-    write_object_version_internal(&metadata, true, true).await?;
+    write_object_version_internal(
+        &metadata,
+        true,
+        true,
+        IndexReplicaWriteMode::BackgroundBestEffort,
+        false,
+    )
+    .await?;
     delete_object_version_internal(fragment, object_key, version_id, false).await?;
     schedule_prefix_projection_for_key(fragment.to_string(), object_key.to_string());
     Ok(Some(metadata))
@@ -3131,7 +3647,14 @@ pub async fn restore_object_version_from_trash(
         Err(e) => return Err(e),
     };
 
-    write_object_version_internal(&metadata, force_latest, false).await?;
+    write_object_version_internal(
+        &metadata,
+        force_latest,
+        false,
+        IndexReplicaWriteMode::BackgroundBestEffort,
+        false,
+    )
+    .await?;
     delete_object_version_internal(fragment, object_key, version_id, true).await?;
     schedule_prefix_projection_for_key(fragment.to_string(), object_key.to_string());
     Ok(Some(metadata))

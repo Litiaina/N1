@@ -25,10 +25,12 @@ use super::object_parser::{
     STREAM_READAHEAD_BYTES_ATOMIC,
 };
 use super::quota_manager::{get_quota, init_quota_file, set_storage_used, update_quota};
-use super::recovery::{RAW_VERIFY_ON_READ_ATOMIC, ShardRepairContext, repair_entire_shard};
+use super::recovery::{
+    RAW_VERIFY_ON_READ_ATOMIC, RepairLogMode, ShardRepairContext, repair_entire_shard,
+};
 use super::redistribution::{
-    RedistributionDurabilityMode, RedistributionRunOptions, run_redistribution_job,
-    run_redistribution_job_with_options,
+    RedistributionDurabilityMode, RedistributionExecutionMode, RedistributionRunOptions,
+    run_redistribution_job, run_redistribution_job_with_options,
 };
 use super::repair_manager::{
     RepairCheckMode, RepairRunConfig, RepairRunOptions, run_repair_job, run_repair_job_with_options,
@@ -45,6 +47,7 @@ use super::upload::{
 use crate::n1_core::disk_manager::{
     STORAGE_TEST_LOCK as TEST_LOCK, replace_storage_roots_for_tests, version_recency_is_newer,
 };
+use crate::n1_core::operation_gate::MaintenanceAccessMode;
 use crate::routes::storage_routes::AppState;
 use crate::settings::constants::CONFIG_FILE;
 use crate::settings::create_config::create_default_config_ini;
@@ -1152,6 +1155,17 @@ async fn init_upload(
     total_size: u64,
     expected_parts: u64,
 ) -> (String, String) {
+    init_upload_with_plan(fragment, object_key, total_size, expected_parts, None, None).await
+}
+
+async fn init_upload_with_plan(
+    fragment: &str,
+    object_key: &str,
+    total_size: u64,
+    expected_parts: u64,
+    part_size_bytes: Option<u64>,
+    part_sizes_bytes: Option<Vec<u64>>,
+) -> (String, String) {
     let init_resp = initiate_object_upload(
         full_claims(fragment),
         AxumPath((fragment.to_string(), object_key.to_string())),
@@ -1159,6 +1173,8 @@ async fn init_upload(
             content_type: Some("application/octet-stream".into()),
             total_size_bytes: total_size,
             expected_parts,
+            part_size_bytes,
+            part_sizes_bytes,
         }),
     )
     .await
@@ -1202,6 +1218,8 @@ async fn finalize_upload(
             content_type: Some("application/octet-stream".into()),
             total_size_bytes: total_size,
             expected_parts,
+            part_size_bytes: None,
+            part_sizes_bytes: None,
         }),
     )
     .await
@@ -2447,6 +2465,22 @@ async fn matrix_cancel_upload_before_first_part_succeeds() {
         .expect("init metadata");
 
     let (version_id, _session_id) = init_upload(&fragment, &key, 4 * 1024 * 1024, 1).await;
+    let session_state = index::load_session(&fragment, &version_id)
+        .await
+        .expect("load session")
+        .expect("active session");
+    let planned_addresses = session_state.manifest.all_planned_raw_addresses();
+    assert!(
+        !planned_addresses.is_empty(),
+        "single-part uploads should pre-reserve deterministic raw slots"
+    );
+    for raw in &planned_addresses {
+        assert!(
+            raw_blob_address_exists(raw).await.expect("raw exists check"),
+            "planned raw slot should exist before any part upload"
+        );
+    }
+
     let cancel_resp = cancel_upload_session(
         full_claims(&fragment),
         AxumPath((fragment.clone(), version_id.clone())),
@@ -2466,6 +2500,12 @@ async fn matrix_cancel_upload_before_first_part_succeeds() {
             .is_none(),
         "session should be removed even when no snapshot file was written"
     );
+    for raw in &planned_addresses {
+        assert!(
+            !raw_blob_address_exists(raw).await.expect("raw exists check"),
+            "cancel should free planned raw slot reservations"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2549,6 +2589,228 @@ async fn matrix_cancel_upload_after_part_frees_raw_part_extents() {
             .is_none(),
         "session should be removed"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_planned_multipart_upload_reuses_reserved_raw_slots() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "matrix/planned-upload.bin".to_string();
+    let part0 = vec![0x41; 8 * 1024 + 17];
+    let part1 = vec![0x52; 6 * 1024 + 9];
+    let total_len = (part0.len() + part1.len()) as u64;
+
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+    let planned_sizes = vec![part0.len() as u64, part1.len() as u64];
+    let (version_id, session_id) = init_upload_with_plan(
+        &fragment,
+        &key,
+        total_len,
+        2,
+        None,
+        Some(planned_sizes.clone()),
+    )
+    .await;
+
+    let session_state = index::load_session(&fragment, &version_id)
+        .await
+        .expect("load session")
+        .expect("session state");
+    assert_eq!(session_state.manifest.planned_parts.len(), 2);
+    let planned_part0 = session_state
+        .manifest
+        .planned_part_layout(0)
+        .expect("planned part 0")
+        .clone();
+    let planned_part1 = session_state
+        .manifest
+        .planned_part_layout(1)
+        .expect("planned part 1")
+        .clone();
+    assert_eq!(planned_part0.size_bytes, planned_sizes[0]);
+    assert_eq!(planned_part1.size_bytes, planned_sizes[1]);
+    for raw in session_state.manifest.all_planned_raw_addresses() {
+        assert!(
+            raw_blob_address_exists(&raw).await.expect("raw exists check"),
+            "planned raw slot should exist after init"
+        );
+    }
+
+    assert_eq!(
+        upload_part(&fragment, &version_id, 0, part0.clone())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        upload_part(&fragment, &version_id, 1, part1.clone())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let committed_part0 =
+        super::upload::read_part_meta_any(&ObjectPathManager::new(), &fragment, &version_id, 0)
+            .await
+            .expect("part 0 metadata");
+    let committed_part1 =
+        super::upload::read_part_meta_any(&ObjectPathManager::new(), &fragment, &version_id, 1)
+            .await
+            .expect("part 1 metadata");
+
+    let committed_part0_raws: Vec<_> = committed_part0
+        .shards
+        .iter()
+        .filter_map(|shard| shard.raw_blob_address.clone())
+        .collect();
+    let committed_part1_raws: Vec<_> = committed_part1
+        .shards
+        .iter()
+        .filter_map(|shard| shard.raw_blob_address.clone())
+        .collect();
+    let planned_part0_raws: Vec<_> = planned_part0
+        .shards
+        .iter()
+        .map(|shard| shard.raw_blob_address.clone())
+        .collect();
+    let planned_part1_raws: Vec<_> = planned_part1
+        .shards
+        .iter()
+        .map(|shard| shard.raw_blob_address.clone())
+        .collect();
+
+    assert_eq!(committed_part0_raws, planned_part0_raws);
+    assert_eq!(committed_part1_raws, planned_part1_raws);
+
+    let finalize_ok = finalize_upload(
+        state,
+        &fragment,
+        &version_id,
+        &session_id,
+        &key,
+        total_len,
+        2,
+    )
+    .await;
+    assert_eq!(finalize_ok.status(), StatusCode::OK);
+
+    let expected = [part0, part1].concat();
+    let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+    assert_eq!(got, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_planned_part_commit_rehydrates_from_compact_wal_after_cache_drop() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "matrix/planned-wal-replay.bin".to_string();
+    let part0 = vec![0x61; 9 * 1024 + 7];
+    let part1 = vec![0x62; 7 * 1024 + 5];
+    let total_len = (part0.len() + part1.len()) as u64;
+
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+    let (version_id, session_id) = init_upload_with_plan(
+        &fragment,
+        &key,
+        total_len,
+        2,
+        None,
+        Some(vec![part0.len() as u64, part1.len() as u64]),
+    )
+    .await;
+
+    assert_eq!(
+        upload_part(&fragment, &version_id, 0, part0.clone())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    index::clear_runtime_caches_for_tests().await;
+
+    let status_resp = get_upload_status(
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), version_id.clone())),
+    )
+    .await
+    .expect("upload status after cache drop")
+    .into_response();
+    assert_eq!(status_resp.status(), StatusCode::OK);
+    let status_json = read_response_json(status_resp).await;
+    assert_eq!(status_json["uploaded_parts"][0].as_u64(), Some(0));
+
+    assert_eq!(
+        upload_part(&fragment, &version_id, 1, part1.clone())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    index::clear_runtime_caches_for_tests().await;
+
+    let finalize_ok = finalize_upload(
+        state,
+        &fragment,
+        &version_id,
+        &session_id,
+        &key,
+        total_len,
+        2,
+    )
+    .await;
+    assert_eq!(finalize_ok.status(), StatusCode::OK);
+
+    let expected = [part0, part1].concat();
+    let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+    assert_eq!(got, expected);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3546,6 +3808,7 @@ async fn matrix_fragment_scoped_redistribution_only_touches_requested_fragment()
         RedistributionRunOptions {
             fast_mode: false,
             durability_mode: RedistributionDurabilityMode::Auto,
+            execution_mode: RedistributionExecutionMode::Availability,
             object_concurrency: 4,
             status_batch: 32,
             fragment_filter: Some(fragment_a.clone()),
@@ -3867,6 +4130,7 @@ async fn matrix_fragment_scoped_repair_only_touches_requested_fragment() {
         },
         RepairRunOptions {
             fast_mode: false,
+            access_mode: MaintenanceAccessMode::Quiesced,
             fragment_filter: Some(fragment_a.clone()),
         },
         Arc::new(WsConnectionManager::new()),
@@ -4361,7 +4625,13 @@ async fn matrix_raw_blob_stale_reader_after_relocation_is_idempotent() {
         false,
     );
 
-    repair_entire_shard(stale_part, target_shard_index, 4096, Some(repair_context))
+    repair_entire_shard(
+        stale_part,
+        target_shard_index,
+        4096,
+        Some(repair_context),
+        RepairLogMode::Verbose,
+    )
         .await
         .expect("stale second repair should observe existing relocation");
 
@@ -4469,6 +4739,7 @@ async fn matrix_raw_blob_manual_repair_relocates_stale_device_id() {
         },
         RepairRunOptions {
             fast_mode: false,
+            access_mode: MaintenanceAccessMode::Quiesced,
             fragment_filter: None,
         },
         Arc::new(WsConnectionManager::new()),
@@ -4594,6 +4865,7 @@ async fn matrix_raw_blob_manual_availability_repair_relocates_stale_device_id() 
         },
         RepairRunOptions {
             fast_mode: false,
+            access_mode: MaintenanceAccessMode::Availability,
             fragment_filter: None,
         },
         Arc::new(WsConnectionManager::new()),
@@ -4898,15 +5170,32 @@ async fn matrix_redistribution_read_falls_back_when_primary_index_copy_is_corrup
         .await
         .expect("restore primary index disk");
 
-    let current_meta = get_metadata(&fragment, &key, &fragment)
-        .await
-        .expect("metadata after redistribution");
-    index::upsert_object_version(&current_meta)
-        .await
-        .expect("restore index replicas after disk return");
-
     let meta_paths = index::get_object_version_paths(&fragment, &key, &version_id, false)
         .expect("index metadata paths");
+    let mut current_meta = None;
+    let mut current_rank = 0usize;
+    for path in &meta_paths {
+        let Ok(bytes) = fs::read(path).await else {
+            continue;
+        };
+        let Ok(candidate) = rmp_serde::from_slice::<crate::n1_core::disk_manager::ObjectMetadata>(&bytes)
+        else {
+            continue;
+        };
+        let candidate_rank = candidate.parts.iter().map(|part| part.shards.len()).sum();
+        if current_meta.is_none() || candidate_rank > current_rank {
+            current_rank = candidate_rank;
+            current_meta = Some(candidate);
+        }
+    }
+    let current_meta = current_meta.expect("metadata after redistribution");
+    index::upsert_object_version_with_replica_mode(
+        &current_meta,
+        index::IndexReplicaWriteMode::SyncBestEffort,
+    )
+    .await
+    .expect("restore index replicas after disk return");
+
     assert!(meta_paths.len() >= 2, "expected mirrored index paths");
     assert!(
         fs::try_exists(&meta_paths[1]).await.unwrap_or(false),
@@ -6225,6 +6514,7 @@ async fn matrix_crud_cpu_ram_probe() {
             RedistributionRunOptions {
                 fast_mode: redist_fast_mode,
                 durability_mode: redist_durability_mode,
+                execution_mode: RedistributionExecutionMode::Availability,
                 object_concurrency: redist_object_concurrency,
                 status_batch: redist_status_batch,
                 fragment_filter: None,
@@ -6289,6 +6579,7 @@ async fn matrix_crud_cpu_ram_probe() {
             },
             RepairRunOptions {
                 fast_mode: repair_fast_mode,
+                access_mode: MaintenanceAccessMode::Quiesced,
                 fragment_filter: None,
             },
             Arc::new(WsConnectionManager::new()),

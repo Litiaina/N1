@@ -6,10 +6,16 @@ use tokio::fs;
 #[derive(Debug, Serialize, Clone, Default)]
 pub struct SystemMetrics {
     pub cpu_usage_percent: f64,
+    pub cpu_cores: u64,
     pub ram_total_bytes: u64,
     pub ram_used_bytes: u64,
     pub ram_usage_percent: f64,
     pub load_avg_1m: f64,
+    pub uptime_seconds: u64,
+    pub process_resident_bytes: u64,
+    pub process_virtual_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_open_fds: Option<u64>,
 }
 
 static PREV_TOTAL: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
@@ -19,6 +25,9 @@ pub async fn get_system_metrics() -> SystemMetrics {
     let (cpu_usage, _) = calculate_cpu_usage().await;
     let (ram_total, ram_available) = get_memory_info().await;
     let load_avg = get_load_avg().await;
+    let uptime_seconds = get_uptime_seconds().await;
+    let (process_resident_bytes, process_virtual_bytes) = get_process_memory_info().await;
+    let process_open_fds = count_open_fds().await;
 
     let ram_used = ram_total.saturating_sub(ram_available);
     let ram_percent = if ram_total > 0 {
@@ -29,10 +38,17 @@ pub async fn get_system_metrics() -> SystemMetrics {
 
     SystemMetrics {
         cpu_usage_percent: cpu_usage,
+        cpu_cores: std::thread::available_parallelism()
+            .map(|value| value.get() as u64)
+            .unwrap_or(1),
         ram_total_bytes: ram_total,
         ram_used_bytes: ram_used,
         ram_usage_percent: ram_percent,
         load_avg_1m: load_avg,
+        uptime_seconds,
+        process_resident_bytes,
+        process_virtual_bytes,
+        process_open_fds,
     }
 }
 
@@ -106,4 +122,53 @@ async fn get_load_avg() -> f64 {
         }
     }
     0.0
+}
+
+async fn get_uptime_seconds() -> u64 {
+    if let Ok(content) = fs::read_to_string("/proc/uptime").await {
+        if let Some(first) = content.split_whitespace().next() {
+            return first
+                .split('.')
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+    }
+    0
+}
+
+async fn get_process_memory_info() -> (u64, u64) {
+    let mut resident = 0u64;
+    let mut virtual_bytes = 0u64;
+
+    if let Ok(content) = fs::read_to_string("/proc/self/status").await {
+        for line in content.lines() {
+            if line.starts_with("VmRSS:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    resident = parts[1].parse::<u64>().unwrap_or(0).saturating_mul(1024);
+                }
+            } else if line.starts_with("VmSize:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    virtual_bytes = parts[1].parse::<u64>().unwrap_or(0).saturating_mul(1024);
+                }
+            }
+        }
+    }
+
+    (resident, virtual_bytes)
+}
+
+async fn count_open_fds() -> Option<u64> {
+    let mut count = 0u64;
+    let mut entries = fs::read_dir("/proc/self/fd").await.ok()?;
+    loop {
+        match entries.next_entry().await {
+            Ok(Some(_)) => count += 1,
+            Ok(None) => break,
+            Err(_) => return None,
+        }
+    }
+    Some(count)
 }

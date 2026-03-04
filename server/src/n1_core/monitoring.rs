@@ -24,7 +24,6 @@ use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::sync::{Semaphore, oneshot};
 use tokio::time::timeout;
-use ulid::Ulid;
 
 static DEEP_SCAN_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
 const DISK_CHECK_TIMEOUT: Duration = Duration::from_millis(5000);
@@ -76,11 +75,26 @@ pub struct ConsistencyStats {
 
 #[derive(Serialize, Clone)]
 pub struct SystemHealthResponse {
+    pub sampled_at: i64,
     pub status: String,
     pub disks: Vec<DiskStatus>,
     pub consistency: ConsistencyStats,
     pub system: SystemMetrics,
+    pub uploads: index::UploadRuntimeStats,
+    pub index_runtime: index::IndexRuntimeStats,
+    pub storage: StoragePlaneStats,
     pub summary: String,
+}
+
+#[derive(Serialize, Clone, Default)]
+pub struct StoragePlaneStats {
+    pub index_roots_total: u64,
+    pub index_roots_online: u64,
+    pub blob_devices_total: u64,
+    pub blob_devices_online: u64,
+    pub raw_total_bytes: u64,
+    pub raw_used_bytes: u64,
+    pub raw_available_bytes: u64,
 }
 
 async fn check_index_disk_accessibility(path_str: String) -> DiskStatus {
@@ -90,61 +104,45 @@ async fn check_index_disk_accessibility(path_str: String) -> DiskStatus {
         let check_result = timeout(DISK_CHECK_TIMEOUT, async {
             match fs::metadata(&path).await {
                 Ok(meta) => {
-                    if meta.permissions().readonly() {
+                    if !meta.is_dir() {
                         return (
-                            "readonly".to_string(),
-                            Some("Disk is mounted read-only".to_string()),
+                            "offline".to_string(),
+                            Some("Index root path is not a directory".to_string()),
                             None,
                         );
                     }
 
                     let start_time = Instant::now();
-                    let check_file_name = format!(".n1_health_{}", Ulid::new().to_string());
-                    let check_path = path.join(check_file_name);
-                    let payload = b"n1_io_check";
-
-                    if let Err(e) = fs::write(&check_path, payload).await {
+                    let mut entries = match fs::read_dir(&path).await {
+                        Ok(entries) => entries,
+                        Err(e) => {
+                            return (
+                                "offline".to_string(),
+                                Some(format!("Failed to read dir: {}", e)),
+                                None,
+                            );
+                        }
+                    };
+                    if let Err(e) = entries.next_entry().await {
                         return (
-                            "readonly".to_string(),
-                            Some(format!("Write test failed: {}", e)),
+                            "offline".to_string(),
+                            Some(format!("Failed to read dir entry: {}", e)),
                             None,
                         );
                     }
-
-                    let read_result = fs::read(&check_path).await;
-                    let delete_result = fs::remove_file(&check_path).await;
-
-                    match read_result {
-                        Ok(data) => {
-                            if data == payload {
-                                if let Err(e) = delete_result {
-                                    return (
-                                        "degraded".to_string(),
-                                        Some(format!("Write/Read OK, delete failed: {}", e)),
-                                        None,
-                                    );
-                                }
-                                let latency = start_time.elapsed().as_millis() as u64;
-                                let status = if latency > 1000 {
-                                    "slow".to_string()
-                                } else {
-                                    "online".to_string()
-                                };
-                                (status, None, Some(latency))
-                            } else {
-                                (
-                                    "corruption".to_string(),
-                                    Some("Data read mismatch".to_string()),
-                                    None,
-                                )
-                            }
-                        }
-                        Err(e) => (
-                            "write_only".to_string(),
-                            Some(format!("Write OK, Read failed: {}", e)),
-                            None,
-                        ),
-                    }
+                    let latency = start_time.elapsed().as_millis() as u64;
+                    let readonly = meta.permissions().readonly();
+                    (
+                        if readonly {
+                            "readonly".to_string()
+                        } else if latency > 1000 {
+                            "slow".to_string()
+                        } else {
+                            "online".to_string()
+                        },
+                        readonly.then(|| "Index root is mounted read-only".to_string()),
+                        Some(latency),
+                    )
                 }
                 Err(e) => (
                     "offline".to_string(),
@@ -160,7 +158,7 @@ async fn check_index_disk_accessibility(path_str: String) -> DiskStatus {
             Err(_) => (
                 "slow".to_string(),
                 None,
-                Some("Disk I/O timed out (>5s)".to_string()),
+                Some("Disk probe timed out (>5s)".to_string()),
             ),
         }
     } else {
@@ -179,6 +177,133 @@ async fn check_index_disk_accessibility(path_str: String) -> DiskStatus {
         error,
         raw_backend: None,
     }
+}
+
+fn is_index_healthy_status(status: &str) -> bool {
+    matches!(status, "online" | "slow" | "readonly")
+}
+
+fn is_blob_healthy_status(status: &str) -> bool {
+    matches!(status, "online" | "slow" | "unformatted")
+}
+
+fn compute_storage_plane_stats(disks: &[DiskStatus]) -> StoragePlaneStats {
+    let mut stats = StoragePlaneStats::default();
+    for disk in disks {
+        match disk.role.as_str() {
+            "index" => {
+                stats.index_roots_total += 1;
+                if is_index_healthy_status(&disk.status) {
+                    stats.index_roots_online += 1;
+                }
+            }
+            "blob" => {
+                stats.blob_devices_total += 1;
+                if is_blob_healthy_status(&disk.status) {
+                    stats.blob_devices_online += 1;
+                }
+                if let Some(raw) = disk.raw_backend.as_ref() {
+                    stats.raw_total_bytes =
+                        stats.raw_total_bytes.saturating_add(raw.total_bytes.unwrap_or(0));
+                    stats.raw_used_bytes =
+                        stats.raw_used_bytes.saturating_add(raw.used_bytes.unwrap_or(0));
+                    stats.raw_available_bytes = stats
+                        .raw_available_bytes
+                        .saturating_add(raw.available_bytes.unwrap_or(0));
+                }
+            }
+            _ => {}
+        }
+    }
+    stats
+}
+
+async fn enumerate_fragment_names(roots: &[PathBuf]) -> Vec<String> {
+    let mut fragments = std::collections::BTreeSet::new();
+    for root in roots {
+        let mut entries = match fs::read_dir(root).await {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let is_dir = entry
+                .file_type()
+                .await
+                .map(|ft| ft.is_dir())
+                .unwrap_or(false);
+            if !is_dir {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                if !name.starts_with('.') {
+                    fragments.insert(name.to_string());
+                }
+            }
+        }
+    }
+    fragments.into_iter().collect()
+}
+
+async fn collect_consistency_counts(
+    roots: &[PathBuf],
+) -> Result<(u64, Option<HashMap<String, u64>>, bool), AppError> {
+    let fragments = enumerate_fragment_names(roots).await;
+    let mut total_objects = 0u64;
+    let mut scan_failed = false;
+
+    for fragment in fragments {
+        match index::count_fragment_latest_objects(&fragment, false).await {
+            Ok(count) => {
+                total_objects = total_objects.saturating_add(count);
+            }
+            Err(_) => {
+                scan_failed = true;
+            }
+        }
+    }
+
+    Ok((total_objects, None, scan_failed))
+}
+
+async fn collect_upload_stats_from_fragments(
+    roots: &[PathBuf],
+) -> Result<index::UploadRuntimeStats, AppError> {
+    let fragments = enumerate_fragment_names(roots).await;
+    let mut stats = index::UploadRuntimeStats::default();
+    let now = chrono::Utc::now().timestamp();
+
+    for fragment in fragments {
+        let sessions = index::list_active_sessions(&fragment).await?;
+        if sessions.is_empty() {
+            continue;
+        }
+        stats.active_fragments += 1;
+        for session in sessions {
+            stats.active_sessions += 1;
+            stats.reserved_bytes = stats
+                .reserved_bytes
+                .saturating_add(session.reservation.map(|r| r.amount).unwrap_or(0));
+            stats.committed_parts = stats
+                .committed_parts
+                .saturating_add(session.parts.len() as u64);
+            stats.committed_bytes = stats.committed_bytes.saturating_add(
+                session
+                    .parts
+                    .values()
+                    .map(|part| part.size_bytes)
+                    .sum::<u64>(),
+            );
+            let age_seconds = now.saturating_sub(session.manifest.created_at).max(0) as u64;
+            stats.oldest_session_age_seconds = Some(
+                stats
+                    .oldest_session_age_seconds
+                    .map(|current| current.max(age_seconds))
+                    .unwrap_or(age_seconds),
+            );
+        }
+    }
+
+    Ok(stats)
 }
 
 fn map_raw_blob_status_to_disk_status(raw: RawBlobDeviceStatus) -> DiskStatus {
@@ -203,6 +328,8 @@ async fn collect_system_health(
     let system_metrics = get_system_metrics().await;
     let redist_status = get_redist_status().await;
     let repair_status = get_repair_status().await;
+    let mut upload_stats = index::collect_runtime_upload_stats().await;
+    let index_runtime = index::collect_index_runtime_stats().await;
 
     let index_disks_config = configured_index_store_disks()?;
     let blob_disks_config = configured_blob_store_disks()?;
@@ -224,24 +351,27 @@ async fn collect_system_health(
     let mut disk_statuses = Vec::new();
 
     for stat in disk_results {
-        if stat.status == "online" || stat.status == "slow" {
+        if is_index_healthy_status(&stat.status) || is_blob_healthy_status(&stat.status) {
             if stat.role == "index" {
                 online_index_count += 1;
                 active_index_roots.push(PathBuf::from(&stat.path));
-            } else if stat.status == "online" || stat.status == "unformatted" {
+            } else if is_blob_healthy_status(&stat.status) {
                 online_blob_count += 1;
             }
         }
         disk_statuses.push(stat);
     }
+    let storage = compute_storage_plane_stats(&disk_statuses);
 
     let deep_scan = params
         .get("deep_scan")
         .map(|v| v == "true")
         .unwrap_or(false);
     let mut total_objects = 0u64;
+    let mut mirror_counts = None;
     let mut scan_performed = false;
     let mut scan_busy = false;
+    let mut scan_failed = false;
 
     if deep_scan && !active_index_roots.is_empty() {
         if let Ok(_permit) = DEEP_SCAN_SEMAPHORE.try_acquire() {
@@ -249,34 +379,27 @@ async fn collect_system_health(
             let roots_clone = active_index_roots.clone();
             let (tx, rx) = oneshot::channel();
 
-            std::thread::spawn(move || {
-                let mut fragments = std::collections::BTreeSet::new();
-                for root in roots_clone {
-                    let Ok(entries) = std::fs::read_dir(root) else {
-                        continue;
-                    };
-                    for entry in entries.filter_map(|entry| entry.ok()) {
-                        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                            if let Some(name) = entry.file_name().to_str() {
-                                if !name.starts_with('.') {
-                                    fragments.insert(name.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-                let _ = tx.send(fragments.into_iter().collect::<Vec<_>>());
+            tokio::spawn(async move {
+                let _ = tx.send(collect_consistency_counts(&roots_clone).await);
             });
 
-            let fragments = rx.await.map_err(|e| {
-                AppError::InternalServerError(format!("Consistency check thread failed: {}", e))
-            })?;
-
-            for fragment in fragments {
-                total_objects += index::list_fragment_object_versions(&fragment, false)
-                    .await
-                    .map(|versions| versions.len() as u64)
-                    .unwrap_or(0);
+            match rx.await {
+                Ok(Ok((count, counts, failed))) => {
+                    total_objects = count;
+                    mirror_counts = counts;
+                    scan_failed = failed;
+                    if let Ok(scanned_uploads) = collect_upload_stats_from_fragments(&active_index_roots).await
+                    {
+                        upload_stats = scanned_uploads;
+                    }
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(e) => {
+                    return Err(AppError::InternalServerError(format!(
+                        "Consistency check task failed: {}",
+                        e
+                    )));
+                }
             }
         } else {
             scan_busy = true;
@@ -287,8 +410,10 @@ async fn collect_system_health(
         "skipped (scan in progress)".to_string()
     } else if !scan_performed {
         "skipped (use ?deep_scan=true)".to_string()
+    } else if scan_failed {
+        "degraded (scan completed with read errors)".to_string()
     } else {
-        "partitioned (index authoritative)".to_string()
+        "authoritative latest scan".to_string()
     };
 
     let total_index = index_disks_config.len();
@@ -320,14 +445,21 @@ async fn collect_system_health(
                 online_blob_count, total_blob
             ),
         )
-    } else if index_health == "desynchronized" {
+    } else if scan_failed {
         (
             "warning",
-            "Index mirrors have mismatched active object metadata counts. Run repair job."
+            "Deep consistency scan completed with read errors. Review index root health."
                 .to_string(),
         )
     } else {
-        ("healthy", "All systems operational.".to_string())
+        let mut summary = "All systems operational.".to_string();
+        if upload_stats.active_sessions > 0 {
+            summary.push_str(&format!(
+                " {} active upload session(s) holding {} byte(s).",
+                upload_stats.active_sessions, upload_stats.reserved_bytes
+            ));
+        }
+        ("healthy", summary)
     };
 
     let monitoring_update = StorageEventPayload::MonitoringUpdate {
@@ -335,19 +467,23 @@ async fn collect_system_health(
         repair_job: serde_json::to_value(&repair_status).ok(),
         redist_job: serde_json::to_value(&redist_status).ok(),
         shadow_index_status: index_health.clone(),
-        shadow_index_healthy: index_health != "desynchronized",
+        shadow_index_healthy: !scan_failed,
     };
     state.ws_manager.broadcast_system_wide(monitoring_update);
 
     Ok(SystemHealthResponse {
+        sampled_at: chrono::Utc::now().timestamp(),
         status: status.to_string(),
         disks: disk_statuses,
         consistency: ConsistencyStats {
             total_objects_scanned: total_objects,
             index_mirror_health: index_health,
-            mirror_counts: None,
+            mirror_counts,
         },
         system: system_metrics,
+        uploads: upload_stats,
+        index_runtime,
+        storage,
         summary,
     })
 }

@@ -7,9 +7,12 @@ use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, PartMetadata, Quota, configured_index_store_disks,
 };
 use crate::n1_core::index;
-use crate::n1_core::operation_gate::acquire_read_only_fast_mode;
-use crate::n1_core::prefix_rebuilder::run_prefix_rebuild_job;
-use crate::n1_core::recovery::{ShardRepairContext, repair_entire_shard, verify_shard_integrity};
+use crate::n1_core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
+use crate::n1_core::upload;
+use crate::n1_core::recovery::{
+    RepairLogMode, RepairShardOutcome, ShardRepairContext, repair_entire_shard,
+    verify_shard_integrity,
+};
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::manager::WsConnectionManager;
@@ -62,7 +65,23 @@ static STOP_SIGNAL: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(fals
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepairCheckMode {
     Availability,
+    Checksum,
+    Strict,
     Scrub,
+}
+
+impl RepairCheckMode {
+    fn maintenance_access_mode(self) -> MaintenanceAccessMode {
+        match self {
+            Self::Availability => MaintenanceAccessMode::Availability,
+            Self::Checksum | Self::Strict => MaintenanceAccessMode::ReadOnly,
+            Self::Scrub => MaintenanceAccessMode::Quiesced,
+        }
+    }
+
+    fn verifies_full_integrity(self) -> bool {
+        !matches!(self, Self::Availability)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -74,10 +93,21 @@ pub struct RepairRunConfig {
     pub meta_batch_size: usize,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct RepairRunOptions {
     pub fast_mode: bool,
+    pub access_mode: MaintenanceAccessMode,
     pub fragment_filter: Option<String>,
+}
+
+impl Default for RepairRunOptions {
+    fn default() -> Self {
+        Self {
+            fast_mode: false,
+            access_mode: MaintenanceAccessMode::Availability,
+            fragment_filter: None,
+        }
+    }
 }
 
 #[derive(Default, Clone)]
@@ -97,6 +127,28 @@ struct RepairObjectTarget {
     is_trash: bool,
 }
 
+#[derive(Default)]
+struct AvailabilityRepairSummary {
+    parts_scanned: usize,
+    parts_requiring_repair: usize,
+    unavailable_shards: usize,
+    stale_device_mappings: usize,
+    relocated_raw_shards: usize,
+    repair_failures: usize,
+}
+
+struct AvailabilityRepairPlan {
+    part: Arc<PartMetadata>,
+    missing_shards: Vec<usize>,
+}
+
+#[derive(Default)]
+struct AvailabilityPartRepairOutcome {
+    repaired_shards: usize,
+    relocated_raw_shards: usize,
+    failures: usize,
+}
+
 #[inline]
 fn should_stop() -> bool {
     STOP_SIGNAL.load(Ordering::Relaxed)
@@ -109,7 +161,9 @@ fn clamp_usize(v: usize, lo: usize, hi: usize) -> usize {
 
 fn parse_check_mode(params: &HashMap<String, String>) -> RepairCheckMode {
     match params.get("mode").map(|s| s.as_str()) {
-        Some("scrub") | Some("strict") | Some("checksum") => RepairCheckMode::Scrub,
+        Some("scrub") | Some("quiesced") | Some("offline") => RepairCheckMode::Scrub,
+        Some("strict") | Some("readonly") | Some("read_only") => RepairCheckMode::Strict,
+        Some("checksum") => RepairCheckMode::Checksum,
         _ => RepairCheckMode::Availability,
     }
 }
@@ -129,8 +183,8 @@ fn build_repair_config_from_params(
     params: &HashMap<String, String>,
     forced_mode: Option<RepairCheckMode>,
 ) -> (RepairRunConfig, RepairRunOptions) {
-    let fast_mode = parse_bool_param(params, "fast_mode", false)
-        || parse_bool_param(params, "read_only_fast", false);
+    let fast_mode = parse_bool_param(params, "fast_mode", false);
+    let read_only_fast = parse_bool_param(params, "read_only_fast", false);
     let ram_gib = detect_total_ram_gib();
     let cpu_cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -138,10 +192,15 @@ fn build_repair_config_from_params(
     let (default_meta_conc, default_repair_conc, default_batch) =
         repair_defaults_for_runtime(fast_mode, ram_gib, cpu_cores);
     let (max_meta_conc, max_repair_conc, max_batch_size) = repair_limits_for_ram_gib(ram_gib);
+    let check_mode = forced_mode.unwrap_or_else(|| parse_check_mode(params));
+    let mut access_mode = check_mode.maintenance_access_mode();
+    if read_only_fast && access_mode == MaintenanceAccessMode::Availability {
+        access_mode = MaintenanceAccessMode::ReadOnly;
+    }
 
     let cfg = RepairRunConfig {
         dry_run: parse_bool_param(params, "dry_run", false),
-        check_mode: forced_mode.unwrap_or_else(|| parse_check_mode(params)),
+        check_mode,
         meta_concurrency: clamp_usize(
             params
                 .get("meta_concurrency")
@@ -168,10 +227,11 @@ fn build_repair_config_from_params(
         ),
     };
     info!(
-        "Repair tuning: ram_gib={} cpu_cores={} fast_mode={} mode={:?} meta_conc={} repair_conc={} batch={} (caps: meta<= {}, repair<= {}, batch<= {})",
+        "Repair tuning: ram_gib={} cpu_cores={} fast_mode={} access_mode={:?} mode={:?} meta_conc={} repair_conc={} batch={} (caps: meta<= {}, repair<= {}, batch<= {})",
         ram_gib,
         cpu_cores,
         fast_mode,
+        access_mode,
         cfg.check_mode,
         cfg.meta_concurrency,
         cfg.shard_repair_concurrency,
@@ -192,9 +252,108 @@ fn build_repair_config_from_params(
         cfg,
         RepairRunOptions {
             fast_mode,
+            access_mode,
             fragment_filter,
         },
     )
+}
+
+fn availability_part_parallelism(cfg: &RepairRunConfig) -> usize {
+    cfg.shard_repair_concurrency.clamp(1, 4)
+}
+
+fn is_stale_raw_device_mapping_error(err: &AppError) -> bool {
+    match err {
+        AppError::InternalServerError(message) => {
+            message.contains("No raw blob device found for device id")
+        }
+        _ => false,
+    }
+}
+
+async fn inspect_part_availability(part: &PartMetadata) -> (Vec<usize>, usize) {
+    let mut missing_shards = Vec::new();
+    let mut stale_device_mappings = 0usize;
+
+    for shard in &part.shards {
+        let healthy = if shard.raw_blob_address.is_some() {
+            match shard.raw_blob_address.as_ref() {
+                Some(raw) if raw.size_bytes == shard.size_bytes => {
+                    match raw_blob_address_exists(raw).await {
+                        Ok(exists) => exists,
+                        Err(err) => {
+                            if is_stale_raw_device_mapping_error(&err) {
+                                stale_device_mappings += 1;
+                            }
+                            false
+                        }
+                    }
+                }
+                _ => false,
+            }
+        } else {
+            let shard_path = PathBuf::from(strip_tmp_attempt_suffix(&shard.absolute_path));
+            match fs::metadata(&shard_path).await {
+                Ok(metadata) => metadata.len() == shard.size_bytes,
+                Err(_) => false,
+            }
+        };
+
+        if !healthy {
+            missing_shards.push(shard.shard_index);
+        }
+    }
+
+    (missing_shards, stale_device_mappings)
+}
+
+async fn repair_availability_part(
+    plan: AvailabilityRepairPlan,
+    stripe_size: usize,
+    shard_repair_sem: Arc<Semaphore>,
+    repair_context: ShardRepairContext,
+) -> Result<AvailabilityPartRepairOutcome, AppError> {
+    let mut outcome = AvailabilityPartRepairOutcome::default();
+
+    for missing_idx in plan.missing_shards {
+        if should_stop() {
+            break;
+        }
+
+        let _permit = shard_repair_sem
+            .acquire()
+            .await
+            .map_err(|_| AppError::InternalServerError("Repair semaphore closed".into()))?;
+
+        match repair_entire_shard(
+            plan.part.clone(),
+            missing_idx,
+            stripe_size,
+            Some(repair_context.clone()),
+            RepairLogMode::Summary,
+        )
+        .await
+        {
+            Ok(RepairShardOutcome {
+                relocated_raw_shard,
+                ..
+            }) => {
+                outcome.repaired_shards += 1;
+                if relocated_raw_shard {
+                    outcome.relocated_raw_shards += 1;
+                }
+            }
+            Err(err) => {
+                outcome.failures += 1;
+                warn!(
+                    "Availability repair failed for part={} shard={}: {}",
+                    plan.part.part_index, missing_idx, err
+                );
+            }
+        }
+    }
+
+    Ok(outcome)
 }
 
 fn ensure_repair_job_idle(status: &RepairJobStatus) -> Result<(), AppError> {
@@ -709,6 +868,17 @@ async fn repair_fragment_sessions_strict(
         let (m, d) = replicate_bytes_strict(&paths, &canon_state, dry_run).await?;
         miss += m;
         div += d;
+
+        for part in upload::load_all_part_metas_from_disk(fragment, &version_id).await? {
+            let part_paths =
+                upload::session_part_meta_paths(fragment, &version_id, part.part_index).await?;
+            let canon_part = rmp_serde::to_vec(&part).map_err(|e| {
+                AppError::InternalServerError(format!("serialize session part repair: {}", e))
+            })?;
+            let (m, d) = replicate_bytes_strict(&part_paths, &canon_part, dry_run).await?;
+            miss += m;
+            div += d;
+        }
     }
 
     Ok((miss, div, corrupt))
@@ -1076,6 +1246,117 @@ async fn process_object_repair(
     let mut corrupt_found = 0usize;
     let mut last_repaired: Option<String> = None;
 
+    if cfg.check_mode == RepairCheckMode::Availability {
+        let mut plans = Vec::new();
+        let mut availability_summary = AvailabilityRepairSummary::default();
+
+        for part in &meta_arc.parts {
+            if should_stop() {
+                break;
+            }
+
+            let part_fixed = normalize_part_paths_for_repair(
+                &path_manager,
+                blob_roots,
+                &meta_arc.fragment,
+                &meta_arc.version_id,
+                part.clone(),
+            )
+            .await;
+
+            let part_arc = Arc::new(part_fixed);
+            let (missing_shards, stale_device_mappings) =
+                inspect_part_availability(part_arc.as_ref()).await;
+
+            availability_summary.parts_scanned += 1;
+            availability_summary.stale_device_mappings += stale_device_mappings;
+
+            if missing_shards.is_empty() {
+                continue;
+            }
+
+            corrupt_found += missing_shards.len();
+            availability_summary.parts_requiring_repair += 1;
+            availability_summary.unavailable_shards += missing_shards.len();
+
+            if !cfg.dry_run {
+                plans.push(AvailabilityRepairPlan {
+                    part: part_arc,
+                    missing_shards,
+                });
+            }
+        }
+
+        if !cfg.dry_run && !plans.is_empty() {
+            let stripe_size = meta_arc.stripe_size_bytes;
+            let part_parallelism = availability_part_parallelism(&cfg);
+            let mut repairs = stream::iter(plans.into_iter())
+                .map(|plan| {
+                    let shard_repair_sem = shard_repair_sem.clone();
+                    let repair_context = repair_context.clone();
+
+                    async move {
+                        repair_availability_part(
+                            plan,
+                            stripe_size,
+                            shard_repair_sem,
+                            repair_context,
+                        )
+                        .await
+                    }
+                })
+                .buffer_unordered(part_parallelism);
+
+            while let Some(result) = repairs.next().await {
+                match result {
+                    Ok(part_outcome) => {
+                        repaired_total += part_outcome.repaired_shards;
+                        availability_summary.relocated_raw_shards +=
+                            part_outcome.relocated_raw_shards;
+                        availability_summary.repair_failures += part_outcome.failures;
+
+                        if part_outcome.repaired_shards > 0 {
+                            last_repaired =
+                                Some(format!("{}/{}", meta_arc.fragment, meta_arc.object_key));
+                        }
+                    }
+                    Err(err) => {
+                        availability_summary.repair_failures += 1;
+                        warn!(
+                            "Availability repair failed for {}/{} (v:{}): {}",
+                            meta_arc.fragment, meta_arc.object_key, meta_arc.version_id, err
+                        );
+                    }
+                }
+            }
+        }
+
+        if availability_summary.parts_requiring_repair > 0 || availability_summary.repair_failures > 0
+        {
+            let log_message = format!(
+                "Availability repair summary fragment={} key={} version={} parts_scanned={} parts_needing_repair={} unavailable_shards={} stale_device_mappings={} relocated_raw_shards={} repair_failures={} dry_run={}",
+                meta_arc.fragment,
+                meta_arc.object_key,
+                meta_arc.version_id,
+                availability_summary.parts_scanned,
+                availability_summary.parts_requiring_repair,
+                availability_summary.unavailable_shards,
+                availability_summary.stale_device_mappings,
+                availability_summary.relocated_raw_shards,
+                availability_summary.repair_failures,
+                cfg.dry_run
+            );
+
+            if availability_summary.repair_failures > 0 || cfg.dry_run {
+                warn!("{}", log_message);
+            } else {
+                info!("{}", log_message);
+            }
+        }
+
+        return Ok((repaired_total, corrupt_found, last_repaired));
+    }
+
     for part in &meta_arc.parts {
         if should_stop() {
             break;
@@ -1097,30 +1378,7 @@ async fn process_object_repair(
             let mut healthy = false;
 
             if shard.raw_blob_address.is_some() {
-                if cfg.check_mode == RepairCheckMode::Availability {
-                    healthy = match shard.raw_blob_address.as_ref() {
-                        Some(raw) if raw.size_bytes == shard.size_bytes => {
-                            match raw_blob_address_exists(raw).await {
-                                Ok(exists) => exists,
-                                Err(err) => {
-                                    warn!(
-                                        "Raw shard unavailable in availability mode: {} ({})",
-                                        shard.absolute_path, err
-                                    );
-                                    false
-                                }
-                            }
-                        }
-                        _ => false,
-                    };
-                    if !healthy {
-                        corrupt_found += 1;
-                        warn!(
-                            "Unavailable raw shard (availability): {}",
-                            shard.absolute_path
-                        );
-                    }
-                } else {
+                if cfg.check_mode.verifies_full_integrity() {
                     healthy = verify_shard_checksum(shard).await.unwrap_or(false);
                     if !healthy {
                         corrupt_found += 1;
@@ -1131,18 +1389,16 @@ async fn process_object_repair(
                 let shard_path = PathBuf::from(strip_tmp_attempt_suffix(&shard.absolute_path));
                 match fs::metadata(&shard_path).await {
                     Ok(m) => {
-                        if cfg.check_mode == RepairCheckMode::Availability {
+                        if cfg.check_mode.verifies_full_integrity() {
+                            if let Ok(mut f) = File::open(&shard_path).await {
+                                healthy = verify_shard_integrity(&mut f, &shard.checksum).await;
+                                if !healthy {
+                                    corrupt_found += 1;
+                                    warn!("Corrupt shard found: {:?}", shard_path);
+                                }
+                            }
+                        } else {
                             healthy = m.len() == shard.size_bytes;
-                            if !healthy {
-                                corrupt_found += 1;
-                                warn!("Size mismatch shard (availability): {:?}", shard_path);
-                            }
-                        } else if let Ok(mut f) = File::open(&shard_path).await {
-                            healthy = verify_shard_integrity(&mut f, &shard.checksum).await;
-                            if !healthy {
-                                corrupt_found += 1;
-                                warn!("Corrupt shard found: {:?}", shard_path);
-                            }
                         }
                     }
                     Err(_) => {
@@ -1171,8 +1427,14 @@ async fn process_object_repair(
                     let _permit = sem.acquire().await.map_err(|_| {
                         AppError::InternalServerError("Repair semaphore closed".into())
                     })?;
-                    repair_entire_shard(part_for_task, missing_idx, stripe, Some(repair_context))
-                        .await
+                    repair_entire_shard(
+                        part_for_task,
+                        missing_idx,
+                        stripe,
+                        Some(repair_context),
+                        RepairLogMode::Verbose,
+                    )
+                    .await
                 }
             })
             .buffer_unordered(cfg.shard_repair_concurrency);
@@ -1208,7 +1470,7 @@ pub async fn run_repair_job_with_options(
 ) -> Result<(), AppError> {
     STOP_SIGNAL.store(false, Ordering::Relaxed);
     let start_time = Instant::now();
-    let _write_gate = acquire_read_only_fast_mode(opts.fast_mode);
+    let _write_gate = acquire_maintenance_mode(opts.access_mode);
 
     let scope_label = opts.fragment_filter.as_deref().unwrap_or("all-fragments");
     {
@@ -1216,8 +1478,9 @@ pub async fn run_repair_job_with_options(
         status.is_running = true;
         status.fast_mode = opts.fast_mode;
         status.phase = format!(
-            "Initializing (scope={}, mode={:?}, meta_conc={}, repair_conc={}, batch={}, dry_run={}, fast_mode={})",
+            "Initializing (scope={}, access_mode={:?}, mode={:?}, meta_conc={}, repair_conc={}, batch={}, dry_run={}, fast_mode={})",
             scope_label,
+            opts.access_mode,
             cfg.check_mode,
             cfg.meta_concurrency,
             cfg.shard_repair_concurrency,
@@ -1348,14 +1611,13 @@ pub async fn run_repair_job_with_options(
         }
 
         let repair_targets = collect_fragment_repair_targets(&fragment_hash).await?;
-        let mut fragment_touched = false;
 
         for batch in repair_targets.chunks(cfg.meta_batch_size.max(1)) {
             if should_stop() {
                 break;
             }
 
-            let d = apply_meta_batch(
+            apply_meta_batch(
                 batch,
                 blob_roots.clone(),
                 num_disks,
@@ -1365,28 +1627,6 @@ pub async fn run_repair_job_with_options(
                 start_time,
             )
             .await?;
-
-            if d.repaired_shards > 0 || d.missing_meta_repaired > 0 || d.divergent_meta_repaired > 0
-            {
-                fragment_touched = true;
-            }
-        }
-
-        if !cfg.dry_run && fragment_touched && !should_stop() {
-            {
-                let mut status = REPAIR_STATUS.write().await;
-                status.phase = format!("Rebuilding Prefix Index {}", fragment_hash);
-                ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
-            }
-
-            if let Err(e) =
-                run_prefix_rebuild_job(Some(fragment_hash.clone()), ws_manager.clone()).await
-            {
-                warn!(
-                    "Prefix rebuild failed for fragment {}: {}",
-                    fragment_hash, e
-                );
-            }
         }
     }
 
