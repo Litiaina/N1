@@ -13,7 +13,9 @@ use ulid::Ulid;
 use walkdir::WalkDir;
 
 use crate::enums::app_error_enum::AppError;
-use crate::n1_core::blob_store::{free_raw_shards_for_metadata, metadata_contains_raw_shards};
+use crate::n1_core::blob_store::{
+    free_raw_shards_for_metadata, free_raw_shards_for_metadatas, metadata_contains_raw_shards,
+};
 use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, compare_version_recency, default_stripe_size,
 };
@@ -376,13 +378,20 @@ pub async fn empty_trash(
         .map(|meta| meta.total_size_bytes)
         .sum();
 
-    for meta in &trash_versions {
-        if metadata_contains_raw_shards(meta) {
-            let _ = free_raw_shards_for_metadata(meta).await;
-        }
-        let _ = index::delete_trashed_object_version(&fragment, &meta.object_key, &meta.version_id)
-            .await;
+    let raw_trash_versions = trash_versions
+        .iter()
+        .filter(|meta| metadata_contains_raw_shards(meta))
+        .cloned()
+        .collect::<Vec<_>>();
+    let touched_partitions = trash_versions
+        .iter()
+        .map(|meta| index::object_partition_id(&meta.fragment, &meta.object_key))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if !raw_trash_versions.is_empty() {
+        free_raw_shards_for_metadatas(&raw_trash_versions).await?;
     }
+
+    index::clear_fragment_trash_in_partitions(&fragment, &touched_partitions).await?;
 
     let mut delete_tasks: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
     for root in &blob_roots {

@@ -230,10 +230,11 @@ Scrub is the integrity-check pass for committed raw shards.
 - `GET /v4/maintenance/blob/raw/status` shows all devices healthy
 - scrub can start and report status
 - authoritative `index` writes ACK on the owner root first; replica roots are expected to reconcile behind that ACK path
+- multipart part uploads are payload-first and disk-backed: committed part metadata remains the resumability source of truth, and pending-part receipts allow GC/cancel to reclaim raw orphaned extents after a crash
 
 ## 10. Release Hardening On Target Hardware
 
-N1 `0.9.0` is the architecture-freeze line. Run the release drill harness before cutting a `1.0.0` stable build:
+N1 `0.9.1` is the architecture-freeze line. Run the release drill harness before cutting a `1.0.0` stable build:
 
 ```bash
 scripts/bench/run_release_drills.sh

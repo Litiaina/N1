@@ -1,11 +1,15 @@
 use super::archive::download_selected_archive;
-use super::blob_store::{open_raw_direct_io, verify_shard_checksum, write_shard_range};
+use super::blob_store::{
+    allocate_raw_direct_io, free_raw_shards_for_metadatas, open_raw_direct_io, raw_blob_address_exists,
+    verify_shard_checksum, write_shard_range,
+};
 use super::constants::{
     PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_DELIMITER_SEGMENT_PREFIX, PREFIX_SEGMENT_EXT,
 };
 use super::delete::delete_object;
 use super::delete::{
-    delete_object_permanently, delete_object_version, recover_object, recover_object_version,
+    delete_object_permanently, delete_object_version, empty_trash, recover_object,
+    recover_object_version,
 };
 use super::disk_manager::{
     DownloadArchiveRequest, InitiateUploadParams, ObjectKeyQuery, ObjectPathManager,
@@ -20,7 +24,7 @@ use super::object_parser::{
     STREAM_CHUNK_SIZE_ATOMIC, STREAM_LOCALITY_BIAS_ENABLED_ATOMIC, STREAM_MAX_CONCURRENCY,
     STREAM_READAHEAD_BYTES_ATOMIC,
 };
-use super::quota_manager::{get_quota, init_quota_file, set_storage_used};
+use super::quota_manager::{get_quota, init_quota_file, set_storage_used, update_quota};
 use super::recovery::{RAW_VERIFY_ON_READ_ATOMIC, ShardRepairContext, repair_entire_shard};
 use super::redistribution::{
     RedistributionDurabilityMode, RedistributionRunOptions, run_redistribution_job,
@@ -34,8 +38,9 @@ use super::sync::{ensure_fragment_blob_directories, sync_single_fragment_quota};
 use super::upload::{
     DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC,
     STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC, UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC,
-    WRITER_BUFFER_SIZE_ATOMIC, finalize_object_upload, get_upload_status, initiate_object_upload,
-    object_upload_part,
+    WRITER_BUFFER_SIZE_ATOMIC, cancel_upload_session, finalize_object_upload, get_upload_status,
+    initiate_object_upload, object_upload_part, cleanup_orphaned_upload_artifacts_for_fragment,
+    write_pending_part_receipt_for_tests,
 };
 use crate::n1_core::disk_manager::{
     STORAGE_TEST_LOCK as TEST_LOCK, replace_storage_roots_for_tests, version_recency_is_newer,
@@ -54,7 +59,7 @@ use axum::response::IntoResponse;
 use futures_util::{StreamExt, stream};
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -465,7 +470,7 @@ async fn stream_object_bytes(fragment: String, object_key: String) -> Vec<u8> {
 
 fn print_perf_stage(stage: &PerfStageResult) {
     println!(
-        "N1 CRUD probe stage={} ops={} bytes={} wall_s={:.3} cpu_s={} rss_before_mib={} rss_after_mib={} rss_peak_mib={} hwm_mib={}",
+        "N1 perf stage={} ops={} bytes={} wall_s={:.3} cpu_s={} rss_before_mib={} rss_after_mib={} rss_peak_mib={} hwm_mib={}",
         stage.name,
         stage.ops,
         stage.bytes,
@@ -943,9 +948,21 @@ async fn simulate_index_root_down(root: &std::path::Path) -> (PathBuf, PathBuf) 
 }
 
 async fn restore_index_root(root: &std::path::Path, down_path: &std::path::Path) {
-    fs::remove_file(root)
-        .await
-        .unwrap_or_else(|e| panic!("remove index blocker {}: {}", root.display(), e));
+    if fs::try_exists(root).await.unwrap_or(false) {
+        match fs::metadata(root).await {
+            Ok(meta) if meta.is_dir() => {
+                fs::remove_dir_all(root)
+                    .await
+                    .unwrap_or_else(|e| panic!("remove recreated index dir {}: {}", root.display(), e));
+            }
+            Ok(_) => {
+                fs::remove_file(root)
+                    .await
+                    .unwrap_or_else(|e| panic!("remove index blocker {}: {}", root.display(), e));
+            }
+            Err(e) => panic!("stat index root {}: {}", root.display(), e),
+        }
+    }
     fs::rename(down_path, root)
         .await
         .unwrap_or_else(|e| panic!("restore index root {}: {}", root.display(), e));
@@ -2233,7 +2250,8 @@ async fn matrix_index_object_partition_uses_segmented_wal_and_checkpoints() {
     );
 
     let mut saw_checkpoint = false;
-    let mut saw_multiple_segments = false;
+    let mut saw_segmented_wal = false;
+    let mut checkpoint_paths = Vec::new();
     for meta_path in meta_paths {
         let partition_dir = meta_path
             .ancestors()
@@ -2257,9 +2275,7 @@ async fn matrix_index_object_partition_uses_segmented_wal_and_checkpoints() {
             "legacy single active.wal should not be present"
         );
 
-        if fs::try_exists(&checkpoint_path).await.unwrap_or(false) {
-            saw_checkpoint = true;
-        }
+        checkpoint_paths.push(checkpoint_path);
 
         let mut segment_count = 0usize;
         if fs::try_exists(&segments_dir).await.unwrap_or(false) {
@@ -2272,15 +2288,29 @@ async fn matrix_index_object_partition_uses_segmented_wal_and_checkpoints() {
                 }
             }
         }
-        if segment_count >= 2 {
-            saw_multiple_segments = true;
+        if segment_count >= 1 {
+            saw_segmented_wal = true;
         }
+    }
+
+    let checkpoint_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < checkpoint_deadline {
+        for checkpoint_path in &checkpoint_paths {
+            if fs::try_exists(checkpoint_path).await.unwrap_or(false) {
+                saw_checkpoint = true;
+                break;
+            }
+        }
+        if saw_checkpoint {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     assert!(saw_checkpoint, "expected at least one current checkpoint");
     assert!(
-        saw_multiple_segments,
-        "expected the repeated object partition to rotate into multiple wal segments"
+        saw_segmented_wal,
+        "expected the repeated object partition to persist segmented wal files"
     );
 }
 
@@ -2385,6 +2415,269 @@ async fn matrix_upload_resume_status_then_finalize_success() {
     let expected = [part0, part1, part2].concat();
     let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
     assert_eq!(got, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_cancel_upload_before_first_part_succeeds() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "matrix/cancel-before-part.bin".to_string();
+
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let (version_id, _session_id) = init_upload(&fragment, &key, 4 * 1024 * 1024, 1).await;
+    let cancel_resp = cancel_upload_session(
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), version_id.clone())),
+        Query(ObjectKeyQuery {
+            object_key: key.clone(),
+            version_id: None,
+        }),
+    )
+    .await
+    .expect("cancel upload")
+    .into_response();
+    assert_eq!(cancel_resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        index::load_session(&fragment, &version_id)
+            .await
+            .expect("load session")
+            .is_none(),
+        "session should be removed even when no snapshot file was written"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_cancel_upload_after_part_frees_raw_part_extents() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "matrix/cancel-after-part.bin".to_string();
+
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let content = vec![0x5Au8; 2 * 1024 * 1024];
+    let (version_id, _session_id) = init_upload(&fragment, &key, content.len() as u64, 1).await;
+    upload_part(&fragment, &version_id, 0, content).await;
+
+    let uploaded_parts_resp = get_upload_status(
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), version_id.clone())),
+    )
+    .await
+    .expect("upload status");
+    let status_json = read_response_json(uploaded_parts_resp.into_response()).await;
+    assert_eq!(status_json["uploaded_parts"][0].as_u64(), Some(0));
+
+    let part_meta =
+        super::upload::read_part_meta_any(&ObjectPathManager::new(), &fragment, &version_id, 0)
+            .await
+            .expect("part meta");
+    let raw_addresses: Vec<_> = part_meta
+        .shards
+        .iter()
+        .filter_map(|shard| shard.raw_blob_address.clone())
+        .collect();
+    assert!(!raw_addresses.is_empty(), "raw addresses recorded");
+
+    let cancel_resp = cancel_upload_session(
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), version_id.clone())),
+        Query(ObjectKeyQuery {
+            object_key: key.clone(),
+            version_id: None,
+        }),
+    )
+    .await
+    .expect("cancel upload")
+    .into_response();
+    assert_eq!(cancel_resp.status(), StatusCode::NO_CONTENT);
+
+    for raw in raw_addresses {
+        assert!(
+            !raw_blob_address_exists(&raw)
+                .await
+                .expect("raw exists check"),
+            "cancel should free raw part extent"
+        );
+    }
+    assert!(
+        index::load_session(&fragment, &version_id)
+            .await
+            .expect("load session")
+            .is_none(),
+        "session should be removed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_gc_orphaned_pending_part_receipt_frees_raw_extent() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "matrix/gc-orphan-pending.bin".to_string();
+
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let (version_id, _session_id) = init_upload(&fragment, &key, 4096, 1).await;
+    let (raw_address, io) = allocate_raw_direct_io(0, 4096).expect("allocate raw io");
+    io.write(0, &[0xAB; 4096]).expect("write pending raw bytes");
+    io.flush_data().expect("flush pending raw bytes");
+
+    write_pending_part_receipt_for_tests(&fragment, &version_id, 0, vec![raw_address.clone()])
+        .await
+        .expect("write pending receipt");
+
+    let _ = index::remove_session(&fragment, &version_id, "test-orphaned-pending").await;
+
+    let cleaned = cleanup_orphaned_upload_artifacts_for_fragment(
+        &fragment,
+        std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+        std::time::Duration::from_secs(1),
+    )
+    .await
+    .expect("cleanup orphaned upload artifacts");
+    assert_eq!(cleaned, 1);
+    assert!(
+        !raw_blob_address_exists(&raw_address)
+            .await
+            .expect("raw exists check"),
+        "orphaned pending receipt should be reclaimed by GC helper"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_empty_trash_bulk_clears_multi_version_key_and_refunds_quota() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 128 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let key = "trash/bulk.bin".to_string();
+    put_object(state.clone(), &fragment, &key, vec![1u8; 1024]).await;
+    put_object(state.clone(), &fragment, &key, vec![2u8; 2048]).await;
+    put_object(state.clone(), &fragment, &key, vec![3u8; 4096]).await;
+
+    let before_delete_quota = get_quota(&fragment).await.expect("quota before delete");
+    assert!(before_delete_quota.storage_used >= 7168);
+
+    let delete_response = delete_object(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), key.clone())),
+    )
+    .await
+    .expect("delete object")
+    .into_response();
+    assert_eq!(delete_response.status(), StatusCode::OK);
+
+    let trashed_before = index::list_trashed_object_versions_metadata(&fragment, &key)
+        .await
+        .expect("trash before empty");
+    assert_eq!(trashed_before.len(), 3);
+
+    let empty_response = empty_trash(
+        State(state),
+        full_claims(&fragment),
+        AxumPath(fragment.clone()),
+    )
+    .await
+    .expect("empty trash")
+    .into_response();
+    assert_eq!(empty_response.status(), StatusCode::NO_CONTENT);
+
+    let trashed_after = index::list_trashed_object_versions_metadata(&fragment, &key)
+        .await
+        .expect("trash after empty");
+    assert!(trashed_after.is_empty());
+    let fragment_trash_after = index::list_fragment_trash_objects(&fragment)
+        .await
+        .expect("fragment trash after empty");
+    assert!(fragment_trash_after.is_empty());
+    let trash_versions_after = index::list_fragment_object_versions(&fragment, true)
+        .await
+        .expect("fragment trash versions after empty");
+    assert!(trash_versions_after.is_empty());
+
+    let quota_after = get_quota(&fragment).await.expect("quota after empty");
+    assert_eq!(quota_after.storage_used, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6300,10 +6593,6 @@ async fn matrix_crud_cpu_ram_probe() {
 #[ignore = "throughput probe for single-NVMe upload saturation; run manually with env knobs"]
 async fn matrix_upload_single_nvme_saturation_probe() {
     let _guard = TEST_LOCK.lock().await;
-    let base = TEST_BASE.clone();
-    ensure_global_storage_config(&base).await;
-    ensure_upload_runtime_config();
-
     let workers = test_env_usize("N1_UPLOAD_PROBE_CONCURRENCY", 8, 1, 128);
     let uploads_per_worker = test_env_usize("N1_UPLOAD_PROBE_OBJECTS_PER_WORKER", 2, 1, 1024);
     let object_bytes = test_env_u64(
@@ -6352,6 +6641,13 @@ async fn matrix_upload_single_nvme_saturation_probe() {
         );
     }
 
+    let total_uploads = workers * uploads_per_worker;
+    let total_bytes = total_uploads as u64 * object_bytes as u64;
+    let raw_disk_bytes = total_bytes.saturating_mul(4).max(512 * 1024 * 1024);
+    let base = TEST_BASE.join(format!("upload-probe-{}", Ulid::new()));
+    ensure_raw_storage_config(&base, 3, raw_disk_bytes).await;
+    ensure_upload_runtime_config();
+
     MAX_PART_SIZE_ATOMIC
         .get()
         .expect("MAX_PART_SIZE_ATOMIC")
@@ -6369,8 +6665,6 @@ async fn matrix_upload_single_nvme_saturation_probe() {
         let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
         hex::encode(digest)
     };
-    let total_uploads = workers * uploads_per_worker;
-    let total_bytes = total_uploads as u64 * object_bytes as u64;
     setup_fragment(&fragment).await;
     let quota_bytes = total_bytes.saturating_mul(2).max(64 * 1024 * 1024);
     init_quota_file(&fragment, quota_bytes)
@@ -6608,6 +6902,437 @@ async fn matrix_stream_sequential_readahead_locality_probe() {
             "stream readahead/locality regression: ratio {:.3} < required {:.3}",
             ratio,
             min_ratio_permil
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "empty-trash stage probe; run manually with N1_EMPTY_TRASH_PROBE_* env knobs"]
+async fn matrix_empty_trash_fragment_nuke_probe() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let object_count = test_env_usize("N1_EMPTY_TRASH_PROBE_OBJECTS", 2048, 1, 200_000);
+    let object_bytes = test_env_usize(
+        "N1_EMPTY_TRASH_PROBE_OBJECT_BYTES",
+        256 * 1024,
+        4 * 1024,
+        8 * 1024 * 1024,
+    );
+    let part_bytes = test_env_usize(
+        "N1_EMPTY_TRASH_PROBE_PART_BYTES",
+        256 * 1024,
+        64 * 1024,
+        8 * 1024 * 1024,
+    );
+    let concurrency = test_env_usize("N1_EMPTY_TRASH_PROBE_CONCURRENCY", 16, 1, 256);
+
+    MAX_PART_SIZE_ATOMIC
+        .get()
+        .expect("MAX_PART_SIZE_ATOMIC")
+        .store(part_bytes as u64 + 4096, Ordering::Relaxed);
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+    let total_bytes = (object_count as u64).saturating_mul(object_bytes as u64);
+    init_quota_file(
+        &fragment,
+        total_bytes.saturating_mul(4).max(64 * 1024 * 1024),
+    )
+    .await
+    .expect("set empty-trash probe quota");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    stream::iter(0..object_count)
+        .for_each_concurrent(concurrency, |i| {
+            let state = state.clone();
+            let fragment = fragment.clone();
+            async move {
+                let key = format!("trash-probe/obj-{:06}.bin", i);
+                put_object_generated_chunked(state, &fragment, &key, object_bytes, part_bytes, i)
+                    .await;
+            }
+        })
+        .await;
+
+    stream::iter(0..object_count)
+        .for_each_concurrent(concurrency, |i| {
+            let state = state.clone();
+            let fragment = fragment.clone();
+            async move {
+                let key = format!("trash-probe/obj-{:06}.bin", i);
+                let resp = delete_object(
+                    State(state),
+                    full_claims(&fragment),
+                    AxumPath((fragment.clone(), key)),
+                )
+                .await
+                .expect("delete probe object")
+                .into_response();
+                assert_eq!(resp.status(), StatusCode::OK);
+            }
+        })
+        .await;
+
+    let started_wait = Instant::now();
+    let trash_versions = loop {
+        let versions = index::list_fragment_object_versions(&fragment, true)
+            .await
+            .expect("list probe trash versions");
+        if versions.len() == object_count {
+            break versions;
+        }
+        assert!(
+            started_wait.elapsed() < Duration::from_secs(30),
+            "probe trash population did not converge: expected {} versions, saw {}",
+            object_count,
+            versions.len()
+        );
+        sleep(Duration::from_millis(50)).await;
+    };
+
+    let total_refund_size: u64 = trash_versions
+        .iter()
+        .map(|meta| meta.total_size_bytes)
+        .sum();
+    let raw_trash_versions = trash_versions
+        .iter()
+        .filter(|meta| {
+            meta.parts
+                .iter()
+                .flat_map(|part| part.shards.iter())
+                .any(|shard| shard.raw_blob_address.is_some())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let touched_partitions = trash_versions
+        .iter()
+        .map(|meta| index::object_partition_id(&meta.fragment, &meta.object_key))
+        .collect::<Result<BTreeSet<_>, _>>()
+        .expect("derive touched trash partitions");
+
+    let mut stages = Vec::new();
+    let mut peak_rss_mib = perf_snapshot().rss_mib;
+
+    let before = perf_snapshot();
+    let started = Instant::now();
+    free_raw_shards_for_metadatas(&raw_trash_versions)
+        .await
+        .expect("batch free raw trash");
+    update_rss_peak(&mut peak_rss_mib);
+    stages.push(finish_perf_stage(
+        "raw_free",
+        raw_trash_versions.len(),
+        total_refund_size,
+        started,
+        before,
+        peak_rss_mib,
+    ));
+
+    let before = perf_snapshot();
+    let started = Instant::now();
+    let touched_partitions =
+        index::clear_fragment_trash_in_partitions(&fragment, &touched_partitions)
+            .await
+            .expect("clear fragment trash");
+    update_rss_peak(&mut peak_rss_mib);
+    stages.push(finish_perf_stage(
+        "index_clear",
+        touched_partitions,
+        0,
+        started,
+        before,
+        peak_rss_mib,
+    ));
+
+    let path_manager = ObjectPathManager::new();
+    let blob_roots = path_manager.get_blob_roots();
+    let before = perf_snapshot();
+    let started = Instant::now();
+    for root in &blob_roots {
+        let trash_root = root.join(&fragment).join(".trash");
+        if fs::try_exists(&trash_root).await.unwrap_or(false) {
+            let _ = fs::remove_dir_all(&trash_root).await;
+        }
+    }
+    update_rss_peak(&mut peak_rss_mib);
+    stages.push(finish_perf_stage(
+        "blob_trash_rm",
+        blob_roots.len(),
+        0,
+        started,
+        before,
+        peak_rss_mib,
+    ));
+
+    let before = perf_snapshot();
+    let started = Instant::now();
+    if total_refund_size > 0 {
+        update_quota(&fragment, -(total_refund_size as i64))
+            .await
+            .expect("refund empty trash quota");
+    }
+    update_rss_peak(&mut peak_rss_mib);
+    stages.push(finish_perf_stage(
+        "quota_refund",
+        1,
+        total_refund_size,
+        started,
+        before,
+        peak_rss_mib,
+    ));
+
+    let trashed_after = index::list_fragment_object_versions(&fragment, true)
+        .await
+        .expect("list trash after probe clear");
+    assert!(
+        trashed_after.is_empty(),
+        "trash should be empty after probe"
+    );
+    let quota_after = get_quota(&fragment)
+        .await
+        .expect("quota after empty-trash probe");
+    assert_eq!(quota_after.storage_used, 0);
+
+    let total_wall_secs: f64 = stages.iter().map(|stage| stage.wall_secs).sum();
+    let total_cpu_secs = stages
+        .iter()
+        .filter_map(|stage| stage.cpu_secs)
+        .sum::<f64>();
+    for stage in &stages {
+        print_perf_stage(stage);
+    }
+
+    let raw_free_secs = stages
+        .iter()
+        .find(|stage| stage.name == "raw_free")
+        .map(|stage| stage.wall_secs)
+        .unwrap_or(0.0);
+    let index_clear_secs = stages
+        .iter()
+        .find(|stage| stage.name == "index_clear")
+        .map(|stage| stage.wall_secs)
+        .unwrap_or(0.0);
+    let blob_trash_rm_secs = stages
+        .iter()
+        .find(|stage| stage.name == "blob_trash_rm")
+        .map(|stage| stage.wall_secs)
+        .unwrap_or(0.0);
+    let quota_refund_secs = stages
+        .iter()
+        .find(|stage| stage.name == "quota_refund")
+        .map(|stage| stage.wall_secs)
+        .unwrap_or(0.0);
+
+    println!(
+        "N1 empty trash probe: objects={} object_bytes={} part_bytes={} concurrency={} total_mib={:.2} raw_versions={} raw_free_s={:.3} index_clear_s={:.3} blob_rm_s={:.3} quota_s={:.3} total_wall_s={:.3} total_cpu_s={} peak_rss_mib={} peak_hwm_mib={}",
+        object_count,
+        object_bytes,
+        part_bytes,
+        concurrency,
+        total_refund_size as f64 / (1024.0 * 1024.0),
+        raw_trash_versions.len(),
+        raw_free_secs,
+        index_clear_secs,
+        blob_trash_rm_secs,
+        quota_refund_secs,
+        total_wall_secs,
+        if total_cpu_secs > 0.0 {
+            format!("{:.3}", total_cpu_secs)
+        } else {
+            "n/a".to_string()
+        },
+        peak_rss_mib
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        perf_snapshot()
+            .hwm_mib
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "upload RSS plateau probe; run manually with N1_UPLOAD_RSS_PROBE_* env knobs"]
+async fn matrix_upload_rss_plateau_probe() {
+    let _guard = TEST_LOCK.lock().await;
+    let workers = test_env_usize("N1_UPLOAD_RSS_PROBE_CONCURRENCY", 4, 1, 64);
+    let uploads_per_worker = test_env_usize("N1_UPLOAD_RSS_PROBE_OBJECTS_PER_WORKER", 1, 1, 256);
+    let object_bytes = test_env_u64(
+        "N1_UPLOAD_RSS_PROBE_OBJECT_BYTES",
+        256 * 1024 * 1024,
+        1024 * 1024,
+        16 * 1024 * 1024 * 1024,
+    ) as usize;
+    let part_bytes = test_env_usize(
+        "N1_UPLOAD_RSS_PROBE_PART_BYTES",
+        32 * 1024 * 1024,
+        256 * 1024,
+        512 * 1024 * 1024,
+    );
+    let cooldown_ms = test_env_u64("N1_UPLOAD_RSS_PROBE_COOLDOWN_MS", 2000, 0, 120_000);
+    let max_peak_mib = test_env_u64("N1_UPLOAD_RSS_PROBE_MAX_PEAK_MIB", 0, 0, 1_000_000);
+    let max_settle_delta_mib =
+        test_env_u64("N1_UPLOAD_RSS_PROBE_MAX_SETTLE_DELTA_MIB", 0, 0, 1_000_000);
+    let total_uploads = workers * uploads_per_worker;
+    let total_bytes = total_uploads as u64 * object_bytes as u64;
+    let raw_disk_bytes = total_bytes.saturating_mul(4).max(512 * 1024 * 1024);
+    let base = TEST_BASE.join(format!("upload-rss-probe-{}", Ulid::new()));
+    ensure_raw_storage_config(&base, 3, raw_disk_bytes).await;
+    ensure_upload_runtime_config();
+
+    MAX_PART_SIZE_ATOMIC
+        .get()
+        .expect("MAX_PART_SIZE_ATOMIC")
+        .store(part_bytes as u64 + 4096, Ordering::Relaxed);
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+    init_quota_file(
+        &fragment,
+        total_bytes.saturating_mul(2).max(64 * 1024 * 1024),
+    )
+    .await
+    .expect("set rss probe quota");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let before = perf_snapshot();
+    let rss_peak_atomic = Arc::new(AtomicU64::new(before.rss_mib.unwrap_or(0)));
+    let rss_sampler_stop = Arc::new(AtomicBool::new(false));
+    let rss_sampler = {
+        let rss_peak_atomic = rss_peak_atomic.clone();
+        let rss_sampler_stop = rss_sampler_stop.clone();
+        tokio::spawn(async move {
+            while !rss_sampler_stop.load(Ordering::Relaxed) {
+                if let Some(cur) = process_rss_hwm_mib().0 {
+                    rss_peak_atomic.fetch_max(cur, Ordering::Relaxed);
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+    };
+    let started = Instant::now();
+
+    stream::iter(0..workers)
+        .for_each_concurrent(workers, |w| {
+            let state = state.clone();
+            let fragment = fragment.clone();
+            async move {
+                for i in 0..uploads_per_worker {
+                    let key = format!("rss-probe/w{}/obj-{}.bin", w, i);
+                    put_object_generated_chunked(
+                        state.clone(),
+                        &fragment,
+                        &key,
+                        object_bytes,
+                        part_bytes,
+                        w * 97 + i,
+                    )
+                    .await;
+                }
+            }
+        })
+        .await;
+
+    rss_sampler_stop.store(true, Ordering::Relaxed);
+    let _ = rss_sampler.await;
+    let after = perf_snapshot();
+    if cooldown_ms > 0 {
+        sleep(Duration::from_millis(cooldown_ms)).await;
+    }
+    let settled = perf_snapshot();
+    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    let rss_peak = match rss_peak_atomic.load(Ordering::Relaxed) {
+        0 => None,
+        peak => Some(peak),
+    };
+
+    println!(
+        "N1 upload RSS probe: workers={} uploads_per_worker={} object_bytes={} part_bytes={} total_uploads={} total_mib={:.2} elapsed_s={:.3} throughput_mib_s={:.2} rss_before_mib={} rss_after_mib={} rss_peak_mib={} rss_settled_mib={} hwm_mib={}",
+        workers,
+        uploads_per_worker,
+        object_bytes,
+        part_bytes,
+        total_uploads,
+        total_bytes as f64 / (1024.0 * 1024.0),
+        elapsed,
+        (total_bytes as f64 / (1024.0 * 1024.0)) / elapsed,
+        before
+            .rss_mib
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        after
+            .rss_mib
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        rss_peak
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        settled
+            .rss_mib
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        settled
+            .hwm_mib
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+    );
+
+    if max_peak_mib > 0 {
+        let observed = rss_peak
+            .or(settled.hwm_mib)
+            .expect("RSS/HWM metric unavailable on this platform");
+        assert!(
+            observed <= max_peak_mib,
+            "upload RSS peak exceeded: {} MiB > {} MiB",
+            observed,
+            max_peak_mib
+        );
+    }
+
+    if max_settle_delta_mib > 0 {
+        let before_rss = before
+            .rss_mib
+            .expect("RSS metric unavailable on this platform for before snapshot");
+        let settled_rss = settled
+            .rss_mib
+            .expect("RSS metric unavailable on this platform for settled snapshot");
+        let delta = settled_rss.saturating_sub(before_rss);
+        assert!(
+            delta <= max_settle_delta_mib,
+            "upload RSS settled delta exceeded: {} MiB > {} MiB",
+            delta,
+            max_settle_delta_mib
         );
     }
 }

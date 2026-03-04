@@ -28,9 +28,10 @@
 > - If two versions share the same second-level timestamp, ULID `version_id` order breaks the tie.
 > - Exact-key reads resolve the latest marker and then rehydrate the referenced immutable version record before serving metadata or bytes.
 > - Prefix-serving state may lag, but it must never override or invent visibility that `index` does not contain.
+> - Multipart uploads do not rely on in-memory part state for resumability. Part truth is durable part metadata on disk, and a pending-part receipt covers the raw-allocation crash window until that metadata exists.
 
 > Release status note:
-> - N1 `0.9.0` freezes the storage architecture, not the public API surface.
+> - N1 `0.9.1` freezes the storage architecture, not the public API surface.
 > - This document describes the current implementation and current routes.
 > - Request/response details and endpoint layout may still change before `1.0.0` even though the underlying storage model is now fixed.
 
@@ -478,7 +479,8 @@ Durability default:
 - Upload I/O gating follows `[upload_config].upload_io_gate_enabled` (`true` by default) unless overridden by `io_gate`.
 
 Notes:
-- Part upload commits raw shard payload first, then records the committed part inside the upload session's `index` state.
+- Part upload writes a durable pending-part receipt, commits raw shard payload, then writes durable part metadata on disk.
+- The upload hot path does not rely on in-memory part state for resumability.
 - A successful part upload does not publish object visibility by itself.
 
 ```bash

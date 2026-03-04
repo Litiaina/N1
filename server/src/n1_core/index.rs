@@ -18,11 +18,12 @@ use std::sync::{Arc, LazyLock};
 use std::time::SystemTime;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
 #[cfg(not(test))]
 use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, mpsc, oneshot};
 #[cfg(not(test))]
-use tokio::time::{Duration, sleep};
+use tokio::time::sleep;
+use tokio::time::{Duration, Instant, timeout_at};
 use tracing::warn;
 use ulid::Ulid;
 
@@ -41,11 +42,24 @@ const INDEX_LATEST_SUFFIX: &str = ".latest.msgpack";
 const INDEX_SESSION_SUFFIX: &str = ".session.msgpack";
 const INDEX_OBJECT_SUFFIX: &str = ".msgpack";
 const INDEX_PARTITION_COUNT: u16 = 256;
-const INDEX_WAL_SEGMENT_MAX_BYTES: u64 = 16 * 1024;
-const INDEX_CHECKPOINT_RECORD_INTERVAL: u64 = 32;
-const INDEX_SESSION_SNAPSHOT_PART_INTERVAL: usize = 16;
+const INDEX_WAL_SEGMENT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const INDEX_CHECKPOINT_RECORD_INTERVAL: u64 = 64;
+const INDEX_WAL_MANIFEST_PERSIST_INTERVAL: u64 = 64;
+const INDEX_WAL_GROUP_COMMIT_WINDOW_MS: u64 = 4;
+const INDEX_WAL_GROUP_COMMIT_MAX_RECORDS: usize = 32;
 
-static INDEX_WAL_APPEND_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+static INDEX_WAL_APPENDERS: LazyLock<Mutex<HashMap<String, mpsc::Sender<WalAppendRequest>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static INDEX_WAL_MANIFEST_CACHE: LazyLock<Mutex<HashMap<String, IndexWalManifest>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static INDEX_ACTIVE_SESSIONS: LazyLock<Mutex<HashMap<String, HashMap<String, IndexSessionState>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static INDEX_ACTIVE_SESSION_FRAGMENTS_SCANNED: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+static INDEX_PARTITION_RUNTIME: LazyLock<
+    Mutex<HashMap<String, Arc<Mutex<PartitionRuntimeState>>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static INDEX_SESSION_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +81,19 @@ pub struct IndexSessionState {
 pub struct IndexLatestState {
     pub version_id: String,
     pub metadata: ObjectMetadata,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PartitionMaterializedState {
+    live_latest: HashMap<String, IndexLatestState>,
+    trash_latest: HashMap<String, IndexLatestState>,
+    sessions: HashMap<String, IndexSessionState>,
+}
+
+#[derive(Debug, Clone)]
+struct PartitionRuntimeState {
+    manifest: IndexWalManifest,
+    materialized: PartitionMaterializedState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +122,8 @@ enum IndexWalRecord {
         version_id: String,
         removed_at: i64,
         from_trash: bool,
+        #[serde(default)]
+        next_latest: Option<IndexLatestState>,
     },
     SessionRemoved {
         fragment: String,
@@ -116,6 +145,12 @@ struct IndexWalManifest {
     active_segment_id: u64,
     next_sequence: u64,
     last_checkpoint_sequence: u64,
+}
+
+#[derive(Debug)]
+struct WalAppendRequest {
+    record: IndexWalRecord,
+    response: oneshot::Sender<Result<u64, AppError>>,
 }
 
 impl Default for IndexWalManifest {
@@ -150,14 +185,35 @@ struct PrefixProjectionCursor {
 struct PrefixProjectionTaskState {
     running: bool,
     rerun_requested: bool,
+    #[cfg(not(test))]
+    recovery_scan_needed: bool,
 }
 
-static PREFIX_PROJECTION_TASKS: LazyLock<Mutex<HashMap<String, PrefixProjectionTaskState>>> =
+#[derive(Debug, Clone, Default)]
+struct PrefixProjectionPendingState {
+    task: PrefixProjectionTaskState,
+    #[cfg(not(test))]
+    dirty_keys: HashSet<String>,
+}
+
+static PREFIX_PROJECTION_TASKS: LazyLock<Mutex<HashMap<String, PrefixProjectionPendingState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(not(test))]
+#[derive(Debug, Clone, Copy, Default)]
+struct PartitionMaintenanceTaskState {
+    running: bool,
+    rerun_requested: bool,
+}
+#[cfg(not(test))]
+static INDEX_PARTITION_MAINTENANCE_TASKS: LazyLock<
+    Mutex<HashMap<String, PartitionMaintenanceTaskState>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 #[cfg(not(test))]
 static PREFIX_PROJECTION_IO_GATE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
 #[cfg(not(test))]
 static INDEX_REPLICA_IO_GATE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
+#[cfg(not(test))]
+static INDEX_BACKGROUND_IO_GATE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(2));
 
 #[derive(Debug, Clone)]
 struct IndexRoute {
@@ -170,6 +226,122 @@ fn normalize_session_state(mut state: IndexSessionState) -> IndexSessionState {
         state.last_activity_at = state.manifest.created_at;
     }
     state
+}
+
+fn runtime_key(root: &Path, fragment: &str, partition_id: u16) -> String {
+    format!("{}:{}:{:04x}", root.display(), fragment, partition_id)
+}
+
+fn checkpoint_to_materialized(checkpoint: IndexCheckpoint) -> PartitionMaterializedState {
+    PartitionMaterializedState {
+        live_latest: checkpoint
+            .live_latest
+            .into_iter()
+            .map(|state| (canonical_key(&state.metadata.object_key), state))
+            .collect(),
+        trash_latest: checkpoint
+            .trash_latest
+            .into_iter()
+            .map(|state| (canonical_key(&state.metadata.object_key), state))
+            .collect(),
+        sessions: checkpoint
+            .sessions
+            .into_iter()
+            .map(normalize_session_state)
+            .map(|state| (state.manifest.version_id.clone(), state))
+            .collect(),
+    }
+}
+
+fn materialized_to_checkpoint(
+    materialized: &PartitionMaterializedState,
+    up_to_sequence: u64,
+) -> IndexCheckpoint {
+    IndexCheckpoint {
+        created_at: Utc::now().timestamp(),
+        up_to_sequence,
+        live_latest: materialized.live_latest.values().cloned().collect(),
+        trash_latest: materialized.trash_latest.values().cloned().collect(),
+        sessions: materialized.sessions.values().cloned().collect(),
+    }
+}
+
+fn apply_wal_record_to_materialized(
+    materialized: &mut PartitionMaterializedState,
+    record: &IndexWalRecord,
+) {
+    match record {
+        IndexWalRecord::SessionOpened { session } => {
+            materialized.sessions.insert(
+                session.manifest.version_id.clone(),
+                normalize_session_state(session.clone()),
+            );
+        }
+        IndexWalRecord::PartCommitted {
+            fragment,
+            version_id,
+            part_index,
+            part,
+            committed_at,
+        } => {
+            if let Some(state) = materialized.sessions.get_mut(version_id) {
+                if state.manifest.fragment == *fragment {
+                    state.parts.insert(*part_index, part.clone());
+                    state.last_activity_at = *committed_at;
+                }
+            }
+        }
+        IndexWalRecord::SessionRemoved { version_id, .. } => {
+            materialized.sessions.remove(version_id);
+        }
+        IndexWalRecord::VersionPublished { metadata, .. } => {
+            let key = canonical_key(&metadata.object_key);
+            let candidate = IndexLatestState {
+                version_id: metadata.version_id.clone(),
+                metadata: metadata.clone(),
+            };
+            match materialized.live_latest.get(&key) {
+                Some(current) if !metadata_is_newer(&candidate.metadata, &current.metadata) => {}
+                _ => {
+                    materialized.live_latest.insert(key, candidate);
+                }
+            }
+        }
+        IndexWalRecord::VersionTrashed { metadata, .. } => {
+            let key = canonical_key(&metadata.object_key);
+            let candidate = IndexLatestState {
+                version_id: metadata.version_id.clone(),
+                metadata: metadata.clone(),
+            };
+            match materialized.trash_latest.get(&key) {
+                Some(current) if !metadata_is_newer(&candidate.metadata, &current.metadata) => {}
+                _ => {
+                    materialized.trash_latest.insert(key, candidate);
+                }
+            }
+        }
+        IndexWalRecord::VersionRemoved {
+            object_key,
+            from_trash,
+            next_latest,
+            ..
+        } => {
+            let key = canonical_key(object_key);
+            let target = if *from_trash {
+                &mut materialized.trash_latest
+            } else {
+                &mut materialized.live_latest
+            };
+            match next_latest {
+                Some(state) => {
+                    target.insert(key, state.clone());
+                }
+                None => {
+                    target.remove(&key);
+                }
+            }
+        }
+    }
 }
 
 fn hash_key(parts: &[&str]) -> [u8; 32] {
@@ -185,8 +357,51 @@ fn object_partition_route(fragment: &str, object_key: &str) -> Result<IndexRoute
     route_for_hash(hash_key(&["object", fragment, object_key]))
 }
 
+pub(crate) fn object_partition_id(fragment: &str, object_key: &str) -> Result<u16, AppError> {
+    Ok(object_partition_route(fragment, object_key)?.partition_id)
+}
+
 fn session_partition_route(fragment: &str, version_id: &str) -> Result<IndexRoute, AppError> {
     route_for_hash(hash_key(&["session", fragment, version_id]))
+}
+
+fn session_cache_key(fragment: &str, version_id: &str) -> String {
+    format!("{}:{}", fragment, version_id)
+}
+
+async fn cache_active_session(state: &IndexSessionState) {
+    if state.finalized_at.is_some() || state.aborted_at.is_some() {
+        return;
+    }
+    let mut guard = INDEX_ACTIVE_SESSIONS.lock().await;
+    guard
+        .entry(state.manifest.fragment.clone())
+        .or_default()
+        .insert(state.manifest.version_id.clone(), state.clone());
+    INDEX_ACTIVE_SESSION_FRAGMENTS_SCANNED
+        .lock()
+        .await
+        .insert(state.manifest.fragment.clone());
+}
+
+async fn remove_active_session(fragment: &str, version_id: &str) {
+    let mut guard = INDEX_ACTIVE_SESSIONS.lock().await;
+    if let Some(fragment_sessions) = guard.get_mut(fragment) {
+        fragment_sessions.remove(version_id);
+    }
+    INDEX_ACTIVE_SESSION_FRAGMENTS_SCANNED
+        .lock()
+        .await
+        .insert(fragment.to_string());
+}
+
+async fn session_lock(fragment: &str, version_id: &str) -> Arc<Mutex<()>> {
+    let key = session_cache_key(fragment, version_id);
+    let mut guard = INDEX_SESSION_LOCKS.lock().await;
+    guard
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 fn route_for_hash(hash: [u8; 32]) -> Result<IndexRoute, AppError> {
@@ -265,6 +480,12 @@ fn session_state_path(root: &Path, fragment: &str, partition_id: u16, version_id
     partition_dir(root, fragment, partition_id)
         .join(INDEX_SESSIONS_DIR)
         .join(format!("{}{}", version_id, INDEX_SESSION_SUFFIX))
+}
+
+fn session_parts_dir(root: &Path, fragment: &str, partition_id: u16, version_id: &str) -> PathBuf {
+    partition_dir(root, fragment, partition_id)
+        .join(INDEX_SESSIONS_DIR)
+        .join(format!("{}.parts", version_id))
 }
 
 fn object_prefix_dir_for_state(
@@ -429,38 +650,279 @@ where
     read_messagepack(path).await.map(Some)
 }
 
-async fn append_length_prefixed_record<T>(path: &Path, record: &T) -> Result<(), AppError>
-where
-    T: Serialize,
-{
+async fn open_wal_segment_for_append(path: &Path) -> Result<(fs::File, u64, bool), AppError> {
     let parent = path.parent().ok_or_else(|| {
         AppError::InternalServerError(format!("No parent dir for {}", path.display()))
     })?;
     fs::create_dir_all(parent)
         .await
         .map_err(|e| AppError::Io(e, format!("mkdir {}", parent.display())))?;
-    let mut file = fs::OpenOptions::new()
+    let existed = fs::try_exists(path).await.unwrap_or(false);
+    let len = if existed {
+        fs::metadata(path)
+            .await
+            .map_err(|e| AppError::Io(e, format!("metadata {}", path.display())))?
+            .len()
+    } else {
+        0
+    };
+    let file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .await
         .map_err(|e| AppError::Io(e, format!("open {}", path.display())))?;
-    let payload = rmp_serde::to_vec(record)
-        .map_err(|e| AppError::InternalServerError(format!("serialize wal record: {}", e)))?;
-    let len = u32::try_from(payload.len())
-        .map_err(|_| AppError::InternalServerError("WAL record too large".to_string()))?;
-    let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&len.to_le_bytes());
-    frame.extend_from_slice(&payload);
-    file.write_all(&frame)
-        .await
-        .map_err(|e| AppError::Io(e, format!("append wal {}", path.display())))?;
-    file.sync_all()
+    Ok((file, len, !existed))
+}
+
+async fn flush_wal_segment(
+    file: &mut fs::File,
+    path: &Path,
+    created_new: bool,
+) -> Result<(), AppError> {
+    file.sync_data()
         .await
         .map_err(|e| AppError::Io(e, format!("sync wal {}", path.display())))?;
-    drop(file);
-    sync_dir(parent).await?;
+    if created_new {
+        if let Some(parent) = path.parent() {
+            sync_dir(parent).await?;
+        }
+    }
     Ok(())
+}
+
+async fn get_wal_appender(
+    root: &Path,
+    fragment: &str,
+    partition_id: u16,
+) -> mpsc::Sender<WalAppendRequest> {
+    let key = format!("{}:{}:{:04x}", root.display(), fragment, partition_id);
+    let mut guard = INDEX_WAL_APPENDERS.lock().await;
+    if let Some(existing) = guard.get(&key) {
+        if !existing.is_closed() {
+            return existing.clone();
+        }
+    }
+
+    let (tx, rx) = mpsc::channel::<WalAppendRequest>(INDEX_WAL_GROUP_COMMIT_MAX_RECORDS * 8);
+    let root_path = root.to_path_buf();
+    let fragment_name = fragment.to_string();
+    tokio::spawn(async move {
+        wal_appender_task(root_path, fragment_name, partition_id, rx).await;
+    });
+    guard.insert(key, tx.clone());
+    tx
+}
+
+async fn wal_appender_task(
+    root: PathBuf,
+    fragment: String,
+    partition_id: u16,
+    mut rx: mpsc::Receiver<WalAppendRequest>,
+) {
+    let manifest = match load_wal_manifest(&root, &fragment, partition_id).await {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            while let Some(request) = rx.recv().await {
+                let _ = request
+                    .response
+                    .send(Err(AppError::InternalServerError(format!(
+                        "load wal manifest {}:{}:{:04x}: {}",
+                        root.display(),
+                        fragment,
+                        partition_id,
+                        e
+                    ))));
+            }
+            return;
+        }
+    };
+    let runtime =
+        match load_partition_runtime_state(&root, &fragment, partition_id, &manifest).await {
+            Ok(state) => Arc::new(Mutex::new(state)),
+            Err(e) => {
+                while let Some(request) = rx.recv().await {
+                    let _ = request
+                        .response
+                        .send(Err(AppError::InternalServerError(format!(
+                            "load partition runtime {}:{}:{:04x}: {}",
+                            root.display(),
+                            fragment,
+                            partition_id,
+                            e
+                        ))));
+                }
+                return;
+            }
+        };
+    INDEX_PARTITION_RUNTIME
+        .lock()
+        .await
+        .insert(runtime_key(&root, &fragment, partition_id), runtime.clone());
+
+    let mut active_segment_id = manifest.active_segment_id;
+    let mut active_segment_path =
+        wal_segment_path(&root, &fragment, partition_id, active_segment_id);
+    let mut active_file: Option<fs::File> = None;
+    let mut active_len: u64 = 0;
+    let mut active_file_created_new = false;
+
+    while let Some(first) = rx.recv().await {
+        let mut batch = vec![first];
+        let deadline = Instant::now() + Duration::from_millis(INDEX_WAL_GROUP_COMMIT_WINDOW_MS);
+        while batch.len() < INDEX_WAL_GROUP_COMMIT_MAX_RECORDS {
+            match timeout_at(deadline, rx.recv()).await {
+                Ok(Some(request)) => batch.push(request),
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        let mut replies: Vec<(oneshot::Sender<Result<u64, AppError>>, u64)> =
+            Vec::with_capacity(batch.len());
+        let mut wrote_current_segment = false;
+        let mut rotated = false;
+        let mut batch_failed = None::<String>;
+        let mut runtime_guard = runtime.lock().await;
+
+        for request in batch {
+            let payload = match rmp_serde::to_vec(&IndexWalEnvelope {
+                sequence: runtime_guard.manifest.next_sequence,
+                recorded_at: Utc::now().timestamp(),
+                record: request.record.clone(),
+            }) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    batch_failed = Some(format!("serialize wal record: {}", e));
+                    let _ = request.response.send(Err(AppError::InternalServerError(
+                        batch_failed.clone().unwrap(),
+                    )));
+                    break;
+                }
+            };
+            let payload_len = match u32::try_from(payload.len()) {
+                Ok(len) => len,
+                Err(_) => {
+                    batch_failed = Some("WAL record too large".to_string());
+                    let _ = request.response.send(Err(AppError::InternalServerError(
+                        batch_failed.clone().unwrap(),
+                    )));
+                    break;
+                }
+            };
+            let mut frame = Vec::with_capacity(4 + payload.len());
+            frame.extend_from_slice(&payload_len.to_le_bytes());
+            frame.extend_from_slice(&payload);
+            let frame_len = u64::try_from(frame.len()).unwrap_or(u64::MAX);
+
+            if active_file.is_some()
+                && active_len > 0
+                && active_len.saturating_add(frame_len) > INDEX_WAL_SEGMENT_MAX_BYTES
+            {
+                if wrote_current_segment {
+                    if let Some(file) = active_file.as_mut() {
+                        if let Err(e) =
+                            flush_wal_segment(file, &active_segment_path, active_file_created_new)
+                                .await
+                        {
+                            batch_failed = Some(e.to_string());
+                            let _ = request.response.send(Err(AppError::InternalServerError(
+                                batch_failed.clone().unwrap(),
+                            )));
+                            break;
+                        }
+                    }
+                    wrote_current_segment = false;
+                }
+                active_segment_id += 1;
+                runtime_guard.manifest.active_segment_id = active_segment_id;
+                active_segment_path =
+                    wal_segment_path(&root, &fragment, partition_id, active_segment_id);
+                active_file = None;
+                active_len = 0;
+                active_file_created_new = false;
+                rotated = true;
+            }
+
+            if active_file.is_none() {
+                match open_wal_segment_for_append(&active_segment_path).await {
+                    Ok((file, len, created_new)) => {
+                        active_file = Some(file);
+                        active_len = len;
+                        active_file_created_new = created_new;
+                    }
+                    Err(e) => {
+                        batch_failed = Some(e.to_string());
+                        let _ = request.response.send(Err(AppError::InternalServerError(
+                            batch_failed.clone().unwrap(),
+                        )));
+                        break;
+                    }
+                }
+            }
+
+            if let Some(file) = active_file.as_mut() {
+                if let Err(e) = file.write_all(&frame).await.map_err(|err| {
+                    AppError::Io(err, format!("append wal {}", active_segment_path.display()))
+                }) {
+                    batch_failed = Some(e.to_string());
+                    let _ = request.response.send(Err(AppError::InternalServerError(
+                        batch_failed.clone().unwrap(),
+                    )));
+                    break;
+                }
+            }
+
+            let sequence = runtime_guard.manifest.next_sequence;
+            runtime_guard.manifest.next_sequence += 1;
+            active_len = active_len.saturating_add(frame_len);
+            apply_wal_record_to_materialized(&mut runtime_guard.materialized, &request.record);
+            wrote_current_segment = true;
+            replies.push((request.response, sequence));
+        }
+
+        if batch_failed.is_some() {
+            drop(runtime_guard);
+            let message = batch_failed.unwrap();
+            for (response, _) in replies.drain(..) {
+                let _ = response.send(Err(AppError::InternalServerError(message.clone())));
+            }
+            continue;
+        }
+
+        if wrote_current_segment {
+            if let Some(file) = active_file.as_mut() {
+                if let Err(e) =
+                    flush_wal_segment(file, &active_segment_path, active_file_created_new).await
+                {
+                    drop(runtime_guard);
+                    let message = e.to_string();
+                    for (response, _) in replies.drain(..) {
+                        let _ = response.send(Err(AppError::InternalServerError(message.clone())));
+                    }
+                    continue;
+                }
+            }
+            active_file_created_new = false;
+        }
+
+        INDEX_WAL_MANIFEST_CACHE.lock().await.insert(
+            wal_manifest_cache_key(&root, &fragment, partition_id),
+            runtime_guard.manifest.clone(),
+        );
+        let persisted_sequence = runtime_guard.manifest.next_sequence.saturating_sub(1);
+        let needs_maintenance = rotated
+            || persisted_sequence == 1
+            || persisted_sequence % INDEX_WAL_MANIFEST_PERSIST_INTERVAL == 0
+            || persisted_sequence.saturating_sub(runtime_guard.manifest.last_checkpoint_sequence)
+                >= INDEX_CHECKPOINT_RECORD_INTERVAL;
+        drop(runtime_guard);
+        for (response, sequence) in replies.drain(..) {
+            let _ = response.send(Ok(sequence));
+        }
+        if needs_maintenance {
+            schedule_partition_maintenance(root.clone(), fragment.clone(), partition_id);
+        }
+    }
 }
 
 fn decode_length_prefixed_records<T>(bytes: &[u8], path: &Path) -> Result<Vec<T>, AppError>
@@ -498,16 +960,155 @@ where
     Ok(out)
 }
 
+fn wal_manifest_cache_key(root: &Path, fragment: &str, partition_id: u16) -> String {
+    format!("{}:{}:{:04x}", root.display(), fragment, partition_id)
+}
+
+fn parse_wal_segment_id(path: &Path) -> Option<u64> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.parse::<u64>().ok())
+}
+
+async fn rebuild_wal_manifest(
+    root: &Path,
+    fragment: &str,
+    partition_id: u16,
+) -> Result<IndexWalManifest, AppError> {
+    let checkpoint_up_to = read_messagepack_if_exists::<IndexCheckpoint>(&latest_checkpoint_path(
+        root,
+        fragment,
+        partition_id,
+    ))
+    .await?
+    .map(|checkpoint| checkpoint.up_to_sequence)
+    .unwrap_or(0);
+    let segments_dir = wal_segments_dir(root, fragment, partition_id);
+    if !fs::try_exists(&segments_dir).await.unwrap_or(false) {
+        return Ok(IndexWalManifest {
+            active_segment_id: 1,
+            next_sequence: checkpoint_up_to.saturating_add(1),
+            last_checkpoint_sequence: checkpoint_up_to,
+        });
+    }
+
+    let mut highest_segment_id = 1u64;
+    let mut highest_sequence = checkpoint_up_to;
+    let mut entries = match fs::read_dir(&segments_dir).await {
+        Ok(entries) => entries,
+        Err(_) => {
+            return Ok(IndexWalManifest {
+                active_segment_id: 1,
+                next_sequence: checkpoint_up_to.saturating_add(1),
+                last_checkpoint_sequence: checkpoint_up_to,
+            });
+        }
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("wal") {
+            continue;
+        }
+        if let Some(segment_id) = parse_wal_segment_id(&path) {
+            highest_segment_id = highest_segment_id.max(segment_id);
+        }
+        let bytes = fs::read(&path)
+            .await
+            .map_err(|e| AppError::Io(e, format!("read {}", path.display())))?;
+        let records = decode_length_prefixed_records::<IndexWalEnvelope>(&bytes, &path)?;
+        if let Some(sequence) = records.last().map(|record| record.sequence) {
+            highest_sequence = highest_sequence.max(sequence);
+        }
+    }
+
+    Ok(IndexWalManifest {
+        active_segment_id: highest_segment_id,
+        next_sequence: highest_sequence.saturating_add(1),
+        last_checkpoint_sequence: checkpoint_up_to,
+    })
+}
+
 async fn load_wal_manifest(
     root: &Path,
     fragment: &str,
     partition_id: u16,
 ) -> Result<IndexWalManifest, AppError> {
-    Ok(
-        read_messagepack_if_exists(&wal_manifest_path(root, fragment, partition_id))
+    let cache_key = wal_manifest_cache_key(root, fragment, partition_id);
+    if let Some(manifest) = INDEX_WAL_MANIFEST_CACHE
+        .lock()
+        .await
+        .get(&cache_key)
+        .cloned()
+    {
+        return Ok(manifest);
+    }
+
+    let manifest = rebuild_wal_manifest(root, fragment, partition_id).await?;
+    INDEX_WAL_MANIFEST_CACHE
+        .lock()
+        .await
+        .insert(cache_key, manifest.clone());
+    Ok(manifest)
+}
+
+async fn load_partition_runtime_state(
+    root: &Path,
+    fragment: &str,
+    partition_id: u16,
+    manifest: &IndexWalManifest,
+) -> Result<PartitionRuntimeState, AppError> {
+    let checkpoint = read_messagepack_if_exists::<IndexCheckpoint>(&latest_checkpoint_path(
+        root,
+        fragment,
+        partition_id,
+    ))
+    .await?;
+    let after_sequence = checkpoint
+        .as_ref()
+        .map(|value| value.up_to_sequence)
+        .unwrap_or(0);
+    let mut materialized = if let Some(checkpoint) = checkpoint {
+        checkpoint_to_materialized(checkpoint)
+    } else {
+        PartitionMaterializedState {
+            live_latest: collect_partition_latest_states_on_root(
+                root,
+                fragment,
+                partition_id,
+                false,
+            )
             .await?
-            .unwrap_or_default(),
-    )
+            .into_iter()
+            .map(|state| (canonical_key(&state.metadata.object_key), state))
+            .collect(),
+            trash_latest: collect_partition_latest_states_on_root(
+                root,
+                fragment,
+                partition_id,
+                true,
+            )
+            .await?
+            .into_iter()
+            .map(|state| (canonical_key(&state.metadata.object_key), state))
+            .collect(),
+            sessions: materialize_partition_sessions_on_root(root, fragment, partition_id)
+                .await?
+                .into_iter()
+                .map(|state| (state.manifest.version_id.clone(), state))
+                .collect(),
+        }
+    };
+    for envelope in read_wal_records_since(root, fragment, partition_id, after_sequence).await? {
+        apply_wal_record_to_materialized(&mut materialized, &envelope.record);
+    }
+    let mut manifest = manifest.clone();
+    if manifest.last_checkpoint_sequence < after_sequence {
+        manifest.last_checkpoint_sequence = after_sequence;
+    }
+    Ok(PartitionRuntimeState {
+        manifest,
+        materialized,
+    })
 }
 
 async fn persist_wal_manifest(
@@ -570,13 +1171,13 @@ async fn maybe_write_checkpoint(
     fragment: &str,
     partition_id: u16,
     manifest: &mut IndexWalManifest,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     let current_sequence = manifest.next_sequence.saturating_sub(1);
     if current_sequence == 0
         || current_sequence.saturating_sub(manifest.last_checkpoint_sequence)
             < INDEX_CHECKPOINT_RECORD_INTERVAL
     {
-        return Ok(());
+        return Ok(false);
     }
 
     let live_latest =
@@ -599,7 +1200,7 @@ async fn maybe_write_checkpoint(
     )
     .await?;
     manifest.last_checkpoint_sequence = current_sequence;
-    Ok(())
+    Ok(true)
 }
 
 async fn append_wal(
@@ -608,41 +1209,30 @@ async fn append_wal(
     partition_id: u16,
     record: &IndexWalRecord,
 ) -> Result<u64, AppError> {
-    let lock_key = format!("{}:{}:{:04x}", root.display(), fragment, partition_id);
-    let append_lock = {
-        let mut guard = INDEX_WAL_APPEND_LOCKS.lock().await;
-        guard
-            .entry(lock_key)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    };
-    let _append_guard = append_lock.lock().await;
-    let mut manifest = load_wal_manifest(root, fragment, partition_id).await?;
-    let active_path = wal_segment_path(root, fragment, partition_id, manifest.active_segment_id);
-    let should_rotate = fs::metadata(&active_path)
+    let sender = get_wal_appender(root, fragment, partition_id).await;
+    let (response_tx, response_rx) = oneshot::channel();
+    sender
+        .send(WalAppendRequest {
+            record: record.clone(),
+            response: response_tx,
+        })
         .await
-        .ok()
-        .map(|meta| meta.len() >= INDEX_WAL_SEGMENT_MAX_BYTES)
-        .unwrap_or(false);
-    if should_rotate {
-        manifest.active_segment_id += 1;
-    }
-
-    let sequence = manifest.next_sequence;
-    let envelope = IndexWalEnvelope {
-        sequence,
-        recorded_at: Utc::now().timestamp(),
-        record: record.clone(),
-    };
-    append_length_prefixed_record(
-        &wal_segment_path(root, fragment, partition_id, manifest.active_segment_id),
-        &envelope,
-    )
-    .await?;
-    manifest.next_sequence += 1;
-    maybe_write_checkpoint(root, fragment, partition_id, &mut manifest).await?;
-    persist_wal_manifest(root, fragment, partition_id, &manifest).await?;
-    Ok(sequence)
+        .map_err(|_| {
+            AppError::InternalServerError(format!(
+                "wal appender unavailable {}:{}:{:04x}",
+                root.display(),
+                fragment,
+                partition_id
+            ))
+        })?;
+    response_rx.await.map_err(|_| {
+        AppError::InternalServerError(format!(
+            "wal appender dropped {}:{}:{:04x}",
+            root.display(),
+            fragment,
+            partition_id
+        ))
+    })?
 }
 
 async fn read_current_checkpoint(
@@ -650,8 +1240,6 @@ async fn read_current_checkpoint(
     fragment: &str,
     partition_id: u16,
 ) -> Result<Option<IndexCheckpoint>, AppError> {
-    let manifest = load_wal_manifest(root, fragment, partition_id).await?;
-    let latest_sequence = manifest.next_sequence.saturating_sub(1);
     let Some(checkpoint) = read_messagepack_if_exists::<IndexCheckpoint>(&latest_checkpoint_path(
         root,
         fragment,
@@ -661,7 +1249,10 @@ async fn read_current_checkpoint(
     else {
         return Ok(None);
     };
-    if checkpoint.up_to_sequence == latest_sequence {
+    if read_wal_records_since(root, fragment, partition_id, checkpoint.up_to_sequence)
+        .await?
+        .is_empty()
+    {
         return Ok(Some(checkpoint));
     }
     Ok(None)
@@ -673,12 +1264,6 @@ async fn read_wal_records_since(
     partition_id: u16,
     after_sequence: u64,
 ) -> Result<Vec<IndexWalEnvelope>, AppError> {
-    let manifest = load_wal_manifest(root, fragment, partition_id).await?;
-    let latest_sequence = manifest.next_sequence.saturating_sub(1);
-    if latest_sequence <= after_sequence {
-        return Ok(Vec::new());
-    }
-
     let segments_dir = wal_segments_dir(root, fragment, partition_id);
     if !fs::try_exists(&segments_dir).await.unwrap_or(false) {
         return Ok(Vec::new());
@@ -805,6 +1390,162 @@ where
             }
         });
     }
+}
+
+#[cfg(not(test))]
+fn partition_maintenance_task_key(root: &Path, fragment: &str, partition_id: u16) -> String {
+    format!("{}:{}:{:04x}", root.display(), fragment, partition_id)
+}
+
+async fn run_partition_maintenance(
+    root: &Path,
+    fragment: &str,
+    partition_id: u16,
+) -> Result<(), AppError> {
+    let key = runtime_key(root, fragment, partition_id);
+    if let Some(runtime) = INDEX_PARTITION_RUNTIME.lock().await.get(&key).cloned() {
+        let (mut manifest, checkpoint) = {
+            let runtime = runtime.lock().await;
+            let checkpoint = materialized_to_checkpoint(
+                &runtime.materialized,
+                runtime.manifest.next_sequence.saturating_sub(1),
+            );
+            (runtime.manifest.clone(), checkpoint)
+        };
+        let current_sequence = checkpoint.up_to_sequence;
+        let checkpoint_written = if current_sequence > 0
+            && current_sequence.saturating_sub(manifest.last_checkpoint_sequence)
+                >= INDEX_CHECKPOINT_RECORD_INTERVAL
+        {
+            let bytes = rmp_serde::to_vec(&checkpoint).map_err(|e| {
+                AppError::InternalServerError(format!("serialize checkpoint: {}", e))
+            })?;
+            write_atomic(
+                &latest_checkpoint_path(root, fragment, partition_id),
+                &bytes,
+            )
+            .await?;
+            manifest.last_checkpoint_sequence = current_sequence;
+            true
+        } else {
+            false
+        };
+        let persisted_sequence = manifest.next_sequence.saturating_sub(1);
+        if checkpoint_written
+            || persisted_sequence == 1
+            || persisted_sequence % INDEX_WAL_MANIFEST_PERSIST_INTERVAL == 0
+        {
+            persist_wal_manifest(root, fragment, partition_id, &manifest).await?;
+        }
+        {
+            let mut runtime = runtime.lock().await;
+            runtime.manifest.last_checkpoint_sequence = runtime
+                .manifest
+                .last_checkpoint_sequence
+                .max(manifest.last_checkpoint_sequence);
+        }
+        INDEX_WAL_MANIFEST_CACHE.lock().await.insert(
+            wal_manifest_cache_key(root, fragment, partition_id),
+            manifest,
+        );
+        return Ok(());
+    }
+
+    let mut manifest = load_wal_manifest(root, fragment, partition_id).await?;
+    let checkpoint_written =
+        maybe_write_checkpoint(root, fragment, partition_id, &mut manifest).await?;
+    let persisted_sequence = manifest.next_sequence.saturating_sub(1);
+    if checkpoint_written
+        || persisted_sequence == 1
+        || persisted_sequence % INDEX_WAL_MANIFEST_PERSIST_INTERVAL == 0
+    {
+        persist_wal_manifest(root, fragment, partition_id, &manifest).await?;
+    }
+    INDEX_WAL_MANIFEST_CACHE.lock().await.insert(
+        wal_manifest_cache_key(root, fragment, partition_id),
+        manifest,
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+fn schedule_partition_maintenance(root: PathBuf, fragment: String, partition_id: u16) {
+    tokio::task::block_in_place(|| {
+        let handle = tokio::runtime::Handle::current();
+        handle.block_on(async move {
+            if let Err(e) = run_partition_maintenance(&root, &fragment, partition_id).await {
+                warn!(
+                    "index partition maintenance failed root={} fragment={} partition={:04x}: {}",
+                    root.display(),
+                    fragment,
+                    partition_id,
+                    e
+                );
+            }
+        });
+    });
+}
+
+#[cfg(not(test))]
+fn schedule_partition_maintenance(root: PathBuf, fragment: String, partition_id: u16) {
+    tokio::spawn(async move {
+        let task_key = partition_maintenance_task_key(&root, &fragment, partition_id);
+        let should_start = {
+            let mut tasks = INDEX_PARTITION_MAINTENANCE_TASKS.lock().await;
+            let state = tasks.entry(task_key.clone()).or_default();
+            if state.running {
+                state.rerun_requested = true;
+                false
+            } else {
+                state.running = true;
+                state.rerun_requested = false;
+                true
+            }
+        };
+        if !should_start {
+            return;
+        }
+
+        loop {
+            let _permit = match INDEX_BACKGROUND_IO_GATE.acquire().await {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
+            let maintenance_result =
+                run_partition_maintenance(&root, &fragment, partition_id).await;
+            if let Err(e) = &maintenance_result {
+                warn!(
+                    "index partition maintenance failed root={} fragment={} partition={:04x}: {}",
+                    root.display(),
+                    fragment,
+                    partition_id,
+                    e
+                );
+            }
+
+            let should_rerun = {
+                let mut tasks = INDEX_PARTITION_MAINTENANCE_TASKS.lock().await;
+                match tasks.get_mut(&task_key) {
+                    Some(state) => {
+                        let rerun = state.rerun_requested || maintenance_result.is_err();
+                        state.rerun_requested = false;
+                        if !rerun {
+                            tasks.remove(&task_key);
+                        }
+                        rerun
+                    }
+                    None => false,
+                }
+            };
+            if !should_rerun {
+                break;
+            }
+
+            if maintenance_result.is_err() {
+                sleep(Duration::from_millis(250)).await;
+            }
+        }
+    });
 }
 
 fn canonical_key(key: &str) -> String {
@@ -1006,76 +1747,89 @@ async fn persist_prefix_projection_cursor(
     Ok(())
 }
 
-async fn project_fragment_prefixes(fragment: &str) -> Result<(), AppError> {
+async fn project_fragment_prefixes(
+    fragment: &str,
+    mut changed_keys: HashSet<String>,
+    recover_from_wal: bool,
+) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
     let roots = path_manager.get_all_index_roots();
-    let mut cursor = load_prefix_projection_cursor(fragment).await?;
-    let mut changed_keys = HashSet::<String>::new();
+    let mut cursor = if recover_from_wal {
+        load_prefix_projection_cursor(fragment).await?
+    } else {
+        PrefixProjectionCursor::default()
+    };
 
-    for root in roots {
-        let partitions_root = root
-            .join(fragment)
-            .join(INDEX_DIR)
-            .join(INDEX_PARTITIONS_DIR);
-        if !fs::try_exists(&partitions_root).await.unwrap_or(false) {
-            continue;
-        }
-
-        let mut partitions = match fs::read_dir(&partitions_root).await {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-        while let Ok(Some(partition)) = partitions.next_entry().await {
-            let partition_name = partition.file_name().to_string_lossy().to_string();
-            let Ok(partition_id) = u16::from_str_radix(&partition_name, 16) else {
+    if recover_from_wal {
+        for root in roots {
+            let partitions_root = root
+                .join(fragment)
+                .join(INDEX_DIR)
+                .join(INDEX_PARTITIONS_DIR);
+            if !fs::try_exists(&partitions_root).await.unwrap_or(false) {
                 continue;
-            };
-            let source_id = format!("{}::{:04x}", root.display(), partition_id);
-            let after_sequence = cursor.sources.get(&source_id).copied().unwrap_or(0);
-            let records = match read_wal_records_since(
-                &root,
-                fragment,
-                partition_id,
-                after_sequence,
-            )
-            .await
-            {
-                Ok(records) => records,
-                Err(e) => {
-                    warn!(
-                        "index prefix projector wal read failed fragment={} root={} partition={:04x}: {}",
-                        fragment,
-                        root.display(),
-                        partition_id,
-                        e
-                    );
-                    continue;
-                }
-            };
-            let mut max_sequence = after_sequence;
-            for envelope in records {
-                max_sequence = max_sequence.max(envelope.sequence);
-                match envelope.record {
-                    IndexWalRecord::VersionPublished { metadata, .. }
-                    | IndexWalRecord::VersionTrashed { metadata, .. } => {
-                        changed_keys.insert(canonical_key(&metadata.object_key));
-                    }
-                    IndexWalRecord::VersionRemoved { object_key, .. } => {
-                        changed_keys.insert(canonical_key(&object_key));
-                    }
-                    IndexWalRecord::SessionOpened { .. }
-                    | IndexWalRecord::PartCommitted { .. }
-                    | IndexWalRecord::SessionRemoved { .. } => {}
-                }
             }
-            if max_sequence > after_sequence {
-                cursor.sources.insert(source_id, max_sequence);
+
+            let mut partitions = match fs::read_dir(&partitions_root).await {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            while let Ok(Some(partition)) = partitions.next_entry().await {
+                let partition_name = partition.file_name().to_string_lossy().to_string();
+                let Ok(partition_id) = u16::from_str_radix(&partition_name, 16) else {
+                    continue;
+                };
+                let source_id = format!("{}::{:04x}", root.display(), partition_id);
+                let after_sequence = cursor.sources.get(&source_id).copied().unwrap_or(0);
+                let records = match read_wal_records_since(
+                    &root,
+                    fragment,
+                    partition_id,
+                    after_sequence,
+                )
+                .await
+                {
+                    Ok(records) => records,
+                    Err(e) => {
+                        warn!(
+                            "index prefix projector wal read failed fragment={} root={} partition={:04x}: {}",
+                            fragment,
+                            root.display(),
+                            partition_id,
+                            e
+                        );
+                        continue;
+                    }
+                };
+                let mut max_sequence = after_sequence;
+                for envelope in records {
+                    max_sequence = max_sequence.max(envelope.sequence);
+                    match envelope.record {
+                        IndexWalRecord::VersionPublished { metadata, .. }
+                        | IndexWalRecord::VersionTrashed { metadata, .. } => {
+                            changed_keys.insert(canonical_key(&metadata.object_key));
+                        }
+                        IndexWalRecord::VersionRemoved { object_key, .. } => {
+                            changed_keys.insert(canonical_key(&object_key));
+                        }
+                        IndexWalRecord::SessionOpened { .. }
+                        | IndexWalRecord::PartCommitted { .. }
+                        | IndexWalRecord::SessionRemoved { .. } => {}
+                    }
+                }
+                if max_sequence > after_sequence {
+                    cursor.sources.insert(source_id, max_sequence);
+                }
             }
         }
     }
 
     if changed_keys.is_empty() {
-        return persist_prefix_projection_cursor(fragment, &cursor).await;
+        return if recover_from_wal {
+            persist_prefix_projection_cursor(fragment, &cursor).await
+        } else {
+            Ok(())
+        };
     }
 
     let affected_prefixes = changed_keys
@@ -1159,15 +1913,29 @@ async fn project_fragment_prefixes(fragment: &str) -> Result<(), AppError> {
         )));
     }
 
-    persist_prefix_projection_cursor(fragment, &cursor).await
+    if recover_from_wal {
+        persist_prefix_projection_cursor(fragment, &cursor).await
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
-fn schedule_prefix_projection(fragment: String) {
+fn schedule_prefix_projection_internal(
+    fragment: String,
+    object_key: Option<String>,
+    recover_from_wal: bool,
+) {
+    let mut changed_keys = HashSet::new();
+    if let Some(object_key) = object_key {
+        changed_keys.insert(canonical_key(&object_key));
+    }
     tokio::task::block_in_place(|| {
         let handle = tokio::runtime::Handle::current();
         handle.block_on(async move {
-            if let Err(e) = project_fragment_prefixes(&fragment).await {
+            if let Err(e) =
+                project_fragment_prefixes(&fragment, changed_keys, recover_from_wal).await
+            {
                 warn!(
                     "index prefix projection task failed fragment={}: {}",
                     fragment, e
@@ -1178,17 +1946,27 @@ fn schedule_prefix_projection(fragment: String) {
 }
 
 #[cfg(not(test))]
-fn schedule_prefix_projection(fragment: String) {
+fn schedule_prefix_projection_internal(
+    fragment: String,
+    object_key: Option<String>,
+    recover_from_wal: bool,
+) {
     tokio::spawn(async move {
         let should_start = {
             let mut tasks = PREFIX_PROJECTION_TASKS.lock().await;
             let state = tasks.entry(fragment.clone()).or_default();
-            if state.running {
-                state.rerun_requested = true;
+            if let Some(object_key) = object_key.as_ref() {
+                state.dirty_keys.insert(canonical_key(object_key));
+            }
+            if recover_from_wal {
+                state.task.recovery_scan_needed = true;
+            }
+            if state.task.running {
+                state.task.rerun_requested = true;
                 false
             } else {
-                state.running = true;
-                state.rerun_requested = false;
+                state.task.running = true;
+                state.task.rerun_requested = false;
                 true
             }
         };
@@ -1201,7 +1979,17 @@ fn schedule_prefix_projection(fragment: String) {
                 Ok(permit) => permit,
                 Err(_) => break,
             };
-            let projection_result = project_fragment_prefixes(&fragment).await;
+            let (dirty_keys, recovery_scan_needed) = {
+                let mut tasks = PREFIX_PROJECTION_TASKS.lock().await;
+                let state = tasks.entry(fragment.clone()).or_default();
+                let dirty_keys = std::mem::take(&mut state.dirty_keys);
+                let recovery_scan_needed = state.task.recovery_scan_needed;
+                state.task.recovery_scan_needed = false;
+                (dirty_keys, recovery_scan_needed)
+            };
+            let projection_result =
+                project_fragment_prefixes(&fragment, dirty_keys.clone(), recovery_scan_needed)
+                    .await;
             if let Err(e) = &projection_result {
                 warn!(
                     "index prefix projection task failed fragment={}: {}",
@@ -1213,8 +2001,12 @@ fn schedule_prefix_projection(fragment: String) {
                 let mut tasks = PREFIX_PROJECTION_TASKS.lock().await;
                 match tasks.get_mut(&fragment) {
                     Some(state) => {
-                        let rerun = state.rerun_requested || projection_result.is_err();
-                        state.rerun_requested = false;
+                        if projection_result.is_err() {
+                            state.dirty_keys.extend(dirty_keys);
+                            state.task.recovery_scan_needed |= recovery_scan_needed;
+                        }
+                        let rerun = state.task.rerun_requested || projection_result.is_err();
+                        state.task.rerun_requested = false;
                         if !rerun {
                             tasks.remove(&fragment);
                         }
@@ -1234,12 +2026,16 @@ fn schedule_prefix_projection(fragment: String) {
     });
 }
 
+fn schedule_prefix_projection_for_key(fragment: String, object_key: String) {
+    schedule_prefix_projection_internal(fragment, Some(object_key), false);
+}
+
 pub async fn is_prefix_projection_pending(fragment: &str) -> bool {
     PREFIX_PROJECTION_TASKS
         .lock()
         .await
         .get(fragment)
-        .map(|state| state.running || state.rerun_requested)
+        .map(|state| state.task.running || state.task.rerun_requested)
         .unwrap_or(false)
 }
 
@@ -1572,6 +2368,7 @@ async fn delete_object_version_internal(
         version_id: version_id.to_string(),
         removed_at: Utc::now().timestamp(),
         from_trash: trashed,
+        next_latest: next_latest.clone(),
     };
     let _ = append_wal(&owner_root, fragment, partition_id, &wal).await;
     if route.roots.len() > 1 {
@@ -1621,6 +2418,118 @@ async fn delete_object_version_internal(
     }
 
     Ok(true)
+}
+
+async fn clear_fragment_trash_partitions_inner<I>(
+    fragment: &str,
+    partition_ids: I,
+) -> Result<usize, AppError>
+where
+    I: IntoIterator<Item = u16>,
+{
+    let mut touched_partitions = 0usize;
+    let cleared_at = Utc::now().timestamp();
+
+    for partition_id in partition_ids {
+        let route = route_for_partition_id(partition_id)?;
+        let mut touched = false;
+
+        for root in &route.roots {
+            let partition_root = partition_dir(root, fragment, partition_id);
+            if !fs::try_exists(&partition_root).await.unwrap_or(false) {
+                continue;
+            }
+
+            let trash_root = partition_root.join(INDEX_TRASH_DIR);
+            let checkpoint_path = latest_checkpoint_path(root, fragment, partition_id);
+            let existing_checkpoint =
+                read_messagepack_if_exists::<IndexCheckpoint>(&checkpoint_path).await?;
+            let runtime = INDEX_PARTITION_RUNTIME
+                .lock()
+                .await
+                .get(&runtime_key(root, fragment, partition_id))
+                .cloned();
+            let (needs_checkpoint_refresh, current_sequence, live_latest, sessions) =
+                if let Some(runtime) = runtime {
+                    let mut runtime = runtime.lock().await;
+                    let live_latest = runtime.materialized.live_latest.values().cloned().collect();
+                    let sessions = runtime.materialized.sessions.values().cloned().collect();
+                    let needs = !runtime.materialized.trash_latest.is_empty();
+                    runtime.materialized.trash_latest.clear();
+                    (
+                        needs,
+                        runtime.manifest.next_sequence.saturating_sub(1),
+                        live_latest,
+                        sessions,
+                    )
+                } else {
+                    let needs = existing_checkpoint
+                        .as_ref()
+                        .map(|checkpoint| !checkpoint.trash_latest.is_empty())
+                        .unwrap_or(false);
+                    let current_sequence = load_wal_manifest(root, fragment, partition_id)
+                        .await?
+                        .next_sequence
+                        .saturating_sub(1);
+                    let (live_latest, sessions) = match existing_checkpoint.as_ref() {
+                        Some(checkpoint) if checkpoint.up_to_sequence >= current_sequence => {
+                            (checkpoint.live_latest.clone(), checkpoint.sessions.clone())
+                        }
+                        _ => (
+                            collect_partition_latest_states_on_root(
+                                root,
+                                fragment,
+                                partition_id,
+                                false,
+                            )
+                            .await?,
+                            materialize_partition_sessions_on_root(root, fragment, partition_id)
+                                .await?,
+                        ),
+                    };
+                    (needs, current_sequence, live_latest, sessions)
+                };
+
+            if fs::try_exists(&trash_root).await.unwrap_or(false) || needs_checkpoint_refresh {
+                let checkpoint = IndexCheckpoint {
+                    created_at: cleared_at,
+                    up_to_sequence: current_sequence,
+                    live_latest,
+                    trash_latest: Vec::new(),
+                    sessions,
+                };
+                let checkpoint_bytes = rmp_serde::to_vec(&checkpoint).map_err(|e| {
+                    AppError::InternalServerError(format!(
+                        "serialize trash-cleared checkpoint: {}",
+                        e
+                    ))
+                })?;
+                write_atomic(&checkpoint_path, &checkpoint_bytes).await?;
+                touched = true;
+            }
+
+            if fs::try_exists(&trash_root).await.unwrap_or(false) {
+                fs::remove_dir_all(&trash_root)
+                    .await
+                    .map_err(|e| AppError::Io(e, format!("remove {}", trash_root.display())))?;
+                let _ = sync_dir(&partition_root).await;
+                touched = true;
+            }
+        }
+
+        if touched {
+            touched_partitions += 1;
+        }
+    }
+
+    Ok(touched_partitions)
+}
+
+pub async fn clear_fragment_trash_in_partitions(
+    fragment: &str,
+    touched_partitions: &BTreeSet<u16>,
+) -> Result<usize, AppError> {
+    clear_fragment_trash_partitions_inner(fragment, touched_partitions.iter().copied()).await
 }
 
 async fn read_object_version_for_state(
@@ -1813,6 +2722,8 @@ pub async fn open_session(
     manifest: &UploadSessionManifest,
     reservation: Option<ReservationReceipt>,
 ) -> Result<(), AppError> {
+    let session_guard = session_lock(&manifest.fragment, &manifest.version_id).await;
+    let _session_guard = session_guard.lock().await;
     let route = session_partition_route(&manifest.fragment, &manifest.version_id)?;
     let state = IndexSessionState {
         manifest: manifest.clone(),
@@ -1822,31 +2733,21 @@ pub async fn open_session(
         finalized_at: None,
         aborted_at: None,
     };
-    let state_bytes = rmp_serde::to_vec(&state)
-        .map_err(|e| AppError::InternalServerError(format!("serialize session: {}", e)))?;
     let fragment = manifest.fragment.clone();
-    let version_id = manifest.version_id.clone();
     let wal = IndexWalRecord::SessionOpened {
         session: state.clone(),
     };
     let owner_root = route.roots[0].clone();
-    let owner_state_path =
-        session_state_path(&owner_root, &fragment, route.partition_id, &version_id);
-    write_atomic(&owner_state_path, &state_bytes).await?;
     append_wal(&owner_root, &fragment, route.partition_id, &wal)
         .await
         .map(|_| ())?;
+    cache_active_session(&state).await;
     if route.roots.len() > 1 {
         let replica_roots = route.roots[1..].to_vec();
         let fragment_clone = fragment.clone();
-        let version_clone = version_id.clone();
-        let bytes = state_bytes.clone();
         let wal_clone = wal.clone();
         maybe_replicate("index session open replica sync", async move {
             for root in replica_roots {
-                let state_path =
-                    session_state_path(&root, &fragment_clone, route.partition_id, &version_clone);
-                write_atomic(&state_path, &bytes).await?;
                 append_wal(&root, &fragment_clone, route.partition_id, &wal_clone)
                     .await
                     .map(|_| ())?;
@@ -1858,7 +2759,7 @@ pub async fn open_session(
     Ok(())
 }
 
-pub async fn load_session(
+async fn load_session_uncached(
     fragment: &str,
     version_id: &str,
 ) -> Result<Option<IndexSessionState>, AppError> {
@@ -1887,75 +2788,51 @@ pub async fn load_session(
     Ok(None)
 }
 
-pub async fn commit_part(
+async fn load_session_parts_from_disk(
     fragment: &str,
     version_id: &str,
-    part_meta: &PartMetadata,
-) -> Result<bool, AppError> {
+) -> Result<BTreeMap<u64, PartMetadata>, AppError> {
     let route = session_partition_route(fragment, version_id)?;
-    let mut state = load_session(fragment, version_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if state.parts.contains_key(&part_meta.part_index) {
-        return Ok(false);
-    }
-    state.parts.insert(part_meta.part_index, part_meta.clone());
-    state.last_activity_at = Utc::now().timestamp();
-    let persist_snapshot = state.parts.len() == 1
-        || state.parts.len() % INDEX_SESSION_SNAPSHOT_PART_INTERVAL == 0
-        || state.parts.len() as u64 >= state.manifest.expected_parts;
-    let state_bytes = if persist_snapshot {
-        Some(
-            rmp_serde::to_vec(&state)
-                .map_err(|e| AppError::InternalServerError(format!("serialize session: {}", e)))?,
-        )
-    } else {
-        None
-    };
-    let fragment = fragment.to_string();
-    let version_id = version_id.to_string();
-    let wal = IndexWalRecord::PartCommitted {
-        fragment: fragment.clone(),
-        version_id: version_id.clone(),
-        part_index: part_meta.part_index,
-        part: part_meta.clone(),
-        committed_at: state.last_activity_at,
-    };
-    let owner_root = route.roots[0].clone();
-    append_wal(&owner_root, &fragment, route.partition_id, &wal)
-        .await
-        .map(|_| ())?;
-    if let Some(bytes) = &state_bytes {
-        let state_path =
-            session_state_path(&owner_root, &fragment, route.partition_id, &version_id);
-        write_atomic(&state_path, bytes).await?;
-    }
-    if route.roots.len() > 1 {
-        let replica_roots = route.roots[1..].to_vec();
-        let fragment_clone = fragment.clone();
-        let version_clone = version_id.clone();
-        let bytes = state_bytes.clone();
-        let wal_clone = wal.clone();
-        maybe_replicate("index session part replica sync", async move {
-            for root in replica_roots {
-                if let Some(state_bytes) = &bytes {
-                    let state_path = session_state_path(
-                        &root,
-                        &fragment_clone,
-                        route.partition_id,
-                        &version_clone,
-                    );
-                    write_atomic(&state_path, state_bytes).await?;
-                }
-                append_wal(&root, &fragment_clone, route.partition_id, &wal_clone)
-                    .await
-                    .map(|_| ())?;
+    let mut parts = BTreeMap::new();
+    for root in &route.roots {
+        let dir = session_parts_dir(root, fragment, route.partition_id, version_id);
+        let mut entries = match fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.kind() == std::io::ErrorKind::NotADirectory =>
+            {
+                continue;
             }
-            Ok(())
-        })
-        .await;
+            Err(e) => return Err(AppError::Io(e, format!("read_dir {}", dir.display()))),
+        };
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| AppError::Io(e, format!("read_dir {}", dir.display())))?
+        {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("msgpack") {
+                continue;
+            }
+            if let Ok(Some(meta)) = read_messagepack_if_exists::<PartMetadata>(&path).await {
+                parts.entry(meta.part_index).or_insert(meta);
+            }
+        }
     }
-    Ok(true)
+    Ok(parts)
+}
+
+pub async fn load_session(
+    fragment: &str,
+    version_id: &str,
+) -> Result<Option<IndexSessionState>, AppError> {
+    let mut state = match load_session_uncached(fragment, version_id).await? {
+        Some(state) => normalize_session_state(state),
+        None => return Ok(None),
+    };
+    state.parts = load_session_parts_from_disk(fragment, version_id).await?;
+    Ok(Some(state))
 }
 
 pub async fn remove_session(
@@ -1963,7 +2840,10 @@ pub async fn remove_session(
     version_id: &str,
     reason: &str,
 ) -> Result<(), AppError> {
+    let session_guard = session_lock(fragment, version_id).await;
+    let _session_guard = session_guard.lock().await;
     let route = session_partition_route(fragment, version_id)?;
+    let existed = load_session_uncached(fragment, version_id).await?.is_some();
     let wal = IndexWalRecord::SessionRemoved {
         fragment: fragment.to_string(),
         version_id: version_id.to_string(),
@@ -1972,13 +2852,11 @@ pub async fn remove_session(
     };
     let owner_root = route.roots[0].clone();
     let owner_path = session_state_path(&owner_root, fragment, route.partition_id, version_id);
-    let mut success = 0usize;
     if fs::try_exists(&owner_path).await.unwrap_or(false) {
         if fs::remove_file(&owner_path).await.is_ok() {
             if let Some(parent) = owner_path.parent() {
                 let _ = sync_dir(parent).await;
             }
-            success += 1;
         }
     }
     let _ = append_wal(&owner_root, fragment, route.partition_id, &wal).await;
@@ -2007,13 +2885,28 @@ pub async fn remove_session(
         })
         .await;
     }
-    if success == 0 {
+    remove_active_session(fragment, version_id).await;
+    if !existed {
         return Err(AppError::NotFound);
     }
     Ok(())
 }
 
 pub async fn list_active_sessions(fragment: &str) -> Result<Vec<IndexSessionState>, AppError> {
+    if INDEX_ACTIVE_SESSION_FRAGMENTS_SCANNED
+        .lock()
+        .await
+        .contains(fragment)
+    {
+        let cached = INDEX_ACTIVE_SESSIONS
+            .lock()
+            .await
+            .get(fragment)
+            .cloned()
+            .unwrap_or_default();
+        return Ok(cached.into_values().collect());
+    }
+
     let mut sessions = HashMap::<String, IndexSessionState>::new();
     for partition_id in 0..INDEX_PARTITION_COUNT {
         let route = route_for_partition_id(partition_id)?;
@@ -2036,6 +2929,15 @@ pub async fn list_active_sessions(fragment: &str) -> Result<Vec<IndexSessionStat
         }
     }
 
+    INDEX_ACTIVE_SESSIONS
+        .lock()
+        .await
+        .insert(fragment.to_string(), sessions.clone());
+    INDEX_ACTIVE_SESSION_FRAGMENTS_SCANNED
+        .lock()
+        .await
+        .insert(fragment.to_string());
+
     Ok(sessions.into_values().collect())
 }
 
@@ -2050,19 +2952,19 @@ pub fn get_session_state_paths(fragment: &str, version_id: &str) -> Result<Vec<P
 
 pub async fn publish_object(metadata: &ObjectMetadata) -> Result<(), AppError> {
     write_object_version_internal(metadata, false, false).await?;
-    schedule_prefix_projection(metadata.fragment.clone());
+    schedule_prefix_projection_for_key(metadata.fragment.clone(), metadata.object_key.clone());
     Ok(())
 }
 
 pub async fn upsert_object_version(metadata: &ObjectMetadata) -> Result<(), AppError> {
     write_object_version_internal(metadata, false, false).await?;
-    schedule_prefix_projection(metadata.fragment.clone());
+    schedule_prefix_projection_for_key(metadata.fragment.clone(), metadata.object_key.clone());
     Ok(())
 }
 
 pub async fn upsert_trashed_object_version(metadata: &ObjectMetadata) -> Result<(), AppError> {
     write_object_version_internal(metadata, false, true).await?;
-    schedule_prefix_projection(metadata.fragment.clone());
+    schedule_prefix_projection_for_key(metadata.fragment.clone(), metadata.object_key.clone());
     Ok(())
 }
 
@@ -2182,7 +3084,7 @@ pub async fn delete_object_version(
 ) -> Result<bool, AppError> {
     let removed = delete_object_version_internal(fragment, object_key, version_id, false).await?;
     if removed {
-        schedule_prefix_projection(fragment.to_string());
+        schedule_prefix_projection_for_key(fragment.to_string(), object_key.to_string());
     }
     Ok(removed)
 }
@@ -2194,7 +3096,7 @@ pub async fn delete_trashed_object_version(
 ) -> Result<bool, AppError> {
     let removed = delete_object_version_internal(fragment, object_key, version_id, true).await?;
     if removed {
-        schedule_prefix_projection(fragment.to_string());
+        schedule_prefix_projection_for_key(fragment.to_string(), object_key.to_string());
     }
     Ok(removed)
 }
@@ -2212,7 +3114,7 @@ pub async fn move_object_version_to_trash(
 
     write_object_version_internal(&metadata, true, true).await?;
     delete_object_version_internal(fragment, object_key, version_id, false).await?;
-    schedule_prefix_projection(fragment.to_string());
+    schedule_prefix_projection_for_key(fragment.to_string(), object_key.to_string());
     Ok(Some(metadata))
 }
 
@@ -2231,7 +3133,7 @@ pub async fn restore_object_version_from_trash(
 
     write_object_version_internal(&metadata, force_latest, false).await?;
     delete_object_version_internal(fragment, object_key, version_id, true).await?;
-    schedule_prefix_projection(fragment.to_string());
+    schedule_prefix_projection_for_key(fragment.to_string(), object_key.to_string());
     Ok(Some(metadata))
 }
 

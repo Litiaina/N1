@@ -7,6 +7,9 @@ use crate::n1_core::disk_manager::{ObjectMetadata, ObjectPathManager, configured
 use crate::n1_core::index;
 use crate::n1_core::quota_manager::update_quota;
 use crate::n1_core::sync::sync_single_fragment_quota;
+use crate::n1_core::upload::{
+    cleanup_orphaned_upload_artifacts_for_fragment, cleanup_upload_part_metadata_for_version,
+};
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
 use crate::websocket::ws_structs::StorageEventPayload;
@@ -622,6 +625,21 @@ async fn process_fragment_gc(
 
     for version_id in &sessions_to_delete {
         let _ = index::remove_session(fragment, version_id, "gc-expired").await;
+        cleanup_upload_part_metadata_for_version(fragment, version_id, true).await;
+    }
+
+    match cleanup_orphaned_upload_artifacts_for_fragment(fragment, now, file_ttl).await {
+        Ok(cleaned) if cleaned > 0 => {
+            info!(
+                "GC: Cleaned {} orphaned upload artifact set(s) for fragment {}",
+                cleaned, fragment
+            );
+        }
+        Ok(_) => {}
+        Err(e) => warn!(
+            "GC: Orphaned upload artifact cleanup failed for fragment {}: {}",
+            fragment, e
+        ),
     }
 
     for root in blob_roots {

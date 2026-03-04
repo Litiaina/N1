@@ -38,6 +38,8 @@ run_probe() {
 
 run_probe matrix_crud_cpu_ram_probe "N1 CRUD probe summary:"
 run_probe matrix_upload_single_nvme_saturation_probe "N1 upload probe:"
+run_probe matrix_upload_rss_plateau_probe "N1 upload RSS probe:"
 run_probe matrix_stream_sequential_readahead_locality_probe "N1 stream probe:"
+run_probe matrix_empty_trash_fragment_nuke_probe "N1 empty trash probe:"
 
 awk -F, 'NR==1 { next } { if ($2 != 0) fail++ ; total++ } END { printf "probes=%d fail=%d\n", total+0, fail+0 }' "$CSV" | tee "$SUMMARY"

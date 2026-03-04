@@ -10,7 +10,7 @@ This replaces the legacy "full mirrored metadata tree on every index root" model
 
 ## Freeze Status
 
-The N1 architecture is frozen at version `0.9.0`.
+The N1 architecture is frozen at version `0.9.1`.
 
 That freeze applies to the storage model:
 
@@ -27,6 +27,7 @@ It does **not** freeze the HTTP/API surface yet. API and operational route detai
 - Exact-key reads, finalize, delete, recover, GC, repair, and prefix rebuild all resolve against `index`.
 - Each object key hashes to one metadata partition. Each partition selects one owning index root and one replica root when more than one root exists.
 - Session state is partitioned separately by `fragment + version_id`, which keeps resumable upload state bounded to the session's selected roots.
+- Multipart part truth stays on disk: part uploads write durable part metadata, and a pending-part receipt covers the crash window before that metadata exists.
 - The prefix index is not the source of truth. It is a rebuildable namespace-serving structure with inline list payload.
 - Raw blob extents are payload durability only. They do not make an object visible until `index` publishes the version.
 

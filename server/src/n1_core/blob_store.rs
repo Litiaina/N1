@@ -520,6 +520,95 @@ pub async fn free_raw_shards_for_metadata(metadata: &ObjectMetadata) -> Result<(
     Ok(())
 }
 
+pub async fn free_raw_shards_for_metadatas(metadatas: &[ObjectMetadata]) -> Result<(), AppError> {
+    let mut grouped = HashMap::<String, Vec<RawBlobAddress>>::new();
+    let mut seen = std::collections::HashSet::<(String, u64, u64, u64)>::new();
+
+    for metadata in metadatas {
+        for part in &metadata.parts {
+            for shard in &part.shards {
+                let Some(raw) = shard.raw_blob_address.as_ref() else {
+                    continue;
+                };
+                let key = (
+                    raw.device_id.clone(),
+                    raw.allocation_id,
+                    raw.offset_bytes,
+                    raw.size_bytes,
+                );
+                if seen.insert(key) {
+                    grouped
+                        .entry(raw.device_id.clone())
+                        .or_default()
+                        .push(raw.clone());
+                }
+            }
+        }
+    }
+
+    for (device_id, addresses) in grouped {
+        tokio::task::spawn_blocking(move || {
+            let manager = raw_manager_by_device_id(device_id.as_str())?;
+            let mut mgr = manager.lock().map_err(|_| {
+                AppError::InternalServerError("Raw blob manager lock poisoned".into())
+            })?;
+            let mut mutated = false;
+            for raw in addresses {
+                let address = RawExtentAddress {
+                    device_id: mgr.header().device_id,
+                    allocation_id: raw.allocation_id,
+                    offset_bytes: raw.offset_bytes,
+                    size_bytes: raw.size_bytes,
+                };
+                match mgr.free_address(&address) {
+                    Ok(()) => mutated = true,
+                    Err(err) => {
+                        if mutated {
+                            let _ = mgr.flush();
+                        }
+                        return Err(block_manager_error_to_app(err));
+                    }
+                }
+            }
+            if mutated {
+                mgr.flush().map_err(block_manager_error_to_app)?;
+            }
+            Ok::<(), AppError>(())
+        })
+        .await
+        .map_err(|e| {
+            AppError::InternalServerError(format!("raw batch free task failed: {}", e))
+        })??;
+    }
+
+    Ok(())
+}
+
+pub async fn flush_raw_metadata_for_addresses(
+    addresses: &[RawBlobAddress],
+) -> Result<(), AppError> {
+    let mut device_ids = std::collections::HashSet::<String>::new();
+    for raw in addresses {
+        device_ids.insert(raw.device_id.clone());
+    }
+
+    for device_id in device_ids {
+        tokio::task::spawn_blocking(move || {
+            let manager = raw_manager_by_device_id(device_id.as_str())?;
+            let mut mgr = manager.lock().map_err(|_| {
+                AppError::InternalServerError("Raw blob manager lock poisoned".into())
+            })?;
+            mgr.flush_meta().map_err(block_manager_error_to_app)
+        })
+        .await
+        .map_err(|e| {
+            AppError::InternalServerError(format!("raw metadata flush task failed: {}", e))
+        })??;
+    }
+
+    Ok(())
+}
+
 pub fn metadata_contains_raw_shards(metadata: &ObjectMetadata) -> bool {
     metadata
         .parts

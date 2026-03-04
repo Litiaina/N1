@@ -103,14 +103,14 @@ fn adaptive_writer_buffer_size(
 ) -> usize {
     let ram = ram_gib(ram_bytes);
     let mut bytes = match ram_gib(ram_bytes) {
-        0..=4 => 256 * 1024,
+        0..=4 => 128 * 1024,
         5..=8 => 512 * 1024,
         9..=64 => 1024 * 1024,
         _ => 2 * 1024 * 1024,
     };
 
     if cpu_cores <= 2 {
-        bytes = bytes.min(256 * 1024);
+        bytes = bytes.min(128 * 1024);
     } else if cpu_cores <= 4 {
         bytes = bytes.min(512 * 1024);
     } else if cpu_cores <= 8 {
@@ -127,7 +127,7 @@ fn adaptive_writer_buffer_size(
 
     if blob_disks <= 1 {
         let single_disk_cap = if cpu_cores <= 2 || ram <= 4 {
-            512 * 1024
+            256 * 1024
         } else if cpu_cores <= 4 || ram <= 8 {
             1024 * 1024
         } else if cpu_cores <= 8 || ram <= 16 {
@@ -223,7 +223,7 @@ fn adaptive_upload_memory_budget_bytes(
     total_shards: usize,
 ) -> usize {
     let mut budget: usize = match ram_gib(ram_bytes) {
-        0..=4 => 48usize * 1024 * 1024,
+        0..=4 => 32usize * 1024 * 1024,
         5..=8 => 64usize * 1024 * 1024,
         9..=16 => 96usize * 1024 * 1024,
         17..=32 => 128usize * 1024 * 1024,
@@ -244,7 +244,7 @@ fn adaptive_upload_memory_budget_bytes(
         budget = budget.min(160usize * 1024 * 1024);
     }
 
-    budget.clamp(48usize * 1024 * 1024, 384usize * 1024 * 1024)
+    budget.clamp(32usize * 1024 * 1024, 384usize * 1024 * 1024)
 }
 
 fn estimate_upload_part_working_set_bytes(
@@ -414,6 +414,12 @@ mod tests {
             1,
         );
         assert_eq!(limit, 2);
+    }
+
+    #[test]
+    fn low_ram_single_disk_writer_buffer_stays_small() {
+        let bytes = adaptive_writer_buffer_size(2, Some(4 * 1024 * 1024 * 1024), 1, 1);
+        assert!(bytes <= 256 * 1024);
     }
 
     #[test]

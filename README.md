@@ -71,7 +71,7 @@ Profile note:
 
 ## Release Status
 
-- N1 `0.9.0` is the architecture-freeze line.
+- N1 `0.9.1` is the architecture-freeze line.
 - The storage model is frozen at this point:
   - raw direct-I/O blob plane
   - filesystem-backed authoritative `index`
@@ -79,6 +79,7 @@ Profile note:
   - projected prefix namespace serving
 - The HTTP/API surface is **not** frozen yet. Route shapes, request fields, and operational endpoints may still change before `1.0.0`.
 - `1.0.0` is reserved for the post-freeze stabilization release, not for the architecture-freeze point itself.
+- Multipart upload crash safety now includes a durable pending-part receipt on the index side so orphaned raw extents can be reclaimed without relying on memory state.
 
 ## What is N1 (index architecture)
 
@@ -318,12 +319,13 @@ At this point no object version is visible.
 Part upload remains strict and payload-first:
 
 1. stream request bytes through the RS encoder
-2. write and verify shard payloads
-3. commit shard payloads into raw blob extents
-4. build `PartMetadata`
-5. update the session's authoritative `index` state with the committed part
+2. reserve raw extents and write a durable pending-part receipt
+3. write and verify shard payloads
+4. commit shard payloads into raw blob extents
+5. build `PartMetadata`
+6. persist committed part metadata on disk
 
-This keeps raw payload durability separate from namespace visibility.
+This keeps raw payload durability separate from namespace visibility and keeps resumability on disk instead of in memory.
 
 ### 3) Finalize upload (publish into `index`)
 
@@ -347,17 +349,18 @@ This is the mental model N1 is built around now.
 
 You may see:
 
-- staged or committed raw extents
-- no committed part in session state
+- a durable pending-part receipt
+- raw extents that were reserved or partially written
+- no committed part metadata yet
 
-The part is not complete because authoritative session metadata does not claim it.
+The part is not complete because committed part metadata does not claim it yet. GC or cancel can reclaim the raw extents by following the pending receipt.
 
 ### Crash after session part commit but before finalize
 
 You may see:
 
 - committed raw extents
-- committed part state in `index`
+- committed part metadata on disk
 - no published object version
 
 This is safe and resumable. Finalize can be retried.

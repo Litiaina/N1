@@ -28,6 +28,7 @@ pub struct BlockManager {
     allocations: HashMap<u64, Extent>,
     next_allocation_id: u64,
     journal_cursor: u64,
+    journal_dirty: bool,
 }
 
 impl BlockManager {
@@ -114,6 +115,7 @@ impl BlockManager {
             allocations: HashMap::new(),
             next_allocation_id: 1,
             journal_cursor: 0,
+            journal_dirty: false,
             header,
         };
         manager.replay_journal()?;
@@ -280,6 +282,14 @@ impl BlockManager {
 
     pub fn flush_data(&self) -> Result<(), BlockManagerError> {
         self.direct_file.sync_all()?;
+        Ok(())
+    }
+
+    pub fn flush_meta(&mut self) -> Result<(), BlockManagerError> {
+        if self.journal_dirty {
+            self.meta_file.sync_all()?;
+            self.journal_dirty = false;
+        }
         Ok(())
     }
 
@@ -450,9 +460,8 @@ impl BlockManager {
 
         let buf = encode_record(record);
         write_all_at(&self.meta_file, &buf, offset)?;
-        // Raw block devices can reject fdatasync even though fsync is valid.
-        self.meta_file.sync_all()?;
         self.journal_cursor = self.journal_cursor.saturating_add(1);
+        self.journal_dirty = true;
         Ok(())
     }
 

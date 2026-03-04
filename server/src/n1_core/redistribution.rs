@@ -1,8 +1,9 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::blob_store::{
     BlobDiskHandle, allocate_raw_direct_io, commit_staged_raw_shard, copy_raw_extent,
-    free_raw_address, open_raw_direct_io, raw_blob_debug_path, raw_stage_path_for_shard,
-    resolve_blob_disk_path, stable_shard_file_name, verify_shard_checksum, write_raw_gc_markers,
+    flush_raw_metadata_for_addresses, free_raw_address, open_raw_direct_io, raw_blob_debug_path,
+    raw_stage_path_for_shard, resolve_blob_disk_path, stable_shard_file_name,
+    verify_shard_checksum, write_raw_gc_markers,
 };
 use crate::n1_core::constants::{GC_SUFFIX, QUOTA_FILE};
 use crate::n1_core::disk_manager::{
@@ -1299,6 +1300,8 @@ async fn redistribute_object_streaming(
                     is_parity,
                 });
             }
+
+            flush_raw_metadata_for_addresses(&allocated_raw).await?;
 
             let new_part = PartMetadata {
                 part_index: old_part_arc.part_index,
