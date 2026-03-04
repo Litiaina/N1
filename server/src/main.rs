@@ -324,7 +324,17 @@ fn adaptive_stream_max_concurrency(
 }
 
 #[cfg(unix)]
+fn storage_identity_for_metadata(dev: u64, rdev: u64, is_block_device: bool) -> u64 {
+    if is_block_device && rdev != 0 {
+        rdev
+    } else {
+        dev
+    }
+}
+
+#[cfg(unix)]
 fn detect_unique_storage_devices(paths: &[String]) -> usize {
+    use std::os::unix::fs::FileTypeExt;
     use std::os::unix::fs::MetadataExt;
 
     let mut dev_ids: HashSet<u64> = HashSet::new();
@@ -336,7 +346,11 @@ fn detect_unique_storage_devices(paths: &[String]) -> usize {
         fallback_paths.insert(resolved.clone());
 
         if let Ok(meta) = std::fs::metadata(&resolved) {
-            dev_ids.insert(meta.dev());
+            dev_ids.insert(storage_identity_for_metadata(
+                meta.dev(),
+                meta.rdev(),
+                meta.file_type().is_block_device(),
+            ));
         }
     }
 
@@ -396,6 +410,8 @@ mod tests {
         adaptive_raw_writer_inflight_limit, adaptive_writer_buffer_size,
         estimate_upload_part_working_set_bytes,
     };
+    #[cfg(unix)]
+    use super::storage_identity_for_metadata;
 
     #[test]
     fn single_disk_writer_buffer_size_is_not_artificially_tiny() {
@@ -453,6 +469,20 @@ mod tests {
         let shallow = estimate_upload_part_working_set_bytes(1, 0, 1024 * 1024, 2, 1024 * 1024);
         let deep = estimate_upload_part_working_set_bytes(1, 0, 1024 * 1024, 8, 1024 * 1024);
         assert!(deep > shallow);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn block_device_identity_prefers_rdev_over_devtmpfs_dev() {
+        let identity = storage_identity_for_metadata(42, 1337, true);
+        assert_eq!(identity, 1337);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mounted_path_identity_stays_on_filesystem_dev() {
+        let identity = storage_identity_for_metadata(42, 1337, false);
+        assert_eq!(identity, 42);
     }
 }
 
