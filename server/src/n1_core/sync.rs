@@ -62,25 +62,17 @@ async fn sweep_fragment_gc_files(fragment_hash: String) {
 async fn calculate_usage_across_mirrors(fragment_hash: String) -> u64 {
     let mut total_usage = 0u64;
     let mut seen_versions = HashSet::new();
-
-    for meta in index::list_fragment_object_versions(&fragment_hash, false)
-        .await
-        .unwrap_or_default()
-    {
-        if meta.is_delete_marker || !seen_versions.insert(meta.version_id.clone()) {
-            continue;
+    for trashed in [false, true] {
+        let mut stream = index::stream_fragment_object_versions(fragment_hash.clone(), trashed);
+        while let Some(next_meta) = stream.recv().await {
+            let Ok(meta) = next_meta else {
+                continue;
+            };
+            if meta.is_delete_marker || !seen_versions.insert(meta.version_id.clone()) {
+                continue;
+            }
+            total_usage += meta.total_size_bytes;
         }
-        total_usage += meta.total_size_bytes;
-    }
-
-    for meta in index::list_fragment_object_versions(&fragment_hash, true)
-        .await
-        .unwrap_or_default()
-    {
-        if meta.is_delete_marker || !seen_versions.insert(meta.version_id.clone()) {
-            continue;
-        }
-        total_usage += meta.total_size_bytes;
     }
 
     total_usage

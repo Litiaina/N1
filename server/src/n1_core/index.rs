@@ -48,6 +48,7 @@ const INDEX_CHECKPOINT_RECORD_INTERVAL: u64 = 64;
 const INDEX_WAL_MANIFEST_PERSIST_INTERVAL: u64 = 64;
 const INDEX_WAL_GROUP_COMMIT_WINDOW_MS: u64 = 4;
 const INDEX_WAL_GROUP_COMMIT_MAX_RECORDS: usize = 32;
+const INDEX_FRAGMENT_VERSION_STREAM_BUFFER: usize = 64;
 
 static INDEX_WAL_APPENDERS: LazyLock<Mutex<HashMap<String, mpsc::Sender<WalAppendRequest>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -2949,79 +2950,110 @@ async fn scan_fragment_latest_states(
     scan_fragment_latest_states_filtered(fragment, trashed, None).await
 }
 
-fn absorb_version_state(
-    versions: &mut HashMap<(String, String), ObjectMetadata>,
-    candidate: ObjectMetadata,
-) {
-    let key = (candidate.object_key.clone(), candidate.version_id.clone());
-    match versions.get(&key) {
-        None => {
-            versions.insert(key, candidate);
-        }
-        Some(current) => {
-            if metadata_is_newer(&candidate, current) {
-                versions.insert(key, candidate);
-            }
-        }
-    }
+fn partition_versions_root(root: &Path, fragment: &str, partition_id: u16, trashed: bool) -> PathBuf {
+    partition_dir(root, fragment, partition_id).join(if trashed {
+        INDEX_TRASH_DIR
+    } else {
+        INDEX_OBJECTS_DIR
+    })
 }
 
-async fn scan_fragment_versions(
+async fn emit_partition_versions_on_partition(
+    tx: &mpsc::Sender<Result<ObjectMetadata, AppError>>,
     fragment: &str,
+    partition_id: u16,
     trashed: bool,
-) -> Result<Vec<ObjectMetadata>, AppError> {
-    let mut versions = HashMap::<(String, String), ObjectMetadata>::new();
+) -> Result<(), AppError> {
+    let route = route_for_partition_id(partition_id)?;
+    let mut seen = HashSet::<PathBuf>::new();
 
-    for partition_id in 0..INDEX_PARTITION_COUNT {
-        let route = route_for_partition_id(partition_id)?;
-        for root in &route.roots {
-            let partition_root = partition_dir(root, fragment, partition_id);
-            if !fs::try_exists(&partition_root).await.unwrap_or(false) {
-                continue;
-            }
-            let objects_root = partition_dir(root, fragment, partition_id).join(if trashed {
-                INDEX_TRASH_DIR
-            } else {
-                INDEX_OBJECTS_DIR
-            });
-            if !fs::try_exists(&objects_root).await.unwrap_or(false) {
-                continue;
-            }
+    for root in &route.roots {
+        let partition_root = partition_dir(root, fragment, partition_id);
+        if !fs::try_exists(&partition_root).await.unwrap_or(false) {
+            continue;
+        }
 
-            let mut bucket_dirs = match fs::read_dir(&objects_root).await {
+        let objects_root = partition_versions_root(root, fragment, partition_id, trashed);
+        if !fs::try_exists(&objects_root).await.unwrap_or(false) {
+            continue;
+        }
+
+        let mut bucket_dirs = match fs::read_dir(&objects_root).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                return Err(AppError::Io(
+                    e,
+                    format!("read partition version root {}", objects_root.display()),
+                ));
+            }
+        };
+
+        while let Ok(Some(bucket_dir)) = bucket_dirs.next_entry().await {
+            let mut object_dirs = match fs::read_dir(bucket_dir.path()).await {
                 Ok(entries) => entries,
                 Err(_) => continue,
             };
-            while let Ok(Some(bucket_dir)) = bucket_dirs.next_entry().await {
-                let mut object_dirs = match fs::read_dir(bucket_dir.path()).await {
+            while let Ok(Some(object_dir)) = object_dirs.next_entry().await {
+                let mut files = match fs::read_dir(object_dir.path()).await {
                     Ok(entries) => entries,
                     Err(_) => continue,
                 };
-                while let Ok(Some(object_dir)) = object_dirs.next_entry().await {
-                    let mut files = match fs::read_dir(object_dir.path()).await {
-                        Ok(entries) => entries,
-                        Err(_) => continue,
+                while let Ok(Some(file)) = files.next_entry().await {
+                    let name = file.file_name().to_string_lossy().to_string();
+                    if !is_version_entry(&name) {
+                        continue;
+                    }
+                    let Ok(relative_path) = file.path().strip_prefix(&objects_root).map(Path::to_path_buf) else {
+                        continue;
                     };
-                    while let Ok(Some(file)) = files.next_entry().await {
-                        let name = file.file_name().to_string_lossy().to_string();
-                        if !is_version_entry(&name) {
-                            continue;
+                    if !seen.insert(relative_path) {
+                        continue;
+                    }
+                    match read_messagepack::<ObjectMetadata>(&file.path()).await {
+                        Ok(metadata) => {
+                            if tx.send(Ok(metadata)).await.is_err() {
+                                return Ok(());
+                            }
                         }
-                        match read_messagepack::<ObjectMetadata>(&file.path()).await {
-                            Ok(metadata) => absorb_version_state(&mut versions, metadata),
-                            Err(e) => warn!(
-                                "index version scan decode failed {}: {}",
-                                file.path().display(),
-                                e
-                            ),
-                        }
+                        Err(e) => warn!(
+                            "index version scan decode failed {}: {}",
+                            file.path().display(),
+                            e
+                        ),
                     }
                 }
             }
         }
     }
 
-    Ok(versions.into_values().collect())
+    Ok(())
+}
+
+async fn run_fragment_versions_stream(
+    fragment: String,
+    trashed: bool,
+    tx: mpsc::Sender<Result<ObjectMetadata, AppError>>,
+) -> Result<(), AppError> {
+    for partition_id in 0..INDEX_PARTITION_COUNT {
+        emit_partition_versions_on_partition(&tx, &fragment, partition_id, trashed).await?;
+        if tx.is_closed() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+pub fn stream_fragment_object_versions(
+    fragment: String,
+    trashed: bool,
+) -> mpsc::Receiver<Result<ObjectMetadata, AppError>> {
+    let (tx, rx) = mpsc::channel(INDEX_FRAGMENT_VERSION_STREAM_BUFFER);
+    tokio::spawn(async move {
+        if let Err(err) = run_fragment_versions_stream(fragment, trashed, tx.clone()).await {
+            let _ = tx.send(Err(err)).await;
+        }
+    });
+    rx
 }
 
 pub async fn open_session(
@@ -3571,19 +3603,6 @@ pub async fn list_fragment_trash_objects_for_prefix(
             .then(left.version_id.cmp(&right.version_id))
     });
     Ok(objects)
-}
-
-pub async fn list_fragment_object_versions(
-    fragment: &str,
-    trashed: bool,
-) -> Result<Vec<ObjectMetadata>, AppError> {
-    let mut versions = scan_fragment_versions(fragment, trashed).await?;
-    versions.sort_by(|left, right| {
-        left.object_key
-            .cmp(&right.object_key)
-            .then(left.version_id.cmp(&right.version_id))
-    });
-    Ok(versions)
 }
 
 pub async fn delete_object_version(

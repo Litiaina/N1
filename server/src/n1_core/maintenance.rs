@@ -15,18 +15,15 @@ async fn perform_quota_sync(fragment: &str) -> Result<u64, AppError> {
     let mut valid_versions = HashSet::new();
     let mut total_usage = 0u64;
 
-    for meta in index::list_fragment_object_versions(fragment, false).await? {
-        if meta.is_delete_marker || !valid_versions.insert(meta.version_id.clone()) {
-            continue;
+    for trashed in [false, true] {
+        let mut stream = index::stream_fragment_object_versions(fragment.to_string(), trashed);
+        while let Some(next_meta) = stream.recv().await {
+            let meta = next_meta?;
+            if meta.is_delete_marker || !valid_versions.insert(meta.version_id.clone()) {
+                continue;
+            }
+            total_usage += meta.total_size_bytes;
         }
-        total_usage += meta.total_size_bytes;
-    }
-
-    for meta in index::list_fragment_object_versions(fragment, true).await? {
-        if meta.is_delete_marker || !valid_versions.insert(meta.version_id.clone()) {
-            continue;
-        }
-        total_usage += meta.total_size_bytes;
     }
 
     let (_valid_versions, orphans_removed) =

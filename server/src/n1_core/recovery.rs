@@ -26,7 +26,7 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use ulid::Ulid;
 
 #[cfg(unix)]
@@ -50,6 +50,20 @@ const MAX_RAW_RELOCATIONS: usize = 8192;
 pub enum RepairLogMode {
     Verbose,
     Summary,
+}
+
+#[inline]
+fn log_repair_verbose_warn(log_mode: RepairLogMode, message: impl FnOnce() -> String) {
+    if matches!(log_mode, RepairLogMode::Verbose) {
+        warn!("{}", message());
+    }
+}
+
+#[inline]
+fn log_repair_verbose_info(log_mode: RepairLogMode, message: impl FnOnce() -> String) {
+    if matches!(log_mode, RepairLogMode::Verbose) {
+        info!("{}", message());
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1096,16 +1110,12 @@ pub async fn repair_entire_shard(
                             ),
                         )
                     })?;
-                match log_mode {
-                    RepairLogMode::Verbose => warn!(
+                log_repair_verbose_warn(log_mode, || {
+                    format!(
                         "Relocating raw shard {} after stale or missing raw device mapping: {}",
                         target_shard.file_name, err
-                    ),
-                    RepairLogMode::Summary => debug!(
-                        "Relocating raw shard {} after stale or missing raw device mapping: {}",
-                        target_shard.file_name, err
-                    ),
-                }
+                    )
+                });
                 RepairTarget::TempFile {
                     final_path: PathBuf::new(),
                     parent_dir,
@@ -1450,14 +1460,9 @@ pub async fn repair_entire_shard(
                     "Repaired raw shard failed checksum verification".into(),
                 ));
             }
-            match log_mode {
-                RepairLogMode::Verbose => {
-                    info!("Successfully repaired raw shard {}", target_shard.file_name);
-                }
-                RepairLogMode::Summary => {
-                    debug!("Successfully repaired raw shard {}", target_shard.file_name);
-                }
-            }
+            log_repair_verbose_info(log_mode, || {
+                format!("Successfully repaired raw shard {}", target_shard.file_name)
+            });
         }
         RepairTarget::TempFile {
             final_path,
@@ -1520,18 +1525,13 @@ pub async fn repair_entire_shard(
 
                         outcome.relocated_raw_shard = true;
                         outcome.stale_mapping_relocated = true;
-                        match log_mode {
-                            RepairLogMode::Verbose => info!(
+                        log_repair_verbose_info(log_mode, || {
+                            format!(
                                 "Successfully relocated raw shard {} -> {}",
                                 target_shard.file_name,
                                 raw_blob_debug_path(&new_raw)
-                            ),
-                            RepairLogMode::Summary => debug!(
-                                "Successfully relocated raw shard {} -> {}",
-                                target_shard.file_name,
-                                raw_blob_debug_path(&new_raw)
-                            ),
-                        }
+                            )
+                        });
                     }
                     Ok(RelocatedRawMetadataOutcome::AlreadyRelocated(existing_raw)) => {
                         let _ = free_raw_address(&new_raw).await;
@@ -1540,18 +1540,13 @@ pub async fn repair_entire_shard(
                         }
                         outcome.relocated_raw_shard = true;
                         outcome.stale_mapping_relocated = true;
-                        match log_mode {
-                            RepairLogMode::Verbose => info!(
+                        log_repair_verbose_info(log_mode, || {
+                            format!(
                                 "Raw shard {} already relocated to {}",
                                 target_shard.file_name,
                                 raw_blob_debug_path(&existing_raw)
-                            ),
-                            RepairLogMode::Summary => debug!(
-                                "Raw shard {} already relocated to {}",
-                                target_shard.file_name,
-                                raw_blob_debug_path(&existing_raw)
-                            ),
-                        }
+                            )
+                        });
                     }
                     Err(err) => {
                         let _ = free_raw_address(&new_raw).await;
@@ -1571,18 +1566,13 @@ pub async fn repair_entire_shard(
                 }
                 let _ = sync_dir(&parent_dir).await;
 
-                match log_mode {
-                    RepairLogMode::Verbose => info!(
+                log_repair_verbose_info(log_mode, || {
+                    format!(
                         "Successfully repaired shard {} -> {}",
                         target_shard.file_name,
                         final_path.display()
-                    ),
-                    RepairLogMode::Summary => debug!(
-                        "Successfully repaired shard {} -> {}",
-                        target_shard.file_name,
-                        final_path.display()
-                    ),
-                }
+                    )
+                });
             }
         }
     }

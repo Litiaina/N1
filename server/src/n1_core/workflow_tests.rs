@@ -13,7 +13,7 @@ use super::delete::{
 };
 use super::disk_manager::{
     DownloadArchiveRequest, InitiateUploadParams, ObjectKeyQuery, ObjectPathManager,
-    PrefixIndexSegment, RenameObjectRequest, UploadPartQuery,
+    ObjectMetadata, PrefixIndexSegment, RenameObjectRequest, UploadPartQuery,
 };
 use super::fragment_metadata::init_fragment_metadata;
 use super::garbage_collector::{get_gc_status_api, run_garbage_collector};
@@ -514,6 +514,23 @@ async fn read_response_json(resp: axum::response::Response) -> serde_json::Value
         .await
         .expect("read response body");
     serde_json::from_slice(&body).expect("decode JSON response")
+}
+
+async fn collect_fragment_versions_streamed(
+    fragment: &str,
+    trashed: bool,
+) -> Vec<ObjectMetadata> {
+    let mut out = Vec::new();
+    let mut stream = index::stream_fragment_object_versions(fragment.to_string(), trashed);
+    while let Some(next_meta) = stream.recv().await {
+        out.push(next_meta.expect("stream fragment metadata"));
+    }
+    out.sort_by(|left, right| {
+        left.object_key
+            .cmp(&right.object_key)
+            .then(left.version_id.cmp(&right.version_id))
+    });
+    out
 }
 
 async fn list_objects_json(
@@ -2937,9 +2954,7 @@ async fn matrix_empty_trash_bulk_clears_multi_version_key_and_refunds_quota() {
         .await
         .expect("fragment trash after empty");
     assert!(fragment_trash_after.is_empty());
-    let trash_versions_after = index::list_fragment_object_versions(&fragment, true)
-        .await
-        .expect("fragment trash versions after empty");
+    let trash_versions_after = collect_fragment_versions_streamed(&fragment, true).await;
     assert!(trash_versions_after.is_empty());
 
     let quota_after = get_quota(&fragment).await.expect("quota after empty");
@@ -3437,6 +3452,132 @@ async fn matrix_raw_blob_crud_delete_recover_and_permanent_delete() {
             shard.file_name
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_redelete_trashed_version_preserves_latest_live_version() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "matrix/version-trash-delete.bin".to_string();
+    let v1 = b"older-version".to_vec();
+    let v2 = b"latest-version".to_vec();
+
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let (ver1, sess1) = init_upload(&fragment, &key, v1.len() as u64, 1).await;
+    assert_eq!(
+        upload_part(&fragment, &ver1, 0, v1.clone()).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        finalize_upload(
+            state.clone(),
+            &fragment,
+            &ver1,
+            &sess1,
+            &key,
+            v1.len() as u64,
+            1,
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+
+    let (ver2, sess2) = init_upload(&fragment, &key, v2.len() as u64, 1).await;
+    assert_eq!(
+        upload_part(&fragment, &ver2, 0, v2.clone()).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        finalize_upload(
+            state.clone(),
+            &fragment,
+            &ver2,
+            &sess2,
+            &key,
+            v2.len() as u64,
+            1,
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+
+    let soft_delete = delete_object_version(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), ver1.clone(), key.clone())),
+    )
+    .await
+    .expect("soft delete older version")
+    .into_response();
+    assert_eq!(soft_delete.status(), StatusCode::OK);
+
+    let latest_after_soft_delete = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("latest metadata after soft delete");
+    assert_eq!(latest_after_soft_delete.version_id, ver2);
+
+    let permanent_delete_trashed = delete_object_version(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), ver1.clone(), key.clone())),
+    )
+    .await
+    .expect("permanently delete trashed version")
+    .into_response();
+    assert_eq!(permanent_delete_trashed.status(), StatusCode::OK);
+
+    let latest_after_redelete = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("latest metadata after permanent trashed delete");
+    assert_eq!(latest_after_redelete.version_id, ver2);
+
+    let current = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+    assert_eq!(current, v2);
+
+    assert!(
+        index::read_trashed_object_version(&fragment, &key, &ver1)
+            .await
+            .is_err(),
+        "trashed version should be gone after second delete"
+    );
+    assert!(
+        recover_object_version(
+            State(state),
+            full_claims(&fragment),
+            AxumPath((fragment.clone(), ver1, key.clone())),
+        )
+        .await
+        .is_err(),
+        "permanently deleted trashed version should not be recoverable"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -7287,9 +7428,7 @@ async fn matrix_empty_trash_fragment_nuke_probe() {
 
     let started_wait = Instant::now();
     let trash_versions = loop {
-        let versions = index::list_fragment_object_versions(&fragment, true)
-            .await
-            .expect("list probe trash versions");
+        let versions = collect_fragment_versions_streamed(&fragment, true).await;
         if versions.len() == object_count {
             break versions;
         }
@@ -7393,9 +7532,7 @@ async fn matrix_empty_trash_fragment_nuke_probe() {
         peak_rss_mib,
     ));
 
-    let trashed_after = index::list_fragment_object_versions(&fragment, true)
-        .await
-        .expect("list trash after probe clear");
+    let trashed_after = collect_fragment_versions_streamed(&fragment, true).await;
     assert!(
         trashed_after.is_empty(),
         "trash should be empty after probe"

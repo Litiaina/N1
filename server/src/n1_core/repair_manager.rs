@@ -121,12 +121,6 @@ struct BatchDelta {
     last_disagreement: Option<String>,
 }
 
-#[derive(Clone)]
-struct RepairObjectTarget {
-    metadata: ObjectMetadata,
-    is_trash: bool,
-}
-
 #[derive(Default)]
 struct AvailabilityRepairSummary {
     parts_scanned: usize,
@@ -189,10 +183,10 @@ fn build_repair_config_from_params(
     let cpu_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let (default_meta_conc, default_repair_conc, default_batch) =
-        repair_defaults_for_runtime(fast_mode, ram_gib, cpu_cores);
     let (max_meta_conc, max_repair_conc, max_batch_size) = repair_limits_for_ram_gib(ram_gib);
     let check_mode = forced_mode.unwrap_or_else(|| parse_check_mode(params));
+    let (default_meta_conc, default_repair_conc, default_batch) =
+        repair_defaults_for_runtime(check_mode, fast_mode, ram_gib, cpu_cores);
     let mut access_mode = check_mode.maintenance_access_mode();
     if read_only_fast && access_mode == MaintenanceAccessMode::Availability {
         access_mode = MaintenanceAccessMode::ReadOnly;
@@ -259,7 +253,7 @@ fn build_repair_config_from_params(
 }
 
 fn availability_part_parallelism(cfg: &RepairRunConfig) -> usize {
-    cfg.shard_repair_concurrency.clamp(1, 4)
+    cfg.shard_repair_concurrency.clamp(1, 2)
 }
 
 fn is_stale_raw_device_mapping_error(err: &AppError) -> bool {
@@ -397,21 +391,51 @@ fn repair_limits_for_ram_gib(ram_gib: usize) -> (usize, usize, usize) {
 }
 
 fn repair_defaults_for_runtime(
+    check_mode: RepairCheckMode,
     fast_mode: bool,
     ram_gib: usize,
     cpu_cores: usize,
 ) -> (usize, usize, usize) {
-    let mut meta = if fast_mode {
-        cpu_cores.saturating_mul(2).clamp(2, 16)
-    } else {
-        cpu_cores.clamp(1, 8)
+    let (mut meta, mut shard, mut batch) = match check_mode {
+        RepairCheckMode::Availability => {
+            let meta = if fast_mode {
+                cpu_cores.clamp(2, 6)
+            } else {
+                (cpu_cores / 2).clamp(1, 4)
+            };
+            let shard = if fast_mode { 2 } else { 1 };
+            let batch = if fast_mode { 192 } else { 128 };
+            (meta, shard, batch)
+        }
+        RepairCheckMode::Checksum | RepairCheckMode::Strict => {
+            let meta = if fast_mode {
+                cpu_cores.saturating_mul(2).clamp(4, 16)
+            } else {
+                cpu_cores.clamp(2, 10)
+            };
+            let shard = if fast_mode {
+                cpu_cores.clamp(2, 8)
+            } else {
+                (cpu_cores / 2).clamp(1, 4)
+            };
+            let batch = if fast_mode { 768 } else { 384 };
+            (meta, shard, batch)
+        }
+        RepairCheckMode::Scrub => {
+            let meta = if fast_mode {
+                cpu_cores.saturating_mul(3).clamp(6, 24)
+            } else {
+                cpu_cores.saturating_mul(2).clamp(4, 16)
+            };
+            let shard = if fast_mode {
+                cpu_cores.saturating_mul(2).clamp(2, 12)
+            } else {
+                cpu_cores.clamp(2, 6)
+            };
+            let batch = if fast_mode { 1024 } else { 512 };
+            (meta, shard, batch)
+        }
     };
-    let mut shard = if fast_mode {
-        (cpu_cores / 2).clamp(1, 8)
-    } else {
-        (cpu_cores / 4).clamp(1, 2)
-    };
-    let mut batch = if fast_mode { 512 } else { 256 };
 
     match ram_gib {
         0..=2 => {
@@ -448,6 +472,32 @@ fn repair_defaults_for_runtime(
         clamp_usize(shard, 1, max_shard),
         clamp_usize(batch, 32, max_batch),
     )
+}
+
+fn normalize_repair_cfg_for_layout(
+    mut cfg: RepairRunConfig,
+    blob_disks: usize,
+    index_roots: usize,
+) -> RepairRunConfig {
+    let blob_width = blob_disks.max(1);
+    let index_width = index_roots.max(1);
+    let io_width = blob_width.min(index_width.saturating_mul(2)).max(1);
+
+    let (meta_cap, shard_cap) = match cfg.check_mode {
+        RepairCheckMode::Availability => (io_width.clamp(1, 4), blob_width.clamp(1, 2)),
+        RepairCheckMode::Checksum | RepairCheckMode::Strict => (
+            io_width.saturating_mul(2).clamp(2, 16),
+            blob_width.saturating_mul(2).clamp(1, 8),
+        ),
+        RepairCheckMode::Scrub => (
+            io_width.saturating_mul(4).clamp(4, 24),
+            blob_width.saturating_mul(4).clamp(1, 12),
+        ),
+    };
+
+    cfg.meta_concurrency = cfg.meta_concurrency.min(meta_cap).max(1);
+    cfg.shard_repair_concurrency = cfg.shard_repair_concurrency.min(shard_cap).max(1);
+    cfg
 }
 
 #[inline]
@@ -1154,51 +1204,6 @@ async fn reconcile_object_metadata_strict(
     ))
 }
 
-async fn collect_fragment_repair_targets(
-    fragment: &str,
-) -> Result<Vec<RepairObjectTarget>, AppError> {
-    let mut seen = HashSet::new();
-    let mut targets = Vec::new();
-
-    for metadata in index::list_fragment_object_versions(fragment, false).await? {
-        let key = (
-            metadata.object_key.clone(),
-            metadata.version_id.clone(),
-            false,
-        );
-        if seen.insert(key) {
-            targets.push(RepairObjectTarget {
-                metadata,
-                is_trash: false,
-            });
-        }
-    }
-
-    for metadata in index::list_fragment_object_versions(fragment, true).await? {
-        let key = (
-            metadata.object_key.clone(),
-            metadata.version_id.clone(),
-            true,
-        );
-        if seen.insert(key) {
-            targets.push(RepairObjectTarget {
-                metadata,
-                is_trash: true,
-            });
-        }
-    }
-
-    targets.sort_by(|left, right| {
-        left.metadata
-            .object_key
-            .cmp(&right.metadata.object_key)
-            .then(left.metadata.version_id.cmp(&right.metadata.version_id))
-            .then(left.is_trash.cmp(&right.is_trash))
-    });
-
-    Ok(targets)
-}
-
 async fn repair_fragment_quota_mirrors(
     index_roots: &[PathBuf],
     fragment: &str,
@@ -1510,6 +1515,16 @@ pub async fn run_repair_job_with_options(
     let index_roots: Vec<PathBuf> = path_manager.get_all_index_roots().into_iter().collect();
     let blob_roots = Arc::new(path_manager.get_blob_roots());
     let num_disks = blob_roots.len();
+    let cfg = normalize_repair_cfg_for_layout(cfg, num_disks, index_roots.len());
+    info!(
+        "Repair runtime caps after layout normalization: mode={:?} meta_conc={} repair_conc={} batch={} blob_disks={} index_roots={}",
+        cfg.check_mode,
+        cfg.meta_concurrency,
+        cfg.shard_repair_concurrency,
+        cfg.meta_batch_size,
+        num_disks,
+        index_roots.len()
+    );
 
     let shard_repair_sem = Arc::new(Semaphore::new(cfg.shard_repair_concurrency));
     let mut fragments = list_all_fragments(&index_roots).await;
@@ -1610,23 +1625,48 @@ pub async fn run_repair_job_with_options(
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 
-        let repair_targets = collect_fragment_repair_targets(&fragment_hash).await?;
+        for is_trash in [false, true] {
+            let batch_size = cfg.meta_batch_size.max(1);
+            let mut pending_batch = Vec::with_capacity(batch_size);
+            let mut repair_targets =
+                index::stream_fragment_object_versions(fragment_hash.clone(), is_trash);
 
-        for batch in repair_targets.chunks(cfg.meta_batch_size.max(1)) {
-            if should_stop() {
-                break;
+            while let Some(next_target) = repair_targets.recv().await {
+                if should_stop() {
+                    break;
+                }
+                pending_batch.push(next_target?);
+                if pending_batch.len() < batch_size {
+                    continue;
+                }
+
+                apply_meta_batch(
+                    &pending_batch,
+                    is_trash,
+                    blob_roots.clone(),
+                    num_disks,
+                    cfg.clone(),
+                    shard_repair_sem.clone(),
+                    ws_manager.clone(),
+                    start_time,
+                )
+                .await?;
+                pending_batch.clear();
             }
 
-            apply_meta_batch(
-                batch,
-                blob_roots.clone(),
-                num_disks,
-                cfg.clone(),
-                shard_repair_sem.clone(),
-                ws_manager.clone(),
-                start_time,
-            )
-            .await?;
+            if !pending_batch.is_empty() && !should_stop() {
+                apply_meta_batch(
+                    &pending_batch,
+                    is_trash,
+                    blob_roots.clone(),
+                    num_disks,
+                    cfg.clone(),
+                    shard_repair_sem.clone(),
+                    ws_manager.clone(),
+                    start_time,
+                )
+                .await?;
+            }
         }
     }
 
@@ -1656,7 +1696,8 @@ pub async fn run_repair_job_with_options(
 }
 
 async fn apply_meta_batch(
-    batch: &[RepairObjectTarget],
+    batch: &[ObjectMetadata],
+    is_trash: bool,
     blob_roots: Arc<Vec<PathBuf>>,
     num_disks: usize,
     cfg: RepairRunConfig,
@@ -1669,13 +1710,21 @@ async fn apply_meta_batch(
     }
 
     let mut stream = stream::iter(batch.iter().cloned())
-        .map(|target| {
+        .map(|metadata| {
             let blob_roots = blob_roots.clone();
             let shard_repair_sem = shard_repair_sem.clone();
             let cfg = cfg.clone();
 
             async move {
-                process_one_meta_target(target, blob_roots, num_disks, cfg, shard_repair_sem).await
+                process_one_meta_target(
+                    metadata,
+                    is_trash,
+                    blob_roots,
+                    num_disks,
+                    cfg,
+                    shard_repair_sem,
+                )
+                .await
             }
         })
         .buffer_unordered(cfg.meta_concurrency);
@@ -1785,7 +1834,8 @@ async fn apply_meta_batch(
 }
 
 async fn process_one_meta_target(
-    target: RepairObjectTarget,
+    metadata: ObjectMetadata,
+    is_trash: bool,
     blob_roots: Arc<Vec<PathBuf>>,
     num_disks: usize,
     cfg: RepairRunConfig,
@@ -1799,7 +1849,7 @@ async fn process_one_meta_target(
     delta.scanned = 1;
 
     let (_canonical_data, canonical_meta, miss_rep, div_rep, report) =
-        reconcile_object_metadata_strict(&target.metadata, target.is_trash, cfg.dry_run).await?;
+        reconcile_object_metadata_strict(&metadata, is_trash, cfg.dry_run).await?;
 
     delta.missing_meta_repaired += miss_rep;
     delta.divergent_meta_repaired += div_rep;
@@ -1819,7 +1869,7 @@ async fn process_one_meta_target(
         canonical_meta.fragment.clone(),
         canonical_meta.object_key.clone(),
         canonical_meta.version_id.clone(),
-        target.is_trash,
+        is_trash,
     );
 
     let (repaired, corrupt, last_rep) = process_object_repair(
@@ -1837,4 +1887,67 @@ async fn process_one_meta_target(
     delta.last_repaired = last_rep;
 
     Ok(delta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        RepairCheckMode, RepairRunConfig, availability_part_parallelism,
+        normalize_repair_cfg_for_layout, repair_defaults_for_runtime,
+    };
+
+    #[test]
+    fn availability_defaults_stay_steadier_than_strict_and_scrub() {
+        let availability = repair_defaults_for_runtime(RepairCheckMode::Availability, true, 16, 8);
+        let strict = repair_defaults_for_runtime(RepairCheckMode::Strict, true, 16, 8);
+        let scrub = repair_defaults_for_runtime(RepairCheckMode::Scrub, true, 16, 8);
+
+        assert!(availability.0 <= strict.0);
+        assert!(availability.1 <= strict.1);
+        assert!(strict.0 <= scrub.0);
+        assert!(strict.1 <= scrub.1);
+    }
+
+    #[test]
+    fn availability_parallelism_is_capped_low() {
+        let cfg = RepairRunConfig {
+            dry_run: false,
+            check_mode: RepairCheckMode::Availability,
+            meta_concurrency: 16,
+            shard_repair_concurrency: 8,
+            meta_batch_size: 512,
+        };
+        assert_eq!(availability_part_parallelism(&cfg), 2);
+    }
+
+    #[test]
+    fn layout_normalization_respects_mode_intent() {
+        let availability = normalize_repair_cfg_for_layout(
+            RepairRunConfig {
+                dry_run: false,
+                check_mode: RepairCheckMode::Availability,
+                meta_concurrency: 32,
+                shard_repair_concurrency: 32,
+                meta_batch_size: 512,
+            },
+            2,
+            1,
+        );
+        assert!(availability.meta_concurrency <= 2);
+        assert!(availability.shard_repair_concurrency <= 2);
+
+        let scrub = normalize_repair_cfg_for_layout(
+            RepairRunConfig {
+                dry_run: false,
+                check_mode: RepairCheckMode::Scrub,
+                meta_concurrency: 32,
+                shard_repair_concurrency: 32,
+                meta_batch_size: 512,
+            },
+            4,
+            2,
+        );
+        assert!(scrub.meta_concurrency >= availability.meta_concurrency);
+        assert!(scrub.shard_repair_concurrency >= availability.shard_repair_concurrency);
+    }
 }

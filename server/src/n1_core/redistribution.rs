@@ -125,37 +125,94 @@ pub struct RedistributionRunOptions {
     pub fragment_filter: Option<String>,
 }
 
-fn default_object_concurrency(fast_mode: bool) -> usize {
+fn default_object_concurrency(
+    execution_mode: RedistributionExecutionMode,
+    fast_mode: bool,
+) -> usize {
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
     let ram_gib = detect_total_ram_gib();
-    let ram_cap = if fast_mode {
-        match ram_gib {
-            0..=2 => 2,
-            3..=4 => 4,
-            5..=8 => 8,
-            9..=16 => 12,
-            17..=32 => 16,
-            33..=64 => 24,
-            _ => 32,
+    let ram_cap = match execution_mode {
+        RedistributionExecutionMode::Availability => match ram_gib {
+            0..=2 => 1,
+            3..=4 => 2,
+            5..=8 => 3,
+            9..=16 => 4,
+            17..=32 => 6,
+            33..=64 => 8,
+            _ => 10,
+        },
+        RedistributionExecutionMode::Strict => {
+            if fast_mode {
+                match ram_gib {
+                    0..=2 => 2,
+                    3..=4 => 4,
+                    5..=8 => 8,
+                    9..=16 => 12,
+                    17..=32 => 16,
+                    33..=64 => 24,
+                    _ => 32,
+                }
+            } else {
+                match ram_gib {
+                    0..=2 => 2,
+                    3..=4 => 4,
+                    5..=8 => 6,
+                    9..=16 => 8,
+                    17..=32 => 12,
+                    33..=64 => 16,
+                    _ => 24,
+                }
+            }
         }
-    } else {
-        match ram_gib {
-            0..=2 => 2,
-            3..=4 => 4,
-            5..=8 => 6,
-            9..=16 => 8,
-            17..=32 => 12,
-            33..=64 => 16,
-            _ => 24,
+        RedistributionExecutionMode::Scrub => {
+            if fast_mode {
+                match ram_gib {
+                    0..=2 => 2,
+                    3..=4 => 4,
+                    5..=8 => 10,
+                    9..=16 => 16,
+                    17..=32 => 24,
+                    33..=64 => 32,
+                    _ => 48,
+                }
+            } else {
+                match ram_gib {
+                    0..=2 => 2,
+                    3..=4 => 4,
+                    5..=8 => 8,
+                    9..=16 => 12,
+                    17..=32 => 16,
+                    33..=64 => 24,
+                    _ => 32,
+                }
+            }
         }
     };
 
-    let cpu_default = if fast_mode {
-        (cpus.saturating_mul(2)).clamp(4, 64)
-    } else {
-        cpus.clamp(2, 16)
+    let cpu_default = match execution_mode {
+        RedistributionExecutionMode::Availability => {
+            if fast_mode {
+                (cpus / 2).clamp(1, 4)
+            } else {
+                (cpus / 3).clamp(1, 3)
+            }
+        }
+        RedistributionExecutionMode::Strict => {
+            if fast_mode {
+                (cpus.saturating_mul(2)).clamp(4, 48)
+            } else {
+                cpus.clamp(2, 16)
+            }
+        }
+        RedistributionExecutionMode::Scrub => {
+            if fast_mode {
+                (cpus.saturating_mul(3)).clamp(6, 64)
+            } else {
+                (cpus.saturating_mul(2)).clamp(4, 32)
+            }
+        }
     };
 
     cpu_default.min(ram_cap).max(2)
@@ -193,21 +250,51 @@ fn redistribution_limits_for_ram_gib(ram_gib: usize) -> (usize, u64) {
     }
 }
 
-fn default_status_batch(fast_mode: bool) -> u64 {
+fn default_status_batch(
+    execution_mode: RedistributionExecutionMode,
+    fast_mode: bool,
+) -> u64 {
     let ram_gib = detect_total_ram_gib();
-    if fast_mode {
-        match ram_gib {
-            0..=4 => 32,
-            5..=8 => 64,
-            9..=32 => 128,
-            _ => 256,
+    match execution_mode {
+        RedistributionExecutionMode::Availability => match ram_gib {
+            0..=4 => 8,
+            5..=8 => 16,
+            9..=32 => 32,
+            _ => 64,
+        },
+        RedistributionExecutionMode::Strict => {
+            if fast_mode {
+                match ram_gib {
+                    0..=4 => 32,
+                    5..=8 => 64,
+                    9..=32 => 128,
+                    _ => 256,
+                }
+            } else {
+                match ram_gib {
+                    0..=4 => 16,
+                    5..=8 => 32,
+                    9..=32 => 64,
+                    _ => 128,
+                }
+            }
         }
-    } else {
-        match ram_gib {
-            0..=4 => 16,
-            5..=8 => 32,
-            9..=32 => 64,
-            _ => 128,
+        RedistributionExecutionMode::Scrub => {
+            if fast_mode {
+                match ram_gib {
+                    0..=4 => 64,
+                    5..=8 => 128,
+                    9..=32 => 256,
+                    _ => 512,
+                }
+            } else {
+                match ram_gib {
+                    0..=4 => 32,
+                    5..=8 => 64,
+                    9..=32 => 128,
+                    _ => 256,
+                }
+            }
         }
     }
 }
@@ -218,8 +305,11 @@ impl Default for RedistributionRunOptions {
             fast_mode: false,
             execution_mode: RedistributionExecutionMode::Availability,
             durability_mode: RedistributionDurabilityMode::Auto,
-            object_concurrency: default_object_concurrency(false),
-            status_batch: default_status_batch(false),
+            object_concurrency: default_object_concurrency(
+                RedistributionExecutionMode::Availability,
+                false,
+            ),
+            status_batch: default_status_batch(RedistributionExecutionMode::Availability, false),
             fragment_filter: None,
         }
     }
@@ -243,6 +333,25 @@ impl RedistributionRunOptions {
             "batched"
         }
     }
+}
+
+fn normalize_redistribution_opts_for_layout(
+    mut opts: RedistributionRunOptions,
+    live_blob_disks: usize,
+    live_index_roots: usize,
+) -> RedistributionRunOptions {
+    let blob_width = live_blob_disks.max(1);
+    let index_width = live_index_roots.max(1);
+    let io_width = blob_width.min(index_width.saturating_mul(2)).max(1);
+
+    let object_cap = match opts.execution_mode {
+        RedistributionExecutionMode::Availability => io_width.clamp(1, 4),
+        RedistributionExecutionMode::Strict => io_width.saturating_mul(2).clamp(2, 16),
+        RedistributionExecutionMode::Scrub => io_width.saturating_mul(4).clamp(4, 32),
+    };
+
+    opts.object_concurrency = opts.object_concurrency.min(object_cap).max(1);
+    opts
 }
 
 #[inline]
@@ -412,17 +521,17 @@ pub async fn trigger_redistribution_job_api(
     }
     let object_concurrency = clamp_usize(
         params
-            .get("object_concurrency")
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or_else(|| default_object_concurrency(fast_mode)),
+                .get("object_concurrency")
+                .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| default_object_concurrency(execution_mode, fast_mode)),
         1,
         max_object_concurrency,
     );
     let status_batch = clamp_u64(
         params
-            .get("status_batch")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or_else(|| default_status_batch(fast_mode)),
+                .get("status_batch")
+                .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(|| default_status_batch(execution_mode, fast_mode)),
         1,
         max_status_batch,
     );
@@ -760,7 +869,11 @@ pub async fn run_redistribution_job_with_options(
     let _write_gate = acquire_maintenance_mode(opts.execution_mode.maintenance_access_mode());
     let strict_durability = opts.strict_durability();
     let effective_durability = opts.effective_durability_mode();
-    let scope_label = opts.fragment_filter.as_deref().unwrap_or("all-fragments");
+    let scope_label = opts
+        .fragment_filter
+        .as_deref()
+        .unwrap_or("all-fragments")
+        .to_string();
 
     {
         let mut st = REDIST_STATUS.write().await;
@@ -822,6 +935,11 @@ pub async fn run_redistribution_job_with_options(
             "No reachable index roots".into(),
         ));
     }
+    let opts = normalize_redistribution_opts_for_layout(
+        opts,
+        layout.live_blob.len(),
+        layout.live_index.len(),
+    );
 
     info!(
         "Starting Redistribution Job (scope={}, Active & Trash). mode={} target={}D+{}P stripe={} bytes blob_cfg={} index_cfg={} dry_run={} fast_mode={} durability={}=>{} object_concurrency={} status_batch={}",
@@ -838,6 +956,13 @@ pub async fn run_redistribution_job_with_options(
         effective_durability,
         opts.object_concurrency,
         opts.status_batch
+    );
+    info!(
+        "Redistribution runtime caps after layout normalization: mode={} object_concurrency={} live_blob_disks={} live_index_roots={}",
+        opts.execution_mode.as_str(),
+        opts.object_concurrency,
+        layout.live_blob.len(),
+        layout.live_index.len()
     );
 
     let mut fragments = list_all_fragments(layout.live_index.as_ref()).await;
@@ -901,21 +1026,25 @@ pub async fn run_redistribution_job_with_options(
             };
             let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
 
-            let metas = match index::list_fragment_object_versions(&fragment_hash, is_trash).await {
-                Ok(metas) => metas,
-                Err(e) => {
-                    warn!(
-                        "Redistribution metadata scan failed for fragment {} trash={}: {}",
-                        fragment_hash, is_trash, e
-                    );
-                    continue;
-                }
-            };
+            let mut metas =
+                index::stream_fragment_object_versions(fragment_hash.clone(), is_trash);
 
-            for meta in metas {
+            while let Some(next_meta) = metas.recv().await {
                 if should_stop() {
                     break;
                 }
+                let meta = match next_meta {
+                    Ok(meta) => meta,
+                    Err(e) => {
+                        warn!(
+                            "Redistribution metadata scan failed for fragment {} trash={}: {}",
+                            fragment_hash, is_trash, e
+                        );
+                        delta.errors += 1;
+                        delta.last_error = Some(e.to_string());
+                        break;
+                    }
+                };
 
                 if meta.is_delete_marker {
                     continue;
@@ -1634,6 +1763,7 @@ async fn redistribute_object_streaming(
 mod tests {
     use super::{
         RedistributionDurabilityMode, RedistributionExecutionMode, RedistributionRunOptions,
+        default_object_concurrency, default_status_batch, normalize_redistribution_opts_for_layout,
         parse_durability_mode_param, parse_execution_mode_param,
     };
     use std::collections::HashMap;
@@ -1743,5 +1873,53 @@ mod tests {
             parse_execution_mode_param(&params),
             RedistributionExecutionMode::Scrub
         );
+    }
+
+    #[test]
+    fn execution_modes_scale_default_concurrency() {
+        let availability =
+            default_object_concurrency(RedistributionExecutionMode::Availability, true);
+        let strict = default_object_concurrency(RedistributionExecutionMode::Strict, true);
+        let scrub = default_object_concurrency(RedistributionExecutionMode::Scrub, true);
+
+        assert!(availability <= strict);
+        assert!(strict <= scrub);
+    }
+
+    #[test]
+    fn execution_modes_scale_status_batch() {
+        let availability = default_status_batch(RedistributionExecutionMode::Availability, true);
+        let strict = default_status_batch(RedistributionExecutionMode::Strict, true);
+        let scrub = default_status_batch(RedistributionExecutionMode::Scrub, true);
+
+        assert!(availability <= strict);
+        assert!(strict <= scrub);
+    }
+
+    #[test]
+    fn layout_normalization_keeps_availability_steady() {
+        let availability = normalize_redistribution_opts_for_layout(
+            RedistributionRunOptions {
+                fast_mode: true,
+                execution_mode: RedistributionExecutionMode::Availability,
+                object_concurrency: 32,
+                ..Default::default()
+            },
+            2,
+            1,
+        );
+        assert!(availability.object_concurrency <= 2);
+
+        let scrub = normalize_redistribution_opts_for_layout(
+            RedistributionRunOptions {
+                fast_mode: true,
+                execution_mode: RedistributionExecutionMode::Scrub,
+                object_concurrency: 32,
+                ..Default::default()
+            },
+            4,
+            2,
+        );
+        assert!(scrub.object_concurrency >= availability.object_concurrency);
     }
 }

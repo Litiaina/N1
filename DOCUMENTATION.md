@@ -419,6 +419,8 @@ curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
 
 ### 7.6 `DELETE /v4/fragment/version/delete/{fragment}/{version_id}/{*object_key}`
 Delete specific version.
+- If the version is live, it is soft-deleted into trash.
+- If the same version is already in trash, the delete permanently removes only that trashed version and leaves newer live versions untouched.
 ```bash
 curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/version/delete/<fragment_hash>/<version_id>/videos/a.mp4"
@@ -591,6 +593,11 @@ Start query params:
 Notes:
 - Repair reconciles partition replicas and blob availability from `index`.
 - Full mirrored equality across every index root is no longer the invariant; owner/replica survivability for each partition is.
+- `mode=availability` keeps CRUD online and intentionally caps repair pressure lower so the node stays latency-friendly.
+- `mode=strict` makes the node read-only and raises repair aggressiveness to use more of the available I/O width.
+- `mode=scrub` quiesces reads and writes and runs the same integrity-first repair engine at the highest practical aggressiveness.
+- Runtime concurrency is normalized against live blob disks and live index roots, so auto-tuning follows actual reachable hardware instead of static CPU counts alone.
+- Fragment object-version scans are streamed incrementally from partition roots, so repair no longer materializes a whole fragment-wide metadata vector before work begins.
 
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
@@ -626,6 +633,10 @@ curl -k -X GET -H "Authorization: Bearer $TOKEN" \
 
 Scrub runs the repair engine in checksum-verification mode against committed raw shards.
 
+Notes:
+- Scrub is the quiesced/offline execution mode of the repair engine.
+- It blocks reads and mutations so integrity verification and repair can consume more of the available I/O path without serving traffic.
+
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/maintenance/scrub/start"
@@ -644,6 +655,7 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
 
 Start query params:
 - `dry_run=true|false`
+- `mode=availability|strict|scrub`
 - `fast_mode=true|false` (enables read-only fast maintenance mode)
 - `read_only_fast=true|false` (alias of `fast_mode`)
 - `durability=auto|strict|batched` (aliases: `sync|durable|async|fast|relaxed`)
@@ -654,6 +666,11 @@ Start query params:
 
 Notes:
 - Redistribution rewrites payload placement first, then republishes updated shard addresses through authoritative `index` metadata.
+- `mode=availability` keeps CRUD online and intentionally throttles object concurrency lower so redistribution does not consume the full device bandwidth.
+- `mode=strict` makes the node read-only and drives redistribution harder across the live blob/index layout.
+- `mode=scrub` quiesces reads and writes and uses the widest redistribution concurrency that the live layout and RAM caps allow.
+- Execution `mode` controls service access and scheduler aggressiveness; `durability` still separately controls strict-vs-batched write sync behavior.
+- Fragment object-version scans are streamed incrementally from partition roots, so redistribution can start moving data without first loading an entire fragment into memory.
 
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \

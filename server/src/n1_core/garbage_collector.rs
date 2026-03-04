@@ -434,16 +434,18 @@ async fn process_fragment_gc(
     let mut trash_versions = HashSet::new();
     let mut expired_trash_refund = 0u64;
     let mut expired_versions = HashSet::new();
+    let mut expired_delete_targets: Vec<(String, String)> = Vec::new();
     let mut expired_raw_metas: Vec<ObjectMetadata> = Vec::new();
     let mut eligible_raw_gc_markers: HashMap<
         String,
         (crate::n1_core::disk_manager::RawBlobAddress, Vec<PathBuf>),
     > = HashMap::new();
 
-    for meta in index::list_fragment_object_versions(fragment, false)
-        .await
-        .unwrap_or_default()
-    {
+    let mut live_stream = index::stream_fragment_object_versions(fragment.to_string(), false);
+    while let Some(next_meta) = live_stream.recv().await {
+        let Ok(meta) = next_meta else {
+            continue;
+        };
         if !meta.is_delete_marker {
             live_versions.insert(meta.version_id);
         }
@@ -495,10 +497,11 @@ async fn process_fragment_gc(
         }
     }
 
-    for meta in index::list_fragment_object_versions(fragment, true)
-        .await
-        .unwrap_or_default()
-    {
+    let mut trash_stream = index::stream_fragment_object_versions(fragment.to_string(), true);
+    while let Some(next_meta) = trash_stream.recv().await {
+        let Ok(meta) = next_meta else {
+            continue;
+        };
         let Some(modified) = latest_existing_mtime(
             &index::get_object_version_paths(fragment, &meta.object_key, &meta.version_id, true)
                 .unwrap_or_default(),
@@ -513,6 +516,7 @@ async fn process_fragment_gc(
         if should_expire {
             if expired_versions.insert(meta.version_id.clone()) {
                 expired_trash_refund += meta.total_size_bytes;
+                expired_delete_targets.push((meta.object_key.clone(), meta.version_id.clone()));
                 if meta.parts.iter().any(|part| {
                     part.shards
                         .iter()
@@ -551,15 +555,9 @@ async fn process_fragment_gc(
     }
 
     if !expired_versions.is_empty() {
-        for meta in index::list_fragment_object_versions(fragment, true)
-            .await
-            .unwrap_or_default()
-        {
-            if !expired_versions.contains(&meta.version_id) {
-                continue;
-            }
+        for (object_key, version_id) in &expired_delete_targets {
             let _ =
-                index::delete_trashed_object_version(fragment, &meta.object_key, &meta.version_id)
+                index::delete_trashed_object_version(fragment, object_key, version_id)
                     .await;
         }
 

@@ -303,7 +303,9 @@ async fn scan_latest_by_key(
     let mut latest: HashMap<String, PrefixIndexEntry> = HashMap::new();
     let mut latest_tombstone: HashMap<String, (String, i64)> = HashMap::new();
 
-    for meta in index::list_fragment_object_versions(fragment, false).await? {
+    let mut stream = index::stream_fragment_object_versions(fragment.to_string(), false);
+    while let Some(next_meta) = stream.recv().await {
+        let meta = next_meta?;
         let entry = PrefixIndexEntry::from_metadata(&meta);
         let key = canonical_key(&entry.object_key);
         let ts = entry.created_at;

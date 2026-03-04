@@ -30,6 +30,18 @@ fn get_trash_root(disk_root: &std::path::Path, fragment_hash: &str) -> std::path
     disk_root.join(fragment_hash).join(".trash")
 }
 
+async fn collect_fragment_versions_streamed(
+    fragment: &str,
+    trashed: bool,
+) -> Result<Vec<ObjectMetadata>, AppError> {
+    let mut versions = Vec::new();
+    let mut stream = index::stream_fragment_object_versions(fragment.to_string(), trashed);
+    while let Some(next_meta) = stream.recv().await {
+        versions.push(next_meta?);
+    }
+    Ok(versions)
+}
+
 #[cfg(unix)]
 #[allow(dead_code)]
 pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
@@ -214,6 +226,43 @@ async fn purge_delete_markers_for_key(
     }
 }
 
+async fn permanently_delete_trashed_version_only(
+    fragment: &str,
+    object_key: &str,
+    meta: &ObjectMetadata,
+    blob_roots: &[std::path::PathBuf],
+) -> Result<u64, AppError> {
+    let path_manager = ObjectPathManager::new();
+
+    if metadata_contains_raw_shards(meta) {
+        if let Err(e) = free_raw_shards_for_metadata(meta).await {
+            warn!(
+                "Failed to free raw shards for trashed version {}/{}/{}: {}",
+                fragment, object_key, meta.version_id, e
+            );
+        }
+    } else {
+        for disk in blob_roots {
+            let trash_shard = get_trash_root(disk, fragment).join("blob").join(&meta.version_id);
+            let _ = fs::remove_dir_all(&trash_shard).await;
+
+            // Best-effort cleanup for stale live shard directories with the same
+            // version id. This should not affect newer live versions because
+            // version ids are immutable and unique per upload.
+            let live_shard = path_manager.get_shard_dir_on_disk(disk, fragment, &meta.version_id);
+            let _ = fs::remove_dir_all(&live_shard).await;
+        }
+    }
+
+    let removed =
+        index::delete_trashed_object_version(fragment, object_key, &meta.version_id).await?;
+    if !removed {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(meta.total_size_bytes)
+}
+
 pub async fn delete_object_version(
     State(state): State<Arc<AppState>>,
     claims: Claims,
@@ -228,9 +277,46 @@ pub async fn delete_object_version(
 
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
-    let template_meta = index::move_object_version_to_trash(&fragment, &object_key, &version_id)
+    let template_meta = match index::move_object_version_to_trash(&fragment, &object_key, &version_id)
         .await?
-        .ok_or(AppError::NotFound)?;
+    {
+        Some(meta) => meta,
+        None => {
+            let trashed_meta =
+                index::read_trashed_object_version(&fragment, &object_key, &version_id).await?;
+            let refunded = permanently_delete_trashed_version_only(
+                &fragment,
+                &object_key,
+                &trashed_meta,
+                &blob_roots,
+            )
+            .await?;
+            if refunded > 0 {
+                if let Err(e) = update_quota(&fragment, -(refunded as i64)).await {
+                    error!(
+                        "Failed to refund quota after permanent version delete {}/{}/{}: {}",
+                        fragment, object_key, version_id, e
+                    );
+                }
+            }
+
+            info!(
+                "Permanently deleted trashed version: {}/{} (v: {})",
+                fragment, object_key, version_id
+            );
+
+            state.emit(
+                &fragment,
+                StorageEventPayload::FileDeleted {
+                    fragment: fragment.clone(),
+                    object_key,
+                    version_id: Some(version_id),
+                },
+            );
+
+            return Ok(StatusCode::OK);
+        }
+    };
 
     let raw_blob_version = metadata_contains_raw_shards(&template_meta);
 
@@ -372,7 +458,7 @@ pub async fn empty_trash(
 
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
-    let trash_versions = index::list_fragment_object_versions(&fragment, true).await?;
+    let trash_versions = collect_fragment_versions_streamed(&fragment, true).await?;
     let total_refund_size: u64 = trash_versions
         .iter()
         .map(|meta| meta.total_size_bytes)
@@ -652,7 +738,7 @@ pub async fn recover_all_trash(
 
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
-    let recovered_versions = index::list_fragment_object_versions(&fragment, true).await?;
+    let recovered_versions = collect_fragment_versions_streamed(&fragment, true).await?;
     let mut sorted_versions = recovered_versions;
     sorted_versions.sort_by(|left, right| {
         left.object_key.cmp(&right.object_key).then_with(|| {

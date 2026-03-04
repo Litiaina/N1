@@ -37,7 +37,7 @@
   - [Visibility and list behavior](#visibility-and-list-behavior)
 - [Maintenance jobs](#maintenance-jobs)
   - [Repair (authoritative metadata + blob)](#repair-authoritative-metadata--blob)
-  - [Recovery runtime (background heal)](#recovery-runtime-background-heal)
+  - [Recovery runtime (read and heal)](#recovery-runtime-read-and-heal)
   - [Redistribution](#redistribution)
   - [Garbage collection and trash](#garbage-collection-and-trash)
   - [Raw blob operations](#raw-blob-operations)
@@ -445,12 +445,19 @@ Repair now reconciles from `index`:
 - reconstruct missing or corrupt payloads
 - republish repaired metadata through authoritative state
 
-### Recovery runtime (background heal)
+Execution modes:
+
+- `availability`: keep CRUD online and hold repair concurrency to a steadier, bandwidth-friendlier level
+- `strict`: keep reads online, block mutations, and run repair harder
+- `scrub`: quiesce reads and writes and use the widest safe repair concurrency
+- fragment scans are streamed incrementally from partition roots instead of being materialized fragment-wide first
+
+### Recovery runtime (read and heal)
 
 Reads can degrade gracefully. When a shard is missing or corrupt:
 
 - serve bytes by reconstructing them
-- schedule background shard repair
+- repair the missing shard immediately when this read owns the repair token
 - commit repaired payload to a new raw extent
 - preserve authoritative metadata through `index`
 
@@ -462,6 +469,13 @@ Redistribution moves payloads to new blob placement without interrupting CRUD:
 - write to new raw extents
 - republish shard addresses through `index`
 - leave old extents for later GC
+
+Execution modes:
+
+- `availability`: keep CRUD online and intentionally cap redistribution pressure lower
+- `strict`: make the node read-only and redistribute faster across the live layout
+- `scrub`: quiesce reads and writes and use the widest safe redistribution concurrency
+- fragment scans are streamed incrementally from partition roots so large fragments do not require full metadata vectors up front
 
 ### Garbage collection and trash
 
