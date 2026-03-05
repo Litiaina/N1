@@ -26,7 +26,7 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 use ulid::Ulid;
 
 #[cfg(unix)]
@@ -50,13 +50,6 @@ const MAX_RAW_RELOCATIONS: usize = 8192;
 pub enum RepairLogMode {
     Verbose,
     Summary,
-}
-
-#[inline]
-fn log_repair_verbose_warn(log_mode: RepairLogMode, message: impl FnOnce() -> String) {
-    if matches!(log_mode, RepairLogMode::Verbose) {
-        warn!("{}", message());
-    }
 }
 
 #[inline]
@@ -111,6 +104,10 @@ pub enum CachedShardHandle {
     File(File),
     Raw {
         ring: Arc<RawReadRing>,
+        raw_blob_address: RawBlobAddress,
+        verified: bool,
+    },
+    RawUnavailable {
         raw_blob_address: RawBlobAddress,
         verified: bool,
     },
@@ -613,45 +610,136 @@ fn cached_raw_handle(
     Some((Arc::clone(ring), *verified))
 }
 
+fn is_cached_raw_unavailable(
+    file_cache: &ShardFileCache,
+    shard_info: &ShardInfo,
+    validation_mode: RawReadValidationMode,
+) -> bool {
+    let Some(expected_raw) = shard_info.raw_blob_address.as_ref() else {
+        return false;
+    };
+    let Some(CachedShardHandle::RawUnavailable {
+        raw_blob_address,
+        verified,
+    }) = file_cache.get(&shard_info.file_name)
+    else {
+        return false;
+    };
+    if raw_blob_address != expected_raw {
+        return false;
+    }
+    if validation_mode == RawReadValidationMode::Verified && !*verified {
+        return false;
+    }
+    true
+}
+
+fn cache_unavailable_raw_shard(
+    file_cache: &mut ShardFileCache,
+    shard_info: &ShardInfo,
+    verified: bool,
+) {
+    let Some(raw_blob_address) = shard_info.raw_blob_address.as_ref() else {
+        return;
+    };
+    file_cache.insert(
+        shard_info.file_name.clone(),
+        CachedShardHandle::RawUnavailable {
+            raw_blob_address: raw_blob_address.clone(),
+            verified,
+        },
+    );
+}
+
 async fn get_or_open_raw_shard(
     file_cache: &mut ShardFileCache,
     shard_info: &ShardInfo,
     validation_mode: RawReadValidationMode,
 ) -> Option<Arc<RawReadRing>> {
+    let raw_blob_address = shard_info.raw_blob_address.clone()?;
+    if is_cached_raw_unavailable(file_cache, shard_info, validation_mode) {
+        return None;
+    }
+
     if let Some((ring, verified)) = cached_raw_handle(file_cache, shard_info) {
         if validation_mode == RawReadValidationMode::Verified && !verified {
-            if !verify_shard_checksum(shard_info).await.ok()? {
-                return None;
+            match verify_shard_checksum(shard_info).await {
+                Ok(true) => {
+                    file_cache.insert(
+                        shard_info.file_name.clone(),
+                        CachedShardHandle::Raw {
+                            ring: Arc::clone(&ring),
+                            raw_blob_address: raw_blob_address.clone(),
+                            verified: true,
+                        },
+                    );
+                }
+                Ok(false) | Err(_) => {
+                    cache_unavailable_raw_shard(file_cache, shard_info, true);
+                    return None;
+                }
             }
-            file_cache.insert(
-                shard_info.file_name.clone(),
-                CachedShardHandle::Raw {
-                    ring: Arc::clone(&ring),
-                    raw_blob_address: shard_info.raw_blob_address.clone()?,
-                    verified: true,
-                },
-            );
         }
         return Some(ring);
     }
 
-    if validation_mode == RawReadValidationMode::Verified
-        && !verify_shard_checksum(shard_info).await.ok()?
-    {
-        return None;
+    if validation_mode == RawReadValidationMode::Verified {
+        match verify_shard_checksum(shard_info).await {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                cache_unavailable_raw_shard(file_cache, shard_info, true);
+                return None;
+            }
+        }
     }
 
-    let io = open_raw_direct_io(shard_info).ok()?;
+    let io = match open_raw_direct_io(shard_info) {
+        Ok(io) => io,
+        Err(_) => {
+            cache_unavailable_raw_shard(
+                file_cache,
+                shard_info,
+                validation_mode == RawReadValidationMode::Verified,
+            );
+            return None;
+        }
+    };
     let ring = Arc::new(RawReadRing::new(io, 4));
     file_cache.insert(
         shard_info.file_name.clone(),
         CachedShardHandle::Raw {
             ring: Arc::clone(&ring),
-            raw_blob_address: shard_info.raw_blob_address.clone()?,
+            raw_blob_address,
             verified: validation_mode == RawReadValidationMode::Verified,
         },
     );
     Some(ring)
+}
+
+fn spawn_read_triggered_repair(
+    repair_key: String,
+    part: Arc<PartMetadata>,
+    target_shard_idx: usize,
+    block_size: usize,
+    repair_context: Option<ShardRepairContext>,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = repair_entire_shard(
+            part,
+            target_shard_idx,
+            block_size,
+            repair_context,
+            RepairLogMode::Summary,
+        )
+        .await
+        {
+            warn!(
+                "Read-triggered background repair failed for shard {}: {}",
+                target_shard_idx, e
+            );
+        }
+        unregister_inflight_repair(&repair_key);
+    });
 }
 
 async fn submit_raw_read_via_ring(
@@ -767,7 +855,7 @@ async fn read_shard_chunk_cached_into(
             Ok(()) => Some(()),
             Err((err, returned)) => {
                 *out = returned;
-                warn!(
+                debug!(
                     "Raw shard read failed file={} path={} offset={} len={} err={}",
                     effective_shard.file_name, effective_shard.absolute_path, offset, len, err
                 );
@@ -855,13 +943,20 @@ pub async fn read_or_recover_chunk_into(
     }
 
     if parity_count == 0 {
+        error!(
+            "Unrecoverable read failure for shard={} part={} (no parity shards configured)",
+            target_shard.file_name, part.part_index
+        );
         return Err(AppError::InternalServerError(format!(
             "Read failed for validated shard {} and no parity shards are available",
             target_shard.file_name
         )));
     }
 
-    warn!("Read failed for validated shard, attempting recovery.");
+    debug!(
+        "Validated shard read failed for shard={} part={}, attempting recovery",
+        target_shard.file_name, part.part_index
+    );
 
     let mut decoder = ReedSolomonDecoder::new(data_count, parity_count, recovery_len)
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
@@ -962,7 +1057,7 @@ pub async fn read_or_recover_chunk_into(
                 buffer_pool.recycle_peer_buffer(buffer);
             }
             Err((err, buffer)) => {
-                warn!(
+                debug!(
                     "Raw shard read failed file={} path={} offset={} len={} err={}",
                     task.file_name, task.absolute_path, offset, recovery_len, err
                 );
@@ -982,6 +1077,10 @@ pub async fn read_or_recover_chunk_into(
     }
 
     if shards_added < data_count {
+        error!(
+            "Unrecoverable read failure for shard={} part={} (insufficient shards: have={}, need={})",
+            target_shard.file_name, part.part_index, shards_added, data_count
+        );
         return Err(AppError::InternalServerError(format!(
             "Insufficient shards to recover data. Need {}, found {}.",
             data_count, shards_added
@@ -1002,23 +1101,17 @@ pub async fn read_or_recover_chunk_into(
     out.clear();
     out.extend_from_slice(&restored[..len]);
 
-    let part_clone = Arc::clone(&part);
     let target_idx = target_shard.shard_index;
     let repair_key = repair_job_key(&part, target_shard, repair_context.as_ref());
 
     if register_inflight_repair(&repair_key) {
-        if let Err(e) = repair_entire_shard(
-            part_clone,
+        spawn_read_triggered_repair(
+            repair_key,
+            Arc::clone(&part),
             target_idx,
             block_size,
             repair_context.clone(),
-            RepairLogMode::Verbose,
-        )
-        .await
-        {
-            warn!("Read-triggered repair failed for shard {}: {}", target_idx, e);
-        }
-        unregister_inflight_repair(&repair_key);
+        );
     }
 
     Ok(())
@@ -1110,7 +1203,7 @@ pub async fn repair_entire_shard(
                             ),
                         )
                     })?;
-                log_repair_verbose_warn(log_mode, || {
+                log_repair_verbose_info(log_mode, || {
                     format!(
                         "Relocating raw shard {} after stale or missing raw device mapping: {}",
                         target_shard.file_name, err
@@ -1199,8 +1292,8 @@ pub async fn repair_entire_shard(
         if let RepairTarget::TempFile { temp_path, .. } = &repair_target {
             let _ = fs::remove_file(temp_path).await;
         }
-            return Err(AppError::InternalServerError("No data shards".into()));
-        }
+        return Err(AppError::InternalServerError("No data shards".into()));
+    }
 
     let mut peer_cache: ShardFileCache = HashMap::new();
     let mut file_peers = Vec::new();

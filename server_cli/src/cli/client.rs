@@ -746,19 +746,17 @@ fn print_upload_status_pretty(st: &UploadStatusResponse) {
     draw_top("UPLOAD STATUS", 0);
     draw_row(
         "Object",
-        st.object_key
-            .as_deref()
-            .unwrap_or("<unknown object>"),
+        st.object_key.as_deref().unwrap_or("<unknown object>"),
     );
     draw_row(
         "Session",
-        st.session_id
-            .as_deref()
-            .unwrap_or("<unknown session>"),
+        st.session_id.as_deref().unwrap_or("<unknown session>"),
     );
     draw_row(
         "Started At",
-        &st.created_at.map(fmt_unix_ts).unwrap_or_else(|| "n/a".to_string()),
+        &st.created_at
+            .map(fmt_unix_ts)
+            .unwrap_or_else(|| "n/a".to_string()),
     );
     draw_divider(Some("PROGRESS"));
     draw_row("Committed Parts", &fmt_num(st.committed_parts));
@@ -796,10 +794,7 @@ fn print_upload_list_pretty(st: &ListUploadsResponse) {
         draw_row("Sessions", "<none>");
     } else {
         for (idx, session) in st.sessions.iter().enumerate() {
-            let object_key = session
-                .object_key
-                .as_deref()
-                .unwrap_or("<unknown object>");
+            let object_key = session.object_key.as_deref().unwrap_or("<unknown object>");
             draw_row(
                 &format!("Upload {}", idx + 1),
                 &truncate(object_key, UI_WIDTH - 26),
@@ -1090,10 +1085,7 @@ fn render_health_monitor(st: &HealthResponse, elapsed: Duration, deep_scan: bool
             fmt_num(st.uploads.active_fragments)
         ),
     );
-    draw_row(
-        "Reserved",
-        &fmt_bytes(st.uploads.reserved_bytes),
-    );
+    draw_row("Reserved", &fmt_bytes(st.uploads.reserved_bytes));
     draw_row(
         "Committed",
         &format!(
@@ -1812,7 +1804,10 @@ pub async fn execute_command(
                 Commands::Uploads { cmd } => match cmd {
                     UploadCommands::List { limit, offset } => {
                         let resp = client
-                            .get(format!("{}/v4/upload/status/list/{}", base_url, fragment_context))
+                            .get(format!(
+                                "{}/v4/upload/status/list/{}",
+                                base_url, fragment_context
+                            ))
                             .query(&[("limit", limit), ("offset", offset)])
                             .bearer_auth(&token)
                             .send()

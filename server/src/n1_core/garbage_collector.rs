@@ -1,7 +1,10 @@
 use crate::enums::app_error_enum::AppError;
 use crate::fs::cleanup_manager::start_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
-use crate::n1_core::blob_store::{RawGcMarker, free_raw_address, free_raw_shards_for_metadata};
+use crate::n1_core::blob_store::{
+    RawGcMarker, free_raw_address, free_raw_shards_for_metadatas,
+    is_missing_raw_device_mapping_error,
+};
 use crate::n1_core::constants::GC_SUFFIX;
 use crate::n1_core::disk_manager::{ObjectMetadata, ObjectPathManager, configured_fs_storage_root};
 use crate::n1_core::index;
@@ -534,9 +537,12 @@ async fn process_fragment_gc(
     stats.refund_bytes += expired_trash_refund;
     stats.trash_versions_expired += expired_versions.len() as u64;
 
-    for meta in &expired_raw_metas {
-        let _ = free_raw_shards_for_metadata(meta).await;
+    if !expired_raw_metas.is_empty() {
+        let _ = free_raw_shards_for_metadatas(&expired_raw_metas).await;
     }
+
+    let mut missing_device_extent_counts: HashMap<String, u64> = HashMap::new();
+    let mut missing_device_marker_files: u64 = 0;
 
     for (_, (raw, marker_paths)) in eligible_raw_gc_markers {
         match free_raw_address(&raw).await {
@@ -546,6 +552,14 @@ async fn process_fragment_gc(
                 }
             }
             Err(e) => {
+                if is_missing_raw_device_mapping_error(&e) {
+                    *missing_device_extent_counts
+                        .entry(raw.device_id.clone())
+                        .or_insert(0) += 1;
+                    missing_device_marker_files += marker_paths.len() as u64;
+                    continue;
+                }
+
                 warn!(
                     "GC: Failed to free redistributed raw extent {}:{}:{}:{}: {}",
                     raw.device_id, raw.allocation_id, raw.offset_bytes, raw.size_bytes, e
@@ -554,11 +568,34 @@ async fn process_fragment_gc(
         }
     }
 
+    if !missing_device_extent_counts.is_empty() {
+        let mut by_device: Vec<(String, u64)> = missing_device_extent_counts.into_iter().collect();
+        by_device.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let total_extents: u64 = by_device.iter().map(|(_, count)| *count).sum();
+        let sample = by_device
+            .iter()
+            .take(4)
+            .map(|(device_id, count)| format!("{}={}", device_id, count))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let remaining = by_device.len().saturating_sub(4);
+
+        if remaining > 0 {
+            info!(
+                "GC: Deferred {} redistributed raw extent(s) across {} marker file(s) because device id(s) are not currently configured [{} +{} more]. Markers retained for later cleanup.",
+                total_extents, missing_device_marker_files, sample, remaining
+            );
+        } else {
+            info!(
+                "GC: Deferred {} redistributed raw extent(s) across {} marker file(s) because device id(s) are not currently configured [{}]. Markers retained for later cleanup.",
+                total_extents, missing_device_marker_files, sample
+            );
+        }
+    }
+
     if !expired_versions.is_empty() {
         for (object_key, version_id) in &expired_delete_targets {
-            let _ =
-                index::delete_trashed_object_version(fragment, object_key, version_id)
-                    .await;
+            let _ = index::delete_trashed_object_version(fragment, object_key, version_id).await;
         }
 
         let tasks = index_roots.iter().chain(blob_roots.iter()).map(|root| {

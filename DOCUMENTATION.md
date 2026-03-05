@@ -264,6 +264,8 @@ curl -k -H "Authorization: Bearer $TOKEN" \
 Trash listing, same pagination style.
 - Supports the same `include_internal` query behavior as object listing.
 - Trash visibility comes from `index` trash state.
+- Both non-delimiter and `delimiter=/` trash listing now use a partition-paged index merge path with streaming row projection (instead of full fragment aggregate+sort each request), improving large-fragment pagination latency and memory profile.
+- `continuation_token` is opaque. For delimiter trash listing it represents a row cursor, not a `(object_key, version_id)` tuple, so clients must pass it through unchanged.
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/trash/<fragment_hash>?limit=100"
@@ -391,6 +393,10 @@ curl -k -X PATCH -H "Authorization: Bearer $TOKEN" \
 curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/trash/empty/<fragment_hash>"
 ```
+Notes:
+- Raw-extent cleanup is best-effort for decommissioned blob device ids; stale mappings no longer fail the API path.
+- Empty-trash now streams trash metadata instead of materializing all versions first, reducing peak RAM and startup latency on large fragments.
+- Raw extent frees are batched per blob device (single allocator lock and single metadata sync per batch) instead of one fsync per extent.
 
 ### 7.4 `PATCH /v4/fragment/object/rename`
 Body (`RenameObjectRequest`):
@@ -450,6 +456,9 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/recover/trash/all/<fragment_hash>"
 ```
+Notes:
+- Recovery is now parallelized per object key (versions within one key still restore in recency order), which improves large fragment recover-all throughput.
+- Recover-all and empty-trash free raw extents through allocator batch commits; this reduces cleanup latency for large trash sets.
 
 ## 8. Protected v4 Upload APIs (Resumable Object Storage Upload)
 
@@ -545,6 +554,10 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
 ```
 
 ### 8.6 `DELETE /v4/upload/cancel/{fragment}/{version_id}`
+Response:
+- `204 No Content` on successful cancel.
+- If already finalized, returns conflict.
+
 ```bash
 curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/upload/cancel/<fragment_hash>/<version_id>"
@@ -594,10 +607,13 @@ Notes:
 - Repair reconciles partition replicas and blob availability from `index`.
 - Full mirrored equality across every index root is no longer the invariant; owner/replica survivability for each partition is.
 - `mode=availability` keeps CRUD online and intentionally caps repair pressure lower so the node stays latency-friendly.
+- Degraded reads stay online-first: missing/corrupt shard blocks are reconstructed on-the-fly for the response, while full-shard rebuild is queued in bounded background work (no foreground read blocking on full repair).
 - `mode=strict` makes the node read-only and raises repair aggressiveness to use more of the available I/O width.
 - `mode=scrub` quiesces reads and writes and runs the same integrity-first repair engine at the highest practical aggressiveness.
 - Runtime concurrency is normalized against live blob disks and live index roots, so auto-tuning follows actual reachable hardware instead of static CPU counts alone.
 - Fragment object-version scans are streamed incrementally from partition roots, so repair no longer materializes a whole fragment-wide metadata vector before work begins.
+- Log severity policy for repair/recovery paths: expected retry/remap steps emit `DEBUG`, successful per-object summaries emit `INFO`, degraded-but-continued outcomes emit `WARN`, and unrecoverable read failures emit `ERROR`.
+- Repair/scrub dry-run no longer aborts when `.raw_gc` markers reference a decommissioned device id; those markers are kept and treated as deferred cleanup state.
 
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
@@ -617,6 +633,8 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
 Notes:
 - GC deletes trashed versions and abandoned upload sessions through `index`.
 - Raw payload without authoritative session or object state is cleanup-candidate data.
+- If raw-GC markers reference a device id that is no longer configured (for example after disk decommission), GC defers those extents and logs a single summary `INFO`; markers are retained for later cleanup if the device is reintroduced.
+- Raw extent cleanup updates allocator metadata in batch journal commits; payload zeroing is not the authority for free state.
 
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
@@ -671,6 +689,7 @@ Notes:
 - `mode=scrub` quiesces reads and writes and uses the widest redistribution concurrency that the live layout and RAM caps allow.
 - Execution `mode` controls service access and scheduler aggressiveness; `durability` still separately controls strict-vs-batched write sync behavior.
 - Fragment object-version scans are streamed incrementally from partition roots, so redistribution can start moving data without first loading an entire fragment into memory.
+- Redistribution now follows the same log-severity contract as repair/recovery (`DEBUG` expected retries, `INFO` successful migration summaries, `WARN` degraded-but-continued failures, `ERROR` unrecoverable read failures).
 
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
@@ -698,6 +717,15 @@ Reports one row per configured blob device:
 - used block count
 - journal cursor
 - detected foreign signature
+
+Status semantics:
+- `managed` or `unformatted`: usable by runtime.
+- `unavailable`: configured path cannot currently be opened (for example hot-unplug/stale by-id path).
+- `misconfigured`: path exists but violates raw-disk requirements (for example mounted directory or foreign/dirty media state).
+
+Degraded-path behavior:
+- The endpoint returns per-disk status rows even when one path is unavailable; it no longer fails the whole request because of a single missing disk path.
+- Runtime disk resolution falls forward to the next usable configured blob disk when the selected disk slot is unavailable.
 
 ```bash
 curl -k -X GET -H "Authorization: Bearer $TOKEN" \
@@ -755,6 +783,47 @@ curl -k -X GET -H "Authorization: Bearer $TOKEN" \
 curl -k -X GET -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/maintenance/health?deep_scan=true"
 ```
+
+### 9.9 Hotplug HA Validation and Deploy Checklist
+Validated on March 5, 2026 (real hardware, raw blob devices, hot-unplug and reattach cycle).
+
+Validated outcomes:
+- Degraded raw status behavior: when one blob disk was unplugged, `GET /v4/maintenance/blob/raw/status` remained `200` and returned per-disk rows with one disk marked `unavailable` instead of failing the endpoint.
+- Degraded CRUD path: upload init/chunk/finalize/read succeeded while one blob disk was unavailable.
+- Pre-failure object recovery proof: object written while both disks were healthy remained readable while one disk was unplugged, and both `GET` and `STREAM` checksums matched expected SHA256.
+- Degraded maintenance behavior: repair and redistribution in availability mode completed without fatal errors (`last_error=null`).
+- Failback behavior: after reattach, both disks returned to `managed`; redistribution (`dry_run=false`) and repair completed with `total_errors=0`/`last_error=null`, and proof-object checksum stayed unchanged.
+
+Deploy smoke test (dev server):
+1. Verify both disks are visible and managed:
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/blob/raw/status"
+```
+2. Run redistribution real pass:
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/redistribution/start?dry_run=false&mode=availability&fast_mode=true"
+```
+3. Wait for completion and verify no fatal error:
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/redistribution/monitor"
+```
+4. Run repair pass:
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/repair/start?dry_run=false&mode=availability&fast_mode=true"
+```
+5. Verify repair status:
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/repair/status"
+```
+6. Confirm read path integrity for one known object using both endpoints:
+- `GET /v4/fragment/get/{fragment}/{object_key}`
+- `GET /v4/fragment/stream/{fragment}/{object_key}`
+- Compare client-side SHA256 with expected.
 
 ## 10. WebSocket APIs
 

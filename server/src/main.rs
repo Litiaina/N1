@@ -406,12 +406,12 @@ fn adaptive_monitor_deep_scan_interval_seconds(cpu_cores: usize, ram_bytes: Opti
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::storage_identity_for_metadata;
     use super::{
         adaptive_raw_writer_inflight_limit, adaptive_writer_buffer_size,
         estimate_upload_part_working_set_bytes,
     };
-    #[cfg(unix)]
-    use super::storage_identity_for_metadata;
 
     #[test]
     fn single_disk_writer_buffer_size_is_not_artificially_tiny() {

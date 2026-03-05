@@ -12,8 +12,8 @@ use super::delete::{
     recover_object_version,
 };
 use super::disk_manager::{
-    DownloadArchiveRequest, InitiateUploadParams, ObjectKeyQuery, ObjectPathManager,
-    ObjectMetadata, PrefixIndexSegment, RenameObjectRequest, UploadPartQuery,
+    DownloadArchiveRequest, InitiateUploadParams, ObjectKeyQuery, ObjectMetadata,
+    ObjectPathManager, PrefixIndexSegment, RenameObjectRequest, UploadPartQuery,
 };
 use super::fragment_metadata::init_fragment_metadata;
 use super::garbage_collector::{get_gc_status_api, run_garbage_collector};
@@ -35,7 +35,9 @@ use super::redistribution::{
 use super::repair_manager::{
     RepairCheckMode, RepairRunConfig, RepairRunOptions, run_repair_job, run_repair_job_with_options,
 };
-use super::retrieve::{get_object, get_object_metadata, list_objects, stream_object};
+use super::retrieve::{
+    get_object, get_object_metadata, list_objects, list_trash_objects, stream_object,
+};
 use super::sync::{ensure_fragment_blob_directories, sync_single_fragment_quota};
 use super::upload::{
     DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC,
@@ -516,10 +518,7 @@ async fn read_response_json(resp: axum::response::Response) -> serde_json::Value
     serde_json::from_slice(&body).expect("decode JSON response")
 }
 
-async fn collect_fragment_versions_streamed(
-    fragment: &str,
-    trashed: bool,
-) -> Vec<ObjectMetadata> {
+async fn collect_fragment_versions_streamed(fragment: &str, trashed: bool) -> Vec<ObjectMetadata> {
     let mut out = Vec::new();
     let mut stream = index::stream_fragment_object_versions(fragment.to_string(), trashed);
     while let Some(next_meta) = stream.recv().await {
@@ -596,6 +595,37 @@ async fn list_objects_json_page(
     )
     .await
     .expect("list objects page")
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    read_response_json(resp).await
+}
+
+async fn list_trash_json_page(
+    fragment: &str,
+    prefix: Option<&str>,
+    delimiter: Option<&str>,
+    limit: usize,
+    continuation_token: Option<String>,
+) -> serde_json::Value {
+    let mut params: HashMap<String, String> = HashMap::new();
+    if let Some(p) = prefix {
+        params.insert("prefix".to_string(), p.to_string());
+    }
+    if let Some(d) = delimiter {
+        params.insert("delimiter".to_string(), d.to_string());
+    }
+    params.insert("limit".to_string(), limit.to_string());
+    if let Some(tok) = continuation_token {
+        params.insert("continuation_token".to_string(), tok);
+    }
+
+    let resp = list_trash_objects(
+        full_claims(fragment),
+        AxumPath(fragment.to_string()),
+        Query(params),
+    )
+    .await
+    .expect("list trash page")
     .into_response();
     assert_eq!(resp.status(), StatusCode::OK);
     read_response_json(resp).await
@@ -1990,6 +2020,180 @@ async fn matrix_delimiter_listing_paginates_without_skipping_rows() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_trash_listing_paginates_without_full_scan_sort_path() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let mut keys = vec![
+        "trash-page/c.bin".to_string(),
+        "trash-page/a.bin".to_string(),
+        "trash-page/e.bin".to_string(),
+        "trash-page/b.bin".to_string(),
+        "trash-page/d.bin".to_string(),
+    ];
+
+    for (idx, key) in keys.iter().enumerate() {
+        put_object(state.clone(), &fragment, key, vec![idx as u8 + 1; 2048]).await;
+        let delete_resp = delete_object(
+            State(state.clone()),
+            full_claims(&fragment),
+            AxumPath((fragment.clone(), key.clone())),
+        )
+        .await
+        .expect("soft delete object")
+        .into_response();
+        assert_eq!(delete_resp.status(), StatusCode::OK);
+    }
+
+    let page1 = list_trash_json_page(&fragment, Some("trash-page"), None, 2, None).await;
+    let token1 = page1["continuation_token"]
+        .as_str()
+        .expect("page1 continuation token")
+        .to_string();
+
+    let page2 = list_trash_json_page(&fragment, Some("trash-page"), None, 2, Some(token1)).await;
+    let token2 = page2["continuation_token"]
+        .as_str()
+        .expect("page2 continuation token")
+        .to_string();
+
+    let page3 = list_trash_json_page(&fragment, Some("trash-page"), None, 2, Some(token2)).await;
+    assert!(
+        page3["continuation_token"].is_null(),
+        "last page should not return continuation token"
+    );
+
+    let mut listed = Vec::<String>::new();
+    for page in [&page1, &page2, &page3] {
+        listed.extend(
+            page["objects"]
+                .as_array()
+                .expect("objects array")
+                .iter()
+                .filter_map(|v| v["object_key"].as_str())
+                .map(|s| s.to_string()),
+        );
+    }
+    keys.sort();
+    assert_eq!(listed, keys);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_trash_delimiter_listing_paginates_without_full_materialize_path() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    for (idx, key) in [
+        "trash-delim",
+        "trash-delim/a.bin",
+        "trash-delim/b.bin",
+        "trash-delim/sub-a/x.bin",
+        "trash-delim/sub-b/y.bin",
+    ]
+    .iter()
+    .enumerate()
+    {
+        put_object(state.clone(), &fragment, key, vec![idx as u8 + 1; 2048]).await;
+        let delete_resp = delete_object(
+            State(state.clone()),
+            full_claims(&fragment),
+            AxumPath((fragment.clone(), key.to_string())),
+        )
+        .await
+        .expect("soft delete object")
+        .into_response();
+        assert_eq!(delete_resp.status(), StatusCode::OK);
+    }
+
+    let page1 = list_trash_json_page(&fragment, Some("trash-delim"), Some("/"), 2, None).await;
+    let token1 = page1["continuation_token"]
+        .as_str()
+        .expect("page1 continuation token")
+        .to_string();
+
+    let page2 =
+        list_trash_json_page(&fragment, Some("trash-delim"), Some("/"), 2, Some(token1)).await;
+    let token2 = page2["continuation_token"]
+        .as_str()
+        .expect("page2 continuation token")
+        .to_string();
+
+    let page3 =
+        list_trash_json_page(&fragment, Some("trash-delim"), Some("/"), 2, Some(token2)).await;
+    assert!(
+        page3["continuation_token"].is_null(),
+        "last page should not return continuation token"
+    );
+
+    let mut rows = Vec::new();
+    for page in [&page1, &page2, &page3] {
+        rows.extend(
+            page["objects"]
+                .as_array()
+                .expect("objects array")
+                .iter()
+                .filter_map(|v| v["object_key"].as_str())
+                .map(|s| format!("object:{s}")),
+        );
+        rows.extend(
+            page["common_prefixes"]
+                .as_array()
+                .expect("common prefixes array")
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| format!("prefix:{s}")),
+        );
+    }
+
+    assert_eq!(
+        rows,
+        vec![
+            "object:trash-delim".to_string(),
+            "object:trash-delim/a.bin".to_string(),
+            "object:trash-delim/b.bin".to_string(),
+            "prefix:trash-delim/sub-a/".to_string(),
+            "prefix:trash-delim/sub-b/".to_string(),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_multipart_finalize_conflict_then_success() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -2493,7 +2697,9 @@ async fn matrix_cancel_upload_before_first_part_succeeds() {
     );
     for raw in &planned_addresses {
         assert!(
-            raw_blob_address_exists(raw).await.expect("raw exists check"),
+            raw_blob_address_exists(raw)
+                .await
+                .expect("raw exists check"),
             "planned raw slot should exist before any part upload"
         );
     }
@@ -2519,7 +2725,9 @@ async fn matrix_cancel_upload_before_first_part_succeeds() {
     );
     for raw in &planned_addresses {
         assert!(
-            !raw_blob_address_exists(raw).await.expect("raw exists check"),
+            !raw_blob_address_exists(raw)
+                .await
+                .expect("raw exists check"),
             "cancel should free planned raw slot reservations"
         );
     }
@@ -2673,7 +2881,9 @@ async fn matrix_planned_multipart_upload_reuses_reserved_raw_slots() {
     assert_eq!(planned_part1.size_bytes, planned_sizes[1]);
     for raw in session_state.manifest.all_planned_raw_addresses() {
         assert!(
-            raw_blob_address_exists(&raw).await.expect("raw exists check"),
+            raw_blob_address_exists(&raw)
+                .await
+                .expect("raw exists check"),
             "planned raw slot should exist after init"
         );
     }
@@ -4773,8 +4983,8 @@ async fn matrix_raw_blob_stale_reader_after_relocation_is_idempotent() {
         Some(repair_context),
         RepairLogMode::Verbose,
     )
-        .await
-        .expect("stale second repair should observe existing relocation");
+    .await
+    .expect("stale second repair should observe existing relocation");
 
     let current_meta = get_metadata(&fragment, &key, &fragment)
         .await
@@ -5319,7 +5529,8 @@ async fn matrix_redistribution_read_falls_back_when_primary_index_copy_is_corrup
         let Ok(bytes) = fs::read(path).await else {
             continue;
         };
-        let Ok(candidate) = rmp_serde::from_slice::<crate::n1_core::disk_manager::ObjectMetadata>(&bytes)
+        let Ok(candidate) =
+            rmp_serde::from_slice::<crate::n1_core::disk_manager::ObjectMetadata>(&bytes)
         else {
             continue;
         };

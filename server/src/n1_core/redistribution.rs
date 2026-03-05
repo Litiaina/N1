@@ -1,7 +1,7 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::blob_store::{
     BlobDiskHandle, allocate_raw_direct_io, commit_staged_raw_shard, copy_raw_extent,
-    flush_raw_metadata_for_addresses, free_raw_address, open_raw_direct_io, raw_blob_debug_path,
+    flush_raw_metadata_for_addresses, free_raw_addresses, open_raw_direct_io, raw_blob_debug_path,
     raw_stage_path_for_shard, resolve_blob_disk_path, stable_shard_file_name,
     verify_shard_checksum, write_raw_gc_markers,
 };
@@ -250,10 +250,7 @@ fn redistribution_limits_for_ram_gib(ram_gib: usize) -> (usize, u64) {
     }
 }
 
-fn default_status_batch(
-    execution_mode: RedistributionExecutionMode,
-    fast_mode: bool,
-) -> u64 {
+fn default_status_batch(execution_mode: RedistributionExecutionMode, fast_mode: bool) -> u64 {
     let ram_gib = detect_total_ram_gib();
     match execution_mode {
         RedistributionExecutionMode::Availability => match ram_gib {
@@ -521,16 +518,16 @@ pub async fn trigger_redistribution_job_api(
     }
     let object_concurrency = clamp_usize(
         params
-                .get("object_concurrency")
-                .and_then(|v| v.parse::<usize>().ok())
+            .get("object_concurrency")
+            .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or_else(|| default_object_concurrency(execution_mode, fast_mode)),
         1,
         max_object_concurrency,
     );
     let status_batch = clamp_u64(
         params
-                .get("status_batch")
-                .and_then(|v| v.parse::<u64>().ok())
+            .get("status_batch")
+            .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or_else(|| default_status_batch(execution_mode, fast_mode)),
         1,
         max_status_batch,
@@ -1026,8 +1023,7 @@ pub async fn run_redistribution_job_with_options(
             };
             let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
 
-            let mut metas =
-                index::stream_fragment_object_versions(fragment_hash.clone(), is_trash);
+            let mut metas = index::stream_fragment_object_versions(fragment_hash.clone(), is_trash);
 
             while let Some(next_meta) = metas.recv().await {
                 if should_stop() {
@@ -1395,9 +1391,7 @@ async fn redistribute_object_streaming(
             let mut allocated_raw = Vec::with_capacity(total_shards);
             for shard_idx in 0..total_shards {
                 if should_stop() {
-                    for raw in &allocated_raw {
-                        let _ = free_raw_address(raw).await;
-                    }
+                    let _ = free_raw_addresses(&allocated_raw).await;
                     return Err(AppError::InternalServerError("Stopped".into()));
                 }
 
@@ -1413,9 +1407,7 @@ async fn redistribute_object_streaming(
                     })?;
 
                 if !verify_shard_checksum(old_shard).await? {
-                    for raw in &allocated_raw {
-                        let _ = free_raw_address(raw).await;
-                    }
+                    let _ = free_raw_addresses(&allocated_raw).await;
                     return Err(AppError::InternalServerError(format!(
                         "raw shard {} failed checksum verification during redistribution",
                         old_shard.file_name
@@ -1437,12 +1429,7 @@ async fn redistribute_object_streaming(
                 )
                 .await
                 {
-                    let _ = free_raw_address(&raw_addr).await;
-                    for raw in &allocated_raw {
-                        if raw != &raw_addr {
-                            let _ = free_raw_address(raw).await;
-                        }
-                    }
+                    let _ = free_raw_addresses(&allocated_raw).await;
                     return Err(err);
                 }
 

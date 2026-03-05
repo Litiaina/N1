@@ -203,10 +203,12 @@ fn compute_storage_plane_stats(disks: &[DiskStatus]) -> StoragePlaneStats {
                     stats.blob_devices_online += 1;
                 }
                 if let Some(raw) = disk.raw_backend.as_ref() {
-                    stats.raw_total_bytes =
-                        stats.raw_total_bytes.saturating_add(raw.total_bytes.unwrap_or(0));
-                    stats.raw_used_bytes =
-                        stats.raw_used_bytes.saturating_add(raw.used_bytes.unwrap_or(0));
+                    stats.raw_total_bytes = stats
+                        .raw_total_bytes
+                        .saturating_add(raw.total_bytes.unwrap_or(0));
+                    stats.raw_used_bytes = stats
+                        .raw_used_bytes
+                        .saturating_add(raw.used_bytes.unwrap_or(0));
                     stats.raw_available_bytes = stats
                         .raw_available_bytes
                         .saturating_add(raw.available_bytes.unwrap_or(0));
@@ -388,7 +390,8 @@ async fn collect_system_health(
                     total_objects = count;
                     mirror_counts = counts;
                     scan_failed = failed;
-                    if let Ok(scanned_uploads) = collect_upload_stats_from_fragments(&active_index_roots).await
+                    if let Ok(scanned_uploads) =
+                        collect_upload_stats_from_fragments(&active_index_roots).await
                     {
                         upload_stats = scanned_uploads;
                     }

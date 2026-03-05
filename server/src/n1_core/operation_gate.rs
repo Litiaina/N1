@@ -7,8 +7,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static READ_ONLY_FAST_MODE_REFCOUNT: LazyLock<AtomicUsize> = LazyLock::new(|| AtomicUsize::new(0));
-static QUIESCED_MAINTENANCE_REFCOUNT: LazyLock<AtomicUsize> =
-    LazyLock::new(|| AtomicUsize::new(0));
+static QUIESCED_MAINTENANCE_REFCOUNT: LazyLock<AtomicUsize> = LazyLock::new(|| AtomicUsize::new(0));
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MaintenanceAccessMode {

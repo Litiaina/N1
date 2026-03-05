@@ -228,6 +228,41 @@ impl BlockManager {
         Ok(())
     }
 
+    pub fn free_addresses(
+        &mut self,
+        addresses: &[RawExtentAddress],
+    ) -> Result<usize, BlockManagerError> {
+        if addresses.is_empty() {
+            return Ok(0);
+        }
+
+        let mut seen = std::collections::HashSet::<u64>::new();
+        let mut pending = Vec::<(u64, Extent)>::with_capacity(addresses.len());
+        for address in addresses {
+            let extent = self.validate_raw_address(address)?;
+            if seen.insert(address.allocation_id) {
+                pending.push((address.allocation_id, extent));
+            }
+        }
+
+        self.ensure_journal_capacity(pending.len())?;
+
+        for (allocation_id, extent) in &pending {
+            self.append_journal(JournalRecord {
+                op: JournalOp::Free,
+                allocation_id: *allocation_id,
+                extent: *extent,
+            })?;
+
+            self.allocations
+                .remove(allocation_id)
+                .ok_or(BlockManagerError::UnknownAllocation(*allocation_id))?;
+            insert_and_merge_extent(&mut self.free_extents, *extent);
+        }
+
+        Ok(pending.len())
+    }
+
     pub fn write(
         &self,
         handle: AllocationHandle,
@@ -443,26 +478,35 @@ impl BlockManager {
     }
 
     fn append_journal(&mut self, record: JournalRecord) -> Result<(), BlockManagerError> {
-        let journal_bytes = self
-            .header
-            .journal_block_count
-            .saturating_mul(u64::from(self.header.block_size));
+        self.ensure_journal_capacity(1)?;
         let offset = block_offset(&self.header, self.header.journal_start_block).saturating_add(
             self.journal_cursor
                 .saturating_mul(JOURNAL_RECORD_SIZE as u64),
         );
-        if offset.saturating_add(JOURNAL_RECORD_SIZE as u64)
-            > block_offset(&self.header, self.header.journal_start_block)
-                .saturating_add(journal_bytes)
-        {
-            return Err(BlockManagerError::JournalFull);
-        }
 
         let buf = encode_record(record);
         write_all_at(&self.meta_file, &buf, offset)?;
         self.journal_cursor = self.journal_cursor.saturating_add(1);
         self.journal_dirty = true;
         Ok(())
+    }
+
+    fn ensure_journal_capacity(&self, additional_records: usize) -> Result<(), BlockManagerError> {
+        let max_records = self.max_journal_records();
+        let required = self
+            .journal_cursor
+            .saturating_add(additional_records as u64);
+        if required > max_records {
+            return Err(BlockManagerError::JournalFull);
+        }
+        Ok(())
+    }
+
+    fn max_journal_records(&self) -> u64 {
+        self.header
+            .journal_block_count
+            .saturating_mul(u64::from(self.header.block_size))
+            / JOURNAL_RECORD_SIZE as u64
     }
 
     fn apply_record(&mut self, record: JournalRecord) -> Result<(), BlockManagerError> {
@@ -794,6 +838,43 @@ mod tests {
 
         mgr.free_address(&address).expect("free via address");
         assert_eq!(mgr.allocation_count(), 0);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn batch_free_addresses_releases_unique_allocations() {
+        let path = temp_loopback("batch-free-addresses");
+        let mut mgr = BlockManager::format(
+            &path,
+            FormatOptions {
+                block_size: 4096,
+                journal_blocks: 16,
+                total_bytes: Some(4 * 1024 * 1024),
+            },
+        )
+        .expect("format device");
+
+        let a = mgr.allocate_bytes(8 * 1024).expect("allocate a");
+        let b = mgr.allocate_bytes(8 * 1024).expect("allocate b");
+        let a_addr = mgr.raw_extent_address(a, 8 * 1024).expect("address a");
+        let b_addr = mgr.raw_extent_address(b, 8 * 1024).expect("address b");
+
+        let freed = mgr
+            .free_addresses(&[a_addr.clone(), b_addr.clone(), a_addr.clone()])
+            .expect("batch free");
+        assert_eq!(freed, 2);
+        assert_eq!(mgr.allocation_count(), 0);
+        mgr.flush_meta().expect("flush metadata");
+
+        match mgr.read_address(&a_addr, 0, 1) {
+            Err(BlockManagerError::UnknownAllocation(id)) => assert_eq!(id, a_addr.allocation_id),
+            other => panic!("expected freed allocation a to be unknown, got {:?}", other),
+        }
+        match mgr.read_address(&b_addr, 0, 1) {
+            Err(BlockManagerError::UnknownAllocation(id)) => assert_eq!(id, b_addr.allocation_id),
+            other => panic!("expected freed allocation b to be unknown, got {:?}", other),
+        }
 
         let _ = fs::remove_file(path);
     }

@@ -1,6 +1,7 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::blob_store::{
-    RawGcMarker, raw_blob_address_exists, stable_shard_file_name, verify_shard_checksum,
+    RawGcMarker, is_missing_raw_device_mapping_error, raw_blob_address_exists,
+    stable_shard_file_name, verify_shard_checksum,
 };
 use crate::n1_core::constants::{FRAGMENT_METADATA_FILE, QUOTA_FILE};
 use crate::n1_core::disk_manager::{
@@ -8,11 +9,11 @@ use crate::n1_core::disk_manager::{
 };
 use crate::n1_core::index;
 use crate::n1_core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
-use crate::n1_core::upload;
 use crate::n1_core::recovery::{
     RepairLogMode, RepairShardOutcome, ShardRepairContext, repair_entire_shard,
     verify_shard_integrity,
 };
+use crate::n1_core::upload;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::manager::WsConnectionManager;
@@ -256,15 +257,6 @@ fn availability_part_parallelism(cfg: &RepairRunConfig) -> usize {
     cfg.shard_repair_concurrency.clamp(1, 2)
 }
 
-fn is_stale_raw_device_mapping_error(err: &AppError) -> bool {
-    match err {
-        AppError::InternalServerError(message) => {
-            message.contains("No raw blob device found for device id")
-        }
-        _ => false,
-    }
-}
-
 async fn inspect_part_availability(part: &PartMetadata) -> (Vec<usize>, usize) {
     let mut missing_shards = Vec::new();
     let mut stale_device_mappings = 0usize;
@@ -276,7 +268,7 @@ async fn inspect_part_availability(part: &PartMetadata) -> (Vec<usize>, usize) {
                     match raw_blob_address_exists(raw).await {
                         Ok(exists) => exists,
                         Err(err) => {
-                            if is_stale_raw_device_mapping_error(&err) {
+                            if is_missing_raw_device_mapping_error(&err) {
                                 stale_device_mappings += 1;
                             }
                             false
@@ -1014,7 +1006,19 @@ async fn repair_fragment_raw_gc_markers(
             AppError::InternalServerError(format!("decode raw gc marker {}: {}", name, e))
         })?;
 
-        if raw_blob_address_exists(&marker.address).await? {
+        let raw_exists = match raw_blob_address_exists(&marker.address).await {
+            Ok(exists) => exists,
+            Err(err) if is_missing_raw_device_mapping_error(&err) => {
+                info!(
+                    "Repair: keeping raw GC marker {} for deferred cleanup because device id {} is not currently configured",
+                    name, marker.address.device_id
+                );
+                true
+            }
+            Err(err) => return Err(err),
+        };
+
+        if raw_exists {
             let (m, d) = replicate_bytes_strict(&paths, &canon, dry_run).await?;
             miss += m;
             div += d;
@@ -1336,7 +1340,8 @@ async fn process_object_repair(
             }
         }
 
-        if availability_summary.parts_requiring_repair > 0 || availability_summary.repair_failures > 0
+        if availability_summary.parts_requiring_repair > 0
+            || availability_summary.repair_failures > 0
         {
             let log_message = format!(
                 "Availability repair summary fragment={} key={} version={} parts_scanned={} parts_needing_repair={} unavailable_shards={} stale_device_mappings={} relocated_raw_shards={} repair_failures={} dry_run={}",
@@ -1352,7 +1357,7 @@ async fn process_object_repair(
                 cfg.dry_run
             );
 
-            if availability_summary.repair_failures > 0 || cfg.dry_run {
+            if availability_summary.repair_failures > 0 {
                 warn!("{}", log_message);
             } else {
                 info!("{}", log_message);
@@ -1857,7 +1862,7 @@ async fn process_one_meta_target(
     if let Some(r) = report {
         delta.last_disagreement = Some(r.clone());
         if cfg.dry_run {
-            warn!("{}", r);
+            info!("{}", r);
         }
     }
 

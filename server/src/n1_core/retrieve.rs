@@ -563,6 +563,14 @@ async fn list_objects_from_index(
     scan_trash: bool,
     include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
+    if limit == 0 {
+        return Ok(ListObjectsResult {
+            objects: Vec::new(),
+            common_prefixes: Vec::new(),
+            continuation_token: None,
+        });
+    }
+
     #[derive(Clone)]
     struct DelimiterRow {
         row_key: String,
@@ -577,6 +585,212 @@ async fn list_objects_from_index(
         format!("{}/", pfx)
     };
     let want_delim = delimiter == Some("/");
+
+    if scan_trash && want_delim {
+        let prefix_filter = if pfx.is_empty() {
+            None
+        } else {
+            Some(pfx.as_str())
+        };
+        let start_after_row = if let Some(tok) = continuation_token.as_deref() {
+            let Some(row_key) = parse_delimiter_continuation_token(tok) else {
+                return Err(AppError::BadRequest(
+                    "invalid continuation_token for delimiter listing".into(),
+                ));
+            };
+            Some(row_key)
+        } else {
+            None
+        };
+        let mut scan_cursor = start_after_row
+            .as_ref()
+            .map(|row_key| (row_key.clone(), String::from("\u{10ffff}")));
+        let mut out_objects = Vec::with_capacity(limit);
+        let mut out_prefixes = Vec::with_capacity(limit);
+        let mut last_output_row: Option<String> = None;
+        let mut last_emitted_row = start_after_row.clone();
+        let mut reached_limit = false;
+
+        while out_objects.len() + out_prefixes.len() < limit {
+            let page_limit = limit
+                .saturating_sub(out_objects.len() + out_prefixes.len())
+                .max(1)
+                .saturating_mul(4)
+                .min(1024);
+
+            let (page, page_next) = index::list_fragment_latest_objects_page(
+                fragment,
+                true,
+                prefix_filter,
+                scan_cursor
+                    .as_ref()
+                    .map(|(object_key, version_id)| (object_key.as_str(), version_id.as_str())),
+                page_limit,
+            )
+            .await?;
+
+            if page.is_empty() {
+                break;
+            }
+
+            for meta in page {
+                let ck = canonical_key(&meta.object_key);
+                if !include_internal && is_internal_object_key(&ck) {
+                    continue;
+                }
+                if !pfx.is_empty() && ck != pfx && !ck.starts_with(&pfx_with_slash) {
+                    continue;
+                }
+
+                let rel = if pfx.is_empty() {
+                    ck.clone()
+                } else if ck == pfx {
+                    ck.clone()
+                } else if ck.len() > pfx.len() + 1 {
+                    ck[(pfx.len() + 1)..].to_string()
+                } else {
+                    String::new()
+                };
+
+                let (row_key, is_common_prefix) = if !pfx.is_empty() && ck == pfx {
+                    (ck.clone(), false)
+                } else if let Some((first, _rest)) = rel.split_once('/') {
+                    if !first.is_empty() {
+                        let folder = if pfx.is_empty() {
+                            format!("{}/", first)
+                        } else {
+                            format!("{}/{}/", pfx, first)
+                        };
+                        (folder, true)
+                    } else {
+                        (ck.clone(), false)
+                    }
+                } else {
+                    (ck.clone(), false)
+                };
+
+                if start_after_row
+                    .as_ref()
+                    .map(|start| row_key <= *start)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+
+                if last_emitted_row
+                    .as_ref()
+                    .map(|last| last == &row_key)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+
+                if is_common_prefix {
+                    out_prefixes.push(row_key.clone());
+                } else {
+                    out_objects.push(meta);
+                }
+
+                last_emitted_row = Some(row_key.clone());
+                last_output_row = Some(row_key);
+
+                if out_objects.len() + out_prefixes.len() >= limit {
+                    reached_limit = true;
+                    break;
+                }
+            }
+
+            if reached_limit {
+                break;
+            }
+
+            match page_next {
+                Some(next) => scan_cursor = Some(next),
+                None => break,
+            }
+        }
+
+        return Ok(ListObjectsResult {
+            objects: out_objects,
+            common_prefixes: out_prefixes,
+            continuation_token: if reached_limit {
+                last_output_row
+                    .as_deref()
+                    .map(create_delimiter_continuation_token)
+            } else {
+                None
+            },
+        });
+    }
+
+    if scan_trash && !want_delim {
+        let prefix_filter = if pfx.is_empty() {
+            None
+        } else {
+            Some(pfx.as_str())
+        };
+        let mut scan_cursor = continuation_token
+            .as_deref()
+            .and_then(parse_prefix_continuation_token);
+        let mut out_objects = Vec::with_capacity(limit);
+        let mut next_scan_cursor: Option<(String, String)> = None;
+
+        while out_objects.len() < limit {
+            let page_limit = limit.saturating_sub(out_objects.len()).max(1);
+            let (page, page_next) = index::list_fragment_latest_objects_page(
+                fragment,
+                true,
+                prefix_filter,
+                scan_cursor
+                    .as_ref()
+                    .map(|(object_key, version_id)| (object_key.as_str(), version_id.as_str())),
+                page_limit,
+            )
+            .await?;
+
+            if page.is_empty() {
+                next_scan_cursor = None;
+                break;
+            }
+
+            for meta in page {
+                let ck = canonical_key(&meta.object_key);
+                if !include_internal && is_internal_object_key(&ck) {
+                    continue;
+                }
+                out_objects.push(meta);
+                if out_objects.len() >= limit {
+                    break;
+                }
+            }
+
+            match page_next {
+                Some(next) => {
+                    next_scan_cursor = Some(next.clone());
+                    if out_objects.len() >= limit {
+                        break;
+                    }
+                    scan_cursor = Some(next);
+                }
+                None => {
+                    next_scan_cursor = None;
+                    break;
+                }
+            }
+        }
+
+        return Ok(ListObjectsResult {
+            objects: out_objects,
+            common_prefixes: Vec::new(),
+            continuation_token: if next_scan_cursor.is_some() {
+                next_scan_cursor.as_ref().map(|(object_key, version_id)| {
+                    create_prefix_continuation_token(object_key, version_id)
+                })
+            } else {
+                None
+            },
+        });
+    }
 
     let objects = if scan_trash {
         if pfx.is_empty() {

@@ -129,8 +129,14 @@ pub fn print_health_report(health: &HealthResponse) {
             human_bytes(health.system.ram_total_bytes),
         ),
     );
-    kv("Process RSS", human_bytes(health.system.process_resident_bytes));
-    kv("Process VMem", human_bytes(health.system.process_virtual_bytes));
+    kv(
+        "Process RSS",
+        human_bytes(health.system.process_resident_bytes),
+    );
+    kv(
+        "Process VMem",
+        human_bytes(health.system.process_virtual_bytes),
+    );
     kv("Load Avg (1m)", format!("{:.2}", health.system.load_avg_1m));
     kv("Uptime", health.system.uptime_seconds);
     kv(
@@ -160,7 +166,10 @@ pub fn print_health_report(health: &HealthResponse) {
     kv("Active Fragments", health.uploads.active_fragments);
     kv("Reserved Bytes", human_bytes(health.uploads.reserved_bytes));
     kv("Committed Parts", health.uploads.committed_parts);
-    kv("Committed Bytes", human_bytes(health.uploads.committed_bytes));
+    kv(
+        "Committed Bytes",
+        human_bytes(health.uploads.committed_bytes),
+    );
     kv(
         "Oldest Age (s)",
         health

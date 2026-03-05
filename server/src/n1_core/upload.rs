@@ -34,7 +34,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::blob_store::{
     allocate_raw_direct_io, configured_blob_disk_count, flush_raw_metadata_for_addresses,
-    free_raw_address, open_raw_direct_io_for_address, raw_blob_address_from_extent,
+    free_raw_addresses, open_raw_direct_io_for_address, raw_blob_address_from_extent,
     raw_blob_debug_path, stable_shard_file_name,
 };
 use crate::n1_core::disk_manager::{
@@ -255,9 +255,7 @@ impl UploadSessionManifest {
             .find(|layout| layout.part_index == part_index)
     }
 
-    pub fn all_planned_raw_addresses(
-        &self,
-    ) -> Vec<crate::n1_core::disk_manager::RawBlobAddress> {
+    pub fn all_planned_raw_addresses(&self) -> Vec<crate::n1_core::disk_manager::RawBlobAddress> {
         self.planned_parts
             .iter()
             .flat_map(|layout| layout.shards.iter())
@@ -298,7 +296,6 @@ impl UploadSessionManifest {
             checksum: receipt.checksum.clone(),
         })
     }
-
 }
 
 fn derive_planned_part_sizes(
@@ -794,10 +791,7 @@ impl Drop for RawDirectWriter {
 async fn cleanup_raw_addresses_best_effort(
     addresses: &[crate::n1_core::disk_manager::RawBlobAddress],
 ) {
-    let futs = addresses.iter().cloned().map(|raw| async move {
-        let _ = free_raw_address(&raw).await;
-    });
-    let _ = join_all(futs).await;
+    let _ = free_raw_addresses(addresses).await;
 }
 
 fn raw_addresses_from_writers(
@@ -1027,8 +1021,9 @@ async fn write_atomic_messagepack<T: Serialize>(
         .await
         .map_err(|e| AppError::Io(e, format!("mkdir {}", parent.display())))?;
 
-    let bytes = rmp_serde::to_vec(value)
-        .map_err(|e| AppError::InternalServerError(format!("serialize {}: {}", path.display(), e)))?;
+    let bytes = rmp_serde::to_vec(value).map_err(|e| {
+        AppError::InternalServerError(format!("serialize {}: {}", path.display(), e))
+    })?;
     let tmp = parent.join(format!(
         ".{}.tmp.{}",
         path.file_name().and_then(|v| v.to_str()).unwrap_or("meta"),
@@ -1121,7 +1116,8 @@ pub(crate) async fn cleanup_upload_part_metadata_for_version(
 ) {
     let manifest = if let Ok(Some(state)) = load_session_state_any(fragment, version_id).await {
         Some(state.manifest)
-    } else if let Ok(Some(receipt)) = index::read_removed_session_receipt(fragment, version_id).await
+    } else if let Ok(Some(receipt)) =
+        index::read_removed_session_receipt(fragment, version_id).await
     {
         Some(receipt.state.manifest)
     } else {
@@ -1271,7 +1267,8 @@ pub(crate) async fn cleanup_orphaned_upload_artifacts_for_fragment(
                 if index::load_session(fragment, version_id).await?.is_some() {
                     continue;
                 }
-                let Some(receipt) = index::read_removed_session_receipt(fragment, version_id).await?
+                let Some(receipt) =
+                    index::read_removed_session_receipt(fragment, version_id).await?
                 else {
                     continue;
                 };
@@ -1576,8 +1573,13 @@ pub async fn object_upload_part(
         .map(|value: &str| value.trim())
         .filter(|s| !s.is_empty());
 
-    if let Some(existing) =
-        read_part_meta_any(&ObjectPathManager::new(), &fragment, &version_id, part_index).await
+    if let Some(existing) = read_part_meta_any(
+        &ObjectPathManager::new(),
+        &fragment,
+        &version_id,
+        part_index,
+    )
+    .await
     {
         if existing.size_bytes != content_length {
             return Ok((
@@ -1929,7 +1931,10 @@ pub async fn finalize_object_upload(
     }
 
     let mut parts = load_all_part_metas_from_disk(&fragment, &version_id).await?;
-    let present = parts.iter().map(|part| part.part_index).collect::<BTreeSet<_>>();
+    let present = parts
+        .iter()
+        .map(|part| part.part_index)
+        .collect::<BTreeSet<_>>();
 
     let mut missing = Vec::new();
     for i in 0..expected_parts {

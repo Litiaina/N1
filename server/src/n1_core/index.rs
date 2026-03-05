@@ -7,10 +7,12 @@ use crate::n1_core::disk_manager::{
 use crate::n1_core::prefix_delimiter::build_delimiter_compacted_from_entries;
 use crate::n1_core::upload::{PartCommitReceipt, UploadSessionManifest};
 use chrono::Utc;
+use futures_util::{StreamExt, stream};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 #[cfg(all(unix, not(test)))]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -49,6 +51,7 @@ const INDEX_WAL_MANIFEST_PERSIST_INTERVAL: u64 = 64;
 const INDEX_WAL_GROUP_COMMIT_WINDOW_MS: u64 = 4;
 const INDEX_WAL_GROUP_COMMIT_MAX_RECORDS: usize = 32;
 const INDEX_FRAGMENT_VERSION_STREAM_BUFFER: usize = 64;
+const INDEX_FRAGMENT_VERSION_PARTITION_CONCURRENCY: usize = 8;
 
 static INDEX_WAL_APPENDERS: LazyLock<Mutex<HashMap<String, mpsc::Sender<WalAppendRequest>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -1459,7 +1462,8 @@ async fn enrich_session_state_from_root(
     state: &mut IndexSessionState,
 ) -> Result<(), AppError> {
     let parts =
-        load_session_parts_on_root(root, fragment, partition_id, &state.manifest.version_id).await?;
+        load_session_parts_on_root(root, fragment, partition_id, &state.manifest.version_id)
+            .await?;
     if !parts.is_empty() {
         let latest_part_activity = parts
             .values()
@@ -1551,8 +1555,7 @@ async fn persist_session_snapshot_on_roots(
         let partition_id = route.partition_id;
         let replicate_fut = async move {
             for root in replica_roots {
-                let path =
-                    session_state_path(&root, &fragment_clone, partition_id, &version_clone);
+                let path = session_state_path(&root, &fragment_clone, partition_id, &version_clone);
                 write_atomic(&path, &bytes_clone).await?;
             }
             Ok(())
@@ -1582,8 +1585,9 @@ async fn persist_removed_session_receipt_on_roots(
     receipt: &RemovedSessionReceipt,
     replica_write_mode: IndexReplicaWriteMode,
 ) -> Result<(), AppError> {
-    let bytes = rmp_serde::to_vec(receipt)
-        .map_err(|e| AppError::InternalServerError(format!("serialize removed session receipt: {}", e)))?;
+    let bytes = rmp_serde::to_vec(receipt).map_err(|e| {
+        AppError::InternalServerError(format!("serialize removed session receipt: {}", e))
+    })?;
     let owner_root = route.roots[0].clone();
     let owner_path =
         session_removed_receipt_path(&owner_root, fragment, route.partition_id, version_id);
@@ -2892,6 +2896,98 @@ fn absorb_latest_state(
     }
 }
 
+fn latest_state_key_cmp(
+    left_key: &str,
+    left_version: &str,
+    right_key: &str,
+    right_version: &str,
+) -> Ordering {
+    left_key
+        .cmp(right_key)
+        .then(left_version.cmp(right_version))
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PartitionPageCursor {
+    partition_id: u16,
+    index: usize,
+    object_key: String,
+    version_id: String,
+}
+
+impl Ord for PartitionPageCursor {
+    fn cmp(&self, other: &Self) -> Ordering {
+        latest_state_key_cmp(
+            self.object_key.as_str(),
+            self.version_id.as_str(),
+            other.object_key.as_str(),
+            other.version_id.as_str(),
+        )
+        .then(self.partition_id.cmp(&other.partition_id))
+        .then(self.index.cmp(&other.index))
+    }
+}
+
+impl PartialOrd for PartitionPageCursor {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+async fn collect_partition_latest_states_filtered(
+    fragment: &str,
+    partition_id: u16,
+    trashed: bool,
+    prefix: Option<&str>,
+) -> Result<Vec<IndexLatestState>, AppError> {
+    let route = route_for_partition_id(partition_id)?;
+    let mut latest_by_key = HashMap::<String, IndexLatestState>::new();
+
+    for root in &route.roots {
+        let partition_root = partition_dir(root, fragment, partition_id);
+        if !fs::try_exists(&partition_root).await.unwrap_or(false) {
+            continue;
+        }
+        if let Some(checkpoint) = read_current_checkpoint(&root, fragment, partition_id).await? {
+            for state in if trashed {
+                checkpoint.trash_latest
+            } else {
+                checkpoint.live_latest
+            } {
+                if prefix
+                    .map(|pfx| object_key_matches_prefix(&state.metadata.object_key, pfx))
+                    .unwrap_or(true)
+                {
+                    absorb_latest_state(&mut latest_by_key, state);
+                }
+            }
+            continue;
+        }
+
+        for state in
+            collect_partition_latest_states_on_root(&root, fragment, partition_id, trashed).await?
+        {
+            if prefix
+                .map(|pfx| object_key_matches_prefix(&state.metadata.object_key, pfx))
+                .unwrap_or(true)
+            {
+                absorb_latest_state(&mut latest_by_key, state);
+            }
+        }
+    }
+
+    let mut states = latest_by_key.into_values().collect::<Vec<_>>();
+    states.sort_by(|left, right| {
+        latest_state_key_cmp(
+            left.metadata.object_key.as_str(),
+            left.metadata.version_id.as_str(),
+            right.metadata.object_key.as_str(),
+            right.metadata.version_id.as_str(),
+        )
+    });
+    Ok(states)
+}
+
 async fn scan_fragment_latest_states_filtered(
     fragment: &str,
     trashed: bool,
@@ -2901,42 +2997,15 @@ async fn scan_fragment_latest_states_filtered(
     let prefix = prefix.map(canonical_prefix);
 
     for partition_id in 0..INDEX_PARTITION_COUNT {
-        let route = route_for_partition_id(partition_id)?;
-        for root in &route.roots {
-            let partition_root = partition_dir(root, fragment, partition_id);
-            if !fs::try_exists(&partition_root).await.unwrap_or(false) {
-                continue;
-            }
-            if let Some(checkpoint) = read_current_checkpoint(&root, fragment, partition_id).await?
-            {
-                for state in if trashed {
-                    checkpoint.trash_latest
-                } else {
-                    checkpoint.live_latest
-                } {
-                    if prefix
-                        .as_deref()
-                        .map(|pfx| object_key_matches_prefix(&state.metadata.object_key, pfx))
-                        .unwrap_or(true)
-                    {
-                        absorb_latest_state(&mut latest_by_key, state);
-                    }
-                }
-                continue;
-            }
-
-            for state in
-                collect_partition_latest_states_on_root(&root, fragment, partition_id, trashed)
-                    .await?
-            {
-                if prefix
-                    .as_deref()
-                    .map(|pfx| object_key_matches_prefix(&state.metadata.object_key, pfx))
-                    .unwrap_or(true)
-                {
-                    absorb_latest_state(&mut latest_by_key, state);
-                }
-            }
+        for state in collect_partition_latest_states_filtered(
+            fragment,
+            partition_id,
+            trashed,
+            prefix.as_deref(),
+        )
+        .await?
+        {
+            absorb_latest_state(&mut latest_by_key, state);
         }
     }
 
@@ -2950,7 +3019,12 @@ async fn scan_fragment_latest_states(
     scan_fragment_latest_states_filtered(fragment, trashed, None).await
 }
 
-fn partition_versions_root(root: &Path, fragment: &str, partition_id: u16, trashed: bool) -> PathBuf {
+fn partition_versions_root(
+    root: &Path,
+    fragment: &str,
+    partition_id: u16,
+    trashed: bool,
+) -> PathBuf {
     partition_dir(root, fragment, partition_id).join(if trashed {
         INDEX_TRASH_DIR
     } else {
@@ -3003,7 +3077,11 @@ async fn emit_partition_versions_on_partition(
                     if !is_version_entry(&name) {
                         continue;
                     }
-                    let Ok(relative_path) = file.path().strip_prefix(&objects_root).map(Path::to_path_buf) else {
+                    let Ok(relative_path) = file
+                        .path()
+                        .strip_prefix(&objects_root)
+                        .map(Path::to_path_buf)
+                    else {
                         continue;
                     };
                     if !seen.insert(relative_path) {
@@ -3034,11 +3112,24 @@ async fn run_fragment_versions_stream(
     trashed: bool,
     tx: mpsc::Sender<Result<ObjectMetadata, AppError>>,
 ) -> Result<(), AppError> {
-    for partition_id in 0..INDEX_PARTITION_COUNT {
-        emit_partition_versions_on_partition(&tx, &fragment, partition_id, trashed).await?;
+    let partition_concurrency = INDEX_FRAGMENT_VERSION_PARTITION_CONCURRENCY
+        .max(1)
+        .min(INDEX_PARTITION_COUNT as usize);
+    let mut scans = stream::iter(0..INDEX_PARTITION_COUNT)
+        .map(|partition_id| {
+            let tx = tx.clone();
+            let fragment = fragment.clone();
+            async move {
+                emit_partition_versions_on_partition(&tx, &fragment, partition_id, trashed).await
+            }
+        })
+        .buffer_unordered(partition_concurrency);
+
+    while let Some(result) = scans.next().await {
         if tx.is_closed() {
             break;
         }
+        result?;
     }
     Ok(())
 }
@@ -3205,9 +3296,10 @@ pub async fn remove_session(
         removed_at: Utc::now().timestamp(),
         reason: reason.to_string(),
     };
-    if let Some(state) = session_state.as_ref().filter(|state| {
-        !state.parts.is_empty() || !state.manifest.planned_parts.is_empty()
-    }) {
+    if let Some(state) = session_state
+        .as_ref()
+        .filter(|state| !state.parts.is_empty() || !state.manifest.planned_parts.is_empty())
+    {
         let receipt = RemovedSessionReceipt {
             state: state.clone(),
             removed_at: match &wal {
@@ -3407,7 +3499,8 @@ pub async fn read_removed_session_receipt(
             }
             Err(e) => return Err(AppError::Io(e, format!("metadata {}", path.display()))),
         };
-        let Some(receipt) = read_messagepack_if_exists::<RemovedSessionReceipt>(&path).await? else {
+        let Some(receipt) = read_messagepack_if_exists::<RemovedSessionReceipt>(&path).await?
+        else {
             continue;
         };
         match &best {
@@ -3458,11 +3551,8 @@ pub async fn publish_object(metadata: &ObjectMetadata) -> Result<(), AppError> {
 }
 
 pub async fn upsert_object_version(metadata: &ObjectMetadata) -> Result<(), AppError> {
-    upsert_object_version_with_replica_mode(
-        metadata,
-        IndexReplicaWriteMode::BackgroundBestEffort,
-    )
-    .await
+    upsert_object_version_with_replica_mode(metadata, IndexReplicaWriteMode::BackgroundBestEffort)
+        .await
 }
 
 pub async fn upsert_object_version_with_replica_mode(
@@ -3603,6 +3693,112 @@ pub async fn list_fragment_trash_objects_for_prefix(
             .then(left.version_id.cmp(&right.version_id))
     });
     Ok(objects)
+}
+
+pub async fn list_fragment_latest_objects_page(
+    fragment: &str,
+    trashed: bool,
+    prefix: Option<&str>,
+    start_after: Option<(&str, &str)>,
+    limit: usize,
+) -> Result<(Vec<ObjectMetadata>, Option<(String, String)>), AppError> {
+    if limit == 0 {
+        return Ok((Vec::new(), None));
+    }
+
+    let prefix = prefix.map(canonical_prefix);
+    let partition_concurrency = INDEX_FRAGMENT_VERSION_PARTITION_CONCURRENCY
+        .max(1)
+        .min(INDEX_PARTITION_COUNT as usize);
+    let mut partition_states = vec![Vec::<IndexLatestState>::new(); INDEX_PARTITION_COUNT as usize];
+    let mut scans = stream::iter(0..INDEX_PARTITION_COUNT)
+        .map(|partition_id| {
+            let fragment = fragment.to_string();
+            let prefix = prefix.clone();
+            async move {
+                let states = collect_partition_latest_states_filtered(
+                    &fragment,
+                    partition_id,
+                    trashed,
+                    prefix.as_deref(),
+                )
+                .await?;
+                Ok::<(u16, Vec<IndexLatestState>), AppError>((partition_id, states))
+            }
+        })
+        .buffer_unordered(partition_concurrency);
+
+    while let Some(result) = scans.next().await {
+        let (partition_id, states) = result?;
+        partition_states[partition_id as usize] = states;
+    }
+
+    let mut cursors = BinaryHeap::<Reverse<PartitionPageCursor>>::new();
+    for partition_id in 0..INDEX_PARTITION_COUNT {
+        let states = &partition_states[partition_id as usize];
+        if states.is_empty() {
+            continue;
+        }
+        let start_index = if let Some((start_key, start_version)) = start_after {
+            match states.binary_search_by(|state| {
+                latest_state_key_cmp(
+                    state.metadata.object_key.as_str(),
+                    state.metadata.version_id.as_str(),
+                    start_key,
+                    start_version,
+                )
+            }) {
+                Ok(idx) => idx.saturating_add(1),
+                Err(idx) => idx,
+            }
+        } else {
+            0
+        };
+
+        if let Some(state) = states.get(start_index) {
+            cursors.push(Reverse(PartitionPageCursor {
+                partition_id,
+                index: start_index,
+                object_key: state.metadata.object_key.clone(),
+                version_id: state.metadata.version_id.clone(),
+            }));
+        }
+    }
+
+    let mut out = Vec::with_capacity(limit);
+    let mut last_pair: Option<(String, String)> = None;
+    while out.len() < limit {
+        let Some(Reverse(cursor)) = cursors.pop() else {
+            break;
+        };
+        let states = &partition_states[cursor.partition_id as usize];
+        let state = states
+            .get(cursor.index)
+            .ok_or_else(|| AppError::InternalServerError("invalid partition cursor".into()))?;
+
+        out.push(state.metadata.clone());
+        last_pair = Some((
+            state.metadata.object_key.clone(),
+            state.metadata.version_id.clone(),
+        ));
+
+        let next_index = cursor.index.saturating_add(1);
+        if let Some(next_state) = states.get(next_index) {
+            cursors.push(Reverse(PartitionPageCursor {
+                partition_id: cursor.partition_id,
+                index: next_index,
+                object_key: next_state.metadata.object_key.clone(),
+                version_id: next_state.metadata.version_id.clone(),
+            }));
+        }
+    }
+
+    let next = if out.len() >= limit && !cursors.is_empty() {
+        last_pair
+    } else {
+        None
+    };
+    Ok((out, next))
 }
 
 pub async fn delete_object_version(

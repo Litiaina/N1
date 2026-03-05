@@ -9,7 +9,7 @@ use block_manager::{
 };
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -97,6 +97,8 @@ pub struct RawGcMarker {
 static RAW_MANAGER_CACHE: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<BlockManager>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+const MISSING_RAW_DEVICE_ERROR_PREFIX: &str = "No raw blob device found for device id ";
+
 pub fn stable_shard_file_name(part_index: u64, shard_index: usize, is_parity: bool) -> String {
     let ext = if is_parity {
         PARITY_SUFFIX
@@ -130,16 +132,21 @@ pub fn configured_blob_disk_count() -> Result<usize, AppError> {
 }
 
 pub fn validate_configured_raw_blob_disks() -> Result<Vec<RawBlobDeviceStatus>, AppError> {
-    let disks = configured_blob_store_disks()?;
-    let mut out = Vec::with_capacity(disks.len());
-    for disk in &disks {
-        out.push(inspect_raw_blob_device(Path::new(disk), false)?);
+    let statuses = collect_raw_blob_device_statuses()?;
+    let usable = statuses
+        .iter()
+        .filter(|status| matches!(status.status.as_str(), "managed" | "unformatted"))
+        .count();
+    if usable == 0 {
+        return Err(AppError::InternalServerError(
+            "No usable raw blob disks available from blob_store_disks".into(),
+        ));
     }
-    Ok(out.into_iter().map(status_from_inspection).collect())
+    Ok(statuses)
 }
 
 pub fn raw_blob_device_statuses() -> Result<Vec<RawBlobDeviceStatus>, AppError> {
-    validate_configured_raw_blob_disks()
+    collect_raw_blob_device_statuses()
 }
 
 pub fn format_raw_blob_device(path: &Path, force: bool) -> Result<RawBlobDeviceStatus, AppError> {
@@ -205,11 +212,38 @@ pub fn format_raw_blob_device(path: &Path, force: bool) -> Result<RawBlobDeviceS
 
 pub fn resolve_blob_disk(disk_idx: usize) -> Result<BlobDiskHandle, AppError> {
     let disks = configured_blob_store_disks()?;
-    let raw_path = disks.get(disk_idx).ok_or_else(|| {
-        AppError::InternalServerError(format!("Blob disk index {} out of bounds", disk_idx))
-    })?;
-    let path = PathBuf::from(raw_path);
-    let inspection = inspect_raw_blob_device(&path, true)?;
+    if disks.is_empty() {
+        return Err(AppError::InternalServerError(
+            "No blob disks configured".into(),
+        ));
+    }
+    if disk_idx >= disks.len() {
+        return Err(AppError::InternalServerError(format!(
+            "Blob disk index {} out of bounds",
+            disk_idx
+        )));
+    }
+
+    let mut first_err: Option<AppError> = None;
+    for offset in 0..disks.len() {
+        let idx = (disk_idx + offset) % disks.len();
+        match resolve_blob_disk_from_path(Path::new(&disks[idx])) {
+            Ok(handle) => return Ok(handle),
+            Err(err) => {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+    }
+
+    Err(first_err.unwrap_or_else(|| {
+        AppError::InternalServerError("No usable raw blob disks configured".into())
+    }))
+}
+
+fn resolve_blob_disk_from_path(path: &Path) -> Result<BlobDiskHandle, AppError> {
+    let inspection = inspect_raw_blob_device(path, true)?;
     let manager = open_or_format_raw_manager(&inspection.canonical_path)?;
     let device_id = manager
         .lock()
@@ -227,23 +261,65 @@ pub fn resolve_blob_disk_path(path: &Path) -> Result<BlobDiskHandle, AppError> {
         let candidate = PathBuf::from(raw);
         let canonical = fs::canonicalize(&candidate).unwrap_or(candidate.clone());
         if canonical == wanted {
-            let inspection = inspect_raw_blob_device(&candidate, true)?;
-            let manager = open_or_format_raw_manager(&inspection.canonical_path)?;
-            let device_id = manager
-                .lock()
-                .map_err(|_| {
-                    AppError::InternalServerError("Raw blob manager lock poisoned".into())
-                })?
-                .header()
-                .device_id
-                .to_string();
-            return Ok(BlobDiskHandle::Raw { device_id, manager });
+            return resolve_blob_disk_from_path(&candidate);
         }
     }
     Err(AppError::InternalServerError(format!(
         "configured blob disk not found for {}",
         path.display()
     )))
+}
+
+fn collect_raw_blob_device_statuses() -> Result<Vec<RawBlobDeviceStatus>, AppError> {
+    let disks = configured_blob_store_disks()?;
+    let mut out = Vec::with_capacity(disks.len());
+    for disk in &disks {
+        let path = Path::new(disk);
+        match inspect_raw_blob_device(path, false) {
+            Ok(inspection) => out.push(status_from_inspection(inspection)),
+            Err(err) => out.push(status_from_inspection_error(path, &err)),
+        }
+    }
+    Ok(out)
+}
+
+fn status_from_inspection_error(path: &Path, err: &AppError) -> RawBlobDeviceStatus {
+    let kind = raw_blob_path_kind_hint(path);
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let status = match err {
+        AppError::BadRequest(_) => "misconfigured",
+        AppError::Io(_, _) => "unavailable",
+        _ => "error",
+    }
+    .to_string();
+
+    RawBlobDeviceStatus {
+        path: path.to_string_lossy().to_string(),
+        canonical_path: canonical.to_string_lossy().to_string(),
+        kind,
+        status,
+        direct_io: true,
+        mounted: false,
+        mount_points: Vec::new(),
+        path_warning: raw_path_warning(path, kind),
+        detected_signature: None,
+        device_id: None,
+        block_size_bytes: None,
+        allocation_count: None,
+        journal_cursor: None,
+        total_bytes: None,
+        used_bytes: None,
+        available_bytes: None,
+        error: Some(err.to_string()),
+    }
+}
+
+fn raw_blob_path_kind_hint(path: &Path) -> RawBlobPathKind {
+    if path.to_string_lossy().starts_with("/dev/") {
+        RawBlobPathKind::BlockDevice
+    } else {
+        RawBlobPathKind::LoopbackFile
+    }
 }
 
 pub async fn raw_stage_path_for_shard(
@@ -518,15 +594,12 @@ pub async fn free_raw_shards_for_metadata(metadata: &ObjectMetadata) -> Result<(
             }
         }
     }
-    for raw in seen {
-        free_raw_address(&raw).await?;
-    }
-    Ok(())
+    free_raw_addresses(&seen).await
 }
 
 pub async fn free_raw_shards_for_metadatas(metadatas: &[ObjectMetadata]) -> Result<(), AppError> {
-    let mut grouped = HashMap::<String, Vec<RawBlobAddress>>::new();
-    let mut seen = std::collections::HashSet::<(String, u64, u64, u64)>::new();
+    let mut addrs = Vec::<RawBlobAddress>::new();
+    let mut seen = HashSet::<(String, u64, u64, u64)>::new();
 
     for metadata in metadatas {
         for part in &metadata.parts {
@@ -541,48 +614,91 @@ pub async fn free_raw_shards_for_metadatas(metadatas: &[ObjectMetadata]) -> Resu
                     raw.size_bytes,
                 );
                 if seen.insert(key) {
-                    grouped
-                        .entry(raw.device_id.clone())
-                        .or_default()
-                        .push(raw.clone());
+                    addrs.push(raw.clone());
                 }
             }
         }
     }
 
+    free_raw_addresses(&addrs).await
+}
+
+pub async fn free_raw_addresses(addresses: &[RawBlobAddress]) -> Result<(), AppError> {
+    if addresses.is_empty() {
+        return Ok(());
+    }
+
+    let mut grouped = HashMap::<String, Vec<RawBlobAddress>>::new();
+    let mut seen = HashSet::<(String, u64, u64, u64)>::new();
+    for raw in addresses {
+        let key = (
+            raw.device_id.clone(),
+            raw.allocation_id,
+            raw.offset_bytes,
+            raw.size_bytes,
+        );
+        if seen.insert(key) {
+            grouped
+                .entry(raw.device_id.clone())
+                .or_default()
+                .push(raw.clone());
+        }
+    }
+
     for (device_id, addresses) in grouped {
-        tokio::task::spawn_blocking(move || {
-            let manager = raw_manager_by_device_id(device_id.as_str())?;
+        let result = tokio::task::spawn_blocking(move || {
+            let manager = match raw_manager_by_device_id(device_id.as_str()) {
+                Ok(manager) => manager,
+                Err(err) if is_missing_raw_device_mapping_error(&err) => return Ok(()),
+                Err(err) => return Err(err),
+            };
             let mut mgr = manager.lock().map_err(|_| {
                 AppError::InternalServerError("Raw blob manager lock poisoned".into())
             })?;
-            let mut mutated = false;
+
+            let manager_device_id = mgr.header().device_id;
+            let mut raw_extents = Vec::<RawExtentAddress>::with_capacity(addresses.len());
             for raw in addresses {
-                let address = RawExtentAddress {
-                    device_id: mgr.header().device_id,
+                raw_extents.push(RawExtentAddress {
+                    device_id: manager_device_id,
                     allocation_id: raw.allocation_id,
                     offset_bytes: raw.offset_bytes,
                     size_bytes: raw.size_bytes,
-                };
-                match mgr.free_address(&address) {
-                    Ok(()) => mutated = true,
-                    Err(err) => {
-                        if mutated {
-                            let _ = mgr.flush();
-                        }
-                        return Err(block_manager_error_to_app(err));
-                    }
-                }
+                });
             }
-            if mutated {
-                mgr.flush().map_err(block_manager_error_to_app)?;
+
+            let freed = match mgr.free_addresses(&raw_extents) {
+                Ok(freed) => freed,
+                Err(BlockManagerError::UnknownAllocation(_)) => {
+                    // Batch free should stay idempotent across retries/crash windows where
+                    // some extents were already freed before index metadata was cleared.
+                    let mut recovered_freed = 0usize;
+                    for address in &raw_extents {
+                        match mgr.free_address(address) {
+                            Ok(()) => {
+                                recovered_freed = recovered_freed.saturating_add(1);
+                            }
+                            Err(BlockManagerError::UnknownAllocation(_)) => {
+                                // Already freed; treat as success for cleanup workflows.
+                            }
+                            Err(err) => return Err(block_manager_error_to_app(err)),
+                        }
+                    }
+                    recovered_freed
+                }
+                Err(err) => return Err(block_manager_error_to_app(err)),
+            };
+            if freed > 0 {
+                mgr.flush_meta().map_err(block_manager_error_to_app)?;
             }
             Ok::<(), AppError>(())
         })
         .await
-        .map_err(|e| {
-            AppError::InternalServerError(format!("raw batch free task failed: {}", e))
-        })??;
+        .map_err(|e| AppError::InternalServerError(format!("raw batch free task failed: {}", e)))?;
+
+        if let Err(err) = result {
+            return Err(err);
+        }
     }
 
     Ok(())
@@ -622,28 +738,15 @@ pub fn metadata_contains_raw_shards(metadata: &ObjectMetadata) -> bool {
 }
 
 pub async fn free_raw_address(raw: &RawBlobAddress) -> Result<(), AppError> {
-    let raw = raw.clone();
-    tokio::task::spawn_blocking(move || {
-        let manager = raw_manager_by_device_id(raw.device_id.as_str())?;
-        let mut mgr = manager
-            .lock()
-            .map_err(|_| AppError::InternalServerError("Raw blob manager lock poisoned".into()))?;
-        let address = RawExtentAddress {
-            device_id: mgr.header().device_id,
-            allocation_id: raw.allocation_id,
-            offset_bytes: raw.offset_bytes,
-            size_bytes: raw.size_bytes,
-        };
-        mgr.free_address(&address)
-            .map_err(block_manager_error_to_app)?;
-        mgr.flush().map_err(block_manager_error_to_app)
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("raw free task failed: {}", e)))?
+    free_raw_addresses(std::slice::from_ref(raw)).await
 }
 
 pub async fn raw_blob_address_exists(raw: &RawBlobAddress) -> Result<bool, AppError> {
-    let manager = raw_manager_by_device_id(raw.device_id.as_str())?;
+    let manager = match raw_manager_by_device_id(raw.device_id.as_str()) {
+        Ok(manager) => manager,
+        Err(err) if is_missing_raw_device_mapping_error(&err) => return Ok(false),
+        Err(err) => return Err(err),
+    };
     let address = RawExtentAddress {
         device_id: manager
             .lock()
@@ -727,20 +830,44 @@ pub fn raw_gc_marker_file_name(raw: &RawBlobAddress) -> String {
 
 fn raw_manager_by_device_id(device_id: &str) -> Result<Arc<Mutex<BlockManager>>, AppError> {
     let disk_count = configured_blob_disk_count()?;
+    let mut first_resolve_err: Option<AppError> = None;
+    let mut resolved_any = false;
     for idx in 0..disk_count {
         let BlobDiskHandle::Raw {
             device_id: raw_device_id,
             manager,
             ..
-        } = resolve_blob_disk(idx)?;
+        } = match resolve_blob_disk(idx) {
+            Ok(handle) => handle,
+            Err(err) => {
+                if first_resolve_err.is_none() {
+                    first_resolve_err = Some(err);
+                }
+                continue;
+            }
+        };
+        resolved_any = true;
         if raw_device_id == device_id {
             return Ok(manager);
         }
     }
+    if !resolved_any {
+        return Err(first_resolve_err.unwrap_or_else(|| {
+            AppError::InternalServerError("No usable raw blob disks configured".into())
+        }));
+    }
     Err(AppError::InternalServerError(format!(
-        "No raw blob device found for device id {}",
-        device_id
+        "{}{}",
+        MISSING_RAW_DEVICE_ERROR_PREFIX, device_id
     )))
+}
+
+pub fn is_missing_raw_device_mapping_error(err: &AppError) -> bool {
+    matches!(
+        err,
+        AppError::InternalServerError(message)
+            if message.starts_with(MISSING_RAW_DEVICE_ERROR_PREFIX)
+    )
 }
 
 fn open_or_format_raw_manager(path: &Path) -> Result<Arc<Mutex<BlockManager>>, AppError> {
@@ -1193,6 +1320,7 @@ const BLKGETSIZE64_IOCTL: libc::c_ulong = 0x8008_1272;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::n1_core::disk_manager::replace_storage_roots_for_tests;
     use std::fs::OpenOptions;
     use std::os::unix::fs::FileExt;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1440,5 +1568,88 @@ mod tests {
         assert_eq!(status.status, "managed");
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn raw_blob_device_statuses_reports_missing_path_without_failing() {
+        let index_root = temp_loopback("index-root");
+        std::fs::create_dir_all(&index_root).expect("create index root");
+        let fs_root = temp_loopback("fs-root");
+        std::fs::create_dir_all(&fs_root).expect("create fs root");
+
+        let healthy = temp_loopback("healthy-status");
+        let healthy_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&healthy)
+            .expect("create healthy loopback");
+        healthy_file.set_len(4 * 1024 * 1024).expect("size healthy");
+        drop(healthy_file);
+
+        let missing = temp_loopback("missing-status");
+        replace_storage_roots_for_tests(
+            vec![index_root.to_string_lossy().to_string()],
+            vec![
+                healthy.to_string_lossy().to_string(),
+                missing.to_string_lossy().to_string(),
+            ],
+            fs_root.to_string_lossy().to_string(),
+        );
+
+        let statuses = raw_blob_device_statuses().expect("status probe should not hard fail");
+        assert_eq!(statuses.len(), 2);
+        assert!(
+            statuses
+                .iter()
+                .any(|s| s.path == missing.to_string_lossy() && s.status == "unavailable"),
+            "missing disk path should be reported as unavailable"
+        );
+        validate_configured_raw_blob_disks().expect("one healthy disk should keep validation ok");
+
+        let _ = std::fs::remove_file(healthy);
+        let _ = std::fs::remove_dir_all(index_root);
+        let _ = std::fs::remove_dir_all(fs_root);
+    }
+
+    #[test]
+    fn resolve_blob_disk_falls_back_to_next_usable_path() {
+        let index_root = temp_loopback("index-fallback");
+        std::fs::create_dir_all(&index_root).expect("create index root");
+        let fs_root = temp_loopback("fs-fallback");
+        std::fs::create_dir_all(&fs_root).expect("create fs root");
+
+        let missing = temp_loopback("missing-fallback");
+        let healthy = temp_loopback("healthy-fallback");
+        let healthy_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&healthy)
+            .expect("create healthy loopback");
+        healthy_file.set_len(8 * 1024 * 1024).expect("size healthy");
+        drop(healthy_file);
+
+        replace_storage_roots_for_tests(
+            vec![index_root.to_string_lossy().to_string()],
+            vec![
+                missing.to_string_lossy().to_string(),
+                healthy.to_string_lossy().to_string(),
+            ],
+            fs_root.to_string_lossy().to_string(),
+        );
+
+        let handle = resolve_blob_disk(0).expect("resolver should fall back to healthy disk");
+        let BlobDiskHandle::Raw { device_id, .. } = handle;
+        assert!(
+            !device_id.is_empty(),
+            "resolved fallback disk should expose a device id"
+        );
+
+        let _ = std::fs::remove_file(healthy);
+        let _ = std::fs::remove_dir_all(index_root);
+        let _ = std::fs::remove_dir_all(fs_root);
     }
 }
