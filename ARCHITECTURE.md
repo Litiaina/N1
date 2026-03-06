@@ -10,7 +10,7 @@ This replaces the legacy "full mirrored metadata tree on every index root" model
 
 ## Freeze Status
 
-The N1 architecture is frozen at version `0.9.1`.
+The N1 architecture is frozen at version `0.3.0`.
 
 That freeze applies to the storage model:
 
@@ -21,6 +21,22 @@ That freeze applies to the storage model:
 - stateless resumability through authoritative session state
 
 It does **not** freeze the HTTP/API surface yet. API and operational route details can still change before `1.0.0` while the core storage architecture stays fixed.
+
+## Engine Identity And Variant Choice
+
+N1 is intentionally a specialized object-storage engine, not a general filesystem:
+
+- authoritative object/session/trash truth on disk
+- immutable version publish discipline
+- crash-first repairability
+- low-overhead multipart payload paths
+
+Two server variants exist so users can choose deployment posture:
+
+- `standard`: filesystem-backed N1 for general-purpose use and broad hardware compatibility.
+- `monilith`: raw-device/direct-I/O N1 for absolute device control and maximum throughput ceiling.
+
+They are expected to keep the same storage semantics. The difference is backend execution model and operational profile, not object correctness guarantees.
 
 ## Platform Truth
 
@@ -112,6 +128,10 @@ The serving index remains under the `index/prefix/...` tree:
   dcompacted.msgpack
 ```
 
+`standard` variant note:
+- `standard` now persists upload session state and object latest/version metadata in this partitioned `index/partitions/{partition_id}` namespace as its primary metadata path, while legacy mirrored index files are still written for transition compatibility.
+- During this transition window, maintenance object-walk scanners in `standard` intentionally consume legacy object metadata files (`{object_hash}#{version}.msgpack`) as the single scan authority to avoid duplicate stale processing from mixed legacy+partition trees; partition/session state remains persisted and used for upload/session control-plane flows.
+
 This plane stores projected namespace snapshots only. It can be rebuilt from `index` whenever serving state needs regeneration.
 
 ### Blob storage
@@ -119,8 +139,13 @@ This plane stores projected namespace snapshots only. It can be rebuilt from `in
 The payload plane remains:
 
 - raw blob devices managed by `block_manager`
-- shard addresses recorded as `raw://<device_id>/<allocation_id>`
+- shard addresses recorded as `raw://<device_id>/<allocation_id>` with topology epoch metadata
 - direct-I/O writes and reads on the blob path
+
+Allocator design note:
+- The target allocator architecture and rollout plan are defined in [`BLOCK_ALLOCATOR_V2.md`](BLOCK_ALLOCATOR_V2.md).
+- Current allocator journals are txid-stamped and replay is idempotent.
+- Large raw free workloads are deferred and applied by a bounded background worker to keep foreground paths predictable.
 
 ## Write Path
 
@@ -140,12 +165,16 @@ At this stage no object is visible.
 Part upload is still payload-first:
 
 1. stream bytes through RS encode
-2. write staged shard data
-3. commit staged shard data into raw blob extents
+2. write bytes directly into pre-reserved raw shard extents from init geometry
+3. commit part metadata and session part state
 4. build `PartMetadata`
 5. update the session's `index` state with the committed part
 
 This keeps metadata small and bounded: blob payload durability and part-session durability are separate from object visibility.
+
+Upload geometry behavior:
+- Explicit geometry (`part_size_bytes` / `part_sizes_bytes`) is strict.
+- If geometry is not supplied, init derives deterministic geometry from `total_size_bytes + expected_parts` and pre-reserves shard capacity so chunk uploads avoid allocate/free on the hot path.
 
 ### 3. Finalize upload
 

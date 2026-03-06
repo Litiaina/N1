@@ -47,19 +47,19 @@ Preferred commands:
 
 ```bash
 # Start redistribution
-cargo run -p server -- ops redistribute start --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+cargo run -p monilith -- ops redistribute start --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
 
 # Dry-run (plan only, no writes)
-cargo run -p server -- ops redistribute start --dry-run --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+cargo run -p monilith -- ops redistribute start --dry-run --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
 
 # Watch monitor
-cargo run -p server -- ops redistribute watch --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+cargo run -p monilith -- ops redistribute watch --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
 
 # One-shot status
-cargo run -p server -- ops redistribute status --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+cargo run -p monilith -- ops redistribute status --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
 
 # Stop job (cooperative)
-cargo run -p server -- ops redistribute stop --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+cargo run -p monilith -- ops redistribute stop --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
 ```
 
 Notes:

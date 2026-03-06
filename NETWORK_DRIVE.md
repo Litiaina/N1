@@ -2,14 +2,14 @@
 
 This guide covers both ways to expose N1 as a network drive:
 
-- Native SMB-lite gateway (`smb`) built into `litiaina-n1` (recommended).
+- Native SMB-lite gateway (`smb`) built into `litiaina-n1-monilith` (recommended).
 - Fallback bridge (`fsd_mount` + Samba) for environments where you still need it.
 
 ## Current Status
 
 `smb` is SMB-lite, not full enterprise SMB.
 
-Implemented in `server/src/smb/server.rs`:
+Implemented in `monilith/src/smb/server.rs`:
 - auth + signing
 - `list/read/open`
 - query-directory / query-info metadata paths
@@ -97,10 +97,10 @@ Template:
 ### 3) Start N1 server
 
 ```bash
-cargo run -p server --bin litiaina-n1
+cargo run -p monilith --bin litiaina-n1-monilith
 ```
 
-Or run your installed systemd service for `litiaina-n1`.
+Or run your installed systemd service for `litiaina-n1-monilith`.
 
 ### 4) Verify listener
 
@@ -139,7 +139,7 @@ Use this only if you need the previous bridge model.
 ### Build
 
 ```bash
-cargo build --release -p server
+cargo build --release -p monilith
 cargo build --release -p server_cli --features fsd-mount --bin fsd_mount
 ```
 
@@ -197,7 +197,7 @@ This is expected with conservative share-mode handling. Retry after releasing co
 ## Verification Commands
 
 ```bash
-cargo check -p server
-cargo test -p server smb::server::tests -- --nocapture
-cargo test -p server -- --nocapture
+cargo check -p monilith
+cargo test -p monilith smb::server::tests -- --nocapture
+cargo test -p monilith -- --nocapture
 ```

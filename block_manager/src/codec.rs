@@ -93,7 +93,8 @@ pub(crate) fn encode_record(record: JournalRecord) -> [u8; JOURNAL_RECORD_SIZE] 
     out[8..16].copy_from_slice(&record.allocation_id.to_le_bytes());
     out[16..24].copy_from_slice(&record.extent.start_block.to_le_bytes());
     out[24..32].copy_from_slice(&record.extent.block_count.to_le_bytes());
-    let crc = crc32(&out[..32]);
+    out[36..44].copy_from_slice(&record.txn_id.to_le_bytes());
+    let crc = record_crc32(&out);
     out[32..36].copy_from_slice(&crc.to_le_bytes());
     out
 }
@@ -108,7 +109,7 @@ pub(crate) fn decode_record(
         ));
     }
     let crc_expected = u32::from_le_bytes(buf[32..36].try_into().expect("crc bytes"));
-    let crc_actual = crc32(&buf[..32]);
+    let crc_actual = record_crc32(buf);
     if crc_expected != crc_actual {
         return Err(BlockManagerError::Corrupt(
             "journal record checksum mismatch".to_string(),
@@ -125,6 +126,7 @@ pub(crate) fn decode_record(
         }
     };
     Ok(JournalRecord {
+        txn_id: u64::from_le_bytes(buf[36..44].try_into().expect("txn id")),
         op,
         allocation_id: u64::from_le_bytes(buf[8..16].try_into().expect("alloc id")),
         extent: Extent {
@@ -137,5 +139,12 @@ pub(crate) fn decode_record(
 fn crc32(bytes: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(bytes);
+    hasher.finalize()
+}
+
+fn record_crc32(buf: &[u8; JOURNAL_RECORD_SIZE]) -> u32 {
+    let mut hasher = Hasher::new();
+    hasher.update(&buf[..32]);
+    hasher.update(&buf[36..44]);
     hasher.finalize()
 }

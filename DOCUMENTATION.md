@@ -9,13 +9,18 @@
   <p>Complete route reference and usage guide (current implementation).</p>
 </div>
 
-> Source of truth for routing: `server/src/routes/storage_routes.rs`.
-> Source of truth for request/response behavior: the handler files under `server/src/n1_core` and `server/src/fs`.
+> Source of truth for routing: `monilith/src/routes/storage_routes.rs`.
+> Source of truth for request/response behavior: the handler files under `monilith/src/n1_core` and `monilith/src/fs`.
 
 > Storage backend note:
 > - `index_store_disks` must be mounted filesystem paths.
 > - `blob_store_disks` are raw, unformatted, unmounted device paths managed directly by N1.
 > - Blob payload I/O uses `O_DIRECT`; metadata and control files stay filesystem-backed.
+
+> Engine profile note:
+> - `standard` exists for general-purpose filesystem-backed deployments.
+> - `monilith` exists for raw-device absolute control and maximum performance.
+> - Both variants are intended to keep the same object/API semantics; the difference is backend execution model and operations envelope.
 
 > Metadata architecture note:
 > - `index` is the authoritative object, trash, and upload-session metadata plane.
@@ -28,10 +33,10 @@
 > - If two versions share the same second-level timestamp, ULID `version_id` order breaks the tie.
 > - Exact-key reads resolve the latest marker and then rehydrate the referenced immutable version record before serving metadata or bytes.
 > - Prefix-serving state may lag, but it must never override or invent visibility that `index` does not contain.
-> - Multipart uploads do not rely on in-memory part state for resumability. Part truth is durable part metadata on disk, and a pending-part receipt covers the raw-allocation crash window until that metadata exists.
+> - Multipart uploads do not rely on in-memory part state for resumability. Part commits are durably recorded in the `index` WAL/session state and mirrored as per-part metadata files for compatibility and recovery workflows.
 
 > Release status note:
-> - N1 `0.9.1` freezes the storage architecture, not the public API surface.
+> - N1 `0.3.0` freezes the storage architecture, not the public API surface.
 > - This document describes the current implementation and current routes.
 > - Request/response details and endpoint layout may still change before `1.0.0` even though the underlying storage model is now fixed.
 
@@ -397,6 +402,7 @@ Notes:
 - Raw-extent cleanup is best-effort for decommissioned blob device ids; stale mappings no longer fail the API path.
 - Empty-trash now streams trash metadata instead of materializing all versions first, reducing peak RAM and startup latency on large fragments.
 - Raw extent frees are batched per blob device (single allocator lock and single metadata sync per batch) instead of one fsync per extent.
+- Large raw-free sets are now deferred into durable index markers and applied by a bounded background worker (`FreeDefer -> FreeApply`) to avoid long foreground stalls.
 
 ### 7.4 `PATCH /v4/fragment/object/rename`
 Body (`RenameObjectRequest`):
@@ -459,6 +465,7 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
 Notes:
 - Recovery is now parallelized per object key (versions within one key still restore in recency order), which improves large fragment recover-all throughput.
 - Recover-all and empty-trash free raw extents through allocator batch commits; this reduces cleanup latency for large trash sets.
+- Raw extent identities include topology epoch. Hotplug/reconfiguration is tracked through a mirrored raw device-map table (`.n1/raw_device_map.msgpack`) and reflected in new allocations.
 
 ## 8. Protected v4 Upload APIs (Resumable Object Storage Upload)
 
@@ -479,7 +486,9 @@ Body:
 
 Behavior:
 - Opens the authoritative multipart session in `index`.
-- If geometry is supplied at init, the node pre-reserves deterministic raw shard slots up front so part uploads can reuse them directly.
+- The node now derives deterministic part geometry at init and pre-reserves raw shard slots up front.
+- Explicit geometry (`part_size_bytes` / `part_sizes_bytes`) is strict.
+- Inferred geometry (from `total_size_bytes` + `expected_parts`) is soft for part-byte equality, but still bounded by reserved shard stripe capacity.
 
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
@@ -501,9 +510,9 @@ Durability default:
 - Upload I/O gating follows `[upload_config].upload_io_gate_enabled` (`true` by default) unless overridden by `io_gate`.
 
 Notes:
-- Part upload writes a durable pending-part receipt, commits raw shard payload, then writes durable part metadata on disk.
+- Part upload writes a durable pending-part receipt, commits raw shard payload, persists part metadata on disk, then records the part commit in `index` session WAL/state.
 - The upload hot path does not rely on in-memory part state for resumability.
-- If init provided geometry, the part path reuses pre-reserved raw shard slots instead of allocating new extents on the hot path.
+- Part upload reuses pre-reserved raw shard slots from init instead of allocating new extents on the hot path.
 - Multipart part commits are unordered across distinct `part_index` values.
 - Client coordination should keep one logical writer per `(version_id, part_index)` and use upload-status checks for stateless resume.
 - A successful part upload does not publish object visibility by itself.
@@ -517,7 +526,7 @@ curl -k -X PUT -H "Authorization: Bearer $TOKEN" \
 
 ### 8.3 `GET /v4/upload/status/{fragment}/{version_id}`
 Behavior:
-- Reads the routed upload manifest from `index` and the committed part receipts from disk.
+- Reads the routed upload manifest and committed part set from `index` session state (with disk metadata fallback when needed).
 - Returns committed part indexes plus committed byte/part counters for resumability checks.
 
 ```bash
@@ -531,7 +540,7 @@ Query:
 - `offset` default 0
 
 Behavior:
-- Lists active routed multipart sessions from `index` and derives committed progress from durable part receipts on disk.
+- Lists active routed multipart sessions from `index` and reports committed progress from session state.
 - Includes committed part/byte progress per session.
 
 ```bash
@@ -542,7 +551,7 @@ curl -k -H "Authorization: Bearer $TOKEN" \
 ### 8.5 `POST /v4/upload/finalize/{fragment}/{version_id}/{session_id}`
 Behavior:
 - Loads the authoritative upload session from `index`.
-- Verifies the committed parts and publishes the immutable object version into the object's `index` partition.
+- Verifies committed parts from session state (with disk metadata fallback for legacy sessions) and publishes the immutable object version into the object's `index` partition.
 - Exact-key visibility is gated by this publish step.
 - Prefix listing is serving state layered on top of the publish and may be rebuilt from `index`.
 
@@ -611,7 +620,7 @@ Notes:
 - `mode=strict` makes the node read-only and raises repair aggressiveness to use more of the available I/O width.
 - `mode=scrub` quiesces reads and writes and runs the same integrity-first repair engine at the highest practical aggressiveness.
 - Runtime concurrency is normalized against live blob disks and live index roots, so auto-tuning follows actual reachable hardware instead of static CPU counts alone.
-- Fragment object-version scans are streamed incrementally from partition roots, so repair no longer materializes a whole fragment-wide metadata vector before work begins.
+- Fragment object-version scans are streamed incrementally (no full fragment materialization before work begins). In `standard`, this walk currently uses legacy `{hash}#{version}.msgpack` metadata files as the single scan stream while mixed legacy+partition maintenance projection is being finalized.
 - Log severity policy for repair/recovery paths: expected retry/remap steps emit `DEBUG`, successful per-object summaries emit `INFO`, degraded-but-continued outcomes emit `WARN`, and unrecoverable read failures emit `ERROR`.
 - Repair/scrub dry-run no longer aborts when `.raw_gc` markers reference a decommissioned device id; those markers are kept and treated as deferred cleanup state.
 
@@ -688,7 +697,7 @@ Notes:
 - `mode=strict` makes the node read-only and drives redistribution harder across the live blob/index layout.
 - `mode=scrub` quiesces reads and writes and uses the widest redistribution concurrency that the live layout and RAM caps allow.
 - Execution `mode` controls service access and scheduler aggressiveness; `durability` still separately controls strict-vs-batched write sync behavior.
-- Fragment object-version scans are streamed incrementally from partition roots, so redistribution can start moving data without first loading an entire fragment into memory.
+- Fragment object-version scans are streamed incrementally so redistribution can start moving data without first loading an entire fragment into memory. In `standard`, redistribution currently walks the legacy `{hash}#{version}.msgpack` stream as its scan authority during migration.
 - Redistribution now follows the same log-severity contract as repair/recovery (`DEBUG` expected retries, `INFO` successful migration summaries, `WARN` degraded-but-continued failures, `ERROR` unrecoverable read failures).
 
 ```bash

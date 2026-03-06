@@ -2,7 +2,6 @@ mod codec;
 pub(crate) mod constants;
 mod device_io;
 mod error;
-mod extent_map;
 mod manager;
 mod types;
 

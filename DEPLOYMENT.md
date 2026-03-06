@@ -83,14 +83,14 @@ findmnt /dev/disk/by-id/nvme-Samsung_SSD_1 || true
 Format a raw blob device explicitly with N1:
 
 ```bash
-sudo target/release/litiaina-n1 format-blob-device \
+sudo target/release/litiaina-n1-monilith format-blob-device \
   --path /dev/disk/by-id/nvme-Samsung_SSD_1
 ```
 
 For destructive reinitialization of a device that already contains foreign or stale data:
 
 ```bash
-sudo target/release/litiaina-n1 format-blob-device \
+sudo target/release/litiaina-n1-monilith format-blob-device \
   --path /dev/disk/by-id/nvme-Samsung_SSD_1 \
   --force
 ```
@@ -234,7 +234,7 @@ Scrub is the integrity-check pass for committed raw shards.
 
 ## 10. Release Hardening On Target Hardware
 
-N1 `0.9.1` is the architecture-freeze line. Run the release drill harness before cutting a `1.0.0` stable build:
+N1 `0.3.0` is the architecture-freeze line. Run the release drill harness before cutting a `1.0.0` stable build:
 
 ```bash
 scripts/bench/run_release_drills.sh

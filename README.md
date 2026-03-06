@@ -62,7 +62,7 @@ For raw blob device setup and operator steps, see `DEPLOYMENT.md`.
 For explicit raw blob initialization, use:
 
 ```bash
-sudo target/release/litiaina-n1 format-blob-device --path /dev/disk/by-id/...
+sudo target/release/litiaina-n1-monilith format-blob-device --path /dev/disk/by-id/...
 ```
 
 Profile note:
@@ -71,7 +71,7 @@ Profile note:
 
 ## Release Status
 
-- N1 `0.9.1` is the architecture-freeze line.
+- N1 `0.3.0` is the architecture-freeze line.
 - The storage model is frozen at this point:
   - raw direct-I/O blob plane
   - filesystem-backed authoritative `index`
@@ -114,6 +114,17 @@ Operationally, "true N1" now means:
 - `index` is the authoritative source for live objects, trash, and upload sessions
 - prefix and delimiter listing are served from a derived namespace index
 - maintenance jobs reconcile from the same authoritative metadata plane
+
+## Engine Identity And Why Two Variants Exist
+
+N1's core identity is a specialized object-storage engine: authoritative on-disk metadata truth, immutable version publish, crash-first recovery semantics, and lock-lean multipart data paths.
+
+Both variants exist by design so operators can choose deployment style without changing object semantics:
+
+- `standard`: filesystem-backed N1 for general-purpose deployments where operational simplicity and broad hardware compatibility are the priority.
+- `monilith`: raw-device/block-manager-backed N1 for operators that want absolute device control and the highest performance ceiling.
+
+Both keep the same core behavior contracts (init/chunk/finalize semantics, immutable versions, repair/redistribution/GC guarantees). The choice is execution substrate and operational envelope, not storage correctness model.
 
 ### Fragment-centric engine (no multitenant UID layout)
 
@@ -548,26 +559,31 @@ That discipline is now applied to partition state rather than a whole mirrored m
 
 ## N1 CLI Functions
 
-N1 CLI is embedded in the `server` binary (`server/src/main.rs`) and uses `server_cli` as the command layer.
+N1 CLI is embedded in the `monilith` binary (`monilith/src/main.rs`) and uses `server_cli` as the command layer.
+
+Workspace server variants:
+- `monilith`: raw-device/block-manager-backed N1 for maximum control/performance.
+- `standard`: filesystem-backed N1 (`standard/src/main.rs`) for general-purpose deployments, with partitioned index roots under `index/partitions/<pid>/...` and directory-only `index_store_disks` / `blob_store_disks`.
+  - Transition rule: `standard` still mirrors legacy object metadata files and currently runs redistribution/repair object walks from the legacy `{hash}#{version}.msgpack` view to prevent duplicate stale processing while rename/delete/recover projection to fully partition-native maintenance is finalized.
 
 ### How to run the CLI
 
 Use:
 
 ```bash
-cargo run -p server -- <command> [flags]
+cargo run -p monilith -- <command> [flags]
 ```
 
 or the built binary:
 
 ```bash
-./target/release/litiaina-n1 <command> [flags]
+./target/release/litiaina-n1-monilith <command> [flags]
 ```
 
 Server mode:
 
 ```bash
-cargo run -p server -- server
+cargo run -p monilith -- server
 ```
 
 If no command is given, server mode is the default.
@@ -593,7 +609,7 @@ Auth behavior for CLI:
 Starts the N1 service process.
 
 ```bash
-cargo run -p server -- server
+cargo run -p monilith -- server
 ```
 
 #### `create-fragment`
@@ -604,14 +620,14 @@ Flags:
 - `--quota <BYTES>` optional (default `10737418240`)
 
 ```bash
-cargo run -p server -- create-fragment --name imaging-a --quota 1099511627776
+cargo run -p monilith -- create-fragment --name imaging-a --quota 1099511627776
 ```
 
 #### `gc`
 Starts garbage collection and follows status.
 
 ```bash
-cargo run -p server -- gc --fragment <fragment_hash>
+cargo run -p monilith -- gc --fragment <fragment_hash>
 ```
 
 #### `repair`
@@ -621,7 +637,7 @@ Flags:
 - `--dry-run` optional
 
 ```bash
-cargo run -p server -- repair --fragment <fragment_hash> --dry-run
+cargo run -p monilith -- repair --fragment <fragment_hash> --dry-run
 ```
 
 #### `redistribute`
@@ -631,14 +647,14 @@ Flags:
 - `--dry-run` optional
 
 ```bash
-cargo run -p server -- redistribute --fragment <fragment_hash>
+cargo run -p monilith -- redistribute --fragment <fragment_hash>
 ```
 
 #### `prefix-rebuild`
 Starts prefix index rebuild and follows status.
 
 ```bash
-cargo run -p server -- prefix-rebuild --fragment <fragment_hash>
+cargo run -p monilith -- prefix-rebuild --fragment <fragment_hash>
 ```
 
 #### `health`
@@ -654,15 +670,15 @@ Health now reports:
 - index runtime counters and raw/blob storage totals
 
 ```bash
-cargo run -p server -- health --fragment <fragment_hash> --watch --deep-scan
+cargo run -p monilith -- health --fragment <fragment_hash> --watch --deep-scan
 ```
 
 #### `uploads`
 Inspect active multipart sessions and resumable upload progress.
 
 ```bash
-cargo run -p server -- uploads list --fragment <fragment_hash>
-cargo run -p server -- uploads status --fragment <fragment_hash> --version-id <version_id>
+cargo run -p monilith -- uploads list --fragment <fragment_hash>
+cargo run -p monilith -- uploads status --fragment <fragment_hash> --version-id <version_id>
 ```
 
 ### Ops subcommands (recommended)
@@ -672,7 +688,7 @@ cargo run -p server -- uploads status --fragment <fragment_hash> --version-id <v
 Pattern:
 
 ```bash
-cargo run -p server -- ops <job> <action> [job-flags]
+cargo run -p monilith -- ops <job> <action> [job-flags]
 ```
 
 Jobs:
@@ -695,24 +711,24 @@ Examples:
 ```bash
 # GC lifecycle (admin context)
 export ADMIN_KEY="<admin_fragment_key>"
-cargo run -p server -- ops gc start --fragment "$ADMIN_KEY" --secret "<MASTER_KEY>"
-cargo run -p server -- ops gc status --fragment "$ADMIN_KEY" --secret "<MASTER_KEY>"
+cargo run -p monilith -- ops gc start --fragment "$ADMIN_KEY" --secret "<MASTER_KEY>"
+cargo run -p monilith -- ops gc status --fragment "$ADMIN_KEY" --secret "<MASTER_KEY>"
 
 # Repair lifecycle
-cargo run -p server -- ops repair start --fragment <fragment_hash>
-cargo run -p server -- ops repair status --fragment <fragment_hash>
-cargo run -p server -- ops repair watch --fragment <fragment_hash> --poll-ms 250
-cargo run -p server -- ops repair stop --fragment <fragment_hash>
+cargo run -p monilith -- ops repair start --fragment <fragment_hash>
+cargo run -p monilith -- ops repair status --fragment <fragment_hash>
+cargo run -p monilith -- ops repair watch --fragment <fragment_hash> --poll-ms 250
+cargo run -p monilith -- ops repair stop --fragment <fragment_hash>
 
 # Redistribution lifecycle
-cargo run -p server -- ops redistribute start --fragment <fragment_hash>
-cargo run -p server -- ops redistribute status --fragment <fragment_hash>
-cargo run -p server -- ops redistribute stop --fragment <fragment_hash>
+cargo run -p monilith -- ops redistribute start --fragment <fragment_hash>
+cargo run -p monilith -- ops redistribute status --fragment <fragment_hash>
+cargo run -p monilith -- ops redistribute stop --fragment <fragment_hash>
 
 # Prefix rebuild lifecycle
-cargo run -p server -- ops prefix-rebuild start --fragment <fragment_hash>
-cargo run -p server -- ops prefix-rebuild status --fragment <fragment_hash>
-cargo run -p server -- ops prefix-rebuild watch --fragment <fragment_hash>
+cargo run -p monilith -- ops prefix-rebuild start --fragment <fragment_hash>
+cargo run -p monilith -- ops prefix-rebuild status --fragment <fragment_hash>
+cargo run -p monilith -- ops prefix-rebuild watch --fragment <fragment_hash>
 ```
 
 Sequential stream probe (readahead/locality):
@@ -720,20 +736,20 @@ Sequential stream probe (readahead/locality):
 N1_STREAM_PROBE_OBJECT_BYTES=$((64*1024*1024)) \
 N1_STREAM_PROBE_PART_BYTES=$((4*1024*1024)) \
 N1_STREAM_PROBE_PASSES=2 \
-cargo test -p server matrix_stream_sequential_readahead_locality_probe -- --ignored --nocapture
+cargo test -p monilith matrix_stream_sequential_readahead_locality_probe -- --ignored --nocapture
 ```
 
 ### General Testing
 
 ```bash
 # Core server test suite
-cargo test -p server
+cargo test -p monilith
 
 # CLI test suite
 cargo test -p server_cli
 
 # Ignored/manual suites
-cargo test -p server -- --ignored --nocapture
+cargo test -p monilith -- --ignored --nocapture
 ```
 
 ---

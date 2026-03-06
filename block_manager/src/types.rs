@@ -76,6 +76,7 @@ pub(crate) enum JournalOp {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct JournalRecord {
+    pub(crate) txn_id: u64,
     pub(crate) op: JournalOp,
     pub(crate) allocation_id: u64,
     pub(crate) extent: Extent,

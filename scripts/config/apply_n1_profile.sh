@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PROFILE_NAME="${1:-}"
-TARGET_CONFIG="${2:-$ROOT_DIR/server/n1_config.ini}"
+TARGET_CONFIG="${2:-$ROOT_DIR/n1_config.ini}"
 PROFILE_DIR="${ROOT_DIR}/profiles/n1"
 
 if [[ -z "${PROFILE_NAME}" ]]; then
