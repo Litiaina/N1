@@ -33,7 +33,7 @@ use crate::n1_core::fragment_manager::{
     verify_fragment_existence,
 };
 use crate::n1_core::garbage_collector::{
-    get_gc_status_api, run_garbage_collector, run_lifecycle_manager,
+    get_gc_status_api, run_garbage_collector, run_lifecycle_manager, stop_garbage_collector,
 };
 use crate::n1_core::maintenance::sync_fragment_metadata;
 use crate::n1_core::modify::rename_object;
@@ -264,6 +264,7 @@ pub async fn serve_storage_routes() -> Router {
             .route("/v4/maintenance/scrub/status", get(get_scrub_status_api))
             .route("/v4/maintenance/gc/start", post(run_garbage_collector))
             .route("/v4/maintenance/gc/status", get(get_gc_status_api))
+            .route("/v4/maintenance/gc/stop", post(stop_garbage_collector))
             .route(
                 "/v4/maintenance/redistribution/start",
                 post(trigger_redistribution_job_api),

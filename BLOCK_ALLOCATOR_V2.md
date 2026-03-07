@@ -2,6 +2,8 @@
 
 This document defines the production target allocator design for N1 raw blob devices.
 
+Hardening and certification work (formatter safety + crash/powerfail stability gates) is tracked in [`BLOCK_ALLOCATOR_HARDENING_PLAN.md`](BLOCK_ALLOCATOR_HARDENING_PLAN.md).
+
 It is specialized for N1 workloads:
 - immutable shard writes
 - reservation-first multipart uploads
@@ -264,13 +266,20 @@ Required transitions:
 Status:
 - Completed in N1: AG-split allocator and dual free-space indexes are active in `block_manager`.
 - Extended with AG max-free index to avoid full AG scans in best-fit allocation.
+- AG range lookup now uses a start-block index with binary-search selection (replacing linear AG scans for block-to-AG resolution).
 
 ### Phase B: WAL tx semantics
 - Introduce txid-based WAL records and idempotent replay.
 - Add deferred free queue and `FreeApply` worker.
 Status:
 - Txid-based journal records and idempotent replay are active in N1.
+- Two-phase prepare/commit WAL records are active for allocator allocate/free transactions.
+- Journal checkpoint compaction is active and bumps superblock generation on compaction commits.
+- Journal checkpoint compaction now includes rollback-on-failure semantics:
+  - prior journal bytes, superblock copies, and in-memory journal state are restored if checkpoint rewrite/persist fails mid-flight.
+- `JournalFull` now primarily indicates a live-set-to-journal-capacity mismatch, not steady churn exhaustion.
 - Deferred free markers and bounded `FreeApply` background worker are active in N1 for large raw-free workloads.
+- Replay now enforces txid monotonicity across all records (including prepare-only tails) and hard-fails on regressions.
 
 ### Phase C: Epoch/device map
 - Add topology epoch persistence and device map table.
@@ -278,6 +287,9 @@ Status:
 Status:
 - Topology epoch and mirrored raw device-map table are active in N1 (`.n1/raw_device_map.msgpack`).
 - Stale-map relocation-first behavior remains in recovery/repair paths and now operates with epoch-tagged raw addresses.
+- Raw addresses now carry `extent_gen`, and block-manager enforces generation match on raw read/write/free/direct-io validation.
+- Raw device status now includes allocator health telemetry (generation, replay txids, journal headroom, and fragmentation per disk).
+- Raw device status now includes deferred-free backlog per device (deduped across mirrored index roots).
 
 ### Phase D: Default-on hardening
 - Make BM-V2 default.

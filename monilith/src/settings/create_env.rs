@@ -37,9 +37,6 @@ pub fn create_env_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     writeln!(file, "MASTER_KEY=")?;
     writeln!(file)?;
 
-    writeln!(file, "# Admin access key")?;
-    writeln!(file, "ADMIN_KEY=")?;
-    writeln!(file)?;
     writeln!(
         file,
         "# ─────────────────────────────────────────────────────────"

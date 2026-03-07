@@ -163,9 +163,18 @@ impl RawIoRing {
 impl Drop for RawIoRing {
     fn drop(&mut self) {
         self.close();
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
+        let workers: Vec<JoinHandle<()>> = self.workers.drain(..).collect();
+        if workers.is_empty() {
+            return;
         }
+        // Never block async runtime threads on potentially slow direct-IO worker joins.
+        let _ = thread::Builder::new()
+            .name("n1-raw-io-reaper".to_string())
+            .spawn(move || {
+                for worker in workers {
+                    let _ = worker.join();
+                }
+            });
     }
 }
 
@@ -286,9 +295,18 @@ impl RawReadRing {
 impl Drop for RawReadRing {
     fn drop(&mut self) {
         self.close();
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
+        let workers: Vec<JoinHandle<()>> = self.workers.drain(..).collect();
+        if workers.is_empty() {
+            return;
         }
+        // Never block async runtime threads on potentially slow direct-IO worker joins.
+        let _ = thread::Builder::new()
+            .name("n1-raw-read-reaper".to_string())
+            .spawn(move || {
+                for worker in workers {
+                    let _ = worker.join();
+                }
+            });
     }
 }
 

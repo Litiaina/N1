@@ -239,11 +239,17 @@ pub struct RawBlobAddress {
     pub topology_epoch: u64,
     pub device_id: String,
     pub allocation_id: u64,
+    #[serde(default = "default_raw_extent_generation")]
+    pub extent_gen: u32,
     pub offset_bytes: u64,
     pub size_bytes: u64,
 }
 
 fn default_raw_topology_epoch() -> u64 {
+    1
+}
+
+fn default_raw_extent_generation() -> u32 {
     1
 }
 

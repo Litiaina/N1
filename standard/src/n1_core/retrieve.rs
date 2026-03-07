@@ -8,6 +8,7 @@ use crate::n1_core::disk_manager::{
     PrefixDelimiterCompactedSegment, PrefixDelimiterSegment, PrefixIndexSegment, Quota,
 };
 use crate::n1_core::fragment_manager::is_fragment_hash;
+use crate::n1_core::index;
 use crate::n1_core::metadata_parser::get_metadata;
 use crate::n1_core::object_parser::{get_object_logic, stream_object_logic};
 use crate::n1_core::quota_manager::get_quota;
@@ -25,7 +26,6 @@ use dashmap::DashMap;
 use futures_util::StreamExt;
 use once_cell::sync::OnceCell;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -170,48 +170,27 @@ fn next_index_root_cursor(key: &str) -> usize {
 }
 
 async fn read_metadata_best(
-    path_manager: &ObjectPathManager,
+    _path_manager: &ObjectPathManager,
     fragment: &str,
     object_key: &str,
     version_id: &str,
 ) -> Option<ObjectSummary> {
-    let paths = path_manager.get_all_metadata_paths(fragment, object_key, version_id);
-
-    let mut best: Option<ObjectSummary> = None;
-
-    for p in paths {
-        if !fs::try_exists(&p).await.unwrap_or(false) {
-            continue;
-        }
-
-        let Ok(data) = fs::read(&p).await else {
-            continue;
-        };
-
-        let Ok(meta) = rmp_serde::from_slice::<ObjectSummary>(&data) else {
-            continue;
-        };
-
-        if meta.fragment != fragment
-            || meta.object_key != object_key
-            || meta.version_id != version_id
-        {
-            continue;
-        }
-
-        match &best {
-            None => best = Some(meta),
-            Some(cur) => {
-                if meta.created_at > cur.created_at
-                    || (meta.created_at == cur.created_at && meta.version_id > cur.version_id)
-                {
-                    best = Some(meta);
-                }
-            }
-        }
-    }
-
-    best
+    index::read_object_version(fragment, object_key, version_id)
+        .await
+        .ok()
+        .map(|m| ObjectSummary {
+            object_key: m.object_key,
+            version_id: m.version_id,
+            fragment: m.fragment,
+            upload_session_id: m.upload_session_id,
+            owner_uid: m.owner_uid,
+            content_type: m.content_type,
+            total_size_bytes: m.total_size_bytes,
+            created_at: m.created_at,
+            _parts_ignored: serde::de::IgnoredAny,
+            is_delete_marker: m.is_delete_marker,
+            stripe_size_bytes: m.stripe_size_bytes,
+        })
 }
 
 fn merge_prefix_latest(
@@ -322,10 +301,9 @@ async fn try_list_by_prefix_index(
         let max_deltas = prefix_max_delta_segments();
         if recent_delta_count > max_deltas {
             debug!(
-                "Prefix delta fan-in too large for fragment={} prefix='{}' bucket={:?} recent_deltas={} (max={}); fallback to full scan",
+                "Prefix delta fan-in high for fragment={} prefix='{}' bucket={:?} recent_deltas={} (max={}); continuing index merge",
                 fragment, pfx, d, recent_delta_count, max_deltas
             );
-            return Ok(None);
         }
 
         for (_name, _mtime, path) in seg_files {
@@ -662,10 +640,9 @@ async fn try_list_by_delimiter_index(
     let max_deltas = prefix_max_delta_segments();
     if recent_delta_count > max_deltas {
         debug!(
-            "Delimiter delta fan-in too large for fragment={} prefix='{}' recent_deltas={} (max={}); fallback to full prefix scan",
+            "Delimiter delta fan-in high for fragment={} prefix='{}' recent_deltas={} (max={}); continuing index merge",
             fragment, pfx, recent_delta_count, max_deltas
         );
-        return Ok(None);
     }
 
     delta_segments.sort_by(|a, b| a.0.cmp(&b.0));
@@ -911,6 +888,146 @@ pub async fn list_trash_objects(
     list_objects_internal(fragment, params, true).await
 }
 
+async fn list_objects_partition_native(
+    fragment: &str,
+    scan_trash: bool,
+    prefix: &str,
+    delimiter: Option<&str>,
+    limit: usize,
+    continuation_token: Option<String>,
+    include_internal: bool,
+) -> Result<ListObjectsResult, AppError> {
+    #[derive(Clone)]
+    struct Row {
+        row_key: String,
+        object: Option<ObjectMetadata>,
+        common_prefix: Option<String>,
+    }
+
+    let pfx = canonical_prefix(prefix);
+    let pfx_with_slash = if pfx.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", pfx)
+    };
+    let want_delim = delimiter == Some("/");
+
+    let mut rows: Vec<Row> = Vec::new();
+    let mut seen_prefixes = HashSet::<String>::new();
+
+    let metas = if scan_trash {
+        index::list_fragment_trash_objects(fragment).await?
+    } else {
+        index::list_fragment_live_objects(fragment).await?
+    };
+
+    for meta in metas {
+        if meta.is_delete_marker {
+            continue;
+        }
+        let ck = canonical_key(&meta.object_key);
+        if !include_internal && is_internal_object_key(&ck) {
+            continue;
+        }
+        if !pfx.is_empty() && ck != pfx && !ck.starts_with(&pfx_with_slash) {
+            continue;
+        }
+
+        if want_delim {
+            let rel = if pfx.is_empty() {
+                ck.clone()
+            } else if ck == pfx {
+                ck.clone()
+            } else if ck.len() > pfx.len() + 1 {
+                ck[(pfx.len() + 1)..].to_string()
+            } else {
+                String::new()
+            };
+
+            if !pfx.is_empty() && ck == pfx {
+                rows.push(Row {
+                    row_key: format!("o|{}|{}", ck, meta.version_id),
+                    object: Some(meta),
+                    common_prefix: None,
+                });
+            } else if let Some((first, _)) = rel.split_once('/') {
+                if !first.is_empty() {
+                    let folder = if pfx.is_empty() {
+                        format!("{}/", first)
+                    } else {
+                        format!("{}/{}/", pfx, first)
+                    };
+                    if seen_prefixes.insert(folder.clone()) {
+                        rows.push(Row {
+                            row_key: format!("p|{}", folder),
+                            object: None,
+                            common_prefix: Some(folder),
+                        });
+                    }
+                }
+            } else {
+                rows.push(Row {
+                    row_key: format!("o|{}|{}", ck, meta.version_id),
+                    object: Some(meta),
+                    common_prefix: None,
+                });
+            }
+        } else {
+            rows.push(Row {
+                row_key: format!("o|{}|{}", ck, meta.version_id),
+                object: Some(meta),
+                common_prefix: None,
+            });
+        }
+    }
+
+    rows.sort_by(|left, right| left.row_key.cmp(&right.row_key));
+
+    let start_after = continuation_token.as_deref().and_then(|token| {
+        parse_delimiter_continuation_token(token).or_else(|| {
+            parse_prefix_continuation_token(token).map(|(object_key, version_id)| {
+                format!("o|{}|{}", canonical_key(&object_key), version_id)
+            })
+        })
+    });
+    let start_idx = if let Some(start_after) = start_after.as_ref() {
+        match rows.binary_search_by(|row| row.row_key.cmp(start_after)) {
+            Ok(idx) => idx + 1,
+            Err(idx) => idx,
+        }
+    } else {
+        0
+    };
+
+    let mut out_objects = Vec::<ObjectMetadata>::new();
+    let mut out_prefixes = Vec::<String>::new();
+    let mut last_row_key = None::<String>;
+
+    for row in rows.iter().skip(start_idx).take(limit) {
+        if let Some(meta) = row.object.clone() {
+            out_objects.push(meta);
+        } else if let Some(common_prefix) = row.common_prefix.clone() {
+            out_prefixes.push(common_prefix);
+        }
+        last_row_key = Some(row.row_key.clone());
+    }
+
+    let has_more = start_idx.saturating_add(out_objects.len() + out_prefixes.len()) < rows.len();
+    let continuation_token = if has_more {
+        last_row_key
+            .as_deref()
+            .map(create_delimiter_continuation_token)
+    } else {
+        None
+    };
+
+    Ok(ListObjectsResult {
+        objects: out_objects,
+        common_prefixes: out_prefixes,
+        continuation_token,
+    })
+}
+
 async fn list_objects_internal(
     fragment: String,
     params: HashMap<String, String>,
@@ -965,6 +1082,20 @@ async fn list_objects_internal(
         {
             return Ok(AxumJson(res));
         }
+    }
+
+    if let Ok(res) = list_objects_partition_native(
+        &fragment,
+        scan_trash,
+        &prefix,
+        delimiter,
+        limit,
+        continuation_token.clone(),
+        include_internal,
+    )
+    .await
+    {
+        return Ok(AxumJson(res));
     }
 
     let continuation_cursor = continuation_token
@@ -1333,62 +1464,9 @@ pub async fn list_object_versions(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let path_manager = ObjectPathManager::new();
-
-    let mut hasher = Sha256::new();
-    hasher.update(object_key.as_bytes());
-    let hash = hex::encode(hasher.finalize());
-
-    let shard1 = &hash[0..2];
-    let shard2 = &hash[2..4];
-    let shard3 = &hash[4..6];
-    let shard4 = &hash[6..8];
-
-    let index_dirs = path_manager.get_all_index_dirs(&fragment);
-
-    let mut versions: Vec<ObjectSummary> = Vec::new();
-    let mut seen_versions = HashSet::new();
-
-    for dir in index_dirs {
-        let candidate = dir.join(shard1).join(shard2).join(shard3).join(shard4);
-        if !fs::try_exists(&candidate).await.unwrap_or(false) {
-            continue;
-        }
-
-        let prefix = format!("{}#", hash);
-        let mut entries = match fs::read_dir(&candidate).await {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(&prefix) && name.ends_with(METADATA_EXT) {
-                if let Some(rest) = name.strip_prefix(&prefix) {
-                    if let Some(ver_id) = rest.strip_suffix(METADATA_EXT) {
-                        if seen_versions.contains(ver_id) {
-                            continue;
-                        }
-
-                        if let Ok(data) = fs::read(entry.path()).await {
-                            if let Ok(meta) = rmp_serde::from_slice::<ObjectSummary>(&data) {
-                                if seen_versions.insert(meta.version_id.clone()) {
-                                    versions.push(meta);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    versions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-    let response_objects: Vec<ObjectMetadata> =
-        versions.into_iter().map(ObjectMetadata::from).collect();
-
-    Ok(AxumJson(response_objects))
+    Ok(AxumJson(
+        index::list_live_object_versions_metadata(&fragment, &object_key).await?,
+    ))
 }
 
 #[derive(Serialize)]

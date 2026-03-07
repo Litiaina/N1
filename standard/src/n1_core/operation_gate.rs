@@ -111,12 +111,28 @@ pub async fn enforce_read_only_fast_mode_on_mutations(req: Request<Body>, next: 
     }
 }
 
+pub async fn enforce_quiesced_mode_on_reads(req: Request<Body>, next: Next) -> Response {
+    if matches!(req.method(), &Method::OPTIONS) {
+        return next.run(req).await;
+    }
+
+    if current_maintenance_access_mode() == MaintenanceAccessMode::Quiesced {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Read operations are temporarily disabled: scrub mode is active.",
+        )
+            .into_response();
+    }
+
+    next.run(req).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         MaintenanceAccessMode, acquire_maintenance_mode, acquire_read_only_fast_mode,
-        current_maintenance_access_mode, enforce_read_only_fast_mode_on_mutations,
-        is_read_only_fast_mode_active,
+        current_maintenance_access_mode, enforce_quiesced_mode_on_reads,
+        enforce_read_only_fast_mode_on_mutations, is_read_only_fast_mode_active,
     };
     use axum::Router;
     use axum::body::Body;
@@ -246,6 +262,44 @@ mod tests {
             .await
             .expect("write request");
         assert_eq!(write_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn quiesced_read_middleware_blocks_all_read_route_methods() {
+        let _test_lock = acquire_test_lock();
+        let app = Router::new()
+            .route("/read-get", get(|| async { "ok" }))
+            .route("/read-post", post(|| async { "ok" }))
+            .layer(from_fn(enforce_quiesced_mode_on_reads));
+
+        let guard = acquire_maintenance_mode(MaintenanceAccessMode::Quiesced);
+
+        let get_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/read-get")
+                    .body(Body::empty())
+                    .expect("build get request"),
+            )
+            .await
+            .expect("get request");
+        assert_eq!(get_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let post_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/read-post")
+                    .body(Body::empty())
+                    .expect("build post request"),
+            )
+            .await
+            .expect("post request");
+        assert_eq!(post_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         drop(guard);
     }

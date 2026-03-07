@@ -26,6 +26,8 @@ const INDEX_OBJECT_SUFFIX: &str = ".msgpack";
 const INDEX_SESSION_SUFFIX: &str = ".session.msgpack";
 const INDEX_SESSION_REMOVED_SUFFIX: &str = ".removed.msgpack";
 const INDEX_PART_META_SUFFIX: &str = ".meta.msgpack";
+const SESSION_MANIFEST_FILE: &str = "session.manifest.msgpack";
+const RESERVATION_FILE: &str = "reservation.msgpack";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexReplicaWriteMode {
@@ -226,6 +228,12 @@ fn removed_session_receipt_path(
         .join(format!("{}{}", version_id, INDEX_SESSION_REMOVED_SUFFIX))
 }
 
+fn session_compat_dir(root: &Path, fragment: &str, partition_id: u16, version_id: &str) -> PathBuf {
+    partition_dir(root, fragment, partition_id)
+        .join(INDEX_SESSIONS_DIR)
+        .join(version_id)
+}
+
 #[cfg(unix)]
 async fn sync_dir(path: &Path) -> Result<(), AppError> {
     let dir = fs::OpenOptions::new()
@@ -303,7 +311,9 @@ async fn read_messagepack<T: DeserializeOwned>(path: &Path) -> Result<T, AppErro
         .map_err(|e| AppError::InternalServerError(format!("decode {}: {}", path.display(), e)))
 }
 
-async fn read_messagepack_if_exists<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, AppError> {
+async fn read_messagepack_if_exists<T: DeserializeOwned>(
+    path: &Path,
+) -> Result<Option<T>, AppError> {
     if !fs::try_exists(path).await.unwrap_or(false) {
         return Ok(None);
     }
@@ -378,11 +388,43 @@ pub async fn open_session(
     };
     let bytes = rmp_serde::to_vec(&state)
         .map_err(|e| AppError::InternalServerError(format!("serialize session state: {}", e)))?;
+    let manifest_bytes = rmp_serde::to_vec(manifest)
+        .map_err(|e| AppError::InternalServerError(format!("serialize session manifest: {}", e)))?;
+    let reservation_bytes = state
+        .reservation
+        .as_ref()
+        .map(|r| {
+            rmp_serde::to_vec(r).map_err(|e| {
+                AppError::InternalServerError(format!("serialize reservation receipt: {}", e))
+            })
+        })
+        .transpose()?;
     let mut success = 0usize;
     for root in &route.roots {
-        let path = session_state_path(root, &manifest.fragment, route.partition_id, &manifest.version_id);
+        let path = session_state_path(
+            root,
+            &manifest.fragment,
+            route.partition_id,
+            &manifest.version_id,
+        );
         if write_atomic(&path, &bytes).await.is_ok() {
             success += 1;
+        }
+        let compat_dir = session_compat_dir(
+            root,
+            &manifest.fragment,
+            route.partition_id,
+            &manifest.version_id,
+        );
+        let manifest_path = compat_dir.join(SESSION_MANIFEST_FILE);
+        let _ = write_atomic(&manifest_path, &manifest_bytes).await;
+        match &reservation_bytes {
+            Some(bytes) => {
+                let _ = write_atomic(&compat_dir.join(RESERVATION_FILE), bytes).await;
+            }
+            None => {
+                let _ = fs::remove_file(compat_dir.join(RESERVATION_FILE)).await;
+            }
         }
         let removed = removed_session_receipt_path(
             root,
@@ -411,10 +453,22 @@ pub async fn commit_session_part(
         .map_err(|e| AppError::InternalServerError(format!("serialize part metadata: {}", e)))?;
     let mut success = 0usize;
     for root in &route.roots {
-        let path = session_part_path(root, fragment, route.partition_id, version_id, part.part_index);
+        let path = session_part_path(
+            root,
+            fragment,
+            route.partition_id,
+            version_id,
+            part.part_index,
+        );
         if write_atomic(&path, &part_bytes).await.is_ok() {
             success += 1;
         }
+        let compat_dir = session_compat_dir(root, fragment, route.partition_id, version_id);
+        let compat_part = compat_dir.join(format!(
+            "part_{}{}",
+            part.part_index, INDEX_PART_META_SUFFIX
+        ));
+        let _ = write_atomic(&compat_part, &part_bytes).await;
     }
     if success == 0 {
         return Err(AppError::InternalServerError(
@@ -424,7 +478,10 @@ pub async fn commit_session_part(
     Ok(())
 }
 
-pub async fn load_session(fragment: &str, version_id: &str) -> Result<Option<IndexSessionState>, AppError> {
+pub async fn load_session(
+    fragment: &str,
+    version_id: &str,
+) -> Result<Option<IndexSessionState>, AppError> {
     let route = session_route(fragment, version_id)?;
     let mut candidates = Vec::<(IndexSessionState, SystemTime)>::new();
     for root in &route.roots {
@@ -434,7 +491,9 @@ pub async fn load_session(fragment: &str, version_id: &str) -> Result<Option<Ind
             .ok()
             .and_then(|meta| meta.modified().ok())
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        if let Some(state) = load_session_on_root(root, fragment, route.partition_id, version_id).await? {
+        if let Some(state) =
+            load_session_on_root(root, fragment, route.partition_id, version_id).await?
+        {
             candidates.push((state, modified));
         }
     }
@@ -469,7 +528,11 @@ pub async fn read_session_part(
     Ok(None)
 }
 
-pub async fn remove_session(fragment: &str, version_id: &str, reason: &str) -> Result<(), AppError> {
+pub async fn remove_session(
+    fragment: &str,
+    version_id: &str,
+    reason: &str,
+) -> Result<(), AppError> {
     let route = session_route(fragment, version_id)?;
     let snapshot = load_session(fragment, version_id).await?;
     let removed_at = Utc::now().timestamp();
@@ -487,6 +550,11 @@ pub async fn remove_session(fragment: &str, version_id: &str, reason: &str) -> R
             let _ = fs::remove_dir_all(&parts_dir).await;
             changed = true;
         }
+        let compat_dir = session_compat_dir(root, fragment, route.partition_id, version_id);
+        if fs::try_exists(&compat_dir).await.unwrap_or(false) {
+            let _ = fs::remove_dir_all(&compat_dir).await;
+            changed = true;
+        }
 
         if let Some(state) = snapshot.clone() {
             let receipt = RemovedSessionReceipt {
@@ -495,7 +563,8 @@ pub async fn remove_session(fragment: &str, version_id: &str, reason: &str) -> R
                 reason: reason.to_string(),
             };
             if let Ok(bytes) = rmp_serde::to_vec(&receipt) {
-                let path = removed_session_receipt_path(root, fragment, route.partition_id, version_id);
+                let path =
+                    removed_session_receipt_path(root, fragment, route.partition_id, version_id);
                 let _ = write_atomic(&path, &bytes).await;
             }
         }
@@ -580,9 +649,8 @@ async fn upsert_object_version_internal(
     _replica_write_mode: IndexReplicaWriteMode,
 ) -> Result<(), AppError> {
     let route = object_route(&metadata.fragment, &metadata.object_key)?;
-    let version_bytes = rmp_serde::to_vec(metadata).map_err(|e| {
-        AppError::InternalServerError(format!("serialize object metadata: {}", e))
-    })?;
+    let version_bytes = rmp_serde::to_vec(metadata)
+        .map_err(|e| AppError::InternalServerError(format!("serialize object metadata: {}", e)))?;
     let latest_state = IndexLatestState {
         version_id: metadata.version_id.clone(),
         metadata: metadata.clone(),
@@ -612,11 +680,12 @@ async fn upsert_object_version_internal(
             &metadata.object_key,
             trashed,
         );
-        let should_update_latest = match read_messagepack_if_exists::<IndexLatestState>(&latest_path).await {
-            Ok(Some(current)) => metadata_is_newer(metadata, &current.metadata),
-            Ok(None) => true,
-            Err(_) => true,
-        };
+        let should_update_latest =
+            match read_messagepack_if_exists::<IndexLatestState>(&latest_path).await {
+                Ok(Some(current)) => metadata_is_newer(metadata, &current.metadata),
+                Ok(None) => true,
+                Err(_) => true,
+            };
         if should_update_latest {
             let _ = write_atomic(&latest_path, &latest_bytes).await;
         }
@@ -631,30 +700,18 @@ async fn upsert_object_version_internal(
 }
 
 pub async fn publish_object(metadata: &ObjectMetadata) -> Result<(), AppError> {
-    upsert_object_version_internal(
-        metadata,
-        false,
-        IndexReplicaWriteMode::BackgroundBestEffort,
-    )
-    .await
+    upsert_object_version_internal(metadata, false, IndexReplicaWriteMode::BackgroundBestEffort)
+        .await
 }
 
 pub async fn upsert_object_version(metadata: &ObjectMetadata) -> Result<(), AppError> {
-    upsert_object_version_internal(
-        metadata,
-        false,
-        IndexReplicaWriteMode::BackgroundBestEffort,
-    )
-    .await
+    upsert_object_version_internal(metadata, false, IndexReplicaWriteMode::BackgroundBestEffort)
+        .await
 }
 
 pub async fn upsert_trashed_object_version(metadata: &ObjectMetadata) -> Result<(), AppError> {
-    upsert_object_version_internal(
-        metadata,
-        true,
-        IndexReplicaWriteMode::BackgroundBestEffort,
-    )
-    .await
+    upsert_object_version_internal(metadata, true, IndexReplicaWriteMode::BackgroundBestEffort)
+        .await
 }
 
 pub async fn read_object_version(
@@ -785,7 +842,10 @@ pub async fn list_trashed_object_versions_metadata(
     list_object_versions_metadata_internal(fragment, object_key, true).await
 }
 
-pub async fn read_latest_object(fragment: &str, object_key: &str) -> Result<ObjectMetadata, AppError> {
+pub async fn read_latest_object(
+    fragment: &str,
+    object_key: &str,
+) -> Result<ObjectMetadata, AppError> {
     let route = object_route(fragment, object_key)?;
     let mut latest_candidates = Vec::<(ObjectMetadata, SystemTime)>::new();
     for root in &route.roots {
@@ -836,6 +896,10 @@ pub async fn list_fragment_trash_objects(fragment: &str) -> Result<Vec<ObjectMet
     list_fragment_objects_internal(fragment, true).await
 }
 
+pub async fn list_fragment_live_objects(fragment: &str) -> Result<Vec<ObjectMetadata>, AppError> {
+    list_fragment_objects_internal(fragment, false).await
+}
+
 async fn list_fragment_objects_internal(
     fragment: &str,
     trashed: bool,
@@ -863,12 +927,7 @@ async fn list_fragment_objects_internal(
                 Err(_) => continue,
             };
             while let Ok(Some(p1)) = l1.next_entry().await {
-                if !p1
-                    .file_type()
-                    .await
-                    .map(|ft| ft.is_dir())
-                    .unwrap_or(false)
-                {
+                if !p1.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
                     continue;
                 }
 
@@ -997,7 +1056,8 @@ async fn delete_object_version_internal(
 
     let next_latest = recompute_latest_state(fragment, object_key, trashed).await?;
     for root in &route.roots {
-        let latest_path = object_latest_path(root, fragment, route.partition_id, object_key, trashed);
+        let latest_path =
+            object_latest_path(root, fragment, route.partition_id, object_key, trashed);
         match &next_latest {
             Some(metadata) => {
                 let latest_state = IndexLatestState {

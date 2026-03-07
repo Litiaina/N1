@@ -8,5 +8,7 @@ mod types;
 pub use error::BlockManagerError;
 pub use manager::BlockManager;
 pub use types::{
-    AllocationHandle, DeviceHeader, DirectExtentIo, Extent, FormatOptions, RawExtentAddress,
+    AllocationGroupHealth, AllocationHandle, AllocatorHealthSnapshot, DeviceHeader, DirectExtentIo,
+    Extent, FormatNonceChallenge, FormatOptions, FormatTargetPreflight, FormatTargetSignature,
+    RawExtentAddress,
 };

@@ -33,12 +33,14 @@ use crate::n1_core::fragment_manager::{
     verify_fragment_existence,
 };
 use crate::n1_core::garbage_collector::{
-    get_gc_status_api, run_garbage_collector, run_lifecycle_manager,
+    get_gc_status_api, run_garbage_collector, run_lifecycle_manager, stop_garbage_collector,
 };
 use crate::n1_core::maintenance::sync_fragment_metadata;
 use crate::n1_core::modify::rename_object;
 use crate::n1_core::monitoring::{get_system_health, run_system_monitor};
-use crate::n1_core::operation_gate::enforce_read_only_fast_mode_on_mutations;
+use crate::n1_core::operation_gate::{
+    enforce_quiesced_mode_on_reads, enforce_read_only_fast_mode_on_mutations,
+};
 use crate::n1_core::prefix_rebuilder::{
     get_prefix_rebuild_status_api, stop_prefix_rebuild_job_api, trigger_prefix_rebuild_job_api,
 };
@@ -173,7 +175,9 @@ pub async fn serve_storage_routes() -> Router {
             .route("/v4/fsd/stat/{*mount_path}", get(fsd_stat))
             .route("/v4/fsd/read/{*mount_path}", get(fsd_read));
 
-        let read_ops = layers.layer_view(read_ops);
+        let read_ops = layers
+            .layer_view(read_ops)
+            .layer(from_fn(enforce_quiesced_mode_on_reads));
 
         let write_ops = Router::new()
             .route("/v4/fragment/delete/{:fragment}", delete(delete_fragment))
@@ -255,6 +259,7 @@ pub async fn serve_storage_routes() -> Router {
             .route("/v4/maintenance/repair/stop", post(stop_repair_job_api))
             .route("/v4/maintenance/repair/status", get(get_repair_status_api))
             .route("/v4/maintenance/gc/start", post(run_garbage_collector))
+            .route("/v4/maintenance/gc/stop", post(stop_garbage_collector))
             .route("/v4/maintenance/gc/status", get(get_gc_status_api))
             .route(
                 "/v4/maintenance/redistribution/start",
@@ -296,7 +301,9 @@ pub async fn serve_storage_routes() -> Router {
 
         let public_routes = Router::new().route("/v4/public/share", get(get_shared_object));
 
-        let public_routes = layers.layer_sharing(public_routes);
+        let public_routes = layers
+            .layer_sharing(public_routes)
+            .layer(from_fn(enforce_quiesced_mode_on_reads));
 
         Router::new().merge(protected_routes).merge(public_routes)
     };
@@ -381,7 +388,9 @@ pub async fn serve_storage_routes() -> Router {
             .route("/dir/file/download/", get(download_file))
             .route("/dir/file/download/{*path}", get(download_file));
 
-        let read_ops = layers.layer_view(read_ops);
+        let read_ops = layers
+            .layer_view(read_ops)
+            .layer(from_fn(enforce_quiesced_mode_on_reads));
 
         Router::new()
             .merge(upload_routes)

@@ -1,5 +1,11 @@
 pub(crate) const SUPERBLOCK_MAGIC: [u8; 16] = *b"LITIAINA-BM-V1\0\0";
-pub(crate) const HEADER_VERSION: u32 = 1;
-pub(crate) const HEADER_CRC_OFFSET: usize = 72;
+pub(crate) const HEADER_VERSION_V1: u32 = 1;
+pub(crate) const HEADER_VERSION_V2: u32 = 2;
+pub(crate) const HEADER_VERSION: u32 = HEADER_VERSION_V2;
+pub(crate) const HEADER_CRC_OFFSET_V1: usize = 72;
+pub(crate) const HEADER_CRC_OFFSET: usize = 80;
+pub(crate) const HEADER_DECODE_BYTES: usize = 4096;
+pub(crate) const SECONDARY_SUPERBLOCK_BLOCK: u64 = 1;
+pub(crate) const HEADER_FALLBACK_SCAN_LIMIT_BYTES: u64 = 1024 * 1024;
 pub(crate) const JOURNAL_RECORD_SIZE: usize = 64;
 pub(crate) const JOURNAL_MAGIC: u32 = 0x4C42_4D4A;

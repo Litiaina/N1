@@ -15,6 +15,7 @@ use crate::n1_core::upload::{
 };
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
+use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::Json;
 use axum::extract::State;
@@ -66,6 +67,13 @@ static GC_STATUS: std::sync::LazyLock<Arc<RwLock<GcJobStatus>>> =
     std::sync::LazyLock::new(|| Arc::new(RwLock::new(GcJobStatus::default())));
 static GC_RUNNING: std::sync::LazyLock<AtomicBool> =
     std::sync::LazyLock::new(|| AtomicBool::new(false));
+static GC_STOP_SIGNAL: std::sync::LazyLock<AtomicBool> =
+    std::sync::LazyLock::new(|| AtomicBool::new(false));
+
+#[inline]
+fn should_stop_gc() -> bool {
+    GC_STOP_SIGNAL.load(Ordering::Relaxed)
+}
 
 fn gc_status_read_clone() -> GcJobStatus {
     GC_STATUS
@@ -112,6 +120,7 @@ pub async fn run_lifecycle_manager(state: Arc<AppState>) {
             sleep(cleanup_interval).await;
             continue;
         }
+        GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
 
         if let Err(err) = run_gc_scan_offthread(state.clone(), false).await {
             error!("Lifecycle Manager Scan failed: {}", err);
@@ -124,10 +133,11 @@ pub async fn run_lifecycle_manager(state: Arc<AppState>) {
 
         with_gc_status_write(|st| {
             st.is_running = false;
-            if st.phase != "Failed" {
+            if st.phase != "Failed" && st.phase != "Stopped by User" {
                 st.phase = "Completed".to_string();
             }
         });
+        GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
         GC_RUNNING.store(false, Ordering::SeqCst);
 
         sleep(cleanup_interval).await;
@@ -150,6 +160,7 @@ pub async fn run_garbage_collector(State(state): State<Arc<AppState>>) -> impl I
             "GC is already running. Check /v4/maintenance/gc/status.",
         );
     }
+    GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
 
     tokio::spawn(async move {
         {
@@ -178,14 +189,40 @@ pub async fn run_garbage_collector(State(state): State<Arc<AppState>>) -> impl I
 
         with_gc_status_write(|st| {
             st.is_running = false;
-            if st.phase != "Failed" {
+            if st.phase != "Failed" && st.phase != "Stopped by User" {
                 st.phase = "Completed".to_string();
             }
         });
+        GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
         GC_RUNNING.store(false, Ordering::SeqCst);
     });
 
     (StatusCode::ACCEPTED, "GC started")
+}
+
+pub async fn stop_garbage_collector(
+    claims: Claims,
+    State(_state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if !claims.write || !claims.modify || !claims.delete {
+        return (
+            StatusCode::FORBIDDEN,
+            "Write, Modify and Delete permission required",
+        );
+    }
+
+    if !GC_RUNNING.load(Ordering::SeqCst) {
+        return (StatusCode::OK, "GC is not running.");
+    }
+
+    GC_STOP_SIGNAL.store(true, Ordering::Relaxed);
+    with_gc_status_write(|st| {
+        if st.is_running {
+            st.phase = "Stopping...".to_string();
+        }
+    });
+
+    (StatusCode::OK, "Stop signal sent to GC.")
 }
 
 async fn refund_quota(fragment: &str, amount: u64, state: &Arc<AppState>) {
@@ -388,6 +425,9 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
     };
 
     for fragment in fragments {
+        if should_stop_gc() {
+            break;
+        }
         with_gc_status_write(|st| {
             st.current_fragment = fragment.clone();
             st.phase = format!("Processing fragment {}", fragment);
@@ -413,6 +453,15 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
             st.total_refund_bytes += stats.refund_bytes;
             st.duration_seconds = start.elapsed().as_secs();
         });
+    }
+
+    if should_stop_gc() {
+        info!("GC: Scan stopped by user request.");
+        with_gc_status_write(|st| {
+            st.phase = "Stopped by User".to_string();
+            st.duration_seconds = start.elapsed().as_secs();
+        });
+        return Ok(());
     }
 
     info!("GC: Scan completed.");
@@ -446,6 +495,9 @@ async fn process_fragment_gc(
 
     let mut live_stream = index::stream_fragment_object_versions(fragment.to_string(), false);
     while let Some(next_meta) = live_stream.recv().await {
+        if should_stop_gc() {
+            return stats;
+        }
         let Ok(meta) = next_meta else {
             continue;
         };
@@ -458,12 +510,18 @@ async fn process_fragment_gc(
     let now = SystemTime::now();
 
     for root in index_roots {
+        if should_stop_gc() {
+            return stats;
+        }
         let raw_gc_dir = root.join(fragment).join("index").join(".raw_gc");
         if !raw_gc_dir.exists() {
             continue;
         }
 
         for entry in WalkDir::new(&raw_gc_dir).into_iter().filter_map(|e| e.ok()) {
+            if should_stop_gc() {
+                return stats;
+            }
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -503,6 +561,9 @@ async fn process_fragment_gc(
 
     let mut trash_stream = index::stream_fragment_object_versions(fragment.to_string(), true);
     while let Some(next_meta) = trash_stream.recv().await {
+        if should_stop_gc() {
+            return stats;
+        }
         let Ok(meta) = next_meta else {
             continue;
         };
@@ -546,6 +607,9 @@ async fn process_fragment_gc(
     let mut missing_device_marker_files: u64 = 0;
 
     for (_, (raw, marker_paths)) in eligible_raw_gc_markers {
+        if should_stop_gc() {
+            return stats;
+        }
         match free_raw_address(&raw).await {
             Ok(_) => {
                 for marker_path in marker_paths {
@@ -601,7 +665,14 @@ async fn process_fragment_gc(
 
     if !expired_versions.is_empty() {
         for (object_key, version_id) in &expired_delete_targets {
+            if should_stop_gc() {
+                return stats;
+            }
             let _ = index::delete_trashed_object_version(fragment, object_key, version_id).await;
+        }
+
+        if should_stop_gc() {
+            return stats;
         }
 
         let tasks = index_roots.iter().chain(blob_roots.iter()).map(|root| {
@@ -629,6 +700,9 @@ async fn process_fragment_gc(
         .await
         .unwrap_or_default()
     {
+        if should_stop_gc() {
+            return stats;
+        }
         let version_id = session.manifest.version_id.clone();
         let modified = if session.last_activity_at > 0 {
             SystemTime::UNIX_EPOCH
@@ -665,6 +739,9 @@ async fn process_fragment_gc(
     stats.sessions_deleted += sessions_to_delete.len() as u64;
 
     for version_id in &sessions_to_delete {
+        if should_stop_gc() {
+            return stats;
+        }
         let _ = index::remove_session(fragment, version_id, "gc-expired").await;
         cleanup_upload_part_metadata_for_version(fragment, version_id, true).await;
     }
@@ -684,6 +761,9 @@ async fn process_fragment_gc(
     }
 
     for root in blob_roots {
+        if should_stop_gc() {
+            return stats;
+        }
         let blob_root = root.join(fragment).join("blob");
         if !blob_root.exists() {
             continue;
@@ -691,6 +771,9 @@ async fn process_fragment_gc(
 
         if let Ok(entries) = std::fs::read_dir(&blob_root) {
             for entry in entries.filter_map(|e| e.ok()) {
+                if should_stop_gc() {
+                    return stats;
+                }
                 let path = entry.path();
                 if !path.is_dir() {
                     continue;

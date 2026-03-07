@@ -38,6 +38,10 @@ Two server variants exist so users can choose deployment posture:
 
 They are expected to keep the same storage semantics. The difference is backend execution model and operational profile, not object correctness guarantees.
 
+### Monolith Raw-Index Direction
+
+Monolith development is now targeting a raw-only storage-kernel model (`index` + `blob` both on raw devices). The staged structure and migration gates are defined in [`MONOLITH_RAW_KERNEL_PLAN.md`](MONOLITH_RAW_KERNEL_PLAN.md).
+
 ## Platform Truth
 
 - Exact-key reads, finalize, delete, recover, GC, repair, and prefix rebuild all resolve against `index`.

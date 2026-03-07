@@ -1,15 +1,17 @@
 use crate::cli::report::print_health_report;
 
-use super::args::{Commands, JobAction, OpsCommands, UploadCommands};
+use super::args::{
+    Commands, DurabilityArg, ExecutionModeArg, OpsCommands, OpsGcAction, OpsPrefixRebuildAction,
+    OpsRedistributeAction, OpsRepairAction, RedistributeScopeArg, RepairModeArg, UploadCommands,
+};
 use ini::Ini;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::env;
 use std::error::Error;
 use std::io::{self, Write};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{error, info};
 
@@ -262,9 +264,6 @@ impl JobStatusTrait for GcJobStatus {
     }
 }
 
-pub static ADMIN_KEY: LazyLock<String> =
-    LazyLock::new(|| env::var("ADMIN_KEY").expect("ADMIN_KEY must be set for authentication"));
-
 const UI_WIDTH: usize = 70;
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -450,25 +449,51 @@ fn get_secret(secret_opt: Option<String>) -> Result<String, Box<dyn Error>> {
     Ok(rpassword::read_password()?)
 }
 
+fn resolve_auth_fragment(auth_fragment_opt: Option<String>) -> String {
+    if let Some(v) = auth_fragment_opt {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Ok(v) = std::env::var("N1_AUTH_FRAGMENT") {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "admin".to_string()
+}
+
+fn require_target_fragment(
+    fragment_opt: Option<&str>,
+    cmd_name: &str,
+) -> Result<String, Box<dyn Error>> {
+    match fragment_opt.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => Ok(v.to_string()),
+        None => Err(format!(
+            "{} requires a target fragment. Pass `--fragment <fragment_hash_or_name>`.",
+            cmd_name
+        )
+        .into()),
+    }
+}
+
 async fn authenticate(
     client: &Client,
     base_url: &str,
     secret: &str,
-    fragment: &str,
+    auth_fragment: &str,
 ) -> Result<String, Box<dyn Error>> {
-    let fragment_hash = if fragment != *ADMIN_KEY {
-        let mut hasher = sha2::Sha256::new();
-        use sha2::Digest;
-        hasher.update(fragment.as_bytes());
-        format!("{:x}", hasher.finalize())
-    } else {
-        ADMIN_KEY.as_str().to_string()
-    };
+    let fragment = auth_fragment.trim();
+    if fragment.is_empty() {
+        return Err("auth fragment must not be empty".into());
+    }
 
     let resp = client
         .post(format!("{}/authenticate/fragment", base_url))
         .json(&AuthRequest {
-            fragment: fragment_hash,
+            fragment: fragment.to_string(),
             secret: secret.to_string(),
             read: true,
             write: true,
@@ -1401,10 +1426,83 @@ where
     Ok(())
 }
 
+fn push_query_value<T: ToString>(query: &mut Vec<(String, String)>, key: &str, value: Option<T>) {
+    if let Some(v) = value {
+        query.push((key.to_string(), v.to_string()));
+    }
+}
+
+fn push_query_flag(query: &mut Vec<(String, String)>, key: &str, enabled: bool) {
+    if enabled {
+        query.push((key.to_string(), "true".to_string()));
+    }
+}
+
+fn build_repair_start_query(
+    dry_run: bool,
+    fragment: Option<&str>,
+    mode: Option<RepairModeArg>,
+    fast_mode: bool,
+    read_only_fast: bool,
+    meta_concurrency: Option<usize>,
+    repair_concurrency: Option<usize>,
+    batch: Option<usize>,
+) -> Vec<(String, String)> {
+    let mut query = vec![("dry_run".to_string(), dry_run.to_string())];
+    push_query_value(&mut query, "fragment", fragment.map(|s| s.to_string()));
+    push_query_value(
+        &mut query,
+        "mode",
+        mode.map(|m| m.as_query_value().to_string()),
+    );
+    push_query_flag(&mut query, "fast_mode", fast_mode);
+    push_query_flag(&mut query, "read_only_fast", read_only_fast);
+    push_query_value(&mut query, "meta_concurrency", meta_concurrency);
+    push_query_value(&mut query, "repair_concurrency", repair_concurrency);
+    push_query_value(&mut query, "batch", batch);
+    query
+}
+
+fn build_redistribution_start_query(
+    dry_run: bool,
+    fragment: Option<&str>,
+    mode: Option<ExecutionModeArg>,
+    fast_mode: bool,
+    read_only_fast: bool,
+    durability: Option<DurabilityArg>,
+    scope: Option<RedistributeScopeArg>,
+    object_concurrency: Option<usize>,
+    status_batch: Option<u64>,
+) -> Vec<(String, String)> {
+    let mut query = vec![("dry_run".to_string(), dry_run.to_string())];
+    push_query_value(&mut query, "fragment", fragment.map(|s| s.to_string()));
+    push_query_value(
+        &mut query,
+        "mode",
+        mode.map(|m| m.as_query_value().to_string()),
+    );
+    push_query_flag(&mut query, "fast_mode", fast_mode);
+    push_query_flag(&mut query, "read_only_fast", read_only_fast);
+    push_query_value(
+        &mut query,
+        "durability",
+        durability.map(|d| d.as_query_value().to_string()),
+    );
+    push_query_value(
+        &mut query,
+        "scope",
+        scope.map(|s| s.as_query_value().to_string()),
+    );
+    push_query_value(&mut query, "object_concurrency", object_concurrency);
+    push_query_value(&mut query, "status_batch", status_batch);
+    query
+}
+
 pub async fn execute_command(
     cmd: &Commands,
     secret_opt: Option<String>,
-    fragment_context: String,
+    auth_fragment_opt: Option<String>,
+    target_fragment_opt: Option<String>,
     url_opt: Option<String>,
     insecure: bool,
     poll_ms: u64,
@@ -1412,6 +1510,7 @@ pub async fn execute_command(
 ) -> Result<(), Box<dyn Error>> {
     let base_url = get_base_url(url_opt);
     let secret = get_secret(secret_opt)?;
+    let auth_fragment = resolve_auth_fragment(auth_fragment_opt);
 
     let client = Client::builder()
         .danger_accept_invalid_certs(insecure)
@@ -1423,6 +1522,11 @@ pub async fn execute_command(
         Commands::FormatBlobDevice { .. } => {
             return Err(
                 "format-blob-device is a local command; run it directly on the N1 node".into(),
+            );
+        }
+        Commands::FormatIndexDevice { .. } => {
+            return Err(
+                "format-index-device is a local command; run it directly on the N1 node".into(),
             );
         }
         Commands::CreateFragment { name, quota } => {
@@ -1450,13 +1554,13 @@ pub async fn execute_command(
             }
         }
         _ => {
-            info!("Authenticating as context '{}'...", fragment_context);
-            let token = authenticate(&client, &base_url, &secret, &fragment_context).await?;
+            info!("Authenticating as context '{}'...", auth_fragment);
+            let token = authenticate(&client, &base_url, &secret, &auth_fragment).await?;
 
             match cmd {
                 Commands::Ops { cmd: ops_cmd } => match ops_cmd {
                     OpsCommands::Gc { action } => match action {
-                        JobAction::Start => {
+                        OpsGcAction::Start => {
                             let resp = client
                                 .post(format!("{}/v4/maintenance/gc/start", base_url))
                                 .bearer_auth(&token)
@@ -1478,7 +1582,7 @@ pub async fn execute_command(
                             )
                             .await?;
                         }
-                        JobAction::Status => {
+                        OpsGcAction::Status => {
                             let status: GcJobStatus = fetch_status(
                                 &client,
                                 &format!("{}/v4/maintenance/gc/status", base_url),
@@ -1491,13 +1595,17 @@ pub async fn execute_command(
                                 print_gc_status_pretty(&status);
                             }
                         }
-                        JobAction::Stop => {
-                            return Err(
-                                "GC stop is not supported by server API. Use repair/redistribution/prefix stop controls."
-                                    .into(),
-                            );
+                        OpsGcAction::Stop => {
+                            let msg = stop_job(
+                                &client,
+                                "POST",
+                                &format!("{}/v4/maintenance/gc/stop", base_url),
+                                &token,
+                            )
+                            .await?;
+                            info!("GC stop requested: {}", msg);
                         }
-                        JobAction::Watch => {
+                        OpsGcAction::Watch => {
                             run_monitor_loop(
                                 client,
                                 format!("{}/v4/maintenance/gc/status", base_url),
@@ -1509,11 +1617,29 @@ pub async fn execute_command(
                             .await?;
                         }
                     },
-                    OpsCommands::Repair { action, dry_run } => match action {
-                        JobAction::Start => {
+                    OpsCommands::Repair { action } => match action {
+                        OpsRepairAction::Start {
+                            dry_run,
+                            mode,
+                            fast_mode,
+                            read_only_fast,
+                            meta_concurrency,
+                            repair_concurrency,
+                            batch,
+                        } => {
+                            let query = build_repair_start_query(
+                                *dry_run,
+                                target_fragment_opt.as_deref(),
+                                *mode,
+                                *fast_mode,
+                                *read_only_fast,
+                                *meta_concurrency,
+                                *repair_concurrency,
+                                *batch,
+                            );
                             let resp = client
                                 .post(format!("{}/v4/maintenance/repair/start", base_url))
-                                .query(&[("dry_run", dry_run)])
+                                .query(&query)
                                 .bearer_auth(&token)
                                 .send()
                                 .await?;
@@ -1524,7 +1650,7 @@ pub async fn execute_command(
                             }
                             info!("Repair start requested.");
                         }
-                        JobAction::Status => {
+                        OpsRepairAction::Status => {
                             let status: RepairJobStatus = fetch_status(
                                 &client,
                                 &format!("{}/v4/maintenance/repair/status", base_url),
@@ -1537,7 +1663,7 @@ pub async fn execute_command(
                                 print_repair_status_pretty(&status);
                             }
                         }
-                        JobAction::Stop => {
+                        OpsRepairAction::Stop => {
                             let msg = stop_job(
                                 &client,
                                 "POST",
@@ -1547,7 +1673,7 @@ pub async fn execute_command(
                             .await?;
                             info!("Repair stop requested: {}", msg);
                         }
-                        JobAction::Watch => {
+                        OpsRepairAction::Watch => {
                             run_monitor_loop(
                                 client,
                                 format!("{}/v4/maintenance/repair/status", base_url),
@@ -1561,11 +1687,31 @@ pub async fn execute_command(
                             .await?;
                         }
                     },
-                    OpsCommands::Redistribute { action, dry_run } => match action {
-                        JobAction::Start => {
+                    OpsCommands::Redistribute { action } => match action {
+                        OpsRedistributeAction::Start {
+                            dry_run,
+                            mode,
+                            fast_mode,
+                            read_only_fast,
+                            durability,
+                            scope,
+                            object_concurrency,
+                            status_batch,
+                        } => {
+                            let query = build_redistribution_start_query(
+                                *dry_run,
+                                target_fragment_opt.as_deref(),
+                                *mode,
+                                *fast_mode,
+                                *read_only_fast,
+                                *durability,
+                                *scope,
+                                *object_concurrency,
+                                *status_batch,
+                            );
                             let resp = client
                                 .post(format!("{}/v4/maintenance/redistribution/start", base_url))
-                                .query(&[("dry_run", dry_run)])
+                                .query(&query)
                                 .bearer_auth(&token)
                                 .send()
                                 .await?;
@@ -1578,7 +1724,7 @@ pub async fn execute_command(
                             }
                             info!("Redistribution start requested.");
                         }
-                        JobAction::Status => {
+                        OpsRedistributeAction::Status => {
                             let status: RedistributionJobStatus = fetch_status(
                                 &client,
                                 &format!("{}/v4/maintenance/redistribution/monitor", base_url),
@@ -1591,7 +1737,7 @@ pub async fn execute_command(
                                 print_redistribution_status_pretty(&status);
                             }
                         }
-                        JobAction::Stop => {
+                        OpsRedistributeAction::Stop => {
                             let msg = stop_job(
                                 &client,
                                 "PATCH",
@@ -1601,7 +1747,7 @@ pub async fn execute_command(
                             .await?;
                             info!("Redistribution stop requested: {}", msg);
                         }
-                        JobAction::Watch => {
+                        OpsRedistributeAction::Watch => {
                             run_monitor_loop(
                                 client,
                                 format!("{}/v4/maintenance/redistribution/monitor", base_url),
@@ -1615,8 +1761,8 @@ pub async fn execute_command(
                             .await?;
                         }
                     },
-                    OpsCommands::PrefixRebuild { action, fragment } => match action {
-                        JobAction::Start => {
+                    OpsCommands::PrefixRebuild { action } => match action {
+                        OpsPrefixRebuildAction::Start { fragment } => {
                             let mut req = client
                                 .post(format!("{}/v4/maintenance/prefix/rebuild/start", base_url))
                                 .bearer_auth(&token);
@@ -1633,7 +1779,7 @@ pub async fn execute_command(
                             }
                             info!("Prefix rebuild start requested.");
                         }
-                        JobAction::Status => {
+                        OpsPrefixRebuildAction::Status => {
                             let status: PrefixRebuildJobStatus = fetch_status(
                                 &client,
                                 &format!("{}/v4/maintenance/prefix/rebuild/status", base_url),
@@ -1646,7 +1792,7 @@ pub async fn execute_command(
                                 print_prefix_rebuild_status_pretty(&status);
                             }
                         }
-                        JobAction::Stop => {
+                        OpsPrefixRebuildAction::Stop => {
                             let msg = stop_job(
                                 &client,
                                 "POST",
@@ -1656,7 +1802,7 @@ pub async fn execute_command(
                             .await?;
                             info!("Prefix rebuild stop requested: {}", msg);
                         }
-                        JobAction::Watch => {
+                        OpsPrefixRebuildAction::Watch => {
                             run_monitor_loop(
                                 client,
                                 format!("{}/v4/maintenance/prefix/rebuild/status", base_url),
@@ -1695,10 +1841,28 @@ pub async fn execute_command(
                         error!("GC Start Failed: {}", resp.text().await?);
                     }
                 }
-                Commands::Repair { dry_run } => {
+                Commands::Repair {
+                    dry_run,
+                    mode,
+                    fast_mode,
+                    read_only_fast,
+                    meta_concurrency,
+                    repair_concurrency,
+                    batch,
+                } => {
+                    let query = build_repair_start_query(
+                        *dry_run,
+                        target_fragment_opt.as_deref(),
+                        *mode,
+                        *fast_mode,
+                        *read_only_fast,
+                        *meta_concurrency,
+                        *repair_concurrency,
+                        *batch,
+                    );
                     let resp = client
                         .post(format!("{}/v4/maintenance/repair/start", base_url))
-                        .query(&[("dry_run", dry_run)])
+                        .query(&query)
                         .bearer_auth(&token)
                         .send()
                         .await?;
@@ -1721,10 +1885,30 @@ pub async fn execute_command(
                     )
                     .await?;
                 }
-                Commands::Redistribute { dry_run } => {
+                Commands::Redistribute {
+                    dry_run,
+                    mode,
+                    fast_mode,
+                    read_only_fast,
+                    durability,
+                    scope,
+                    object_concurrency,
+                    status_batch,
+                } => {
+                    let query = build_redistribution_start_query(
+                        *dry_run,
+                        target_fragment_opt.as_deref(),
+                        *mode,
+                        *fast_mode,
+                        *read_only_fast,
+                        *durability,
+                        *scope,
+                        *object_concurrency,
+                        *status_batch,
+                    );
                     let resp = client
                         .post(format!("{}/v4/maintenance/redistribution/start", base_url))
-                        .query(&[("dry_run", dry_run)])
+                        .query(&query)
                         .bearer_auth(&token)
                         .send()
                         .await?;
@@ -1803,10 +1987,14 @@ pub async fn execute_command(
                 }
                 Commands::Uploads { cmd } => match cmd {
                     UploadCommands::List { limit, offset } => {
+                        let target_fragment = require_target_fragment(
+                            target_fragment_opt.as_deref(),
+                            "uploads list",
+                        )?;
                         let resp = client
                             .get(format!(
                                 "{}/v4/upload/status/list/{}",
-                                base_url, fragment_context
+                                base_url, target_fragment
                             ))
                             .query(&[("limit", limit), ("offset", offset)])
                             .bearer_auth(&token)
@@ -1825,10 +2013,14 @@ pub async fn execute_command(
                         }
                     }
                     UploadCommands::Status { version_id } => {
+                        let target_fragment = require_target_fragment(
+                            target_fragment_opt.as_deref(),
+                            "uploads status",
+                        )?;
                         let resp = client
                             .get(format!(
                                 "{}/v4/upload/status/{}/{}",
-                                base_url, fragment_context, version_id
+                                base_url, target_fragment, version_id
                             ))
                             .bearer_auth(&token)
                             .send()

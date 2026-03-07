@@ -2,13 +2,13 @@ use crate::enums::app_error_enum::AppError;
 use crate::fs::cleanup_manager::start_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::n1_core::constants::{GC_SUFFIX, METADATA_EXT, QUOTA_FILE, RESERVATION_FILE};
-use crate::n1_core::disk_manager::{
-    FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManager, ReservationReceipt,
-};
+use crate::n1_core::disk_manager::{FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManager};
+use crate::n1_core::index;
 use crate::n1_core::quota_manager::update_quota;
 use crate::n1_core::sync::sync_single_fragment_quota;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
+use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::Json;
 use axum::extract::State;
@@ -60,6 +60,13 @@ static GC_STATUS: std::sync::LazyLock<Arc<RwLock<GcJobStatus>>> =
     std::sync::LazyLock::new(|| Arc::new(RwLock::new(GcJobStatus::default())));
 static GC_RUNNING: std::sync::LazyLock<AtomicBool> =
     std::sync::LazyLock::new(|| AtomicBool::new(false));
+static GC_STOP_SIGNAL: std::sync::LazyLock<AtomicBool> =
+    std::sync::LazyLock::new(|| AtomicBool::new(false));
+
+#[inline]
+fn should_stop_gc() -> bool {
+    GC_STOP_SIGNAL.load(Ordering::Relaxed)
+}
 
 fn gc_status_read_clone() -> GcJobStatus {
     GC_STATUS
@@ -106,6 +113,7 @@ pub async fn run_lifecycle_manager(state: Arc<AppState>) {
             sleep(cleanup_interval).await;
             continue;
         }
+        GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
 
         if let Err(err) = run_gc_scan_offthread(state.clone(), false).await {
             error!("Lifecycle Manager Scan failed: {}", err);
@@ -118,10 +126,11 @@ pub async fn run_lifecycle_manager(state: Arc<AppState>) {
 
         with_gc_status_write(|st| {
             st.is_running = false;
-            if st.phase != "Failed" {
+            if st.phase != "Failed" && st.phase != "Stopped by User" {
                 st.phase = "Completed".to_string();
             }
         });
+        GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
         GC_RUNNING.store(false, Ordering::SeqCst);
 
         sleep(cleanup_interval).await;
@@ -144,6 +153,7 @@ pub async fn run_garbage_collector(State(state): State<Arc<AppState>>) -> impl I
             "GC is already running. Check /v4/maintenance/gc/status.",
         );
     }
+    GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
 
     tokio::spawn(async move {
         {
@@ -171,14 +181,40 @@ pub async fn run_garbage_collector(State(state): State<Arc<AppState>>) -> impl I
 
         with_gc_status_write(|st| {
             st.is_running = false;
-            if st.phase != "Failed" {
+            if st.phase != "Failed" && st.phase != "Stopped by User" {
                 st.phase = "Completed".to_string();
             }
         });
+        GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
         GC_RUNNING.store(false, Ordering::SeqCst);
     });
 
     (StatusCode::ACCEPTED, "GC started")
+}
+
+pub async fn stop_garbage_collector(
+    claims: Claims,
+    State(_state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if !claims.write || !claims.modify || !claims.delete {
+        return (
+            StatusCode::FORBIDDEN,
+            "Write, Modify and Delete permission required",
+        );
+    }
+
+    if !GC_RUNNING.load(Ordering::SeqCst) {
+        return (StatusCode::OK, "GC is not running.");
+    }
+
+    GC_STOP_SIGNAL.store(true, Ordering::Relaxed);
+    with_gc_status_write(|st| {
+        if st.is_running {
+            st.phase = "Stopping...".to_string();
+        }
+    });
+
+    (StatusCode::OK, "Stop signal sent to GC.")
 }
 
 async fn refund_quota(fragment: &str, amount: u64, state: &Arc<AppState>) {
@@ -196,6 +232,31 @@ async fn refund_quota(fragment: &str, amount: u64, state: &Arc<AppState>) {
 
 fn get_trash_root(disk_root: &std::path::Path, fragment_hash: &str) -> PathBuf {
     disk_root.join(fragment_hash).join(".trash")
+}
+
+fn should_scan_object_metadata_candidate(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if !name.ends_with(METADATA_EXT) {
+        return false;
+    }
+    if name == QUOTA_FILE || name == RESERVATION_FILE || name == "latest.msgpack" {
+        return false;
+    }
+    if name.ends_with(".session.msgpack")
+        || name.ends_with(".removed.msgpack")
+        || name.ends_with(".meta.msgpack")
+    {
+        return false;
+    }
+    true
+}
+
+fn is_trash_metadata_path(path: &Path) -> bool {
+    let p = path.to_string_lossy();
+    p.contains("/partitions/") && p.contains("/trash/")
+        || p.contains("\\partitions\\") && p.contains("\\trash\\")
+        || p.contains("/.trash/index/")
+        || p.contains("\\.trash\\index\\")
 }
 
 #[cfg(unix)]
@@ -231,19 +292,33 @@ fn gc_cleanup_version_dir_unix(
             continue;
         }
 
-        let modified = md.modified().unwrap_or(now);
-        let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
-        if !(is_manual || age > gc_ttl) {
-            continue;
-        }
-
         if name.ends_with(GC_SUFFIX) {
-            gc_files.push((name, p));
+            let modified = md.modified().unwrap_or(now);
+            let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+            let ttl_expired = is_manual || age > gc_ttl;
+            let base = name.strip_suffix(GC_SUFFIX).unwrap_or(&name);
+            let link_path = version_dir.join(base);
+            // Strict reclaim rule: if no compatibility link points to this .gc file,
+            // reclaim immediately instead of waiting for TTL.
+            let orphan_gc = match fs::symlink_metadata(&link_path) {
+                Ok(lmd) if lmd.file_type().is_symlink() => match fs::read_link(&link_path) {
+                    Ok(tgt) => tgt.file_name().and_then(|v| v.to_str()) != Some(name.as_str()),
+                    Err(_) => true,
+                },
+                _ => true,
+            };
+            if ttl_expired || orphan_gc {
+                gc_files.push((name, p));
+            }
             continue;
         }
 
         if name.contains(".preexisting.") {
-            preexisting_files.push(p);
+            let modified = md.modified().unwrap_or(now);
+            let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+            if is_manual || age > gc_ttl {
+                preexisting_files.push(p);
+            }
             continue;
         }
     }
@@ -283,12 +358,6 @@ fn gc_cleanup_version_dir_unix(
             continue;
         }
 
-        let modified = md.modified().unwrap_or(now);
-        let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
-        if !(is_manual || age > gc_ttl) {
-            continue;
-        }
-
         let tgt = match fs::read_link(&sp) {
             Ok(t) => t,
             Err(_) => {
@@ -305,6 +374,13 @@ fn gc_cleanup_version_dir_unix(
         let tgt_path = sp.parent().unwrap_or(Path::new("")).join(tgt_name);
         if !tgt_path.exists() {
             let _ = fs::remove_file(&sp);
+            continue;
+        }
+
+        let modified = md.modified().unwrap_or(now);
+        let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+        if !(is_manual || age > gc_ttl) {
+            continue;
         }
     }
 }
@@ -364,6 +440,9 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
     };
 
     for fragment in fragments {
+        if should_stop_gc() {
+            break;
+        }
         with_gc_status_write(|st| {
             st.current_fragment = fragment.clone();
             st.phase = format!("Processing fragment {}", fragment);
@@ -391,6 +470,15 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
         });
     }
 
+    if should_stop_gc() {
+        info!("GC: Scan stopped by user request.");
+        with_gc_status_write(|st| {
+            st.phase = "Stopped by User".to_string();
+            st.duration_seconds = start.elapsed().as_secs();
+        });
+        return Ok(());
+    }
+
     info!("GC: Scan completed.");
     with_gc_status_write(|st| {
         st.phase = "Finalizing".to_string();
@@ -409,211 +497,124 @@ async fn process_fragment_gc(
     state: &Arc<AppState>,
 ) -> FragmentGcStats {
     let mut stats = FragmentGcStats::default();
-    let mut live_versions = HashSet::new();
-    let mut trash_versions = HashSet::new();
-    let mut expired_trash_refund = 0u64;
-    let mut expired_versions = HashSet::new();
+    let mut live_versions = HashSet::<String>::new();
+    let mut trash_versions = HashSet::<String>::new();
+    let mut expired_versions: HashMap<String, (String, u64)> = HashMap::new();
+
+    let now = SystemTime::now();
 
     for root in index_roots {
+        if should_stop_gc() {
+            return stats;
+        }
         let index_dir = root.join(fragment).join("index");
         if !index_dir.exists() {
             continue;
         }
 
         for entry in WalkDir::new(&index_dir).into_iter().filter_map(|e| e.ok()) {
-            if entry.file_type().is_file() {
-                let fname = entry.file_name().to_string_lossy();
-                if fname.ends_with(METADATA_EXT) && fname != QUOTA_FILE && fname != RESERVATION_FILE
-                {
-                    if let Some((_, rest)) = fname.split_once('#') {
-                        if let Some(ver) = rest.strip_suffix(METADATA_EXT) {
-                            live_versions.insert(ver.to_string());
-                        }
-                    }
-                }
+            if should_stop_gc() {
+                return stats;
             }
-        }
-        if !live_versions.is_empty() {
-            break;
-        }
-    }
-    stats.live_versions_seen = live_versions.len() as u64;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if !should_scan_object_metadata_candidate(path) {
+                continue;
+            }
 
-    let now = SystemTime::now();
+            let data = match std::fs::read(path) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let meta = match rmp_serde::from_slice::<ObjectMetadata>(&data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if meta.fragment != fragment {
+                continue;
+            }
 
-    for root in index_roots {
-        let trash_index = get_trash_root(root, fragment).join("index");
-        if !trash_index.exists() {
-            continue;
-        }
-
-        for entry in WalkDir::new(&trash_index)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if entry.file_type().is_file()
-                && entry.file_name().to_string_lossy().ends_with(METADATA_EXT)
-            {
-                let fname = entry.file_name().to_string_lossy().to_string();
-
+            if is_trash_metadata_path(path) {
                 let modified = entry
                     .metadata()
                     .ok()
                     .and_then(|m| m.modified().ok())
                     .unwrap_or(now);
                 let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
-
-                let should_expire = age > retention || is_manual_run;
-
-                let mut ver_id = String::new();
-                if let Some((_, rest)) = fname.split_once('#') {
-                    if let Some(ver) = rest.strip_suffix(METADATA_EXT) {
-                        ver_id = ver.to_string();
-                    }
-                }
-
-                if ver_id.is_empty() {
-                    continue;
-                }
+                let should_expire = is_manual_run || age > retention;
 
                 if should_expire {
-                    if let Ok(data) = std::fs::read(entry.path()) {
-                        if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
-                            if !expired_versions.contains(&ver_id) {
-                                expired_trash_refund += meta.total_size_bytes;
-                                expired_versions.insert(ver_id.clone());
-                            }
-                        }
-                    }
+                    expired_versions
+                        .entry(meta.version_id.clone())
+                        .or_insert((meta.object_key.clone(), meta.total_size_bytes));
                 } else {
-                    trash_versions.insert(ver_id);
+                    trash_versions.insert(meta.version_id.clone());
                 }
+            } else {
+                live_versions.insert(meta.version_id.clone());
             }
         }
-        if !expired_versions.is_empty() || !trash_versions.is_empty() {
-            break;
-        }
     }
+    stats.live_versions_seen = live_versions.len() as u64;
 
+    let expired_trash_refund: u64 = expired_versions.values().map(|(_, sz)| *sz).sum();
     refund_quota(fragment, expired_trash_refund, state).await;
     stats.refund_bytes += expired_trash_refund;
     stats.trash_versions_expired += expired_versions.len() as u64;
 
-    if !expired_versions.is_empty() {
-        let tasks = index_roots.iter().chain(blob_roots.iter()).map(|root| {
-            let frag = fragment.to_string();
-            let expired = expired_versions.clone();
-            let root_path = root.clone();
-
-            tokio::task::spawn_blocking(move || {
-                let trash_idx = get_trash_root(&root_path, &frag).join("index");
-                if trash_idx.exists() {
-                    for entry in WalkDir::new(&trash_idx).into_iter().filter_map(|e| e.ok()) {
-                        let fname = entry.file_name().to_string_lossy();
-                        if fname.ends_with(METADATA_EXT) {
-                            if let Some((_, rest)) = fname.split_once('#') {
-                                if let Some(ver) = rest.strip_suffix(METADATA_EXT) {
-                                    if expired.contains(ver) {
-                                        let _ = std::fs::remove_file(entry.path());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let trash_blob_root = get_trash_root(&root_path, &frag).join("blob");
-                for ver in &expired {
-                    let p = trash_blob_root.join(ver);
-                    if p.exists() {
-                        let _ = std::fs::remove_dir_all(p);
-                    }
-                }
-            })
-        });
-        futures_util::future::join_all(tasks).await;
-    }
-
-    let mut sessions_to_delete = HashSet::new();
-    let mut session_amounts: HashMap<String, u64> = HashMap::new();
-
-    for root in index_roots {
-        let session_root = root.join(fragment).join("index").join("sessions");
-        if !session_root.exists() {
-            continue;
+    for (ver, (object_key, _size)) in &expired_versions {
+        if should_stop_gc() {
+            return stats;
         }
-
-        if let Ok(entries) = std::fs::read_dir(&session_root) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-
-                let session_id = entry.file_name().to_string_lossy().to_string();
-
-                if sessions_to_delete.contains(&session_id) {
-                    if !session_amounts.contains_key(&session_id) {
-                        let res_file = path.join(RESERVATION_FILE);
-                        if let Ok(data) = std::fs::read(&res_file) {
-                            if let Ok(receipt) = rmp_serde::from_slice::<ReservationReceipt>(&data)
-                            {
-                                session_amounts.insert(session_id.clone(), receipt.amount);
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                let modified = fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .unwrap_or(now);
-
-                if now.duration_since(modified).unwrap_or(Duration::ZERO) > file_ttl {
-                    sessions_to_delete.insert(session_id.clone());
-
-                    let res_file = path.join(RESERVATION_FILE);
-                    if res_file.exists() {
-                        if let Ok(data) = std::fs::read(&res_file) {
-                            if let Ok(receipt) = rmp_serde::from_slice::<ReservationReceipt>(&data)
-                            {
-                                session_amounts.insert(session_id, receipt.amount);
-                            }
-                        }
-                    }
-                }
+        let _ = index::delete_trashed_object_version(fragment, object_key, ver).await;
+    }
+    for root in blob_roots {
+        if should_stop_gc() {
+            return stats;
+        }
+        let trash_blob_root = get_trash_root(root, fragment).join("blob");
+        for ver in expired_versions.keys() {
+            if should_stop_gc() {
+                return stats;
             }
-        }
-    }
-
-    for sess in &sessions_to_delete {
-        if !session_amounts.contains_key(sess) {
-            warn!(
-                "GC: Session {} deleted without refund (missing reservation receipt). Quota may drift. Run 'sync_fragment_metadata' to fix.",
-                sess
-            );
-        }
-    }
-
-    let total_session_refund: u64 = session_amounts.values().sum();
-    refund_quota(fragment, total_session_refund, state).await;
-    stats.refund_bytes += total_session_refund;
-    stats.sessions_deleted += sessions_to_delete.len() as u64;
-
-    for root in index_roots {
-        for sess_id in &sessions_to_delete {
-            let p = root
-                .join(fragment)
-                .join("index")
-                .join("sessions")
-                .join(sess_id);
+            let p = trash_blob_root.join(ver);
             if p.exists() {
                 let _ = std::fs::remove_dir_all(p);
             }
         }
     }
 
+    let now_ts = Utc::now().timestamp();
+    let ttl_secs = file_ttl.as_secs() as i64;
+    let mut sessions_to_delete = Vec::<(String, u64)>::new();
+    if let Ok(active_sessions) = index::list_active_sessions(fragment).await {
+        for session in active_sessions {
+            let idle_secs = now_ts.saturating_sub(session.last_activity_at.max(0));
+            if is_manual_run || idle_secs > ttl_secs {
+                let amount = session.reservation.map(|r| r.amount).unwrap_or(0);
+                sessions_to_delete.push((session.manifest.version_id, amount));
+            }
+        }
+    }
+
+    let total_session_refund: u64 = sessions_to_delete.iter().map(|(_, amount)| *amount).sum();
+    refund_quota(fragment, total_session_refund, state).await;
+    stats.refund_bytes += total_session_refund;
+    stats.sessions_deleted += sessions_to_delete.len() as u64;
+
+    for (version_id, _) in &sessions_to_delete {
+        if should_stop_gc() {
+            return stats;
+        }
+        let _ = index::remove_session(fragment, version_id, "gc-expired").await;
+    }
+
     for root in blob_roots {
+        if should_stop_gc() {
+            return stats;
+        }
         let blob_root = root.join(fragment).join("blob");
         if !blob_root.exists() {
             continue;
@@ -621,6 +622,9 @@ async fn process_fragment_gc(
 
         if let Ok(entries) = std::fs::read_dir(&blob_root) {
             for entry in entries.filter_map(|e| e.ok()) {
+                if should_stop_gc() {
+                    return stats;
+                }
                 let path = entry.path();
                 if !path.is_dir() {
                     continue;
@@ -632,7 +636,7 @@ async fn process_fragment_gc(
 
                 if !live_versions.contains(&ver_id)
                     && !trash_versions.contains(&ver_id)
-                    && !expired_versions.contains(&ver_id)
+                    && !expired_versions.contains_key(&ver_id)
                 {
                     let modified = fs::metadata(&path)
                         .and_then(|m| m.modified())

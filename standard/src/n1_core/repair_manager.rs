@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::fs::{self, File};
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{error, info, warn};
@@ -85,6 +85,7 @@ impl RepairCheckMode {
 #[derive(Clone, Debug)]
 pub struct RepairRunConfig {
     pub dry_run: bool,
+    pub target_fragment: Option<String>,
     pub check_mode: RepairCheckMode,
     pub meta_concurrency: usize,
     pub shard_repair_concurrency: usize,
@@ -128,10 +129,25 @@ fn clamp_usize(v: usize, lo: usize, hi: usize) -> usize {
 }
 
 fn parse_check_mode(params: &HashMap<String, String>) -> RepairCheckMode {
-    match params.get("mode").map(|s| s.as_str()) {
+    let normalized_mode = params
+        .get("mode")
+        .or_else(|| params.get("check_mode"))
+        .or_else(|| params.get("execution_mode"))
+        .map(|s| s.trim().to_ascii_lowercase());
+
+    match normalized_mode.as_deref() {
+        Some("scrub") | Some("quiesced") | Some("offline") => return RepairCheckMode::Scrub,
+        Some("strict") | Some("readonly") | Some("read_only") => return RepairCheckMode::Strict,
+        Some("checksum") => return RepairCheckMode::Checksum,
+        _ => {}
+    }
+
+    let normalized_access_mode = params
+        .get("access_mode")
+        .map(|s| s.trim().to_ascii_lowercase());
+    match normalized_access_mode.as_deref() {
         Some("scrub") | Some("quiesced") | Some("offline") => RepairCheckMode::Scrub,
         Some("strict") | Some("readonly") | Some("read_only") => RepairCheckMode::Strict,
-        Some("checksum") => RepairCheckMode::Checksum,
         _ => RepairCheckMode::Availability,
     }
 }
@@ -286,6 +302,18 @@ fn normalize_repair_cfg_for_layout(
     cfg.meta_concurrency = cfg.meta_concurrency.min(meta_cap).max(1);
     cfg.shard_repair_concurrency = cfg.shard_repair_concurrency.min(shard_cap).max(1);
     cfg
+}
+
+fn availability_pacing_delay(check_mode: RepairCheckMode, fast_mode: bool) -> Option<Duration> {
+    if check_mode != RepairCheckMode::Availability {
+        return None;
+    }
+
+    Some(if fast_mode {
+        Duration::from_millis(1)
+    } else {
+        Duration::from_millis(3)
+    })
 }
 
 #[inline]
@@ -445,6 +473,10 @@ pub async fn trigger_repair_job_api(
 
     let cfg = RepairRunConfig {
         dry_run: parse_bool_param(&params, "dry_run", false),
+        target_fragment: params
+            .get("fragment")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
         check_mode,
         meta_concurrency: clamp_usize(
             params
@@ -716,24 +748,48 @@ async fn list_all_session_versions(index_roots: &[PathBuf], fragment: &str) -> V
     let mut out = HashSet::<String>::new();
 
     for root in index_roots {
-        let base = root.join(fragment).join("index").join("sessions");
-        if !fs::try_exists(&base).await.unwrap_or(false) {
+        let partitions_base = root.join(fragment).join("index").join("partitions");
+        if !fs::try_exists(&partitions_base).await.unwrap_or(false) {
             continue;
         }
 
-        let mut rd = match fs::read_dir(&base).await {
+        let mut partitions = match fs::read_dir(&partitions_base).await {
             Ok(r) => r,
             Err(_) => continue,
         };
 
-        while let Ok(Some(ent)) = rd.next_entry().await {
-            let p = ent.path();
-            if !p.is_dir() {
+        while let Ok(Some(part)) = partitions.next_entry().await {
+            if !part
+                .file_type()
+                .await
+                .map(|ft| ft.is_dir())
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let vid = ent.file_name().to_string_lossy().to_string();
-            if !vid.is_empty() {
-                out.insert(vid);
+
+            let sessions_dir = part.path().join("sessions");
+            if !fs::try_exists(&sessions_dir).await.unwrap_or(false) {
+                continue;
+            }
+
+            let mut rd = match fs::read_dir(&sessions_dir).await {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            while let Ok(Some(ent)) = rd.next_entry().await {
+                let name = ent.file_name().to_string_lossy().to_string();
+                if ent.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
+                    if !name.is_empty() {
+                        out.insert(name);
+                    }
+                    continue;
+                }
+                if let Some(vid) = name.strip_suffix(".session.msgpack") {
+                    if !vid.is_empty() {
+                        out.insert(vid.to_string());
+                    }
+                }
             }
         }
     }
@@ -1272,19 +1328,41 @@ fn should_scan_object_metadata_file(path: &Path) -> bool {
         return false;
     }
 
-    // Standard variant is still legacy-authoritative for object metadata during
-    // migration; avoid scanning partition-index object copies as independent
-    // repair inputs to prevent duplicate/stale object-version processing.
-    if !name.contains('#') {
-        return false;
-    }
-
     let p = path.to_string_lossy();
     if p.contains("/sessions/") || p.contains("\\sessions\\") {
         return false;
     }
 
     true
+}
+
+async fn fragment_has_legacy_object_metadata(index_roots: &[PathBuf], fragment: &str) -> bool {
+    let roots = index_roots.to_vec();
+    let frag = fragment.to_string();
+    tokio::task::spawn_blocking(move || {
+        for root in roots {
+            let index_dir = root.join(&frag).join("index");
+            if !index_dir.exists() {
+                continue;
+            }
+            for entry in WalkDir::new(index_dir).into_iter().filter_map(|e| e.ok()) {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let p = entry.path();
+                if !should_scan_object_metadata_file(p) {
+                    continue;
+                }
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.contains('#') {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
 }
 
 fn object_version_identity_from_meta_path(path: &Path) -> Option<(String, String)> {
@@ -1342,7 +1420,11 @@ pub async fn run_repair_job(
     cfg: RepairRunConfig,
     ws_manager: Arc<WsConnectionManager>,
 ) -> Result<(), AppError> {
-    run_repair_job_with_options(cfg, RepairRunOptions::default(), ws_manager).await
+    let run_opts = RepairRunOptions {
+        fast_mode: false,
+        access_mode: cfg.check_mode.maintenance_access_mode(),
+    };
+    run_repair_job_with_options(cfg, run_opts, ws_manager).await
 }
 
 pub async fn run_repair_job_with_options(
@@ -1352,7 +1434,17 @@ pub async fn run_repair_job_with_options(
 ) -> Result<(), AppError> {
     STOP_SIGNAL.store(false, Ordering::Relaxed);
     let start_time = Instant::now();
-    let _write_gate = acquire_maintenance_mode(opts.access_mode);
+    let effective_access_mode = opts
+        .access_mode
+        .max(cfg.check_mode.maintenance_access_mode());
+    if effective_access_mode != opts.access_mode {
+        info!(
+            "Repair mode upgraded maintenance gate from {:?} to {:?} based on check_mode={:?}",
+            opts.access_mode, effective_access_mode, cfg.check_mode
+        );
+    }
+    let _write_gate = acquire_maintenance_mode(effective_access_mode);
+    let batch_pacing = availability_pacing_delay(cfg.check_mode, opts.fast_mode);
 
     {
         let mut status = REPAIR_STATUS.write().await;
@@ -1360,7 +1452,7 @@ pub async fn run_repair_job_with_options(
         status.fast_mode = opts.fast_mode;
         status.phase = format!(
             "Initializing (access_mode={:?}, mode={:?}, meta_conc={}, repair_conc={}, batch={}, dry_run={}, fast_mode={})",
-            opts.access_mode,
+            effective_access_mode,
             cfg.check_mode,
             cfg.meta_concurrency,
             cfg.shard_repair_concurrency,
@@ -1406,10 +1498,18 @@ pub async fn run_repair_job_with_options(
     );
 
     let shard_repair_sem = Arc::new(Semaphore::new(cfg.shard_repair_concurrency));
-    let fragments = list_all_fragments(&index_roots).await;
+    let fragments = match cfg.target_fragment.as_ref() {
+        Some(fragment) => vec![fragment.clone()],
+        None => list_all_fragments(&index_roots).await,
+    };
 
     info!(
-        "Starting Storage Repair Job (fragments={}, index_roots={}). mode={:?}, dry_run={}",
+        "Starting Storage Repair Job (scope={}, fragments={}, index_roots={}). mode={:?}, dry_run={}",
+        if cfg.target_fragment.is_some() {
+            "single-fragment"
+        } else {
+            "all-fragments"
+        },
         fragments.len(),
         index_roots.len(),
         cfg.check_mode,
@@ -1465,7 +1565,10 @@ pub async fn run_repair_job_with_options(
         let mut scan_index_dirs: Vec<PathBuf> = Vec::new();
         for root in &index_roots {
             let idx = root.join(&fragment_hash).join("index");
-            if fs::try_exists(&idx).await.unwrap_or(false) {
+            let partitions = idx.join("partitions");
+            if fs::try_exists(&partitions).await.unwrap_or(false) {
+                scan_index_dirs.push(partitions);
+            } else if fs::try_exists(&idx).await.unwrap_or(false) {
                 scan_index_dirs.push(idx);
             }
         }
@@ -1494,25 +1597,30 @@ pub async fn run_repair_job_with_options(
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 
-        {
-            let mut status = REPAIR_STATUS.write().await;
-            status.phase = format!("Reconciling legacy object metadata mirrors {}", fragment_hash);
-            ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
-        }
+        if fragment_has_legacy_object_metadata(&index_roots, &fragment_hash).await {
+            {
+                let mut status = REPAIR_STATUS.write().await;
+                status.phase = format!(
+                    "Reconciling legacy object metadata mirrors {}",
+                    fragment_hash
+                );
+                ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
+            }
 
-        let (omiss, odiv, ocorrupt) = repair_fragment_legacy_object_metadata_mirrors(
-            &index_roots,
-            &fragment_hash,
-            cfg.dry_run,
-        )
-        .await?;
+            let (omiss, odiv, ocorrupt) = repair_fragment_legacy_object_metadata_mirrors(
+                &index_roots,
+                &fragment_hash,
+                cfg.dry_run,
+            )
+            .await?;
 
-        {
-            let mut status = REPAIR_STATUS.write().await;
-            status.missing_meta_repaired += omiss;
-            status.divergent_meta_repaired += odiv;
-            status.corrupt_found += ocorrupt;
-            ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
+            {
+                let mut status = REPAIR_STATUS.write().await;
+                status.missing_meta_repaired += omiss;
+                status.divergent_meta_repaired += odiv;
+                status.corrupt_found += ocorrupt;
+                ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
+            }
         }
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<PathBuf>(1024);
@@ -1552,6 +1660,7 @@ pub async fn run_repair_job_with_options(
                     num_disks,
                     cfg.clone(),
                     shard_repair_sem.clone(),
+                    batch_pacing,
                     ws_manager.clone(),
                     start_time,
                 )
@@ -1575,6 +1684,7 @@ pub async fn run_repair_job_with_options(
                 num_disks,
                 cfg.clone(),
                 shard_repair_sem.clone(),
+                batch_pacing,
                 ws_manager.clone(),
                 start_time,
             )
@@ -1637,6 +1747,7 @@ async fn apply_meta_batch(
     num_disks: usize,
     cfg: RepairRunConfig,
     shard_repair_sem: Arc<Semaphore>,
+    batch_pacing: Option<Duration>,
     ws_manager: Arc<WsConnectionManager>,
     start_time: Instant,
 ) -> Result<BatchDelta, AppError> {
@@ -1674,6 +1785,7 @@ async fn apply_meta_batch(
     let mut batch_agg = BatchDelta::default();
     let mut pending_update = BatchDelta::default();
     let mut last_update = Instant::now();
+    let mut processed_since_pause: usize = 0;
 
     while let Some(res) = stream.next().await {
         let delta = match res {
@@ -1706,6 +1818,14 @@ async fn apply_meta_batch(
         }
         if delta.last_disagreement.is_some() {
             pending_update.last_disagreement = delta.last_disagreement.clone();
+        }
+
+        if let Some(delay) = batch_pacing {
+            processed_since_pause += 1;
+            if processed_since_pause >= 32 {
+                processed_since_pause = 0;
+                tokio::time::sleep(delay).await;
+            }
         }
 
         let significant_change = delta.repaired_shards > 0
@@ -1839,4 +1959,33 @@ async fn process_one_meta_path(
     delta.last_repaired = last_rep;
 
     Ok(delta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RepairCheckMode, parse_check_mode};
+    use std::collections::HashMap;
+
+    #[test]
+    fn parse_check_mode_is_case_insensitive_and_accepts_aliases() {
+        let mut params = HashMap::new();
+        params.insert("mode".to_string(), "ScRuB".to_string());
+        assert_eq!(parse_check_mode(&params), RepairCheckMode::Scrub);
+
+        params.insert("mode".to_string(), "READ_ONLY".to_string());
+        assert_eq!(parse_check_mode(&params), RepairCheckMode::Strict);
+
+        params.insert("mode".to_string(), "checksum".to_string());
+        assert_eq!(parse_check_mode(&params), RepairCheckMode::Checksum);
+    }
+
+    #[test]
+    fn parse_check_mode_falls_back_to_access_mode_when_mode_absent() {
+        let mut params = HashMap::new();
+        params.insert("access_mode".to_string(), "quiesced".to_string());
+        assert_eq!(parse_check_mode(&params), RepairCheckMode::Scrub);
+
+        params.insert("access_mode".to_string(), "readonly".to_string());
+        assert_eq!(parse_check_mode(&params), RepairCheckMode::Strict);
+    }
 }

@@ -26,8 +26,7 @@ use tracing::{error, info, warn};
 use ulid::Ulid;
 
 use crate::n1_core::constants::{
-    METADATA_EXT, PREFIX_INDEX_DIR, PREFIX_INDEX_NAMESPACE, PREFIX_INDEX_VERSION,
-    PREFIX_SEGMENT_EXT,
+    PREFIX_INDEX_DIR, PREFIX_INDEX_NAMESPACE, PREFIX_INDEX_VERSION, PREFIX_SEGMENT_EXT,
 };
 
 #[cfg(unix)]
@@ -36,9 +35,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::windows::fs::OpenOptionsExt;
 
 use crate::enums::app_error_enum::AppError;
-use crate::n1_core::constants::{
-    PARITY_SUFFIX, PART_META_SUFFIX, RESERVATION_FILE, SESSION_MANIFEST_FILE, SHARD_SUFFIX,
-};
+use crate::n1_core::constants::{PARITY_SUFFIX, SHARD_SUFFIX};
 use crate::n1_core::disk_manager::{
     FinalizeIncompleteResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery,
     ObjectMetadata, ObjectPathManager, PartMetadata, PrefixIndexEntry, PrefixIndexSegment,
@@ -79,31 +76,32 @@ impl Drop for AdaptiveIoGuard<'_> {
 }
 
 async fn acquire_adaptive_io_guard() -> Result<AdaptiveIoGuard<'static>, AppError> {
-    loop {
-        let target = ADAPTIVE_IO_TARGET_ATOMIC
-            .get()
-            .map(|v| v.load(Ordering::Relaxed))
-            .unwrap_or_else(|| *MAX_IO_SEMAPHORE.get().unwrap_or(&128usize))
-            .max(1);
+    'outer: loop {
+        let permit = match IO_SEMAPHORE.acquire().await {
+            Ok(permit) => permit,
+            Err(_) => return Err(AppError::InternalServerError("Server busy".into())),
+        };
 
-        let active = ACTIVE_IO_INFLIGHT.load(Ordering::Relaxed);
-        if active < target {
+        loop {
+            let target = ADAPTIVE_IO_TARGET_ATOMIC
+                .get()
+                .map(|v| v.load(Ordering::Relaxed))
+                .unwrap_or_else(|| *MAX_IO_SEMAPHORE.get().unwrap_or(&128usize))
+                .max(1);
+
+            let active = ACTIVE_IO_INFLIGHT.load(Ordering::Relaxed);
+            if active >= target {
+                drop(permit);
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                continue 'outer;
+            }
+
             if ACTIVE_IO_INFLIGHT
                 .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                break;
+                return Ok(AdaptiveIoGuard { _permit: permit });
             }
-        } else {
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-    }
-
-    match IO_SEMAPHORE.acquire().await {
-        Ok(permit) => Ok(AdaptiveIoGuard { _permit: permit }),
-        Err(_) => {
-            ACTIVE_IO_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
-            Err(AppError::InternalServerError("Server busy".into()))
         }
     }
 }
@@ -481,51 +479,22 @@ pub async fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<(), App
 }
 
 async fn read_manifest_any(
-    path_manager: &ObjectPathManager,
     fragment: &str,
     version_id: &str,
 ) -> Result<Option<UploadSessionManifest>, AppError> {
     if let Some(state) = index::load_session(fragment, version_id).await? {
         return Ok(Some(state.manifest));
     }
-
-    let meta_dirs = path_manager.get_all_session_dirs(fragment, version_id);
-    for d in meta_dirs {
-        let p = d.join(SESSION_MANIFEST_FILE);
-        if !tokio_fs::try_exists(&p).await.unwrap_or(false) {
-            continue;
-        }
-        if let Ok(bytes) = tokio_fs::read(&p).await {
-            if let Ok(m) = rmp_serde::from_slice::<UploadSessionManifest>(&bytes) {
-                return Ok(Some(m));
-            }
-        }
-    }
     Ok(None)
 }
 
 async fn read_part_meta_any(
-    path_manager: &ObjectPathManager,
     fragment: &str,
     version_id: &str,
     part_index: u64,
 ) -> Option<PartMetadata> {
     if let Ok(Some(part)) = index::read_session_part(fragment, version_id, part_index).await {
         return Some(part);
-    }
-
-    let meta_dirs = path_manager.get_all_session_dirs(fragment, version_id);
-    let name = format!("part_{}{}", part_index, PART_META_SUFFIX);
-    for d in meta_dirs {
-        let p = d.join(&name);
-        if !tokio_fs::try_exists(&p).await.unwrap_or(false) {
-            continue;
-        }
-        if let Ok(bytes) = tokio_fs::read(&p).await {
-            if let Ok(pm) = rmp_serde::from_slice::<PartMetadata>(&bytes) {
-                return Some(pm);
-            }
-        }
     }
     None
 }
@@ -706,51 +675,9 @@ pub async fn initiate_object_upload(
     let version_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
 
-    let path_manager = ObjectPathManager::new();
-    let meta_dirs = path_manager.get_all_session_dirs(&fragment, &version_id);
-
-    let create_futures = meta_dirs.iter().map(|path| async move {
-        let mut attempts = 0;
-        loop {
-            match tokio_fs::create_dir_all(path).await {
-                Ok(_) => return Ok::<(), std::io::Error>(()),
-                Err(e) => {
-                    attempts += 1;
-                    if attempts >= 3 {
-                        return Err(e);
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-            }
-        }
-    });
-
-    let results = join_all(create_futures).await;
-    let success_count = results.iter().filter(|r| r.is_ok()).count();
-
-    if success_count == 0 {
-        error!("Failed to create session directory on any index disk.");
-        let _ = update_quota(&fragment, -(params.total_size_bytes as i64)).await;
-        return Err(AppError::InternalServerError(
-            "Storage backend unavailable".into(),
-        ));
-    }
-
     let receipt = ReservationReceipt {
         amount: params.total_size_bytes,
     };
-    if let Ok(bytes) = rmp_serde::to_vec(&receipt) {
-        let write_futures = meta_dirs.iter().map(|path| {
-            let receipt_path = path.join(RESERVATION_FILE);
-            let data = bytes.clone();
-            async move {
-                if tokio_fs::try_exists(path).await.unwrap_or(false) {
-                    let _ = write_atomic(&receipt_path, &data).await;
-                }
-            }
-        });
-        let _ = join_all(write_futures).await;
-    }
 
     let stripe_size = STRIPE_SIZE_ATOMIC
         .get()
@@ -771,19 +698,6 @@ pub async fn initiate_object_upload(
         created_at: Utc::now().timestamp(),
         stripe_size_bytes: stripe_size,
     };
-
-    if let Ok(bytes) = rmp_serde::to_vec(&manifest) {
-        let write_futures = meta_dirs.iter().map(|path| {
-            let p = path.join(SESSION_MANIFEST_FILE);
-            let data = bytes.clone();
-            async move {
-                if tokio_fs::try_exists(path).await.unwrap_or(false) {
-                    let _ = write_atomic(&p, &data).await;
-                }
-            }
-        });
-        let _ = join_all(write_futures).await;
-    }
 
     if let Err(e) = index::open_session(&manifest, Some(receipt)).await {
         let _ = update_quota(&fragment, -(params.total_size_bytes as i64)).await;
@@ -899,7 +813,22 @@ pub async fn object_upload_part(
             .unwrap_or(true)
     });
     let _io_guard = if io_gate_enabled {
-        Some(acquire_adaptive_io_guard().await?)
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            acquire_adaptive_io_guard(),
+        )
+        .await
+        {
+            Ok(Ok(guard)) => Some(guard),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                warn!(
+                    "Upload IO gate wait timed out (fragment={}, version={}, part={}); proceeding ungated",
+                    fragment, version_id, part_index
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -1315,14 +1244,7 @@ pub async fn finalize_object_upload(
         return Ok((StatusCode::OK, "Upload finalized.").into_response());
     }
 
-    let existing_paths = path_manager.get_all_metadata_paths(&fragment, &object_key, &version_id);
-    for p in &existing_paths {
-        if tokio_fs::try_exists(p).await.unwrap_or(false) {
-            return Ok((StatusCode::OK, "Upload finalized.").into_response());
-        }
-    }
-
-    let manifest = read_manifest_any(&path_manager, &fragment, &version_id).await?;
+    let manifest = read_manifest_any(&fragment, &version_id).await?;
 
     if let Some(m) = manifest.as_ref() {
         if m.session_id != session_id {
@@ -1370,7 +1292,7 @@ pub async fn finalize_object_upload(
     let mut parts: Vec<PartMetadata> = Vec::with_capacity(expected_parts as usize);
 
     for i in 0..expected_parts {
-        if let Some(pm) = read_part_meta_any(&path_manager, &fragment, &version_id, i).await {
+        if let Some(pm) = read_part_meta_any(&fragment, &version_id, i).await {
             present.insert(i);
             parts.push(pm);
         }
@@ -1429,92 +1351,22 @@ pub async fn finalize_object_upload(
 
     index::publish_object(&object_meta).await?;
 
-    let rmp_data = rmp_serde::to_vec(&object_meta).map_err(|e| {
-        AppError::InternalServerError(format!("Failed to serialize object metadata: {}", e))
-    })?;
-
     let index_roots = path_manager.get_all_index_roots();
-
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(object_key.as_bytes());
-    let key_hash = hex::encode(hasher.finalize());
-
-    let shard1 = &key_hash[0..2];
-    let shard2 = &key_hash[2..4];
-    let shard3 = &key_hash[4..6];
-    let shard4 = &key_hash[6..8];
-    let filename = format!("{}#{}{}", key_hash, version_id, METADATA_EXT);
-
-    let mut ok_roots: Vec<PathBuf> = Vec::new();
-
-    for root in &index_roots {
-        let index_path = root
-            .join(&fragment)
-            .join("index")
-            .join(shard1)
-            .join(shard2)
-            .join(shard3)
-            .join(shard4)
-            .join(&filename);
-
-        if let Some(parent) = index_path.parent() {
-            let _ = tokio_fs::create_dir_all(parent).await;
-        }
-
-        match write_atomic(&index_path, &rmp_data).await {
-            Ok(_) => ok_roots.push(root.clone()),
-            Err(e) => {
-                warn!("Failed to write metadata {:?}: {}", index_path, e);
-            }
-        }
-    }
-
-    if ok_roots.is_empty() {
-        warn!(
-            "Legacy mirrored metadata write had zero successful roots for {}/{}#{}; partitioned index publish already succeeded",
-            fragment, object_key, version_id
-        );
-    }
-
-    if !ok_roots.is_empty() {
-        write_prefix_segments_on_roots(
-            &ok_roots,
-            &fragment,
-            &object_key,
-            &version_id,
-            object_meta.created_at,
-            if had_live_before { 0 } else { 1 },
-        )
-        .await?;
-    }
+    write_prefix_segments_on_roots(
+        &index_roots,
+        &fragment,
+        &object_key,
+        &version_id,
+        object_meta.created_at,
+        if had_live_before { 0 } else { 1 },
+    )
+    .await?;
 
     schedule_prefix_compaction(
         fragment.clone(),
         prefixes_for_key(&object_key).into_iter().collect(),
     );
 
-    let meta_dirs = path_manager.get_all_session_dirs(&fragment, &version_id);
-    let cleanup_futures = meta_dirs.iter().map(|dir| async move {
-        if !tokio_fs::try_exists(dir).await.unwrap_or(false) {
-            return;
-        }
-        let mut entries = match tokio_fs::read_dir(dir).await {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name_str = entry.file_name().to_string_lossy().to_string();
-            if name_str == RESERVATION_FILE
-                || name_str == SESSION_MANIFEST_FILE
-                || name_str.ends_with(PART_META_SUFFIX)
-            {
-                let _ = tokio_fs::remove_file(entry.path()).await;
-            }
-        }
-        let _ = sync_dir(dir).await;
-    });
-    let _ = join_all(cleanup_futures).await;
     let _ = index::remove_session(&fragment, &version_id, "finalized").await;
 
     let reserved_size = manifest
@@ -1561,47 +1413,12 @@ pub async fn cancel_upload_session(
         ));
     }
 
-    let index_paths =
-        path_manager.get_all_metadata_paths(&fragment, &key_query.object_key, &version_id);
-    for index_path in &index_paths {
-        if tokio_fs::try_exists(index_path).await.unwrap_or(false) {
-            return Err(AppError::Conflict(
-                "Cannot cancel: Object is already finalized.".to_string(),
-            ));
-        }
-    }
-
-    let meta_dirs = path_manager.get_all_session_dirs(&fragment, &version_id);
-
     let mut refund_amount = 0u64;
-    for meta_dir in &meta_dirs {
-        if !tokio_fs::try_exists(meta_dir).await.unwrap_or(false) {
-            continue;
-        }
-        let receipt_path = meta_dir.join(RESERVATION_FILE);
-        if let Ok(data) = tokio_fs::read(&receipt_path).await {
-            if let Ok(receipt) = rmp_serde::from_slice::<ReservationReceipt>(&data) {
-                refund_amount = receipt.amount;
-                break;
-            }
-        }
-    }
-
-    if refund_amount == 0 {
-        if let Some(state) = index::load_session(&fragment, &version_id).await? {
-            refund_amount = state.reservation.map(|r| r.amount).unwrap_or(0);
-        }
+    if let Some(state) = index::load_session(&fragment, &version_id).await? {
+        refund_amount = state.reservation.map(|r| r.amount).unwrap_or(0);
     }
 
     cleanup_blob_tmp_attempt_files_for_version(&path_manager, &fragment, &version_id).await;
-
-    let cleanup_meta_futures = meta_dirs.iter().map(|dir| {
-        let dir = dir.clone();
-        async move {
-            let _ = tokio_fs::remove_dir_all(&dir).await;
-        }
-    });
-    let _ = join_all(cleanup_meta_futures).await;
     let _ = index::remove_session(&fragment, &version_id, "cancelled").await;
 
     if refund_amount > 0 {

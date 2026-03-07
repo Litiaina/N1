@@ -47,12 +47,59 @@ impl ObjectPathManager {
             .collect()
     }
 
+    fn route_hash(parts: &[&str]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        for part in parts {
+            hasher.update(part.as_bytes());
+            hasher.update([0u8]);
+        }
+        hasher.finalize().into()
+    }
+
+    fn partition_id_from_hash(hash: [u8; 32]) -> u16 {
+        (u16::from(hash[0]) << 8 | u16::from(hash[1])) % 256
+    }
+
+    fn select_partition_roots(&self, partition_id: u16) -> Vec<PathBuf> {
+        let roots = self.get_all_index_roots();
+        if roots.is_empty() {
+            return Vec::new();
+        }
+        let owner_idx = usize::from(partition_id) % roots.len();
+        let mut selected = vec![roots[owner_idx].clone()];
+        if roots.len() > 1 {
+            let replica_offset = 1 + ((usize::from(partition_id >> 8)) % (roots.len() - 1));
+            let replica_idx = (owner_idx + replica_offset) % roots.len();
+            if replica_idx != owner_idx {
+                selected.push(roots[replica_idx].clone());
+            }
+        }
+        selected.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+        selected
+    }
+
+    fn object_partition_id(fragment_hash: &str, object_key: &str) -> u16 {
+        let canonical = Self::canonical_prefix(object_key);
+        Self::partition_id_from_hash(Self::route_hash(&["object", fragment_hash, &canonical]))
+    }
+
+    fn session_partition_id(fragment_hash: &str, version_id: &str) -> u16 {
+        Self::partition_id_from_hash(Self::route_hash(&["session", fragment_hash, version_id]))
+    }
+
+    fn partition_dir(root: &PathBuf, fragment_hash: &str, partition_id: u16) -> PathBuf {
+        root.join(fragment_hash)
+            .join("index")
+            .join("partitions")
+            .join(format!("{:04x}", partition_id))
+    }
+
     pub fn get_all_session_dirs(&self, fragment_hash: &str, version_id: &str) -> Vec<PathBuf> {
-        self.get_all_index_roots()
+        let partition_id = Self::session_partition_id(fragment_hash, version_id);
+        self.select_partition_roots(partition_id)
             .iter()
             .map(|root| {
-                root.join(fragment_hash)
-                    .join("index")
+                Self::partition_dir(root, fragment_hash, partition_id)
                     .join("sessions")
                     .join(version_id)
             })
@@ -83,22 +130,37 @@ impl ObjectPathManager {
         version_id: &str,
     ) -> Vec<PathBuf> {
         let key_hash = Self::object_key_hash(object_key);
-
-        let shard1 = &key_hash[0..2];
-        let shard2 = &key_hash[2..4];
-        let shard3 = &key_hash[4..6];
-        let shard4 = &key_hash[6..8];
-        let filename = format!("{}#{}{}", key_hash, version_id, METADATA_EXT);
-
-        self.get_all_index_roots()
+        let partition_id = Self::object_partition_id(fragment_hash, object_key);
+        let filename = format!("{}{}", version_id, METADATA_EXT);
+        self.select_partition_roots(partition_id)
             .iter()
             .map(|root| {
-                root.join(fragment_hash)
-                    .join("index")
-                    .join(shard1)
-                    .join(shard2)
-                    .join(shard3)
-                    .join(shard4)
+                Self::partition_dir(root, fragment_hash, partition_id)
+                    .join("objects")
+                    .join(&key_hash[0..2])
+                    .join(&key_hash)
+                    .join(&filename)
+            })
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    pub fn get_all_trashed_metadata_paths(
+        &self,
+        fragment_hash: &str,
+        object_key: &str,
+        version_id: &str,
+    ) -> Vec<PathBuf> {
+        let key_hash = Self::object_key_hash(object_key);
+        let partition_id = Self::object_partition_id(fragment_hash, object_key);
+        let filename = format!("{}{}", version_id, METADATA_EXT);
+        self.select_partition_roots(partition_id)
+            .iter()
+            .map(|root| {
+                Self::partition_dir(root, fragment_hash, partition_id)
+                    .join("trash")
+                    .join(&key_hash[0..2])
+                    .join(&key_hash)
                     .join(&filename)
             })
             .collect()

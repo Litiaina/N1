@@ -59,10 +59,30 @@
 For SMB network-drive deployment, see `NETWORK_DRIVE.md`.
 N1 ships with native SMB-lite via `fsgwd`, with `fsd_mount + Samba` kept as fallback.
 For raw blob device setup and operator steps, see `DEPLOYMENT.md`.
-For explicit raw blob initialization, use:
+For explicit raw blob initialization, use the two-step safety flow:
 
 ```bash
-sudo target/release/litiaina-n1-monilith format-blob-device --path /dev/disk/by-id/...
+sudo target/release/litiaina-n1-monilith format-blob-device \
+  --path /dev/disk/by-id/... \
+  --prepare
+
+sudo target/release/litiaina-n1-monilith format-blob-device \
+  --path /dev/disk/by-id/... \
+  --nonce <nonce-from-prepare> \
+  --fingerprint <fingerprint-from-prepare>
+```
+
+For raw index media pre-formatting (kernel-track), use the matching flow:
+
+```bash
+sudo target/release/litiaina-n1-monilith format-index-device \
+  --path /dev/disk/by-id/... \
+  --prepare
+
+sudo target/release/litiaina-n1-monilith format-index-device \
+  --path /dev/disk/by-id/... \
+  --nonce <nonce-from-prepare> \
+  --fingerprint <fingerprint-from-prepare>
 ```
 
 Profile note:
@@ -462,6 +482,7 @@ Execution modes:
 - `strict`: keep reads online, block mutations, and run repair harder
 - `scrub`: quiesce reads and writes and use the widest safe repair concurrency
 - fragment scans are streamed incrementally from partition roots instead of being materialized fragment-wide first
+- API compatibility: no maintenance route/path changes; mode parsing now also accepts `check_mode`/`execution_mode` and `access_mode` aliases.
 
 ### Recovery runtime (read and heal)
 
@@ -481,12 +502,21 @@ Redistribution moves payloads to new blob placement without interrupting CRUD:
 - republish shard addresses through `index`
 - leave old extents for later GC
 
+Redistribution scopes:
+
+- `all` (default): blob+index update in one pass
+- `blob`: move/re-encode blob shards and republish touched metadata
+- `index`: rebalance metadata replicas only (no blob rewrite)
+
 Execution modes:
 
 - `availability`: keep CRUD online and intentionally cap redistribution pressure lower
 - `strict`: make the node read-only and redistribute faster across the live layout
 - `scrub`: quiesce reads and writes and use the widest safe redistribution concurrency
 - fragment scans are streamed incrementally from partition roots so large fragments do not require full metadata vectors up front
+- API compatibility: no redistribution route/path changes; mode parsing now also accepts `check_mode`/`execution_mode` and `access_mode` aliases.
+- cancellation semantics are cooperative: job phase becomes `Stopped by User`; in-flight object tasks that return `Stopped` are no longer counted as hard migration failures.
+- each object migration writes a redistribution intent marker on index roots; interrupted objects are replayed on the next redistribution run before fresh scan work.
 
 ### Garbage collection and trash
 
@@ -564,7 +594,6 @@ N1 CLI is embedded in the `monilith` binary (`monilith/src/main.rs`) and uses `s
 Workspace server variants:
 - `monilith`: raw-device/block-manager-backed N1 for maximum control/performance.
 - `standard`: filesystem-backed N1 (`standard/src/main.rs`) for general-purpose deployments, with partitioned index roots under `index/partitions/<pid>/...` and directory-only `index_store_disks` / `blob_store_disks`.
-  - Transition rule: `standard` still mirrors legacy object metadata files and currently runs redistribution/repair object walks from the legacy `{hash}#{version}.msgpack` view to prevent duplicate stale processing while rename/delete/recover projection to fully partition-native maintenance is finalized.
 
 ### How to run the CLI
 
@@ -572,6 +601,12 @@ Use:
 
 ```bash
 cargo run -p monilith -- <command> [flags]
+```
+
+or:
+
+```bash
+cargo run -p standard -- <command> [flags]
 ```
 
 or the built binary:
@@ -593,15 +628,18 @@ If no command is given, server mode is the default.
 Available on all commands:
 
 - `-s, --secret <SECRET>`: secret input for auth
-- `-f, --fragment <FRAGMENT>`: target fragment (default `admin`)
+- `-f, --fragment <FRAGMENT>`: optional target fragment scope (used by fragment-scoped commands)
+- `--auth-fragment <AUTH_FRAGMENT>`: auth context fragment used during `/authenticate/fragment`
 - `--url <URL>`: explicit N1 API URL
 - `--insecure <bool>`: TLS cert validation toggle (default `true`)
 - `--poll-ms <N>`: watch polling interval in milliseconds (default `500`)
 - `--json <bool>`: machine-readable output mode (default `false`)
 
 Auth behavior for CLI:
-- Maintenance/admin flows use `MASTER_KEY` as `--secret` and must target `--fragment <ADMIN_KEY>`
-- Fragment-scoped data access uses fragment secret + fragment hash
+- Authentication context (`--auth-fragment`) is independent from operation target (`--fragment`).
+- Maintenance/admin flows use `MASTER_KEY` as `--secret`; GC does not require a target fragment.
+- Repair/redistribution accept optional `--fragment` to run single-fragment scope.
+- Fragment-scoped data access uses fragment secret + fragment hash.
 
 ### Top-level commands
 
@@ -627,7 +665,7 @@ cargo run -p monilith -- create-fragment --name imaging-a --quota 1099511627776
 Starts garbage collection and follows status.
 
 ```bash
-cargo run -p monilith -- gc --fragment <fragment_hash>
+cargo run -p monilith -- gc
 ```
 
 #### `repair`
@@ -635,6 +673,12 @@ Starts repair and follows status.
 
 Flags:
 - `--dry-run` optional
+- `--mode availability|checksum|strict|scrub`
+- `--fast-mode`
+- `--read-only-fast`
+- `--meta-concurrency <N>`
+- `--repair-concurrency <N>`
+- `--batch <N>`
 
 ```bash
 cargo run -p monilith -- repair --fragment <fragment_hash> --dry-run
@@ -645,6 +689,12 @@ Starts redistribution and follows status.
 
 Flags:
 - `--dry-run` optional
+- `--mode availability|strict|scrub`
+- `--fast-mode`
+- `--read-only-fast`
+- `--durability auto|strict|batched`
+- `--object-concurrency <N>`
+- `--status-batch <N>`
 
 ```bash
 cargo run -p monilith -- redistribute --fragment <fragment_hash>
@@ -670,7 +720,7 @@ Health now reports:
 - index runtime counters and raw/blob storage totals
 
 ```bash
-cargo run -p monilith -- health --fragment <fragment_hash> --watch --deep-scan
+cargo run -p monilith -- health --watch --deep-scan
 ```
 
 #### `uploads`
@@ -693,10 +743,9 @@ cargo run -p monilith -- ops <job> <action> [job-flags]
 
 Jobs:
 
-- `ops gc start|status|watch`
-  - `ops gc stop` is currently not supported by server API
-- `ops repair start|status|stop|watch [--dry-run]`
-- `ops redistribute start|status|stop|watch [--dry-run]`
+- `ops gc start|status|stop|watch`
+- `ops repair start|status|stop|watch [--fragment <fragment_hash>] [--dry-run --mode --fast-mode --read-only-fast --meta-concurrency --repair-concurrency --batch]`
+- `ops redistribute start|status|stop|watch [--fragment <fragment_hash>] [--dry-run --mode --scope --fast-mode --read-only-fast --durability --object-concurrency --status-batch]`
 - `ops prefix-rebuild start|status|stop|watch [--fragment <fragment_hash>]`
 
 Streaming tuning knobs (`[upload_config]`):
@@ -710,9 +759,9 @@ Examples:
 
 ```bash
 # GC lifecycle (admin context)
-export ADMIN_KEY="<admin_fragment_key>"
-cargo run -p monilith -- ops gc start --fragment "$ADMIN_KEY" --secret "<MASTER_KEY>"
-cargo run -p monilith -- ops gc status --fragment "$ADMIN_KEY" --secret "<MASTER_KEY>"
+cargo run -p monilith -- ops gc start --secret "<MASTER_KEY>"
+cargo run -p monilith -- ops gc status --secret "<MASTER_KEY>"
+cargo run -p monilith -- ops gc stop --secret "<MASTER_KEY>"
 
 # Repair lifecycle
 cargo run -p monilith -- ops repair start --fragment <fragment_hash>

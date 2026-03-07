@@ -9,12 +9,14 @@ use super::disk_manager::{
     PrefixIndexSegment, RenameObjectRequest, UploadPartQuery,
 };
 use super::fragment_metadata::init_fragment_metadata;
+use super::garbage_collector::{get_gc_status_api, run_garbage_collector};
 use super::metadata_parser::get_metadata;
 use super::modify::rename_object;
 use super::object_parser::{
     STREAM_CHUNK_SIZE_ATOMIC, STREAM_LOCALITY_BIAS_ENABLED_ATOMIC, STREAM_MAX_CONCURRENCY,
     STREAM_READAHEAD_BYTES_ATOMIC,
 };
+use super::operation_gate::MaintenanceAccessMode;
 use super::prefix_compactor::{
     PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC, PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC,
     schedule_prefix_compaction,
@@ -24,15 +26,15 @@ use super::quota_manager::init_quota_file;
 use super::recovery::verify_shard_integrity;
 use super::redistribution::{
     RedistributionDurabilityMode, RedistributionExecutionMode, RedistributionRunOptions,
-    run_redistribution_job,
-    run_redistribution_job_with_options,
+    run_redistribution_job, run_redistribution_job_with_options,
 };
 use super::repair_manager::{
     RepairCheckMode, RepairRunConfig, RepairRunOptions, run_repair_job, run_repair_job_with_options,
 };
-use super::operation_gate::MaintenanceAccessMode;
 use super::retrieve::PREFIX_MAX_DELTA_SEGMENTS_ATOMIC;
-use super::retrieve::{get_object, get_object_metadata, list_objects, stream_object};
+use super::retrieve::{
+    get_object, get_object_metadata, list_objects, list_trash_objects, stream_object,
+};
 use super::sync::ensure_fragment_blob_directories;
 use super::upload::{
     DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC,
@@ -551,6 +553,66 @@ async fn list_objects_json_page(
     .into_response();
     assert_eq!(resp.status(), StatusCode::OK);
     read_response_json(resp).await
+}
+
+async fn list_trash_json_page(
+    fragment: &str,
+    prefix: Option<&str>,
+    delimiter: Option<&str>,
+    limit: usize,
+    continuation_token: Option<String>,
+) -> serde_json::Value {
+    let mut params: HashMap<String, String> = HashMap::new();
+    if let Some(p) = prefix {
+        params.insert("prefix".to_string(), p.to_string());
+    }
+    if let Some(d) = delimiter {
+        params.insert("delimiter".to_string(), d.to_string());
+    }
+    params.insert("limit".to_string(), limit.to_string());
+    if let Some(tok) = continuation_token {
+        params.insert("continuation_token".to_string(), tok);
+    }
+
+    let resp = list_trash_objects(
+        full_claims(fragment),
+        AxumPath(fragment.to_string()),
+        Query(params),
+    )
+    .await
+    .expect("list trash page")
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    read_response_json(resp).await
+}
+
+async fn run_manual_gc_and_wait(state: Arc<AppState>) {
+    let baseline = get_gc_status_api(full_claims("gc-status"))
+        .await
+        .expect("gc status baseline")
+        .0;
+    let baseline_start = baseline.start_timestamp;
+
+    let start = run_garbage_collector(State(state)).await.into_response();
+    assert_eq!(start.status(), StatusCode::ACCEPTED, "manual GC must start");
+
+    let deadline = Instant::now() + std::time::Duration::from_secs(20);
+    let mut saw_new_run = false;
+    loop {
+        let status = get_gc_status_api(full_claims("gc-status"))
+            .await
+            .expect("gc status");
+        if status.0.start_timestamp != baseline_start {
+            saw_new_run = true;
+        }
+        if saw_new_run && !status.0.is_running {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("manual GC did not finish in time");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 async fn wait_until_prefix_compacted(fragment: &str, prefix: &str, timeout_ms: u64) -> bool {
@@ -1286,6 +1348,7 @@ async fn workflow_upload_read_modify_delete_redistribute_repair() {
     run_repair_job(
         RepairRunConfig {
             dry_run: false,
+            target_fragment: None,
             check_mode: RepairCheckMode::Scrub,
             meta_concurrency: 2,
             shard_repair_concurrency: 2,
@@ -2269,6 +2332,104 @@ async fn matrix_delete_recover_and_permanent_delete_flows() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_delete_version_again_permanently_removes_only_trashed_version() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "matrix/delete-version-again.bin".to_string();
+    let v1 = b"one".to_vec();
+    let v2 = b"two-newest".to_vec();
+
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let (ver1, sess1) = init_upload(&fragment, &key, v1.len() as u64, 1).await;
+    assert_eq!(
+        upload_part(&fragment, &ver1, 0, v1.clone()).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        finalize_upload(
+            state.clone(),
+            &fragment,
+            &ver1,
+            &sess1,
+            &key,
+            v1.len() as u64,
+            1,
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+
+    let (ver2, sess2) = init_upload(&fragment, &key, v2.len() as u64, 1).await;
+    assert_eq!(
+        upload_part(&fragment, &ver2, 0, v2.clone()).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        finalize_upload(
+            state.clone(),
+            &fragment,
+            &ver2,
+            &sess2,
+            &key,
+            v2.len() as u64,
+            1,
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+
+    let first_delete = delete_object_version(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), ver1.clone(), key.clone())),
+    )
+    .await
+    .expect("first delete")
+    .into_response();
+    assert_eq!(first_delete.status(), StatusCode::OK);
+
+    let second_delete = delete_object_version(
+        State(state),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), ver1.clone(), key.clone())),
+    )
+    .await
+    .expect("second delete")
+    .into_response();
+    assert_eq!(second_delete.status(), StatusCode::NO_CONTENT);
+
+    let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+    assert_eq!(got, v2, "latest live version should stay readable");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_recover_object_stays_listed_in_prefix_index() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -2348,6 +2509,274 @@ async fn matrix_recover_object_stays_listed_in_prefix_index() {
         keys.iter().any(|k| k == &key_keep),
         "unaffected key missing from prefix listing: {:?}",
         keys
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_trash_listing_delimiter_and_recover_updates_rows() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let key_a = "trash/a.bin".to_string();
+    let key_sub = "trash/sub/x.bin".to_string();
+    put_object(state.clone(), &fragment, &key_a, vec![1u8; 2048]).await;
+    put_object(state.clone(), &fragment, &key_sub, vec![2u8; 2048]).await;
+
+    delete_object(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), key_a.clone())),
+    )
+    .await
+    .expect("delete key_a");
+    delete_object(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), key_sub.clone())),
+    )
+    .await
+    .expect("delete key_sub");
+
+    let page1 = list_trash_json_page(&fragment, Some("trash"), Some("/"), 1, None).await;
+    let token1 = page1["continuation_token"]
+        .as_str()
+        .expect("trash page1 continuation")
+        .to_string();
+    let page2 = list_trash_json_page(&fragment, Some("trash"), Some("/"), 1, Some(token1)).await;
+
+    let mut rows = Vec::new();
+    for page in [&page1, &page2] {
+        rows.extend(
+            page["objects"]
+                .as_array()
+                .expect("trash objects array")
+                .iter()
+                .filter_map(|v| v["object_key"].as_str())
+                .map(|s| format!("object:{s}")),
+        );
+        rows.extend(
+            page["common_prefixes"]
+                .as_array()
+                .expect("trash common prefixes array")
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| format!("prefix:{s}")),
+        );
+    }
+    rows.sort();
+    assert!(
+        rows.iter().any(|r| r == "object:trash/a.bin"),
+        "expected trashed object row in delimiter listing: {:?}",
+        rows
+    );
+    assert!(
+        rows.iter().any(|r| r == "prefix:trash/sub/"),
+        "expected trashed common prefix row in delimiter listing: {:?}",
+        rows
+    );
+
+    recover_object(
+        State(state),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), key_sub.clone())),
+    )
+    .await
+    .expect("recover key_sub");
+
+    let after_recover = list_trash_json_page(&fragment, Some("trash"), None, 100, None).await;
+    let keys_after = after_recover["objects"]
+        .as_array()
+        .expect("after recover trash objects")
+        .iter()
+        .filter_map(|v| v["object_key"].as_str())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        keys_after.iter().all(|k| k != "trash/sub/x.bin"),
+        "recovered object should not stay in trash listing: {:?}",
+        keys_after
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_live_listing_without_prefix_uses_partition_pagination() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    for (key, fill) in [
+        ("alpha.bin", 1u8),
+        ("beta.bin", 2u8),
+        ("gamma.bin", 3u8),
+        ("omega/final.bin", 4u8),
+    ] {
+        put_object(state.clone(), &fragment, key, vec![fill; 2048]).await;
+    }
+
+    let page1 = list_objects_json_page(&fragment, None, None, 2, None).await;
+    let token1 = page1["continuation_token"]
+        .as_str()
+        .expect("page1 continuation")
+        .to_string();
+    let page2 = list_objects_json_page(&fragment, None, None, 2, Some(token1)).await;
+
+    let mut keys = Vec::new();
+    keys.extend(
+        page1["objects"]
+            .as_array()
+            .expect("page1 objects")
+            .iter()
+            .filter_map(|v| v["object_key"].as_str())
+            .map(|s| s.to_string()),
+    );
+    keys.extend(
+        page2["objects"]
+            .as_array()
+            .expect("page2 objects")
+            .iter()
+            .filter_map(|v| v["object_key"].as_str())
+            .map(|s| s.to_string()),
+    );
+    keys.sort();
+    keys.dedup();
+
+    assert!(
+        keys.iter().any(|k| k == "alpha.bin"),
+        "missing alpha in paged listing: {:?}",
+        keys
+    );
+    assert!(
+        keys.iter().any(|k| k == "beta.bin"),
+        "missing beta in paged listing: {:?}",
+        keys
+    );
+    assert!(
+        keys.iter().any(|k| k == "gamma.bin"),
+        "missing gamma in paged listing: {:?}",
+        keys
+    );
+    assert!(
+        keys.iter().any(|k| k == "omega/final.bin"),
+        "missing omega/final in paged listing: {:?}",
+        keys
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_gc_keeps_live_data_and_cleans_trash_in_partition_layout() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let key_live = "gc/live.bin".to_string();
+    let key_trash = "gc/trash.bin".to_string();
+    let live_payload = vec![0x11; 4096];
+
+    put_object(state.clone(), &fragment, &key_live, live_payload.clone()).await;
+    put_object(state.clone(), &fragment, &key_trash, vec![0x22; 4096]).await;
+
+    let del_resp = delete_object(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), key_trash.clone())),
+    )
+    .await
+    .expect("soft delete for gc")
+    .into_response();
+    assert_eq!(del_resp.status(), StatusCode::OK);
+
+    run_manual_gc_and_wait(state).await;
+
+    let live_after = read_object_bytes(full_claims(&fragment), fragment.clone(), key_live).await;
+    assert_eq!(live_after, live_payload, "GC must not remove live object");
+
+    let trash_listing = list_trash_json_page(&fragment, Some("gc"), None, 100, None).await;
+    let trashed_keys = trash_listing["objects"]
+        .as_array()
+        .expect("trash objects")
+        .iter()
+        .filter_map(|v| v["object_key"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        trashed_keys.iter().all(|k| *k != "gc/trash.bin"),
+        "manual GC should clear trashed object in this test: {:?}",
+        trashed_keys
     );
 }
 
@@ -2715,6 +3144,7 @@ async fn matrix_bitrot_parity_then_repair() {
     run_repair_job(
         RepairRunConfig {
             dry_run: false,
+            target_fragment: None,
             check_mode: RepairCheckMode::Scrub,
             meta_concurrency: 2,
             shard_repair_concurrency: 2,
@@ -2821,6 +3251,7 @@ async fn matrix_repair_synchronizes_all_index_disks() {
     run_repair_job(
         RepairRunConfig {
             dry_run: false,
+            target_fragment: None,
             check_mode: RepairCheckMode::Availability,
             meta_concurrency: 4,
             shard_repair_concurrency: 2,
@@ -2921,6 +3352,7 @@ async fn matrix_repair_restores_delete_marker_mirror() {
     run_repair_job(
         RepairRunConfig {
             dry_run: false,
+            target_fragment: None,
             check_mode: RepairCheckMode::Availability,
             meta_concurrency: 4,
             shard_repair_concurrency: 2,
@@ -3030,6 +3462,7 @@ async fn matrix_ha_repair_reconverges_index_after_index_disk_down() {
     run_repair_job(
         RepairRunConfig {
             dry_run: false,
+            target_fragment: None,
             check_mode: RepairCheckMode::Scrub,
             meta_concurrency: 8,
             shard_repair_concurrency: 2,
@@ -3278,6 +3711,7 @@ async fn matrix_ha_crud_during_redistribution_and_repair() {
     let repair_task = tokio::spawn(run_repair_job(
         RepairRunConfig {
             dry_run: false,
+            target_fragment: None,
             check_mode: RepairCheckMode::Scrub,
             meta_concurrency: 2,
             shard_repair_concurrency: 2,
@@ -3497,6 +3931,7 @@ async fn matrix_ha_repair_permanent_delete_no_index_desync() {
     let repair_task = tokio::spawn(run_repair_job(
         RepairRunConfig {
             dry_run: false,
+            target_fragment: None,
             check_mode: RepairCheckMode::Scrub,
             meta_concurrency: 2,
             shard_repair_concurrency: 2,
@@ -3685,6 +4120,7 @@ async fn matrix_ha_concurrent_clients_under_maintenance() {
     let repair_task = tokio::spawn(run_repair_job(
         RepairRunConfig {
             dry_run: false,
+            target_fragment: None,
             check_mode: RepairCheckMode::Scrub,
             meta_concurrency: 2,
             shard_repair_concurrency: 2,
@@ -3880,6 +4316,7 @@ async fn matrix_ha_concurrent_clients_with_failure_injection() {
     let repair_task = tokio::spawn(run_repair_job(
         RepairRunConfig {
             dry_run: false,
+            target_fragment: None,
             check_mode: RepairCheckMode::Scrub,
             meta_concurrency: 2,
             shard_repair_concurrency: 2,
@@ -4109,6 +4546,7 @@ async fn run_ha_soak_rounds_under_maintenance(profile: SoakProfile) {
         let repair_task = tokio::spawn(run_repair_job(
             RepairRunConfig {
                 dry_run: false,
+                target_fragment: None,
                 check_mode: RepairCheckMode::Scrub,
                 meta_concurrency: 2,
                 shard_repair_concurrency: 2,
@@ -4513,6 +4951,8 @@ async fn matrix_crud_cpu_ram_probe() {
             RedistributionRunOptions {
                 fast_mode: redist_fast_mode,
                 execution_mode: RedistributionExecutionMode::Availability,
+                scope: crate::n1_core::redistribution::RedistributionScope::All,
+                target_fragment: None,
                 durability_mode: redist_durability_mode,
                 object_concurrency: redist_object_concurrency,
                 status_batch: redist_status_batch,
@@ -4583,6 +5023,7 @@ async fn matrix_crud_cpu_ram_probe() {
         run_repair_job_with_options(
             RepairRunConfig {
                 dry_run: false,
+                target_fragment: None,
                 check_mode: RepairCheckMode::Scrub,
                 meta_concurrency: repair_meta_concurrency,
                 shard_repair_concurrency: repair_shard_concurrency,
@@ -5586,6 +6027,7 @@ async fn matrix_index_mirror_ha_soak_down_recover() {
         run_repair_job(
             RepairRunConfig {
                 dry_run: false,
+                target_fragment: None,
                 check_mode: RepairCheckMode::Scrub,
                 meta_concurrency: 8,
                 shard_repair_concurrency: 2,

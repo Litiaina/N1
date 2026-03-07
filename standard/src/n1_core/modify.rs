@@ -257,7 +257,6 @@ async fn invalidate_compacted_for_key(
 }
 
 async fn write_delete_marker_for_key(
-    path_manager: &ObjectPathManager,
     fragment: &str,
     object_key: &str,
     template: &ObjectMetadata,
@@ -276,25 +275,8 @@ async fn write_delete_marker_for_key(
     dm.total_size_bytes = 0;
 
     index::publish_object(&dm).await?;
-    mirror_legacy_metadata_best_effort(path_manager, &dm).await;
 
     Ok((delete_version_id, now))
-}
-
-async fn delete_source_metadata_versions(
-    path_manager: &ObjectPathManager,
-    fragment: &str,
-    object_key: &str,
-    versions: &HashSet<String>,
-) {
-    for v in versions {
-        for p in path_manager.get_all_metadata_paths(fragment, object_key, v) {
-            let _ = fs::remove_file(&p).await;
-            if let Some(parent) = p.parent() {
-                let _ = sync_dir(parent).await;
-            }
-        }
-    }
 }
 
 fn remap_shard_absolute_path_for_fragment_move(
@@ -333,31 +315,6 @@ fn remap_shard_absolute_path_for_fragment_move(
     current_path.to_string()
 }
 
-async fn mirror_legacy_metadata_best_effort(path_manager: &ObjectPathManager, meta: &ObjectMetadata) {
-    let Ok(bytes) = rmp_serde::to_vec(meta) else {
-        warn!(
-            "Failed to serialize metadata for legacy mirror {}/{}#{}",
-            meta.fragment, meta.object_key, meta.version_id
-        );
-        return;
-    };
-    let mut wrote_any = false;
-    for p in path_manager.get_all_metadata_paths(&meta.fragment, &meta.object_key, &meta.version_id) {
-        if let Some(parent) = p.parent() {
-            let _ = fs::create_dir_all(parent).await;
-        }
-        if write_atomic(&p, &bytes).await.is_ok() {
-            wrote_any = true;
-        }
-    }
-    if !wrote_any {
-        warn!(
-            "Legacy metadata mirror write had zero successful roots for {}/{}#{}",
-            meta.fragment, meta.object_key, meta.version_id
-        );
-    }
-}
-
 pub async fn rename_object(
     State(state): State<Arc<AppState>>,
     claims: Claims,
@@ -394,7 +351,9 @@ pub async fn rename_object(
     )
     .await?;
     if destination_versions.iter().any(|m| !m.is_delete_marker) {
-        return Err(AppError::Conflict("Destination object already exists".into()));
+        return Err(AppError::Conflict(
+            "Destination object already exists".into(),
+        ));
     }
 
     let source_versions =
@@ -435,8 +394,6 @@ pub async fn rename_object(
         }
 
         index::upsert_object_version(&new_meta).await?;
-        mirror_legacy_metadata_best_effort(&path_manager, &new_meta).await;
-
         affected_versions.insert(new_meta.version_id.clone());
         created_at_by_version
             .entry(new_meta.version_id.clone())
@@ -469,17 +426,15 @@ pub async fn rename_object(
     }
 
     for version_id in &affected_versions {
-        let _ = index::delete_object_version(&payload.source_fragment, &payload.source_key, version_id).await;
+        let _ =
+            index::delete_object_version(&payload.source_fragment, &payload.source_key, version_id)
+                .await;
     }
 
     if let Some(tmpl) = template_meta.as_ref() {
-        let (del_vid, del_created_at) = write_delete_marker_for_key(
-            &path_manager,
-            &payload.source_fragment,
-            &payload.source_key,
-            tmpl,
-        )
-        .await?;
+        let (del_vid, del_created_at) =
+            write_delete_marker_for_key(&payload.source_fragment, &payload.source_key, tmpl)
+                .await?;
 
         write_prefix_segments_for_meta(
             &path_manager,
@@ -496,11 +451,8 @@ pub async fn rename_object(
     if payload.source_fragment != payload.destination_fragment {
         for root in blob_roots {
             for version_id in &affected_versions {
-                let src_blob_dir = path_manager.get_shard_dir_on_disk(
-                    &root,
-                    &payload.source_fragment,
-                    version_id,
-                );
+                let src_blob_dir =
+                    path_manager.get_shard_dir_on_disk(&root, &payload.source_fragment, version_id);
 
                 let dst_blob_dir = path_manager.get_shard_dir_on_disk(
                     &root,
@@ -526,20 +478,8 @@ pub async fn rename_object(
         }
     }
 
-    delete_source_metadata_versions(
-        &path_manager,
-        &payload.source_fragment,
-        &payload.source_key,
-        &affected_versions,
-    )
-    .await;
-
-    invalidate_compacted_for_key(
-        &path_manager,
-        &payload.source_fragment,
-        &payload.source_key,
-    )
-    .await;
+    invalidate_compacted_for_key(&path_manager, &payload.source_fragment, &payload.source_key)
+        .await;
 
     invalidate_compacted_for_key(
         &path_manager,

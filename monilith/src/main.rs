@@ -4,7 +4,11 @@ use crate::handlers::error_handlers::handler_404;
 use crate::n1_core::adaptive_concurrency::{
     ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC, ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC,
 };
-use crate::n1_core::blob_store::{format_raw_blob_device, validate_configured_raw_blob_disks};
+use crate::n1_core::blob_store::{
+    format_raw_blob_device_with_intent, format_raw_index_device_with_intent,
+    prepare_raw_blob_device_format, prepare_raw_index_device_format,
+    validate_configured_raw_blob_disks,
+};
 use crate::n1_core::disk_manager::{configured_fs_storage_root, initialize_storage_roots};
 use crate::n1_core::monitoring::{
     MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC, MONITOR_INTERVAL_SECS_ATOMIC,
@@ -566,54 +570,211 @@ async fn main() {
 
     match &args.command {
         Some(Commands::Server) | None => {}
-        Some(Commands::FormatBlobDevice { path, force }) => {
-            let result = format_raw_blob_device(Path::new(path), *force);
+        Some(Commands::FormatBlobDevice {
+            path,
+            force,
+            prepare,
+            nonce,
+            fingerprint,
+        }) => {
+            let result = if *prepare {
+                prepare_raw_blob_device_format(Path::new(path), *force).map(|intent| {
+                    if args.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&intent)
+                                .expect("serialize blob format intent")
+                        );
+                    } else {
+                        println!("Prepared raw blob format intent:");
+                        println!("  path: {}", intent.path);
+                        println!("  canonical_path: {}", intent.canonical_path);
+                        println!("  force: {}", intent.force);
+                        println!("  nonce: {}", intent.nonce);
+                        println!("  fingerprint: {}", intent.fingerprint);
+                        println!("  expires_at_unix: {}", intent.expires_at);
+                        println!("Run format command with:");
+                        println!(
+                            "  --path '{}' --force={} --nonce '{}' --fingerprint '{}'",
+                            intent.path, intent.force, intent.nonce, intent.fingerprint
+                        );
+                    }
+                })
+            } else {
+                let nonce = nonce.as_deref().ok_or_else(|| {
+                    crate::enums::app_error_enum::AppError::BadRequest(
+                        "missing --nonce; run format-blob-device --prepare first".to_string(),
+                    )
+                });
+                let fingerprint = fingerprint.as_deref().ok_or_else(|| {
+                    crate::enums::app_error_enum::AppError::BadRequest(
+                        "missing --fingerprint; run format-blob-device --prepare first".to_string(),
+                    )
+                });
+                match (nonce, fingerprint) {
+                    (Ok(nonce), Ok(fingerprint)) => format_raw_blob_device_with_intent(
+                        Path::new(path),
+                        *force,
+                        nonce,
+                        fingerprint,
+                    )
+                    .map(|status| {
+                        if args.json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&status)
+                                    .expect("serialize blob device status")
+                            );
+                        } else {
+                            println!("Formatted raw blob device:");
+                            println!("  path: {}", status.path);
+                            println!("  canonical_path: {}", status.canonical_path);
+                            println!("  status: {}", status.status);
+                            println!(
+                                "  device_id: {}",
+                                status.device_id.unwrap_or_else(|| "<none>".to_string())
+                            );
+                            println!(
+                                "  block_size_bytes: {}",
+                                status
+                                    .block_size_bytes
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "<unknown>".to_string())
+                            );
+                            println!(
+                                "  total_bytes: {}",
+                                status
+                                    .total_bytes
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "<unknown>".to_string())
+                            );
+                            println!(
+                                "  available_bytes: {}",
+                                status
+                                    .available_bytes
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "<unknown>".to_string())
+                            );
+                            if let Some(warning) = status.path_warning {
+                                println!("  warning: {}", warning);
+                            }
+                        }
+                    }),
+                    (Err(err), _) | (_, Err(err)) => Err(err),
+                }
+            };
 
             drop(_guard);
 
             match result {
-                Ok(status) => {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("Command failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+
+            return;
+        }
+        Some(Commands::FormatIndexDevice {
+            path,
+            force,
+            prepare,
+            nonce,
+            fingerprint,
+        }) => {
+            let result = if *prepare {
+                prepare_raw_index_device_format(Path::new(path), *force).map(|intent| {
                     if args.json {
                         println!(
                             "{}",
-                            serde_json::to_string_pretty(&status)
-                                .expect("serialize blob device status")
+                            serde_json::to_string_pretty(&intent)
+                                .expect("serialize index format intent")
                         );
                     } else {
-                        println!("Formatted raw blob device:");
-                        println!("  path: {}", status.path);
-                        println!("  canonical_path: {}", status.canonical_path);
-                        println!("  status: {}", status.status);
+                        println!("Prepared raw index format intent:");
+                        println!("  path: {}", intent.path);
+                        println!("  canonical_path: {}", intent.canonical_path);
+                        println!("  force: {}", intent.force);
+                        println!("  nonce: {}", intent.nonce);
+                        println!("  fingerprint: {}", intent.fingerprint);
+                        println!("  expires_at_unix: {}", intent.expires_at);
+                        println!("Run format command with:");
                         println!(
-                            "  device_id: {}",
-                            status.device_id.unwrap_or_else(|| "<none>".to_string())
+                            "  --path '{}' --force={} --nonce '{}' --fingerprint '{}'",
+                            intent.path, intent.force, intent.nonce, intent.fingerprint
                         );
-                        println!(
-                            "  block_size_bytes: {}",
-                            status
-                                .block_size_bytes
-                                .map(|v| v.to_string())
-                                .unwrap_or_else(|| "<unknown>".to_string())
-                        );
-                        println!(
-                            "  total_bytes: {}",
-                            status
-                                .total_bytes
-                                .map(|v| v.to_string())
-                                .unwrap_or_else(|| "<unknown>".to_string())
-                        );
-                        println!(
-                            "  available_bytes: {}",
-                            status
-                                .available_bytes
-                                .map(|v| v.to_string())
-                                .unwrap_or_else(|| "<unknown>".to_string())
-                        );
-                        if let Some(warning) = status.path_warning {
-                            println!("  warning: {}", warning);
-                        }
                     }
+                })
+            } else {
+                let nonce = nonce.as_deref().ok_or_else(|| {
+                    crate::enums::app_error_enum::AppError::BadRequest(
+                        "missing --nonce; run format-index-device --prepare first".to_string(),
+                    )
+                });
+                let fingerprint = fingerprint.as_deref().ok_or_else(|| {
+                    crate::enums::app_error_enum::AppError::BadRequest(
+                        "missing --fingerprint; run format-index-device --prepare first"
+                            .to_string(),
+                    )
+                });
+                match (nonce, fingerprint) {
+                    (Ok(nonce), Ok(fingerprint)) => format_raw_index_device_with_intent(
+                        Path::new(path),
+                        *force,
+                        nonce,
+                        fingerprint,
+                    )
+                    .map(|status| {
+                        if args.json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&status)
+                                    .expect("serialize index device status")
+                            );
+                        } else {
+                            println!("Formatted raw index device:");
+                            println!("  path: {}", status.path);
+                            println!("  canonical_path: {}", status.canonical_path);
+                            println!("  status: {}", status.status);
+                            println!(
+                                "  device_id: {}",
+                                status.device_id.unwrap_or_else(|| "<none>".to_string())
+                            );
+                            println!(
+                                "  block_size_bytes: {}",
+                                status
+                                    .block_size_bytes
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "<unknown>".to_string())
+                            );
+                            println!(
+                                "  total_bytes: {}",
+                                status
+                                    .total_bytes
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "<unknown>".to_string())
+                            );
+                            println!(
+                                "  available_bytes: {}",
+                                status
+                                    .available_bytes
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "<unknown>".to_string())
+                            );
+                            if let Some(warning) = status.path_warning {
+                                println!("  warning: {}", warning);
+                            }
+                        }
+                    }),
+                    (Err(err), _) | (_, Err(err)) => Err(err),
                 }
+            };
+
+            drop(_guard);
+
+            match result {
+                Ok(_) => {}
                 Err(e) => {
                     eprintln!("Command failed: {}", e);
                     std::process::exit(1);
@@ -639,6 +800,7 @@ async fn main() {
             let result = execute_command(
                 cmd,
                 args.secret.clone(),
+                args.auth_fragment.clone(),
                 args.fragment.clone(),
                 target_url,
                 args.insecure,

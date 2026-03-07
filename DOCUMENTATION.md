@@ -55,7 +55,7 @@ Purpose:
 - Issues fragment-scoped JWT for `/v4/*` protected APIs.
 - Supports two auth modes:
   - Fragment mode: `secret=<fragment_secret>` and `fragment=<fragment_hash>`
-  - Admin mode: `fragment=<ADMIN_KEY>` and `secret=<MASTER_KEY>` (admin fragment bypasses fragment existence checks)
+  - Master mode: `secret=<MASTER_KEY>` with any non-empty `fragment` auth context
 
 Typical usage:
 ```bash
@@ -76,7 +76,7 @@ Admin maintenance usage:
 curl -k -X POST "https://127.0.0.1:50001/authenticate/fragment" \
   -H "Content-Type: application/json" \
   -d '{
-    "fragment": "admin",
+    "fragment": "maintenance-context",
     "secret": "<MASTER_KEY>",
     "read": true,
     "write": true,
@@ -86,8 +86,10 @@ curl -k -X POST "https://127.0.0.1:50001/authenticate/fragment" \
 ```
 
 Notes:
-- Admin mode requires exact admin fragment value from `ADMIN_KEY`; any other fragment value follows normal fragment existence validation.
+- Master mode no longer requires `ADMIN_KEY`; `MASTER_KEY` alone is the privileged path.
+- CLI semantics are split: `--auth-fragment` controls auth context, while `--fragment` is only an explicit target scope for fragment-scoped operations.
 - For maintenance watches (`ops gc/repair/redistribute/prefix-rebuild`), CLI now prints `Last Error` when status polling fails or times out.
+- CLI maintenance start commands now expose current runtime knobs (`--mode`, `--fast-mode`, `--read-only-fast`, and repair/redistribution concurrency/durability flags) and send them directly to the matching `/v4/maintenance/*/start` endpoints.
 
 ### 2.2 `POST /authenticate/fs`
 Purpose:
@@ -253,6 +255,7 @@ Notes:
 - Normal serving path uses the prefix namespace index.
 - Prefix projection runs asynchronously and coalesces repeated mutations per fragment.
 - If prefix projection is still pending, or if prefix-serving state is missing or insufficient, the server falls back to authoritative `index` scans for the requested prefix, not a legacy mirrored metadata tree.
+- Non-prefix full listing pagination is partition-native and projected from authoritative index metadata (no legacy hash-tree walk).
 - Prefix rows carry inline list payload, so successful prefix hits avoid reopening object metadata for every returned row.
 
 Response shape (`ListObjectsResult`):
@@ -269,8 +272,8 @@ curl -k -H "Authorization: Bearer $TOKEN" \
 Trash listing, same pagination style.
 - Supports the same `include_internal` query behavior as object listing.
 - Trash visibility comes from `index` trash state.
-- Both non-delimiter and `delimiter=/` trash listing now use a partition-paged index merge path with streaming row projection (instead of full fragment aggregate+sort each request), improving large-fragment pagination latency and memory profile.
-- `continuation_token` is opaque. For delimiter trash listing it represents a row cursor, not a `(object_key, version_id)` tuple, so clients must pass it through unchanged.
+- Trash listing is partition-native (no legacy hash-tree scan). It projects latest trashed state per key from authoritative index trash metadata.
+- `continuation_token` is opaque. For delimiter trash listing it is a row cursor, so clients must pass it through unchanged.
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/trash/<fragment_hash>?limit=100"
@@ -399,10 +402,8 @@ curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/trash/empty/<fragment_hash>"
 ```
 Notes:
-- Raw-extent cleanup is best-effort for decommissioned blob device ids; stale mappings no longer fail the API path.
-- Empty-trash now streams trash metadata instead of materializing all versions first, reducing peak RAM and startup latency on large fragments.
-- Raw extent frees are batched per blob device (single allocator lock and single metadata sync per batch) instead of one fsync per extent.
-- Large raw-free sets are now deferred into durable index markers and applied by a bounded background worker (`FreeDefer -> FreeApply`) to avoid long foreground stalls.
+- Empty-trash clears partition trash metadata and removes `.trash` roots directly (`remove_dir_all`) for O(1)-style namespace purge on filesystem-backed standard.
+- Quota refund uses a pre-clear snapshot of partition trash metadata.
 
 ### 7.4 `PATCH /v4/fragment/object/rename`
 Body (`RenameObjectRequest`):
@@ -463,9 +464,8 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/recover/trash/all/<fragment_hash>"
 ```
 Notes:
-- Recovery is now parallelized per object key (versions within one key still restore in recency order), which improves large fragment recover-all throughput.
-- Recover-all and empty-trash free raw extents through allocator batch commits; this reduces cleanup latency for large trash sets.
-- Raw extent identities include topology epoch. Hotplug/reconfiguration is tracked through a mirrored raw device-map table (`.n1/raw_device_map.msgpack`) and reflected in new allocations.
+- Recover-all restores from authoritative partition trash metadata and moves `.trash/blob/{version}` back to live blob dirs per version.
+- Delete markers are purged per recovered key so recovered objects become immediately visible in live listing/read paths.
 
 ## 8. Protected v4 Upload APIs (Resumable Object Storage Upload)
 
@@ -606,13 +606,17 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
 Start query params:
 - `dry_run=true|false`
 - `mode=availability|scrub|strict|checksum`
-- `fast_mode=true|false` (enables read-only fast maintenance mode)
-- `read_only_fast=true|false` (alias of `fast_mode`)
+- `check_mode=availability|scrub|strict|checksum` (alias of `mode`)
+- `execution_mode=availability|scrub|strict|checksum` (alias of `mode`)
+- `access_mode=availability|readonly|read_only|quiesced` (accepted fallback when `mode` is omitted)
+- `fast_mode=true|false` (scheduler tuning)
+- `read_only_fast=true|false` (when set with availability mode, upgrades access behavior to read-only/strict)
 - `meta_concurrency=1..N` (RAM-adaptive cap; low-RAM nodes clamp lower than high-RAM nodes)
 - `repair_concurrency=1..N` (RAM-adaptive cap)
 - `batch=32..N` (RAM-adaptive cap)
 
 Notes:
+- API compatibility: endpoint path/method/response shape did not change; this update only broadened accepted query aliases and tightened mode-to-access enforcement.
 - Repair reconciles partition replicas and blob availability from `index`.
 - Full mirrored equality across every index root is no longer the invariant; owner/replica survivability for each partition is.
 - `mode=availability` keeps CRUD online and intentionally caps repair pressure lower so the node stays latency-friendly.
@@ -620,7 +624,7 @@ Notes:
 - `mode=strict` makes the node read-only and raises repair aggressiveness to use more of the available I/O width.
 - `mode=scrub` quiesces reads and writes and runs the same integrity-first repair engine at the highest practical aggressiveness.
 - Runtime concurrency is normalized against live blob disks and live index roots, so auto-tuning follows actual reachable hardware instead of static CPU counts alone.
-- Fragment object-version scans are streamed incrementally (no full fragment materialization before work begins). In `standard`, this walk currently uses legacy `{hash}#{version}.msgpack` metadata files as the single scan stream while mixed legacy+partition maintenance projection is being finalized.
+- Fragment object-version scans are streamed incrementally from partition metadata paths (`index/partitions/.../{objects|trash}`), so repair does not depend on legacy `{hash}#{version}.msgpack` files.
 - Log severity policy for repair/recovery paths: expected retry/remap steps emit `DEBUG`, successful per-object summaries emit `INFO`, degraded-but-continued outcomes emit `WARN`, and unrecoverable read failures emit `ERROR`.
 - Repair/scrub dry-run no longer aborts when `.raw_gc` markers reference a decommissioned device id; those markers are kept and treated as deferred cleanup state.
 
@@ -637,10 +641,13 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
 
 ### 9.3 Garbage collector endpoints
 - `POST /v4/maintenance/gc/start`
+- `POST /v4/maintenance/gc/stop`
 - `GET /v4/maintenance/gc/status`
 
 Notes:
 - GC deletes trashed versions and abandoned upload sessions through `index`.
+- GC is partition-aware for both live/trash metadata and session cleanup (no dependency on legacy `index/sessions` or `{hash}#{version}` naming).
+- GC stop is cooperative: the current scan loop exits at safe checkpoints and reports `phase=Stopped by User`.
 - Raw payload without authoritative session or object state is cleanup-candidate data.
 - If raw-GC markers reference a device id that is no longer configured (for example after disk decommission), GC defers those extents and logs a single summary `INFO`; markers are retained for later cleanup if the device is reintroduced.
 - Raw extent cleanup updates allocator metadata in batch journal commits; payload zeroing is not the authority for free state.
@@ -651,6 +658,9 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
 
 curl -k -X GET -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/maintenance/gc/status"
+
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/maintenance/gc/stop"
 ```
 
 ### 9.4 Scrub endpoints
@@ -683,8 +693,12 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
 Start query params:
 - `dry_run=true|false`
 - `mode=availability|strict|scrub`
-- `fast_mode=true|false` (enables read-only fast maintenance mode)
-- `read_only_fast=true|false` (alias of `fast_mode`)
+- `check_mode=availability|strict|scrub` (alias of `mode`)
+- `execution_mode=availability|strict|scrub` (alias of `mode`)
+- `access_mode=availability|readonly|read_only|quiesced` (accepted fallback when `mode` is omitted)
+- `fast_mode=true|false` (scheduler tuning)
+- `read_only_fast=true|false` (when set with availability mode, upgrades execution/access behavior to strict/read-only)
+- `scope=all|blob|index`
 - `durability=auto|strict|batched` (aliases: `sync|durable|async|fast|relaxed`)
 - `durability_mode=auto|strict|batched` (alternate key)
 - `strict_durability=true|false` (boolean fallback for durability)
@@ -692,17 +706,23 @@ Start query params:
 - `status_batch=1..N` (RAM-adaptive cap)
 
 Notes:
+- API compatibility: endpoint path/method/response shape did not change; this update only broadened accepted query aliases and tightened execution-mode parsing.
 - Redistribution rewrites payload placement first, then republishes updated shard addresses through authoritative `index` metadata.
+- `scope=all` performs blob+index updates in one run.
+- `scope=blob` rewrites payload placement and republishes touched metadata, but does not run index-only rebalancing for untouched objects.
+- `scope=index` re-publishes metadata to the current routed index layout only; blob payload is not rewritten.
 - `mode=availability` keeps CRUD online and intentionally throttles object concurrency lower so redistribution does not consume the full device bandwidth.
 - `mode=strict` makes the node read-only and drives redistribution harder across the live blob/index layout.
 - `mode=scrub` quiesces reads and writes and uses the widest redistribution concurrency that the live layout and RAM caps allow.
 - Execution `mode` controls service access and scheduler aggressiveness; `durability` still separately controls strict-vs-batched write sync behavior.
-- Fragment object-version scans are streamed incrementally so redistribution can start moving data without first loading an entire fragment into memory. In `standard`, redistribution currently walks the legacy `{hash}#{version}.msgpack` stream as its scan authority during migration.
+- Fragment object-version scans are streamed incrementally from partition metadata paths first, with legacy scan paths used only as compatibility fallback when partition layout is absent.
 - Redistribution now follows the same log-severity contract as repair/recovery (`DEBUG` expected retries, `INFO` successful migration summaries, `WARN` degraded-but-continued failures, `ERROR` unrecoverable read failures).
+- Cancellation is cooperative and crash-safe at object publish boundary: object tasks returning `Stopped` are treated as stop outcomes, not hard migration failures.
+- Object-level redistribution intent markers are persisted on index roots; pending intents are replayed first on the next redistribution run so interrupted large-object migrations can resume safely.
 
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/maintenance/redistribution/start?dry_run=false&fast_mode=true&durability=batched&object_concurrency=32&status_batch=128"
+  "https://127.0.0.1:50001/v4/maintenance/redistribution/start?dry_run=false&scope=all&fast_mode=true&durability=batched&object_concurrency=32&status_batch=128"
 
 curl -k -X GET -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/maintenance/redistribution/monitor"
@@ -1150,6 +1170,7 @@ Recommended starting points:
 - `POST /v4/maintenance/repair/stop`
 - `GET /v4/maintenance/repair/status`
 - `POST /v4/maintenance/gc/start`
+- `POST /v4/maintenance/gc/stop`
 - `GET /v4/maintenance/gc/status`
 - `POST /v4/maintenance/redistribution/start`
 - `PATCH /v4/maintenance/redistribution/stop`

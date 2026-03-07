@@ -1,11 +1,14 @@
 use crate::constants::{
-    HEADER_CRC_OFFSET, HEADER_VERSION, JOURNAL_MAGIC, JOURNAL_RECORD_SIZE, SUPERBLOCK_MAGIC,
+    HEADER_CRC_OFFSET, HEADER_CRC_OFFSET_V1, HEADER_DECODE_BYTES, HEADER_FALLBACK_SCAN_LIMIT_BYTES,
+    HEADER_VERSION, HEADER_VERSION_V1, HEADER_VERSION_V2, JOURNAL_MAGIC, JOURNAL_RECORD_SIZE,
+    SUPERBLOCK_MAGIC,
 };
 use crate::device_io::{read_exact_at, validate_block_size};
 use crate::error::BlockManagerError;
 use crate::types::{DeviceHeader, Extent, JournalOp, JournalRecord};
 use crc32fast::Hasher;
 use std::fs::File;
+use std::io;
 use uuid::Uuid;
 
 pub(crate) fn encode_header(
@@ -26,6 +29,7 @@ pub(crate) fn encode_header(
     out[40..48].copy_from_slice(&header.journal_block_count.to_le_bytes());
     out[48..56].copy_from_slice(&header.data_start_block.to_le_bytes());
     out[56..72].copy_from_slice(header.device_id.as_bytes());
+    out[72..80].copy_from_slice(&header.superblock_generation.to_le_bytes());
 
     let crc = crc32(&out[..HEADER_CRC_OFFSET]);
     out[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
@@ -33,32 +37,89 @@ pub(crate) fn encode_header(
 }
 
 pub(crate) fn read_header(file: &File) -> Result<DeviceHeader, BlockManagerError> {
-    let mut prefix = [0u8; 4096];
-    read_exact_at(file, &mut prefix, 0)?;
+    let mut best: Option<(DeviceHeader, u64)> = None;
+    let mut first_error: Option<BlockManagerError> = None;
+
+    let mut offset = 0u64;
+    while offset <= HEADER_FALLBACK_SCAN_LIMIT_BYTES {
+        match read_header_at(file, offset) {
+            Ok(header) => {
+                let replace = match &best {
+                    None => true,
+                    Some((current, current_offset)) => {
+                        header.superblock_generation > current.superblock_generation
+                            || (header.superblock_generation == current.superblock_generation
+                                && offset < *current_offset)
+                    }
+                };
+                if replace {
+                    best = Some((header, offset));
+                }
+            }
+            Err(BlockManagerError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                if offset == 0 && first_error.is_none() {
+                    first_error = Some(BlockManagerError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "short read while reading primary superblock",
+                    )));
+                }
+                break;
+            }
+            Err(err) => {
+                if offset == 0 && first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+        offset = offset.saturating_add(HEADER_DECODE_BYTES as u64);
+    }
+
+    if let Some((header, _)) = best {
+        return Ok(header);
+    }
+    Err(first_error.unwrap_or_else(|| {
+        BlockManagerError::InvalidDevice("no valid superblock copy found".to_string())
+    }))
+}
+
+fn read_header_at(file: &File, offset: u64) -> Result<DeviceHeader, BlockManagerError> {
+    let mut prefix = [0u8; HEADER_DECODE_BYTES];
+    read_exact_at(file, &mut prefix, offset)?;
+    decode_header_prefix(&prefix)
+}
+
+fn decode_header_prefix(
+    prefix: &[u8; HEADER_DECODE_BYTES],
+) -> Result<DeviceHeader, BlockManagerError> {
     if prefix[0..16] != SUPERBLOCK_MAGIC {
         return Err(BlockManagerError::InvalidDevice(
             "missing block manager superblock magic".to_string(),
         ));
     }
 
-    let expected_crc = u32::from_le_bytes(
-        prefix[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4]
-            .try_into()
-            .expect("crc bytes"),
-    );
-    let actual_crc = crc32(&prefix[..HEADER_CRC_OFFSET]);
-    if expected_crc != actual_crc {
-        return Err(BlockManagerError::Corrupt(
-            "superblock checksum mismatch".to_string(),
-        ));
-    }
-
     let version = u32::from_le_bytes(prefix[16..20].try_into().expect("version bytes"));
-    if version != HEADER_VERSION {
+    if version != HEADER_VERSION_V1 && version != HEADER_VERSION_V2 {
         return Err(BlockManagerError::InvalidDevice(format!(
             "unsupported header version {}",
             version
         )));
+    }
+
+    let crc_offset = if version == HEADER_VERSION_V1 {
+        HEADER_CRC_OFFSET_V1
+    } else {
+        HEADER_CRC_OFFSET
+    };
+    let expected_crc = u32::from_le_bytes(
+        prefix[crc_offset..crc_offset + 4]
+            .try_into()
+            .expect("crc bytes"),
+    );
+    let actual_crc = crc32(&prefix[..crc_offset]);
+    if expected_crc != actual_crc {
+        return Err(BlockManagerError::Corrupt(
+            "superblock checksum mismatch".to_string(),
+        ));
     }
 
     let block_size = u32::from_le_bytes(prefix[20..24].try_into().expect("block size bytes"));
@@ -69,6 +130,11 @@ pub(crate) fn read_header(file: &File) -> Result<DeviceHeader, BlockManagerError
     let data_start_block = u64::from_le_bytes(prefix[48..56].try_into().expect("data start"));
     let device_id = Uuid::from_slice(&prefix[56..72])
         .map_err(|e| BlockManagerError::Corrupt(format!("invalid device uuid in header: {}", e)))?;
+    let superblock_generation = if version == HEADER_VERSION_V2 {
+        u64::from_le_bytes(prefix[72..80].try_into().expect("generation bytes"))
+    } else {
+        1
+    };
 
     if journal_block_count == 0 || data_start_block <= journal_start_block {
         return Err(BlockManagerError::Corrupt(
@@ -78,6 +144,7 @@ pub(crate) fn read_header(file: &File) -> Result<DeviceHeader, BlockManagerError
 
     Ok(DeviceHeader {
         device_id,
+        superblock_generation: superblock_generation.max(1),
         block_size,
         total_blocks,
         journal_start_block,
@@ -118,6 +185,10 @@ pub(crate) fn decode_record(
     let op = match buf[4] {
         1 => JournalOp::Allocate,
         2 => JournalOp::Free,
+        3 => JournalOp::PrepareAllocate,
+        4 => JournalOp::PrepareFree,
+        5 => JournalOp::CommitAllocate,
+        6 => JournalOp::CommitFree,
         other => {
             return Err(BlockManagerError::Corrupt(format!(
                 "unknown journal op {}",

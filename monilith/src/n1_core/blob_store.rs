@@ -10,15 +10,18 @@ use block_manager::{
 use chrono::Utc;
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Instant;
 use tokio::fs as tokio_fs;
 use tokio::sync::Notify;
 use tracing::{info, warn};
+use ulid::Ulid;
 use walkdir::WalkDir;
 
 #[cfg(unix)]
@@ -60,6 +63,52 @@ pub struct RawBlobDeviceStatus {
     pub allocation_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub journal_cursor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superblock_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_last_txid: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub journal_capacity_records: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub journal_free_records: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocator_largest_free_extent_blocks: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocator_fragmentation_ppm: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocator_ag_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocator_worst_ag_fragmentation_ppm: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deferred_free_backlog: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_read_samples: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_read_wait_p50_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_read_wait_p95_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_read_wait_p99_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_read_hold_p50_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_read_hold_p95_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_read_hold_p99_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_write_samples: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_write_wait_p50_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_write_wait_p95_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_write_wait_p99_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_write_hold_p50_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_write_hold_p95_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_write_hold_p99_us: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,6 +183,8 @@ static RAW_TOPOLOGY_LAST_REFRESH_SECS: LazyLock<AtomicU64> = LazyLock::new(|| At
 static RAW_DEFERRED_FREE_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 static RAW_DEFERRED_FREE_WORKER_STARTED: LazyLock<AtomicBool> =
     LazyLock::new(|| AtomicBool::new(false));
+static RAW_LOCK_TELEMETRY: LazyLock<Mutex<HashMap<String, RawDeviceLockTelemetry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 const MISSING_RAW_DEVICE_ERROR_PREFIX: &str = "No raw blob device found for device id ";
 const RAW_DEVICE_MAP_DIR: &str = ".n1";
@@ -143,14 +194,160 @@ const RAW_DEFERRED_FREE_BATCH_SIZE: usize = 512;
 const RAW_DEFERRED_FREE_THRESHOLD: usize = 64;
 const RAW_TOPOLOGY_REFRESH_INTERVAL_SECS: u64 = 5;
 const RAW_DEFERRED_FREE_PRESSURE_MAX_BATCHES: usize = 8;
+const RAW_FORMAT_INTENT_TTL_SECS: i64 = 10 * 60;
+const RAW_FORMAT_INTENTS_FILE: &str = "n1_raw_blob_format_intents.msgpack";
+const RAW_FORMAT_AUDIT_LOG_FILE: &str = "n1_raw_blob_format_audit.log";
+const RAW_LOCK_TELEMETRY_CAPACITY: usize = 2048;
+
+#[derive(Default, Debug, Clone)]
+struct LockSeries {
+    samples_us: VecDeque<u64>,
+}
+
+impl LockSeries {
+    fn push(&mut self, value_us: u64) {
+        if self.samples_us.len() >= RAW_LOCK_TELEMETRY_CAPACITY {
+            let _ = self.samples_us.pop_front();
+        }
+        self.samples_us.push_back(value_us);
+    }
+
+    fn quantiles(&self) -> LockQuantiles {
+        if self.samples_us.is_empty() {
+            return LockQuantiles::default();
+        }
+        let mut vals = self.samples_us.iter().copied().collect::<Vec<_>>();
+        vals.sort_unstable();
+        let len = vals.len();
+        let p50_idx = ((len - 1) * 50) / 100;
+        let p95_idx = ((len - 1) * 95) / 100;
+        let p99_idx = ((len - 1) * 99) / 100;
+        LockQuantiles {
+            p50_us: vals[p50_idx],
+            p95_us: vals[p95_idx],
+            p99_us: vals[p99_idx],
+            samples: len as u64,
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+struct RawDeviceLockTelemetry {
+    read_wait: LockSeries,
+    read_hold: LockSeries,
+    write_wait: LockSeries,
+    write_hold: LockSeries,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+struct LockQuantiles {
+    p50_us: u64,
+    p95_us: u64,
+    p99_us: u64,
+    samples: u64,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+struct RawDeviceLockTelemetrySnapshot {
+    read_wait: LockQuantiles,
+    read_hold: LockQuantiles,
+    write_wait: LockQuantiles,
+    write_hold: LockQuantiles,
+}
+
+struct TimedRawReadGuard<'a> {
+    guard: RwLockReadGuard<'a, BlockManager>,
+    device_id: String,
+    wait_us: u64,
+    hold_started_at: Instant,
+}
+
+impl<'a> Deref for TimedRawReadGuard<'a> {
+    type Target = BlockManager;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl Drop for TimedRawReadGuard<'_> {
+    fn drop(&mut self) {
+        let wait_us = self.wait_us;
+        let hold_us = self.hold_started_at.elapsed().as_micros() as u64;
+        record_lock_telemetry_sample(self.device_id.as_str(), false, wait_us, hold_us);
+    }
+}
+
+struct TimedRawWriteGuard<'a> {
+    guard: RwLockWriteGuard<'a, BlockManager>,
+    device_id: String,
+    wait_us: u64,
+    hold_started_at: Instant,
+}
+
+impl<'a> Deref for TimedRawWriteGuard<'a> {
+    type Target = BlockManager;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for TimedRawWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for TimedRawWriteGuard<'_> {
+    fn drop(&mut self) {
+        let wait_us = self.wait_us;
+        let hold_us = self.hold_started_at.elapsed().as_micros() as u64;
+        record_lock_telemetry_sample(self.device_id.as_str(), true, wait_us, hold_us);
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RawBlobFormatIntent {
+    pub path: String,
+    pub canonical_path: String,
+    pub kind: RawBlobPathKind,
+    pub total_bytes: u64,
+    pub detected_signature: Option<String>,
+    pub force: bool,
+    pub nonce: String,
+    pub fingerprint: String,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawBlobFormatIntentRecord {
+    path: String,
+    canonical_path: String,
+    force: bool,
+    nonce: String,
+    fingerprint: String,
+    created_at: i64,
+    expires_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RawBlobFormatAuditEvent {
+    event: String,
+    path: String,
+    canonical_path: String,
+    force: bool,
+    nonce: Option<String>,
+    fingerprint: Option<String>,
+    result: String,
+    error: Option<String>,
+    actor: String,
+    host: String,
+    pid: u32,
+    timestamp: i64,
+}
 
 fn register_raw_manager_device(manager: &Arc<RwLock<BlockManager>>) -> Result<String, AppError> {
-    let device_id = manager
-        .read()
-        .map_err(|_| AppError::InternalServerError("Raw blob manager lock poisoned".into()))?
-        .header()
-        .device_id
-        .to_string();
+    let mgr = timed_raw_manager_read(manager)?;
+    let device_id = mgr.header().device_id.to_string();
     RAW_MANAGER_BY_DEVICE_ID
         .lock()
         .map_err(|_| {
@@ -172,6 +369,77 @@ fn unregister_raw_manager_device(device_id: &str) {
     }
 }
 
+fn record_lock_telemetry_sample(device_id: &str, write: bool, wait_us: u64, hold_us: u64) {
+    if let Ok(mut telemetry) = RAW_LOCK_TELEMETRY.lock() {
+        let entry = telemetry.entry(device_id.to_string()).or_default();
+        if write {
+            entry.write_wait.push(wait_us);
+            entry.write_hold.push(hold_us);
+        } else {
+            entry.read_wait.push(wait_us);
+            entry.read_hold.push(hold_us);
+        }
+    }
+}
+
+fn raw_lock_telemetry_snapshot(device_id: &str) -> RawDeviceLockTelemetrySnapshot {
+    let Some(telemetry) = RAW_LOCK_TELEMETRY
+        .lock()
+        .ok()
+        .and_then(|m| m.get(device_id).cloned())
+    else {
+        return RawDeviceLockTelemetrySnapshot::default();
+    };
+    RawDeviceLockTelemetrySnapshot {
+        read_wait: telemetry.read_wait.quantiles(),
+        read_hold: telemetry.read_hold.quantiles(),
+        write_wait: telemetry.write_wait.quantiles(),
+        write_hold: telemetry.write_hold.quantiles(),
+    }
+}
+
+fn lock_quantiles_to_options(q: LockQuantiles) -> (Option<u64>, Option<u64>, Option<u64>) {
+    if q.samples == 0 {
+        (None, None, None)
+    } else {
+        (Some(q.p50_us), Some(q.p95_us), Some(q.p99_us))
+    }
+}
+
+fn timed_raw_manager_read<'a>(
+    manager: &'a Arc<RwLock<BlockManager>>,
+) -> Result<TimedRawReadGuard<'a>, AppError> {
+    let wait_started_at = Instant::now();
+    let guard = manager
+        .read()
+        .map_err(|_| AppError::InternalServerError("Raw blob manager lock poisoned".into()))?;
+    let wait_us = wait_started_at.elapsed().as_micros() as u64;
+    let device_id = guard.header().device_id.to_string();
+    Ok(TimedRawReadGuard {
+        guard,
+        device_id,
+        wait_us,
+        hold_started_at: Instant::now(),
+    })
+}
+
+fn timed_raw_manager_write<'a>(
+    manager: &'a Arc<RwLock<BlockManager>>,
+) -> Result<TimedRawWriteGuard<'a>, AppError> {
+    let wait_started_at = Instant::now();
+    let guard = manager
+        .write()
+        .map_err(|_| AppError::InternalServerError("Raw blob manager lock poisoned".into()))?;
+    let wait_us = wait_started_at.elapsed().as_micros() as u64;
+    let device_id = guard.header().device_id.to_string();
+    Ok(TimedRawWriteGuard {
+        guard,
+        device_id,
+        wait_us,
+        hold_started_at: Instant::now(),
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn clear_raw_runtime_caches_for_tests() {
     if let Ok(mut guard) = RAW_MANAGER_CACHE.lock() {
@@ -183,6 +451,9 @@ pub(crate) fn clear_raw_runtime_caches_for_tests() {
     }
     RAW_TOPOLOGY_EPOCH.store(1, Ordering::Relaxed);
     RAW_TOPOLOGY_LAST_REFRESH_SECS.store(0, Ordering::Relaxed);
+    if let Ok(mut guard) = RAW_LOCK_TELEMETRY.lock() {
+        guard.clear();
+    }
 }
 
 pub fn current_raw_topology_epoch() -> u64 {
@@ -374,6 +645,7 @@ pub fn raw_blob_address_from_extent(extent: &RawExtentAddress) -> RawBlobAddress
         topology_epoch: current_raw_topology_epoch(),
         device_id: extent.device_id.to_string(),
         allocation_id: extent.allocation_id,
+        extent_gen: extent.extent_gen,
         offset_bytes: extent.offset_bytes,
         size_bytes: extent.size_bytes,
     }
@@ -414,10 +686,86 @@ pub fn raw_blob_device_statuses() -> Result<Vec<RawBlobDeviceStatus>, AppError> 
     Ok(statuses)
 }
 
-pub fn format_raw_blob_device(path: &Path, force: bool) -> Result<RawBlobDeviceStatus, AppError> {
-    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let inspection = inspect_raw_blob_device(&canonical, false)?;
+fn format_intents_store_path() -> PathBuf {
+    std::env::temp_dir().join(RAW_FORMAT_INTENTS_FILE)
+}
 
+fn format_audit_log_path() -> PathBuf {
+    std::env::temp_dir().join(RAW_FORMAT_AUDIT_LOG_FILE)
+}
+
+fn load_format_intents() -> Result<Vec<RawBlobFormatIntentRecord>, AppError> {
+    let path = format_intents_store_path();
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(AppError::Io(
+                e,
+                format!("read format intent store {}", path.display()),
+            ));
+        }
+    };
+    rmp_serde::from_slice::<Vec<RawBlobFormatIntentRecord>>(&bytes).map_err(|e| {
+        AppError::InternalServerError(format!(
+            "decode format intent store {}: {}",
+            path.display(),
+            e
+        ))
+    })
+}
+
+fn persist_format_intents(records: &[RawBlobFormatIntentRecord]) -> Result<(), AppError> {
+    let path = format_intents_store_path();
+    let bytes = rmp_serde::to_vec(records).map_err(|e| {
+        AppError::InternalServerError(format!(
+            "encode format intent store {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let tmp = path.with_extension(format!(
+        "tmp.{}",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    fs::write(&tmp, &bytes)
+        .map_err(|e| AppError::Io(e, format!("write format intent temp {}", tmp.display())))?;
+    fs::rename(&tmp, &path).map_err(|e| {
+        AppError::Io(
+            e,
+            format!(
+                "rename format intent temp {} -> {}",
+                tmp.display(),
+                path.display()
+            ),
+        )
+    })
+}
+
+fn format_intent_fingerprint(inspection: &RawBlobDiskInspection, force: bool) -> String {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(inspection.canonical_path.to_string_lossy().as_bytes());
+    hasher.update(b"|");
+    hasher.update(format!("{:?}", inspection.kind).as_bytes());
+    hasher.update(b"|");
+    hasher.update(inspection.total_bytes.to_string().as_bytes());
+    hasher.update(b"|");
+    hasher.update(
+        inspection
+            .detected_signature
+            .as_deref()
+            .unwrap_or("<none>")
+            .as_bytes(),
+    );
+    hasher.update(b"|");
+    hasher.update(if force { b"force=1" } else { b"force=0" });
+    format!("{:08x}", hasher.finalize())
+}
+
+fn validate_format_prereqs(
+    inspection: &RawBlobDiskInspection,
+    force: bool,
+) -> Result<(), AppError> {
     if inspection.mounted {
         return Err(AppError::BadRequest(format!(
             "blob device {} is mounted at {}; raw blob disks must stay unmounted",
@@ -427,34 +775,231 @@ pub fn format_raw_blob_device(path: &Path, force: bool) -> Result<RawBlobDeviceS
     }
 
     match inspection.state {
-        RawBlobDiskState::Unformatted => {}
+        RawBlobDiskState::Unformatted => Ok(()),
         RawBlobDiskState::Managed
         | RawBlobDiskState::ForeignSignature
         | RawBlobDiskState::DirtyUnknown
-            if force => {}
-        RawBlobDiskState::Managed => {
-            return Err(AppError::BadRequest(format!(
-                "blob device {} is already N1-formatted; rerun with --force to reinitialize it",
-                inspection.path.display()
-            )));
+            if force =>
+        {
+            Ok(())
         }
-        RawBlobDiskState::ForeignSignature => {
-            return Err(AppError::BadRequest(format!(
-                "blob device {} contains foreign on-disk data ({}); rerun with --force only if you intend to destroy it",
-                inspection.path.display(),
-                inspection
-                    .detected_signature
-                    .as_deref()
-                    .unwrap_or("unknown signature")
-            )));
+        RawBlobDiskState::Managed => Err(AppError::BadRequest(format!(
+            "blob device {} is already N1-formatted; rerun with --force to reinitialize it",
+            inspection.path.display()
+        ))),
+        RawBlobDiskState::ForeignSignature => Err(AppError::BadRequest(format!(
+            "blob device {} contains foreign on-disk data ({}); rerun with --force only if you intend to destroy it",
+            inspection.path.display(),
+            inspection
+                .detected_signature
+                .as_deref()
+                .unwrap_or("unknown signature")
+        ))),
+        RawBlobDiskState::DirtyUnknown => Err(AppError::BadRequest(format!(
+            "blob device {} contains unknown non-zero data; rerun with --force only if you intend to destroy it",
+            inspection.path.display()
+        ))),
+    }
+}
+
+fn format_actor() -> String {
+    std::env::var("SUDO_USER")
+        .ok()
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn append_format_audit(event: RawBlobFormatAuditEvent) {
+    let path = format_audit_log_path();
+    let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => file,
+        Err(err) => {
+            warn!("raw format audit open failed ({}): {}", path.display(), err);
+            return;
         }
-        RawBlobDiskState::DirtyUnknown => {
-            return Err(AppError::BadRequest(format!(
-                "blob device {} contains unknown non-zero data; rerun with --force only if you intend to destroy it",
-                inspection.path.display()
-            )));
+    };
+    let line = match serde_json::to_string(&event) {
+        Ok(v) => v,
+        Err(err) => {
+            warn!("raw format audit encode failed: {}", err);
+            return;
+        }
+    };
+    if let Err(err) = writeln!(file, "{}", line) {
+        warn!(
+            "raw format audit append failed ({}): {}",
+            path.display(),
+            err
+        );
+    }
+}
+
+pub fn prepare_raw_blob_device_format(
+    path: &Path,
+    force: bool,
+) -> Result<RawBlobFormatIntent, AppError> {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let inspection = inspect_raw_blob_device(&canonical, false)?;
+    validate_format_prereqs(&inspection, force)?;
+
+    let now = Utc::now().timestamp();
+    let nonce = Ulid::new().to_string();
+    let fingerprint = format_intent_fingerprint(&inspection, force);
+    let expires_at = now.saturating_add(RAW_FORMAT_INTENT_TTL_SECS);
+
+    let mut records = load_format_intents()?;
+    records.retain(|record| {
+        record.expires_at > now
+            && !(record.canonical_path == inspection.canonical_path.to_string_lossy())
+    });
+    records.push(RawBlobFormatIntentRecord {
+        path: inspection.path.to_string_lossy().to_string(),
+        canonical_path: inspection.canonical_path.to_string_lossy().to_string(),
+        force,
+        nonce: nonce.clone(),
+        fingerprint: fingerprint.clone(),
+        created_at: now,
+        expires_at,
+    });
+    persist_format_intents(&records)?;
+
+    append_format_audit(RawBlobFormatAuditEvent {
+        event: "prepare".to_string(),
+        path: inspection.path.to_string_lossy().to_string(),
+        canonical_path: inspection.canonical_path.to_string_lossy().to_string(),
+        force,
+        nonce: Some(nonce.clone()),
+        fingerprint: Some(fingerprint.clone()),
+        result: "ok".to_string(),
+        error: None,
+        actor: format_actor(),
+        host: hostname::get()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string(),
+        pid: std::process::id(),
+        timestamp: now,
+    });
+
+    Ok(RawBlobFormatIntent {
+        path: inspection.path.to_string_lossy().to_string(),
+        canonical_path: inspection.canonical_path.to_string_lossy().to_string(),
+        kind: inspection.kind,
+        total_bytes: inspection.total_bytes,
+        detected_signature: inspection.detected_signature,
+        force,
+        nonce,
+        fingerprint,
+        expires_at,
+    })
+}
+
+pub fn format_raw_blob_device_with_intent(
+    path: &Path,
+    force: bool,
+    nonce: &str,
+    fingerprint: &str,
+) -> Result<RawBlobDeviceStatus, AppError> {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let inspection = inspect_raw_blob_device(&canonical, false)?;
+    validate_format_prereqs(&inspection, force)?;
+
+    let now = Utc::now().timestamp();
+    let mut records = load_format_intents()?;
+    records.retain(|record| record.expires_at > now);
+
+    let mut matched_idx = None;
+    for (idx, record) in records.iter().enumerate() {
+        if record.nonce == nonce {
+            matched_idx = Some(idx);
+            break;
         }
     }
+
+    let Some(idx) = matched_idx else {
+        return Err(AppError::Conflict(
+            "format intent nonce not found or expired; run --prepare again".to_string(),
+        ));
+    };
+
+    let record = records[idx].clone();
+    let current_fingerprint = format_intent_fingerprint(&inspection, force);
+    if record.canonical_path != inspection.canonical_path.to_string_lossy()
+        || record.force != force
+        || record.fingerprint != current_fingerprint
+        || record.fingerprint != fingerprint
+    {
+        return Err(AppError::Conflict(
+            "format intent does not match current device identity; run --prepare again".to_string(),
+        ));
+    }
+
+    records.remove(idx);
+    persist_format_intents(&records)?;
+
+    let result = format_raw_blob_device(path, force);
+    match &result {
+        Ok(_) => append_format_audit(RawBlobFormatAuditEvent {
+            event: "apply".to_string(),
+            path: inspection.path.to_string_lossy().to_string(),
+            canonical_path: inspection.canonical_path.to_string_lossy().to_string(),
+            force,
+            nonce: Some(nonce.to_string()),
+            fingerprint: Some(fingerprint.to_string()),
+            result: "ok".to_string(),
+            error: None,
+            actor: format_actor(),
+            host: hostname::get()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+            pid: std::process::id(),
+            timestamp: now,
+        }),
+        Err(err) => append_format_audit(RawBlobFormatAuditEvent {
+            event: "apply".to_string(),
+            path: inspection.path.to_string_lossy().to_string(),
+            canonical_path: inspection.canonical_path.to_string_lossy().to_string(),
+            force,
+            nonce: Some(nonce.to_string()),
+            fingerprint: Some(fingerprint.to_string()),
+            result: "error".to_string(),
+            error: Some(err.to_string()),
+            actor: format_actor(),
+            host: hostname::get()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+            pid: std::process::id(),
+            timestamp: now,
+        }),
+    }
+
+    result
+}
+
+// Index-device formatting currently uses the same raw block-manager media format
+// and safety handshake as blob-device formatting.
+pub fn prepare_raw_index_device_format(
+    path: &Path,
+    force: bool,
+) -> Result<RawBlobFormatIntent, AppError> {
+    prepare_raw_blob_device_format(path, force)
+}
+
+pub fn format_raw_index_device_with_intent(
+    path: &Path,
+    force: bool,
+    nonce: &str,
+    fingerprint: &str,
+) -> Result<RawBlobDeviceStatus, AppError> {
+    format_raw_blob_device_with_intent(path, force, nonce, fingerprint)
+}
+
+pub fn format_raw_blob_device(path: &Path, force: bool) -> Result<RawBlobDeviceStatus, AppError> {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let inspection = inspect_raw_blob_device(&canonical, false)?;
+    validate_format_prereqs(&inspection, force)?;
 
     RAW_MANAGER_CACHE
         .lock()
@@ -474,7 +1019,10 @@ pub fn format_raw_blob_device(path: &Path, force: bool) -> Result<RawBlobDeviceS
 
     let refreshed = inspect_raw_blob_device(&inspection.canonical_path, false)?;
     sync_raw_device_map_best_effort(true);
-    Ok(status_from_inspection(refreshed))
+    Ok(status_from_inspection(
+        refreshed,
+        &deferred_raw_free_backlog_by_device(),
+    ))
 }
 
 pub fn resolve_blob_disk(disk_idx: usize) -> Result<BlobDiskHandle, AppError> {
@@ -533,13 +1081,33 @@ pub fn resolve_blob_disk_path(path: &Path) -> Result<BlobDiskHandle, AppError> {
     )))
 }
 
+fn deferred_raw_free_backlog_by_device() -> HashMap<String, u64> {
+    match collect_deferred_raw_free_markers_blocking(usize::MAX) {
+        Ok(markers) => {
+            let mut out = HashMap::<String, u64>::new();
+            for (raw, _) in markers {
+                *out.entry(raw.device_id).or_insert(0) += 1;
+            }
+            out
+        }
+        Err(err) => {
+            warn!("Deferred raw free backlog probe skipped: {}", err);
+            HashMap::new()
+        }
+    }
+}
+
 fn collect_raw_blob_device_statuses() -> Result<Vec<RawBlobDeviceStatus>, AppError> {
     let disks = configured_blob_store_disks()?;
+    let deferred_backlog_by_device = deferred_raw_free_backlog_by_device();
     let mut out = Vec::with_capacity(disks.len());
     for disk in &disks {
         let path = Path::new(disk);
         match inspect_raw_blob_device(path, false) {
-            Ok(inspection) => out.push(status_from_inspection(inspection)),
+            Ok(inspection) => out.push(status_from_inspection(
+                inspection,
+                &deferred_backlog_by_device,
+            )),
             Err(err) => out.push(status_from_inspection_error(path, &err)),
         }
     }
@@ -570,6 +1138,29 @@ fn status_from_inspection_error(path: &Path, err: &AppError) -> RawBlobDeviceSta
         block_size_bytes: None,
         allocation_count: None,
         journal_cursor: None,
+        superblock_generation: None,
+        replay_last_txid: None,
+        journal_capacity_records: None,
+        journal_free_records: None,
+        allocator_largest_free_extent_blocks: None,
+        allocator_fragmentation_ppm: None,
+        allocator_ag_count: None,
+        allocator_worst_ag_fragmentation_ppm: None,
+        deferred_free_backlog: None,
+        lock_read_samples: None,
+        lock_read_wait_p50_us: None,
+        lock_read_wait_p95_us: None,
+        lock_read_wait_p99_us: None,
+        lock_read_hold_p50_us: None,
+        lock_read_hold_p95_us: None,
+        lock_read_hold_p99_us: None,
+        lock_write_samples: None,
+        lock_write_wait_p50_us: None,
+        lock_write_wait_p95_us: None,
+        lock_write_wait_p99_us: None,
+        lock_write_hold_p50_us: None,
+        lock_write_hold_p95_us: None,
+        lock_write_hold_p99_us: None,
         total_bytes: None,
         used_bytes: None,
         available_bytes: None,
@@ -624,12 +1215,10 @@ pub async fn commit_staged_raw_shard(
                 format!("open staged shard {}", staged_for_task.display()),
             )
         })?;
-        let alloc = {
-            let mut mgr = manager.write().map_err(|_| {
-                AppError::InternalServerError("Raw blob manager lock poisoned".into())
-            })?;
-            match mgr.allocate_bytes(size_bytes) {
-                Ok(handle) => handle,
+        let (address, io) = loop {
+            let mut mgr = timed_raw_manager_write(&manager)?;
+            match mgr.allocate_direct_extent_io(size_bytes) {
+                Ok(pair) => break pair,
                 Err(BlockManagerError::NoSpace { .. }) => {
                     drop(mgr);
                     let drained = drain_deferred_raw_frees_under_pressure_blocking();
@@ -639,24 +1228,8 @@ pub async fn commit_staged_raw_shard(
                             drained
                         );
                     }
-                    let mut mgr_retry = manager.write().map_err(|_| {
-                        AppError::InternalServerError("Raw blob manager lock poisoned".into())
-                    })?;
-                    mgr_retry
-                        .allocate_bytes(size_bytes)
-                        .map_err(block_manager_error_to_app)?
                 }
                 Err(err) => return Err(block_manager_error_to_app(err)),
-            }
-        };
-        let mut mgr = manager
-            .write()
-            .map_err(|_| AppError::InternalServerError("Raw blob manager lock poisoned".into()))?;
-        let address = match mgr.raw_extent_address(alloc, size_bytes) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = mgr.free(alloc.allocation_id);
-                return Err(block_manager_error_to_app(e));
             }
         };
 
@@ -669,22 +1242,31 @@ pub async fn commit_staged_raw_shard(
             if read == 0 {
                 break;
             }
-            if let Err(e) = mgr.write_address(&address, offset, &buf[..read]) {
-                let _ = mgr.free(alloc.allocation_id);
+            if let Err(e) = io.write(offset, &buf[..read]) {
+                if let Ok(mut mgr) = timed_raw_manager_write(&manager) {
+                    let _ = mgr.free_address(&address);
+                    let _ = mgr.flush_meta();
+                }
                 return Err(block_manager_error_to_app(e));
             }
             offset = offset.saturating_add(read as u64);
         }
 
         if offset != size_bytes {
-            let _ = mgr.free(alloc.allocation_id);
+            if let Ok(mut mgr) = timed_raw_manager_write(&manager) {
+                let _ = mgr.free_address(&address);
+                let _ = mgr.flush_meta();
+            }
             return Err(AppError::InternalServerError(format!(
                 "staged shard size mismatch: copied {} bytes but expected {}",
                 offset, size_bytes
             )));
         }
 
-        mgr.flush().map_err(block_manager_error_to_app)?;
+        io.flush_data().map_err(block_manager_error_to_app)?;
+        timed_raw_manager_write(&manager)?
+            .flush_meta()
+            .map_err(block_manager_error_to_app)?;
         Ok(raw_blob_address_from_extent(&address))
     })
     .await
@@ -713,12 +1295,11 @@ pub fn open_raw_direct_io_for_address(raw: &RawBlobAddress) -> Result<DirectExte
         );
     }
     let manager = raw_manager_by_device_id(raw.device_id.as_str())?;
-    let mgr = manager
-        .read()
-        .map_err(|_| AppError::InternalServerError("Raw blob manager lock poisoned".into()))?;
+    let mgr = timed_raw_manager_read(&manager)?;
     let address = RawExtentAddress {
         device_id: mgr.header().device_id,
         allocation_id: raw.allocation_id,
+        extent_gen: raw.extent_gen.max(1),
         offset_bytes: raw.offset_bytes,
         size_bytes: raw.size_bytes,
     };
@@ -731,12 +1312,10 @@ pub fn allocate_raw_direct_io(
     size_bytes: u64,
 ) -> Result<(RawBlobAddress, DirectExtentIo), AppError> {
     let BlobDiskHandle::Raw { manager, .. } = resolve_blob_disk(disk_idx)?;
-    let alloc = {
-        let mut mgr = manager
-            .write()
-            .map_err(|_| AppError::InternalServerError("Raw blob manager lock poisoned".into()))?;
-        match mgr.allocate_bytes(size_bytes) {
-            Ok(handle) => handle,
+    let mut mgr = timed_raw_manager_write(&manager)?;
+    let (address, io) = loop {
+        match mgr.allocate_direct_extent_io(size_bytes) {
+            Ok(pair) => break pair,
             Err(BlockManagerError::NoSpace { .. }) => {
                 drop(mgr);
                 let drained = drain_deferred_raw_frees_under_pressure_blocking();
@@ -746,31 +1325,9 @@ pub fn allocate_raw_direct_io(
                         drained
                     );
                 }
-                let mut mgr_retry = manager.write().map_err(|_| {
-                    AppError::InternalServerError("Raw blob manager lock poisoned".into())
-                })?;
-                mgr_retry
-                    .allocate_bytes(size_bytes)
-                    .map_err(block_manager_error_to_app)?
+                mgr = timed_raw_manager_write(&manager)?;
             }
             Err(err) => return Err(block_manager_error_to_app(err)),
-        }
-    };
-    let mut mgr = manager
-        .write()
-        .map_err(|_| AppError::InternalServerError("Raw blob manager lock poisoned".into()))?;
-    let address = match mgr.raw_extent_address(alloc, size_bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = mgr.free(alloc.allocation_id);
-            return Err(block_manager_error_to_app(e));
-        }
-    };
-    let io = match mgr.direct_extent_io(&address) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = mgr.free(alloc.allocation_id);
-            return Err(block_manager_error_to_app(e));
         }
     };
     Ok((raw_blob_address_from_extent(&address), io))
@@ -814,12 +1371,11 @@ pub async fn write_shard_range(
         let payload = data.to_vec();
         return tokio::task::spawn_blocking(move || {
             let manager = raw_manager_by_device_id(raw.device_id.as_str())?;
-            let mgr = manager.read().map_err(|_| {
-                AppError::InternalServerError("Raw blob manager lock poisoned".into())
-            })?;
+            let mgr = timed_raw_manager_read(&manager)?;
             let address = RawExtentAddress {
                 device_id: mgr.header().device_id,
                 allocation_id: raw.allocation_id,
+                extent_gen: raw.extent_gen.max(1),
                 offset_bytes: raw.offset_bytes,
                 size_bytes: raw.size_bytes,
             };
@@ -867,12 +1423,11 @@ pub async fn verify_shard_checksum(shard: &ShardInfo) -> Result<bool, AppError> 
             let take = remaining.min(1024 * 1024) as usize;
             let chunk = if let Some(raw) = shard_clone.raw_blob_address.as_ref() {
                 let manager = raw_manager_by_device_id(raw.device_id.as_str())?;
-                let mgr = manager.read().map_err(|_| {
-                    AppError::InternalServerError("Raw blob manager lock poisoned".into())
-                })?;
+                let mgr = timed_raw_manager_read(&manager)?;
                 let address = RawExtentAddress {
                     device_id: mgr.header().device_id,
                     allocation_id: raw.allocation_id,
+                    extent_gen: raw.extent_gen.max(1),
                     offset_bytes: raw.offset_bytes,
                     size_bytes: raw.size_bytes,
                 };
@@ -915,7 +1470,7 @@ pub async fn free_raw_shards_for_metadata(metadata: &ObjectMetadata) -> Result<(
 
 pub async fn free_raw_shards_for_metadatas(metadatas: &[ObjectMetadata]) -> Result<(), AppError> {
     let mut addrs = Vec::<RawBlobAddress>::new();
-    let mut seen = HashSet::<(u64, String, u64, u64, u64)>::new();
+    let mut seen = HashSet::<(u64, String, u64, u32, u64, u64)>::new();
 
     for metadata in metadatas {
         for part in &metadata.parts {
@@ -924,9 +1479,10 @@ pub async fn free_raw_shards_for_metadatas(metadatas: &[ObjectMetadata]) -> Resu
                     continue;
                 };
                 let key = (
-                    raw.topology_epoch,
+                    raw.topology_epoch.max(1),
                     raw.device_id.clone(),
                     raw.allocation_id,
+                    raw.extent_gen.max(1),
                     raw.offset_bytes,
                     raw.size_bytes,
                 );
@@ -940,11 +1496,12 @@ pub async fn free_raw_shards_for_metadatas(metadatas: &[ObjectMetadata]) -> Resu
     free_raw_addresses(&addrs).await
 }
 
-fn raw_address_identity_key(raw: &RawBlobAddress) -> (u64, String, u64, u64, u64) {
+fn raw_address_identity_key(raw: &RawBlobAddress) -> (u64, String, u64, u32, u64, u64) {
     (
         raw.topology_epoch.max(1),
         raw.device_id.clone(),
         raw.allocation_id,
+        raw.extent_gen.max(1),
         raw.offset_bytes,
         raw.size_bytes,
     )
@@ -957,10 +1514,11 @@ fn raw_deferred_marker_file_name(raw: &RawBlobAddress) -> String {
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
         .collect::<String>();
     format!(
-        "e{}-{}-{}-{}-{}.msgpack",
+        "e{}-{}-{}-g{}-{}-{}.msgpack",
         raw.topology_epoch.max(1),
         sanitized_device,
         raw.allocation_id,
+        raw.extent_gen.max(1),
         raw.offset_bytes,
         raw.size_bytes
     )
@@ -984,7 +1542,7 @@ async fn write_deferred_raw_free_markers(addresses: &[RawBlobAddress]) -> Result
         ));
     }
 
-    let mut unique = HashSet::<(u64, String, u64, u64, u64)>::new();
+    let mut unique = HashSet::<(u64, String, u64, u32, u64, u64)>::new();
     for raw in addresses {
         let key = raw_address_identity_key(raw);
         if !unique.insert(key) {
@@ -1031,7 +1589,7 @@ async fn collect_deferred_raw_free_markers(
         .collect::<Vec<PathBuf>>();
     tokio::task::spawn_blocking(move || {
         let mut markers =
-            HashMap::<(u64, String, u64, u64, u64), (RawBlobAddress, Vec<PathBuf>)>::new();
+            HashMap::<(u64, String, u64, u32, u64, u64), (RawBlobAddress, Vec<PathBuf>)>::new();
         for root in roots {
             let dir = root.join(RAW_DEVICE_MAP_DIR).join(RAW_DEFERRED_FREE_DIR);
             if !dir.exists() {
@@ -1086,7 +1644,7 @@ fn collect_deferred_raw_free_markers_blocking(
         return Ok(Vec::new());
     }
     let mut markers =
-        HashMap::<(u64, String, u64, u64, u64), (RawBlobAddress, Vec<PathBuf>)>::new();
+        HashMap::<(u64, String, u64, u32, u64, u64), (RawBlobAddress, Vec<PathBuf>)>::new();
     for root in index_roots {
         let dir = PathBuf::from(root)
             .join(RAW_DEVICE_MAP_DIR)
@@ -1133,7 +1691,7 @@ fn free_raw_addresses_immediate_blocking(addresses: &[RawBlobAddress]) -> Result
     }
 
     let mut grouped = HashMap::<String, Vec<RawBlobAddress>>::new();
-    let mut seen = HashSet::<(u64, String, u64, u64, u64)>::new();
+    let mut seen = HashSet::<(u64, String, u64, u32, u64, u64)>::new();
     for raw in addresses {
         let key = raw_address_identity_key(raw);
         if seen.insert(key) {
@@ -1160,6 +1718,7 @@ fn free_raw_addresses_immediate_blocking(addresses: &[RawBlobAddress]) -> Result
             raw_extents.push(RawExtentAddress {
                 device_id: manager_device_id,
                 allocation_id: raw.allocation_id,
+                extent_gen: raw.extent_gen.max(1),
                 offset_bytes: raw.offset_bytes,
                 size_bytes: raw.size_bytes,
             });
@@ -1243,7 +1802,7 @@ async fn free_raw_addresses_immediate(addresses: &[RawBlobAddress]) -> Result<()
     }
 
     let mut grouped = HashMap::<String, Vec<RawBlobAddress>>::new();
-    let mut seen = HashSet::<(u64, String, u64, u64, u64)>::new();
+    let mut seen = HashSet::<(u64, String, u64, u32, u64, u64)>::new();
     for raw in addresses {
         let key = raw_address_identity_key(raw);
         if seen.insert(key) {
@@ -1261,9 +1820,7 @@ async fn free_raw_addresses_immediate(addresses: &[RawBlobAddress]) -> Result<()
                 Err(err) if is_missing_raw_device_mapping_error(&err) => return Ok(()),
                 Err(err) => return Err(err),
             };
-            let mut mgr = manager.write().map_err(|_| {
-                AppError::InternalServerError("Raw blob manager lock poisoned".into())
-            })?;
+            let mut mgr = timed_raw_manager_write(&manager)?;
 
             let manager_device_id = mgr.header().device_id;
             let mut raw_extents = Vec::<RawExtentAddress>::with_capacity(addresses.len());
@@ -1271,6 +1828,7 @@ async fn free_raw_addresses_immediate(addresses: &[RawBlobAddress]) -> Result<()
                 raw_extents.push(RawExtentAddress {
                     device_id: manager_device_id,
                     allocation_id: raw.allocation_id,
+                    extent_gen: raw.extent_gen.max(1),
                     offset_bytes: raw.offset_bytes,
                     size_bytes: raw.size_bytes,
                 });
@@ -1403,9 +1961,7 @@ pub async fn flush_raw_metadata_for_addresses(
     for device_id in device_ids {
         tokio::task::spawn_blocking(move || {
             let manager = raw_manager_by_device_id(device_id.as_str())?;
-            let mut mgr = manager.write().map_err(|_| {
-                AppError::InternalServerError("Raw blob manager lock poisoned".into())
-            })?;
+            let mut mgr = timed_raw_manager_write(&manager)?;
             mgr.flush_meta().map_err(block_manager_error_to_app)
         })
         .await
@@ -1435,21 +1991,17 @@ pub async fn raw_blob_address_exists(raw: &RawBlobAddress) -> Result<bool, AppEr
         Err(err) if is_missing_raw_device_mapping_error(&err) => return Ok(false),
         Err(err) => return Err(err),
     };
+    let manager_device_id = timed_raw_manager_read(&manager)?.header().device_id;
     let address = RawExtentAddress {
-        device_id: manager
-            .read()
-            .map_err(|_| AppError::InternalServerError("raw manager lock poisoned".into()))?
-            .header()
-            .device_id,
+        device_id: manager_device_id,
         allocation_id: raw.allocation_id,
+        extent_gen: raw.extent_gen.max(1),
         offset_bytes: raw.offset_bytes,
         size_bytes: raw.size_bytes,
     };
 
     tokio::task::spawn_blocking(move || {
-        let mgr = manager
-            .read()
-            .map_err(|_| AppError::InternalServerError("raw manager lock poisoned".into()))?;
+        let mgr = timed_raw_manager_read(&manager)?;
         match mgr.read_address(&address, 0, 0) {
             Ok(_) => Ok(true),
             Err(BlockManagerError::UnknownAllocation(_)) => Ok(false),
@@ -1511,10 +2063,11 @@ pub fn raw_gc_marker_file_name(raw: &RawBlobAddress) -> String {
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
         .collect::<String>();
     format!(
-        "e{}-{}-{}-{}-{}.msgpack",
+        "e{}-{}-{}-g{}-{}-{}.msgpack",
         raw.topology_epoch.max(1),
         sanitized_device,
         raw.allocation_id,
+        raw.extent_gen.max(1),
         raw.offset_bytes,
         raw.size_bytes
     )
@@ -1590,9 +2143,7 @@ fn open_or_format_raw_manager(path: &Path) -> Result<Arc<RwLock<BlockManager>>, 
             .map_err(|_| AppError::InternalServerError("Raw manager cache lock poisoned".into()))?;
         cache.get(&inspection.canonical_path).cloned()
     } {
-        let cached_device_id = existing
-            .read()
-            .map_err(|_| AppError::InternalServerError("Raw blob manager lock poisoned".into()))?
+        let cached_device_id = timed_raw_manager_read(&existing)?
             .header()
             .device_id
             .to_string();
@@ -1766,31 +2317,85 @@ fn raw_blob_validation_error(inspection: &RawBlobDiskInspection) -> AppError {
     }
 }
 
-fn status_from_inspection(inspection: RawBlobDiskInspection) -> RawBlobDeviceStatus {
+fn status_from_inspection(
+    inspection: RawBlobDiskInspection,
+    deferred_backlog_by_device: &HashMap<String, u64>,
+) -> RawBlobDeviceStatus {
     match BlockManager::open(&inspection.canonical_path) {
-        Ok(mgr) => RawBlobDeviceStatus {
-            path: inspection.path.to_string_lossy().to_string(),
-            canonical_path: inspection.canonical_path.to_string_lossy().to_string(),
-            kind: inspection.kind,
-            status: if inspection.mounted {
-                "misconfigured".to_string()
-            } else {
-                "managed".to_string()
-            },
-            direct_io: true,
-            mounted: inspection.mounted,
-            mount_points: inspection.mount_points,
-            path_warning: inspection.path_warning,
-            detected_signature: inspection.detected_signature,
-            device_id: Some(mgr.header().device_id.to_string()),
-            block_size_bytes: Some(mgr.header().block_size),
-            allocation_count: Some(mgr.allocation_count()),
-            journal_cursor: Some(mgr.journal_cursor()),
-            total_bytes: Some(inspection.total_bytes),
-            used_bytes: Some(mgr.used_bytes()),
-            available_bytes: Some(mgr.available_bytes()),
-            error: None,
-        },
+        Ok(mgr) => {
+            let health = mgr.allocator_health_snapshot();
+            let worst_ag_fragmentation = health
+                .ags
+                .iter()
+                .map(|ag| ag.fragmentation_ppm)
+                .max()
+                .unwrap_or(0);
+            let device_id = mgr.header().device_id.to_string();
+            let lock_telemetry = raw_lock_telemetry_snapshot(&device_id);
+            let (lock_read_wait_p50_us, lock_read_wait_p95_us, lock_read_wait_p99_us) =
+                lock_quantiles_to_options(lock_telemetry.read_wait);
+            let (lock_read_hold_p50_us, lock_read_hold_p95_us, lock_read_hold_p99_us) =
+                lock_quantiles_to_options(lock_telemetry.read_hold);
+            let (lock_write_wait_p50_us, lock_write_wait_p95_us, lock_write_wait_p99_us) =
+                lock_quantiles_to_options(lock_telemetry.write_wait);
+            let (lock_write_hold_p50_us, lock_write_hold_p95_us, lock_write_hold_p99_us) =
+                lock_quantiles_to_options(lock_telemetry.write_hold);
+            let lock_read_samples =
+                (lock_telemetry.read_wait.samples > 0).then_some(lock_telemetry.read_wait.samples);
+            let lock_write_samples = (lock_telemetry.write_wait.samples > 0)
+                .then_some(lock_telemetry.write_wait.samples);
+            RawBlobDeviceStatus {
+                path: inspection.path.to_string_lossy().to_string(),
+                canonical_path: inspection.canonical_path.to_string_lossy().to_string(),
+                kind: inspection.kind,
+                status: if inspection.mounted {
+                    "misconfigured".to_string()
+                } else {
+                    "managed".to_string()
+                },
+                direct_io: true,
+                mounted: inspection.mounted,
+                mount_points: inspection.mount_points,
+                path_warning: inspection.path_warning,
+                detected_signature: inspection.detected_signature,
+                device_id: Some(device_id.clone()),
+                block_size_bytes: Some(mgr.header().block_size),
+                allocation_count: Some(health.allocation_count),
+                journal_cursor: Some(health.journal_used_records),
+                superblock_generation: Some(health.superblock_generation),
+                replay_last_txid: Some(health.replay_last_txid),
+                journal_capacity_records: Some(health.journal_capacity_records),
+                journal_free_records: Some(health.journal_free_records),
+                allocator_largest_free_extent_blocks: Some(health.largest_free_extent_blocks),
+                allocator_fragmentation_ppm: Some(health.fragmentation_ppm),
+                allocator_ag_count: Some(health.ags.len()),
+                allocator_worst_ag_fragmentation_ppm: Some(worst_ag_fragmentation),
+                deferred_free_backlog: Some(
+                    deferred_backlog_by_device
+                        .get(&device_id)
+                        .copied()
+                        .unwrap_or(0),
+                ),
+                lock_read_samples,
+                lock_read_wait_p50_us,
+                lock_read_wait_p95_us,
+                lock_read_wait_p99_us,
+                lock_read_hold_p50_us,
+                lock_read_hold_p95_us,
+                lock_read_hold_p99_us,
+                lock_write_samples,
+                lock_write_wait_p50_us,
+                lock_write_wait_p95_us,
+                lock_write_wait_p99_us,
+                lock_write_hold_p50_us,
+                lock_write_hold_p95_us,
+                lock_write_hold_p99_us,
+                total_bytes: Some(inspection.total_bytes),
+                used_bytes: Some(mgr.used_bytes()),
+                available_bytes: Some(mgr.available_bytes()),
+                error: None,
+            }
+        }
         Err(BlockManagerError::InvalidDevice(_)) => {
             let detected_signature = inspection.detected_signature.clone();
             RawBlobDeviceStatus {
@@ -1813,6 +2418,29 @@ fn status_from_inspection(inspection: RawBlobDiskInspection) -> RawBlobDeviceSta
                 block_size_bytes: None,
                 allocation_count: None,
                 journal_cursor: None,
+                superblock_generation: None,
+                replay_last_txid: None,
+                journal_capacity_records: None,
+                journal_free_records: None,
+                allocator_largest_free_extent_blocks: None,
+                allocator_fragmentation_ppm: None,
+                allocator_ag_count: None,
+                allocator_worst_ag_fragmentation_ppm: None,
+                deferred_free_backlog: None,
+                lock_read_samples: None,
+                lock_read_wait_p50_us: None,
+                lock_read_wait_p95_us: None,
+                lock_read_wait_p99_us: None,
+                lock_read_hold_p50_us: None,
+                lock_read_hold_p95_us: None,
+                lock_read_hold_p99_us: None,
+                lock_write_samples: None,
+                lock_write_wait_p50_us: None,
+                lock_write_wait_p95_us: None,
+                lock_write_wait_p99_us: None,
+                lock_write_hold_p50_us: None,
+                lock_write_hold_p95_us: None,
+                lock_write_hold_p99_us: None,
                 total_bytes: Some(inspection.total_bytes),
                 used_bytes: None,
                 available_bytes: None,
@@ -1850,6 +2478,29 @@ fn status_from_inspection(inspection: RawBlobDiskInspection) -> RawBlobDeviceSta
             block_size_bytes: None,
             allocation_count: None,
             journal_cursor: None,
+            superblock_generation: None,
+            replay_last_txid: None,
+            journal_capacity_records: None,
+            journal_free_records: None,
+            allocator_largest_free_extent_blocks: None,
+            allocator_fragmentation_ppm: None,
+            allocator_ag_count: None,
+            allocator_worst_ag_fragmentation_ppm: None,
+            deferred_free_backlog: None,
+            lock_read_samples: None,
+            lock_read_wait_p50_us: None,
+            lock_read_wait_p95_us: None,
+            lock_read_wait_p99_us: None,
+            lock_read_hold_p50_us: None,
+            lock_read_hold_p95_us: None,
+            lock_read_hold_p99_us: None,
+            lock_write_samples: None,
+            lock_write_wait_p50_us: None,
+            lock_write_wait_p95_us: None,
+            lock_write_wait_p99_us: None,
+            lock_write_hold_p50_us: None,
+            lock_write_hold_p95_us: None,
+            lock_write_hold_p99_us: None,
             total_bytes: Some(inspection.total_bytes),
             used_bytes: None,
             available_bytes: None,
@@ -2058,11 +2709,19 @@ const BLKGETSIZE64_IOCTL: libc::c_ulong = 0x8008_1272;
 mod tests {
     use super::*;
     use crate::n1_core::disk_manager::replace_storage_roots_for_tests;
+    use once_cell::sync::Lazy;
     use std::fs::OpenOptions;
     use std::os::unix::fs::FileExt;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    static FORMAT_INTENT_TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    static RAW_RUNTIME_STATE_TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
     fn clear_raw_manager_caches_for_tests() {
+        let _guard = RAW_RUNTIME_STATE_TEST_LOCK
+            .lock()
+            .expect("raw runtime state test lock");
         clear_raw_runtime_caches_for_tests();
     }
 
@@ -2091,10 +2750,24 @@ mod tests {
             topology_epoch: 1,
             device_id: "dev-1".into(),
             allocation_id: 42,
+            extent_gen: 1,
             offset_bytes: 4096,
             size_bytes: 8192,
         };
         assert_eq!(raw_blob_debug_path(&addr), "raw://dev-1/42");
+    }
+
+    #[test]
+    fn raw_blob_address_defaults_extent_generation_for_legacy_metadata() {
+        let value = serde_json::json!({
+            "topology_epoch": 1,
+            "device_id": "dev-legacy",
+            "allocation_id": 11,
+            "offset_bytes": 4096,
+            "size_bytes": 8192
+        });
+        let addr: RawBlobAddress = serde_json::from_value(value).expect("decode legacy address");
+        assert_eq!(addr.extent_gen, 1);
     }
 
     #[test]
@@ -2286,15 +2959,144 @@ mod tests {
         drop(file);
 
         let _ = open_or_format_raw_manager(&path).expect("format manager");
-        let status =
-            status_from_inspection(inspect_raw_blob_device(&path, false).expect("inspect"));
+        let status = status_from_inspection(
+            inspect_raw_blob_device(&path, false).expect("inspect"),
+            &HashMap::new(),
+        );
         assert_eq!(status.status, "managed");
         assert_eq!(status.kind, RawBlobPathKind::LoopbackFile);
         assert_eq!(status.direct_io, true);
         assert!(status.device_id.is_some());
         assert!(status.total_bytes.unwrap_or(0) > 0);
+        assert_eq!(status.deferred_free_backlog, Some(0));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn managed_loopback_status_exposes_lock_telemetry_quantiles() {
+        let _guard = RAW_RUNTIME_STATE_TEST_LOCK
+            .lock()
+            .expect("raw runtime state test lock");
+        clear_raw_runtime_caches_for_tests();
+        let path = temp_loopback("status-lock-telemetry");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .expect("create loopback file");
+        file.set_len(8 * 1024 * 1024).expect("size loopback");
+        drop(file);
+
+        let manager = open_or_format_raw_manager(&path).expect("format manager");
+        let device_id = timed_raw_manager_read(&manager)
+            .expect("read manager header")
+            .header()
+            .device_id
+            .to_string();
+        if let Ok(mut telemetry) = RAW_LOCK_TELEMETRY.lock() {
+            telemetry.remove(&device_id);
+        }
+
+        for wait_us in 1..=100u64 {
+            record_lock_telemetry_sample(device_id.as_str(), false, wait_us, wait_us * 2);
+        }
+        for wait_us in [5u64, 15, 25, 35] {
+            record_lock_telemetry_sample(device_id.as_str(), true, wait_us, wait_us * 3);
+        }
+
+        let status = status_from_inspection(
+            inspect_raw_blob_device(&path, false).expect("inspect"),
+            &HashMap::new(),
+        );
+        assert_eq!(status.lock_read_samples, Some(100));
+        assert_eq!(status.lock_read_wait_p50_us, Some(50));
+        assert_eq!(status.lock_read_wait_p95_us, Some(95));
+        assert_eq!(status.lock_read_wait_p99_us, Some(99));
+        assert_eq!(status.lock_read_hold_p50_us, Some(100));
+        assert_eq!(status.lock_read_hold_p95_us, Some(190));
+        assert_eq!(status.lock_read_hold_p99_us, Some(198));
+        assert_eq!(status.lock_write_samples, Some(4));
+        assert_eq!(status.lock_write_wait_p50_us, Some(15));
+        assert_eq!(status.lock_write_wait_p95_us, Some(25));
+        assert_eq!(status.lock_write_wait_p99_us, Some(25));
+        assert_eq!(status.lock_write_hold_p50_us, Some(45));
+        assert_eq!(status.lock_write_hold_p95_us, Some(75));
+        assert_eq!(status.lock_write_hold_p99_us, Some(75));
+
+        let _ = std::fs::remove_file(path);
+        clear_raw_runtime_caches_for_tests();
+    }
+
+    #[test]
+    fn deferred_raw_free_backlog_counts_unique_markers_per_device() {
+        clear_raw_manager_caches_for_tests();
+        let index_root = temp_loopback("deferred-backlog-index");
+        std::fs::create_dir_all(&index_root).expect("create index root");
+        let fs_root = temp_loopback("deferred-backlog-fs");
+        std::fs::create_dir_all(&fs_root).expect("create fs root");
+        let blob = temp_loopback("deferred-backlog-blob");
+        let blob_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&blob)
+            .expect("create blob loopback");
+        blob_file
+            .set_len(4 * 1024 * 1024)
+            .expect("size blob loopback");
+        drop(blob_file);
+
+        replace_storage_roots_for_tests(
+            vec![index_root.to_string_lossy().to_string()],
+            vec![blob.to_string_lossy().to_string()],
+            fs_root.to_string_lossy().to_string(),
+        );
+
+        let marker_dir = index_root
+            .join(RAW_DEVICE_MAP_DIR)
+            .join(RAW_DEFERRED_FREE_DIR);
+        std::fs::create_dir_all(&marker_dir).expect("create deferred marker dir");
+
+        let addr_a = RawBlobAddress {
+            topology_epoch: 1,
+            device_id: "dev-a".to_string(),
+            allocation_id: 10,
+            extent_gen: 1,
+            offset_bytes: 4096,
+            size_bytes: 8192,
+        };
+        let addr_b = RawBlobAddress {
+            topology_epoch: 1,
+            device_id: "dev-b".to_string(),
+            allocation_id: 20,
+            extent_gen: 1,
+            offset_bytes: 12288,
+            size_bytes: 8192,
+        };
+        for (file_name, address) in [
+            ("a.msgpack", addr_a.clone()),
+            ("a-duplicate.msgpack", addr_a.clone()),
+            ("b.msgpack", addr_b.clone()),
+        ] {
+            let marker = RawDeferredFreeMarker {
+                address,
+                created_at: Utc::now().timestamp(),
+            };
+            let bytes = rmp_serde::to_vec(&marker).expect("serialize marker");
+            std::fs::write(marker_dir.join(file_name), bytes).expect("write marker");
+        }
+
+        let backlog = deferred_raw_free_backlog_by_device();
+        assert_eq!(backlog.get("dev-a"), Some(&1));
+        assert_eq!(backlog.get("dev-b"), Some(&1));
+
+        let _ = std::fs::remove_file(blob);
+        let _ = std::fs::remove_dir_all(index_root);
+        let _ = std::fs::remove_dir_all(fs_root);
     }
 
     #[test]
@@ -2361,6 +3163,72 @@ mod tests {
         assert_eq!(status.status, "managed");
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn format_raw_blob_device_intent_prepare_and_apply_roundtrip() {
+        let _guard = FORMAT_INTENT_TEST_LOCK
+            .lock()
+            .expect("format intent test lock");
+        let path = temp_loopback("format-intent-roundtrip");
+        let _ = std::fs::remove_file(format_intents_store_path());
+        let _ = std::fs::remove_file(format_audit_log_path());
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .expect("create loopback file");
+        file.set_len(16 * 1024 * 1024).expect("size loopback");
+        drop(file);
+
+        let intent = prepare_raw_blob_device_format(&path, false).expect("prepare format intent");
+        let status = format_raw_blob_device_with_intent(
+            &path,
+            false,
+            intent.nonce.as_str(),
+            intent.fingerprint.as_str(),
+        )
+        .expect("apply format intent");
+        assert_eq!(status.status, "managed");
+        assert!(status.device_id.is_some());
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format_intents_store_path());
+        let _ = std::fs::remove_file(format_audit_log_path());
+    }
+
+    #[test]
+    fn format_raw_blob_device_intent_rejects_mismatched_fingerprint() {
+        let _guard = FORMAT_INTENT_TEST_LOCK
+            .lock()
+            .expect("format intent test lock");
+        let path = temp_loopback("format-intent-mismatch");
+        let _ = std::fs::remove_file(format_intents_store_path());
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .expect("create loopback file");
+        file.set_len(16 * 1024 * 1024).expect("size loopback");
+        drop(file);
+
+        let intent = prepare_raw_blob_device_format(&path, false).expect("prepare format intent");
+        let err =
+            format_raw_blob_device_with_intent(&path, false, intent.nonce.as_str(), "deadbeef")
+                .expect_err("mismatch should be rejected");
+        assert!(
+            err.to_string()
+                .contains("does not match current device identity"),
+            "unexpected error: {}",
+            err
+        );
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format_intents_store_path());
     }
 
     #[test]

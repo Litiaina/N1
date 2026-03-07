@@ -11,6 +11,7 @@ use crate::{
     n1_core::constants::{METADATA_EXT, QUOTA_FILE},
     n1_core::{
         disk_manager::{ObjectMetadata, ObjectPathManager},
+        index,
         quota_manager::set_storage_used,
     },
     structs::auth_structs::Claims,
@@ -141,6 +142,22 @@ async fn calculate_usage_across_mirrors(fragment_hash: String) -> u64 {
     .unwrap_or(0)
 }
 
+async fn calculate_active_session_reservations(fragment_hash: &str) -> u64 {
+    match index::list_active_sessions(fragment_hash).await {
+        Ok(sessions) => sessions
+            .into_iter()
+            .map(|session| session.reservation.map(|r| r.amount).unwrap_or(0))
+            .sum(),
+        Err(e) => {
+            warn!(
+                "Failed to scan active upload reservations for {}: {}",
+                fragment_hash, e
+            );
+            0
+        }
+    }
+}
+
 async fn recover_fragment_name_from_disk(fragment_hash: String) -> Option<String> {
     let path_manager = ObjectPathManager::new();
     let index_roots = path_manager.get_all_index_roots();
@@ -201,7 +218,11 @@ pub async fn sync_quota() -> Result<(), Box<dyn Error + Send + Sync>> {
                     ensure_fragment_blob_directories(&fragment_hash).await;
                     sweep_fragment_gc_files(fragment_hash.clone()).await;
 
-                    let usage = calculate_usage_across_mirrors(fragment_hash.clone()).await;
+                    let committed_usage =
+                        calculate_usage_across_mirrors(fragment_hash.clone()).await;
+                    let active_reservations =
+                        calculate_active_session_reservations(&fragment_hash).await;
+                    let usage = committed_usage.saturating_add(active_reservations);
 
                     if let Err(e) = set_storage_used(&fragment_hash, usage).await {
                         warn!(
@@ -210,8 +231,12 @@ pub async fn sync_quota() -> Result<(), Box<dyn Error + Send + Sync>> {
                         );
                     } else {
                         info!(
-                            "Synced quota for Fragment '{}' (Hash: {}). Usage: {} bytes",
-                            readable_name, fragment_hash, usage
+                            "Synced quota for Fragment '{}' (Hash: {}). Usage: {} bytes (committed={} reserved={})",
+                            readable_name,
+                            fragment_hash,
+                            usage,
+                            committed_usage,
+                            active_reservations
                         );
                     }
                     count += 1;
@@ -234,25 +259,32 @@ pub async fn sync_single_fragment_quota(
 
     sweep_fragment_gc_files(fragment.clone()).await;
 
-    let calculated_usage = calculate_usage_across_mirrors(fragment.clone()).await;
+    let committed_usage = calculate_usage_across_mirrors(fragment.clone()).await;
+    let active_reservations = calculate_active_session_reservations(&fragment).await;
+    let calculated_usage = committed_usage.saturating_add(active_reservations);
 
     if let Err(e) = set_storage_used(&fragment, calculated_usage).await {
         warn!("Failed to update usage stats for {}: {}", fragment, e);
     }
 
-    info!("Fragment-specific quota sync completed for {}", fragment);
+    info!(
+        "Fragment-specific quota sync completed for {}. usage={} (committed={} reserved={})",
+        fragment, calculated_usage, committed_usage, active_reservations
+    );
     Ok(())
 }
 
 pub async fn initialize_storage(fragment_hash: String) -> Result<(), Box<dyn Error + Send + Sync>> {
     ensure_fragment_blob_directories(&fragment_hash).await;
 
-    let calculated_usage = calculate_usage_across_mirrors(fragment_hash.clone()).await;
+    let committed_usage = calculate_usage_across_mirrors(fragment_hash.clone()).await;
+    let active_reservations = calculate_active_session_reservations(&fragment_hash).await;
+    let calculated_usage = committed_usage.saturating_add(active_reservations);
     let _ = set_storage_used(&fragment_hash, calculated_usage).await;
 
     info!(
-        "Initialized storage structure for fragment {}",
-        &fragment_hash
+        "Initialized storage structure for fragment {}. usage={} (committed={} reserved={})",
+        &fragment_hash, calculated_usage, committed_usage, active_reservations
     );
     Ok(())
 }

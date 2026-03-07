@@ -36,9 +36,6 @@ pub static AUTH_KEY: LazyLock<String> =
 pub static MASTER_KEY: LazyLock<String> =
     LazyLock::new(|| env::var("MASTER_KEY").expect("MASTER_KEY must be set for authentication"));
 
-pub static ADMIN_KEY: LazyLock<String> =
-    LazyLock::new(|| env::var("ADMIN_KEY").expect("ADMIN_KEY must be set for authentication"));
-
 pub async fn validate_access(req: Request<Body>, next: Next) -> Result<Response, AuthError> {
     let header = req.headers().get("authorization");
     let token = match header {
@@ -69,11 +66,7 @@ pub async fn authorize_fragment(
         return Err(AuthError::MissingCredentials);
     }
 
-    if payload.fragment == *ADMIN_KEY {
-        if payload.secret != *MASTER_KEY {
-            return Err(AuthError::WrongCredentials);
-        }
-    } else {
+    if payload.secret != *MASTER_KEY {
         match does_fragment_exist(&payload.fragment).await {
             true => {}
             false => return Err(AuthError::FragmentNotFound),
@@ -313,18 +306,16 @@ mod tests {
         if std::env::var("MASTER_KEY").is_err() {
             unsafe { std::env::set_var("MASTER_KEY", "test-master-key") };
         }
-        if std::env::var("ADMIN_KEY").is_err() {
-            unsafe { std::env::set_var("ADMIN_KEY", "test-admin-fragment") };
-        }
     }
 
     #[tokio::test]
-    async fn admin_fragment_accepts_master_key_and_mints_admin_claim() {
+    async fn master_key_accepts_any_auth_fragment_and_mints_claim() {
         let _guard = env_guard().lock().expect("env guard");
         ensure_test_env();
 
+        let requested_fragment = "test-admin-context-fragment".to_string();
         let payload = AuthorizationRequest {
-            fragment: ADMIN_KEY.clone(),
+            fragment: requested_fragment.clone(),
             secret: MASTER_KEY.clone(),
             read: true,
             write: true,
@@ -344,7 +335,7 @@ mod tests {
             &Validation::default(),
         )
         .expect("decode token");
-        assert_eq!(decoded.claims.fragment, *ADMIN_KEY);
+        assert_eq!(decoded.claims.fragment, requested_fragment);
         assert!(decoded.claims.read);
         assert!(decoded.claims.write);
         assert!(decoded.claims.modify);
@@ -352,12 +343,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_fragment_rejects_non_master_secret() {
+    async fn empty_fragment_is_rejected_before_auth_mode_selection() {
         let _guard = env_guard().lock().expect("env guard");
         ensure_test_env();
 
         let payload = AuthorizationRequest {
-            fragment: ADMIN_KEY.clone(),
+            fragment: String::new(),
             secret: "not-master".to_string(),
             read: true,
             write: true,
@@ -367,6 +358,6 @@ mod tests {
         };
 
         let res = authorize_fragment(Json(payload)).await;
-        assert!(matches!(res, Err(AuthError::WrongCredentials)));
+        assert!(matches!(res, Err(AuthError::MissingCredentials)));
     }
 }
