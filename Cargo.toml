@@ -1,5 +1,5 @@
 [workspace]
-members = ["block_manager", "monilith", "standard", "server_cli", "simd-erasure-core"]
+members = ["block_manager", "arc", "standard", "server_cli", "simd-erasure-core"]
 resolver = "2"
 
 [profile.release]

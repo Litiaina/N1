@@ -2,7 +2,7 @@
 
 > Deployment profile status (2026-03-08):
 > - `standard` (`litiaina-n1-standard`) is the stable/default profile.
-> - `monilith` is experimental.
+> - `arc` is experimental.
 > - See `DEPLOYMENT_PROFILES.md`.
 
 This guide covers both ways to expose N1 as a network drive:
@@ -14,7 +14,7 @@ This guide covers both ways to expose N1 as a network drive:
 
 `smb` is SMB-lite, not full enterprise SMB.
 
-Implemented in `standard/src/smb/server.rs` (stable profile), with mirrored experimental development under `monilith/src/smb/server.rs`:
+Implemented in `standard/src/smb/server.rs` (stable profile), with mirrored experimental development under `arc/src/smb/server.rs`:
 - auth + signing
 - `list/read/open`
 - query-directory / query-info metadata paths
@@ -207,8 +207,8 @@ cargo test -p standard smb::server::tests -- --nocapture
 cargo test -p standard -- --nocapture
 ```
 
-Experimental monolith track verification:
+Experimental arc track verification:
 
 ```bash
-cargo check -p monilith
+cargo check -p arc
 ```

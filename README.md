@@ -8,8 +8,9 @@
   <h1>Litiaina N1</h1>
   <p>
     Fragment-centric object storage engine with partitioned <code>index</code> metadata
-    authority, a derived namespace index, and a direct-I/O blob plane, built for strict crash
-    safety and survivable single-node durability.
+    authority and a derived namespace index, with profile-specific blob backends
+    (filesystem-backed standard, raw arc), built for strict crash safety and survivable
+    single-node durability.
   </p>
 </div>
 
@@ -17,12 +18,13 @@
 
 > Deployment profile status (2026-03-08):
 > - `standard` (`litiaina-n1-standard`) is the stable and recommended deployment path.
-> - `monilith` (`litiaina-n1-monilith`) is experimental.
+> - `arc` (`litiaina-n1-arc`) is experimental.
 > - See `DEPLOYMENT_PROFILES.md` for the profile split and architecture guidance.
 
 ## Table of Contents
 
 - [What is N1 (index architecture)](#what-is-n1-index-architecture)
+- [Profile Distinction And Disk Layout (Authoritative)](#profile-distinction-and-disk-layout-authoritative)
 - [What N1 Is (Truth Statement)](#what-n1-is-truth-statement)
 - [Design principles](#design-principles)
 - [Core concepts](#core-concepts)
@@ -45,7 +47,7 @@
   - [Recovery runtime (read and heal)](#recovery-runtime-read-and-heal)
   - [Redistribution](#redistribution)
   - [Garbage collection and trash](#garbage-collection-and-trash)
-  - [Raw blob operations](#raw-blob-operations)
+  - [Raw blob operations](#raw-blob-operations-Arc-only)
 - [Why `index` is future-proof](#why-index-is-future-proof)
 - [Operational notes](#operational-notes)
   - [Linux-first + O_DIRECT](#linux-first--o_direct)
@@ -63,16 +65,29 @@
 
 For SMB network-drive deployment, see `NETWORK_DRIVE.md`.
 N1 ships with native SMB-lite via `fsgwd`, with `fsd_mount + Samba` kept as fallback.
-For raw blob device setup and operator steps, see `DEPLOYMENT.md`.
+For deployment and operator steps, see `DEPLOYMENT.md`.
 For stable-vs-experimental profile guidance, see `DEPLOYMENT_PROFILES.md`.
-For explicit raw blob initialization, use the two-step safety flow:
+
+Stable/default `standard` deployment (production):
+- `index_store_disks` and `blob_store_disks` are directory paths.
+- Do not run raw disk format commands.
+
+```ini
+[disk_config]
+index_store_disks=/srv/n1/index0,/srv/n1/index1
+blob_store_disks=/srv/n1/blob0,/srv/n1/blob1
+```
+
+Experimental `arc` raw media initialization:
+- `format-blob-device` and `format-index-device` are Arc-only commands.
+- Use the arc binary for the two-step safety flow.
 
 ```bash
-sudo target/release/litiaina-n1-standard format-blob-device \
+sudo target/release/litiaina-n1-arc format-blob-device \
   --path /dev/disk/by-id/... \
   --prepare
 
-sudo target/release/litiaina-n1-standard format-blob-device \
+sudo target/release/litiaina-n1-arc format-blob-device \
   --path /dev/disk/by-id/... \
   --nonce <nonce-from-prepare> \
   --fingerprint <fingerprint-from-prepare>
@@ -81,11 +96,11 @@ sudo target/release/litiaina-n1-standard format-blob-device \
 For raw index media pre-formatting (kernel-track), use the matching flow:
 
 ```bash
-sudo target/release/litiaina-n1-standard format-index-device \
+sudo target/release/litiaina-n1-arc format-index-device \
   --path /dev/disk/by-id/... \
   --prepare
 
-sudo target/release/litiaina-n1-standard format-index-device \
+sudo target/release/litiaina-n1-arc format-index-device \
   --path /dev/disk/by-id/... \
   --nonce <nonce-from-prepare> \
   --fingerprint <fingerprint-from-prepare>
@@ -93,19 +108,72 @@ sudo target/release/litiaina-n1-standard format-index-device \
 
 Profile note:
 - `profiles/n1/high-hw.ini` is for multi-disk, high-parallelism deployments.
-- `profiles/n1/single-raw-nvme.ini` is the better starting point for one raw Linux-owned NVMe blob device.
+- `profiles/n1/single-raw-nvme.ini` is arc-oriented and is the better starting point for one raw Linux-owned NVMe blob device.
 
 ## Release Status
 
-- N1 `0.3.0` is the architecture-freeze line.
-- The storage model is frozen at this point:
-  - raw direct-I/O blob plane
+- `standard` is the stable/default deployment profile at `0.4.0`.
+- `arc` is the experimental profile at `0.1.0`.
+- Stable architecture baseline (`standard`):
   - filesystem-backed authoritative `index`
+  - filesystem-backed `blob_store_disks` shard layout (directory roots)
   - partitioned + replicated metadata
   - projected prefix namespace serving
+- Arc is the kernel-track profile and remains under active raw index/blob development.
 - The HTTP/API surface is **not** frozen yet. Route shapes, request fields, and operational endpoints may still change before `1.0.0`.
-- `1.0.0` is reserved for the post-freeze stabilization release, not for the architecture-freeze point itself.
-- Multipart upload crash safety now includes a durable pending-part receipt on the index side so orphaned raw extents can be reclaimed without relying on memory state.
+
+## Profile Distinction And Disk Layout (Authoritative)
+
+| Dimension | Standard (`litiaina-n1-standard`) | Arc (`litiaina-n1-arc`) |
+|---|---|---|
+| Status | Stable / production default | Experimental |
+| `index_store_disks` | Filesystem directories | Filesystem directories |
+| `blob_store_disks` | Filesystem directories | Raw block devices / loopback files |
+| Index metadata backend | Partitioned filesystem metadata | Partitioned filesystem metadata (current) |
+| Blob payload backend | Shard files on blob roots | Raw extent allocator (`block_manager`) |
+| Raw format commands | Not used | Required for explicit raw media prep |
+
+### Standard Disk Layout (Current)
+
+```text
+{INDEX_ROOT}/{fragment}/index/partitions/{partition_id}/
+  wal/manifest.msgpack
+  wal/segments/{segment_id}.wal
+  checkpoints/latest.msgpack
+  sessions/{version_id}.session.msgpack
+  objects/{hh}/{object_key_sha256}/{version_id}.msgpack
+  objects/{hh}/{object_key_sha256}/latest.latest.msgpack
+  trash/{hh}/{object_key_sha256}/{version_id}.msgpack
+  trash/{hh}/{object_key_sha256}/latest.latest.msgpack
+
+{BLOB_ROOT}/{fragment}/blob/{version_id}/
+  part_{p}_shard_{i}.shard
+  part_{p}_shard_{i}.parity
+
+{BLOB_ROOT}/{fragment}/.trash/blob/{version_id}/...
+```
+
+### Arc Disk Layout (Current)
+
+```text
+{INDEX_ROOT}/{fragment}/index/partitions/{partition_id}/
+  wal/manifest.msgpack
+  wal/segments/{segment_id}.wal
+  checkpoints/latest.msgpack
+  sessions/{version_id}.session.msgpack
+  objects/{hh}/{object_key_sha256}/{version_id}.msgpack
+  objects/{hh}/{object_key_sha256}/latest.latest.msgpack
+  trash/{hh}/{object_key_sha256}/{version_id}.msgpack
+  trash/{hh}/{object_key_sha256}/latest.latest.msgpack
+
+{RAW_BLOB_DEVICE}
+  block-manager superblock + journals + allocation groups
+  extents addressed as raw://{device_id}/{allocation_id}
+```
+
+Arc note:
+- Index is still filesystem-backed today.
+- Raw index media is an experimental target track, not current stable behavior.
 
 ## What is N1 (index architecture)
 
@@ -113,7 +181,9 @@ Profile note:
 
 - a partitioned filesystem-backed metadata authority in `index`
 - a derived prefix namespace index for fast `LIST`
-- a direct-I/O blob plane on raw devices
+- a profile-specific blob backend:
+  - `standard`: filesystem-backed shard files under blob roots
+  - `arc`: raw-device/direct-I/O blob plane (experimental)
 
 This is the architectural shift from the legacy node: object and session truth are no longer stored as a whole-node mirrored tree on every index root. Instead, metadata authority is partitioned by hash onto a small selected set of roots.
 
@@ -126,7 +196,7 @@ N1 is designed for environments where you want:
 
 ## What N1 Is (Truth Statement)
 
-N1 is a **fragment-scoped object storage engine with partitioned metadata authority and a direct-I/O blob backend** for single-node multi-disk deployments where:
+N1 is a **fragment-scoped object storage engine with partitioned metadata authority and a profile-specific blob backend** for single-node multi-disk deployments where:
 
 - **high availability** during maintenance matters
 - **durability** matters across index-root and blob-device failures
@@ -148,7 +218,7 @@ N1's core identity is a specialized object-storage engine: authoritative on-disk
 Both variants exist by design so operators can choose deployment style without changing object semantics:
 
 - `standard`: filesystem-backed N1 for general-purpose deployments where operational simplicity and broad hardware compatibility are the priority.
-- `monilith`: raw-device/block-manager-backed N1 for operators that want absolute device control and the highest performance ceiling.
+- `arc`: raw-device/block-manager-backed N1 for operators that want absolute device control and the highest performance ceiling.
 
 Both keep the same core behavior contracts (init/chunk/finalize semantics, immutable versions, repair/redistribution/GC guarantees). The choice is execution substrate and operational envelope, not storage correctness model.
 
@@ -166,9 +236,11 @@ N1 is **not** "user multi-tenant storage" anymore. The isolation boundary is a *
 
 ## Design principles
 
-### 1) Partitioned metadata authority, direct-I/O blob plane
+### 1) Partitioned metadata authority, profile-specific blob plane
 
-N1 keeps authoritative metadata on mounted index filesystems, but that authority now lives in `index` partitions instead of a full mirrored tree on every root. Blob payloads remain on raw, unformatted, unmounted devices managed directly by N1.
+N1 keeps authoritative metadata on mounted index filesystems, but that authority now lives in `index` partitions instead of a full mirrored tree on every root. Blob payload backend depends on profile:
+- `standard`: shard files under configured blob root directories.
+- `arc`: raw, unformatted, unmounted devices managed directly by N1.
 
 **Result:** the node keeps an inspectable on-disk layout while bounding metadata write fanout.
 
@@ -232,7 +304,7 @@ That routed session state holds:
 
 - upload manifest
 - optional reservation receipt
-- optional deterministic raw-slot plan for each expected part
+- optional upload geometry hints (arc may pre-reserve raw slots)
 - finalized or aborted state
 
 Committed multipart progress is not kept as shared in-memory/session-WAL part state. Each committed part is represented by its own durable part metadata receipt on the routed session roots.
@@ -249,7 +321,7 @@ A partition is the placement unit for authoritative metadata:
 
 ### Shard
 
-Each multipart part is encoded into data and parity shards whose payloads are committed to raw blob extents.
+Each multipart part is encoded into data and parity shards whose payloads are committed to the active blob substrate (filesystem files in `standard`, raw extents in `arc`).
 
 ---
 
@@ -282,8 +354,10 @@ It is performance-critical, but not correctness-critical.
 
 ### Blob plane
 
-The blob plane stores payload shards on raw devices:
+The blob plane stores payload shards on the profile-selected substrate:
 
+- `standard`: filesystem-backed shard files under blob roots
+- `arc`: raw devices and extent allocation (experimental)
 - RS-encoded data + parity shards
 - deterministic placement
 - degraded reads via reconstruction
@@ -293,7 +367,7 @@ The blob plane stores payload shards on raw devices:
 
 ## On-disk layout
 
-### `index` partitions
+### `index` partitions (both standard and arc today)
 
 The authoritative metadata shape is:
 
@@ -331,11 +405,17 @@ Prefix-serving state remains under the prefix tree on index disks:
 
 These are serving segments only. If they are missing or stale, the node can rebuild them from `index`.
 
-### Blob storage
+### Blob storage (`standard`)
 
-- `blob_store_disks` point at raw device paths such as `/dev/nvme1n1`
-- committed shard metadata stores `raw://<device_id>/<allocation_id>` addresses
-- startup rejects mounted blob devices and warns on unstable names like `/dev/sdb`
+- `blob_store_disks` point at mounted directory paths (for example `/srv/n1/blob0`)
+- payload shards are files: `part_{p}_shard_{i}.shard|.parity`
+- trash payloads move under `{BLOB_ROOT}/{fragment}/.trash/blob/{version_id}/...`
+
+### Blob storage (`arc`, experimental)
+
+- `blob_store_disks` point at raw device paths (for example `/dev/disk/by-id/...`)
+- shard metadata stores raw extent addresses (`raw://<device_id>/<allocation_id>`)
+- arc startup rejects mounted blob devices and warns on unstable names like `/dev/sdb`
 
 **Deterministic placement rule (typical):**
 
@@ -351,7 +431,7 @@ Initiate does:
 - validate fragment scope
 - reserve quota
 - create `version_id` and `session_id`
-- optionally pre-reserve deterministic raw shard slots when the client provides `part_size_bytes` or `part_sizes_bytes`
+- optionally freeze upload geometry when the client provides `part_size_bytes` or `part_sizes_bytes`
 - open authoritative session state in `index`
 
 At this point no object version is visible.
@@ -361,11 +441,10 @@ At this point no object version is visible.
 Part upload remains strict and payload-first:
 
 1. stream request bytes through the RS encoder
-2. reuse preplanned raw extents when geometry was frozen at init, otherwise reserve raw extents
+2. place shard payloads using the active backend (`standard` file paths, `arc` raw extents)
 3. write and verify shard payloads
-4. commit shard payloads into raw blob extents
-5. build `PartMetadata`
-6. atomically write the independent part metadata receipt on the routed session roots
+4. build `PartMetadata`
+5. atomically write the independent part metadata receipt on the routed session roots
 
 Upload status, resume checks, and finalize read the committed part receipts from disk. The session manifest remains the authoritative upload manifest; per-part truth lives in durable receipt files, not in a shared multipart coordinator.
 
@@ -391,17 +470,16 @@ This is the mental model N1 is built around now.
 
 You may see:
 
-- a durable pending-part receipt
-- raw extents that were reserved or partially written
+- partial shard payload files/extents
 - no committed part metadata yet
 
-The part is not complete because committed part metadata does not claim it yet. GC or cancel can reclaim the raw extents by following the pending receipt.
+The part is not complete because committed part metadata does not claim it yet. GC or cancel can reclaim orphaned payload artifacts.
 
 ### Crash after session part commit but before finalize
 
 You may see:
 
-- committed raw extents
+- committed shard payload artifacts
 - committed part metadata on disk
 - no published object version
 
@@ -423,8 +501,8 @@ You may see:
 Exact-key reads are driven by `index`:
 
 1. resolve the latest or requested version from the object's partition
-2. map the requested range onto parts and shard extents
-3. read shard chunks directly from raw blob devices
+2. map the requested range onto parts and shard locations
+3. read shard chunks from the active backend (files in `standard`, raw devices in `arc`)
 4. reconstruct missing data when parity allows
 
 Prefix and delimiter listing use the prefix namespace index first. If prefix projection is still pending, or if prefix-serving state is missing or insufficient, the node falls back to authoritative `index` scans for the requested prefix rather than a legacy mirrored object tree.
@@ -451,7 +529,7 @@ For authoritative metadata:
 
 A version becomes exact-key visible only after:
 
-- raw shard commit succeeds
+- shard payload commit succeeds
 - session part state is committed
 - `index` publishes the object version
 
@@ -496,7 +574,7 @@ Reads can degrade gracefully. When a shard is missing or corrupt:
 
 - serve bytes by reconstructing them
 - repair the missing shard immediately when this read owns the repair token
-- commit repaired payload to a new raw extent
+- commit repaired payload to a new backend location (file path in `standard`, raw extent in `arc`)
 - preserve authoritative metadata through `index`
 
 ### Redistribution
@@ -504,9 +582,9 @@ Reads can degrade gracefully. When a shard is missing or corrupt:
 Redistribution moves payloads to new blob placement without interrupting CRUD:
 
 - read from current placement
-- write to new raw extents
+- write to new backend placement
 - republish shard addresses through `index`
-- leave old extents for later GC
+- leave old payload artifacts for later GC
 
 Redistribution scopes:
 
@@ -531,9 +609,9 @@ N1 still favors safety:
 - delete moves versions into trash state
 - destructive deletion is handled by GC
 - abandoned sessions are cleaned through `index`
-- raw payload without authoritative metadata is cleanup candidate data
+- payload artifacts without authoritative metadata are cleanup candidate data
 
-### Raw blob operations
+### Raw blob operations (`arc` only)
 
 - `GET /v4/maintenance/blob/raw/status` reports device and allocator state
 - scrub verifies committed raw payload
@@ -570,8 +648,8 @@ N1 is Linux-first and uses `O_DIRECT` on the blob data path for predictable late
 
 This applies to:
 
-- filesystem-backed staging where needed
-- raw blob devices managed directly by `block_manager`
+- filesystem-backed blob/staging writes in `standard` where direct-IO constraints are met
+- raw blob devices managed directly by `block_manager` in `arc`
 
 Metadata, quota state, `index`, and prefix-serving files remain filesystem-backed and buffered by design.
 
@@ -599,7 +677,7 @@ N1 CLI is available in both server binaries and uses `server_cli` as the command
 
 Workspace server variants:
 - `standard` (stable/default): filesystem-backed N1 (`standard/src/main.rs`) for general-purpose deployments, with partitioned index roots under `index/partitions/<pid>/...` and directory-only `index_store_disks` / `blob_store_disks`.
-- `monilith` (experimental): raw-device/block-manager-backed N1 kernel-track runtime.
+- `arc` (experimental): raw-device/block-manager-backed N1 kernel-track runtime.
 
 ### How to run the CLI
 
@@ -609,17 +687,17 @@ Use the stable/default profile:
 cargo run -p standard -- <command> [flags]
 ```
 
-Experimental monolith profile:
+Experimental Arc profile:
 
 ```bash
-cargo run -p monilith -- <command> [flags]
+cargo run -p arc -- <command> [flags]
 ```
 
 Built binaries:
 
 ```bash
 ./target/release/litiaina-n1-standard <command> [flags]
-./target/release/litiaina-n1-monilith <command> [flags] # experimental
+./target/release/litiaina-n1-arc <command> [flags] # experimental
 ```
 
 Server mode:
@@ -888,12 +966,12 @@ For pre-release hardening on target hardware, use:
 
 `scripts/bench/run_release_drills.sh`
 
-It runs the release-critical raw/repair workflows:
+It runs the release-critical storage/repair workflows:
 
 - active multipart upload + resume while one replica index disk is down
-- raw blob CRUD + delete/recover/permanent delete
-- raw blob quota drift reconvergence across redistribution, trash, GC, and sync
-- raw blob redistribution + repair + recovered read + GC marker cleanup
+- blob CRUD + delete/recover/permanent delete
+- blob quota drift reconvergence across redistribution, trash, GC, and sync
+- blob redistribution + repair + recovered read + GC marker cleanup
 - index mirror repair convergence
 - HA repair reconvergence with an index disk down
 

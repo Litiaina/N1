@@ -11,21 +11,21 @@
 
 > Deployment profile status (2026-03-08):
 > - `standard` is stable and default.
-> - `monilith` is experimental.
+> - `arc` is experimental.
 > - See `DEPLOYMENT_PROFILES.md`.
 >
 > Source of truth for routing (stable): `standard/src/routes/storage_routes.rs`.
-> Monolith route parity path (experimental): `monilith/src/routes/storage_routes.rs`.
+> Arc route parity path (experimental): `arc/src/routes/storage_routes.rs`.
 > Source of truth for request/response behavior (stable): handler files under `standard/src/n1_core`.
 
 > Storage backend note:
-> - `index_store_disks` must be mounted filesystem paths.
-> - `blob_store_disks` are raw, unformatted, unmounted device paths managed directly by N1.
-> - Blob payload I/O uses `O_DIRECT`; metadata and control files stay filesystem-backed.
+> - `standard` (stable): `index_store_disks` and `blob_store_disks` are mounted filesystem paths (directory roots).
+> - `arc` (experimental): `index_store_disks` are filesystem paths; `blob_store_disks` are raw, unformatted, unmounted device paths managed directly by N1.
+> - Direct I/O (`O_DIRECT`) is used on the blob write path where supported, but payload substrate differs by profile (filesystem files in standard, raw extents in arc).
 
 > Engine profile note:
 > - `standard` is the stable/default profile for general-purpose filesystem-backed deployments.
-> - `monilith` is experimental for raw-device absolute control and maximum performance development.
+> - `arc` is experimental for raw-device absolute control and maximum performance development.
 > - Both variants are intended to keep the same object/API semantics; the difference is backend execution model and operations envelope.
 
 > Metadata architecture note:
@@ -42,9 +42,40 @@
 > - Multipart uploads do not rely on in-memory part state for resumability. Part commits are durably recorded in the `index` WAL/session state and mirrored as per-part metadata files for compatibility and recovery workflows.
 
 > Release status note:
-> - N1 `0.3.0` freezes the storage architecture, not the public API surface.
+> - N1 `standard` is stable at `0.4.0`; `arc` is experimental at `0.1.0`.
 > - This document describes the current implementation and current routes.
 > - Request/response details and endpoint layout may still change before `1.0.0` even though the underlying storage model is now fixed.
+
+## 0. Profile Distinction And Disk Layout
+
+| Dimension | Standard (`litiaina-n1-standard`) | Arc (`litiaina-n1-arc`) |
+|---|---|---|
+| Status | Stable / default | Experimental |
+| API source of truth | Yes (`standard/src/routes/storage_routes.rs`) | Parity track only |
+| `index_store_disks` | Filesystem directories | Filesystem directories |
+| `blob_store_disks` | Filesystem directories | Raw devices / loopback files |
+| Index metadata layout | Partitioned filesystem index | Partitioned filesystem index (current) |
+| Blob payload layout | Shard files on blob roots | Raw extents via `block_manager` |
+
+Standard disk layout:
+
+```text
+{INDEX_ROOT}/{fragment}/index/partitions/{partition_id}/...
+{BLOB_ROOT}/{fragment}/blob/{version_id}/part_{p}_shard_{i}.shard|.parity
+{BLOB_ROOT}/{fragment}/.trash/blob/{version_id}/...
+```
+
+Arc disk layout:
+
+```text
+{INDEX_ROOT}/{fragment}/index/partitions/{partition_id}/...
+{RAW_BLOB_DEVICE} -> block_manager superblock/journals/allocation groups
+payload address: raw://{device_id}/{allocation_id}
+```
+
+Arc index note:
+- Arc index is still filesystem-backed today.
+- Raw index media is an experimental direction, not current stable behavior.
 
 ## 1. Base URL And Conventions
 - Base URL example: `https://127.0.0.1:50001`
@@ -492,9 +523,8 @@ Body:
 
 Behavior:
 - Opens the authoritative multipart session in `index`.
-- The node now derives deterministic part geometry at init and pre-reserves raw shard slots up front.
-- Explicit geometry (`part_size_bytes` / `part_sizes_bytes`) is strict.
-- Inferred geometry (from `total_size_bytes` + `expected_parts`) is soft for part-byte equality, but still bounded by reserved shard stripe capacity.
+- Persists upload manifest/session state on index roots.
+- Explicit geometry (`part_size_bytes` / `part_sizes_bytes`) is accepted when provided by the client.
 
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
@@ -516,9 +546,10 @@ Durability default:
 - Upload I/O gating follows `[upload_config].upload_io_gate_enabled` (`true` by default) unless overridden by `io_gate`.
 
 Notes:
-- Part upload writes a durable pending-part receipt, commits raw shard payload, persists part metadata on disk, then records the part commit in `index` session WAL/state.
+- Part upload commits shard payload, persists part metadata on disk, then records committed-part state in `index` session state.
 - The upload hot path does not rely on in-memory part state for resumability.
-- Part upload reuses pre-reserved raw shard slots from init instead of allocating new extents on the hot path.
+- In `standard`, shards are written as files under blob root directories.
+- In `arc`, shards are committed to raw extents.
 - Multipart part commits are unordered across distinct `part_index` values.
 - Client coordination should keep one logical writer per `(version_id, part_index)` and use upload-status checks for stateless resume.
 - A successful part upload does not publish object visibility by itself.
@@ -674,7 +705,7 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
 - `POST /v4/maintenance/scrub/stop`
 - `GET /v4/maintenance/scrub/status`
 
-Scrub runs the repair engine in checksum-verification mode against committed raw shards.
+Scrub runs the repair engine in checksum-verification mode against committed shards.
 
 Notes:
 - Scrub is the quiesced/offline execution mode of the repair engine.
@@ -737,8 +768,12 @@ curl -k -X PATCH -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/maintenance/redistribution/stop"
 ```
 
-### 9.6 Raw blob status endpoint
+### 9.6 Raw blob status endpoint (arc only)
 `GET /v4/maintenance/blob/raw/status`
+
+Notes:
+- This endpoint is exposed in arc.
+- Standard route set does not expose `/v4/maintenance/blob/raw/status`.
 
 Reports one row per configured blob device:
 
@@ -819,7 +854,7 @@ curl -k -X GET -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/maintenance/health?deep_scan=true"
 ```
 
-### 9.9 Hotplug HA Validation and Deploy Checklist
+### 9.9 Hotplug HA Validation and Deploy Checklist (arc raw-blob validation)
 Validated on March 5, 2026 (real hardware, raw blob devices, hot-unplug and reattach cycle).
 
 Validated outcomes:

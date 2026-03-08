@@ -2,28 +2,30 @@
 
 > Deployment profile status (2026-03-08):
 > - `standard` is stable and the default deployment profile.
-> - `monilith` is experimental.
+> - `arc` is experimental.
 > - See `DEPLOYMENT_PROFILES.md`.
 
 N1 is a single-node object storage engine with three distinct planes:
 
 - `index` is the authoritative object, session, and trash metadata plane.
 - The prefix namespace index is a derived serving accelerator for `LIST prefix` and `delimiter=/`.
-- The blob plane stores payload shards on raw devices through direct I/O.
+- The blob plane is profile-specific:
+  - `standard`: filesystem-backed shard files under blob roots.
+  - `arc`: raw-device/direct-I/O payload plane (experimental).
 
 This replaces the legacy "full mirrored metadata tree on every index root" model. The node is still single-node, but its metadata authority is now partitioned instead of whole-node mirrored.
 
 ## Freeze Status
 
-The N1 architecture is frozen at version `0.3.0`.
+The stable N1 architecture baseline is `standard 0.4.0` (`arc 0.1.0` remains experimental).
 
-That freeze applies to the storage model:
+That baseline applies to:
 
-- raw direct-I/O blob devices
 - filesystem-backed authoritative `index`
 - partitioned + replicated metadata ownership
 - projected namespace serving derived from `index`
 - stateless resumability through authoritative session state
+- profile-specific payload substrate (`standard` filesystem-backed blob roots, `arc` raw blob devices)
 
 It does **not** freeze the HTTP/API surface yet. API and operational route details can still change before `1.0.0` while the core storage architecture stays fixed.
 
@@ -39,13 +41,25 @@ N1 is intentionally a specialized object-storage engine, not a general filesyste
 Two server variants exist so users can choose deployment posture:
 
 - `standard`: filesystem-backed N1 for general-purpose use and broad hardware compatibility.
-- `monilith`: raw-device/direct-I/O N1 for absolute device control and maximum throughput ceiling (experimental).
+- `arc`: raw-device/direct-I/O N1 for absolute device control and maximum throughput ceiling (experimental).
 
 They are expected to keep the same storage semantics. The difference is backend execution model and operational profile, not object correctness guarantees.
 
-### Monolith Raw-Index Direction
+## Profile Distinction (Current Runtime Truth)
 
-Monolith development is now targeting a raw-only storage-kernel model (`index` + `blob` both on raw devices). The staged structure and migration gates are defined in [`MONOLITH_RAW_KERNEL_PLAN.md`](MONOLITH_RAW_KERNEL_PLAN.md).
+| Dimension | Standard | Arc |
+|---|---|---|
+| Status | Stable/default | Experimental |
+| `index_store_disks` | Filesystem directories | Filesystem directories |
+| `blob_store_disks` | Filesystem directories | Raw devices |
+| Index backend | Partitioned filesystem metadata | Partitioned filesystem metadata (current) |
+| Blob backend | Filesystem shard files | Raw extent allocator (`block_manager`) |
+
+Arc raw-index direction remains a future track; current arc index is still filesystem-backed.
+
+### Arc Raw-Index Direction
+
+Arc development is now targeting a raw-only storage-kernel model (`index` + `blob` both on raw devices). The staged structure and migration gates are defined in [`ARC_RAW_KERNEL_PLAN.md`](ARC_RAW_KERNEL_PLAN.md).
 
 ## Platform Truth
 
@@ -54,7 +68,7 @@ Monolith development is now targeting a raw-only storage-kernel model (`index` +
 - Session state is partitioned separately by `fragment + version_id`, which keeps resumable upload state bounded to the session's selected roots.
 - Multipart part truth stays on disk: part uploads write durable part metadata, and a pending-part receipt covers the crash window before that metadata exists.
 - The prefix index is not the source of truth. It is a rebuildable namespace-serving structure with inline list payload.
-- Raw blob extents are payload durability only. They do not make an object visible until `index` publishes the version.
+- Blob payload durability (file shards in standard, raw extents in arc) does not make an object visible until `index` publishes the version.
 
 ## Why The Legacy Mirrored Index Had To Go
 
@@ -92,11 +106,11 @@ Prefix rows now carry inline list metadata, and the namespace plane is projected
 
 ### 3. Blob plane
 
-Blob payloads live on raw, unformatted blob devices managed by the node:
+Blob payload substrate depends on profile:
 
-- multipart parts are RS-encoded into data and parity shards
-- shard payloads are committed to raw extents
-- repaired or redistributed payloads publish new raw extent addresses through authoritative metadata updates
+- `standard`: multipart parts are RS-encoded into shard files under configured blob root directories.
+- `arc`: multipart parts are RS-encoded and committed to raw extents on managed blob devices.
+- In both profiles, repaired or redistributed payload placement is published through authoritative metadata updates.
 
 ## On-Disk Layout
 
@@ -147,14 +161,37 @@ This plane stores projected namespace snapshots only. It can be rebuilt from `in
 
 The payload plane remains:
 
-- raw blob devices managed by `block_manager`
-- shard addresses recorded as `raw://<device_id>/<allocation_id>` with topology epoch metadata
-- direct-I/O writes and reads on the blob path
+- `standard`: filesystem-backed blob roots with shard files
+- `arc`: raw blob devices managed by `block_manager`
+- shard locations are recorded in metadata using the active backend representation
+- direct-I/O writes and reads are applied on the blob path where supported by the active backend
+
+Standard blob layout:
+
+```text
+{BLOB_ROOT}/{fragment}/blob/{version_id}/
+  part_{p}_shard_{i}.shard
+  part_{p}_shard_{i}.parity
+
+{BLOB_ROOT}/{fragment}/.trash/blob/{version_id}/...
+```
+
+Arc blob layout:
+
+```text
+{RAW_BLOB_DEVICE}
+  block-manager superblock + journals + allocation groups
+  shard payload addressed as raw://{device_id}/{allocation_id}
+```
+
+Arc index note:
+- Index is still filesystem-backed in the current runtime.
+- Raw index media remains an experimental migration target.
 
 Allocator design note:
 - The target allocator architecture and rollout plan are defined in [`BLOCK_ALLOCATOR_V2.md`](BLOCK_ALLOCATOR_V2.md).
 - Current allocator journals are txid-stamped and replay is idempotent.
-- Large raw free workloads are deferred and applied by a bounded background worker to keep foreground paths predictable.
+- Large free workloads are deferred and applied by a bounded background worker to keep foreground paths predictable.
 
 ## Write Path
 
@@ -174,7 +211,7 @@ At this stage no object is visible.
 Part upload is still payload-first:
 
 1. stream bytes through RS encode
-2. write bytes directly into pre-reserved raw shard extents from init geometry
+2. write bytes to the active payload backend (`standard` shard files, `arc` raw extents)
 3. commit part metadata and session part state
 4. build `PartMetadata`
 5. update the session's `index` state with the committed part
@@ -183,7 +220,7 @@ This keeps metadata small and bounded: blob payload durability and part-session 
 
 Upload geometry behavior:
 - Explicit geometry (`part_size_bytes` / `part_sizes_bytes`) is strict.
-- If geometry is not supplied, init derives deterministic geometry from `total_size_bytes + expected_parts` and pre-reserves shard capacity so chunk uploads avoid allocate/free on the hot path.
+- If geometry is not supplied, init derives deterministic geometry from `total_size_bytes + expected_parts` for bounded shard writes.
 
 ### 3. Finalize upload
 
@@ -201,7 +238,7 @@ For the current index model, the owner root is the synchronous publish boundary.
 
 ### Crash matrix
 
-- Crash before part state commit: raw extents may exist, but no session part state means the part is not complete.
+- Crash before part state commit: partial payload artifacts may exist, but no session part state means the part is not complete.
 - Crash after part state commit but before finalize: the upload is resumable and still not visible.
 - Crash after version publish but before prefix maintenance catches up: `GET` and `HEAD` are correct through `index`; `LIST` can serve from existing prefix rows or rebuild from authoritative metadata.
 

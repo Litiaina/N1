@@ -1,10 +1,10 @@
 [package]
-name = "monilith"
+name = "arc"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "litiaina-n1-monilith"
+name = "litiaina-n1-arc"
 path = "src/main.rs"
 
 [dependencies]

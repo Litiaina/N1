@@ -30,15 +30,15 @@ Desktop.ini
 .env
 .env.*
 n1.env
-monilith/n1.env
+arc/n1.env
 standard/n1.env
 
 # Config variables
 config.ini
 n1_config.ini
 .ini.*
-monilith/n1_config.ini
-monilith/n1_config.ini.bak.*
+arc/n1_config.ini
+arc/n1_config.ini.bak.*
 standard/n1_config.ini
 standard/n1_config.ini.bak.*
 .n1-bench/

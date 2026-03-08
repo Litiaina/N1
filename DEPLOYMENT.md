@@ -1,17 +1,28 @@
-# N1 Raw Blob Deployment Runbook
+# N1 Deployment Runbook (Standard + Arc)
 
 > Deployment profile status (2026-03-08):
 > - Stable/default: `standard` (`litiaina-n1-standard`)
-> - Experimental: `monilith` (`litiaina-n1-monilith`)
+> - Experimental: `arc` (`litiaina-n1-arc`)
 > - See `DEPLOYMENT_PROFILES.md` for profile policy.
 
-This runbook documents the current N1 deployment model:
+This runbook documents both N1 deployment profiles:
 
-- `index_store_disks`: mounted filesystem paths
-- `blob_store_disks`: raw, unformatted, unmounted blob devices
+- `standard` (stable/default):
+  - `index_store_disks`: mounted filesystem paths
+  - `blob_store_disks`: mounted filesystem paths (directory roots)
+  - no raw format commands
+- `arc` (experimental):
+  - `index_store_disks`: mounted filesystem paths
+  - `blob_store_disks`: raw, unformatted, unmounted blob devices
+  - raw format commands available (`format-blob-device`, `format-index-device`)
 
-N1 owns the blob device format and extent allocation through `block_manager`.
+N1 Arc owns raw blob device format and extent allocation through `block_manager`.
 For stable-vs-experimental profile policy, see `DEPLOYMENT_PROFILES.md`.
+
+Current runtime truth:
+- Both profiles use filesystem-backed partitioned `index`.
+- Only arc uses raw blob devices.
+- Arc raw index is a future/experimental track, not the current default runtime.
 
 ## 1. Disk Roles
 
@@ -33,7 +44,34 @@ Example mountpoints:
 /srv/n1/index1
 ```
 
-### Blob disks
+Index layout used by both profiles:
+
+```text
+{INDEX_ROOT}/{fragment}/index/partitions/{partition_id}/
+  wal/...
+  checkpoints/...
+  sessions/...
+  objects/...
+  trash/...
+```
+
+### Blob disks (`standard`)
+
+Use normal filesystems for blob roots in standard deployment:
+
+```text
+/srv/n1/blob0
+/srv/n1/blob1
+```
+
+Standard blob layout:
+
+```text
+{BLOB_ROOT}/{fragment}/blob/{version_id}/part_{p}_shard_{i}.shard|.parity
+{BLOB_ROOT}/{fragment}/.trash/blob/{version_id}/...
+```
+
+### Blob disks (`arc`, experimental)
 
 Use dedicated raw devices for:
 
@@ -50,6 +88,14 @@ Example device paths:
 /dev/disk/by-id/nvme-Samsung_SSD_3
 ```
 
+Arc blob layout:
+
+```text
+{RAW_BLOB_DEVICE}
+  block_manager allocator metadata + journals
+  payload extents addressed as raw://{device_id}/{allocation_id}
+```
+
 Do not:
 
 - format them
@@ -57,7 +103,7 @@ Do not:
 - place any filesystem on them
 - share them with another service
 
-N1 rejects startup if a configured blob device is mounted.
+Arc rejects startup if a configured raw blob device is mounted.
 
 ## 2. Prepare The Host
 
@@ -66,14 +112,14 @@ Install or verify:
 - Linux host
 - TLS certificates
 - dedicated index filesystems
-- dedicated raw blob devices
+- dedicated raw blob devices (arc only)
 
 Recommended:
 
 - use stable `/dev/disk/by-id/*` names
 - avoid `/dev/sdX`, `/dev/vdX`, `/dev/nvmeXnY` if enumeration may drift
 
-Verify raw blob devices are unused:
+Verify raw blob devices are unused (arc only):
 
 ```bash
 lsblk -f
@@ -86,10 +132,10 @@ Verify each blob device shows no mounted filesystem:
 findmnt /dev/disk/by-id/nvme-Samsung_SSD_1 || true
 ```
 
-Prepare explicit raw blob formatting with N1 (returns nonce + fingerprint):
+Prepare explicit raw blob formatting with N1 Arc (returns nonce + fingerprint):
 
 ```bash
-sudo target/release/litiaina-n1-standard format-blob-device \
+sudo target/release/litiaina-n1-arc format-blob-device \
   --path /dev/disk/by-id/nvme-Samsung_SSD_1 \
   --prepare
 ```
@@ -97,7 +143,7 @@ sudo target/release/litiaina-n1-standard format-blob-device \
 Apply format using the returned nonce/fingerprint:
 
 ```bash
-sudo target/release/litiaina-n1-standard format-blob-device \
+sudo target/release/litiaina-n1-arc format-blob-device \
   --path /dev/disk/by-id/nvme-Samsung_SSD_1 \
   --nonce <nonce-from-prepare> \
   --fingerprint <fingerprint-from-prepare>
@@ -106,12 +152,12 @@ sudo target/release/litiaina-n1-standard format-blob-device \
 For destructive reinitialization of a device that already contains foreign or stale data:
 
 ```bash
-sudo target/release/litiaina-n1-standard format-blob-device \
+sudo target/release/litiaina-n1-arc format-blob-device \
   --path /dev/disk/by-id/nvme-Samsung_SSD_1 \
   --prepare \
   --force
 
-sudo target/release/litiaina-n1-standard format-blob-device \
+sudo target/release/litiaina-n1-arc format-blob-device \
   --path /dev/disk/by-id/nvme-Samsung_SSD_1 \
   --nonce <nonce-from-prepare> \
   --fingerprint <fingerprint-from-prepare> \
@@ -120,15 +166,15 @@ sudo target/release/litiaina-n1-standard format-blob-device \
 
 This command applies the N1 raw blob format directly and uses a journal sized for current blob workloads.
 
-For index media pre-formatting, use the same safety handshake.
-For monolith raw-index migration track details, see `MONOLITH_RAW_KERNEL_PLAN.md` (experimental track).
+For index media pre-formatting (arc command path), use the same safety handshake.
+For arc raw-index migration track details, see `ARC_RAW_KERNEL_PLAN.md` (experimental track).
 
 ```bash
-sudo target/release/litiaina-n1-standard format-index-device \
+sudo target/release/litiaina-n1-arc format-index-device \
   --path /dev/disk/by-id/nvme-Samsung_SSD_INDEX_1 \
   --prepare
 
-sudo target/release/litiaina-n1-standard format-index-device \
+sudo target/release/litiaina-n1-arc format-index-device \
   --path /dev/disk/by-id/nvme-Samsung_SSD_INDEX_1 \
   --nonce <nonce-from-prepare> \
   --fingerprint <fingerprint-from-prepare>
@@ -136,7 +182,21 @@ sudo target/release/litiaina-n1-standard format-index-device \
 
 ## 3. Example Configuration
 
-`n1_config.ini`:
+`n1_config.ini` (standard, stable/default):
+
+```ini
+[disk_config]
+index_store_disks=/srv/n1/index0,/srv/n1/index1
+blob_store_disks=/srv/n1/blob0,/srv/n1/blob1
+fs_storage_path=/srv/n1/fs
+
+[upload_config]
+data_shards=2
+parity_shards=1
+stripe_block_size=4194304
+```
+
+`n1_config.ini` (arc, experimental):
 
 ```ini
 [disk_config]
@@ -152,29 +212,30 @@ stripe_block_size=4194304
 
 Notes:
 
-- `fs_storage_path` is still required for filesystem-backed control/state and raw staging.
-- Blob payloads are not stored under mounted blob directories anymore.
+- `fs_storage_path` is still required for runtime state/staging.
+- Standard stores blob payload files under mounted blob directories.
+- Arc stores blob payloads on raw devices through `block_manager`.
 
 ## 4. Startup Safeguards
 
-At startup N1 validates each blob device:
+At startup arc validates each raw blob device:
 
 - mounted devices are rejected
 - foreign filesystem signatures are rejected
 - stable device naming is recommended
 - zeroed/unformatted devices are accepted and initialized by `block_manager`
 
-If startup fails on a blob device, fix the device state before retrying.
+If startup fails on a raw blob device, fix the device state before retrying.
 
 ## 5. First Boot On Fresh Blob Devices
 
-Fresh blob devices may be:
+Arc fresh raw blob devices may be:
 
 - zeroed
 - empty loopback files for testing
 - raw block devices with no valid signature
 
-On first use N1 writes its raw blob manager structures to the device. You can also do this explicitly
+On first use arc writes its raw blob manager structures to the device. You can also do this explicitly
 with `format-blob-device` before first server startup.
 
 That is expected. Do not pre-format the device.
@@ -191,7 +252,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/n1
 EnvironmentFile=/opt/n1/n1.env
-ExecStart=/opt/n1/target/release/server
+ExecStart=/opt/n1/target/release/litiaina-n1-standard
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -200,9 +261,11 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 ```
 
+Use `/opt/n1/target/release/litiaina-n1-arc` only when intentionally deploying the experimental Arc profile.
+
 ## 7. Health And Observability
 
-### Raw blob status
+### Raw blob status (`arc` only)
 
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
@@ -245,12 +308,12 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
   https://127.0.0.1:50001/v4/maintenance/scrub/stop
 ```
 
-Scrub is the integrity-check pass for committed raw shards.
+Scrub is the integrity-check pass for committed shards (raw shards on arc, shard files on standard).
 
 ## 8. Operational Rules
 
-- Never mount a blob device while N1 is configured to use it.
-- Never point two N1 instances at the same blob device.
+- For arc: never mount a raw blob device while N1 is configured to use it.
+- For arc: never point two N1 instances at the same raw blob device.
 - Replace blob devices by:
   1. stopping writes or scheduling maintenance
   2. replacing the failed device
@@ -261,28 +324,29 @@ Scrub is the integrity-check pass for committed raw shards.
 ## 9. Quick Validation Checklist
 
 - index disks mounted and writable
-- blob devices unformatted or already N1-managed
-- blob devices not mounted
-- `blob_store_disks` uses stable `/dev/disk/by-id/*` names
-- `GET /v4/maintenance/blob/raw/status` shows all devices healthy
+- standard: blob root directories mounted and writable
+- arc: blob devices unformatted or already N1-managed
+- arc: blob devices not mounted
+- arc: `blob_store_disks` uses stable `/dev/disk/by-id/*` names
+- arc: `GET /v4/maintenance/blob/raw/status` shows all devices healthy
 - scrub can start and report status
 - authoritative `index` writes ACK on the owner root first; replica roots are expected to reconcile behind that ACK path
-- multipart part uploads are payload-first and disk-backed: committed part metadata remains the resumability source of truth, and pending-part receipts allow GC/cancel to reclaim raw orphaned extents after a crash
+- multipart part uploads are payload-first and disk-backed; committed part metadata remains the resumability source of truth
 
 ## 10. Release Hardening On Target Hardware
 
-N1 `0.3.0` is the architecture-freeze line. Run the release drill harness before cutting a `1.0.0` stable build:
+Run the release drill harness before production rollout (`standard 0.4.0` stable, `arc 0.1.0` experimental):
 
 ```bash
 scripts/bench/run_release_drills.sh
 ```
 
-This executes the critical raw-blob workflows plus the quota-drift regression:
+This executes the critical storage workflows plus the quota-drift regression:
 
 - active multipart upload + resume while one replica index disk is down
-- raw CRUD/delete/recover/permanent delete
-- raw redistribution + repair + recovered read
-- raw quota reconvergence after redistribution, trash, GC, and sync
+- CRUD/delete/recover/permanent delete
+- redistribution + repair + recovered read
+- quota reconvergence after redistribution, trash, GC, and sync
 - index mirror repair convergence
 - HA repair with an index disk down
 

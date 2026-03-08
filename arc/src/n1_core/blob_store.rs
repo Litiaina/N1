@@ -1219,7 +1219,7 @@ pub async fn commit_staged_raw_shard(
             let mut mgr = timed_raw_manager_write(&manager)?;
             match mgr.allocate_direct_extent_io(size_bytes) {
                 Ok(pair) => break pair,
-                Err(BlockManagerError::NoSpace { .. }) => {
+                Err(err @ BlockManagerError::NoSpace { .. }) => {
                     drop(mgr);
                     let drained = drain_deferred_raw_frees_under_pressure_blocking();
                     if drained > 0 {
@@ -1227,6 +1227,8 @@ pub async fn commit_staged_raw_shard(
                             "Raw allocator pressure reclaim freed {} deferred extent(s) before staged commit retry",
                             drained
                         );
+                    } else {
+                        return Err(block_manager_error_to_app(err));
                     }
                 }
                 Err(err) => return Err(block_manager_error_to_app(err)),
@@ -1316,7 +1318,7 @@ pub fn allocate_raw_direct_io(
     let (address, io) = loop {
         match mgr.allocate_direct_extent_io(size_bytes) {
             Ok(pair) => break pair,
-            Err(BlockManagerError::NoSpace { .. }) => {
+            Err(err @ BlockManagerError::NoSpace { .. }) => {
                 drop(mgr);
                 let drained = drain_deferred_raw_frees_under_pressure_blocking();
                 if drained > 0 {
@@ -1324,6 +1326,8 @@ pub fn allocate_raw_direct_io(
                         "Raw allocator pressure reclaim freed {} deferred extent(s) before allocation retry",
                         drained
                     );
+                } else {
+                    return Err(block_manager_error_to_app(err));
                 }
                 mgr = timed_raw_manager_write(&manager)?;
             }
@@ -1331,6 +1335,31 @@ pub fn allocate_raw_direct_io(
         }
     };
     Ok((raw_blob_address_from_extent(&address), io))
+}
+
+pub fn allocate_raw_address(disk_idx: usize, size_bytes: u64) -> Result<RawBlobAddress, AppError> {
+    let BlobDiskHandle::Raw { manager, .. } = resolve_blob_disk(disk_idx)?;
+    let mut mgr = timed_raw_manager_write(&manager)?;
+    let address = loop {
+        match mgr.allocate_raw_extent_address(size_bytes) {
+            Ok(address) => break address,
+            Err(err @ BlockManagerError::NoSpace { .. }) => {
+                drop(mgr);
+                let drained = drain_deferred_raw_frees_under_pressure_blocking();
+                if drained > 0 {
+                    info!(
+                        "Raw allocator pressure reclaim freed {} deferred extent(s) before address allocation retry",
+                        drained
+                    );
+                } else {
+                    return Err(block_manager_error_to_app(err));
+                }
+                mgr = timed_raw_manager_write(&manager)?;
+            }
+            Err(err) => return Err(block_manager_error_to_app(err)),
+        }
+    };
+    Ok(raw_blob_address_from_extent(&address))
 }
 
 pub async fn copy_raw_extent(

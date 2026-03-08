@@ -2,7 +2,7 @@
 
 > Deployment profile status (2026-03-08):
 > - `standard` is stable and default for redistribution operations.
-> - `monilith` is experimental.
+> - `arc` is experimental.
 > - See `DEPLOYMENT_PROFILES.md`.
 
 This document reflects the current redistribution engine and API behavior in N1.
@@ -67,10 +67,10 @@ cargo run -p standard -- ops redistribute status --secret "$MASTER_KEY" --fragme
 cargo run -p standard -- ops redistribute stop --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
 ```
 
-Experimental monolith track equivalent:
+Experimental arc track equivalent:
 
 ```bash
-cargo run -p monilith -- ops redistribute start --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+cargo run -p arc -- ops redistribute start --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
 ```
 
 Notes:

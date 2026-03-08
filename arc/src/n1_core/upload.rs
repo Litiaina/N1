@@ -33,7 +33,8 @@ use std::os::windows::fs::OpenOptionsExt;
 
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::blob_store::{
-    allocate_raw_direct_io, configured_blob_disk_count, flush_raw_metadata_for_addresses,
+    allocate_raw_address, allocate_raw_direct_io, configured_blob_disk_count,
+    flush_raw_metadata_for_addresses,
     free_raw_addresses, open_raw_direct_io_for_address, raw_blob_address_from_extent,
     raw_blob_debug_path, stable_shard_file_name,
 };
@@ -480,8 +481,7 @@ async fn reserve_planned_part_layouts(
 
         for shard_index in 0..total_shards {
             let disk_idx = shard_disk_index(version_id, part_index as u64, shard_index, num_disks);
-            let (raw_blob_address, io) = allocate_raw_direct_io(disk_idx, shard_size_bytes)?;
-            drop(io);
+            let raw_blob_address = allocate_raw_address(disk_idx, shard_size_bytes)?;
             reserved_addresses.push(raw_blob_address.clone());
             shards.push(PlannedShardSlot {
                 shard_index,

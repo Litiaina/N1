@@ -1,11 +1,11 @@
 # N1 Block Allocator + Formatter Hardening Plan
 
 > Scope note:
-> - Hardening plan for monolith allocator/formatter track.
-> - Monolith is experimental.
+> - Hardening plan for arc allocator/formatter track.
+> - Arc is experimental.
 > - Stable/default deployment remains `standard` (`DEPLOYMENT_PROFILES.md`).
 
-This plan defines how we make the allocator and formatter production-stable for monolith kernel mode.
+This plan defines how we make the allocator and formatter production-stable for arc kernel mode.
 
 Reality check:
 - No storage engine is literally indestructible.
@@ -126,7 +126,7 @@ Status:
   - replay/next txid
   - journal used/capacity/free records
   - largest free extent and fragmentation ppm (global + per-AG)
-- Monolith raw blob device status now surfaces these allocator health fields per managed raw disk.
+- Arc raw blob device status now surfaces these allocator health fields per managed raw disk.
 - Deferred raw free backlog is now exposed per managed device in raw blob status.
 
 ## 6. Validation Matrix (Must Pass)
@@ -216,7 +216,7 @@ Status:
 - add `extent_gen` handling in allocator + metadata addresses
 - reject stale-generation addresses on read/write paths
 Status:
-- `extent_gen` is now emitted by block-manager raw addresses and persisted through monolith raw metadata.
+- `extent_gen` is now emitted by block-manager raw addresses and persisted through arc raw metadata.
 - Read/write/direct/free raw address paths now validate generation and reject mismatches as corruption.
 - Backward compatibility is retained for existing metadata via default generation value `1`.
 
@@ -259,5 +259,8 @@ Status:
 - Added deterministic mixed-failpoint replay certification test:
   - fixed-seed workload with periodic reopen/crash boundaries and rotating failpoints
   - replayed allocator fingerprint is stable across repeated runs with identical schedule
+- Added raw-address allocation fast path in block manager (`allocate_raw_extent_address`) so reservation flows can allocate without creating unused direct-I/O handles.
+- Arc planned-part reservation path now uses raw-address-only allocation for lower allocator/control-plane overhead during upload init.
+- Raw allocation retry loops in arc now fail fast on `NoSpace` when deferred-free pressure drain yields zero reclaimed extents (prevents unbounded retry stalls).
 - Failpoint state is now thread-local in tests to avoid cross-test contamination under parallel execution.
 - Full `cargo test -p block_manager` remains green with these replay-boundary checks (`80` tests).

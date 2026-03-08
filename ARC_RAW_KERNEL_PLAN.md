@@ -1,20 +1,20 @@
-# N1 Monolith Raw-Kernel Plan
+# N1 Arc Raw-Kernel Plan
 
 > Experimental track note:
-> - This document is for monolith experimental development only.
+> - This document is for arc experimental development only.
 > - Stable/default production deployment remains `standard`.
 > - See `DEPLOYMENT_PROFILES.md`.
 
-This document defines the target structure for `N1 monilith` as a raw-only storage kernel:
+This document defines the target structure for `N1 Arc` as a raw-only storage kernel:
 
 - `blob` on raw devices (already in place)
 - `index` on raw devices (new target)
 - no filesystem-backed legacy `fs` hot path
 
 Scope note:
-- This is for `N1 monilith` only.
+- This is for `N1 Arc` only.
 - `N1 standard` remains filesystem-backed and stable.
-- Do not sync this in-progress monolith work to `N2` until monolith passes stability gates.
+- Do not sync this in-progress arc work to `N2` until arc passes stability gates.
 
 ## 1. Target Planes
 
@@ -29,7 +29,7 @@ Raw index stores all authoritative metadata:
 - quota state
 - WAL + checkpoints for crash recovery
 
-This replaces filesystem index directories for monolith authority.
+This replaces filesystem index directories for arc authority.
 
 ## 1.2 Raw Blob Plane (existing authority for payload)
 
@@ -47,9 +47,9 @@ Prefix/delimiter list acceleration stays derived from index WAL/checkpoints:
 - rebuildable
 - async projection
 
-## 2. Module Layout (Monolith)
+## 2. Module Layout (Arc)
 
-Target module structure under `monilith/src/n1_core`:
+Target module structure under `arc/src/n1_core`:
 
 ```text
 n1_core/
@@ -133,7 +133,7 @@ Exit criteria:
 
 ## Phase 2: Raw index read authority
 
-- Switch monolith read authority to raw index.
+- Switch arc read authority to raw index.
 - fs index write path disabled.
 - Prefix projection sourced from raw index stream.
 
@@ -142,12 +142,12 @@ Exit criteria:
 
 ## Phase 3: Remove legacy fs hot path
 
-- Remove legacy `fs` routes and handlers in monolith.
-- Remove fs cleanup loop dependencies from monolith boot/GC.
+- Remove legacy `fs` routes and handlers in arc.
+- Remove fs cleanup loop dependencies from arc boot/GC.
 - Keep only object APIs and fsd gateway backed by object semantics if needed.
 
 Exit criteria:
-- no `crate::fs::*` dependency in monolith runtime hot path.
+- no `crate::fs::*` dependency in arc runtime hot path.
 
 ## Phase 4: Maintenance convergence
 
@@ -166,7 +166,7 @@ Exit criteria:
 - repair + redistribution correctness checks
 
 Gate:
-- only after Phase 5 passes do we mirror monolith core changes to `N2`.
+- only after Phase 5 passes do we mirror arc core changes to `N2`.
 
 ## 5. Locking And Concurrency Policy
 

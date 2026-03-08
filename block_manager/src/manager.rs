@@ -1277,18 +1277,25 @@ impl BlockManager {
         })
     }
 
+    pub fn allocate_raw_extent_address(
+        &mut self,
+        size_bytes: u64,
+    ) -> Result<RawExtentAddress, BlockManagerError> {
+        let handle = self.allocate_bytes(size_bytes)?;
+        match self.raw_extent_address(handle, size_bytes) {
+            Ok(address) => Ok(address),
+            Err(err) => {
+                let _ = self.free(handle.allocation_id);
+                Err(err)
+            }
+        }
+    }
+
     pub fn allocate_direct_extent_io(
         &mut self,
         size_bytes: u64,
     ) -> Result<(RawExtentAddress, DirectExtentIo), BlockManagerError> {
-        let handle = self.allocate_bytes(size_bytes)?;
-        let address = match self.raw_extent_address(handle, size_bytes) {
-            Ok(address) => address,
-            Err(err) => {
-                let _ = self.free(handle.allocation_id);
-                return Err(err);
-            }
-        };
+        let address = self.allocate_raw_extent_address(size_bytes)?;
         let io = DirectExtentIo {
             file: Arc::clone(&self.direct_file),
             block_size: self.header.block_size,
@@ -2825,6 +2832,39 @@ mod tests {
         assert_eq!(got, payload);
 
         mgr.free_address(&address).expect("free via address");
+        assert_eq!(mgr.allocation_count(), 0);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn allocate_raw_extent_address_roundtrip() {
+        let path = temp_loopback("alloc-raw-address");
+        let mut mgr = BlockManager::format(
+            &path,
+            FormatOptions {
+                block_size: 4096,
+                journal_blocks: 16,
+                total_bytes: Some(4 * 1024 * 1024),
+            },
+        )
+        .expect("format device");
+
+        let address = mgr
+            .allocate_raw_extent_address(16 * 1024)
+            .expect("allocate raw address");
+        let payload = b"allocate-raw-extent-address";
+
+        mgr.write_address(&address, 4096, payload)
+            .expect("write via raw address");
+        mgr.flush_data().expect("flush data");
+
+        let got = mgr
+            .read_address(&address, 4096, payload.len())
+            .expect("read via raw address");
+        assert_eq!(got, payload);
+
+        mgr.free_address(&address).expect("free via raw address");
         assert_eq!(mgr.allocation_count(), 0);
 
         let _ = fs::remove_file(path);

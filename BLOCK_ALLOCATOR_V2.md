@@ -1,8 +1,8 @@
 # N1 Block Allocator V2 (BM-V2) Design
 
 > Scope note:
-> - This document describes the monolith allocator track.
-> - Monolith is experimental.
+> - This document describes the arc allocator track.
+> - Arc is experimental.
 > - Stable/default deployment remains `standard` (`DEPLOYMENT_PROFILES.md`).
 
 This document defines the production target allocator design for N1 raw blob devices.
@@ -251,11 +251,11 @@ All modes are I/O-budgeted first, CPU/RAM bounded second.
 
 Primary integration files:
 - `block_manager/src/manager.rs`
-- `monilith/src/n1_core/blob_store.rs`
-- `monilith/src/n1_core/upload.rs`
-- `monilith/src/n1_core/recovery.rs`
-- `monilith/src/n1_core/redistribution.rs`
-- `monilith/src/n1_core/garbage_collector.rs`
+- `arc/src/n1_core/blob_store.rs`
+- `arc/src/n1_core/upload.rs`
+- `arc/src/n1_core/recovery.rs`
+- `arc/src/n1_core/redistribution.rs`
+- `arc/src/n1_core/garbage_collector.rs`
 
 Required transitions:
 - replace linear free-list allocation with AG + dual indexes
@@ -272,6 +272,8 @@ Status:
 - Completed in N1: AG-split allocator and dual free-space indexes are active in `block_manager`.
 - Extended with AG max-free index to avoid full AG scans in best-fit allocation.
 - AG range lookup now uses a start-block index with binary-search selection (replacing linear AG scans for block-to-AG resolution).
+- Added allocator raw-address-only allocation API (`allocate_raw_extent_address`) so reservation flows can avoid creating unused direct-I/O handles.
+- Arc planned-part reservation path now uses raw-address-only allocation for lower upload-init control-plane overhead.
 
 ### Phase B: WAL tx semantics
 - Introduce txid-based WAL records and idempotent replay.
@@ -285,6 +287,7 @@ Status:
 - `JournalFull` now primarily indicates a live-set-to-journal-capacity mismatch, not steady churn exhaustion.
 - Deferred free markers and bounded `FreeApply` background worker are active in N1 for large raw-free workloads.
 - Replay now enforces txid monotonicity across all records (including prepare-only tails) and hard-fails on regressions.
+- Arc raw allocation retry loops now fail fast when deferred-free pressure drain cannot reclaim space, preventing unbounded `NoSpace` retry stalls.
 
 ### Phase C: Epoch/device map
 - Add topology epoch persistence and device map table.
