@@ -1,15 +1,20 @@
 # N1 Network Drive Guide (SMB-lite)
 
+> Deployment profile status (2026-03-08):
+> - `standard` (`litiaina-n1-standard`) is the stable/default profile.
+> - `monilith` is experimental.
+> - See `DEPLOYMENT_PROFILES.md`.
+
 This guide covers both ways to expose N1 as a network drive:
 
-- Native SMB-lite gateway (`smb`) built into `litiaina-n1-monilith` (recommended).
+- Native SMB-lite gateway (`smb`) built into `litiaina-n1-standard` (recommended).
 - Fallback bridge (`fsd_mount` + Samba) for environments where you still need it.
 
 ## Current Status
 
 `smb` is SMB-lite, not full enterprise SMB.
 
-Implemented in `monilith/src/smb/server.rs`:
+Implemented in `standard/src/smb/server.rs` (stable profile), with mirrored experimental development under `monilith/src/smb/server.rs`:
 - auth + signing
 - `list/read/open`
 - query-directory / query-info metadata paths
@@ -97,10 +102,10 @@ Template:
 ### 3) Start N1 server
 
 ```bash
-cargo run -p monilith --bin litiaina-n1-monilith
+cargo run -p standard --bin litiaina-n1-standard
 ```
 
-Or run your installed systemd service for `litiaina-n1-monilith`.
+Or run your installed systemd service for `litiaina-n1-standard`.
 
 ### 4) Verify listener
 
@@ -139,7 +144,7 @@ Use this only if you need the previous bridge model.
 ### Build
 
 ```bash
-cargo build --release -p monilith
+cargo build --release -p standard
 cargo build --release -p server_cli --features fsd-mount --bin fsd_mount
 ```
 
@@ -197,7 +202,13 @@ This is expected with conservative share-mode handling. Retry after releasing co
 ## Verification Commands
 
 ```bash
+cargo check -p standard
+cargo test -p standard smb::server::tests -- --nocapture
+cargo test -p standard -- --nocapture
+```
+
+Experimental monolith track verification:
+
+```bash
 cargo check -p monilith
-cargo test -p monilith smb::server::tests -- --nocapture
-cargo test -p monilith -- --nocapture
 ```

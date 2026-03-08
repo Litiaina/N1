@@ -1,5 +1,10 @@
 # N1 Block Allocator + Formatter Hardening Plan
 
+> Scope note:
+> - Hardening plan for monolith allocator/formatter track.
+> - Monolith is experimental.
+> - Stable/default deployment remains `standard` (`DEPLOYMENT_PROFILES.md`).
+
 This plan defines how we make the allocator and formatter production-stable for monolith kernel mode.
 
 Reality check:

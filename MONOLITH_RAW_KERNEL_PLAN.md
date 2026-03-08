@@ -1,5 +1,10 @@
 # N1 Monolith Raw-Kernel Plan
 
+> Experimental track note:
+> - This document is for monolith experimental development only.
+> - Stable/default production deployment remains `standard`.
+> - See `DEPLOYMENT_PROFILES.md`.
+
 This document defines the target structure for `N1 monilith` as a raw-only storage kernel:
 
 - `blob` on raw devices (already in place)

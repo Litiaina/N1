@@ -1,11 +1,17 @@
 # N1 Raw Blob Deployment Runbook
 
+> Deployment profile status (2026-03-08):
+> - Stable/default: `standard` (`litiaina-n1-standard`)
+> - Experimental: `monilith` (`litiaina-n1-monilith`)
+> - See `DEPLOYMENT_PROFILES.md` for profile policy.
+
 This runbook documents the current N1 deployment model:
 
 - `index_store_disks`: mounted filesystem paths
 - `blob_store_disks`: raw, unformatted, unmounted blob devices
 
 N1 owns the blob device format and extent allocation through `block_manager`.
+For stable-vs-experimental profile policy, see `DEPLOYMENT_PROFILES.md`.
 
 ## 1. Disk Roles
 
@@ -83,7 +89,7 @@ findmnt /dev/disk/by-id/nvme-Samsung_SSD_1 || true
 Prepare explicit raw blob formatting with N1 (returns nonce + fingerprint):
 
 ```bash
-sudo target/release/litiaina-n1-monilith format-blob-device \
+sudo target/release/litiaina-n1-standard format-blob-device \
   --path /dev/disk/by-id/nvme-Samsung_SSD_1 \
   --prepare
 ```
@@ -91,7 +97,7 @@ sudo target/release/litiaina-n1-monilith format-blob-device \
 Apply format using the returned nonce/fingerprint:
 
 ```bash
-sudo target/release/litiaina-n1-monilith format-blob-device \
+sudo target/release/litiaina-n1-standard format-blob-device \
   --path /dev/disk/by-id/nvme-Samsung_SSD_1 \
   --nonce <nonce-from-prepare> \
   --fingerprint <fingerprint-from-prepare>
@@ -100,12 +106,12 @@ sudo target/release/litiaina-n1-monilith format-blob-device \
 For destructive reinitialization of a device that already contains foreign or stale data:
 
 ```bash
-sudo target/release/litiaina-n1-monilith format-blob-device \
+sudo target/release/litiaina-n1-standard format-blob-device \
   --path /dev/disk/by-id/nvme-Samsung_SSD_1 \
   --prepare \
   --force
 
-sudo target/release/litiaina-n1-monilith format-blob-device \
+sudo target/release/litiaina-n1-standard format-blob-device \
   --path /dev/disk/by-id/nvme-Samsung_SSD_1 \
   --nonce <nonce-from-prepare> \
   --fingerprint <fingerprint-from-prepare> \
@@ -114,14 +120,15 @@ sudo target/release/litiaina-n1-monilith format-blob-device \
 
 This command applies the N1 raw blob format directly and uses a journal sized for current blob workloads.
 
-For index media pre-formatting (monolith raw-index migration track), use the same safety handshake:
+For index media pre-formatting, use the same safety handshake.
+For monolith raw-index migration track details, see `MONOLITH_RAW_KERNEL_PLAN.md` (experimental track).
 
 ```bash
-sudo target/release/litiaina-n1-monilith format-index-device \
+sudo target/release/litiaina-n1-standard format-index-device \
   --path /dev/disk/by-id/nvme-Samsung_SSD_INDEX_1 \
   --prepare
 
-sudo target/release/litiaina-n1-monilith format-index-device \
+sudo target/release/litiaina-n1-standard format-index-device \
   --path /dev/disk/by-id/nvme-Samsung_SSD_INDEX_1 \
   --nonce <nonce-from-prepare> \
   --fingerprint <fingerprint-from-prepare>

@@ -9,8 +9,14 @@
   <p>Complete route reference and usage guide (current implementation).</p>
 </div>
 
-> Source of truth for routing: `monilith/src/routes/storage_routes.rs`.
-> Source of truth for request/response behavior: the handler files under `monilith/src/n1_core` and `monilith/src/fs`.
+> Deployment profile status (2026-03-08):
+> - `standard` is stable and default.
+> - `monilith` is experimental.
+> - See `DEPLOYMENT_PROFILES.md`.
+>
+> Source of truth for routing (stable): `standard/src/routes/storage_routes.rs`.
+> Monolith route parity path (experimental): `monilith/src/routes/storage_routes.rs`.
+> Source of truth for request/response behavior (stable): handler files under `standard/src/n1_core`.
 
 > Storage backend note:
 > - `index_store_disks` must be mounted filesystem paths.
@@ -18,8 +24,8 @@
 > - Blob payload I/O uses `O_DIRECT`; metadata and control files stay filesystem-backed.
 
 > Engine profile note:
-> - `standard` exists for general-purpose filesystem-backed deployments.
-> - `monilith` exists for raw-device absolute control and maximum performance.
+> - `standard` is the stable/default profile for general-purpose filesystem-backed deployments.
+> - `monilith` is experimental for raw-device absolute control and maximum performance development.
 > - Both variants are intended to keep the same object/API semantics; the difference is backend execution model and operations envelope.
 
 > Metadata architecture note:

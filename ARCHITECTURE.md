@@ -1,5 +1,10 @@
 # N1 Architecture
 
+> Deployment profile status (2026-03-08):
+> - `standard` is stable and the default deployment profile.
+> - `monilith` is experimental.
+> - See `DEPLOYMENT_PROFILES.md`.
+
 N1 is a single-node object storage engine with three distinct planes:
 
 - `index` is the authoritative object, session, and trash metadata plane.
@@ -34,7 +39,7 @@ N1 is intentionally a specialized object-storage engine, not a general filesyste
 Two server variants exist so users can choose deployment posture:
 
 - `standard`: filesystem-backed N1 for general-purpose use and broad hardware compatibility.
-- `monilith`: raw-device/direct-I/O N1 for absolute device control and maximum throughput ceiling.
+- `monilith`: raw-device/direct-I/O N1 for absolute device control and maximum throughput ceiling (experimental).
 
 They are expected to keep the same storage semantics. The difference is backend execution model and operational profile, not object correctness guarantees.
 

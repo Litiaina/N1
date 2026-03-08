@@ -1,5 +1,10 @@
 # N1 Redistribution Guide
 
+> Deployment profile status (2026-03-08):
+> - `standard` is stable and default for redistribution operations.
+> - `monilith` is experimental.
+> - See `DEPLOYMENT_PROFILES.md`.
+
 This document reflects the current redistribution engine and API behavior in N1.
 
 Redistribution is the online maintenance job that realigns existing objects to the
@@ -47,19 +52,25 @@ Preferred commands:
 
 ```bash
 # Start redistribution
-cargo run -p monilith -- ops redistribute start --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+cargo run -p standard -- ops redistribute start --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
 
 # Dry-run (plan only, no writes)
-cargo run -p monilith -- ops redistribute start --dry-run --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+cargo run -p standard -- ops redistribute start --dry-run --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
 
 # Watch monitor
-cargo run -p monilith -- ops redistribute watch --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+cargo run -p standard -- ops redistribute watch --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
 
 # One-shot status
-cargo run -p monilith -- ops redistribute status --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+cargo run -p standard -- ops redistribute status --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
 
 # Stop job (cooperative)
-cargo run -p monilith -- ops redistribute stop --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+cargo run -p standard -- ops redistribute stop --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+```
+
+Experimental monolith track equivalent:
+
+```bash
+cargo run -p monilith -- ops redistribute start --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
 ```
 
 Notes:

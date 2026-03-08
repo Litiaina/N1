@@ -664,7 +664,7 @@ fn fragmentation_ppm(free_blocks: u64, largest_free_extent_blocks: u64) -> u32 {
 pub struct BlockManager {
     path: PathBuf,
     meta_file: File,
-    direct_file: File,
+    direct_file: Arc<File>,
     header: DeviceHeader,
     allocation_state: AllocationState,
     allocations: HashMap<u64, Extent>,
@@ -889,7 +889,7 @@ impl BlockManager {
         let path = path.as_ref().to_path_buf();
         let meta_file = OpenOptions::new().read(true).write(true).open(&path)?;
         let header = read_header(&meta_file)?;
-        let direct_file = open_direct_file(&path)?;
+        let direct_file = Arc::new(open_direct_file(&path)?);
         let data_blocks = header.total_blocks.saturating_sub(header.data_start_block);
         let ag_count = derive_ag_count(data_blocks, header.block_size);
 
@@ -1271,7 +1271,7 @@ impl BlockManager {
     ) -> Result<DirectExtentIo, BlockManagerError> {
         let _extent = self.validate_raw_address(address)?;
         Ok(DirectExtentIo {
-            file: Arc::new(self.direct_file.try_clone()?),
+            file: Arc::clone(&self.direct_file),
             block_size: self.header.block_size,
             address: address.clone(),
         })
@@ -1290,7 +1290,7 @@ impl BlockManager {
             }
         };
         let io = DirectExtentIo {
-            file: Arc::new(self.direct_file.try_clone()?),
+            file: Arc::clone(&self.direct_file),
             block_size: self.header.block_size,
             address: address.clone(),
         };
@@ -2792,6 +2792,36 @@ mod tests {
         let got = mgr
             .read_address(&address, 1024, payload.len())
             .expect("read via address");
+        assert_eq!(got, payload);
+
+        mgr.free_address(&address).expect("free via address");
+        assert_eq!(mgr.allocation_count(), 0);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn allocate_direct_extent_io_roundtrip() {
+        let path = temp_loopback("alloc-direct-io");
+        let mut mgr = BlockManager::format(
+            &path,
+            FormatOptions {
+                block_size: 4096,
+                journal_blocks: 16,
+                total_bytes: Some(4 * 1024 * 1024),
+            },
+        )
+        .expect("format device");
+
+        let (address, io) = mgr
+            .allocate_direct_extent_io(16 * 1024)
+            .expect("allocate direct io");
+        let payload = b"allocate-direct-extent-io";
+
+        io.write(2048, payload).expect("write via direct io");
+        io.flush_data().expect("flush direct io data");
+
+        let got = io.read(2048, payload.len()).expect("read via direct io");
         assert_eq!(got, payload);
 
         mgr.free_address(&address).expect("free via address");

@@ -1,5 +1,10 @@
 # N1 Block Allocator V2 (BM-V2) Design
 
+> Scope note:
+> - This document describes the monolith allocator track.
+> - Monolith is experimental.
+> - Stable/default deployment remains `standard` (`DEPLOYMENT_PROFILES.md`).
+
 This document defines the production target allocator design for N1 raw blob devices.
 
 Hardening and certification work (formatter safety + crash/powerfail stability gates) is tracked in [`BLOCK_ALLOCATOR_HARDENING_PLAN.md`](BLOCK_ALLOCATOR_HARDENING_PLAN.md).
