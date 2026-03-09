@@ -9,23 +9,26 @@
   <p>Complete route reference and usage guide (current implementation).</p>
 </div>
 
-> Deployment profile status (2026-03-08):
+> Deployment profile status (2026-03-09):
 > - `standard` is stable and default.
-> - `arc` is experimental.
+> - `arc` is stable at `0.2.0` for raw-device deployments.
 > - See `DEPLOYMENT_PROFILES.md`.
 >
-> Source of truth for routing (stable): `standard/src/routes/storage_routes.rs`.
-> Arc route parity path (experimental): `arc/src/routes/storage_routes.rs`.
-> Source of truth for request/response behavior (stable): handler files under `standard/src/n1_core`.
+> Source of truth for routing (`standard`): `standard/src/routes/storage_routes.rs`.
+> Arc route path: `arc/src/routes/storage_routes.rs`.
+> Source of truth for request/response behavior is profile-specific (`standard/src/n1_core` and `arc/src/n1_core`).
+> Arc route scope note:
+> - Arc serves v4 object/maintenance APIs and does not expose legacy `/dir/*` routes.
+> - Arc also does not expose `/authenticate/fs`.
 
 > Storage backend note:
 > - `standard` (stable): `index_store_disks` and `blob_store_disks` are mounted filesystem paths (directory roots).
-> - `arc` (experimental): `index_store_disks` are filesystem paths; `blob_store_disks` are raw, unformatted, unmounted device paths managed directly by N1.
+> - `arc` (stable raw-kernel): `index_store_disks` and `blob_store_disks` are raw, unformatted, unmounted device paths managed directly by N1.
 > - Direct I/O (`O_DIRECT`) is used on the blob write path where supported, but payload substrate differs by profile (filesystem files in standard, raw extents in arc).
 
 > Engine profile note:
 > - `standard` is the stable/default profile for general-purpose filesystem-backed deployments.
-> - `arc` is experimental for raw-device absolute control and maximum performance development.
+> - `arc` is the stable raw-kernel profile for raw-device absolute control and maximum performance.
 > - Both variants are intended to keep the same object/API semantics; the difference is backend execution model and operations envelope.
 
 > Metadata architecture note:
@@ -42,7 +45,7 @@
 > - Multipart uploads do not rely on in-memory part state for resumability. Part commits are durably recorded in the `index` WAL/session state and mirrored as per-part metadata files for compatibility and recovery workflows.
 
 > Release status note:
-> - N1 `standard` is stable at `0.4.0`; `arc` is experimental at `0.1.0`.
+> - N1 `standard` is stable at `0.4.0`; `arc` is stable at `0.2.0`.
 > - This document describes the current implementation and current routes.
 > - Request/response details and endpoint layout may still change before `1.0.0` even though the underlying storage model is now fixed.
 
@@ -50,11 +53,11 @@
 
 | Dimension | Standard (`litiaina-n1-standard`) | Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / default | Experimental |
-| API source of truth | Yes (`standard/src/routes/storage_routes.rs`) | Parity track only |
-| `index_store_disks` | Filesystem directories | Filesystem directories |
+| Status | Stable / default | Stable / raw-kernel profile |
+| API source of truth | Yes (`standard/src/routes/storage_routes.rs`) | Yes (`arc/src/routes/storage_routes.rs`) |
+| `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw devices / loopback files |
-| Index metadata layout | Partitioned filesystem index | Partitioned filesystem index (current) |
+| Index metadata layout | Partitioned filesystem index | Raw index catalog on block-manager media |
 | Blob payload layout | Shard files on blob roots | Raw extents via `block_manager` |
 
 Standard disk layout:
@@ -68,14 +71,14 @@ Standard disk layout:
 Arc disk layout:
 
 ```text
-{INDEX_ROOT}/{fragment}/index/partitions/{partition_id}/...
+{RAW_INDEX_DEVICE} -> block_manager allocator/journal metadata + raw index catalog records
 {RAW_BLOB_DEVICE} -> block_manager superblock/journals/allocation groups
 payload address: raw://{device_id}/{allocation_id}
 ```
 
 Arc index note:
-- Arc index is still filesystem-backed today.
-- Raw index media is an experimental direction, not current stable behavior.
+- Arc index and blob are both raw block-manager media.
+- Arc is stable at `0.2.0`.
 
 ## 1. Base URL And Conventions
 - Base URL example: `https://127.0.0.1:50001`
@@ -128,7 +131,7 @@ Notes:
 - For maintenance watches (`ops gc/repair/redistribute/prefix-rebuild`), CLI now prints `Last Error` when status polling fails or times out.
 - CLI maintenance start commands now expose current runtime knobs (`--mode`, `--fast-mode`, `--read-only-fast`, and repair/redistribution concurrency/durability flags) and send them directly to the matching `/v4/maintenance/*/start` endpoints.
 
-### 2.2 `POST /authenticate/fs`
+### 2.2 `POST /authenticate/fs` (standard only)
 Purpose:
 - Issues legacy FS auth context for `/dir/*` routes.
 
@@ -925,8 +928,8 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
   -d '{"message":"Maintenance starts","severity":"info"}'
 ```
 
-## 11. Legacy FS API (`/dir/*`)
-These routes are protected by legacy FS auth middleware.
+## 11. Legacy FS API (`/dir/*`, standard only)
+These routes are protected by legacy FS auth middleware and are not exposed by Arc.
 
 ### 11.1 Directory listing and inspection
 
@@ -1140,7 +1143,7 @@ curl -k -X POST -H "Authorization: Bearer $FS_TOKEN" \
 
 ### Auth
 - `POST /authenticate/fragment`
-- `POST /authenticate/fs`
+- `POST /authenticate/fs` (standard only)
 
 ## 13. Streaming And Upload Tuning (Config)
 `[upload_config]` keys used by streaming read and upload-part paths:
@@ -1225,7 +1228,7 @@ Recommended starting points:
 - `GET /ws`
 - `POST /v4/system/broadcast`
 
-### Legacy FS
+### Legacy FS (standard only)
 - `POST /dir/file/upload/`
 - `POST /dir/file/upload/{*path}`
 - `POST /dir/file/upload/v2/`

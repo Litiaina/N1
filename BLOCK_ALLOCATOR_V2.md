@@ -2,7 +2,7 @@
 
 > Scope note:
 > - This document describes the arc allocator track.
-> - Arc is experimental.
+> - Arc is stable at `0.2.0`.
 > - Stable/default deployment remains `standard` (`DEPLOYMENT_PROFILES.md`).
 
 This document defines the production target allocator design for N1 raw blob devices.
@@ -302,6 +302,10 @@ Status:
 ### Phase D: Default-on hardening
 - Make BM-V2 default.
 - Keep BM-V1 read compatibility for legacy addresses.
+Status:
+- In progress (closure gating now standardized).
+- BM-V2 allocator path is the active raw-blob allocator for Arc.
+- Stable tag remains blocked until the full gate pack below passes in both lab and real hardware.
 
 ## 14. Validation Gate (Required Before Stable Tag)
 
@@ -317,3 +321,7 @@ Release gate:
 - deterministic replay
 - bounded tail latency in availability mode
 - no per-shard warning storms for expected relocation paths
+
+Automation entry point:
+- quick gate: `MODE=quick scripts/bench/run_arc_allocator_gate.sh`
+- full gate: `MODE=full RELEASE_RUNS=1 CHAOS_RUNS=3 INDEX_SOAK=1 scripts/bench/run_arc_allocator_gate.sh`

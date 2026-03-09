@@ -1,8 +1,8 @@
 use axum::{
     Json,
-    body::{Body, to_bytes},
-    extract::{Path as AxumPath, Query},
-    http::{StatusCode, header},
+    body::Body,
+    extract::Path as AxumPath,
+    http::header,
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
@@ -23,11 +23,11 @@ use tokio_tar::{Builder as TarBuilder, Header as TarHeader};
 use crate::{
     enums::app_error_enum::AppError,
     n1_core::disk_manager::{
-        DownloadArchiveRequest, ListObjectsResult, ObjectMetadata, ObjectPathManager, PartMetadata,
+        DownloadArchiveRequest, ObjectMetadata, ObjectPathManager, PartMetadata,
         version_recency_is_newer,
     },
     n1_core::{
-        index,
+        index_facade as index,
         metadata_parser::get_metadata,
         object_parser::{data_shards_count, shard_dir_with_locality_hint, shard_dirs_for_version},
         recovery::{ShardFileCache, ShardRepairContext, read_or_recover_chunk_into},
@@ -41,8 +41,10 @@ const ARCHIVE_STREAM_CHANNEL: usize = 8;
 const ARCHIVE_DUPLEX_BYTES: usize = 64 * 1024;
 const ARCHIVE_CHUNK_REQ_SIZE: usize = 64 * 1024;
 const ARCHIVE_NEXT_TOKEN_HEADER: &str = "x-n1-archive-next-token";
+#[cfg(test)]
+const ARCHIVE_LIST_PAGE_LIMIT: usize = 8;
+#[cfg(not(test))]
 const ARCHIVE_LIST_PAGE_LIMIT: usize = 1000;
-const ARCHIVE_LIST_RESPONSE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
 pub async fn download_selected_archive(
     claims: Claims,
@@ -159,59 +161,6 @@ fn matches_prefix_with_delimiter(key: &str, prefix: &str, delimiter: Option<&str
 
     let rel = &ck[(pfx.len() + 1)..];
     !rel.contains('/')
-}
-
-async fn list_objects_page_for_archive_prefix(
-    fragment: &str,
-    prefix: &str,
-    delimiter: Option<&str>,
-    continuation_token: Option<String>,
-) -> Result<ListObjectsResult, AppError> {
-    let mut params = HashMap::new();
-    params.insert("limit".to_string(), ARCHIVE_LIST_PAGE_LIMIT.to_string());
-    params.insert("prefix".to_string(), canonical_prefix(prefix));
-    if let Some(d) = delimiter {
-        params.insert("delimiter".to_string(), d.to_string());
-    }
-    if let Some(token) = continuation_token {
-        params.insert("continuation_token".to_string(), token);
-    }
-
-    let claims = Claims {
-        fragment: fragment.to_string(),
-        read: true,
-        write: false,
-        modify: false,
-        delete: false,
-        exp: usize::MAX,
-    };
-    let response = crate::n1_core::retrieve::list_objects(
-        claims,
-        AxumPath(fragment.to_string()),
-        Query(params),
-    )
-    .await?
-    .into_response();
-
-    let status = response.status();
-    let body = to_bytes(response.into_body(), ARCHIVE_LIST_RESPONSE_LIMIT_BYTES)
-        .await
-        .map_err(|e| {
-            AppError::Io(
-                std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
-                "archive prefix list response".into(),
-            )
-        })?;
-    if status != StatusCode::OK {
-        return Err(AppError::InternalServerError(format!(
-            "archive prefix listing failed with status {}",
-            status
-        )));
-    }
-
-    serde_json::from_slice::<ListObjectsResult>(&body).map_err(|e| {
-        AppError::InternalServerError(format!("archive prefix listing decode failed: {}", e))
-    })
 }
 
 async fn resolve_keys_from_prefix_index(
@@ -638,30 +587,35 @@ async fn write_zip_archive_from_prefix(
     writer: DuplexStream,
 ) -> Result<(), AppError> {
     let mut zip = ZipFileWriter::with_tokio(writer);
-    let mut continuation_token: Option<String> = None;
+    let mut continuation_cursor: Option<(String, String)> = None;
 
     loop {
-        let page = list_objects_page_for_archive_prefix(
+        let (page, next_cursor) = index::list_fragment_latest_objects_page(
             fragment,
-            prefix,
-            delimiter,
-            continuation_token.clone(),
+            false,
+            Some(prefix),
+            continuation_cursor
+                .as_ref()
+                .map(|(object_key, version_id)| (object_key.as_str(), version_id.as_str())),
+            ARCHIVE_LIST_PAGE_LIMIT,
         )
         .await?;
+        if page.is_empty() {
+            break;
+        }
+        let page_len = page.len();
 
-        for summary in page.objects {
-            let clean_key = canonical_key(summary.object_key.as_str());
+        for metadata in page {
+            let clean_key = canonical_key(metadata.object_key.as_str());
             if clean_key.is_empty() {
                 continue;
             }
             if !matches_prefix_with_delimiter(clean_key.as_str(), prefix, delimiter) {
                 continue;
             }
-
-            let metadata = match get_metadata(fragment, clean_key.as_str(), fragment).await {
-                Ok(m) if !m.is_delete_marker => m,
-                _ => continue,
-            };
+            if metadata.is_delete_marker {
+                continue;
+            }
 
             let mut reader = create_multipart_reader(&metadata);
             let builder = ZipEntryBuilder::new(clean_key.as_str().into(), Compression::Stored);
@@ -687,10 +641,19 @@ async fn write_zip_archive_from_prefix(
             })?;
         }
 
-        continuation_token = page.continuation_token;
-        if continuation_token.is_none() {
+        if page_len < ARCHIVE_LIST_PAGE_LIMIT {
             break;
         }
+
+        let Some(next_cursor) = next_cursor else {
+            break;
+        };
+        if continuation_cursor.as_ref() == Some(&next_cursor) {
+            return Err(AppError::InternalServerError(
+                "archive prefix listing cursor did not advance".into(),
+            ));
+        }
+        continuation_cursor = Some(next_cursor);
     }
 
     zip.close().await.map_err(|e| {
@@ -709,30 +672,35 @@ async fn write_tar_archive_from_prefix(
     writer: DuplexStream,
 ) -> Result<(), AppError> {
     let mut tar = TarBuilder::new(writer);
-    let mut continuation_token: Option<String> = None;
+    let mut continuation_cursor: Option<(String, String)> = None;
 
     loop {
-        let page = list_objects_page_for_archive_prefix(
+        let (page, next_cursor) = index::list_fragment_latest_objects_page(
             fragment,
-            prefix,
-            delimiter,
-            continuation_token.clone(),
+            false,
+            Some(prefix),
+            continuation_cursor
+                .as_ref()
+                .map(|(object_key, version_id)| (object_key.as_str(), version_id.as_str())),
+            ARCHIVE_LIST_PAGE_LIMIT,
         )
         .await?;
+        if page.is_empty() {
+            break;
+        }
+        let page_len = page.len();
 
-        for summary in page.objects {
-            let clean_key = canonical_key(summary.object_key.as_str());
+        for metadata in page {
+            let clean_key = canonical_key(metadata.object_key.as_str());
             if clean_key.is_empty() {
                 continue;
             }
             if !matches_prefix_with_delimiter(clean_key.as_str(), prefix, delimiter) {
                 continue;
             }
-
-            let metadata = match get_metadata(fragment, clean_key.as_str(), fragment).await {
-                Ok(m) if !m.is_delete_marker => m,
-                _ => continue,
-            };
+            if metadata.is_delete_marker {
+                continue;
+            }
 
             let mut header = TarHeader::new_gnu();
 
@@ -746,10 +714,19 @@ async fn write_tar_archive_from_prefix(
                 .map_err(|e| AppError::Io(e, "tar append".into()))?;
         }
 
-        continuation_token = page.continuation_token;
-        if continuation_token.is_none() {
+        if page_len < ARCHIVE_LIST_PAGE_LIMIT {
             break;
         }
+
+        let Some(next_cursor) = next_cursor else {
+            break;
+        };
+        if continuation_cursor.as_ref() == Some(&next_cursor) {
+            return Err(AppError::InternalServerError(
+                "archive prefix listing cursor did not advance".into(),
+            ));
+        }
+        continuation_cursor = Some(next_cursor);
     }
 
     tar.finish()

@@ -1,4 +1,6 @@
 use crate::n1_core::disk_manager::ObjectPathManager;
+use crate::n1_core::index_facade::{IndexBackendMode, index_backend_mode};
+use crate::n1_core::raw_index;
 use crate::{enums::app_error_enum::AppError, n1_core::constants::FRAGMENT_METADATA_FILE};
 
 use argon2::{
@@ -171,6 +173,12 @@ pub async fn init_fragment_metadata(
 }
 
 pub async fn read_fragment_metadata(fragment_hash: &str) -> Result<FragmentMetadata, AppError> {
+    if index_backend_mode() != IndexBackendMode::Fs {
+        return raw_index::read_fragment_metadata(fragment_hash)
+            .await?
+            .ok_or(AppError::NotFound);
+    }
+
     let pm = ObjectPathManager::new();
     let roots = pm.get_all_index_roots();
 
@@ -195,6 +203,10 @@ pub async fn read_fragment_metadata(fragment_hash: &str) -> Result<FragmentMetad
 }
 
 pub async fn write_fragment_metadata(meta: &FragmentMetadata) -> Result<(), AppError> {
+    if index_backend_mode() != IndexBackendMode::Fs {
+        return raw_index::upsert_fragment_metadata(meta).await;
+    }
+
     let pm = ObjectPathManager::new();
     let roots = pm.get_all_index_roots();
 

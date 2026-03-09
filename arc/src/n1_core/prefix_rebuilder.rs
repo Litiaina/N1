@@ -21,7 +21,7 @@ use crate::n1_core::constants::{
 use crate::n1_core::disk_manager::{
     ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment, version_recency_is_newer,
 };
-use crate::n1_core::index;
+use crate::n1_core::index_facade as index;
 use crate::n1_core::prefix_delimiter::build_delimiter_compacted_from_entries;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;

@@ -13,7 +13,7 @@ use crate::enums::app_error_enum::AppError;
 use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, RenameObjectRequest, compare_version_recency,
 };
-use crate::n1_core::index;
+use crate::n1_core::index_facade as index;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;

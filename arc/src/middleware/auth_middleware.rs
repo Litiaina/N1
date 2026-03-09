@@ -1,9 +1,7 @@
 use crate::n1_core::fragment_metadata::{
     backfill_fragment_nt_hash_if_missing, verify_fragment_key,
 };
-use crate::structs::auth_structs::{
-    AuthBody, AuthorizationRequest, Claims, FileSystemClaims, LoginRequest,
-};
+use crate::structs::auth_structs::{AuthBody, AuthorizationRequest, Claims};
 use crate::validation::fragment_validation::does_fragment_exist;
 use axum::body::Body;
 use axum::extract::{FromRequestParts, Request};
@@ -29,9 +27,6 @@ pub static JWT_KEYS: LazyLock<Keys> = LazyLock::new(|| {
     let secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
     Keys::new(secret.as_bytes())
 });
-
-pub static AUTH_KEY: LazyLock<String> =
-    LazyLock::new(|| env::var("AUTH_KEY").expect("AUTH_KEY must be set for authentication"));
 
 pub static MASTER_KEY: LazyLock<String> =
     LazyLock::new(|| env::var("MASTER_KEY").expect("MASTER_KEY must be set for authentication"));
@@ -120,77 +115,12 @@ pub async fn authorize_fragment(
     Ok(Json(AuthBody::new(token)))
 }
 
-pub async fn auth(req: Request<Body>, next: Next) -> Result<Response, AuthError> {
-    let header = req.headers().get("authorization");
-    let token = match header {
-        Some(value) => value
-            .to_str()
-            .ok()
-            .and_then(|auth_str| auth_str.strip_prefix("Bearer ")),
-        None => None,
-    };
-
-    if let Some(token) = token {
-        let decoding_key = &JWT_KEYS.decoding;
-        let validation = Validation::default();
-
-        match decode::<FileSystemClaims>(token, decoding_key, &validation) {
-            Ok(_) => Ok(next.run(req).await),
-            Err(_) => Err(AuthError::InvalidToken),
-        }
-    } else {
-        Err(AuthError::InvalidToken)
-    }
-}
-
-pub async fn authorize(Json(payload): Json<LoginRequest>) -> Result<Json<AuthBody>, AuthError> {
-    if payload.secret.is_empty() || payload.path.is_empty() {
-        return Err(AuthError::MissingCredentials);
-    }
-
-    if payload.secret != *AUTH_KEY {
-        return Err(AuthError::WrongCredentials);
-    }
-
-    let duration = payload.expires_in.unwrap_or(24 * 60 * 60);
-
-    let exp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + duration;
-
-    let claims = FileSystemClaims {
-        path: payload.path,
-        write: payload.write,
-        modify: payload.modify,
-        read: payload.read,
-        delete: payload.delete,
-        exp: exp as usize,
-    };
-
-    let token = encode(&Header::default(), &claims, &JWT_KEYS.encoding)
-        .map_err(|_| AuthError::InternalError)?;
-
-    Ok(Json(AuthBody::new(token)))
-}
-
 impl Display for Claims {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "fragment: {}, read: {}, write: {}, modify: {}, delete: {},  exp: {}",
             self.fragment, self.read, self.write, self.modify, self.delete, self.exp
-        )
-    }
-}
-
-impl Display for FileSystemClaims {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "path: {}, read: {}, write: {}, modify: {}, delete: {},  exp: {}",
-            self.path, self.read, self.write, self.modify, self.delete, self.exp
         )
     }
 }
@@ -218,26 +148,6 @@ where
 
         let token_data =
             decode::<Claims>(bearer.token(), &JWT_KEYS.decoding, &Validation::default())
-                .map_err(|_| AuthError::InvalidToken)?;
-
-        Ok(token_data.claims)
-    }
-}
-
-impl<S> FromRequestParts<S> for FileSystemClaims
-where
-    S: Send + Sync,
-{
-    type Rejection = AuthError;
-
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let TypedHeader(Authorization(bearer)) = parts
-            .extract::<TypedHeader<Authorization<Bearer>>>()
-            .await
-            .map_err(|_| AuthError::InvalidToken)?;
-
-        let token_data =
-            decode::<FileSystemClaims>(bearer.token(), &JWT_KEYS.decoding, &Validation::default())
                 .map_err(|_| AuthError::InvalidToken)?;
 
         Ok(token_data.claims)

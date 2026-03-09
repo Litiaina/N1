@@ -6,8 +6,7 @@ use crate::n1_core::disk_manager::{
     ListObjectsResult, ObjectMetadata, ObjectPathManager, PrefixDelimiterCompactedSegment,
     PrefixIndexEntry, PrefixIndexSegment, Quota, compare_version_recency, version_recency_is_newer,
 };
-use crate::n1_core::fragment_manager::is_fragment_hash;
-use crate::n1_core::index;
+use crate::n1_core::index_facade as index;
 use crate::n1_core::metadata_parser::get_metadata;
 use crate::n1_core::object_parser::{get_object_logic, stream_object_logic};
 use crate::n1_core::quota_manager::get_quota;
@@ -28,7 +27,6 @@ use std::{
 };
 use tokio::fs;
 use tracing::warn;
-use walkdir::WalkDir;
 
 #[cfg(test)]
 #[derive(Default)]
@@ -1151,41 +1149,7 @@ pub async fn list_fragments(claims: Claims) -> Result<impl IntoResponse, AppErro
     if !claims.read {
         return Err(AppError::Forbidden("Read permission required".into()));
     }
-
-    let path_manager = ObjectPathManager::new();
-    let index_roots = path_manager.get_all_index_roots();
-
-    let fragments = tokio::task::spawn_blocking(move || -> Result<Vec<String>, std::io::Error> {
-        let mut fragment_hashes = HashSet::new();
-
-        for root in index_roots {
-            if !root.exists() {
-                continue;
-            }
-
-            for entry in WalkDir::new(&root)
-                .min_depth(1)
-                .max_depth(1)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                if entry.file_type().is_dir() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if is_fragment_hash(name) {
-                            fragment_hashes.insert(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut sorted_fragments: Vec<String> = fragment_hashes.into_iter().collect();
-        sorted_fragments.sort();
-        Ok(sorted_fragments)
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))?
-    .map_err(|e| AppError::Io(e, "read storage root".into()))?;
+    let fragments = index::list_fragments().await?;
 
     let mut usage_list = Vec::with_capacity(fragments.len());
 

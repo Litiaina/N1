@@ -1,8 +1,8 @@
 # N1 Architecture
 
-> Deployment profile status (2026-03-08):
+> Deployment profile status (2026-03-09):
 > - `standard` is stable and the default deployment profile.
-> - `arc` is experimental.
+> - `arc` is stable at `0.2.0` for raw-device deployments.
 > - See `DEPLOYMENT_PROFILES.md`.
 
 N1 is a single-node object storage engine with three distinct planes:
@@ -11,13 +11,13 @@ N1 is a single-node object storage engine with three distinct planes:
 - The prefix namespace index is a derived serving accelerator for `LIST prefix` and `delimiter=/`.
 - The blob plane is profile-specific:
   - `standard`: filesystem-backed shard files under blob roots.
-  - `arc`: raw-device/direct-I/O payload plane (experimental).
+  - `arc`: raw-device/direct-I/O payload plane with raw index authority.
 
 This replaces the legacy "full mirrored metadata tree on every index root" model. The node is still single-node, but its metadata authority is now partitioned instead of whole-node mirrored.
 
 ## Freeze Status
 
-The stable N1 architecture baseline is `standard 0.4.0` (`arc 0.1.0` remains experimental).
+The stable N1 architecture baseline is `standard 0.4.0` + `arc 0.2.0`.
 
 That baseline applies to:
 
@@ -41,7 +41,7 @@ N1 is intentionally a specialized object-storage engine, not a general filesyste
 Two server variants exist so users can choose deployment posture:
 
 - `standard`: filesystem-backed N1 for general-purpose use and broad hardware compatibility.
-- `arc`: raw-device/direct-I/O N1 for absolute device control and maximum throughput ceiling (experimental).
+- `arc`: raw-device/direct-I/O N1 for absolute device control and maximum throughput ceiling.
 
 They are expected to keep the same storage semantics. The difference is backend execution model and operational profile, not object correctness guarantees.
 
@@ -49,13 +49,13 @@ They are expected to keep the same storage semantics. The difference is backend 
 
 | Dimension | Standard | Arc |
 |---|---|---|
-| Status | Stable/default | Experimental |
-| `index_store_disks` | Filesystem directories | Filesystem directories |
+| Status | Stable/default | Stable raw-kernel |
+| `index_store_disks` | Filesystem directories | Raw devices |
 | `blob_store_disks` | Filesystem directories | Raw devices |
-| Index backend | Partitioned filesystem metadata | Partitioned filesystem metadata (current) |
+| Index backend | Partitioned filesystem metadata | Raw index catalog (`block_manager`) |
 | Blob backend | Filesystem shard files | Raw extent allocator (`block_manager`) |
 
-Arc raw-index direction remains a future track; current arc index is still filesystem-backed.
+Arc currently runs raw index and raw blob on managed block-manager media.
 
 ### Arc Raw-Index Direction
 
@@ -185,8 +185,7 @@ Arc blob layout:
 ```
 
 Arc index note:
-- Index is still filesystem-backed in the current runtime.
-- Raw index media remains an experimental migration target.
+- Index and blob are both raw in Arc.
 
 Allocator design note:
 - The target allocator architecture and rollout plan are defined in [`BLOCK_ALLOCATOR_V2.md`](BLOCK_ALLOCATOR_V2.md).

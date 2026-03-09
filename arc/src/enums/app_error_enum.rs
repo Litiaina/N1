@@ -13,7 +13,6 @@ pub enum AppError {
     PayloadTooLarge(String),
     Unauthorized,
     Forbidden(String),
-    Multipart(String),
     RangeNotSatisfiable,
     InternalServerError(String),
     InsufficientStorage,
@@ -42,7 +41,6 @@ impl std::fmt::Display for AppError {
             AppError::PayloadTooLarge(msg) => write!(f, "Payload too large: {}", msg),
             AppError::Unauthorized => write!(f, "Unauthorized access"),
             AppError::Forbidden(msg) => write!(f, "Forbidden: {}", msg),
-            AppError::Multipart(msg) => write!(f, "Multipart error: {}", msg),
             AppError::RangeNotSatisfiable => write!(f, "Range not satisfiable"),
             AppError::InternalServerError(msg) => write!(f, "Internal server error: {}", msg),
             AppError::InsufficientStorage => write!(f, "Insufficient storage capacity"),
@@ -79,10 +77,6 @@ impl IntoResponse for AppError {
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
             AppError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg).into_response(),
-            AppError::Multipart(msg) => {
-                tracing::error!("Multipart error: {}", msg);
-                (StatusCode::BAD_REQUEST, msg).into_response()
-            }
             AppError::Unauthorized => {
                 (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()).into_response()
             }

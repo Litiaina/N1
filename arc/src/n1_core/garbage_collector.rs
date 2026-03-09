@@ -1,13 +1,11 @@
 use crate::enums::app_error_enum::AppError;
-use crate::fs::cleanup_manager::start_cleanup;
-use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::n1_core::blob_store::{
     RawGcMarker, free_raw_address, free_raw_shards_for_metadatas,
-    is_missing_raw_device_mapping_error,
+    is_missing_raw_device_mapping_error, raw_index_metadata_roots_for_housekeeping,
 };
 use crate::n1_core::constants::GC_SUFFIX;
-use crate::n1_core::disk_manager::{ObjectMetadata, ObjectPathManager, configured_fs_storage_root};
-use crate::n1_core::index;
+use crate::n1_core::disk_manager::{ObjectMetadata, ObjectPathManager};
+use crate::n1_core::index_facade as index;
 use crate::n1_core::quota_manager::update_quota;
 use crate::n1_core::sync::sync_single_fragment_quota;
 use crate::n1_core::upload::{
@@ -183,9 +181,6 @@ pub async fn run_garbage_collector(State(state): State<Arc<AppState>>) -> impl I
                 st.phase = "Failed".to_string();
             });
         }
-
-        start_cleanup(&configured_fs_storage_root().unwrap_or_else(|| STORAGE_ROOT.to_string()))
-            .await;
 
         with_gc_status_write(|st| {
             st.is_running = false;
@@ -381,19 +376,29 @@ fn gc_cleanup_version_dir_unix(
 
 async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
-    let index_roots = path_manager.get_all_index_roots();
+    let index_roots = if index::index_backend_mode() == index::IndexBackendMode::Fs {
+        path_manager.get_all_index_roots()
+    } else {
+        raw_index_metadata_roots_for_housekeeping()?
+    };
     let blob_roots = path_manager.get_blob_roots();
 
     let mut fragments = HashSet::new();
-    for root in &index_roots {
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    if let Some(name) = entry.file_name().to_str() {
-                        fragments.insert(name.to_string());
+    if index::index_backend_mode() == index::IndexBackendMode::Fs {
+        for root in &index_roots {
+            if let Ok(entries) = std::fs::read_dir(root) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        if let Some(name) = entry.file_name().to_str() {
+                            fragments.insert(name.to_string());
+                        }
                     }
                 }
             }
+        }
+    } else {
+        for fragment in crate::n1_core::raw_index::list_fragments().await? {
+            fragments.insert(fragment);
         }
     }
 

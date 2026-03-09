@@ -933,6 +933,29 @@ impl BlockManager {
         self.allocations.len()
     }
 
+    pub fn allocation_handle(&self, allocation_id: u64) -> Option<AllocationHandle> {
+        self.allocations
+            .get(&allocation_id)
+            .copied()
+            .map(|extent| AllocationHandle {
+                allocation_id,
+                extent,
+            })
+    }
+
+    pub fn allocation_handles(&self) -> Vec<AllocationHandle> {
+        let mut handles = self
+            .allocations
+            .iter()
+            .map(|(allocation_id, extent)| AllocationHandle {
+                allocation_id: *allocation_id,
+                extent: *extent,
+            })
+            .collect::<Vec<_>>();
+        handles.sort_by_key(|h| h.allocation_id);
+        handles
+    }
+
     pub fn used_blocks(&self) -> u64 {
         self.header
             .total_blocks

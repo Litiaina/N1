@@ -2,17 +2,17 @@
 
 This document is the canonical deployment split for N1.
 
-As of 2026-03-08:
+As of 2026-03-09:
 
 - `standard` (`litiaina-n1-standard`) is the stable deployment profile and the default for production.
-- `arc` (`litiaina-n1-arc`) is experimental and must be treated as a development track.
+- `arc` (`litiaina-n1-arc`) is stable at `0.2.0` for raw-device deployments.
 
 ## 1) Profile Status
 
 | Profile | Binary | Status | Production default |
 |---|---|---|---|
 | Standard | `litiaina-n1-standard` | Stable | Yes |
-| Arc | `litiaina-n1-arc` | Experimental | No |
+| Arc | `litiaina-n1-arc` | Stable | No (advanced profile) |
 
 ## 2) Architecture Split
 
@@ -30,18 +30,17 @@ Disk layout snapshot:
 {BLOB_ROOT}/{fragment}/blob/{version_id}/part_{p}_shard_{i}.shard|.parity
 ```
 
-### Arc (experimental)
+### Arc (stable raw-kernel profile)
 
-- Filesystem-backed partitioned `index` plane (current runtime truth).
-- Raw/blob allocator-centric payload plane (`blob_store_disks` are raw devices).
-- Kernel-style storage-kernel direction.
-- Active hardening/certification work still in progress.
-- Not the default deployment target until release gates are closed.
+- Raw partitioned `index` plane (`index_store_disks` are raw devices).
+- Raw payload plane (`blob_store_disks` are raw devices).
+- Managed by `block_manager` with journaling/allocator semantics.
+- Supports same object/API behavior contracts as `standard`.
 
 Disk layout snapshot:
 
 ```text
-{INDEX_ROOT}/{fragment}/index/partitions/{partition_id}/...
+{RAW_INDEX_DEVICE} -> block_manager allocator/journal metadata + raw index catalog
 {RAW_BLOB_DEVICE} -> block_manager allocator/journal metadata
 payload address: raw://{device_id}/{allocation_id}
 ```
@@ -61,23 +60,20 @@ Use Standard for:
 - integration with N2
 - baseline operational runbooks (repair, redistribution, GC, SMB-lite)
 
-## 4) Experimental Arc Track Rules
+## 4) Arc Deployment Guidance
 
-Arc is allowed for:
+Use Arc when you need:
 
-- allocator/kernel-track development
-- isolated benchmarking
-- non-production validation
+- raw device control for both `index` and `blob`
+- direct-I/O raw path operations
+- storage-kernel deployment shape
 
-Arc is not the default for:
+Arc is not the default path when:
 
-- production rollout
-- operator runbooks
-- N2 default node-core expectations
+- broad operator compatibility is the priority
+- you do not want raw-device operational procedures
 
 ## 5) N2 Alignment Policy
 
-Until arc passes full hardening and stability gates:
-
-- N2 documentation and deployment guidance must assume N1 Standard semantics as default.
-- Arc references must be explicitly labeled experimental.
+- N2 documentation and deployment guidance keep `standard` as the default path.
+- Arc-compatible N2 deployment is supported when N1 nodes are intentionally deployed on Arc.

@@ -12,7 +12,7 @@ use crate::n1_core::disk_manager::{
 };
 use crate::n1_core::ec::ErasureStreamWriter;
 use crate::n1_core::fragment_metadata::{read_fragment_metadata, write_fragment_metadata};
-use crate::n1_core::index::{self, IndexReplicaWriteMode};
+use crate::n1_core::index_facade::{self as index, IndexReplicaWriteMode};
 use crate::n1_core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::n1_core::recovery::{ShardFileCache, ShardRepairContext, read_or_recover_chunk_into};
 use crate::n1_core::upload::{
@@ -788,31 +788,14 @@ async fn stage_old_shard_gc_with_symlink(_old_abs: &str) -> Result<(), AppError>
 }
 
 async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
-    let roots = index_roots.to_vec();
-    tokio::task::spawn_blocking(move || {
-        let mut out = HashSet::<String>::new();
-        for root in roots {
-            if !root.exists() {
-                continue;
-            }
-            let rd = match std::fs::read_dir(&root) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            for ent in rd.filter_map(|e| e.ok()) {
-                if ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    if let Some(name) = ent.file_name().to_str() {
-                        out.insert(name.to_string());
-                    }
-                }
-            }
+    let _ = index_roots;
+    match index::list_fragments().await {
+        Ok(fragments) => fragments,
+        Err(e) => {
+            warn!("failed to list fragments for redistribution: {}", e);
+            Vec::new()
         }
-        let mut v: Vec<String> = out.into_iter().collect();
-        v.sort();
-        v
-    })
-    .await
-    .unwrap_or_default()
+    }
 }
 
 struct LiveLayout {

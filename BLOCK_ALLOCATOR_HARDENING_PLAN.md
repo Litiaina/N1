@@ -2,7 +2,7 @@
 
 > Scope note:
 > - Hardening plan for arc allocator/formatter track.
-> - Arc is experimental.
+> - Arc is stable at `0.2.0`.
 > - Stable/default deployment remains `standard` (`DEPLOYMENT_PROFILES.md`).
 
 This plan defines how we make the allocator and formatter production-stable for arc kernel mode.
@@ -177,6 +177,23 @@ Mark allocator/formatter stable only when all are true:
 3. Formatter safety handshake enforced in CLI/API.
 4. Tail latency budgets held in availability mode under maintenance load.
 5. Documentation and operator runbooks updated to final behavior.
+
+## 7.1 Certification Command Pack
+
+Use the Arc allocator certification harness to produce reproducible gate artifacts:
+
+- Quick gate (CI/lab smoke + core allocator correctness):
+  - `MODE=quick scripts/bench/run_arc_allocator_gate.sh`
+- Full gate (release-candidate pass including chaos):
+  - `MODE=full RELEASE_RUNS=1 CHAOS_RUNS=3 INDEX_SOAK=1 scripts/bench/run_arc_allocator_gate.sh`
+
+Artifacts:
+- CSV summary: `.n1-bench/arc-allocator-gate-*/summary.csv`
+- Human summary: `.n1-bench/arc-allocator-gate-*/summary.txt`
+- Per-step logs: `.n1-bench/arc-allocator-gate-*/*.log`
+
+Stable closure rule:
+- Do not mark Arc allocator stable unless the full gate command above passes and the real-hardware matrix in section 6.4 is attached to the release evidence.
 
 ## 8. Execution Phases
 

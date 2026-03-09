@@ -1,6 +1,6 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::disk_manager::ObjectMetadata;
-use crate::n1_core::index;
+use crate::n1_core::index_facade as index;
 
 pub async fn find_latest_metadata_on_disk(
     fragment: &str,

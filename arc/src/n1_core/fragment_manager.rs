@@ -20,7 +20,9 @@ use crate::{
             init_fragment_metadata, read_fragment_metadata, rotate_fragment_key,
             write_fragment_metadata,
         },
+        index_facade::{IndexBackendMode, index_backend_mode},
         quota_manager::init_quota_file,
+        raw_index,
         sync::{CreateFragmentRequest, CreateFragmentResponse, ensure_fragment_blob_directories},
     },
     routes::storage_routes::AppState,
@@ -54,6 +56,17 @@ pub fn is_fragment_hash(name: &str) -> bool {
 }
 
 pub async fn list_public_fragments() -> Result<impl IntoResponse, AppError> {
+    if index_backend_mode() != IndexBackendMode::Fs {
+        let mut fragments = raw_index::list_fragments().await?;
+        fragments.sort();
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "fragments": fragments
+            })),
+        ));
+    }
+
     let path_manager = ObjectPathManager::new();
     let index_roots = path_manager.get_all_index_roots();
 
@@ -153,6 +166,50 @@ pub async fn update_fragment(
     Path(fragment_hash): Path<String>,
     Json(payload): Json<UpdateFragmentRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    if index_backend_mode() != IndexBackendMode::Fs {
+        if payload.new_name.is_some() {
+            return Err(AppError::BadRequest(
+                "fragment rename is not supported in Arc raw-index mode".into(),
+            ));
+        }
+
+        let is_admin = payload
+            .secret
+            .as_ref()
+            .map(|s| s == &*MASTER_KEY)
+            .unwrap_or(false);
+        if !is_admin && claims.fragment != fragment_hash {
+            return Err(AppError::Forbidden("Access denied to this fragment".into()));
+        }
+
+        let wants_quota = payload.new_quota.is_some();
+        let wants_key = payload.new_key.is_some();
+        if (wants_quota || wants_key) && !is_admin && !claims.modify {
+            return Err(AppError::Forbidden(
+                "Modify permission required to update fragment settings".into(),
+            ));
+        }
+
+        let current_hash = fragment_hash.clone();
+        if let Some(quota) = payload.new_quota {
+            init_quota_file(&current_hash, quota).await?;
+            state.emit(&current_hash, StorageEventPayload::StateInvalidated);
+        }
+        if let Some(new_key) = payload.new_key {
+            rotate_fragment_key(&current_hash, &new_key).await?;
+            state.emit(&current_hash, StorageEventPayload::StateInvalidated);
+        }
+
+        return Ok((
+            StatusCode::OK,
+            Json(UpdateFragmentResponse {
+                fragment_hash: current_hash,
+                name: None,
+                message: "Fragment updated successfully".to_string(),
+            }),
+        ));
+    }
+
     let is_admin = payload
         .secret
         .as_ref()
@@ -289,6 +346,32 @@ pub async fn delete_fragment(
     claims: Claims,
     Path(fragment): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
+    if index_backend_mode() != IndexBackendMode::Fs {
+        if !claims.modify {
+            return Err(AppError::Forbidden(
+                "Modify permission required to delete fragment".into(),
+            ));
+        }
+        if claims.fragment != fragment {
+            return Err(AppError::Forbidden("Access denied to this fragment".into()));
+        }
+        raw_index::delete_fragment_state(&fragment).await?;
+        info!("Deleted fragment '{}' from raw index state", fragment);
+        state.emit(
+            &fragment,
+            StorageEventPayload::FragmentDeleted {
+                fragment: fragment.clone(),
+            },
+        );
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "success",
+                "message": "Fragment deleted successfully"
+            })),
+        ));
+    }
+
     if !claims.modify {
         return Err(AppError::Forbidden(
             "Modify permission required to delete fragment".into(),

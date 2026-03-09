@@ -1,13 +1,15 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::blob_store::{RawBlobDeviceStatus, raw_blob_device_statuses};
 use crate::n1_core::disk_manager::{configured_blob_store_disks, configured_index_store_disks};
-use crate::n1_core::index;
+use crate::n1_core::index_facade as index;
+use crate::n1_core::raw_index;
 use crate::n1_core::redistribution::get_redist_status;
 use crate::n1_core::repair_manager::get_repair_status;
 use crate::n1_core::system::{SystemMetrics, get_system_metrics};
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
+use block_manager::{BlockManager, BlockManagerError};
 use axum::{
     Json,
     extract::{Query, State},
@@ -50,6 +52,10 @@ fn deep_scan_interval() -> Duration {
         .unwrap_or(60)
         .clamp(5, 24 * 3600);
     Duration::from_secs(secs)
+}
+
+fn uses_raw_index_backend() -> bool {
+    !matches!(index::index_backend_mode(), index::IndexBackendMode::Fs)
 }
 
 #[derive(Serialize, Clone)]
@@ -98,6 +104,10 @@ pub struct StoragePlaneStats {
 }
 
 async fn check_index_disk_accessibility(path_str: String) -> DiskStatus {
+    if uses_raw_index_backend() {
+        return check_raw_index_media_accessibility(path_str).await;
+    }
+
     let path = PathBuf::from(&path_str);
 
     let (status, latency_ms, error) = if path.exists() {
@@ -179,6 +189,112 @@ async fn check_index_disk_accessibility(path_str: String) -> DiskStatus {
     }
 }
 
+async fn check_raw_index_media_accessibility(path_str: String) -> DiskStatus {
+    let path = PathBuf::from(&path_str);
+    if !path.exists() {
+        return DiskStatus {
+            path: path_str,
+            role: "index".to_string(),
+            status: "offline".to_string(),
+            latency_ms: None,
+            error: Some("Path does not exist".to_string()),
+            raw_backend: None,
+        };
+    }
+
+    let meta = match timeout(DISK_CHECK_TIMEOUT, fs::metadata(&path)).await {
+        Ok(Ok(meta)) => meta,
+        Ok(Err(e)) => {
+            return DiskStatus {
+                path: path_str,
+                role: "index".to_string(),
+                status: "offline".to_string(),
+                latency_ms: None,
+                error: Some(format!("Failed to read metadata: {}", e)),
+                raw_backend: None,
+            };
+        }
+        Err(_) => {
+            return DiskStatus {
+                path: path_str,
+                role: "index".to_string(),
+                status: "slow".to_string(),
+                latency_ms: None,
+                error: Some("Raw index probe timed out (>5s)".to_string()),
+                raw_backend: None,
+            };
+        }
+    };
+
+    if meta.is_dir() {
+        return DiskStatus {
+            path: path_str,
+            role: "index".to_string(),
+            status: "offline".to_string(),
+            latency_ms: None,
+            error: Some(
+                "Index raw path is a directory; raw index expects block device or loopback file"
+                    .to_string(),
+            ),
+            raw_backend: None,
+        };
+    }
+
+    let readonly = meta.permissions().readonly();
+    let canonical = std::fs::canonicalize(&path).unwrap_or(path.clone());
+    let probe_started = Instant::now();
+    let probe = timeout(
+        DISK_CHECK_TIMEOUT,
+        tokio::task::spawn_blocking(move || BlockManager::open(&canonical)),
+    )
+    .await;
+
+    let latency_ms = Some(probe_started.elapsed().as_millis() as u64);
+    let (status, error) = match probe {
+        Ok(Ok(Ok(_mgr))) => {
+            if readonly {
+                (
+                    "readonly".to_string(),
+                    Some("Index raw media is read-only".to_string()),
+                )
+            } else if latency_ms.unwrap_or_default() > 1000 {
+                ("slow".to_string(), None)
+            } else {
+                ("online".to_string(), None)
+            }
+        }
+        Ok(Ok(Err(BlockManagerError::InvalidDevice(msg)))) => (
+            "unformatted".to_string(),
+            Some(format!("Raw index media is not N1-formatted: {}", msg)),
+        ),
+        Ok(Ok(Err(BlockManagerError::Io(e)))) => (
+            "offline".to_string(),
+            Some(format!("Raw index media I/O error: {}", e)),
+        ),
+        Ok(Ok(Err(err))) => (
+            "offline".to_string(),
+            Some(format!("Raw index media probe failed: {}", err)),
+        ),
+        Ok(Err(join_err)) => (
+            "offline".to_string(),
+            Some(format!("Raw index probe task failed: {}", join_err)),
+        ),
+        Err(_) => (
+            "slow".to_string(),
+            Some("Raw index probe timed out (>5s)".to_string()),
+        ),
+    };
+
+    DiskStatus {
+        path: path_str,
+        role: "index".to_string(),
+        status,
+        latency_ms,
+        error,
+        raw_backend: None,
+    }
+}
+
 fn is_index_healthy_status(status: &str) -> bool {
     matches!(status, "online" | "slow" | "readonly")
 }
@@ -221,6 +337,10 @@ fn compute_storage_plane_stats(disks: &[DiskStatus]) -> StoragePlaneStats {
 }
 
 async fn enumerate_fragment_names(roots: &[PathBuf]) -> Vec<String> {
+    if uses_raw_index_backend() {
+        return raw_index::list_fragments().await.unwrap_or_default();
+    }
+
     let mut fragments = std::collections::BTreeSet::new();
     for root in roots {
         let mut entries = match fs::read_dir(root).await {

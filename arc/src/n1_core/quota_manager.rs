@@ -1,6 +1,8 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::constants::LOCK_SHARD_COUNT;
 use crate::n1_core::disk_manager::{ObjectPathManager, Quota};
+use crate::n1_core::index_facade::{IndexBackendMode, index_backend_mode};
+use crate::n1_core::raw_index;
 use futures_util::future::join_all;
 use moka::future::Cache;
 use std::collections::hash_map::DefaultHasher;
@@ -37,6 +39,10 @@ static QUOTA_LOCKS: LazyLock<Vec<Mutex<()>>> = LazyLock::new(|| {
 });
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn is_raw_index_mode() -> bool {
+    index_backend_mode() != IndexBackendMode::Fs
+}
 
 fn get_quota_lock(fragment: &str) -> &Mutex<()> {
     let mut hasher = DefaultHasher::new();
@@ -377,6 +383,18 @@ async fn read_quota_from_any_disk(fragment: &str) -> Result<Quota, AppError> {
 }
 
 pub async fn init_quota_file(fragment: &str, allocated: u64) -> Result<(), AppError> {
+    if is_raw_index_mode() {
+        let _guard = get_quota_lock(fragment).lock().await;
+        let mut quota = raw_index::read_quota(fragment).await?.unwrap_or(Quota {
+            allocated_storage: allocated,
+            storage_used: 0,
+        });
+        quota.allocated_storage = allocated;
+        raw_index::upsert_quota(fragment, &quota).await?;
+        QUOTA_CACHE.insert(fragment.to_string(), quota).await;
+        return Ok(());
+    }
+
     let _ = ensure_flusher_tx().await;
 
     let _guard = get_quota_lock(fragment).lock().await;
@@ -416,6 +434,23 @@ pub async fn init_quota_file(fragment: &str, allocated: u64) -> Result<(), AppEr
 }
 
 pub async fn get_quota(fragment: &str) -> Result<Quota, AppError> {
+    if is_raw_index_mode() {
+        if let Some(quota) = QUOTA_CACHE.get(fragment).await {
+            return Ok(quota);
+        }
+        let _guard = get_quota_lock(fragment).lock().await;
+        if let Some(quota) = QUOTA_CACHE.get(fragment).await {
+            return Ok(quota);
+        }
+        let quota = raw_index::read_quota(fragment)
+            .await?
+            .ok_or(AppError::Unauthorized)?;
+        QUOTA_CACHE
+            .insert(fragment.to_string(), quota.clone())
+            .await;
+        return Ok(quota);
+    }
+
     let _ = ensure_flusher_tx().await;
 
     if let Some(quota) = QUOTA_CACHE.get(fragment).await {
@@ -436,6 +471,26 @@ pub async fn get_quota(fragment: &str) -> Result<Quota, AppError> {
 }
 
 pub async fn update_quota(fragment: &str, delta_bytes: i64) -> Result<(), AppError> {
+    if is_raw_index_mode() {
+        let _guard = get_quota_lock(fragment).lock().await;
+        let mut quota = match QUOTA_CACHE.get(fragment).await {
+            Some(q) => q,
+            None => raw_index::read_quota(fragment).await?.ok_or_else(|| {
+                AppError::InternalServerError("Quota file missing. Fragment not initialized.".into())
+            })?,
+        };
+        if delta_bytes < 0 {
+            quota.storage_used = quota
+                .storage_used
+                .saturating_sub(delta_bytes.unsigned_abs());
+        } else {
+            quota.storage_used = quota.storage_used.saturating_add(delta_bytes as u64);
+        }
+        raw_index::upsert_quota(fragment, &quota).await?;
+        QUOTA_CACHE.insert(fragment.to_string(), quota).await;
+        return Ok(());
+    }
+
     let _ = ensure_flusher_tx().await;
 
     let _guard = get_quota_lock(fragment).lock().await;
@@ -461,6 +516,21 @@ pub async fn update_quota(fragment: &str, delta_bytes: i64) -> Result<(), AppErr
 }
 
 pub async fn try_reserve_quota(fragment: &str, reserve_amount: u64) -> Result<(), AppError> {
+    if is_raw_index_mode() {
+        let _guard = get_quota_lock(fragment).lock().await;
+        let mut quota = match QUOTA_CACHE.get(fragment).await {
+            Some(q) => q,
+            None => raw_index::read_quota(fragment).await?.ok_or(AppError::Unauthorized)?,
+        };
+        if quota.storage_used.saturating_add(reserve_amount) > quota.allocated_storage {
+            return Err(AppError::InsufficientStorage);
+        }
+        quota.storage_used = quota.storage_used.saturating_add(reserve_amount);
+        raw_index::upsert_quota(fragment, &quota).await?;
+        QUOTA_CACHE.insert(fragment.to_string(), quota).await;
+        return Ok(());
+    }
+
     let _ = ensure_flusher_tx().await;
 
     let _guard = get_quota_lock(fragment).lock().await;
@@ -482,6 +552,23 @@ pub async fn try_reserve_quota(fragment: &str, reserve_amount: u64) -> Result<()
 }
 
 pub async fn set_storage_used(fragment: &str, usage: u64) -> Result<(), AppError> {
+    if is_raw_index_mode() {
+        let _guard = get_quota_lock(fragment).lock().await;
+        let mut quota = match QUOTA_CACHE.get(fragment).await {
+            Some(q) => q,
+            None => match raw_index::read_quota(fragment).await? {
+                Some(q) => q,
+                None => return Ok(()),
+            },
+        };
+        if quota.storage_used != usage {
+            quota.storage_used = usage;
+            raw_index::upsert_quota(fragment, &quota).await?;
+            QUOTA_CACHE.insert(fragment.to_string(), quota).await;
+        }
+        return Ok(());
+    }
+
     let _ = ensure_flusher_tx().await;
 
     let _guard = get_quota_lock(fragment).lock().await;

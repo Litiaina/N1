@@ -41,6 +41,7 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("global_limit_burst_size", "300");
 
     conf.with_section(Some("upload_config"))
+        .set("index_backend_mode", "raw-only")
         .set("max_concurrent_io", "auto")
         .set("adaptive_concurrency_enabled", "true")
         .set("adaptive_concurrency_interval_ms", "auto")

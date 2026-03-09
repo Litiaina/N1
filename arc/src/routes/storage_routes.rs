@@ -1,26 +1,10 @@
 use crate::enums::app_error_enum::AppError;
-use crate::fs::direct_upload::upload_file;
-use crate::fs::directory_manager::{
-    create_directory, delete_directory, delete_file, get_file_metadata, rename_file_query,
-};
-use crate::fs::directory_viewer::{
-    stream_file, stream_file_v2, stream_hls_file, view_directory, view_file,
-};
-use crate::fs::download_manager::download_file;
-use crate::fs::fragmented_upload::{check_uploaded_fragments, upload_fragments};
-use crate::fs::fs_constants::MAX_FILE_SIZE;
-use crate::fs::stateless_fragmented_upload::{
-    self, finalize_upload_session, initiate_upload_session, upload_chunk_binary,
-    upload_chunk_multipart,
-};
 use crate::fuse::handlers::{
     fsd_delete, fsd_list_dir, fsd_mkdir, fsd_read, fsd_rename, fsd_rmdir, fsd_stat,
     fsd_write_abort, fsd_write_begin, fsd_write_chunk, fsd_write_commit,
 };
-use crate::handlers::dir_info_handlers::get_storage_capacity;
-use crate::middleware::auth_middleware::{auth, authorize, authorize_fragment, validate_access};
+use crate::middleware::auth_middleware::{authorize_fragment, validate_access};
 use crate::middleware::rate_limiter_middleware::RateLimitLayers;
-use crate::middleware::storage_middleware::enforce_storage_limit;
 use crate::n1_core::adaptive_concurrency::run_adaptive_concurrency_loop;
 use crate::n1_core::archive::download_selected_archive;
 use crate::n1_core::delete::{
@@ -81,6 +65,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
+
+const MAX_FILE_SIZE: usize = 5 * 1024 * 1024 * 1024;
 
 pub struct AppState {
     pub ws_manager: WsConnectionManager,
@@ -328,85 +314,6 @@ pub async fn serve_storage_routes() -> Router {
         Router::new().merge(upgrade_route).merge(broadcast_route)
     };
 
-    let legacy_fs_routes = {
-        let upload_routes = Router::new()
-            .route("/dir/file/upload/", post(upload_file))
-            .route("/dir/file/upload/{*path}", post(upload_file))
-            .route("/dir/file/upload/v2/", post(upload_fragments))
-            .route("/dir/file/upload/v2/{*path}", post(upload_fragments))
-            .route(
-                "/dir/file/upload/v3/initiate/",
-                post(initiate_upload_session),
-            )
-            .route(
-                "/dir/file/upload/v3/initiate/{*path}",
-                post(initiate_upload_session),
-            )
-            .route(
-                "/dir/file/upload/multipart/v3/{:file_id}/{:chunk_index}",
-                put(upload_chunk_multipart),
-            )
-            .route(
-                "/dir/file/upload/v3/{:file_id}/{:chunk_index}",
-                put(upload_chunk_binary),
-            )
-            .route(
-                "/dir/file/upload/v3/{:file_id}/status",
-                get(stateless_fragmented_upload::get_upload_status),
-            )
-            .route(
-                "/dir/file/upload/v3/{:file_id}/finalize",
-                post(finalize_upload_session),
-            )
-            .layer(from_fn(enforce_storage_limit));
-
-        let upload_routes = layers
-            .layer_upload(upload_routes)
-            .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
-
-        let management_ops = Router::new()
-            .route("/dir/create/{*path}", post(create_directory))
-            .route("/dir/delete/{*path}", delete(delete_directory))
-            .route("/dir/file/rename/", put(rename_file_query))
-            .route("/dir/file/rename/{*path}", put(rename_file_query))
-            .route("/dir/file/delete/", delete(delete_file))
-            .route("/dir/file/delete/{*path}", delete(delete_file));
-
-        let management_ops = layers
-            .layer_upload(management_ops)
-            .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
-
-        let read_ops = Router::new()
-            .route("/dir/", get(view_directory))
-            .route("/dir/{*path}", get(view_directory))
-            .route("/dir/capacity", get(get_storage_capacity))
-            .route(
-                "/dir/file/upload/check/{*path}",
-                get(check_uploaded_fragments),
-            )
-            .route("/dir/file/view/{*path}", get(view_file))
-            .route("/dir/file/stream/{*path}", get(stream_file))
-            .route("/dir/file/stream/v2/{*path}", get(stream_file_v2))
-            .route(
-                "/dir/file/transcode/stream/hls/{*path}",
-                get(stream_hls_file),
-            )
-            .route("/dir/file/metadata/", get(get_file_metadata))
-            .route("/dir/file/metadata/{*path}", get(get_file_metadata))
-            .route("/dir/file/download/", get(download_file))
-            .route("/dir/file/download/{*path}", get(download_file));
-
-        let read_ops = layers
-            .layer_view(read_ops)
-            .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
-
-        Router::new()
-            .merge(upload_routes)
-            .merge(management_ops)
-            .merge(read_ops)
-            .layer(from_fn(auth))
-    };
-
     let list_fragments_route =
         Router::new().route("/v4/fragment/list/public", get(list_public_fragments));
     let list_fragments_route = layers
@@ -429,21 +336,16 @@ pub async fn serve_storage_routes() -> Router {
         Router::new().route("/authenticate/fragment", post(authorize_fragment));
     let fragment_auth_route = layers.layer_auth(fragment_auth_route);
 
-    let fs_auth_route = Router::new().route("/authenticate/fs", post(authorize));
-    let fs_auth_route = layers.layer_auth(fs_auth_route);
-
     let ping_route = Router::new().route("/ping", get(ping));
     let ping_route = layers.layer_global(ping_route);
 
     let router = Router::new()
         .merge(ping_route)
         .merge(fragment_auth_route)
-        .merge(fs_auth_route)
         .merge(list_fragments_route)
         .merge(global_routes)
         .merge(create_fragment_route)
         .merge(object_storage_routes)
-        .merge(legacy_fs_routes)
         .merge(ws_routes)
         .layer(DefaultBodyLimit::max(MAX_FILE_SIZE))
         .layer(cors_layer)

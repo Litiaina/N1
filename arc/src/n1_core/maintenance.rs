@@ -1,6 +1,6 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::disk_manager::ObjectPathManager;
-use crate::n1_core::index;
+use crate::n1_core::index_facade as index;
 use crate::n1_core::quota_manager::set_storage_used;
 use crate::structs::auth_structs::Claims;
 use axum::{http::StatusCode, response::IntoResponse};

@@ -7,7 +7,9 @@ use walkdir::WalkDir;
 
 use crate::{
     enums::app_error_enum::AppError,
-    n1_core::{disk_manager::ObjectPathManager, index, quota_manager::set_storage_used},
+    n1_core::{
+        disk_manager::ObjectPathManager, index_facade as index, quota_manager::set_storage_used,
+    },
     structs::auth_structs::Claims,
 };
 
@@ -83,6 +85,32 @@ async fn recover_fragment_name_from_disk(fragment_hash: String) -> Option<String
 }
 
 pub async fn sync_quota() -> Result<(), Box<dyn Error + Send + Sync>> {
+    if index::index_backend_mode() != index::IndexBackendMode::Fs {
+        let mut count = 0usize;
+        for fragment_hash in crate::n1_core::raw_index::list_fragments().await? {
+            ensure_fragment_blob_directories(&fragment_hash).await;
+            sweep_fragment_gc_files(fragment_hash.clone()).await;
+            let usage = calculate_usage_across_mirrors(fragment_hash.clone()).await;
+            if let Err(e) = set_storage_used(&fragment_hash, usage).await {
+                warn!(
+                    "Failed to update usage for raw fragment {}: {}",
+                    fragment_hash, e
+                );
+            } else {
+                info!(
+                    "Synced quota for raw fragment {}. Usage: {} bytes",
+                    fragment_hash, usage
+                );
+            }
+            count += 1;
+        }
+        info!(
+            "Consistency check completed. Synced {} active fragments.",
+            count
+        );
+        return Ok(());
+    }
+
     let path_manager = ObjectPathManager::new();
     let index_roots = path_manager.get_all_index_roots();
 

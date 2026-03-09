@@ -1,8 +1,8 @@
 # N1 Arc Raw-Kernel Plan
 
-> Experimental track note:
-> - This document is for arc experimental development only.
-> - Stable/default production deployment remains `standard`.
+> Arc engineering note:
+> - This document tracks Arc raw-kernel evolution.
+> - Arc is stable at `0.2.0`; `standard` remains the default deployment profile.
 > - See `DEPLOYMENT_PROFILES.md`.
 
 This document defines the target structure for `N1 Arc` as a raw-only storage kernel:
@@ -115,6 +115,10 @@ Durability order:
 - Introduce index facade trait used by control-plane code.
 - Move direct index filesystem reads/writes behind facade impl.
 - Keep existing behavior; no semantic change.
+Status:
+- Added `arc/src/n1_core/index_facade.rs` as the control-plane index boundary.
+- Migrated Arc upload path calls (`init/chunk/status/finalize/cancel`) to the facade.
+- Removed Arc upload-side per-part filesystem sidecar metadata writes/reads; part existence/status now resolves from authoritative index session state.
 
 Exit criteria:
 - all n1_core metadata paths compile through facade calls.
@@ -145,6 +149,12 @@ Exit criteria:
 - Remove legacy `fs` routes and handlers in arc.
 - Remove fs cleanup loop dependencies from arc boot/GC.
 - Keep only object APIs and fsd gateway backed by object semantics if needed.
+Status:
+- Arc HTTP surface no longer mounts legacy `/dir/*` routes.
+- Arc no longer mounts `/authenticate/fs`.
+- Arc runtime boot path no longer runs legacy fs cleanup loops.
+- Arc GC no longer invokes legacy fs cleanup manager.
+- Remaining cleanup: remove dormant `crate::fs::*` module wiring and non-essential legacy helpers that are outside the runtime hot path.
 
 Exit criteria:
 - no `crate::fs::*` dependency in arc runtime hot path.

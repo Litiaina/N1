@@ -20,7 +20,7 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard}
 use std::time::Instant;
 use tokio::fs as tokio_fs;
 use tokio::sync::Notify;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use ulid::Ulid;
 use walkdir::WalkDir;
 
@@ -467,6 +467,44 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn raw_index_metadata_roots() -> Result<Vec<String>, AppError> {
+    let configured = configured_index_store_disks()?;
+    let mut roots = Vec::<String>::new();
+    let mut seen = HashSet::<PathBuf>::new();
+
+    for entry in configured {
+        let path = PathBuf::from(&entry);
+        let include = match std::fs::metadata(&path) {
+            Ok(meta) => meta.is_dir(),
+            Err(_) => !entry.starts_with("/dev/"),
+        };
+        if !include {
+            continue;
+        }
+        if seen.insert(path.clone()) {
+            roots.push(path.to_string_lossy().to_string());
+        }
+    }
+
+    if !roots.is_empty() {
+        return Ok(roots);
+    }
+
+    let fallback = configured_fs_storage_root()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("n1-arc-index-meta"));
+    let aux = fallback.join(".n1-arc-index-meta");
+    Ok(vec![aux.to_string_lossy().to_string()])
+}
+
+pub fn raw_index_metadata_roots_for_housekeeping() -> Result<Vec<PathBuf>, AppError> {
+    Ok(raw_index_metadata_roots()?
+        .into_iter()
+        .map(PathBuf::from)
+        .collect())
+}
+
 fn raw_device_map_path(index_root: &Path) -> PathBuf {
     index_root
         .join(RAW_DEVICE_MAP_DIR)
@@ -530,7 +568,7 @@ fn sync_raw_device_map(force: bool) -> Result<u64, AppError> {
         }
     }
 
-    let index_roots = configured_index_store_disks()?;
+    let index_roots = raw_index_metadata_roots()?;
     if index_roots.is_empty() {
         return Ok(current_raw_topology_epoch());
     }
@@ -627,7 +665,14 @@ fn sync_raw_device_map(force: bool) -> Result<u64, AppError> {
 
 fn sync_raw_device_map_best_effort(force: bool) {
     if let Err(e) = sync_raw_device_map(force) {
-        warn!("Raw topology/device map sync skipped: {}", e);
+        if is_index_store_config_not_initialized(&e) {
+            debug!(
+                "Raw topology/device map sync deferred until index config is initialized: {}",
+                e
+            );
+        } else {
+            warn!("Raw topology/device map sync skipped: {}", e);
+        }
     }
 }
 
@@ -1007,15 +1052,26 @@ pub fn format_raw_blob_device(path: &Path, force: bool) -> Result<RawBlobDeviceS
         .remove(&inspection.canonical_path);
     clear_raw_manager_device_index();
 
-    BlockManager::format(
-        &inspection.canonical_path,
-        FormatOptions {
-            journal_blocks: recommended_raw_journal_blocks(inspection.total_bytes),
-            total_bytes: Some(inspection.total_bytes),
-            ..Default::default()
-        },
-    )
-    .map_err(block_manager_error_to_app)?;
+    let format_result = if force {
+        BlockManager::format_with_force(
+            &inspection.canonical_path,
+            FormatOptions {
+                journal_blocks: recommended_raw_journal_blocks(inspection.total_bytes),
+                total_bytes: Some(inspection.total_bytes),
+                ..Default::default()
+            },
+        )
+    } else {
+        BlockManager::format(
+            &inspection.canonical_path,
+            FormatOptions {
+                journal_blocks: recommended_raw_journal_blocks(inspection.total_bytes),
+                total_bytes: Some(inspection.total_bytes),
+                ..Default::default()
+            },
+        )
+    };
+    format_result.map_err(block_manager_error_to_app)?;
 
     let refreshed = inspect_raw_blob_device(&inspection.canonical_path, false)?;
     sync_raw_device_map_best_effort(true);
@@ -1091,9 +1147,23 @@ fn deferred_raw_free_backlog_by_device() -> HashMap<String, u64> {
             out
         }
         Err(err) => {
-            warn!("Deferred raw free backlog probe skipped: {}", err);
+            if is_index_store_config_not_initialized(&err) {
+                debug!(
+                    "Deferred raw free backlog probe deferred until index config is initialized: {}",
+                    err
+                );
+            } else {
+                warn!("Deferred raw free backlog probe skipped: {}", err);
+            }
             HashMap::new()
         }
+    }
+}
+
+fn is_index_store_config_not_initialized(err: &AppError) -> bool {
+    match err {
+        AppError::InternalServerError(msg) => msg.contains("Index Store Config not initialized"),
+        _ => false,
     }
 }
 
@@ -1564,7 +1634,7 @@ async fn write_deferred_raw_free_markers(addresses: &[RawBlobAddress]) -> Result
     if addresses.is_empty() {
         return Ok(());
     }
-    let index_roots = configured_index_store_disks()?;
+    let index_roots = raw_index_metadata_roots()?;
     if index_roots.is_empty() {
         return Err(AppError::InternalServerError(
             "No index roots configured for deferred raw free markers".into(),
@@ -1608,7 +1678,7 @@ async fn write_deferred_raw_free_markers(addresses: &[RawBlobAddress]) -> Result
 async fn collect_deferred_raw_free_markers(
     batch_limit: usize,
 ) -> Result<Vec<(RawBlobAddress, Vec<PathBuf>)>, AppError> {
-    let index_roots = configured_index_store_disks()?;
+    let index_roots = raw_index_metadata_roots()?;
     if index_roots.is_empty() {
         return Ok(Vec::new());
     }
@@ -1668,7 +1738,7 @@ async fn remove_deferred_marker_paths(paths: &[PathBuf]) {
 fn collect_deferred_raw_free_markers_blocking(
     batch_limit: usize,
 ) -> Result<Vec<(RawBlobAddress, Vec<PathBuf>)>, AppError> {
-    let index_roots = configured_index_store_disks()?;
+    let index_roots = raw_index_metadata_roots()?;
     if index_roots.is_empty() {
         return Ok(Vec::new());
     }
@@ -2050,6 +2120,18 @@ pub async fn write_raw_gc_markers(
         return Ok(());
     }
 
+    let mut roots = index_roots.to_vec();
+    roots.retain(|root| match std::fs::metadata(root) {
+        Ok(meta) => meta.is_dir(),
+        Err(_) => !root.to_string_lossy().starts_with("/dev/"),
+    });
+    if roots.is_empty() {
+        roots = raw_index_metadata_roots()?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+    }
+
     let created_at = chrono::Utc::now().timestamp();
     for raw in addresses {
         let marker = RawGcMarker {
@@ -2061,7 +2143,7 @@ pub async fn write_raw_gc_markers(
             AppError::InternalServerError(format!("serialize raw gc marker: {}", e))
         })?;
 
-        for root in index_roots {
+        for root in &roots {
             let path = raw_gc_marker_path(root, fragment, raw);
             if let Some(parent) = path.parent() {
                 tokio_fs::create_dir_all(parent).await.map_err(|e| {
@@ -2235,6 +2317,12 @@ fn open_or_format_raw_manager(path: &Path) -> Result<Arc<RwLock<BlockManager>>, 
         .insert(inspection.canonical_path, manager.clone());
     let _ = register_raw_manager_device(&manager)?;
     Ok(manager)
+}
+
+pub(crate) fn open_or_format_raw_manager_for_path(
+    path: &Path,
+) -> Result<Arc<RwLock<BlockManager>>, AppError> {
+    open_or_format_raw_manager(path)
 }
 
 fn recommended_raw_journal_blocks(total_bytes: u64) -> u64 {

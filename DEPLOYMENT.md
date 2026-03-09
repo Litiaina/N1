@@ -1,8 +1,8 @@
 # N1 Deployment Runbook (Standard + Arc)
 
-> Deployment profile status (2026-03-08):
+> Deployment profile status (2026-03-09):
 > - Stable/default: `standard` (`litiaina-n1-standard`)
-> - Experimental: `arc` (`litiaina-n1-arc`)
+> - Stable raw-kernel: `arc` (`litiaina-n1-arc`, `0.2.0`)
 > - See `DEPLOYMENT_PROFILES.md` for profile policy.
 
 This runbook documents both N1 deployment profiles:
@@ -11,22 +11,21 @@ This runbook documents both N1 deployment profiles:
   - `index_store_disks`: mounted filesystem paths
   - `blob_store_disks`: mounted filesystem paths (directory roots)
   - no raw format commands
-- `arc` (experimental):
-  - `index_store_disks`: mounted filesystem paths
-  - `blob_store_disks`: raw, unformatted, unmounted blob devices
+- `arc` (stable raw-kernel):
+  - `index_store_disks`: raw, unformatted, unmounted devices
+  - `blob_store_disks`: raw, unformatted, unmounted devices
   - raw format commands available (`format-blob-device`, `format-index-device`)
 
-N1 Arc owns raw blob device format and extent allocation through `block_manager`.
-For stable-vs-experimental profile policy, see `DEPLOYMENT_PROFILES.md`.
+N1 Arc owns raw index/blob device format and extent allocation through `block_manager`.
+For deployment profile policy, see `DEPLOYMENT_PROFILES.md`.
 
 Current runtime truth:
-- Both profiles use filesystem-backed partitioned `index`.
-- Only arc uses raw blob devices.
-- Arc raw index is a future/experimental track, not the current default runtime.
+- `standard`: filesystem-backed partitioned `index` and blob roots.
+- `arc`: raw partitioned `index` and raw blob devices.
 
 ## 1. Disk Roles
 
-### Index disks
+### Index disks (`standard`)
 
 Use normal filesystems for:
 
@@ -44,7 +43,7 @@ Example mountpoints:
 /srv/n1/index1
 ```
 
-Index layout used by both profiles:
+Standard index layout:
 
 ```text
 {INDEX_ROOT}/{fragment}/index/partitions/{partition_id}/
@@ -53,6 +52,23 @@ Index layout used by both profiles:
   sessions/...
   objects/...
   trash/...
+```
+
+### Index disks (`arc`)
+
+Use dedicated raw devices for Arc index authority:
+
+- object metadata
+- session metadata
+- quota and fragment metadata
+- partition WAL/checkpoint data
+
+Arc index layout:
+
+```text
+{RAW_INDEX_DEVICE}
+  block_manager allocator metadata + journals
+  raw index catalog records (sessions/objects/trash/quota/fragment)
 ```
 
 ### Blob disks (`standard`)
@@ -71,7 +87,7 @@ Standard blob layout:
 {BLOB_ROOT}/{fragment}/.trash/blob/{version_id}/...
 ```
 
-### Blob disks (`arc`, experimental)
+### Blob disks (`arc`)
 
 Use dedicated raw devices for:
 
@@ -167,7 +183,6 @@ sudo target/release/litiaina-n1-arc format-blob-device \
 This command applies the N1 raw blob format directly and uses a journal sized for current blob workloads.
 
 For index media pre-formatting (arc command path), use the same safety handshake.
-For arc raw-index migration track details, see `ARC_RAW_KERNEL_PLAN.md` (experimental track).
 
 ```bash
 sudo target/release/litiaina-n1-arc format-index-device \
@@ -196,11 +211,11 @@ parity_shards=1
 stripe_block_size=4194304
 ```
 
-`n1_config.ini` (arc, experimental):
+`n1_config.ini` (arc):
 
 ```ini
 [disk_config]
-index_store_disks=/srv/n1/index0,/srv/n1/index1
+index_store_disks=/dev/disk/by-id/nvme-Samsung_SSD_INDEX_1,/dev/disk/by-id/nvme-Samsung_SSD_INDEX_2
 blob_store_disks=/dev/disk/by-id/nvme-Samsung_SSD_1,/dev/disk/by-id/nvme-Samsung_SSD_2,/dev/disk/by-id/nvme-Samsung_SSD_3
 fs_storage_path=/srv/n1/fs
 
@@ -261,7 +276,7 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 ```
 
-Use `/opt/n1/target/release/litiaina-n1-arc` only when intentionally deploying the experimental Arc profile.
+Use `/opt/n1/target/release/litiaina-n1-arc` when deploying the Arc raw-kernel profile.
 
 ## 7. Health And Observability
 
@@ -313,18 +328,22 @@ Scrub is the integrity-check pass for committed shards (raw shards on arc, shard
 ## 8. Operational Rules
 
 - For arc: never mount a raw blob device while N1 is configured to use it.
+- For arc: never mount a raw index device while N1 is configured to use it.
 - For arc: never point two N1 instances at the same raw blob device.
 - Replace blob devices by:
   1. stopping writes or scheduling maintenance
   2. replacing the failed device
   3. restarting N1
   4. running repair / redistribution as needed
-- Keep index disks on normal filesystems; they remain the authoritative metadata plane.
+- Keep profile layout consistent: `standard` index on filesystem paths, `arc` index on raw devices.
 
 ## 9. Quick Validation Checklist
 
-- index disks mounted and writable
+- standard: index disks mounted and writable
 - standard: blob root directories mounted and writable
+- arc: index devices raw/unformatted or already N1-managed
+- arc: index devices not mounted
+- arc: `index_store_disks` uses stable `/dev/disk/by-id/*` names
 - arc: blob devices unformatted or already N1-managed
 - arc: blob devices not mounted
 - arc: `blob_store_disks` uses stable `/dev/disk/by-id/*` names
@@ -335,7 +354,7 @@ Scrub is the integrity-check pass for committed shards (raw shards on arc, shard
 
 ## 10. Release Hardening On Target Hardware
 
-Run the release drill harness before production rollout (`standard 0.4.0` stable, `arc 0.1.0` experimental):
+Run the release drill harness before production rollout (`standard 0.4.0` stable, `arc 0.2.0` stable):
 
 ```bash
 scripts/bench/run_release_drills.sh

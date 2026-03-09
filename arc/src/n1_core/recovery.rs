@@ -7,7 +7,7 @@ use crate::n1_core::constants::GC_SUFFIX;
 use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, PartMetadata, RawBlobAddress, ShardInfo,
 };
-use crate::n1_core::index;
+use crate::n1_core::index_facade as index;
 use crate::n1_core::raw_io_ring::{RawReadCompletion, RawReadRing, RawReadSubmitError};
 use crate::n1_core::upload::{DirectWriter, sync_dir};
 

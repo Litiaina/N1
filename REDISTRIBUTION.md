@@ -1,8 +1,8 @@
 # N1 Redistribution Guide
 
-> Deployment profile status (2026-03-08):
+> Deployment profile status (2026-03-09):
 > - `standard` is stable and default for redistribution operations.
-> - `arc` is experimental.
+> - `arc` is stable at `0.2.0` for raw-device redistribution operations.
 > - See `DEPLOYMENT_PROFILES.md`.
 
 This document reflects the current redistribution engine and API behavior in N1.
@@ -67,7 +67,7 @@ cargo run -p standard -- ops redistribute status --secret "$MASTER_KEY" --fragme
 cargo run -p standard -- ops redistribute stop --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
 ```
 
-Experimental arc track equivalent:
+Arc equivalent:
 
 ```bash
 cargo run -p arc -- ops redistribute start --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure

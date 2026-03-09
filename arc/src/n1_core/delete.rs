@@ -19,7 +19,7 @@ use crate::n1_core::blob_store::{
 use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, compare_version_recency, default_stripe_size,
 };
-use crate::n1_core::index;
+use crate::n1_core::index_facade as index;
 use crate::n1_core::metadata_parser::get_metadata;
 use crate::n1_core::quota_manager::update_quota;
 use crate::routes::storage_routes::AppState;

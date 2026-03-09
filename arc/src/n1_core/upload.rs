@@ -34,9 +34,8 @@ use std::os::windows::fs::OpenOptionsExt;
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::blob_store::{
     allocate_raw_address, allocate_raw_direct_io, configured_blob_disk_count,
-    flush_raw_metadata_for_addresses,
-    free_raw_addresses, open_raw_direct_io_for_address, raw_blob_address_from_extent,
-    raw_blob_debug_path, stable_shard_file_name,
+    flush_raw_metadata_for_addresses, free_raw_addresses, open_raw_direct_io_for_address,
+    raw_blob_address_from_extent, raw_blob_debug_path, stable_shard_file_name,
 };
 use crate::n1_core::disk_manager::{
     FinalizeIncompleteResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery,
@@ -47,7 +46,7 @@ use crate::n1_core::ec::{
     AlignedBuffer, RawErasureStreamWriter, recycle_pooled_aligned_buffer,
     take_pooled_aligned_buffer,
 };
-use crate::n1_core::index;
+use crate::n1_core::index_facade as index;
 use crate::n1_core::quota_manager::{try_reserve_quota, update_quota};
 use crate::n1_core::raw_io_ring::{RawIoCompletion, RawIoRing, RawIoSubmitError};
 use crate::routes::storage_routes::AppState;
@@ -987,52 +986,26 @@ pub(crate) async fn session_part_meta_paths(
     version_id: &str,
     part_index: u64,
 ) -> Result<Vec<PathBuf>, AppError> {
-    Ok(index::get_session_state_paths(fragment, version_id)?
-        .into_iter()
-        .map(|state_path| {
-            session_part_meta_path_from_state_path(&state_path, version_id, part_index)
-        })
-        .collect())
-}
-
-async fn session_part_meta_dirs(
-    fragment: &str,
-    version_id: &str,
-) -> Result<Vec<PathBuf>, AppError> {
-    Ok(index::get_session_state_paths(fragment, version_id)?
-        .into_iter()
-        .map(|state_path| session_parts_dir_from_state_path(&state_path, version_id))
-        .collect())
-}
-
-async fn read_messagepack_if_exists<T>(path: &std::path::Path) -> Result<Option<T>, AppError>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    match tokio_fs::read(path).await {
-        Ok(bytes) => {
-            let value = rmp_serde::from_slice::<T>(&bytes).map_err(|e| {
-                AppError::InternalServerError(format!("decode {}: {}", path.display(), e))
-            })?;
-            Ok(Some(value))
-        }
-        Err(e)
-            if e.kind() == std::io::ErrorKind::NotFound
-                || e.kind() == std::io::ErrorKind::NotADirectory =>
-        {
-            Ok(None)
-        }
-        Err(e) => Err(AppError::Io(e, format!("read {}", path.display()))),
-    }
+    Ok(
+        index::get_session_state_paths(fragment, version_id)?
+            .into_iter()
+            .map(|state_path| {
+                session_part_meta_path_from_state_path(&state_path, version_id, part_index)
+            })
+            .collect(),
+    )
 }
 
 async fn load_session_state_any(
     fragment: &str,
     version_id: &str,
 ) -> Result<Option<index::IndexSessionState>, AppError> {
-    for path in index::get_session_state_paths(fragment, version_id)? {
-        if let Some(state) = read_messagepack_if_exists::<index::IndexSessionState>(&path).await? {
-            return Ok(Some(state));
+    if let Some(state) = index::load_session(fragment, version_id).await? {
+        return Ok(Some(state));
+    }
+    if let Some(receipt) = index::read_removed_session_receipt(fragment, version_id).await? {
+        if receipt.state.finalized_at.is_none() && receipt.state.aborted_at.is_none() {
+            return Ok(Some(receipt.state));
         }
     }
     Ok(None)
@@ -1050,165 +1023,22 @@ fn raw_address_key(
     )
 }
 
-async fn load_part_meta_from_paths(paths: &[PathBuf]) -> Result<Option<PartMetadata>, AppError> {
-    for path in paths {
-        if let Some(meta) = read_messagepack_if_exists::<PartMetadata>(path).await? {
-            return Ok(Some(meta));
-        }
-    }
-    Ok(None)
-}
-
 pub(crate) async fn load_all_part_metas_from_disk(
     fragment: &str,
     version_id: &str,
 ) -> Result<Vec<PartMetadata>, AppError> {
     let mut parts = BTreeMap::new();
-    for dir in session_part_meta_dirs(fragment, version_id).await? {
-        let mut entries = match tokio_fs::read_dir(&dir).await {
-            Ok(entries) => entries,
-            Err(e)
-                if e.kind() == std::io::ErrorKind::NotFound
-                    || e.kind() == std::io::ErrorKind::NotADirectory =>
-            {
-                continue;
-            }
-            Err(e) => return Err(AppError::Io(e, format!("read_dir {}", dir.display()))),
-        };
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| AppError::Io(e, format!("read_dir {}", dir.display())))?
-        {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("msgpack") {
-                continue;
-            }
-            if let Some(meta) = read_messagepack_if_exists::<PartMetadata>(&path).await? {
-                parts.entry(meta.part_index).or_insert(meta);
-            }
+    if let Some(state) = index::load_session(fragment, version_id).await? {
+        for part in state.parts.into_values() {
+            parts.entry(part.part_index).or_insert(part);
+        }
+    }
+    if let Some(receipt) = index::read_removed_session_receipt(fragment, version_id).await? {
+        for part in receipt.state.parts.into_values() {
+            parts.entry(part.part_index).or_insert(part);
         }
     }
     Ok(parts.into_values().collect())
-}
-
-async fn write_atomic_messagepack<T: Serialize>(
-    path: &std::path::Path,
-    value: &T,
-) -> Result<(), AppError> {
-    let parent = path.parent().ok_or_else(|| {
-        AppError::InternalServerError(format!("No parent dir for {}", path.display()))
-    })?;
-    tokio_fs::create_dir_all(parent)
-        .await
-        .map_err(|e| AppError::Io(e, format!("mkdir {}", parent.display())))?;
-
-    let bytes = rmp_serde::to_vec(value).map_err(|e| {
-        AppError::InternalServerError(format!("serialize {}: {}", path.display(), e))
-    })?;
-    let tmp = parent.join(format!(
-        ".{}.tmp.{}",
-        path.file_name().and_then(|v| v.to_str()).unwrap_or("meta"),
-        Ulid::new()
-    ));
-    let mut file = tokio_fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .await
-        .map_err(|e| AppError::Io(e, format!("open {}", tmp.display())))?;
-    tokio::io::AsyncWriteExt::write_all(&mut file, &bytes)
-        .await
-        .map_err(|e| AppError::Io(e, format!("write {}", tmp.display())))?;
-    file.sync_all()
-        .await
-        .map_err(|e| AppError::Io(e, format!("sync {}", tmp.display())))?;
-    drop(file);
-
-    tokio_fs::rename(&tmp, path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("rename {} -> {}", tmp.display(), path.display())))?;
-    sync_dir(parent).await?;
-    Ok(())
-}
-
-async fn maybe_replicate_part_meta<F>(label: &'static str, fut: F)
-where
-    F: std::future::Future<Output = Result<(), AppError>> + Send + 'static,
-{
-    #[cfg(test)]
-    {
-        if let Err(e) = fut.await {
-            warn!("{} failed: {}", label, e);
-        }
-    }
-    #[cfg(not(test))]
-    {
-        tokio::spawn(async move {
-            if let Err(e) = fut.await {
-                warn!("{} failed: {}", label, e);
-            }
-        });
-    }
-}
-
-async fn persist_part_meta_on_roots(
-    fragment: &str,
-    version_id: &str,
-    part_meta: &PartMetadata,
-    replica_write_mode: index::IndexReplicaWriteMode,
-) -> Result<(), AppError> {
-    let paths = session_part_meta_paths(fragment, version_id, part_meta.part_index).await?;
-    if paths.is_empty() {
-        return Err(AppError::NotFound);
-    }
-
-    write_atomic_messagepack(&paths[0], part_meta).await?;
-    if paths.len() > 1 {
-        let replica_paths = paths[1..].to_vec();
-        let part_meta_clone = part_meta.clone();
-        let replicate_fut = async move {
-            for path in replica_paths {
-                write_atomic_messagepack(&path, &part_meta_clone).await?;
-            }
-            Ok(())
-        };
-        match replica_write_mode {
-            index::IndexReplicaWriteMode::BackgroundBestEffort => {
-                maybe_replicate_part_meta("upload part metadata replica sync", replicate_fut).await;
-            }
-            index::IndexReplicaWriteMode::SyncBestEffort => {
-                if let Err(e) = replicate_fut.await {
-                    warn!(
-                        "upload part metadata replica sync failed fragment={} version={} part={}: {}",
-                        fragment, version_id, part_meta.part_index, e
-                    );
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn remove_part_meta_on_roots_best_effort(fragment: &str, version_id: &str, part_index: u64) {
-    let paths = match session_part_meta_paths(fragment, version_id, part_index).await {
-        Ok(paths) => paths,
-        Err(_) => return,
-    };
-    for path in paths {
-        match tokio_fs::remove_file(&path).await {
-            Ok(()) => {
-                if let Some(parent) = path.parent() {
-                    let _ = sync_dir(parent).await;
-                }
-            }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::NotFound
-                    || e.kind() == std::io::ErrorKind::NotADirectory => {}
-            Err(_) => {}
-        }
-    }
 }
 
 pub(crate) async fn cleanup_upload_part_metadata_for_version(
@@ -1257,30 +1087,6 @@ pub(crate) async fn cleanup_upload_part_metadata_for_version(
     if free_raw_extents {
         if !reserved_addresses.is_empty() {
             cleanup_raw_addresses_best_effort(&reserved_addresses).await;
-        }
-    }
-
-    if let Ok(dirs) = session_part_meta_dirs(fragment, version_id).await {
-        for dir in dirs {
-            if tokio_fs::try_exists(&dir).await.unwrap_or(false) {
-                let _ = tokio_fs::remove_dir_all(&dir).await;
-            }
-        }
-    }
-
-    if let Ok(paths) = index::get_session_state_paths(fragment, version_id) {
-        for path in paths {
-            match tokio_fs::remove_file(&path).await {
-                Ok(()) => {
-                    if let Some(parent) = path.parent() {
-                        let _ = sync_dir(parent).await;
-                    }
-                }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::NotFound
-                        || e.kind() == std::io::ErrorKind::NotADirectory => {}
-                Err(_) => {}
-            }
         }
     }
 
@@ -1413,15 +1219,12 @@ pub(crate) async fn read_part_meta_any(
     version_id: &str,
     part_index: u64,
 ) -> Option<PartMetadata> {
-    if let Ok(Some(state)) = index::load_session(fragment, version_id).await {
+    if let Ok(Some(state)) = load_session_state_any(fragment, version_id).await {
         if let Some(part) = state.parts.get(&part_index) {
             return Some(part.clone());
         }
     }
-    let paths = session_part_meta_paths(fragment, version_id, part_index)
-        .await
-        .ok()?;
-    load_part_meta_from_paths(&paths).await.ok().flatten()
+    None
 }
 
 async fn cleanup_blob_tmp_attempt_files_for_version(fragment: &str, version_id: &str) {
@@ -1998,23 +1801,8 @@ pub async fn object_upload_part(
         index::IndexReplicaWriteMode::BackgroundBestEffort
     };
     if let Err(e) =
-        persist_part_meta_on_roots(&fragment, &version_id, &part_meta, replica_write_mode).await
-    {
-        cleanup_failed_part_attempt(
-            &fragment,
-            &version_id,
-            part_index,
-            &attempt_id,
-            &raw_addresses,
-            raw_addresses_owned,
-        )
-        .await;
-        return Err(e);
-    }
-    if let Err(e) =
         index::commit_session_part(&fragment, &version_id, &part_meta, replica_write_mode).await
     {
-        remove_part_meta_on_roots_best_effort(&fragment, &version_id, part_index).await;
         cleanup_failed_part_attempt(
             &fragment,
             &version_id,

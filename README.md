@@ -16,9 +16,9 @@
 
 ---
 
-> Deployment profile status (2026-03-08):
+> Deployment profile status (2026-03-09):
 > - `standard` (`litiaina-n1-standard`) is the stable and recommended deployment path.
-> - `arc` (`litiaina-n1-arc`) is experimental.
+> - `arc` (`litiaina-n1-arc`) is stable at `0.2.0` for raw-device deployments.
 > - See `DEPLOYMENT_PROFILES.md` for the profile split and architecture guidance.
 
 ## Table of Contents
@@ -66,7 +66,7 @@
 For SMB network-drive deployment, see `NETWORK_DRIVE.md`.
 N1 ships with native SMB-lite via `fsgwd`, with `fsd_mount + Samba` kept as fallback.
 For deployment and operator steps, see `DEPLOYMENT.md`.
-For stable-vs-experimental profile guidance, see `DEPLOYMENT_PROFILES.md`.
+For deployment profile guidance, see `DEPLOYMENT_PROFILES.md`.
 
 Stable/default `standard` deployment (production):
 - `index_store_disks` and `blob_store_disks` are directory paths.
@@ -78,7 +78,7 @@ index_store_disks=/srv/n1/index0,/srv/n1/index1
 blob_store_disks=/srv/n1/blob0,/srv/n1/blob1
 ```
 
-Experimental `arc` raw media initialization:
+`arc` raw media initialization:
 - `format-blob-device` and `format-index-device` are Arc-only commands.
 - Use the arc binary for the two-step safety flow.
 
@@ -106,6 +106,8 @@ sudo target/release/litiaina-n1-arc format-index-device \
   --fingerprint <fingerprint-from-prepare>
 ```
 
+If Arc uses one physical raw device for both `index_store_disks` and `blob_store_disks`, format that device once only.
+
 Profile note:
 - `profiles/n1/high-hw.ini` is for multi-disk, high-parallelism deployments.
 - `profiles/n1/single-raw-nvme.ini` is arc-oriented and is the better starting point for one raw Linux-owned NVMe blob device.
@@ -113,23 +115,23 @@ Profile note:
 ## Release Status
 
 - `standard` is the stable/default deployment profile at `0.4.0`.
-- `arc` is the experimental profile at `0.1.0`.
+- `arc` is the stable raw-kernel profile at `0.2.0`.
 - Stable architecture baseline (`standard`):
   - filesystem-backed authoritative `index`
   - filesystem-backed `blob_store_disks` shard layout (directory roots)
   - partitioned + replicated metadata
   - projected prefix namespace serving
-- Arc is the kernel-track profile and remains under active raw index/blob development.
+- Arc is the raw-kernel profile with raw index/blob media managed by `block_manager`.
 - The HTTP/API surface is **not** frozen yet. Route shapes, request fields, and operational endpoints may still change before `1.0.0`.
 
 ## Profile Distinction And Disk Layout (Authoritative)
 
 | Dimension | Standard (`litiaina-n1-standard`) | Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / production default | Experimental |
-| `index_store_disks` | Filesystem directories | Filesystem directories |
+| Status | Stable / production default | Stable / raw-kernel profile |
+| `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw block devices / loopback files |
-| Index metadata backend | Partitioned filesystem metadata | Partitioned filesystem metadata (current) |
+| Index metadata backend | Partitioned filesystem metadata | Raw index catalog on block-manager media |
 | Blob payload backend | Shard files on blob roots | Raw extent allocator (`block_manager`) |
 | Raw format commands | Not used | Required for explicit raw media prep |
 
@@ -156,15 +158,9 @@ Profile note:
 ### Arc Disk Layout (Current)
 
 ```text
-{INDEX_ROOT}/{fragment}/index/partitions/{partition_id}/
-  wal/manifest.msgpack
-  wal/segments/{segment_id}.wal
-  checkpoints/latest.msgpack
-  sessions/{version_id}.session.msgpack
-  objects/{hh}/{object_key_sha256}/{version_id}.msgpack
-  objects/{hh}/{object_key_sha256}/latest.latest.msgpack
-  trash/{hh}/{object_key_sha256}/{version_id}.msgpack
-  trash/{hh}/{object_key_sha256}/latest.latest.msgpack
+{RAW_INDEX_DEVICE}
+  block-manager superblock + journals + allocation groups
+  raw index catalog allocation (authoritative sessions/versions/quota/fragment metadata)
 
 {RAW_BLOB_DEVICE}
   block-manager superblock + journals + allocation groups
@@ -172,18 +168,18 @@ Profile note:
 ```
 
 Arc note:
-- Index is still filesystem-backed today.
-- Raw index media is an experimental target track, not current stable behavior.
+- Index and blob are both raw block-manager media in Arc.
+- Arc is stable at `0.2.0` and remains under active performance hardening.
 
 ## What is N1 (index architecture)
 
 **Litiaina N1** is a **single-machine, multi-disk** object storage engine with:
 
-- a partitioned filesystem-backed metadata authority in `index`
+- a partitioned metadata authority in `index` (filesystem-backed in `standard`, raw in `arc`)
 - a derived prefix namespace index for fast `LIST`
 - a profile-specific blob backend:
   - `standard`: filesystem-backed shard files under blob roots
-  - `arc`: raw-device/direct-I/O blob plane (experimental)
+  - `arc`: raw-device/direct-I/O blob plane with raw index authority
 
 This is the architectural shift from the legacy node: object and session truth are no longer stored as a whole-node mirrored tree on every index root. Instead, metadata authority is partitioned by hash onto a small selected set of roots.
 
@@ -238,7 +234,7 @@ N1 is **not** "user multi-tenant storage" anymore. The isolation boundary is a *
 
 ### 1) Partitioned metadata authority, profile-specific blob plane
 
-N1 keeps authoritative metadata on mounted index filesystems, but that authority now lives in `index` partitions instead of a full mirrored tree on every root. Blob payload backend depends on profile:
+N1 keeps authoritative metadata on profile-specific media: mounted index filesystems in `standard`, raw index catalog media in `arc`. Blob payload backend depends on profile:
 - `standard`: shard files under configured blob root directories.
 - `arc`: raw, unformatted, unmounted devices managed directly by N1.
 
@@ -357,7 +353,7 @@ It is performance-critical, but not correctness-critical.
 The blob plane stores payload shards on the profile-selected substrate:
 
 - `standard`: filesystem-backed shard files under blob roots
-- `arc`: raw devices and extent allocation (experimental)
+- `arc`: raw devices and extent allocation
 - RS-encoded data + parity shards
 - deterministic placement
 - degraded reads via reconstruction
@@ -367,7 +363,7 @@ The blob plane stores payload shards on the profile-selected substrate:
 
 ## On-disk layout
 
-### `index` partitions (both standard and arc today)
+### `index` partitions (standard)
 
 The authoritative metadata shape is:
 
@@ -411,7 +407,7 @@ These are serving segments only. If they are missing or stale, the node can rebu
 - payload shards are files: `part_{p}_shard_{i}.shard|.parity`
 - trash payloads move under `{BLOB_ROOT}/{fragment}/.trash/blob/{version_id}/...`
 
-### Blob storage (`arc`, experimental)
+### Blob storage (`arc`)
 
 - `blob_store_disks` point at raw device paths (for example `/dev/disk/by-id/...`)
 - shard metadata stores raw extent addresses (`raw://<device_id>/<allocation_id>`)
@@ -651,7 +647,9 @@ This applies to:
 - filesystem-backed blob/staging writes in `standard` where direct-IO constraints are met
 - raw blob devices managed directly by `block_manager` in `arc`
 
-Metadata, quota state, `index`, and prefix-serving files remain filesystem-backed and buffered by design.
+Metadata and serving state are profile-specific:
+- `standard`: metadata/quota/index/prefix state are filesystem-backed and buffered.
+- `arc`: metadata and payload are both raw-device backed via `block_manager`.
 
 ### Preallocation
 
@@ -677,7 +675,7 @@ N1 CLI is available in both server binaries and uses `server_cli` as the command
 
 Workspace server variants:
 - `standard` (stable/default): filesystem-backed N1 (`standard/src/main.rs`) for general-purpose deployments, with partitioned index roots under `index/partitions/<pid>/...` and directory-only `index_store_disks` / `blob_store_disks`.
-- `arc` (experimental): raw-device/block-manager-backed N1 kernel-track runtime.
+- `arc` (stable raw-kernel): raw-device/block-manager-backed N1 runtime.
 
 ### How to run the CLI
 
@@ -687,7 +685,7 @@ Use the stable/default profile:
 cargo run -p standard -- <command> [flags]
 ```
 
-Experimental Arc profile:
+Arc profile:
 
 ```bash
 cargo run -p arc -- <command> [flags]
@@ -697,7 +695,7 @@ Built binaries:
 
 ```bash
 ./target/release/litiaina-n1-standard <command> [flags]
-./target/release/litiaina-n1-arc <command> [flags] # experimental
+./target/release/litiaina-n1-arc <command> [flags]
 ```
 
 Server mode:
@@ -1002,6 +1000,33 @@ scripts/bench/run_release_drills.sh
 ```
 
 Outputs are written under `.n1-bench/release-drills-<timestamp>/`.
+
+## Arc allocator certification harness
+
+For Arc allocator/formatter closure gates, use:
+
+`scripts/bench/run_arc_allocator_gate.sh`
+
+Quick gate:
+
+```bash
+MODE=quick scripts/bench/run_arc_allocator_gate.sh
+```
+
+Full gate (release-candidate):
+
+```bash
+MODE=full \
+RELEASE_RUNS=1 \
+CHAOS_RUNS=3 \
+INDEX_SOAK=1 \
+scripts/bench/run_arc_allocator_gate.sh
+```
+
+Outputs are written under `.n1-bench/arc-allocator-gate-<timestamp>/`.
+
+Current certification snapshot:
+- `ARC_ALLOCATOR_CERT_REPORT.md`
 
 ## Performance probes
 

@@ -1,13 +1,13 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::blob_store::{
     RawGcMarker, is_missing_raw_device_mapping_error, raw_blob_address_exists,
-    stable_shard_file_name, verify_shard_checksum,
+    raw_index_metadata_roots_for_housekeeping, stable_shard_file_name, verify_shard_checksum,
 };
 use crate::n1_core::constants::{FRAGMENT_METADATA_FILE, QUOTA_FILE};
 use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, PartMetadata, Quota, configured_index_store_disks,
 };
-use crate::n1_core::index;
+use crate::n1_core::index_facade as index;
 use crate::n1_core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::n1_core::recovery::{
     RepairLogMode, RepairShardOutcome, ShardRepairContext, repair_entire_shard,
@@ -711,31 +711,14 @@ pub async fn stop_scrub_job_api(
 }
 
 async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
-    let roots = index_roots.to_vec();
-    tokio::task::spawn_blocking(move || {
-        let mut out = HashSet::new();
-        for root in roots {
-            if !root.exists() {
-                continue;
-            }
-            if let Ok(rd) = std::fs::read_dir(&root) {
-                for ent in rd.filter_map(|e| e.ok()) {
-                    if ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                        if let Some(name) = ent.file_name().to_str() {
-                            if !name.starts_with('.') {
-                                out.insert(name.to_string());
-                            }
-                        }
-                    }
-                }
-            }
+    let _ = index_roots;
+    match index::list_fragments().await {
+        Ok(fragments) => fragments,
+        Err(e) => {
+            warn!("failed to list fragments for repair: {}", e);
+            Vec::new()
         }
-        let mut v: Vec<String> = out.into_iter().collect();
-        v.sort();
-        v
-    })
-    .await
-    .unwrap_or_default()
+    }
 }
 
 fn sha256_bytes(b: &[u8]) -> [u8; 32] {
@@ -959,7 +942,13 @@ async fn repair_fragment_raw_gc_markers(
     index_roots: &[PathBuf],
     dry_run: bool,
 ) -> Result<(u64, u64, u64), AppError> {
-    let marker_names = list_all_raw_gc_marker_names(index_roots, fragment).await;
+    let marker_roots = if index::index_backend_mode() == index::IndexBackendMode::Fs {
+        index_roots.to_vec()
+    } else {
+        raw_index_metadata_roots_for_housekeeping()?
+    };
+
+    let marker_names = list_all_raw_gc_marker_names(&marker_roots, fragment).await;
 
     let mut miss = 0u64;
     let mut div = 0u64;
@@ -970,7 +959,7 @@ async fn repair_fragment_raw_gc_markers(
             break;
         }
 
-        let paths: Vec<PathBuf> = index_roots
+        let paths: Vec<PathBuf> = marker_roots
             .iter()
             .map(|root| {
                 root.join(fragment)
@@ -1084,6 +1073,20 @@ async fn reconcile_object_metadata_strict(
     is_trash: bool,
     dry_run: bool,
 ) -> Result<(Vec<u8>, ObjectMetadata, u64, u64, Option<String>), AppError> {
+    if index::index_backend_mode() != index::IndexBackendMode::Fs {
+        let canonical_meta = metadata.clone();
+        let canonical_bytes = rmp_serde::to_vec(&canonical_meta).map_err(|e| {
+            AppError::InternalServerError(format!(
+                "encode canonical raw metadata for {}/{}/{} failed: {}",
+                canonical_meta.fragment,
+                canonical_meta.object_key,
+                canonical_meta.version_id,
+                e
+            ))
+        })?;
+        return Ok((canonical_bytes, canonical_meta, 0, 0, None));
+    }
+
     let all_paths = index::get_object_version_paths(
         &metadata.fragment,
         &metadata.object_key,

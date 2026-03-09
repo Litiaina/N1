@@ -1,8 +1,8 @@
 # N1 Network Drive Guide (SMB-lite)
 
-> Deployment profile status (2026-03-08):
+> Deployment profile status (2026-03-09):
 > - `standard` (`litiaina-n1-standard`) is the stable/default profile.
-> - `arc` is experimental.
+> - `arc` (`litiaina-n1-arc`) is stable at `0.2.0`.
 > - See `DEPLOYMENT_PROFILES.md`.
 
 This guide covers both ways to expose N1 as a network drive:
@@ -14,7 +14,7 @@ This guide covers both ways to expose N1 as a network drive:
 
 `smb` is SMB-lite, not full enterprise SMB.
 
-Implemented in `standard/src/smb/server.rs` (stable profile), with mirrored experimental development under `arc/src/smb/server.rs`:
+Implemented in `standard/src/smb/server.rs` (stable profile), with mirrored implementation under `arc/src/smb/server.rs`:
 - auth + signing
 - `list/read/open`
 - query-directory / query-info metadata paths
