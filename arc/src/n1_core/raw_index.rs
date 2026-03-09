@@ -127,6 +127,17 @@ fn ensure_catalog_handle(manager: &mut BlockManager) -> Result<AllocationHandle,
     let handle = manager.allocate_bytes(RAW_INDEX_CATALOG_BYTES).map_err(|e| {
         AppError::InternalServerError(format!("raw index allocate catalog failed: {}", e))
     })?;
+    let zero_len = handle.capacity_bytes(manager.header().block_size) as usize;
+    let zero = vec![0u8; zero_len];
+    manager
+        .write(handle, 0, &zero)
+        .map_err(|e| AppError::InternalServerError(format!("raw index zero catalog failed: {}", e)))?;
+    manager.flush_data().map_err(|e| {
+        AppError::InternalServerError(format!(
+            "raw index flush data after catalog allocation failed: {}",
+            e
+        ))
+    })?;
     manager.flush_meta().map_err(|e| {
         AppError::InternalServerError(format!(
             "raw index flush meta after catalog allocation failed: {}",
