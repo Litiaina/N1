@@ -2,7 +2,7 @@
 
 > Arc engineering note:
 > - This document tracks Arc raw-kernel evolution.
-> - Arc is experimental; `standard` remains the default deployment profile at `0.5.0`.
+> - Arc is experimental; `standard` remains the default deployment profile at `0.5.1`.
 > - See `DEPLOYMENT_PROFILES.md`.
 
 This document defines the target structure for `N1 Arc` as a raw-only storage kernel:
@@ -26,7 +26,6 @@ Raw index stores all authoritative metadata:
 - committed part receipts
 - object latest/version metadata
 - trash/version tombstone metadata
-- quota state
 - WAL + checkpoints for crash recovery
 
 This replaces filesystem index directories for arc authority.
@@ -55,7 +54,7 @@ Target module structure under `arc/src/n1_core`:
 n1_core/
   raw_index/
     mod.rs
-    types.rs             # index record schemas (session/object/trash/quota)
+    types.rs             # index record schemas (session/object/trash)
     codec.rs             # fixed + msgpack codec for index records
     device.rs            # direct extent IO wrappers for index devices
     partition_table.rs   # partition->owner/replica mapping + epoch
@@ -64,7 +63,6 @@ n1_core/
     session_store.rs     # upload session state read/write
     object_store.rs      # latest/version publish + lookup
     trash_store.rs       # trash/recover metadata paths
-    quota_store.rs       # quota accounting state
     gc_queue.rs          # deferred reclaim queue records
     repair.rs            # replica/index reconvergence
     iter.rs              # fragment/partition walkers (streaming)
@@ -99,7 +97,6 @@ Logical keys:
 - `objv:{fragment}:{object_key_hash}:{version_id}`
 - `objl:{fragment}:{object_key_hash}` (latest pointer)
 - `trash:{fragment}:{object_key_hash}:{version_id}`
-- `quota:{fragment}`
 
 Durability order:
 

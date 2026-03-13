@@ -210,7 +210,7 @@ At this stage no object is visible.
 
 `standard` also exposes a direct single-request path:
 
-- `POST /v4/upload/one-shot/{fragment}/{*object_key}`
+- `POST /v4/upload/one-shot/{*object_key}`
 
 That path skips session state and finalize for small objects:
 
