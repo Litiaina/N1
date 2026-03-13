@@ -1,6 +1,6 @@
 use crate::n1_core::constants::{
-    METADATA_EXT, PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_DELIMITER_SEGMENT_PREFIX,
-    PREFIX_INDEX_DIR, PREFIX_INDEX_NAMESPACE, PREFIX_INDEX_VERSION, PREFIX_SEGMENT_EXT,
+    METADATA_EXT, PREFIX_INDEX_DIR, PREFIX_INDEX_NAMESPACE, PREFIX_INDEX_VERSION,
+    PREFIX_SEGMENT_EXT,
 };
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
@@ -234,69 +234,6 @@ impl ObjectPathManager {
             .collect()
     }
 
-    pub fn get_all_prefix_delimiter_segment_paths(
-        &self,
-        fragment_hash: &str,
-        prefix: &str,
-        segment_id: &str,
-    ) -> Vec<PathBuf> {
-        self.get_all_prefix_delimiter_segment_paths_scoped(fragment_hash, prefix, segment_id, false)
-    }
-
-    pub fn get_all_trash_prefix_delimiter_segment_paths(
-        &self,
-        fragment_hash: &str,
-        prefix: &str,
-        segment_id: &str,
-    ) -> Vec<PathBuf> {
-        self.get_all_prefix_delimiter_segment_paths_scoped(fragment_hash, prefix, segment_id, true)
-    }
-
-    fn get_all_prefix_delimiter_segment_paths_scoped(
-        &self,
-        fragment_hash: &str,
-        prefix: &str,
-        segment_id: &str,
-        trashed: bool,
-    ) -> Vec<PathBuf> {
-        let file = format!(
-            "{}{}{}",
-            PREFIX_DELIMITER_SEGMENT_PREFIX, segment_id, PREFIX_SEGMENT_EXT
-        );
-        self.get_all_prefix_bucket_dirs_scoped(fragment_hash, prefix, trashed)
-            .into_iter()
-            .map(|d| d.join(&file))
-            .collect()
-    }
-
-    pub fn get_all_prefix_delimiter_compacted_paths(
-        &self,
-        fragment_hash: &str,
-        prefix: &str,
-    ) -> Vec<PathBuf> {
-        self.get_all_prefix_delimiter_compacted_paths_scoped(fragment_hash, prefix, false)
-    }
-
-    pub fn get_all_trash_prefix_delimiter_compacted_paths(
-        &self,
-        fragment_hash: &str,
-        prefix: &str,
-    ) -> Vec<PathBuf> {
-        self.get_all_prefix_delimiter_compacted_paths_scoped(fragment_hash, prefix, true)
-    }
-
-    fn get_all_prefix_delimiter_compacted_paths_scoped(
-        &self,
-        fragment_hash: &str,
-        prefix: &str,
-        trashed: bool,
-    ) -> Vec<PathBuf> {
-        self.get_all_prefix_bucket_dirs_scoped(fragment_hash, prefix, trashed)
-            .into_iter()
-            .map(|d| d.join(PREFIX_DELIMITER_COMPACTED_FILE))
-            .collect()
-    }
-
     pub fn get_shard_dir_on_disk(
         &self,
         disk_root: &PathBuf,
@@ -430,21 +367,6 @@ impl PrefixIndexEntry {
         }
     }
 
-    pub fn from_summary(summary: &ObjectSummary) -> Self {
-        Self {
-            object_key: summary.object_key.clone(),
-            version_id: summary.version_id.clone(),
-            created_at: summary.created_at,
-            is_delete_marker: summary.is_delete_marker,
-            has_inline_summary: true,
-            upload_session_id: summary.upload_session_id.clone(),
-            owner_uid: summary.owner_uid.clone(),
-            content_type: summary.content_type.clone(),
-            total_size_bytes: summary.total_size_bytes,
-            stripe_size_bytes: summary.stripe_size_bytes,
-        }
-    }
-
     pub fn to_object_metadata(&self, fragment: &str) -> Option<ObjectMetadata> {
         if !self.has_inline_summary {
             return None;
@@ -470,36 +392,6 @@ impl PrefixIndexEntry {
 pub struct PrefixIndexSegment {
     pub prefix: String,
     pub entries: Vec<PrefixIndexEntry>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PrefixDelimiterChildDelta {
-    pub common_prefix: String,
-    pub delta: i64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PrefixDelimiterChildEntry {
-    pub common_prefix: String,
-    pub live_count: u64,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PrefixDelimiterSegment {
-    pub prefix: String,
-    #[serde(default)]
-    pub object_entries: Vec<PrefixIndexEntry>,
-    #[serde(default)]
-    pub child_deltas: Vec<PrefixDelimiterChildDelta>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PrefixDelimiterCompactedSegment {
-    pub prefix: String,
-    #[serde(default)]
-    pub object_entries: Vec<PrefixIndexEntry>,
-    #[serde(default)]
-    pub child_entries: Vec<PrefixDelimiterChildEntry>,
 }
 
 #[derive(Deserialize)]

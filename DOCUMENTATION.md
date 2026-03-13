@@ -11,7 +11,7 @@
 
 > Deployment profile status (2026-03-13):
 > - `standard` is stable and default.
-> - `standard` is released at `0.5.1`.
+> - `standard` is released at `0.5.2`.
 > - `arc` is experimental for raw-device deployments.
 > - See `DEPLOYMENT_PROFILES.md`.
 >
@@ -39,7 +39,7 @@
 > - Each object or session hashes to one metadata partition with one owner root plus one replica root when multiple index roots exist.
 > - The owner root is the synchronous ACK boundary for object/session writes.
 > - Replica roots are replica-behind durability copies and may lag briefly until repair/replay catches them up.
-> - Prefix and delimiter listing are served from a derived namespace index with inline list payload and are projected from `index` WAL changes into projected namespace snapshots.
+> - Prefix and delimiter listing are served from a derived root full-key accelerator with inline list payload.
 > - Legacy mirrored object/session trees are no longer the hot-path authority.
 > - Same-key upload recency comes from the upload session's `created_at`; finalize does not get to reorder versions.
 > - If two versions share the same second-level timestamp, ULID `version_id` order breaks the tie.
@@ -48,7 +48,7 @@
 > - Multipart uploads do not rely on in-memory part state for resumability. Part commits are durably recorded in the `index` WAL/session state and mirrored as per-part metadata files for compatibility and recovery workflows.
 
 > Release status note:
-> - N1 `standard` is stable at `0.5.1`; `arc` is experimental.
+> - N1 `standard` is stable at `0.5.2`; `arc` is experimental.
 > - This document describes the current implementation and current routes.
 > - Request/response details and endpoint layout may still change before `1.0.0` even though the underlying storage model is now fixed.
 
@@ -56,7 +56,7 @@
 
 | Dimension | Standard (`litiaina-n1-standard`) | Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / default (`0.5.1`) | Experimental / raw-device profile |
+| Status | Stable / default (`0.5.2`) | Experimental / raw-device profile |
 | API source of truth | Yes (`standard/src/routes/storage_routes.rs`) | Yes (`arc/src/routes/storage_routes.rs`) |
 | `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw devices / loopback files |
@@ -309,9 +309,10 @@ Query:
 
 Notes:
 - Internal marker keys (for example `.n1fsd_dir`, `.n1-trash`) are hidden unless `include_internal=true`.
-- Normal serving path uses the prefix namespace index.
-- Prefix projection runs asynchronously and coalesces repeated mutations per fragment.
-- If prefix projection is still pending, or if prefix-serving state is missing or insufficient, the server falls back to authoritative `index` scans for the requested prefix, not a legacy mirrored metadata tree.
+- Normal serving path uses the root full-key accelerator under `index/__p__/...`.
+- The accelerator stores sorted full-key rows with inline list payload.
+- `delimiter=/` rows are derived at read time from those full keys; the server does not maintain ancestor-prefix buckets on every mutation.
+- If the accelerator is missing, the node rebuilds it from authoritative `index` metadata before serving the request.
 - Non-prefix full listing pagination is partition-native and projected from authoritative index metadata (no legacy hash-tree walk).
 - Prefix rows carry inline list payload, so successful prefix hits avoid reopening object metadata for every returned row.
 
@@ -486,7 +487,34 @@ curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/object/delete/videos/a.mp4"
 ```
 
-### 7.6 `DELETE /v4/fragment/version/delete/{version_id}/{*object_key}`
+### 7.6 `POST /v4/fragment/object/bulk-delete`
+Bulk soft delete for many objects in one request. This is the preferred path for UI or operator actions that need to delete hundreds or thousands of keys at once.
+
+Body:
+```json
+{
+  "object_keys": [
+    "videos/a.mp4",
+    "videos/b.mp4"
+  ]
+}
+```
+
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://127.0.0.1:50001/v4/fragment/object/bulk-delete" \
+  -d '{"object_keys":["videos/a.mp4","videos/b.mp4"]}'
+```
+
+Response:
+- `requested`
+- `unique`
+- `succeeded`
+- `not_found`
+- `failed[]`
+
+### 7.7 `DELETE /v4/fragment/version/delete/{version_id}/{*object_key}`
 Delete specific version.
 - If the version is live, it is soft-deleted into trash.
 - If the same version is already in trash, the delete permanently removes only that trashed version and leaves newer live versions untouched.
@@ -495,26 +523,53 @@ curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/version/delete/<version_id>/videos/a.mp4"
 ```
 
-### 7.7 `DELETE /v4/fragment/permanent/delete/{*object_key}`
+### 7.8 `DELETE /v4/fragment/permanent/delete/{*object_key}`
 Permanent delete.
 ```bash
 curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/permanent/delete/videos/a.mp4"
 ```
 
-### 7.8 `POST /v4/fragment/recover/version/{version_id}/{*object_key}`
+### 7.9 `POST /v4/fragment/recover/version/{version_id}/{*object_key}`
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/recover/version/<version_id>/videos/a.mp4"
 ```
 
-### 7.9 `POST /v4/fragment/recover/object/{*object_key}`
+### 7.10 `POST /v4/fragment/recover/object/{*object_key}`
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/recover/object/videos/a.mp4"
 ```
 
-### 7.10 `POST /v4/fragment/recover/trash/all`
+### 7.11 `POST /v4/fragment/object/bulk-recover`
+Bulk restore for many objects in one request.
+
+Body:
+```json
+{
+  "object_keys": [
+    "videos/a.mp4",
+    "videos/b.mp4"
+  ]
+}
+```
+
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://127.0.0.1:50001/v4/fragment/object/bulk-recover" \
+  -d '{"object_keys":["videos/a.mp4","videos/b.mp4"]}'
+```
+
+Response:
+- `requested`
+- `unique`
+- `succeeded`
+- `not_found`
+- `failed[]`
+
+### 7.12 `POST /v4/fragment/recover/trash/all`
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/recover/trash/all"
@@ -848,7 +903,7 @@ curl -k -X GET -H "Authorization: Bearer $TOKEN" \
 
 Notes:
 - Prefix rebuild scans authoritative `index` object state and regenerates namespace-serving segments.
-- Normal prefix maintenance is driven asynchronously from `index` WAL changes with coalesced per-fragment projection; rebuild is the full repair path when the serving plane needs a full regeneration.
+- Normal prefix maintenance appends full-key rows into the root accelerator; rebuild is the full repair path when the serving plane needs a full regeneration.
 - Prefix state is rebuildable acceleration, not object truth.
 
 Start query params:
@@ -1229,10 +1284,12 @@ Recommended starting points:
 - `DELETE /v4/fragment/trash/empty`
 - `PATCH /v4/fragment/object/rename`
 - `DELETE /v4/fragment/object/delete/{*object_key}`
+- `POST /v4/fragment/object/bulk-delete`
 - `DELETE /v4/fragment/version/delete/{version_id}/{*object_key}`
 - `DELETE /v4/fragment/permanent/delete/{*object_key}`
 - `POST /v4/fragment/recover/version/{version_id}/{*object_key}`
 - `POST /v4/fragment/recover/object/{*object_key}`
+- `POST /v4/fragment/object/bulk-recover`
 - `POST /v4/fragment/recover/trash/all`
 - `POST /v4/upload/init/{*object_key}`
 - `POST /v4/upload/one-shot/{*object_key}`

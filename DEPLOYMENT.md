@@ -2,7 +2,7 @@
 
 > Deployment profile status (2026-03-13):
 > - Stable/default: `standard` (`litiaina-n1-standard`)
-> - `standard` release: `0.5.1`
+> - `standard` release: `0.5.2`
 > - Experimental raw-device profile: `arc` (`litiaina-n1-arc`)
 > - See `DEPLOYMENT_PROFILES.md` for profile policy.
 
@@ -352,7 +352,7 @@ Scrub is the integrity-check pass for committed shards (raw shards on arc, shard
 
 ## 10. Release Hardening On Target Hardware
 
-Run the release drill harness before production rollout (`standard 0.5.1` stable, `arc` experimental):
+Run the release drill harness before production rollout (`standard 0.5.2` stable, `arc` experimental):
 
 ```bash
 scripts/bench/run_release_drills.sh

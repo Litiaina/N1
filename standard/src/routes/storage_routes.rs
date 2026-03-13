@@ -25,9 +25,11 @@ use crate::n1_core::adaptive_concurrency::run_adaptive_concurrency_loop;
 use crate::n1_core::archive::download_selected_archive as download_selected_archive_impl;
 use crate::n1_core::delete::{
     delete_object as delete_object_impl,
+    delete_objects_bulk as delete_objects_bulk_impl,
     delete_object_permanently as delete_object_permanently_impl,
     delete_object_version as delete_object_version_impl, empty_trash as empty_trash_impl,
     recover_all_trash as recover_all_trash_impl, recover_object as recover_object_impl,
+    recover_objects_bulk as recover_objects_bulk_impl,
     recover_object_version as recover_object_version_impl,
 };
 use crate::n1_core::download::{
@@ -432,6 +434,10 @@ pub async fn serve_storage_routes() -> Router {
             .route("/v4/fragment/trash/empty", delete(empty_trash_scoped))
             .route("/v4/fragment/object/rename", patch(rename_object))
             .route(
+                "/v4/fragment/object/bulk-delete",
+                post(delete_objects_bulk_impl),
+            )
+            .route(
                 "/v4/fragment/object/delete/{*object_key}",
                 delete(delete_object_scoped),
             )
@@ -446,6 +452,10 @@ pub async fn serve_storage_routes() -> Router {
             .route(
                 "/v4/fragment/recover/version/{:version_id}/{*object_key}",
                 post(recover_object_version_scoped),
+            )
+            .route(
+                "/v4/fragment/object/bulk-recover",
+                post(recover_objects_bulk_impl),
             )
             .route(
                 "/v4/fragment/recover/object/{*object_key}",

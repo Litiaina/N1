@@ -1,41 +1,19 @@
-use std::collections::BTreeSet;
-
 use chrono::Utc;
+use tokio::fs;
 
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::constants::PREFIX_SEGMENT_EXT;
 use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment,
 };
-use crate::n1_core::prefix_compactor::{
-    schedule_prefix_compaction, schedule_trash_prefix_compaction,
-};
-use crate::n1_core::prefix_delimiter::{write_delimiter_delta, write_trash_delimiter_delta};
 use crate::n1_core::upload::write_atomic;
 
-pub fn prefixes_for_key(object_key: &str) -> BTreeSet<String> {
-    let key = ObjectPathManager::canonical_prefix(object_key);
-    let mut out = BTreeSet::new();
-    out.insert(String::new());
+pub fn accelerator_prefix() -> &'static str {
+    ""
+}
 
-    if key.is_empty() {
-        return out;
-    }
-
-    let parts: Vec<&str> = key.split('/').filter(|p| !p.is_empty()).collect();
-    let mut cur = String::new();
-
-    for (idx, part) in parts.iter().enumerate() {
-        if idx == 0 {
-            cur.push_str(part);
-        } else {
-            cur.push('/');
-            cur.push_str(part);
-        }
-        out.insert(cur.clone());
-    }
-
-    out
+fn accelerator_stale_marker_name() -> &'static str {
+    ".stale"
 }
 
 pub fn synthetic_live_entry(metadata: &ObjectMetadata, created_at: i64) -> PrefixIndexEntry {
@@ -72,44 +50,100 @@ pub fn logical_now() -> i64 {
     Utc::now().timestamp()
 }
 
-pub async fn write_prefix_entry_update(
+pub async fn mark_fragment_accelerator_stale(
     fragment: &str,
-    object_key: &str,
-    segment_id: &str,
-    entry: PrefixIndexEntry,
-    child_count_delta: i64,
     trashed: bool,
 ) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
-    let prefixes = prefixes_for_key(object_key);
+    let bucket_dirs = if trashed {
+        path_manager.get_all_trash_prefix_bucket_dirs(fragment, accelerator_prefix())
+    } else {
+        path_manager.get_all_prefix_bucket_dirs(fragment, accelerator_prefix())
+    };
+
     let mut any_ok = false;
-
-    for prefix in &prefixes {
-        let seg = PrefixIndexSegment {
-            prefix: prefix.clone(),
-            entries: vec![entry.clone()],
-        };
-
-        let bytes = rmp_serde::to_vec(&seg).map_err(|e| {
-            AppError::InternalServerError(format!("serialize prefix segment: {}", e))
-        })?;
-        let file = format!("seg_{}{}", segment_id, PREFIX_SEGMENT_EXT);
-
-        let bucket_dirs = if trashed {
-            path_manager.get_all_trash_prefix_bucket_dirs(fragment, prefix)
-        } else {
-            path_manager.get_all_prefix_bucket_dirs(fragment, prefix)
-        };
-
-        let mut wrote_this_prefix = false;
-        for bucket in bucket_dirs {
-            let path = bucket.join(&file);
-            if write_atomic(&path, &bytes).await.is_ok() {
-                wrote_this_prefix = true;
-            }
+    for bucket in bucket_dirs {
+        if fs::create_dir_all(&bucket).await.is_err() {
+            continue;
         }
+        if fs::write(bucket.join(accelerator_stale_marker_name()), b"")
+            .await
+            .is_ok()
+        {
+            any_ok = true;
+        }
+    }
 
-        if wrote_this_prefix {
+    if !any_ok {
+        return Err(AppError::InternalServerError(
+            "failed to mark accelerator stale on index roots".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+pub async fn clear_fragment_accelerator_stale(fragment: &str, trashed: bool) {
+    let path_manager = ObjectPathManager::new();
+    let bucket_dirs = if trashed {
+        path_manager.get_all_trash_prefix_bucket_dirs(fragment, accelerator_prefix())
+    } else {
+        path_manager.get_all_prefix_bucket_dirs(fragment, accelerator_prefix())
+    };
+
+    for bucket in bucket_dirs {
+        let _ = fs::remove_file(bucket.join(accelerator_stale_marker_name())).await;
+    }
+}
+
+pub async fn fragment_accelerator_is_stale(fragment: &str, trashed: bool) -> bool {
+    let path_manager = ObjectPathManager::new();
+    let bucket_dirs = if trashed {
+        path_manager.get_all_trash_prefix_bucket_dirs(fragment, accelerator_prefix())
+    } else {
+        path_manager.get_all_prefix_bucket_dirs(fragment, accelerator_prefix())
+    };
+
+    for bucket in bucket_dirs {
+        if fs::try_exists(&bucket.join(accelerator_stale_marker_name()))
+            .await
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+pub async fn write_prefix_entry_update(
+    fragment: &str,
+    _object_key: &str,
+    segment_id: &str,
+    entry: PrefixIndexEntry,
+    _child_count_delta: i64,
+    trashed: bool,
+) -> Result<(), AppError> {
+    let path_manager = ObjectPathManager::new();
+    let seg = PrefixIndexSegment {
+        prefix: accelerator_prefix().to_string(),
+        entries: vec![entry],
+    };
+    let bytes = rmp_serde::to_vec(&seg).map_err(|e| {
+        AppError::InternalServerError(format!("serialize prefix segment: {}", e))
+    })?;
+    let file = format!("seg_{}{}", segment_id, PREFIX_SEGMENT_EXT);
+
+    let bucket_dirs = if trashed {
+        path_manager.get_all_trash_prefix_bucket_dirs(fragment, accelerator_prefix())
+    } else {
+        path_manager.get_all_prefix_bucket_dirs(fragment, accelerator_prefix())
+    };
+
+    let mut any_ok = false;
+    for bucket in bucket_dirs {
+        let path = bucket.join(&file);
+        if write_atomic(&path, &bytes).await.is_ok() {
             any_ok = true;
         }
     }
@@ -118,30 +152,6 @@ pub async fn write_prefix_entry_update(
         return Err(AppError::InternalServerError(
             "failed to write prefix update on index roots".into(),
         ));
-    }
-
-    if trashed {
-        write_trash_delimiter_delta(
-            &path_manager,
-            fragment,
-            object_key,
-            segment_id,
-            Some(entry),
-            child_count_delta,
-        )
-        .await?;
-        schedule_trash_prefix_compaction(fragment.to_string(), prefixes.into_iter().collect());
-    } else {
-        write_delimiter_delta(
-            &path_manager,
-            fragment,
-            object_key,
-            segment_id,
-            Some(entry),
-            child_count_delta,
-        )
-        .await?;
-        schedule_prefix_compaction(fragment.to_string(), prefixes.into_iter().collect());
     }
 
     Ok(())

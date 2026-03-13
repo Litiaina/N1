@@ -2,7 +2,7 @@
 
 > Deployment profile status (2026-03-13):
 > - `standard` is stable and the default deployment profile.
-> - `standard` is released at `0.5.1`.
+> - `standard` is released at `0.5.2`.
 > - `arc` is an experimental raw-device deployment profile.
 > - See `DEPLOYMENT_PROFILES.md`.
 
@@ -18,7 +18,7 @@ This replaces the legacy "full mirrored metadata tree on every index root" model
 
 ## Freeze Status
 
-The current production architecture baseline is `standard 0.5.1`.
+The current production architecture baseline is `standard 0.5.2`.
 
 That baseline applies to:
 
@@ -50,7 +50,7 @@ They are expected to keep the same storage semantics. The difference is backend 
 
 | Dimension | Standard | Arc |
 |---|---|---|
-| Status | Stable/default (`0.5.1`) | Experimental raw-device profile |
+| Status | Stable/default (`0.5.2`) | Experimental raw-device profile |
 | `index_store_disks` | Filesystem directories | Raw devices |
 | `blob_store_disks` | Filesystem directories | Raw devices |
 | Index backend | Partitioned filesystem metadata | Raw index catalog (`block_manager`) |
@@ -103,7 +103,7 @@ The prefix subsystem remains filesystem-backed, but it is no longer authoritativ
 - `LIST prefix delimiter=/`
 - archive selection by prefix
 
-Prefix rows now carry inline list metadata, and the namespace plane is projected from `index` WAL changes into projected namespace snapshots. Projection is asynchronous and coalesced per fragment, so repeated writes do not re-run namespace maintenance in the foreground. A prefix hit can serve list results without reopening object metadata per row. If prefix state is pending, missing, or stale, the node falls back to authoritative `index` scans for the requested prefix and can rebuild the namespace plane from there.
+Prefix rows now carry inline list metadata, and `standard` serves them from a root full-key accelerator. Mutations update only full-key rows; delimiter/common-prefix views are derived during the read path instead of being maintained as ancestor-prefix state. A prefix hit can serve list results without reopening object metadata per row. If the accelerator is missing, the node rebuilds that fragment from authoritative `index` metadata and then serves the request from the rebuilt accelerator.
 
 ### 3. Blob plane
 
@@ -144,19 +144,16 @@ Notes:
 
 ### Prefix namespace index
 
-The serving index remains under the `index/prefix/...` tree:
+The serving index remains under the prefix tree on index disks, but `standard` now treats it as a
+root full-key accelerator instead of one eagerly-maintained bucket per ancestor prefix:
 
 ```text
-{INDEX_ROOT}/{fragment}/index/prefix/<version>/<namespace>/{p1}/{p2}/{prefix_hash}/
+{INDEX_ROOT}/{fragment}/index/__p__/v1/pfx/{p1}/{p2}/{root_prefix_hash}/
   compacted.msgpack
-  dcompacted.msgpack
+  seg_<id>.msgpack
 ```
 
-`standard` variant note:
-- `standard` now persists upload session state and object latest/version metadata in this partitioned `index/partitions/{partition_id}` namespace as its primary metadata path, while legacy mirrored index files are still written for transition compatibility.
-- During this transition window, maintenance object-walk scanners in `standard` intentionally consume legacy object metadata files (`{object_hash}#{version}.msgpack`) as the single scan authority to avoid duplicate stale processing from mixed legacy+partition trees; partition/session state remains persisted and used for upload/session control-plane flows.
-
-This plane stores projected namespace snapshots only. It can be rebuilt from `index` whenever serving state needs regeneration.
+This plane stores serving snapshots only. Live and trash listing each use one root accelerator bucket, and the node can rebuild that bucket from authoritative `index` whenever serving state needs regeneration.
 
 ### Blob storage
 
@@ -270,10 +267,10 @@ For the current index model, the owner root is the synchronous publish boundary.
 
 `LIST` is intentionally separated from exact-key truth:
 
-- normal serving path is the prefix namespace index
+- normal serving path is the root full-key accelerator
 - rows include inline list metadata
 - delimiter rows materialize the folder illusion without real directories
-- fallback scans authoritative `index`, not a legacy mirrored object tree
+- if the accelerator is missing, the node rebuilds it from authoritative `index` metadata before serving the request
 
 That keeps exact-key correctness and namespace serving performance independent.
 

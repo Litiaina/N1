@@ -18,7 +18,7 @@
 
 > Deployment profile status (2026-03-13):
 > - `standard` (`litiaina-n1-standard`) is the stable and recommended deployment path.
-> - `standard` is released at `0.5.1`.
+> - `standard` is released at `0.5.2`.
 > - `arc` (`litiaina-n1-arc`) is the experimental raw-device profile and is not the production default.
 > - See `DEPLOYMENT_PROFILES.md` for the profile split and architecture guidance.
 > - Operator shortcut: if you are deploying today, follow `DEPLOYMENT.md` for `standard` and ignore Arc unless you are explicitly doing raw-device testing.
@@ -116,7 +116,7 @@ Profile note:
 
 ## Release Status
 
-- `standard` is the stable/default deployment profile at `0.5.1`.
+- `standard` is the stable/default deployment profile at `0.5.2`.
 - `arc` is the experimental raw-device profile.
 - Stable architecture baseline (`standard`):
   - filesystem-backed authoritative `index`
@@ -124,6 +124,9 @@ Profile note:
   - partitioned + replicated metadata
   - projected prefix namespace serving
 - `standard` also exposes `POST /v4/upload/one-shot/{object_key}` for direct small-object upload without session/finalize overhead. The fragment comes from the authenticated claim.
+- `standard` also exposes claim-scoped bulk mutation routes for high-count object workflows:
+  - `POST /v4/fragment/object/bulk-delete`
+  - `POST /v4/fragment/object/bulk-recover`
 - On Linux, `standard` prefers `io_uring` on the blob data path when available and falls back to `O_DIRECT` + blocking writes when it is not.
 - Arc is the experimental raw-device profile with raw index/blob media managed by `block_manager`.
 - The HTTP/API surface is **not** frozen yet. Route shapes, request fields, and operational endpoints may still change before `1.0.0`.
@@ -132,7 +135,7 @@ Profile note:
 
 | Dimension | Standard (`litiaina-n1-standard`) | Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / production default (`0.5.1`) | Experimental / raw-device profile |
+| Status | Stable / production default (`0.5.2`) | Experimental / raw-device profile |
 | `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | Index metadata backend | Partitioned filesystem metadata | Raw index catalog on block-manager media |
@@ -346,8 +349,8 @@ The prefix subsystem is a serving accelerator:
 - serves `LIST prefix`
 - serves delimiter-based folder illusion
 - stores inline list payload so successful list hits avoid reopening object metadata per entry
-- is projected from `index` WAL changes into projected namespace snapshots
-- projects asynchronously and coalesces repeated mutations per fragment
+- indexes full object keys in sorted order under one root accelerator bucket per namespace
+- derives delimiter/common-prefix rows at read time instead of maintaining ancestor prefixes on every mutation
 - can be rebuilt from `index`
 
 It is performance-critical, but not correctness-critical.
@@ -395,15 +398,21 @@ Notes:
 
 ### Prefix namespace index
 
-Prefix-serving state remains under the prefix tree on index disks:
+Prefix-serving state remains under the prefix tree on index disks, but `standard` now treats it as a
+root full-key accelerator rather than one eagerly-maintained bucket per ancestor prefix:
 
 ```text
-{INDEX_ROOT}/{fragment}/index/prefix/<version>/<namespace>/{p1}/{p2}/{prefix_hash}/
+{INDEX_ROOT}/{fragment}/index/__p__/v1/pfx/{p1}/{p2}/{root_prefix_hash}/
   compacted.msgpack
-  dcompacted.msgpack
+  seg_<id>.msgpack
 ```
 
-These are serving segments only. If they are missing or stale, the node can rebuild them from `index`.
+Notes:
+
+- live listing uses the root accelerator under `index/__p__/...`
+- trash listing uses the same layout under `{INDEX_ROOT}/{fragment}/.trash/index/__p__/...`
+- upload/delete/restore/rename update only full-key rows; they do not synchronously maintain ancestor prefix buckets
+- if the accelerator is missing or stale, the node rebuilds that fragment from authoritative `index` metadata
 
 ### Blob storage (`standard`)
 
@@ -447,6 +456,24 @@ That path:
 - writes the blob once
 - publishes final metadata + latest immediately
 - returns without creating an upload session or requiring finalize
+
+For large file-management actions on many keys, `standard` also exposes claim-scoped bulk object mutation routes:
+
+- `POST /v4/fragment/object/bulk-delete`
+- `POST /v4/fragment/object/bulk-recover`
+
+These accept a JSON body of the form:
+
+```json
+{
+  "object_keys": [
+    "xray/2025/02-02-2026/doctor/files/images/ppacs/file-001.dcm",
+    "xray/2025/02-02-2026/doctor/files/images/ppacs/file-002.dcm"
+  ]
+}
+```
+
+They are intended for UI or operator flows that need to mutate hundreds or thousands of objects without paying one HTTPS request per object.
 
 ### 2) Upload part (payload first, metadata second)
 
@@ -517,7 +544,7 @@ Exact-key reads are driven by `index`:
 3. read shard chunks from the active backend (files in `standard`, raw devices in `arc`)
 4. reconstruct missing data when parity allows
 
-Prefix and delimiter listing use the prefix namespace index first. If prefix projection is still pending, or if prefix-serving state is missing or insufficient, the node falls back to authoritative `index` scans for the requested prefix rather than a legacy mirrored object tree.
+Prefix and delimiter listing use the root full-key accelerator first. If that accelerator is missing, the node rebuilds the fragment’s serving snapshot from authoritative `index` metadata before serving the request. Authoritative partition scans remain a last-resort safety path, not the normal listing strategy.
 
 ---
 

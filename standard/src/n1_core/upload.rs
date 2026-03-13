@@ -51,8 +51,7 @@ use crate::n1_core::disk_manager::{
 use crate::n1_core::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::n1_core::index;
 use crate::n1_core::metadata_parser::get_metadata;
-use crate::n1_core::prefix_compactor::schedule_prefix_compaction;
-use crate::n1_core::prefix_delimiter::write_delimiter_delta;
+use crate::n1_core::prefix_updates::accelerator_prefix;
 use crate::n1_core::quota_manager::ensure_capacity_available;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -481,31 +480,6 @@ impl AsyncWrite for DirectWriter {
     ) -> Poll<Result<(), std::io::Error>> {
         self.as_mut().poll_flush(cx)
     }
-}
-
-fn prefixes_for_key(object_key: &str) -> BTreeSet<String> {
-    let key = ObjectPathManager::canonical_prefix(object_key);
-    let mut out = BTreeSet::new();
-    out.insert(String::new());
-
-    if key.is_empty() {
-        return out;
-    }
-
-    let parts: Vec<&str> = key.split('/').filter(|p| !p.is_empty()).collect();
-    let mut cur = String::new();
-
-    for (i, p) in parts.iter().enumerate() {
-        if i == 0 {
-            cur.push_str(p);
-        } else {
-            cur.push('/');
-            cur.push_str(p);
-        }
-        out.insert(cur.clone());
-    }
-
-    out
 }
 
 pub async fn create_direct_file(path: &PathBuf) -> Result<fs::File, AppError> {
@@ -1406,10 +1380,6 @@ pub async fn upload_object_one_shot(
         if had_live_before { 0 } else { 1 },
     )
     .await?;
-    schedule_prefix_compaction(
-        fragment.clone(),
-        prefixes_for_key(&object_key).into_iter().collect(),
-    );
 
     let stripped_meta = ObjectMetadata {
         parts: Vec::new(),
@@ -1423,51 +1393,40 @@ pub async fn upload_object_one_shot(
 async fn write_prefix_segments_on_roots(
     index_roots: &[PathBuf],
     metadata: &ObjectMetadata,
-    child_count_delta: i64,
+    _child_count_delta: i64,
 ) -> Result<(), AppError> {
-    let prefixes = prefixes_for_key(&metadata.object_key);
     let mut any_ok = false;
-    let entry = PrefixIndexEntry::from_metadata(metadata);
+    let seg = PrefixIndexSegment {
+        prefix: accelerator_prefix().to_string(),
+        entries: vec![PrefixIndexEntry::from_metadata(metadata)],
+    };
 
-    for prefix in prefixes {
-        let seg = PrefixIndexSegment {
-            prefix: prefix.clone(),
-            entries: vec![entry.clone()],
-        };
+    let bytes = rmp_serde::to_vec(&seg).map_err(|e| {
+        AppError::InternalServerError(format!("Serialize prefix segment: {}", e))
+    })?;
 
-        let bytes = rmp_serde::to_vec(&seg).map_err(|e| {
-            AppError::InternalServerError(format!("Serialize prefix segment: {}", e))
-        })?;
+    let ph = ObjectPathManager::prefix_hash(accelerator_prefix());
+    let p1 = &ph[0..2];
+    let p2 = &ph[2..4];
+    let file = format!("seg_{}{}", metadata.version_id, PREFIX_SEGMENT_EXT);
 
-        let ph = ObjectPathManager::prefix_hash(&prefix);
-        let p1 = &ph[0..2];
-        let p2 = &ph[2..4];
-        let file = format!("seg_{}{}", metadata.version_id, PREFIX_SEGMENT_EXT);
+    for root in index_roots {
+        let p = root
+            .join(&metadata.fragment)
+            .join("index")
+            .join(PREFIX_INDEX_DIR)
+            .join(PREFIX_INDEX_VERSION)
+            .join(PREFIX_INDEX_NAMESPACE)
+            .join(p1)
+            .join(p2)
+            .join(&ph)
+            .join(&file);
 
-        let mut wrote_this_prefix = false;
-
-        for root in index_roots {
-            let p = root
-                .join(&metadata.fragment)
-                .join("index")
-                .join(PREFIX_INDEX_DIR)
-                .join(PREFIX_INDEX_VERSION)
-                .join(PREFIX_INDEX_NAMESPACE)
-                .join(p1)
-                .join(p2)
-                .join(&ph)
-                .join(&file);
-
-            if let Some(parent) = p.parent() {
-                let _ = tokio_fs::create_dir_all(parent).await;
-            }
-
-            if write_atomic(&p, &bytes).await.is_ok() {
-                wrote_this_prefix = true;
-            }
+        if let Some(parent) = p.parent() {
+            let _ = tokio_fs::create_dir_all(parent).await;
         }
 
-        if wrote_this_prefix {
+        if write_atomic(&p, &bytes).await.is_ok() {
             any_ok = true;
         }
     }
@@ -1477,17 +1436,6 @@ async fn write_prefix_segments_on_roots(
             "Failed to write prefix index to any mirror".into(),
         ));
     }
-
-    let path_manager = ObjectPathManager::new();
-    write_delimiter_delta(
-        &path_manager,
-        &metadata.fragment,
-        &metadata.object_key,
-        &metadata.version_id,
-        Some(entry),
-        child_count_delta,
-    )
-    .await?;
 
     Ok(())
 }
@@ -1631,11 +1579,6 @@ pub async fn finalize_object_upload(
         if had_live_before { 0 } else { 1 },
     )
     .await?;
-
-    schedule_prefix_compaction(
-        fragment.clone(),
-        prefixes_for_key(&object_key).into_iter().collect(),
-    );
 
     let _ = index::remove_session(&fragment, &version_id, "finalized").await;
 

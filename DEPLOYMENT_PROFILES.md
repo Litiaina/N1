@@ -4,7 +4,7 @@ This document is the canonical deployment split for N1.
 
 As of 2026-03-13:
 
-- `standard` (`litiaina-n1-standard`) is the stable deployment profile, the default for production, and released at `0.5.1`.
+- `standard` (`litiaina-n1-standard`) is the stable deployment profile, the default for production, and released at `0.5.2`.
 - `arc` (`litiaina-n1-arc`) is the experimental raw-device profile.
 - If you are unsure which one to deploy, use `standard`.
 
@@ -12,7 +12,7 @@ As of 2026-03-13:
 
 | Profile | Binary | Status | Production default |
 |---|---|---|---|
-| Standard | `litiaina-n1-standard` | Stable (`0.5.1`) | Yes |
+| Standard | `litiaina-n1-standard` | Stable (`0.5.2`) | Yes |
 | Arc | `litiaina-n1-arc` | Experimental | No |
 
 ## 2) Architecture Split
