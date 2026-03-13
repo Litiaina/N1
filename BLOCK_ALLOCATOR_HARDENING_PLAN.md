@@ -2,7 +2,7 @@
 
 > Scope note:
 > - Hardening plan for arc allocator/formatter track.
-> - Arc is stable at `0.2.0`.
+> - Arc is experimental.
 > - Stable/default deployment remains `standard` (`DEPLOYMENT_PROFILES.md`).
 
 This plan defines how we make the allocator and formatter production-stable for arc kernel mode.

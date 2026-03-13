@@ -18,8 +18,7 @@ use walkdir::WalkDir;
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::constants::{
     METADATA_EXT, PART_META_SUFFIX, PREFIX_DELIMITER_COMPACTED_FILE,
-    PREFIX_DELIMITER_SEGMENT_PREFIX, PREFIX_INDEX_DIR, PREFIX_SEGMENT_EXT, QUOTA_FILE,
-    RESERVATION_FILE,
+    PREFIX_DELIMITER_SEGMENT_PREFIX, PREFIX_INDEX_DIR, PREFIX_SEGMENT_EXT, RESERVATION_FILE,
 };
 use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, ObjectSummary, PrefixIndexEntry, PrefixIndexSegment,
@@ -351,7 +350,14 @@ async fn choose_best_index_dir_for_fragment(
 async fn scan_latest_by_key(
     scan_index_dir: &Path,
     fragment: &str,
-) -> Result<(u64, HashMap<String, (String, i64)>, Vec<(String, String)>), AppError> {
+) -> Result<
+    (
+        u64,
+        HashMap<String, PrefixIndexEntry>,
+        Vec<(String, String)>,
+    ),
+    AppError,
+> {
     let scan_root = scan_index_dir.to_path_buf();
     let frag = fragment.to_string();
     let now_ts = Utc::now().timestamp();
@@ -363,7 +369,7 @@ async fn scan_latest_by_key(
 
     tokio::task::spawn_blocking(move || {
         let mut scanned = 0u64;
-        let mut latest: HashMap<String, (String, i64)> = HashMap::new();
+        let mut latest: HashMap<String, PrefixIndexEntry> = HashMap::new();
         let mut latest_tombstone: HashMap<String, (String, i64)> = HashMap::new();
 
         let prefix_dir_os = std::ffi::OsStr::new(PREFIX_INDEX_DIR);
@@ -383,7 +389,7 @@ async fn scan_latest_by_key(
             if !name.ends_with(METADATA_EXT) {
                 continue;
             }
-            if name == QUOTA_FILE || name == RESERVATION_FILE || name.ends_with(PART_META_SUFFIX) {
+            if name == RESERVATION_FILE || name.ends_with(PART_META_SUFFIX) {
                 continue;
             }
 
@@ -401,57 +407,44 @@ async fn scan_latest_by_key(
                 Err(_) => continue,
             };
 
-            let (meta_frag, is_del, obj_key, ver_id, cr_at) =
-                match rmp_serde::from_slice::<ObjectSummary>(&raw) {
-                    Ok(m) => (
-                        m.fragment,
-                        m.is_delete_marker,
-                        m.object_key,
-                        m.version_id,
-                        m.created_at,
-                    ),
-                    Err(_) => match rmp_serde::from_slice::<ObjectMetadata>(&raw) {
-                        Ok(m) => (
-                            m.fragment,
-                            m.is_delete_marker,
-                            m.object_key,
-                            m.version_id,
-                            m.created_at,
-                        ),
-                        Err(_) => continue,
-                    },
-                };
+            let (meta_frag, entry) = match rmp_serde::from_slice::<ObjectSummary>(&raw) {
+                Ok(m) => (m.fragment.clone(), PrefixIndexEntry::from_summary(&m)),
+                Err(_) => match rmp_serde::from_slice::<ObjectMetadata>(&raw) {
+                    Ok(m) => (m.fragment.clone(), PrefixIndexEntry::from_metadata(&m)),
+                    Err(_) => continue,
+                },
+            };
 
             if meta_frag != frag {
                 continue;
             }
 
-            if is_del {
-                let key = canonical_key(&obj_key);
-                let ts = cr_at;
+            let key = canonical_key(&entry.object_key);
+            let ts = entry.created_at;
+
+            if entry.is_delete_marker {
                 match latest_tombstone.get(&key) {
                     None => {
-                        latest_tombstone.insert(key, (ver_id, ts));
+                        latest_tombstone.insert(key, (entry.version_id.clone(), ts));
                     }
                     Some((cur_vid, cur_ts)) => {
-                        if ts > *cur_ts || (ts == *cur_ts && &ver_id > cur_vid) {
-                            latest_tombstone.insert(key, (ver_id, ts));
+                        if ts > *cur_ts || (ts == *cur_ts && &entry.version_id > cur_vid) {
+                            latest_tombstone.insert(key, (entry.version_id.clone(), ts));
                         }
                     }
                 }
                 continue;
             }
 
-            let key = canonical_key(&obj_key);
-            let ts = cr_at;
-
             match latest.get(&key) {
                 None => {
-                    latest.insert(key, (ver_id, ts));
+                    latest.insert(key, entry);
                 }
-                Some((cur_vid, cur_ts)) => {
-                    if ts > *cur_ts || (ts == *cur_ts && &ver_id > cur_vid) {
-                        latest.insert(key, (ver_id, ts));
+                Some(current) => {
+                    if ts > current.created_at
+                        || (ts == current.created_at && entry.version_id > current.version_id)
+                    {
+                        latest.insert(key, entry);
                     }
                 }
             }
@@ -463,7 +456,7 @@ async fn scan_latest_by_key(
         for (key, (vid, ts)) in latest_tombstone {
             let overshadowed = match latest.get(&key) {
                 None => true,
-                Some((_, nts)) => ts >= *nts,
+                Some(current) => ts >= current.created_at,
             };
             if overshadowed && ts <= cutoff_ts {
                 stale_tombstones.push((key, vid));
@@ -477,21 +470,16 @@ async fn scan_latest_by_key(
 }
 
 fn build_per_prefix(
-    latest_by_key: HashMap<String, (String, i64)>,
+    latest_by_key: HashMap<String, PrefixIndexEntry>,
 ) -> HashMap<String, Vec<PrefixIndexEntry>> {
     let mut per_prefix: HashMap<String, Vec<PrefixIndexEntry>> = HashMap::new();
 
-    for (object_key, (version_id, created_at)) in latest_by_key {
+    for (object_key, entry) in latest_by_key {
         for pfx in prefixes_for_key(&object_key) {
             per_prefix
                 .entry(canonical_prefix(&pfx))
                 .or_insert_with(Vec::new)
-                .push(PrefixIndexEntry {
-                    object_key: object_key.clone(),
-                    version_id: version_id.clone(),
-                    created_at,
-                    is_delete_marker: false,
-                });
+                .push(entry.clone());
         }
     }
 

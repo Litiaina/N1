@@ -7,21 +7,25 @@ use crate::n1_core::prefix_delimiter::build_delimiter_compacted_from_entries;
 use once_cell::sync::OnceCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::fs;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Notify, RwLock};
 
 pub static PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC: OnceCell<AtomicU64> = OnceCell::new();
 
-static PREFIX_COMPACTION_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
 static PREFIX_LAST_COMPACTED_AT: LazyLock<Arc<RwLock<HashMap<String, Instant>>>> =
     LazyLock::new(|| Arc::new(RwLock::new(HashMap::new())));
+static PREFIX_COMPACTION_PENDING: LazyLock<Arc<Mutex<HashMap<String, BTreeSet<String>>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+static PREFIX_COMPACTION_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
+static PREFIX_COMPACTION_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 const PREFIX_LAST_COMPACTED_MAX_ENTRIES: usize = 16_384;
 const PREFIX_LAST_COMPACTED_STALE_MULTIPLIER: u32 = 8;
 const PREFIX_LAST_COMPACTED_MIN_STALE_SECS: u64 = 300;
+const PREFIX_COMPACTION_BATCH_DEBOUNCE: Duration = Duration::from_millis(25);
 
 fn compact_trigger_segments() -> usize {
     PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
@@ -145,34 +149,44 @@ async fn write_atomic_overwrite(path: &Path, data: &[u8]) -> Result<(), AppError
     Ok(())
 }
 
-fn merge_entry(latest: &mut HashMap<String, (String, i64, bool)>, e: PrefixIndexEntry) {
+fn merge_entry(latest: &mut HashMap<String, PrefixIndexEntry>, e: PrefixIndexEntry) {
     match latest.get(&e.object_key) {
         None => {
-            latest.insert(
-                e.object_key,
-                (e.version_id, e.created_at, e.is_delete_marker),
-            );
+            latest.insert(e.object_key.clone(), e);
         }
-        Some((cur_vid, cur_ts, _)) => {
-            if e.created_at > *cur_ts || (e.created_at == *cur_ts && e.version_id > *cur_vid) {
-                latest.insert(
-                    e.object_key,
-                    (e.version_id, e.created_at, e.is_delete_marker),
-                );
+        Some(current) => {
+            if e.created_at > current.created_at
+                || (e.created_at == current.created_at && e.version_id > current.version_id)
+            {
+                latest.insert(e.object_key.clone(), e);
             }
         }
     }
 }
 
+#[allow(dead_code)]
 async fn compact_prefix_if_needed(
     path_manager: &ObjectPathManager,
     fragment: &str,
     prefix: &str,
 ) -> Result<(), AppError> {
-    let bucket_dirs = path_manager.get_all_prefix_bucket_dirs(fragment, prefix);
+    compact_prefix_if_needed_scoped(path_manager, fragment, prefix, false).await
+}
+
+async fn compact_prefix_if_needed_scoped(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    prefix: &str,
+    trashed: bool,
+) -> Result<(), AppError> {
+    let bucket_dirs = if trashed {
+        path_manager.get_all_trash_prefix_bucket_dirs(fragment, prefix)
+    } else {
+        path_manager.get_all_prefix_bucket_dirs(fragment, prefix)
+    };
     let mut all_seg_paths: Vec<(String, PathBuf)> = Vec::new();
     let mut all_delim_seg_paths: Vec<PathBuf> = Vec::new();
-    let mut latest: HashMap<String, (String, i64, bool)> = HashMap::new();
+    let mut latest: HashMap<String, PrefixIndexEntry> = HashMap::new();
     let mut had_any_data = false;
     let mut needs_delimiter_bootstrap = false;
 
@@ -237,15 +251,8 @@ async fn compact_prefix_if_needed(
     }
 
     let mut entries: Vec<PrefixIndexEntry> = latest
-        .into_iter()
-        .filter_map(|(object_key, (version_id, created_at, is_delete_marker))| {
-            (!is_delete_marker).then_some(PrefixIndexEntry {
-                object_key,
-                version_id,
-                created_at,
-                is_delete_marker: false,
-            })
-        })
+        .into_values()
+        .filter(|entry| !entry.is_delete_marker)
         .collect();
     entries.sort_by(|a, b| match a.object_key.cmp(&b.object_key) {
         std::cmp::Ordering::Equal => a.version_id.cmp(&b.version_id),
@@ -268,7 +275,12 @@ async fn compact_prefix_if_needed(
     let mut wrote_any = false;
     let mut wrote_delimiter_any = false;
 
-    for p in path_manager.get_all_prefix_compacted_paths(fragment, prefix) {
+    let compacted_paths = if trashed {
+        path_manager.get_all_trash_prefix_compacted_paths(fragment, prefix)
+    } else {
+        path_manager.get_all_prefix_compacted_paths(fragment, prefix)
+    };
+    for p in compacted_paths {
         if let Some(parent) = p.parent() {
             let _ = fs::create_dir_all(parent).await;
             parent_dirs_to_sync.insert(parent.to_path_buf());
@@ -277,7 +289,12 @@ async fn compact_prefix_if_needed(
             wrote_any = true;
         }
     }
-    for p in path_manager.get_all_prefix_delimiter_compacted_paths(fragment, prefix) {
+    let delimiter_paths = if trashed {
+        path_manager.get_all_trash_prefix_delimiter_compacted_paths(fragment, prefix)
+    } else {
+        path_manager.get_all_prefix_delimiter_compacted_paths(fragment, prefix)
+    };
+    for p in delimiter_paths {
         if let Some(parent) = p.parent() {
             let _ = fs::create_dir_all(parent).await;
             parent_dirs_to_sync.insert(parent.to_path_buf());
@@ -317,37 +334,101 @@ async fn compact_prefix_if_needed(
 }
 
 pub fn schedule_prefix_compaction(fragment: String, prefixes: Vec<String>) {
+    schedule_prefix_compaction_scoped(fragment, prefixes, false);
+}
+
+pub fn schedule_trash_prefix_compaction(fragment: String, prefixes: Vec<String>) {
+    schedule_prefix_compaction_scoped(fragment, prefixes, true);
+}
+
+fn schedule_prefix_compaction_scoped(fragment: String, prefixes: Vec<String>, trashed: bool) {
+    ensure_prefix_compaction_worker();
+
+    let mut dedup: BTreeSet<String> = BTreeSet::new();
+    for prefix in prefixes {
+        dedup.insert(ObjectPathManager::canonical_prefix(&prefix));
+    }
+
+    if dedup.is_empty() {
+        return;
+    }
+
+    if let Ok(mut pending) = PREFIX_COMPACTION_PENDING.lock() {
+        let scope_key = format!("{}|{}", if trashed { "trash" } else { "live" }, fragment);
+        let queued = pending.entry(scope_key).or_default();
+        queued.extend(dedup);
+    }
+
+    PREFIX_COMPACTION_NOTIFY.notify_one();
+}
+
+fn ensure_prefix_compaction_worker() {
+    if PREFIX_COMPACTION_WORKER_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
     tokio::spawn(async move {
-        let _permit = match PREFIX_COMPACTION_SEMAPHORE.try_acquire() {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-
         let path_manager = ObjectPathManager::new();
-        let mut dedup: BTreeSet<String> = BTreeSet::new();
-        for p in prefixes {
-            dedup.insert(ObjectPathManager::canonical_prefix(&p));
-        }
 
-        for prefix in dedup {
-            let key = format!("{}|{}", fragment, prefix);
-            let min_interval = compact_min_interval();
-            {
-                let last = PREFIX_LAST_COMPACTED_AT.read().await;
-                if let Some(ts) = last.get(&key) {
-                    if ts.elapsed() < min_interval {
-                        continue;
+        loop {
+            PREFIX_COMPACTION_NOTIFY.notified().await;
+            tokio::time::sleep(PREFIX_COMPACTION_BATCH_DEBOUNCE).await;
+
+            loop {
+                let pending = {
+                    let mut guard = PREFIX_COMPACTION_PENDING
+                        .lock()
+                        .expect("prefix compaction pending mutex poisoned");
+                    if guard.is_empty() {
+                        break;
+                    }
+                    std::mem::take(&mut *guard)
+                };
+
+                let min_interval = compact_min_interval();
+                for (scope_key, prefixes) in pending {
+                    let (trashed, fragment) =
+                        if let Some(fragment) = scope_key.strip_prefix("trash|") {
+                            (true, fragment.to_string())
+                        } else if let Some(fragment) = scope_key.strip_prefix("live|") {
+                            (false, fragment.to_string())
+                        } else {
+                            (false, scope_key)
+                        };
+                    for prefix in prefixes {
+                        let key = format!(
+                            "{}|{}|{}",
+                            if trashed { "trash" } else { "live" },
+                            fragment,
+                            prefix
+                        );
+                        {
+                            let last = PREFIX_LAST_COMPACTED_AT.read().await;
+                            if let Some(ts) = last.get(&key) {
+                                if ts.elapsed() < min_interval {
+                                    continue;
+                                }
+                            }
+                        }
+
+                        if compact_prefix_if_needed_scoped(
+                            &path_manager,
+                            &fragment,
+                            &prefix,
+                            trashed,
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            let mut last = PREFIX_LAST_COMPACTED_AT.write().await;
+                            last.insert(key, Instant::now());
+                            prune_last_compacted_entries(&mut last, min_interval);
+                        }
                     }
                 }
-            }
-
-            if compact_prefix_if_needed(&path_manager, &fragment, &prefix)
-                .await
-                .is_ok()
-            {
-                let mut last = PREFIX_LAST_COMPACTED_AT.write().await;
-                last.insert(key, Instant::now());
-                prune_last_compacted_entries(&mut last, min_interval);
             }
         }
     });

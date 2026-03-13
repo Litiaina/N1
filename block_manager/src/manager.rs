@@ -24,6 +24,23 @@ use std::os::unix::fs::FileTypeExt;
 const MIN_AG_COUNT: usize = 1;
 const MAX_AG_COUNT: usize = 16;
 const TARGET_AG_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const SEGMENT_POOL_MIN_DEVICE_BYTES: u64 = 1 * 1024 * 1024 * 1024;
+const DEFAULT_SEGMENT_SIZE_BYTES: u64 = 256 * 1024 * 1024;
+const MIN_METADATA_POOL_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_METADATA_POOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const SEGMENT_RECORD_BYTES: usize = 32;
+const SEGMENT_RECORD_SLOT_BYTES: u64 = 64;
+const SEGMENT_RECORD_MAGIC: u32 = 0x4C42_4D53;
+const SEGMENT_STATE_FREE: u8 = 0;
+const SEGMENT_STATE_OPEN: u8 = 1;
+const SEGMENT_STATE_SEALED: u8 = 2;
+const SEGMENT_ALLOCATION_ID_TAG: u64 = 1u64 << 63;
+const SEGMENT_ALLOCATION_OFFSET_BITS: u32 = 16;
+const SEGMENT_ALLOCATION_GENERATION_BITS: u32 = 23;
+const SEGMENT_ALLOCATION_SEGMENT_BITS: u32 = 24;
+const SEGMENT_ALLOCATION_OFFSET_MASK: u64 = (1u64 << SEGMENT_ALLOCATION_OFFSET_BITS) - 1;
+const SEGMENT_ALLOCATION_GENERATION_MASK: u64 = (1u64 << SEGMENT_ALLOCATION_GENERATION_BITS) - 1;
+const SEGMENT_ALLOCATION_SEGMENT_MASK: u64 = (1u64 << SEGMENT_ALLOCATION_SEGMENT_BITS) - 1;
 const FORMAT_NONCE_TTL_SECS: u64 = 5 * 60;
 const FORMAT_NONCE_FILE_PREFIX: &str = "n1-bm-format-nonce-";
 const FORMAT_NONCE_FILE_VERSION: &str = "v1";
@@ -661,6 +678,225 @@ fn fragmentation_ppm(free_blocks: u64, largest_free_extent_blocks: u64) -> u32 {
     ppm.min(1_000_000) as u32
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SegmentCatalogEntry {
+    sequence: u64,
+    generation: u32,
+    write_pointer_bytes: u32,
+    dead_bytes: u32,
+    state: u8,
+}
+
+impl Default for SegmentCatalogEntry {
+    fn default() -> Self {
+        Self {
+            sequence: 0,
+            generation: 1,
+            write_pointer_bytes: 0,
+            dead_bytes: 0,
+            state: SEGMENT_STATE_FREE,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SegmentPoolState {
+    segment_start_block: u64,
+    segment_block_count: u64,
+    segment_size_bytes: u64,
+    entries: Vec<SegmentCatalogEntry>,
+    active_segment_id: Option<u32>,
+}
+
+fn recommended_metadata_pool_bytes(total_bytes: u64) -> u64 {
+    (total_bytes / 1024).clamp(MIN_METADATA_POOL_BYTES, MAX_METADATA_POOL_BYTES)
+}
+
+fn encode_segment_record(entry: SegmentCatalogEntry) -> [u8; SEGMENT_RECORD_BYTES] {
+    let mut out = [0u8; SEGMENT_RECORD_BYTES];
+    if entry.sequence == 0
+        && entry.write_pointer_bytes == 0
+        && entry.dead_bytes == 0
+        && entry.state == SEGMENT_STATE_FREE
+        && entry.generation <= 1
+    {
+        return out;
+    }
+    out[0..4].copy_from_slice(&SEGMENT_RECORD_MAGIC.to_le_bytes());
+    out[4..12].copy_from_slice(&entry.sequence.to_le_bytes());
+    out[12..16].copy_from_slice(&entry.generation.to_le_bytes());
+    out[16..20].copy_from_slice(&entry.write_pointer_bytes.to_le_bytes());
+    out[20..24].copy_from_slice(&entry.dead_bytes.to_le_bytes());
+    out[24] = entry.state;
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(&out[..28]);
+    let crc = hasher.finalize();
+    out[28..32].copy_from_slice(&crc.to_le_bytes());
+    out
+}
+
+fn decode_segment_record(buf: &[u8; SEGMENT_RECORD_BYTES]) -> Result<SegmentCatalogEntry, BlockManagerError> {
+    if buf.iter().all(|byte| *byte == 0) {
+        return Ok(SegmentCatalogEntry::default());
+    }
+    let magic = u32::from_le_bytes(buf[0..4].try_into().expect("segment record magic"));
+    if magic != SEGMENT_RECORD_MAGIC {
+        return Err(BlockManagerError::Corrupt(
+            "segment catalog record magic mismatch".to_string(),
+        ));
+    }
+    let expected_crc = u32::from_le_bytes(buf[28..32].try_into().expect("segment record crc"));
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(&buf[..28]);
+    let actual_crc = hasher.finalize();
+    if expected_crc != actual_crc {
+        return Err(BlockManagerError::Corrupt(
+            "segment catalog record checksum mismatch".to_string(),
+        ));
+    }
+    Ok(SegmentCatalogEntry {
+        sequence: u64::from_le_bytes(buf[4..12].try_into().expect("segment sequence")),
+        generation: u32::from_le_bytes(buf[12..16].try_into().expect("segment generation")).max(1),
+        write_pointer_bytes: u32::from_le_bytes(
+            buf[16..20].try_into().expect("segment write pointer bytes"),
+        ),
+        dead_bytes: u32::from_le_bytes(buf[20..24].try_into().expect("segment dead bytes")),
+        state: buf[24],
+    })
+}
+
+fn encode_segment_allocation_id(
+    segment_id: u32,
+    generation: u32,
+    offset_blocks: u32,
+) -> Result<u64, BlockManagerError> {
+    if u64::from(segment_id) > SEGMENT_ALLOCATION_SEGMENT_MASK {
+        return Err(BlockManagerError::InvalidArgument(format!(
+            "segment id {} exceeds encoded range",
+            segment_id
+        )));
+    }
+    if generation == 0 || u64::from(generation) > SEGMENT_ALLOCATION_GENERATION_MASK {
+        return Err(BlockManagerError::InvalidArgument(format!(
+            "segment generation {} exceeds encoded range",
+            generation
+        )));
+    }
+    if u64::from(offset_blocks) > SEGMENT_ALLOCATION_OFFSET_MASK {
+        return Err(BlockManagerError::InvalidArgument(format!(
+            "segment offset blocks {} exceeds encoded range",
+            offset_blocks
+        )));
+    }
+    Ok(
+        SEGMENT_ALLOCATION_ID_TAG
+            | (u64::from(segment_id)
+                << (SEGMENT_ALLOCATION_GENERATION_BITS + SEGMENT_ALLOCATION_OFFSET_BITS))
+            | (u64::from(generation) << SEGMENT_ALLOCATION_OFFSET_BITS)
+            | u64::from(offset_blocks),
+    )
+}
+
+fn decode_segment_allocation_id(
+    allocation_id: u64,
+) -> Result<(u32, u32, u32), BlockManagerError> {
+    if allocation_id & SEGMENT_ALLOCATION_ID_TAG == 0 {
+        return Err(BlockManagerError::InvalidArgument(format!(
+            "allocation id {} is not segment-backed",
+            allocation_id
+        )));
+    }
+    let raw = allocation_id & !SEGMENT_ALLOCATION_ID_TAG;
+    let offset_blocks = (raw & SEGMENT_ALLOCATION_OFFSET_MASK) as u32;
+    let generation =
+        ((raw >> SEGMENT_ALLOCATION_OFFSET_BITS) & SEGMENT_ALLOCATION_GENERATION_MASK) as u32;
+    let segment_id = ((raw
+        >> (SEGMENT_ALLOCATION_GENERATION_BITS + SEGMENT_ALLOCATION_OFFSET_BITS))
+        & SEGMENT_ALLOCATION_SEGMENT_MASK) as u32;
+    Ok((segment_id, generation, offset_blocks))
+}
+
+fn is_segment_allocation_id(allocation_id: u64) -> bool {
+    allocation_id & SEGMENT_ALLOCATION_ID_TAG != 0
+}
+
+fn derive_segment_layout(
+    total_blocks: u64,
+    block_size: u32,
+    journal_start_block: u64,
+    journal_block_count: u64,
+) -> Option<(u64, u64, u64, u64)> {
+    let total_bytes = total_blocks.saturating_mul(u64::from(block_size));
+    if total_bytes < SEGMENT_POOL_MIN_DEVICE_BYTES {
+        return None;
+    }
+
+    let base_data_start = journal_start_block.saturating_add(journal_block_count);
+    let available_after_journal = total_blocks.saturating_sub(base_data_start);
+    if available_after_journal == 0 {
+        return None;
+    }
+
+    let segment_size_bytes = DEFAULT_SEGMENT_SIZE_BYTES;
+    let segment_block_count = div_ceil(segment_size_bytes, u64::from(block_size));
+    if segment_block_count == 0 || available_after_journal <= segment_block_count {
+        return None;
+    }
+
+    let mut catalog_block_count = 1u64;
+    let mut metadata_pool_block_count = 0u64;
+
+    for _ in 0..8 {
+        let data_start_block = base_data_start.saturating_add(catalog_block_count);
+        let available_after_catalog = total_blocks.saturating_sub(data_start_block);
+        if available_after_catalog <= segment_block_count {
+            return None;
+        }
+
+        let recommended_metadata_blocks =
+            div_ceil(recommended_metadata_pool_bytes(total_bytes), u64::from(block_size));
+        metadata_pool_block_count = recommended_metadata_blocks.min(available_after_catalog / 4);
+        if metadata_pool_block_count >= available_after_catalog {
+            metadata_pool_block_count = 0;
+        }
+
+        let segment_pool_blocks = available_after_catalog.saturating_sub(metadata_pool_block_count);
+        let segment_count = segment_pool_blocks / segment_block_count;
+        if segment_count == 0 {
+            let reduced_metadata = available_after_catalog.saturating_sub(segment_block_count);
+            metadata_pool_block_count = metadata_pool_block_count.min(reduced_metadata);
+        }
+
+        let segment_pool_blocks = available_after_catalog.saturating_sub(metadata_pool_block_count);
+        let segment_count = segment_pool_blocks / segment_block_count;
+        if segment_count == 0 {
+            return None;
+        }
+
+        let needed_catalog_blocks = div_ceil(
+            segment_count.saturating_mul(SEGMENT_RECORD_SLOT_BYTES),
+            u64::from(block_size),
+        );
+        if needed_catalog_blocks == catalog_block_count {
+            break;
+        }
+        catalog_block_count = needed_catalog_blocks;
+    }
+
+    let data_start_block = base_data_start.saturating_add(catalog_block_count);
+    let available_after_catalog = total_blocks.saturating_sub(data_start_block);
+    if available_after_catalog <= metadata_pool_block_count.saturating_add(segment_block_count) {
+        return None;
+    }
+
+    Some((
+        data_start_block,
+        catalog_block_count,
+        metadata_pool_block_count,
+        segment_size_bytes,
+    ))
+}
+
 pub struct BlockManager {
     path: PathBuf,
     meta_file: File,
@@ -669,11 +905,13 @@ pub struct BlockManager {
     allocation_state: AllocationState,
     allocations: HashMap<u64, Extent>,
     allocation_generations: HashMap<u64, u32>,
+    segment_pool: Option<SegmentPoolState>,
     next_allocation_id: u64,
     next_journal_txn_id: u64,
     last_applied_journal_txn_id: u64,
     journal_cursor: u64,
     journal_dirty: bool,
+    segment_catalog_dirty: bool,
 }
 
 impl BlockManager {
@@ -836,23 +1074,47 @@ impl BlockManager {
         };
 
         let total_blocks = total_bytes / u64::from(block_size);
-        if total_blocks <= options.journal_blocks.saturating_add(2) {
+        let journal_start_block = 1u64.saturating_add(SECONDARY_SUPERBLOCK_BLOCK);
+        let journal_block_count = options.journal_blocks.max(1);
+        if total_blocks <= journal_start_block.saturating_add(journal_block_count).saturating_add(1)
+        {
             return Err(BlockManagerError::InvalidArgument(format!(
                 "device too small for block manager: total_blocks={} journal_blocks={}",
                 total_blocks, options.journal_blocks
             )));
         }
 
+        let (data_start_block, segment_catalog_block_count, metadata_pool_block_count, segment_size_bytes) =
+            if let Some((data_start_block, segment_catalog_block_count, metadata_pool_block_count, segment_size_bytes)) =
+                derive_segment_layout(total_blocks, block_size, journal_start_block, journal_block_count)
+            {
+                (
+                    data_start_block,
+                    segment_catalog_block_count,
+                    metadata_pool_block_count,
+                    segment_size_bytes,
+                )
+            } else {
+                (
+                    journal_start_block.saturating_add(journal_block_count),
+                    0,
+                    total_blocks.saturating_sub(journal_start_block.saturating_add(journal_block_count)),
+                    0,
+                )
+            };
+
         let header = DeviceHeader {
             device_id: Uuid::new_v4(),
             superblock_generation: 1,
             block_size,
             total_blocks,
-            journal_start_block: 1u64.saturating_add(SECONDARY_SUPERBLOCK_BLOCK),
-            journal_block_count: options.journal_blocks.max(1),
-            data_start_block: 1u64
-                .saturating_add(SECONDARY_SUPERBLOCK_BLOCK)
-                .saturating_add(options.journal_blocks.max(1)),
+            journal_start_block,
+            journal_block_count,
+            data_start_block,
+            segment_catalog_start_block: journal_start_block.saturating_add(journal_block_count),
+            segment_catalog_block_count,
+            metadata_pool_block_count,
+            segment_size_bytes,
         };
 
         zero_region_with_failpoint(
@@ -864,6 +1126,17 @@ impl BlockManager {
                 .saturating_mul(u64::from(header.block_size)),
             "format.zero_journal",
         )?;
+        if header.segment_catalog_block_count > 0 {
+            zero_region_with_failpoint(
+                &file,
+                header.block_size,
+                block_offset(&header, header.segment_catalog_start_block),
+                header
+                    .segment_catalog_block_count
+                    .saturating_mul(u64::from(header.block_size)),
+                "format.zero_segment_catalog",
+            )?;
+        }
 
         let mut header_block = vec![0u8; header.block_size as usize];
         encode_header(&header, &mut header_block)?;
@@ -890,23 +1163,30 @@ impl BlockManager {
         let meta_file = OpenOptions::new().read(true).write(true).open(&path)?;
         let header = read_header(&meta_file)?;
         let direct_file = Arc::new(open_direct_file(&path)?);
-        let data_blocks = header.total_blocks.saturating_sub(header.data_start_block);
-        let ag_count = derive_ag_count(data_blocks, header.block_size);
+        let metadata_blocks = if header.metadata_pool_block_count > 0 {
+            header.metadata_pool_block_count
+        } else {
+            header.total_blocks.saturating_sub(header.data_start_block)
+        };
+        let ag_count = derive_ag_count(metadata_blocks, header.block_size);
 
         let mut manager = Self {
             path,
             meta_file,
             direct_file,
-            allocation_state: AllocationState::new(header.data_start_block, data_blocks, ag_count),
+            allocation_state: AllocationState::new(header.data_start_block, metadata_blocks, ag_count),
             allocations: HashMap::new(),
             allocation_generations: HashMap::new(),
+            segment_pool: None,
             next_allocation_id: 1,
             next_journal_txn_id: 1,
             last_applied_journal_txn_id: 0,
             journal_cursor: 0,
             journal_dirty: false,
+            segment_catalog_dirty: false,
             header,
         };
+        manager.load_segment_pool_state()?;
         manager.replay_journal()?;
         manager.validate_allocator_state()?;
         Ok(manager)
@@ -920,8 +1200,295 @@ impl BlockManager {
         &self.header
     }
 
+    fn segment_pool_enabled(&self) -> bool {
+        self.header.segment_catalog_block_count > 0
+            && self.header.segment_size_bytes > 0
+            && self.header.metadata_pool_block_count
+                < self
+                    .header
+                    .total_blocks
+                    .saturating_sub(self.header.data_start_block)
+    }
+
+    fn segment_data_start_block(&self) -> u64 {
+        self.header
+            .data_start_block
+            .saturating_add(self.header.metadata_pool_block_count)
+    }
+
+    fn segment_pool_total_blocks(&self) -> u64 {
+        self.header
+            .total_blocks
+            .saturating_sub(self.segment_data_start_block())
+    }
+
+    fn segment_block_count(&self) -> u64 {
+        if self.header.segment_size_bytes == 0 {
+            0
+        } else {
+            div_ceil(self.header.segment_size_bytes, u64::from(self.header.block_size))
+        }
+    }
+
+    fn segment_catalog_slot_offset(&self, segment_id: u32, copy_idx: u64) -> u64 {
+        block_offset(&self.header, self.header.segment_catalog_start_block)
+            .saturating_add(u64::from(segment_id).saturating_mul(SEGMENT_RECORD_SLOT_BYTES))
+            .saturating_add(copy_idx.saturating_mul(SEGMENT_RECORD_BYTES as u64))
+    }
+
+    fn load_segment_pool_state(&mut self) -> Result<(), BlockManagerError> {
+        if !self.segment_pool_enabled() {
+            self.segment_pool = None;
+            return Ok(());
+        }
+        let segment_block_count = self.segment_block_count();
+        if segment_block_count == 0 {
+            self.segment_pool = None;
+            return Ok(());
+        }
+        let segment_count = self.segment_pool_total_blocks() / segment_block_count;
+        if segment_count == 0 {
+            self.segment_pool = None;
+            return Ok(());
+        }
+
+        let mut entries = Vec::with_capacity(segment_count as usize);
+        let mut active_segment_id = None;
+        for segment_idx in 0..segment_count {
+            let mut best: Option<SegmentCatalogEntry> = None;
+            for copy_idx in 0..2 {
+                let mut buf = [0u8; SEGMENT_RECORD_BYTES];
+                read_exact_at(
+                    &self.meta_file,
+                    &mut buf,
+                    self.segment_catalog_slot_offset(segment_idx as u32, copy_idx),
+                )?;
+                let entry = decode_segment_record(&buf)?;
+                if best
+                    .as_ref()
+                    .map(|current| entry.sequence > current.sequence)
+                    .unwrap_or(true)
+                {
+                    best = Some(entry);
+                }
+            }
+            let mut entry = best.unwrap_or_default();
+            let max_write = self.header.segment_size_bytes.min(u64::from(u32::MAX)) as u32;
+            entry.write_pointer_bytes = entry.write_pointer_bytes.min(max_write);
+            entry.dead_bytes = entry.dead_bytes.min(entry.write_pointer_bytes);
+            if entry.generation == 0 {
+                entry.generation = 1;
+            }
+            if entry.state == SEGMENT_STATE_OPEN {
+                if active_segment_id.is_none() {
+                    active_segment_id = Some(segment_idx as u32);
+                } else {
+                    entry.state = SEGMENT_STATE_SEALED;
+                }
+            }
+            entries.push(entry);
+        }
+
+        self.segment_pool = Some(SegmentPoolState {
+            segment_start_block: self.segment_data_start_block(),
+            segment_block_count,
+            segment_size_bytes: self.header.segment_size_bytes,
+            entries,
+            active_segment_id,
+        });
+        Ok(())
+    }
+
+    fn persist_segment_entry(
+        &mut self,
+        segment_id: u32,
+        sync_immediately: bool,
+    ) -> Result<(), BlockManagerError> {
+        let entry = self
+            .segment_pool
+            .as_ref()
+            .and_then(|pool| pool.entries.get(segment_id as usize).copied())
+            .ok_or_else(|| {
+                BlockManagerError::InvalidArgument(format!(
+                    "segment {} is outside segment pool",
+                    segment_id
+                ))
+            })?;
+        let copy_idx = entry.sequence & 1;
+        let buf = encode_segment_record(entry);
+        write_all_at_with_failpoint(
+            &self.meta_file,
+            &buf,
+            self.segment_catalog_slot_offset(segment_id, copy_idx),
+            "segment.catalog.write",
+        )?;
+        self.segment_catalog_dirty = true;
+        if sync_immediately {
+            sync_all_with_failpoint(&self.meta_file, "segment.catalog.sync")?;
+            self.segment_catalog_dirty = false;
+        }
+        Ok(())
+    }
+
+    fn recycle_fully_dead_segments(&mut self) -> Result<bool, BlockManagerError> {
+        let mut recycled_any = false;
+        let active_segment_id = self
+            .segment_pool
+            .as_ref()
+            .and_then(|pool| pool.active_segment_id);
+        let mut recycle_ids = Vec::new();
+        if let Some(pool) = self.segment_pool.as_ref() {
+            for (segment_idx, entry) in pool.entries.iter().enumerate() {
+                if Some(segment_idx as u32) == active_segment_id {
+                    continue;
+                }
+                if entry.state == SEGMENT_STATE_SEALED
+                    && entry.write_pointer_bytes > 0
+                    && entry.dead_bytes >= entry.write_pointer_bytes
+                {
+                    recycle_ids.push(segment_idx as u32);
+                }
+            }
+        }
+        for segment_id in recycle_ids {
+            if let Some(entry) = self
+                .segment_pool
+                .as_mut()
+                .and_then(|pool| pool.entries.get_mut(segment_id as usize))
+            {
+                entry.sequence = entry.sequence.saturating_add(1);
+                entry.generation = entry.generation.saturating_add(1).max(1);
+                entry.write_pointer_bytes = 0;
+                entry.dead_bytes = 0;
+                entry.state = SEGMENT_STATE_FREE;
+                self.persist_segment_entry(segment_id, true)?;
+                recycled_any = true;
+            }
+        }
+        Ok(recycled_any)
+    }
+
+    fn ensure_open_segment(&mut self, required_bytes: u32) -> Result<u32, BlockManagerError> {
+        if !self.segment_pool_enabled() {
+            return Err(BlockManagerError::NoSpace {
+                requested_blocks: div_ceil(u64::from(required_bytes), u64::from(self.header.block_size)),
+                available_blocks: 0,
+            });
+        }
+
+        if let Some(pool) = self.segment_pool.as_ref() {
+            if let Some(active_segment_id) = pool.active_segment_id {
+                let entry = pool.entries[active_segment_id as usize];
+                if entry.state == SEGMENT_STATE_OPEN
+                    && u64::from(entry.write_pointer_bytes).saturating_add(u64::from(required_bytes))
+                        <= pool.segment_size_bytes
+                {
+                    return Ok(active_segment_id);
+                }
+            }
+        }
+
+        if let Some(active_segment_id) = self
+            .segment_pool
+            .as_ref()
+            .and_then(|pool| pool.active_segment_id)
+        {
+            if let Some(entry) = self
+                .segment_pool
+                .as_mut()
+                .and_then(|pool| pool.entries.get_mut(active_segment_id as usize))
+            {
+                entry.sequence = entry.sequence.saturating_add(1);
+                entry.state = SEGMENT_STATE_SEALED;
+                self.persist_segment_entry(active_segment_id, true)?;
+            }
+            if let Some(pool) = self.segment_pool.as_mut() {
+                pool.active_segment_id = None;
+            }
+        }
+
+        let _ = self.recycle_fully_dead_segments()?;
+
+        let mut free_segment_id = None;
+        if let Some(pool) = self.segment_pool.as_ref() {
+            for (segment_idx, entry) in pool.entries.iter().enumerate() {
+                if entry.state == SEGMENT_STATE_FREE {
+                    free_segment_id = Some(segment_idx as u32);
+                    break;
+                }
+            }
+        }
+        let segment_id = free_segment_id.ok_or_else(|| BlockManagerError::NoSpace {
+            requested_blocks: div_ceil(u64::from(required_bytes), u64::from(self.header.block_size)),
+            available_blocks: self.available_blocks(),
+        })?;
+        if let Some(entry) = self
+            .segment_pool
+            .as_mut()
+            .and_then(|pool| pool.entries.get_mut(segment_id as usize))
+        {
+            entry.sequence = entry.sequence.saturating_add(1);
+            entry.write_pointer_bytes = 0;
+            entry.dead_bytes = 0;
+            entry.state = SEGMENT_STATE_OPEN;
+            if entry.generation == 0 {
+                entry.generation = 1;
+            }
+            self.persist_segment_entry(segment_id, true)?;
+        }
+        if let Some(pool) = self.segment_pool.as_mut() {
+            pool.active_segment_id = Some(segment_id);
+        }
+        Ok(segment_id)
+    }
+
+    fn segment_pool_available_blocks(&self) -> u64 {
+        let Some(pool) = self.segment_pool.as_ref() else {
+            return 0;
+        };
+        let mut free_blocks = 0u64;
+        for entry in &pool.entries {
+            match entry.state {
+                SEGMENT_STATE_FREE => free_blocks = free_blocks.saturating_add(pool.segment_block_count),
+                SEGMENT_STATE_OPEN => {
+                    let free_bytes = pool
+                        .segment_size_bytes
+                        .saturating_sub(u64::from(entry.write_pointer_bytes));
+                    free_blocks = free_blocks
+                        .saturating_add(div_ceil(free_bytes, u64::from(self.header.block_size)));
+                }
+                _ => {}
+            }
+        }
+        free_blocks
+    }
+
+    fn segment_pool_used_blocks(&self) -> u64 {
+        let Some(pool) = self.segment_pool.as_ref() else {
+            return 0;
+        };
+        pool.entries
+            .iter()
+            .filter(|entry| entry.state != SEGMENT_STATE_FREE)
+            .map(|entry| {
+                div_ceil(
+                    u64::from(entry.write_pointer_bytes),
+                    u64::from(self.header.block_size),
+                )
+            })
+            .sum()
+    }
+
+    fn metadata_pool_used_blocks(&self) -> u64 {
+        self.header
+            .metadata_pool_block_count
+            .saturating_sub(self.allocation_state.available_blocks())
+    }
+
     pub fn available_blocks(&self) -> u64 {
-        self.allocation_state.available_blocks()
+        self.allocation_state
+            .available_blocks()
+            .saturating_add(self.segment_pool_available_blocks())
     }
 
     pub fn available_bytes(&self) -> u64 {
@@ -957,10 +1524,8 @@ impl BlockManager {
     }
 
     pub fn used_blocks(&self) -> u64 {
-        self.header
-            .total_blocks
-            .saturating_sub(self.header.data_start_block)
-            .saturating_sub(self.available_blocks())
+        self.metadata_pool_used_blocks()
+            .saturating_add(self.segment_pool_used_blocks())
     }
 
     pub fn used_bytes(&self) -> u64 {
@@ -981,7 +1546,7 @@ impl BlockManager {
             .total_blocks
             .saturating_sub(self.header.data_start_block);
         let free_blocks = self.available_blocks();
-        let used_blocks = data_blocks.saturating_sub(free_blocks);
+        let used_blocks = self.used_blocks();
 
         let mut largest_free_extent_blocks = 0u64;
         let mut ags = Vec::with_capacity(self.allocation_state.ags.len());
@@ -996,6 +1561,20 @@ impl BlockManager {
                 largest_free_extent_blocks: ag_largest_free,
                 fragmentation_ppm: fragmentation_ppm(ag.free_blocks, ag_largest_free),
             });
+        }
+        if let Some(pool) = self.segment_pool.as_ref() {
+            for entry in &pool.entries {
+                let segment_largest_free = match entry.state {
+                    SEGMENT_STATE_FREE => pool.segment_block_count,
+                    SEGMENT_STATE_OPEN => div_ceil(
+                        pool.segment_size_bytes
+                            .saturating_sub(u64::from(entry.write_pointer_bytes)),
+                        u64::from(self.header.block_size),
+                    ),
+                    _ => 0,
+                };
+                largest_free_extent_blocks = largest_free_extent_blocks.max(segment_largest_free);
+            }
         }
 
         AllocatorHealthSnapshot {
@@ -1073,6 +1652,12 @@ impl BlockManager {
         let mut seen = std::collections::HashSet::<u64>::new();
         let mut pending = Vec::<(u64, Extent)>::with_capacity(addresses.len());
         for address in addresses {
+            if is_segment_allocation_id(address.allocation_id) {
+                if seen.insert(address.allocation_id) {
+                    self.free_address(address)?;
+                }
+                continue;
+            }
             let extent = self.validate_raw_address(address)?;
             if seen.insert(address.allocation_id) {
                 pending.push((address.allocation_id, extent));
@@ -1152,9 +1737,10 @@ impl BlockManager {
     }
 
     pub fn flush_meta(&mut self) -> Result<(), BlockManagerError> {
-        if self.journal_dirty {
+        if self.journal_dirty || self.segment_catalog_dirty {
             sync_all_with_failpoint(&self.meta_file, "flush_meta.sync")?;
             self.journal_dirty = false;
+            self.segment_catalog_dirty = false;
         }
         Ok(())
     }
@@ -1193,6 +1779,57 @@ impl BlockManager {
                 "address device {} does not match manager device {}",
                 address.device_id, self.header.device_id
             )));
+        }
+
+        if is_segment_allocation_id(address.allocation_id) {
+            let (segment_id, generation, offset_blocks) =
+                decode_segment_allocation_id(address.allocation_id)?;
+            let pool = self
+                .segment_pool
+                .as_ref()
+                .ok_or(BlockManagerError::UnknownAllocation(address.allocation_id))?;
+            let Some(entry) = pool.entries.get(segment_id as usize) else {
+                return Err(BlockManagerError::UnknownAllocation(address.allocation_id));
+            };
+            if entry.generation != generation
+                || address.extent_gen != generation
+                || entry.state == SEGMENT_STATE_FREE
+            {
+                return Err(BlockManagerError::UnknownAllocation(address.allocation_id));
+            }
+            let expected_offset = block_offset(
+                &self.header,
+                pool.segment_start_block
+                    .saturating_add(u64::from(segment_id).saturating_mul(pool.segment_block_count))
+                    .saturating_add(u64::from(offset_blocks)),
+            );
+            if address.offset_bytes != expected_offset {
+                return Err(BlockManagerError::Corrupt(format!(
+                    "segment-backed address offset {} does not match expected offset {}",
+                    address.offset_bytes, expected_offset
+                )));
+            }
+            let start_offset_bytes =
+                u64::from(offset_blocks).saturating_mul(u64::from(self.header.block_size));
+            let end_offset_bytes = start_offset_bytes.saturating_add(address.size_bytes);
+            if address.size_bytes == 0
+                || end_offset_bytes > u64::from(entry.write_pointer_bytes)
+                || end_offset_bytes > pool.segment_size_bytes
+            {
+                return Err(BlockManagerError::OutOfBounds {
+                    allocation_id: address.allocation_id,
+                    offset: 0,
+                    len: address.size_bytes as usize,
+                    capacity: u64::from(entry.write_pointer_bytes),
+                });
+            }
+            return Ok(Extent {
+                start_block: pool
+                    .segment_start_block
+                    .saturating_add(u64::from(segment_id).saturating_mul(pool.segment_block_count))
+                    .saturating_add(u64::from(offset_blocks)),
+                block_count: div_ceil(address.size_bytes, u64::from(self.header.block_size)),
+            });
         }
 
         let extent = *self
@@ -1304,6 +1941,82 @@ impl BlockManager {
         &mut self,
         size_bytes: u64,
     ) -> Result<RawExtentAddress, BlockManagerError> {
+        if self.segment_pool_enabled() && size_bytes <= self.header.segment_size_bytes {
+            let aligned_size =
+                div_ceil(size_bytes, u64::from(self.header.block_size))
+                    .saturating_mul(u64::from(self.header.block_size));
+            let aligned_size_u32 = u32::try_from(aligned_size).map_err(|_| {
+                BlockManagerError::InvalidArgument(format!(
+                    "allocation size {} exceeds supported segment allocation range",
+                    size_bytes
+                ))
+            })?;
+            loop {
+                let segment_id = self.ensure_open_segment(aligned_size_u32)?;
+                let segment_base_offset = {
+                    let pool = self.segment_pool.as_ref().expect("segment pool enabled");
+                    block_offset(
+                        &self.header,
+                        pool.segment_start_block
+                            .saturating_add(u64::from(segment_id).saturating_mul(pool.segment_block_count)),
+                    )
+                };
+                let Some(entry) = self
+                    .segment_pool
+                    .as_ref()
+                    .and_then(|pool| pool.entries.get(segment_id as usize))
+                    .copied()
+                else {
+                    return Err(BlockManagerError::Corrupt(format!(
+                        "active segment {} missing from segment pool",
+                        segment_id
+                    )));
+                };
+                if u64::from(entry.write_pointer_bytes).saturating_add(aligned_size)
+                    > self.header.segment_size_bytes
+                {
+                    if let Some(entry) = self
+                        .segment_pool
+                        .as_mut()
+                        .and_then(|pool| pool.entries.get_mut(segment_id as usize))
+                    {
+                        entry.sequence = entry.sequence.saturating_add(1);
+                        entry.state = SEGMENT_STATE_SEALED;
+                    }
+                    self.persist_segment_entry(segment_id, true)?;
+                    if let Some(pool) = self.segment_pool.as_mut() {
+                        pool.active_segment_id = None;
+                    }
+                    continue;
+                }
+
+                let start_offset_bytes = entry.write_pointer_bytes;
+                let start_offset_blocks = start_offset_bytes / self.header.block_size;
+                let generation = entry.generation;
+                if let Some(entry) = self
+                    .segment_pool
+                    .as_mut()
+                    .and_then(|pool| pool.entries.get_mut(segment_id as usize))
+                {
+                    entry.sequence = entry.sequence.saturating_add(1);
+                    entry.write_pointer_bytes =
+                        entry.write_pointer_bytes.saturating_add(aligned_size_u32);
+                }
+                self.persist_segment_entry(segment_id, true)?;
+                return Ok(RawExtentAddress {
+                    device_id: self.header.device_id,
+                    allocation_id: encode_segment_allocation_id(
+                        segment_id,
+                        generation,
+                        start_offset_blocks,
+                    )?,
+                    extent_gen: generation,
+                    offset_bytes: segment_base_offset.saturating_add(u64::from(start_offset_bytes)),
+                    size_bytes: aligned_size,
+                });
+            }
+        }
+
         let handle = self.allocate_bytes(size_bytes)?;
         match self.raw_extent_address(handle, size_bytes) {
             Ok(address) => Ok(address),
@@ -1329,6 +2042,39 @@ impl BlockManager {
 
     pub fn free_address(&mut self, address: &RawExtentAddress) -> Result<(), BlockManagerError> {
         let _extent = self.validate_raw_address(address)?;
+        if is_segment_allocation_id(address.allocation_id) {
+            let (segment_id, _generation, _offset_blocks) =
+                decode_segment_allocation_id(address.allocation_id)?;
+            let active_segment_id = self
+                .segment_pool
+                .as_ref()
+                .and_then(|pool| pool.active_segment_id);
+            let mut should_recycle = false;
+            if let Some(entry) = self
+                .segment_pool
+                .as_mut()
+                .and_then(|pool| pool.entries.get_mut(segment_id as usize))
+            {
+                entry.sequence = entry.sequence.saturating_add(1);
+                entry.dead_bytes = entry
+                    .dead_bytes
+                    .saturating_add(address.size_bytes.min(u64::from(u32::MAX)) as u32)
+                    .min(entry.write_pointer_bytes);
+                if entry.state == SEGMENT_STATE_SEALED
+                    && entry.dead_bytes >= entry.write_pointer_bytes
+                    && Some(segment_id) != active_segment_id
+                {
+                    entry.sequence = entry.sequence.saturating_add(1);
+                    entry.generation = entry.generation.saturating_add(1).max(1);
+                    entry.write_pointer_bytes = 0;
+                    entry.dead_bytes = 0;
+                    entry.state = SEGMENT_STATE_FREE;
+                    should_recycle = true;
+                }
+            }
+            self.persist_segment_entry(segment_id, should_recycle)?;
+            return Ok(());
+        }
         self.free(address.allocation_id)
     }
 
@@ -1697,7 +2443,11 @@ impl BlockManager {
 
     fn validate_allocator_state(&self) -> Result<(), BlockManagerError> {
         let data_start = self.header.data_start_block;
-        let data_blocks = self.header.total_blocks.saturating_sub(data_start);
+        let data_blocks = if self.segment_pool_enabled() {
+            self.header.metadata_pool_block_count
+        } else {
+            self.header.total_blocks.saturating_sub(data_start)
+        };
         let data_end = data_start.saturating_add(data_blocks);
 
         if data_blocks > 0 && self.allocation_state.ags.is_empty() {
@@ -2305,6 +3055,31 @@ mod tests {
         assert_eq!(state.ag_index_for_block(107), Some(2));
         assert_eq!(state.ag_index_for_block(109), Some(2));
         assert_eq!(state.ag_index_for_block(110), None);
+    }
+
+    #[test]
+    fn large_segment_pool_device_formats_and_reopens_cleanly() {
+        let path = temp_loopback("segment-pool-open");
+        let total_bytes = 2 * 1024 * 1024 * 1024u64;
+        BlockManager::format(
+            &path,
+            FormatOptions {
+                total_bytes: Some(total_bytes),
+                ..Default::default()
+            },
+        )
+        .expect("format large loopback");
+
+        let reopened = BlockManager::open(&path).expect("reopen large loopback");
+        assert!(
+            reopened.segment_pool.is_some(),
+            "segment pool should be enabled on large device"
+        );
+        reopened
+            .validate_allocator_state()
+            .expect("allocator state should validate on segment-pooled device");
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]

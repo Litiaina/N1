@@ -8,7 +8,6 @@ use crate::n1_core::blob_store::{
     validate_configured_raw_blob_disks,
 };
 use crate::n1_core::disk_manager::initialize_storage_roots;
-use crate::n1_core::index_facade::{IndexBackendMode, set_index_backend_mode};
 use crate::n1_core::monitoring::{
     MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC, MONITOR_INTERVAL_SECS_ATOMIC,
 };
@@ -322,17 +321,6 @@ fn adaptive_stream_max_concurrency(
         .max(1);
     let mem_cap = (adaptive_stream_memory_budget_bytes(ram_bytes) / per_stream).clamp(8, 768);
     core_cap.min(disk_cap).min(mem_cap).clamp(8, 768)
-}
-
-fn parse_index_backend_mode(raw: Option<&str>) -> IndexBackendMode {
-    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return IndexBackendMode::RawOnly;
-    };
-    match value.to_ascii_lowercase().as_str() {
-        "raw" | "raw-only" | "raw_only" => IndexBackendMode::RawOnly,
-        "raw-shadow" | "raw_shadow" | "shadow" => IndexBackendMode::RawShadow,
-        _ => IndexBackendMode::Fs,
-    }
 }
 
 #[cfg(unix)]
@@ -946,18 +934,6 @@ pub async fn run_server() {
     }
 
     let upload_section = config.section(Some("upload_config"));
-    let env_index_backend_mode = std::env::var("N1_ARC_INDEX_BACKEND_MODE").ok();
-    let index_backend_mode = parse_index_backend_mode(
-        env_index_backend_mode
-            .as_deref()
-            .or_else(|| upload_section.and_then(|s| s.get("index_backend_mode"))),
-    );
-    set_index_backend_mode(index_backend_mode);
-    tracing::info!(
-        "Arc index backend mode initialized: {:?} (env_override={})",
-        index_backend_mode,
-        env_index_backend_mode.is_some()
-    );
     let cpu_cores = detect_cpu_cores();
     let detected_ram_bytes = detect_total_ram_bytes();
     let detected_ram_gib = ram_gib(detected_ram_bytes);

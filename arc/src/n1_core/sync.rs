@@ -9,6 +9,7 @@ use crate::{
     enums::app_error_enum::AppError,
     n1_core::{
         disk_manager::ObjectPathManager, index_facade as index, quota_manager::set_storage_used,
+        raw_index,
     },
     structs::auth_structs::Claims,
 };
@@ -80,85 +81,25 @@ async fn calculate_usage_across_mirrors(fragment_hash: String) -> u64 {
     total_usage
 }
 
-async fn recover_fragment_name_from_disk(fragment_hash: String) -> Option<String> {
-    Some(fragment_hash)
-}
-
 pub async fn sync_quota() -> Result<(), Box<dyn Error + Send + Sync>> {
-    if index::index_backend_mode() != index::IndexBackendMode::Fs {
-        let mut count = 0usize;
-        for fragment_hash in crate::n1_core::raw_index::list_fragments().await? {
-            ensure_fragment_blob_directories(&fragment_hash).await;
-            sweep_fragment_gc_files(fragment_hash.clone()).await;
-            let usage = calculate_usage_across_mirrors(fragment_hash.clone()).await;
-            if let Err(e) = set_storage_used(&fragment_hash, usage).await {
-                warn!(
-                    "Failed to update usage for raw fragment {}: {}",
-                    fragment_hash, e
-                );
-            } else {
-                info!(
-                    "Synced quota for raw fragment {}. Usage: {} bytes",
-                    fragment_hash, usage
-                );
-            }
-            count += 1;
+    let mut count = 0usize;
+    for fragment_hash in raw_index::list_fragments().await? {
+        ensure_fragment_blob_directories(&fragment_hash).await;
+        sweep_fragment_gc_files(fragment_hash.clone()).await;
+        let usage = calculate_usage_across_mirrors(fragment_hash.clone()).await;
+        if let Err(e) = set_storage_used(&fragment_hash, usage).await {
+            warn!(
+                "Failed to update usage for raw fragment {}: {}",
+                fragment_hash, e
+            );
+        } else {
+            info!(
+                "Synced quota for raw fragment {}. Usage: {} bytes",
+                fragment_hash, usage
+            );
         }
-        info!(
-            "Consistency check completed. Synced {} active fragments.",
-            count
-        );
-        return Ok(());
+        count += 1;
     }
-
-    let path_manager = ObjectPathManager::new();
-    let index_roots = path_manager.get_all_index_roots();
-
-    let mut processed_hashes = HashSet::new();
-    let mut count = 0;
-
-    for root in index_roots {
-        let mut entries = match tokio::fs::read_dir(&root).await {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Ok(file_type) = entry.file_type().await {
-                if file_type.is_dir() {
-                    let fragment_hash = entry.file_name().to_string_lossy().to_string();
-
-                    if processed_hashes.contains(&fragment_hash) {
-                        continue;
-                    }
-                    processed_hashes.insert(fragment_hash.clone());
-
-                    let readable_name = recover_fragment_name_from_disk(fragment_hash.clone())
-                        .await
-                        .unwrap_or_else(|| "Unknown/Empty".to_string());
-
-                    ensure_fragment_blob_directories(&fragment_hash).await;
-                    sweep_fragment_gc_files(fragment_hash.clone()).await;
-
-                    let usage = calculate_usage_across_mirrors(fragment_hash.clone()).await;
-
-                    if let Err(e) = set_storage_used(&fragment_hash, usage).await {
-                        warn!(
-                            "Failed to update usage for Fragment '{}' (Hash: {}): {}",
-                            readable_name, fragment_hash, e
-                        );
-                    } else {
-                        info!(
-                            "Synced quota for Fragment '{}' (Hash: {}). Usage: {} bytes",
-                            readable_name, fragment_hash, usage
-                        );
-                    }
-                    count += 1;
-                }
-            }
-        }
-    }
-
     info!(
         "Consistency check completed. Synced {} active fragments.",
         count
@@ -221,33 +162,36 @@ pub async fn sync_fragment_quota_api(claims: Claims) -> Result<impl IntoResponse
 
     tokio::spawn(async move {
         match sync_single_fragment_quota(fragment.clone()).await {
-            Ok(_) => info!(
-                "Fragment quota sync completed successfully for {}.",
-                fragment
-            ),
-            Err(e) => error!("Fragment quota sync failed for {}: {}", fragment, e),
+            Ok(_) => info!("Quota sync completed for fragment {}", fragment),
+            Err(e) => error!("Quota sync failed for fragment {}: {}", fragment, e),
         }
     });
 
-    Ok(StatusCode::ACCEPTED)
+    Ok((
+        StatusCode::ACCEPTED,
+        "Fragment quota sync started in background.",
+    ))
 }
 
 pub async fn initialize_fragment_storage_api(
     claims: Claims,
 ) -> Result<impl IntoResponse, AppError> {
-    if !claims.write {
+    if !claims.modify {
         return Err(AppError::Forbidden(
-            "Write permission required to initialize storage".into(),
+            "Modify permission required to initialize fragment storage".into(),
         ));
     }
 
     let fragment = claims.fragment.clone();
-
     tokio::spawn(async move {
-        if let Err(e) = initialize_storage(fragment.clone()).await {
-            error!("Storage initialization failed for {}: {}", fragment, e);
+        match initialize_storage(fragment.clone()).await {
+            Ok(_) => info!("Storage initialization completed for fragment {}", fragment),
+            Err(e) => error!("Storage initialization failed for fragment {}: {}", fragment, e),
         }
     });
 
-    Ok(StatusCode::ACCEPTED)
+    Ok((
+        StatusCode::ACCEPTED,
+        "Fragment storage initialization started in background.",
+    ))
 }

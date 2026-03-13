@@ -1,7 +1,6 @@
 pub const PART_META_SUFFIX: &str = ".meta.msgpack";
 pub const SHARD_SUFFIX: &str = ".shard";
 pub const PARITY_SUFFIX: &str = ".parity";
-pub const QUOTA_FILE: &str = "quota.msgpack";
 pub const RESERVATION_FILE: &str = "reservation.msgpack";
 pub const SESSION_MANIFEST_FILE: &str = "session.manifest.msgpack";
 pub const REDIST_TMP_SUFFIX: &str = ".redist_tmp";
@@ -15,4 +14,3 @@ pub const PREFIX_DELIMITER_COMPACTED_FILE: &str = "dcompacted.msgpack";
 pub const FRAGMENT_METADATA_FILE: &str = "fragment.metadata.msgpack";
 pub const GC_SUFFIX: &str = ".gc";
 pub const BROWSER_CACHE_MAX_AGE: u64 = 3600;
-pub const LOCK_SHARD_COUNT: usize = 64;

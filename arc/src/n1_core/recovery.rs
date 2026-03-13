@@ -36,8 +36,6 @@ use std::os::windows::fs::OpenOptionsExt;
 
 static RECOVERY_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
 
-static BLOB_ROOTS: LazyLock<Vec<PathBuf>> =
-    LazyLock::new(|| ObjectPathManager::new().get_blob_roots());
 static INFLIGHT_REPAIRS: LazyLock<StdMutex<HashSet<String>>> =
     LazyLock::new(|| StdMutex::new(HashSet::new()));
 static RAW_RELOCATIONS: LazyLock<StdMutex<HashMap<String, RawBlobAddress>>> =
@@ -45,6 +43,16 @@ static RAW_RELOCATIONS: LazyLock<StdMutex<HashMap<String, RawBlobAddress>>> =
 pub static RAW_VERIFY_ON_READ_ATOMIC: OnceCell<AtomicBool> = OnceCell::new();
 
 const MAX_RAW_RELOCATIONS: usize = 8192;
+
+#[cfg(test)]
+pub fn clear_runtime_state_for_tests() {
+    if let Ok(mut inflight) = INFLIGHT_REPAIRS.lock() {
+        inflight.clear();
+    }
+    if let Ok(mut relocations) = RAW_RELOCATIONS.lock() {
+        relocations.clear();
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepairLogMode {
@@ -551,7 +559,7 @@ async fn get_or_open_shard_ha(
         );
 
         if let Some((fragment, version_id, is_trash)) = parse_version_dir_hint(vdir) {
-            for root in BLOB_ROOTS.iter() {
+            for root in ObjectPathManager::new().get_blob_roots() {
                 let dir = shard_dir_on_root(root.as_path(), &fragment, &version_id, is_trash);
                 candidates.push(
                     dir.join(&shard_info.file_name)
@@ -565,7 +573,7 @@ async fn get_or_open_shard_ha(
     if let Some((fragment, version_id, is_trash)) =
         extract_fragment_version_from_abs(&shard_info.absolute_path)
     {
-        for root in BLOB_ROOTS.iter() {
+        for root in ObjectPathManager::new().get_blob_roots() {
             let dir = shard_dir_on_root(root.as_path(), &fragment, &version_id, is_trash);
             candidates.push(
                 dir.join(&shard_info.file_name)

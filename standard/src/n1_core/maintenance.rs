@@ -1,14 +1,13 @@
 use crate::enums::app_error_enum::AppError;
-use crate::n1_core::constants::{METADATA_EXT, QUOTA_FILE};
+use crate::n1_core::constants::METADATA_EXT;
 use crate::n1_core::disk_manager::{ObjectMetadata, ObjectPathManager};
-use crate::n1_core::quota_manager::set_storage_used;
 use crate::structs::auth_structs::Claims;
 use axum::{http::StatusCode, response::IntoResponse};
 use std::collections::HashSet;
 use tracing::{error, info};
 use walkdir::WalkDir;
 
-async fn perform_quota_sync(fragment: &str) -> Result<u64, AppError> {
+async fn perform_fragment_cleanup(fragment: &str) -> Result<(u64, i32), AppError> {
     let path_manager = ObjectPathManager::new();
 
     let index_dirs = path_manager.get_all_index_dirs(fragment);
@@ -29,7 +28,7 @@ async fn perform_quota_sync(fragment: &str) -> Result<u64, AppError> {
                 for entry in WalkDir::new(index_dir).into_iter().filter_map(|e| e.ok()) {
                     if entry.file_type().is_file() {
                         let filename = entry.file_name().to_string_lossy();
-                        if filename.ends_with(METADATA_EXT) && filename != QUOTA_FILE {
+                        if filename.ends_with(METADATA_EXT) {
                             if let Ok(data) = std::fs::read(entry.path()) {
                                 if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
                                     if !valid_versions.contains(&meta.version_id) {
@@ -84,28 +83,21 @@ async fn perform_quota_sync(fragment: &str) -> Result<u64, AppError> {
         );
     }
 
-    if let Err(e) = set_storage_used(fragment, total_usage).await {
-        error!("Failed to update quota for {}: {}", fragment, e);
-    }
-
-    Ok(total_usage)
+    Ok((total_usage, orphans_removed))
 }
 
 pub async fn sync_fragment_metadata(claims: Claims) -> Result<impl IntoResponse, AppError> {
     if !claims.modify {
         return Err(AppError::Forbidden(
-            "Modify permissions required to sync quota".into(),
+            "Modify permissions required to clean fragment metadata".into(),
         ));
     }
 
-    let usage = perform_quota_sync(&claims.fragment).await?;
+    let (usage, orphans_removed) = perform_fragment_cleanup(&claims.fragment).await?;
     info!(
-        "Self-sync complete for fragment {}. New Usage: {} bytes",
-        claims.fragment, usage
+        "Fragment cleanup complete for {}. Usage: {} bytes, orphaned blobs removed: {}",
+        claims.fragment, usage, orphans_removed
     );
 
-    Ok((
-        StatusCode::OK,
-        "Metadata synchronization and cleanup complete.",
-    ))
+    Ok((StatusCode::OK, "Fragment metadata cleanup complete."))
 }

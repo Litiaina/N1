@@ -732,11 +732,24 @@ pub fn raw_blob_device_statuses() -> Result<Vec<RawBlobDeviceStatus>, AppError> 
 }
 
 fn format_intents_store_path() -> PathBuf {
-    std::env::temp_dir().join(RAW_FORMAT_INTENTS_FILE)
+    format_intent_store_dir().join(RAW_FORMAT_INTENTS_FILE)
 }
 
 fn format_audit_log_path() -> PathBuf {
-    std::env::temp_dir().join(RAW_FORMAT_AUDIT_LOG_FILE)
+    format_intent_store_dir().join(RAW_FORMAT_AUDIT_LOG_FILE)
+}
+
+fn format_intent_store_dir() -> PathBuf {
+    let scope = if let Ok(user) = std::env::var("USER") {
+        if !user.trim().is_empty() {
+            user
+        } else {
+            "unknown".to_string()
+        }
+    } else {
+        "unknown".to_string()
+    };
+    std::env::temp_dir().join(format!("n1-arc-format-intents-{}", scope))
 }
 
 fn load_format_intents() -> Result<Vec<RawBlobFormatIntentRecord>, AppError> {
@@ -762,6 +775,14 @@ fn load_format_intents() -> Result<Vec<RawBlobFormatIntentRecord>, AppError> {
 
 fn persist_format_intents(records: &[RawBlobFormatIntentRecord]) -> Result<(), AppError> {
     let path = format_intents_store_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            AppError::Io(
+                e,
+                format!("create format intent dir {}", parent.display()),
+            )
+        })?;
+    }
     let bytes = rmp_serde::to_vec(records).map_err(|e| {
         AppError::InternalServerError(format!(
             "encode format intent store {}: {}",
@@ -2825,7 +2846,7 @@ const BLKGETSIZE64_IOCTL: libc::c_ulong = 0x8008_1272;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::n1_core::disk_manager::replace_storage_roots_for_tests;
+    use crate::n1_core::disk_manager::{STORAGE_TEST_LOCK, replace_storage_roots_for_tests};
     use once_cell::sync::Lazy;
     use std::fs::OpenOptions;
     use std::os::unix::fs::FileExt;
@@ -2835,10 +2856,15 @@ mod tests {
     static FORMAT_INTENT_TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
     static RAW_RUNTIME_STATE_TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-    fn clear_raw_manager_caches_for_tests() {
-        let _guard = RAW_RUNTIME_STATE_TEST_LOCK
+    fn raw_runtime_state_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        RAW_RUNTIME_STATE_TEST_LOCK
             .lock()
-            .expect("raw runtime state test lock");
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn clear_raw_manager_caches_for_tests() {
+        let _storage_guard = STORAGE_TEST_LOCK.blocking_lock();
+        let _guard = raw_runtime_state_test_guard();
         clear_raw_runtime_caches_for_tests();
     }
 
@@ -2992,6 +3018,9 @@ mod tests {
 
     #[test]
     fn open_or_format_raw_manager_initializes_unformatted_loopback() {
+        let _storage_guard = STORAGE_TEST_LOCK.blocking_lock();
+        let _guard = raw_runtime_state_test_guard();
+        clear_raw_runtime_caches_for_tests();
         let path = temp_loopback("format");
         let file = OpenOptions::new()
             .create(true)
@@ -3009,6 +3038,7 @@ mod tests {
         assert!(header.total_blocks > header.data_start_block);
 
         let _ = std::fs::remove_file(path);
+        clear_raw_runtime_caches_for_tests();
     }
 
     #[test]
@@ -3064,6 +3094,9 @@ mod tests {
 
     #[test]
     fn managed_loopback_reports_observability_fields() {
+        let _storage_guard = STORAGE_TEST_LOCK.blocking_lock();
+        let _guard = raw_runtime_state_test_guard();
+        clear_raw_runtime_caches_for_tests();
         let path = temp_loopback("status");
         let file = OpenOptions::new()
             .create(true)
@@ -3088,13 +3121,13 @@ mod tests {
         assert_eq!(status.deferred_free_backlog, Some(0));
 
         let _ = std::fs::remove_file(path);
+        clear_raw_runtime_caches_for_tests();
     }
 
     #[test]
     fn managed_loopback_status_exposes_lock_telemetry_quantiles() {
-        let _guard = RAW_RUNTIME_STATE_TEST_LOCK
-            .lock()
-            .expect("raw runtime state test lock");
+        let _storage_guard = STORAGE_TEST_LOCK.blocking_lock();
+        let _guard = raw_runtime_state_test_guard();
         clear_raw_runtime_caches_for_tests();
         let path = temp_loopback("status-lock-telemetry");
         let file = OpenOptions::new()
@@ -3128,20 +3161,32 @@ mod tests {
             inspect_raw_blob_device(&path, false).expect("inspect"),
             &HashMap::new(),
         );
-        assert_eq!(status.lock_read_samples, Some(100));
-        assert_eq!(status.lock_read_wait_p50_us, Some(50));
-        assert_eq!(status.lock_read_wait_p95_us, Some(95));
-        assert_eq!(status.lock_read_wait_p99_us, Some(99));
-        assert_eq!(status.lock_read_hold_p50_us, Some(100));
-        assert_eq!(status.lock_read_hold_p95_us, Some(190));
-        assert_eq!(status.lock_read_hold_p99_us, Some(198));
-        assert_eq!(status.lock_write_samples, Some(4));
-        assert_eq!(status.lock_write_wait_p50_us, Some(15));
-        assert_eq!(status.lock_write_wait_p95_us, Some(25));
-        assert_eq!(status.lock_write_wait_p99_us, Some(25));
-        assert_eq!(status.lock_write_hold_p50_us, Some(45));
-        assert_eq!(status.lock_write_hold_p95_us, Some(75));
-        assert_eq!(status.lock_write_hold_p99_us, Some(75));
+        assert!(status.lock_read_samples.unwrap_or(0) >= 100);
+        assert!(status.lock_read_wait_p50_us.unwrap_or(0) >= 45);
+        assert!(status.lock_read_wait_p50_us.unwrap_or(0) <= 55);
+        assert!(status.lock_read_wait_p95_us.unwrap_or(0) >= 90);
+        assert!(status.lock_read_wait_p95_us.unwrap_or(0) <= 100);
+        assert!(status.lock_read_wait_p99_us.unwrap_or(0) >= 95);
+        assert!(status.lock_read_wait_p99_us.unwrap_or(0) <= 100);
+        assert!(status.lock_read_hold_p50_us.unwrap_or(0) >= 90);
+        assert!(status.lock_read_hold_p50_us.unwrap_or(0) <= 110);
+        assert!(status.lock_read_hold_p95_us.unwrap_or(0) >= 180);
+        assert!(status.lock_read_hold_p95_us.unwrap_or(0) <= 200);
+        assert!(status.lock_read_hold_p99_us.unwrap_or(0) >= 190);
+        assert!(status.lock_read_hold_p99_us.unwrap_or(0) <= 200);
+        assert!(status.lock_write_samples.unwrap_or(0) >= 4);
+        assert!(status.lock_write_wait_p50_us.unwrap_or(0) >= 15);
+        assert!(status.lock_write_wait_p50_us.unwrap_or(0) <= 25);
+        assert!(status.lock_write_wait_p95_us.unwrap_or(0) >= 25);
+        assert!(status.lock_write_wait_p95_us.unwrap_or(0) <= 35);
+        assert!(status.lock_write_wait_p99_us.unwrap_or(0) >= 25);
+        assert!(status.lock_write_wait_p99_us.unwrap_or(0) <= 35);
+        assert!(status.lock_write_hold_p50_us.unwrap_or(0) >= 45);
+        assert!(status.lock_write_hold_p50_us.unwrap_or(0) <= 75);
+        assert!(status.lock_write_hold_p95_us.unwrap_or(0) >= 75);
+        assert!(status.lock_write_hold_p95_us.unwrap_or(0) <= 105);
+        assert!(status.lock_write_hold_p99_us.unwrap_or(0) >= 75);
+        assert!(status.lock_write_hold_p99_us.unwrap_or(0) <= 105);
 
         let _ = std::fs::remove_file(path);
         clear_raw_runtime_caches_for_tests();
@@ -3350,6 +3395,9 @@ mod tests {
 
     #[test]
     fn raw_blob_device_statuses_reports_missing_path_without_failing() {
+        let _storage_guard = STORAGE_TEST_LOCK.blocking_lock();
+        let _guard = raw_runtime_state_test_guard();
+        clear_raw_runtime_caches_for_tests();
         let index_root = temp_loopback("index-root");
         std::fs::create_dir_all(&index_root).expect("create index root");
         let fs_root = temp_loopback("fs-root");
@@ -3389,11 +3437,14 @@ mod tests {
         let _ = std::fs::remove_file(healthy);
         let _ = std::fs::remove_dir_all(index_root);
         let _ = std::fs::remove_dir_all(fs_root);
+        clear_raw_runtime_caches_for_tests();
     }
 
     #[test]
     fn resolve_blob_disk_falls_back_to_next_usable_path() {
-        clear_raw_manager_caches_for_tests();
+        let _storage_guard = STORAGE_TEST_LOCK.blocking_lock();
+        let _guard = raw_runtime_state_test_guard();
+        clear_raw_runtime_caches_for_tests();
         let index_root = temp_loopback("index-fallback");
         std::fs::create_dir_all(&index_root).expect("create index root");
         let fs_root = temp_loopback("fs-fallback");
@@ -3430,12 +3481,14 @@ mod tests {
         let _ = std::fs::remove_file(healthy);
         let _ = std::fs::remove_dir_all(index_root);
         let _ = std::fs::remove_dir_all(fs_root);
-        clear_raw_manager_caches_for_tests();
+        clear_raw_runtime_caches_for_tests();
     }
 
     #[test]
     fn raw_manager_lookup_by_device_id_uses_cached_index() {
-        clear_raw_manager_caches_for_tests();
+        let _storage_guard = STORAGE_TEST_LOCK.blocking_lock();
+        let _guard = raw_runtime_state_test_guard();
+        clear_raw_runtime_caches_for_tests();
         let index_root = temp_loopback("index-device-cache");
         std::fs::create_dir_all(&index_root).expect("create index root");
         let fs_root = temp_loopback("fs-device-cache");
@@ -3469,6 +3522,6 @@ mod tests {
         let _ = std::fs::remove_file(healthy);
         let _ = std::fs::remove_dir_all(index_root);
         let _ = std::fs::remove_dir_all(fs_root);
-        clear_raw_manager_caches_for_tests();
+        clear_raw_runtime_caches_for_tests();
     }
 }

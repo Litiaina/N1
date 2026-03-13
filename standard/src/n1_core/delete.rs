@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -6,20 +6,16 @@ use std::sync::Arc;
 use axum::extract::{Path as AxumPath, State};
 use axum::{http::StatusCode, response::IntoResponse};
 
-use futures_util::{StreamExt, stream};
 use tokio::fs;
-use tracing::{error, info, warn};
-use ulid::Ulid;
+use tracing::{info, warn};
 use walkdir::WalkDir;
 
 use crate::enums::app_error_enum::AppError;
-use crate::n1_core::disk_manager::{
-    ObjectMetadata, ObjectPathManager, PrefixIndexEntry, PrefixIndexSegment, default_stripe_size,
-};
+use crate::n1_core::disk_manager::{ObjectMetadata, ObjectPathManager};
 use crate::n1_core::index;
-use crate::n1_core::prefix_compactor::schedule_prefix_compaction;
-use crate::n1_core::prefix_delimiter::write_delimiter_delta;
-use crate::n1_core::quota_manager::update_quota;
+use crate::n1_core::prefix_updates::{
+    logical_now, synthetic_delete_marker, synthetic_live_entry, write_prefix_entry_update,
+};
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
@@ -108,252 +104,6 @@ async fn move_dir_or_copy(src: &std::path::Path, dst: &std::path::Path) -> Resul
     }
 }
 
-#[cfg(unix)]
-pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        use std::fs::OpenOptions;
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let f = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY)
-            .open(&path)
-            .map_err(|e| AppError::Io(e, format!("open dir for sync: {:?}", path)))?;
-
-        f.sync_all()
-            .map_err(|e| AppError::Io(e, format!("sync dir: {:?}", path)))?;
-
-        Ok::<(), AppError>(())
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("sync dir task: {}", e)))?
-}
-
-#[cfg(windows)]
-pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        use std::fs::OpenOptions;
-        use std::os::windows::fs::OpenOptionsExt;
-
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
-
-        let result = OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(&path);
-
-        match result {
-            Ok(file) => {
-                let _ = file.sync_all();
-            }
-            Err(e) => {
-                warn!(
-                    "Windows: Failed to open directory for sync (non-fatal): {} - {}",
-                    path.display(),
-                    e
-                );
-            }
-        }
-
-        Ok::<(), AppError>(())
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("sync dir task: {}", e)))?
-}
-
-#[cfg(not(any(unix, windows)))]
-pub async fn sync_dir(_path: &std::path::Path) -> Result<(), AppError> {
-    Ok(())
-}
-
-fn canonical_prefix(prefix: &str) -> String {
-    prefix.trim_start_matches('/').to_string()
-}
-
-fn prefixes_for_key(object_key: &str) -> BTreeSet<String> {
-    let key = canonical_prefix(object_key);
-    let mut out = BTreeSet::new();
-    out.insert(String::new());
-
-    if key.is_empty() {
-        return out;
-    }
-
-    let parts: Vec<&str> = key.split('/').filter(|p| !p.is_empty()).collect();
-    let mut cur = String::new();
-
-    for (i, p) in parts.iter().enumerate() {
-        if i == 0 {
-            cur.push_str(p);
-        } else {
-            cur.push('/');
-            cur.push_str(p);
-        }
-        out.insert(cur.clone());
-    }
-
-    out
-}
-
-async fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<(), AppError> {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent).await;
-    }
-
-    let tmp = path.with_file_name(format!(
-        ".tmp_{}_{}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
-        Ulid::new().to_string()
-    ));
-
-    fs::write(&tmp, data)
-        .await
-        .map_err(|e| AppError::Io(e, format!("write tmp {}", tmp.display())))?;
-
-    fs::rename(&tmp, path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("rename tmp -> {}", path.display())))?;
-
-    if let Some(parent) = path.parent() {
-        let _ = sync_dir(parent).await;
-    }
-
-    Ok(())
-}
-
-async fn read_metadata_any(
-    fragment: &str,
-    object_key: &str,
-    version_id: &str,
-) -> Option<ObjectMetadata> {
-    if let Ok(meta) = index::read_object_version(fragment, object_key, version_id).await {
-        return Some(meta);
-    }
-    if let Ok(meta) = index::read_trashed_object_version(fragment, object_key, version_id).await {
-        return Some(meta);
-    }
-    None
-}
-
-async fn write_prefix_segments_for_meta(
-    path_manager: &ObjectPathManager,
-    fragment: &str,
-    object_key: &str,
-    version_id: &str,
-    created_at: i64,
-    is_delete_marker: bool,
-    child_count_delta: i64,
-) -> Result<(), AppError> {
-    let prefixes = prefixes_for_key(object_key);
-    let mut any_ok = false;
-
-    for prefix in prefixes {
-        let seg = PrefixIndexSegment {
-            prefix: prefix.clone(),
-            entries: vec![PrefixIndexEntry {
-                object_key: object_key.to_string(),
-                version_id: version_id.to_string(),
-                created_at,
-                is_delete_marker,
-            }],
-        };
-
-        let bytes = rmp_serde::to_vec(&seg).map_err(|e| {
-            AppError::InternalServerError(format!("Serialize prefix segment: {}", e))
-        })?;
-
-        let paths = path_manager.get_all_prefix_segment_paths(fragment, &prefix, version_id);
-
-        let mut wrote_this_prefix = false;
-        for p in paths {
-            if let Some(parent) = p.parent() {
-                let _ = fs::create_dir_all(parent).await;
-            }
-            if write_atomic(&p, &bytes).await.is_ok() {
-                wrote_this_prefix = true;
-            }
-        }
-
-        if wrote_this_prefix {
-            any_ok = true;
-        }
-    }
-
-    if !any_ok {
-        return Err(AppError::InternalServerError(
-            "Failed to write prefix index segment to any mirror".into(),
-        ));
-    }
-
-    write_delimiter_delta(
-        path_manager,
-        fragment,
-        object_key,
-        version_id,
-        Some(PrefixIndexEntry {
-            object_key: object_key.to_string(),
-            version_id: version_id.to_string(),
-            created_at,
-            is_delete_marker,
-        }),
-        child_count_delta,
-    )
-    .await?;
-
-    Ok(())
-}
-
-async fn invalidate_compacted_for_key(
-    _path_manager: &ObjectPathManager,
-    fragment: &str,
-    object_key: &str,
-) {
-    let prefixes = prefixes_for_key(object_key);
-    let mut compact_candidates = Vec::new();
-    for pfx in prefixes {
-        let cpfx = canonical_prefix(&pfx);
-        compact_candidates.push(cpfx.clone());
-    }
-    schedule_prefix_compaction(fragment.to_string(), compact_candidates);
-}
-
-async fn write_delete_marker_for_key(
-    fragment: &str,
-    object_key: &str,
-    template: Option<&ObjectMetadata>,
-) -> Result<(String, i64), AppError> {
-    let now = chrono::Utc::now().timestamp();
-    let delete_version_id = Ulid::new().to_string();
-
-    let mut dm = template.cloned().unwrap_or_else(|| ObjectMetadata {
-        object_key: object_key.to_string(),
-        fragment: fragment.to_string(),
-        version_id: delete_version_id.clone(),
-        upload_session_id: String::new(),
-        owner_uid: fragment.to_string(),
-        content_type: "application/octet-stream".to_string(),
-        total_size_bytes: 0,
-        created_at: now,
-        parts: Vec::new(),
-        is_delete_marker: true,
-        stripe_size_bytes: default_stripe_size(),
-    });
-
-    dm.fragment = fragment.to_string();
-    dm.owner_uid = fragment.to_string();
-    dm.object_key = object_key.to_string();
-    dm.version_id = delete_version_id.clone();
-    dm.created_at = now;
-    dm.is_delete_marker = true;
-    dm.parts.clear();
-    dm.total_size_bytes = 0;
-
-    index::publish_object(&dm).await?;
-    Ok((delete_version_id, now))
-}
-
 async fn purge_delete_markers_for_key(fragment: &str, object_key: &str) {
     if let Ok(metas) = index::list_live_object_versions_metadata(fragment, object_key).await {
         for meta in metas {
@@ -369,28 +119,60 @@ async fn list_object_versions_any(
     fragment: &str,
     object_key: &str,
 ) -> Result<Vec<String>, AppError> {
-    let mut versions = index::list_live_object_versions_metadata(fragment, object_key)
-        .await?
-        .into_iter()
-        .map(|m| m.version_id)
-        .collect::<Vec<_>>();
-    versions.sort();
-    versions.dedup();
-    Ok(versions)
+    index::list_live_object_version_ids(fragment, object_key).await
 }
 
 async fn list_trashed_object_versions_any(
     fragment: &str,
     object_key: &str,
 ) -> Result<Vec<String>, AppError> {
-    let mut versions = index::list_trashed_object_versions_metadata(fragment, object_key)
-        .await?
-        .into_iter()
-        .map(|m| m.version_id)
-        .collect::<Vec<_>>();
-    versions.sort();
-    versions.dedup();
-    Ok(versions)
+    index::list_trashed_object_version_ids(fragment, object_key).await
+}
+
+async fn move_blob_versions_between_states(
+    path_manager: &ObjectPathManager,
+    blob_roots: &[std::path::PathBuf],
+    fragment: &str,
+    version_ids: &[String],
+    from_trash: bool,
+) {
+    for version_id in version_ids {
+        for root in blob_roots {
+            let src = if from_trash {
+                get_trash_root(root, fragment).join("blob").join(version_id)
+            } else {
+                path_manager.get_shard_dir_on_disk(root, fragment, version_id)
+            };
+            if !fs::try_exists(&src).await.unwrap_or(false) {
+                continue;
+            }
+
+            let dst = if from_trash {
+                path_manager.get_shard_dir_on_disk(root, fragment, version_id)
+            } else {
+                get_trash_root(root, fragment).join("blob").join(version_id)
+            };
+
+            let _ = move_dir_or_copy(&src, &dst).await;
+        }
+    }
+}
+
+async fn remove_blob_versions(
+    path_manager: &ObjectPathManager,
+    blob_roots: &[std::path::PathBuf],
+    fragment: &str,
+    version_ids: &[String],
+) {
+    for version_id in version_ids {
+        for disk in blob_roots {
+            let live_shard = path_manager.get_shard_dir_on_disk(disk, fragment, version_id);
+            let _ = fs::remove_dir_all(&live_shard).await;
+
+            let trash_shard = get_trash_root(disk, fragment).join("blob").join(version_id);
+            let _ = fs::remove_dir_all(&trash_shard).await;
+        }
+    }
 }
 
 pub async fn delete_object_version(
@@ -407,7 +189,10 @@ pub async fn delete_object_version(
 
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
-    if let Ok(meta) = index::read_trashed_object_version(&fragment, &object_key, &version_id).await
+    let had_trash_before = !list_trashed_object_versions_any(&fragment, &object_key)
+        .await?
+        .is_empty();
+    if let Ok(_meta) = index::read_trashed_object_version(&fragment, &object_key, &version_id).await
     {
         for root in &blob_roots {
             let trash_blob_dir = get_trash_root(root, &fragment)
@@ -417,11 +202,46 @@ pub async fn delete_object_version(
         }
         let _ = index::delete_trashed_object_version(&fragment, &object_key, &version_id).await;
         let _ = index::remove_session(&fragment, &version_id, "permanent-delete-version").await;
-        if meta.total_size_bytes > 0 {
-            let _ = update_quota(&fragment, -(meta.total_size_bytes as i64)).await;
+        let trashed_after =
+            index::list_trashed_object_versions_metadata(&fragment, &object_key).await?;
+        let ts = logical_now();
+        if let Some(latest_trash) = trashed_after.first() {
+            let latest_entry = synthetic_live_entry(latest_trash, ts);
+            let _ = write_prefix_entry_update(
+                &fragment,
+                &object_key,
+                &latest_trash.version_id,
+                latest_entry,
+                0,
+                true,
+            )
+            .await;
+        } else {
+            let tombstone_source = ObjectMetadata {
+                object_key: object_key.clone(),
+                fragment: fragment.clone(),
+                version_id: version_id.clone(),
+                upload_session_id: String::new(),
+                owner_uid: String::new(),
+                content_type: String::new(),
+                total_size_bytes: 0,
+                created_at: ts,
+                parts: Vec::new(),
+                is_delete_marker: true,
+                stripe_size_bytes: 0,
+            };
+            let tombstone = synthetic_delete_marker(&tombstone_source, ts);
+            let delta = if had_trash_before { -1 } else { 0 };
+            let _ = write_prefix_entry_update(
+                &fragment,
+                &object_key,
+                &version_id,
+                tombstone,
+                delta,
+                true,
+            )
+            .await;
         }
-
-        invalidate_compacted_for_key(&path_manager, &fragment, &object_key).await;
         state.emit(
             &fragment,
             StorageEventPayload::FileDeleted {
@@ -433,8 +253,9 @@ pub async fn delete_object_version(
         return Ok(StatusCode::NO_CONTENT);
     }
 
-    let template_meta = read_metadata_any(&fragment, &object_key, &version_id).await;
-    index::move_object_version_to_trash(&fragment, &object_key, &version_id).await?;
+    let moved_meta =
+        index::move_object_version_to_trash_with_metadata(&fragment, &object_key, &version_id)
+            .await?;
 
     for root in &blob_roots {
         let src_blob_dir = path_manager.get_shard_dir_on_disk(root, &fragment, &version_id);
@@ -452,42 +273,46 @@ pub async fn delete_object_version(
     }
 
     let _ = index::remove_session(&fragment, &version_id, "soft-delete-version").await;
+    let live_after = index::list_live_object_versions_metadata(&fragment, &object_key).await?;
+    let trash_after = index::list_trashed_object_versions_metadata(&fragment, &object_key).await?;
+    let ts = logical_now();
 
-    let latest_live = match index::read_latest_object(&fragment, &object_key).await {
-        Ok(meta) if !meta.is_delete_marker => Some(meta),
-        _ => None,
-    };
-
-    if let Some(meta) = latest_live {
-        let relisted_at = chrono::Utc::now().timestamp().saturating_add(1);
-        let _ = write_prefix_segments_for_meta(
-            &path_manager,
+    let live_tombstone = synthetic_delete_marker(&moved_meta, ts);
+    let live_child_delta = if live_after.is_empty() { -1 } else { 0 };
+    let _ = write_prefix_entry_update(
+        &fragment,
+        &object_key,
+        &moved_meta.version_id,
+        live_tombstone,
+        live_child_delta,
+        false,
+    )
+    .await;
+    if let Some(latest_live) = live_after.first() {
+        let live_entry = synthetic_live_entry(latest_live, ts.saturating_add(1));
+        let _ = write_prefix_entry_update(
             &fragment,
-            &meta.object_key,
-            &meta.version_id,
-            relisted_at,
-            false,
+            &object_key,
+            &latest_live.version_id,
+            live_entry,
             0,
+            false,
         )
         .await;
-    } else {
-        if let Ok((del_vid, del_created_at)) =
-            write_delete_marker_for_key(&fragment, &object_key, template_meta.as_ref()).await
-        {
-            let _ = write_prefix_segments_for_meta(
-                &path_manager,
-                &fragment,
-                &object_key,
-                &del_vid,
-                del_created_at,
-                true,
-                -1,
-            )
-            .await;
-        }
     }
 
-    invalidate_compacted_for_key(&path_manager, &fragment, &object_key).await;
+    if let Some(latest_trash) = trash_after.first() {
+        let trash_entry = synthetic_live_entry(latest_trash, ts.saturating_add(2));
+        let _ = write_prefix_entry_update(
+            &fragment,
+            &object_key,
+            &latest_trash.version_id,
+            trash_entry,
+            if had_trash_before { 0 } else { 1 },
+            true,
+        )
+        .await;
+    }
 
     info!(
         "Soft deleted (moved to trash) version: {}/{} (v: {})",
@@ -525,63 +350,86 @@ pub async fn delete_object(
         return Err(AppError::NotFound);
     }
 
-    let mut template_meta: Option<ObjectMetadata> = None;
-    for v in &versions_found {
-        if let Some(m) = read_metadata_any(&fragment, &object_key, v).await {
-            template_meta = Some(m);
-            break;
-        }
-    }
-
+    let had_trash_before = !list_trashed_object_versions_any(&fragment, &object_key)
+        .await?
+        .is_empty();
+    let live_latest_before = index::read_latest_object(&fragment, &object_key).await.ok();
     let blob_roots = path_manager.get_blob_roots();
-
-    let mut success_count = 0usize;
-
-    for version_id in &versions_found {
-        if let Err(e) =
-            index::move_object_version_to_trash(&fragment, &object_key, version_id).await
-        {
-            warn!(
-                "Partition trash move failed for {}/{}#{}: {}",
-                fragment, object_key, version_id, e
-            );
-            continue;
-        }
-
-        let _ = index::remove_session(&fragment, version_id, "soft-delete-object").await;
-
-        for root in &blob_roots {
-            let src_blob = path_manager.get_shard_dir_on_disk(root, &fragment, version_id);
-            if fs::try_exists(&src_blob).await.unwrap_or(false) {
-                let trash_root = get_trash_root(root, &fragment);
-                let dst_blob = trash_root.join("blob").join(version_id);
-                let _ = move_dir_or_copy(&src_blob, &dst_blob).await;
+    let moved_versions = match index::move_object_to_trash_fast(&fragment, &object_key).await {
+        Ok(Some(version_ids)) => version_ids,
+        Ok(None) => {
+            let versions_found = list_object_versions_any(&fragment, &object_key).await?;
+            if versions_found.is_empty() {
+                return Err(AppError::NotFound);
             }
+            let mut moved = Vec::new();
+            for version_id in &versions_found {
+                let _moved_meta = match index::move_object_version_to_trash_with_metadata(
+                    &fragment,
+                    &object_key,
+                    version_id,
+                )
+                .await
+                {
+                    Ok(meta) => meta,
+                    Err(e) => {
+                        warn!(
+                            "Partition trash move failed for {}/{}#{}: {}",
+                            fragment, object_key, version_id, e
+                        );
+                        continue;
+                    }
+                };
+                moved.push(version_id.clone());
+            }
+            moved
         }
+        Err(e) => return Err(e),
+    };
 
-        success_count += 1;
+    for version_id in &moved_versions {
+        let _ = index::remove_session(&fragment, version_id, "soft-delete-object").await;
     }
-
-    if let Ok((del_vid, del_created_at)) =
-        write_delete_marker_for_key(&fragment, &object_key, template_meta.as_ref()).await
-    {
-        let _ = write_prefix_segments_for_meta(
-            &path_manager,
+    move_blob_versions_between_states(
+        &path_manager,
+        &blob_roots,
+        &fragment,
+        &moved_versions,
+        false,
+    )
+    .await;
+    let trash_after = index::list_trashed_object_versions_metadata(&fragment, &object_key).await?;
+    let ts = logical_now();
+    if let Some(anchor) = live_latest_before.as_ref().or(trash_after.first()) {
+        let live_tombstone = synthetic_delete_marker(anchor, ts);
+        let _ = write_prefix_entry_update(
             &fragment,
             &object_key,
-            &del_vid,
-            del_created_at,
-            true,
+            &anchor.version_id,
+            live_tombstone,
             -1,
+            false,
+        )
+        .await;
+    }
+    if let Some(latest_trash) = trash_after.first() {
+        let trash_entry = synthetic_live_entry(latest_trash, ts.saturating_add(1));
+        let _ = write_prefix_entry_update(
+            &fragment,
+            &object_key,
+            &latest_trash.version_id,
+            trash_entry,
+            if had_trash_before { 0 } else { 1 },
+            true,
         )
         .await;
     }
 
-    invalidate_compacted_for_key(&path_manager, &fragment, &object_key).await;
-
     info!(
         "Soft deleted {} versions for object {}/{}",
-        success_count, fragment, object_key
+        moved_versions.len(),
+        fragment,
+        object_key
     );
 
     state.emit(
@@ -612,11 +460,6 @@ pub async fn empty_trash(
     let index_roots = path_manager.get_all_index_roots();
     let blob_roots = path_manager.get_blob_roots();
 
-    let mut total_refund_size: u64 = 0;
-    if let Ok(trash_objects) = index::list_fragment_trash_objects(&fragment).await {
-        total_refund_size = trash_objects.iter().map(|m| m.total_size_bytes).sum();
-    }
-
     index::clear_fragment_trash_in_partitions(&fragment, None).await?;
 
     let mut trash_targets = BTreeSet::new();
@@ -640,20 +483,6 @@ pub async fn empty_trash(
 
     futures_util::future::join_all(delete_tasks).await;
 
-    if total_refund_size > 0 {
-        if let Err(e) = update_quota(&fragment, -(total_refund_size as i64)).await {
-            error!(
-                "Failed to refund quota after emptying trash for {}: {}",
-                fragment, e
-            );
-        } else {
-            info!(
-                "Refunded {} bytes after emptying trash for {}",
-                total_refund_size, fragment
-            );
-        }
-    }
-
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -670,81 +499,52 @@ pub async fn delete_object_permanently(
     }
 
     let path_manager = ObjectPathManager::new();
-
-    let mut versions_map: HashMap<String, u64> = HashMap::new();
-    if let Ok(metas) = index::list_live_object_versions_metadata(&fragment, &object_key).await {
-        for meta in metas {
-            versions_map
-                .entry(meta.version_id.clone())
-                .or_insert(meta.total_size_bytes);
-        }
-    }
-    if let Ok(metas) = index::list_trashed_object_versions_metadata(&fragment, &object_key).await {
-        for meta in metas {
-            versions_map
-                .entry(meta.version_id.clone())
-                .or_insert(meta.total_size_bytes);
-        }
+    let live_latest_before = index::read_latest_object(&fragment, &object_key).await.ok();
+    let trash_latest_before = index::list_trashed_object_versions_metadata(&fragment, &object_key)
+        .await?
+        .into_iter()
+        .next();
+    let versions_to_delete = match index::delete_object_fast(&fragment, &object_key).await? {
+        Some(version_ids) => version_ids,
+        None => return Err(AppError::NotFound),
+    };
+    let blob_roots = path_manager.get_blob_roots();
+    remove_blob_versions(&path_manager, &blob_roots, &fragment, &versions_to_delete).await;
+    for version_id in &versions_to_delete {
+        let _ = index::remove_session(&fragment, version_id, "permanent-delete").await;
     }
 
-    if versions_map.is_empty() {
-        return Err(AppError::NotFound);
-    }
-
-    let mut versions_to_delete: Vec<(String, u64)> = versions_map.into_iter().collect();
-    versions_to_delete.sort_by(|a, b| a.0.cmp(&b.0));
-    versions_to_delete.dedup_by(|a, b| a.0 == b.0);
-
-    let blob_roots = Arc::new(path_manager.get_blob_roots());
-    let path_manager = Arc::new(path_manager);
-
-    let results: Vec<u64> = stream::iter(versions_to_delete)
-        .map(|(version_id, size)| {
-            let f = fragment.clone();
-            let object_key_for_index = object_key.clone();
-            let pm = path_manager.clone();
-            let blobs = blob_roots.clone();
-
-            async move {
-                for disk in blobs.iter() {
-                    let live_shard = pm.get_shard_dir_on_disk(disk, &f, &version_id);
-                    let _ = fs::remove_dir_all(&live_shard).await;
-
-                    let trash_shard = get_trash_root(disk, &f).join("blob").join(&version_id);
-                    let _ = fs::remove_dir_all(&trash_shard).await;
-                }
-
-                let _ = index::delete_object_version(&f, &object_key_for_index, &version_id).await;
-                let _ =
-                    index::delete_trashed_object_version(&f, &object_key_for_index, &version_id)
-                        .await;
-                let _ = index::remove_session(&f, &version_id, "permanent-delete").await;
-
-                size
-            }
-        })
-        .buffer_unordered(20)
-        .collect()
+    let ts = logical_now();
+    if let Some(live_meta) = live_latest_before.as_ref() {
+        let tombstone = synthetic_delete_marker(live_meta, ts);
+        let _ = write_prefix_entry_update(
+            &fragment,
+            &object_key,
+            &live_meta.version_id,
+            tombstone,
+            -1,
+            false,
+        )
         .await;
-
-    let total_freed: u64 = results.iter().sum();
-
-    if total_freed > 0 {
-        if let Err(e) = update_quota(&fragment, -(total_freed as i64)).await {
-            error!(
-                "Failed to refund quota for permanent delete {}: {}",
-                fragment, e
-            );
-        }
     }
-
-    let pm = ObjectPathManager::new();
-
-    invalidate_compacted_for_key(&pm, &fragment, &object_key).await;
+    if let Some(trash_meta) = trash_latest_before.as_ref() {
+        let tombstone = synthetic_delete_marker(trash_meta, ts.saturating_add(1));
+        let _ = write_prefix_entry_update(
+            &fragment,
+            &object_key,
+            &trash_meta.version_id,
+            tombstone,
+            -1,
+            true,
+        )
+        .await;
+    }
 
     info!(
-        "Permanently deleted {} bytes for {}/{}",
-        total_freed, fragment, object_key
+        "Permanently deleted {} versions for {}/{}",
+        versions_to_delete.len(),
+        fragment,
+        object_key
     );
 
     state.emit(
@@ -775,12 +575,16 @@ pub async fn recover_object_version(
 
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
-    index::restore_object_version_from_trash(&fragment, &object_key, &version_id).await?;
-
-    let had_live_before = matches!(
-        index::read_latest_object(&fragment, &object_key).await,
-        Ok(meta) if !meta.is_delete_marker
-    );
+    let had_live_before = !list_object_versions_any(&fragment, &object_key)
+        .await?
+        .is_empty();
+    let had_trash_before = !list_trashed_object_versions_any(&fragment, &object_key)
+        .await?
+        .is_empty();
+    purge_delete_markers_for_key(&fragment, &object_key).await;
+    let restored_meta =
+        index::restore_object_version_from_trash_with_metadata(&fragment, &object_key, &version_id)
+            .await?;
 
     for root in &blob_roots {
         let trash_blob_dir = get_trash_root(root, &fragment)
@@ -799,23 +603,50 @@ pub async fn recover_object_version(
         let _ = move_dir_or_copy(&trash_blob_dir, &live_blob_dir).await;
     }
 
-    purge_delete_markers_for_key(&fragment, &object_key).await;
+    let live_after = index::list_live_object_versions_metadata(&fragment, &object_key).await?;
+    let trash_after = index::list_trashed_object_versions_metadata(&fragment, &object_key).await?;
+    let ts = logical_now();
 
-    if let Some(meta) = read_metadata_any(&fragment, &object_key, &version_id).await {
-        let restored_at = chrono::Utc::now().timestamp().saturating_add(1);
-        let _ = write_prefix_segments_for_meta(
-            &path_manager,
+    if let Some(latest_live) = live_after.first() {
+        let live_entry = synthetic_live_entry(latest_live, ts.saturating_add(1));
+        let _ = write_prefix_entry_update(
             &fragment,
-            &meta.object_key,
-            &meta.version_id,
-            restored_at,
-            false,
+            &object_key,
+            &latest_live.version_id,
+            live_entry,
             if had_live_before { 0 } else { 1 },
+            false,
         )
         .await;
     }
 
-    invalidate_compacted_for_key(&path_manager, &fragment, &object_key).await;
+    let trash_tombstone = synthetic_delete_marker(&restored_meta, ts);
+    let trash_child_delta = if had_trash_before && trash_after.is_empty() {
+        -1
+    } else {
+        0
+    };
+    let _ = write_prefix_entry_update(
+        &fragment,
+        &object_key,
+        &restored_meta.version_id,
+        trash_tombstone,
+        trash_child_delta,
+        true,
+    )
+    .await;
+    if let Some(latest_trash) = trash_after.first() {
+        let trash_entry = synthetic_live_entry(latest_trash, ts.saturating_add(2));
+        let _ = write_prefix_entry_update(
+            &fragment,
+            &object_key,
+            &latest_trash.version_id,
+            trash_entry,
+            0,
+            true,
+        )
+        .await;
+    }
 
     info!(
         "Recovered object version: {}/{} (v: {})",
@@ -845,76 +676,105 @@ pub async fn recover_object(
 
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
-
-    let mut found_versions = list_trashed_object_versions_any(&fragment, &object_key).await?;
-
-    if found_versions.is_empty() {
-        return Err(AppError::NotFound);
-    }
-
-    found_versions.sort();
-    found_versions.dedup();
+    let had_live_before = !list_object_versions_any(&fragment, &object_key)
+        .await?
+        .is_empty();
+    let had_trash_before = !list_trashed_object_versions_any(&fragment, &object_key)
+        .await?
+        .is_empty();
     purge_delete_markers_for_key(&fragment, &object_key).await;
 
-    let mut recovered_count = 0usize;
-    let had_live_before = matches!(
-        index::read_latest_object(&fragment, &object_key).await,
-        Ok(meta) if !meta.is_delete_marker
-    );
-    let mut wrote_presence_delta = false;
-
-    for version_id in &found_versions {
-        if let Err(e) =
-            index::restore_object_version_from_trash(&fragment, &object_key, version_id).await
-        {
-            warn!(
-                "Partition restore failed for {}/{}#{}: {}",
-                fragment, object_key, version_id, e
-            );
-            continue;
-        }
-
-        for root in &blob_roots {
-            let trash_blob = get_trash_root(root, &fragment)
-                .join("blob")
-                .join(version_id);
-
-            if fs::try_exists(&trash_blob).await.unwrap_or(false) {
-                let live_blob = path_manager.get_shard_dir_on_disk(root, &fragment, version_id);
-                if let Some(p) = live_blob.parent() {
-                    let _ = fs::create_dir_all(p).await;
+    let restored_versions =
+        match index::restore_object_from_trash_fast(&fragment, &object_key).await {
+            Ok(Some(version_ids)) => version_ids,
+            Ok(None) => {
+                let mut found_versions =
+                    list_trashed_object_versions_any(&fragment, &object_key).await?;
+                if found_versions.is_empty() {
+                    return Err(AppError::NotFound);
                 }
-                let _ = move_dir_or_copy(&trash_blob, &live_blob).await;
+                found_versions.sort();
+                found_versions.dedup();
+                let mut restored = Vec::new();
+                for version_id in &found_versions {
+                    if let Err(e) = index::restore_object_version_from_trash_with_metadata(
+                        &fragment,
+                        &object_key,
+                        version_id,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "Partition restore failed for {}/{}#{}: {}",
+                            fragment, object_key, version_id, e
+                        );
+                        continue;
+                    }
+                    restored.push(version_id.clone());
+                }
+                restored
             }
-        }
+            Err(e) => return Err(e),
+        };
 
-        if let Some(meta) = read_metadata_any(&fragment, &object_key, version_id).await {
-            let restored_at = chrono::Utc::now().timestamp().saturating_add(1);
-            let _ = write_prefix_segments_for_meta(
-                &path_manager,
-                &fragment,
-                &meta.object_key,
-                &meta.version_id,
-                restored_at,
-                false,
-                if !had_live_before && !wrote_presence_delta {
-                    wrote_presence_delta = true;
-                    1
-                } else {
-                    0
-                },
-            )
-            .await;
-        }
-
-        recovered_count += 1;
+    move_blob_versions_between_states(
+        &path_manager,
+        &blob_roots,
+        &fragment,
+        &restored_versions,
+        true,
+    )
+    .await;
+    let live_after = index::list_live_object_versions_metadata(&fragment, &object_key).await?;
+    let trash_after = index::list_trashed_object_versions_metadata(&fragment, &object_key).await?;
+    let ts = logical_now();
+    if let Some(latest_live) = live_after.first() {
+        let live_entry = synthetic_live_entry(latest_live, ts.saturating_add(1));
+        let _ = write_prefix_entry_update(
+            &fragment,
+            &object_key,
+            &latest_live.version_id,
+            live_entry,
+            if had_live_before { 0 } else { 1 },
+            false,
+        )
+        .await;
     }
-
-    invalidate_compacted_for_key(&path_manager, &fragment, &object_key).await;
+    if let Some(restored_anchor) = live_after.first() {
+        let trash_tombstone = synthetic_delete_marker(restored_anchor, ts);
+        let trash_child_delta = if had_trash_before && trash_after.is_empty() {
+            -1
+        } else {
+            0
+        };
+        let _ = write_prefix_entry_update(
+            &fragment,
+            &object_key,
+            &restored_anchor.version_id,
+            trash_tombstone,
+            trash_child_delta,
+            true,
+        )
+        .await;
+    }
+    if let Some(latest_trash) = trash_after.first() {
+        let trash_entry = synthetic_live_entry(latest_trash, ts.saturating_add(2));
+        let _ = write_prefix_entry_update(
+            &fragment,
+            &object_key,
+            &latest_trash.version_id,
+            trash_entry,
+            0,
+            true,
+        )
+        .await;
+    }
 
     info!(
         "Recovered {} versions for object {}/{}",
-        recovered_count, fragment, object_key
+        restored_versions.len(),
+        fragment,
+        object_key
     );
 
     state.emit(&fragment, StorageEventPayload::StateInvalidated);
@@ -939,104 +799,137 @@ pub async fn recover_all_trash(
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
 
-    let mut recovered_meta_entries: HashMap<String, (String, String, i64)> = HashMap::new();
-    let mut had_live_before: HashMap<String, bool> = HashMap::new();
-
     let mut trashed_keys = BTreeSet::new();
     if let Ok(trashed_latest) = index::list_fragment_trash_objects(&fragment).await {
         for meta in trashed_latest {
             trashed_keys.insert(meta.object_key);
         }
     }
-    for object_key in trashed_keys {
-        if let Ok(metas) =
-            index::list_trashed_object_versions_metadata(&fragment, &object_key).await
-        {
-            for meta in metas {
-                let k = format!("{}\n{}", meta.object_key, meta.version_id);
-                had_live_before
-                    .entry(meta.object_key.clone())
-                    .or_insert(false);
-                recovered_meta_entries
-                    .insert(k, (meta.object_key, meta.version_id, meta.created_at));
-            }
-        }
-    }
 
-    if recovered_meta_entries.is_empty() {
+    if trashed_keys.is_empty() {
         return Ok(StatusCode::OK);
     }
+    let mut recovered_count = 0usize;
 
-    for key in had_live_before.keys().cloned().collect::<Vec<_>>() {
-        had_live_before.insert(
-            key.clone(),
-            matches!(index::read_latest_object(&fragment, &key).await, Ok(meta) if !meta.is_delete_marker),
-        );
-    }
+    for object_key in trashed_keys {
+        let had_live_before = !list_object_versions_any(&fragment, &object_key)
+            .await?
+            .is_empty();
+        let had_trash_before = !list_trashed_object_versions_any(&fragment, &object_key)
+            .await?
+            .is_empty();
+        purge_delete_markers_for_key(&fragment, &object_key).await;
 
-    let mut affected_prefixes: BTreeSet<String> = BTreeSet::new();
-    let mut wrote_presence_delta: HashMap<String, bool> = HashMap::new();
-    for (_k, (object_key, version_id, _created_at)) in &recovered_meta_entries {
-        if let Err(e) =
-            index::restore_object_version_from_trash(&fragment, object_key, version_id).await
-        {
-            warn!(
-                "Partition restore failed during recover-all for {}/{}#{}: {}",
-                fragment, object_key, version_id, e
-            );
+        let restored_versions =
+            match index::restore_object_from_trash_fast(&fragment, &object_key).await {
+                Ok(Some(version_ids)) => version_ids,
+                Ok(None) => {
+                    let Ok(metas) =
+                        index::list_trashed_object_versions_metadata(&fragment, &object_key).await
+                    else {
+                        continue;
+                    };
+                    if metas.is_empty() {
+                        continue;
+                    }
+
+                    let mut restored = Vec::new();
+                    for meta in metas {
+                        if let Err(e) = index::restore_object_version_from_trash_with_metadata(
+                            &fragment,
+                            &object_key,
+                            &meta.version_id,
+                        )
+                        .await
+                        {
+                            warn!(
+                                "Partition restore failed during recover-all for {}/{}#{}: {}",
+                                fragment, object_key, meta.version_id, e
+                            );
+                            continue;
+                        }
+                        restored.push(meta.version_id);
+                    }
+                    restored
+                }
+                Err(e) => {
+                    warn!(
+                        "Fast recover-all restore failed for {}/{}: {}",
+                        fragment, object_key, e
+                    );
+                    continue;
+                }
+            };
+
+        if restored_versions.is_empty() {
             continue;
         }
 
-        for root in &blob_roots {
-            let trash_blob = get_trash_root(root, &fragment)
-                .join("blob")
-                .join(version_id);
-            if !fs::try_exists(&trash_blob).await.unwrap_or(false) {
-                continue;
-            }
-            let live_blob = path_manager.get_shard_dir_on_disk(root, &fragment, version_id);
-            if let Some(parent) = live_blob.parent() {
-                let _ = fs::create_dir_all(parent).await;
-            }
-            let _ = move_dir_or_copy(&trash_blob, &live_blob).await;
-        }
-
-        let restored_at = chrono::Utc::now().timestamp().saturating_add(1);
-        let child_count_delta = if !had_live_before.get(object_key).copied().unwrap_or(false)
-            && !wrote_presence_delta
-                .get(object_key)
-                .copied()
-                .unwrap_or(false)
-        {
-            wrote_presence_delta.insert(object_key.clone(), true);
-            1
-        } else {
-            0
-        };
-        let _ = write_prefix_segments_for_meta(
+        move_blob_versions_between_states(
             &path_manager,
+            &blob_roots,
             &fragment,
-            object_key,
-            version_id,
-            restored_at,
-            false,
-            child_count_delta,
+            &restored_versions,
+            true,
         )
         .await;
-        purge_delete_markers_for_key(&fragment, object_key).await;
-
-        for pfx in prefixes_for_key(object_key) {
-            affected_prefixes.insert(pfx);
+        let live_after =
+            match index::list_live_object_versions_metadata(&fragment, &object_key).await {
+                Ok(metas) => metas,
+                Err(_) => continue,
+            };
+        let trash_after =
+            match index::list_trashed_object_versions_metadata(&fragment, &object_key).await {
+                Ok(metas) => metas,
+                Err(_) => continue,
+            };
+        let ts = logical_now();
+        if let Some(latest_live) = live_after.first() {
+            let live_entry = synthetic_live_entry(latest_live, ts.saturating_add(1));
+            let _ = write_prefix_entry_update(
+                &fragment,
+                &object_key,
+                &latest_live.version_id,
+                live_entry,
+                if had_live_before { 0 } else { 1 },
+                false,
+            )
+            .await;
+            let trash_tombstone = synthetic_delete_marker(latest_live, ts);
+            let trash_child_delta = if had_trash_before && trash_after.is_empty() {
+                -1
+            } else {
+                0
+            };
+            let _ = write_prefix_entry_update(
+                &fragment,
+                &object_key,
+                &latest_live.version_id,
+                trash_tombstone,
+                trash_child_delta,
+                true,
+            )
+            .await;
         }
+        if let Some(latest_trash) = trash_after.first() {
+            let trash_entry = synthetic_live_entry(latest_trash, ts.saturating_add(2));
+            let _ = write_prefix_entry_update(
+                &fragment,
+                &object_key,
+                &latest_trash.version_id,
+                trash_entry,
+                0,
+                true,
+            )
+            .await;
+        }
+        recovered_count = recovered_count.saturating_add(restored_versions.len());
     }
 
-    let mut compact_candidates = Vec::new();
-    for pfx in affected_prefixes {
-        compact_candidates.push(canonical_prefix(&pfx));
-    }
-    schedule_prefix_compaction(fragment.clone(), compact_candidates);
-
-    info!("Recovered all items from trash for fragment {}", fragment);
+    info!(
+        "Recovered {} trashed item(s) for fragment {}",
+        recovered_count, fragment
+    );
     state.emit(&fragment, StorageEventPayload::StateInvalidated);
 
     Ok(StatusCode::OK)

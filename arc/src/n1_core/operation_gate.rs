@@ -112,6 +112,12 @@ pub async fn enforce_read_only_fast_mode_on_mutations(req: Request<Body>, next: 
 }
 
 #[cfg(test)]
+pub fn reset_maintenance_mode_for_tests() {
+    READ_ONLY_FAST_MODE_REFCOUNT.store(0, Ordering::Release);
+    QUIESCED_MAINTENANCE_REFCOUNT.store(0, Ordering::Release);
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         MaintenanceAccessMode, acquire_maintenance_mode, acquire_read_only_fast_mode,

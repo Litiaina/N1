@@ -1,10 +1,10 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::constants::{
-    FRAGMENT_METADATA_FILE, METADATA_EXT, PARITY_SUFFIX, PART_META_SUFFIX, QUOTA_FILE,
-    RESERVATION_FILE, SESSION_MANIFEST_FILE, SHARD_SUFFIX,
+    FRAGMENT_METADATA_FILE, METADATA_EXT, PARITY_SUFFIX, PART_META_SUFFIX, RESERVATION_FILE,
+    SESSION_MANIFEST_FILE, SHARD_SUFFIX,
 };
 use crate::n1_core::disk_manager::{
-    INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, Quota,
+    INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata,
 };
 use crate::n1_core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::n1_core::prefix_rebuilder::run_prefix_rebuild_job;
@@ -1096,34 +1096,6 @@ async fn reconcile_object_metadata_strict(
     ))
 }
 
-async fn repair_fragment_quota_mirrors(
-    index_roots: &[PathBuf],
-    fragment: &str,
-    dry_run: bool,
-) -> Result<(u64, u64, u64), AppError> {
-    let paths: Vec<PathBuf> = index_roots
-        .iter()
-        .map(|r| r.join(fragment).join(QUOTA_FILE))
-        .collect();
-
-    let valid = |b: &[u8]| -> bool { rmp_serde::from_slice::<Quota>(b).is_ok() };
-
-    let mut reps = Vec::with_capacity(paths.len());
-    for p in &paths {
-        reps.push(read_raw_replica(p, &valid).await);
-    }
-
-    let Some(best) = choose_best_raw_replica(&reps) else {
-        let any_exists = reps.iter().any(|r| r.bytes.is_some());
-        let corrupt = if any_exists { 1 } else { 0 };
-        return Ok((0, 0, corrupt));
-    };
-
-    let canon = reps[best].bytes.clone().unwrap();
-    let (m, d) = replicate_bytes_strict(&paths, &canon, dry_run).await?;
-    Ok((m, d, 0))
-}
-
 async fn repair_fragment_legacy_object_metadata_mirrors(
     index_roots: &[PathBuf],
     fragment: &str,
@@ -1320,7 +1292,7 @@ fn should_scan_object_metadata_file(path: &Path) -> bool {
         return false;
     }
 
-    if name == QUOTA_FILE || name == RESERVATION_FILE || name == SESSION_MANIFEST_FILE {
+    if name == RESERVATION_FILE || name == SESSION_MANIFEST_FILE {
         return false;
     }
 
@@ -1578,23 +1550,6 @@ pub async fn run_repair_job_with_options(
                 fragment_hash
             );
             continue;
-        }
-
-        {
-            let mut status = REPAIR_STATUS.write().await;
-            status.phase = format!("Repairing quota {}", fragment_hash);
-            ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
-        }
-
-        let (qmiss, qdiv, qcorrupt) =
-            repair_fragment_quota_mirrors(&index_roots, &fragment_hash, cfg.dry_run).await?;
-
-        {
-            let mut status = REPAIR_STATUS.write().await;
-            status.missing_meta_repaired += qmiss;
-            status.divergent_meta_repaired += qdiv;
-            status.corrupt_found += qcorrupt;
-            ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 
         if fragment_has_legacy_object_metadata(&index_roots, &fragment_hash).await {

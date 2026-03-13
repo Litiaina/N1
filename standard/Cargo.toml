@@ -1,6 +1,6 @@
 [package]
 name = "standard"
-version = "0.4.0"
+version = "0.5.1"
 edition = "2024"
 
 [[bin]]
@@ -62,3 +62,6 @@ rand.workspace = true
 
 [dev-dependencies]
 tower.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"

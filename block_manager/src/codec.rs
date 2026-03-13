@@ -1,7 +1,7 @@
 use crate::constants::{
-    HEADER_CRC_OFFSET, HEADER_CRC_OFFSET_V1, HEADER_DECODE_BYTES, HEADER_FALLBACK_SCAN_LIMIT_BYTES,
-    HEADER_VERSION, HEADER_VERSION_V1, HEADER_VERSION_V2, JOURNAL_MAGIC, JOURNAL_RECORD_SIZE,
-    SUPERBLOCK_MAGIC,
+    HEADER_CRC_OFFSET, HEADER_CRC_OFFSET_V1, HEADER_CRC_OFFSET_V2, HEADER_DECODE_BYTES,
+    HEADER_FALLBACK_SCAN_LIMIT_BYTES, HEADER_VERSION, HEADER_VERSION_V1, HEADER_VERSION_V2,
+    HEADER_VERSION_V3, JOURNAL_MAGIC, JOURNAL_RECORD_SIZE, SUPERBLOCK_MAGIC,
 };
 use crate::device_io::{read_exact_at, validate_block_size};
 use crate::error::BlockManagerError;
@@ -30,6 +30,10 @@ pub(crate) fn encode_header(
     out[48..56].copy_from_slice(&header.data_start_block.to_le_bytes());
     out[56..72].copy_from_slice(header.device_id.as_bytes());
     out[72..80].copy_from_slice(&header.superblock_generation.to_le_bytes());
+    out[80..88].copy_from_slice(&header.segment_catalog_start_block.to_le_bytes());
+    out[88..96].copy_from_slice(&header.segment_catalog_block_count.to_le_bytes());
+    out[96..104].copy_from_slice(&header.metadata_pool_block_count.to_le_bytes());
+    out[104..112].copy_from_slice(&header.segment_size_bytes.to_le_bytes());
 
     let crc = crc32(&out[..HEADER_CRC_OFFSET]);
     out[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
@@ -98,7 +102,8 @@ fn decode_header_prefix(
     }
 
     let version = u32::from_le_bytes(prefix[16..20].try_into().expect("version bytes"));
-    if version != HEADER_VERSION_V1 && version != HEADER_VERSION_V2 {
+    if version != HEADER_VERSION_V1 && version != HEADER_VERSION_V2 && version != HEADER_VERSION_V3
+    {
         return Err(BlockManagerError::InvalidDevice(format!(
             "unsupported header version {}",
             version
@@ -107,6 +112,8 @@ fn decode_header_prefix(
 
     let crc_offset = if version == HEADER_VERSION_V1 {
         HEADER_CRC_OFFSET_V1
+    } else if version == HEADER_VERSION_V2 {
+        HEADER_CRC_OFFSET_V2
     } else {
         HEADER_CRC_OFFSET
     };
@@ -130,10 +137,30 @@ fn decode_header_prefix(
     let data_start_block = u64::from_le_bytes(prefix[48..56].try_into().expect("data start"));
     let device_id = Uuid::from_slice(&prefix[56..72])
         .map_err(|e| BlockManagerError::Corrupt(format!("invalid device uuid in header: {}", e)))?;
-    let superblock_generation = if version == HEADER_VERSION_V2 {
+    let superblock_generation = if version == HEADER_VERSION_V2 || version == HEADER_VERSION_V3 {
         u64::from_le_bytes(prefix[72..80].try_into().expect("generation bytes"))
     } else {
         1
+    };
+    let segment_catalog_start_block = if version == HEADER_VERSION_V3 {
+        u64::from_le_bytes(prefix[80..88].try_into().expect("segment catalog start"))
+    } else {
+        0
+    };
+    let segment_catalog_block_count = if version == HEADER_VERSION_V3 {
+        u64::from_le_bytes(prefix[88..96].try_into().expect("segment catalog count"))
+    } else {
+        0
+    };
+    let metadata_pool_block_count = if version == HEADER_VERSION_V3 {
+        u64::from_le_bytes(prefix[96..104].try_into().expect("metadata pool block count"))
+    } else {
+        total_blocks.saturating_sub(data_start_block)
+    };
+    let segment_size_bytes = if version == HEADER_VERSION_V3 {
+        u64::from_le_bytes(prefix[104..112].try_into().expect("segment size bytes"))
+    } else {
+        0
     };
 
     if journal_block_count == 0 || data_start_block <= journal_start_block {
@@ -150,6 +177,10 @@ fn decode_header_prefix(
         journal_start_block,
         journal_block_count,
         data_start_block,
+        segment_catalog_start_block,
+        segment_catalog_block_count,
+        metadata_pool_block_count,
+        segment_size_bytes,
     })
 }
 

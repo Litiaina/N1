@@ -1,11 +1,9 @@
 use crate::enums::app_error_enum::AppError;
 use crate::fs::cleanup_manager::start_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
-use crate::n1_core::constants::{GC_SUFFIX, METADATA_EXT, QUOTA_FILE, RESERVATION_FILE};
+use crate::n1_core::constants::{GC_SUFFIX, METADATA_EXT, RESERVATION_FILE};
 use crate::n1_core::disk_manager::{FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManager};
 use crate::n1_core::index;
-use crate::n1_core::quota_manager::update_quota;
-use crate::n1_core::sync::sync_single_fragment_quota;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
 use crate::structs::auth_structs::Claims;
@@ -25,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::runtime::Handle;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -217,19 +215,6 @@ pub async fn stop_garbage_collector(
     (StatusCode::OK, "Stop signal sent to GC.")
 }
 
-async fn refund_quota(fragment: &str, amount: u64, state: &Arc<AppState>) {
-    if amount == 0 {
-        return;
-    }
-
-    if let Err(e) = update_quota(fragment, -(amount as i64)).await {
-        warn!("Failed to refund quota for fragment {}: {}", fragment, e);
-    } else {
-        info!("GC: Refunded {} bytes to fragment {}", amount, fragment);
-        state.emit(fragment, StorageEventPayload::StateInvalidated);
-    }
-}
-
 fn get_trash_root(disk_root: &std::path::Path, fragment_hash: &str) -> PathBuf {
     disk_root.join(fragment_hash).join(".trash")
 }
@@ -239,7 +224,7 @@ fn should_scan_object_metadata_candidate(path: &Path) -> bool {
     if !name.ends_with(METADATA_EXT) {
         return false;
     }
-    if name == QUOTA_FILE || name == RESERVATION_FILE || name == "latest.msgpack" {
+    if name == RESERVATION_FILE || name == "latest.msgpack" {
         return false;
     }
     if name.ends_with(".session.msgpack")
@@ -560,7 +545,6 @@ async fn process_fragment_gc(
     stats.live_versions_seen = live_versions.len() as u64;
 
     let expired_trash_refund: u64 = expired_versions.values().map(|(_, sz)| *sz).sum();
-    refund_quota(fragment, expired_trash_refund, state).await;
     stats.refund_bytes += expired_trash_refund;
     stats.trash_versions_expired += expired_versions.len() as u64;
 
@@ -600,7 +584,6 @@ async fn process_fragment_gc(
     }
 
     let total_session_refund: u64 = sessions_to_delete.iter().map(|(_, amount)| *amount).sum();
-    refund_quota(fragment, total_session_refund, state).await;
     stats.refund_bytes += total_session_refund;
     stats.sessions_deleted += sessions_to_delete.len() as u64;
 
@@ -651,11 +634,11 @@ async fn process_fragment_gc(
         }
     }
 
-    if let Err(e) = sync_single_fragment_quota(fragment.to_string()).await {
-        warn!(
-            "GC: Fragment quota reconciliation failed for {}: {}",
-            fragment, e
-        );
+    if stats.trash_versions_expired > 0
+        || stats.sessions_deleted > 0
+        || stats.orphan_blob_dirs_deleted > 0
+    {
+        state.emit(fragment, StorageEventPayload::StateInvalidated);
     }
 
     stats

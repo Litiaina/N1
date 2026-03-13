@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -14,7 +14,8 @@ use walkdir::WalkDir;
 
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::blob_store::{
-    free_raw_shards_for_metadata, free_raw_shards_for_metadatas, metadata_contains_raw_shards,
+    free_raw_shards_for_metadata, metadata_contains_raw_shards,
+    raw_index_metadata_roots_for_housekeeping, write_raw_gc_markers,
 };
 use crate::n1_core::disk_manager::{
     ObjectMetadata, ObjectPathManager, compare_version_recency, default_stripe_size,
@@ -461,7 +462,7 @@ pub async fn empty_trash(
     let blob_roots = path_manager.get_blob_roots();
     let mut total_refund_size = 0u64;
     let mut touched_partitions = BTreeSet::<u16>::new();
-    let mut raw_trash_versions = Vec::<ObjectMetadata>::new();
+    let mut raw_gc_addresses = Vec::new();
     let mut stream = index::stream_fragment_object_versions(fragment.clone(), true);
     while let Some(next_meta) = stream.recv().await {
         let meta = next_meta?;
@@ -471,12 +472,19 @@ pub async fn empty_trash(
             &meta.object_key,
         )?);
         if metadata_contains_raw_shards(&meta) {
-            raw_trash_versions.push(meta);
+            for part in &meta.parts {
+                for shard in &part.shards {
+                    if let Some(raw) = shard.raw_blob_address.as_ref() {
+                        raw_gc_addresses.push(raw.clone());
+                    }
+                }
+            }
         }
     }
 
-    if !raw_trash_versions.is_empty() {
-        free_raw_shards_for_metadatas(&raw_trash_versions).await?;
+    if !raw_gc_addresses.is_empty() {
+        let index_roots = raw_index_metadata_roots_for_housekeeping()?;
+        write_raw_gc_markers(&index_roots, &fragment, &raw_gc_addresses).await?;
     }
 
     index::clear_fragment_trash_in_partitions(&fragment, &touched_partitions).await?;
@@ -741,73 +749,40 @@ pub async fn recover_all_trash(
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
     let recovered_versions = collect_fragment_versions_streamed(&fragment, true).await?;
-    let mut versions_by_key = BTreeMap::<String, Vec<ObjectMetadata>>::new();
+    let mut recovered_count = 0usize;
+    let mut last_key = String::new();
     for meta in recovered_versions {
-        versions_by_key
-            .entry(meta.object_key.clone())
-            .or_default()
-            .push(meta);
-    }
+        if meta.object_key != last_key {
+            purge_delete_markers_for_key(&path_manager, &fragment, &meta.object_key).await;
+            last_key = meta.object_key.clone();
+        }
 
-    let object_concurrency = blob_roots.len().clamp(1, 16);
-    let recovered_count: usize = stream::iter(versions_by_key.into_iter())
-        .map(|(object_key, mut versions)| {
-            let fragment = fragment.clone();
-            let blob_roots = blob_roots.clone();
-            async move {
-                versions.sort_by(|left, right| {
-                    compare_version_recency(
-                        left.created_at,
-                        &left.version_id,
-                        right.created_at,
-                        &right.version_id,
-                    )
-                });
-
-                let path_manager = ObjectPathManager::new();
-                purge_delete_markers_for_key(&path_manager, &fragment, &object_key).await;
-
-                let mut recovered_for_key = 0usize;
-                for meta in versions {
-                    for root in &blob_roots {
-                        let trash_blob = get_trash_root(root, &fragment)
-                            .join("blob")
-                            .join(&meta.version_id);
-                        if fs::try_exists(&trash_blob).await.unwrap_or(false) {
-                            let live_blob = path_manager.get_shard_dir_on_disk(
-                                root,
-                                &fragment,
-                                &meta.version_id,
-                            );
-                            if let Some(parent) = live_blob.parent() {
-                                let _ = fs::create_dir_all(parent).await;
-                            }
-                            let _ = move_dir_or_copy(&trash_blob, &live_blob).await;
-                        }
-                    }
-
-                    if index::restore_object_version_from_trash(
-                        &fragment,
-                        &object_key,
-                        &meta.version_id,
-                        false,
-                    )
-                    .await?
-                    .is_some()
-                    {
-                        recovered_for_key = recovered_for_key.saturating_add(1);
-                    }
+        for root in &blob_roots {
+            let trash_blob = get_trash_root(root, &fragment)
+                .join("blob")
+                .join(&meta.version_id);
+            if fs::try_exists(&trash_blob).await.unwrap_or(false) {
+                let live_blob =
+                    path_manager.get_shard_dir_on_disk(root, &fragment, &meta.version_id);
+                if let Some(parent) = live_blob.parent() {
+                    let _ = fs::create_dir_all(parent).await;
                 }
-                Ok::<usize, AppError>(recovered_for_key)
+                let _ = move_dir_or_copy(&trash_blob, &live_blob).await;
             }
-        })
-        .buffer_unordered(object_concurrency)
-        .collect::<Vec<Result<usize, AppError>>>()
-        .await
-        .into_iter()
-        .try_fold(0usize, |acc, item| {
-            item.map(|count| acc.saturating_add(count))
-        })?;
+        }
+
+        if index::restore_object_version_from_trash(
+            &fragment,
+            &meta.object_key,
+            &meta.version_id,
+            false,
+        )
+        .await?
+        .is_some()
+        {
+            recovered_count = recovered_count.saturating_add(1);
+        }
+    }
 
     info!(
         "Recovered {} trashed version(s) for fragment {}",

@@ -2,17 +2,18 @@
 
 This document is the canonical deployment split for N1.
 
-As of 2026-03-09:
+As of 2026-03-13:
 
-- `standard` (`litiaina-n1-standard`) is the stable deployment profile and the default for production.
-- `arc` (`litiaina-n1-arc`) is stable at `0.2.0` for raw-device deployments.
+- `standard` (`litiaina-n1-standard`) is the stable deployment profile, the default for production, and released at `0.5.1`.
+- `arc` (`litiaina-n1-arc`) is the experimental raw-device profile.
+- If you are unsure which one to deploy, use `standard`.
 
 ## 1) Profile Status
 
 | Profile | Binary | Status | Production default |
 |---|---|---|---|
-| Standard | `litiaina-n1-standard` | Stable | Yes |
-| Arc | `litiaina-n1-arc` | Stable | No (advanced profile) |
+| Standard | `litiaina-n1-standard` | Stable (`0.5.1`) | Yes |
+| Arc | `litiaina-n1-arc` | Experimental | No |
 
 ## 2) Architecture Split
 
@@ -30,7 +31,7 @@ Disk layout snapshot:
 {BLOB_ROOT}/{fragment}/blob/{version_id}/part_{p}_shard_{i}.shard|.parity
 ```
 
-### Arc (stable raw-kernel profile)
+### Arc (experimental raw-device profile)
 
 - Raw partitioned `index` plane (`index_store_disks` are raw devices).
 - Raw payload plane (`blob_store_disks` are raw devices).

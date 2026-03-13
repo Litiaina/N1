@@ -1,19 +1,12 @@
 use axum::{http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::{error::Error, time::Duration};
+use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
 use crate::{
-    enums::app_error_enum::AppError,
-    n1_core::constants::{METADATA_EXT, QUOTA_FILE},
-    n1_core::{
-        disk_manager::{ObjectMetadata, ObjectPathManager},
-        index,
-        quota_manager::set_storage_used,
-    },
+    enums::app_error_enum::AppError, n1_core::disk_manager::ObjectPathManager,
     structs::auth_structs::Claims,
 };
 
@@ -22,7 +15,6 @@ const DISK_OP_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Deserialize)]
 pub struct CreateFragmentRequest {
     pub name: String,
-    pub quota: u64,
     pub secret: String,
     pub key: String,
 }
@@ -31,7 +23,6 @@ pub struct CreateFragmentRequest {
 pub struct CreateFragmentResponse {
     pub fragment_hash: String,
     pub name: String,
-    pub quota: u64,
 }
 
 pub async fn ensure_fragment_blob_directories(fragment_hash: &str) {
@@ -99,230 +90,15 @@ async fn sweep_fragment_gc_files(fragment_hash: String) {
     .ok();
 }
 
-async fn calculate_usage_across_mirrors(fragment_hash: String) -> u64 {
-    let path_manager = ObjectPathManager::new();
-    let index_dirs = path_manager.get_all_index_dirs(&fragment_hash);
-
-    tokio::task::spawn_blocking(move || {
-        let mut max_total_usage = 0u64;
-
-        for index_dir in index_dirs {
-            if !index_dir.exists() {
-                continue;
-            }
-
-            let mut current_disk_usage = 0u64;
-
-            for entry in WalkDir::new(&index_dir).into_iter().filter_map(|e| e.ok()) {
-                if entry.file_type().is_file()
-                    && entry.file_name().to_string_lossy().ends_with(METADATA_EXT)
-                {
-                    if entry.file_name() == QUOTA_FILE {
-                        continue;
-                    }
-
-                    if let Ok(data) = std::fs::read(entry.path()) {
-                        if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
-                            if !meta.is_delete_marker {
-                                current_disk_usage += meta.total_size_bytes;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if current_disk_usage > max_total_usage {
-                max_total_usage = current_disk_usage;
-            }
-        }
-
-        max_total_usage
-    })
-    .await
-    .unwrap_or(0)
-}
-
-async fn calculate_active_session_reservations(fragment_hash: &str) -> u64 {
-    match index::list_active_sessions(fragment_hash).await {
-        Ok(sessions) => sessions
-            .into_iter()
-            .map(|session| session.reservation.map(|r| r.amount).unwrap_or(0))
-            .sum(),
-        Err(e) => {
-            warn!(
-                "Failed to scan active upload reservations for {}: {}",
-                fragment_hash, e
-            );
-            0
-        }
-    }
-}
-
-async fn recover_fragment_name_from_disk(fragment_hash: String) -> Option<String> {
-    let path_manager = ObjectPathManager::new();
-    let index_roots = path_manager.get_all_index_roots();
-
-    tokio::task::spawn_blocking(move || {
-        for root in index_roots {
-            let index_dir = root.join(&fragment_hash).join("index");
-            if !index_dir.exists() {
-                continue;
-            }
-
-            for entry in WalkDir::new(&index_dir).into_iter().filter_map(|e| e.ok()) {
-                if entry.file_type().is_file()
-                    && entry.file_name().to_string_lossy().ends_with(METADATA_EXT)
-                    && entry.file_name() != QUOTA_FILE
-                {
-                    if let Ok(data) = std::fs::read(entry.path()) {
-                        if let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(&data) {
-                            return Some(meta.fragment);
-                        }
-                    }
-                }
-            }
-        }
-        None
-    })
-    .await
-    .unwrap_or(None)
-}
-
-pub async fn sync_quota() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let path_manager = ObjectPathManager::new();
-    let index_roots = path_manager.get_all_index_roots();
-
-    let mut processed_hashes = HashSet::new();
-    let mut count = 0;
-
-    for root in index_roots {
-        let mut entries = match tokio::fs::read_dir(&root).await {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Ok(file_type) = entry.file_type().await {
-                if file_type.is_dir() {
-                    let fragment_hash = entry.file_name().to_string_lossy().to_string();
-
-                    if processed_hashes.contains(&fragment_hash) {
-                        continue;
-                    }
-                    processed_hashes.insert(fragment_hash.clone());
-
-                    let readable_name = recover_fragment_name_from_disk(fragment_hash.clone())
-                        .await
-                        .unwrap_or_else(|| "Unknown/Empty".to_string());
-
-                    ensure_fragment_blob_directories(&fragment_hash).await;
-                    sweep_fragment_gc_files(fragment_hash.clone()).await;
-
-                    let committed_usage =
-                        calculate_usage_across_mirrors(fragment_hash.clone()).await;
-                    let active_reservations =
-                        calculate_active_session_reservations(&fragment_hash).await;
-                    let usage = committed_usage.saturating_add(active_reservations);
-
-                    if let Err(e) = set_storage_used(&fragment_hash, usage).await {
-                        warn!(
-                            "Failed to update usage for Fragment '{}' (Hash: {}): {}",
-                            readable_name, fragment_hash, e
-                        );
-                    } else {
-                        info!(
-                            "Synced quota for Fragment '{}' (Hash: {}). Usage: {} bytes (committed={} reserved={})",
-                            readable_name,
-                            fragment_hash,
-                            usage,
-                            committed_usage,
-                            active_reservations
-                        );
-                    }
-                    count += 1;
-                }
-            }
-        }
-    }
-
-    info!(
-        "Consistency check completed. Synced {} active fragments.",
-        count
-    );
-    Ok(())
-}
-
-pub async fn sync_single_fragment_quota(
-    fragment: String,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    ensure_fragment_blob_directories(&fragment).await;
-
-    sweep_fragment_gc_files(fragment.clone()).await;
-
-    let committed_usage = calculate_usage_across_mirrors(fragment.clone()).await;
-    let active_reservations = calculate_active_session_reservations(&fragment).await;
-    let calculated_usage = committed_usage.saturating_add(active_reservations);
-
-    if let Err(e) = set_storage_used(&fragment, calculated_usage).await {
-        warn!("Failed to update usage stats for {}: {}", fragment, e);
-    }
-
-    info!(
-        "Fragment-specific quota sync completed for {}. usage={} (committed={} reserved={})",
-        fragment, calculated_usage, committed_usage, active_reservations
-    );
-    Ok(())
-}
-
-pub async fn initialize_storage(fragment_hash: String) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub async fn initialize_storage(fragment_hash: String) -> Result<(), AppError> {
     ensure_fragment_blob_directories(&fragment_hash).await;
-
-    let committed_usage = calculate_usage_across_mirrors(fragment_hash.clone()).await;
-    let active_reservations = calculate_active_session_reservations(&fragment_hash).await;
-    let calculated_usage = committed_usage.saturating_add(active_reservations);
-    let _ = set_storage_used(&fragment_hash, calculated_usage).await;
+    sweep_fragment_gc_files(fragment_hash.clone()).await;
 
     info!(
-        "Initialized storage structure for fragment {}. usage={} (committed={} reserved={})",
-        &fragment_hash, calculated_usage, committed_usage, active_reservations
+        "Initialized storage structure for fragment {}.",
+        &fragment_hash
     );
     Ok(())
-}
-
-pub async fn sync_quota_api() -> impl IntoResponse {
-    tokio::spawn(async move {
-        match sync_quota().await {
-            Ok(_) => info!("Manual global quota sync completed."),
-            Err(e) => error!("Manual global quota sync failed: {}", e),
-        }
-    });
-
-    (
-        StatusCode::ACCEPTED,
-        "Global quota sync started in background.",
-    )
-}
-
-pub async fn sync_fragment_quota_api(claims: Claims) -> Result<impl IntoResponse, AppError> {
-    if !claims.modify {
-        return Err(AppError::Forbidden(
-            "Modify permission required to sync quota".into(),
-        ));
-    }
-
-    let fragment = claims.fragment.clone();
-
-    tokio::spawn(async move {
-        match sync_single_fragment_quota(fragment.clone()).await {
-            Ok(_) => info!(
-                "Fragment quota sync completed successfully for {}.",
-                fragment
-            ),
-            Err(e) => error!("Fragment quota sync failed for {}: {}", fragment, e),
-        }
-    });
-
-    Ok(StatusCode::ACCEPTED)
 }
 
 pub async fn initialize_fragment_storage_api(

@@ -22,12 +22,17 @@ use crate::middleware::auth_middleware::{auth, authorize, authorize_fragment, va
 use crate::middleware::rate_limiter_middleware::RateLimitLayers;
 use crate::middleware::storage_middleware::enforce_storage_limit;
 use crate::n1_core::adaptive_concurrency::run_adaptive_concurrency_loop;
-use crate::n1_core::archive::download_selected_archive;
+use crate::n1_core::archive::download_selected_archive as download_selected_archive_impl;
 use crate::n1_core::delete::{
-    delete_object, delete_object_permanently, delete_object_version, empty_trash,
-    recover_all_trash, recover_object, recover_object_version,
+    delete_object as delete_object_impl,
+    delete_object_permanently as delete_object_permanently_impl,
+    delete_object_version as delete_object_version_impl, empty_trash as empty_trash_impl,
+    recover_all_trash as recover_all_trash_impl, recover_object as recover_object_impl,
+    recover_object_version as recover_object_version_impl,
 };
-use crate::n1_core::download::{download_object, download_object_chunk};
+use crate::n1_core::download::{
+    download_object as download_object_impl, download_object_chunk as download_object_chunk_impl,
+};
 use crate::n1_core::fragment_manager::{
     create_fragment, delete_fragment, get_fragment_hash, list_public_fragments, update_fragment,
     verify_fragment_existence,
@@ -51,17 +56,20 @@ use crate::n1_core::repair_manager::{
     get_repair_status_api, stop_repair_job_api, trigger_repair_job_api,
 };
 use crate::n1_core::retrieve::{
-    get_object, get_object_metadata, list_fragments, list_object_versions, list_objects,
-    list_trash_objects, stream_object,
+    get_object as get_object_impl, get_object_metadata as get_object_metadata_impl, list_fragments,
+    list_object_versions as list_object_versions_impl, list_objects as list_objects_impl,
+    list_trash_objects as list_trash_objects_impl, stream_object as stream_object_impl,
 };
 use crate::n1_core::sharing::{create_signed_url, get_shared_object};
-use crate::n1_core::storage_capacity_parser::get_capacity_usage;
-use crate::n1_core::sync::{
-    initialize_fragment_storage_api, sync_fragment_quota_api, sync_quota_api,
-};
+use crate::n1_core::storage_capacity_parser::get_capacity_usage as get_capacity_usage_impl;
+use crate::n1_core::sync::initialize_fragment_storage_api;
 use crate::n1_core::upload::{
-    cancel_upload_session, finalize_object_upload, get_upload_status, initiate_object_upload,
-    list_active_uploads, object_upload_part,
+    cancel_upload_session as cancel_upload_session_impl,
+    finalize_object_upload as finalize_object_upload_impl,
+    get_upload_status as get_upload_status_impl,
+    initiate_object_upload as initiate_object_upload_impl,
+    list_active_uploads as list_active_uploads_impl, object_upload_part as object_upload_part_impl,
+    upload_object_one_shot as upload_object_one_shot_impl,
 };
 use crate::smb::server::list_transfer_progress_for_fragment;
 use crate::structs::auth_structs::Claims;
@@ -71,10 +79,11 @@ use crate::websocket::ws_structs::SmbTransferProgressPayload;
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::http::{HeaderName, Method};
 use axum::middleware::from_fn;
+use axum::response::IntoResponse;
 use axum::routing::{delete, get, patch, post, put};
 use axum::{
     Json as AxumJson, Router,
-    extract::{DefaultBodyLimit, Path, Query},
+    extract::{DefaultBodyLimit, Path, Query, State},
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -89,6 +98,247 @@ impl AppState {
     pub fn emit(&self, uid: &str, payload: StorageEventPayload) {
         self.ws_manager.publish(uid, payload);
     }
+}
+
+async fn get_capacity_usage_scoped(claims: Claims) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    get_capacity_usage_impl(claims, Path(fragment)).await
+}
+
+async fn list_objects_scoped(
+    claims: Claims,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    list_objects_impl(claims, Path(fragment), Query(params)).await
+}
+
+async fn list_trash_objects_scoped(
+    claims: Claims,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    list_trash_objects_impl(claims, Path(fragment), Query(params)).await
+}
+
+async fn list_object_versions_scoped(
+    claims: Claims,
+    Path(object_key): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    list_object_versions_impl(claims, Path((fragment, object_key))).await
+}
+
+async fn get_object_scoped(
+    claims: Claims,
+    Path(object_key): Path<String>,
+    req: axum::http::Request<axum::body::Body>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    get_object_impl(claims, Path((fragment, object_key)), req).await
+}
+
+async fn stream_object_scoped(
+    claims: Claims,
+    headers: axum::http::HeaderMap,
+    Path(object_key): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    stream_object_impl(claims, headers, Path((fragment, object_key))).await
+}
+
+async fn get_object_metadata_scoped(
+    claims: Claims,
+    Path(object_key): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    get_object_metadata_impl(claims, Path((fragment, object_key))).await
+}
+
+async fn download_object_scoped(
+    claims: Claims,
+    Query(query): Query<crate::n1_core::disk_manager::ObjectKeyQuery>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    download_object_impl(claims, Path(fragment), Query(query), headers).await
+}
+
+async fn download_object_chunk_scoped(
+    claims: Claims,
+    Query(params): Query<crate::n1_core::disk_manager::ChunkQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    download_object_chunk_impl(claims, Path(fragment), Query(params)).await
+}
+
+async fn download_selected_archive_scoped(
+    claims: Claims,
+    AxumJson(req): AxumJson<crate::n1_core::disk_manager::DownloadArchiveRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    download_selected_archive_impl(claims, Path(fragment), AxumJson(req)).await
+}
+
+async fn empty_trash_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    empty_trash_impl(State(state), claims, Path(fragment)).await
+}
+
+async fn delete_object_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Path(object_key): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    delete_object_impl(State(state), claims, Path((fragment, object_key))).await
+}
+
+async fn delete_object_version_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Path((version_id, object_key)): Path<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    delete_object_version_impl(
+        State(state),
+        claims,
+        Path((fragment, version_id, object_key)),
+    )
+    .await
+}
+
+async fn delete_object_permanently_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Path(object_key): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    delete_object_permanently_impl(State(state), claims, Path((fragment, object_key))).await
+}
+
+async fn recover_object_version_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Path((version_id, object_key)): Path<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    recover_object_version_impl(
+        State(state),
+        claims,
+        Path((fragment, version_id, object_key)),
+    )
+    .await
+}
+
+async fn recover_object_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Path(object_key): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    recover_object_impl(State(state), claims, Path((fragment, object_key))).await
+}
+
+async fn recover_all_trash_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    recover_all_trash_impl(State(state), claims, Path(fragment)).await
+}
+
+async fn initiate_object_upload_scoped(
+    claims: Claims,
+    Path(object_key): Path<String>,
+    AxumJson(params): AxumJson<crate::n1_core::disk_manager::InitiateUploadParams>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    initiate_object_upload_impl(claims, Path((fragment, object_key)), AxumJson(params)).await
+}
+
+async fn upload_object_one_shot_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    headers: axum::http::HeaderMap,
+    Path(object_key): Path<String>,
+    Query(query): Query<crate::n1_core::disk_manager::UploadPartQuery>,
+    body: axum::body::Body,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    upload_object_one_shot_impl(
+        State(state),
+        claims,
+        headers,
+        Path((fragment, object_key)),
+        Query(query),
+        body,
+    )
+    .await
+}
+
+async fn get_upload_status_scoped(
+    claims: Claims,
+    Path(version_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    get_upload_status_impl(claims, Path((fragment, version_id))).await
+}
+
+async fn list_active_uploads_scoped(
+    claims: Claims,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    list_active_uploads_impl(claims, Path(fragment), Query(params)).await
+}
+
+async fn object_upload_part_scoped(
+    claims: Claims,
+    headers: axum::http::HeaderMap,
+    Path((version_id, part_index)): Path<(String, u64)>,
+    Query(query): Query<crate::n1_core::disk_manager::UploadPartQuery>,
+    body: axum::body::Body,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    object_upload_part_impl(
+        claims,
+        headers,
+        Path((fragment, version_id, part_index)),
+        Query(query),
+        body,
+    )
+    .await
+}
+
+async fn finalize_object_upload_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Path((version_id, session_id)): Path<(String, String)>,
+    Query(key_query): Query<crate::n1_core::disk_manager::ObjectKeyQuery>,
+    AxumJson(params): AxumJson<crate::n1_core::disk_manager::InitiateUploadParams>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    finalize_object_upload_impl(
+        State(state),
+        claims,
+        Path((fragment, version_id, session_id)),
+        Query(key_query),
+        AxumJson(params),
+    )
+    .await
+}
+
+async fn cancel_upload_session_scoped(
+    claims: Claims,
+    Path(version_id): Path<String>,
+    Query(key_query): Query<crate::n1_core::disk_manager::ObjectKeyQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    cancel_upload_session_impl(claims, Path((fragment, version_id)), Query(key_query)).await
 }
 
 pub async fn serve_storage_routes() -> Router {
@@ -140,37 +390,34 @@ pub async fn serve_storage_routes() -> Router {
 
     let object_storage_routes = {
         let read_ops = Router::new()
-            .route("/v4/capacity/usage/{:fragment}", get(get_capacity_usage))
+            .route("/v4/capacity/usage", get(get_capacity_usage_scoped))
             .route("/v4/fragment/list", get(list_fragments))
-            .route("/v4/fragment/objects/{:fragment}", get(list_objects))
-            .route("/v4/fragment/trash/{:fragment}", get(list_trash_objects))
+            .route("/v4/fragment/objects", get(list_objects_scoped))
+            .route("/v4/fragment/trash", get(list_trash_objects_scoped))
             .route(
-                "/v4/fragment/versions/{:fragment}/{*object_key}",
-                get(list_object_versions),
+                "/v4/fragment/versions/{*object_key}",
+                get(list_object_versions_scoped),
+            )
+            .route("/v4/fragment/get/{*object_key}", get(get_object_scoped))
+            .route(
+                "/v4/fragment/stream/{*object_key}",
+                get(stream_object_scoped),
             )
             .route(
-                "/v4/fragment/get/{:fragment}/{*object_key}",
-                get(get_object),
+                "/v4/fragment/meta/{*object_key}",
+                get(get_object_metadata_scoped),
+            )
+            .route("/v4/fragment/download", get(download_object_scoped))
+            .route(
+                "/v4/fragment/download/chunk",
+                get(download_object_chunk_scoped),
             )
             .route(
-                "/v4/fragment/stream/{:fragment}/{*object_key}",
-                get(stream_object),
-            )
-            .route(
-                "/v4/fragment/meta/{:fragment}/{*object_key}",
-                get(get_object_metadata),
-            )
-            .route("/v4/fragment/download/{:fragment}", get(download_object))
-            .route(
-                "/v4/fragment/download/chunk/{:fragment}",
-                get(download_object_chunk),
-            )
-            .route(
-                "/v4/fragment/archive/{:fragment}",
-                post(download_selected_archive),
+                "/v4/fragment/archive",
+                post(download_selected_archive_scoped),
             )
             .route("/v4/share/create", post(create_signed_url))
-            .route("/v4/smb/progress/{:fragment}", get(smb_progress))
+            .route("/v4/smb/progress", get(smb_progress))
             .route("/v4/fsd/list/{*mount_path}", get(fsd_list_dir))
             .route("/v4/fsd/stat/{*mount_path}", get(fsd_stat))
             .route("/v4/fsd/read/{*mount_path}", get(fsd_read));
@@ -182,55 +429,56 @@ pub async fn serve_storage_routes() -> Router {
         let write_ops = Router::new()
             .route("/v4/fragment/delete/{:fragment}", delete(delete_fragment))
             .route("/v4/fragment/modify/{:fragment}", patch(update_fragment))
-            .route("/v4/fragment/trash/empty/{:fragment}", delete(empty_trash))
+            .route("/v4/fragment/trash/empty", delete(empty_trash_scoped))
             .route("/v4/fragment/object/rename", patch(rename_object))
             .route(
-                "/v4/fragment/object/delete/{:fragment}/{*object_key}",
-                delete(delete_object),
+                "/v4/fragment/object/delete/{*object_key}",
+                delete(delete_object_scoped),
             )
             .route(
-                "/v4/fragment/version/delete/{:fragment}/{:version_id}/{*object_key}",
-                delete(delete_object_version),
+                "/v4/fragment/version/delete/{:version_id}/{*object_key}",
+                delete(delete_object_version_scoped),
             )
             .route(
-                "/v4/fragment/permanent/delete/{:fragment}/{*object_key}",
-                delete(delete_object_permanently),
+                "/v4/fragment/permanent/delete/{*object_key}",
+                delete(delete_object_permanently_scoped),
             )
             .route(
-                "/v4/fragment/recover/version/{:fragment}/{:version_id}/{*object_key}",
-                post(recover_object_version),
+                "/v4/fragment/recover/version/{:version_id}/{*object_key}",
+                post(recover_object_version_scoped),
             )
             .route(
-                "/v4/fragment/recover/object/{:fragment}/{*object_key}",
-                post(recover_object),
+                "/v4/fragment/recover/object/{*object_key}",
+                post(recover_object_scoped),
             )
             .route(
-                "/v4/fragment/recover/trash/all/{:fragment}",
-                post(recover_all_trash),
+                "/v4/fragment/recover/trash/all",
+                post(recover_all_trash_scoped),
             )
             .route(
-                "/v4/upload/init/{:fragment}/{*object_key}",
-                post(initiate_object_upload),
+                "/v4/upload/init/{*object_key}",
+                post(initiate_object_upload_scoped),
             )
             .route(
-                "/v4/upload/status/{:fragment}/{:version_id}",
-                get(get_upload_status),
+                "/v4/upload/one-shot/{*object_key}",
+                post(upload_object_one_shot_scoped),
             )
             .route(
-                "/v4/upload/status/list/{:fragment}",
-                get(list_active_uploads),
+                "/v4/upload/status/{:version_id}",
+                get(get_upload_status_scoped),
+            )
+            .route("/v4/upload/status/list", get(list_active_uploads_scoped))
+            .route(
+                "/v4/upload/chunk/{:version_id}/{:part_index}",
+                put(object_upload_part_scoped),
             )
             .route(
-                "/v4/upload/chunk/{:fragment}/{:version_id}/{:part_index}",
-                put(object_upload_part),
+                "/v4/upload/finalize/{:version_id}/{:session_id}",
+                post(finalize_object_upload_scoped),
             )
             .route(
-                "/v4/upload/finalize/{:fragment}/{:version_id}/{:session_id}",
-                post(finalize_object_upload),
-            )
-            .route(
-                "/v4/upload/cancel/{:fragment}/{:version_id}",
-                delete(cancel_upload_session),
+                "/v4/upload/cancel/{:version_id}",
+                delete(cancel_upload_session_scoped),
             )
             .route("/v4/fsd/write/begin/{*mount_path}", post(fsd_write_begin))
             .route("/v4/fsd/write/chunk/{:session_id}", put(fsd_write_chunk))
@@ -242,11 +490,6 @@ pub async fn serve_storage_routes() -> Router {
             .route("/v4/fsd/rename", patch(fsd_rename));
 
         let maintenance_ops = Router::new()
-            .route("/v4/maintenance/sync/global", post(sync_quota_api))
-            .route(
-                "/v4/maintenance/sync/fragment",
-                post(sync_fragment_quota_api),
-            )
             .route(
                 "/v4/maintenance/cleanup/fragment",
                 post(sync_fragment_metadata),
@@ -446,16 +689,13 @@ async fn ping() -> &'static str {
 
 async fn smb_progress(
     claims: Claims,
-    Path(fragment): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<AxumJson<Vec<SmbTransferProgressPayload>>, AppError> {
     if !claims.read {
         return Err(AppError::Forbidden("Read permission required".into()));
     }
 
-    if claims.fragment != fragment {
-        return Err(AppError::Forbidden("Access denied to this fragment".into()));
-    }
+    let fragment = claims.fragment.clone();
 
     let include_completed = params
         .get("include_completed")

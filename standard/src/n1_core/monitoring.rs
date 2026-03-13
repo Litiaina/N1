@@ -1,7 +1,6 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::constants::{
-    FRAGMENT_METADATA_FILE, METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, RESERVATION_FILE,
-    SESSION_MANIFEST_FILE,
+    FRAGMENT_METADATA_FILE, METADATA_EXT, PART_META_SUFFIX, RESERVATION_FILE, SESSION_MANIFEST_FILE,
 };
 use crate::n1_core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
 use crate::n1_core::redistribution::get_redist_status;
@@ -105,7 +104,6 @@ fn should_count_object_metadata_file(path: &std::path::Path) -> bool {
     }
 
     if name.ends_with(PART_META_SUFFIX)
-        || name == QUOTA_FILE
         || name == RESERVATION_FILE
         || name == SESSION_MANIFEST_FILE
         || name == FRAGMENT_METADATA_FILE
@@ -132,9 +130,6 @@ mod tests {
         )));
         assert!(!should_count_object_metadata_file(Path::new(
             "sessions/01ABC/part_0.meta.msgpack"
-        )));
-        assert!(!should_count_object_metadata_file(Path::new(
-            "quota.msgpack"
         )));
         assert!(!should_count_object_metadata_file(Path::new(
             "__p__/v1/pfx/aa/bb/hash/seg_01ABC.msgpack"

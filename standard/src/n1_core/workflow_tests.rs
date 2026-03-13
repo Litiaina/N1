@@ -10,6 +10,7 @@ use super::disk_manager::{
 };
 use super::fragment_metadata::init_fragment_metadata;
 use super::garbage_collector::{get_gc_status_api, run_garbage_collector};
+use super::index;
 use super::metadata_parser::get_metadata;
 use super::modify::rename_object;
 use super::object_parser::{
@@ -35,12 +36,13 @@ use super::retrieve::PREFIX_MAX_DELTA_SEGMENTS_ATOMIC;
 use super::retrieve::{
     get_object, get_object_metadata, list_objects, list_trash_objects, stream_object,
 };
+use super::storage_capacity_parser::get_capacity_usage;
 use super::sync::ensure_fragment_blob_directories;
 use super::upload::{
     DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC,
     STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC, UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC,
     WRITER_BUFFER_SIZE_ATOMIC, finalize_object_upload, get_upload_status, initiate_object_upload,
-    object_upload_part,
+    object_upload_part, upload_object_one_shot,
 };
 use crate::n1_core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
 use crate::routes::storage_routes::AppState;
@@ -128,6 +130,26 @@ async fn ensure_global_storage_config(base: &std::path::Path) {
             .set(base.to_string_lossy().to_string())
             .expect("set FS_STORAGE_ROOT");
     }
+}
+
+async fn restore_simulated_index_disk(
+    down_src: &std::path::Path,
+    down_dst: &std::path::Path,
+    label: &str,
+) {
+    if fs::try_exists(down_src).await.unwrap_or(false) {
+        match fs::metadata(down_src).await {
+            Ok(meta) if meta.is_dir() => {
+                let _ = fs::remove_dir_all(down_src).await;
+            }
+            Ok(_) => {
+                let _ = fs::remove_file(down_src).await;
+            }
+            Err(_) => {}
+        }
+    }
+
+    fs::rename(down_dst, down_src).await.expect(label);
 }
 
 fn ensure_upload_runtime_config() {
@@ -963,6 +985,40 @@ async fn upload_part(
     upload_part_with_options(fragment, version_id, part_index, bytes, None, None).await
 }
 
+async fn upload_one_shot(
+    state: Arc<AppState>,
+    fragment: &str,
+    object_key: &str,
+    bytes: Vec<u8>,
+) -> axum::response::Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "content-length",
+        HeaderValue::from_str(&bytes.len().to_string()).expect("content-length"),
+    );
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+
+    upload_object_one_shot(
+        State(state),
+        full_claims(fragment),
+        headers,
+        AxumPath((fragment.to_string(), object_key.to_string())),
+        Query(UploadPartQuery {
+            checksum: None,
+            durability: Some("batched".to_string()),
+            strict_durability: None,
+            io_gate: None,
+        }),
+        Body::from(bytes),
+    )
+    .await
+    .expect("upload one-shot")
+    .into_response()
+}
+
 async fn upload_part_with_durability(
     fragment: &str,
     version_id: &str,
@@ -1051,6 +1107,105 @@ async fn matrix_upload_part_batched_durability_finalize_ok() {
 
     let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.to_string()).await;
     assert_eq!(got, content);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_upload_one_shot_publishes_without_active_session() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "oneshot/small.bin";
+    let content = (0..(64 * 1024 + 123))
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<u8>>();
+
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "test-fragment-key")
+        .await
+        .expect("init fragment metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let resp = upload_one_shot(state, &fragment, key, content.clone()).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let meta_json = read_response_json(resp).await;
+    let version_id = meta_json["version_id"]
+        .as_str()
+        .expect("version_id")
+        .to_string();
+
+    let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.to_string()).await;
+    assert_eq!(got, content);
+
+    let meta = index::read_object_version(&fragment, key, &version_id)
+        .await
+        .expect("read version");
+    assert_eq!(meta.total_size_bytes, content.len() as u64);
+    assert_eq!(meta.parts.len(), 1);
+    assert_eq!(meta.parts[0].part_index, 0);
+
+    let sessions = index::list_active_sessions(&fragment)
+        .await
+        .expect("list active sessions");
+    assert!(sessions.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_capacity_usage_reports_live_filesystem_totals() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "test-fragment-key")
+        .await
+        .expect("init fragment metadata");
+
+    let resp = get_capacity_usage(full_claims(&fragment), AxumPath(fragment.clone()))
+        .await
+        .expect("capacity usage")
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = read_response_json(resp).await;
+    let allocated = json["capacity_allocated"]
+        .as_u64()
+        .expect("capacity_allocated");
+    let used = json["capacity_used"].as_u64().expect("capacity_used");
+    let available = json["capacity_available"]
+        .as_u64()
+        .expect("capacity_available");
+    let filesystems = json["filesystem_count"].as_u64().expect("filesystem_count");
+
+    assert!(
+        allocated > 0,
+        "allocated capacity must come from real filesystems"
+    );
+    assert!(used <= allocated, "used must not exceed allocated");
+    assert_eq!(
+        allocated.saturating_sub(used),
+        available,
+        "available should match allocated-used"
+    );
+    assert!(filesystems >= 1, "must report at least one filesystem");
 }
 
 async fn init_upload(
@@ -1385,12 +1540,10 @@ async fn workflow_upload_read_modify_delete_redistribute_repair() {
     .into_response();
     assert_eq!(delete_resp.status(), StatusCode::OK);
 
-    let soft_deleted_meta = get_metadata(&fragment, &renamed_key, &fragment)
-        .await
-        .expect("metadata should exist as tombstone after soft delete");
+    let soft_deleted_meta = get_metadata(&fragment, &renamed_key, &fragment).await;
     assert!(
-        soft_deleted_meta.is_delete_marker,
-        "soft delete should leave a delete-marker tombstone"
+        soft_deleted_meta.is_err(),
+        "soft delete should remove the live latest metadata"
     );
 }
 
@@ -1847,6 +2000,131 @@ async fn matrix_delimiter_listing_paginates_without_skipping_rows() {
         ]
     );
     assert!(page3["continuation_token"].is_null());
+
+    PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
+        .get()
+        .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
+        .store(prev_compact_trigger, Ordering::Relaxed);
+    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
+        .get()
+        .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
+        .store(prev_compact_min_interval, Ordering::Relaxed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_delimiter_listing_keeps_direct_files_after_compaction_with_new_deltas() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let prev_compact_trigger = PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or(128);
+    let prev_compact_min_interval = PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or(30);
+
+    if PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC.get().is_none() {
+        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
+            .set(AtomicUsize::new(1))
+            .expect("set PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC");
+    } else {
+        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
+            .get()
+            .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
+            .store(1, Ordering::Relaxed);
+    }
+    if PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC.get().is_none() {
+        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
+            .set(AtomicU64::new(1))
+            .expect("set PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC");
+    } else {
+        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
+            .get()
+            .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
+            .store(1, Ordering::Relaxed);
+    }
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    for (key, fill) in [("videos/a.bin", 1u8), ("videos/b.bin", 2u8)] {
+        put_object(state.clone(), &fragment, key, vec![fill; 2048]).await;
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    schedule_prefix_compaction(fragment.clone(), vec!["videos".to_string()]);
+    run_prefix_rebuild_job(Some(fragment.clone()), Arc::new(WsConnectionManager::new()))
+        .await
+        .expect("run prefix rebuild");
+
+    assert!(
+        wait_until_prefix_compacted(&fragment, "videos", 5000).await,
+        "videos prefix should compact during test setup"
+    );
+    assert!(
+        wait_until_delimiter_compacted(&fragment, "videos", 5000).await,
+        "videos delimiter prefix should compact during test setup"
+    );
+
+    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
+        .get()
+        .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
+        .store(3600, Ordering::Relaxed);
+
+    for (key, fill) in [("videos/c.bin", 3u8), ("videos/new-folder/x.bin", 4u8)] {
+        put_object(state.clone(), &fragment, key, vec![fill; 2048]).await;
+    }
+
+    let listing = list_objects_json(&fragment, Some("videos"), Some("/")).await;
+    let mut object_keys = listing["objects"]
+        .as_array()
+        .expect("objects array")
+        .iter()
+        .filter_map(|v| v["object_key"].as_str())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    object_keys.sort();
+
+    let mut common_prefixes = listing["common_prefixes"]
+        .as_array()
+        .expect("common prefixes array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    common_prefixes.sort();
+
+    assert_eq!(
+        object_keys,
+        vec![
+            "videos/a.bin".to_string(),
+            "videos/b.bin".to_string(),
+            "videos/c.bin".to_string(),
+        ],
+        "direct files disappeared from delimiter listing: {listing:?}"
+    );
+    assert_eq!(
+        common_prefixes,
+        vec!["videos/new-folder/".to_string()],
+        "child folder missing from delimiter listing: {listing:?}"
+    );
 
     PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
         .get()
@@ -3209,13 +3487,6 @@ async fn matrix_repair_synchronizes_all_index_disks() {
     let _v2 = put_object(state.clone(), &fragment, &k2, c2.clone()).await;
 
     let pm = ObjectPathManager::new();
-    let quota_paths = pm.get_all_quota_paths(&fragment);
-    assert!(quota_paths.len() >= 2);
-
-    fs::remove_file(&quota_paths[0])
-        .await
-        .expect("delete one quota mirror");
-
     let (pending_vid, _pending_sid) = init_upload(&fragment, "idx-sync/pending.bin", 8192, 1).await;
     let pending_chunk = vec![0xAB; 8192];
     let put_pending = upload_part(&fragment, &pending_vid, 0, pending_chunk).await;
@@ -3282,7 +3553,7 @@ async fn matrix_repair_synchronizes_all_index_disks() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_repair_restores_delete_marker_mirror() {
+async fn matrix_repair_tolerates_missing_trashed_metadata_replica() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
     ensure_global_storage_config(&base).await;
@@ -3326,19 +3597,19 @@ async fn matrix_repair_restores_delete_marker_mirror() {
     .into_response();
     assert_eq!(del_resp.status(), StatusCode::OK);
 
-    let marker_meta = get_metadata(&fragment, &key, &fragment)
+    let marker_meta = index::read_latest_trashed_object(&fragment, &key)
         .await
-        .expect("latest metadata after delete");
+        .expect("latest trashed metadata after delete");
     assert!(
-        marker_meta.is_delete_marker,
-        "latest metadata should be a delete marker"
+        !marker_meta.is_delete_marker,
+        "trashed metadata should remain a real object record"
     );
 
     let pm = ObjectPathManager::new();
-    let marker_paths = pm.get_all_metadata_paths(&fragment, &key, &marker_meta.version_id);
+    let marker_paths = pm.get_all_trashed_metadata_paths(&fragment, &key, &marker_meta.version_id);
     assert!(
         marker_paths.len() >= 2,
-        "expected mirrored marker metadata paths"
+        "expected mirrored trashed metadata paths"
     );
 
     fs::remove_file(&marker_paths[0])
@@ -3361,22 +3632,12 @@ async fn matrix_repair_restores_delete_marker_mirror() {
         Arc::new(WsConnectionManager::new()),
     )
     .await
-    .expect("repair should restore delete marker metadata mirror");
+    .expect("repair should tolerate missing trashed metadata replica");
 
-    assert!(
-        fs::try_exists(&marker_paths[0]).await.unwrap_or(false),
-        "repair should restore missing delete marker replica"
-    );
-
-    let restored = fs::read(&marker_paths[0])
+    let trashed_meta_after = index::read_latest_trashed_object(&fragment, &key)
         .await
-        .expect("read restored marker replica");
-    let canonical = fs::read(&marker_paths[1])
-        .await
-        .expect("read canonical marker replica");
-    assert_eq!(restored, canonical, "marker replicas should match");
-
-    assert_all_index_disks_synchronized(&fragment).await;
+        .expect("latest trashed metadata should still be readable");
+    assert_eq!(trashed_meta_after.object_key, key);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3455,9 +3716,7 @@ async fn matrix_ha_repair_reconverges_index_after_index_disk_down() {
     fs::remove_file(&down_src)
         .await
         .expect("remove index down blocker file");
-    fs::rename(&down_dst, &down_src)
-        .await
-        .expect("restore index disk");
+    restore_simulated_index_disk(&down_src, &down_dst, "restore index disk").await;
 
     run_repair_job(
         RepairRunConfig {
@@ -3548,9 +3807,7 @@ async fn matrix_redistribution_read_falls_back_when_primary_index_copy_is_corrup
     fs::remove_file(&down_src)
         .await
         .expect("remove index down blocker file");
-    fs::rename(&down_dst, &down_src)
-        .await
-        .expect("restore primary index disk");
+    restore_simulated_index_disk(&down_src, &down_dst, "restore primary index disk").await;
 
     let path_manager = ObjectPathManager::new();
     let meta_paths = path_manager.get_all_metadata_paths(&fragment, &key, &version_id);
@@ -6020,9 +6277,7 @@ async fn matrix_index_mirror_ha_soak_down_recover() {
         fs::remove_file(&down_src)
             .await
             .expect("remove index down blocker file");
-        fs::rename(&down_dst, &down_src)
-            .await
-            .expect("restore index disk");
+        restore_simulated_index_disk(&down_src, &down_dst, "restore index disk").await;
 
         run_repair_job(
             RepairRunConfig {

@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tokio::fs;
@@ -318,6 +318,73 @@ async fn read_messagepack_if_exists<T: DeserializeOwned>(
         return Ok(None);
     }
     read_messagepack(path).await.map(Some)
+}
+
+async fn list_version_ids_from_object_dir(dir: &Path) -> Result<Vec<String>, AppError> {
+    let mut version_ids = HashSet::<String>::new();
+    if !fs::try_exists(dir).await.unwrap_or(false) {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = fs::read_dir(dir)
+        .await
+        .map_err(|e| AppError::Io(e, format!("read dir {}", dir.display())))?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if !entry
+            .file_type()
+            .await
+            .map(|ft| ft.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(INDEX_OBJECT_SUFFIX) || name == INDEX_LATEST_FILE {
+            continue;
+        }
+        if let Some(version_id) = name.strip_suffix(INDEX_OBJECT_SUFFIX) {
+            version_ids.insert(version_id.to_string());
+        }
+    }
+
+    let mut out: Vec<String> = version_ids.into_iter().collect();
+    out.sort_by(|left, right| compare_version_id_recency(left, right));
+    Ok(out)
+}
+
+async fn remove_object_dir_fast_internal(
+    fragment: &str,
+    object_key: &str,
+    trashed: bool,
+) -> Result<Option<Vec<String>>, AppError> {
+    let route = object_route(fragment, object_key)?;
+    let mut version_ids = HashSet::<String>::new();
+    let mut dirs_to_remove = Vec::<PathBuf>::new();
+
+    for root in &route.roots {
+        let dir = object_base_dir(root, fragment, route.partition_id, object_key, trashed);
+        if !fs::try_exists(&dir).await.unwrap_or(false) {
+            continue;
+        }
+        for version_id in list_version_ids_from_object_dir(&dir).await? {
+            version_ids.insert(version_id);
+        }
+        dirs_to_remove.push(dir);
+    }
+
+    if dirs_to_remove.is_empty() {
+        return Ok(None);
+    }
+
+    for dir in dirs_to_remove {
+        fs::remove_dir_all(&dir)
+            .await
+            .map_err(|e| AppError::Io(e, format!("remove object dir {}", dir.display())))?;
+    }
+
+    let mut out: Vec<String> = version_ids.into_iter().collect();
+    out.sort_by(|left, right| compare_version_id_recency(left, right));
+    Ok(Some(out))
 }
 
 fn part_file_name_to_index(name: &str) -> Option<u64> {
@@ -828,6 +895,46 @@ async fn list_object_versions_metadata_internal(
     Ok(out)
 }
 
+async fn list_object_version_ids_internal(
+    fragment: &str,
+    object_key: &str,
+    trashed: bool,
+) -> Result<Vec<String>, AppError> {
+    let route = object_route(fragment, object_key)?;
+    let mut version_ids = HashSet::<String>::new();
+    for root in &route.roots {
+        let dir = object_base_dir(root, fragment, route.partition_id, object_key, trashed);
+        if !fs::try_exists(&dir).await.unwrap_or(false) {
+            continue;
+        }
+        let mut entries = match fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if !entry
+                .file_type()
+                .await
+                .map(|ft| ft.is_file())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(INDEX_OBJECT_SUFFIX) || name == INDEX_LATEST_FILE {
+                continue;
+            }
+            if let Some(version_id) = name.strip_suffix(INDEX_OBJECT_SUFFIX) {
+                version_ids.insert(version_id.to_string());
+            }
+        }
+    }
+
+    let mut out: Vec<String> = version_ids.into_iter().collect();
+    out.sort();
+    Ok(out)
+}
+
 pub async fn list_live_object_versions_metadata(
     fragment: &str,
     object_key: &str,
@@ -842,14 +949,30 @@ pub async fn list_trashed_object_versions_metadata(
     list_object_versions_metadata_internal(fragment, object_key, true).await
 }
 
-pub async fn read_latest_object(
+pub async fn list_live_object_version_ids(
     fragment: &str,
     object_key: &str,
+) -> Result<Vec<String>, AppError> {
+    list_object_version_ids_internal(fragment, object_key, false).await
+}
+
+pub async fn list_trashed_object_version_ids(
+    fragment: &str,
+    object_key: &str,
+) -> Result<Vec<String>, AppError> {
+    list_object_version_ids_internal(fragment, object_key, true).await
+}
+
+async fn read_latest_object_internal(
+    fragment: &str,
+    object_key: &str,
+    trashed: bool,
 ) -> Result<ObjectMetadata, AppError> {
     let route = object_route(fragment, object_key)?;
     let mut latest_candidates = Vec::<(ObjectMetadata, SystemTime)>::new();
     for root in &route.roots {
-        let latest_path = object_latest_path(root, fragment, route.partition_id, object_key, false);
+        let latest_path =
+            object_latest_path(root, fragment, route.partition_id, object_key, trashed);
         if !fs::try_exists(&latest_path).await.unwrap_or(false) {
             continue;
         }
@@ -866,7 +989,11 @@ pub async fn read_latest_object(
     }
 
     if latest_candidates.is_empty() {
-        let versions = list_live_object_versions_metadata(fragment, object_key).await?;
+        let versions = if trashed {
+            list_trashed_object_versions_metadata(fragment, object_key).await?
+        } else {
+            list_live_object_versions_metadata(fragment, object_key).await?
+        };
         if let Some(mut latest) = versions.into_iter().next() {
             if latest.fragment != fragment {
                 latest.fragment = fragment.to_string();
@@ -890,6 +1017,21 @@ pub async fn read_latest_object(
         latest.fragment = fragment.to_string();
     }
     Ok(latest)
+}
+
+pub async fn read_latest_object(
+    fragment: &str,
+    object_key: &str,
+) -> Result<ObjectMetadata, AppError> {
+    read_latest_object_internal(fragment, object_key, false).await
+}
+
+#[cfg(test)]
+pub async fn read_latest_trashed_object(
+    fragment: &str,
+    object_key: &str,
+) -> Result<ObjectMetadata, AppError> {
+    read_latest_object_internal(fragment, object_key, true).await
 }
 
 pub async fn list_fragment_trash_objects(fragment: &str) -> Result<Vec<ObjectMetadata>, AppError> {
@@ -986,24 +1128,159 @@ async fn list_fragment_objects_internal(
     Ok(out)
 }
 
+pub async fn move_object_version_to_trash_with_metadata(
+    fragment: &str,
+    object_key: &str,
+    version_id: &str,
+) -> Result<ObjectMetadata, AppError> {
+    let metadata = read_object_version(fragment, object_key, version_id).await?;
+    upsert_trashed_object_version(&metadata).await?;
+    delete_object_version(fragment, object_key, version_id).await?;
+    Ok(metadata)
+}
+
+#[allow(dead_code)]
 pub async fn move_object_version_to_trash(
     fragment: &str,
     object_key: &str,
     version_id: &str,
 ) -> Result<(), AppError> {
-    let metadata = read_object_version(fragment, object_key, version_id).await?;
-    upsert_trashed_object_version(&metadata).await?;
-    delete_object_version(fragment, object_key, version_id).await
+    move_object_version_to_trash_with_metadata(fragment, object_key, version_id)
+        .await
+        .map(|_| ())
 }
 
-pub async fn restore_object_version_from_trash(
+pub async fn restore_object_version_from_trash_with_metadata(
     fragment: &str,
     object_key: &str,
     version_id: &str,
-) -> Result<(), AppError> {
+) -> Result<ObjectMetadata, AppError> {
     let metadata = read_trashed_object_version(fragment, object_key, version_id).await?;
     upsert_object_version(&metadata).await?;
-    delete_trashed_object_version(fragment, object_key, version_id).await
+    delete_trashed_object_version(fragment, object_key, version_id).await?;
+    Ok(metadata)
+}
+
+pub async fn move_object_to_trash_fast(
+    fragment: &str,
+    object_key: &str,
+) -> Result<Option<Vec<String>>, AppError> {
+    let route = object_route(fragment, object_key)?;
+    let mut live_dirs = Vec::<PathBuf>::new();
+    let mut trash_dirs = Vec::<PathBuf>::new();
+    let mut version_ids = HashSet::<String>::new();
+
+    for root in &route.roots {
+        let src = object_base_dir(root, fragment, route.partition_id, object_key, false);
+        let dst = object_base_dir(root, fragment, route.partition_id, object_key, true);
+        if fs::try_exists(&dst).await.unwrap_or(false) {
+            return Ok(None);
+        }
+        if fs::try_exists(&src).await.unwrap_or(false) {
+            for version_id in list_version_ids_from_object_dir(&src).await? {
+                version_ids.insert(version_id);
+            }
+            live_dirs.push(src);
+            trash_dirs.push(dst);
+        }
+    }
+
+    if live_dirs.is_empty() {
+        return Ok(None);
+    }
+
+    for dst in &trash_dirs {
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| AppError::Io(e, format!("mkdir {}", parent.display())))?;
+        }
+    }
+
+    for (src, dst) in live_dirs.iter().zip(trash_dirs.iter()) {
+        fs::rename(src, dst).await.map_err(|e| {
+            AppError::Io(
+                e,
+                format!("rename object dir {} -> {}", src.display(), dst.display()),
+            )
+        })?;
+    }
+
+    let mut out: Vec<String> = version_ids.into_iter().collect();
+    out.sort_by(|left, right| compare_version_id_recency(left, right));
+    Ok(Some(out))
+}
+
+pub async fn restore_object_from_trash_fast(
+    fragment: &str,
+    object_key: &str,
+) -> Result<Option<Vec<String>>, AppError> {
+    let route = object_route(fragment, object_key)?;
+    let mut live_dirs = Vec::<PathBuf>::new();
+    let mut trash_dirs = Vec::<PathBuf>::new();
+    let mut version_ids = HashSet::<String>::new();
+
+    for root in &route.roots {
+        let src = object_base_dir(root, fragment, route.partition_id, object_key, true);
+        let dst = object_base_dir(root, fragment, route.partition_id, object_key, false);
+        if fs::try_exists(&dst).await.unwrap_or(false) {
+            return Ok(None);
+        }
+        if fs::try_exists(&src).await.unwrap_or(false) {
+            for version_id in list_version_ids_from_object_dir(&src).await? {
+                version_ids.insert(version_id);
+            }
+            trash_dirs.push(src);
+            live_dirs.push(dst);
+        }
+    }
+
+    if trash_dirs.is_empty() {
+        return Ok(None);
+    }
+
+    for dst in &live_dirs {
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| AppError::Io(e, format!("mkdir {}", parent.display())))?;
+        }
+    }
+
+    for (src, dst) in trash_dirs.iter().zip(live_dirs.iter()) {
+        fs::rename(src, dst).await.map_err(|e| {
+            AppError::Io(
+                e,
+                format!("rename object dir {} -> {}", src.display(), dst.display()),
+            )
+        })?;
+    }
+
+    let mut out: Vec<String> = version_ids.into_iter().collect();
+    out.sort_by(|left, right| compare_version_id_recency(left, right));
+    Ok(Some(out))
+}
+
+pub async fn delete_object_fast(
+    fragment: &str,
+    object_key: &str,
+) -> Result<Option<Vec<String>>, AppError> {
+    let mut version_ids = HashSet::<String>::new();
+
+    if let Some(live_ids) = remove_object_dir_fast_internal(fragment, object_key, false).await? {
+        version_ids.extend(live_ids);
+    }
+    if let Some(trash_ids) = remove_object_dir_fast_internal(fragment, object_key, true).await? {
+        version_ids.extend(trash_ids);
+    }
+
+    if version_ids.is_empty() {
+        return Ok(None);
+    }
+
+    let mut out: Vec<String> = version_ids.into_iter().collect();
+    out.sort_by(|left, right| compare_version_id_recency(left, right));
+    Ok(Some(out))
 }
 
 async fn recompute_latest_state(

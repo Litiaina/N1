@@ -5,7 +5,7 @@ use crate::fuse::config::FsdConfig;
 use crate::fuse::gateway::FsdGateway;
 use crate::fuse::model::{NodeKind, NodeMetadata};
 use crate::n1_core::fragment_metadata::read_fragment_metadata;
-use crate::n1_core::quota_manager::get_quota;
+use crate::n1_core::quota_manager::get_storage_usage;
 use crate::validation::fragment_validation::does_fragment_exist;
 use crate::websocket::ws_structs::SmbTransferProgressPayload;
 use hmac::{Hmac, Mac};
@@ -2790,17 +2790,17 @@ async fn handle_query_info(
         }
     };
     let fs_capacity_bytes = if info_type == SMB2_INFO_TYPE_FILESYSTEM {
-        match get_quota(handle.fragment.as_str()).await {
-            Ok(quota) => {
-                let used = quota.storage_used.min(quota.allocated_storage);
+        match get_storage_usage().await {
+            Ok(usage) => {
+                let used = usage.capacity_used.min(usage.capacity_allocated);
                 Some((
-                    quota.allocated_storage,
-                    quota.allocated_storage.saturating_sub(used),
+                    usage.capacity_allocated,
+                    usage.capacity_allocated.saturating_sub(used),
                 ))
             }
             Err(e) => {
                 warn!(
-                    "smb query_info quota lookup failed for fragment='{}': {}",
+                    "smb query_info capacity lookup failed for fragment='{}': {}",
                     handle.fragment, e
                 );
                 None

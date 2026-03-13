@@ -231,16 +231,6 @@ fn default_planned_part_strict_size() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartCommitReceipt {
-    pub size_bytes: u64,
-    pub created_at: i64,
-    #[serde(default)]
-    pub checksum: Option<String>,
-    #[serde(default)]
-    pub shard_checksums: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadSessionManifest {
     pub fragment: String,
     pub object_key: String,
@@ -286,40 +276,6 @@ impl UploadSessionManifest {
             .flat_map(|layout| layout.shards.iter())
             .map(|shard| shard.raw_blob_address.clone())
             .collect()
-    }
-
-    pub fn materialize_part_from_receipt(
-        &self,
-        part_index: u64,
-        receipt: &PartCommitReceipt,
-    ) -> Option<PartMetadata> {
-        let layout = self.planned_part_layout(part_index)?;
-        if layout.shards.len() != receipt.shard_checksums.len() {
-            return None;
-        }
-
-        let shards = layout
-            .shards
-            .iter()
-            .zip(receipt.shard_checksums.iter())
-            .map(|(planned, checksum)| ShardInfo {
-                shard_index: planned.shard_index,
-                file_name: planned.file_name.clone(),
-                absolute_path: raw_blob_debug_path(&planned.raw_blob_address),
-                raw_blob_address: Some(planned.raw_blob_address.clone()),
-                size_bytes: layout.shard_size_bytes,
-                checksum: checksum.clone(),
-                is_parity: planned.is_parity,
-            })
-            .collect();
-
-        Some(PartMetadata {
-            part_index,
-            size_bytes: receipt.size_bytes,
-            created_at: receipt.created_at,
-            shards,
-            checksum: receipt.checksum.clone(),
-        })
     }
 }
 
@@ -965,37 +921,6 @@ pub async fn sync_dir(_path: &std::path::Path) -> Result<(), AppError> {
     Ok(())
 }
 
-fn session_parts_dir_from_state_path(state_path: &std::path::Path, version_id: &str) -> PathBuf {
-    state_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join(format!("{}.parts", version_id))
-}
-
-fn session_part_meta_path_from_state_path(
-    state_path: &std::path::Path,
-    version_id: &str,
-    part_index: u64,
-) -> PathBuf {
-    session_parts_dir_from_state_path(state_path, version_id)
-        .join(format!("{:020}.msgpack", part_index))
-}
-
-pub(crate) async fn session_part_meta_paths(
-    fragment: &str,
-    version_id: &str,
-    part_index: u64,
-) -> Result<Vec<PathBuf>, AppError> {
-    Ok(
-        index::get_session_state_paths(fragment, version_id)?
-            .into_iter()
-            .map(|state_path| {
-                session_part_meta_path_from_state_path(&state_path, version_id, part_index)
-            })
-            .collect(),
-    )
-}
-
 async fn load_session_state_any(
     fragment: &str,
     version_id: &str,
@@ -1006,6 +931,21 @@ async fn load_session_state_any(
     if let Some(receipt) = index::read_removed_session_receipt(fragment, version_id).await? {
         if receipt.state.finalized_at.is_none() && receipt.state.aborted_at.is_none() {
             return Ok(Some(receipt.state));
+        }
+    }
+    Ok(None)
+}
+
+async fn load_session_manifest_any(
+    fragment: &str,
+    version_id: &str,
+) -> Result<Option<UploadSessionManifest>, AppError> {
+    if let Some(manifest) = index::load_session_manifest(fragment, version_id).await? {
+        return Ok(Some(manifest));
+    }
+    if let Some(receipt) = index::read_removed_session_receipt(fragment, version_id).await? {
+        if receipt.state.finalized_at.is_none() && receipt.state.aborted_at.is_none() {
+            return Ok(Some(receipt.state.manifest));
         }
     }
     Ok(None)
@@ -1112,98 +1052,37 @@ pub(crate) async fn cleanup_orphaned_upload_artifacts_for_fragment(
     now: std::time::SystemTime,
     file_ttl: std::time::Duration,
 ) -> Result<u64, AppError> {
-    let path_manager = ObjectPathManager::new();
     let mut orphan_versions = BTreeSet::new();
-    for root in path_manager.get_all_index_roots() {
-        let partitions_root = root.join(fragment).join("index").join("partitions");
-        let mut partition_entries = match tokio_fs::read_dir(&partitions_root).await {
-            Ok(entries) => entries,
-            Err(e)
-                if e.kind() == std::io::ErrorKind::NotFound
-                    || e.kind() == std::io::ErrorKind::NotADirectory =>
-            {
-                continue;
-            }
-            Err(e) => {
-                return Err(AppError::Io(
-                    e,
-                    format!("read_dir {}", partitions_root.display()),
-                ));
-            }
+    for (_, receipt) in index::list_removed_session_receipts(fragment).await? {
+        let version_id = receipt.state.manifest.version_id.clone();
+        let modified = if receipt.removed_at > 0 {
+            std::time::SystemTime::UNIX_EPOCH
+                .checked_add(std::time::Duration::from_secs(receipt.removed_at as u64))
+                .unwrap_or(now)
+        } else {
+            now
         };
-        while let Some(partition_entry) = partition_entries
-            .next_entry()
-            .await
-            .map_err(|e| AppError::Io(e, format!("read_dir {}", partitions_root.display())))?
+        if now
+            .duration_since(modified)
+            .unwrap_or(std::time::Duration::ZERO)
+            <= file_ttl
         {
-            let sessions_dir = partition_entry.path().join("sessions");
-            let mut session_entries = match tokio_fs::read_dir(&sessions_dir).await {
-                Ok(entries) => entries,
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::NotFound
-                        || e.kind() == std::io::ErrorKind::NotADirectory =>
-                {
-                    continue;
-                }
-                Err(e) => {
-                    return Err(AppError::Io(
-                        e,
-                        format!("read_dir {}", sessions_dir.display()),
-                    ));
-                }
-            };
-            while let Some(entry) = session_entries
-                .next_entry()
+            continue;
+        }
+        if index::load_session(fragment, &version_id).await?.is_some() {
+            continue;
+        }
+        let object_key = receipt.state.manifest.object_key.clone();
+        let published = index::read_object_version(fragment, &object_key, &version_id)
+            .await
+            .is_ok()
+            || index::read_trashed_object_version(fragment, &object_key, &version_id)
                 .await
-                .map_err(|e| AppError::Io(e, format!("read_dir {}", sessions_dir.display())))?
-            {
-                let path = entry.path();
-                let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
-                    continue;
-                };
-                if !name.ends_with(".removed.msgpack") {
-                    continue;
-                }
-                let version_id = name.trim_end_matches(".removed.msgpack");
-                let modified = tokio_fs::metadata(&path)
-                    .await
-                    .and_then(|meta| meta.modified())
-                    .unwrap_or(now);
-                if now
-                    .duration_since(modified)
-                    .unwrap_or(std::time::Duration::ZERO)
-                    <= file_ttl
-                {
-                    continue;
-                }
-                if index::load_session(fragment, version_id).await?.is_some() {
-                    continue;
-                }
-                let Some(receipt) =
-                    index::read_removed_session_receipt(fragment, version_id).await?
-                else {
-                    continue;
-                };
-                let published = index::read_object_version(
-                    fragment,
-                    &receipt.state.manifest.object_key,
-                    version_id,
-                )
-                .await
-                .is_ok()
-                    || index::read_trashed_object_version(
-                        fragment,
-                        &receipt.state.manifest.object_key,
-                        version_id,
-                    )
-                    .await
-                    .is_ok();
-                if published {
-                    cleanup_upload_part_metadata_for_version(fragment, version_id, false).await;
-                } else {
-                    orphan_versions.insert(version_id.to_string());
-                }
-            }
+                .is_ok();
+        if published {
+            cleanup_upload_part_metadata_for_version(fragment, &version_id, false).await;
+        } else {
+            orphan_versions.insert(version_id);
         }
     }
 
@@ -1219,9 +1098,12 @@ pub(crate) async fn read_part_meta_any(
     version_id: &str,
     part_index: u64,
 ) -> Option<PartMetadata> {
-    if let Ok(Some(state)) = load_session_state_any(fragment, version_id).await {
-        if let Some(part) = state.parts.get(&part_index) {
-            return Some(part.clone());
+    if let Ok(Some(part)) = index::read_session_part(fragment, version_id, part_index).await {
+        return Some(part);
+    }
+    if let Ok(Some(receipt)) = index::read_removed_session_receipt(fragment, version_id).await {
+        if receipt.state.finalized_at.is_none() && receipt.state.aborted_at.is_none() {
+            return receipt.state.parts.get(&part_index).cloned();
         }
     }
     None
@@ -1462,10 +1344,9 @@ pub async fn object_upload_part(
     let strict_durability = durability_mode.strict();
 
     let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
-    let session_state = load_session_state_any(&fragment, &version_id)
+    let manifest = load_session_manifest_any(&fragment, &version_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let manifest = session_state.manifest;
 
     let content_length = headers
         .get("content-length")
@@ -1504,13 +1385,8 @@ pub async fn object_upload_part(
         .map(|value: &str| value.trim())
         .filter(|s| !s.is_empty());
 
-    if let Some(existing) = read_part_meta_any(
-        &ObjectPathManager::new(),
-        &fragment,
-        &version_id,
-        part_index,
-    )
-    .await
+    if let Some(existing) =
+        read_part_meta_any(&ObjectPathManager::new(), &fragment, &version_id, part_index).await
     {
         if existing.size_bytes != content_length {
             return Ok((

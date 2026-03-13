@@ -2,7 +2,7 @@
 
 > Scope note:
 > - This document describes the arc allocator track.
-> - Arc is stable at `0.2.0`.
+> - Arc is experimental.
 > - Stable/default deployment remains `standard` (`DEPLOYMENT_PROFILES.md`).
 
 This document defines the production target allocator design for N1 raw blob devices.

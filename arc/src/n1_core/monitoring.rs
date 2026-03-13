@@ -54,10 +54,6 @@ fn deep_scan_interval() -> Duration {
     Duration::from_secs(secs)
 }
 
-fn uses_raw_index_backend() -> bool {
-    !matches!(index::index_backend_mode(), index::IndexBackendMode::Fs)
-}
-
 #[derive(Serialize, Clone)]
 pub struct DiskStatus {
     pub path: String,
@@ -104,89 +100,7 @@ pub struct StoragePlaneStats {
 }
 
 async fn check_index_disk_accessibility(path_str: String) -> DiskStatus {
-    if uses_raw_index_backend() {
-        return check_raw_index_media_accessibility(path_str).await;
-    }
-
-    let path = PathBuf::from(&path_str);
-
-    let (status, latency_ms, error) = if path.exists() {
-        let check_result = timeout(DISK_CHECK_TIMEOUT, async {
-            match fs::metadata(&path).await {
-                Ok(meta) => {
-                    if !meta.is_dir() {
-                        return (
-                            "offline".to_string(),
-                            Some("Index root path is not a directory".to_string()),
-                            None,
-                        );
-                    }
-
-                    let start_time = Instant::now();
-                    let mut entries = match fs::read_dir(&path).await {
-                        Ok(entries) => entries,
-                        Err(e) => {
-                            return (
-                                "offline".to_string(),
-                                Some(format!("Failed to read dir: {}", e)),
-                                None,
-                            );
-                        }
-                    };
-                    if let Err(e) = entries.next_entry().await {
-                        return (
-                            "offline".to_string(),
-                            Some(format!("Failed to read dir entry: {}", e)),
-                            None,
-                        );
-                    }
-                    let latency = start_time.elapsed().as_millis() as u64;
-                    let readonly = meta.permissions().readonly();
-                    (
-                        if readonly {
-                            "readonly".to_string()
-                        } else if latency > 1000 {
-                            "slow".to_string()
-                        } else {
-                            "online".to_string()
-                        },
-                        readonly.then(|| "Index root is mounted read-only".to_string()),
-                        Some(latency),
-                    )
-                }
-                Err(e) => (
-                    "offline".to_string(),
-                    Some(format!("Failed to read metadata: {}", e)),
-                    None,
-                ),
-            }
-        })
-        .await;
-
-        match check_result {
-            Ok((s, e, l)) => (s, l, e),
-            Err(_) => (
-                "slow".to_string(),
-                None,
-                Some("Disk probe timed out (>5s)".to_string()),
-            ),
-        }
-    } else {
-        (
-            "offline".to_string(),
-            None,
-            Some("Path does not exist".to_string()),
-        )
-    };
-
-    DiskStatus {
-        path: path_str,
-        role: "index".to_string(),
-        status,
-        latency_ms,
-        error,
-        raw_backend: None,
-    }
+    check_raw_index_media_accessibility(path_str).await
 }
 
 async fn check_raw_index_media_accessibility(path_str: String) -> DiskStatus {
@@ -337,33 +251,8 @@ fn compute_storage_plane_stats(disks: &[DiskStatus]) -> StoragePlaneStats {
 }
 
 async fn enumerate_fragment_names(roots: &[PathBuf]) -> Vec<String> {
-    if uses_raw_index_backend() {
-        return raw_index::list_fragments().await.unwrap_or_default();
-    }
-
-    let mut fragments = std::collections::BTreeSet::new();
-    for root in roots {
-        let mut entries = match fs::read_dir(root).await {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let is_dir = entry
-                .file_type()
-                .await
-                .map(|ft| ft.is_dir())
-                .unwrap_or(false);
-            if !is_dir {
-                continue;
-            }
-            if let Some(name) = entry.file_name().to_str() {
-                if !name.starts_with('.') {
-                    fragments.insert(name.to_string());
-                }
-            }
-        }
-    }
-    fragments.into_iter().collect()
+    let _ = roots;
+    raw_index::list_fragments().await.unwrap_or_default()
 }
 
 async fn collect_consistency_counts(

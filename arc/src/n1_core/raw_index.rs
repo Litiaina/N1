@@ -4,7 +4,9 @@ use crate::n1_core::disk_manager::{
     ObjectMetadata, Quota, compare_version_recency, configured_index_store_disks,
 };
 use crate::n1_core::fragment_metadata::FragmentMetadata;
-use crate::n1_core::index::{IndexRuntimeStats, IndexSessionState, RemovedSessionReceipt, UploadRuntimeStats};
+use crate::n1_core::index_types::{
+    IndexRuntimeStats, IndexSessionState, RemovedSessionReceipt, UploadRuntimeStats,
+};
 use crate::n1_core::upload::UploadSessionManifest;
 use block_manager::{AllocationHandle, BlockManager};
 use serde::{Deserialize, Serialize};
@@ -320,6 +322,32 @@ pub async fn load_session(fragment: &str, version_id: &str) -> Result<Option<Ind
         .cloned())
 }
 
+pub async fn load_session_manifest(
+    fragment: &str,
+    version_id: &str,
+) -> Result<Option<UploadSessionManifest>, AppError> {
+    let rt = runtime().await?;
+    let state = rt.state.read().await;
+    Ok(state
+        .sessions
+        .get(&session_key(fragment, version_id))
+        .map(|session| session.manifest.clone()))
+}
+
+pub async fn read_session_part(
+    fragment: &str,
+    version_id: &str,
+    part_index: u64,
+) -> Result<Option<crate::n1_core::disk_manager::PartMetadata>, AppError> {
+    let rt = runtime().await?;
+    let state = rt.state.read().await;
+    Ok(state
+        .sessions
+        .get(&session_key(fragment, version_id))
+        .and_then(|session| session.parts.get(&part_index))
+        .cloned())
+}
+
 pub async fn remove_session(fragment: &str, version_id: &str, reason: &str) -> Result<(), AppError> {
     persist_with_mutation(|state| {
         let key = session_key(fragment, version_id);
@@ -356,6 +384,22 @@ pub async fn read_removed_session_receipt(
         .removed_sessions
         .get(&session_key(fragment, version_id))
         .cloned())
+}
+
+pub async fn list_removed_session_receipts(
+    fragment: &str,
+) -> Result<Vec<(String, RemovedSessionReceipt)>, AppError> {
+    let rt = runtime().await?;
+    let state = rt.state.read().await;
+    let mut out = state
+        .removed_sessions
+        .iter()
+        .filter_map(|(key, receipt)| {
+            (receipt.state.manifest.fragment == fragment).then_some((key.clone(), receipt.clone()))
+        })
+        .collect::<Vec<_>>();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
 }
 
 pub async fn delete_removed_session_receipt(fragment: &str, version_id: &str) -> Result<(), AppError> {
@@ -478,14 +522,55 @@ pub async fn list_fragment_latest_objects_page(
     start_after: Option<(&str, &str)>,
     limit: usize,
 ) -> Result<(Vec<ObjectMetadata>, Option<(String, String)>), AppError> {
-    let mut all = list_latest_objects_internal(fragment, trashed, prefix).await?;
-    if let Some((start_key, start_version)) = start_after {
-        all.retain(|m| {
-            (m.object_key.as_str(), m.version_id.as_str()) > (start_key, start_version)
-        });
+    let rt = runtime().await?;
+    let state = rt.state.read().await;
+    let source = if trashed {
+        &state.trash_versions
+    } else {
+        &state.live_versions
+    };
+    let pfx = prefix.map(|p| p.trim_start_matches('/'));
+    let mut latest = BTreeMap::<String, ObjectMetadata>::new();
+
+    for meta in source.values() {
+        if meta.fragment != fragment {
+            continue;
+        }
+        if let Some(prefix) = pfx {
+            if prefix.is_empty() {
+                // keep all
+            } else if !meta.object_key.starts_with(prefix) {
+                continue;
+            }
+        }
+        match latest.get(&meta.object_key) {
+            Some(current)
+                if compare_version_recency(
+                    current.created_at,
+                    &current.version_id,
+                    meta.created_at,
+                    &meta.version_id,
+                )
+                .is_ge() => {}
+            _ => {
+                latest.insert(meta.object_key.clone(), meta.clone());
+            }
+        }
     }
+
     let capped_limit = limit.max(1);
-    let page: Vec<ObjectMetadata> = all.into_iter().take(capped_limit).collect();
+    let mut page = Vec::with_capacity(capped_limit);
+    for (object_key, meta) in latest {
+        if let Some((start_key, start_version)) = start_after {
+            if (object_key.as_str(), meta.version_id.as_str()) <= (start_key, start_version) {
+                continue;
+            }
+        }
+        page.push(meta);
+        if page.len() >= capped_limit {
+            break;
+        }
+    }
     let next = page
         .last()
         .map(|m| (m.object_key.clone(), m.version_id.clone()));
@@ -676,13 +761,13 @@ pub async fn list_fragments() -> Result<Vec<String>, AppError> {
     let mut fragments = BTreeSet::new();
     fragments.extend(state.fragment_metadata.keys().cloned());
     fragments.extend(state.quotas.keys().cloned());
-    for meta in state.live_versions.values() {
-        fragments.insert(meta.fragment.clone());
-    }
-    for meta in state.trash_versions.values() {
-        fragments.insert(meta.fragment.clone());
-    }
     Ok(fragments.into_iter().collect())
+}
+
+pub async fn fragment_exists(fragment: &str) -> Result<bool, AppError> {
+    let rt = runtime().await?;
+    let state = rt.state.read().await;
+    Ok(state.fragment_metadata.contains_key(fragment) || state.quotas.contains_key(fragment))
 }
 
 pub async fn read_quota(fragment: &str) -> Result<Option<Quota>, AppError> {
@@ -750,6 +835,7 @@ mod tests {
 
     #[tokio::test]
     async fn raw_index_and_blob_can_share_single_raw_device() {
+        let _guard = crate::n1_core::disk_manager::STORAGE_TEST_LOCK.lock().await;
         let path = unique_loopback_path("shared");
         let total_bytes = 512 * 1024 * 1024u64;
         BlockManager::format(

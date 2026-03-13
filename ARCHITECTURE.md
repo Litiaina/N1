@@ -1,8 +1,9 @@
 # N1 Architecture
 
-> Deployment profile status (2026-03-09):
+> Deployment profile status (2026-03-13):
 > - `standard` is stable and the default deployment profile.
-> - `arc` is stable at `0.2.0` for raw-device deployments.
+> - `standard` is released at `0.5.1`.
+> - `arc` is an experimental raw-device deployment profile.
 > - See `DEPLOYMENT_PROFILES.md`.
 
 N1 is a single-node object storage engine with three distinct planes:
@@ -17,7 +18,7 @@ This replaces the legacy "full mirrored metadata tree on every index root" model
 
 ## Freeze Status
 
-The stable N1 architecture baseline is `standard 0.4.0` + `arc 0.2.0`.
+The current production architecture baseline is `standard 0.5.1`.
 
 That baseline applies to:
 
@@ -41,7 +42,7 @@ N1 is intentionally a specialized object-storage engine, not a general filesyste
 Two server variants exist so users can choose deployment posture:
 
 - `standard`: filesystem-backed N1 for general-purpose use and broad hardware compatibility.
-- `arc`: raw-device/direct-I/O N1 for absolute device control and maximum throughput ceiling.
+- `arc`: raw-device/direct-I/O N1 for absolute device control and maximum throughput ceiling, currently treated as experimental.
 
 They are expected to keep the same storage semantics. The difference is backend execution model and operational profile, not object correctness guarantees.
 
@@ -49,7 +50,7 @@ They are expected to keep the same storage semantics. The difference is backend 
 
 | Dimension | Standard | Arc |
 |---|---|---|
-| Status | Stable/default | Stable raw-kernel |
+| Status | Stable/default (`0.5.1`) | Experimental raw-device profile |
 | `index_store_disks` | Filesystem directories | Raw devices |
 | `blob_store_disks` | Filesystem directories | Raw devices |
 | Index backend | Partitioned filesystem metadata | Raw index catalog (`block_manager`) |
@@ -199,11 +200,25 @@ Allocator design note:
 Initiate does:
 
 - validate fragment scope
-- reserve quota
+- check available backing-store capacity
 - generate `version_id` and `session_id`
 - open `index` session state on the session partition
 
 At this stage no object is visible.
+
+### 1a. Standard one-shot upload
+
+`standard` also exposes a direct single-request path:
+
+- `POST /v4/upload/one-shot/{fragment}/{*object_key}`
+
+That path skips session state and finalize for small objects:
+
+1. validate fragment scope and request size
+2. check live filesystem capacity
+3. write blob payload once
+4. publish immutable metadata + latest marker immediately
+5. return success
 
 ### 2. Upload part
 
@@ -266,7 +281,7 @@ That keeps exact-key correctness and namespace serving performance independent.
 
 All major maintenance flows now share the same authority source:
 
-- sync and cleanup recompute fragment usage from `index` live and trash state
+- cleanup removes orphaned blob state and repairs fragment-local metadata shape
 - repair reconciles partition replicas and blob availability from `index`
 - redistribution republishes moved shard addresses through `index`
 - GC expires trash versions and abandoned sessions through `index`

@@ -16,10 +16,12 @@
 
 ---
 
-> Deployment profile status (2026-03-09):
+> Deployment profile status (2026-03-13):
 > - `standard` (`litiaina-n1-standard`) is the stable and recommended deployment path.
-> - `arc` (`litiaina-n1-arc`) is stable at `0.2.0` for raw-device deployments.
+> - `standard` is released at `0.5.1`.
+> - `arc` (`litiaina-n1-arc`) is the experimental raw-device profile and is not the production default.
 > - See `DEPLOYMENT_PROFILES.md` for the profile split and architecture guidance.
+> - Operator shortcut: if you are deploying today, follow `DEPLOYMENT.md` for `standard` and ignore Arc unless you are explicitly doing raw-device testing.
 
 ## Table of Contents
 
@@ -50,7 +52,7 @@
   - [Raw blob operations](#raw-blob-operations-Arc-only)
 - [Why `index` is future-proof](#why-index-is-future-proof)
 - [Operational notes](#operational-notes)
-  - [Linux-first + O_DIRECT](#linux-first--o_direct)
+  - [Linux-first + direct I/O](#linux-first--direct-io)
   - [Preallocation](#preallocation)
   - [Directory sync](#directory-sync)
 - [N1 CLI Functions](#n1-cli-functions)
@@ -114,21 +116,23 @@ Profile note:
 
 ## Release Status
 
-- `standard` is the stable/default deployment profile at `0.4.0`.
-- `arc` is the stable raw-kernel profile at `0.2.0`.
+- `standard` is the stable/default deployment profile at `0.5.1`.
+- `arc` is the experimental raw-device profile.
 - Stable architecture baseline (`standard`):
   - filesystem-backed authoritative `index`
   - filesystem-backed `blob_store_disks` shard layout (directory roots)
   - partitioned + replicated metadata
   - projected prefix namespace serving
-- Arc is the raw-kernel profile with raw index/blob media managed by `block_manager`.
+- `standard` also exposes `POST /v4/upload/one-shot/{object_key}` for direct small-object upload without session/finalize overhead. The fragment comes from the authenticated claim.
+- On Linux, `standard` prefers `io_uring` on the blob data path when available and falls back to `O_DIRECT` + blocking writes when it is not.
+- Arc is the experimental raw-device profile with raw index/blob media managed by `block_manager`.
 - The HTTP/API surface is **not** frozen yet. Route shapes, request fields, and operational endpoints may still change before `1.0.0`.
 
 ## Profile Distinction And Disk Layout (Authoritative)
 
 | Dimension | Standard (`litiaina-n1-standard`) | Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / production default | Stable / raw-kernel profile |
+| Status | Stable / production default (`0.5.1`) | Experimental / raw-device profile |
 | `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | Index metadata backend | Partitioned filesystem metadata | Raw index catalog on block-manager media |
@@ -160,7 +164,7 @@ Profile note:
 ```text
 {RAW_INDEX_DEVICE}
   block-manager superblock + journals + allocation groups
-  raw index catalog allocation (authoritative sessions/versions/quota/fragment metadata)
+  raw index catalog allocation (authoritative sessions/versions/fragment metadata)
 
 {RAW_BLOB_DEVICE}
   block-manager superblock + journals + allocation groups
@@ -169,7 +173,7 @@ Profile note:
 
 Arc note:
 - Index and blob are both raw block-manager media in Arc.
-- Arc is stable at `0.2.0` and remains under active performance hardening.
+- Arc is experimental and remains under active performance and control-plane hardening.
 
 ## What is N1 (index architecture)
 
@@ -276,7 +280,7 @@ N1 stays correct by making `index` the only object authority and treating everyt
 
 A Fragment is the unit of isolation and operational scope:
 
-- quota boundary
+- virtual disk boundary
 - auth boundary
 - maintenance boundary
 - namespace boundary
@@ -425,12 +429,24 @@ These are serving segments only. If they are missing or stale, the node can rebu
 Initiate does:
 
 - validate fragment scope
-- reserve quota
+- check available storage headroom on the current backing filesystems or raw media
 - create `version_id` and `session_id`
 - optionally freeze upload geometry when the client provides `part_size_bytes` or `part_sizes_bytes`
 - open authoritative session state in `index`
 
 At this point no object version is visible.
+
+### 1a) One-shot upload (`standard`)
+
+For small single-request objects, `standard` also exposes `POST /v4/upload/one-shot/{*object_key}`. The fragment is claim-scoped and is not passed in the path.
+
+That path:
+
+- validates fragment scope and request size
+- checks available filesystem capacity
+- writes the blob once
+- publishes final metadata + latest immediately
+- returns without creating an upload session or requiring finalize
 
 ### 2) Upload part (payload first, metadata second)
 
@@ -638,17 +654,17 @@ The legacy mirrored tree was safe, but it scaled badly because every publish and
 
 ## Operational notes
 
-### Linux-first + O_DIRECT
+### Linux-first + direct I/O
 
-N1 is Linux-first and uses `O_DIRECT` on the blob data path for predictable latency and reduced page-cache pressure.
+N1 is Linux-first and uses direct I/O on the blob data path for predictable latency and reduced page-cache pressure.
 
 This applies to:
 
-- filesystem-backed blob/staging writes in `standard` where direct-IO constraints are met
+- filesystem-backed blob/staging writes in `standard`, which prefer Linux `io_uring` when available and fall back to `O_DIRECT` + blocking writes when not
 - raw blob devices managed directly by `block_manager` in `arc`
 
 Metadata and serving state are profile-specific:
-- `standard`: metadata/quota/index/prefix state are filesystem-backed and buffered.
+- `standard`: metadata/index/prefix state are filesystem-backed and buffered; capacity monitoring uses live filesystem totals.
 - `arc`: metadata and payload are both raw-device backed via `block_manager`.
 
 ### Preallocation
@@ -675,7 +691,7 @@ N1 CLI is available in both server binaries and uses `server_cli` as the command
 
 Workspace server variants:
 - `standard` (stable/default): filesystem-backed N1 (`standard/src/main.rs`) for general-purpose deployments, with partitioned index roots under `index/partitions/<pid>/...` and directory-only `index_store_disks` / `blob_store_disks`.
-- `arc` (stable raw-kernel): raw-device/block-manager-backed N1 runtime.
+- `arc` (experimental raw-device): raw-device/block-manager-backed N1 runtime.
 
 ### How to run the CLI
 
@@ -738,10 +754,10 @@ Creates a new fragment.
 
 Flags:
 - `--name <NAME>` required
-- `--quota <BYTES>` optional (default `10737418240`)
+- `--key <KEY>` required
 
 ```bash
-cargo run -p standard -- create-fragment --name imaging-a --quota 1099511627776
+cargo run -p standard -- create-fragment --name imaging-a --key supersecretfragmentkey
 ```
 
 #### `gc`
@@ -968,7 +984,7 @@ It runs the release-critical storage/repair workflows:
 
 - active multipart upload + resume while one replica index disk is down
 - blob CRUD + delete/recover/permanent delete
-- blob quota drift reconvergence across redistribution, trash, GC, and sync
+- live capacity reporting and storage-path reconciliation
 - blob redistribution + repair + recovered read + GC marker cleanup
 - index mirror repair convergence
 - HA repair reconvergence with an index disk down

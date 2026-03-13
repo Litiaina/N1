@@ -1,10 +1,10 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::constants::{
-    GC_SUFFIX, METADATA_EXT, PARITY_SUFFIX, PART_META_SUFFIX, QUOTA_FILE, REDIST_TMP_SUFFIX,
-    RESERVATION_FILE, SHARD_SUFFIX,
+    GC_SUFFIX, METADATA_EXT, PARITY_SUFFIX, PART_META_SUFFIX, REDIST_TMP_SUFFIX, RESERVATION_FILE,
+    SHARD_SUFFIX,
 };
 use crate::n1_core::disk_manager::{
-    INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, Quota, ShardInfo,
+    INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo,
     default_stripe_size,
 };
 use crate::n1_core::ec::ErasureStreamWriter;
@@ -37,7 +37,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -699,59 +699,6 @@ pub async fn stop_redistribution_job_api(
     Ok((StatusCode::OK, "Stop signal sent.").into_response())
 }
 
-async fn replicate_quota_best_effort(fragment_hash: &str, index_roots: &[PathBuf], dry_run: bool) {
-    let mut best_bytes: Option<Vec<u8>> = None;
-    let mut best_mtime: SystemTime = SystemTime::UNIX_EPOCH;
-    let mut best_len: u64 = 0;
-
-    for r in index_roots {
-        let p = r.join(fragment_hash).join(QUOTA_FILE);
-        let bytes = match tokio_fs::read(&p).await {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        if rmp_serde::from_slice::<Quota>(&bytes).is_err() {
-            continue;
-        }
-        let meta = tokio_fs::metadata(&p).await.ok();
-        let mtime = meta
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        let len = meta.as_ref().map(|m| m.len()).unwrap_or(bytes.len() as u64);
-
-        let take =
-            best_bytes.is_none() || (mtime > best_mtime) || (mtime == best_mtime && len > best_len);
-        if take {
-            best_bytes = Some(bytes);
-            best_mtime = mtime;
-            best_len = len;
-        }
-    }
-
-    let Some(canon) = best_bytes else {
-        return;
-    };
-
-    for r in index_roots {
-        let p = r.join(fragment_hash).join(QUOTA_FILE);
-        let same = match tokio_fs::read(&p).await {
-            Ok(cur) => cur == canon,
-            Err(_) => false,
-        };
-        if same || dry_run {
-            continue;
-        }
-        if let Err(e) = durable_atomic_write_bytes(&p, &canon).await {
-            warn!(
-                "Failed to mirror quota file during redistribution {}: {}",
-                p.display(),
-                e
-            );
-        }
-    }
-}
-
 fn get_shard_dir_custom(
     disk_root: &Path,
     fragment_hash: &str,
@@ -1056,10 +1003,6 @@ async fn replicate_fragment_metadata_best_effort(fragment_hash: &str) {
     if let Ok(meta) = read_fragment_metadata(fragment_hash).await {
         let _ = write_fragment_metadata(&meta).await;
     }
-}
-
-async fn durable_atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
-    durable_atomic_write_bytes_with_mode(path, bytes, true).await
 }
 
 async fn durable_atomic_write_bytes_with_mode(
@@ -1470,7 +1413,6 @@ pub async fn run_redistribution_job_with_options(
         }
 
         replicate_fragment_metadata_best_effort(&fragment_hash).await;
-        replicate_quota_best_effort(&fragment_hash, live_index.as_ref(), dry_run).await;
         if !dry_run {
             replay_pending_intents_for_fragment(
                 &fragment_hash,
@@ -1539,7 +1481,6 @@ pub async fn run_redistribution_job_with_options(
 
                         if name.ends_with(METADATA_EXT)
                             && !name.ends_with(PART_META_SUFFIX)
-                            && name != QUOTA_FILE
                             && name != RESERVATION_FILE
                             && name != "latest.msgpack"
                             && !name.ends_with(".session.msgpack")

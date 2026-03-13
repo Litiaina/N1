@@ -19,6 +19,7 @@ pub mod operation_gate;
 pub mod prefix_compactor;
 pub mod prefix_delimiter;
 pub mod prefix_rebuilder;
+pub mod prefix_updates;
 pub mod quota_manager;
 pub mod recovery;
 pub mod redistribution;

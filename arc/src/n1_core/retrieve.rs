@@ -4,7 +4,7 @@ use crate::n1_core::constants::{
 };
 use crate::n1_core::disk_manager::{
     ListObjectsResult, ObjectMetadata, ObjectPathManager, PrefixDelimiterCompactedSegment,
-    PrefixIndexEntry, PrefixIndexSegment, Quota, compare_version_recency, version_recency_is_newer,
+    PrefixIndexEntry, PrefixIndexSegment, Quota, compare_version_recency,
 };
 use crate::n1_core::index_facade as index;
 use crate::n1_core::metadata_parser::get_metadata;
@@ -23,7 +23,6 @@ use base64::engine::general_purpose;
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
 };
 use tokio::fs;
 use tracing::warn;
@@ -154,22 +153,305 @@ async fn read_index_entry_best(
     read_metadata_best(path_manager, fragment, &entry.object_key, &entry.version_id).await
 }
 
-fn merge_prefix_latest(latest: &mut HashMap<String, PrefixIndexEntry>, entry: PrefixIndexEntry) {
-    match latest.get(&entry.object_key) {
-        None => {
-            latest.insert(entry.object_key.clone(), entry);
+async fn load_best_prefix_compacted_segment(
+    fragment: &str,
+    prefix: &str,
+) -> Option<PrefixIndexSegment> {
+    let pfx = canonical_prefix(prefix);
+    let path_manager = ObjectPathManager::new();
+    let mut best: Option<(std::time::SystemTime, PrefixIndexSegment)> = None;
+
+    for dir in path_manager.get_all_prefix_bucket_dirs(fragment, &pfx) {
+        if !fs::try_exists(&dir).await.unwrap_or(false) {
+            continue;
         }
-        Some(current) => {
-            if version_recency_is_newer(
-                entry.created_at,
-                &entry.version_id,
-                current.created_at,
-                &current.version_id,
-            ) {
-                latest.insert(entry.object_key.clone(), entry);
-            }
+
+        let compacted_path = dir.join(format!("compacted{}", PREFIX_SEGMENT_EXT));
+        if !fs::try_exists(&compacted_path).await.unwrap_or(false) {
+            continue;
+        }
+
+        let modified = fs::metadata(&compacted_path)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let Ok(data) = fs::read(&compacted_path).await else {
+            continue;
+        };
+        let Ok(seg) = rmp_serde::from_slice::<PrefixIndexSegment>(&data) else {
+            continue;
+        };
+        if canonical_prefix(&seg.prefix) != pfx {
+            continue;
+        }
+
+        if best
+            .as_ref()
+            .map(|(current, _)| modified > *current)
+            .unwrap_or(true)
+        {
+            best = Some((modified, seg));
         }
     }
+
+    best.map(|(_, seg)| seg)
+}
+
+async fn load_best_delimiter_compacted_segment(
+    fragment: &str,
+    prefix: &str,
+) -> Option<PrefixDelimiterCompactedSegment> {
+    let pfx = canonical_prefix(prefix);
+    let path_manager = ObjectPathManager::new();
+    let mut best: Option<(std::time::SystemTime, PrefixDelimiterCompactedSegment)> = None;
+
+    for dir in path_manager.get_all_prefix_bucket_dirs(fragment, &pfx) {
+        if !fs::try_exists(&dir).await.unwrap_or(false) {
+            continue;
+        }
+
+        let compacted_path = dir.join(PREFIX_DELIMITER_COMPACTED_FILE);
+        if !fs::try_exists(&compacted_path).await.unwrap_or(false) {
+            continue;
+        }
+
+        let modified = fs::metadata(&compacted_path)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let Ok(data) = fs::read(&compacted_path).await else {
+            continue;
+        };
+        let Ok(seg) = rmp_serde::from_slice::<PrefixDelimiterCompactedSegment>(&data) else {
+            continue;
+        };
+        if canonical_prefix(&seg.prefix) != pfx {
+            continue;
+        }
+
+        if best
+            .as_ref()
+            .map(|(current, _)| modified > *current)
+            .unwrap_or(true)
+        {
+            best = Some((modified, seg));
+        }
+    }
+
+    best.map(|(_, seg)| seg)
+}
+
+fn first_prefix_entry_after(entries: &[PrefixIndexEntry], key: &str, version_id: &str) -> usize {
+    entries
+        .binary_search_by(|entry| match canonical_key(&entry.object_key).as_str().cmp(key) {
+            std::cmp::Ordering::Equal => entry.version_id.as_str().cmp(version_id),
+            other => other,
+        })
+        .map(|idx| idx + 1)
+        .unwrap_or_else(|idx| idx)
+}
+
+async fn list_prefix_compacted_page_fast(
+    fragment: &str,
+    prefix: &str,
+    limit: usize,
+    continuation_token: Option<String>,
+    include_internal: bool,
+    seg: PrefixIndexSegment,
+) -> Result<ListObjectsResult, AppError> {
+    let pfx = canonical_prefix(prefix);
+    let pfx_with_slash = if pfx.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", pfx)
+    };
+    let path_manager = ObjectPathManager::new();
+    let start_idx = if let Some(tok) = continuation_token.as_deref() {
+        let Some((object_key, version_id)) = parse_prefix_continuation_token(tok) else {
+            return Ok(ListObjectsResult {
+                objects: Vec::new(),
+                common_prefixes: Vec::new(),
+                continuation_token: None,
+            });
+        };
+        first_prefix_entry_after(&seg.entries, &canonical_key(&object_key), &version_id)
+    } else {
+        0
+    };
+
+    let mut out_objects = Vec::<ObjectMetadata>::new();
+    let mut last_pair = None::<(String, String)>;
+    let mut reached_limit = false;
+
+    for mut entry in seg.entries.into_iter().skip(start_idx) {
+        if out_objects.len() >= limit {
+            break;
+        }
+
+        entry.object_key = canonical_key(&entry.object_key);
+        if entry.is_delete_marker {
+            continue;
+        }
+        if !include_internal && is_internal_object_key(entry.object_key.as_str()) {
+            continue;
+        }
+        if !pfx.is_empty() && entry.object_key != pfx && !entry.object_key.starts_with(&pfx_with_slash)
+        {
+            continue;
+        }
+
+        let Some(meta) = read_index_entry_best(&path_manager, fragment, &entry).await else {
+            warn!(
+                "Skipping unreadable compacted prefix metadata fragment={} key={} version={}",
+                fragment, entry.object_key, entry.version_id
+            );
+            continue;
+        };
+        if meta.is_delete_marker {
+            continue;
+        }
+
+        last_pair = Some((entry.object_key.clone(), entry.version_id.clone()));
+        out_objects.push(meta);
+
+        if out_objects.len() >= limit {
+            reached_limit = true;
+            break;
+        }
+    }
+
+    Ok(ListObjectsResult {
+        objects: out_objects,
+        common_prefixes: Vec::new(),
+        continuation_token: if reached_limit {
+            last_pair
+                .as_ref()
+                .map(|(key, version)| create_prefix_continuation_token(key, version))
+        } else {
+            None
+        },
+    })
+}
+
+async fn list_delimiter_compacted_page_fast(
+    fragment: &str,
+    limit: usize,
+    continuation_token: Option<String>,
+    include_internal: bool,
+    seg: PrefixDelimiterCompactedSegment,
+) -> Result<ListObjectsResult, AppError> {
+    let path_manager = ObjectPathManager::new();
+    let start_after = continuation_token
+        .as_deref()
+        .and_then(parse_delimiter_continuation_token);
+    let mut object_idx = start_after
+        .as_deref()
+        .map(|row_key| {
+            seg.object_entries
+                .binary_search_by(|entry| canonical_key(&entry.object_key).as_str().cmp(row_key))
+                .map(|idx| idx + 1)
+                .unwrap_or_else(|idx| idx)
+        })
+        .unwrap_or(0);
+    let mut child_idx = start_after
+        .as_deref()
+        .map(|row_key| {
+            seg.child_entries
+                .binary_search_by(|entry| entry.common_prefix.trim_start_matches('/').cmp(row_key))
+                .map(|idx| idx + 1)
+                .unwrap_or_else(|idx| idx)
+        })
+        .unwrap_or(0);
+
+    let mut out_objects = Vec::<ObjectMetadata>::new();
+    let mut out_prefixes = Vec::<String>::new();
+    let mut last_row_key = None::<String>;
+    let mut reached_limit = false;
+
+    loop {
+        while object_idx < seg.object_entries.len() {
+            let entry = &seg.object_entries[object_idx];
+            let key = canonical_key(&entry.object_key);
+            if entry.is_delete_marker || (!include_internal && is_internal_object_key(&key)) {
+                object_idx += 1;
+                continue;
+            }
+            break;
+        }
+
+        while child_idx < seg.child_entries.len() {
+            let child = &seg.child_entries[child_idx];
+            let row_key = child.common_prefix.trim_start_matches('/').to_string();
+            if child.live_count == 0 || (!include_internal && is_internal_object_key(&row_key)) {
+                child_idx += 1;
+                continue;
+            }
+            break;
+        }
+
+        if object_idx >= seg.object_entries.len() && child_idx >= seg.child_entries.len() {
+            break;
+        }
+        if out_objects.len() + out_prefixes.len() >= limit {
+            reached_limit = true;
+            break;
+        }
+
+        let next_object_key = seg
+            .object_entries
+            .get(object_idx)
+            .map(|entry| canonical_key(&entry.object_key));
+        let next_child_key = seg
+            .child_entries
+            .get(child_idx)
+            .map(|entry| entry.common_prefix.trim_start_matches('/').to_string());
+
+        let emit_object = match (&next_object_key, &next_child_key) {
+            (Some(object_key), Some(child_key)) => object_key <= child_key,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+
+        if emit_object {
+            let mut entry = seg.object_entries[object_idx].clone();
+            entry.object_key = next_object_key.expect("object key available");
+            let Some(meta) = read_index_entry_best(&path_manager, fragment, &entry).await else {
+                warn!(
+                    "Skipping unreadable compacted delimiter metadata fragment={} key={} version={}",
+                    fragment, entry.object_key, entry.version_id
+                );
+                object_idx += 1;
+                continue;
+            };
+            if meta.is_delete_marker {
+                object_idx += 1;
+                continue;
+            }
+            last_row_key = Some(entry.object_key.clone());
+            out_objects.push(meta);
+            object_idx += 1;
+        } else {
+            let row_key = next_child_key.expect("child key available");
+            last_row_key = Some(row_key.clone());
+            out_prefixes.push(row_key);
+            child_idx += 1;
+        }
+    }
+
+    Ok(ListObjectsResult {
+        objects: out_objects,
+        common_prefixes: out_prefixes,
+        continuation_token: if reached_limit {
+            last_row_key
+                .as_deref()
+                .map(create_delimiter_continuation_token)
+        } else {
+            None
+        },
+    })
 }
 
 async fn try_list_by_prefix_index(
@@ -181,196 +463,25 @@ async fn try_list_by_prefix_index(
     include_internal: bool,
 ) -> Result<Option<ListObjectsResult>, AppError> {
     let pfx = canonical_prefix(prefix);
-    let pfx_with_slash = if pfx.is_empty() {
-        String::new()
-    } else {
-        format!("{}/", pfx)
-    };
-    let want_delim = delimiter == Some("/");
-
-    let path_manager = ObjectPathManager::new();
-    let mut latest: HashMap<String, PrefixIndexEntry> = HashMap::new();
-    let mut had_any_index_data = false;
-
-    let bucket_dirs = path_manager.get_all_prefix_bucket_dirs(fragment, &pfx);
-    for d in bucket_dirs {
-        if !fs::try_exists(&d).await.unwrap_or(false) {
-            continue;
-        }
-
-        let compacted_path = d.join(format!("compacted{}", PREFIX_SEGMENT_EXT));
-        if fs::try_exists(&compacted_path).await.unwrap_or(false) {
-            if let Ok(data) = fs::read(&compacted_path).await {
-                if let Ok(seg) = rmp_serde::from_slice::<PrefixIndexSegment>(&data) {
-                    had_any_index_data = true;
-                    if canonical_prefix(&seg.prefix) == pfx {
-                        for mut e in seg.entries {
-                            let ck = canonical_key(&e.object_key);
-                            if !pfx.is_empty() && ck != pfx && !ck.starts_with(&pfx_with_slash) {
-                                continue;
-                            }
-                            e.object_key = ck;
-                            merge_prefix_latest(&mut latest, e);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if !had_any_index_data {
+    if delimiter.is_some() {
         return Ok(None);
     }
 
-    if latest.is_empty() {
-        return Ok(Some(ListObjectsResult {
-            objects: Vec::new(),
-            common_prefixes: Vec::new(),
-            continuation_token: None,
-        }));
-    }
-
-    let mut entries: Vec<PrefixIndexEntry> = latest.into_values().collect();
-
-    entries.sort_by(|a, b| match a.object_key.cmp(&b.object_key) {
-        std::cmp::Ordering::Equal => a.version_id.cmp(&b.version_id),
-        other => other,
-    });
-
-    let start_after = if let Some(tok) = continuation_token.as_deref() {
-        let Some((k, v)) = parse_prefix_continuation_token(tok) else {
-            return Ok(None);
-        };
-        Some((canonical_key(&k), v))
-    } else {
-        None
+    let Some(seg) = load_best_prefix_compacted_segment(fragment, &pfx).await else {
+        return Ok(None);
     };
 
-    let start_idx = if let Some((k, v)) = start_after.as_ref() {
-        match entries.binary_search_by(|entry| match entry.object_key.cmp(k) {
-            std::cmp::Ordering::Equal => entry.version_id.cmp(v),
-            other => other,
-        }) {
-            Ok(i) => i + 1,
-            Err(i) => i,
-        }
-    } else {
-        0
-    };
-
-    let mut out_objects: Vec<ObjectMetadata> = Vec::new();
-    let mut out_prefixes: Vec<String> = Vec::new();
-    let mut seen_prefixes: HashSet<String> = HashSet::new();
-
-    let mut last_pair: Option<(String, String)> = None;
-    let mut reached_limit = false;
-
-    for entry in entries.into_iter().skip(start_idx) {
-        if out_objects.len() + out_prefixes.len() >= limit {
-            break;
-        }
-
-        if entry.is_delete_marker {
-            continue;
-        }
-
-        if !include_internal && is_internal_object_key(entry.object_key.as_str()) {
-            continue;
-        }
-
-        if !pfx.is_empty()
-            && entry.object_key != pfx
-            && !entry.object_key.starts_with(&pfx_with_slash)
-        {
-            continue;
-        }
-
-        if want_delim {
-            let rel = if pfx.is_empty() {
-                entry.object_key.clone()
-            } else if entry.object_key == pfx {
-                entry.object_key.clone()
-            } else if entry.object_key.len() > pfx.len() + 1 {
-                entry.object_key[(pfx.len() + 1)..].to_string()
-            } else {
-                String::new()
-            };
-
-            if !pfx.is_empty() && entry.object_key == pfx {
-                let Some(meta) = read_index_entry_best(&path_manager, fragment, &entry).await
-                else {
-                    warn!(
-                        "Skipping unreadable prefix-index metadata fragment={} key={} version={}",
-                        fragment, entry.object_key, entry.version_id
-                    );
-                    continue;
-                };
-                if meta.is_delete_marker {
-                    continue;
-                }
-                out_objects.push(meta);
-                last_pair = Some((entry.object_key.clone(), entry.version_id.clone()));
-            } else if let Some((first, _rest)) = rel.split_once('/') {
-                if !first.is_empty() {
-                    let folder = if pfx.is_empty() {
-                        format!("{}/", first)
-                    } else {
-                        format!("{}/{}/", pfx, first)
-                    };
-                    if seen_prefixes.insert(folder.clone()) {
-                        out_prefixes.push(folder);
-                        last_pair = Some((entry.object_key.clone(), entry.version_id.clone()));
-                    }
-                }
-            } else {
-                let Some(meta) = read_index_entry_best(&path_manager, fragment, &entry).await
-                else {
-                    warn!(
-                        "Skipping unreadable prefix-index metadata fragment={} key={} version={}",
-                        fragment, entry.object_key, entry.version_id
-                    );
-                    continue;
-                };
-                if meta.is_delete_marker {
-                    continue;
-                }
-                out_objects.push(meta);
-                last_pair = Some((entry.object_key.clone(), entry.version_id.clone()));
-            }
-        } else {
-            let Some(meta) = read_index_entry_best(&path_manager, fragment, &entry).await else {
-                warn!(
-                    "Skipping unreadable prefix-index metadata fragment={} key={} version={}",
-                    fragment, entry.object_key, entry.version_id
-                );
-                continue;
-            };
-            if meta.is_delete_marker {
-                continue;
-            }
-            out_objects.push(meta);
-            last_pair = Some((entry.object_key.clone(), entry.version_id.clone()));
-        }
-
-        if out_objects.len() + out_prefixes.len() >= limit {
-            reached_limit = true;
-            break;
-        }
-    }
-
-    let next_token = if reached_limit {
-        last_pair
-            .as_ref()
-            .map(|(k, v)| create_prefix_continuation_token(k, v))
-    } else {
-        None
-    };
-
-    Ok(Some(ListObjectsResult {
-        objects: out_objects,
-        common_prefixes: out_prefixes,
-        continuation_token: next_token,
-    }))
+    Ok(Some(
+        list_prefix_compacted_page_fast(
+            fragment,
+            &pfx,
+            limit,
+            continuation_token,
+            include_internal,
+            seg,
+        )
+        .await?,
+    ))
 }
 
 async fn try_list_by_delimiter_index(
@@ -380,176 +491,21 @@ async fn try_list_by_delimiter_index(
     continuation_token: Option<String>,
     include_internal: bool,
 ) -> Result<Option<ListObjectsResult>, AppError> {
-    #[derive(Clone)]
-    struct DelimiterRow {
-        row_key: String,
-        object_entry: Option<PrefixIndexEntry>,
-        common_prefix: Option<String>,
-    }
-
     let pfx = canonical_prefix(prefix);
-    let path_manager = ObjectPathManager::new();
-
-    let mut compacted_candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-
-    for d in path_manager.get_all_prefix_bucket_dirs(fragment, &pfx) {
-        if !fs::try_exists(&d).await.unwrap_or(false) {
-            continue;
-        }
-
-        let compacted_path = d.join(PREFIX_DELIMITER_COMPACTED_FILE);
-        if fs::try_exists(&compacted_path).await.unwrap_or(false) {
-            let modified = fs::metadata(&compacted_path)
-                .await
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .unwrap_or(std::time::UNIX_EPOCH);
-            compacted_candidates.push((modified, compacted_path));
-        }
-    }
-
-    if compacted_candidates.is_empty() {
-        return Ok(None);
-    }
-
-    compacted_candidates.sort_by(|a, b| b.0.cmp(&a.0));
-
-    let mut compacted_mtime = None;
-    let mut direct_latest: HashMap<String, PrefixIndexEntry> = HashMap::new();
-    let mut child_counts: HashMap<String, i64> = HashMap::new();
-
-    for (mtime, path) in compacted_candidates {
-        let Ok(data) = fs::read(&path).await else {
-            continue;
-        };
-        let Ok(seg) = rmp_serde::from_slice::<PrefixDelimiterCompactedSegment>(&data) else {
-            continue;
-        };
-        if canonical_prefix(&seg.prefix) != pfx {
-            continue;
-        }
-
-        for entry in seg.object_entries {
-            let mut entry = entry;
-            entry.object_key = canonical_key(&entry.object_key);
-            merge_prefix_latest(&mut direct_latest, entry);
-        }
-        for child in seg.child_entries {
-            let common_prefix = child.common_prefix.trim_start_matches('/').to_string();
-            let live_count = i64::try_from(child.live_count).unwrap_or(i64::MAX);
-            child_counts
-                .entry(common_prefix)
-                .and_modify(|count| *count = count.saturating_add(live_count))
-                .or_insert(live_count);
-        }
-
-        compacted_mtime = Some(mtime);
-        break;
-    }
-
-    let Some(_compacted_mtime) = compacted_mtime else {
+    let Some(seg) = load_best_delimiter_compacted_segment(fragment, &pfx).await else {
         return Ok(None);
     };
 
-    let mut rows: Vec<DelimiterRow> = Vec::new();
-    for entry in direct_latest.into_values() {
-        if entry.is_delete_marker {
-            continue;
-        }
-        if !include_internal && is_internal_object_key(&entry.object_key) {
-            continue;
-        }
-        rows.push(DelimiterRow {
-            row_key: entry.object_key.clone(),
-            object_entry: Some(entry),
-            common_prefix: None,
-        });
-    }
-
-    for (common_prefix, live_count) in child_counts {
-        if live_count <= 0 {
-            continue;
-        }
-        if !include_internal && is_internal_object_key(common_prefix.as_str()) {
-            continue;
-        }
-        rows.push(DelimiterRow {
-            row_key: common_prefix.clone(),
-            object_entry: None,
-            common_prefix: Some(common_prefix),
-        });
-    }
-
-    rows.sort_by(|a, b| match a.row_key.cmp(&b.row_key) {
-        std::cmp::Ordering::Equal => a.object_entry.is_none().cmp(&b.object_entry.is_none()),
-        other => other,
-    });
-
-    let start_after = if let Some(tok) = continuation_token.as_deref() {
-        let Some(row_key) = parse_delimiter_continuation_token(tok) else {
-            return Ok(None);
-        };
-        Some(row_key)
-    } else {
-        None
-    };
-
-    let start_idx = if let Some(start_after) = start_after {
-        match rows.binary_search_by(|row| row.row_key.cmp(&start_after)) {
-            Ok(i) => i + 1,
-            Err(i) => i,
-        }
-    } else {
-        0
-    };
-
-    let mut out_objects: Vec<ObjectMetadata> = Vec::new();
-    let mut out_prefixes: Vec<String> = Vec::new();
-    let mut last_row_key: Option<String> = None;
-    let mut reached_limit = false;
-
-    for row in rows.into_iter().skip(start_idx) {
-        if out_objects.len() + out_prefixes.len() >= limit {
-            break;
-        }
-
-        if let Some(common_prefix) = row.common_prefix {
-            out_prefixes.push(common_prefix);
-            last_row_key = Some(row.row_key);
-        } else if let Some(entry) = row.object_entry {
-            let Some(meta) = read_index_entry_best(&path_manager, fragment, &entry).await else {
-                warn!(
-                    "Skipping unreadable delimiter-index metadata fragment={} key={} version={}",
-                    fragment, entry.object_key, entry.version_id
-                );
-                continue;
-            };
-            if meta.is_delete_marker {
-                continue;
-            }
-            out_objects.push(meta);
-            last_row_key = Some(row.row_key);
-        }
-
-        if out_objects.len() + out_prefixes.len() >= limit {
-            reached_limit = true;
-            break;
-        }
-    }
-
-    let continuation_token = if reached_limit {
-        last_row_key
-            .as_deref()
-            .map(create_delimiter_continuation_token)
-    } else {
-        None
-    };
-
-    Ok(Some(ListObjectsResult {
-        objects: out_objects,
-        common_prefixes: out_prefixes,
-        continuation_token,
-    }))
+    Ok(Some(
+        list_delimiter_compacted_page_fast(
+            fragment,
+            limit,
+            continuation_token,
+            include_internal,
+            seg,
+        )
+        .await?,
+    ))
 }
 
 async fn list_objects_from_index(

@@ -237,23 +237,6 @@ fn get_trash_root(disk_root: &std::path::Path, fragment_hash: &str) -> PathBuf {
     disk_root.join(fragment_hash).join(".trash")
 }
 
-async fn latest_existing_mtime(paths: &[PathBuf]) -> Option<SystemTime> {
-    let mut best: Option<SystemTime> = None;
-    for path in paths {
-        let Ok(metadata) = tokio::fs::metadata(path).await else {
-            continue;
-        };
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        best = Some(match best {
-            Some(current) => current.max(modified),
-            None => modified,
-        });
-    }
-    best
-}
-
 #[cfg(unix)]
 fn gc_cleanup_version_dir_unix(
     version_dir: &Path,
@@ -376,30 +359,12 @@ fn gc_cleanup_version_dir_unix(
 
 async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
-    let index_roots = if index::index_backend_mode() == index::IndexBackendMode::Fs {
-        path_manager.get_all_index_roots()
-    } else {
-        raw_index_metadata_roots_for_housekeeping()?
-    };
+    let index_roots = raw_index_metadata_roots_for_housekeeping()?;
     let blob_roots = path_manager.get_blob_roots();
 
     let mut fragments = HashSet::new();
-    if index::index_backend_mode() == index::IndexBackendMode::Fs {
-        for root in &index_roots {
-            if let Ok(entries) = std::fs::read_dir(root) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                        if let Some(name) = entry.file_name().to_str() {
-                            fragments.insert(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        for fragment in crate::n1_core::raw_index::list_fragments().await? {
-            fragments.insert(fragment);
-        }
+    for fragment in crate::n1_core::raw_index::list_fragments().await? {
+        fragments.insert(fragment);
     }
 
     info!("GC: Starting scan for {} fragments...", fragments.len());
@@ -572,13 +537,12 @@ async fn process_fragment_gc(
         let Ok(meta) = next_meta else {
             continue;
         };
-        let Some(modified) = latest_existing_mtime(
-            &index::get_object_version_paths(fragment, &meta.object_key, &meta.version_id, true)
-                .unwrap_or_default(),
-        )
-        .await
-        else {
-            continue;
+        let modified = if meta.created_at > 0 {
+            SystemTime::UNIX_EPOCH
+                .checked_add(Duration::from_secs(meta.created_at as u64))
+                .unwrap_or(now)
+        } else {
+            now
         };
         let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
         let should_expire = age > retention || is_manual_run;
@@ -714,11 +678,9 @@ async fn process_fragment_gc(
                 .checked_add(Duration::from_secs(session.last_activity_at as u64))
                 .unwrap_or(now)
         } else {
-            latest_existing_mtime(
-                &index::get_session_state_paths(fragment, &version_id).unwrap_or_default(),
-            )
-            .await
-            .unwrap_or(now)
+            SystemTime::UNIX_EPOCH
+                .checked_add(Duration::from_secs(session.manifest.created_at.max(0) as u64))
+                .unwrap_or(now)
         };
 
         if now.duration_since(modified).unwrap_or(Duration::ZERO) > file_ttl {

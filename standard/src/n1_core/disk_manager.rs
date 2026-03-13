@@ -1,6 +1,6 @@
 use crate::n1_core::constants::{
     METADATA_EXT, PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_DELIMITER_SEGMENT_PREFIX,
-    PREFIX_INDEX_DIR, PREFIX_INDEX_NAMESPACE, PREFIX_INDEX_VERSION, PREFIX_SEGMENT_EXT, QUOTA_FILE,
+    PREFIX_INDEX_DIR, PREFIX_INDEX_NAMESPACE, PREFIX_INDEX_VERSION, PREFIX_SEGMENT_EXT,
 };
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
@@ -167,6 +167,23 @@ impl ObjectPathManager {
     }
 
     pub fn get_all_prefix_bucket_dirs(&self, fragment_hash: &str, prefix: &str) -> Vec<PathBuf> {
+        self.get_all_prefix_bucket_dirs_scoped(fragment_hash, prefix, false)
+    }
+
+    pub fn get_all_trash_prefix_bucket_dirs(
+        &self,
+        fragment_hash: &str,
+        prefix: &str,
+    ) -> Vec<PathBuf> {
+        self.get_all_prefix_bucket_dirs_scoped(fragment_hash, prefix, true)
+    }
+
+    fn get_all_prefix_bucket_dirs_scoped(
+        &self,
+        fragment_hash: &str,
+        prefix: &str,
+        trashed: bool,
+    ) -> Vec<PathBuf> {
         let ph = Self::prefix_hash(prefix);
         let p1 = &ph[0..2];
         let p2 = &ph[2..4];
@@ -174,9 +191,12 @@ impl ObjectPathManager {
         self.get_all_index_roots()
             .iter()
             .map(|root| {
-                root.join(fragment_hash)
-                    .join("index")
-                    .join(PREFIX_INDEX_DIR)
+                let base = if trashed {
+                    root.join(fragment_hash).join(".trash").join("index")
+                } else {
+                    root.join(fragment_hash).join("index")
+                };
+                base.join(PREFIX_INDEX_DIR)
                     .join(PREFIX_INDEX_VERSION)
                     .join(PREFIX_INDEX_NAMESPACE)
                     .join(p1)
@@ -186,25 +206,29 @@ impl ObjectPathManager {
             .collect()
     }
 
-    pub fn get_all_prefix_segment_paths(
-        &self,
-        fragment_hash: &str,
-        prefix: &str,
-        segment_id: &str,
-    ) -> Vec<PathBuf> {
-        let file = format!("seg_{}{}", segment_id, PREFIX_SEGMENT_EXT);
-        self.get_all_prefix_bucket_dirs(fragment_hash, prefix)
-            .into_iter()
-            .map(|d| d.join(&file))
-            .collect()
-    }
-
     pub fn get_all_prefix_compacted_paths(
         &self,
         fragment_hash: &str,
         prefix: &str,
     ) -> Vec<PathBuf> {
-        self.get_all_prefix_bucket_dirs(fragment_hash, prefix)
+        self.get_all_prefix_compacted_paths_scoped(fragment_hash, prefix, false)
+    }
+
+    pub fn get_all_trash_prefix_compacted_paths(
+        &self,
+        fragment_hash: &str,
+        prefix: &str,
+    ) -> Vec<PathBuf> {
+        self.get_all_prefix_compacted_paths_scoped(fragment_hash, prefix, true)
+    }
+
+    fn get_all_prefix_compacted_paths_scoped(
+        &self,
+        fragment_hash: &str,
+        prefix: &str,
+        trashed: bool,
+    ) -> Vec<PathBuf> {
+        self.get_all_prefix_bucket_dirs_scoped(fragment_hash, prefix, trashed)
             .into_iter()
             .map(|d| d.join(format!("compacted{}", PREFIX_SEGMENT_EXT)))
             .collect()
@@ -216,11 +240,30 @@ impl ObjectPathManager {
         prefix: &str,
         segment_id: &str,
     ) -> Vec<PathBuf> {
+        self.get_all_prefix_delimiter_segment_paths_scoped(fragment_hash, prefix, segment_id, false)
+    }
+
+    pub fn get_all_trash_prefix_delimiter_segment_paths(
+        &self,
+        fragment_hash: &str,
+        prefix: &str,
+        segment_id: &str,
+    ) -> Vec<PathBuf> {
+        self.get_all_prefix_delimiter_segment_paths_scoped(fragment_hash, prefix, segment_id, true)
+    }
+
+    fn get_all_prefix_delimiter_segment_paths_scoped(
+        &self,
+        fragment_hash: &str,
+        prefix: &str,
+        segment_id: &str,
+        trashed: bool,
+    ) -> Vec<PathBuf> {
         let file = format!(
             "{}{}{}",
             PREFIX_DELIMITER_SEGMENT_PREFIX, segment_id, PREFIX_SEGMENT_EXT
         );
-        self.get_all_prefix_bucket_dirs(fragment_hash, prefix)
+        self.get_all_prefix_bucket_dirs_scoped(fragment_hash, prefix, trashed)
             .into_iter()
             .map(|d| d.join(&file))
             .collect()
@@ -231,7 +274,24 @@ impl ObjectPathManager {
         fragment_hash: &str,
         prefix: &str,
     ) -> Vec<PathBuf> {
-        self.get_all_prefix_bucket_dirs(fragment_hash, prefix)
+        self.get_all_prefix_delimiter_compacted_paths_scoped(fragment_hash, prefix, false)
+    }
+
+    pub fn get_all_trash_prefix_delimiter_compacted_paths(
+        &self,
+        fragment_hash: &str,
+        prefix: &str,
+    ) -> Vec<PathBuf> {
+        self.get_all_prefix_delimiter_compacted_paths_scoped(fragment_hash, prefix, true)
+    }
+
+    fn get_all_prefix_delimiter_compacted_paths_scoped(
+        &self,
+        fragment_hash: &str,
+        prefix: &str,
+        trashed: bool,
+    ) -> Vec<PathBuf> {
+        self.get_all_prefix_bucket_dirs_scoped(fragment_hash, prefix, trashed)
             .into_iter()
             .map(|d| d.join(PREFIX_DELIMITER_COMPACTED_FILE))
             .collect()
@@ -244,13 +304,6 @@ impl ObjectPathManager {
         version_id: &str,
     ) -> PathBuf {
         disk_root.join(fragment_hash).join("blob").join(version_id)
-    }
-
-    pub fn get_all_quota_paths(&self, fragment_hash: &str) -> Vec<PathBuf> {
-        self.get_all_index_roots()
-            .iter()
-            .map(|root| root.join(fragment_hash).join(QUOTA_FILE))
-            .collect()
     }
 }
 
@@ -347,6 +400,70 @@ pub struct PrefixIndexEntry {
     pub created_at: i64,
     #[serde(default)]
     pub is_delete_marker: bool,
+    #[serde(default)]
+    pub has_inline_summary: bool,
+    #[serde(default)]
+    pub upload_session_id: String,
+    #[serde(default)]
+    pub owner_uid: String,
+    #[serde(default)]
+    pub content_type: String,
+    #[serde(default)]
+    pub total_size_bytes: u64,
+    #[serde(default = "default_stripe_size")]
+    pub stripe_size_bytes: usize,
+}
+
+impl PrefixIndexEntry {
+    pub fn from_metadata(metadata: &ObjectMetadata) -> Self {
+        Self {
+            object_key: metadata.object_key.clone(),
+            version_id: metadata.version_id.clone(),
+            created_at: metadata.created_at,
+            is_delete_marker: metadata.is_delete_marker,
+            has_inline_summary: true,
+            upload_session_id: metadata.upload_session_id.clone(),
+            owner_uid: metadata.owner_uid.clone(),
+            content_type: metadata.content_type.clone(),
+            total_size_bytes: metadata.total_size_bytes,
+            stripe_size_bytes: metadata.stripe_size_bytes,
+        }
+    }
+
+    pub fn from_summary(summary: &ObjectSummary) -> Self {
+        Self {
+            object_key: summary.object_key.clone(),
+            version_id: summary.version_id.clone(),
+            created_at: summary.created_at,
+            is_delete_marker: summary.is_delete_marker,
+            has_inline_summary: true,
+            upload_session_id: summary.upload_session_id.clone(),
+            owner_uid: summary.owner_uid.clone(),
+            content_type: summary.content_type.clone(),
+            total_size_bytes: summary.total_size_bytes,
+            stripe_size_bytes: summary.stripe_size_bytes,
+        }
+    }
+
+    pub fn to_object_metadata(&self, fragment: &str) -> Option<ObjectMetadata> {
+        if !self.has_inline_summary {
+            return None;
+        }
+
+        Some(ObjectMetadata {
+            object_key: self.object_key.clone(),
+            fragment: fragment.to_string(),
+            version_id: self.version_id.clone(),
+            upload_session_id: self.upload_session_id.clone(),
+            owner_uid: self.owner_uid.clone(),
+            content_type: self.content_type.clone(),
+            total_size_bytes: self.total_size_bytes,
+            created_at: self.created_at,
+            parts: Vec::new(),
+            is_delete_marker: self.is_delete_marker,
+            stripe_size_bytes: self.stripe_size_bytes,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -402,6 +519,10 @@ pub struct InitiateUploadResponse {
 pub struct CapacityUsageResponse {
     pub capacity_used: u64,
     pub capacity_allocated: u64,
+    #[serde(default)]
+    pub capacity_available: u64,
+    #[serde(default)]
+    pub filesystem_count: usize,
 }
 
 #[derive(Deserialize)]
@@ -463,12 +584,6 @@ pub struct UploadPartQuery {
     pub strict_durability: Option<bool>,
     #[serde(default)]
     pub io_gate: Option<bool>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Quota {
-    pub allocated_storage: u64,
-    pub storage_used: u64,
 }
 
 #[derive(serde::Deserialize)]

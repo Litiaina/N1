@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -29,8 +30,14 @@ use crate::n1_core::constants::{
     PREFIX_INDEX_DIR, PREFIX_INDEX_NAMESPACE, PREFIX_INDEX_VERSION, PREFIX_SEGMENT_EXT,
 };
 
+#[cfg(target_os = "linux")]
+use io_uring::{IoUring, opcode, types};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::FileExt;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 
@@ -46,7 +53,7 @@ use crate::n1_core::index;
 use crate::n1_core::metadata_parser::get_metadata;
 use crate::n1_core::prefix_compactor::schedule_prefix_compaction;
 use crate::n1_core::prefix_delimiter::write_delimiter_delta;
-use crate::n1_core::quota_manager::{try_reserve_quota, update_quota};
+use crate::n1_core::quota_manager::ensure_capacity_available;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
@@ -64,6 +71,34 @@ pub static UPLOAD_IO_GATE_ENABLED_ATOMIC: OnceCell<AtomicBool> = OnceCell::new()
 static IO_SEMAPHORE: Lazy<Semaphore> =
     Lazy::new(|| Semaphore::new(*MAX_IO_SEMAPHORE.get().unwrap()));
 static ACTIVE_IO_INFLIGHT: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
+
+#[cfg(target_os = "linux")]
+static IO_URING_ENABLED: Lazy<bool> = Lazy::new(|| {
+    let enabled = std::env::var("N1_IO_URING_ENABLED")
+        .ok()
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true);
+
+    if !enabled {
+        return false;
+    }
+
+    match IoUring::new(8) {
+        Ok(_) => true,
+        Err(err) => {
+            warn!(
+                "io_uring unavailable for Standard direct writer, falling back to O_DIRECT blocking writes: {}",
+                err
+            );
+            false
+        }
+    }
+});
 
 struct AdaptiveIoGuard<'a> {
     _permit: tokio::sync::SemaphorePermit<'a>,
@@ -221,7 +256,120 @@ pub struct ListUploadsResponse {
 pub struct DirectWriter {
     file: Arc<fs::File>,
     write_buffer: AlignedBuffer,
+    next_offset: u64,
     write_task: Option<tokio::task::JoinHandle<Result<AlignedBuffer, std::io::Error>>>,
+}
+
+#[cfg(target_os = "linux")]
+fn write_all_at_blocking(file: &fs::File, buf: &[u8], offset: u64) -> io::Result<()> {
+    let mut written = 0usize;
+    while written < buf.len() {
+        let n = file.write_at(&buf[written..], offset + written as u64)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "write_at returned 0",
+            ));
+        }
+        written += n;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn write_all_at_blocking(file: &fs::File, buf: &[u8], offset: u64) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let mut cloned = file.try_clone()?;
+    cloned.seek(SeekFrom::Start(offset))?;
+    cloned.write_all(buf)
+}
+
+#[cfg(target_os = "linux")]
+fn write_all_at_io_uring(file: &fs::File, buf: &[u8], offset: u64) -> io::Result<()> {
+    let mut ring = IoUring::new(8)?;
+    let fd = types::Fd(file.as_raw_fd());
+    let mut written = 0usize;
+
+    while written < buf.len() {
+        let ptr = unsafe { buf.as_ptr().add(written) };
+        let len = (buf.len() - written) as u32;
+        let entry = opcode::Write::new(fd, ptr, len)
+            .offset(offset + written as u64)
+            .build()
+            .user_data(1);
+
+        unsafe {
+            ring.submission()
+                .push(&entry)
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring submission full"))?;
+        }
+
+        ring.submit_and_wait(1)?;
+        let cqe = ring
+            .completion()
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "io_uring completion missing"))?;
+        let result = cqe.result();
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(-result));
+        }
+        if result == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "io_uring write returned 0",
+            ));
+        }
+        written += result as usize;
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_all_direct(file: &fs::File, buf: &[u8], offset: u64) -> io::Result<()> {
+    if *IO_URING_ENABLED {
+        write_all_at_io_uring(file, buf, offset)
+    } else {
+        write_all_at_blocking(file, buf, offset)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn write_all_direct(file: &fs::File, buf: &[u8], offset: u64) -> io::Result<()> {
+    write_all_at_blocking(file, buf, offset)
+}
+
+#[cfg(target_os = "linux")]
+fn sync_file_direct(file: &fs::File) -> io::Result<()> {
+    if *IO_URING_ENABLED {
+        let mut ring = IoUring::new(8)?;
+        let entry = opcode::Fsync::new(types::Fd(file.as_raw_fd()))
+            .build()
+            .user_data(1);
+        unsafe {
+            ring.submission()
+                .push(&entry)
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring submission full"))?;
+        }
+        ring.submit_and_wait(1)?;
+        let cqe = ring
+            .completion()
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "io_uring completion missing"))?;
+        let result = cqe.result();
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(-result));
+        }
+        Ok(())
+    } else {
+        file.sync_all()
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sync_file_direct(file: &fs::File) -> io::Result<()> {
+    file.sync_all()
 }
 
 impl DirectWriter {
@@ -234,6 +382,7 @@ impl DirectWriter {
         Self {
             file: Arc::new(file),
             write_buffer: AlignedBuffer::new(aligned),
+            next_offset: 0,
             write_task: None,
         }
     }
@@ -265,12 +414,12 @@ impl DirectWriter {
         }
 
         let file = self.file.clone();
+        let offset = self.next_offset;
         let mut to_write = std::mem::replace(&mut self.write_buffer, AlignedBuffer::new(0));
+        self.next_offset = self.next_offset.saturating_add(to_write.len() as u64);
 
         let task = tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-            let mut f = &*file;
-            f.write_all(to_write.as_slice())?;
+            write_all_direct(&file, to_write.as_slice(), offset)?;
             to_write.clear();
             Ok::<AlignedBuffer, std::io::Error>(to_write)
         });
@@ -280,7 +429,7 @@ impl DirectWriter {
 
     pub async fn sync_data(&self) -> Result<(), std::io::Error> {
         let file = self.file.clone();
-        tokio::task::spawn_blocking(move || file.sync_all()).await?
+        tokio::task::spawn_blocking(move || sync_file_direct(&file)).await?
     }
 }
 
@@ -499,6 +648,255 @@ async fn read_part_meta_any(
     None
 }
 
+fn request_content_length(headers: &HeaderMap) -> Result<u64, AppError> {
+    headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or(AppError::BadRequest(
+            "Content-Length header required".into(),
+        ))
+}
+
+fn request_content_type(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or(v).trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+async fn write_part_blob_to_disk(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    version_id: &str,
+    part_index: u64,
+    content_length: u64,
+    body: Body,
+    expected_checksum: Option<&str>,
+    strict_durability: bool,
+) -> Result<PartMetadata, AppError> {
+    let data_shards = DATA_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
+    let parity_shards = PARITY_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
+    let total_shards = data_shards + parity_shards;
+
+    let block_size = STRIPE_SIZE_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or_else(default_stripe_size);
+
+    if block_size % 4096 != 0 {
+        return Err(AppError::InternalServerError(format!(
+            "stripe_size_bytes must be multiple of 4096 for O_DIRECT (got {})",
+            block_size
+        )));
+    }
+
+    let attempt_id = Ulid::new().to_string();
+    let stripe_data_width = block_size as u64 * data_shards as u64;
+    let stripe_count = (content_length + stripe_data_width - 1) / stripe_data_width;
+    let final_shard_len = stripe_count * block_size as u64;
+
+    let blob_roots = path_manager.get_blob_roots();
+    let num_disks = blob_roots.len();
+    if num_disks == 0 {
+        return Err(AppError::InternalServerError(
+            "No blob storage disks configured".into(),
+        ));
+    }
+
+    let mut writers: Vec<Option<DirectWriter>> = Vec::with_capacity(total_shards);
+    let mut tmp_paths: Vec<PathBuf> = Vec::with_capacity(total_shards);
+    let mut stable_paths: Vec<PathBuf> = Vec::with_capacity(total_shards);
+    let mut stable_names: Vec<String> = Vec::with_capacity(total_shards);
+    let mut successful_opens = 0usize;
+
+    for i in 0..total_shards {
+        let is_parity = i >= data_shards;
+        let ext = if is_parity {
+            PARITY_SUFFIX
+        } else {
+            SHARD_SUFFIX
+        };
+
+        let stable_name = format!("part_{}_shard_{}{}", part_index, i, ext);
+        let tmp_name = format!("{}.tmp.{}", stable_name, attempt_id);
+        let disk_idx = (part_index as usize + i) % num_disks;
+        let target_disk = &blob_roots[disk_idx];
+        let shard_dir = path_manager.get_shard_dir_on_disk(
+            target_disk,
+            &fragment.to_string(),
+            &version_id.to_string(),
+        );
+
+        let _ = tokio_fs::create_dir_all(&shard_dir).await;
+
+        let tmp_path = shard_dir.join(&tmp_name);
+        let stable_path = shard_dir.join(&stable_name);
+
+        match create_direct_file(&tmp_path).await {
+            Ok(file) => {
+                if strict_durability {
+                    let file_clone = file
+                        .try_clone()
+                        .map_err(|e| AppError::Io(e, "clone file handle".into()))?;
+                    let prealloc_result =
+                        tokio::task::spawn_blocking(move || file_clone.set_len(final_shard_len))
+                            .await;
+
+                    if let Ok(Ok(_)) = prealloc_result {
+                        writers.push(Some(DirectWriter::new(file)));
+                        successful_opens += 1;
+                    } else {
+                        writers.push(None);
+                    }
+                } else {
+                    writers.push(Some(DirectWriter::new(file)));
+                    successful_opens += 1;
+                }
+            }
+            Err(_) => writers.push(None),
+        }
+
+        tmp_paths.push(tmp_path);
+        stable_paths.push(stable_path);
+        stable_names.push(stable_name);
+    }
+
+    if successful_opens < data_shards {
+        cleanup_files_best_effort(&tmp_paths).await;
+        return Err(AppError::InternalServerError(format!(
+            "Insufficient healthy disks for write quorum. Need {}, got {}.",
+            data_shards, successful_opens
+        )));
+    }
+
+    let calc_total_checksum = expected_checksum.is_some();
+    let mut stream_writer = ErasureStreamWriter::new(
+        writers,
+        data_shards,
+        parity_shards,
+        final_shard_len as usize,
+        calc_total_checksum,
+        block_size,
+    )?;
+
+    let mut body_stream = body.into_data_stream();
+    let mut total_bytes_read = 0u64;
+
+    while let Some(chunk_result) = body_stream.next().await {
+        let chunk = chunk_result.map_err(|e| {
+            AppError::Io(
+                std::io::Error::new(std::io::ErrorKind::Other, e),
+                "stream read".into(),
+            )
+        })?;
+
+        if chunk.is_empty() {
+            continue;
+        }
+
+        total_bytes_read += chunk.len() as u64;
+        if total_bytes_read > content_length {
+            cleanup_files_best_effort(&tmp_paths).await;
+            return Err(AppError::BadRequest("Body exceeds Content-Length".into()));
+        }
+
+        stream_writer.write(&chunk).await?;
+    }
+
+    if total_bytes_read != content_length {
+        cleanup_files_best_effort(&tmp_paths).await;
+        return Err(AppError::BadRequest(format!(
+            "Incomplete body: got {} bytes, expected {}",
+            total_bytes_read, content_length
+        )));
+    }
+
+    stream_writer.finalize().await?;
+
+    if let Some(expected) = expected_checksum {
+        let calculated = stream_writer.get_total_checksum();
+        if let Some(calc_str) = calculated.as_ref() {
+            if !expected.eq_ignore_ascii_case(calc_str) {
+                cleanup_files_best_effort(&tmp_paths).await;
+                return Err(AppError::BadRequest("Checksum mismatch".into()));
+            }
+        }
+    }
+
+    let shard_checksums = stream_writer.get_shard_checksums();
+    let total_checksum = stream_writer.get_total_checksum();
+    let writers = stream_writer.into_writers();
+
+    if strict_durability {
+        let sync_futs = writers.into_iter().filter_map(|w_opt| {
+            w_opt.map(|w| async move {
+                if let Err(e) = w.sync_data().await {
+                    warn!("Failed to fsync shard: {}", e);
+                    return Err(AppError::Io(e, "fsync shard".into()));
+                }
+                Ok(())
+            })
+        });
+
+        let sync_results = join_all(sync_futs).await;
+        for r in sync_results {
+            if let Err(e) = r {
+                cleanup_files_best_effort(&tmp_paths).await;
+                return Err(e);
+            }
+        }
+    }
+
+    let mut dirs_to_sync: Vec<PathBuf> = Vec::new();
+    for i in 0..total_shards {
+        let expected_crc = shard_checksums.get(i).map(|s| s.as_str());
+        publish_one_shard(
+            tmp_paths[i].as_path(),
+            stable_paths[i].as_path(),
+            final_shard_len,
+            expected_crc,
+        )
+        .await?;
+
+        if let Some(parent) = stable_paths[i].parent() {
+            dirs_to_sync.push(parent.to_path_buf());
+        }
+    }
+
+    dirs_to_sync.sort();
+    dirs_to_sync.dedup();
+
+    if strict_durability {
+        let _ = join_all(dirs_to_sync.iter().map(|d| sync_dir(d.as_path()))).await;
+    }
+
+    let mut shards_info = Vec::with_capacity(total_shards);
+    for i in 0..total_shards {
+        shards_info.push(ShardInfo {
+            shard_index: i,
+            file_name: stable_names[i].clone(),
+            absolute_path: stable_paths[i].to_string_lossy().to_string(),
+            size_bytes: final_shard_len,
+            checksum: shard_checksums.get(i).cloned().unwrap_or_default(),
+            is_parity: i >= data_shards,
+        });
+    }
+
+    Ok(PartMetadata {
+        part_index,
+        size_bytes: total_bytes_read,
+        created_at: Utc::now().timestamp(),
+        checksum: if calc_total_checksum {
+            total_checksum
+        } else {
+            None
+        },
+        shards: shards_info,
+    })
+}
+
 async fn cleanup_files_best_effort(paths: &[PathBuf]) {
     let futs = paths.iter().cloned().map(|p| async move {
         let _ = tokio_fs::remove_file(&p).await;
@@ -662,15 +1060,7 @@ pub async fn initiate_object_upload(
         return Err(AppError::BadRequest("expected_parts must be >= 1".into()));
     }
 
-    if let Err(e) = try_reserve_quota(&fragment, params.total_size_bytes).await {
-        if let AppError::Unauthorized = e {
-            return Err(AppError::Forbidden(
-                "Fragment not initialized. Quota file missing.".into(),
-            ));
-        } else {
-            return Err(e);
-        }
-    }
+    ensure_capacity_available(params.total_size_bytes).await?;
 
     let version_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
@@ -700,7 +1090,6 @@ pub async fn initiate_object_upload(
     };
 
     if let Err(e) = index::open_session(&manifest, Some(receipt)).await {
-        let _ = update_quota(&fragment, -(params.total_size_bytes as i64)).await;
         return Err(AppError::InternalServerError(format!(
             "Failed to initialize partitioned session index: {}",
             e
@@ -836,29 +1225,7 @@ pub async fn object_upload_part(
     let strict_durability = durability_mode.strict();
 
     let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
-    let data_shards = DATA_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
-    let parity_shards = PARITY_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
-    let total_shards = data_shards + parity_shards;
-
-    let block_size = STRIPE_SIZE_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or_else(default_stripe_size);
-
-    if block_size % 4096 != 0 {
-        return Err(AppError::InternalServerError(format!(
-            "stripe_size_bytes must be multiple of 4096 for O_DIRECT (got {})",
-            block_size
-        )));
-    }
-
-    let content_length = headers
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .ok_or(AppError::BadRequest(
-            "Content-Length header required".into(),
-        ))?;
+    let content_length = request_content_length(&headers)?;
 
     if content_length > max_part_size {
         return Ok((StatusCode::PAYLOAD_TOO_LARGE, "Part too large").into_response());
@@ -899,229 +1266,25 @@ pub async fn object_upload_part(
         return Ok((StatusCode::OK, "Part already uploaded").into_response());
     }
 
-    let attempt_id = Ulid::new().to_string();
-
-    let fragment_arc = Arc::new(fragment);
-    let version_id_arc = Arc::new(version_id);
-    let path_manager = Arc::new(path_manager);
-
-    let stripe_data_width = block_size as u64 * data_shards as u64;
-    let stripe_count = (content_length + stripe_data_width - 1) / stripe_data_width;
-    let final_shard_len = stripe_count * block_size as u64;
-
-    let blob_roots = path_manager.get_blob_roots();
-    let num_disks = blob_roots.len();
-    if num_disks == 0 {
-        return Err(AppError::InternalServerError(
-            "No blob storage disks configured".into(),
-        ));
-    }
-
-    let mut writers: Vec<Option<DirectWriter>> = Vec::with_capacity(total_shards);
-
-    let mut tmp_paths: Vec<PathBuf> = Vec::with_capacity(total_shards);
-    let mut stable_paths: Vec<PathBuf> = Vec::with_capacity(total_shards);
-    let mut stable_names: Vec<String> = Vec::with_capacity(total_shards);
-
-    let mut successful_opens = 0usize;
-
-    for i in 0..total_shards {
-        let is_parity = i >= data_shards;
-        let ext = if is_parity {
-            PARITY_SUFFIX
-        } else {
-            SHARD_SUFFIX
-        };
-
-        let stable_name = format!("part_{}_shard_{}{}", part_index, i, ext);
-        let tmp_name = format!("{}.tmp.{}", stable_name, attempt_id);
-
-        let disk_idx = (part_index as usize + i) % num_disks;
-        let target_disk = &blob_roots[disk_idx];
-
-        let shard_dir =
-            path_manager.get_shard_dir_on_disk(target_disk, &fragment_arc, &version_id_arc);
-
-        let _ = tokio_fs::create_dir_all(&shard_dir).await;
-
-        let tmp_path = shard_dir.join(&tmp_name);
-        let stable_path = shard_dir.join(&stable_name);
-
-        match create_direct_file(&tmp_path).await {
-            Ok(file) => {
-                if strict_durability {
-                    let file_clone = file
-                        .try_clone()
-                        .map_err(|e| AppError::Io(e, "clone file handle".into()))?;
-                    let prealloc_result =
-                        tokio::task::spawn_blocking(move || file_clone.set_len(final_shard_len))
-                            .await;
-
-                    if let Ok(Ok(_)) = prealloc_result {
-                        writers.push(Some(DirectWriter::new(file)));
-                        successful_opens += 1;
-                    } else {
-                        writers.push(None);
-                    }
-                } else {
-                    writers.push(Some(DirectWriter::new(file)));
-                    successful_opens += 1;
-                }
-            }
-            Err(_) => {
-                writers.push(None);
-            }
-        }
-
-        tmp_paths.push(tmp_path);
-        stable_paths.push(stable_path);
-        stable_names.push(stable_name);
-    }
-
-    if successful_opens < data_shards {
-        cleanup_files_best_effort(&tmp_paths).await;
-        return Err(AppError::InternalServerError(format!(
-            "Insufficient healthy disks for write quorum. Need {}, got {}.",
-            data_shards, successful_opens
-        )));
-    }
-
-    let calc_total_checksum = expected_checksum.is_some();
-
-    let mut stream_writer = ErasureStreamWriter::new(
-        writers,
-        data_shards,
-        parity_shards,
-        final_shard_len as usize,
-        calc_total_checksum,
-        block_size,
-    )?;
-
-    let mut body_stream = body.into_data_stream();
-    let mut total_bytes_read = 0u64;
-
-    while let Some(chunk_result) = body_stream.next().await {
-        let chunk = chunk_result.map_err(|e| {
-            AppError::Io(
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-                "stream read".into(),
-            )
-        })?;
-
-        if chunk.is_empty() {
-            continue;
-        }
-
-        total_bytes_read += chunk.len() as u64;
-
-        if total_bytes_read > content_length {
-            cleanup_files_best_effort(&tmp_paths).await;
-            return Err(AppError::BadRequest("Body exceeds Content-Length".into()));
-        }
-
-        stream_writer.write(&chunk).await?;
-    }
-
-    if total_bytes_read != content_length {
-        cleanup_files_best_effort(&tmp_paths).await;
-        return Err(AppError::BadRequest(format!(
-            "Incomplete body: got {} bytes, expected {}",
-            total_bytes_read, content_length
-        )));
-    }
-
-    stream_writer.finalize().await?;
-
-    if let Some(expected) = expected_checksum {
-        let calculated = stream_writer.get_total_checksum();
-        if let Some(calc_str) = calculated.as_ref() {
-            if !expected.eq_ignore_ascii_case(calc_str) {
-                cleanup_files_best_effort(&tmp_paths).await;
-                return Ok((StatusCode::BAD_REQUEST, "Checksum mismatch").into_response());
-            }
-        }
-    }
-
-    let shard_checksums = stream_writer.get_shard_checksums();
-    let total_checksum = stream_writer.get_total_checksum();
-    let writers = stream_writer.into_writers();
-
-    if strict_durability {
-        let sync_futs = writers.into_iter().filter_map(|w_opt| {
-            w_opt.map(|w| async move {
-                if let Err(e) = w.sync_data().await {
-                    warn!("Failed to fsync shard: {}", e);
-                    return Err(AppError::Io(e, "fsync shard".into()));
-                }
-                Ok(())
-            })
-        });
-
-        let sync_results = join_all(sync_futs).await;
-        for r in sync_results {
-            if let Err(e) = r {
-                cleanup_files_best_effort(&tmp_paths).await;
-                return Err(e);
-            }
-        }
-    }
-
-    let mut dirs_to_sync: Vec<PathBuf> = Vec::new();
-
-    for i in 0..total_shards {
-        let expected_crc = shard_checksums.get(i).map(|s| s.as_str());
-
-        publish_one_shard(
-            tmp_paths[i].as_path(),
-            stable_paths[i].as_path(),
-            final_shard_len,
-            expected_crc,
-        )
-        .await?;
-
-        if let Some(parent) = stable_paths[i].parent() {
-            dirs_to_sync.push(parent.to_path_buf());
-        }
-    }
-
-    dirs_to_sync.sort();
-    dirs_to_sync.dedup();
-
-    if strict_durability {
-        let _ = join_all(dirs_to_sync.iter().map(|d| sync_dir(d.as_path()))).await;
-    }
-
-    let mut shards_info = Vec::with_capacity(total_shards);
-    for i in 0..total_shards {
-        shards_info.push(ShardInfo {
-            shard_index: i,
-            file_name: stable_names[i].clone(),
-            absolute_path: stable_paths[i].to_string_lossy().to_string(),
-            size_bytes: final_shard_len,
-            checksum: shard_checksums.get(i).cloned().unwrap_or_default(),
-            is_parity: i >= data_shards,
-        });
-    }
-
-    let part_meta = PartMetadata {
+    let part_meta = write_part_blob_to_disk(
+        &path_manager,
+        &fragment,
+        &version_id,
         part_index,
-        size_bytes: total_bytes_read,
-        created_at: Utc::now().timestamp(),
-        checksum: if calc_total_checksum {
-            total_checksum
-        } else {
-            None
-        },
-        shards: shards_info,
-    };
+        content_length,
+        body,
+        expected_checksum,
+        strict_durability,
+    )
+    .await?;
 
     let meta_bytes = rmp_serde::to_vec(&part_meta)
         .map_err(|e| AppError::InternalServerError(format!("Serialize part meta: {}", e)))?;
 
     let committed = commit_part_meta_lockless(
         &path_manager,
-        &fragment_arc,
-        &version_id_arc,
+        &fragment,
+        &version_id,
         part_index,
         &meta_bytes,
         strict_durability,
@@ -1135,26 +1298,141 @@ pub async fn object_upload_part(
     Ok((StatusCode::OK, "Part uploaded").into_response())
 }
 
+pub async fn upload_object_one_shot(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    headers: HeaderMap,
+    AxumPath((fragment, object_key)): AxumPath<(String, String)>,
+    Query(query): Query<UploadPartQuery>,
+    body: Body,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+
+    let io_gate_enabled = query.io_gate.unwrap_or_else(|| {
+        UPLOAD_IO_GATE_ENABLED_ATOMIC
+            .get()
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(true)
+    });
+    let _io_guard = if io_gate_enabled {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            acquire_adaptive_io_guard(),
+        )
+        .await
+        {
+            Ok(Ok(guard)) => Some(guard),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                warn!(
+                    "One-shot upload IO gate wait timed out (fragment={}, object_key={}); proceeding ungated",
+                    fragment, object_key
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let durability_mode = parse_upload_durability_mode(&query);
+    let strict_durability = durability_mode.strict();
+    let content_length = request_content_length(&headers)?;
+    let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
+    if content_length > max_part_size {
+        return Ok((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Object too large for one-shot upload",
+        )
+            .into_response());
+    }
+
+    ensure_capacity_available(content_length).await?;
+
+    let version_id = Ulid::new().to_string();
+    let session_id = Ulid::new().to_string();
+    let had_live_before = matches!(get_metadata(&fragment, &object_key, &fragment).await, Ok(meta) if !meta.is_delete_marker);
+    let expected_checksum = query
+        .checksum
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let content_type =
+        request_content_type(&headers).unwrap_or_else(|| "application/octet-stream".to_string());
+
+    let path_manager = ObjectPathManager::new();
+    let part_meta = write_part_blob_to_disk(
+        &path_manager,
+        &fragment,
+        &version_id,
+        0,
+        content_length,
+        body,
+        expected_checksum,
+        strict_durability,
+    )
+    .await?;
+
+    let stripe_size = STRIPE_SIZE_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or_else(default_stripe_size);
+
+    let object_meta = ObjectMetadata {
+        object_key: object_key.clone(),
+        fragment: fragment.clone(),
+        version_id: version_id.clone(),
+        upload_session_id: session_id,
+        owner_uid: fragment.clone(),
+        content_type,
+        total_size_bytes: content_length,
+        created_at: Utc::now().timestamp(),
+        parts: vec![part_meta],
+        is_delete_marker: false,
+        stripe_size_bytes: stripe_size,
+    };
+
+    index::publish_object(&object_meta).await?;
+
+    let index_roots = path_manager.get_all_index_roots();
+    write_prefix_segments_on_roots(
+        &index_roots,
+        &object_meta,
+        if had_live_before { 0 } else { 1 },
+    )
+    .await?;
+    schedule_prefix_compaction(
+        fragment.clone(),
+        prefixes_for_key(&object_key).into_iter().collect(),
+    );
+
+    let stripped_meta = ObjectMetadata {
+        parts: Vec::new(),
+        ..object_meta.clone()
+    };
+    state.emit(&fragment, StorageEventPayload::FileUploaded(stripped_meta));
+
+    Ok((StatusCode::CREATED, AxumJson(json!(object_meta))).into_response())
+}
+
 async fn write_prefix_segments_on_roots(
     index_roots: &[PathBuf],
-    fragment: &str,
-    object_key: &str,
-    version_id: &str,
-    created_at: i64,
+    metadata: &ObjectMetadata,
     child_count_delta: i64,
 ) -> Result<(), AppError> {
-    let prefixes = prefixes_for_key(object_key);
+    let prefixes = prefixes_for_key(&metadata.object_key);
     let mut any_ok = false;
+    let entry = PrefixIndexEntry::from_metadata(metadata);
 
     for prefix in prefixes {
         let seg = PrefixIndexSegment {
             prefix: prefix.clone(),
-            entries: vec![PrefixIndexEntry {
-                object_key: object_key.to_string(),
-                version_id: version_id.to_string(),
-                created_at,
-                is_delete_marker: false,
-            }],
+            entries: vec![entry.clone()],
         };
 
         let bytes = rmp_serde::to_vec(&seg).map_err(|e| {
@@ -1164,13 +1442,13 @@ async fn write_prefix_segments_on_roots(
         let ph = ObjectPathManager::prefix_hash(&prefix);
         let p1 = &ph[0..2];
         let p2 = &ph[2..4];
-        let file = format!("seg_{}{}", version_id, PREFIX_SEGMENT_EXT);
+        let file = format!("seg_{}{}", metadata.version_id, PREFIX_SEGMENT_EXT);
 
         let mut wrote_this_prefix = false;
 
         for root in index_roots {
             let p = root
-                .join(fragment)
+                .join(&metadata.fragment)
                 .join("index")
                 .join(PREFIX_INDEX_DIR)
                 .join(PREFIX_INDEX_VERSION)
@@ -1203,15 +1481,10 @@ async fn write_prefix_segments_on_roots(
     let path_manager = ObjectPathManager::new();
     write_delimiter_delta(
         &path_manager,
-        fragment,
-        object_key,
-        version_id,
-        Some(PrefixIndexEntry {
-            object_key: object_key.to_string(),
-            version_id: version_id.to_string(),
-            created_at,
-            is_delete_marker: false,
-        }),
+        &metadata.fragment,
+        &metadata.object_key,
+        &metadata.version_id,
+        Some(entry),
         child_count_delta,
     )
     .await?;
@@ -1354,10 +1627,7 @@ pub async fn finalize_object_upload(
     let index_roots = path_manager.get_all_index_roots();
     write_prefix_segments_on_roots(
         &index_roots,
-        &fragment,
-        &object_key,
-        &version_id,
-        object_meta.created_at,
+        &object_meta,
         if had_live_before { 0 } else { 1 },
     )
     .await?;
@@ -1368,18 +1638,6 @@ pub async fn finalize_object_upload(
     );
 
     let _ = index::remove_session(&fragment, &version_id, "finalized").await;
-
-    let reserved_size = manifest
-        .as_ref()
-        .map(|m| m.total_size_bytes as i64)
-        .unwrap_or(params.total_size_bytes as i64);
-
-    let actual_size = total_size_calculated as i64;
-    let delta = actual_size - reserved_size;
-
-    if delta != 0 {
-        update_quota(&fragment, delta).await?;
-    }
 
     let stripped_meta = ObjectMetadata {
         parts: Vec::new(),
@@ -1413,22 +1671,8 @@ pub async fn cancel_upload_session(
         ));
     }
 
-    let mut refund_amount = 0u64;
-    if let Some(state) = index::load_session(&fragment, &version_id).await? {
-        refund_amount = state.reservation.map(|r| r.amount).unwrap_or(0);
-    }
-
     cleanup_blob_tmp_attempt_files_for_version(&path_manager, &fragment, &version_id).await;
     let _ = index::remove_session(&fragment, &version_id, "cancelled").await;
-
-    if refund_amount > 0 {
-        if let Err(e) = update_quota(&fragment, -(refund_amount as i64)).await {
-            error!(
-                "Failed to refund quota for cancelled upload {}: {}",
-                fragment, e
-            );
-        }
-    }
 
     Ok(StatusCode::NO_CONTENT)
 }

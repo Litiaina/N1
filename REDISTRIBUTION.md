@@ -2,7 +2,7 @@
 
 > Deployment profile status (2026-03-09):
 > - `standard` is stable and default for redistribution operations.
-> - `arc` is stable at `0.2.0` for raw-device redistribution operations.
+> - `arc` is experimental for raw-device redistribution operations.
 > - See `DEPLOYMENT_PROFILES.md`.
 
 This document reflects the current redistribution engine and API behavior in N1.

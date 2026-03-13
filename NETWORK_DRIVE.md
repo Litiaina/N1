@@ -2,7 +2,7 @@
 
 > Deployment profile status (2026-03-09):
 > - `standard` (`litiaina-n1-standard`) is the stable/default profile.
-> - `arc` (`litiaina-n1-arc`) is stable at `0.2.0`.
+> - `arc` (`litiaina-n1-arc`) is experimental.
 > - See `DEPLOYMENT_PROFILES.md`.
 
 This guide covers both ways to expose N1 as a network drive:

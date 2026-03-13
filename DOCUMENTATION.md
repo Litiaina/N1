@@ -9,26 +9,29 @@
   <p>Complete route reference and usage guide (current implementation).</p>
 </div>
 
-> Deployment profile status (2026-03-09):
+> Deployment profile status (2026-03-13):
 > - `standard` is stable and default.
-> - `arc` is stable at `0.2.0` for raw-device deployments.
+> - `standard` is released at `0.5.1`.
+> - `arc` is experimental for raw-device deployments.
 > - See `DEPLOYMENT_PROFILES.md`.
 >
 > Source of truth for routing (`standard`): `standard/src/routes/storage_routes.rs`.
 > Arc route path: `arc/src/routes/storage_routes.rs`.
 > Source of truth for request/response behavior is profile-specific (`standard/src/n1_core` and `arc/src/n1_core`).
+> - unless explicitly labeled otherwise, the route descriptions below document the stable `standard` runtime first
 > Arc route scope note:
 > - Arc serves v4 object/maintenance APIs and does not expose legacy `/dir/*` routes.
 > - Arc also does not expose `/authenticate/fs`.
 
 > Storage backend note:
 > - `standard` (stable): `index_store_disks` and `blob_store_disks` are mounted filesystem paths (directory roots).
-> - `arc` (stable raw-kernel): `index_store_disks` and `blob_store_disks` are raw, unformatted, unmounted device paths managed directly by N1.
-> - Direct I/O (`O_DIRECT`) is used on the blob write path where supported, but payload substrate differs by profile (filesystem files in standard, raw extents in arc).
+> - `arc` (experimental raw-device): `index_store_disks` and `blob_store_disks` are raw, unformatted, unmounted device paths managed directly by N1.
+> - `standard` prefers Linux `io_uring` on the blob write path when available and falls back to `O_DIRECT` + blocking writes when it is not.
+> - Payload substrate still differs by profile (filesystem files in standard, raw extents in arc).
 
 > Engine profile note:
 > - `standard` is the stable/default profile for general-purpose filesystem-backed deployments.
-> - `arc` is the stable raw-kernel profile for raw-device absolute control and maximum performance.
+> - `arc` is the experimental raw-device profile for absolute device control and maximum performance ceiling.
 > - Both variants are intended to keep the same object/API semantics; the difference is backend execution model and operations envelope.
 
 > Metadata architecture note:
@@ -45,7 +48,7 @@
 > - Multipart uploads do not rely on in-memory part state for resumability. Part commits are durably recorded in the `index` WAL/session state and mirrored as per-part metadata files for compatibility and recovery workflows.
 
 > Release status note:
-> - N1 `standard` is stable at `0.4.0`; `arc` is stable at `0.2.0`.
+> - N1 `standard` is stable at `0.5.1`; `arc` is experimental.
 > - This document describes the current implementation and current routes.
 > - Request/response details and endpoint layout may still change before `1.0.0` even though the underlying storage model is now fixed.
 
@@ -53,7 +56,7 @@
 
 | Dimension | Standard (`litiaina-n1-standard`) | Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / default | Stable / raw-kernel profile |
+| Status | Stable / default (`0.5.1`) | Experimental / raw-device profile |
 | API source of truth | Yes (`standard/src/routes/storage_routes.rs`) | Yes (`arc/src/routes/storage_routes.rs`) |
 | `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw devices / loopback files |
@@ -78,7 +81,7 @@ payload address: raw://{device_id}/{allocation_id}
 
 Arc index note:
 - Arc index and blob are both raw block-manager media.
-- Arc is stable at `0.2.0`.
+- Arc is experimental.
 
 ## 1. Base URL And Conventions
 - Base URL example: `https://127.0.0.1:50001`
@@ -245,11 +248,14 @@ curl -k -X POST "https://127.0.0.1:50001/v4/fragment/create" \
   -H "Content-Type: application/json" \
   -d '{
     "name":"tenant-a",
-    "quota":1099511627776,
     "secret":"<master_key>",
     "key":"<fragment_key>"
   }'
 ```
+
+Notes:
+- Fragment creation no longer requires or persists a per-fragment quota field.
+- Live storage monitoring and `/v4/capacity/usage` report real filesystem totals for the current node.
 
 ### 5.6 `GET /v4/public/share`
 No bearer token required. Query is signature-based.
@@ -267,12 +273,23 @@ curl -k "https://127.0.0.1:50001/v4/public/share?fragment=<f>&object_key=<k>&exp
 
 ## 6. Protected v4 Read APIs
 All endpoints in this section require a valid fragment JWT with `read=true`.
+For claim-scoped object APIs below, the fragment comes from the JWT claim and is not passed in the path.
 
-### 6.1 `GET /v4/capacity/usage/{fragment}`
-Returns fragment capacity usage.
+### 6.1 `GET /v4/capacity/usage`
+Returns live filesystem capacity totals visible to the current `standard` node.
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/capacity/usage/<fragment_hash>"
+  "https://127.0.0.1:50001/v4/capacity/usage"
+```
+
+Response shape:
+```json
+{
+  "capacity_used": 123456789,
+  "capacity_allocated": 999999999,
+  "capacity_available": 876543210,
+  "filesystem_count": 2
+}
 ```
 
 ### 6.2 `GET /v4/fragment/list`
@@ -282,7 +299,7 @@ curl -k -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/list"
 ```
 
-### 6.3 `GET /v4/fragment/objects/{fragment}`
+### 6.3 `GET /v4/fragment/objects`
 Query:
 - `limit` default `100`, max `1000`
 - `continuation_token` optional
@@ -305,10 +322,10 @@ Response shape (`ListObjectsResult`):
 
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/fragment/objects/<fragment_hash>?prefix=videos/2026&delimiter=/&limit=200"
+  "https://127.0.0.1:50001/v4/fragment/objects?prefix=videos/2026&delimiter=/&limit=200"
 ```
 
-### 6.4 `GET /v4/fragment/trash/{fragment}`
+### 6.4 `GET /v4/fragment/trash`
 Trash listing, same pagination style.
 - Supports the same `include_internal` query behavior as object listing.
 - Trash visibility comes from `index` trash state.
@@ -316,54 +333,54 @@ Trash listing, same pagination style.
 - `continuation_token` is opaque. For delimiter trash listing it is a row cursor, so clients must pass it through unchanged.
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/fragment/trash/<fragment_hash>?limit=100"
+  "https://127.0.0.1:50001/v4/fragment/trash?limit=100"
 ```
 
-### 6.5 `GET /v4/fragment/versions/{fragment}/{*object_key}`
+### 6.5 `GET /v4/fragment/versions/{*object_key}`
 Lists versions for one object key.
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/fragment/versions/<fragment_hash>/videos/a.mp4"
+  "https://127.0.0.1:50001/v4/fragment/versions/videos/a.mp4"
 ```
 
-### 6.6 `GET /v4/fragment/get/{fragment}/{*object_key}`
+### 6.6 `GET /v4/fragment/get/{*object_key}`
 Inline object response. Supports range.
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
   -H "Range: bytes=0-1048575" \
-  "https://127.0.0.1:50001/v4/fragment/get/<fragment_hash>/videos/a.mp4" \
+  "https://127.0.0.1:50001/v4/fragment/get/videos/a.mp4" \
   -o part.bin
 ```
 
-### 6.7 `GET /v4/fragment/stream/{fragment}/{*object_key}`
+### 6.7 `GET /v4/fragment/stream/{*object_key}`
 Streaming variant. Supports range.
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
   -H "Range: bytes=0-1048575" \
-  "https://127.0.0.1:50001/v4/fragment/stream/<fragment_hash>/videos/a.mp4" \
+  "https://127.0.0.1:50001/v4/fragment/stream/videos/a.mp4" \
   -o stream.bin
 ```
 
-### 6.8 `GET /v4/fragment/meta/{fragment}/{*object_key}`
+### 6.8 `GET /v4/fragment/meta/{*object_key}`
 Returns full object metadata.
 - Metadata is resolved from authoritative `index` state.
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/fragment/meta/<fragment_hash>/videos/a.mp4"
+  "https://127.0.0.1:50001/v4/fragment/meta/videos/a.mp4"
 ```
 
-### 6.9 `GET /v4/fragment/download/{fragment}`
+### 6.9 `GET /v4/fragment/download`
 Query:
 - `object_key` required
 - `version_id` optional
 
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/fragment/download/<fragment_hash>?object_key=videos/a.mp4" \
+  "https://127.0.0.1:50001/v4/fragment/download?object_key=videos/a.mp4" \
   -o a.mp4
 ```
 
-### 6.10 `GET /v4/fragment/download/chunk/{fragment}`
+### 6.10 `GET /v4/fragment/download/chunk`
 Query:
 - `object_key` required
 - `offset` required
@@ -371,11 +388,11 @@ Query:
 
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/fragment/download/chunk/<fragment_hash>?object_key=videos/a.mp4&offset=0&chunk_size=1048576" \
+  "https://127.0.0.1:50001/v4/fragment/download/chunk?object_key=videos/a.mp4&offset=0&chunk_size=1048576" \
   -o chunk.bin
 ```
 
-### 6.11 `POST /v4/fragment/archive/{fragment}`
+### 6.11 `POST /v4/fragment/archive`
 Purpose:
 - Streams selected objects as `tar` or `zip`.
 - Memory bounded; does not materialize whole archive in RAM.
@@ -388,7 +405,7 @@ Behavior:
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  "https://127.0.0.1:50001/v4/fragment/archive/<fragment_hash>" \
+  "https://127.0.0.1:50001/v4/fragment/archive" \
   -d '{
     "prefix":"videos/2026",
     "delimiter":"/",
@@ -425,7 +442,6 @@ curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
 ### 7.2 `PATCH /v4/fragment/modify/{fragment}`
 Body fields:
 - `new_name` optional
-- `new_quota` optional
 - `new_key` optional
 - `secret` optional (master secret for admin-level actions)
 
@@ -433,17 +449,17 @@ Body fields:
 curl -k -X PATCH -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   "https://127.0.0.1:50001/v4/fragment/modify/<fragment_hash>" \
-  -d '{"new_quota":2199023255552}'
+  -d '{"new_key":"<new_fragment_key>"}'
 ```
 
-### 7.3 `DELETE /v4/fragment/trash/empty/{fragment}`
+### 7.3 `DELETE /v4/fragment/trash/empty`
 ```bash
 curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/fragment/trash/empty/<fragment_hash>"
+  "https://127.0.0.1:50001/v4/fragment/trash/empty"
 ```
 Notes:
 - Empty-trash clears partition trash metadata and removes `.trash` roots directly (`remove_dir_all`) for O(1)-style namespace purge on filesystem-backed standard.
-- Quota refund uses a pre-clear snapshot of partition trash metadata.
+- No quota-led refund pass is required for the live monitoring model.
 
 ### 7.4 `PATCH /v4/fragment/object/rename`
 Body (`RenameObjectRequest`):
@@ -463,49 +479,49 @@ curl -k -X PATCH -H "Authorization: Bearer $TOKEN" \
   -d '{"source_fragment":"<f>","source_key":"a.bin","destination_fragment":"<f>","destination_key":"b.bin"}'
 ```
 
-### 7.5 `DELETE /v4/fragment/object/delete/{fragment}/{*object_key}`
-Soft delete (trash marker flow).
+### 7.5 `DELETE /v4/fragment/object/delete/{*object_key}`
+Soft delete (move to trash flow).
 ```bash
 curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/fragment/object/delete/<fragment_hash>/videos/a.mp4"
+  "https://127.0.0.1:50001/v4/fragment/object/delete/videos/a.mp4"
 ```
 
-### 7.6 `DELETE /v4/fragment/version/delete/{fragment}/{version_id}/{*object_key}`
+### 7.6 `DELETE /v4/fragment/version/delete/{version_id}/{*object_key}`
 Delete specific version.
 - If the version is live, it is soft-deleted into trash.
 - If the same version is already in trash, the delete permanently removes only that trashed version and leaves newer live versions untouched.
 ```bash
 curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/fragment/version/delete/<fragment_hash>/<version_id>/videos/a.mp4"
+  "https://127.0.0.1:50001/v4/fragment/version/delete/<version_id>/videos/a.mp4"
 ```
 
-### 7.7 `DELETE /v4/fragment/permanent/delete/{fragment}/{*object_key}`
+### 7.7 `DELETE /v4/fragment/permanent/delete/{*object_key}`
 Permanent delete.
 ```bash
 curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/fragment/permanent/delete/<fragment_hash>/videos/a.mp4"
+  "https://127.0.0.1:50001/v4/fragment/permanent/delete/videos/a.mp4"
 ```
 
-### 7.8 `POST /v4/fragment/recover/version/{fragment}/{version_id}/{*object_key}`
+### 7.8 `POST /v4/fragment/recover/version/{version_id}/{*object_key}`
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/fragment/recover/version/<fragment_hash>/<version_id>/videos/a.mp4"
+  "https://127.0.0.1:50001/v4/fragment/recover/version/<version_id>/videos/a.mp4"
 ```
 
-### 7.9 `POST /v4/fragment/recover/object/{fragment}/{*object_key}`
+### 7.9 `POST /v4/fragment/recover/object/{*object_key}`
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/fragment/recover/object/<fragment_hash>/videos/a.mp4"
+  "https://127.0.0.1:50001/v4/fragment/recover/object/videos/a.mp4"
 ```
 
-### 7.10 `POST /v4/fragment/recover/trash/all/{fragment}`
+### 7.10 `POST /v4/fragment/recover/trash/all`
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/fragment/recover/trash/all/<fragment_hash>"
+  "https://127.0.0.1:50001/v4/fragment/recover/trash/all"
 ```
 Notes:
 - Recover-all restores from authoritative partition trash metadata and moves `.trash/blob/{version}` back to live blob dirs per version.
-- Delete markers are purged per recovered key so recovered objects become immediately visible in live listing/read paths.
+- Recovery follows direct move semantics; there is no quota-led refund/re-reserve pass.
 
 ## 8. Protected v4 Upload APIs (Resumable Object Storage Upload)
 
@@ -516,7 +532,7 @@ Notes:
 4. Finalize
 5. Optional cancel
 
-### 8.1 `POST /v4/upload/init/{fragment}/{*object_key}`
+### 8.1 `POST /v4/upload/init/{*object_key}`
 Body:
 - `content_type` optional
 - `total_size_bytes` required
@@ -532,11 +548,38 @@ Behavior:
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  "https://127.0.0.1:50001/v4/upload/init/<fragment_hash>/videos/a.mp4" \
+  "https://127.0.0.1:50001/v4/upload/init/videos/a.mp4" \
   -d '{"content_type":"video/mp4","total_size_bytes":1073741824,"expected_parts":256,"part_size_bytes":4194304}'
 ```
 
-### 8.2 `PUT /v4/upload/chunk/{fragment}/{version_id}/{part_index}`
+### 8.2 `POST /v4/upload/one-shot/{*object_key}` (standard)
+Direct single-request upload for small objects. This path skips upload session creation, part tracking, and finalize.
+
+Headers:
+- `Content-Type` optional
+- `Content-Length` required
+
+Query:
+- `checksum` optional
+- `durability` optional: `strict|sync|durable|batched|async|fast|relaxed`
+- `strict_durability` optional bool fallback (`true|false`)
+- `io_gate` optional bool (`true|false`)
+
+Behavior:
+- Validates fragment scope and request size.
+- Writes shard payload once.
+- Publishes final metadata and latest immediately.
+- Leaves no active upload session behind.
+
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/octet-stream" \
+  -H "Content-Length: 8192" \
+  "https://127.0.0.1:50001/v4/upload/one-shot/tiny.bin?durability=batched&io_gate=false" \
+  --data-binary @tiny.bin
+```
+
+### 8.3 `PUT /v4/upload/chunk/{version_id}/{part_index}`
 Requirements:
 - `Content-Length` header required
 - query `checksum` optional
@@ -560,21 +603,21 @@ Notes:
 ```bash
 curl -k -X PUT -H "Authorization: Bearer $TOKEN" \
   -H "Content-Length: 4194304" \
-  "https://127.0.0.1:50001/v4/upload/chunk/<fragment_hash>/<version_id>/0?checksum=<optional_crc_or_hash>&durability=batched&io_gate=false" \
+  "https://127.0.0.1:50001/v4/upload/chunk/<version_id>/0?checksum=<optional_crc_or_hash>&durability=batched&io_gate=false" \
   --data-binary @part-000.bin
 ```
 
-### 8.3 `GET /v4/upload/status/{fragment}/{version_id}`
+### 8.4 `GET /v4/upload/status/{version_id}`
 Behavior:
 - Reads the routed upload manifest and committed part set from `index` session state (with disk metadata fallback when needed).
 - Returns committed part indexes plus committed byte/part counters for resumability checks.
 
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/upload/status/<fragment_hash>/<version_id>"
+  "https://127.0.0.1:50001/v4/upload/status/<version_id>"
 ```
 
-### 8.4 `GET /v4/upload/status/list/{fragment}`
+### 8.5 `GET /v4/upload/status/list`
 Query:
 - `limit` default 50, max 100
 - `offset` default 0
@@ -585,10 +628,10 @@ Behavior:
 
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/upload/status/list/<fragment_hash>?limit=50&offset=0"
+  "https://127.0.0.1:50001/v4/upload/status/list?limit=50&offset=0"
 ```
 
-### 8.5 `POST /v4/upload/finalize/{fragment}/{version_id}/{session_id}`
+### 8.6 `POST /v4/upload/finalize/{version_id}/{session_id}`
 Behavior:
 - Loads the authoritative upload session from `index`.
 - Verifies committed parts from session state (with disk metadata fallback for legacy sessions) and publishes the immutable object version into the object's `index` partition.
@@ -598,39 +641,32 @@ Behavior:
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  "https://127.0.0.1:50001/v4/upload/finalize/<fragment_hash>/<version_id>/<session_id>" \
+  "https://127.0.0.1:50001/v4/upload/finalize/<version_id>/<session_id>" \
   -d '{"content_type":"video/mp4","total_size_bytes":1073741824,"expected_parts":256}'
 ```
 
-### 8.6 `DELETE /v4/upload/cancel/{fragment}/{version_id}`
+### 8.7 `DELETE /v4/upload/cancel/{version_id}`
 Response:
 - `204 No Content` on successful cancel.
 - If already finalized, returns conflict.
 
 ```bash
 curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/upload/cancel/<fragment_hash>/<version_id>"
+  "https://127.0.0.1:50001/v4/upload/cancel/<version_id>"
 ```
 
 ## 9. Protected v4 Maintenance APIs
 
-### 9.1 Quota/metadata sync endpoints
-- `POST /v4/maintenance/sync/global`
-- `POST /v4/maintenance/sync/fragment`
+### 9.1 Fragment bootstrap / cleanup endpoints
 - `POST /v4/maintenance/cleanup/fragment`
 - `POST /v4/maintenance/init/fragment`
 
 Notes:
-- Sync and cleanup recompute live and trash usage from authoritative `index` state.
-- Quota-file mirrors remain persisted state, but they are no longer the hot-path authority for object truth.
+- `cleanup/fragment` removes orphaned blob directories and reconciles fragment metadata shape.
+- `init/fragment` ensures fragment blob directories exist and clears stale `.gc` files.
+- Live storage monitoring and `/v4/capacity/usage` use current filesystem totals.
 
 ```bash
-curl -k -X POST -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/maintenance/sync/global"
-
-curl -k -X POST -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/maintenance/sync/fragment"
-
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/maintenance/cleanup/fragment"
 
@@ -894,8 +930,8 @@ curl -k -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/maintenance/repair/status"
 ```
 6. Confirm read path integrity for one known object using both endpoints:
-- `GET /v4/fragment/get/{fragment}/{object_key}`
-- `GET /v4/fragment/stream/{fragment}/{object_key}`
+- `GET /v4/fragment/get/{object_key}`
+- `GET /v4/fragment/stream/{object_key}`
 - Compare client-side SHA256 with expected.
 
 ## 10. WebSocket APIs
@@ -1173,41 +1209,40 @@ Recommended starting points:
 - `GET /v4/public/share`
 
 ### Protected v4 read
-- `GET /v4/capacity/usage/{fragment}`
+- `GET /v4/capacity/usage`
 - `GET /v4/fragment/list`
-- `GET /v4/fragment/objects/{fragment}`
-- `GET /v4/fragment/trash/{fragment}`
-- `GET /v4/fragment/versions/{fragment}/{*object_key}`
-- `GET /v4/fragment/get/{fragment}/{*object_key}`
-- `GET /v4/fragment/stream/{fragment}/{*object_key}`
-- `GET /v4/fragment/meta/{fragment}/{*object_key}`
-- `GET /v4/fragment/download/{fragment}`
-- `GET /v4/fragment/download/chunk/{fragment}`
-- `GET /v4/smb/progress/{fragment}`
-- `POST /v4/fragment/archive/{fragment}`
+- `GET /v4/fragment/objects`
+- `GET /v4/fragment/trash`
+- `GET /v4/fragment/versions/{*object_key}`
+- `GET /v4/fragment/get/{*object_key}`
+- `GET /v4/fragment/stream/{*object_key}`
+- `GET /v4/fragment/meta/{*object_key}`
+- `GET /v4/fragment/download`
+- `GET /v4/fragment/download/chunk`
+- `GET /v4/smb/progress`
+- `POST /v4/fragment/archive`
 - `POST /v4/share/create`
 
 ### Protected v4 write/upload
 - `DELETE /v4/fragment/delete/{fragment}`
 - `PATCH /v4/fragment/modify/{fragment}`
-- `DELETE /v4/fragment/trash/empty/{fragment}`
+- `DELETE /v4/fragment/trash/empty`
 - `PATCH /v4/fragment/object/rename`
-- `DELETE /v4/fragment/object/delete/{fragment}/{*object_key}`
-- `DELETE /v4/fragment/version/delete/{fragment}/{version_id}/{*object_key}`
-- `DELETE /v4/fragment/permanent/delete/{fragment}/{*object_key}`
-- `POST /v4/fragment/recover/version/{fragment}/{version_id}/{*object_key}`
-- `POST /v4/fragment/recover/object/{fragment}/{*object_key}`
-- `POST /v4/fragment/recover/trash/all/{fragment}`
-- `POST /v4/upload/init/{fragment}/{*object_key}`
-- `GET /v4/upload/status/{fragment}/{version_id}`
-- `GET /v4/upload/status/list/{fragment}`
-- `PUT /v4/upload/chunk/{fragment}/{version_id}/{part_index}`
-- `POST /v4/upload/finalize/{fragment}/{version_id}/{session_id}`
-- `DELETE /v4/upload/cancel/{fragment}/{version_id}`
+- `DELETE /v4/fragment/object/delete/{*object_key}`
+- `DELETE /v4/fragment/version/delete/{version_id}/{*object_key}`
+- `DELETE /v4/fragment/permanent/delete/{*object_key}`
+- `POST /v4/fragment/recover/version/{version_id}/{*object_key}`
+- `POST /v4/fragment/recover/object/{*object_key}`
+- `POST /v4/fragment/recover/trash/all`
+- `POST /v4/upload/init/{*object_key}`
+- `POST /v4/upload/one-shot/{*object_key}`
+- `GET /v4/upload/status/{version_id}`
+- `GET /v4/upload/status/list`
+- `PUT /v4/upload/chunk/{version_id}/{part_index}`
+- `POST /v4/upload/finalize/{version_id}/{session_id}`
+- `DELETE /v4/upload/cancel/{version_id}`
 
 ### Protected v4 maintenance
-- `POST /v4/maintenance/sync/global`
-- `POST /v4/maintenance/sync/fragment`
 - `POST /v4/maintenance/cleanup/fragment`
 - `POST /v4/maintenance/init/fragment`
 - `POST /v4/maintenance/repair/start`
@@ -1283,15 +1318,14 @@ Behavior:
 - SMB `username` is fragment identifier (`<fragment_name>` or `<fragment_hash>`).
 - SMB `password` is fragment key.
 - Share `N1` maps to the authenticated fragment for the session.
-- SMB filesystem capacity reported to clients (for example Windows "Properties") is derived from that fragment's quota (`allocated_storage` / `storage_used`), not a global fixed size.
+- SMB filesystem capacity reported to clients (for example Windows "Properties") is derived from live filesystem totals on the current node, not a mutable per-fragment quota file.
 - SMB is read-only: browse/list/open/read/query operations are supported, while write/create/rename/delete/truncate and other mutating requests are denied with `STATUS_ACCESS_DENIED`.
 - Optional static mode: if `auth_username` and `auth_password` are configured, that static account is also accepted.
 - If `require_signing=true`, SMB signing is required.
-- Quota mutations are applied to the in-memory quota cache first and flushed asynchronously to mirrored `quota.msgpack` files.
-- If one quota mirror lags during disk saturation, the background flusher keeps retrying until mirrors converge; warnings are reserved for full flush failure, not transient partial lag.
+- There is no active per-fragment quota mechanism in the stable Standard runtime; live monitoring and SMB capacity reporting use current filesystem totals.
 
 ### 14.2 SMB Transfer Progress API
-`GET /v4/smb/progress/{fragment}`
+`GET /v4/smb/progress`
 
 Query:
 - `include_completed` optional (`true|false`, default `false`)

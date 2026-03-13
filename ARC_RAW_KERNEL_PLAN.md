@@ -2,7 +2,7 @@
 
 > Arc engineering note:
 > - This document tracks Arc raw-kernel evolution.
-> - Arc is stable at `0.2.0`; `standard` remains the default deployment profile.
+> - Arc is experimental; `standard` remains the default deployment profile at `0.5.0`.
 > - See `DEPLOYMENT_PROFILES.md`.
 
 This document defines the target structure for `N1 Arc` as a raw-only storage kernel:

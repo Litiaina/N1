@@ -1,7 +1,9 @@
 use crate::n1_core::constants::{
     PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_INDEX_DIR, PREFIX_INDEX_NAMESPACE,
-    PREFIX_INDEX_VERSION, PREFIX_SEGMENT_EXT, QUOTA_FILE,
+    PREFIX_INDEX_VERSION, PREFIX_SEGMENT_EXT,
 };
+#[cfg(test)]
+use crate::n1_core::constants::QUOTA_FILE;
 #[cfg(test)]
 use once_cell::sync::Lazy;
 use serde::de::IgnoredAny;
@@ -144,12 +146,6 @@ impl ObjectPathManager {
             .collect()
     }
 
-    pub fn object_key_hash(object_key: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(object_key.as_bytes());
-        hex::encode(hasher.finalize())
-    }
-
     pub fn canonical_prefix(prefix: &str) -> String {
         prefix.trim_start_matches('/').to_string()
     }
@@ -212,6 +208,7 @@ impl ObjectPathManager {
         disk_root.join(fragment_hash).join("blob").join(version_id)
     }
 
+    #[cfg(test)]
     pub fn get_all_quota_paths(&self, fragment_hash: &str) -> Vec<PathBuf> {
         self.get_all_index_roots()
             .iter()

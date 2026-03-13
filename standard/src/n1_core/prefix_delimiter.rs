@@ -83,24 +83,19 @@ pub fn immediate_child_common_prefix(prefix: &str, object_key: &str) -> Option<S
 
 pub fn build_delimiter_compacted_from_latest(
     prefix: &str,
-    latest: &HashMap<String, (String, i64, bool)>,
+    latest: &HashMap<String, PrefixIndexEntry>,
 ) -> PrefixDelimiterCompactedSegment {
     let pfx = canonical_prefix(prefix);
     let mut object_entries = Vec::new();
     let mut child_counts: HashMap<String, u64> = HashMap::new();
 
-    for (object_key, (version_id, created_at, is_delete_marker)) in latest {
-        if *is_delete_marker {
+    for (object_key, entry) in latest {
+        if entry.is_delete_marker {
             continue;
         }
 
         if is_direct_object_for_prefix(&pfx, object_key) {
-            object_entries.push(PrefixIndexEntry {
-                object_key: object_key.clone(),
-                version_id: version_id.clone(),
-                created_at: *created_at,
-                is_delete_marker: false,
-            });
+            object_entries.push(entry.clone());
             continue;
         }
 
@@ -134,19 +129,22 @@ pub fn build_delimiter_compacted_from_entries(
     prefix: &str,
     entries: &[PrefixIndexEntry],
 ) -> PrefixDelimiterCompactedSegment {
-    let latest: HashMap<String, (String, i64, bool)> = entries
-        .iter()
-        .map(|entry| {
-            (
-                entry.object_key.clone(),
-                (
-                    entry.version_id.clone(),
-                    entry.created_at,
-                    entry.is_delete_marker,
-                ),
-            )
-        })
-        .collect();
+    let mut latest: HashMap<String, PrefixIndexEntry> = HashMap::new();
+    for entry in entries {
+        match latest.get(&entry.object_key) {
+            None => {
+                latest.insert(entry.object_key.clone(), entry.clone());
+            }
+            Some(current) => {
+                if entry.created_at > current.created_at
+                    || (entry.created_at == current.created_at
+                        && entry.version_id > current.version_id)
+                {
+                    latest.insert(entry.object_key.clone(), entry.clone());
+                }
+            }
+        }
+    }
     build_delimiter_compacted_from_latest(prefix, &latest)
 }
 
@@ -193,6 +191,47 @@ pub async fn write_delimiter_delta(
     object_entry: Option<PrefixIndexEntry>,
     child_count_delta: i64,
 ) -> Result<(), AppError> {
+    write_delimiter_delta_scoped(
+        path_manager,
+        fragment,
+        object_key,
+        segment_id,
+        object_entry,
+        child_count_delta,
+        false,
+    )
+    .await
+}
+
+pub async fn write_trash_delimiter_delta(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    object_key: &str,
+    segment_id: &str,
+    object_entry: Option<PrefixIndexEntry>,
+    child_count_delta: i64,
+) -> Result<(), AppError> {
+    write_delimiter_delta_scoped(
+        path_manager,
+        fragment,
+        object_key,
+        segment_id,
+        object_entry,
+        child_count_delta,
+        true,
+    )
+    .await
+}
+
+async fn write_delimiter_delta_scoped(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    object_key: &str,
+    segment_id: &str,
+    object_entry: Option<PrefixIndexEntry>,
+    child_count_delta: i64,
+    trashed: bool,
+) -> Result<(), AppError> {
     let parent_prefix = parent_prefix_for_key(object_key);
     let mut wrote_any = false;
     if let Some(object_entry) = object_entry {
@@ -205,11 +244,20 @@ pub async fn write_delimiter_delta(
             AppError::InternalServerError(format!("serialize delimiter object segment: {}", e))
         })?;
 
-        for path in path_manager.get_all_prefix_delimiter_segment_paths(
-            fragment,
-            &parent_prefix,
-            segment_id,
-        ) {
+        let paths = if trashed {
+            path_manager.get_all_trash_prefix_delimiter_segment_paths(
+                fragment,
+                &parent_prefix,
+                segment_id,
+            )
+        } else {
+            path_manager.get_all_prefix_delimiter_segment_paths(
+                fragment,
+                &parent_prefix,
+                segment_id,
+            )
+        };
+        for path in paths {
             if write_atomic(&path, &parent_bytes).await.is_ok() {
                 wrote_any = true;
             }
@@ -230,11 +278,20 @@ pub async fn write_delimiter_delta(
                 AppError::InternalServerError(format!("serialize delimiter child segment: {}", e))
             })?;
 
-            for path in path_manager.get_all_prefix_delimiter_segment_paths(
-                fragment,
-                &bucket_prefix,
-                segment_id,
-            ) {
+            let paths = if trashed {
+                path_manager.get_all_trash_prefix_delimiter_segment_paths(
+                    fragment,
+                    &bucket_prefix,
+                    segment_id,
+                )
+            } else {
+                path_manager.get_all_prefix_delimiter_segment_paths(
+                    fragment,
+                    &bucket_prefix,
+                    segment_id,
+                )
+            };
+            for path in paths {
                 if write_atomic(&path, &bytes).await.is_ok() {
                     wrote_any = true;
                 }

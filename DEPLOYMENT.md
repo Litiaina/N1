@@ -1,27 +1,26 @@
-# N1 Deployment Runbook (Standard + Arc)
+# N1 Deployment Runbook (Standard-First)
 
-> Deployment profile status (2026-03-09):
+> Deployment profile status (2026-03-13):
 > - Stable/default: `standard` (`litiaina-n1-standard`)
-> - Stable raw-kernel: `arc` (`litiaina-n1-arc`, `0.2.0`)
+> - `standard` release: `0.5.1`
+> - Experimental raw-device profile: `arc` (`litiaina-n1-arc`)
 > - See `DEPLOYMENT_PROFILES.md` for profile policy.
 
-This runbook documents both N1 deployment profiles:
+If you are deploying N1 today, use `standard`.
+
+This runbook is written standard-first:
 
 - `standard` (stable/default):
   - `index_store_disks`: mounted filesystem paths
   - `blob_store_disks`: mounted filesystem paths (directory roots)
   - no raw format commands
-- `arc` (stable raw-kernel):
-  - `index_store_disks`: raw, unformatted, unmounted devices
-  - `blob_store_disks`: raw, unformatted, unmounted devices
-  - raw format commands available (`format-blob-device`, `format-index-device`)
 
-N1 Arc owns raw index/blob device format and extent allocation through `block_manager`.
+Arc still exists, but only as an experimental raw-device appendix at the bottom of this document.
 For deployment profile policy, see `DEPLOYMENT_PROFILES.md`.
 
 Current runtime truth:
 - `standard`: filesystem-backed partitioned `index` and blob roots.
-- `arc`: raw partitioned `index` and raw blob devices.
+- `arc`: raw partitioned `index` and raw blob devices, experimental only.
 
 ## 1. Disk Roles
 
@@ -30,7 +29,6 @@ Current runtime truth:
 Use normal filesystems for:
 
 - object metadata
-- quota state
 - fragment metadata
 - sessions
 - prefix and delimiter indexes
@@ -60,7 +58,7 @@ Use dedicated raw devices for Arc index authority:
 
 - object metadata
 - session metadata
-- quota and fragment metadata
+- fragment metadata
 - partition WAL/checkpoint data
 
 Arc index layout:
@@ -68,7 +66,7 @@ Arc index layout:
 ```text
 {RAW_INDEX_DEVICE}
   block_manager allocator metadata + journals
-  raw index catalog records (sessions/objects/trash/quota/fragment)
+  raw index catalog records (sessions/objects/trash/fragment)
 ```
 
 ### Blob disks (`standard`)
@@ -354,18 +352,17 @@ Scrub is the integrity-check pass for committed shards (raw shards on arc, shard
 
 ## 10. Release Hardening On Target Hardware
 
-Run the release drill harness before production rollout (`standard 0.4.0` stable, `arc 0.2.0` stable):
+Run the release drill harness before production rollout (`standard 0.5.1` stable, `arc` experimental):
 
 ```bash
 scripts/bench/run_release_drills.sh
 ```
 
-This executes the critical storage workflows plus the quota-drift regression:
+This executes the critical storage workflows:
 
 - active multipart upload + resume while one replica index disk is down
 - CRUD/delete/recover/permanent delete
 - redistribution + repair + recovered read
-- quota reconvergence after redistribution, trash, GC, and sync
 - index mirror repair convergence
 - HA repair with an index disk down
 

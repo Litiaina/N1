@@ -13,7 +13,6 @@ use crate::n1_core::recovery::{
     RepairLogMode, RepairShardOutcome, ShardRepairContext, repair_entire_shard,
     verify_shard_integrity,
 };
-use crate::n1_core::upload;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::manager::WsConnectionManager;
@@ -876,37 +875,26 @@ async fn repair_fragment_sessions_strict(
     fragment: &str,
     dry_run: bool,
 ) -> Result<(u64, u64, u64), AppError> {
-    let mut miss = 0u64;
-    let mut div = 0u64;
-    let corrupt = 0u64;
+    let _ = dry_run;
+    let mut corrupt = 0u64;
 
     for state in index::list_active_sessions(fragment).await? {
         if should_stop() {
             break;
         }
 
-        let version_id = state.manifest.version_id.clone();
-        let paths = index::get_session_state_paths(fragment, &version_id)?;
-        let canon_state = rmp_serde::to_vec(&state).map_err(|e| {
-            AppError::InternalServerError(format!("serialize session repair: {}", e))
-        })?;
-        let (m, d) = replicate_bytes_strict(&paths, &canon_state, dry_run).await?;
-        miss += m;
-        div += d;
+        if rmp_serde::to_vec(&state).is_err() {
+            corrupt = corrupt.saturating_add(1);
+        }
 
-        for part in upload::load_all_part_metas_from_disk(fragment, &version_id).await? {
-            let part_paths =
-                upload::session_part_meta_paths(fragment, &version_id, part.part_index).await?;
-            let canon_part = rmp_serde::to_vec(&part).map_err(|e| {
-                AppError::InternalServerError(format!("serialize session part repair: {}", e))
-            })?;
-            let (m, d) = replicate_bytes_strict(&part_paths, &canon_part, dry_run).await?;
-            miss += m;
-            div += d;
+        for part in state.parts.into_values() {
+            if rmp_serde::to_vec(&part).is_err() {
+                corrupt = corrupt.saturating_add(1);
+            }
         }
     }
 
-    Ok((miss, div, corrupt))
+    Ok((0, 0, corrupt))
 }
 
 async fn list_all_raw_gc_marker_names(index_roots: &[PathBuf], fragment: &str) -> HashSet<String> {
@@ -942,11 +930,8 @@ async fn repair_fragment_raw_gc_markers(
     index_roots: &[PathBuf],
     dry_run: bool,
 ) -> Result<(u64, u64, u64), AppError> {
-    let marker_roots = if index::index_backend_mode() == index::IndexBackendMode::Fs {
-        index_roots.to_vec()
-    } else {
-        raw_index_metadata_roots_for_housekeeping()?
-    };
+    let _ = index_roots;
+    let marker_roots = raw_index_metadata_roots_for_housekeeping()?;
 
     let marker_names = list_all_raw_gc_marker_names(&marker_roots, fragment).await;
 
@@ -1027,188 +1012,23 @@ async fn repair_fragment_raw_gc_markers(
     Ok((miss, div, corrupt))
 }
 
-#[derive(Clone)]
-struct ReplicaInfo {
-    full_path: PathBuf,
-    bytes: Option<Vec<u8>>,
-    mtime: SystemTime,
-    len: u64,
-    sha256: Option<[u8; 32]>,
-    parsed_ok: bool,
-}
-
-async fn read_replica(full: &Path) -> ReplicaInfo {
-    match fs::read(full).await {
-        Ok(bytes) => {
-            let meta = fs::metadata(full).await.ok();
-            let mtime = meta
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            let len = meta.as_ref().map(|m| m.len()).unwrap_or(bytes.len() as u64);
-            let sha = Some(sha256_bytes(&bytes));
-            let parsed_ok = rmp_serde::from_slice::<ObjectMetadata>(&bytes).is_ok();
-            ReplicaInfo {
-                full_path: full.to_path_buf(),
-                bytes: Some(bytes),
-                mtime,
-                len,
-                sha256: sha,
-                parsed_ok,
-            }
-        }
-        Err(_) => ReplicaInfo {
-            full_path: full.to_path_buf(),
-            bytes: None,
-            mtime: SystemTime::UNIX_EPOCH,
-            len: 0,
-            sha256: None,
-            parsed_ok: false,
-        },
-    }
-}
-
 async fn reconcile_object_metadata_strict(
     metadata: &ObjectMetadata,
     is_trash: bool,
     dry_run: bool,
 ) -> Result<(Vec<u8>, ObjectMetadata, u64, u64, Option<String>), AppError> {
-    if index::index_backend_mode() != index::IndexBackendMode::Fs {
-        let canonical_meta = metadata.clone();
-        let canonical_bytes = rmp_serde::to_vec(&canonical_meta).map_err(|e| {
-            AppError::InternalServerError(format!(
-                "encode canonical raw metadata for {}/{}/{} failed: {}",
-                canonical_meta.fragment,
-                canonical_meta.object_key,
-                canonical_meta.version_id,
-                e
-            ))
-        })?;
-        return Ok((canonical_bytes, canonical_meta, 0, 0, None));
-    }
-
-    let all_paths = index::get_object_version_paths(
-        &metadata.fragment,
-        &metadata.object_key,
-        &metadata.version_id,
-        is_trash,
-    )?;
-
-    if all_paths.is_empty() {
-        return Err(AppError::InternalServerError(
-            "No metadata paths configured".into(),
-        ));
-    }
-
-    let mut replicas: Vec<ReplicaInfo> = Vec::with_capacity(all_paths.len());
-    for p in &all_paths {
-        replicas.push(read_replica(p).await);
-    }
-
-    let mut best_idx: Option<usize> = None;
-    let mut best_meta: Option<ObjectMetadata> = None;
-
-    for (idx, ri) in replicas.iter().enumerate() {
-        if !ri.parsed_ok {
-            continue;
-        }
-        let Some(bytes) = &ri.bytes else {
-            continue;
-        };
-        let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(bytes) else {
-            continue;
-        };
-
-        match best_idx {
-            None => {
-                best_idx = Some(idx);
-                best_meta = Some(meta);
-            }
-            Some(cur) => {
-                let cur_ri = &replicas[cur];
-                let take = (ri.mtime > cur_ri.mtime)
-                    || (ri.mtime == cur_ri.mtime && ri.len > cur_ri.len)
-                    || (ri.mtime == cur_ri.mtime
-                        && ri.len == cur_ri.len
-                        && ri.sha256.unwrap_or([0u8; 32]) > cur_ri.sha256.unwrap_or([0u8; 32]));
-                if take {
-                    best_idx = Some(idx);
-                    best_meta = Some(meta);
-                }
-            }
-        }
-    }
-
-    let best_idx = best_idx.ok_or_else(|| {
+    let _ = (is_trash, dry_run);
+    let canonical_meta = metadata.clone();
+    let canonical_bytes = rmp_serde::to_vec(&canonical_meta).map_err(|e| {
         AppError::InternalServerError(format!(
-            "All replicas unreadable/corrupt msgpack for {}/{}/{}",
-            metadata.fragment, metadata.object_key, metadata.version_id
+            "encode canonical raw metadata for {}/{}/{} failed: {}",
+            canonical_meta.fragment,
+            canonical_meta.object_key,
+            canonical_meta.version_id,
+            e
         ))
     })?;
-
-    let canonical_bytes = replicas[best_idx]
-        .bytes
-        .clone()
-        .ok_or_else(|| AppError::InternalServerError("Canonical replica missing bytes".into()))?;
-
-    let canonical_meta = best_meta
-        .ok_or_else(|| AppError::InternalServerError("Canonical replica missing meta".into()))?;
-    let canon_sha = sha256_bytes(&canonical_bytes);
-
-    let mut missing_repairs = 0u64;
-    let mut divergent_repairs = 0u64;
-    let mut report_lines: Vec<String> = Vec::new();
-
-    for ri in &replicas {
-        match &ri.bytes {
-            None => {
-                report_lines.push(format!("MISSING path={}", ri.full_path.display()));
-                if !dry_run {
-                    atomic_write(&ri.full_path, &canonical_bytes)
-                        .await
-                        .map_err(|e| AppError::Io(e, "repair missing index meta".into()))?;
-                    missing_repairs += 1;
-                }
-            }
-            Some(b) => {
-                let sha = sha256_bytes(b);
-                if sha != canon_sha {
-                    report_lines.push(format!(
-                        "DIVERGENT path={} len={} canon_path={}",
-                        ri.full_path.display(),
-                        b.len(),
-                        replicas[best_idx].full_path.display()
-                    ));
-                    if !dry_run {
-                        atomic_write(&ri.full_path, &canonical_bytes)
-                            .await
-                            .map_err(|e| AppError::Io(e, "repair divergent index meta".into()))?;
-                        divergent_repairs += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    let report = if report_lines.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "INDEX DISAGREEMENT {}/{}/{}:\n{}",
-            metadata.fragment,
-            metadata.object_key,
-            metadata.version_id,
-            report_lines.join("\n")
-        ))
-    };
-
-    Ok((
-        canonical_bytes,
-        canonical_meta,
-        missing_repairs,
-        divergent_repairs,
-        report,
-    ))
+    Ok((canonical_bytes, canonical_meta, 0, 0, None))
 }
 
 async fn repair_fragment_quota_mirrors(
@@ -1474,6 +1294,13 @@ pub async fn run_repair_job(
     ws_manager: Arc<WsConnectionManager>,
 ) -> Result<(), AppError> {
     run_repair_job_with_options(cfg, RepairRunOptions::default(), ws_manager).await
+}
+
+#[cfg(test)]
+pub async fn reset_runtime_state_for_tests() {
+    STOP_SIGNAL.store(false, Ordering::Relaxed);
+    let mut status = REPAIR_STATUS.write().await;
+    *status = RepairJobStatus::default();
 }
 
 pub async fn run_repair_job_with_options(

@@ -20,7 +20,6 @@ use crate::{
             init_fragment_metadata, read_fragment_metadata, rotate_fragment_key,
             write_fragment_metadata,
         },
-        quota_manager::init_quota_file,
         sync::{CreateFragmentRequest, CreateFragmentResponse, ensure_fragment_blob_directories},
     },
     routes::storage_routes::AppState,
@@ -32,7 +31,6 @@ use crate::{
 #[derive(Deserialize)]
 pub struct UpdateFragmentRequest {
     pub new_name: Option<String>,
-    pub new_quota: Option<u64>,
     pub new_key: Option<String>,
     pub secret: Option<String>,
 }
@@ -128,7 +126,6 @@ pub async fn create_fragment(
         )));
     }
 
-    init_quota_file(&hash, payload.quota).await?;
     ensure_fragment_blob_directories(&hash).await;
     let _ = init_fragment_metadata(&hash, &payload.key).await?;
 
@@ -142,7 +139,6 @@ pub async fn create_fragment(
         Json(CreateFragmentResponse {
             fragment_hash: hash,
             name: payload.name,
-            quota: payload.quota,
         }),
     ))
 }
@@ -169,10 +165,9 @@ pub async fn update_fragment(
         ));
     }
 
-    let wants_quota = payload.new_quota.is_some();
     let wants_key = payload.new_key.is_some();
 
-    if (wants_quota || wants_key) && !is_admin && !claims.modify {
+    if wants_key && !is_admin && !claims.modify {
         return Err(AppError::Forbidden(
             "Modify permission required to update fragment settings".into(),
         ));
@@ -258,15 +253,6 @@ pub async fn update_fragment(
             current_hash = new_hash;
             new_name_display = Some(new_name.clone());
         }
-    }
-
-    if let Some(quota) = payload.new_quota {
-        init_quota_file(&current_hash, quota).await?;
-        info!(
-            "Updated quota for fragment {} to {} bytes",
-            current_hash, quota
-        );
-        state.emit(&current_hash, StorageEventPayload::StateInvalidated);
     }
 
     if let Some(new_key) = payload.new_key {

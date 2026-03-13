@@ -33,7 +33,7 @@ pub struct AuthResponse {
 #[derive(Serialize)]
 pub struct CreateFragmentRequest {
     pub name: String,
-    pub quota: u64,
+    pub key: String,
     pub secret: String,
 }
 
@@ -1529,13 +1529,13 @@ pub async fn execute_command(
                 "format-index-device is a local command; run it directly on the N1 node".into(),
             );
         }
-        Commands::CreateFragment { name, quota } => {
+        Commands::CreateFragment { name, key } => {
             info!("Creating fragment '{}' on {}...", name, base_url);
             let resp = client
                 .post(format!("{}/v4/fragment/create", base_url))
                 .json(&CreateFragmentRequest {
                     name: name.clone(),
-                    quota: *quota,
+                    key: key.clone(),
                     secret: secret.clone(),
                 })
                 .send()
@@ -1987,15 +1987,12 @@ pub async fn execute_command(
                 }
                 Commands::Uploads { cmd } => match cmd {
                     UploadCommands::List { limit, offset } => {
-                        let target_fragment = require_target_fragment(
+                        let _target_fragment = require_target_fragment(
                             target_fragment_opt.as_deref(),
                             "uploads list",
                         )?;
                         let resp = client
-                            .get(format!(
-                                "{}/v4/upload/status/list/{}",
-                                base_url, target_fragment
-                            ))
+                            .get(format!("{}/v4/upload/status/list", base_url))
                             .query(&[("limit", limit), ("offset", offset)])
                             .bearer_auth(&token)
                             .send()
@@ -2013,15 +2010,12 @@ pub async fn execute_command(
                         }
                     }
                     UploadCommands::Status { version_id } => {
-                        let target_fragment = require_target_fragment(
+                        let _target_fragment = require_target_fragment(
                             target_fragment_opt.as_deref(),
                             "uploads status",
                         )?;
                         let resp = client
-                            .get(format!(
-                                "{}/v4/upload/status/{}/{}",
-                                base_url, target_fragment, version_id
-                            ))
+                            .get(format!("{}/v4/upload/status/{}", base_url, version_id))
                             .bearer_auth(&token)
                             .send()
                             .await?;

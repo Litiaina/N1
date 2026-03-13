@@ -7,6 +7,7 @@ use crate::handlers::error_handlers;
 #[derive(Debug)]
 pub enum AppError {
     Io(io::Error, String),
+    #[allow(dead_code)]
     Timeout(String),
     BadRequest(String),
     Conflict(String),

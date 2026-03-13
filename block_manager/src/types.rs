@@ -53,6 +53,10 @@ pub struct DeviceHeader {
     pub journal_start_block: u64,
     pub journal_block_count: u64,
     pub data_start_block: u64,
+    pub segment_catalog_start_block: u64,
+    pub segment_catalog_block_count: u64,
+    pub metadata_pool_block_count: u64,
+    pub segment_size_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -839,6 +839,13 @@ pub(crate) async fn run_redistribution_job(
         .await
 }
 
+#[cfg(test)]
+pub async fn reset_runtime_state_for_tests() {
+    STOP_SIGNAL.store(false, Ordering::Relaxed);
+    let mut st = REDIST_STATUS.write().await;
+    *st = RedistributionJobStatus::default();
+}
+
 pub async fn run_redistribution_job_with_options(
     dry_run: bool,
     opts: RedistributionRunOptions,

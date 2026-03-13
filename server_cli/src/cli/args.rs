@@ -223,8 +223,8 @@ pub enum Commands {
     CreateFragment {
         #[arg(short, long)]
         name: String,
-        #[arg(short, long, default_value_t = 10_737_418_240)]
-        quota: u64,
+        #[arg(long)]
+        key: String,
     },
     Gc,
     Repair {

@@ -16,7 +16,6 @@ use crate::n1_core::prefix_compactor::{
     PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC, PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC,
 };
 use crate::n1_core::retrieve::PREFIX_MAX_DELTA_SEGMENTS_ATOMIC;
-use crate::n1_core::sync::sync_quota;
 use crate::n1_core::upload::{
     ADAPTIVE_IO_TARGET_ATOMIC, DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC,
     PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC,
@@ -622,15 +621,6 @@ pub async fn run_server() {
     tracing::info!(
         "Storage mode: standard variant is filesystem-backed (directory-only index/blob roots)"
     );
-
-    tokio::spawn(async {
-        tracing::info!(
-            "Starting startup quota reconciliation (committed object bytes + active reservations)"
-        );
-        if let Err(e) = sync_quota().await {
-            tracing::warn!("Startup quota reconciliation failed: {}", e);
-        }
-    });
 
     let upload_section = config.section(Some("upload_config"));
     let cpu_cores = detect_cpu_cores();

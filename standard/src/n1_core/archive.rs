@@ -24,7 +24,7 @@ use walkdir::WalkDir;
 
 use crate::{
     enums::app_error_enum::AppError,
-    n1_core::constants::{METADATA_EXT, PART_META_SUFFIX, QUOTA_FILE, RESERVATION_FILE},
+    n1_core::constants::{METADATA_EXT, PART_META_SUFFIX, RESERVATION_FILE},
     n1_core::disk_manager::{
         DownloadArchiveRequest, ListObjectsResult, ObjectMetadata, ObjectPathManager,
         ObjectSummary, PartMetadata, ShardInfo,
@@ -369,7 +369,7 @@ async fn resolve_keys_from_prefix_scan(
             if !name.ends_with(METADATA_EXT) {
                 continue;
             }
-            if name == QUOTA_FILE || name == RESERVATION_FILE || name.ends_with(PART_META_SUFFIX) {
+            if name == RESERVATION_FILE || name.ends_with(PART_META_SUFFIX) {
                 continue;
             }
 
