@@ -254,7 +254,7 @@ curl -k -X POST "https://127.0.0.1:50001/v4/fragment/create" \
 ```
 
 Notes:
-- Fragment creation no longer requires or persists a per-fragment quota field.
+- Fragment creation only requires the fragment name, fragment key, and master secret.
 - Live storage monitoring and `/v4/capacity/usage` report real filesystem totals for the current node.
 
 ### 5.6 `GET /v4/public/share`
@@ -460,7 +460,7 @@ curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
 ```
 Notes:
 - Empty-trash clears partition trash metadata and removes `.trash` roots directly (`remove_dir_all`) for O(1)-style namespace purge on filesystem-backed standard.
-- No quota-led refund pass is required for the live monitoring model.
+- Live storage reporting is derived from current filesystem totals on the node.
 
 ### 7.4 `PATCH /v4/fragment/object/rename`
 Body (`RenameObjectRequest`):
@@ -576,7 +576,7 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
 ```
 Notes:
 - Recover-all restores from authoritative partition trash metadata and moves `.trash/blob/{version}` back to live blob dirs per version.
-- Recovery follows direct move semantics; there is no quota-led refund/re-reserve pass.
+- Recovery follows direct move semantics and does not perform any separate capacity bookkeeping.
 
 ## 8. Protected v4 Upload APIs (Resumable Object Storage Upload)
 
@@ -1375,11 +1375,11 @@ Behavior:
 - SMB `username` is fragment identifier (`<fragment_name>` or `<fragment_hash>`).
 - SMB `password` is fragment key.
 - Share `N1` maps to the authenticated fragment for the session.
-- SMB filesystem capacity reported to clients (for example Windows "Properties") is derived from live filesystem totals on the current node, not a mutable per-fragment quota file.
+- SMB filesystem capacity reported to clients (for example Windows "Properties") is derived from live filesystem totals on the current node.
 - SMB is read-only: browse/list/open/read/query operations are supported, while write/create/rename/delete/truncate and other mutating requests are denied with `STATUS_ACCESS_DENIED`.
 - Optional static mode: if `auth_username` and `auth_password` are configured, that static account is also accepted.
 - If `require_signing=true`, SMB signing is required.
-- There is no active per-fragment quota mechanism in the stable Standard runtime; live monitoring and SMB capacity reporting use current filesystem totals.
+- Live monitoring and SMB capacity reporting use current filesystem totals.
 
 ### 14.2 SMB Transfer Progress API
 `GET /v4/smb/progress`

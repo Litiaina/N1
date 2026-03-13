@@ -75,7 +75,7 @@ Optional static mode:
 - if `auth_username` + `auth_password` are configured, that static account is also accepted.
 
 Progress API (JWT protected):
-- `GET /v4/smb/progress/{fragment}?include_completed=true&limit=100`
+- `GET /v4/smb/progress?include_completed=true&limit=100`
 - In the current read-only SMB mode this normally stays empty because SMB uploads are disabled.
 
 ### 2) Optional env overrides

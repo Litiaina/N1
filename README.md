@@ -230,7 +230,7 @@ Both keep the same core behavior contracts (init/chunk/finalize semantics, immut
 N1 is **not** "user multi-tenant storage" anymore. The isolation boundary is a **Fragment**:
 
 - **Fragment = virtual disk / namespace / tenant boundary**
-- **Quota is per Fragment**
+- **Capacity is enforced from live filesystem totals on the node**
 - **Auth scopes to Fragment**
 - **Maintenance jobs operate per Fragment**
 - N1 is the **core single-node engine**: partitioned metadata authority, strict publish discipline, and repairable blob durability
