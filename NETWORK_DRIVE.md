@@ -45,9 +45,9 @@ async_close_commit=false
 async_close_threshold_bytes=67108864
 auth_domain=N1
 require_signing=true
-query_directory_page_limit=256
-query_directory_max_buffered_entries=512
-query_directory_max_seeded_entries=128
+query_directory_page_limit=1000
+query_directory_max_buffered_entries=4096
+query_directory_max_seeded_entries=512
 ```
 
 Config keys:
@@ -56,8 +56,8 @@ Config keys:
 - `smb_port`: SMB TCP port.
 - `max_sessions`: connection/session cap.
 - `max_frame_bytes`: SMB frame size cap.
-- `async_close_commit`: retained for compatibility, ignored in read-only SMB mode.
-- `async_close_threshold_bytes`: retained for compatibility, ignored in read-only SMB mode.
+- `async_close_commit`: retained for compatibility, ignored in SMB-lite transport mode.
+- `async_close_threshold_bytes`: retained for compatibility, ignored in SMB-lite transport mode.
 - `auth_username`: optional static SMB user.
 - `auth_password`: optional static SMB password.
 - `auth_domain`: SMB auth domain string (optional).

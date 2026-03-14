@@ -104,22 +104,31 @@ const FILE_CREATE_ACTION_CREATED: u32 = 2;
 const FILE_CREATE_ACTION_OVERWRITTEN: u32 = 3;
 
 const FILE_INFORMATION_CLASS_DIRECTORY_INFORMATION: u8 = 0x01;
+const FILE_INFORMATION_CLASS_FULL_DIRECTORY_INFORMATION: u8 = 0x02;
 const FILE_INFORMATION_CLASS_BOTH_DIRECTORY_INFORMATION: u8 = 0x03;
 const FILE_INFORMATION_CLASS_FILE_NAMES_INFORMATION: u8 = 0x0C;
 const FILE_INFORMATION_CLASS_ID_BOTH_DIRECTORY_INFORMATION: u8 = 0x25;
+const FILE_INFORMATION_CLASS_ID_FULL_DIRECTORY_INFORMATION: u8 = 0x26;
 const SMB2_INFO_TYPE_FILE: u8 = 0x01;
 const SMB2_INFO_TYPE_FILESYSTEM: u8 = 0x02;
+const FILE_INFO_CLASS_INTERNAL_INFORMATION: u8 = 0x06;
+const FILE_INFO_CLASS_EA_INFORMATION: u8 = 0x07;
+const FILE_INFO_CLASS_ACCESS_INFORMATION: u8 = 0x08;
 const FILE_INFO_CLASS_BASIC_INFORMATION: u8 = 0x04;
 const FILE_INFO_CLASS_STANDARD_INFORMATION: u8 = 0x05;
 const FILE_INFO_CLASS_RENAME_INFORMATION: u8 = 0x0A;
 const FILE_INFO_CLASS_POSITION_INFORMATION: u8 = 0x0E;
 const FILE_INFO_CLASS_DISPOSITION_INFORMATION: u8 = 0x0D;
 const FILE_INFO_CLASS_MODE_INFORMATION: u8 = 0x10;
+const FILE_INFO_CLASS_ALIGNMENT_INFORMATION: u8 = 0x11;
 const FILE_INFO_CLASS_DISPOSITION_INFORMATION_EX: u8 = 0x40;
 const FILE_INFO_CLASS_ALL_INFORMATION: u8 = 0x12;
+const FILE_INFO_CLASS_STREAM_INFORMATION: u8 = 0x16;
 const FILE_INFO_CLASS_ALLOCATION_INFORMATION: u8 = 0x13;
 const FILE_INFO_CLASS_END_OF_FILE_INFORMATION: u8 = 0x14;
+const FILE_INFO_CLASS_COMPRESSION_INFORMATION: u8 = 0x1C;
 const FILE_INFO_CLASS_NETWORK_OPEN_INFORMATION: u8 = 0x22;
+const FILE_INFO_CLASS_ATTRIBUTE_TAG_INFORMATION: u8 = 0x23;
 const FS_INFO_CLASS_VOLUME_INFORMATION: u8 = 0x01;
 const FS_INFO_CLASS_SIZE_INFORMATION: u8 = 0x03;
 const FS_INFO_CLASS_DEVICE_INFORMATION: u8 = 0x04;
@@ -452,8 +461,9 @@ pub async fn spawn_listener(config: SmbConfig) -> io::Result<(SocketAddr, JoinHa
 
     let join = tokio::spawn(async move {
         info!(
-            "smb loop started on {} (max_sessions={}, max_frame_bytes={}, auth_required={}, require_signing={}, query_dir_page_limit={}, query_dir_max_buffered_entries={}, query_dir_max_seeded_entries={})",
+            "smb loop started on {} (mode={}, max_sessions={}, max_frame_bytes={}, auth_required={}, require_signing={}, query_dir_page_limit={}, query_dir_max_buffered_entries={}, query_dir_max_seeded_entries={})",
             local_addr,
+            "read_only",
             max_sessions,
             max_frame_bytes,
             true,
@@ -1872,7 +1882,10 @@ fn smb2_command_name(command: u16) -> &'static str {
     }
 }
 
-async fn cleanup_connection_state(state: &mut ConnectionState, shared_smb_state: &SharedSmbState) {
+async fn cleanup_connection_state(
+    state: &mut ConnectionState,
+    shared_smb_state: &SharedSmbState,
+) {
     state.handles.clear();
     unregister_connection_state(shared_smb_state, state.connection_id).await;
 }
@@ -2022,15 +2035,29 @@ fn read_only_create_access_status(
     requested_write: bool,
     requested_delete: bool,
     delete_on_close: bool,
+    exists: bool,
 ) -> Result<(), u32> {
-    if requested_write
-        || requested_delete
-        || delete_on_close
-        || create_disposition != FILE_CREATE_DISPOSITION_OPEN
-    {
+    if requested_write || requested_delete || delete_on_close {
         return Err(SMB2_STATUS_ACCESS_DENIED);
     }
-    Ok(())
+
+    match create_disposition {
+        FILE_CREATE_DISPOSITION_OPEN => {
+            if exists {
+                Ok(())
+            } else {
+                Err(SMB2_STATUS_OBJECT_NAME_NOT_FOUND)
+            }
+        }
+        FILE_CREATE_DISPOSITION_OPEN_IF => {
+            if exists {
+                Ok(())
+            } else {
+                Err(SMB2_STATUS_OBJECT_NAME_NOT_FOUND)
+            }
+        }
+        _ => Err(SMB2_STATUS_ACCESS_DENIED),
+    }
 }
 
 fn read_only_write_status() -> u32 {
@@ -2179,15 +2206,6 @@ async fn handle_create(
         object_key, create_disposition, desired_access, create_options
     );
 
-    if let Err(status) = read_only_create_access_status(
-        create_disposition,
-        requested_write,
-        requested_delete,
-        delete_on_close,
-    ) {
-        return (status, build_not_supported_error_body());
-    }
-
     if !matches!(
         create_disposition,
         FILE_CREATE_DISPOSITION_SUPERSEDE
@@ -2200,6 +2218,26 @@ async fn handle_create(
         return (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body());
     }
 
+    let requested_dir = object_key.is_empty() || (create_options & FILE_DIRECTORY_FILE) != 0;
+    let requested_non_dir = (create_options & FILE_NON_DIRECTORY_FILE) != 0;
+
+    let mount_path = mount_path(&fragment, &object_key);
+    let existing = match stat_optional(gateway, &mount_path).await {
+        Ok(v) => v,
+        Err(e) => return (app_error_to_status(e), build_not_supported_error_body()),
+    };
+    let exists = object_key.is_empty() || existing.is_some();
+
+    if let Err(status) = read_only_create_access_status(
+        create_disposition,
+        requested_write,
+        requested_delete,
+        delete_on_close,
+        exists,
+    ) {
+        return (status, build_not_supported_error_body());
+    }
+
     if let Some(stream_name) = named_stream {
         if object_key.is_empty() {
             return (
@@ -2208,21 +2246,6 @@ async fn handle_create(
             );
         }
         let file_id = state.new_file_id();
-        let create_action = if matches!(
-            create_disposition,
-            FILE_CREATE_DISPOSITION_CREATE
-                | FILE_CREATE_DISPOSITION_OPEN_IF
-                | FILE_CREATE_DISPOSITION_OVERWRITE_IF
-        ) {
-            FILE_CREATE_ACTION_CREATED
-        } else if matches!(
-            create_disposition,
-            FILE_CREATE_DISPOSITION_SUPERSEDE | FILE_CREATE_DISPOSITION_OVERWRITE
-        ) {
-            FILE_CREATE_ACTION_SUPERSEDED
-        } else {
-            FILE_CREATE_ACTION_OPENED
-        };
         debug!(
             "smb create virtual named stream path='{}' stream='{}' disposition={} desired_access=0x{:08X} create_options=0x{:08X}",
             object_key, stream_name, create_disposition, desired_access, create_options
@@ -2245,18 +2268,9 @@ async fn handle_create(
         );
         return (
             SMB2_STATUS_SUCCESS,
-            build_create_response_body(file_id, false, 0, create_action),
+            build_create_response_body(file_id, false, 0, FILE_CREATE_ACTION_OPENED),
         );
     }
-
-    let requested_dir = object_key.is_empty() || (create_options & FILE_DIRECTORY_FILE) != 0;
-    let requested_non_dir = (create_options & FILE_NON_DIRECTORY_FILE) != 0;
-
-    let mount_path = mount_path(&fragment, &object_key);
-    let existing = match stat_optional(gateway, &mount_path).await {
-        Ok(v) => v,
-        Err(e) => return (app_error_to_status(e), build_not_supported_error_body()),
-    };
 
     if object_key.is_empty() {
         let file_id = state.new_file_id();
@@ -2295,7 +2309,6 @@ async fn handle_create(
         );
     }
 
-    let exists = existing.is_some();
     let existing_is_dir = existing
         .as_ref()
         .map(|m| matches!(m.kind, NodeKind::Directory))
@@ -2818,11 +2831,28 @@ async fn handle_query_info(
             FILE_INFO_CLASS_STANDARD_INFORMATION => {
                 build_file_standard_information_buffer(&metadata, handle.is_dir)
             }
+            FILE_INFO_CLASS_INTERNAL_INFORMATION => {
+                build_file_internal_information_buffer(&handle.object_key)
+            }
+            FILE_INFO_CLASS_EA_INFORMATION => build_file_ea_information_buffer(),
+            FILE_INFO_CLASS_ACCESS_INFORMATION => build_file_access_information_buffer(),
             FILE_INFO_CLASS_ALL_INFORMATION => {
                 build_file_all_information_buffer(&metadata, handle.is_dir, &handle.object_key)
             }
+            FILE_INFO_CLASS_POSITION_INFORMATION => build_file_position_information_buffer(),
+            FILE_INFO_CLASS_MODE_INFORMATION => build_file_mode_information_buffer(),
+            FILE_INFO_CLASS_ALIGNMENT_INFORMATION => {
+                build_file_alignment_information_buffer()
+            }
+            FILE_INFO_CLASS_STREAM_INFORMATION => build_file_stream_information_buffer(),
+            FILE_INFO_CLASS_COMPRESSION_INFORMATION => {
+                build_file_compression_information_buffer(&metadata)
+            }
             FILE_INFO_CLASS_NETWORK_OPEN_INFORMATION => {
                 build_file_network_open_information_buffer(&metadata, handle.is_dir)
+            }
+            FILE_INFO_CLASS_ATTRIBUTE_TAG_INFORMATION => {
+                build_file_attribute_tag_information_buffer(handle.is_dir)
             }
             _ => {
                 debug!(
@@ -3068,9 +3098,11 @@ async fn handle_query_directory(
     let file_info_class = request[base + 2];
     let flags = request[base + 3];
     if file_info_class != FILE_INFORMATION_CLASS_DIRECTORY_INFORMATION
+        && file_info_class != FILE_INFORMATION_CLASS_FULL_DIRECTORY_INFORMATION
         && file_info_class != FILE_INFORMATION_CLASS_BOTH_DIRECTORY_INFORMATION
         && file_info_class != FILE_INFORMATION_CLASS_FILE_NAMES_INFORMATION
         && file_info_class != FILE_INFORMATION_CLASS_ID_BOTH_DIRECTORY_INFORMATION
+        && file_info_class != FILE_INFORMATION_CLASS_ID_FULL_DIRECTORY_INFORMATION
     {
         debug!(
             "smb query_directory unsupported file_info_class=0x{:02X}",
@@ -3162,7 +3194,10 @@ async fn handle_query_directory(
     let path = mount_path(&fragment, &object_key);
     let initial_buffer_len = buffered_entries.len();
     let mut pages_fetched = 0usize;
-    while buffered_entries.is_empty() && !exhausted {
+    let target_prefetch_entries = query_directory_max_seeded_entries
+        .min(query_directory_max_buffered_entries)
+        .max(buffered_entries.len().max(1));
+    while buffered_entries.len() < target_prefetch_entries && !exhausted {
         let page = match gateway
             .list_dir_page(
                 path.as_str(),
@@ -3710,6 +3745,53 @@ fn build_file_network_open_information_buffer(metadata: &NodeMetadata, is_dir: b
     out
 }
 
+fn build_file_internal_information_buffer(object_key: &str) -> Vec<u8> {
+    stable_object_file_id(object_key).to_le_bytes().to_vec()
+}
+
+fn build_file_ea_information_buffer() -> Vec<u8> {
+    0u32.to_le_bytes().to_vec()
+}
+
+fn build_file_access_information_buffer() -> Vec<u8> {
+    FILE_GENERIC_READ.to_le_bytes().to_vec()
+}
+
+fn build_file_position_information_buffer() -> Vec<u8> {
+    0u64.to_le_bytes().to_vec()
+}
+
+fn build_file_mode_information_buffer() -> Vec<u8> {
+    0u32.to_le_bytes().to_vec()
+}
+
+fn build_file_alignment_information_buffer() -> Vec<u8> {
+    0u32.to_le_bytes().to_vec()
+}
+
+fn build_file_stream_information_buffer() -> Vec<u8> {
+    Vec::new()
+}
+
+fn build_file_compression_information_buffer(metadata: &NodeMetadata) -> Vec<u8> {
+    let mut out = vec![0u8; 16];
+    out[0..8].copy_from_slice(&metadata.size_bytes.to_le_bytes());
+    out[8..10].copy_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+fn build_file_attribute_tag_information_buffer(is_dir: bool) -> Vec<u8> {
+    let mut out = vec![0u8; 8];
+    let attrs = if is_dir {
+        FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        FILE_ATTRIBUTE_NORMAL
+    };
+    out[0..4].copy_from_slice(&attrs.to_le_bytes());
+    out[4..8].copy_from_slice(&0u32.to_le_bytes());
+    out
+}
+
 fn build_fs_volume_information_buffer(volume_label: &str) -> Vec<u8> {
     let label_utf16: Vec<u16> = volume_label.encode_utf16().collect();
     let mut label_bytes = Vec::with_capacity(label_utf16.len() * 2);
@@ -3792,6 +3874,9 @@ fn build_directory_information_buffer(
 ) -> (Vec<u8>, usize) {
     let min_record_len = match file_info_class {
         FILE_INFORMATION_CLASS_ID_BOTH_DIRECTORY_INFORMATION => 104usize,
+        FILE_INFORMATION_CLASS_ID_FULL_DIRECTORY_INFORMATION => 80usize,
+        FILE_INFORMATION_CLASS_BOTH_DIRECTORY_INFORMATION => 94usize,
+        FILE_INFORMATION_CLASS_FULL_DIRECTORY_INFORMATION => 68usize,
         FILE_INFORMATION_CLASS_FILE_NAMES_INFORMATION => 12usize,
         _ => 64usize,
     };
@@ -3810,6 +3895,9 @@ fn build_directory_information_buffer(
 
         let fixed_len = match file_info_class {
             FILE_INFORMATION_CLASS_ID_BOTH_DIRECTORY_INFORMATION => 104usize,
+            FILE_INFORMATION_CLASS_ID_FULL_DIRECTORY_INFORMATION => 80usize,
+            FILE_INFORMATION_CLASS_BOTH_DIRECTORY_INFORMATION => 94usize,
+            FILE_INFORMATION_CLASS_FULL_DIRECTORY_INFORMATION => 68usize,
             FILE_INFORMATION_CLASS_FILE_NAMES_INFORMATION => 12usize,
             _ => 64usize,
         };
@@ -3835,31 +3923,6 @@ fn build_directory_information_buffer(
         if file_info_class == FILE_INFORMATION_CLASS_FILE_NAMES_INFORMATION {
             out[start + 8..start + 12].copy_from_slice(&(name_bytes.len() as u32).to_le_bytes());
             out[start + 12..start + 12 + name_bytes.len()].copy_from_slice(&name_bytes);
-        } else if file_info_class == FILE_INFORMATION_CLASS_ID_BOTH_DIRECTORY_INFORMATION {
-            out[start + 8..start + 16].copy_from_slice(&mtime.to_le_bytes());
-            out[start + 16..start + 24].copy_from_slice(&mtime.to_le_bytes());
-            out[start + 24..start + 32].copy_from_slice(&mtime.to_le_bytes());
-            out[start + 32..start + 40].copy_from_slice(&mtime.to_le_bytes());
-            out[start + 40..start + 48].copy_from_slice(&(eof as i64).to_le_bytes());
-            out[start + 48..start + 56].copy_from_slice(&(alloc as i64).to_le_bytes());
-            out[start + 56..start + 60].copy_from_slice(&attrs.to_le_bytes());
-            out[start + 60..start + 64].copy_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-            out[start + 64..start + 68].copy_from_slice(&0u32.to_le_bytes());
-            out[start + 68] = 0;
-            out[start + 69] = 0;
-
-            let file_id = if entry.path.object_key.is_empty() {
-                0u64
-            } else {
-                let mut id = 0xcbf2_9ce4_8422_2325u64;
-                for b in entry.path.object_key.as_bytes() {
-                    id ^= *b as u64;
-                    id = id.wrapping_mul(0x1000_0000_01b3);
-                }
-                id
-            };
-            out[start + 96..start + 104].copy_from_slice(&file_id.to_le_bytes());
-            out[start + 104..start + 104 + name_bytes.len()].copy_from_slice(&name_bytes);
         } else {
             out[start + 8..start + 16].copy_from_slice(&mtime.to_le_bytes());
             out[start + 16..start + 24].copy_from_slice(&mtime.to_le_bytes());
@@ -3869,7 +3932,41 @@ fn build_directory_information_buffer(
             out[start + 48..start + 56].copy_from_slice(&(alloc as i64).to_le_bytes());
             out[start + 56..start + 60].copy_from_slice(&attrs.to_le_bytes());
             out[start + 60..start + 64].copy_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-            out[start + 64..start + 64 + name_bytes.len()].copy_from_slice(&name_bytes);
+
+            match file_info_class {
+                FILE_INFORMATION_CLASS_DIRECTORY_INFORMATION => {
+                    out[start + 64..start + 64 + name_bytes.len()].copy_from_slice(&name_bytes);
+                }
+                FILE_INFORMATION_CLASS_FULL_DIRECTORY_INFORMATION => {
+                    out[start + 64..start + 68].copy_from_slice(&0u32.to_le_bytes());
+                    out[start + 68..start + 68 + name_bytes.len()].copy_from_slice(&name_bytes);
+                }
+                FILE_INFORMATION_CLASS_BOTH_DIRECTORY_INFORMATION => {
+                    out[start + 64..start + 68].copy_from_slice(&0u32.to_le_bytes());
+                    out[start + 68] = 0;
+                    out[start + 69] = 0;
+                    out[start + 94..start + 94 + name_bytes.len()].copy_from_slice(&name_bytes);
+                }
+                FILE_INFORMATION_CLASS_ID_FULL_DIRECTORY_INFORMATION => {
+                    out[start + 64..start + 68].copy_from_slice(&0u32.to_le_bytes());
+                    out[start + 72..start + 80].copy_from_slice(
+                        &stable_object_file_id(&entry.path.object_key).to_le_bytes(),
+                    );
+                    out[start + 80..start + 80 + name_bytes.len()].copy_from_slice(&name_bytes);
+                }
+                FILE_INFORMATION_CLASS_ID_BOTH_DIRECTORY_INFORMATION => {
+                    out[start + 64..start + 68].copy_from_slice(&0u32.to_le_bytes());
+                    out[start + 68] = 0;
+                    out[start + 69] = 0;
+                    out[start + 96..start + 104].copy_from_slice(
+                        &stable_object_file_id(&entry.path.object_key).to_le_bytes(),
+                    );
+                    out[start + 104..start + 104 + name_bytes.len()].copy_from_slice(&name_bytes);
+                }
+                _ => {
+                    out[start + 64..start + 64 + name_bytes.len()].copy_from_slice(&name_bytes);
+                }
+            }
         }
 
         record_starts.push(start);
@@ -3887,6 +3984,19 @@ fn build_directory_information_buffer(
     }
 
     (out, emitted_count)
+}
+
+fn stable_object_file_id(object_key: &str) -> u64 {
+    if object_key.is_empty() {
+        return 0;
+    }
+
+    let mut id = 0xcbf2_9ce4_8422_2325u64;
+    for b in object_key.as_bytes() {
+        id ^= *b as u64;
+        id = id.wrapping_mul(0x1000_0000_01b3);
+    }
+    id
 }
 
 fn synthetic_directory_entry(name: &str, fragment: &str, object_key: &str) -> DirEntry {
@@ -5118,6 +5228,72 @@ mod tests {
     }
 
     #[test]
+    fn directory_information_buffer_supports_both_directory_information_layout() {
+        let entry = DirEntry {
+            name: "sample.txt".to_string(),
+            path: crate::fuse::model::FsdPath {
+                fragment: "frag".to_string(),
+                object_key: "sample.txt".to_string(),
+            },
+            metadata: NodeMetadata {
+                kind: NodeKind::File,
+                size_bytes: 10,
+                modified_at_unix: 1,
+            },
+        };
+
+        let (chunk, count) = build_directory_information_buffer(
+            &[entry],
+            4096,
+            FILE_INFORMATION_CLASS_BOTH_DIRECTORY_INFORMATION,
+        );
+        assert_eq!(count, 1);
+        assert_eq!(
+            u32::from_le_bytes(chunk[60..64].try_into().expect("name len")),
+            "sample.txt".encode_utf16().count() as u32 * 2
+        );
+        assert_eq!(chunk[68], 0);
+        assert_eq!(chunk[69], 0);
+        let expected_name = utf16le_bytes("sample.txt");
+        assert_eq!(
+            &chunk[94..94 + expected_name.len()],
+            expected_name.as_slice()
+        );
+    }
+
+    #[test]
+    fn directory_information_buffer_supports_id_full_directory_information_layout() {
+        let entry = DirEntry {
+            name: "sample.txt".to_string(),
+            path: crate::fuse::model::FsdPath {
+                fragment: "frag".to_string(),
+                object_key: "sample.txt".to_string(),
+            },
+            metadata: NodeMetadata {
+                kind: NodeKind::File,
+                size_bytes: 10,
+                modified_at_unix: 1,
+            },
+        };
+
+        let (chunk, count) = build_directory_information_buffer(
+            &[entry],
+            4096,
+            FILE_INFORMATION_CLASS_ID_FULL_DIRECTORY_INFORMATION,
+        );
+        assert_eq!(count, 1);
+        assert_eq!(
+            u64::from_le_bytes(chunk[72..80].try_into().expect("file id")),
+            stable_object_file_id("sample.txt")
+        );
+        let expected_name = utf16le_bytes("sample.txt");
+        assert_eq!(
+            &chunk[80..80 + expected_name.len()],
+            expected_name.as_slice()
+        );
+    }
+
+    #[test]
     fn directory_information_buffer_emits_first_entry_with_small_output_limit() {
         let entries = vec![DirEntry {
             name: "tiny".to_string(),
@@ -5210,15 +5386,27 @@ mod tests {
     #[test]
     fn read_only_create_policy_denies_write_access() {
         let result =
-            read_only_create_access_status(FILE_CREATE_DISPOSITION_OPEN, true, false, false);
+            read_only_create_access_status(FILE_CREATE_DISPOSITION_OPEN, true, false, false, true);
         assert_eq!(result, Err(SMB2_STATUS_ACCESS_DENIED));
     }
 
     #[test]
-    fn read_only_create_policy_denies_non_open_disposition() {
+    fn read_only_create_policy_allows_open_if_for_existing_path() {
         let result =
-            read_only_create_access_status(FILE_CREATE_DISPOSITION_OPEN_IF, false, false, false);
-        assert_eq!(result, Err(SMB2_STATUS_ACCESS_DENIED));
+            read_only_create_access_status(FILE_CREATE_DISPOSITION_OPEN_IF, false, false, false, true);
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn read_only_create_policy_reports_not_found_for_missing_open_if() {
+        let result = read_only_create_access_status(
+            FILE_CREATE_DISPOSITION_OPEN_IF,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(result, Err(SMB2_STATUS_OBJECT_NAME_NOT_FOUND));
     }
 
     #[test]

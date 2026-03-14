@@ -1360,15 +1360,15 @@ Recommended starting points:
 - `smb_port=<u16>`
 - `max_sessions=<64..65536>`
 - `max_frame_bytes=<4096..67108864>`
-- `async_close_commit=true|false` (default `false`; retained for compatibility, ignored in read-only SMB mode)
-- `async_close_threshold_bytes=<u64>` (default `67108864`; retained for compatibility, ignored in read-only SMB mode)
+- `async_close_commit=true|false` (default `false`; retained for compatibility, ignored in SMB-lite transport mode)
+- `async_close_threshold_bytes=<u64>` (default `67108864`; retained for compatibility, ignored in SMB-lite transport mode)
 - `auth_username=<string>` optional
 - `auth_password=<string>` optional
 - `auth_domain=<string>` optional
 - `require_signing=true|false`
-- `query_directory_page_limit=<16..1000>` (default `256`)
-- `query_directory_max_buffered_entries=<32..8192>` (default `512`)
-- `query_directory_max_seeded_entries=<8..2048>` (default `128`, capped by `query_directory_max_buffered_entries`)
+- `query_directory_page_limit=<16..1000>` (default `1000`)
+- `query_directory_max_buffered_entries=<32..8192>` (default `4096`)
+- `query_directory_max_seeded_entries=<8..2048>` (default `512`, capped by `query_directory_max_buffered_entries`)
 
 Behavior:
 - Preferred auth mode is fragment-scoped:
@@ -1376,7 +1376,7 @@ Behavior:
 - SMB `password` is fragment key.
 - Share `N1` maps to the authenticated fragment for the session.
 - SMB filesystem capacity reported to clients (for example Windows "Properties") is derived from live filesystem totals on the current node.
-- SMB is read-only: browse/list/open/read/query operations are supported, while write/create/rename/delete/truncate and other mutating requests are denied with `STATUS_ACCESS_DENIED`.
+- SMB is read-only: browse/list/open/read/query only.
 - Optional static mode: if `auth_username` and `auth_password` are configured, that static account is also accepted.
 - If `require_signing=true`, SMB signing is required.
 - Live monitoring and SMB capacity reporting use current filesystem totals.

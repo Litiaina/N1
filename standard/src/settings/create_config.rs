@@ -71,9 +71,9 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("async_close_commit", "false")
         .set("async_close_threshold_bytes", "67108864")
         .set("require_signing", "false")
-        .set("query_directory_page_limit", "256")
-        .set("query_directory_max_buffered_entries", "512")
-        .set("query_directory_max_seeded_entries", "128");
+        .set("query_directory_page_limit", "1000")
+        .set("query_directory_max_buffered_entries", "4096")
+        .set("query_directory_max_seeded_entries", "512");
 
     conf.write_to_file(path)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
@@ -101,9 +101,9 @@ mod tests {
         let ini = Ini::load_from_file(&path).expect("load generated config");
         let smb = ini.section(Some("smb")).expect("smb section");
 
-        assert_eq!(smb.get("query_directory_page_limit"), Some("256"));
-        assert_eq!(smb.get("query_directory_max_buffered_entries"), Some("512"));
-        assert_eq!(smb.get("query_directory_max_seeded_entries"), Some("128"));
+        assert_eq!(smb.get("query_directory_page_limit"), Some("1000"));
+        assert_eq!(smb.get("query_directory_max_buffered_entries"), Some("4096"));
+        assert_eq!(smb.get("query_directory_max_seeded_entries"), Some("512"));
 
         let _ = fs::remove_file(path);
     }

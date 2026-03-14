@@ -974,7 +974,7 @@ pub async fn list_objects(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    list_objects_internal(fragment, params, false).await
+    Ok(AxumJson(list_objects_internal(fragment, params, false).await?))
 }
 
 pub async fn list_trash_objects(
@@ -990,7 +990,7 @@ pub async fn list_trash_objects(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    list_objects_internal(fragment, params, true).await
+    Ok(AxumJson(list_objects_internal(fragment, params, true).await?))
 }
 
 async fn list_objects_partition_native(
@@ -1133,11 +1133,19 @@ async fn list_objects_partition_native(
     })
 }
 
+pub async fn list_objects_direct(
+    fragment: &str,
+    params: HashMap<String, String>,
+    scan_trash: bool,
+) -> Result<ListObjectsResult, AppError> {
+    list_objects_internal(fragment.to_string(), params, scan_trash).await
+}
+
 async fn list_objects_internal(
     fragment: String,
     params: HashMap<String, String>,
     scan_trash: bool,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<ListObjectsResult, AppError> {
     let limit: usize = params
         .get("limit")
         .and_then(|s| s.parse().ok())
@@ -1171,7 +1179,7 @@ async fn list_objects_internal(
     )
     .await?
     {
-        return Ok(AxumJson(res));
+        return Ok(res);
     }
 
     if let Ok(res) = list_objects_partition_native(
@@ -1185,7 +1193,7 @@ async fn list_objects_internal(
     )
     .await
     {
-        return Ok(AxumJson(res));
+        return Ok(res);
     }
 
     let continuation_cursor = continuation_token
@@ -1198,11 +1206,11 @@ async fn list_objects_internal(
             Some(root) => root,
             None => {
                 debug!("No active index root found for fragment {}", fragment);
-                return Ok(AxumJson(ListObjectsResult {
+                return Ok(ListObjectsResult {
                     objects: Vec::new(),
                     common_prefixes: Vec::new(),
                     continuation_token: None,
-                }));
+                });
             }
         };
 
@@ -1477,11 +1485,11 @@ async fn list_objects_internal(
         }
     }
 
-    Ok(AxumJson(ListObjectsResult {
+    Ok(ListObjectsResult {
         objects: results.into_iter().map(ObjectMetadata::from).collect(),
         common_prefixes: out_prefixes,
         continuation_token: if reached_limit { next_token } else { None },
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -1632,13 +1640,20 @@ pub async fn get_object_metadata(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let metadata = get_metadata(&fragment, &object_key, &claims.fragment).await?;
+    Ok(AxumJson(
+        get_object_metadata_direct(&fragment, &object_key).await?,
+    ))
+}
 
+pub async fn get_object_metadata_direct(
+    fragment: &str,
+    object_key: &str,
+) -> Result<ObjectMetadata, AppError> {
+    let metadata = get_metadata(fragment, object_key, fragment).await?;
     if metadata.is_delete_marker {
         return Err(AppError::NotFound);
     }
-
-    Ok(AxumJson(metadata))
+    Ok(metadata)
 }
 
 pub async fn get_object(

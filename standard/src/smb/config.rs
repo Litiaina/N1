@@ -94,14 +94,14 @@ impl Default for SmbConfig {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .map(clamp_query_directory_page_limit)
-            .unwrap_or(256);
+            .unwrap_or(1000);
 
         let query_directory_max_buffered_entries =
             env::var("N1_SMB_QUERY_DIRECTORY_MAX_BUFFERED_ENTRIES")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .map(clamp_query_directory_max_buffered_entries)
-                .unwrap_or(512);
+                .unwrap_or(4096);
 
         let query_directory_max_seeded_entries =
             env::var("N1_SMB_QUERY_DIRECTORY_MAX_SEEDED_ENTRIES")
@@ -113,7 +113,7 @@ impl Default for SmbConfig {
                         query_directory_max_buffered_entries,
                     )
                 })
-                .unwrap_or(128);
+                .unwrap_or(512);
 
         Self {
             enabled,

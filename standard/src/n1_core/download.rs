@@ -53,11 +53,9 @@ pub async fn download_object_chunk(
     }
 
     let metadata = get_metadata(&fragment, &params.object_key, &claims.fragment).await?;
-
     if metadata.is_delete_marker {
         return Err(AppError::NotFound);
     }
-
     if params.offset >= metadata.total_size_bytes {
         return Ok(Response::builder()
             .status(StatusCode::NO_CONTENT)
@@ -66,10 +64,43 @@ pub async fn download_object_chunk(
             .into_response());
     }
 
+    let (result_buffer, checksum_header) =
+        download_object_chunk_from_metadata(metadata, &params).await?;
+
+    let body = Body::from(result_buffer);
+    let mut builder = Response::builder().header(header::CONTENT_TYPE, "application/octet-stream");
+
+    if let Some(crc) = checksum_header.as_deref() {
+        builder = builder.header("x-litiaina-checksum", crc);
+    }
+
+    Ok(builder.body(body).unwrap().into_response())
+}
+
+pub async fn download_object_chunk_direct(
+    fragment: &str,
+    params: &ChunkQuery,
+) -> Result<Vec<u8>, AppError> {
+    let metadata = get_metadata(fragment, &params.object_key, fragment).await?;
+    if metadata.is_delete_marker {
+        return Err(AppError::NotFound);
+    }
+    if params.offset >= metadata.total_size_bytes {
+        return Ok(Vec::new());
+    }
+
+    let (result_buffer, _) = download_object_chunk_from_metadata(metadata, params).await?;
+    Ok(result_buffer)
+}
+
+async fn download_object_chunk_from_metadata(
+    metadata: crate::n1_core::disk_manager::ObjectMetadata,
+    params: &ChunkQuery,
+) -> Result<(Vec<u8>, Option<String>), AppError> {
     let stripe_block_size = metadata.stripe_size_bytes;
     let mut result_buffer = Vec::with_capacity(params.chunk_size);
     let mut current_global_pos = 0u64;
-    let mut checksum_header: Option<&str> = None;
+    let mut checksum_header: Option<String> = None;
     let mut file_cache: HashMap<String, File> = HashMap::new();
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
@@ -89,7 +120,7 @@ pub async fn download_object_chunk(
         let req_end = params.offset + params.chunk_size as u64;
 
         if req_start == current_global_pos && params.chunk_size as u64 == part_len {
-            checksum_header = part.checksum.as_deref();
+            checksum_header = part.checksum.clone();
         }
 
         if req_end > current_global_pos && req_start < part_end {
@@ -160,12 +191,5 @@ pub async fn download_object_chunk(
         }
     }
 
-    let body = Body::from(result_buffer);
-    let mut builder = Response::builder().header(header::CONTENT_TYPE, "application/octet-stream");
-
-    if let Some(crc) = checksum_header {
-        builder = builder.header("x-litiaina-checksum", crc);
-    }
-
-    Ok(builder.body(body).unwrap().into_response())
+    Ok((result_buffer, checksum_header))
 }

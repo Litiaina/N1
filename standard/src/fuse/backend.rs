@@ -4,12 +4,15 @@ use crate::n1_core::delete::{
     delete_object, delete_object_permanently, empty_trash, recover_object,
 };
 use crate::n1_core::disk_manager::{
-    ChunkQuery, InitiateUploadParams, ObjectKeyQuery, ObjectMetadata, RenameObjectRequest,
+    ChunkQuery, InitiateUploadParams, ListObjectsResult, ObjectKeyQuery, ObjectMetadata,
+    RenameObjectRequest,
     UploadPartQuery,
 };
-use crate::n1_core::download::download_object_chunk;
+use crate::n1_core::download::download_object_chunk_direct;
 use crate::n1_core::modify::rename_object;
-use crate::n1_core::retrieve::{get_object_metadata, list_objects, list_trash_objects};
+use crate::n1_core::retrieve::{
+    get_object_metadata_direct, list_objects_direct,
+};
 use crate::n1_core::upload::{
     cancel_upload_session, finalize_object_upload, initiate_object_upload, object_upload_part,
 };
@@ -22,8 +25,8 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::future::BoxFuture;
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::mem;
@@ -111,14 +114,6 @@ struct DirectPendingWrite {
 enum PendingWriteState {
     Staged(StagedPendingWrite),
     Direct(DirectPendingWrite),
-}
-
-#[derive(Debug, Deserialize)]
-struct ListObjectsResponse {
-    objects: Vec<ObjectMetadata>,
-    #[serde(default)]
-    common_prefixes: Vec<String>,
-    continuation_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -241,7 +236,7 @@ impl InProcessBackend {
         fragment: &str,
         prefix: &str,
         continuation_token: Option<String>,
-    ) -> Result<ListObjectsResponse, AppError> {
+    ) -> Result<ListObjectsResult, AppError> {
         self.list_page_with_limit(
             fragment,
             prefix,
@@ -257,7 +252,7 @@ impl InProcessBackend {
         prefix: &str,
         continuation_token: Option<String>,
         page_limit: usize,
-    ) -> Result<ListObjectsResponse, AppError> {
+    ) -> Result<ListObjectsResult, AppError> {
         let limit = page_limit.clamp(1, FSD_LIST_PAGE_LIMIT_MAX);
         let mut params = HashMap::new();
         params.insert("limit".to_string(), limit.to_string());
@@ -270,15 +265,7 @@ impl InProcessBackend {
             params.insert("continuation_token".to_string(), token);
         }
 
-        let response = list_objects(
-            Self::claims_for(fragment),
-            AxumPath(fragment.to_string()),
-            Query(params),
-        )
-        .await?
-        .into_response();
-
-        Self::parse_json_response(response, &[StatusCode::OK]).await
+        list_objects_direct(fragment, params, false).await
     }
 
     async fn list_page_recursive(
@@ -286,7 +273,7 @@ impl InProcessBackend {
         fragment: &str,
         prefix: &str,
         continuation_token: Option<String>,
-    ) -> Result<ListObjectsResponse, AppError> {
+    ) -> Result<ListObjectsResult, AppError> {
         let mut params = HashMap::new();
         params.insert("limit".to_string(), "1000".to_string());
         params.insert("include_internal".to_string(), "true".to_string());
@@ -297,15 +284,7 @@ impl InProcessBackend {
             params.insert("continuation_token".to_string(), token);
         }
 
-        let response = list_objects(
-            Self::claims_for(fragment),
-            AxumPath(fragment.to_string()),
-            Query(params),
-        )
-        .await?
-        .into_response();
-
-        Self::parse_json_response(response, &[StatusCode::OK]).await
+        list_objects_direct(fragment, params, false).await
     }
 
     async fn list_trash_page(
@@ -313,7 +292,7 @@ impl InProcessBackend {
         fragment: &str,
         prefix: &str,
         continuation_token: Option<String>,
-    ) -> Result<ListObjectsResponse, AppError> {
+    ) -> Result<ListObjectsResult, AppError> {
         self.list_trash_page_with_limit(
             fragment,
             prefix,
@@ -329,7 +308,7 @@ impl InProcessBackend {
         prefix: &str,
         continuation_token: Option<String>,
         page_limit: usize,
-    ) -> Result<ListObjectsResponse, AppError> {
+    ) -> Result<ListObjectsResult, AppError> {
         let limit = page_limit.clamp(1, FSD_LIST_PAGE_LIMIT_MAX);
         let mut params = HashMap::new();
         params.insert("limit".to_string(), limit.to_string());
@@ -341,15 +320,7 @@ impl InProcessBackend {
             params.insert("continuation_token".to_string(), token);
         }
 
-        let response = list_trash_objects(
-            Self::claims_for(fragment),
-            AxumPath(fragment.to_string()),
-            Query(params),
-        )
-        .await?
-        .into_response();
-
-        Self::parse_json_response(response, &[StatusCode::OK]).await
+        list_objects_direct(fragment, params, true).await
     }
 
     async fn fetch_object_metadata(
@@ -357,14 +328,7 @@ impl InProcessBackend {
         fragment: &str,
         object_key: &str,
     ) -> Result<ObjectMetadata, AppError> {
-        let response = get_object_metadata(
-            Self::claims_for(fragment),
-            AxumPath((fragment.to_string(), object_key.to_string())),
-        )
-        .await?
-        .into_response();
-
-        Self::parse_json_response(response, &[StatusCode::OK]).await
+        get_object_metadata_direct(fragment, object_key).await
     }
 
     fn split_trash_virtual_key<'a>(key: &'a str) -> Option<&'a str> {
@@ -1009,7 +973,7 @@ impl FsdBackend for InProcessBackend {
                         page_limit,
                     )
                     .await?;
-                let ListObjectsResponse {
+                let ListObjectsResult {
                     objects,
                     continuation_token: next_continuation_token,
                     ..
@@ -1115,7 +1079,7 @@ impl FsdBackend for InProcessBackend {
                     page_limit,
                 )
                 .await?;
-            let ListObjectsResponse {
+            let ListObjectsResult {
                 objects,
                 common_prefixes,
                 continuation_token: next_continuation_token,
@@ -1351,28 +1315,15 @@ impl FsdBackend for InProcessBackend {
 
             let capped_len = length.clamp(1, FSD_MAX_READ_BYTES);
 
-            let response = download_object_chunk(
-                Self::claims_for(&path.fragment),
-                AxumPath(path.fragment.clone()),
-                Query(ChunkQuery {
+            download_object_chunk_direct(
+                &path.fragment,
+                &ChunkQuery {
                     object_key: path.object_key.clone(),
                     offset,
                     chunk_size: capped_len,
-                }),
+                },
             )
-            .await?
-            .into_response();
-
-            let (status, body) = Self::response_bytes(response, capped_len).await?;
-            if status == StatusCode::NO_CONTENT {
-                return Ok(Vec::new());
-            }
-
-            if status != StatusCode::OK {
-                return Err(Self::status_to_error(status, &body));
-            }
-
-            Ok(body)
+            .await
         })
     }
 
