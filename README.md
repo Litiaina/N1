@@ -1156,4 +1156,4 @@ Outputs are written under `.n1-bench/perf-probes-<timestamp>/`.
 
 ---
 
-© Litiaina --- N1 Core Engine
+© Litiaina --- N2
