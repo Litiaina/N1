@@ -29,11 +29,8 @@ use crate::validation::enforce_init_settings::{ensure_config_file, ensure_env_fi
 use axum::Router;
 use axum_server::tls_rustls::RustlsConfig;
 use chrono::Local;
-use clap::Parser;
-use dotenv::dotenv;
+use clap::{Parser, Subcommand};
 use ini::Ini;
-use server_cli::cli::args::{Cli, Commands};
-use server_cli::cli::client::execute_command;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -59,6 +56,45 @@ mod structs;
 mod utils;
 mod validation;
 mod websocket;
+
+#[derive(Parser, Debug)]
+#[command(name = "litiaina-n1-arc")]
+#[command(version, about = "Arc runtime and raw-device formatting utility")]
+struct ArcCli {
+    #[command(subcommand)]
+    command: Option<ArcCommands>,
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum ArcCommands {
+    Server,
+    FormatBlobDevice {
+        #[arg(long)]
+        path: String,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        #[arg(long, default_value_t = false)]
+        prepare: bool,
+        #[arg(long)]
+        nonce: Option<String>,
+        #[arg(long)]
+        fingerprint: Option<String>,
+    },
+    FormatIndexDevice {
+        #[arg(long)]
+        path: String,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        #[arg(long, default_value_t = false)]
+        prepare: bool,
+        #[arg(long)]
+        nonce: Option<String>,
+        #[arg(long)]
+        fingerprint: Option<String>,
+    },
+}
 
 fn detect_cpu_cores() -> usize {
     std::thread::available_parallelism()
@@ -523,7 +559,7 @@ pub fn init_tracing() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
 
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            "info,litiaina_n1=trace,server_cli=trace,axum=info,hyper=info".into()
+            "info,litiaina_n1=trace,axum=info,hyper=info".into()
         }))
         .with(
             fmt::layer()
@@ -562,11 +598,11 @@ async fn main() {
 
     let _guard = init_tracing().expect("Failed to initialize tracing subscriber");
 
-    let args = Cli::parse();
+    let args = ArcCli::parse();
 
-    match &args.command {
-        Some(Commands::Server) | None => {}
-        Some(Commands::FormatBlobDevice {
+    match args.command.as_ref() {
+        Some(ArcCommands::Server) | None => {}
+        Some(ArcCommands::FormatBlobDevice {
             path,
             force,
             prepare,
@@ -589,11 +625,6 @@ async fn main() {
                         println!("  nonce: {}", intent.nonce);
                         println!("  fingerprint: {}", intent.fingerprint);
                         println!("  expires_at_unix: {}", intent.expires_at);
-                        println!("Run format command with:");
-                        println!(
-                            "  --path '{}' --force={} --nonce '{}' --fingerprint '{}'",
-                            intent.path, intent.force, intent.nonce, intent.fingerprint
-                        );
                     }
                 })
             } else {
@@ -626,34 +657,6 @@ async fn main() {
                             println!("  path: {}", status.path);
                             println!("  canonical_path: {}", status.canonical_path);
                             println!("  status: {}", status.status);
-                            println!(
-                                "  device_id: {}",
-                                status.device_id.unwrap_or_else(|| "<none>".to_string())
-                            );
-                            println!(
-                                "  block_size_bytes: {}",
-                                status
-                                    .block_size_bytes
-                                    .map(|v| v.to_string())
-                                    .unwrap_or_else(|| "<unknown>".to_string())
-                            );
-                            println!(
-                                "  total_bytes: {}",
-                                status
-                                    .total_bytes
-                                    .map(|v| v.to_string())
-                                    .unwrap_or_else(|| "<unknown>".to_string())
-                            );
-                            println!(
-                                "  available_bytes: {}",
-                                status
-                                    .available_bytes
-                                    .map(|v| v.to_string())
-                                    .unwrap_or_else(|| "<unknown>".to_string())
-                            );
-                            if let Some(warning) = status.path_warning {
-                                println!("  warning: {}", warning);
-                            }
                         }
                     }),
                     (Err(err), _) | (_, Err(err)) => Err(err),
@@ -661,18 +664,13 @@ async fn main() {
             };
 
             drop(_guard);
-
-            match result {
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("Command failed: {}", e);
-                    std::process::exit(1);
-                }
+            if let Err(error) = result {
+                eprintln!("Command failed: {}", error);
+                std::process::exit(1);
             }
-
             return;
         }
-        Some(Commands::FormatIndexDevice {
+        Some(ArcCommands::FormatIndexDevice {
             path,
             force,
             prepare,
@@ -695,11 +693,6 @@ async fn main() {
                         println!("  nonce: {}", intent.nonce);
                         println!("  fingerprint: {}", intent.fingerprint);
                         println!("  expires_at_unix: {}", intent.expires_at);
-                        println!("Run format command with:");
-                        println!(
-                            "  --path '{}' --force={} --nonce '{}' --fingerprint '{}'",
-                            intent.path, intent.force, intent.nonce, intent.fingerprint
-                        );
                     }
                 })
             } else {
@@ -733,34 +726,6 @@ async fn main() {
                             println!("  path: {}", status.path);
                             println!("  canonical_path: {}", status.canonical_path);
                             println!("  status: {}", status.status);
-                            println!(
-                                "  device_id: {}",
-                                status.device_id.unwrap_or_else(|| "<none>".to_string())
-                            );
-                            println!(
-                                "  block_size_bytes: {}",
-                                status
-                                    .block_size_bytes
-                                    .map(|v| v.to_string())
-                                    .unwrap_or_else(|| "<unknown>".to_string())
-                            );
-                            println!(
-                                "  total_bytes: {}",
-                                status
-                                    .total_bytes
-                                    .map(|v| v.to_string())
-                                    .unwrap_or_else(|| "<unknown>".to_string())
-                            );
-                            println!(
-                                "  available_bytes: {}",
-                                status
-                                    .available_bytes
-                                    .map(|v| v.to_string())
-                                    .unwrap_or_else(|| "<unknown>".to_string())
-                            );
-                            if let Some(warning) = status.path_warning {
-                                println!("  warning: {}", warning);
-                            }
                         }
                     }),
                     (Err(err), _) | (_, Err(err)) => Err(err),
@@ -768,50 +733,10 @@ async fn main() {
             };
 
             drop(_guard);
-
-            match result {
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("Command failed: {}", e);
-                    std::process::exit(1);
-                }
-            }
-
-            return;
-        }
-        Some(cmd) => {
-            dotenv().ok();
-
-            let target_url = args.url.or_else(|| {
-                Ini::load_from_file(CONFIG_FILE).ok().and_then(|conf| {
-                    conf.section(Some("server")).map(|section| {
-                        let host = section.get("host").unwrap_or("127.0.0.1");
-                        let port = section.get("https_port").unwrap_or("50001");
-                        let effective_host = if host == "0.0.0.0" { "127.0.0.1" } else { host };
-                        format!("https://{}:{}", effective_host, port)
-                    })
-                })
-            });
-
-            let result = execute_command(
-                cmd,
-                args.secret.clone(),
-                args.auth_fragment.clone(),
-                args.fragment.clone(),
-                target_url,
-                args.insecure,
-                args.poll_ms,
-                args.json,
-            )
-            .await;
-
-            drop(_guard);
-
-            if let Err(e) = result {
-                eprintln!("Command failed: {}", e);
+            if let Err(error) = result {
+                eprintln!("Command failed: {}", error);
                 std::process::exit(1);
             }
-
             return;
         }
     }

@@ -1,5 +1,14 @@
 [workspace]
-members = ["block_manager", "arc", "standard", "server_cli", "simd-erasure-core"]
+members = [
+    "block_manager",
+    "arc",
+    "cli_core",
+    "standard",
+    "standard_cli",
+    "distribution-runtime",
+    "distribution_cli",
+    "simd-erasure-core",
+]
 resolver = "2"
 
 [profile.release]
@@ -60,7 +69,7 @@ async_zip = { version = "0.0.18", features = ["tokio", "deflate"] }
 tokio-tar = "0.3.1"
 tracing-appender = "0.2.4"
 clap = { version = "4.5.54", features = ["derive"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
 core_affinity = "0.8.3"
 rmp-serde = "1.3.1"
 argon2 = "0.5.3"

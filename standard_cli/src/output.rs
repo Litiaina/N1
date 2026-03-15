@@ -1,0 +1,299 @@
+use chrono::{Local, TimeZone};
+
+use cli_core::models::{
+    GcJobStatus, HealthResponse, ListUploadsResponse, PrefixRebuildJobStatus,
+    RedistributionJobStatus, RepairJobStatus, UploadStatusResponse,
+};
+
+fn format_timestamp(ts: i64) -> String {
+    Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut idx = 0usize;
+    while value >= 1024.0 && idx < UNITS.len() - 1 {
+        value /= 1024.0;
+        idx += 1;
+    }
+    if idx == 0 {
+        format!("{bytes} {}", UNITS[idx])
+    } else {
+        format!("{value:.2} {}", UNITS[idx])
+    }
+}
+
+fn format_rows(title: &str, rows: &[(&str, String)]) -> String {
+    let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    out.push_str(title);
+    out.push('\n');
+    out.push_str(&"-".repeat(title.len()));
+    out.push('\n');
+    for (key, value) in rows {
+        out.push_str(&format!("{key:width$}  {value}\n", width = width));
+    }
+    out.trim_end().to_string()
+}
+
+fn format_optional_error(error: &Option<String>) -> String {
+    error.clone().unwrap_or_else(|| "-".to_string())
+}
+
+pub fn format_health(response: &HealthResponse) -> String {
+    let rows = vec![
+        ("sampled_at", format_timestamp(response.sampled_at)),
+        ("status", response.status.clone()),
+        ("summary", response.summary.clone()),
+        (
+            "cpu",
+            format!(
+                "{:.2}% on {} core(s)",
+                response.system.cpu_usage_percent, response.system.cpu_cores
+            ),
+        ),
+        (
+            "ram",
+            format!(
+                "{:.2}% ({} / {})",
+                response.system.ram_usage_percent,
+                human_bytes(response.system.ram_used_bytes),
+                human_bytes(response.system.ram_total_bytes)
+            ),
+        ),
+        (
+            "process_rss",
+            human_bytes(response.system.process_resident_bytes),
+        ),
+        (
+            "storage",
+            format!(
+                "{} free / {} raw",
+                human_bytes(response.storage.raw_available_bytes),
+                human_bytes(response.storage.raw_total_bytes)
+            ),
+        ),
+        (
+            "index_health",
+            response.consistency.index_mirror_health.clone(),
+        ),
+        (
+            "blob_devices",
+            format!(
+                "{}/{} online",
+                response.storage.blob_devices_online, response.storage.blob_devices_total
+            ),
+        ),
+        (
+            "index_roots",
+            format!(
+                "{}/{} online",
+                response.storage.index_roots_online, response.storage.index_roots_total
+            ),
+        ),
+    ];
+
+    let mut out = format_rows("N1 Standard Health", &rows);
+
+    if !response.disks.is_empty() {
+        out.push_str("\n\ndisks");
+        out.push_str("\n-----");
+        for disk in &response.disks {
+            let usage = match (disk.used_bytes, disk.total_bytes, disk.available_bytes) {
+                (Some(used), Some(total), Some(available)) => format!(
+                    "{} used / {} total / {} free ({:.2}%)",
+                    human_bytes(used),
+                    human_bytes(total),
+                    human_bytes(available),
+                    disk.usage_percent.unwrap_or(0.0)
+                ),
+                _ => "usage unavailable".to_string(),
+            };
+            let latency = disk
+                .latency_ms
+                .map(|value| format!("{value}ms"))
+                .unwrap_or_else(|| "-".to_string());
+            let error = disk.error.clone().unwrap_or_else(|| "-".to_string());
+            out.push_str(&format!(
+                "\n{} [{}] {}  latency={}  usage={}  path={}  error={}",
+                disk.role, disk.status, if disk.status == "online" { "healthy" } else { "attention" }, latency, usage, disk.path, error
+            ));
+        }
+    }
+
+    out
+}
+
+pub fn format_health_watch_line(response: &HealthResponse) -> String {
+    let disk_summary = response
+        .disks
+        .iter()
+        .map(|disk| {
+            let usage = disk
+                .usage_percent
+                .map(|value| format!("{value:.0}%"))
+                .unwrap_or_else(|| "?".to_string());
+            format!("{}:{}@{}", disk.role, disk.status, usage)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{}  status={} cpu={:.2}% ram={:.2}% uploads={} blob={}/{} disks={} summary={}",
+        format_timestamp(response.sampled_at),
+        response.status,
+        response.system.cpu_usage_percent,
+        response.system.ram_usage_percent,
+        response.uploads.active_sessions,
+        response.storage.blob_devices_online,
+        response.storage.blob_devices_total,
+        disk_summary,
+        response.summary
+    )
+}
+
+pub fn format_upload_list(response: &ListUploadsResponse) -> String {
+    let mut out = format_rows(
+        "Active Uploads",
+        &[
+            ("total", response.total.to_string()),
+            ("sessions", response.sessions.len().to_string()),
+        ],
+    );
+    if response.sessions.is_empty() {
+        out.push_str("\n\nNo active upload sessions.");
+        return out;
+    }
+
+    out.push_str("\n\nsession_id  version_id  committed_parts  committed_bytes  object_key");
+    for session in &response.sessions {
+        out.push_str(&format!(
+            "\n{}  {}  {}  {}  {}",
+            session.session_id,
+            session.version_id,
+            session.committed_parts,
+            human_bytes(session.committed_bytes),
+            session.object_key.clone().unwrap_or_else(|| "-".to_string())
+        ));
+    }
+    out
+}
+
+pub fn format_upload_status(response: &UploadStatusResponse) -> String {
+    format_rows(
+        "Upload Status",
+        &[
+            ("session_id", response.session_id.clone().unwrap_or_else(|| "-".to_string())),
+            ("version_id", response.version_id.clone().unwrap_or_else(|| "-".to_string())),
+            ("object_key", response.object_key.clone().unwrap_or_else(|| "-".to_string())),
+            ("committed_parts", response.committed_parts.to_string()),
+            ("committed_bytes", human_bytes(response.committed_bytes)),
+            (
+                "expected_parts",
+                response
+                    .expected_parts
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            (
+                "uploaded_parts",
+                if response.uploaded_parts.is_empty() {
+                    "-".to_string()
+                } else {
+                    response
+                        .uploaded_parts
+                        .iter()
+                        .map(|part| part.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                },
+            ),
+        ],
+    )
+}
+
+pub fn format_gc_status(status: &GcJobStatus) -> String {
+    format_rows(
+        "Garbage Collector",
+        &[
+            ("running", status.is_running.to_string()),
+            ("phase", status.phase.clone()),
+            ("fragment", status.current_fragment.clone()),
+            ("duration", format!("{}s", status.duration_seconds)),
+            (
+                "fragments",
+                format!("{}/{}", status.total_fragments_scanned, status.total_fragments),
+            ),
+            ("trash_expired", status.total_trash_versions_expired.to_string()),
+            ("orphan_blob_dirs", status.total_orphan_blob_dirs_deleted.to_string()),
+            ("refund_bytes", human_bytes(status.total_refund_bytes)),
+            ("errors", status.total_errors.to_string()),
+            ("last_error", format_optional_error(&status.last_error)),
+        ],
+    )
+}
+
+pub fn format_repair_status(status: &RepairJobStatus) -> String {
+    format_rows(
+        "Repair",
+        &[
+            ("running", status.is_running.to_string()),
+            ("phase", status.phase.clone()),
+            ("fragment", status.current_fragment.clone()),
+            ("duration", format!("{}s", status.duration_seconds)),
+            ("scanned", status.total_scanned.to_string()),
+            ("repaired", status.total_repaired.to_string()),
+            ("corrupt_found", status.corrupt_found.to_string()),
+            ("scan_rate", format!("{:.2}/s", status.scan_rate_per_sec)),
+            (
+                "last_repaired",
+                status.last_repaired.clone().unwrap_or_else(|| "-".to_string()),
+            ),
+            ("last_error", format_optional_error(&status.last_error)),
+        ],
+    )
+}
+
+pub fn format_redistribution_status(status: &RedistributionJobStatus) -> String {
+    format_rows(
+        "Redistribution",
+        &[
+            ("running", status.is_running.to_string()),
+            ("phase", status.phase.clone()),
+            ("fragment", status.current_fragment.clone()),
+            ("duration", format!("{}s", status.duration_seconds)),
+            ("fragments_scanned", status.total_fragments_scanned.to_string()),
+            ("objects_scanned", status.total_objects_scanned.to_string()),
+            (
+                "objects_need_move",
+                status.total_objects_need_redistribution.to_string(),
+            ),
+            ("objects_migrated", status.total_objects_migrated.to_string()),
+            ("scan_rate", format!("{:.2}/s", status.scan_rate_per_sec)),
+            ("last_error", format_optional_error(&status.last_error)),
+        ],
+    )
+}
+
+pub fn format_prefix_rebuild_status(status: &PrefixRebuildJobStatus) -> String {
+    format_rows(
+        "Prefix Rebuild",
+        &[
+            ("running", status.is_running.to_string()),
+            ("phase", status.phase.clone()),
+            ("fragment", status.current_fragment.clone()),
+            ("duration", format!("{}s", status.duration_seconds)),
+            ("fragments_scanned", status.total_fragments_scanned.to_string()),
+            ("metadata_scanned", status.total_metadata_scanned.to_string()),
+            ("objects_indexed", status.total_objects_indexed.to_string()),
+            ("prefixes_written", status.total_prefixes_written.to_string()),
+            ("entries_written", status.total_entries_written.to_string()),
+            ("errors", status.total_errors.to_string()),
+            ("last_error", format_optional_error(&status.last_error)),
+        ],
+    )
+}

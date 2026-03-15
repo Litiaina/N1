@@ -21,9 +21,7 @@ use axum::{
 use base64::Engine;
 use base64::engine::general_purpose;
 use serde::Serialize;
-use std::{
-    collections::{HashMap, HashSet},
-};
+use std::collections::{HashMap, HashSet};
 use tokio::fs;
 use tracing::warn;
 
@@ -245,10 +243,12 @@ async fn load_best_delimiter_compacted_segment(
 
 fn first_prefix_entry_after(entries: &[PrefixIndexEntry], key: &str, version_id: &str) -> usize {
     entries
-        .binary_search_by(|entry| match canonical_key(&entry.object_key).as_str().cmp(key) {
-            std::cmp::Ordering::Equal => entry.version_id.as_str().cmp(version_id),
-            other => other,
-        })
+        .binary_search_by(
+            |entry| match canonical_key(&entry.object_key).as_str().cmp(key) {
+                std::cmp::Ordering::Equal => entry.version_id.as_str().cmp(version_id),
+                other => other,
+            },
+        )
         .map(|idx| idx + 1)
         .unwrap_or_else(|idx| idx)
 }
@@ -297,7 +297,9 @@ async fn list_prefix_compacted_page_fast(
         if !include_internal && is_internal_object_key(entry.object_key.as_str()) {
             continue;
         }
-        if !pfx.is_empty() && entry.object_key != pfx && !entry.object_key.starts_with(&pfx_with_slash)
+        if !pfx.is_empty()
+            && entry.object_key != pfx
+            && !entry.object_key.starts_with(&pfx_with_slash)
         {
             continue;
         }

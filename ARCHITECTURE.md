@@ -1,12 +1,24 @@
-# N1 Architecture
+# N2 Architecture
 
 > Deployment profile status (2026-03-13):
-> - `standard` is stable and the default deployment profile.
+> - `N2` is the product identity of this workspace.
+> - `N1` is the shared storage engine used underneath both deployment shapes.
+> - `standard` is the stable single-node deployment profile.
 > - `standard` is released at `0.5.2`.
+> - `distribution-runtime` is the multi-node N2 deployment profile.
 > - `arc` is an experimental raw-device deployment profile.
 > - See `DEPLOYMENT_PROFILES.md`.
 
-N1 is a single-node object storage engine with three distinct planes:
+N2 has two deployment shapes:
+
+- single-node N2:
+  - run `standard`
+  - use the N1 engine directly on one node
+- multi-node N2:
+  - run `distribution-runtime`
+  - use that same N1 engine on each node, then add cluster membership, placement, and peer traffic
+
+At the node layer, N1 is a single-node object storage engine with three distinct planes:
 
 - `index` is the authoritative object, session, and trash metadata plane.
 - The prefix namespace index is a derived serving accelerator for `LIST prefix` and `delimiter=/`.
@@ -30,7 +42,7 @@ That baseline applies to:
 
 It does **not** freeze the HTTP/API surface yet. API and operational route details can still change before `1.0.0` while the core storage architecture stays fixed.
 
-## Engine Identity And Variant Choice
+## N1 Core Identity And Variant Choice
 
 N1 is intentionally a specialized object-storage engine, not a general filesystem:
 
@@ -39,7 +51,7 @@ N1 is intentionally a specialized object-storage engine, not a general filesyste
 - crash-first repairability
 - low-overhead multipart payload paths
 
-Two server variants exist so users can choose deployment posture:
+At the N1 core layer, two engine variants exist so operators can choose the execution substrate:
 
 - `standard`: filesystem-backed N1 for general-purpose use and broad hardware compatibility.
 - `arc`: raw-device/direct-I/O N1 for absolute device control and maximum throughput ceiling, currently treated as experimental.
@@ -172,7 +184,13 @@ Standard blob layout:
   part_{p}_shard_{i}.parity
 
 {BLOB_ROOT}/{fragment}/.trash/blob/{version_id}/...
+{BLOB_ROOT}/{fragment}/.thumbs/{version_id}/thumb-{profile}.{ext}
 ```
+
+Thumbnail note:
+- `standard` thumbnails are derived cache files, not user objects.
+- They are keyed by immutable `version_id` plus thumbnail profile (`width`, `height`, `fit`, `format`).
+- They do not appear in object listings and can be regenerated from the original object version at any time.
 
 Arc blob layout:
 
@@ -263,6 +281,25 @@ For the current index model, the owner root is the synchronous publish boundary.
 - the freshest readable replica is preferred
 - blob addresses come from the published `ObjectMetadata`
 
+### Derived thumbnails
+
+`standard` also exposes a derived image preview path:
+
+- `GET /v4/fragment/thumb/{*object_key}`
+
+That path resolves the authoritative object version first, then:
+
+- validates that the target is an image object
+- checks for a disk-backed thumbnail cache entry under `.thumbs/{version_id}/...`
+- generates the thumbnail lazily on first request when the cache entry is missing
+- serves later requests from that derived file
+
+This keeps image-heavy gallery browsing efficient without changing the core object model:
+
+- no thumbnail rows in `index`
+- no thumbnail entries in normal object listing
+- no extra user-visible object versions
+
 ### Prefix and delimiter listing
 
 `LIST` is intentionally separated from exact-key truth:
@@ -317,8 +354,8 @@ This architecture gives N1 a better long-term shape than the legacy mirrored tre
 4. The model can evolve without another semantic rewrite.
    The current segmented WAL plus partition checkpoints already give a clean path to richer replay, compaction, and replica-repair behavior without changing API-visible behavior.
 
-5. The same node-core model composes cleanly into N2.
-   N2 can keep its distributed control plane while inheriting a cheaper, clearer node-local authority model.
+5. The same node-core model is what N2 runs in both deployment shapes.
+   Single-node N2 exposes it directly through `standard`; multi-node N2 composes it with the distributed control plane in `distribution-runtime`.
 
 ## HA Model
 

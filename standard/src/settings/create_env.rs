@@ -25,6 +25,27 @@ pub fn create_env_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     writeln!(file, "JWT_SECRET=")?;
     writeln!(file)?;
 
+    writeln!(
+        file,
+        "# Default access-token TTL in seconds (default runtime: 900 / 15 minutes)"
+    )?;
+    writeln!(file, "ACCESS_TOKEN_DEFAULT_TTL_SECS=900")?;
+    writeln!(file)?;
+
+    writeln!(
+        file,
+        "# Maximum access-token TTL in seconds even if clients request more (default runtime: 3600 / 1 hour)"
+    )?;
+    writeln!(file, "ACCESS_TOKEN_MAX_TTL_SECS=3600")?;
+    writeln!(file)?;
+
+    writeln!(
+        file,
+        "# Refresh-token TTL in seconds (default runtime: 604800 / 7 days)"
+    )?;
+    writeln!(file, "REFRESH_TOKEN_TTL_SECS=604800")?;
+    writeln!(file)?;
+
     writeln!(file, "# Secret key used for URL signing and validation")?;
     writeln!(file, "URL_SIGNING_SECRET=")?;
     writeln!(file)?;
@@ -35,6 +56,10 @@ pub fn create_env_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
 
     writeln!(file, "# Server authentication key")?;
     writeln!(file, "MASTER_KEY=")?;
+    writeln!(file)?;
+
+    writeln!(file, "# Admin access key")?;
+    writeln!(file, "ADMIN_KEY=")?;
     writeln!(file)?;
 
     writeln!(

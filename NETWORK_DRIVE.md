@@ -1,14 +1,17 @@
-# N1 Network Drive Guide (SMB-lite)
+# N2 Network Drive Guide (SMB-lite)
 
 > Deployment profile status (2026-03-09):
-> - `standard` (`litiaina-n1-standard`) is the stable/default profile.
+> - `N2` is the product identity of this workspace.
+> - `N1` is the shared storage engine underneath the deployment shapes.
+> - `standard` (`litiaina-n1-standard`) is the stable/default single-node deployment path.
+> - `distribution-runtime` (`litiaina-n2`) is the multi-node deployment path.
 > - `arc` (`litiaina-n1-arc`) is experimental.
 > - See `DEPLOYMENT_PROFILES.md`.
 
-This guide covers both ways to expose N1 as a network drive:
+This guide covers the SMB-lite path for the single-node N2 deployment, which is powered by the N1 engine:
 
 - Native SMB-lite gateway (`smb`) built into `litiaina-n1-standard` (recommended).
-- Fallback bridge (`fsd_mount` + Samba) for environments where you still need it.
+- Legacy `fsd_mount + Samba` bridge note for older deployments; new workspace builds do not ship that bridge.
 
 ## Current Status
 
@@ -139,14 +142,7 @@ macOS:
 
 ## Mode B: Fallback Bridge (`fsd_mount` + Samba)
 
-Use this only if you need the previous bridge model.
-
-### Build
-
-```bash
-cargo build --release -p standard
-cargo build --release -p server_cli --features fsd-mount --bin fsd_mount
-```
+This legacy bridge path is retired in the current workspace. The supported network-drive path is the native SMB server in `standard`.
 
 ### Host setup
 

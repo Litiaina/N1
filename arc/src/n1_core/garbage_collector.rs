@@ -679,7 +679,9 @@ async fn process_fragment_gc(
                 .unwrap_or(now)
         } else {
             SystemTime::UNIX_EPOCH
-                .checked_add(Duration::from_secs(session.manifest.created_at.max(0) as u64))
+                .checked_add(Duration::from_secs(
+                    session.manifest.created_at.max(0) as u64
+                ))
                 .unwrap_or(now)
         };
 

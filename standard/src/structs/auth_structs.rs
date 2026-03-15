@@ -50,8 +50,22 @@ pub struct AuthorizationRequest {
     pub expires_in: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RefreshRequest {
+    pub refresh_token: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum AuthSessionScope {
+    Fragment { fragment: String },
+    FileSystem { path: String },
+}
+
 #[derive(Debug, Serialize)]
 pub struct AuthBody {
     pub access_token: String,
     pub token_type: String,
+    pub expires_in: u64,
+    pub refresh_token: Option<String>,
+    pub refresh_expires_in: Option<u64>,
 }

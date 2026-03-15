@@ -1,11 +1,14 @@
-# N1 Redistribution Guide
+# N2 Redistribution Guide
 
 > Deployment profile status (2026-03-09):
-> - `standard` is stable and default for redistribution operations.
+> - `N2` is the product identity of this workspace.
+> - `N1` is the shared redistribution/storage engine underneath both deployment shapes.
+> - `standard` is the stable single-node path for redistribution operations.
+> - `distribution-runtime` is the multi-node path and uses the same redistribution core plus cluster routing.
 > - `arc` is experimental for raw-device redistribution operations.
 > - See `DEPLOYMENT_PROFILES.md`.
 
-This document reflects the current redistribution engine and API behavior in N1.
+This document reflects the current redistribution engine and API behavior in N2.
 
 Redistribution is the online maintenance job that realigns existing objects to the
 current runtime storage topology:
@@ -51,32 +54,51 @@ Admin bypass behavior:
 Preferred commands:
 
 ```bash
-# Start redistribution
-cargo run -p standard -- ops redistribute start --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+# Start redistribution on the single-node deployment
+./target/release/litiaina-n1-cli redistribute start \
+  --secret "$MASTER_KEY" \
+  --auth-fragment "$ADMIN_KEY" \
+  --insecure
 
 # Dry-run (plan only, no writes)
-cargo run -p standard -- ops redistribute start --dry-run --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+./target/release/litiaina-n1-cli redistribute start \
+  --dry-run \
+  --secret "$MASTER_KEY" \
+  --auth-fragment "$ADMIN_KEY" \
+  --insecure
 
 # Watch monitor
-cargo run -p standard -- ops redistribute watch --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+./target/release/litiaina-n1-cli redistribute watch \
+  --secret "$MASTER_KEY" \
+  --auth-fragment "$ADMIN_KEY" \
+  --insecure
 
 # One-shot status
-cargo run -p standard -- ops redistribute status --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+./target/release/litiaina-n1-cli redistribute status \
+  --secret "$MASTER_KEY" \
+  --auth-fragment "$ADMIN_KEY" \
+  --insecure
 
 # Stop job (cooperative)
-cargo run -p standard -- ops redistribute stop --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+./target/release/litiaina-n1-cli redistribute stop \
+  --secret "$MASTER_KEY" \
+  --auth-fragment "$ADMIN_KEY" \
+  --insecure
 ```
 
-Arc equivalent:
+Multi-node equivalent:
 
 ```bash
-cargo run -p arc -- ops redistribute start --secret "$MASTER_KEY" --fragment "$ADMIN_KEY" --insecure
+./target/release/litiaina-n2-cli redistribute start \
+  --secret "$MASTER_KEY" \
+  --auth-fragment "$ADMIN_KEY" \
+  --insecure
 ```
 
 Notes:
 
-- `ops redistribute start` only submits the job.
-- `ops redistribute watch` attaches a live terminal monitor.
+- `redistribute start` only submits the job.
+- `redistribute watch` attaches a live terminal monitor.
 - monitor polling uses `--poll-ms` (global CLI flag).
 
 ## HTTP Usage
@@ -177,7 +199,7 @@ During run:
 
 - expect increased disk I/O and CPU
 - CRUD remains available, but throughput can dip under load
-- use `ops redistribute watch` for real-time visibility
+- use `redistribute watch` for real-time visibility
 
 After run:
 

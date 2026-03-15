@@ -254,10 +254,12 @@ fn build_root_accelerator_from_objects(objects: Vec<ObjectMetadata>) -> PrefixIn
         .into_iter()
         .map(|metadata| PrefixIndexEntry::from_metadata(&metadata))
         .collect();
-    entries.sort_by(|a, b| match canonical_key(&a.object_key).cmp(&canonical_key(&b.object_key)) {
-        std::cmp::Ordering::Equal => a.version_id.cmp(&b.version_id),
-        other => other,
-    });
+    entries.sort_by(
+        |a, b| match canonical_key(&a.object_key).cmp(&canonical_key(&b.object_key)) {
+            std::cmp::Ordering::Equal => a.version_id.cmp(&b.version_id),
+            other => other,
+        },
+    );
     entries.dedup_by(|a, b| a.object_key == b.object_key && a.version_id == b.version_id);
 
     PrefixIndexSegment {
@@ -355,12 +357,22 @@ async fn rebuild_fragment_prefix_accelerator_internal(
     let live_accelerator = build_root_accelerator_from_objects(live_objects);
     let trash_accelerator = build_root_accelerator_from_objects(trash_objects);
 
-    let (live_prefixes_written, live_entries_written) =
-        write_root_compacted_prefix(path_manager, fragment, live_accelerator, snapshot_time, false)
-            .await?;
-    let (trash_prefixes_written, trash_entries_written) =
-        write_root_compacted_prefix(path_manager, fragment, trash_accelerator, snapshot_time, true)
-            .await?;
+    let (live_prefixes_written, live_entries_written) = write_root_compacted_prefix(
+        path_manager,
+        fragment,
+        live_accelerator,
+        snapshot_time,
+        false,
+    )
+    .await?;
+    let (trash_prefixes_written, trash_entries_written) = write_root_compacted_prefix(
+        path_manager,
+        fragment,
+        trash_accelerator,
+        snapshot_time,
+        true,
+    )
+    .await?;
 
     Ok((
         scanned,

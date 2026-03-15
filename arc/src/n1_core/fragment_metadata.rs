@@ -1,5 +1,5 @@
-use crate::n1_core::raw_index;
 use crate::enums::app_error_enum::AppError;
+use crate::n1_core::raw_index;
 
 use argon2::{
     Argon2,

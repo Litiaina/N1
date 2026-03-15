@@ -3,8 +3,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use axum::extract::{Path as AxumPath, State};
 use axum::Json as AxumJson;
+use axum::extract::{Path as AxumPath, State};
 use axum::{http::StatusCode, response::IntoResponse};
 
 use futures_util::{StreamExt, stream};
@@ -240,23 +240,20 @@ async fn delete_object_core(fragment: &str, object_key: &str) -> Result<usize, A
             }
             let mut moved = Vec::new();
             for version_id in &versions_found {
-                let _moved_meta =
-                    match index::move_object_version_to_trash_with_metadata(
-                        fragment,
-                        object_key,
-                        version_id,
-                    )
-                    .await
-                    {
-                        Ok(meta) => meta,
-                        Err(e) => {
-                            warn!(
-                                "Partition trash move failed for {}/{}#{}: {}",
-                                fragment, object_key, version_id, e
-                            );
-                            continue;
-                        }
-                    };
+                let _moved_meta = match index::move_object_version_to_trash_with_metadata(
+                    fragment, object_key, version_id,
+                )
+                .await
+                {
+                    Ok(meta) => meta,
+                    Err(e) => {
+                        warn!(
+                            "Partition trash move failed for {}/{}#{}: {}",
+                            fragment, object_key, version_id, e
+                        );
+                        continue;
+                    }
+                };
                 moved.push(version_id.clone());
             }
             moved
@@ -267,14 +264,8 @@ async fn delete_object_core(fragment: &str, object_key: &str) -> Result<usize, A
     for version_id in &moved_versions {
         let _ = index::remove_session(fragment, version_id, "soft-delete-object").await;
     }
-    move_blob_versions_between_states(
-        &path_manager,
-        &blob_roots,
-        fragment,
-        &moved_versions,
-        false,
-    )
-    .await;
+    move_blob_versions_between_states(&path_manager, &blob_roots, fragment, &moved_versions, false)
+        .await;
     mark_accelerators_stale(fragment, true, true).await;
 
     Ok(moved_versions.len())
@@ -285,39 +276,35 @@ async fn recover_object_core(fragment: &str, object_key: &str) -> Result<usize, 
     let blob_roots = path_manager.get_blob_roots();
     purge_delete_markers_for_key(fragment, object_key).await;
 
-    let restored_versions =
-        match index::restore_object_from_trash_fast(fragment, object_key).await {
-            Ok(Some(version_ids)) => version_ids,
-            Ok(None) => {
-                let mut found_versions =
-                    list_trashed_object_versions_any(fragment, object_key).await?;
-                if found_versions.is_empty() {
-                    return Err(AppError::NotFound);
-                }
-                found_versions.sort();
-                found_versions.dedup();
-                let mut restored = Vec::new();
-                for version_id in &found_versions {
-                    if let Err(e) =
-                        index::restore_object_version_from_trash_with_metadata(
-                            fragment,
-                            object_key,
-                            version_id,
-                        )
-                        .await
-                    {
-                        warn!(
-                            "Partition restore failed for {}/{}#{}: {}",
-                            fragment, object_key, version_id, e
-                        );
-                        continue;
-                    }
-                    restored.push(version_id.clone());
-                }
-                restored
+    let restored_versions = match index::restore_object_from_trash_fast(fragment, object_key).await
+    {
+        Ok(Some(version_ids)) => version_ids,
+        Ok(None) => {
+            let mut found_versions = list_trashed_object_versions_any(fragment, object_key).await?;
+            if found_versions.is_empty() {
+                return Err(AppError::NotFound);
             }
-            Err(e) => return Err(e),
-        };
+            found_versions.sort();
+            found_versions.dedup();
+            let mut restored = Vec::new();
+            for version_id in &found_versions {
+                if let Err(e) = index::restore_object_version_from_trash_with_metadata(
+                    fragment, object_key, version_id,
+                )
+                .await
+                {
+                    warn!(
+                        "Partition restore failed for {}/{}#{}: {}",
+                        fragment, object_key, version_id, e
+                    );
+                    continue;
+                }
+                restored.push(version_id.clone());
+            }
+            restored
+        }
+        Err(e) => return Err(e),
+    };
 
     move_blob_versions_between_states(
         &path_manager,
@@ -767,17 +754,17 @@ pub async fn recover_all_trash(
                 Ok(count) => count,
                 Err(AppError::NotFound) => 0,
                 Err(e) => {
-                    warn!(
-                        "Recover-all failed for {}/{}: {}",
-                        fragment, object_key, e
-                    );
+                    warn!("Recover-all failed for {}/{}: {}", fragment, object_key, e);
                     0
                 }
             }
         }
     }))
     .buffer_unordered(concurrency)
-    .fold(0usize, |acc, count| async move { acc.saturating_add(count) })
+    .fold(
+        0usize,
+        |acc, count| async move { acc.saturating_add(count) },
+    )
     .await;
 
     if recovered_count > 0 {

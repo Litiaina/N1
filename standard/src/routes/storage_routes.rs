@@ -18,19 +18,22 @@ use crate::fuse::handlers::{
     fsd_write_abort, fsd_write_begin, fsd_write_chunk, fsd_write_commit,
 };
 use crate::handlers::dir_info_handlers::get_storage_capacity;
-use crate::middleware::auth_middleware::{auth, authorize, authorize_fragment, validate_access};
+use crate::middleware::auth_middleware::{
+    auth, authorize, authorize_fragment, logout_refresh_token, refresh_access_token,
+    validate_access,
+};
 use crate::middleware::rate_limiter_middleware::RateLimitLayers;
 use crate::middleware::storage_middleware::enforce_storage_limit;
 use crate::n1_core::adaptive_concurrency::run_adaptive_concurrency_loop;
 use crate::n1_core::archive::download_selected_archive as download_selected_archive_impl;
 use crate::n1_core::delete::{
     delete_object as delete_object_impl,
-    delete_objects_bulk as delete_objects_bulk_impl,
     delete_object_permanently as delete_object_permanently_impl,
-    delete_object_version as delete_object_version_impl, empty_trash as empty_trash_impl,
+    delete_object_version as delete_object_version_impl,
+    delete_objects_bulk as delete_objects_bulk_impl, empty_trash as empty_trash_impl,
     recover_all_trash as recover_all_trash_impl, recover_object as recover_object_impl,
-    recover_objects_bulk as recover_objects_bulk_impl,
     recover_object_version as recover_object_version_impl,
+    recover_objects_bulk as recover_objects_bulk_impl,
 };
 use crate::n1_core::download::{
     download_object as download_object_impl, download_object_chunk as download_object_chunk_impl,
@@ -65,6 +68,9 @@ use crate::n1_core::retrieve::{
 use crate::n1_core::sharing::{create_signed_url, get_shared_object};
 use crate::n1_core::storage_capacity_parser::get_capacity_usage as get_capacity_usage_impl;
 use crate::n1_core::sync::initialize_fragment_storage_api;
+use crate::n1_core::thumbnail::{
+    ThumbnailQuery, get_object_thumbnail as get_object_thumbnail_impl,
+};
 use crate::n1_core::upload::{
     cancel_upload_session as cancel_upload_session_impl,
     finalize_object_upload as finalize_object_upload_impl,
@@ -155,6 +161,15 @@ async fn get_object_metadata_scoped(
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
     get_object_metadata_impl(claims, Path((fragment, object_key))).await
+}
+
+async fn get_object_thumbnail_scoped(
+    claims: Claims,
+    Path(object_key): Path<String>,
+    Query(query): Query<ThumbnailQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    get_object_thumbnail_impl(claims, Path((fragment, object_key)), Query(query)).await
 }
 
 async fn download_object_scoped(
@@ -343,29 +358,8 @@ async fn cancel_upload_session_scoped(
     cancel_upload_session_impl(claims, Path((fragment, version_id)), Query(key_query)).await
 }
 
-pub async fn serve_storage_routes() -> Router {
-    let layers = RateLimitLayers::new();
-
-    let ws_manager = WsConnectionManager::new();
-    register_global_ws_manager(ws_manager.clone());
-
-    let app_state = Arc::new(AppState { ws_manager });
-
-    let lifecycle_state = Arc::clone(&app_state);
-    tokio::spawn(async move {
-        run_lifecycle_manager(lifecycle_state).await;
-    });
-
-    let monitoring_state = Arc::clone(&app_state);
-    tokio::spawn(async move {
-        run_system_monitor(monitoring_state).await;
-    });
-
-    tokio::spawn(async move {
-        run_adaptive_concurrency_loop().await;
-    });
-
-    let cors_layer = CorsLayer::new()
+fn build_cors_layer() -> CorsLayer {
+    CorsLayer::new()
         .allow_origin(Any)
         .allow_headers([
             HeaderName::from_static("authorization"),
@@ -388,7 +382,35 @@ pub async fn serve_storage_routes() -> Router {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .max_age(Duration::from_secs(86400));
+        .max_age(Duration::from_secs(86400))
+}
+
+pub fn apply_runtime_http_layers(router: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
+    router
+        .layer(DefaultBodyLimit::max(MAX_FILE_SIZE))
+        .layer(build_cors_layer())
+}
+
+pub fn build_storage_routes_unbound() -> (Router<Arc<AppState>>, Arc<AppState>) {
+    let layers = RateLimitLayers::new();
+    let ws_manager = WsConnectionManager::new();
+    register_global_ws_manager(ws_manager.clone());
+
+    let app_state = Arc::new(AppState { ws_manager });
+
+    let lifecycle_state = Arc::clone(&app_state);
+    tokio::spawn(async move {
+        run_lifecycle_manager(lifecycle_state).await;
+    });
+
+    let monitoring_state = Arc::clone(&app_state);
+    tokio::spawn(async move {
+        run_system_monitor(monitoring_state).await;
+    });
+
+    tokio::spawn(async move {
+        run_adaptive_concurrency_loop().await;
+    });
 
     let object_storage_routes = {
         let read_ops = Router::new()
@@ -401,6 +423,10 @@ pub async fn serve_storage_routes() -> Router {
                 get(list_object_versions_scoped),
             )
             .route("/v4/fragment/get/{*object_key}", get(get_object_scoped))
+            .route(
+                "/v4/fragment/thumb/{*object_key}",
+                get(get_object_thumbnail_scoped),
+            )
             .route(
                 "/v4/fragment/stream/{*object_key}",
                 get(stream_object_scoped),
@@ -673,6 +699,12 @@ pub async fn serve_storage_routes() -> Router {
     let fs_auth_route = Router::new().route("/authenticate/fs", post(authorize));
     let fs_auth_route = layers.layer_auth(fs_auth_route);
 
+    let refresh_auth_route = Router::new().route("/authenticate/refresh", post(refresh_access_token));
+    let refresh_auth_route = layers.layer_auth(refresh_auth_route);
+
+    let logout_auth_route = Router::new().route("/authenticate/logout", post(logout_refresh_token));
+    let logout_auth_route = layers.layer_auth(logout_auth_route);
+
     let ping_route = Router::new().route("/ping", get(ping));
     let ping_route = layers.layer_global(ping_route);
 
@@ -680,17 +712,21 @@ pub async fn serve_storage_routes() -> Router {
         .merge(ping_route)
         .merge(fragment_auth_route)
         .merge(fs_auth_route)
+        .merge(refresh_auth_route)
+        .merge(logout_auth_route)
         .merge(list_fragments_route)
         .merge(global_routes)
         .merge(create_fragment_route)
         .merge(object_storage_routes)
         .merge(legacy_fs_routes)
-        .merge(ws_routes)
-        .layer(DefaultBodyLimit::max(MAX_FILE_SIZE))
-        .layer(cors_layer)
-        .with_state(Arc::clone(&app_state));
+        .merge(ws_routes);
 
-    router
+    (router, app_state)
+}
+
+pub async fn serve_storage_routes() -> Router {
+    let (router, app_state) = build_storage_routes_unbound();
+    apply_runtime_http_layers(router).with_state(app_state)
 }
 
 async fn ping() -> &'static str {

@@ -1,16 +1,19 @@
-# N1 Deployment Runbook (Standard-First)
+# N2 Deployment Runbook
 
 > Deployment profile status (2026-03-13):
-> - Stable/default: `standard` (`litiaina-n1-standard`)
+> - `N2` is the product identity of this workspace.
+> - `N1` is the shared storage engine used underneath both deployment shapes.
+> - Single-node deployment: `standard` (`litiaina-n1-standard`)
 > - `standard` release: `0.5.2`
+> - Multi-node deployment: `distribution-runtime` (`litiaina-n2`)
 > - Experimental raw-device profile: `arc` (`litiaina-n1-arc`)
 > - See `DEPLOYMENT_PROFILES.md` for profile policy.
 
-If you are deploying N1 today, use `standard`.
+If you are deploying one node today, use the single-node N2 path on `standard`.
 
-This runbook is written standard-first:
+This runbook is written N2-first, with the single-node path first because it is the simplest production deployment:
 
-- `standard` (stable/default):
+- Single-node N2 on `standard` (stable/default):
   - `index_store_disks`: mounted filesystem paths
   - `blob_store_disks`: mounted filesystem paths (directory roots)
   - no raw format commands
@@ -19,8 +22,39 @@ Arc still exists, but only as an experimental raw-device appendix at the bottom 
 For deployment profile policy, see `DEPLOYMENT_PROFILES.md`.
 
 Current runtime truth:
-- `standard`: filesystem-backed partitioned `index` and blob roots.
+- `N2` is the platform identity exposed to operators and deployment docs.
+- `standard`: single-node N2 deployment on the shared N1 engine with filesystem-backed partitioned `index` and blob roots.
+- `distribution-runtime`: multi-node N2 deployment on the same shared N1 engine, with extra `/v4/n2/*` and `/v4/n2/internal/*` APIs for cluster membership and peer data movement.
 - `arc`: raw partitioned `index` and raw blob devices, experimental only.
+- Auth/session security defaults:
+  - access token default TTL: `15 minutes`
+  - access token max TTL: `1 hour`
+  - refresh token default TTL: `7 days`
+  - dedicated CLIs automatically refresh short-lived access tokens in-memory during long-running watch/poll sessions
+  - env knobs:
+    - `ACCESS_TOKEN_DEFAULT_TTL_SECS`
+    - `ACCESS_TOKEN_MAX_TTL_SECS`
+    - `REFRESH_TOKEN_TTL_SECS`
+
+## 0. Choose The N2 Deployment Shape
+
+Use the runtime that matches the deployment shape:
+
+- Single-node deployment:
+  - run `target/release/litiaina-n1-standard`
+  - use `target/release/litiaina-n1-cli` for Standard admin commands
+  - use normal mounted filesystem paths for `index_store_disks` and `blob_store_disks`
+  - this is the recommended production path for one node
+  - this is still N2, just without the cluster layer
+- Multi-node deployment:
+  - run `target/release/litiaina-n2`
+  - use `target/release/litiaina-n2-cli` for cluster admin commands
+  - each node still uses normal mounted filesystem paths for `index_store_disks` and `blob_store_disks`
+  - add an `[n2]` section for node identity, membership file, and internal peer token
+  - use this when the cluster needs cross-node placement, replication, and peer recovery
+- Raw-device engine testing:
+  - run `target/release/litiaina-n1-arc`
+  - arc remains experimental and is not the default deployment path
 
 ## 1. Disk Roles
 
@@ -209,6 +243,42 @@ parity_shards=1
 stripe_block_size=4194304
 ```
 
+`n1_config.ini` (multi-node `distribution-runtime` / `litiaina-n2`):
+
+```ini
+[disk_config]
+index_store_disks=/srv/n1/index0,/srv/n1/index1
+blob_store_disks=/srv/n1/blob0,/srv/n1/blob1,/srv/n1/blob2,/srv/n1/blob3
+fs_storage_path=/srv/n1/fs
+
+[upload_config]
+data_shards=3
+parity_shards=1
+stripe_block_size=4194304
+
+[n2]
+node_id=node-a
+node_endpoint=https://10.0.0.11:50001
+cluster_membership_file=/etc/litiaina/n2_cluster_membership.json
+internal_token=replace-this-internal-peer-token
+auto_cross_params=false
+kc=2
+mc=1
+kd=2
+md=1
+cluster_stripe_block_size=262144
+remote_request_timeout_ms=60000
+```
+
+Notes for `distribution-runtime`:
+
+- `node_endpoint` must be the address other nodes use to reach this node.
+- `cluster_membership_file` must be readable and writable by the runtime.
+- `internal_token` protects the `/v4/n2/internal/*` peer APIs and should be rotated like any other secret.
+- `auto_cross_params=true` derives `kc/mc` from active node count and `kd/md` from local blob root count at startup.
+- If you want explicit `kc/mc/kd/md`, set `auto_cross_params=false`.
+- Startup now fails early if `kc+mc` exceeds active nodes or `kd` exceeds local blob roots.
+
 `n1_config.ini` (arc):
 
 ```ini
@@ -227,6 +297,7 @@ Notes:
 
 - `fs_storage_path` is still required for runtime state/staging.
 - Standard stores blob payload files under mounted blob directories.
+- `distribution-runtime` uses the same filesystem-backed disk roles as `standard`, then adds its `[n2]` runtime section for cluster behavior.
 - Arc stores blob payloads on raw devices through `block_manager`.
 
 ## 4. Startup Safeguards
@@ -257,7 +328,7 @@ That is expected. Do not pre-format the device.
 
 ```ini
 [Unit]
-Description=Litiaina N1
+Description=Litiaina N2
 After=network-online.target
 Wants=network-online.target
 

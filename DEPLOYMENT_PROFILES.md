@@ -1,21 +1,33 @@
-# N1 Deployment Profiles
+# N2 Deployment Profiles
 
-This document is the canonical deployment split for N1.
+This document is the canonical deployment split for N2.
+
+N2 is the product identity of this workspace.
+N1 is the shared storage engine underneath it.
 
 As of 2026-03-13:
 
-- `standard` (`litiaina-n1-standard`) is the stable deployment profile, the default for production, and released at `0.5.2`.
+- `standard` (`litiaina-n1-standard`) is the single-node N2 deployment path, the default for production, and released at `0.5.2`.
+- `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path on top of the same N1 core.
 - `arc` (`litiaina-n1-arc`) is the experimental raw-device profile.
 - If you are unsure which one to deploy, use `standard`.
 
-## 1) Profile Status
+## 1) Deployment Shapes
+
+| Deployment shape | Binary | Uses | Status |
+|---|---|---|---|
+| Single-node N2 | `litiaina-n1-standard` | N1 engine directly | Stable / default |
+| Multi-node N2 | `litiaina-n2` | N1 engine + N2 cluster runtime | Available in this workspace |
+| Arc engine testing | `litiaina-n1-arc` | Experimental N1 engine profile | Experimental |
+
+## 2) Engine Profile Status
 
 | Profile | Binary | Status | Production default |
 |---|---|---|---|
 | Standard | `litiaina-n1-standard` | Stable (`0.5.2`) | Yes |
 | Arc | `litiaina-n1-arc` | Experimental | No |
 
-## 2) Architecture Split
+## 3) Architecture Split
 
 ### Standard (stable)
 
@@ -46,13 +58,13 @@ Disk layout snapshot:
 payload address: raw://{device_id}/{allocation_id}
 ```
 
-## 3) Recommended Production Deployment
+## 4) Recommended Production Deployment
 
 Build and run Standard:
 
 ```bash
 cargo build --release -p standard
-./target/release/litiaina-n1-standard server
+./target/release/litiaina-n1-standard
 ```
 
 Use Standard for:
@@ -61,7 +73,7 @@ Use Standard for:
 - integration with N2
 - baseline operational runbooks (repair, redistribution, GC, SMB-lite)
 
-## 4) Arc Deployment Guidance
+## 5) Arc Deployment Guidance
 
 Use Arc when you need:
 
@@ -74,7 +86,8 @@ Arc is not the default path when:
 - broad operator compatibility is the priority
 - you do not want raw-device operational procedures
 
-## 5) N2 Alignment Policy
+## 6) N2 Alignment Policy
 
-- N2 documentation and deployment guidance keep `standard` as the default path.
+- N2 documentation and deployment guidance keep `standard` as the default single-node path.
+- Multi-node N2 builds on that same Standard-backed N1 engine through `distribution-runtime`.
 - Arc-compatible N2 deployment is supported when N1 nodes are intentionally deployed on Arc.

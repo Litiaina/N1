@@ -151,11 +151,7 @@ async fn ensure_raw_storage_config(
         raw_paths.push(raw_path);
     }
 
-    replace_storage_roots_for_tests(
-        index_roots,
-        blob_roots,
-        base.to_string_lossy().to_string(),
-    );
+    replace_storage_roots_for_tests(index_roots, blob_roots, base.to_string_lossy().to_string());
     super::blob_store::clear_raw_runtime_caches_for_tests();
     index::clear_runtime_caches_for_tests().await;
     super::recovery::clear_runtime_state_for_tests();
@@ -982,10 +978,7 @@ async fn assert_all_index_disks_synchronized(fragment: &str) {
         );
 
         let (_base_root, base_map) = &snapshots[0];
-        let converged = snapshots
-            .iter()
-            .skip(1)
-            .all(|(_root, map)| map == base_map);
+        let converged = snapshots.iter().skip(1).all(|(_root, map)| map == base_map);
         if converged {
             return;
         }

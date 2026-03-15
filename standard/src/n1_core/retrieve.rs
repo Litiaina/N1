@@ -1,7 +1,5 @@
 use crate::enums::app_error_enum::AppError;
-use crate::n1_core::constants::{
-    BROWSER_CACHE_MAX_AGE, METADATA_EXT, PREFIX_SEGMENT_EXT,
-};
+use crate::n1_core::constants::{BROWSER_CACHE_MAX_AGE, METADATA_EXT, PREFIX_SEGMENT_EXT};
 use crate::n1_core::disk_manager::{
     ListObjectsResult, ObjectMetadata, ObjectPathManager, ObjectSummary, PrefixIndexEntry,
     PrefixIndexSegment,
@@ -399,13 +397,8 @@ async fn list_prefix_compacted_page_fast(
                         continue;
                     }
                 }
-                let Some(meta) = read_index_entry_best(
-                    &path_manager,
-                    fragment,
-                    &entry,
-                    scan_trash,
-                )
-                .await
+                let Some(meta) =
+                    read_index_entry_best(&path_manager, fragment, &entry, scan_trash).await
                 else {
                     warn!(
                         "Skipping unreadable compacted prefix metadata fragment={} key={} version={}",
@@ -444,13 +437,8 @@ async fn list_prefix_compacted_page_fast(
                         continue;
                     }
                 }
-                let Some(meta) = read_index_entry_best(
-                    &path_manager,
-                    fragment,
-                    &entry,
-                    scan_trash,
-                )
-                .await
+                let Some(meta) =
+                    read_index_entry_best(&path_manager, fragment, &entry, scan_trash).await
                 else {
                     warn!(
                         "Skipping unreadable compacted prefix metadata fragment={} key={} version={}",
@@ -467,13 +455,8 @@ async fn list_prefix_compacted_page_fast(
                 out_objects.push(meta.into());
             }
         } else {
-            let Some(meta) = read_index_entry_best(
-                &path_manager,
-                fragment,
-                &entry,
-                scan_trash,
-            )
-            .await
+            let Some(meta) =
+                read_index_entry_best(&path_manager, fragment, &entry, scan_trash).await
             else {
                 warn!(
                     "Skipping unreadable compacted prefix metadata fragment={} key={} version={}",
@@ -974,7 +957,9 @@ pub async fn list_objects(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    Ok(AxumJson(list_objects_internal(fragment, params, false).await?))
+    Ok(AxumJson(
+        list_objects_internal(fragment, params, false).await?,
+    ))
 }
 
 pub async fn list_trash_objects(
@@ -990,7 +975,9 @@ pub async fn list_trash_objects(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    Ok(AxumJson(list_objects_internal(fragment, params, true).await?))
+    Ok(AxumJson(
+        list_objects_internal(fragment, params, true).await?,
+    ))
 }
 
 async fn list_objects_partition_native(

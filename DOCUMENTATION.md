@@ -5,20 +5,28 @@
     width="150"
     height="150"
   />
-  <h1>Litiaina N1 API Documentation</h1>
-  <p>Complete route reference and usage guide (current implementation).</p>
+  <h1>Litiaina N2 API Documentation</h1>
+  <p>Unified route reference for the N2 platform. N1 remains the shared node-core engine.</p>
 </div>
 
 > Deployment profile status (2026-03-13):
-> - `standard` is stable and default.
+> - `N2` is the product identity of this workspace.
+> - `N1` is the shared storage engine used by both deployment shapes.
+> - `standard` is the stable single-node deployment path.
 > - `standard` is released at `0.5.2`.
+> - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path in this workspace.
 > - `arc` is experimental for raw-device deployments.
 > - See `DEPLOYMENT_PROFILES.md`.
 >
-> Source of truth for routing (`standard`): `standard/src/routes/storage_routes.rs`.
+> Source of truth for routing (`standard`, single-node): `standard/src/routes/storage_routes.rs`.
+> Source of truth for routing (`distribution-runtime`, multi-node): `distribution-runtime/src/routes/storage_routes.rs`.
 > Arc route path: `arc/src/routes/storage_routes.rs`.
-> Source of truth for request/response behavior is profile-specific (`standard/src/n1_core` and `arc/src/n1_core`).
+> Source of truth for request/response behavior is profile-specific (`standard/src/n1_core` as the shared N1 engine for both `standard` and `distribution-runtime`, and `arc/src/n1_core` for Arc).
 > - unless explicitly labeled otherwise, the route descriptions below document the stable `standard` runtime first
+> Runtime split note:
+> - Single-node N2 deployment runs `standard` (`litiaina-n1-standard`).
+> - Multi-node N2 deployment runs `distribution-runtime` (`litiaina-n2`).
+> - `distribution-runtime` adds `/v4/n2/*` cluster routes and `/v4/n2/internal/*` peer routes on top of the same shared stable N1 node core used by `standard`.
 > Arc route scope note:
 > - Arc serves v4 object/maintenance APIs and does not expose legacy `/dir/*` routes.
 > - Arc also does not expose `/authenticate/fs`.
@@ -28,6 +36,12 @@
 > - `arc` (experimental raw-device): `index_store_disks` and `blob_store_disks` are raw, unformatted, unmounted device paths managed directly by N1.
 > - `standard` prefers Linux `io_uring` on the blob write path when available and falls back to `O_DIRECT` + blocking writes when it is not.
 > - Payload substrate still differs by profile (filesystem files in standard, raw extents in arc).
+
+> Platform identity note:
+> - N2 is the operator-facing platform and API identity.
+> - N1 is the node-local storage engine inside N2.
+> - Single-node N2 serves the shared v4 object/maintenance surface directly.
+> - Multi-node N2 serves that same node surface plus the `/v4/n2/*` distributed control/data-plane routes.
 
 > Engine profile note:
 > - `standard` is the stable/default profile for general-purpose filesystem-backed deployments.
@@ -93,6 +107,25 @@ Arc index note:
 
 ## 2. Auth APIs
 
+Auth response shape for both fragment and FS login now includes:
+
+```json
+{
+  "access_token": "<jwt>",
+  "token_type": "Bearer",
+  "expires_in": 900,
+  "refresh_token": "<opaque_refresh_token>",
+  "refresh_expires_in": 604800
+}
+```
+
+Notes:
+- `access_token` is still a bearer JWT used on protected routes.
+- `refresh_token` is server-tracked, rotates on every successful refresh, and can be revoked explicitly.
+- Current default refresh TTL is `7 days` (`REFRESH_TOKEN_TTL_SECS`).
+- Current default access-token TTL is `15 minutes` (`ACCESS_TOKEN_DEFAULT_TTL_SECS=900`).
+- Requested `expires_in` is capped at `1 hour` by default (`ACCESS_TOKEN_MAX_TTL_SECS=3600`).
+
 ### 2.1 `POST /authenticate/fragment`
 Purpose:
 - Issues fragment-scoped JWT for `/v4/*` protected APIs.
@@ -130,9 +163,15 @@ curl -k -X POST "https://127.0.0.1:50001/authenticate/fragment" \
 
 Notes:
 - Master mode no longer requires `ADMIN_KEY`; `MASTER_KEY` alone is the privileged path.
-- CLI semantics are split: `--auth-fragment` controls auth context, while `--fragment` is only an explicit target scope for fragment-scoped operations.
-- For maintenance watches (`ops gc/repair/redistribute/prefix-rebuild`), CLI now prints `Last Error` when status polling fails or times out.
-- CLI maintenance start commands now expose current runtime knobs (`--mode`, `--fast-mode`, `--read-only-fast`, and repair/redistribution concurrency/durability flags) and send them directly to the matching `/v4/maintenance/*/start` endpoints.
+- `litiaina-n1-cli` is the dedicated Standard admin CLI; `litiaina-n1-standard` now runs the server only.
+- `litiaina-n2-cli` is the dedicated distribution-runtime admin CLI; `litiaina-n2` now runs the server only.
+- CLI semantics are split: `--auth-fragment` controls auth context, while `--fragment` is only passed to maintenance start endpoints that support explicit fragment targeting.
+- Standard CLI watch mode is line-oriented and low-overhead: health prints one compact line per poll, and job watches only print when status changes.
+- Health responses now include per-disk total, used, available, usage percentage, and current disk state for each configured index/blob path.
+- Fragment auth now also mints a refresh token for session continuation.
+- `litiaina-n1-cli` and `litiaina-n2-cli` automatically use that refresh token in-memory, so long-running watch/poll sessions can keep operating without manual re-authentication.
+- If `expires_in` is omitted, the server issues a `15 minute` access token by default.
+- If `expires_in` is larger than the configured maximum, the server clamps it before minting the token.
 
 ### 2.2 `POST /authenticate/fs` (standard only)
 Purpose:
@@ -141,7 +180,48 @@ Purpose:
 ```bash
 curl -k -X POST "https://127.0.0.1:50001/authenticate/fs" \
   -H "Content-Type: application/json" \
-  -d '{"username":"...","password":"..."}'
+  -d '{
+    "path":"/",
+    "secret":"<AUTH_KEY>",
+    "read":true,
+    "write":false,
+    "modify":false,
+    "delete":false
+  }'
+```
+
+Notes:
+- FS auth now also returns a refresh token with the same response shape.
+- The same access-token default/max TTL rules apply to FS auth.
+
+### 2.3 `POST /authenticate/refresh`
+Purpose:
+- Rotates a refresh token and returns a new access token plus a new refresh token.
+- Works for both fragment-scoped auth and FS auth sessions.
+
+```bash
+curl -k -X POST "https://127.0.0.1:50001/authenticate/refresh" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "refresh_token":"<refresh_token>"
+  }'
+```
+
+Notes:
+- Refresh tokens are one-time rotating tokens.
+- Reuse of an already-rotated refresh token revokes the session.
+
+### 2.4 `POST /authenticate/logout`
+Purpose:
+- Revokes the current refresh session.
+- Returns `204 No Content` on success.
+
+```bash
+curl -k -X POST "https://127.0.0.1:50001/authenticate/logout" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "refresh_token":"<refresh_token>"
+  }'
 ```
 
 ## 3. Permission Model (Protected v4)
@@ -370,7 +450,29 @@ curl -k -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/meta/videos/a.mp4"
 ```
 
-### 6.9 `GET /v4/fragment/download`
+### 6.9 `GET /v4/fragment/thumb/{*object_key}`
+Returns a derived image thumbnail.
+
+Query:
+- `w` optional, default `256`, max `2048`
+- `h` optional, default `w`
+- `fit` optional: `contain|cover`, default `contain`
+- `format` optional: `jpeg|png`, default `jpeg`
+- `version_id` optional: generate thumbnail for a specific immutable object version
+
+Behavior:
+- Validates fragment scope and resolves authoritative object metadata.
+- Only supports image objects.
+- Uses a disk-backed derived cache keyed by `fragment + version_id + thumbnail profile`.
+- Does not create or publish a separate user object.
+
+```bash
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "https://127.0.0.1:50001/v4/fragment/thumb/images/a.png?w=256&h=256&fit=contain&format=jpeg" \
+  -o a-thumb.jpg
+```
+
+### 6.10 `GET /v4/fragment/download`
 Query:
 - `object_key` required
 - `version_id` optional
@@ -381,7 +483,7 @@ curl -k -H "Authorization: Bearer $TOKEN" \
   -o a.mp4
 ```
 
-### 6.10 `GET /v4/fragment/download/chunk`
+### 6.11 `GET /v4/fragment/download/chunk`
 Query:
 - `object_key` required
 - `offset` required
@@ -1235,6 +1337,8 @@ curl -k -X POST -H "Authorization: Bearer $FS_TOKEN" \
 ### Auth
 - `POST /authenticate/fragment`
 - `POST /authenticate/fs` (standard only)
+- `POST /authenticate/refresh`
+- `POST /authenticate/logout`
 
 ## 13. Streaming And Upload Tuning (Config)
 `[upload_config]` keys used by streaming read and upload-part paths:
@@ -1272,6 +1376,7 @@ Recommended starting points:
 - `GET /v4/fragment/get/{*object_key}`
 - `GET /v4/fragment/stream/{*object_key}`
 - `GET /v4/fragment/meta/{*object_key}`
+- `GET /v4/fragment/thumb/{*object_key}`
 - `GET /v4/fragment/download`
 - `GET /v4/fragment/download/chunk`
 - `GET /v4/smb/progress`

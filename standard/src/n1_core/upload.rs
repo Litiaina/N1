@@ -1401,9 +1401,8 @@ async fn write_prefix_segments_on_roots(
         entries: vec![PrefixIndexEntry::from_metadata(metadata)],
     };
 
-    let bytes = rmp_serde::to_vec(&seg).map_err(|e| {
-        AppError::InternalServerError(format!("Serialize prefix segment: {}", e))
-    })?;
+    let bytes = rmp_serde::to_vec(&seg)
+        .map_err(|e| AppError::InternalServerError(format!("Serialize prefix segment: {}", e)))?;
 
     let ph = ObjectPathManager::prefix_hash(accelerator_prefix());
     let p1 = &ph[0..2];

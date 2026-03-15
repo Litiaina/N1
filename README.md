@@ -5,29 +5,32 @@
     width="150"
     height="150"
   />
-  <h1>Litiaina N1</h1>
+  <h1>Litiaina N2</h1>
   <p>
-    Fragment-centric object storage engine with partitioned <code>index</code> metadata
-    authority and a derived namespace index, with profile-specific blob backends
-    (filesystem-backed standard, raw arc), built for strict crash safety and survivable
-    single-node durability.
+    Unified object storage platform built on the <code>N1</code> core engine:
+    single-node deployment through <code>standard</code>, multi-node deployment through
+    <code>distribution-runtime</code>, and an experimental raw-device engine profile
+    through <code>arc</code>.
   </p>
 </div>
 
 ---
 
 > Deployment profile status (2026-03-13):
-> - `standard` (`litiaina-n1-standard`) is the stable and recommended deployment path.
+> - `N2` is the product identity of this workspace.
+> - `N1` is the shared node-local storage engine used by both deployments.
+> - `standard` (`litiaina-n1-standard`) is the single-node N2 deployment path and the stable default.
 > - `standard` is released at `0.5.2`.
+> - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path.
 > - `arc` (`litiaina-n1-arc`) is the experimental raw-device profile and is not the production default.
 > - See `DEPLOYMENT_PROFILES.md` for the profile split and architecture guidance.
-> - Operator shortcut: if you are deploying today, follow `DEPLOYMENT.md` for `standard` and ignore Arc unless you are explicitly doing raw-device testing.
+> - Operator shortcut: choose the deployment shape in `DEPLOYMENT.md` first, then ignore Arc unless you are explicitly doing raw-device testing.
 
 ## Table of Contents
 
-- [What is N1 (index architecture)](#what-is-n1-index-architecture)
+- [What is N2 (platform architecture)](#what-is-n2-platform-architecture)
 - [Profile Distinction And Disk Layout (Authoritative)](#profile-distinction-and-disk-layout-authoritative)
-- [What N1 Is (Truth Statement)](#what-n1-is-truth-statement)
+- [What N1 Is Inside N2](#what-n1-is-inside-n2)
 - [Design principles](#design-principles)
 - [Core concepts](#core-concepts)
 - [Architecture (Authority vs Namespace vs Blob)](#architecture-authority-vs-namespace-vs-blob)
@@ -55,24 +58,39 @@
   - [Linux-first + direct I/O](#linux-first--direct-io)
   - [Preallocation](#preallocation)
   - [Directory sync](#directory-sync)
-- [N1 CLI Functions](#n1-cli-functions)
-  - [How to run the CLI](#how-to-run-the-cli)
-  - [Global CLI flags](#global-cli-flags)
-  - [Top-level commands](#top-level-commands)
-  - [Ops subcommands (recommended)](#ops-subcommands-recommended)
+- [Admin CLIs](#admin-clis)
+  - [How to run the CLIs](#how-to-run-the-clis)
+  - [N1 Standard CLI](#n1-standard-cli)
+  - [N2 Runtime CLI](#n2-runtime-cli)
 - [Invariants (must always be true)](#invariants-must-always-be-true)
 - [Glossary](#glossary)
 
 ---
 
 For SMB network-drive deployment, see `NETWORK_DRIVE.md`.
-N1 ships with native SMB-lite via `fsgwd`, with `fsd_mount + Samba` kept as fallback.
+The single-node N2 deployment ships with native SMB-lite via `fsgwd`; the old `fsd_mount + Samba` bridge is now retired.
 For deployment and operator steps, see `DEPLOYMENT.md`.
 For deployment profile guidance, see `DEPLOYMENT_PROFILES.md`.
 
-Stable/default `standard` deployment (production):
+N2 deployment split in this workspace:
+- Single-node deployment: run `litiaina-n1-standard` from `standard`.
+- Multi-node deployment: run `litiaina-n2` from `distribution-runtime`.
+- Raw-device testing remains `litiaina-n1-arc` from `arc`.
+- `standard` and `distribution-runtime` now share the same stable `standard/src/n1_core` implementation; `distribution-runtime` only adds cluster-specific `n2_core` and route layers.
+- Product identity:
+  - `N2` is the operator-facing platform identity.
+  - `N1` is the shared storage engine underneath both deployment shapes.
+- Security defaults:
+  - access token default TTL: `15 minutes`
+  - access token max TTL: `1 hour`
+  - refresh token default TTL: `7 days`
+
+Single-node N2 on stable/default `standard` (production):
 - `index_store_disks` and `blob_store_disks` are directory paths.
 - Do not run raw disk format commands.
+- Auth now supports rotating refresh tokens through:
+  - `POST /authenticate/refresh`
+  - `POST /authenticate/logout`
 
 ```ini
 [disk_config]
@@ -127,6 +145,7 @@ Profile note:
 - `standard` also exposes claim-scoped bulk mutation routes for high-count object workflows:
   - `POST /v4/fragment/object/bulk-delete`
   - `POST /v4/fragment/object/bulk-recover`
+- `standard` also exposes `GET /v4/fragment/thumb/{*object_key}` for disk-backed derived image thumbnails. Thumbnails are keyed by object `version_id`, are not listed as normal objects, and are regenerated on demand.
 - On Linux, `standard` prefers `io_uring` on the blob data path when available and falls back to `O_DIRECT` + blocking writes when it is not.
 - Arc is the experimental raw-device profile with raw index/blob media managed by `block_manager`.
 - The HTTP/API surface is **not** frozen yet. Route shapes, request fields, and operational endpoints may still change before `1.0.0`.
@@ -178,9 +197,20 @@ Arc note:
 - Index and blob are both raw block-manager media in Arc.
 - Arc is experimental and remains under active performance and control-plane hardening.
 
-## What is N1 (index architecture)
+## What is N2 (platform architecture)
 
-**Litiaina N1** is a **single-machine, multi-disk** object storage engine with:
+**Litiaina N2** is the storage platform delivered by this repository.
+
+It has two deployment shapes:
+
+- **Single-node N2**
+  - runs `standard` (`litiaina-n1-standard`)
+  - uses the N1 engine directly on one node
+- **Multi-node N2**
+  - runs `distribution-runtime` (`litiaina-n2`)
+  - uses the same N1 engine on every node, then adds cluster membership, placement, and peer data movement
+
+Under both shapes, the node-local storage engine is still **N1**. N1 provides:
 
 - a partitioned metadata authority in `index` (filesystem-backed in `standard`, raw in `arc`)
 - a derived prefix namespace index for fast `LIST`
@@ -188,25 +218,25 @@ Arc note:
   - `standard`: filesystem-backed shard files under blob roots
   - `arc`: raw-device/direct-I/O blob plane with raw index authority
 
-This is the architectural shift from the legacy node: object and session truth are no longer stored as a whole-node mirrored tree on every index root. Instead, metadata authority is partitioned by hash onto a small selected set of roots.
+This is the architectural shift from the legacy node: object and session truth are no longer stored as a whole-node mirrored tree on every index root. Instead, metadata authority is partitioned by hash onto a small selected set of roots, and N2 composes that node-local engine into either a single-node or multi-node deployment.
 
-N1 is designed for environments where you want:
+N2 is designed for environments where you want:
 
 - **NVMe / JBOD speed** without cluster coordination tax
 - **video-grade streaming** with bounded memory
 - **crash safety** and recoverability on unstable disks
 - storage that remains **inspectable and movable on disk** without a database hot path
 
-## What N1 Is (Truth Statement)
+## What N1 Is Inside N2
 
-N1 is a **fragment-scoped object storage engine with partitioned metadata authority and a profile-specific blob backend** for single-node multi-disk deployments where:
+N1 is the **fragment-scoped core storage engine** inside N2. It provides partitioned metadata authority and a profile-specific blob backend for node-local storage where:
 
 - **high availability** during maintenance matters
 - **durability** matters across index-root and blob-device failures
 - **bounded resource usage** matters
 - **no external database hot path** is required
 
-Operationally, "true N1" now means:
+Operationally, N1 means:
 
 - fragments are the isolation boundary
 - object versions are immutable
@@ -233,7 +263,7 @@ N1 is **not** "user multi-tenant storage" anymore. The isolation boundary is a *
 - **Capacity is enforced from live filesystem totals on the node**
 - **Auth scopes to Fragment**
 - **Maintenance jobs operate per Fragment**
-- N1 is the **core single-node engine**: partitioned metadata authority, strict publish discipline, and repairable blob durability
+- N1 is the **shared node-local engine**: partitioned metadata authority, strict publish discipline, and repairable blob durability
 
 ---
 
@@ -475,6 +505,24 @@ These accept a JSON body of the form:
 
 They are intended for UI or operator flows that need to mutate hundreds or thousands of objects without paying one HTTPS request per object.
 
+### 1b) Derived thumbnails (`standard`)
+
+For image-heavy browsing, `standard` also exposes `GET /v4/fragment/thumb/{*object_key}`.
+
+That path:
+
+- validates fragment scope and resolves the current or requested object version
+- loads the original image once
+- generates a bounded thumbnail on demand
+- stores the derived thumbnail on disk under a hidden cache path keyed by `fragment + version_id + profile`
+- serves later requests from that disk cache instead of reloading the full original image
+
+This is a derived cache, not a second user object:
+
+- thumbnails do not appear in normal object listings
+- thumbnails do not create new object versions
+- cache keys are version-aware, so a new upload of the same object key produces a fresh thumbnail path
+
 ### 2) Upload part (payload first, metadata second)
 
 Part upload remains strict and payload-first:
@@ -712,71 +760,77 @@ Durable metadata publish still relies on atomic file replace plus directory sync
 
 That discipline is now applied to partition state rather than a whole mirrored metadata tree.
 
-## N1 CLI Functions
+## Admin CLIs
 
-N1 CLI is available in both server binaries and uses `server_cli` as the command layer.
+This workspace now has two dedicated admin shells:
 
-Workspace server variants:
-- `standard` (stable/default): filesystem-backed N1 (`standard/src/main.rs`) for general-purpose deployments, with partitioned index roots under `index/partitions/<pid>/...` and directory-only `index_store_disks` / `blob_store_disks`.
-- `arc` (experimental raw-device): raw-device/block-manager-backed N1 runtime.
+- `litiaina-n1-cli` for `N1 Standard`
+- `litiaina-n2-cli` for `distribution-runtime`
 
-### How to run the CLI
+Runtime binaries are server-only:
 
-Use the stable/default profile:
+- `litiaina-n1-standard`
+- `litiaina-n2`
+
+### How to run the CLIs
+
+Use the dedicated Standard CLI:
 
 ```bash
-cargo run -p standard -- <command> [flags]
+cargo run -p standard_cli -- <command> [flags]
 ```
 
-Arc profile:
+Use the dedicated N2 CLI:
 
 ```bash
-cargo run -p arc -- <command> [flags]
+cargo run -p distribution_cli -- <command> [flags]
 ```
 
 Built binaries:
 
 ```bash
-./target/release/litiaina-n1-standard <command> [flags]
-./target/release/litiaina-n1-arc <command> [flags]
+./target/release/litiaina-n1-cli <command> [flags]
+./target/release/litiaina-n2-cli <command> [flags]
 ```
 
-Server mode:
+Server runtime:
 
 ```bash
-cargo run -p standard -- server
+cargo run -p standard
 ```
 
-If no command is given, server mode is the default.
+Or run the built server directly:
+
+```bash
+./target/release/litiaina-n1-standard
+```
+
+`litiaina-n1-standard` and `litiaina-n2` no longer double as admin CLIs. If you pass command arguments to them, they exit and tell you to use the dedicated CLI binaries.
+
+### N1 Standard CLI
 
 ### Global CLI flags
 
 Available on all commands:
 
 - `-s, --secret <SECRET>`: secret input for auth
-- `-f, --fragment <FRAGMENT>`: optional target fragment scope (used by fragment-scoped commands)
+- `-f, --fragment <FRAGMENT>`: optional maintenance target fragment
 - `--auth-fragment <AUTH_FRAGMENT>`: auth context fragment used during `/authenticate/fragment`
 - `--url <URL>`: explicit N1 API URL
 - `--insecure <bool>`: TLS cert validation toggle (default `true`)
-- `--poll-ms <N>`: watch polling interval in milliseconds (default `500`)
+- `--poll-ms <N>`: watch polling interval in milliseconds (default `1000`)
 - `--json <bool>`: machine-readable output mode (default `false`)
 
 Auth behavior for CLI:
 - Authentication context (`--auth-fragment`) is independent from operation target (`--fragment`).
 - Maintenance/admin flows use `MASTER_KEY` as `--secret`; GC does not require a target fragment.
 - Repair/redistribution accept optional `--fragment` to run single-fragment scope.
-- Fragment-scoped data access uses fragment secret + fragment hash.
+- Upload status/listing and health are claim-scoped; they do not require a separate target fragment in the CLI.
+- `litiaina-n1-cli` and `litiaina-n2-cli` now keep refresh tokens in-memory and automatically rotate access tokens during long-running watch/poll commands.
 
 ### Top-level commands
 
-#### `server`
-Starts the N1 service process.
-
-```bash
-cargo run -p standard -- server
-```
-
-#### `create-fragment`
+#### `fragment create`
 Creates a new fragment.
 
 Flags:
@@ -784,18 +838,46 @@ Flags:
 - `--key <KEY>` required
 
 ```bash
-cargo run -p standard -- create-fragment --name imaging-a --key supersecretfragmentkey
+cargo run -p standard_cli -- fragment create --name imaging-a --key supersecretfragmentkey
+```
+
+#### `health`
+Gets health once, or watches continuously.
+
+Flags:
+- `--watch`
+- `--deep-scan`
+
+Health reports:
+- system CPU/RAM plus process RSS/open-FD pressure
+- active upload sessions, reserved bytes, and committed multipart progress
+- index runtime counters and raw/blob storage totals
+- per-disk health plus total/used/free capacity on every configured index and blob path
+
+```bash
+cargo run -p standard_cli -- health --watch --deep-scan
+```
+
+#### `uploads`
+Inspect active multipart sessions and resumable upload progress.
+
+```bash
+cargo run -p standard_cli -- uploads list
+cargo run -p standard_cli -- uploads status --version-id <version_id>
 ```
 
 #### `gc`
-Starts garbage collection and follows status.
+Lifecycle control for garbage collection.
 
 ```bash
-cargo run -p standard -- gc
+cargo run -p standard_cli -- gc start
+cargo run -p standard_cli -- gc status
+cargo run -p standard_cli -- gc watch
+cargo run -p standard_cli -- gc stop
 ```
 
 #### `repair`
-Starts repair and follows status.
+Lifecycle control for repair.
 
 Flags:
 - `--dry-run` optional
@@ -807,11 +889,13 @@ Flags:
 - `--batch <N>`
 
 ```bash
-cargo run -p standard -- repair --fragment <fragment_hash> --dry-run
+cargo run -p standard_cli -- repair start --fragment <fragment_hash> --dry-run
+cargo run -p standard_cli -- repair status
+cargo run -p standard_cli -- repair watch
 ```
 
 #### `redistribute`
-Starts redistribution and follows status.
+Lifecycle control for redistribution.
 
 Flags:
 - `--dry-run` optional
@@ -823,87 +907,51 @@ Flags:
 - `--status-batch <N>`
 
 ```bash
-cargo run -p standard -- redistribute --fragment <fragment_hash>
+cargo run -p standard_cli -- redistribute start --fragment <fragment_hash>
+cargo run -p standard_cli -- redistribute status
+cargo run -p standard_cli -- redistribute stop
 ```
 
 #### `prefix-rebuild`
-Starts prefix index rebuild and follows status.
+Lifecycle control for prefix rebuild.
 
 ```bash
-cargo run -p standard -- prefix-rebuild --fragment <fragment_hash>
+cargo run -p standard_cli -- prefix-rebuild start --fragment <fragment_hash>
+cargo run -p standard_cli -- prefix-rebuild status
+cargo run -p standard_cli -- prefix-rebuild watch
 ```
 
-#### `health`
-Gets health once, or watches continuously.
+### Watch behavior
 
-Flags:
-- `--watch`
-- `--deep-scan`
+The Standard CLI watch path is intentionally lightweight now:
 
-Health now reports:
-- system CPU/RAM plus process RSS/open-FD pressure
-- active upload sessions, reserved bytes, and committed multipart progress
-- index runtime counters and raw/blob storage totals
+- health watch prints one compact line per poll
+- maintenance job watch prints only when the status actually changes
+- no full-screen redraw loop
+- no ANSI screen clearing or terminal state management
 
-```bash
-cargo run -p standard -- health --watch --deep-scan
-```
+### N2 Runtime CLI
 
-#### `uploads`
-Inspect active multipart sessions and resumable upload progress.
+`distribution-runtime` has its own admin CLI:
 
-```bash
-cargo run -p standard -- uploads list --fragment <fragment_hash>
-cargo run -p standard -- uploads status --fragment <fragment_hash> --version-id <version_id>
-```
+- crate: `distribution_cli`
+- binary: `litiaina-n2-cli`
 
-### Ops subcommands (recommended)
+It includes the shared maintenance/admin surface plus N2-specific cluster commands:
 
-`ops` gives explicit lifecycle control with `start|status|stop|watch`.
-
-Pattern:
-
-```bash
-cargo run -p standard -- ops <job> <action> [job-flags]
-```
-
-Jobs:
-
-- `ops gc start|status|stop|watch`
-- `ops repair start|status|stop|watch [--fragment <fragment_hash>] [--dry-run --mode --fast-mode --read-only-fast --meta-concurrency --repair-concurrency --batch]`
-- `ops redistribute start|status|stop|watch [--fragment <fragment_hash>] [--dry-run --mode --scope --fast-mode --read-only-fast --durability --object-concurrency --status-batch]`
-- `ops prefix-rebuild start|status|stop|watch [--fragment <fragment_hash>]`
-
-Streaming tuning knobs (`[upload_config]`):
-- `stream_chunk_size`
-- `stream_readahead_bytes`
-- `stream_locality_bias_enabled`
-- `upload_part_strict_durability_default`
-- `upload_io_gate_enabled`
+- `cluster-view [--public] [--expected-epoch <N>]`
+- `membership get`
+- `membership apply --file membership.json`
+- `membership rollback --epoch <N>`
+- `placement --fragment <fragment> --object-key <key> [--uid ... --version-id ... --kc ... --mc ...]`
 
 Examples:
 
 ```bash
-# GC lifecycle (admin context)
-cargo run -p standard -- ops gc start --secret "<MASTER_KEY>"
-cargo run -p standard -- ops gc status --secret "<MASTER_KEY>"
-cargo run -p standard -- ops gc stop --secret "<MASTER_KEY>"
-
-# Repair lifecycle
-cargo run -p standard -- ops repair start --fragment <fragment_hash>
-cargo run -p standard -- ops repair status --fragment <fragment_hash>
-cargo run -p standard -- ops repair watch --fragment <fragment_hash> --poll-ms 250
-cargo run -p standard -- ops repair stop --fragment <fragment_hash>
-
-# Redistribution lifecycle
-cargo run -p standard -- ops redistribute start --fragment <fragment_hash>
-cargo run -p standard -- ops redistribute status --fragment <fragment_hash>
-cargo run -p standard -- ops redistribute stop --fragment <fragment_hash>
-
-# Prefix rebuild lifecycle
-cargo run -p standard -- ops prefix-rebuild start --fragment <fragment_hash>
-cargo run -p standard -- ops prefix-rebuild status --fragment <fragment_hash>
-cargo run -p standard -- ops prefix-rebuild watch --fragment <fragment_hash>
+cargo run -p distribution_cli -- cluster-view
+cargo run -p distribution_cli -- membership get
+cargo run -p distribution_cli -- membership rollback --epoch 12
+cargo run -p distribution_cli -- placement --fragment imaging-a --object-key scans/ct/0001.dcm
 ```
 
 Sequential stream probe (readahead/locality):
@@ -920,8 +968,11 @@ cargo test -p standard matrix_stream_sequential_readahead_locality_probe -- --ig
 # Core server test suite
 cargo test -p standard
 
-# CLI test suite
-cargo test -p server_cli
+# Dedicated Standard CLI
+cargo check -p standard_cli
+
+# Dedicated N2 CLI
+cargo check -p distribution_cli
 
 # Ignored/manual suites
 cargo test -p standard -- --ignored --nocapture

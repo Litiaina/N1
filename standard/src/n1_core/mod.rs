@@ -28,6 +28,7 @@ pub mod sharing;
 pub mod storage_capacity_parser;
 pub mod sync;
 pub mod system;
+pub mod thumbnail;
 pub mod upload;
 
 #[cfg(test)]

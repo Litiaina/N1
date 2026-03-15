@@ -1,5 +1,7 @@
 use crate::enums::app_error_enum::AppError;
-use crate::n1_core::disk_manager::{ChunkQuery, ObjectKeyQuery, ObjectPathManager, ShardInfo};
+use crate::n1_core::disk_manager::{
+    ChunkQuery, ObjectKeyQuery, ObjectMetadata, ObjectPathManager, ShardInfo,
+};
 use crate::n1_core::metadata_parser::{get_metadata, get_version_metadata};
 use crate::n1_core::object_parser::stream_object_logic;
 use crate::n1_core::recovery::read_or_recover_chunk;
@@ -93,8 +95,48 @@ pub async fn download_object_chunk_direct(
     Ok(result_buffer)
 }
 
+pub async fn read_object_bytes_direct(
+    fragment: &str,
+    object_key: &str,
+    version_id: Option<&str>,
+    max_bytes: usize,
+) -> Result<(ObjectMetadata, Vec<u8>), AppError> {
+    let metadata = if let Some(version_id) = version_id {
+        get_version_metadata(fragment, object_key, version_id, fragment).await?
+    } else {
+        get_metadata(fragment, object_key, fragment).await?
+    };
+
+    if metadata.is_delete_marker {
+        return Err(AppError::NotFound);
+    }
+
+    let object_size = usize::try_from(metadata.total_size_bytes).map_err(|_| {
+        AppError::PayloadTooLarge("Object is too large for direct in-memory read".into())
+    })?;
+
+    if object_size > max_bytes {
+        return Err(AppError::PayloadTooLarge(format!(
+            "Object exceeds thumbnail source limit of {} bytes",
+            max_bytes
+        )));
+    }
+
+    if object_size == 0 {
+        return Ok((metadata, Vec::new()));
+    }
+
+    let params = ChunkQuery {
+        object_key: object_key.to_string(),
+        offset: 0,
+        chunk_size: object_size,
+    };
+    let (bytes, _) = download_object_chunk_from_metadata(metadata.clone(), &params).await?;
+    Ok((metadata, bytes))
+}
+
 async fn download_object_chunk_from_metadata(
-    metadata: crate::n1_core::disk_manager::ObjectMetadata,
+    metadata: ObjectMetadata,
     params: &ChunkQuery,
 ) -> Result<(Vec<u8>, Option<String>), AppError> {
     let stripe_block_size = metadata.stripe_size_bytes;

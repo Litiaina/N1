@@ -1,7 +1,5 @@
 use crate::enums::app_error_enum::AppError;
-use crate::n1_core::disk_manager::{
-    ObjectMetadata, PartMetadata, ReservationReceipt,
-};
+use crate::n1_core::disk_manager::{ObjectMetadata, PartMetadata, ReservationReceipt};
 pub use crate::n1_core::index_types::{
     IndexReplicaWriteMode, IndexRuntimeStats, IndexSessionState, RemovedSessionReceipt,
     UploadRuntimeStats,
@@ -36,7 +34,10 @@ pub async fn commit_session_part(
     raw_index::commit_session_part(fragment, version_id, part).await
 }
 
-pub async fn load_session(fragment: &str, version_id: &str) -> Result<Option<IndexSessionState>, AppError> {
+pub async fn load_session(
+    fragment: &str,
+    version_id: &str,
+) -> Result<Option<IndexSessionState>, AppError> {
     ensure_raw_backend("load_session").await?;
     raw_index::load_session(fragment, version_id).await
 }
@@ -118,7 +119,10 @@ pub async fn read_trashed_object_version(
     raw_index::read_object_version(fragment, object_key, version_id, true).await
 }
 
-pub async fn read_latest_object(fragment: &str, object_key: &str) -> Result<ObjectMetadata, AppError> {
+pub async fn read_latest_object(
+    fragment: &str,
+    object_key: &str,
+) -> Result<ObjectMetadata, AppError> {
     ensure_raw_backend("read_latest_object").await?;
     raw_index::read_latest_object(fragment, object_key).await
 }
@@ -204,7 +208,8 @@ pub async fn list_fragment_latest_objects_page(
     limit: usize,
 ) -> Result<(Vec<ObjectMetadata>, Option<(String, String)>), AppError> {
     ensure_raw_backend("list_fragment_latest_objects_page").await?;
-    raw_index::list_fragment_latest_objects_page(fragment, trashed, prefix, start_after, limit).await
+    raw_index::list_fragment_latest_objects_page(fragment, trashed, prefix, start_after, limit)
+        .await
 }
 
 pub async fn list_live_object_versions_metadata(
@@ -265,7 +270,8 @@ pub async fn upsert_trashed_object_version_on_available_roots_with_replica_mode(
     replica_write_mode: IndexReplicaWriteMode,
 ) -> Result<(), AppError> {
     let _ = replica_write_mode;
-    ensure_raw_backend("upsert_trashed_object_version_on_available_roots_with_replica_mode").await?;
+    ensure_raw_backend("upsert_trashed_object_version_on_available_roots_with_replica_mode")
+        .await?;
     raw_index::upsert_object_version(metadata, true).await
 }
 

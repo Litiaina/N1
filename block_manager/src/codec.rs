@@ -153,7 +153,11 @@ fn decode_header_prefix(
         0
     };
     let metadata_pool_block_count = if version == HEADER_VERSION_V3 {
-        u64::from_le_bytes(prefix[96..104].try_into().expect("metadata pool block count"))
+        u64::from_le_bytes(
+            prefix[96..104]
+                .try_into()
+                .expect("metadata pool block count"),
+        )
     } else {
         total_blocks.saturating_sub(data_start_block)
     };

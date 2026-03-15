@@ -186,7 +186,10 @@ pub async fn initialize_fragment_storage_api(
     tokio::spawn(async move {
         match initialize_storage(fragment.clone()).await {
             Ok(_) => info!("Storage initialization completed for fragment {}", fragment),
-            Err(e) => error!("Storage initialization failed for fragment {}: {}", fragment, e),
+            Err(e) => error!(
+                "Storage initialization failed for fragment {}: {}",
+                fragment, e
+            ),
         }
     });
 

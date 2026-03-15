@@ -1,3 +1,5 @@
+pub use standard::*;
+
 use crate::fs::cleanup_manager::interval_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
@@ -28,11 +30,7 @@ use crate::validation::enforce_init_settings::{ensure_config_file, ensure_env_fi
 use axum::Router;
 use axum_server::tls_rustls::RustlsConfig;
 use chrono::Local;
-use clap::Parser;
-use dotenv::dotenv;
 use ini::Ini;
-use server_cli::cli::args::{Cli, Commands};
-use server_cli::cli::client::execute_command;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -44,21 +42,6 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
-
-mod enums;
-mod fs;
-mod fuse;
-mod handlers;
-mod middleware;
-mod n1_core;
-mod routes;
-mod settings;
-mod smb;
-mod statics;
-mod structs;
-mod utils;
-mod validation;
-mod websocket;
 
 fn detect_cpu_cores() -> usize {
     std::thread::available_parallelism()
@@ -436,7 +419,7 @@ pub fn init_tracing() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
 
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            "info,litiaina_n1=trace,server_cli=trace,axum=info,hyper=info".into()
+            "info,litiaina_n1=trace,axum=info,hyper=info".into()
         }))
         .with(
             fmt::layer()
@@ -475,45 +458,11 @@ async fn main() {
 
     let _guard = init_tracing().expect("Failed to initialize tracing subscriber");
 
-    let args = Cli::parse();
-
-    match &args.command {
-        Some(Commands::Server) | None => {}
-        Some(cmd) => {
-            dotenv().ok();
-
-            let target_url = args.url.or_else(|| {
-                Ini::load_from_file(CONFIG_FILE).ok().and_then(|conf| {
-                    conf.section(Some("server")).map(|section| {
-                        let host = section.get("host").unwrap_or("127.0.0.1");
-                        let port = section.get("https_port").unwrap_or("50001");
-                        let effective_host = if host == "0.0.0.0" { "127.0.0.1" } else { host };
-                        format!("https://{}:{}", effective_host, port)
-                    })
-                })
-            });
-
-            let result = execute_command(
-                cmd,
-                args.secret.clone(),
-                args.auth_fragment.clone(),
-                args.fragment.clone(),
-                target_url,
-                args.insecure,
-                args.poll_ms,
-                args.json,
-            )
-            .await;
-
-            drop(_guard);
-
-            if let Err(e) = result {
-                eprintln!("Command failed: {}", e);
-                std::process::exit(1);
-            }
-
-            return;
-        }
+    if std::env::args_os().nth(1).is_some() {
+        eprintln!(
+            "litiaina-n1-standard runs the server only. Use `litiaina-n1-cli` for admin commands."
+        );
+        std::process::exit(2);
     }
 
     let current_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();

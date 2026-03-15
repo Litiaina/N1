@@ -1022,10 +1022,7 @@ async fn reconcile_object_metadata_strict(
     let canonical_bytes = rmp_serde::to_vec(&canonical_meta).map_err(|e| {
         AppError::InternalServerError(format!(
             "encode canonical raw metadata for {}/{}/{} failed: {}",
-            canonical_meta.fragment,
-            canonical_meta.object_key,
-            canonical_meta.version_id,
-            e
+            canonical_meta.fragment, canonical_meta.object_key, canonical_meta.version_id, e
         ))
     })?;
     Ok((canonical_bytes, canonical_meta, 0, 0, None))

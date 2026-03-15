@@ -1,9 +1,9 @@
+#[cfg(test)]
+use crate::n1_core::constants::QUOTA_FILE;
 use crate::n1_core::constants::{
     PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_INDEX_DIR, PREFIX_INDEX_NAMESPACE,
     PREFIX_INDEX_VERSION, PREFIX_SEGMENT_EXT,
 };
-#[cfg(test)]
-use crate::n1_core::constants::QUOTA_FILE;
 #[cfg(test)]
 use once_cell::sync::Lazy;
 use serde::de::IgnoredAny;

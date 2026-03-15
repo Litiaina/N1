@@ -1,8 +1,13 @@
 use crate::n1_core::fragment_metadata::{
     backfill_fragment_nt_hash_if_missing, verify_fragment_key,
 };
+use crate::middleware::refresh_store::{
+    RefreshStoreError, SessionPermissions, create_refresh_session, revoke_refresh_session,
+    rotate_refresh_session,
+};
 use crate::structs::auth_structs::{
-    AuthBody, AuthorizationRequest, Claims, FileSystemClaims, LoginRequest,
+    AuthBody, AuthSessionScope, AuthorizationRequest, Claims, FileSystemClaims, LoginRequest,
+    RefreshRequest,
 };
 use crate::validation::fragment_validation::does_fragment_exist;
 use axum::body::Body;
@@ -35,6 +40,30 @@ pub static AUTH_KEY: LazyLock<String> =
 
 pub static MASTER_KEY: LazyLock<String> =
     LazyLock::new(|| env::var("MASTER_KEY").expect("MASTER_KEY must be set for authentication"));
+
+pub static ADMIN_KEY: LazyLock<String> =
+    LazyLock::new(|| env::var("ADMIN_KEY").expect("ADMIN_KEY must be set for authentication"));
+
+pub static REFRESH_TOKEN_TTL_SECS: LazyLock<u64> = LazyLock::new(|| {
+    env::var("REFRESH_TOKEN_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(7 * 24 * 60 * 60)
+});
+
+pub static ACCESS_TOKEN_DEFAULT_TTL_SECS: LazyLock<u64> = LazyLock::new(|| {
+    env::var("ACCESS_TOKEN_DEFAULT_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(15 * 60)
+});
+
+pub static ACCESS_TOKEN_MAX_TTL_SECS: LazyLock<u64> = LazyLock::new(|| {
+    env::var("ACCESS_TOKEN_MAX_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(60 * 60)
+});
 
 pub async fn validate_access(req: Request<Body>, next: Next) -> Result<Response, AuthError> {
     let header = req.headers().get("authorization");
@@ -97,27 +126,17 @@ pub async fn authorize_fragment(
         }
     }
 
-    let duration = payload.expires_in.unwrap_or(24 * 60 * 60);
+    let body = mint_fragment_auth_body(
+        payload.fragment,
+        payload.read,
+        payload.write,
+        payload.modify,
+        payload.delete,
+        resolve_access_token_ttl(payload.expires_in),
+    )
+    .await?;
 
-    let exp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + duration;
-
-    let claims = Claims {
-        fragment: payload.fragment,
-        read: payload.read,
-        write: payload.write,
-        modify: payload.modify,
-        delete: payload.delete,
-        exp: exp as usize,
-    };
-
-    let token = encode(&Header::default(), &claims, &JWT_KEYS.encoding)
-        .map_err(|_| AuthError::InternalError)?;
-
-    Ok(Json(AuthBody::new(token)))
+    Ok(Json(body))
 }
 
 pub async fn auth(req: Request<Body>, next: Next) -> Result<Response, AuthError> {
@@ -152,27 +171,79 @@ pub async fn authorize(Json(payload): Json<LoginRequest>) -> Result<Json<AuthBod
         return Err(AuthError::WrongCredentials);
     }
 
-    let duration = payload.expires_in.unwrap_or(24 * 60 * 60);
+    let body = mint_fs_auth_body(
+        payload.path,
+        payload.read,
+        payload.write,
+        payload.modify,
+        payload.delete,
+        resolve_access_token_ttl(payload.expires_in),
+    )
+    .await?;
 
-    let exp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + duration;
+    Ok(Json(body))
+}
 
-    let claims = FileSystemClaims {
-        path: payload.path,
-        write: payload.write,
-        modify: payload.modify,
-        read: payload.read,
-        delete: payload.delete,
-        exp: exp as usize,
+pub async fn refresh_access_token(
+    Json(payload): Json<RefreshRequest>,
+) -> Result<Json<AuthBody>, AuthError> {
+    if payload.refresh_token.trim().is_empty() {
+        return Err(AuthError::MissingCredentials);
+    }
+
+    let rotated = rotate_refresh_session(&payload.refresh_token)
+        .await
+        .map_err(map_refresh_error)?;
+
+    let body = match rotated.scope {
+        AuthSessionScope::Fragment { fragment } => {
+            AuthBody::new(
+                mint_fragment_access_token(
+                    fragment,
+                    rotated.permissions.read,
+                    rotated.permissions.write,
+                    rotated.permissions.modify,
+                    rotated.permissions.delete,
+                    rotated.access_expires_in,
+                )?,
+                rotated.access_expires_in,
+                None,
+                None,
+            )
+            .with_refresh(rotated.refresh_token, rotated.refresh_expires_in)
+        }
+        AuthSessionScope::FileSystem { path } => {
+            AuthBody::new(
+                mint_fs_access_token(
+                    path,
+                    rotated.permissions.read,
+                    rotated.permissions.write,
+                    rotated.permissions.modify,
+                    rotated.permissions.delete,
+                    rotated.access_expires_in,
+                )?,
+                rotated.access_expires_in,
+                None,
+                None,
+            )
+            .with_refresh(rotated.refresh_token, rotated.refresh_expires_in)
+        }
     };
 
-    let token = encode(&Header::default(), &claims, &JWT_KEYS.encoding)
-        .map_err(|_| AuthError::InternalError)?;
+    Ok(Json(body))
+}
 
-    Ok(Json(AuthBody::new(token)))
+pub async fn logout_refresh_token(
+    Json(payload): Json<RefreshRequest>,
+) -> Result<StatusCode, AuthError> {
+    if payload.refresh_token.trim().is_empty() {
+        return Err(AuthError::MissingCredentials);
+    }
+
+    revoke_refresh_session(&payload.refresh_token)
+        .await
+        .map_err(map_refresh_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 impl Display for Claims {
@@ -196,11 +267,25 @@ impl Display for FileSystemClaims {
 }
 
 impl AuthBody {
-    fn new(access_token: String) -> Self {
+    fn new(
+        access_token: String,
+        expires_in: u64,
+        refresh_token: Option<String>,
+        refresh_expires_in: Option<u64>,
+    ) -> Self {
         Self {
             access_token,
             token_type: "Bearer".to_string(),
+            expires_in,
+            refresh_token,
+            refresh_expires_in,
         }
+    }
+
+    fn with_refresh(mut self, refresh_token: String, refresh_expires_in: u64) -> Self {
+        self.refresh_token = Some(refresh_token);
+        self.refresh_expires_in = Some(refresh_expires_in);
+        self
     }
 }
 
@@ -277,6 +362,7 @@ impl Keys {
     }
 }
 
+#[derive(Debug)]
 pub enum AuthError {
     WrongCredentials,
     MissingCredentials,
@@ -285,9 +371,151 @@ pub enum AuthError {
     FragmentNotFound,
 }
 
+async fn mint_fragment_auth_body(
+    fragment: String,
+    read: bool,
+    write: bool,
+    modify: bool,
+    delete: bool,
+    access_expires_in: u64,
+) -> Result<AuthBody, AuthError> {
+    let token = mint_fragment_access_token(
+        fragment.clone(),
+        read,
+        write,
+        modify,
+        delete,
+        access_expires_in,
+    )?;
+
+    let refresh = create_refresh_session(
+        AuthSessionScope::Fragment { fragment },
+        SessionPermissions {
+            read,
+            write,
+            modify,
+            delete,
+        },
+        access_expires_in,
+        *REFRESH_TOKEN_TTL_SECS,
+    )
+    .await
+    .map_err(map_refresh_error)?;
+
+    Ok(AuthBody::new(
+        token,
+        access_expires_in,
+        Some(refresh.refresh_token),
+        Some(refresh.refresh_expires_in),
+    ))
+}
+
+async fn mint_fs_auth_body(
+    path: String,
+    read: bool,
+    write: bool,
+    modify: bool,
+    delete: bool,
+    access_expires_in: u64,
+) -> Result<AuthBody, AuthError> {
+    let token = mint_fs_access_token(
+        path.clone(),
+        read,
+        write,
+        modify,
+        delete,
+        access_expires_in,
+    )?;
+
+    let refresh = create_refresh_session(
+        AuthSessionScope::FileSystem { path },
+        SessionPermissions {
+            read,
+            write,
+            modify,
+            delete,
+        },
+        access_expires_in,
+        *REFRESH_TOKEN_TTL_SECS,
+    )
+    .await
+    .map_err(map_refresh_error)?;
+
+    Ok(AuthBody::new(
+        token,
+        access_expires_in,
+        Some(refresh.refresh_token),
+        Some(refresh.refresh_expires_in),
+    ))
+}
+
+fn expiry_ts(duration_secs: u64) -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + duration_secs
+}
+
+fn resolve_access_token_ttl(requested: Option<u64>) -> u64 {
+    let default_ttl = (*ACCESS_TOKEN_DEFAULT_TTL_SECS).max(60);
+    let max_ttl = (*ACCESS_TOKEN_MAX_TTL_SECS).max(default_ttl);
+    requested.unwrap_or(default_ttl).clamp(60, max_ttl)
+}
+
+fn mint_fragment_access_token(
+    fragment: String,
+    read: bool,
+    write: bool,
+    modify: bool,
+    delete: bool,
+    access_expires_in: u64,
+) -> Result<String, AuthError> {
+    let claims = Claims {
+        fragment,
+        read,
+        write,
+        modify,
+        delete,
+        exp: expiry_ts(access_expires_in) as usize,
+    };
+
+    encode(&Header::default(), &claims, &JWT_KEYS.encoding).map_err(|_| AuthError::InternalError)
+}
+
+fn mint_fs_access_token(
+    path: String,
+    read: bool,
+    write: bool,
+    modify: bool,
+    delete: bool,
+    access_expires_in: u64,
+) -> Result<String, AuthError> {
+    let claims = FileSystemClaims {
+        path,
+        write,
+        modify,
+        read,
+        delete,
+        exp: expiry_ts(access_expires_in) as usize,
+    };
+
+    encode(&Header::default(), &claims, &JWT_KEYS.encoding).map_err(|_| AuthError::InternalError)
+}
+
+fn map_refresh_error(error: RefreshStoreError) -> AuthError {
+    match error {
+        RefreshStoreError::InvalidToken
+        | RefreshStoreError::TokenExpired
+        | RefreshStoreError::TokenReuseDetected => AuthError::InvalidToken,
+        RefreshStoreError::Io(_) | RefreshStoreError::Json(_) => AuthError::InternalError,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::middleware::refresh_store::clear_refresh_store_for_tests;
     use jsonwebtoken::Validation;
     use std::sync::{Mutex, OnceLock};
 
@@ -306,11 +534,21 @@ mod tests {
         if std::env::var("MASTER_KEY").is_err() {
             unsafe { std::env::set_var("MASTER_KEY", "test-master-key") };
         }
+        if std::env::var("REFRESH_TOKEN_TTL_SECS").is_err() {
+            unsafe { std::env::set_var("REFRESH_TOKEN_TTL_SECS", "3600") };
+        }
+        let isolated_refresh_root = std::env::temp_dir().join(format!(
+            "n1-auth-refresh-tests-{}",
+            std::process::id()
+        ));
+        unsafe {
+            std::env::set_var("N1_REFRESH_STORE_ROOT", isolated_refresh_root);
+        }
     }
 
     #[tokio::test]
     async fn master_key_accepts_any_auth_fragment_and_mints_claim() {
-        let _guard = env_guard().lock().expect("env guard");
+        let _guard = env_guard().lock().unwrap_or_else(|e| e.into_inner());
         ensure_test_env();
 
         let requested_fragment = "test-admin-context-fragment".to_string();
@@ -329,6 +567,9 @@ mod tests {
             Err(_) => panic!("admin auth should succeed"),
         };
 
+        assert!(body.refresh_token.is_some());
+        assert_eq!(body.refresh_expires_in, Some(3600));
+
         let decoded = decode::<Claims>(
             &body.access_token,
             &JWT_KEYS.decoding,
@@ -344,7 +585,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_fragment_is_rejected_before_auth_mode_selection() {
-        let _guard = env_guard().lock().expect("env guard");
+        let _guard = env_guard().lock().unwrap_or_else(|e| e.into_inner());
         ensure_test_env();
 
         let payload = AuthorizationRequest {
@@ -359,5 +600,134 @@ mod tests {
 
         let res = authorize_fragment(Json(payload)).await;
         assert!(matches!(res, Err(AuthError::MissingCredentials)));
+    }
+
+    #[tokio::test]
+    async fn refresh_rotates_token_and_logout_revokes_session() {
+        let _guard = env_guard().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_test_env();
+        clear_refresh_store_for_tests().await;
+
+        let payload = AuthorizationRequest {
+            fragment: "refresh-fragment".to_string(),
+            secret: MASTER_KEY.clone(),
+            read: true,
+            write: false,
+            modify: false,
+            delete: false,
+            expires_in: Some(120),
+        };
+
+        let Json(initial) = authorize_fragment(Json(payload)).await.expect("initial auth");
+        let initial_refresh = initial
+            .refresh_token
+            .clone()
+            .expect("refresh token should be present");
+
+        let Json(rotated) = refresh_access_token(Json(RefreshRequest {
+            refresh_token: initial_refresh.clone(),
+        }))
+        .await
+        .expect("refresh should succeed");
+
+        let rotated_refresh = rotated
+            .refresh_token
+            .clone()
+            .expect("rotated refresh token");
+        assert_ne!(initial_refresh, rotated_refresh);
+
+        let logout_status = logout_refresh_token(Json(RefreshRequest {
+            refresh_token: rotated_refresh.clone(),
+        }))
+        .await
+        .expect("logout should succeed");
+        assert_eq!(logout_status, StatusCode::NO_CONTENT);
+
+        let post_logout = refresh_access_token(Json(RefreshRequest {
+            refresh_token: rotated_refresh,
+        }))
+        .await;
+        assert!(matches!(post_logout, Err(AuthError::InvalidToken)));
+    }
+
+    #[tokio::test]
+    async fn refresh_reuse_detection_revokes_rotated_session() {
+        let _guard = env_guard().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_test_env();
+        clear_refresh_store_for_tests().await;
+
+        let payload = AuthorizationRequest {
+            fragment: "refresh-fragment".to_string(),
+            secret: MASTER_KEY.clone(),
+            read: true,
+            write: false,
+            modify: false,
+            delete: false,
+            expires_in: Some(120),
+        };
+
+        let Json(initial) = authorize_fragment(Json(payload)).await.expect("initial auth");
+        let initial_refresh = initial
+            .refresh_token
+            .clone()
+            .expect("refresh token should be present");
+
+        let Json(rotated) = refresh_access_token(Json(RefreshRequest {
+            refresh_token: initial_refresh.clone(),
+        }))
+        .await
+        .expect("refresh should succeed");
+
+        let rotated_refresh = rotated
+            .refresh_token
+            .clone()
+            .expect("rotated refresh token");
+
+        let reuse_attempt = refresh_access_token(Json(RefreshRequest {
+            refresh_token: initial_refresh,
+        }))
+        .await;
+        assert!(matches!(reuse_attempt, Err(AuthError::InvalidToken)));
+
+        let post_reuse = refresh_access_token(Json(RefreshRequest {
+            refresh_token: rotated_refresh,
+        }))
+        .await;
+        assert!(matches!(post_reuse, Err(AuthError::InvalidToken)));
+    }
+
+    #[tokio::test]
+    async fn omitted_expiration_uses_short_default_and_requested_ttl_is_clamped() {
+        let _guard = env_guard().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_test_env();
+        clear_refresh_store_for_tests().await;
+
+        let Json(default_body) = authorize_fragment(Json(AuthorizationRequest {
+            fragment: "default-ttl-fragment".to_string(),
+            secret: MASTER_KEY.clone(),
+            read: true,
+            write: true,
+            modify: true,
+            delete: true,
+            expires_in: None,
+        }))
+        .await
+        .expect("default ttl auth");
+
+        assert_eq!(default_body.expires_in, 15 * 60);
+
+        let Json(clamped_body) = authorize_fragment(Json(AuthorizationRequest {
+            fragment: "clamped-ttl-fragment".to_string(),
+            secret: MASTER_KEY.clone(),
+            read: true,
+            write: true,
+            modify: true,
+            delete: true,
+            expires_in: Some(24 * 60 * 60),
+        }))
+        .await
+        .expect("clamped ttl auth");
+
+        assert_eq!(clamped_body.expires_in, 60 * 60);
     }
 }

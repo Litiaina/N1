@@ -1385,8 +1385,13 @@ pub async fn object_upload_part(
         .map(|value: &str| value.trim())
         .filter(|s| !s.is_empty());
 
-    if let Some(existing) =
-        read_part_meta_any(&ObjectPathManager::new(), &fragment, &version_id, part_index).await
+    if let Some(existing) = read_part_meta_any(
+        &ObjectPathManager::new(),
+        &fragment,
+        &version_id,
+        part_index,
+    )
+    .await
     {
         if existing.size_bytes != content_length {
             return Ok((

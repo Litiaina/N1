@@ -18,6 +18,10 @@ use futures_util::future::join_all;
 use once_cell::sync::OnceCell;
 use serde::Serialize;
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -60,6 +64,14 @@ pub struct DiskStatus {
     pub path: String,
     pub role: String,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_percent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -142,6 +154,7 @@ mod tests {
 
 async fn check_disk_accessibility(path_str: String, role: String) -> DiskStatus {
     let path = PathBuf::from(&path_str);
+    let capacity = disk_capacity_snapshot(&path);
 
     let (status, latency_ms, error) = if path.exists() {
         let check_result = timeout(DISK_CHECK_TIMEOUT, async {
@@ -232,9 +245,63 @@ async fn check_disk_accessibility(path_str: String, role: String) -> DiskStatus 
         path: path_str,
         role,
         status,
+        total_bytes: capacity.as_ref().map(|v| v.total_bytes),
+        used_bytes: capacity.as_ref().map(|v| v.used_bytes),
+        available_bytes: capacity.as_ref().map(|v| v.available_bytes),
+        usage_percent: capacity.as_ref().map(|v| v.usage_percent),
         latency_ms,
         error,
     }
+}
+
+#[derive(Clone, Copy)]
+struct DiskCapacitySnapshot {
+    total_bytes: u64,
+    used_bytes: u64,
+    available_bytes: u64,
+    usage_percent: f64,
+}
+
+#[cfg(unix)]
+fn disk_capacity_snapshot(path: &std::path::Path) -> Option<DiskCapacitySnapshot> {
+    let raw_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let rc = unsafe { libc::statvfs(raw_path.as_ptr(), stats.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+
+    let stats = unsafe { stats.assume_init() };
+    let block_size = u128::from(if stats.f_frsize > 0 {
+        stats.f_frsize
+    } else {
+        stats.f_bsize
+    });
+    if block_size == 0 {
+        return None;
+    }
+
+    let total_bytes = u128::from(stats.f_blocks).saturating_mul(block_size);
+    let free_bytes = u128::from(stats.f_bfree).saturating_mul(block_size);
+    let available_bytes = u128::from(stats.f_bavail).saturating_mul(block_size);
+    let used_bytes = total_bytes.saturating_sub(free_bytes);
+    let usage_percent = if total_bytes == 0 {
+        0.0
+    } else {
+        (used_bytes as f64 / total_bytes as f64) * 100.0
+    };
+
+    Some(DiskCapacitySnapshot {
+        total_bytes: total_bytes.min(u128::from(u64::MAX)) as u64,
+        used_bytes: used_bytes.min(u128::from(u64::MAX)) as u64,
+        available_bytes: available_bytes.min(u128::from(u64::MAX)) as u64,
+        usage_percent,
+    })
+}
+
+#[cfg(not(unix))]
+fn disk_capacity_snapshot(_path: &std::path::Path) -> Option<DiskCapacitySnapshot> {
+    None
 }
 
 async fn collect_system_health(

@@ -5,14 +5,11 @@ use crate::n1_core::delete::{
 };
 use crate::n1_core::disk_manager::{
     ChunkQuery, InitiateUploadParams, ListObjectsResult, ObjectKeyQuery, ObjectMetadata,
-    RenameObjectRequest,
-    UploadPartQuery,
+    RenameObjectRequest, UploadPartQuery,
 };
 use crate::n1_core::download::download_object_chunk_direct;
 use crate::n1_core::modify::rename_object;
-use crate::n1_core::retrieve::{
-    get_object_metadata_direct, list_objects_direct,
-};
+use crate::n1_core::retrieve::{get_object_metadata_direct, list_objects_direct};
 use crate::n1_core::upload::{
     cancel_upload_session, finalize_object_upload, initiate_object_upload, object_upload_part,
 };
@@ -25,8 +22,8 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::future::BoxFuture;
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::mem;

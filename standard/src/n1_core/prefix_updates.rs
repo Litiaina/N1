@@ -129,9 +129,8 @@ pub async fn write_prefix_entry_update(
         prefix: accelerator_prefix().to_string(),
         entries: vec![entry],
     };
-    let bytes = rmp_serde::to_vec(&seg).map_err(|e| {
-        AppError::InternalServerError(format!("serialize prefix segment: {}", e))
-    })?;
+    let bytes = rmp_serde::to_vec(&seg)
+        .map_err(|e| AppError::InternalServerError(format!("serialize prefix segment: {}", e)))?;
     let file = format!("seg_{}{}", segment_id, PREFIX_SEGMENT_EXT);
 
     let bucket_dirs = if trashed {

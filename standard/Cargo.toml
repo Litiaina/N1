@@ -8,9 +8,6 @@ name = "litiaina-n1-standard"
 path = "src/main.rs"
 
 [dependencies]
-# Internal dependencies
-server_cli = { path = "../server_cli" }
-
 # External workspace dependencies
 axum.workspace = true
 chrono.workspace = true
@@ -53,12 +50,12 @@ tokio-stream.workspace = true
 async_zip = { workspace = true, features = ["tokio", "deflate"] }
 tokio-tar.workspace = true
 tracing-appender.workspace = true
-clap.workspace = true
 simd-erasure-core = { path = "../simd-erasure-core" }
 core_affinity.workspace = true
 rmp-serde.workspace = true
 argon2.workspace = true
 rand.workspace = true
+image = { version = "0.25.6", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 
 [dev-dependencies]
 tower.workspace = true

@@ -1882,10 +1882,7 @@ fn smb2_command_name(command: u16) -> &'static str {
     }
 }
 
-async fn cleanup_connection_state(
-    state: &mut ConnectionState,
-    shared_smb_state: &SharedSmbState,
-) {
+async fn cleanup_connection_state(state: &mut ConnectionState, shared_smb_state: &SharedSmbState) {
     state.handles.clear();
     unregister_connection_state(shared_smb_state, state.connection_id).await;
 }
@@ -2841,9 +2838,7 @@ async fn handle_query_info(
             }
             FILE_INFO_CLASS_POSITION_INFORMATION => build_file_position_information_buffer(),
             FILE_INFO_CLASS_MODE_INFORMATION => build_file_mode_information_buffer(),
-            FILE_INFO_CLASS_ALIGNMENT_INFORMATION => {
-                build_file_alignment_information_buffer()
-            }
+            FILE_INFO_CLASS_ALIGNMENT_INFORMATION => build_file_alignment_information_buffer(),
             FILE_INFO_CLASS_STREAM_INFORMATION => build_file_stream_information_buffer(),
             FILE_INFO_CLASS_COMPRESSION_INFORMATION => {
                 build_file_compression_information_buffer(&metadata)
@@ -5392,8 +5387,13 @@ mod tests {
 
     #[test]
     fn read_only_create_policy_allows_open_if_for_existing_path() {
-        let result =
-            read_only_create_access_status(FILE_CREATE_DISPOSITION_OPEN_IF, false, false, false, true);
+        let result = read_only_create_access_status(
+            FILE_CREATE_DISPOSITION_OPEN_IF,
+            false,
+            false,
+            false,
+            true,
+        );
         assert_eq!(result, Ok(()));
     }
 

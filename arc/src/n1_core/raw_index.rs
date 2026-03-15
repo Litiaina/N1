@@ -62,16 +62,13 @@ fn parse_raw_index_record(buf: &[u8]) -> Result<Option<(u64, RawIndexState)>, Ap
     if &buf[..8] != RAW_INDEX_MAGIC {
         return Ok(None);
     }
-    let generation = u64::from_le_bytes(
-        buf[8..16]
-            .try_into()
-            .map_err(|_| AppError::InternalServerError("invalid raw index generation header".into()))?,
-    );
-    let payload_len = u32::from_le_bytes(
-        buf[16..20]
-            .try_into()
-            .map_err(|_| AppError::InternalServerError("invalid raw index payload header".into()))?,
-    ) as usize;
+    let generation = u64::from_le_bytes(buf[8..16].try_into().map_err(|_| {
+        AppError::InternalServerError("invalid raw index generation header".into())
+    })?);
+    let payload_len =
+        u32::from_le_bytes(buf[16..20].try_into().map_err(|_| {
+            AppError::InternalServerError("invalid raw index payload header".into())
+        })?) as usize;
     if payload_len == 0 {
         return Ok(Some((generation, RawIndexState::default())));
     }
@@ -87,7 +84,8 @@ fn parse_raw_index_record(buf: &[u8]) -> Result<Option<(u64, RawIndexState)>, Ap
 
 fn encode_raw_index_record(generation: u64, state: &RawIndexState) -> Result<Vec<u8>, AppError> {
     let payload = rmp_serde::to_vec(state)?;
-    let max_payload = (RAW_INDEX_CATALOG_BYTES as usize).saturating_sub(RAW_INDEX_RECORD_HEADER_BYTES);
+    let max_payload =
+        (RAW_INDEX_CATALOG_BYTES as usize).saturating_sub(RAW_INDEX_RECORD_HEADER_BYTES);
     if payload.len() > max_payload {
         return Err(AppError::InternalServerError(format!(
             "raw index catalog overflow: {} > {} bytes",
@@ -126,14 +124,16 @@ fn ensure_catalog_handle(manager: &mut BlockManager) -> Result<AllocationHandle,
     if let Some(handle) = detect_catalog_handle(manager)? {
         return Ok(handle);
     }
-    let handle = manager.allocate_bytes(RAW_INDEX_CATALOG_BYTES).map_err(|e| {
-        AppError::InternalServerError(format!("raw index allocate catalog failed: {}", e))
-    })?;
+    let handle = manager
+        .allocate_bytes(RAW_INDEX_CATALOG_BYTES)
+        .map_err(|e| {
+            AppError::InternalServerError(format!("raw index allocate catalog failed: {}", e))
+        })?;
     let zero_len = handle.capacity_bytes(manager.header().block_size) as usize;
     let zero = vec![0u8; zero_len];
-    manager
-        .write(handle, 0, &zero)
-        .map_err(|e| AppError::InternalServerError(format!("raw index zero catalog failed: {}", e)))?;
+    manager.write(handle, 0, &zero).map_err(|e| {
+        AppError::InternalServerError(format!("raw index zero catalog failed: {}", e))
+    })?;
     manager.flush_data().map_err(|e| {
         AppError::InternalServerError(format!(
             "raw index flush data after catalog allocation failed: {}",
@@ -149,23 +149,23 @@ fn ensure_catalog_handle(manager: &mut BlockManager) -> Result<AllocationHandle,
     Ok(handle)
 }
 
-async fn load_best_state(devices: &[Arc<RawIndexDevice>]) -> Result<(u64, RawIndexState), AppError> {
+async fn load_best_state(
+    devices: &[Arc<RawIndexDevice>],
+) -> Result<(u64, RawIndexState), AppError> {
     let mut best_generation = 0u64;
     let mut best_state = RawIndexState::default();
     for device in devices {
         let manager = device.manager.read().map_err(|_| {
             AppError::InternalServerError("raw index manager read lock poisoned".into())
         })?;
-        let cap = device
-            .catalog
-            .capacity_bytes(manager.header().block_size) as usize;
-        let bytes = manager
-            .read(device.catalog, 0, cap)
-            .map_err(|e| AppError::InternalServerError(format!(
+        let cap = device.catalog.capacity_bytes(manager.header().block_size) as usize;
+        let bytes = manager.read(device.catalog, 0, cap).map_err(|e| {
+            AppError::InternalServerError(format!(
                 "raw index read catalog {} failed: {}",
                 device.path.display(),
                 e
-            )))?;
+            ))
+        })?;
         if let Some((generation, state)) = parse_raw_index_record(&bytes)? {
             if generation >= best_generation {
                 best_generation = generation;
@@ -176,33 +176,37 @@ async fn load_best_state(devices: &[Arc<RawIndexDevice>]) -> Result<(u64, RawInd
     Ok((best_generation, best_state))
 }
 
-async fn persist_state(devices: &[Arc<RawIndexDevice>], generation: u64, state: &RawIndexState) -> Result<(), AppError> {
+async fn persist_state(
+    devices: &[Arc<RawIndexDevice>],
+    generation: u64,
+    state: &RawIndexState,
+) -> Result<(), AppError> {
     let bytes = encode_raw_index_record(generation, state)?;
     for device in devices {
         let mut manager = device.manager.write().map_err(|_| {
             AppError::InternalServerError("raw index manager write lock poisoned".into())
         })?;
-        manager
-            .write(device.catalog, 0, &bytes)
-            .map_err(|e| AppError::InternalServerError(format!(
+        manager.write(device.catalog, 0, &bytes).map_err(|e| {
+            AppError::InternalServerError(format!(
                 "raw index write catalog {} failed: {}",
                 device.path.display(),
                 e
-            )))?;
-        manager
-            .flush_data()
-            .map_err(|e| AppError::InternalServerError(format!(
+            ))
+        })?;
+        manager.flush_data().map_err(|e| {
+            AppError::InternalServerError(format!(
                 "raw index flush data {} failed: {}",
                 device.path.display(),
                 e
-            )))?;
-        manager
-            .flush_meta()
-            .map_err(|e| AppError::InternalServerError(format!(
+            ))
+        })?;
+        manager.flush_meta().map_err(|e| {
+            AppError::InternalServerError(format!(
                 "raw index flush meta {} failed: {}",
                 device.path.display(),
                 e
-            )))?;
+            ))
+        })?;
     }
     Ok(())
 }
@@ -223,7 +227,8 @@ async fn runtime() -> Result<Arc<RawIndexRuntime>, AppError> {
     let mut seen = HashSet::<PathBuf>::new();
     let mut devices = Vec::with_capacity(paths.len());
     for raw_path in paths {
-        let canonical = std::fs::canonicalize(&raw_path).unwrap_or_else(|_| PathBuf::from(&raw_path));
+        let canonical =
+            std::fs::canonicalize(&raw_path).unwrap_or_else(|_| PathBuf::from(&raw_path));
         if !seen.insert(canonical.clone()) {
             continue;
         }
@@ -290,9 +295,10 @@ pub async fn open_session(
         aborted_at: None,
     };
     persist_with_mutation(|state| {
-        state
-            .sessions
-            .insert(session_key(&manifest.fragment, &manifest.version_id), session);
+        state.sessions.insert(
+            session_key(&manifest.fragment, &manifest.version_id),
+            session,
+        );
         Ok(())
     })
     .await
@@ -313,7 +319,10 @@ pub async fn commit_session_part(
     .await
 }
 
-pub async fn load_session(fragment: &str, version_id: &str) -> Result<Option<IndexSessionState>, AppError> {
+pub async fn load_session(
+    fragment: &str,
+    version_id: &str,
+) -> Result<Option<IndexSessionState>, AppError> {
     let rt = runtime().await?;
     let state = rt.state.read().await;
     Ok(state
@@ -348,7 +357,11 @@ pub async fn read_session_part(
         .cloned())
 }
 
-pub async fn remove_session(fragment: &str, version_id: &str, reason: &str) -> Result<(), AppError> {
+pub async fn remove_session(
+    fragment: &str,
+    version_id: &str,
+    reason: &str,
+) -> Result<(), AppError> {
     persist_with_mutation(|state| {
         let key = session_key(fragment, version_id);
         let removed = state.sessions.remove(&key).ok_or(AppError::NotFound)?;
@@ -402,7 +415,10 @@ pub async fn list_removed_session_receipts(
     Ok(out)
 }
 
-pub async fn delete_removed_session_receipt(fragment: &str, version_id: &str) -> Result<(), AppError> {
+pub async fn delete_removed_session_receipt(
+    fragment: &str,
+    version_id: &str,
+) -> Result<(), AppError> {
     persist_with_mutation(|state| {
         state
             .removed_sessions
@@ -412,7 +428,9 @@ pub async fn delete_removed_session_receipt(fragment: &str, version_id: &str) ->
     .await
 }
 
-fn choose_latest_for_key<'a>(versions: impl Iterator<Item = &'a ObjectMetadata>) -> Option<ObjectMetadata> {
+fn choose_latest_for_key<'a>(
+    versions: impl Iterator<Item = &'a ObjectMetadata>,
+) -> Option<ObjectMetadata> {
     let mut latest: Option<ObjectMetadata> = None;
     for item in versions {
         match latest.as_ref() {
@@ -437,9 +455,16 @@ pub async fn publish_object(metadata: &ObjectMetadata) -> Result<(), AppError> {
     upsert_object_version(metadata, false).await
 }
 
-pub async fn upsert_object_version(metadata: &ObjectMetadata, trashed: bool) -> Result<(), AppError> {
+pub async fn upsert_object_version(
+    metadata: &ObjectMetadata,
+    trashed: bool,
+) -> Result<(), AppError> {
     persist_with_mutation(|state| {
-        let key = object_version_key(&metadata.fragment, &metadata.object_key, &metadata.version_id);
+        let key = object_version_key(
+            &metadata.fragment,
+            &metadata.object_key,
+            &metadata.version_id,
+        );
         if trashed {
             state.trash_versions.insert(key, metadata.clone());
         } else {
@@ -467,7 +492,10 @@ pub async fn read_object_version(
     found.cloned().ok_or(AppError::NotFound)
 }
 
-pub async fn read_latest_object(fragment: &str, object_key: &str) -> Result<ObjectMetadata, AppError> {
+pub async fn read_latest_object(
+    fragment: &str,
+    object_key: &str,
+) -> Result<ObjectMetadata, AppError> {
     let rt = runtime().await?;
     let state = rt.state.read().await;
     choose_latest_for_key(
@@ -512,7 +540,9 @@ async fn list_latest_objects_internal(
 }
 
 pub async fn count_fragment_latest_objects(fragment: &str, trashed: bool) -> Result<u64, AppError> {
-    Ok(list_latest_objects_internal(fragment, trashed, None).await?.len() as u64)
+    Ok(list_latest_objects_internal(fragment, trashed, None)
+        .await?
+        .len() as u64)
 }
 
 pub async fn list_fragment_latest_objects_page(
@@ -577,7 +607,11 @@ pub async fn list_fragment_latest_objects_page(
     Ok((page, next))
 }
 
-pub async fn list_fragment_objects(fragment: &str, prefix: Option<&str>, trashed: bool) -> Result<Vec<ObjectMetadata>, AppError> {
+pub async fn list_fragment_objects(
+    fragment: &str,
+    prefix: Option<&str>,
+    trashed: bool,
+) -> Result<Vec<ObjectMetadata>, AppError> {
     list_latest_objects_internal(fragment, trashed, prefix).await
 }
 
@@ -723,9 +757,8 @@ pub async fn collect_runtime_upload_stats() -> UploadRuntimeStats {
             for sess in state.sessions.values() {
                 active_fragments.insert(sess.manifest.fragment.clone());
                 committed_parts = committed_parts.saturating_add(sess.parts.len() as u64);
-                committed_bytes = committed_bytes.saturating_add(
-                    sess.parts.values().map(|p| p.size_bytes).sum::<u64>(),
-                );
+                committed_bytes = committed_bytes
+                    .saturating_add(sess.parts.values().map(|p| p.size_bytes).sum::<u64>());
             }
             UploadRuntimeStats {
                 active_fragments: active_fragments.len() as u64,
@@ -804,8 +837,12 @@ pub async fn delete_fragment_state(fragment: &str) -> Result<(), AppError> {
     persist_with_mutation(|state| {
         state.fragment_metadata.remove(fragment);
         state.quotas.remove(fragment);
-        state.sessions.retain(|_, s| s.manifest.fragment != fragment);
-        state.removed_sessions.retain(|_, r| r.state.manifest.fragment != fragment);
+        state
+            .sessions
+            .retain(|_, s| s.manifest.fragment != fragment);
+        state
+            .removed_sessions
+            .retain(|_, r| r.state.manifest.fragment != fragment);
         state.live_versions.retain(|_, m| m.fragment != fragment);
         state.trash_versions.retain(|_, m| m.fragment != fragment);
         Ok(())

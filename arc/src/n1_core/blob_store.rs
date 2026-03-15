@@ -777,10 +777,7 @@ fn persist_format_intents(records: &[RawBlobFormatIntentRecord]) -> Result<(), A
     let path = format_intents_store_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| {
-            AppError::Io(
-                e,
-                format!("create format intent dir {}", parent.display()),
-            )
+            AppError::Io(e, format!("create format intent dir {}", parent.display()))
         })?;
     }
     let bytes = rmp_serde::to_vec(records).map_err(|e| {
