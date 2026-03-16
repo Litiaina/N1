@@ -1026,7 +1026,6 @@ pub async fn read_latest_object(
     read_latest_object_internal(fragment, object_key, false).await
 }
 
-#[cfg(test)]
 pub async fn read_latest_trashed_object(
     fragment: &str,
     object_key: &str,

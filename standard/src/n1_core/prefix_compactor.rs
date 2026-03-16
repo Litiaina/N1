@@ -122,7 +122,7 @@ async fn compact_prefix_if_needed(
     fragment: &str,
     prefix: &str,
 ) -> Result<(), AppError> {
-    compact_prefix_if_needed_scoped(path_manager, fragment, prefix, false).await
+    compact_prefix_if_needed_scoped(path_manager, fragment, prefix, false, false).await
 }
 
 async fn compact_prefix_if_needed_scoped(
@@ -130,6 +130,7 @@ async fn compact_prefix_if_needed_scoped(
     fragment: &str,
     prefix: &str,
     trashed: bool,
+    force: bool,
 ) -> Result<(), AppError> {
     let bucket_dirs = if trashed {
         path_manager.get_all_trash_prefix_bucket_dirs(fragment, prefix)
@@ -173,7 +174,7 @@ async fn compact_prefix_if_needed_scoped(
         return Ok(());
     }
 
-    if saw_compacted && all_seg_paths.len() < compact_trigger_segments() {
+    if !force && saw_compacted && all_seg_paths.len() < compact_trigger_segments() {
         return Ok(());
     }
 
@@ -250,10 +251,10 @@ async fn compact_prefix_if_needed_scoped(
 
 pub async fn compact_prefix_now(fragment: &str, prefix: &str) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
-    compact_prefix_if_needed_scoped(&path_manager, fragment, prefix, false).await
+    compact_prefix_if_needed_scoped(&path_manager, fragment, prefix, false, true).await
 }
 
 pub async fn compact_trash_prefix_now(fragment: &str, prefix: &str) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
-    compact_prefix_if_needed_scoped(&path_manager, fragment, prefix, true).await
+    compact_prefix_if_needed_scoped(&path_manager, fragment, prefix, true, true).await
 }

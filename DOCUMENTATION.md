@@ -750,6 +750,7 @@ Durability default:
 
 Notes:
 - Part upload commits shard payload, persists part metadata on disk, then records committed-part state in `index` session state.
+- If upload I/O gating is enabled and the node cannot admit more upload work within the gate timeout, the request is rejected with `503 Service Unavailable` instead of proceeding ungated.
 - The upload hot path does not rely on in-memory part state for resumability.
 - In `standard`, shards are written as files under blob root directories.
 - In `arc`, shards are committed to raw extents.
@@ -1348,7 +1349,7 @@ curl -k -X POST -H "Authorization: Bearer $FS_TOKEN" \
 - `stream_locality_bias_enabled`: prefer shard directory inferred from shard absolute path for sequential streaming.
 - `stream_max_concurrency`: global stream semaphore capacity.
 - `upload_part_strict_durability_default`: default durability for `PUT /v4/upload/chunk` when query override is absent (`true` = strict fsync/dir-sync, `false` = batched, default `false`).
-- `upload_io_gate_enabled`: default for upload I/O gate in `PUT /v4/upload/chunk` when `io_gate` query override is absent.
+- `upload_io_gate_enabled`: default for upload I/O gate in `PUT /v4/upload/chunk` when `io_gate` query override is absent. When enabled, uploads that cannot acquire gate capacity within the timeout are rejected with `503` to preserve backpressure.
 
 `auto` preset behavior:
 - `auto` values are hardware-aware (CPU cores + detected RAM + disk count + EC shard layout).

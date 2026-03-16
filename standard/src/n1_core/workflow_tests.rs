@@ -23,7 +23,7 @@ use super::prefix_compactor::{
     PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC, PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC,
 };
 use super::prefix_rebuilder::run_prefix_rebuild_job;
-use super::prefix_updates::accelerator_prefix;
+use super::prefix_updates::{accelerator_prefix, fragment_accelerator_is_stale};
 use super::quota_manager::init_quota_file;
 use super::recovery::verify_shard_integrity;
 use super::redistribution::{
@@ -709,6 +709,70 @@ async fn wait_until_prefix_compacted(fragment: &str, _prefix: &str, timeout_ms: 
             }
 
             if !has_compacted {
+                all_buckets_compacted = false;
+                break;
+            }
+        }
+
+        if any_bucket && all_buckets_compacted {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_until_root_accelerator_fully_compacted(
+    fragment: &str,
+    trashed: bool,
+    timeout_ms: u64,
+) -> bool {
+    let path_manager = ObjectPathManager::new();
+    let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let compacted_name = format!("compacted{}", PREFIX_SEGMENT_EXT);
+    let accelerator = accelerator_prefix();
+
+    loop {
+        let mut any_bucket = false;
+        let mut all_buckets_compacted = true;
+
+        let buckets = if trashed {
+            path_manager.get_all_trash_prefix_bucket_dirs(fragment, accelerator)
+        } else {
+            path_manager.get_all_prefix_bucket_dirs(fragment, accelerator)
+        };
+
+        for bucket in buckets {
+            if !fs::try_exists(&bucket).await.unwrap_or(false) {
+                continue;
+            }
+            any_bucket = true;
+
+            let mut has_compacted = false;
+            let mut has_delta_segments = false;
+
+            let mut rd = match fs::read_dir(&bucket).await {
+                Ok(v) => v,
+                Err(_) => {
+                    all_buckets_compacted = false;
+                    break;
+                }
+            };
+
+            while let Ok(Some(ent)) = rd.next_entry().await {
+                let name = ent.file_name().to_string_lossy().to_string();
+                if name == compacted_name {
+                    has_compacted = true;
+                }
+                if name.starts_with("seg_") && name.ends_with(PREFIX_SEGMENT_EXT) {
+                    has_delta_segments = true;
+                }
+            }
+
+            if !has_compacted || has_delta_segments {
                 all_buckets_compacted = false;
                 break;
             }
@@ -6334,6 +6398,22 @@ async fn matrix_bulk_delete_and_recover_round_trip() {
         serde_json::from_slice(&bulk_delete_body).expect("bulk delete json");
     assert_eq!(bulk_delete_json["succeeded"].as_u64(), Some(64));
     assert_eq!(bulk_delete_json["not_found"].as_u64(), Some(0));
+    assert!(
+        !fragment_accelerator_is_stale(&fragment, false).await,
+        "live accelerator should stay warm after bulk delete"
+    );
+    assert!(
+        !fragment_accelerator_is_stale(&fragment, true).await,
+        "trash accelerator should stay warm after bulk delete"
+    );
+    assert!(
+        wait_until_root_accelerator_fully_compacted(&fragment, false, 5000).await,
+        "live root accelerator should be compacted after bulk delete"
+    );
+    assert!(
+        wait_until_root_accelerator_fully_compacted(&fragment, true, 5000).await,
+        "trash root accelerator should be compacted after bulk delete"
+    );
 
     let live_after_delete_resp = list_objects(
         full_claims(&fragment),
@@ -6398,6 +6478,22 @@ async fn matrix_bulk_delete_and_recover_round_trip() {
         serde_json::from_slice(&bulk_recover_body).expect("bulk recover json");
     assert_eq!(bulk_recover_json["succeeded"].as_u64(), Some(64));
     assert_eq!(bulk_recover_json["not_found"].as_u64(), Some(0));
+    assert!(
+        !fragment_accelerator_is_stale(&fragment, false).await,
+        "live accelerator should stay warm after bulk recover"
+    );
+    assert!(
+        !fragment_accelerator_is_stale(&fragment, true).await,
+        "trash accelerator should stay warm after bulk recover"
+    );
+    assert!(
+        wait_until_root_accelerator_fully_compacted(&fragment, false, 5000).await,
+        "live root accelerator should be compacted after bulk recover"
+    );
+    assert!(
+        wait_until_root_accelerator_fully_compacted(&fragment, true, 5000).await,
+        "trash root accelerator should be compacted after bulk recover"
+    );
 
     let live_after_recover_resp = list_objects(
         full_claims(&fragment),

@@ -10,7 +10,9 @@ use crate::n1_core::metadata_parser::get_metadata;
 use crate::n1_core::object_parser::{get_object_logic, stream_object_logic};
 use crate::n1_core::prefix_compactor::{compact_prefix_now, compact_trash_prefix_now};
 use crate::n1_core::prefix_rebuilder::rebuild_fragment_prefix_accelerator;
-use crate::n1_core::prefix_updates::{accelerator_prefix, fragment_accelerator_is_stale};
+use crate::n1_core::prefix_updates::{
+    accelerator_prefix, fragment_accelerator_is_stale, synthetic_live_entry,
+};
 use crate::n1_core::quota_manager::get_storage_usage;
 use crate::structs::auth_structs::Claims;
 use axum::{
@@ -318,7 +320,7 @@ async fn list_prefix_compacted_page_fast(
     limit: usize,
     continuation_token: Option<String>,
     include_internal: bool,
-    seg: PrefixIndexSegment,
+    mut seg: PrefixIndexSegment,
     scan_trash: bool,
 ) -> Result<ListObjectsResult, AppError> {
     let pfx = canonical_prefix(prefix);
@@ -327,6 +329,18 @@ async fn list_prefix_compacted_page_fast(
     } else {
         format!("{}/", pfx)
     };
+    if !pfx.is_empty() && !seg.entries.iter().any(|entry| canonical_key(&entry.object_key) == pfx) {
+        if let Some(exact_entry) = load_exact_prefix_latest_entry(fragment, &pfx, scan_trash).await {
+            let insert_at = seg
+                .entries
+                .binary_search_by(|entry| match canonical_key(&entry.object_key).cmp(&pfx) {
+                    std::cmp::Ordering::Equal => entry.version_id.cmp(&exact_entry.version_id),
+                    other => other,
+                })
+                .unwrap_or_else(|idx| idx);
+            seg.entries.insert(insert_at, exact_entry);
+        }
+    }
     let path_manager = ObjectPathManager::new();
     let want_delim = delimiter == Some("/");
     let start_after_delim = if want_delim {
@@ -497,22 +511,36 @@ async fn list_prefix_compacted_page_fast(
     })
 }
 
-fn merge_prefix_latest(
-    latest: &mut HashMap<String, (String, i64, bool)>,
-    object_key: String,
-    version_id: String,
-    created_at: i64,
-    is_delete_marker: bool,
-) {
+fn merge_prefix_latest(latest: &mut HashMap<String, PrefixIndexEntry>, entry: PrefixIndexEntry) {
+    let object_key = canonical_key(&entry.object_key);
+
     match latest.get(&object_key) {
         None => {
-            latest.insert(object_key, (version_id, created_at, is_delete_marker));
+            latest.insert(object_key, entry);
         }
-        Some((cur_vid, cur_ts, _)) => {
-            if created_at > *cur_ts || (created_at == *cur_ts && version_id > *cur_vid) {
-                latest.insert(object_key, (version_id, created_at, is_delete_marker));
+        Some(current) => {
+            if entry.created_at > current.created_at
+                || (entry.created_at == current.created_at && entry.version_id > current.version_id)
+            {
+                latest.insert(object_key, entry);
             }
         }
+    }
+}
+
+async fn load_exact_prefix_latest_entry(
+    fragment: &str,
+    prefix: &str,
+    scan_trash: bool,
+) -> Option<PrefixIndexEntry> {
+    let res = if scan_trash {
+        index::read_latest_trashed_object(fragment, prefix).await
+    } else {
+        index::read_latest_object(fragment, prefix).await
+    };
+    match res {
+        Ok(meta) if !meta.is_delete_marker => Some(synthetic_live_entry(&meta, meta.created_at)),
+        _ => None,
     }
 }
 
@@ -532,32 +560,36 @@ async fn try_list_by_prefix_index(
         format!("{}/", pfx)
     };
     let want_delim = delimiter == Some("/");
-    let accelerator_prefix = accelerator_prefix();
+    let accelerator_prefix = if pfx.is_empty() {
+        accelerator_prefix().to_string()
+    } else {
+        pfx.clone()
+    };
 
     if fragment_accelerator_is_stale(fragment, scan_trash).await {
         let _ = rebuild_fragment_prefix_accelerator(fragment).await;
     }
 
     if let Some((_, delta_count)) =
-        load_best_prefix_compacted_segment(fragment, accelerator_prefix, scan_trash).await
+        load_best_prefix_compacted_segment(fragment, &accelerator_prefix, scan_trash).await
     {
         if delta_count > prefix_max_delta_segments() {
             let _ = if scan_trash {
-                compact_trash_prefix_now(fragment, accelerator_prefix).await
+                compact_trash_prefix_now(fragment, &accelerator_prefix).await
             } else {
-                compact_prefix_now(fragment, accelerator_prefix).await
+                compact_prefix_now(fragment, &accelerator_prefix).await
             };
         }
     } else {
         let _ = if scan_trash {
-            compact_trash_prefix_now(fragment, accelerator_prefix).await
+            compact_trash_prefix_now(fragment, &accelerator_prefix).await
         } else {
-            compact_prefix_now(fragment, accelerator_prefix).await
+            compact_prefix_now(fragment, &accelerator_prefix).await
         };
     }
 
     if let Some((seg, delta_count)) =
-        load_best_prefix_compacted_segment(fragment, accelerator_prefix, scan_trash).await
+        load_best_prefix_compacted_segment(fragment, &accelerator_prefix, scan_trash).await
     {
         if delta_count == 0 {
             return Ok(Some(
@@ -577,13 +609,13 @@ async fn try_list_by_prefix_index(
     }
 
     let path_manager = ObjectPathManager::new();
-    let mut latest: HashMap<String, (String, i64, bool)> = HashMap::new();
+    let mut latest: HashMap<String, PrefixIndexEntry> = HashMap::new();
     let mut had_any_index_data = false;
 
     let bucket_dirs = if scan_trash {
-        path_manager.get_all_trash_prefix_bucket_dirs(fragment, accelerator_prefix)
+        path_manager.get_all_trash_prefix_bucket_dirs(fragment, &accelerator_prefix)
     } else {
-        path_manager.get_all_prefix_bucket_dirs(fragment, accelerator_prefix)
+        path_manager.get_all_prefix_bucket_dirs(fragment, &accelerator_prefix)
     };
     for d in bucket_dirs {
         if !fs::try_exists(&d).await.unwrap_or(false) {
@@ -605,13 +637,7 @@ async fn try_list_by_prefix_index(
                         if !pfx.is_empty() && ck != pfx && !ck.starts_with(&pfx_with_slash) {
                             continue;
                         }
-                        merge_prefix_latest(
-                            &mut latest,
-                            ck,
-                            e.version_id,
-                            e.created_at,
-                            e.is_delete_marker,
-                        );
+                        merge_prefix_latest(&mut latest, e);
                     }
                 }
             }
@@ -667,13 +693,7 @@ async fn try_list_by_prefix_index(
                             continue;
                         }
 
-                        merge_prefix_latest(
-                            &mut latest,
-                            ck,
-                            e.version_id,
-                            e.created_at,
-                            e.is_delete_marker,
-                        );
+                        merge_prefix_latest(&mut latest, e);
                     }
                 }
             }
@@ -684,7 +704,7 @@ async fn try_list_by_prefix_index(
         let _ = rebuild_fragment_prefix_accelerator(fragment).await;
 
         if let Some((seg, delta_count)) =
-            load_best_prefix_compacted_segment(fragment, accelerator_prefix, scan_trash).await
+            load_best_prefix_compacted_segment(fragment, &accelerator_prefix, scan_trash).await
         {
             if delta_count == 0 {
                 return Ok(Some(
@@ -706,6 +726,12 @@ async fn try_list_by_prefix_index(
         return Ok(None);
     }
 
+    if !pfx.is_empty() && !latest.contains_key(&pfx) {
+        if let Some(entry) = load_exact_prefix_latest_entry(fragment, &pfx, scan_trash).await {
+            latest.insert(pfx.clone(), entry);
+        }
+    }
+
     if latest.is_empty() {
         return Ok(Some(ListObjectsResult {
             objects: Vec::new(),
@@ -714,13 +740,10 @@ async fn try_list_by_prefix_index(
         }));
     }
 
-    let mut entries: Vec<(String, String, bool)> = latest
-        .into_iter()
-        .map(|(k, (v, _, is_delete_marker))| (k, v, is_delete_marker))
-        .collect();
+    let mut entries: Vec<PrefixIndexEntry> = latest.into_values().collect();
 
-    entries.sort_by(|a, b| match a.0.cmp(&b.0) {
-        std::cmp::Ordering::Equal => a.1.cmp(&b.1),
+    entries.sort_by(|a, b| match canonical_key(&a.object_key).cmp(&canonical_key(&b.object_key)) {
+        std::cmp::Ordering::Equal => a.version_id.cmp(&b.version_id),
         other => other,
     });
 
@@ -734,15 +757,15 @@ async fn try_list_by_prefix_index(
     };
 
     let start_idx = if let Some((k, v)) = start_after.as_ref() {
-        match entries.binary_search_by(|(ek, ev, _)| match ek.cmp(k) {
-            std::cmp::Ordering::Equal => ev.cmp(v),
+        match entries.binary_search_by(|entry| match canonical_key(&entry.object_key).cmp(k) {
+            std::cmp::Ordering::Equal => entry.version_id.cmp(v),
             other => other,
         }) {
             Ok(i) => i + 1,
             Err(i) => i,
         }
     } else if !entries.is_empty() && !pfx.is_empty() {
-        match entries.binary_search_by(|(ek, _ev, _)| ek.cmp(&pfx)) {
+        match entries.binary_search_by(|entry| canonical_key(&entry.object_key).cmp(&pfx)) {
             Ok(i) => i,
             Err(i) => i,
         }
@@ -757,12 +780,15 @@ async fn try_list_by_prefix_index(
     let mut last_pair: Option<(String, String)> = None;
     let mut reached_limit = false;
 
-    for (k, v, is_delete_marker) in entries.into_iter().skip(start_idx) {
+    for entry in entries.into_iter().skip(start_idx) {
         if out_objects.len() + out_prefixes.len() >= limit {
             break;
         }
 
-        if is_delete_marker {
+        let k = canonical_key(&entry.object_key);
+        let v = entry.version_id.clone();
+
+        if entry.is_delete_marker {
             continue;
         }
 
@@ -787,7 +813,7 @@ async fn try_list_by_prefix_index(
 
             if !pfx.is_empty() && k == pfx {
                 let Some(meta) =
-                    read_metadata_best(&path_manager, fragment, &k, &v, scan_trash).await
+                    read_index_entry_best(&path_manager, fragment, &entry, scan_trash).await
                 else {
                     warn!(
                         "Skipping unreadable prefix-index metadata fragment={} key={} version={}",
@@ -814,7 +840,7 @@ async fn try_list_by_prefix_index(
                 }
             } else {
                 let Some(meta) =
-                    read_metadata_best(&path_manager, fragment, &k, &v, scan_trash).await
+                    read_index_entry_best(&path_manager, fragment, &entry, scan_trash).await
                 else {
                     warn!(
                         "Skipping unreadable prefix-index metadata fragment={} key={} version={}",
@@ -829,7 +855,7 @@ async fn try_list_by_prefix_index(
                 last_pair = Some((k, v));
             }
         } else {
-            let Some(meta) = read_metadata_best(&path_manager, fragment, &k, &v, scan_trash).await
+            let Some(meta) = read_index_entry_best(&path_manager, fragment, &entry, scan_trash).await
             else {
                 warn!(
                     "Skipping unreadable prefix-index metadata fragment={} key={} version={}",

@@ -8,6 +8,7 @@ use crate::handlers::error_handlers;
 pub enum AppError {
     Io(io::Error, String),
     Timeout(String),
+    ServiceUnavailable(String),
     BadRequest(String),
     Conflict(String),
     PayloadTooLarge(String),
@@ -37,6 +38,7 @@ impl std::fmt::Display for AppError {
         match self {
             AppError::Io(err, context) => write!(f, "IO error during '{}': {}", context, err),
             AppError::Timeout(context) => write!(f, "Operation timed out: {}", context),
+            AppError::ServiceUnavailable(msg) => write!(f, "Service unavailable: {}", msg),
             AppError::BadRequest(msg) => write!(f, "Bad request: {}", msg),
             AppError::Conflict(msg) => write!(f, "Conflict: {}", msg),
             AppError::PayloadTooLarge(msg) => write!(f, "Payload too large: {}", msg),
@@ -76,6 +78,10 @@ impl IntoResponse for AppError {
                 let message = format!("Operation timed out: {}", context);
                 (StatusCode::REQUEST_TIMEOUT, message).into_response()
             }
+            AppError::ServiceUnavailable(msg) => {
+                tracing::warn!("Service unavailable: {}", msg);
+                (StatusCode::SERVICE_UNAVAILABLE, msg).into_response()
+            }
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
             AppError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg).into_response(),
@@ -106,5 +112,18 @@ impl IntoResponse for AppError {
             )
                 .into_response(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppError;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    #[test]
+    fn service_unavailable_maps_to_503() {
+        let response = AppError::ServiceUnavailable("busy".to_string()).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

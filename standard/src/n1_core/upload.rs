@@ -19,16 +19,11 @@ use futures_util::StreamExt;
 use futures_util::future::join_all;
 use once_cell::sync::{Lazy, OnceCell};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use ulid::Ulid;
-
-use crate::n1_core::constants::{
-    PREFIX_INDEX_DIR, PREFIX_INDEX_NAMESPACE, PREFIX_INDEX_VERSION, PREFIX_SEGMENT_EXT,
-};
 
 #[cfg(target_os = "linux")]
 use io_uring::{IoUring, opcode, types};
@@ -45,13 +40,15 @@ use crate::enums::app_error_enum::AppError;
 use crate::n1_core::constants::{PARITY_SUFFIX, SHARD_SUFFIX};
 use crate::n1_core::disk_manager::{
     FinalizeIncompleteResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery,
-    ObjectMetadata, ObjectPathManager, PartMetadata, PrefixIndexEntry, PrefixIndexSegment,
-    ReservationReceipt, ShardInfo, UploadPartQuery, UploadStatusResponse, default_stripe_size,
+    ObjectMetadata, ObjectPathManager, PartMetadata, ReservationReceipt, ShardInfo,
+    UploadPartQuery, UploadStatusResponse, default_stripe_size,
 };
 use crate::n1_core::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::n1_core::index;
 use crate::n1_core::metadata_parser::get_metadata;
-use crate::n1_core::prefix_updates::accelerator_prefix;
+use crate::n1_core::prefix_updates::{
+    object_key_directory_scopes, write_prefix_entries_update_for_prefix,
+};
 use crate::n1_core::quota_manager::ensure_capacity_available;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -70,6 +67,7 @@ pub static UPLOAD_IO_GATE_ENABLED_ATOMIC: OnceCell<AtomicBool> = OnceCell::new()
 static IO_SEMAPHORE: Lazy<Semaphore> =
     Lazy::new(|| Semaphore::new(*MAX_IO_SEMAPHORE.get().unwrap()));
 static ACTIVE_IO_INFLIGHT: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
+const UPLOAD_IO_GATE_TIMEOUT_SECS: u64 = 2;
 
 #[cfg(target_os = "linux")]
 static IO_URING_ENABLED: Lazy<bool> = Lazy::new(|| {
@@ -140,6 +138,34 @@ async fn acquire_adaptive_io_guard() -> Result<AdaptiveIoGuard<'static>, AppErro
     }
 }
 
+async fn acquire_upload_io_guard_with_timeout(
+    io_gate_enabled: bool,
+    context: &str,
+) -> Result<Option<AdaptiveIoGuard<'static>>, AppError> {
+    if !io_gate_enabled {
+        return Ok(None);
+    }
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(UPLOAD_IO_GATE_TIMEOUT_SECS),
+        acquire_adaptive_io_guard(),
+    )
+    .await
+    {
+        Ok(Ok(guard)) => Ok(Some(guard)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            warn!(
+                "Upload IO gate wait timed out ({}); rejecting request to preserve backpressure",
+                context
+            );
+            Err(AppError::ServiceUnavailable(
+                "Upload path is saturated; retry shortly.".into(),
+            ))
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UploadDurabilityMode {
     Strict,
@@ -179,7 +205,9 @@ fn parse_upload_durability_mode(query: &UploadPartQuery) -> UploadDurabilityMode
 
 #[cfg(test)]
 mod tests {
-    use super::{UploadDurabilityMode, parse_upload_durability_mode};
+    use super::{
+        UploadDurabilityMode, acquire_upload_io_guard_with_timeout, parse_upload_durability_mode,
+    };
     use crate::n1_core::disk_manager::UploadPartQuery;
 
     #[test]
@@ -219,6 +247,14 @@ mod tests {
             parse_upload_durability_mode(&q_strict),
             UploadDurabilityMode::Strict
         ));
+    }
+
+    #[tokio::test]
+    async fn upload_io_gate_helper_bypasses_when_disabled() {
+        let guard = acquire_upload_io_guard_with_timeout(false, "unit-test")
+            .await
+            .expect("gate bypass succeeds");
+        assert!(guard.is_none());
     }
 }
 
@@ -697,11 +733,7 @@ async fn write_part_blob_to_disk(
         let tmp_name = format!("{}.tmp.{}", stable_name, attempt_id);
         let disk_idx = (part_index as usize + i) % num_disks;
         let target_disk = &blob_roots[disk_idx];
-        let shard_dir = path_manager.get_shard_dir_on_disk(
-            target_disk,
-            &fragment.to_string(),
-            &version_id.to_string(),
-        );
+        let shard_dir = path_manager.get_shard_dir_on_disk(target_disk, fragment, version_id);
 
         let _ = tokio_fs::create_dir_all(&shard_dir).await;
 
@@ -1175,26 +1207,11 @@ pub async fn object_upload_part(
             .map(|v| v.load(Ordering::Relaxed))
             .unwrap_or(true)
     });
-    let _io_guard = if io_gate_enabled {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            acquire_adaptive_io_guard(),
-        )
-        .await
-        {
-            Ok(Ok(guard)) => Some(guard),
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                warn!(
-                    "Upload IO gate wait timed out (fragment={}, version={}, part={}); proceeding ungated",
-                    fragment, version_id, part_index
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let gate_context = format!(
+        "fragment={}, version={}, part={}",
+        fragment, version_id, part_index
+    );
+    let _io_guard = acquire_upload_io_guard_with_timeout(io_gate_enabled, &gate_context).await?;
     let durability_mode = parse_upload_durability_mode(&query);
     let strict_durability = durability_mode.strict();
 
@@ -1293,26 +1310,8 @@ pub async fn upload_object_one_shot(
             .map(|v| v.load(Ordering::Relaxed))
             .unwrap_or(true)
     });
-    let _io_guard = if io_gate_enabled {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            acquire_adaptive_io_guard(),
-        )
-        .await
-        {
-            Ok(Ok(guard)) => Some(guard),
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                warn!(
-                    "One-shot upload IO gate wait timed out (fragment={}, object_key={}); proceeding ungated",
-                    fragment, object_key
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let gate_context = format!("fragment={}, object_key={}", fragment, object_key);
+    let _io_guard = acquire_upload_io_guard_with_timeout(io_gate_enabled, &gate_context).await?;
 
     let durability_mode = parse_upload_durability_mode(&query);
     let strict_durability = durability_mode.strict();
@@ -1373,67 +1372,34 @@ pub async fn upload_object_one_shot(
 
     index::publish_object(&object_meta).await?;
 
-    let index_roots = path_manager.get_all_index_roots();
-    write_prefix_segments_on_roots(
-        &index_roots,
-        &object_meta,
-        if had_live_before { 0 } else { 1 },
-    )
-    .await?;
+    write_prefix_segments_on_roots(&object_meta, if had_live_before { 0 } else { 1 }).await?;
 
+    let response_body = serde_json::to_value(&object_meta).map_err(|e| {
+        AppError::InternalServerError(format!("serialize one-shot upload response: {}", e))
+    })?;
     let stripped_meta = ObjectMetadata {
         parts: Vec::new(),
-        ..object_meta.clone()
+        ..object_meta
     };
     state.emit(&fragment, StorageEventPayload::FileUploaded(stripped_meta));
 
-    Ok((StatusCode::CREATED, AxumJson(json!(object_meta))).into_response())
+    Ok((StatusCode::CREATED, AxumJson(response_body)).into_response())
 }
 
 async fn write_prefix_segments_on_roots(
-    index_roots: &[PathBuf],
     metadata: &ObjectMetadata,
     _child_count_delta: i64,
 ) -> Result<(), AppError> {
-    let mut any_ok = false;
-    let seg = PrefixIndexSegment {
-        prefix: accelerator_prefix().to_string(),
-        entries: vec![PrefixIndexEntry::from_metadata(metadata)],
-    };
-
-    let bytes = rmp_serde::to_vec(&seg)
-        .map_err(|e| AppError::InternalServerError(format!("Serialize prefix segment: {}", e)))?;
-
-    let ph = ObjectPathManager::prefix_hash(accelerator_prefix());
-    let p1 = &ph[0..2];
-    let p2 = &ph[2..4];
-    let file = format!("seg_{}{}", metadata.version_id, PREFIX_SEGMENT_EXT);
-
-    for root in index_roots {
-        let p = root
-            .join(&metadata.fragment)
-            .join("index")
-            .join(PREFIX_INDEX_DIR)
-            .join(PREFIX_INDEX_VERSION)
-            .join(PREFIX_INDEX_NAMESPACE)
-            .join(p1)
-            .join(p2)
-            .join(&ph)
-            .join(&file);
-
-        if let Some(parent) = p.parent() {
-            let _ = tokio_fs::create_dir_all(parent).await;
-        }
-
-        if write_atomic(&p, &bytes).await.is_ok() {
-            any_ok = true;
-        }
-    }
-
-    if !any_ok {
-        return Err(AppError::InternalServerError(
-            "Failed to write prefix index to any mirror".into(),
-        ));
+    let scopes = object_key_directory_scopes(&metadata.object_key);
+    for scope in scopes {
+        write_prefix_entries_update_for_prefix(
+            &metadata.fragment,
+            &scope,
+            &metadata.version_id,
+            vec![crate::n1_core::disk_manager::PrefixIndexEntry::from_metadata(metadata)],
+            false,
+        )
+        .await?;
     }
 
     Ok(())
@@ -1571,23 +1537,20 @@ pub async fn finalize_object_upload(
 
     index::publish_object(&object_meta).await?;
 
-    let index_roots = path_manager.get_all_index_roots();
-    write_prefix_segments_on_roots(
-        &index_roots,
-        &object_meta,
-        if had_live_before { 0 } else { 1 },
-    )
-    .await?;
+    write_prefix_segments_on_roots(&object_meta, if had_live_before { 0 } else { 1 }).await?;
 
     let _ = index::remove_session(&fragment, &version_id, "finalized").await;
 
+    let response_body = serde_json::to_value(&object_meta).map_err(|e| {
+        AppError::InternalServerError(format!("serialize finalized upload response: {}", e))
+    })?;
     let stripped_meta = ObjectMetadata {
         parts: Vec::new(),
-        ..object_meta.clone()
+        ..object_meta
     };
     state.emit(&fragment, StorageEventPayload::FileUploaded(stripped_meta));
 
-    Ok((StatusCode::OK, AxumJson(json!(object_meta))).into_response())
+    Ok((StatusCode::OK, AxumJson(response_body)).into_response())
 }
 
 pub async fn cancel_upload_session(

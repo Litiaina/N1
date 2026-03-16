@@ -4602,6 +4602,7 @@ fn app_error_to_status(err: AppError) -> u32 {
         AppError::Forbidden(_) => SMB2_STATUS_ACCESS_DENIED,
         AppError::InsufficientStorage => SMB2_STATUS_DISK_FULL,
         AppError::Timeout(_) => SMB2_STATUS_IO_TIMEOUT,
+        AppError::ServiceUnavailable(_) => SMB2_STATUS_IO_TIMEOUT,
         AppError::Io(_, _) => SMB2_STATUS_UNSUCCESSFUL,
         AppError::InternalServerError(_) => SMB2_STATUS_UNSUCCESSFUL,
         AppError::Multipart(_) => SMB2_STATUS_INVALID_PARAMETER,
