@@ -306,6 +306,29 @@ pub struct ListObjectsResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ObjectStatsQuery {
+    pub fragment: Option<String>,
+    pub prefix: Option<String>,
+    pub search: Option<String>,
+    pub include_pending: Option<bool>,
+    pub include_trashed: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ObjectExtensionStat {
+    pub extension: String,
+    pub object_count: usize,
+    pub total_size_bytes: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ObjectStatsResponse {
+    pub total_objects: usize,
+    pub total_size_bytes: i64,
+    pub extension_stats: Vec<ObjectExtensionStat>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct SuggestObjectsQuery {
     pub fragment: Option<String>,
     pub prefix: Option<String>,

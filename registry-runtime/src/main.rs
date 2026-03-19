@@ -33,7 +33,8 @@ use models::{
     DeleteObjectQuery, DeleteUserResponse, DisableTwoFactorRequest, EnableTwoFactorRequest,
     FinalizeObjectRequest, FragmentListResponse, FragmentStateRequest, LinkFragmentRequest,
     LinkFragmentResponse, ListObjectsQuery, ListObjectsResponse, LoginRequest, LoginResponse,
-    ObjectDeleteResponse, ObjectMutationResponse, ObjectStateRequest, RefreshRequest,
+    ObjectDeleteResponse, ObjectMutationResponse, ObjectStateRequest, ObjectStatsQuery,
+    ObjectStatsResponse, RefreshRequest,
     RefreshResponse, RegisterObjectRequest, RenameRegistryObjectRequest, ResolveObjectQuery,
     SetupTwoFactorRequest, SignupRequest, SignupResponse, StorageSessionRequest,
     StorageSessionResponse, SuggestObjectsQuery, SuggestObjectsResponse, TwoFactorSetupResponse,
@@ -265,6 +266,7 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/objects/trash/empty", post(empty_trash))
         .route("/v1/objects", delete(delete_object))
         .route("/v1/objects", get(list_objects))
+        .route("/v1/objects/stats", get(object_stats))
         .route("/v1/objects/archive", post(archive_objects))
         .route("/v1/objects/resolve", get(resolve_object))
         .layer(build_cors_layer())
@@ -948,6 +950,30 @@ async fn suggest_objects(
         )
         .await?;
     Ok(Json(SuggestObjectsResponse { suggestions }))
+}
+
+async fn object_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ObjectStatsQuery>,
+) -> Result<Json<ObjectStatsResponse>, RegistryError> {
+    let claims = claims_from_headers(&headers, &state.auth)?;
+    let stats = state
+        .db
+        .object_stats(
+            claims.sub,
+            query.fragment,
+            query.prefix,
+            query.search,
+            query.include_pending.unwrap_or(false),
+            query.include_trashed.unwrap_or(false),
+        )
+        .await?;
+    Ok(Json(ObjectStatsResponse {
+        total_objects: stats.total_objects,
+        total_size_bytes: stats.total_size_bytes,
+        extension_stats: stats.extension_stats,
+    }))
 }
 
 async fn archive_objects(

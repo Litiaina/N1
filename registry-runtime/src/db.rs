@@ -11,14 +11,21 @@ use uuid::Uuid;
 use crate::auth::hash_refresh_token;
 use crate::error::RegistryError;
 use crate::models::{
-    FragmentBindingRecord, HealthResponse, ObjectRecord, StorageDeployment, UserAuthRecord,
-    UserRecord,
+    FragmentBindingRecord, HealthResponse, ObjectExtensionStat, ObjectRecord, StorageDeployment,
+    UserAuthRecord, UserRecord,
 };
 
 #[derive(Debug, Clone)]
 pub struct RegistryListPage {
     pub objects: Vec<ObjectRecord>,
     pub common_prefixes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegistryObjectStats {
+    pub total_objects: usize,
+    pub total_size_bytes: i64,
+    pub extension_stats: Vec<ObjectExtensionStat>,
 }
 
 #[derive(Debug, Clone)]
@@ -1031,6 +1038,144 @@ impl RegistryDb {
             Ok(RegistryListPage {
                 objects: objects.into_iter().skip(offset).take(limit).collect::<Vec<_>>(),
                 common_prefixes: common_prefixes.into_iter().collect(),
+            })
+        })
+        .await
+    }
+
+    pub async fn object_stats(
+        &self,
+        owner_uid: String,
+        fragment: Option<String>,
+        prefix: Option<String>,
+        search: Option<String>,
+        include_pending: bool,
+        include_trashed: bool,
+    ) -> Result<RegistryObjectStats, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            let fragment_filter = fragment.clone();
+            let prefix_filter = normalize_listing_prefix(prefix.unwrap_or_default(), Some("/"));
+            let prefix_pattern = if prefix_filter.is_empty() {
+                None
+            } else {
+                Some(format!("{}%", prefix_filter))
+            };
+            let search_pattern = search
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("%{}%", value));
+            let target_status = if include_trashed { "trashed" } else { "ready" };
+
+            let mut sql = String::from(
+                r#"
+                SELECT fragment, object_key, object_size_bytes
+                FROM objects
+                WHERE owner_uid = ?
+                "#,
+            );
+            let mut args = vec![Value::Text(owner_uid.clone())];
+            sql.push_str(" AND status = ?");
+            args.push(Value::Text(target_status.to_string()));
+            if let Some(fragment_value) = fragment_filter.clone() {
+                sql.push_str(" AND fragment = ?");
+                args.push(Value::Text(fragment_value));
+            }
+            if let Some(pattern) = prefix_pattern.clone() {
+                sql.push_str(" AND object_key LIKE ?");
+                args.push(Value::Text(pattern));
+            }
+            if let Some(pattern) = search_pattern.clone() {
+                sql.push_str(" AND object_key LIKE ?");
+                args.push(Value::Text(pattern));
+            }
+
+            let mut by_key = std::collections::BTreeMap::<(String, String), i64>::new();
+            let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+            let mut rows = stmt
+                .query_map(params_from_iter(args), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(sql_err)?;
+            while let Some(row) = rows.next().transpose().map_err(sql_err)? {
+                by_key.insert((row.0, row.1), row.2.max(0));
+            }
+
+            if include_pending && !include_trashed {
+                let mut pending_sql = String::from(
+                    r#"
+                    SELECT fragment, object_key, expected_size_bytes
+                    FROM object_uploads
+                    WHERE owner_uid = ?
+                    "#,
+                );
+                let mut pending_args = vec![Value::Text(owner_uid)];
+                if let Some(fragment_value) = fragment_filter {
+                    pending_sql.push_str(" AND fragment = ?");
+                    pending_args.push(Value::Text(fragment_value));
+                }
+                if let Some(pattern) = prefix_pattern {
+                    pending_sql.push_str(" AND object_key LIKE ?");
+                    pending_args.push(Value::Text(pattern));
+                }
+                if let Some(pattern) = search_pattern {
+                    pending_sql.push_str(" AND object_key LIKE ?");
+                    pending_args.push(Value::Text(pattern));
+                }
+
+                let mut stmt = conn.prepare(&pending_sql).map_err(sql_err)?;
+                let mut rows = stmt
+                    .query_map(params_from_iter(pending_args), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                        ))
+                    })
+                    .map_err(sql_err)?;
+                while let Some(row) = rows.next().transpose().map_err(sql_err)? {
+                    by_key.insert((row.0, row.1), row.2.max(0));
+                }
+            }
+
+            let mut extension_stats =
+                std::collections::BTreeMap::<String, (usize, i64)>::new();
+            let mut total_size_bytes = 0i64;
+            for ((_fragment, object_key), size_bytes) in &by_key {
+                total_size_bytes = total_size_bytes.saturating_add(*size_bytes);
+                let extension = object_key
+                    .rsplit_once('.')
+                    .map(|(_, value)| value.trim().to_lowercase())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "_none".to_string());
+                let entry = extension_stats.entry(extension).or_insert((0usize, 0i64));
+                entry.0 += 1;
+                entry.1 = entry.1.saturating_add(*size_bytes);
+            }
+
+            let mut extension_stats = extension_stats
+                .into_iter()
+                .map(|(extension, (object_count, total_size_bytes))| ObjectExtensionStat {
+                    extension,
+                    object_count,
+                    total_size_bytes,
+                })
+                .collect::<Vec<_>>();
+            extension_stats.sort_by(|a, b| {
+                b.total_size_bytes
+                    .cmp(&a.total_size_bytes)
+                    .then_with(|| a.extension.cmp(&b.extension))
+            });
+
+            Ok(RegistryObjectStats {
+                total_objects: by_key.len(),
+                total_size_bytes,
+                extension_stats,
             })
         })
         .await
@@ -2464,6 +2609,83 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&manifest.manifest_path);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn object_stats_cover_full_filtered_scope_not_just_one_page() {
+        let path = std::env::temp_dir().join(format!(
+            "registry-object-stats-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = RegistryDb::new(path.clone(), 1024 * 1024);
+        db.init().await.expect("init db");
+
+        let password_hash = hash_password("secret").expect("hash password");
+        let user = db
+            .create_user(
+                "stats@example.com".to_string(),
+                password_hash,
+                Some(500_000),
+                false,
+            )
+            .await
+            .expect("create user");
+
+        for index in 0..205usize {
+            db.finalize_object(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                format!("Screenshots/shot-{index:03}.png"),
+                format!("01HSTATSVERSION{index:013}"),
+                1024,
+                Some("image/png".to_string()),
+            )
+            .await
+            .expect("finalize png");
+        }
+        db.finalize_object(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            "Screenshots/report.pdf".to_string(),
+            "01HSTATSVERSIONPDF0000000001".to_string(),
+            2048,
+            Some("application/pdf".to_string()),
+        )
+        .await
+        .expect("finalize pdf");
+
+        let stats = db
+            .object_stats(
+                user.uid.clone(),
+                Some("fragment-a".to_string()),
+                Some("Screenshots".to_string()),
+                None,
+                false,
+                false,
+            )
+            .await
+            .expect("object stats");
+
+        assert_eq!(stats.total_objects, 206);
+        assert_eq!(stats.total_size_bytes, 205 * 1024 + 2048);
+        assert_eq!(
+            stats
+                .extension_stats
+                .iter()
+                .find(|entry| entry.extension == "png")
+                .map(|entry| (entry.object_count, entry.total_size_bytes)),
+            Some((205, 205 * 1024))
+        );
+        assert_eq!(
+            stats
+                .extension_stats
+                .iter()
+                .find(|entry| entry.extension == "pdf")
+                .map(|entry| (entry.object_count, entry.total_size_bytes)),
+            Some((1, 2048))
+        );
+
         let _ = std::fs::remove_file(path);
     }
 }
