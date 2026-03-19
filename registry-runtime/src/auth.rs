@@ -15,12 +15,14 @@ pub struct AuthSettings {
     pub jwt_secret: String,
     pub master_key: String,
     pub access_token_ttl_secs: u64,
+    pub refresh_token_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistryClaims {
     pub sub: String,
     pub email: String,
+    pub is_admin: bool,
     pub exp: usize,
     pub iat: usize,
 }
@@ -49,6 +51,7 @@ pub fn issue_access_token(
     let claims = RegistryClaims {
         sub: user.uid.clone(),
         email: user.email.clone(),
+        is_admin: user.is_admin,
         iat: now as usize,
         exp: now.saturating_add(settings.access_token_ttl_secs) as usize,
     };
@@ -59,6 +62,13 @@ pub fn issue_access_token(
     )
     .map_err(|err| RegistryError::internal(format!("jwt issue failed: {}", err)))?;
     Ok((token, settings.access_token_ttl_secs))
+}
+
+pub fn hash_refresh_token(token: &str) -> String {
+    let mut hasher = sha2::Sha256::new();
+    use sha2::Digest;
+    hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 pub fn claims_from_headers(
@@ -97,6 +107,17 @@ pub fn require_master_key(
         return Err(RegistryError::forbidden("invalid registry master key"));
     }
     Ok(())
+}
+
+pub fn require_admin_claims(
+    headers: &HeaderMap,
+    settings: &AuthSettings,
+) -> Result<RegistryClaims, RegistryError> {
+    let claims = claims_from_headers(headers, settings)?;
+    if !claims.is_admin {
+        return Err(RegistryError::forbidden("administrator access is required"));
+    }
+    Ok(claims)
 }
 
 fn now_unix() -> u64 {

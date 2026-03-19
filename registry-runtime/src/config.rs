@@ -14,6 +14,7 @@ pub struct RegistryConfig {
     pub jwt_secret: String,
     pub master_key: String,
     pub access_token_ttl_secs: u64,
+    pub refresh_token_ttl_secs: u64,
     pub default_quota_bytes: i64,
     pub storage_session_ttl_secs: u64,
     pub single_node_url: Option<String>,
@@ -39,6 +40,7 @@ impl RegistryConfig {
         let jwt_secret = required("REGISTRY_JWT_SECRET")?;
         let master_key = required("REGISTRY_MASTER_KEY")?;
         let access_token_ttl_secs = parse_or("REGISTRY_ACCESS_TOKEN_TTL_SECS", 900u64)?;
+        let refresh_token_ttl_secs = parse_or("REGISTRY_REFRESH_TOKEN_TTL_SECS", 604_800u64)?;
         let default_quota_bytes =
             parse_or("REGISTRY_DEFAULT_QUOTA_BYTES", 25_i64 * 1024 * 1024 * 1024)?;
         let storage_session_ttl_secs = parse_or("REGISTRY_STORAGE_SESSION_TTL_SECS", 15 * 60u64)?;
@@ -68,6 +70,7 @@ impl RegistryConfig {
             jwt_secret,
             master_key,
             access_token_ttl_secs,
+            refresh_token_ttl_secs,
             default_quota_bytes,
             storage_session_ttl_secs,
             single_node_url,

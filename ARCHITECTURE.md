@@ -1,6 +1,6 @@
 # N2 Architecture
 
-> Deployment profile status (2026-03-19):
+> Deployment profile status (2026-03-20):
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used underneath both deployment shapes.
 > - `standard` is the stable single-node deployment profile.
@@ -32,7 +32,12 @@ At the node layer, N1 is a single-node object storage engine with two distinct s
 
 At the platform layer, `registry-runtime` owns the business plane:
 
+- first-admin bootstrap guarded by `REGISTRY_MASTER_KEY`
+- administrator account control
 - users
+- rotating refresh sessions
+- self-service account management
+- optional TOTP 2FA
 - ownership
 - quotas
 - logical listing/filtering
@@ -134,6 +139,12 @@ The Registry plane is where namespace and business logic now belongs:
 - issuing short-lived storage sessions to client applications
 
 In the `0.6.2` / `0.2.0` baseline, the Registry is a dedicated binary. The engine contract is flat, exact-key-oriented object storage, while client-facing namespace behavior moves into the Registry layer.
+
+Registry identity/session notes:
+- the first administrator is created through a master-key bootstrap flow
+- later browser/client sessions use rotating refresh tokens rather than long-lived bearer tokens
+- 2FA is TOTP-based and enforced at the Registry identity layer, not in the storage engine
+- account deletion cascades through Registry state and removes linked managed fragments through the engine before the user row is deleted
 
 Registry-backed client flow:
 

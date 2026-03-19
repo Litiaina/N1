@@ -5,6 +5,7 @@ mod db;
 mod error;
 mod models;
 mod storage_broker;
+mod totp;
 
 use std::fs::{self, OpenOptions};
 use std::net::SocketAddr;
@@ -12,10 +13,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use auth::{
-    AuthSettings, claims_from_headers, issue_access_token, require_master_key, verify_password,
+    AuthSettings, claims_from_headers, issue_access_token, require_admin_claims,
+    require_master_key, verify_password,
 };
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::HeaderName;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
@@ -26,13 +28,17 @@ use config::{RegistryConfig, normalize_backend_url};
 use db::RegistryDb;
 use error::RegistryError;
 use models::{
-    ArchiveObjectsRequest, BulkObjectMutationResponse, CreateUserRequest, CreateUserResponse,
-    DeleteObjectQuery, FinalizeObjectRequest, FragmentListResponse, FragmentStateRequest,
-    LinkFragmentRequest, LinkFragmentResponse, ListObjectsQuery, ListObjectsResponse, LoginRequest,
-    LoginResponse, ObjectDeleteResponse, ObjectMutationResponse, ObjectStateRequest,
-    RegisterObjectRequest, RenameRegistryObjectRequest, ResolveObjectQuery, SignupRequest,
-    SignupResponse, StorageSessionRequest, StorageSessionResponse, SuggestObjectsQuery,
-    SuggestObjectsResponse, UserRecord,
+    AdminUserListResponse, AdminUserSummary, ArchiveObjectsRequest, BootstrapAdminRequest,
+    BootstrapAdminResponse, BulkObjectMutationResponse, CreateUserRequest, CreateUserResponse,
+    DeleteObjectQuery, DeleteUserResponse, DisableTwoFactorRequest, EnableTwoFactorRequest,
+    FinalizeObjectRequest, FragmentListResponse, FragmentStateRequest, LinkFragmentRequest,
+    LinkFragmentResponse, ListObjectsQuery, ListObjectsResponse, LoginRequest, LoginResponse,
+    ObjectDeleteResponse, ObjectMutationResponse, ObjectStateRequest, RefreshRequest,
+    RefreshResponse, RegisterObjectRequest, RenameRegistryObjectRequest, ResolveObjectQuery,
+    SetupTwoFactorRequest, SignupRequest, SignupResponse, StorageSessionRequest,
+    StorageSessionResponse, SuggestObjectsQuery, SuggestObjectsResponse, TwoFactorSetupResponse,
+    UpdateCredentialsRequest, UpdateEmailRequest, UpdatePasswordRequest, UpdateQuotaRequest,
+    UserMutationResponse, UserRecord,
 };
 use std::time::Duration;
 use storage_broker::StorageBroker;
@@ -50,7 +56,19 @@ struct AppState {
 }
 
 fn default_fragment_name(user: &UserRecord) -> String {
-    format!("registry-user-{}", user.uid)
+    user.email.clone()
+}
+
+async fn issue_registry_session(
+    state: &AppState,
+    user: &UserRecord,
+) -> Result<(String, u64, String, u64), RegistryError> {
+    let (access_token, expires_in) = issue_access_token(user, &state.auth)?;
+    let (refresh_token, refresh_expires_in) = state
+        .db
+        .create_refresh_session(user.uid.clone(), state.auth.refresh_token_ttl_secs)
+        .await?;
+    Ok((access_token, expires_in, refresh_token, refresh_expires_in))
 }
 
 async fn ensure_user_default_fragment(
@@ -69,6 +87,86 @@ async fn ensure_user_default_fragment(
         .upsert_fragment_binding(user.uid.clone(), fragment_hash.clone(), deployment, None)
         .await?;
     Ok(fragment_hash)
+}
+
+fn legacy_fragment_name(uid: &str) -> String {
+    format!("registry-user-{}", uid)
+}
+
+fn hash_fragment_name(name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn managed_fragment_candidates(user: &UserRecord) -> Vec<String> {
+    vec![
+        hash_fragment_name(&user.email),
+        hash_fragment_name(&legacy_fragment_name(&user.uid)),
+    ]
+}
+
+fn normalize_email(email: &str) -> Result<String, RegistryError> {
+    let normalized = email.trim().to_lowercase();
+    if normalized.is_empty() {
+        return Err(RegistryError::bad_request("email is required"));
+    }
+    Ok(normalized)
+}
+
+fn validate_new_password(password: &str) -> Result<(), RegistryError> {
+    if password.len() < 8 {
+        return Err(RegistryError::bad_request(
+            "password must be at least 8 characters",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_optional_totp(
+    auth_user: &models::UserAuthRecord,
+    otp: Option<&str>,
+) -> Result<(), RegistryError> {
+    if !auth_user.user.two_factor_enabled {
+        return Ok(());
+    }
+    let code = otp
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| RegistryError::unauthorized("OTP required"))?;
+    let secret = auth_user
+        .totp_secret
+        .as_deref()
+        .ok_or_else(|| RegistryError::unauthorized("2FA is not configured correctly"))?;
+    if !totp::verify_totp(secret, code, 1) {
+        return Err(RegistryError::unauthorized("invalid OTP"));
+    }
+    Ok(())
+}
+
+async fn rename_managed_fragment_for_email_change(
+    state: &AppState,
+    user: &UserRecord,
+    next_email: &str,
+) -> Result<(), RegistryError> {
+    let bindings = state.db.list_fragment_bindings(user.uid.clone()).await?;
+    let managed = managed_fragment_candidates(user);
+    let Some(binding) = bindings
+        .into_iter()
+        .find(|binding| managed.iter().any(|value| value == &binding.fragment))
+    else {
+        return Ok(());
+    };
+
+    let next_fragment = state.broker.rename_fragment(&binding, next_email).await?;
+    if next_fragment != binding.fragment {
+        state
+            .db
+            .rename_fragment_references(user.uid.clone(), binding.fragment, next_fragment)
+            .await?;
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -101,6 +199,7 @@ async fn run() -> Result<(), String> {
             jwt_secret: config.jwt_secret.clone(),
             master_key: config.master_key.clone(),
             access_token_ttl_secs: config.access_token_ttl_secs,
+            refresh_token_ttl_secs: config.refresh_token_ttl_secs,
         }),
         broker: StorageBroker::new(Arc::new(config.clone()))
             .map_err(|err| format!("failed to initialize storage broker: {}", err.message))?,
@@ -125,10 +224,34 @@ async fn run() -> Result<(), String> {
 fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/v1/admin/bootstrap", post(bootstrap_admin))
+        .route("/v1/admin/auth/login", post(admin_login))
         .route("/v1/admin/users", post(create_user))
+        .route("/v1/admin/users", get(list_admin_users))
+        .route("/v1/admin/users/{uid}/quota", post(update_admin_user_quota))
+        .route(
+            "/v1/admin/users/{uid}/credentials",
+            post(update_admin_user_credentials),
+        )
+        .route(
+            "/v1/admin/users/{uid}/2fa/setup",
+            post(admin_setup_user_2fa),
+        )
+        .route(
+            "/v1/admin/users/{uid}/2fa/disable",
+            post(admin_disable_user_2fa),
+        )
+        .route("/v1/admin/users/{uid}", delete(delete_admin_user))
         .route("/v1/auth/signup", post(signup))
         .route("/v1/auth/login", post(login))
+        .route("/v1/auth/refresh", post(refresh))
+        .route("/v1/auth/logout", post(logout))
         .route("/v1/me", get(me))
+        .route("/v1/account/email", post(update_account_email))
+        .route("/v1/account/password", post(update_account_password))
+        .route("/v1/account/2fa/setup", post(setup_account_2fa))
+        .route("/v1/account/2fa/enable", post(enable_account_2fa))
+        .route("/v1/account/2fa/disable", post(disable_account_2fa))
         .route("/v1/fragments", get(list_fragments))
         .route("/v1/fragments/link", post(link_fragment))
         .route("/v1/storage/session", post(issue_storage_session))
@@ -173,28 +296,99 @@ async fn health(
     Ok(Json(state.db.health().await?))
 }
 
+async fn bootstrap_admin(
+    State(state): State<AppState>,
+    Json(req): Json<BootstrapAdminRequest>,
+) -> Result<(StatusCode, Json<BootstrapAdminResponse>), RegistryError> {
+    let _write_guard = state.write_gate.lock().await;
+    if state.db.count_admin_users().await? > 0 {
+        return Err(RegistryError::conflict(
+            "registry administrator is already configured",
+        ));
+    }
+    if req.master_key.trim() != state.auth.master_key {
+        return Err(RegistryError::forbidden("invalid registry master key"));
+    }
+    let email = normalize_email(&req.email)?;
+    validate_new_password(&req.password)?;
+    let password_hash = auth::hash_password(&req.password)?;
+    let user = state
+        .db
+        .create_user(email, password_hash, None, true)
+        .await?;
+    let _ = ensure_user_default_fragment(&state, &user).await?;
+    let (access_token, expires_in, refresh_token, refresh_expires_in) =
+        issue_registry_session(&state, &user).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(BootstrapAdminResponse {
+            access_token,
+            token_type: "Bearer",
+            expires_in,
+            refresh_token,
+            refresh_expires_in,
+            user,
+        }),
+    ))
+}
+
+async fn admin_login(
+    State(state): State<AppState>,
+    Json(req): Json<LoginRequest>,
+) -> Result<Json<LoginResponse>, RegistryError> {
+    let _write_guard = state.write_gate.lock().await;
+    if state.db.count_admin_users().await? == 0 {
+        return Err(RegistryError::conflict(
+            "registry administrator is not configured yet",
+        ));
+    }
+    let email = normalize_email(&req.email)?;
+    let auth_user = state
+        .db
+        .find_user_auth_by_email(email)
+        .await?
+        .ok_or_else(|| RegistryError::unauthorized("invalid credentials"))?;
+    if !auth_user.user.is_admin {
+        return Err(RegistryError::forbidden("administrator access is required"));
+    }
+    verify_password(&req.password, &auth_user.password_hash)?;
+    verify_optional_totp(&auth_user, req.otp.as_deref())?;
+    let _ = ensure_user_default_fragment(&state, &auth_user.user).await?;
+    let (access_token, expires_in, refresh_token, refresh_expires_in) =
+        issue_registry_session(&state, &auth_user.user).await?;
+    Ok(Json(LoginResponse {
+        access_token,
+        token_type: "Bearer",
+        expires_in,
+        refresh_token,
+        refresh_expires_in,
+        user: auth_user.user,
+    }))
+}
+
 async fn create_user(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<CreateUserRequest>,
 ) -> Result<(StatusCode, Json<CreateUserResponse>), RegistryError> {
-    require_master_key(&headers, &state.auth)?;
+    let _admin_claims = match require_admin_claims(&headers, &state.auth) {
+        Ok(claims) => Some(claims),
+        Err(_) => {
+            require_master_key(&headers, &state.auth)?;
+            None
+        }
+    };
     let _write_guard = state.write_gate.lock().await;
-    if req.email.trim().is_empty() {
-        return Err(RegistryError::bad_request("email is required"));
-    }
-    if req.password.len() < 8 {
-        return Err(RegistryError::bad_request(
-            "password must be at least 8 characters",
-        ));
-    }
+    let email = normalize_email(&req.email)?;
+    validate_new_password(&req.password)?;
     let password_hash = auth::hash_password(&req.password)?;
     let user = state
         .db
         .create_user(
-            req.email.trim().to_lowercase(),
+            email,
             password_hash,
             req.quota_limit_bytes,
+            req.is_admin.unwrap_or(false),
         )
         .await?;
     let _ = ensure_user_default_fragment(&state, &user).await?;
@@ -206,31 +400,24 @@ async fn signup(
     Json(req): Json<SignupRequest>,
 ) -> Result<(StatusCode, Json<SignupResponse>), RegistryError> {
     let _write_guard = state.write_gate.lock().await;
-    if req.email.trim().is_empty() {
-        return Err(RegistryError::bad_request("email is required"));
-    }
-    if req.password.len() < 8 {
-        return Err(RegistryError::bad_request(
-            "password must be at least 8 characters",
-        ));
-    }
+    let email = normalize_email(&req.email)?;
+    validate_new_password(&req.password)?;
     let password_hash = auth::hash_password(&req.password)?;
     let user = state
         .db
-        .create_user(
-            req.email.trim().to_lowercase(),
-            password_hash,
-            req.quota_limit_bytes,
-        )
+        .create_user(email, password_hash, req.quota_limit_bytes, false)
         .await?;
     let _ = ensure_user_default_fragment(&state, &user).await?;
-    let (access_token, expires_in) = issue_access_token(&user, &state.auth)?;
+    let (access_token, expires_in, refresh_token, refresh_expires_in) =
+        issue_registry_session(&state, &user).await?;
     Ok((
         StatusCode::CREATED,
         Json(SignupResponse {
             access_token,
             token_type: "Bearer",
             expires_in,
+            refresh_token,
+            refresh_expires_in,
             user,
         }),
     ))
@@ -241,20 +428,60 @@ async fn login(
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, RegistryError> {
     let _write_guard = state.write_gate.lock().await;
+    let email = normalize_email(&req.email)?;
     let auth_user = state
         .db
-        .find_user_auth_by_email(req.email.trim().to_lowercase())
+        .find_user_auth_by_email(email)
         .await?
         .ok_or_else(|| RegistryError::unauthorized("invalid credentials"))?;
     verify_password(&req.password, &auth_user.password_hash)?;
+    verify_optional_totp(&auth_user, req.otp.as_deref())?;
     let _ = ensure_user_default_fragment(&state, &auth_user.user).await?;
-    let (access_token, expires_in) = issue_access_token(&auth_user.user, &state.auth)?;
+    let (access_token, expires_in, refresh_token, refresh_expires_in) =
+        issue_registry_session(&state, &auth_user.user).await?;
     Ok(Json(LoginResponse {
         access_token,
         token_type: "Bearer",
         expires_in,
+        refresh_token,
+        refresh_expires_in,
         user: auth_user.user,
     }))
+}
+
+async fn refresh(
+    State(state): State<AppState>,
+    Json(req): Json<RefreshRequest>,
+) -> Result<Json<RefreshResponse>, RegistryError> {
+    let _write_guard = state.write_gate.lock().await;
+    if req.refresh_token.trim().is_empty() {
+        return Err(RegistryError::bad_request("refresh token is required"));
+    }
+    let (user, refresh_token, refresh_expires_in) = state
+        .db
+        .rotate_refresh_session(req.refresh_token, state.auth.refresh_token_ttl_secs)
+        .await?;
+    let (access_token, expires_in) = issue_access_token(&user, &state.auth)?;
+    Ok(Json(RefreshResponse {
+        access_token,
+        token_type: "Bearer",
+        expires_in,
+        refresh_token,
+        refresh_expires_in,
+        user,
+    }))
+}
+
+async fn logout(
+    State(state): State<AppState>,
+    Json(req): Json<RefreshRequest>,
+) -> Result<StatusCode, RegistryError> {
+    let _write_guard = state.write_gate.lock().await;
+    if req.refresh_token.trim().is_empty() {
+        return Err(RegistryError::bad_request("refresh token is required"));
+    }
+    state.db.revoke_refresh_session(req.refresh_token).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn me(
@@ -264,6 +491,284 @@ async fn me(
     let claims = claims_from_headers(&headers, &state.auth)?;
     let user = state.db.get_user(claims.sub).await?;
     Ok(Json(user))
+}
+
+async fn list_admin_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminUserListResponse>, RegistryError> {
+    let _claims = require_admin_claims(&headers, &state.auth)?;
+    let users = state.db.list_admin_users().await?;
+    let mut summaries = Vec::with_capacity(users.len());
+    for user in users {
+        let fragments = state.db.list_fragments(user.uid.clone()).await?;
+        summaries.push(AdminUserSummary {
+            uid: user.uid,
+            email: user.email,
+            is_admin: user.is_admin,
+            two_factor_enabled: user.two_factor_enabled,
+            quota_limit_bytes: user.quota_limit_bytes,
+            quota_used_bytes: user.quota_used_bytes,
+            fragment_count: fragments.len(),
+            fragments,
+            created_at: user.created_at,
+            updated_at: user.updated_at,
+        });
+    }
+    Ok(Json(AdminUserListResponse { users: summaries }))
+}
+
+async fn update_admin_user_quota(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(uid): AxumPath<String>,
+    Json(req): Json<UpdateQuotaRequest>,
+) -> Result<Json<UserMutationResponse>, RegistryError> {
+    let _claims = require_admin_claims(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
+    if req.quota_limit_bytes < 0 {
+        return Err(RegistryError::bad_request(
+            "quota_limit_bytes must be non-negative",
+        ));
+    }
+    let user = state
+        .db
+        .update_user_quota(uid, req.quota_limit_bytes)
+        .await?;
+    Ok(Json(UserMutationResponse { user }))
+}
+
+async fn update_admin_user_credentials(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(uid): AxumPath<String>,
+    Json(req): Json<UpdateCredentialsRequest>,
+) -> Result<Json<UserMutationResponse>, RegistryError> {
+    let _claims = require_admin_claims(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
+    let target_before = state.db.get_user(uid.clone()).await?;
+
+    if let Some(email) = req.email.as_deref() {
+        let email = normalize_email(email)?;
+        if email != target_before.email {
+            rename_managed_fragment_for_email_change(&state, &target_before, &email).await?;
+        }
+    }
+
+    let next_email = req.email.as_deref().map(normalize_email).transpose()?;
+    let next_password_hash = req
+        .password
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            validate_new_password(value)?;
+            auth::hash_password(value)
+        })
+        .transpose()?;
+    let user = state
+        .db
+        .update_user_credentials(uid, next_email, next_password_hash, req.is_admin)
+        .await?;
+    Ok(Json(UserMutationResponse { user }))
+}
+
+async fn admin_setup_user_2fa(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(uid): AxumPath<String>,
+    Json(req): Json<SetupTwoFactorRequest>,
+) -> Result<Json<TwoFactorSetupResponse>, RegistryError> {
+    let claims = require_admin_claims(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
+    let admin_auth = state
+        .db
+        .get_user_auth_by_uid(claims.sub)
+        .await?
+        .ok_or_else(|| RegistryError::unauthorized("administrator account not found"))?;
+    verify_password(&req.password, &admin_auth.password_hash)?;
+
+    let target = state.db.get_user(uid.clone()).await?;
+    let secret = totp::generate_secret();
+    state.db.force_set_totp_secret(uid, secret.clone()).await?;
+    let otpauth_uri = totp::otpauth_uri(&target.email, &secret);
+    let qr_data_url = totp::qr_data_url(&otpauth_uri)
+        .map_err(|err| RegistryError::internal(format!("failed to build 2FA QR: {}", err)))?;
+    Ok(Json(TwoFactorSetupResponse {
+        secret,
+        otpauth_uri,
+        qr_data_url,
+        pending: false,
+    }))
+}
+
+async fn admin_disable_user_2fa(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(uid): AxumPath<String>,
+    Json(req): Json<DisableTwoFactorRequest>,
+) -> Result<Json<UserMutationResponse>, RegistryError> {
+    let claims = require_admin_claims(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
+    let admin_auth = state
+        .db
+        .get_user_auth_by_uid(claims.sub)
+        .await?
+        .ok_or_else(|| RegistryError::unauthorized("administrator account not found"))?;
+    verify_password(&req.password, &admin_auth.password_hash)?;
+    verify_optional_totp(&admin_auth, req.otp.as_deref())?;
+    let user = state.db.clear_totp(uid).await?;
+    Ok(Json(UserMutationResponse { user }))
+}
+
+async fn delete_admin_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(uid): AxumPath<String>,
+) -> Result<Json<DeleteUserResponse>, RegistryError> {
+    let claims = require_admin_claims(&headers, &state.auth)?;
+    if claims.sub == uid {
+        return Err(RegistryError::conflict(
+            "administrator account cannot delete itself",
+        ));
+    }
+    let _write_guard = state.write_gate.lock().await;
+    let bindings = state.db.list_fragment_bindings(uid.clone()).await?;
+    let deleted_fragments = bindings
+        .iter()
+        .map(|binding| binding.fragment.clone())
+        .collect::<Vec<_>>();
+    for binding in &bindings {
+        state.broker.delete_fragment(binding).await?;
+    }
+    state.db.delete_user_cascade(uid).await?;
+    Ok(Json(DeleteUserResponse {
+        removed: true,
+        deleted_fragments,
+    }))
+}
+
+async fn update_account_email(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateEmailRequest>,
+) -> Result<Json<UserMutationResponse>, RegistryError> {
+    let claims = claims_from_headers(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
+    let auth_user = state
+        .db
+        .get_user_auth_by_uid(claims.sub.clone())
+        .await?
+        .ok_or_else(|| RegistryError::unauthorized("account not found"))?;
+    verify_password(&req.current_password, &auth_user.password_hash)?;
+    verify_optional_totp(&auth_user, req.otp.as_deref())?;
+    let next_email = normalize_email(&req.new_email)?;
+    if next_email != auth_user.user.email {
+        rename_managed_fragment_for_email_change(&state, &auth_user.user, &next_email).await?;
+    }
+    let user = state
+        .db
+        .update_user_credentials(claims.sub, Some(next_email), None, None)
+        .await?;
+    Ok(Json(UserMutationResponse { user }))
+}
+
+async fn update_account_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<UpdatePasswordRequest>,
+) -> Result<Json<UserMutationResponse>, RegistryError> {
+    let claims = claims_from_headers(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
+    let auth_user = state
+        .db
+        .get_user_auth_by_uid(claims.sub.clone())
+        .await?
+        .ok_or_else(|| RegistryError::unauthorized("account not found"))?;
+    verify_password(&req.current_password, &auth_user.password_hash)?;
+    verify_optional_totp(&auth_user, req.otp.as_deref())?;
+    validate_new_password(&req.new_password)?;
+    let password_hash = auth::hash_password(&req.new_password)?;
+    let user = state
+        .db
+        .update_user_credentials(claims.sub, None, Some(password_hash), None)
+        .await?;
+    Ok(Json(UserMutationResponse { user }))
+}
+
+async fn setup_account_2fa(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<SetupTwoFactorRequest>,
+) -> Result<Json<TwoFactorSetupResponse>, RegistryError> {
+    let claims = claims_from_headers(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
+    let auth_user = state
+        .db
+        .get_user_auth_by_uid(claims.sub.clone())
+        .await?
+        .ok_or_else(|| RegistryError::unauthorized("account not found"))?;
+    verify_password(&req.password, &auth_user.password_hash)?;
+    if auth_user.user.two_factor_enabled {
+        return Err(RegistryError::conflict(
+            "2FA is already enabled for this account",
+        ));
+    }
+    let secret = totp::generate_secret();
+    state
+        .db
+        .prepare_pending_totp(claims.sub, secret.clone())
+        .await?;
+    let otpauth_uri = totp::otpauth_uri(&auth_user.user.email, &secret);
+    let qr_data_url = totp::qr_data_url(&otpauth_uri)
+        .map_err(|err| RegistryError::internal(format!("failed to build 2FA QR: {}", err)))?;
+    Ok(Json(TwoFactorSetupResponse {
+        secret,
+        otpauth_uri,
+        qr_data_url,
+        pending: true,
+    }))
+}
+
+async fn enable_account_2fa(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<EnableTwoFactorRequest>,
+) -> Result<Json<UserMutationResponse>, RegistryError> {
+    let claims = claims_from_headers(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
+    let auth_user = state
+        .db
+        .get_user_auth_by_uid(claims.sub.clone())
+        .await?
+        .ok_or_else(|| RegistryError::unauthorized("account not found"))?;
+    verify_password(&req.password, &auth_user.password_hash)?;
+    let pending = auth_user
+        .totp_pending_secret
+        .as_deref()
+        .ok_or_else(|| RegistryError::conflict("2FA setup has not been started"))?;
+    if !totp::verify_totp(pending, &req.otp, 1) {
+        return Err(RegistryError::unauthorized("invalid OTP"));
+    }
+    let user = state.db.activate_totp_secret(claims.sub).await?;
+    Ok(Json(UserMutationResponse { user }))
+}
+
+async fn disable_account_2fa(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DisableTwoFactorRequest>,
+) -> Result<Json<UserMutationResponse>, RegistryError> {
+    let claims = claims_from_headers(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
+    let auth_user = state
+        .db
+        .get_user_auth_by_uid(claims.sub.clone())
+        .await?
+        .ok_or_else(|| RegistryError::unauthorized("account not found"))?;
+    verify_password(&req.password, &auth_user.password_hash)?;
+    verify_optional_totp(&auth_user, req.otp.as_deref())?;
+    let user = state.db.clear_totp(claims.sub).await?;
+    Ok(Json(UserMutationResponse { user }))
 }
 
 async fn list_fragments(
@@ -845,6 +1350,7 @@ mod tests {
                 "drive@example.com".to_string(),
                 password_hash,
                 Some(50 * 1024 * 1024),
+                false,
             )
             .await
             .expect("create user");
@@ -857,6 +1363,7 @@ mod tests {
             jwt_secret: "registry-secret".to_string(),
             master_key: "registry-master".to_string(),
             access_token_ttl_secs: 900,
+            refresh_token_ttl_secs: 3600,
             default_quota_bytes: 25 * 1024 * 1024 * 1024,
             storage_session_ttl_secs: 900,
             single_node_url: Some(single_url),
@@ -870,6 +1377,7 @@ mod tests {
             jwt_secret: config.jwt_secret.clone(),
             master_key: config.master_key.clone(),
             access_token_ttl_secs: config.access_token_ttl_secs,
+            refresh_token_ttl_secs: config.refresh_token_ttl_secs,
         });
         let state = AppState {
             db,
@@ -1128,6 +1636,182 @@ mod tests {
             serde_json::from_slice(&session_body).expect("parse session body");
         assert_eq!(session_json["engine_url"], single_url);
         assert_eq!(session_json["access_token"], "single-stub-token");
+    }
+
+    #[tokio::test]
+    async fn registry_refresh_rotates_and_logout_revokes_browser_session() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, _) = test_state(single_url, multi_url).await;
+        let app = build_router(state);
+
+        let login_req = Request::builder()
+            .method("POST")
+            .uri("/v1/auth/login")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "email": "drive@example.com",
+                    "password": "password123"
+                }))
+                .expect("serialize login request"),
+            ))
+            .expect("login request");
+        let login_resp = app
+            .clone()
+            .oneshot(login_req)
+            .await
+            .expect("login response");
+        assert_eq!(login_resp.status(), StatusCode::OK);
+        let login_body = axum::body::to_bytes(login_resp.into_body(), usize::MAX)
+            .await
+            .expect("read login body");
+        let login_json: Value = serde_json::from_slice(&login_body).expect("parse login body");
+        let first_access = login_json["access_token"].as_str().expect("access token");
+        let first_refresh = login_json["refresh_token"].as_str().expect("refresh token");
+
+        let me_req = Request::builder()
+            .method("GET")
+            .uri("/v1/me")
+            .header("authorization", format!("Bearer {}", first_access))
+            .body(Body::empty())
+            .expect("me request");
+        let me_resp = app.clone().oneshot(me_req).await.expect("me response");
+        assert_eq!(me_resp.status(), StatusCode::OK);
+
+        let refresh_req = Request::builder()
+            .method("POST")
+            .uri("/v1/auth/refresh")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "refresh_token": first_refresh
+                }))
+                .expect("serialize refresh request"),
+            ))
+            .expect("refresh request");
+        let refresh_resp = app
+            .clone()
+            .oneshot(refresh_req)
+            .await
+            .expect("refresh response");
+        assert_eq!(refresh_resp.status(), StatusCode::OK);
+        let refresh_body = axum::body::to_bytes(refresh_resp.into_body(), usize::MAX)
+            .await
+            .expect("read refresh body");
+        let refresh_json: Value =
+            serde_json::from_slice(&refresh_body).expect("parse refresh body");
+        let rotated_access = refresh_json["access_token"]
+            .as_str()
+            .expect("rotated access token");
+        let rotated_refresh = refresh_json["refresh_token"]
+            .as_str()
+            .expect("rotated refresh token");
+        assert_ne!(first_refresh, rotated_refresh);
+
+        let rotated_me_req = Request::builder()
+            .method("GET")
+            .uri("/v1/me")
+            .header("authorization", format!("Bearer {}", rotated_access))
+            .body(Body::empty())
+            .expect("rotated me request");
+        let rotated_me_resp = app
+            .clone()
+            .oneshot(rotated_me_req)
+            .await
+            .expect("rotated me response");
+        assert_eq!(rotated_me_resp.status(), StatusCode::OK);
+
+        let logout_req = Request::builder()
+            .method("POST")
+            .uri("/v1/auth/logout")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "refresh_token": rotated_refresh
+                }))
+                .expect("serialize logout request"),
+            ))
+            .expect("logout request");
+        let logout_resp = app
+            .clone()
+            .oneshot(logout_req)
+            .await
+            .expect("logout response");
+        assert_eq!(logout_resp.status(), StatusCode::NO_CONTENT);
+
+        let refresh_again_req = Request::builder()
+            .method("POST")
+            .uri("/v1/auth/refresh")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "refresh_token": rotated_refresh
+                }))
+                .expect("serialize second refresh request"),
+            ))
+            .expect("second refresh request");
+        let refresh_again_resp = app
+            .oneshot(refresh_again_req)
+            .await
+            .expect("second refresh response");
+        assert_eq!(refresh_again_resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_bootstrap_and_user_listing_work() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, _) = test_state(single_url, multi_url).await;
+        let app = build_router(state);
+
+        let bootstrap_req = Request::builder()
+            .method("POST")
+            .uri("/v1/admin/bootstrap")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "email": "admin@example.com",
+                    "password": "password123",
+                    "master_key": "registry-master"
+                }))
+                .expect("serialize bootstrap request"),
+            ))
+            .expect("bootstrap request");
+        let bootstrap_resp = app
+            .clone()
+            .oneshot(bootstrap_req)
+            .await
+            .expect("bootstrap response");
+        assert_eq!(bootstrap_resp.status(), StatusCode::CREATED);
+        let bootstrap_body = axum::body::to_bytes(bootstrap_resp.into_body(), usize::MAX)
+            .await
+            .expect("read bootstrap body");
+        let bootstrap_json: Value =
+            serde_json::from_slice(&bootstrap_body).expect("parse bootstrap body");
+        let access_token = bootstrap_json["access_token"]
+            .as_str()
+            .expect("bootstrap access token");
+        assert_eq!(bootstrap_json["user"]["is_admin"], true);
+
+        let list_req = Request::builder()
+            .method("GET")
+            .uri("/v1/admin/users")
+            .header("authorization", format!("Bearer {}", access_token))
+            .body(Body::empty())
+            .expect("list admin users request");
+        let list_resp = app.clone().oneshot(list_req).await.expect("list response");
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_body = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+            .await
+            .expect("read list body");
+        let list_json: Value = serde_json::from_slice(&list_body).expect("parse list body");
+        let users = list_json["users"].as_array().expect("users array");
+        assert_eq!(users.len(), 2);
+        assert!(
+            users.iter()
+                .any(|user| user["email"] == "admin@example.com" && user["is_admin"] == true)
+        );
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@
   <p>Unified route reference for the N2 platform. N1 remains the shared node-core engine.</p>
 </div>
 
-> Deployment profile status (2026-03-19):
+> Deployment profile status (2026-03-20):
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used by both deployment shapes.
 > - `standard` is the stable single-node deployment path.
@@ -115,10 +115,25 @@ Startup note:
 
 Registry routes available in `0.2.0`:
 - `GET /health`
+- `POST /v1/admin/bootstrap`
+- `POST /v1/admin/auth/login`
 - `POST /v1/admin/users`
+- `GET /v1/admin/users`
+- `POST /v1/admin/users/{uid}/quota`
+- `POST /v1/admin/users/{uid}/credentials`
+- `POST /v1/admin/users/{uid}/2fa/setup`
+- `POST /v1/admin/users/{uid}/2fa/disable`
+- `DELETE /v1/admin/users/{uid}`
 - `POST /v1/auth/signup`
 - `POST /v1/auth/login`
+- `POST /v1/auth/refresh`
+- `POST /v1/auth/logout`
 - `GET /v1/me`
+- `POST /v1/account/email`
+- `POST /v1/account/password`
+- `POST /v1/account/2fa/setup`
+- `POST /v1/account/2fa/enable`
+- `POST /v1/account/2fa/disable`
 - `GET /v1/fragments`
 - `POST /v1/fragments/link`
 - `POST /v1/storage/session`
@@ -136,7 +151,11 @@ Registry routes available in `0.2.0`:
 - `GET /v1/objects/resolve`
 
 Registry responsibilities:
+- first-administrator bootstrap guarded by `REGISTRY_MASTER_KEY`
+- administrator identity, user administration, and quota control
 - user creation and login
+- rotating browser/client refresh-session management
+- self-service account changes (email, password, optional 2FA)
 - user quota accounting
 - ownership metadata
 - logical listing/filtering
@@ -151,14 +170,122 @@ Current Registry backing store:
 
 Current product surface:
 - CLI + HTTP API are the stable shipped interfaces in this repository today
-- web/admin surfaces are still under development and are not part of the stable N2 release contract yet
+- bundled web/admin surfaces exist for development, but they are still under development and are not part of the stable N2 release contract yet
 
-### 1.1.1 `GET /v1/fragments`
+### 1.1.1 `POST /v1/admin/bootstrap`
+Purpose:
+- creates the first Registry administrator
+- only works while the Registry has zero administrator accounts
+- uses `REGISTRY_MASTER_KEY` as the trust anchor for first-admin creation
+
+Request shape:
+```json
+{
+  "email": "admin@example.com",
+  "password": "password123",
+  "master_key": "<REGISTRY_MASTER_KEY>"
+}
+```
+
+Response shape:
+- same token/user envelope as normal login, including refresh token rotation support
+
+Notes:
+- once an administrator already exists, this route returns conflict
+- bootstrap also provisions the caller's default managed fragment binding
+
+### 1.1.2 `POST /v1/admin/auth/login`
+Purpose:
+- signs an administrator into the Registry control plane
+
+Request shape:
+```json
+{
+  "email": "admin@example.com",
+  "password": "password123",
+  "otp": "123456"
+}
+```
+
+Notes:
+- `otp` is only required when the admin account has 2FA enabled
+- successful login returns both access and refresh tokens
+
+### 1.1.3 Registry session lifecycle
+Routes:
+- `POST /v1/auth/login`
+- `POST /v1/auth/signup`
+- `POST /v1/auth/refresh`
+- `POST /v1/auth/logout`
+
+Auth response shape:
+```json
+{
+  "access_token": "<jwt>",
+  "token_type": "Bearer",
+  "expires_in": 900,
+  "refresh_token": "<opaque_refresh_token>",
+  "refresh_expires_in": 604800,
+  "user": {
+    "uid": "<uid>",
+    "email": "user@example.com",
+    "is_admin": false,
+    "two_factor_enabled": false,
+    "quota_limit_bytes": 26843545600,
+    "quota_used_bytes": 0,
+    "created_at": "<timestamp>",
+    "updated_at": "<timestamp>"
+  }
+}
+```
+
+Notes:
+- refresh tokens are server-tracked and rotate on every successful refresh
+- `POST /v1/auth/logout` revokes the current refresh chain
+- user and admin login both accept `otp` when 2FA is enabled
+
+### 1.1.4 Self-service account routes
+Routes:
+- `POST /v1/account/email`
+- `POST /v1/account/password`
+- `POST /v1/account/2fa/setup`
+- `POST /v1/account/2fa/enable`
+- `POST /v1/account/2fa/disable`
+
+Important behavior:
+- email change requires current password and, when enabled, the current OTP
+- password change requires current password and, when enabled, the current OTP
+- email change will also rename the Registry-managed default fragment when the binding matches a managed naming scheme
+- disabling 2FA requires the current password and, when already enabled, the current OTP
+
+TOTP profile:
+- algorithm: `HMAC-SHA1`
+- digits: `6`
+- step: `30 seconds`
+- verification window: `±1` step
+
+### 1.1.5 Admin user-management routes
+Routes:
+- `POST /v1/admin/users`
+- `GET /v1/admin/users`
+- `POST /v1/admin/users/{uid}/quota`
+- `POST /v1/admin/users/{uid}/credentials`
+- `POST /v1/admin/users/{uid}/2fa/setup`
+- `POST /v1/admin/users/{uid}/2fa/disable`
+- `DELETE /v1/admin/users/{uid}`
+
+Notes:
+- these routes require an administrator bearer token
+- `POST /v1/admin/users` can create either normal users or additional admins
+- admin 2FA setup returns a secret, otpauth URI, and QR PNG data URL for the target user
+- deleting a user removes Registry state and deletes linked managed fragments through the storage engine before the account row is removed
+
+### 1.1.6 `GET /v1/fragments`
 Purpose:
 - lists the caller's known fragments
 - returns any saved fragment backend bindings for Registry-backed clients
 
-### 1.1.2 `POST /v1/fragments/link`
+### 1.1.7 `POST /v1/fragments/link`
 Purpose:
 - binds a fragment to the storage backend a Registry-backed client should use
 
@@ -175,7 +302,7 @@ Notes:
 - `deployment` must be either `single_node` or `multi_node`
 - `engine_url_override` is optional; if omitted, the Registry uses its configured default backend for that deployment type
 
-### 1.1.3 `POST /v1/storage/session`
+### 1.1.8 `POST /v1/storage/session`
 Purpose:
 - asks the Registry to mint a short-lived fragment access session against the linked storage backend
 - used by Registry-backed clients for upload/download/rename/delete/recover without exposing fragment secrets in the client
@@ -188,9 +315,14 @@ Response shape:
   "engine_url": "https://storage.example",
   "access_token": "<fragment_jwt>",
   "token_type": "Bearer",
-  "expires_in": 900
+  "expires_in": 900,
+  "refresh_token": "<engine_refresh_token>",
+  "refresh_expires_in": 604800
 }
 ```
+
+Notes:
+- engine refresh fields are optional and only appear when the backend returns them
 
 ## 2. Auth APIs
 

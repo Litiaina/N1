@@ -36,6 +36,8 @@ struct EngineAuthResponse {
     access_token: String,
     token_type: String,
     expires_in: u64,
+    refresh_token: Option<String>,
+    refresh_expires_in: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +55,17 @@ struct CreateFragmentRequest<'a> {
 
 #[derive(Debug, Deserialize)]
 struct CreateFragmentResponse {
+    fragment_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateFragmentRequest<'a> {
+    new_name: &'a str,
+    secret: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateFragmentResponse {
     fragment_hash: String,
 }
 
@@ -104,6 +117,8 @@ impl StorageBroker {
             access_token: payload.access_token,
             token_type: payload.token_type,
             expires_in: payload.expires_in,
+            refresh_token: payload.refresh_token,
+            refresh_expires_in: payload.refresh_expires_in,
         })
     }
 
@@ -215,6 +230,93 @@ impl StorageBroker {
         }
 
         Ok(response)
+    }
+
+    pub async fn rename_fragment(
+        &self,
+        binding: &FragmentBindingRecord,
+        new_name: &str,
+    ) -> Result<String, RegistryError> {
+        let backend = self.resolve_backend(binding)?;
+        let payload = self
+            .authenticate_fragment(&backend, &binding.fragment, true, false, true, false)
+            .await?;
+        let response = self
+            .client_for_backend(&backend)
+            .patch(format!(
+                "{}/v4/fragment/modify/{}",
+                backend.engine_url, binding.fragment
+            ))
+            .bearer_auth(payload.access_token)
+            .json(&UpdateFragmentRequest {
+                new_name,
+                secret: &backend.master_key,
+            })
+            .send()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "storage fragment rename failed for {}: {}",
+                    backend.engine_url, err
+                ))
+            })?;
+
+        if !response.status().is_success() {
+            let fallback = format!(
+                "storage fragment rename failed against {} backend",
+                match backend.deployment {
+                    StorageDeployment::SingleNode => "single-node",
+                    StorageDeployment::MultiNode => "multi-node",
+                }
+            );
+            let message = extract_engine_error_message(response, fallback).await;
+            return Err(RegistryError::bad_gateway(message));
+        }
+
+        let updated = response
+            .json::<UpdateFragmentResponse>()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!("invalid fragment rename response: {}", err))
+            })?;
+        Ok(updated.fragment_hash)
+    }
+
+    pub async fn delete_fragment(
+        &self,
+        binding: &FragmentBindingRecord,
+    ) -> Result<(), RegistryError> {
+        let backend = self.resolve_backend(binding)?;
+        let payload = self
+            .authenticate_fragment(&backend, &binding.fragment, false, false, true, true)
+            .await?;
+        let response = self
+            .client_for_backend(&backend)
+            .delete(format!(
+                "{}/v4/fragment/delete/{}",
+                backend.engine_url, binding.fragment
+            ))
+            .bearer_auth(payload.access_token)
+            .send()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "storage fragment delete failed for {}: {}",
+                    backend.engine_url, err
+                ))
+            })?;
+        if !response.status().is_success() {
+            let fallback = format!(
+                "storage fragment delete failed against {} backend",
+                match backend.deployment {
+                    StorageDeployment::SingleNode => "single-node",
+                    StorageDeployment::MultiNode => "multi-node",
+                }
+            );
+            let message = extract_engine_error_message(response, fallback).await;
+            return Err(RegistryError::bad_gateway(message));
+        }
+        Ok(())
     }
 
     fn resolve_backend(

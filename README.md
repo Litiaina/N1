@@ -16,7 +16,7 @@
 
 ---
 
-> Deployment profile status (2026-03-19):
+> Deployment profile status (2026-03-20):
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared node-local storage engine used by both deployments.
 > - `standard` (`litiaina-n1-standard`) is the single-node N2 deployment path and the stable default.
@@ -80,8 +80,9 @@ N2 deployment split in this workspace:
 - If `registry.env` is missing in the current working directory, `registry-server` creates a template automatically and tells you which required value is still missing.
 - Raw-device testing remains `litiaina-n1-arc` from `arc`.
 - `standard` and `distribution-runtime` now share the same stable `standard/src/n1_core` implementation; `distribution-runtime` only adds cluster-specific `n2_core` and route layers.
-- `registry-runtime` owns business logic and user convenience metadata: users, ownership, quotas, logical listing, and logical object lookup.
+- `registry-runtime` owns business logic and user convenience metadata: users, administrators, ownership, quotas, logical listing, logical object lookup, rotating refresh sessions, and optional TOTP 2FA.
 - `registry-runtime` also brokers short-lived storage sessions for Registry-backed clients and future GUI/web surfaces that are still under development.
+- First Registry administrator bootstrap is protected by `REGISTRY_MASTER_KEY` and is only allowed before any admin exists.
 - Product identity:
   - `N2` is the operator-facing platform identity.
   - `N1` is the shared storage engine underneath both deployment shapes.
@@ -151,7 +152,11 @@ Profile note:
   - partitioned + replicated metadata
   - fragment-scoped exact-key object serving
 - Registry architecture baseline (`registry-runtime`):
+  - first-admin bootstrap guarded by `REGISTRY_MASTER_KEY`
+  - administrator login and account administration
   - user management and login
+  - rotating refresh-session lifecycle (`/v1/auth/refresh`, `/v1/auth/logout`)
+  - self-service account updates (email, password, optional 2FA)
   - ownership and quota accounting
   - logical listing and filtering
   - registry-owned object metadata lookup

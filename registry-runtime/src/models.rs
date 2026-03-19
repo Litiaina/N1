@@ -28,6 +28,8 @@ impl StorageDeployment {
 pub struct UserRecord {
     pub uid: String,
     pub email: String,
+    pub is_admin: bool,
+    pub two_factor_enabled: bool,
     pub quota_limit_bytes: i64,
     pub quota_used_bytes: i64,
     pub created_at: String,
@@ -38,6 +40,8 @@ pub struct UserRecord {
 pub struct UserAuthRecord {
     pub user: UserRecord,
     pub password_hash: String,
+    pub totp_secret: Option<String>,
+    pub totp_pending_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +81,7 @@ pub struct CreateUserRequest {
     pub email: String,
     pub password: String,
     pub quota_limit_bytes: Option<i64>,
+    pub is_admin: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +100,7 @@ pub struct CreateUserResponse {
 pub struct LoginRequest {
     pub email: String,
     pub password: String,
+    pub otp: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,6 +108,8 @@ pub struct LoginResponse {
     pub access_token: String,
     pub token_type: &'static str,
     pub expires_in: u64,
+    pub refresh_token: String,
+    pub refresh_expires_in: u64,
     pub user: UserRecord,
 }
 
@@ -110,7 +118,122 @@ pub struct SignupResponse {
     pub access_token: String,
     pub token_type: &'static str,
     pub expires_in: u64,
+    pub refresh_token: String,
+    pub refresh_expires_in: u64,
     pub user: UserRecord,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RefreshRequest {
+    pub refresh_token: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RefreshResponse {
+    pub access_token: String,
+    pub token_type: &'static str,
+    pub expires_in: u64,
+    pub refresh_token: String,
+    pub refresh_expires_in: u64,
+    pub user: UserRecord,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BootstrapAdminRequest {
+    pub email: String,
+    pub password: String,
+    pub master_key: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BootstrapAdminResponse {
+    pub access_token: String,
+    pub token_type: &'static str,
+    pub expires_in: u64,
+    pub refresh_token: String,
+    pub refresh_expires_in: u64,
+    pub user: UserRecord,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminUserListResponse {
+    pub users: Vec<AdminUserSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminUserSummary {
+    pub uid: String,
+    pub email: String,
+    pub is_admin: bool,
+    pub two_factor_enabled: bool,
+    pub quota_limit_bytes: i64,
+    pub quota_used_bytes: i64,
+    pub fragment_count: usize,
+    pub fragments: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateQuotaRequest {
+    pub quota_limit_bytes: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateCredentialsRequest {
+    pub email: Option<String>,
+    pub password: Option<String>,
+    pub is_admin: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateEmailRequest {
+    pub current_password: String,
+    pub new_email: String,
+    pub otp: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdatePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+    pub otp: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetupTwoFactorRequest {
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EnableTwoFactorRequest {
+    pub password: String,
+    pub otp: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DisableTwoFactorRequest {
+    pub password: String,
+    pub otp: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TwoFactorSetupResponse {
+    pub secret: String,
+    pub otpauth_uri: String,
+    pub qr_data_url: String,
+    pub pending: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UserMutationResponse {
+    pub user: UserRecord,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeleteUserResponse {
+    pub removed: bool,
+    pub deleted_fragments: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,6 +376,8 @@ pub struct StorageSessionResponse {
     pub access_token: String,
     pub token_type: String,
     pub expires_in: u64,
+    pub refresh_token: Option<String>,
+    pub refresh_expires_in: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]

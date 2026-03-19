@@ -5,7 +5,7 @@ This document is the canonical deployment split for N2.
 N2 is the product identity of this workspace.
 N1 is the shared storage engine underneath it.
 
-As of 2026-03-19:
+As of 2026-03-20:
 
 - `standard` (`litiaina-n1-standard`) is the single-node N2 deployment path, the default for production, and released at `0.6.2`.
 - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path on top of the same N1 core.
@@ -42,10 +42,13 @@ As of 2026-03-19:
 
 - SQLite-backed metadata and control plane.
 - Runs in both single-node and multi-node deployments.
+- Owns first-admin bootstrap through `REGISTRY_MASTER_KEY`.
+- Owns administrator/user identity, rotating refresh sessions, and optional TOTP 2FA.
 - Owns users, ownership, quotas, logical listing, and logical object lookup.
 - Owns fragment backend binding (`single_node` vs `multi_node`) for Registry-backed clients.
 - Brokers short-lived storage sessions so clients do not need fragment secrets for normal Registry-backed usage.
 - Resolves prefix/search archive selections into exact-key manifests for engine-side tar streaming.
+- Bundled web/admin shells can target this layer, but they are still under development and are not the stable N2 product surface yet.
 
 Disk layout snapshot:
 

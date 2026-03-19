@@ -8,6 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use tokio::task;
 use uuid::Uuid;
 
+use crate::auth::hash_refresh_token;
 use crate::error::RegistryError;
 use crate::models::{
     FragmentBindingRecord, HealthResponse, ObjectRecord, StorageDeployment, UserAuthRecord,
@@ -110,9 +111,29 @@ impl RegistryDb {
                 );
                 CREATE INDEX IF NOT EXISTS idx_fragment_bindings_owner
                     ON fragment_bindings (owner_uid, fragment);
+
+                CREATE TABLE IF NOT EXISTS registry_refresh_sessions (
+                    token_hash TEXT PRIMARY KEY,
+                    user_uid TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    rotated_at TEXT,
+                    replaced_by_hash TEXT,
+                    revoked_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_registry_refresh_sessions_user
+                    ON registry_refresh_sessions (user_uid, expires_at);
                 "#,
             )
             .map_err(sql_err)?;
+            for statement in [
+                "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN totp_secret TEXT",
+                "ALTER TABLE users ADD COLUMN totp_pending_secret TEXT",
+                "ALTER TABLE users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0",
+            ] {
+                let _ = conn.execute(statement, params![]);
+            }
             Ok(())
         })
         .await
@@ -145,6 +166,7 @@ impl RegistryDb {
         email: String,
         password_hash: String,
         quota_limit_bytes: Option<i64>,
+        is_admin: bool,
     ) -> Result<UserRecord, RegistryError> {
         let db = self.clone();
         spawn_blocking(move || {
@@ -155,10 +177,10 @@ impl RegistryDb {
             conn.execute(
                 r#"
                 INSERT INTO users (
-                    uid, email, password_hash, quota_limit_bytes, quota_used_bytes, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)
+                    uid, email, password_hash, quota_limit_bytes, quota_used_bytes, created_at, updated_at, is_admin, totp_secret, totp_pending_secret, totp_enabled
+                ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, NULL, NULL, 0)
                 "#,
-                params![uid, email, password_hash, quota_limit, now, now],
+                params![uid, email, password_hash, quota_limit, now, now, is_admin],
             )
             .map_err(map_insert_user_err)?;
             user_by_uid(&conn, &uid)
@@ -176,7 +198,7 @@ impl RegistryDb {
             let mut stmt = conn
                 .prepare(
                     r#"
-                    SELECT uid, email, password_hash, quota_limit_bytes, quota_used_bytes, created_at, updated_at
+                    SELECT uid, email, password_hash, quota_limit_bytes, quota_used_bytes, created_at, updated_at, is_admin, totp_secret, totp_pending_secret, totp_enabled
                     FROM users
                     WHERE email = ?1
                     "#,
@@ -188,12 +210,16 @@ impl RegistryDb {
                         user: UserRecord {
                             uid: row.get(0)?,
                             email: row.get(1)?,
+                            is_admin: row.get::<_, i64>(7)? != 0,
+                            two_factor_enabled: row.get::<_, i64>(10)? != 0,
                             quota_limit_bytes: row.get(3)?,
                             quota_used_bytes: row.get(4)?,
                             created_at: row.get(5)?,
                             updated_at: row.get(6)?,
                         },
                         password_hash: row.get(2)?,
+                        totp_secret: row.get(8)?,
+                        totp_pending_secret: row.get(9)?,
                     })
                 })
                 .optional()
@@ -208,6 +234,478 @@ impl RegistryDb {
         spawn_blocking(move || {
             let conn = db.open_connection()?;
             user_by_uid(&conn, &uid)
+        })
+        .await
+    }
+
+    pub async fn count_admin_users(&self) -> Result<i64, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            scalar_i64(
+                &conn,
+                "SELECT COUNT(*) FROM users WHERE is_admin = 1",
+                params![],
+            )
+        })
+        .await
+    }
+
+    pub async fn get_user_auth_by_uid(
+        &self,
+        uid: String,
+    ) -> Result<Option<UserAuthRecord>, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            let mut stmt = conn
+                .prepare(
+                    r#"
+                    SELECT uid, email, password_hash, quota_limit_bytes, quota_used_bytes, created_at, updated_at, is_admin, totp_secret, totp_pending_secret, totp_enabled
+                    FROM users
+                    WHERE uid = ?1
+                    "#,
+                )
+                .map_err(sql_err)?;
+            let row = stmt
+                .query_row(params![uid], map_user_auth_row)
+                .optional()
+                .map_err(sql_err)?;
+            Ok(row)
+        })
+        .await
+    }
+
+    pub async fn list_admin_users(&self) -> Result<Vec<UserRecord>, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            let mut stmt = conn
+                .prepare(
+                    r#"
+                    SELECT uid, email, quota_limit_bytes, quota_used_bytes, created_at, updated_at, is_admin, totp_enabled
+                    FROM users
+                    ORDER BY email ASC
+                    "#,
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params![], |row| {
+                    Ok(UserRecord {
+                        uid: row.get(0)?,
+                        email: row.get(1)?,
+                        quota_limit_bytes: row.get(2)?,
+                        quota_used_bytes: row.get(3)?,
+                        created_at: row.get(4)?,
+                        updated_at: row.get(5)?,
+                        is_admin: row.get::<_, i64>(6)? != 0,
+                        two_factor_enabled: row.get::<_, i64>(7)? != 0,
+                    })
+                })
+                .map_err(sql_err)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(sql_err)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    pub async fn update_user_quota(
+        &self,
+        uid: String,
+        quota_limit_bytes: i64,
+    ) -> Result<UserRecord, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let quota_used = scalar_i64(
+                &tx,
+                "SELECT quota_used_bytes FROM users WHERE uid = ?1",
+                params![uid.clone()],
+            )?;
+            if quota_limit_bytes < quota_used {
+                return Err(RegistryError::conflict(
+                    "quota limit cannot be lower than current usage",
+                ));
+            }
+            tx.execute(
+                "UPDATE users SET quota_limit_bytes = ?2, updated_at = ?3 WHERE uid = ?1",
+                params![uid.clone(), quota_limit_bytes, now_rfc3339()],
+            )
+            .map_err(sql_err)?;
+            tx.commit().map_err(sql_err)?;
+            let conn = db.open_connection()?;
+            user_by_uid(&conn, &uid)
+        })
+        .await
+    }
+
+    pub async fn update_user_credentials(
+        &self,
+        uid: String,
+        next_email: Option<String>,
+        next_password_hash: Option<String>,
+        is_admin: Option<bool>,
+    ) -> Result<UserRecord, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let current = user_auth_by_uid(&tx, &uid)?
+                .ok_or_else(|| RegistryError::not_found("user not found"))?;
+            let email = next_email.unwrap_or(current.user.email);
+            tx.execute(
+                r#"
+                UPDATE users
+                SET email = ?2,
+                    password_hash = COALESCE(?3, password_hash),
+                    is_admin = COALESCE(?4, is_admin),
+                    updated_at = ?5
+                WHERE uid = ?1
+                "#,
+                params![
+                    uid.clone(),
+                    email,
+                    next_password_hash,
+                    is_admin.map(|value| if value { 1 } else { 0 }),
+                    now_rfc3339()
+                ],
+            )
+            .map_err(map_insert_user_err)?;
+            tx.commit().map_err(sql_err)?;
+            let conn = db.open_connection()?;
+            user_by_uid(&conn, &uid)
+        })
+        .await
+    }
+
+    pub async fn prepare_pending_totp(
+        &self,
+        uid: String,
+        secret: String,
+    ) -> Result<UserRecord, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            tx.execute(
+                r#"
+                UPDATE users
+                SET totp_pending_secret = ?2,
+                    updated_at = ?3
+                WHERE uid = ?1
+                "#,
+                params![uid.clone(), secret, now_rfc3339()],
+            )
+            .map_err(sql_err)?;
+            tx.commit().map_err(sql_err)?;
+            let conn = db.open_connection()?;
+            user_by_uid(&conn, &uid)
+        })
+        .await
+    }
+
+    pub async fn activate_totp_secret(&self, uid: String) -> Result<UserRecord, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            tx.execute(
+                r#"
+                UPDATE users
+                SET totp_secret = COALESCE(totp_pending_secret, totp_secret),
+                    totp_pending_secret = NULL,
+                    totp_enabled = CASE WHEN COALESCE(totp_pending_secret, totp_secret) IS NULL THEN 0 ELSE 1 END,
+                    updated_at = ?2
+                WHERE uid = ?1
+                "#,
+                params![uid.clone(), now_rfc3339()],
+            )
+            .map_err(sql_err)?;
+            tx.commit().map_err(sql_err)?;
+            let conn = db.open_connection()?;
+            user_by_uid(&conn, &uid)
+        })
+        .await
+    }
+
+    pub async fn force_set_totp_secret(
+        &self,
+        uid: String,
+        secret: String,
+    ) -> Result<UserRecord, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            tx.execute(
+                r#"
+                UPDATE users
+                SET totp_secret = ?2,
+                    totp_pending_secret = NULL,
+                    totp_enabled = 1,
+                    updated_at = ?3
+                WHERE uid = ?1
+                "#,
+                params![uid.clone(), secret, now_rfc3339()],
+            )
+            .map_err(sql_err)?;
+            tx.commit().map_err(sql_err)?;
+            let conn = db.open_connection()?;
+            user_by_uid(&conn, &uid)
+        })
+        .await
+    }
+
+    pub async fn clear_totp(&self, uid: String) -> Result<UserRecord, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            tx.execute(
+                r#"
+                UPDATE users
+                SET totp_secret = NULL,
+                    totp_pending_secret = NULL,
+                    totp_enabled = 0,
+                    updated_at = ?2
+                WHERE uid = ?1
+                "#,
+                params![uid.clone(), now_rfc3339()],
+            )
+            .map_err(sql_err)?;
+            tx.commit().map_err(sql_err)?;
+            let conn = db.open_connection()?;
+            user_by_uid(&conn, &uid)
+        })
+        .await
+    }
+
+    pub async fn rename_fragment_references(
+        &self,
+        owner_uid: String,
+        old_fragment: String,
+        new_fragment: String,
+    ) -> Result<(), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            tx.execute(
+                "UPDATE objects SET fragment = ?3 WHERE owner_uid = ?1 AND fragment = ?2",
+                params![owner_uid, old_fragment, new_fragment],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                "UPDATE object_versions SET fragment = ?3 WHERE owner_uid = ?1 AND fragment = ?2",
+                params![owner_uid, old_fragment, new_fragment],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                "UPDATE object_uploads SET fragment = ?3 WHERE owner_uid = ?1 AND fragment = ?2",
+                params![owner_uid, old_fragment, new_fragment],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                "UPDATE fragment_bindings SET fragment = ?3, updated_at = ?4 WHERE owner_uid = ?1 AND fragment = ?2",
+                params![owner_uid, old_fragment, new_fragment, now_rfc3339()],
+            )
+            .map_err(sql_err)?;
+            tx.commit().map_err(sql_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn delete_user_cascade(&self, uid: String) -> Result<(), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            tx.execute(
+                "DELETE FROM registry_refresh_sessions WHERE user_uid = ?1",
+                params![uid.clone()],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                "DELETE FROM object_uploads WHERE owner_uid = ?1",
+                params![uid.clone()],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                "DELETE FROM object_versions WHERE owner_uid = ?1",
+                params![uid.clone()],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                "DELETE FROM objects WHERE owner_uid = ?1",
+                params![uid.clone()],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                "DELETE FROM fragment_bindings WHERE owner_uid = ?1",
+                params![uid.clone()],
+            )
+            .map_err(sql_err)?;
+            let removed = tx
+                .execute("DELETE FROM users WHERE uid = ?1", params![uid.clone()])
+                .map_err(sql_err)?;
+            if removed == 0 {
+                return Err(RegistryError::not_found("user not found"));
+            }
+            tx.commit().map_err(sql_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn create_refresh_session(
+        &self,
+        user_uid: String,
+        ttl_secs: u64,
+    ) -> Result<(String, u64), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            let now = now_unix();
+            let created_at = now_rfc3339();
+            let expires_at = now.saturating_add(ttl_secs as i64);
+            let token = generate_refresh_token();
+            let token_hash = hash_refresh_token(&token);
+            conn.execute(
+                r#"
+                INSERT INTO registry_refresh_sessions (
+                    token_hash, user_uid, expires_at, created_at, rotated_at, replaced_by_hash, revoked_at
+                ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL)
+                "#,
+                params![token_hash, user_uid, expires_at, created_at],
+            )
+            .map_err(sql_err)?;
+            Ok((token, ttl_secs))
+        })
+        .await
+    }
+
+    pub async fn rotate_refresh_session(
+        &self,
+        refresh_token: String,
+        ttl_secs: u64,
+    ) -> Result<(UserRecord, String, u64), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let now = now_unix();
+            let now_text = now_rfc3339();
+            let token_hash = hash_refresh_token(refresh_token.trim());
+
+            let session = tx
+                .query_row(
+                    r#"
+                    SELECT user_uid, expires_at, replaced_by_hash, revoked_at
+                    FROM registry_refresh_sessions
+                    WHERE token_hash = ?1
+                    "#,
+                    params![token_hash],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(sql_err)?
+                .ok_or_else(|| RegistryError::unauthorized("invalid or expired refresh token"))?;
+
+            if session.3.is_some() || session.1 <= now {
+                tx.execute(
+                    "UPDATE registry_refresh_sessions SET revoked_at = COALESCE(revoked_at, ?2) WHERE token_hash = ?1",
+                    params![token_hash, now_text],
+                )
+                .map_err(sql_err)?;
+                tx.commit().map_err(sql_err)?;
+                return Err(RegistryError::unauthorized(
+                    "invalid or expired refresh token",
+                ));
+            }
+
+            if let Some(next_hash) = session.2.clone() {
+                revoke_refresh_chain(&tx, &next_hash, &now_text)?;
+                tx.execute(
+                    "UPDATE registry_refresh_sessions SET revoked_at = COALESCE(revoked_at, ?2) WHERE token_hash = ?1",
+                    params![token_hash, now_text],
+                )
+                .map_err(sql_err)?;
+                tx.commit().map_err(sql_err)?;
+                return Err(RegistryError::unauthorized(
+                    "invalid or expired refresh token",
+                ));
+            }
+
+            let next_token = generate_refresh_token();
+            let next_hash = hash_refresh_token(&next_token);
+            let next_expires_at = now.saturating_add(ttl_secs as i64);
+
+            tx.execute(
+                r#"
+                INSERT INTO registry_refresh_sessions (
+                    token_hash, user_uid, expires_at, created_at, rotated_at, replaced_by_hash, revoked_at
+                ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL)
+                "#,
+                params![next_hash, session.0, next_expires_at, now_text],
+            )
+            .map_err(sql_err)?;
+
+            tx.execute(
+                r#"
+                UPDATE registry_refresh_sessions
+                SET rotated_at = ?2, replaced_by_hash = ?3
+                WHERE token_hash = ?1
+                "#,
+                params![token_hash, now_text, next_hash],
+            )
+            .map_err(sql_err)?;
+
+            let user = user_by_uid(&tx, &session.0)?;
+            tx.commit().map_err(sql_err)?;
+            Ok((user, next_token, ttl_secs))
+        })
+        .await
+    }
+
+    pub async fn revoke_refresh_session(&self, refresh_token: String) -> Result<(), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let token_hash = hash_refresh_token(refresh_token.trim());
+            let now_text = now_rfc3339();
+            let next_hash = tx
+                .query_row(
+                    "SELECT replaced_by_hash FROM registry_refresh_sessions WHERE token_hash = ?1",
+                    params![token_hash],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(sql_err)?
+                .flatten();
+
+            tx.execute(
+                "UPDATE registry_refresh_sessions SET revoked_at = COALESCE(revoked_at, ?2) WHERE token_hash = ?1",
+                params![token_hash, now_text],
+            )
+            .map_err(sql_err)?;
+            if let Some(next_hash) = next_hash {
+                revoke_refresh_chain(&tx, &next_hash, &now_text)?;
+            }
+            tx.commit().map_err(sql_err)?;
+            Ok(())
         })
         .await
     }
@@ -1205,7 +1703,7 @@ where
 fn user_by_uid(conn: &Connection, uid: &str) -> Result<UserRecord, RegistryError> {
     conn.query_row(
         r#"
-        SELECT uid, email, quota_limit_bytes, quota_used_bytes, created_at, updated_at
+        SELECT uid, email, quota_limit_bytes, quota_used_bytes, created_at, updated_at, is_admin, totp_enabled
         FROM users
         WHERE uid = ?1
         "#,
@@ -1218,12 +1716,47 @@ fn user_by_uid(conn: &Connection, uid: &str) -> Result<UserRecord, RegistryError
                 quota_used_bytes: row.get(3)?,
                 created_at: row.get(4)?,
                 updated_at: row.get(5)?,
+                is_admin: row.get::<_, i64>(6)? != 0,
+                two_factor_enabled: row.get::<_, i64>(7)? != 0,
             })
         },
     )
     .map_err(|err| match err {
         rusqlite::Error::QueryReturnedNoRows => RegistryError::not_found("user not found"),
         other => sql_err(other),
+    })
+}
+
+fn user_auth_by_uid(conn: &Connection, uid: &str) -> Result<Option<UserAuthRecord>, RegistryError> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT uid, email, password_hash, quota_limit_bytes, quota_used_bytes, created_at, updated_at, is_admin, totp_secret, totp_pending_secret, totp_enabled
+            FROM users
+            WHERE uid = ?1
+            "#,
+        )
+        .map_err(sql_err)?;
+    stmt.query_row(params![uid], map_user_auth_row)
+        .optional()
+        .map_err(sql_err)
+}
+
+fn map_user_auth_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserAuthRecord> {
+    Ok(UserAuthRecord {
+        user: UserRecord {
+            uid: row.get(0)?,
+            email: row.get(1)?,
+            quota_limit_bytes: row.get(3)?,
+            quota_used_bytes: row.get(4)?,
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
+            is_admin: row.get::<_, i64>(7)? != 0,
+            two_factor_enabled: row.get::<_, i64>(10)? != 0,
+        },
+        password_hash: row.get(2)?,
+        totp_secret: row.get(8)?,
+        totp_pending_secret: row.get(9)?,
     })
 }
 
@@ -1326,6 +1859,32 @@ fn quota_for_user(conn: &Connection, owner_uid: &str) -> Result<(i64, i64), Regi
     })
 }
 
+fn revoke_refresh_chain(
+    conn: &Connection,
+    start_hash: &str,
+    now_text: &str,
+) -> Result<(), RegistryError> {
+    let mut current = Some(start_hash.to_string());
+    while let Some(token_hash) = current.take() {
+        current = conn
+            .query_row(
+                "SELECT replaced_by_hash FROM registry_refresh_sessions WHERE token_hash = ?1",
+                params![token_hash],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(sql_err)?
+            .flatten();
+
+        conn.execute(
+            "UPDATE registry_refresh_sessions SET revoked_at = COALESCE(revoked_at, ?2) WHERE token_hash = ?1",
+            params![token_hash, now_text],
+        )
+        .map_err(sql_err)?;
+    }
+    Ok(())
+}
+
 fn scalar_i64<P>(conn: &Connection, sql: &str, params: P) -> Result<i64, RegistryError>
 where
     P: rusqlite::Params,
@@ -1416,6 +1975,14 @@ fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
 }
 
+fn now_unix() -> i64 {
+    Utc::now().timestamp()
+}
+
+fn generate_refresh_token() -> String {
+    format!("{}.{}", Uuid::new_v4(), Uuid::new_v4())
+}
+
 #[cfg(test)]
 mod tests {
     use super::RegistryDb;
@@ -1434,6 +2001,7 @@ mod tests {
                 "owner@example.com".to_string(),
                 password_hash.clone(),
                 Some(10_000),
+                false,
             )
             .await
             .expect("create user");
@@ -1642,6 +2210,7 @@ mod tests {
                 "folder@example.com".to_string(),
                 password_hash,
                 Some(50_000),
+                false,
             )
             .await
             .expect("create user");
@@ -1708,7 +2277,12 @@ mod tests {
 
         let password_hash = hash_password("secret").expect("hash password");
         let user = db
-            .create_user("bulk@example.com".to_string(), password_hash, Some(20_000))
+            .create_user(
+                "bulk@example.com".to_string(),
+                password_hash,
+                Some(20_000),
+                false,
+            )
             .await
             .expect("create user");
 
@@ -1831,6 +2405,7 @@ mod tests {
                 "archive@example.com".to_string(),
                 password_hash,
                 Some(50_000),
+                false,
             )
             .await
             .expect("create user");

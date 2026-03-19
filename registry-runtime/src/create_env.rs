@@ -54,6 +54,10 @@ pub fn create_registry_env_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     writeln!(file, "REGISTRY_ACCESS_TOKEN_TTL_SECS=900")?;
     writeln!(file)?;
 
+    writeln!(file, "# Refresh-token TTL in seconds")?;
+    writeln!(file, "REGISTRY_REFRESH_TOKEN_TTL_SECS=604800")?;
+    writeln!(file)?;
+
     writeln!(file, "# Default quota in bytes for new users")?;
     writeln!(file, "REGISTRY_DEFAULT_QUOTA_BYTES=26843545600")?;
     writeln!(file)?;

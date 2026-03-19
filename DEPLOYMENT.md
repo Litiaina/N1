@@ -1,6 +1,6 @@
 # N2 Deployment Runbook
 
-> Deployment profile status (2026-03-19):
+> Deployment profile status (2026-03-20):
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used underneath both deployment shapes.
 > - Single-node deployment: `standard` (`litiaina-n1-standard`)
@@ -29,6 +29,7 @@ Current runtime truth:
 - `distribution-runtime`: multi-node N2 deployment on the same shared N1 engine, with extra `/v4/n2/*` and `/v4/n2/internal/*` APIs for cluster membership and peer data movement.
 - `registry-runtime`: SQLite-backed Registry layer for users, ownership, quotas, and logical listing/filtering across both deployment shapes.
 - `registry-runtime` also brokers short-lived storage sessions for Registry-backed clients and future GUI/web surfaces.
+- `registry-runtime` also owns first-admin bootstrap, administrator account control, rotating refresh sessions, and optional TOTP 2FA.
 - `arc`: raw partitioned `index` and raw blob devices, experimental only.
 - stable operator surface today is CLI + HTTP API; web/admin surfaces are still under development
 - Auth/session security defaults:
@@ -80,7 +81,10 @@ Run the Registry binary alongside either deployment shape:
 
 The Registry owns business metadata:
 
+- first-administrator bootstrap and admin login
 - users
+- rotating refresh sessions
+- self-service account changes (email, password, optional 2FA)
 - ownership
 - quotas
 - logical object listing/filtering
@@ -101,6 +105,37 @@ Storage-broker env:
 - `REGISTRY_MULTI_NODE_URL`
 - `REGISTRY_MULTI_NODE_MASTER_KEY`
 - `REGISTRY_STORAGE_SESSION_TTL_SECS`
+
+Registry auth/control-plane notes:
+- `REGISTRY_MASTER_KEY` is both the broker trust secret for engine-side privileged actions and the trust anchor for first-admin bootstrap.
+- Browser/API sessions use rotating refresh tokens through:
+  - `POST /v1/auth/refresh`
+  - `POST /v1/auth/logout`
+- Optional TOTP 2FA is available for both administrator and normal Registry accounts.
+
+Bootstrap the first Registry administrator once the server is running:
+
+```bash
+curl -k -X POST "https://127.0.0.1:51001/v1/admin/bootstrap" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email":"admin@example.com",
+    "password":"replace-this-password",
+    "master_key":"<REGISTRY_MASTER_KEY>"
+  }'
+```
+
+Notes:
+- bootstrap only works while the Registry has zero administrator accounts
+- later administrator sign-in uses `POST /v1/admin/auth/login`
+- account/user administration then happens through the Registry admin APIs:
+  - `GET /v1/admin/users`
+  - `POST /v1/admin/users/{uid}/quota`
+  - `POST /v1/admin/users/{uid}/credentials`
+  - `POST /v1/admin/users/{uid}/2fa/setup`
+  - `POST /v1/admin/users/{uid}/2fa/disable`
+  - `DELETE /v1/admin/users/{uid}`
+
 ### Index disks (`standard`)
 
 Use normal filesystems for:
