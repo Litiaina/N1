@@ -81,10 +81,13 @@ N2 deployment split in this workspace:
 - Raw-device testing remains `litiaina-n1-arc` from `arc`.
 - `standard` and `distribution-runtime` now share the same stable `standard/src/n1_core` implementation; `distribution-runtime` only adds cluster-specific `n2_core` and route layers.
 - `registry-runtime` owns business logic and user convenience metadata: users, ownership, quotas, logical listing, and logical object lookup.
-- `registry-runtime` also brokers short-lived storage sessions for the Registry-backed Drive UI, so the browser no longer needs fragment secrets for normal Drive use.
+- `registry-runtime` also brokers short-lived storage sessions for Registry-backed clients and future GUI/web surfaces that are still under development.
 - Product identity:
   - `N2` is the operator-facing platform identity.
   - `N1` is the shared storage engine underneath both deployment shapes.
+- Stable operator surface today:
+  - CLI + HTTP API first
+  - web surfaces are still under development and are not part of the stable N2 release contract yet
 - Security defaults:
   - access token default TTL: `15 minutes`
   - access token max TTL: `1 hour`
@@ -153,7 +156,7 @@ Profile note:
   - logical listing and filtering
   - registry-owned object metadata lookup
   - fragment-to-backend binding for `single_node` and `multi_node` storage targets
-  - storage-session brokering for Registry-backed clients
+  - storage-session brokering for Registry-backed clients and future GUI/web integrations
 - `standard` also exposes `POST /v4/upload/one-shot/{object_key}` for direct small-object upload without session/finalize overhead. The fragment comes from the authenticated claim.
 - `standard` also exposes claim-scoped bulk mutation routes for high-count object workflows:
   - `POST /v4/fragment/object/bulk-delete`
@@ -244,30 +247,22 @@ That Registry layer runs as `registry-server` and uses SQLite in both single-nod
 Registry-backed client flow now looks like this:
 
 - user logs in to the Registry with email/password
-- Drive links a fragment to either:
+- a Registry-backed client links a fragment to either:
   - `single_node`
   - `multi_node`
-- Drive asks the Registry for a short-lived storage session
+- the client asks the Registry for a short-lived storage session
 - Registry authenticates against the selected engine backend and returns:
   - engine URL
   - short-lived fragment access token
-- browser sends object bytes directly to the storage engine
+- the client sends object bytes directly to the storage engine
 - Registry remains the business/control plane
 
-This keeps the data path direct while removing fragment-secret handling from the normal Drive browser flow.
+This keeps the data path direct while removing fragment-secret handling from Registry-backed clients.
 
-Web surface split:
+Current shipped surface:
 
-- `/`
-  - Registry login/signup
-- `/drive`
-  - Registry-backed Drive UI
-  - prefix/delimiter listing, search, ownership, quota, and storage-session brokering
-- `/storage`
-  - raw N1 explorer
-  - direct fragment mount
-  - flat engine-native listing
-  - health/resource view
+- CLI + HTTP API are the stable operator interfaces in this repository today
+- web/admin surfaces remain under development and should not be treated as the stable N2 product surface yet
 
 This is the architectural shift from the legacy node: object and session truth are no longer stored as a whole-node mirrored tree on every index root. Instead, metadata authority is partitioned by hash onto a small selected set of roots, and N2 composes that node-local engine into either a single-node or multi-node deployment.
 

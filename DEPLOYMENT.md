@@ -28,8 +28,9 @@ Current runtime truth:
 - `standard`: single-node N2 deployment on the shared N1 engine with filesystem-backed partitioned `index` and blob roots.
 - `distribution-runtime`: multi-node N2 deployment on the same shared N1 engine, with extra `/v4/n2/*` and `/v4/n2/internal/*` APIs for cluster membership and peer data movement.
 - `registry-runtime`: SQLite-backed Registry layer for users, ownership, quotas, and logical listing/filtering across both deployment shapes.
-- `registry-runtime` also brokers short-lived storage sessions for the Registry-backed Drive UI.
+- `registry-runtime` also brokers short-lived storage sessions for Registry-backed clients and future GUI/web surfaces.
 - `arc`: raw partitioned `index` and raw blob devices, experimental only.
+- stable operator surface today is CLI + HTTP API; web/admin surfaces are still under development
 - Auth/session security defaults:
   - access token default TTL: `15 minutes`
   - access token max TTL: `1 hour`
@@ -85,7 +86,7 @@ The Registry owns business metadata:
 - logical object listing/filtering
 - logical object resolution by owner + key
 - fragment backend bindings
-- short-lived storage session brokering for Drive
+- short-lived storage session brokering for Registry-backed clients
 
 Required env:
 - `REGISTRY_JWT_SECRET`
@@ -100,17 +101,6 @@ Storage-broker env:
 - `REGISTRY_MULTI_NODE_URL`
 - `REGISTRY_MULTI_NODE_MASTER_KEY`
 - `REGISTRY_STORAGE_SESSION_TTL_SECS`
-
-Drive/browser split:
-- `/`
-  - Registry login/signup
-- `/drive`
-  - Registry-backed Drive UI
-  - links fragments to `single_node` or `multi_node`
-  - asks Registry for short-lived storage sessions
-- `/storage`
-  - raw N1 explorer
-  - direct fragment auth and engine-native flat listing
 ### Index disks (`standard`)
 
 Use normal filesystems for:

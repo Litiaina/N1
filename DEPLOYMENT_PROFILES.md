@@ -43,8 +43,8 @@ As of 2026-03-19:
 - SQLite-backed metadata and control plane.
 - Runs in both single-node and multi-node deployments.
 - Owns users, ownership, quotas, logical listing, and logical object lookup.
-- Owns fragment backend binding (`single_node` vs `multi_node`) for Registry-backed Drive.
-- Brokers short-lived storage sessions so the browser does not need fragment secrets for normal Drive usage.
+- Owns fragment backend binding (`single_node` vs `multi_node`) for Registry-backed clients.
+- Brokers short-lived storage sessions so clients do not need fragment secrets for normal Registry-backed usage.
 
 Disk layout snapshot:
 

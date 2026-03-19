@@ -139,24 +139,24 @@ Registry responsibilities:
 - logical listing/filtering
 - prefix/delimiter browsing for Registry-backed clients
 - fragment binding to a `single_node` or `multi_node` storage backend
-- brokering short-lived storage sessions so the Drive UI does not need fragment secrets
+- brokering short-lived storage sessions for Registry-backed clients and future GUI/web surfaces
 - exact-key logical resolution before talking to the storage engine
 
 Current Registry backing store:
 - SQLite in both single-node and multi-node deployments
 
-Registry-backed Drive split:
-- `/drive` talks to the Registry for business behavior and receives short-lived storage sessions
-- `/storage` remains the raw N1 explorer and talks to the engine directly
+Current product surface:
+- CLI + HTTP API are the stable shipped interfaces in this repository today
+- web/admin surfaces are still under development and are not part of the stable N2 release contract yet
 
 ### 1.1.1 `GET /v1/fragments`
 Purpose:
 - lists the caller's known fragments
-- returns any saved fragment backend bindings for Drive
+- returns any saved fragment backend bindings for Registry-backed clients
 
 ### 1.1.2 `POST /v1/fragments/link`
 Purpose:
-- binds a fragment to the storage backend Drive should use
+- binds a fragment to the storage backend a Registry-backed client should use
 
 Request shape:
 ```json
@@ -174,7 +174,7 @@ Notes:
 ### 1.1.3 `POST /v1/storage/session`
 Purpose:
 - asks the Registry to mint a short-lived fragment access session against the linked storage backend
-- used by the Registry-backed Drive UI for upload/download/rename/delete/recover without exposing fragment secrets in the browser
+- used by Registry-backed clients for upload/download/rename/delete/recover without exposing fragment secrets in the client
 
 Response shape:
 ```json

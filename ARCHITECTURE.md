@@ -130,22 +130,22 @@ The Registry plane is where namespace and business logic now belongs:
 - quota/accounting
 - exact-key logical lookup before engine access
 - binding a fragment to either a `single_node` or `multi_node` storage backend
-- issuing short-lived storage sessions to browser clients
+- issuing short-lived storage sessions to client applications
 
 In the `0.6.1` baseline, the Registry is a dedicated binary. The engine contract is flat, exact-key-oriented object storage, while client-facing namespace behavior moves into the Registry layer.
 
-Registry-backed Drive flow:
+Registry-backed client flow:
 
 1. user logs in to the Registry with email/password
-2. Drive selects or links a fragment to a storage deployment:
+2. a Registry-backed client selects or links a fragment to a storage deployment:
    - `single_node`
    - `multi_node`
-3. Drive requests a short-lived storage session from the Registry
+3. the client requests a short-lived storage session from the Registry
 4. Registry authenticates against the linked engine backend using its configured master access
 5. Registry returns:
    - engine URL
    - short-lived fragment access token
-6. browser sends object bytes directly to the engine
+6. the client sends object bytes directly to the engine
 
 That keeps the Registry as the control plane and the engine as the direct data plane.
 
