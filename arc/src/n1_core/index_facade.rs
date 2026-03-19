@@ -2,7 +2,7 @@ use crate::enums::app_error_enum::AppError;
 use crate::n1_core::disk_manager::{ObjectMetadata, PartMetadata, ReservationReceipt};
 pub use crate::n1_core::index_types::{
     IndexReplicaWriteMode, IndexRuntimeStats, IndexSessionState, RemovedSessionReceipt,
-    UploadRuntimeStats,
+    SessionPartReceipt, UploadRuntimeStats,
 };
 use crate::n1_core::raw_index;
 use crate::n1_core::upload::UploadSessionManifest;
@@ -23,6 +23,7 @@ pub async fn open_session(
     raw_index::open_session(manifest, reservation).await
 }
 
+#[allow(dead_code)]
 pub async fn commit_session_part(
     fragment: &str,
     version_id: &str,
@@ -32,6 +33,15 @@ pub async fn commit_session_part(
     let _ = replica_write_mode;
     ensure_raw_backend("commit_session_part").await?;
     raw_index::commit_session_part(fragment, version_id, part).await
+}
+
+pub async fn commit_session_part_receipt(
+    fragment: &str,
+    version_id: &str,
+    receipt: &SessionPartReceipt,
+) -> Result<(), AppError> {
+    ensure_raw_backend("commit_session_part_receipt").await?;
+    raw_index::commit_session_part_receipt(fragment, version_id, receipt).await
 }
 
 pub async fn load_session(
@@ -57,6 +67,24 @@ pub async fn read_session_part(
 ) -> Result<Option<PartMetadata>, AppError> {
     ensure_raw_backend("read_session_part").await?;
     raw_index::read_session_part(fragment, version_id, part_index).await
+}
+
+pub async fn read_session_part_receipt(
+    fragment: &str,
+    version_id: &str,
+    part_index: u64,
+) -> Result<Option<SessionPartReceipt>, AppError> {
+    ensure_raw_backend("read_session_part_receipt").await?;
+    raw_index::read_session_part_receipt(fragment, version_id, part_index).await
+}
+
+pub async fn load_session_part_receipts(
+    fragment: &str,
+    version_id: &str,
+    manifest: &UploadSessionManifest,
+) -> Result<Option<Vec<Option<SessionPartReceipt>>>, AppError> {
+    ensure_raw_backend("load_session_part_receipts").await?;
+    raw_index::load_session_part_receipts(fragment, version_id, manifest).await
 }
 
 pub async fn remove_session(

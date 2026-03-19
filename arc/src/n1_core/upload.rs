@@ -279,6 +279,60 @@ impl UploadSessionManifest {
     }
 }
 
+fn format_crc32_u32(value: u32) -> String {
+    format!("{:08x}", value)
+}
+
+fn parse_crc32_hex(value: &str) -> Result<u32, AppError> {
+    u32::from_str_radix(value.trim(), 16).map_err(|e| {
+        AppError::InternalServerError(format!("invalid crc32 value '{}': {}", value, e))
+    })
+}
+
+async fn reconstruct_part_meta_from_receipt(
+    manifest: &UploadSessionManifest,
+    receipt: &index::SessionPartReceipt,
+) -> Result<Option<PartMetadata>, AppError> {
+    let Some(layout) = manifest.planned_part_layout(receipt.part_index) else {
+        return Ok(None);
+    };
+    if layout.strict_size && layout.size_bytes != receipt.size_bytes {
+        return Ok(None);
+    }
+
+    let total_shards = manifest
+        .data_shards
+        .saturating_add(manifest.parity_shards)
+        .max(1);
+    if layout.shards.len() != total_shards || receipt.shard_checksums.len() != total_shards {
+        return Ok(None);
+    }
+
+    let mut shards = Vec::with_capacity(total_shards);
+    for (planned, checksum) in layout.shards.iter().zip(receipt.shard_checksums.iter()) {
+        if planned.raw_blob_address.size_bytes < layout.shard_size_bytes {
+            return Ok(None);
+        }
+        shards.push(ShardInfo {
+            shard_index: planned.shard_index,
+            file_name: planned.file_name.clone(),
+            absolute_path: raw_blob_debug_path(&planned.raw_blob_address),
+            raw_blob_address: Some(planned.raw_blob_address.clone()),
+            size_bytes: layout.shard_size_bytes,
+            checksum: format_crc32_u32(*checksum),
+            is_parity: planned.is_parity,
+        });
+    }
+
+    Ok(Some(PartMetadata {
+        part_index: receipt.part_index,
+        size_bytes: receipt.size_bytes,
+        created_at: receipt.created_at,
+        shards,
+        checksum: receipt.checksum.map(format_crc32_u32),
+    }))
+}
+
 fn derive_planned_part_sizes(
     params: &InitiateUploadParams,
     max_part_size: u64,
@@ -974,8 +1028,16 @@ pub(crate) async fn load_all_part_metas_from_disk(
         }
     }
     if let Some(receipt) = index::read_removed_session_receipt(fragment, version_id).await? {
+        let manifest = receipt.state.manifest.clone();
         for part in receipt.state.parts.into_values() {
             parts.entry(part.part_index).or_insert(part);
+        }
+        for session_receipt in receipt.session_part_receipts.into_values() {
+            if let Some(part) =
+                reconstruct_part_meta_from_receipt(&manifest, &session_receipt).await?
+            {
+                parts.entry(part.part_index).or_insert(part);
+            }
         }
     }
     Ok(parts.into_values().collect())
@@ -1101,7 +1163,23 @@ pub(crate) async fn read_part_meta_any(
     if let Ok(Some(part)) = index::read_session_part(fragment, version_id, part_index).await {
         return Some(part);
     }
+    if let Ok(Some(manifest)) = load_session_manifest_any(fragment, version_id).await {
+        if let Ok(Some(receipt)) =
+            index::read_session_part_receipt(fragment, version_id, part_index).await
+        {
+            if let Ok(Some(part)) = reconstruct_part_meta_from_receipt(&manifest, &receipt).await {
+                return Some(part);
+            }
+        }
+    }
     if let Ok(Some(receipt)) = index::read_removed_session_receipt(fragment, version_id).await {
+        if let Some(session_receipt) = receipt.session_part_receipts.get(&part_index) {
+            if let Ok(Some(part)) =
+                reconstruct_part_meta_from_receipt(&receipt.state.manifest, session_receipt).await
+            {
+                return Some(part);
+            }
+        }
         if receipt.state.finalized_at.is_none() && receipt.state.aborted_at.is_none() {
             return receipt.state.parts.get(&part_index).cloned();
         }
@@ -1250,12 +1328,32 @@ pub async fn list_active_uploads(
     }
     let mut sessions: Vec<ActiveSessionInfo> = Vec::with_capacity(states.len());
     for state in states {
-        let committed_parts = state.parts.len() as u64;
-        let committed_bytes = state
-            .parts
-            .values()
-            .map(|part| part.size_bytes)
-            .sum::<u64>();
+        let (committed_parts, committed_bytes) = if !state.parts.is_empty() {
+            (
+                state.parts.len() as u64,
+                state
+                    .parts
+                    .values()
+                    .map(|part| part.size_bytes)
+                    .sum::<u64>(),
+            )
+        } else if let Some(receipts) = index::load_session_part_receipts(
+            &fragment,
+            &state.manifest.version_id,
+            &state.manifest,
+        )
+        .await?
+        {
+            let mut parts = 0u64;
+            let mut bytes = 0u64;
+            for receipt in receipts.into_iter().flatten() {
+                parts = parts.saturating_add(1);
+                bytes = bytes.saturating_add(receipt.size_bytes);
+            }
+            (parts, bytes)
+        } else {
+            (0, 0)
+        };
         sessions.push(ActiveSessionInfo {
             session_id: state.manifest.session_id,
             version_id: state.manifest.version_id,
@@ -1293,19 +1391,40 @@ pub async fn get_upload_status(
     let state = index::load_session(&fragment, &version_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let mut part_metas: Vec<PartMetadata> = state.parts.into_values().collect();
-    if part_metas.is_empty() {
-        part_metas = load_all_part_metas_from_disk(&fragment, &version_id).await?;
-    }
-    part_metas.sort_by_key(|part| part.part_index);
-    let uploaded_parts = part_metas
-        .iter()
-        .map(|part| part.part_index)
-        .collect::<Vec<_>>();
-    let committed_bytes = part_metas.iter().map(|part| part.size_bytes).sum::<u64>();
+    let (uploaded_parts, committed_parts, committed_bytes) = if !state.parts.is_empty() {
+        let mut part_metas: Vec<PartMetadata> = state.parts.into_values().collect();
+        part_metas.sort_by_key(|part| part.part_index);
+        let uploaded_parts = part_metas
+            .iter()
+            .map(|part| part.part_index)
+            .collect::<Vec<_>>();
+        let committed_bytes = part_metas.iter().map(|part| part.size_bytes).sum::<u64>();
+        (uploaded_parts, part_metas.len() as u64, committed_bytes)
+    } else if let Some(receipts) =
+        index::load_session_part_receipts(&fragment, &version_id, &state.manifest).await?
+    {
+        let mut uploaded_parts = Vec::new();
+        let mut committed_bytes = 0u64;
+        for receipt in receipts.into_iter().flatten() {
+            uploaded_parts.push(receipt.part_index);
+            committed_bytes = committed_bytes.saturating_add(receipt.size_bytes);
+        }
+        uploaded_parts.sort_unstable();
+        let committed_parts = uploaded_parts.len() as u64;
+        (uploaded_parts, committed_parts, committed_bytes)
+    } else {
+        let mut part_metas = load_all_part_metas_from_disk(&fragment, &version_id).await?;
+        part_metas.sort_by_key(|part| part.part_index);
+        let uploaded_parts = part_metas
+            .iter()
+            .map(|part| part.part_index)
+            .collect::<Vec<_>>();
+        let committed_bytes = part_metas.iter().map(|part| part.size_bytes).sum::<u64>();
+        (uploaded_parts, part_metas.len() as u64, committed_bytes)
+    };
     Ok(AxumJson(UploadStatusResponse {
         uploaded_parts,
-        committed_parts: part_metas.len() as u64,
+        committed_parts,
         committed_bytes,
         expected_parts: Some(state.manifest.expected_parts),
         total_size_bytes: Some(state.manifest.total_size_bytes),
@@ -1676,14 +1795,23 @@ pub async fn object_upload_part(
         },
         shards: shards_info,
     };
-    let replica_write_mode = if strict_durability {
-        index::IndexReplicaWriteMode::SyncBestEffort
-    } else {
-        index::IndexReplicaWriteMode::BackgroundBestEffort
+    let receipt = index::SessionPartReceipt {
+        part_index,
+        size_bytes: total_bytes_read,
+        created_at: part_meta.created_at,
+        checksum: part_meta
+            .checksum
+            .as_deref()
+            .map(parse_crc32_hex)
+            .transpose()?,
+        shard_checksums: part_meta
+            .shards
+            .iter()
+            .map(|shard| parse_crc32_hex(&shard.checksum))
+            .collect::<Result<Vec<_>, _>>()?,
     };
-    if let Err(e) =
-        index::commit_session_part(&fragment, &version_id, &part_meta, replica_write_mode).await
-    {
+
+    if let Err(e) = index::commit_session_part_receipt(&fragment, &version_id, &receipt).await {
         cleanup_failed_part_attempt(
             &fragment,
             &version_id,
@@ -1739,9 +1867,28 @@ pub async fn finalize_object_upload(
     }
 
     let mut parts_map = session_state.parts;
+    if let Some(receipts) =
+        index::load_session_part_receipts(&fragment, &version_id, &manifest).await?
+    {
+        for receipt in receipts.into_iter().flatten() {
+            if let Some(part) = reconstruct_part_meta_from_receipt(&manifest, &receipt).await? {
+                match parts_map.get(&part.part_index) {
+                    Some(existing) if !existing.shards.is_empty() => {}
+                    _ => {
+                        parts_map.insert(part.part_index, part);
+                    }
+                }
+            }
+        }
+    }
     if parts_map.len() < expected_parts as usize {
         for part in load_all_part_metas_from_disk(&fragment, &version_id).await? {
-            parts_map.entry(part.part_index).or_insert(part);
+            match parts_map.get(&part.part_index) {
+                Some(existing) if !existing.shards.is_empty() => {}
+                _ => {
+                    parts_map.insert(part.part_index, part);
+                }
+            }
         }
     }
     let present = parts_map.keys().copied().collect::<BTreeSet<_>>();

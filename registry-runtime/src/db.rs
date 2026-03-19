@@ -1,3 +1,4 @@
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -17,6 +18,12 @@ use crate::models::{
 pub struct RegistryListPage {
     pub objects: Vec<ObjectRecord>,
     pub common_prefixes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArchiveManifestResult {
+    pub manifest_path: PathBuf,
+    pub selected_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -719,6 +726,144 @@ impl RegistryDb {
         .await
     }
 
+    pub async fn write_archive_manifest(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        keys: Vec<String>,
+        prefix: Option<String>,
+        search: Option<String>,
+        include_trashed: bool,
+    ) -> Result<ArchiveManifestResult, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            let manifest_path =
+                std::env::temp_dir().join(format!("registry-archive-{}.lst", Uuid::new_v4()));
+            let file = std::fs::File::create(&manifest_path).map_err(|err| {
+                RegistryError::internal(format!("failed to create archive manifest: {}", err))
+            })?;
+            let mut writer = BufWriter::new(file);
+            let mut selected_count = 0usize;
+            let status = if include_trashed { "trashed" } else { "ready" };
+
+            if !keys.is_empty() {
+                let mut canonical_keys = keys
+                    .into_iter()
+                    .map(|value| canonical_archive_key(&value))
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>();
+                canonical_keys.sort();
+                canonical_keys.dedup();
+
+                if canonical_keys.is_empty() {
+                    return Err(RegistryError::bad_request(
+                        "archive request did not include any valid object keys",
+                    ));
+                }
+
+                let placeholders = std::iter::repeat_n("?", canonical_keys.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    r#"
+                    SELECT object_key
+                    FROM objects
+                    WHERE owner_uid = ? AND fragment = ? AND status = ? AND object_key IN ({})
+                    ORDER BY object_key ASC
+                    "#,
+                    placeholders
+                );
+                let mut args = vec![
+                    Value::Text(owner_uid),
+                    Value::Text(fragment),
+                    Value::Text(status.to_string()),
+                ];
+                args.extend(canonical_keys.into_iter().map(Value::Text));
+
+                let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+                let rows = stmt
+                    .query_map(params_from_iter(args), |row| row.get::<_, String>(0))
+                    .map_err(sql_err)?;
+                for row in rows {
+                    let key = row.map_err(sql_err)?;
+                    writeln!(writer, "{}", key).map_err(|err| {
+                        RegistryError::internal(format!(
+                            "failed to write archive manifest entry: {}",
+                            err
+                        ))
+                    })?;
+                    selected_count += 1;
+                }
+            } else {
+                let prefix_filter = prefix
+                    .map(|value| normalize_listing_prefix(value, Some("/")))
+                    .filter(|value| !value.is_empty());
+                let prefix_pattern = prefix_filter
+                    .as_ref()
+                    .map(|value| Value::Text(format!("{}%", value)));
+                let search_pattern = search
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .map(|value| Value::Text(format!("%{}%", value)));
+
+                let mut sql = String::from(
+                    r#"
+                    SELECT object_key
+                    FROM objects
+                    WHERE owner_uid = ? AND fragment = ? AND status = ?
+                    "#,
+                );
+                let mut args = vec![
+                    Value::Text(owner_uid),
+                    Value::Text(fragment),
+                    Value::Text(status.to_string()),
+                ];
+                if let Some(pattern) = prefix_pattern {
+                    sql.push_str(" AND object_key LIKE ?");
+                    args.push(pattern);
+                }
+                if let Some(pattern) = search_pattern {
+                    sql.push_str(" AND object_key LIKE ?");
+                    args.push(pattern);
+                }
+                sql.push_str(" ORDER BY object_key ASC");
+
+                let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+                let rows = stmt
+                    .query_map(params_from_iter(args), |row| row.get::<_, String>(0))
+                    .map_err(sql_err)?;
+                for row in rows {
+                    let key = row.map_err(sql_err)?;
+                    writeln!(writer, "{}", key).map_err(|err| {
+                        RegistryError::internal(format!(
+                            "failed to write archive manifest entry: {}",
+                            err
+                        ))
+                    })?;
+                    selected_count += 1;
+                }
+            }
+
+            writer.flush().map_err(|err| {
+                RegistryError::internal(format!("failed to flush archive manifest: {}", err))
+            })?;
+
+            if selected_count == 0 {
+                let _ = std::fs::remove_file(&manifest_path);
+                return Err(RegistryError::not_found(
+                    "no matching objects found for archive export",
+                ));
+            }
+
+            Ok(ArchiveManifestResult {
+                manifest_path,
+                selected_count,
+            })
+        })
+        .await
+    }
+
     pub async fn resolve_object(
         &self,
         owner_uid: String,
@@ -1159,6 +1304,10 @@ fn normalize_listing_prefix(prefix: String, delimiter: Option<&str>) -> String {
         return format!("{}/", trimmed);
     }
     trimmed
+}
+
+fn canonical_archive_key(value: &str) -> String {
+    value.trim().trim_start_matches('/').to_string()
 }
 
 fn quota_for_user(conn: &Connection, owner_uid: &str) -> Result<(i64, i64), RegistryError> {
@@ -1660,6 +1809,76 @@ mod tests {
             .expect("list trash after empty");
         assert!(trash_after_empty.objects.is_empty());
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn archive_manifest_writes_prefix_selected_keys_in_order() {
+        let path = std::env::temp_dir().join(format!(
+            "registry-archive-manifest-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = RegistryDb::new(path.clone(), 1024 * 1024);
+        db.init().await.expect("init db");
+
+        let password_hash = hash_password("secret").expect("hash password");
+        let user = db
+            .create_user(
+                "archive@example.com".to_string(),
+                password_hash,
+                Some(50_000),
+            )
+            .await
+            .expect("create user");
+
+        db.finalize_object(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            "patients/a/one.dcm".to_string(),
+            "01HARCHMANIFESTVERSION0000000001".to_string(),
+            1024,
+            Some("application/dicom".to_string()),
+        )
+        .await
+        .expect("finalize one");
+        db.finalize_object(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            "patients/a/two.dcm".to_string(),
+            "01HARCHMANIFESTVERSION0000000002".to_string(),
+            1024,
+            Some("application/dicom".to_string()),
+        )
+        .await
+        .expect("finalize two");
+        db.finalize_object(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            "patients/b/three.dcm".to_string(),
+            "01HARCHMANIFESTVERSION0000000003".to_string(),
+            1024,
+            Some("application/dicom".to_string()),
+        )
+        .await
+        .expect("finalize three");
+
+        let manifest = db
+            .write_archive_manifest(
+                user.uid,
+                "fragment-a".to_string(),
+                Vec::new(),
+                Some("patients/a".to_string()),
+                None,
+                false,
+            )
+            .await
+            .expect("write archive manifest");
+        assert_eq!(manifest.selected_count, 2);
+
+        let body = std::fs::read_to_string(&manifest.manifest_path).expect("read manifest");
+        assert_eq!(body, "patients/a/one.dcm\npatients/a/two.dcm\n");
+
+        let _ = std::fs::remove_file(&manifest.manifest_path);
         let _ = std::fs::remove_file(path);
     }
 }

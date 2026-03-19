@@ -1708,6 +1708,7 @@ async fn workflow_upload_read_modify_delete_redistribute_repair() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Arc is flat-list only; prefix listing semantics moved to the registry layer"]
 async fn matrix_prefix_listing_survives_rename_delete_after_compaction() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -1870,6 +1871,7 @@ async fn matrix_prefix_listing_survives_rename_delete_after_compaction() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Arc is flat-list only; delimiter listing moved to the registry layer"]
 async fn matrix_delimiter_listing_keeps_exact_prefix_object_and_child_prefixes() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -1933,6 +1935,7 @@ async fn matrix_delimiter_listing_keeps_exact_prefix_object_and_child_prefixes()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Arc is flat-list only; delimiter pagination moved to the registry layer"]
 async fn matrix_delimiter_listing_paginates_without_skipping_rows() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -2056,19 +2059,19 @@ async fn matrix_trash_listing_paginates_without_full_scan_sort_path() {
         assert_eq!(delete_resp.status(), StatusCode::OK);
     }
 
-    let page1 = list_trash_json_page(&fragment, Some("trash-page"), None, 2, None).await;
+    let page1 = list_trash_json_page(&fragment, None, None, 2, None).await;
     let token1 = page1["continuation_token"]
         .as_str()
         .expect("page1 continuation token")
         .to_string();
 
-    let page2 = list_trash_json_page(&fragment, Some("trash-page"), None, 2, Some(token1)).await;
+    let page2 = list_trash_json_page(&fragment, None, None, 2, Some(token1)).await;
     let token2 = page2["continuation_token"]
         .as_str()
         .expect("page2 continuation token")
         .to_string();
 
-    let page3 = list_trash_json_page(&fragment, Some("trash-page"), None, 2, Some(token2)).await;
+    let page3 = list_trash_json_page(&fragment, None, None, 2, Some(token2)).await;
     assert!(
         page3["continuation_token"].is_null(),
         "last page should not return continuation token"
@@ -2082,14 +2085,17 @@ async fn matrix_trash_listing_paginates_without_full_scan_sort_path() {
                 .expect("objects array")
                 .iter()
                 .filter_map(|v| v["object_key"].as_str())
+                .filter(|key| key.starts_with("trash-page/"))
                 .map(|s| s.to_string()),
         );
     }
+    listed.sort();
     keys.sort();
     assert_eq!(listed, keys);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Arc is flat-list only; trash delimiter listing moved to the registry layer"]
 async fn matrix_trash_delimiter_listing_paginates_without_full_materialize_path() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -2187,6 +2193,84 @@ async fn matrix_trash_delimiter_listing_paginates_without_full_materialize_path(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_flat_listing_rejects_prefix_and_delimiter_queries() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    for params in [
+        HashMap::from([("prefix".to_string(), "x".to_string())]),
+        HashMap::from([("delimiter".to_string(), "/".to_string())]),
+        HashMap::from([
+            ("prefix".to_string(), "x".to_string()),
+            ("delimiter".to_string(), "/".to_string()),
+        ]),
+    ] {
+        let err = match list_objects(
+            full_claims(&fragment),
+            AxumPath(fragment.clone()),
+            Query(params),
+        )
+        .await
+        {
+            Ok(_) => panic!("flat Arc listing should reject prefix and delimiter"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, crate::enums::app_error_enum::AppError::BadRequest(_)),
+            "expected bad request, got {:?}",
+            err
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_flat_trash_listing_rejects_prefix_and_delimiter_queries() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    for params in [
+        HashMap::from([("prefix".to_string(), "x".to_string())]),
+        HashMap::from([("delimiter".to_string(), "/".to_string())]),
+        HashMap::from([
+            ("prefix".to_string(), "x".to_string()),
+            ("delimiter".to_string(), "/".to_string()),
+        ]),
+    ] {
+        let err = match list_trash_objects(
+            full_claims(&fragment),
+            AxumPath(fragment.clone()),
+            Query(params),
+        )
+        .await
+        {
+            Ok(_) => panic!("flat Arc trash listing should reject prefix and delimiter"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, crate::enums::app_error_enum::AppError::BadRequest(_)),
+            "expected bad request, got {:?}",
+            err
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_multipart_finalize_conflict_then_success() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -2261,6 +2345,7 @@ async fn matrix_multipart_finalize_conflict_then_success() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Arc is flat-list only; prefix listing semantics moved to the registry layer"]
 async fn matrix_prefix_listing_serves_from_inline_prefix_rows_without_object_metadata_reads() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -3508,23 +3593,24 @@ async fn matrix_recover_object_stays_listed_in_prefix_index() {
     .into_response();
     assert_eq!(rec_resp.status(), StatusCode::OK);
 
-    let listing = list_objects_json(&fragment, Some("restore"), None).await;
+    let listing = list_objects_json(&fragment, None, None).await;
     let keys = listing["objects"]
         .as_array()
         .expect("objects array")
         .iter()
         .filter_map(|v| v["object_key"].as_str())
+        .filter(|key| key.starts_with("restore/"))
         .map(|s| s.to_string())
         .collect::<Vec<_>>();
 
     assert!(
         keys.iter().any(|k| k == &key_recover),
-        "recovered key missing from prefix listing: {:?}",
+        "recovered key missing from flat listing: {:?}",
         keys
     );
     assert!(
         keys.iter().any(|k| k == &key_keep),
-        "unaffected key missing from prefix listing: {:?}",
+        "unaffected key missing from flat listing: {:?}",
         keys
     );
 }
@@ -3925,12 +4011,13 @@ async fn matrix_list_objects_hides_internal_keys_unless_requested() {
     .await;
     put_object(state, &fragment, "videos/.n1fsd_dir", vec![0x22]).await;
 
-    let listing_default = list_objects_json(&fragment, Some("videos"), None).await;
+    let listing_default = list_objects_json(&fragment, None, None).await;
     let default_keys = listing_default["objects"]
         .as_array()
         .expect("objects array")
         .iter()
         .filter_map(|v| v["object_key"].as_str())
+        .filter(|key| key.starts_with("videos/"))
         .map(|s| s.to_string())
         .collect::<Vec<_>>();
 
@@ -3945,13 +4032,13 @@ async fn matrix_list_objects_hides_internal_keys_unless_requested() {
         default_keys
     );
 
-    let listing_internal =
-        list_objects_json_with_internal(&fragment, Some("videos"), None, true).await;
+    let listing_internal = list_objects_json_with_internal(&fragment, None, None, true).await;
     let internal_keys = listing_internal["objects"]
         .as_array()
         .expect("objects array")
         .iter()
         .filter_map(|v| v["object_key"].as_str())
+        .filter(|key| key.starts_with("videos/"))
         .map(|s| s.to_string())
         .collect::<Vec<_>>();
 
@@ -8424,8 +8511,14 @@ async fn matrix_repro_delete_multiple_restore_all_listing_blank() {
         keys.push(key);
     }
 
-    let initial = list_objects_json(&fragment, Some(prefix), None).await;
-    let initial_keys = initial["objects"].as_array().expect("objects array").len();
+    let initial = list_objects_json(&fragment, None, None).await;
+    let initial_keys = initial["objects"]
+        .as_array()
+        .expect("objects array")
+        .iter()
+        .filter_map(|v| v["object_key"].as_str())
+        .filter(|key| key.starts_with("repro-blank/"))
+        .count();
     assert_eq!(initial_keys, count, "initial listing mismatch");
 
     for key in &keys {
@@ -8440,8 +8533,17 @@ async fn matrix_repro_delete_multiple_restore_all_listing_blank() {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    let empty = list_objects_json(&fragment, Some(prefix), None).await;
-    let empty_keys = empty["objects"].as_array().map(|v| v.len()).unwrap_or(0);
+    let empty = list_objects_json(&fragment, None, None).await;
+    let empty_keys = empty["objects"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v["object_key"].as_str())
+                .filter(|key| key.starts_with("repro-blank/"))
+                .count()
+        })
+        .unwrap_or(0);
     assert_eq!(empty_keys, 0, "listing should be empty after delete");
 
     for key in &keys {
@@ -8456,21 +8558,20 @@ async fn matrix_repro_delete_multiple_restore_all_listing_blank() {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    let restored = list_objects_json(&fragment, Some(prefix), None).await;
-    let restored_keys = restored["objects"].as_array().map(|v| v.len()).unwrap_or(0);
+    let restored = list_objects_json(&fragment, None, None).await;
+    let restored_keys = restored["objects"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v["object_key"].as_str())
+                .filter(|key| key.starts_with("repro-blank/"))
+                .count()
+        })
+        .unwrap_or(0);
 
     assert_eq!(
         restored_keys, count,
         "listing should be restored after recover"
-    );
-
-    let restored_delim = list_objects_json(&fragment, Some(prefix), Some("/")).await;
-    let restored_delim_keys = restored_delim["objects"]
-        .as_array()
-        .map(|v| v.len())
-        .unwrap_or(0);
-    assert_eq!(
-        restored_delim_keys, count,
-        "listing with delimiter should be restored after recover"
     );
 }

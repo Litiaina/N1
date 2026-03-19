@@ -18,8 +18,6 @@ pub mod modify;
 pub mod monitoring;
 pub mod object_parser;
 pub mod operation_gate;
-pub mod prefix_delimiter;
-pub mod prefix_rebuilder;
 pub mod quota_manager;
 pub mod raw_index;
 pub mod raw_io_ring;

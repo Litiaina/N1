@@ -4,6 +4,9 @@ use hex::encode as hex_encode;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::path::Path;
+use tokio::fs::File;
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::config::{RegistryConfig, normalize_backend_url};
@@ -90,49 +93,9 @@ impl StorageBroker {
         delete: bool,
     ) -> Result<StorageSessionResponse, RegistryError> {
         let backend = self.resolve_backend(binding)?;
-        let response = self
-            .client_for_backend(&backend)
-            .post(format!("{}/authenticate/fragment", backend.engine_url))
-            .json(&FragmentAuthRequest {
-                fragment: &binding.fragment,
-                secret: &backend.master_key,
-                read,
-                write,
-                modify,
-                delete,
-                expires_in: Some(self.config.storage_session_ttl_secs),
-            })
-            .send()
-            .await
-            .map_err(|err| {
-                RegistryError::bad_gateway(format!(
-                    "storage auth request failed for {}: {}",
-                    backend.engine_url, err
-                ))
-            })?;
-
-        if !response.status().is_success() {
-            let fallback = format!(
-                "storage auth failed against {} backend",
-                match backend.deployment {
-                    StorageDeployment::SingleNode => "single-node",
-                    StorageDeployment::MultiNode => "multi-node",
-                }
-            );
-            let message = response
-                .json::<EngineErrorResponse>()
-                .await
-                .ok()
-                .and_then(|body| body.error.or(body.message))
-                .unwrap_or(fallback);
-            return Err(RegistryError::bad_gateway(
-                normalize_engine_auth_error_message(message),
-            ));
-        }
-
-        let payload = response.json::<EngineAuthResponse>().await.map_err(|err| {
-            RegistryError::bad_gateway(format!("invalid storage auth response: {}", err))
-        })?;
+        let payload = self
+            .authenticate_fragment(&backend, &binding.fragment, read, write, modify, delete)
+            .await?;
 
         Ok(StorageSessionResponse {
             fragment: binding.fragment.clone(),
@@ -197,6 +160,55 @@ impl StorageBroker {
             .and_then(|body| body.error.or(body.message))
             .unwrap_or(fallback);
         Err(RegistryError::bad_gateway(message))
+    }
+
+    pub async fn stream_manifest_archive(
+        &self,
+        binding: &FragmentBindingRecord,
+        manifest_path: &Path,
+        filename: Option<&str>,
+    ) -> Result<reqwest::Response, RegistryError> {
+        let backend = self.resolve_backend(binding)?;
+        let payload = self
+            .authenticate_fragment(&backend, &binding.fragment, true, false, false, false)
+            .await?;
+
+        let file = File::open(manifest_path).await.map_err(|err| {
+            RegistryError::internal(format!("failed to open archive manifest for streaming: {}", err))
+        })?;
+        let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
+        let request = self
+            .client_for_backend(&backend)
+            .post(format!("{}/v4/fragment/archive/manifest", backend.engine_url))
+            .bearer_auth(payload.access_token)
+            .query(&[
+                ("format", "tar"),
+                ("filename", filename.unwrap_or("export")),
+            ])
+            .body(body);
+
+        let response = request.send().await.map_err(|err| {
+            RegistryError::bad_gateway(format!(
+                "storage archive request failed for {}: {}",
+                backend.engine_url, err
+            ))
+        });
+        let _ = tokio::fs::remove_file(manifest_path).await;
+        let response = response?;
+
+        if !response.status().is_success() {
+            let fallback = format!(
+                "storage archive failed against {} backend",
+                match backend.deployment {
+                    StorageDeployment::SingleNode => "single-node",
+                    StorageDeployment::MultiNode => "multi-node",
+                }
+            );
+            let message = extract_engine_error_message(response, fallback).await;
+            return Err(RegistryError::bad_gateway(message));
+        }
+
+        Ok(response)
     }
 
     fn resolve_backend(
@@ -314,6 +326,55 @@ impl StorageBroker {
             &self.strict_client
         }
     }
+
+    async fn authenticate_fragment(
+        &self,
+        backend: &ResolvedBackend,
+        fragment: &str,
+        read: bool,
+        write: bool,
+        modify: bool,
+        delete: bool,
+    ) -> Result<EngineAuthResponse, RegistryError> {
+        let response = self
+            .client_for_backend(backend)
+            .post(format!("{}/authenticate/fragment", backend.engine_url))
+            .json(&FragmentAuthRequest {
+                fragment,
+                secret: &backend.master_key,
+                read,
+                write,
+                modify,
+                delete,
+                expires_in: Some(self.config.storage_session_ttl_secs),
+            })
+            .send()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "storage auth request failed for {}: {}",
+                    backend.engine_url, err
+                ))
+            })?;
+
+        if !response.status().is_success() {
+            let fallback = format!(
+                "storage auth failed against {} backend",
+                match backend.deployment {
+                    StorageDeployment::SingleNode => "single-node",
+                    StorageDeployment::MultiNode => "multi-node",
+                }
+            );
+            let message = extract_engine_error_message(response, fallback).await;
+            return Err(RegistryError::bad_gateway(
+                normalize_engine_auth_error_message(message),
+            ));
+        }
+
+        response.json::<EngineAuthResponse>().await.map_err(|err| {
+            RegistryError::bad_gateway(format!("invalid storage auth response: {}", err))
+        })
+    }
 }
 
 fn normalize_engine_auth_error_message(message: String) -> String {
@@ -322,6 +383,18 @@ fn normalize_engine_auth_error_message(message: String) -> String {
         return "storage fragment auth failed inside N1; check that REGISTRY_SINGLE_NODE_MASTER_KEY or REGISTRY_MULTI_NODE_MASTER_KEY matches the engine MASTER_KEY, and that the fragment metadata exists and is readable".to_string();
     }
     trimmed.to_string()
+}
+
+async fn extract_engine_error_message(
+    response: reqwest::Response,
+    fallback: String,
+) -> String {
+    if let Ok(body) = response.json::<EngineErrorResponse>().await {
+        if let Some(message) = body.error.or(body.message) {
+            return message;
+        }
+    }
+    fallback
 }
 
 fn hash_fragment_name(name: &str) -> String {

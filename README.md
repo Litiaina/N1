@@ -20,9 +20,9 @@
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared node-local storage engine used by both deployments.
 > - `standard` (`litiaina-n1-standard`) is the single-node N2 deployment path and the stable default.
-> - `standard` is released at `0.6.1`.
+> - `standard` is released at `0.6.2`.
 > - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path.
-> - `registry-runtime` (`registry-server`) is the SQLite-backed business metadata layer for both deployment shapes.
+> - `registry-runtime` (`registry-server`) is the SQLite-backed business metadata layer for both deployment shapes and is versioned independently at `0.2.0`.
 > - `arc` (`litiaina-n1-arc`) is the experimental raw-device profile and is not the production default.
 > - Prefer a non-root service user for `litiaina-n1-standard`, `litiaina-n2`, and `registry-server`. Keep `root` for `litiaina-n1-arc` raw-device operations only.
 > - See `DEPLOYMENT_PROFILES.md` for the profile split and architecture guidance.
@@ -142,8 +142,8 @@ Profile note:
 
 ## Release Status
 
-- `standard` is the stable/default deployment profile at `0.6.1`.
-- `registry-runtime` is available in `0.6.1` as the SQLite-backed Registry layer.
+- `standard` is the stable/default deployment profile at `0.6.2`.
+- `registry-runtime` is released independently at `0.2.0` as the SQLite-backed Registry layer.
 - `arc` is the experimental raw-device profile.
 - Stable architecture baseline (`standard`):
   - filesystem-backed authoritative `index`
@@ -170,7 +170,7 @@ Profile note:
 
 | Dimension | Standard (`litiaina-n1-standard`) | Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / production default (`0.6.1`) | Experimental / raw-device profile |
+| Status | Stable / production default (`0.6.2`) | Experimental / raw-device profile |
 | `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | Index metadata backend | Partitioned filesystem metadata | Raw index catalog on block-manager media |
@@ -234,13 +234,14 @@ Under both shapes, the node-local storage engine is still **N1**. N1 provides:
   - `standard`: filesystem-backed shard files under blob roots
   - `arc`: raw-device/direct-I/O blob plane with raw index authority
 
-In the `0.6.1` baseline, user convenience behavior moves out of the engine and into the Registry layer:
+In the `0.6.2` engine baseline, user convenience behavior moves out of the engine and into the Registry layer:
 
 - user management
 - ownership tracking
 - quota enforcement
 - logical listing and filtering
 - folder/prefix simulation for clients
+- prefix/search archive selection resolved into exact-key manifests
 
 That Registry layer runs as `registry-server` and uses SQLite in both single-node and multi-node deployments.
 

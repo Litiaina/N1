@@ -13,9 +13,9 @@
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used by both deployment shapes.
 > - `standard` is the stable single-node deployment path.
-> - `standard` is released at `0.6.1`.
+> - `standard` is released at `0.6.2`.
 > - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path in this workspace.
-> - `registry-runtime` (`registry-server`) is the SQLite-backed Registry layer for user/business metadata.
+> - `registry-runtime` (`registry-server`) is the SQLite-backed Registry layer for user/business metadata and is versioned independently at `0.2.0`.
 > - `arc` is experimental for raw-device deployments.
 > - See `DEPLOYMENT_PROFILES.md`.
 >
@@ -59,10 +59,10 @@
 > - Same-key upload recency comes from the upload session's `created_at`; finalize does not get to reorder versions.
 > - If two versions share the same second-level timestamp, ULID `version_id` order breaks the tie.
 > - Exact-key reads resolve the latest marker and then rehydrate the referenced immutable version record before serving metadata or bytes.
-> - Multipart uploads do not rely on in-memory part state for resumability. Part commits are durably recorded in the `index` WAL/session state and mirrored as per-part metadata files for compatibility and recovery workflows.
+> - Multipart uploads do not rely on in-memory part state for resumability. Part commits are durably recorded in the `index` session state through compact per-part receipts, and finalize assembles the authoritative object metadata from those receipts.
 
 > Release status note:
-> - N1 `standard` is stable at `0.6.1`; `arc` is experimental.
+> - N1 `standard` is stable at `0.6.2`; `arc` is experimental.
 > - This document describes the current implementation and current routes.
 > - Request/response details and endpoint layout may still change before `1.0.0` even though the underlying storage model is now fixed.
 
@@ -70,7 +70,7 @@
 
 | Dimension | Standard (`litiaina-n1-standard`) | Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / default (`0.6.1`) | Experimental / raw-device profile |
+| Status | Stable / default (`0.6.2`) | Experimental / raw-device profile |
 | API source of truth | Yes (`standard/src/routes/storage_routes.rs`) | Yes (`arc/src/routes/storage_routes.rs`) |
 | `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw devices / loopback files |
@@ -113,7 +113,7 @@ Registry base URL example:
 Startup note:
 - if `registry.env` is missing in the current working directory, the Registry creates a template automatically and then stops on the first required unset value
 
-Registry routes available in `0.6.1`:
+Registry routes available in `0.2.0`:
 - `GET /health`
 - `POST /v1/admin/users`
 - `POST /v1/auth/signup`
@@ -124,10 +124,13 @@ Registry routes available in `0.6.1`:
 - `POST /v1/storage/session`
 - `POST /v1/objects/register`
 - `POST /v1/objects/finalize`
+- `POST /v1/objects/archive`
 - `GET /v1/objects/suggest`
 - `POST /v1/objects/rename`
 - `POST /v1/objects/trash`
 - `POST /v1/objects/recover`
+- `POST /v1/objects/recover-all`
+- `POST /v1/objects/trash/empty`
 - `DELETE /v1/objects`
 - `GET /v1/objects`
 - `GET /v1/objects/resolve`
@@ -138,6 +141,7 @@ Registry responsibilities:
 - ownership metadata
 - logical listing/filtering
 - prefix/delimiter browsing for Registry-backed clients
+- prefix/search archive selection resolved into exact-key manifests for the storage engine
 - fragment binding to a `single_node` or `multi_node` storage backend
 - brokering short-lived storage sessions for Registry-backed clients and future GUI/web surfaces
 - exact-key logical resolution before talking to the storage engine
@@ -350,19 +354,16 @@ Response (`InitiateUploadResponse`):
 ```json
 {
   "keys": ["reports/a.pdf", "videos/b.mp4"],
-  "prefix": "videos/2026",
-  "delimiter": "/",
-  "max_keys": 10000,
-  "continuation_token": "<token>",
   "format": "tar",
-  "filename": "export"
+  "filename": "export",
+  "export_all": false,
+  "include_internal": false
 }
 ```
 Notes:
-- `keys` can be explicit list.
-- Or resolve by `prefix` with optional `delimiter` (`/` supported).
-- For full prefix recovery at scale, omit `max_keys` to stream the entire prefix in one archive response (server forces `tar`).
-- Large archive responses can return header `x-n1-archive-next-token`.
+- `keys` can be an explicit list of exact object keys.
+- Or set `export_all=true` to stream the entire fragment in flat engine order.
+- Prefix/delimiter selection is no longer an engine concern; Registry-backed archive flows resolve exact keys first, then stream them through the engine manifest route.
 
 ### 4.4 Signed URL Request
 ```json
@@ -479,7 +480,7 @@ Notes:
   - `limit`
   - `continuation_token`
   - `include_internal`
-- Unsupported in `0.6.1` engine mode:
+- Unsupported in `0.6.2` engine mode:
   - `prefix`
   - `delimiter`
 - Namespace browsing, folder simulation, and filtered views belong in the registry layer above the engine.
@@ -590,20 +591,29 @@ Purpose:
 
 Behavior:
 - If selection is very large (>1000 keys), server forces `tar`.
-- If `prefix` is used without `max_keys`, server streams all matching keys (unbounded prefix walk, memory bounded) and forces `tar`.
-- Response may include `x-n1-archive-next-token` for continuation.
+- If `export_all=true`, server scans the fragment in flat engine order and forces `tar`.
 
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   "https://127.0.0.1:50001/v4/fragment/archive" \
   -d '{
-    "prefix":"videos/2026",
-    "delimiter":"/",
-    "max_keys":5000,
+    "keys":["videos/2026/a.mp4","videos/2026/b.mp4"],
     "format":"tar",
     "filename":"videos-export"
   }' \
+  -o videos-export.tar
+```
+
+### 6.11.1 `POST /v4/fragment/archive/manifest`
+Purpose:
+- Streams a tar archive from a newline-delimited manifest of exact object keys.
+- Used by the Registry to support prefix/search archive exports without reintroducing prefix logic into the engine.
+
+```bash
+curl -k -X POST -H "Authorization: Bearer $TOKEN" \
+  --data-binary @keys.lst \
+  "https://127.0.0.1:50001/v4/fragment/archive/manifest?format=tar&filename=videos-export" \
   -o videos-export.tar
 ```
 
@@ -1470,6 +1480,7 @@ Recommended starting points:
 - `GET /v4/fragment/download/chunk`
 - `GET /v4/smb/progress`
 - `POST /v4/fragment/archive`
+- `POST /v4/fragment/archive/manifest`
 - `POST /v4/share/create`
 
 ### Protected v4 write/upload

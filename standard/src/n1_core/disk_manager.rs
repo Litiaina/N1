@@ -9,6 +9,10 @@ pub fn default_format() -> String {
     "zip".to_string()
 }
 
+pub fn default_tar_format() -> String {
+    "tar".to_string()
+}
+
 pub static INDEX_STORE_DISKS: OnceLock<Vec<String>> = OnceLock::new();
 pub static BLOB_STORE_DISKS: OnceLock<Vec<String>> = OnceLock::new();
 pub static FS_STORAGE_ROOT: OnceLock<String> = OnceLock::new();
@@ -340,8 +344,21 @@ pub struct UploadPartQuery {
 
 #[derive(serde::Deserialize)]
 pub struct DownloadArchiveRequest {
+    #[serde(default)]
     pub keys: Vec<String>,
     #[serde(default = "default_format")]
+    pub format: String,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub export_all: bool,
+    #[serde(default)]
+    pub include_internal: bool,
+}
+
+#[derive(serde::Deserialize)]
+pub struct DownloadArchiveManifestQuery {
+    #[serde(default = "default_tar_format")]
     pub format: String,
     #[serde(default)]
     pub filename: Option<String>,

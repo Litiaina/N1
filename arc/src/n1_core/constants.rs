@@ -5,6 +5,7 @@ pub const PREFIX_INDEX_DIR: &str = "__p__";
 pub const PREFIX_INDEX_VERSION: &str = "v1";
 pub const PREFIX_INDEX_NAMESPACE: &str = "pfx";
 pub const PREFIX_SEGMENT_EXT: &str = ".msgpack";
+#[allow(dead_code)]
 pub const PREFIX_DELIMITER_SEGMENT_PREFIX: &str = "dseg_";
 pub const PREFIX_DELIMITER_COMPACTED_FILE: &str = "dcompacted.msgpack";
 pub const FRAGMENT_METADATA_FILE: &str = "fragment.metadata.msgpack";

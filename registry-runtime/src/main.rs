@@ -14,9 +14,11 @@ use std::sync::Arc;
 use auth::{
     AuthSettings, claims_from_headers, issue_access_token, require_master_key, verify_password,
 };
+use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::HeaderName;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use axum_server::tls_rustls::RustlsConfig;
@@ -24,13 +26,13 @@ use config::{RegistryConfig, normalize_backend_url};
 use db::RegistryDb;
 use error::RegistryError;
 use models::{
-    BulkObjectMutationResponse, CreateUserRequest, CreateUserResponse, DeleteObjectQuery,
-    FinalizeObjectRequest, FragmentListResponse, FragmentStateRequest, LinkFragmentRequest,
-    LinkFragmentResponse, ListObjectsQuery, ListObjectsResponse, LoginRequest, LoginResponse,
-    ObjectDeleteResponse, ObjectMutationResponse, ObjectStateRequest, RegisterObjectRequest,
-    RenameRegistryObjectRequest, ResolveObjectQuery, SignupRequest, SignupResponse,
-    StorageSessionRequest, StorageSessionResponse, SuggestObjectsQuery, SuggestObjectsResponse,
-    UserRecord,
+    ArchiveObjectsRequest, BulkObjectMutationResponse, CreateUserRequest, CreateUserResponse,
+    DeleteObjectQuery, FinalizeObjectRequest, FragmentListResponse, FragmentStateRequest,
+    LinkFragmentRequest, LinkFragmentResponse, ListObjectsQuery, ListObjectsResponse,
+    LoginRequest, LoginResponse, ObjectDeleteResponse, ObjectMutationResponse, ObjectStateRequest,
+    RegisterObjectRequest, RenameRegistryObjectRequest, ResolveObjectQuery, SignupRequest,
+    SignupResponse, StorageSessionRequest, StorageSessionResponse, SuggestObjectsQuery,
+    SuggestObjectsResponse, UserRecord,
 };
 use std::time::Duration;
 use storage_broker::StorageBroker;
@@ -140,6 +142,7 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/objects/trash/empty", post(empty_trash))
         .route("/v1/objects", delete(delete_object))
         .route("/v1/objects", get(list_objects))
+        .route("/v1/objects/archive", post(archive_objects))
         .route("/v1/objects/resolve", get(resolve_object))
         .layer(build_cors_layer())
         .with_state(state)
@@ -442,6 +445,91 @@ async fn suggest_objects(
     Ok(Json(SuggestObjectsResponse { suggestions }))
 }
 
+async fn archive_objects(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ArchiveObjectsRequest>,
+) -> Result<Response, RegistryError> {
+    validate_fragment(&req.fragment)?;
+    let requested_format = req.format.as_deref().unwrap_or("tar");
+    if requested_format != "tar" {
+        return Err(RegistryError::bad_request(
+            "registry archive currently supports tar only",
+        ));
+    }
+
+    let has_prefix = req
+        .prefix
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let has_search = req
+        .search
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if !req.keys.is_empty() && (has_prefix || has_search) {
+        return Err(RegistryError::bad_request(
+            "archive request must use either explicit keys or prefix/search selection, not both",
+        ));
+    }
+
+    let claims = claims_from_headers(&headers, &state.auth)?;
+    let binding = state
+        .db
+        .get_fragment_binding(claims.sub.clone(), req.fragment.trim().to_string())
+        .await?
+        .ok_or_else(|| {
+            RegistryError::conflict(
+                "fragment is not linked to a storage backend yet; link it first",
+            )
+        })?;
+
+    let manifest = state
+        .db
+        .write_archive_manifest(
+            claims.sub,
+            req.fragment.trim().to_string(),
+            req.keys,
+            req.prefix,
+            req.search,
+            req.include_trashed.unwrap_or(false),
+        )
+        .await?;
+    let _selected_count = manifest.selected_count;
+    let fallback_filename = req.filename.clone().unwrap_or_else(|| "export".to_string());
+    let upstream = state
+        .broker
+        .stream_manifest_archive(&binding, &manifest.manifest_path, req.filename.as_deref())
+        .await?;
+
+    let content_type = upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .cloned()
+        .unwrap_or_else(|| header::HeaderValue::from_static("application/x-tar"));
+    let content_disposition = upstream
+        .headers()
+        .get(header::CONTENT_DISPOSITION)
+        .cloned()
+        .unwrap_or_else(|| {
+            header::HeaderValue::from_str(&format!(
+                "attachment; filename=\"{}.tar\"",
+                fallback_filename
+            ))
+            .unwrap_or_else(|_| header::HeaderValue::from_static("attachment"))
+        });
+    let status = StatusCode::from_u16(upstream.status().as_u16())
+        .unwrap_or(StatusCode::OK);
+
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_DISPOSITION, content_disposition)
+        .body(Body::from_stream(upstream.bytes_stream()))
+        .map_err(|err| RegistryError::internal(format!("failed to build archive response: {}", err)))
+}
+
 async fn rename_object(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -680,7 +768,8 @@ mod tests {
     use axum::body::Body;
     use axum::http::header::{
         ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-        ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD, ORIGIN,
+        ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD, CONTENT_DISPOSITION,
+        CONTENT_TYPE, ORIGIN,
     };
     use axum::http::{Request, StatusCode};
     use axum::routing::post;
@@ -711,6 +800,30 @@ mod tests {
                         "name": name
                     }))
                 }),
+            )
+            .route(
+                "/v4/fragment/archive/manifest",
+                post(
+                    |Query(query): Query<std::collections::HashMap<String, String>>,
+                     body: String| async move {
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/x-tar")
+                            .header(
+                                CONTENT_DISPOSITION,
+                                query
+                                    .get("filename")
+                                    .map(|value| {
+                                        format!("attachment; filename=\"{}.tar\"", value)
+                                    })
+                                    .unwrap_or_else(|| {
+                                        "attachment; filename=\"export.tar\"".to_string()
+                                    }),
+                            )
+                            .body(Body::from(body))
+                            .expect("stub archive response")
+                    },
+                ),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1016,5 +1129,113 @@ mod tests {
             serde_json::from_slice(&session_body).expect("parse session body");
         assert_eq!(session_json["engine_url"], single_url);
         assert_eq!(session_json["access_token"], "single-stub-token");
+    }
+
+    #[tokio::test]
+    async fn archive_route_selects_prefix_via_registry_and_streams_engine_tar() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, access_token) = test_state(single_url, multi_url).await;
+        let owner = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                owner.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("link fragment");
+        state
+            .db
+            .finalize_object(
+                owner.uid.clone(),
+                "fragment-a".to_string(),
+                "patients/a/one.dcm".to_string(),
+                "01HARCHIVEVERSION000000000000001".to_string(),
+                1024,
+                Some("application/dicom".to_string()),
+            )
+            .await
+            .expect("finalize one");
+        state
+            .db
+            .finalize_object(
+                owner.uid.clone(),
+                "fragment-a".to_string(),
+                "patients/a/two.dcm".to_string(),
+                "01HARCHIVEVERSION000000000000002".to_string(),
+                1024,
+                Some("application/dicom".to_string()),
+            )
+            .await
+            .expect("finalize two");
+        state
+            .db
+            .finalize_object(
+                owner.uid,
+                "fragment-a".to_string(),
+                "patients/b/three.dcm".to_string(),
+                "01HARCHIVEVERSION000000000000003".to_string(),
+                1024,
+                Some("application/dicom".to_string()),
+            )
+            .await
+            .expect("finalize three");
+
+        let app = build_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/objects/archive")
+            .header("authorization", format!("Bearer {}", access_token))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "fragment": "fragment-a",
+                    "prefix": "patients/a",
+                    "filename": "selected"
+                }))
+                .expect("serialize archive request"),
+            ))
+            .expect("archive request");
+        let response = app.oneshot(request).await.expect("archive response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE),
+            Some(&"application/x-tar".parse().expect("content type"))
+        );
+        assert_eq!(
+            response.headers().get(CONTENT_DISPOSITION),
+            Some(
+                &"attachment; filename=\"selected.tar\""
+                    .parse()
+                    .expect("content disposition")
+            )
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read archive body");
+        let lines = String::from_utf8(body.to_vec())
+            .expect("archive body utf8")
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            vec![
+                "patients/a/one.dcm".to_string(),
+                "patients/a/two.dcm".to_string()
+            ]
+        );
     }
 }

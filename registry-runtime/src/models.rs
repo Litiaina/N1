@@ -122,6 +122,18 @@ pub struct RegisterObjectRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ArchiveObjectsRequest {
+    pub fragment: String,
+    #[serde(default)]
+    pub keys: Vec<String>,
+    pub prefix: Option<String>,
+    pub search: Option<String>,
+    pub filename: Option<String>,
+    pub format: Option<String>,
+    pub include_trashed: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct FinalizeObjectRequest {
     pub fragment: String,
     pub object_key: String,

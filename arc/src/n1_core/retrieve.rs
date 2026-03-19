@@ -961,6 +961,13 @@ async fn list_objects_internal(
     params: HashMap<String, String>,
     scan_trash: bool,
 ) -> Result<impl IntoResponse, AppError> {
+    if params.contains_key("prefix") || params.contains_key("delimiter") {
+        return Err(AppError::BadRequest(
+            "prefix and delimiter listing were removed in 0.6.0; use the registry layer for namespace queries"
+                .to_string(),
+        ));
+    }
+
     let limit: usize = params
         .get("limit")
         .and_then(|s| s.parse().ok())

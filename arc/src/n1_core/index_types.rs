@@ -24,9 +24,20 @@ pub struct IndexSessionState {
     pub aborted_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionPartReceipt {
+    pub part_index: u64,
+    pub size_bytes: u64,
+    pub created_at: i64,
+    pub checksum: Option<u32>,
+    pub shard_checksums: Vec<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemovedSessionReceipt {
     pub state: IndexSessionState,
+    #[serde(default)]
+    pub session_part_receipts: BTreeMap<u64, SessionPartReceipt>,
     pub removed_at: i64,
     pub reason: String,
 }

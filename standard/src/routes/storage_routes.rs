@@ -25,7 +25,10 @@ use crate::middleware::auth_middleware::{
 use crate::middleware::rate_limiter_middleware::RateLimitLayers;
 use crate::middleware::storage_middleware::enforce_storage_limit;
 use crate::n1_core::adaptive_concurrency::run_adaptive_concurrency_loop;
-use crate::n1_core::archive::download_selected_archive as download_selected_archive_impl;
+use crate::n1_core::archive::{
+    download_manifest_archive as download_manifest_archive_impl,
+    download_selected_archive as download_selected_archive_impl,
+};
 use crate::n1_core::delete::{
     delete_object as delete_object_impl,
     delete_object_permanently as delete_object_permanently_impl,
@@ -192,6 +195,15 @@ async fn download_selected_archive_scoped(
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
     download_selected_archive_impl(claims, Path(fragment), AxumJson(req)).await
+}
+
+async fn download_manifest_archive_scoped(
+    claims: Claims,
+    Query(query): Query<crate::n1_core::disk_manager::DownloadArchiveManifestQuery>,
+    body: axum::body::Body,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    download_manifest_archive_impl(claims, Path(fragment), Query(query), body).await
 }
 
 async fn empty_trash_scoped(
@@ -440,6 +452,10 @@ pub fn build_storage_routes_unbound() -> (Router<Arc<AppState>>, Arc<AppState>) 
             .route(
                 "/v4/fragment/archive",
                 post(download_selected_archive_scoped),
+            )
+            .route(
+                "/v4/fragment/archive/manifest",
+                post(download_manifest_archive_scoped),
             )
             .route("/v4/share/create", post(create_signed_url))
             .route("/v4/smb/progress", get(smb_progress))

@@ -4,9 +4,9 @@
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used underneath both deployment shapes.
 > - `standard` is the stable single-node deployment profile.
-> - `standard` is released at `0.6.1`.
+> - `standard` is released at `0.6.2`.
 > - `distribution-runtime` is the multi-node N2 deployment profile.
-> - `registry-runtime` is the SQLite-backed Registry/business layer.
+> - `registry-runtime` is the SQLite-backed Registry/business layer and is versioned independently at `0.2.0`.
 > - `arc` is an experimental raw-device deployment profile.
 > - See `DEPLOYMENT_PROFILES.md`.
 
@@ -37,6 +37,7 @@ At the platform layer, `registry-runtime` owns the business plane:
 - quotas
 - logical listing/filtering
 - folder/prefix simulation for clients
+- prefix/search archive selection resolved into exact-key manifests for the engine
 - fragment backend bindings
 - storage-session brokering for Registry-backed clients
 
@@ -44,7 +45,7 @@ This replaces the legacy "full mirrored metadata tree on every index root" model
 
 ## Freeze Status
 
-The current production architecture baseline is `standard 0.6.1`.
+The current production architecture baseline is `standard 0.6.2` with `registry-runtime 0.2.0`.
 
 That baseline applies to:
 
@@ -76,7 +77,7 @@ They are expected to keep the same storage semantics. The difference is backend 
 
 | Dimension | Standard | Arc |
 |---|---|---|
-| Status | Stable/default (`0.6.1`) | Experimental raw-device profile |
+| Status | Stable/default (`0.6.2`) | Experimental raw-device profile |
 | `index_store_disks` | Filesystem directories | Raw devices |
 | `blob_store_disks` | Filesystem directories | Raw devices |
 | Index backend | Partitioned filesystem metadata | Raw index catalog (`block_manager`) |
@@ -132,7 +133,7 @@ The Registry plane is where namespace and business logic now belongs:
 - binding a fragment to either a `single_node` or `multi_node` storage backend
 - issuing short-lived storage sessions to client applications
 
-In the `0.6.1` baseline, the Registry is a dedicated binary. The engine contract is flat, exact-key-oriented object storage, while client-facing namespace behavior moves into the Registry layer.
+In the `0.6.2` / `0.2.0` baseline, the Registry is a dedicated binary. The engine contract is flat, exact-key-oriented object storage, while client-facing namespace behavior moves into the Registry layer.
 
 Registry-backed client flow:
 

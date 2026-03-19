@@ -177,6 +177,7 @@ impl ObjectPathManager {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub fn get_all_prefix_compacted_paths(
         &self,
         fragment_hash: &str,
@@ -188,6 +189,7 @@ impl ObjectPathManager {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub fn get_all_prefix_delimiter_compacted_paths(
         &self,
         fragment_hash: &str,
@@ -365,6 +367,7 @@ pub struct PrefixIndexEntry {
 }
 
 impl PrefixIndexEntry {
+    #[allow(dead_code)]
     pub fn from_metadata(metadata: &ObjectMetadata) -> Self {
         Self {
             object_key: metadata.object_key.clone(),

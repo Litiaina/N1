@@ -7,9 +7,9 @@ N1 is the shared storage engine underneath it.
 
 As of 2026-03-19:
 
-- `standard` (`litiaina-n1-standard`) is the single-node N2 deployment path, the default for production, and released at `0.6.1`.
+- `standard` (`litiaina-n1-standard`) is the single-node N2 deployment path, the default for production, and released at `0.6.2`.
 - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path on top of the same N1 core.
-- `registry-runtime` (`registry-server`) is the SQLite-backed Registry layer used in both deployment shapes.
+- `registry-runtime` (`registry-server`) is the SQLite-backed Registry layer used in both deployment shapes and released independently at `0.2.0`.
 - `arc` (`litiaina-n1-arc`) is the experimental raw-device profile.
 - Privilege split: `standard`, `distribution-runtime`, and `registry-runtime` should normally run as non-root services, while `arc` is the only profile that should require root for raw-device workflows.
 - If you are unsure which one to deploy, use `standard`.
@@ -26,7 +26,7 @@ As of 2026-03-19:
 
 | Profile | Binary | Status | Production default |
 |---|---|---|---|
-| Standard | `litiaina-n1-standard` | Stable (`0.6.1`) | Yes |
+| Standard | `litiaina-n1-standard` | Stable (`0.6.2`) | Yes |
 | Arc | `litiaina-n1-arc` | Experimental | No |
 
 ## 3) Architecture Split
@@ -38,13 +38,14 @@ As of 2026-03-19:
 - Partitioned metadata authority and exact-key object serving.
 - Best operator compatibility and lowest deployment risk.
 
-### Registry (`0.6.1` baseline)
+### Registry (`0.2.0` baseline)
 
 - SQLite-backed metadata and control plane.
 - Runs in both single-node and multi-node deployments.
 - Owns users, ownership, quotas, logical listing, and logical object lookup.
 - Owns fragment backend binding (`single_node` vs `multi_node`) for Registry-backed clients.
 - Brokers short-lived storage sessions so clients do not need fragment secrets for normal Registry-backed usage.
+- Resolves prefix/search archive selections into exact-key manifests for engine-side tar streaming.
 
 Disk layout snapshot:
 
