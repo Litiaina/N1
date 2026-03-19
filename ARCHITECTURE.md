@@ -5,8 +5,8 @@
 > - `N1` is the shared storage engine used underneath both deployment shapes.
 > - `standard` is the stable single-node deployment profile.
 > - `standard` is released at `0.6.2`.
-> - `distribution-runtime` is the multi-node N2 deployment profile.
-> - `registry-runtime` is the SQLite-backed Registry/business layer and is versioned independently at `0.2.0`.
+> - `distribution-runtime` is the multi-node N2 deployment profile and is released at `0.1.1`.
+> - `registry-runtime` is the SQLite-backed Registry/business layer and is versioned independently at `0.2.1`.
 > - `arc` is an experimental raw-device deployment profile.
 > - See `DEPLOYMENT_PROFILES.md`.
 
@@ -50,7 +50,7 @@ This replaces the legacy "full mirrored metadata tree on every index root" model
 
 ## Freeze Status
 
-The current production architecture baseline is `standard 0.6.2` with `registry-runtime 0.2.0`.
+The current production architecture baseline is `standard 0.6.2`, `distribution-runtime 0.1.1`, and `registry-runtime 0.2.1`.
 
 That baseline applies to:
 
@@ -138,7 +138,7 @@ The Registry plane is where namespace and business logic now belongs:
 - binding a fragment to either a `single_node` or `multi_node` storage backend
 - issuing short-lived storage sessions to client applications
 
-In the `0.6.2` / `0.2.0` baseline, the Registry is a dedicated binary. The engine contract is flat, exact-key-oriented object storage, while client-facing namespace behavior moves into the Registry layer.
+In the `0.6.2` / `0.1.1` / `0.2.1` baseline, the Registry is a dedicated binary. The engine contract is flat, exact-key-oriented object storage, while client-facing namespace behavior moves into the Registry layer.
 
 Registry identity/session notes:
 - the first administrator is created through a master-key bootstrap flow

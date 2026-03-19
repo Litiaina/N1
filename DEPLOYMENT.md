@@ -5,8 +5,8 @@
 > - `N1` is the shared storage engine used underneath both deployment shapes.
 > - Single-node deployment: `standard` (`litiaina-n1-standard`)
 > - `standard` release: `0.6.2`
-> - Multi-node deployment: `distribution-runtime` (`litiaina-n2`)
-> - Registry/business deployment: `registry-runtime` (`registry-server`, `0.2.0`)
+> - Multi-node deployment: `distribution-runtime` (`litiaina-n2`, `0.1.1`)
+> - Registry/business deployment: `registry-runtime` (`registry-server`, `0.2.1`)
 > - Experimental raw-device profile: `arc` (`litiaina-n1-arc`)
 > - Privilege split: prefer a normal service user for `litiaina-n1-standard`, `litiaina-n2`, and `registry-server`. Reserve `root` for `litiaina-n1-arc` raw-device operations only, and let the runtimes validate their writable state paths explicitly.
 > - See `DEPLOYMENT_PROFILES.md` for profile policy.

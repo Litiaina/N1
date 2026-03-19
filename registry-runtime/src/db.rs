@@ -19,6 +19,7 @@ use crate::models::{
 pub struct RegistryListPage {
     pub objects: Vec<ObjectRecord>,
     pub common_prefixes: Vec<String>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1035,9 +1036,20 @@ impl RegistryDb {
                 out
             };
 
+            let mut paged_objects = objects
+                .into_iter()
+                .skip(offset)
+                .take(limit.saturating_add(1))
+                .collect::<Vec<_>>();
+            let has_more = paged_objects.len() > limit;
+            if has_more {
+                paged_objects.truncate(limit);
+            }
+
             Ok(RegistryListPage {
-                objects: objects.into_iter().skip(offset).take(limit).collect::<Vec<_>>(),
+                objects: paged_objects,
                 common_prefixes: common_prefixes.into_iter().collect(),
+                has_more,
             })
         })
         .await

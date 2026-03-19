@@ -85,6 +85,7 @@ pub struct GetObjectQuery {
 #[derive(Clone, Debug, Deserialize)]
 pub struct ListN2ObjectsQuery {
     pub limit: Option<usize>,
+    pub continuation: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -201,6 +202,8 @@ pub struct N2ObjectSummary {
 pub struct N2ListObjectsResponse {
     pub fragment: String,
     pub limit: usize,
+    pub continuation: Option<String>,
+    pub has_more: bool,
     pub objects: Vec<N2ObjectSummary>,
 }
 

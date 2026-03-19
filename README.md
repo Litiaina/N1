@@ -21,8 +21,8 @@
 > - `N1` is the shared node-local storage engine used by both deployments.
 > - `standard` (`litiaina-n1-standard`) is the single-node N2 deployment path and the stable default.
 > - `standard` is released at `0.6.2`.
-> - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path.
-> - `registry-runtime` (`registry-server`) is the SQLite-backed business metadata layer for both deployment shapes and is versioned independently at `0.2.0`.
+> - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path and is released at `0.1.1`.
+> - `registry-runtime` (`registry-server`) is the SQLite-backed business metadata layer for both deployment shapes and is versioned independently at `0.2.1`.
 > - `arc` (`litiaina-n1-arc`) is the experimental raw-device profile and is not the production default.
 > - Prefer a non-root service user for `litiaina-n1-standard`, `litiaina-n2`, and `registry-server`. Keep `root` for `litiaina-n1-arc` raw-device operations only.
 > - See `DEPLOYMENT_PROFILES.md` for the profile split and architecture guidance.
@@ -144,7 +144,8 @@ Profile note:
 ## Release Status
 
 - `standard` is the stable/default deployment profile at `0.6.2`.
-- `registry-runtime` is released independently at `0.2.0` as the SQLite-backed Registry layer.
+- `distribution-runtime` is released independently at `0.1.1` as the multi-node N2 layer.
+- `registry-runtime` is released independently at `0.2.1` as the SQLite-backed Registry layer.
 - `arc` is the experimental raw-device profile.
 - Stable architecture baseline (`standard`):
   - filesystem-backed authoritative `index`

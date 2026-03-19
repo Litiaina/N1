@@ -407,7 +407,7 @@ async fn signup(
     let password_hash = auth::hash_password(&req.password)?;
     let user = state
         .db
-        .create_user(email, password_hash, req.quota_limit_bytes, false)
+        .create_user(email, password_hash, None, false)
         .await?;
     let _ = ensure_user_default_fragment(&state, &user).await?;
     let (access_token, expires_in, refresh_token, refresh_expires_in) =
@@ -929,6 +929,9 @@ async fn list_objects(
         common_prefixes: page.common_prefixes,
         limit,
         offset,
+        continuation_token: page
+            .has_more
+            .then(|| offset.saturating_add(limit).to_string()),
     }))
 }
 
@@ -1662,6 +1665,41 @@ mod tests {
             serde_json::from_slice(&session_body).expect("parse session body");
         assert_eq!(session_json["engine_url"], single_url);
         assert_eq!(session_json["access_token"], "single-stub-token");
+    }
+
+    #[tokio::test]
+    async fn signup_ignores_client_supplied_quota_limit() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, _) = test_state(single_url, multi_url).await;
+        let app = build_router(state);
+
+        let signup_req = Request::builder()
+            .method("POST")
+            .uri("/v1/auth/signup")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "email": "quota-abuse@example.com",
+                    "password": "password123",
+                    "quota_limit_bytes": 999999999999i64
+                }))
+                .expect("serialize signup request"),
+            ))
+            .expect("signup request");
+        let signup_resp = app
+            .oneshot(signup_req)
+            .await
+            .expect("signup response");
+        assert_eq!(signup_resp.status(), StatusCode::CREATED);
+        let signup_body = axum::body::to_bytes(signup_resp.into_body(), usize::MAX)
+            .await
+            .expect("read signup body");
+        let signup_json: Value = serde_json::from_slice(&signup_body).expect("parse signup body");
+        assert_eq!(
+            signup_json["user"]["quota_limit_bytes"].as_i64(),
+            Some(1024 * 1024)
+        );
     }
 
     #[tokio::test]

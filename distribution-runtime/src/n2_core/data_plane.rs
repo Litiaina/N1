@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use simd_erasure_core::{ReedSolomonDecoder, ReedSolomonEncoder};
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -60,10 +61,26 @@ struct LocalClusterShardMeta {
 }
 
 #[derive(Clone, Debug)]
-struct ClusterShardFileSource {
+struct MemoryClusterShardSource {
     cluster_shard_index: usize,
-    path: PathBuf,
+    bytes: Vec<u8>,
+    cursor: usize,
+}
+
+type RemoteShardByteStream =
+    Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+
+struct RemoteClusterShardStreamSource {
+    cluster_shard_index: usize,
     size_bytes: usize,
+    cursor: usize,
+    pending: BytesMut,
+    stream: RemoteShardByteStream,
+}
+
+enum ClusterShardReadSource {
+    Memory(MemoryClusterShardSource),
+    Remote(RemoteClusterShardStreamSource),
 }
 
 #[derive(Clone, Debug)]
@@ -540,11 +557,16 @@ async fn persist_n2_object_map(map: &N2ObjectMap) -> Result<(), AppError> {
         }
     }
 
-    if replicated == 0 {
+    let required_remote_acks = remote_endpoints
+        .len()
+        .min(usize::from(map.write_quorum.saturating_sub(1)));
+
+    if replicated < required_remote_acks {
         return Err(AppError::Conflict(format!(
-            "object committed locally ({} mirrors) but map replication failed on all {} remote targets",
+            "object committed locally ({} mirrors) but map replication acknowledged only {} remote targets, need {}",
             local_writes,
-            remote_endpoints.len()
+            replicated,
+            required_remote_acks
         )));
     }
 
@@ -560,8 +582,17 @@ async fn read_n2_map_version(
     let roots = path_manager.get_all_index_roots();
     let key_hash = object_key_hash(object_key);
 
+    read_n2_map_version_by_hash(roots, fragment, &key_hash, version_id).await
+}
+
+async fn read_n2_map_version_by_hash(
+    roots: Vec<PathBuf>,
+    fragment: &str,
+    key_hash: &str,
+    version_id: &str,
+) -> Result<N2ObjectMap, AppError> {
     for root in roots {
-        let map_path = map_path_for_root(&root, fragment, &key_hash, version_id);
+        let map_path = map_path_for_root(&root, fragment, key_hash, version_id);
         let exists = fs::try_exists(&map_path)
             .await
             .map_err(|e| AppError::Io(e, format!("check {:?}", map_path)))?;
@@ -826,6 +857,122 @@ async fn list_fragment_n2_maps(
                 Err(_) => continue,
             };
             let map = match rmp_serde::from_slice::<N2ObjectMap>(&bytes) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if map.object.fragment != fragment {
+                continue;
+            }
+            out.push(map);
+            if out.len() >= max_objects {
+                return Ok(out);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+async fn collect_n2_latest_marker_paths(
+    index_root: &StdPath,
+    max_paths: usize,
+) -> Result<Vec<PathBuf>, AppError> {
+    let exists = fs::try_exists(index_root)
+        .await
+        .map_err(|e| AppError::Io(e, format!("check {:?}", index_root)))?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+
+    let mut stack = vec![index_root.to_path_buf()];
+    let mut out = Vec::new();
+    while let Some(dir) = stack.pop() {
+        let mut entries = match fs::read_dir(&dir).await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| AppError::Io(e, format!("read dir entry {:?}", dir)))?
+        {
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .await
+                .map_err(|e| AppError::Io(e, format!("file type {:?}", path)))?;
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(N2_OBJECT_LATEST_EXT) {
+                continue;
+            }
+            out.push(path);
+            if out.len() >= max_paths {
+                return Ok(out);
+            }
+        }
+    }
+    Ok(out)
+}
+
+async fn list_fragment_n2_latest_maps(
+    fragment: &str,
+    max_objects: usize,
+) -> Result<Vec<N2ObjectMap>, AppError> {
+    let path_manager = ObjectPathManager::new();
+    let roots = path_manager.get_all_index_roots();
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut seen_key_hashes = HashSet::new();
+    let mut out = Vec::new();
+    for root in roots.clone() {
+        let index_root = root.join(fragment).join("n2").join("index");
+        let exists = fs::try_exists(&index_root)
+            .await
+            .map_err(|e| AppError::Io(e, format!("check {:?}", index_root)))?;
+        if !exists {
+            continue;
+        }
+
+        let mut latest_paths =
+            collect_n2_latest_marker_paths(&index_root, max_objects.saturating_mul(8)).await?;
+        latest_paths.sort();
+        for latest_path in latest_paths {
+            let Some(file_name) = latest_path.file_name().and_then(|v| v.to_str()) else {
+                continue;
+            };
+            let Some(key_hash) = file_name.strip_suffix(N2_OBJECT_LATEST_EXT) else {
+                continue;
+            };
+            if !seen_key_hashes.insert(key_hash.to_string()) {
+                continue;
+            }
+            let latest_bytes = match fs::read(&latest_path).await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let version_id = String::from_utf8_lossy(&latest_bytes).trim().to_string();
+            if version_id.is_empty() {
+                continue;
+            }
+            let map = match read_n2_map_version_by_hash(
+                roots.clone(),
+                fragment,
+                key_hash,
+                version_id.as_str(),
+            )
+            .await
+            {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -1597,147 +1744,6 @@ async fn read_local_cluster_shard(
     Ok(out)
 }
 
-async fn read_local_cluster_shard_to_file(
-    fragment: &str,
-    version_id: &str,
-    cluster_shard_index: usize,
-    destination_path: &StdPath,
-) -> Result<usize, AppError> {
-    let meta = load_local_cluster_shard_meta(fragment, version_id, cluster_shard_index).await?;
-    let kd = usize::from(meta.kd);
-    let md = usize::from(meta.md);
-    if kd == 0 {
-        return Err(AppError::InternalServerError(
-            "local cshard meta has invalid kd".to_string(),
-        ));
-    }
-
-    if let Some(parent) = destination_path.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .map_err(|e| AppError::Io(e, format!("mkdir {:?}", parent)))?;
-    }
-    let mut destination_file = fs::File::create(destination_path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("create {:?}", destination_path)))?;
-
-    if meta.cluster_size_bytes == 0 {
-        destination_file
-            .flush()
-            .await
-            .map_err(|e| AppError::Io(e, "flush local cshard destination".to_string()))?;
-        return Ok(0);
-    }
-
-    let stripe_count = if meta.disk_shard_size_bytes == 0 {
-        0
-    } else {
-        (meta.disk_shard_size_bytes / meta.stripe_block_size as u64) as usize
-    };
-
-    let mut files = HashMap::<usize, fs::File>::new();
-    for shard in &meta.disk_shards {
-        if let Ok(file) = fs::File::open(shard.absolute_path.as_str()).await {
-            files.insert(shard.disk_shard_index, file);
-        }
-    }
-
-    if md == 0 {
-        for stripe_idx in 0..stripe_count {
-            let offset = stripe_idx as u64 * meta.stripe_block_size as u64;
-            for disk_shard_index in 0..kd {
-                let file = files.get_mut(&disk_shard_index).ok_or_else(|| {
-                    AppError::InternalServerError(format!(
-                        "missing required data disk shard {} for cshard read",
-                        disk_shard_index
-                    ))
-                })?;
-                file.seek(SeekFrom::Start(offset))
-                    .await
-                    .map_err(|e| AppError::Io(e, "seek local data disk shard".to_string()))?;
-                let mut block = vec![0u8; meta.stripe_block_size];
-                file.read_exact(&mut block)
-                    .await
-                    .map_err(|e| AppError::Io(e, "read local data disk shard".to_string()))?;
-                destination_file
-                    .write_all(&block)
-                    .await
-                    .map_err(|e| AppError::Io(e, "write local cshard destination".to_string()))?;
-            }
-        }
-    } else {
-        for stripe_idx in 0..stripe_count {
-            let offset = stripe_idx as u64 * meta.stripe_block_size as u64;
-            let mut decoder =
-                ReedSolomonDecoder::new(kd, md, meta.stripe_block_size).map_err(|e| {
-                    AppError::InternalServerError(format!("local RS decode init: {}", e))
-                })?;
-
-            let mut originals: Vec<Option<Vec<u8>>> = vec![None; kd];
-            let mut added = 0usize;
-
-            for shard in &meta.disk_shards {
-                let Some(file) = files.get_mut(&shard.disk_shard_index) else {
-                    continue;
-                };
-                if file.seek(SeekFrom::Start(offset)).await.is_err() {
-                    continue;
-                }
-                let mut block = vec![0u8; meta.stripe_block_size];
-                if file.read_exact(&mut block).await.is_err() {
-                    continue;
-                }
-
-                let add_res = if shard.disk_shard_index < kd {
-                    originals[shard.disk_shard_index] = Some(block.clone());
-                    decoder.add_original_shard(shard.disk_shard_index, &block)
-                } else {
-                    decoder.add_recovery_shard(shard.disk_shard_index - kd, &block)
-                };
-                if add_res.is_ok() {
-                    added = added.saturating_add(1);
-                }
-            }
-
-            if added < kd {
-                return Err(AppError::InternalServerError(format!(
-                    "insufficient disk shards to rebuild cshard (need {}, have {})",
-                    kd, added
-                )));
-            }
-
-            let decoded = decoder
-                .decode()
-                .map_err(|e| AppError::InternalServerError(format!("local RS decode: {}", e)))?;
-            for (idx, data) in decoded.restored_original_iter() {
-                if idx < kd {
-                    originals[idx] = Some(data.to_vec());
-                }
-            }
-
-            for maybe in originals {
-                let block = maybe.ok_or_else(|| {
-                    AppError::InternalServerError("missing restored original block".to_string())
-                })?;
-                destination_file
-                    .write_all(block.as_slice())
-                    .await
-                    .map_err(|e| AppError::Io(e, "write local cshard destination".to_string()))?;
-            }
-        }
-    }
-
-    destination_file
-        .set_len(meta.cluster_size_bytes)
-        .await
-        .map_err(|e| AppError::Io(e, "truncate local cshard destination".to_string()))?;
-    destination_file
-        .flush()
-        .await
-        .map_err(|e| AppError::Io(e, "flush local cshard destination".to_string()))?;
-    Ok(meta.cluster_size_bytes as usize)
-}
-
 async fn delete_local_cluster_shard(
     fragment: &str,
     version_id: &str,
@@ -1886,14 +1892,14 @@ async fn fetch_remote_cluster_shard(
         .map_err(|e| AppError::InternalServerError(format!("read remote shard body failed: {}", e)))
 }
 
-async fn fetch_remote_cluster_shard_to_file(
+async fn open_remote_cluster_shard_stream(
     client: &reqwest::Client,
     endpoint: &str,
     fragment: &str,
     version_id: &str,
     cluster_shard_index: usize,
-    destination_path: &StdPath,
-) -> Result<usize, AppError> {
+    expected_size_bytes: usize,
+) -> Result<ClusterShardReadSource, AppError> {
     let base = endpoint.trim_end_matches('/');
     let url = format!(
         "{}/v4/n2/internal/read/{}/{}/{}",
@@ -1915,34 +1921,15 @@ async fn fetch_remote_cluster_shard_to_file(
         )));
     }
 
-    if let Some(parent) = destination_path.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .map_err(|e| AppError::Io(e, format!("mkdir {:?}", parent)))?;
-    }
-    let mut destination_file = fs::File::create(destination_path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("create {:?}", destination_path)))?;
-    let mut written = 0usize;
-    let mut stream = response.bytes_stream();
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|e| {
-            AppError::InternalServerError(format!("read remote shard body chunk failed: {}", e))
-        })?;
-        if chunk.is_empty() {
-            continue;
-        }
-        destination_file
-            .write_all(&chunk)
-            .await
-            .map_err(|e| AppError::Io(e, "write remote staged shard".to_string()))?;
-        written = written.saturating_add(chunk.len());
-    }
-    destination_file
-        .flush()
-        .await
-        .map_err(|e| AppError::Io(e, "flush remote staged shard".to_string()))?;
-    Ok(written)
+    Ok(ClusterShardReadSource::Remote(
+        RemoteClusterShardStreamSource {
+            cluster_shard_index,
+            size_bytes: expected_size_bytes,
+            cursor: 0,
+            pending: BytesMut::new(),
+            stream: Box::pin(response.bytes_stream()),
+        },
+    ))
 }
 
 async fn delete_remote_cluster_shard(
@@ -2174,35 +2161,73 @@ async fn send_reconstructed_stream_err(
         .await;
 }
 
-async fn read_cluster_shard_file_block(
-    file: &mut fs::File,
-    shard_size: usize,
-    stripe_idx: usize,
-    stripe_block_size: usize,
-) -> Result<Vec<u8>, AppError> {
-    let offset = stripe_idx.saturating_mul(stripe_block_size);
-    let mut block = vec![0u8; stripe_block_size];
-    if offset >= shard_size {
-        return Ok(block);
+impl ClusterShardReadSource {
+    fn cluster_shard_index(&self) -> usize {
+        match self {
+            ClusterShardReadSource::Memory(source) => source.cluster_shard_index,
+            ClusterShardReadSource::Remote(source) => source.cluster_shard_index,
+        }
     }
-    let copy_len = (shard_size - offset).min(stripe_block_size);
-    file.seek(SeekFrom::Start(offset as u64))
-        .await
-        .map_err(|e| AppError::Io(e, "seek staged cluster shard file".to_string()))?;
-    file.read_exact(&mut block[..copy_len])
-        .await
-        .map_err(|e| AppError::Io(e, "read staged cluster shard file".to_string()))?;
-    Ok(block)
+
+    fn size_bytes(&self) -> usize {
+        match self {
+            ClusterShardReadSource::Memory(source) => source.bytes.len(),
+            ClusterShardReadSource::Remote(source) => source.size_bytes,
+        }
+    }
+
+    async fn read_block(&mut self, stripe_block_size: usize) -> Result<Vec<u8>, AppError> {
+        match self {
+            ClusterShardReadSource::Memory(source) => {
+                let mut block = vec![0u8; stripe_block_size];
+                if source.cursor >= source.bytes.len() {
+                    return Ok(block);
+                }
+                let copy_len = (source.bytes.len() - source.cursor).min(stripe_block_size);
+                block[..copy_len]
+                    .copy_from_slice(&source.bytes[source.cursor..source.cursor + copy_len]);
+                source.cursor = source.cursor.saturating_add(copy_len);
+                Ok(block)
+            }
+            ClusterShardReadSource::Remote(source) => {
+                let mut block = vec![0u8; stripe_block_size];
+                if source.cursor >= source.size_bytes {
+                    return Ok(block);
+                }
+                let copy_len = (source.size_bytes - source.cursor).min(stripe_block_size);
+                while source.pending.len() < copy_len {
+                    let Some(next_chunk) = source.stream.next().await else {
+                        return Err(AppError::InternalServerError(
+                            "remote cluster shard stream ended early".to_string(),
+                        ));
+                    };
+                    let chunk = next_chunk.map_err(|e| {
+                        AppError::InternalServerError(format!(
+                            "read remote cluster shard stream failed: {}",
+                            e
+                        ))
+                    })?;
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    source.pending.extend_from_slice(chunk.as_ref());
+                }
+                let drained = source.pending.split_to(copy_len);
+                block[..copy_len].copy_from_slice(drained.as_ref());
+                source.cursor = source.cursor.saturating_add(copy_len);
+                Ok(block)
+            }
+        }
+    }
 }
 
-fn reconstruct_object_stream_from_cluster_shard_files(
+fn reconstruct_object_stream_from_cluster_sources(
     kc: usize,
     mc: usize,
     stripe_block_size: usize,
     total_size_bytes: u64,
-    mut sources: Vec<ClusterShardFileSource>,
+    mut sources: Vec<ClusterShardReadSource>,
     range: Option<(u64, u64)>,
-    staged_root: PathBuf,
 ) -> ReceiverStream<Result<Bytes, std::io::Error>> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
     tokio::spawn(async move {
@@ -2217,30 +2242,11 @@ fn reconstruct_object_stream_from_cluster_shard_files(
                     sources.len()
                 )));
             }
-            sources.sort_by_key(|s| s.cluster_shard_index);
+            sources.sort_by_key(|s| s.cluster_shard_index());
             let mut seen_indices = HashSet::new();
-            sources.retain(|s| seen_indices.insert(s.cluster_shard_index));
+            sources.retain(|s| seen_indices.insert(s.cluster_shard_index()));
 
-            let mut staged_files = Vec::<(usize, usize, fs::File)>::new();
-            for source in sources {
-                let file = fs::File::open(source.path.as_path())
-                    .await
-                    .map_err(|e| AppError::Io(e, format!("open {:?}", source.path)))?;
-                staged_files.push((source.cluster_shard_index, source.size_bytes, file));
-            }
-            if staged_files.len() < kc {
-                return Err(AppError::InternalServerError(format!(
-                    "insufficient opened shard files for reconstruction (need {}, have {})",
-                    kc,
-                    staged_files.len()
-                )));
-            }
-
-            let max_shard_size = staged_files
-                .iter()
-                .map(|(_, size, _)| *size)
-                .max()
-                .unwrap_or(0);
+            let max_shard_size = sources.iter().map(ClusterShardReadSource::size_bytes).max().unwrap_or(0);
             if max_shard_size == 0 || total_size_bytes == 0 {
                 return Ok(());
             }
@@ -2252,18 +2258,13 @@ fn reconstruct_object_stream_from_cluster_shard_files(
             for stripe_idx in 0..stripe_count {
                 let stripe_result = if mc == 0 {
                     let mut data_blocks = HashMap::<usize, Vec<u8>>::new();
-                    for (cluster_idx, size_bytes, file) in &mut staged_files {
-                        if *cluster_idx >= kc || data_blocks.contains_key(cluster_idx) {
+                    for source in &mut sources {
+                        let cluster_idx = source.cluster_shard_index();
+                        if cluster_idx >= kc || data_blocks.contains_key(&cluster_idx) {
                             continue;
                         }
-                        let block = read_cluster_shard_file_block(
-                            file,
-                            *size_bytes,
-                            stripe_idx,
-                            stripe_block_size,
-                        )
-                        .await?;
-                        data_blocks.insert(*cluster_idx, block);
+                        let block = source.read_block(stripe_block_size).await?;
+                        data_blocks.insert(cluster_idx, block);
                     }
                     if data_blocks.len() < kc {
                         Err(AppError::InternalServerError(format!(
@@ -2295,19 +2296,14 @@ fn reconstruct_object_stream_from_cluster_shard_files(
                     let mut originals: Vec<Option<Vec<u8>>> = vec![None; kc];
                     let mut added = 0usize;
 
-                    for (cluster_idx, size_bytes, file) in &mut staged_files {
-                        let block = read_cluster_shard_file_block(
-                            file,
-                            *size_bytes,
-                            stripe_idx,
-                            stripe_block_size,
-                        )
-                        .await?;
-                        let add_res = if *cluster_idx < kc {
-                            originals[*cluster_idx] = Some(block.clone());
-                            decoder.add_original_shard(*cluster_idx, &block)
+                    for source in &mut sources {
+                        let cluster_idx = source.cluster_shard_index();
+                        let block = source.read_block(stripe_block_size).await?;
+                        let add_res = if cluster_idx < kc {
+                            originals[cluster_idx] = Some(block.clone());
+                            decoder.add_original_shard(cluster_idx, &block)
                         } else {
-                            decoder.add_recovery_shard(*cluster_idx - kc, &block)
+                            decoder.add_recovery_shard(cluster_idx - kc, &block)
                         };
                         if add_res.is_ok() {
                             added = added.saturating_add(1);
@@ -2383,7 +2379,6 @@ fn reconstruct_object_stream_from_cluster_shard_files(
         if let Err(err) = run {
             send_reconstructed_stream_err(&tx, err).await;
         }
-        let _ = fs::remove_dir_all(&staged_root).await;
     });
     ReceiverStream::new(rx)
 }
@@ -2894,48 +2889,41 @@ pub async fn get_n2_object(
 
     let kc = usize::from(map.params.kc);
     let mc = usize::from(map.params.mc);
-    let staged_root = std::env::temp_dir().join(format!("n2-read-stage-{}", Ulid::new()));
-    fs::create_dir_all(&staged_root)
-        .await
-        .map_err(|e| AppError::Io(e, format!("mkdir {:?}", staged_root)))?;
-
-    let mut staged_sources = Vec::new();
-    for (source_idx, shard) in map.shards.iter().enumerate() {
-        let staged_path = staged_root.join(format!(
-            "cluster_shard_{}_{}.bin",
-            shard.cluster_shard_index, source_idx
-        ));
+    let mut shard_sources = Vec::new();
+    for shard in &map.shards {
         let result = if is_local_target(&NodeDescriptor {
             node_id: shard.node_id.clone(),
             endpoint: shard.endpoint.clone(),
             epoch: map.epoch,
             active: true,
         }) {
-            read_local_cluster_shard_to_file(
+            read_local_cluster_shard(
                 map.object.fragment.as_str(),
                 map.object.version_id.as_str(),
                 shard.cluster_shard_index,
-                staged_path.as_path(),
             )
             .await
+            .map(|bytes| {
+                ClusterShardReadSource::Memory(MemoryClusterShardSource {
+                    cluster_shard_index: shard.cluster_shard_index,
+                    bytes,
+                    cursor: 0,
+                })
+            })
         } else {
-            fetch_remote_cluster_shard_to_file(
+            open_remote_cluster_shard_stream(
                 &http_client,
                 shard.endpoint.as_str(),
                 map.object.fragment.as_str(),
                 map.object.version_id.as_str(),
                 shard.cluster_shard_index,
-                staged_path.as_path(),
+                shard.size_bytes as usize,
             )
             .await
         };
 
         match result {
-            Ok(size_bytes) => staged_sources.push(ClusterShardFileSource {
-                cluster_shard_index: shard.cluster_shard_index,
-                path: staged_path,
-                size_bytes,
-            }),
+            Ok(source) => shard_sources.push(source),
             Err(e) => warn!(
                 "n2 shard read failed fragment={} object_key={} version={} shard={} node={} endpoint={} err={}",
                 map.object.fragment,
@@ -2949,21 +2937,17 @@ pub async fn get_n2_object(
         }
     }
 
-    if staged_sources.len() < kc {
-        let _ = fs::remove_dir_all(&staged_root).await;
+    if shard_sources.len() < kc {
         return Err(AppError::InternalServerError(format!(
             "insufficient cluster shards available for read: need {}, have {}",
             kc,
-            staged_sources.len()
+            shard_sources.len()
         )));
     }
 
     let range = match parse_single_byte_range(&headers, map.total_size_bytes) {
         Ok(v) => v,
-        Err(e) => {
-            let _ = fs::remove_dir_all(&staged_root).await;
-            return Err(e);
-        }
+        Err(e) => return Err(e),
     };
     let (status, content_len, content_range_value) = if let Some((start, end)) = range {
         (
@@ -2974,14 +2958,13 @@ pub async fn get_n2_object(
     } else {
         (StatusCode::OK, map.total_size_bytes, None)
     };
-    let stream = reconstruct_object_stream_from_cluster_shard_files(
+    let stream = reconstruct_object_stream_from_cluster_sources(
         kc,
         mc,
         map.stripe_block_size,
         map.total_size_bytes,
-        staged_sources,
+        shard_sources,
         range,
-        staged_root,
     );
 
     let mut response = Response::new(Body::from_stream(stream));
@@ -3020,26 +3003,16 @@ pub async fn list_n2_objects(
     }
 
     let limit = query.limit.unwrap_or(256).clamp(1, 10_000);
-    let scan_limit = limit.saturating_mul(32).clamp(limit, 100_000);
-    let maps = list_fragment_n2_maps(fragment.as_str(), scan_limit).await?;
+    let continuation = query
+        .continuation
+        .as_ref()
+        .map(|v| v.trim().trim_matches('/').to_string())
+        .filter(|v| !v.is_empty());
+    let scan_limit = limit.saturating_mul(1024).clamp(limit, 1_000_000);
+    let maps = list_fragment_n2_latest_maps(fragment.as_str(), scan_limit).await?;
 
-    let mut latest_by_key: HashMap<String, N2ObjectMap> = HashMap::new();
-    for map in maps {
-        let key = map.object.object_key.clone();
-        if let Some(current) = latest_by_key.get(&key) {
-            let should_replace = map.committed_at > current.committed_at
-                || (map.committed_at == current.committed_at
-                    && map.object.version_id > current.object.version_id);
-            if should_replace {
-                latest_by_key.insert(key, map);
-            }
-        } else {
-            latest_by_key.insert(key, map);
-        }
-    }
-
-    let mut objects = latest_by_key
-        .into_values()
+    let mut objects = maps
+        .into_iter()
         .map(|map| N2ObjectSummary {
             object_key: map.object.object_key,
             latest_version_id: map.object.version_id,
@@ -3051,11 +3024,24 @@ pub async fn list_n2_objects(
         })
         .collect::<Vec<_>>();
     objects.sort_by(|a, b| a.object_key.cmp(&b.object_key));
+
+    if let Some(cursor) = continuation.as_ref() {
+        objects.retain(|object| object.object_key.as_str() > cursor.as_str());
+    }
+
+    let has_more = objects.len() > limit;
+    let next_continuation = if has_more {
+        objects.get(limit - 1).map(|object| object.object_key.clone())
+    } else {
+        None
+    };
     objects.truncate(limit);
 
     Ok(AxumJson(N2ListObjectsResponse {
         fragment,
         limit,
+        continuation: next_continuation,
+        has_more,
         objects,
     }))
 }
@@ -4884,7 +4870,10 @@ mod tests {
         let listed = list_n2_objects(
             full_claims(fragment.as_str()),
             AxumPath(fragment.clone()),
-            AxumQuery(ListN2ObjectsQuery { limit: Some(100) }),
+            AxumQuery(ListN2ObjectsQuery {
+                limit: Some(100),
+                continuation: None,
+            }),
         )
         .await
         .expect("list n2 objects")
@@ -4934,7 +4923,10 @@ mod tests {
         let after_all = list_n2_objects(
             full_claims(fragment.as_str()),
             AxumPath(fragment.clone()),
-            AxumQuery(ListN2ObjectsQuery { limit: Some(100) }),
+            AxumQuery(ListN2ObjectsQuery {
+                limit: Some(100),
+                continuation: None,
+            }),
         )
         .await
         .expect("list n2 objects after deletes")

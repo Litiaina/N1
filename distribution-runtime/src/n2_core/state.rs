@@ -210,6 +210,16 @@ pub async fn get_membership() -> Result<ClusterMembership, AppError> {
     Ok(snapshot)
 }
 
+async fn replace_membership(snapshot: ClusterMembership) -> Result<ClusterMembership, AppError> {
+    validate_membership(&snapshot)?;
+    let lock = membership_lock().await;
+    let mut guard = lock.write().await;
+    let cfg = n2_runtime_config();
+    write_membership_file(cfg.membership_file.as_path(), &snapshot).await?;
+    *guard = snapshot.clone();
+    Ok(snapshot)
+}
+
 pub async fn get_cluster_view(
     expected_epoch: Option<u64>,
 ) -> Result<N2ClusterViewResponse, AppError> {
@@ -235,12 +245,19 @@ pub async fn ensure_cluster_write_ready(
     Ok(view)
 }
 
+#[allow(dead_code)]
 pub async fn upsert_membership(
     request: UpsertMembershipRequest,
 ) -> Result<ClusterMembership, AppError> {
-    let lock = membership_lock().await;
-    let mut guard = lock.write().await;
+    let (_, next) = stage_upsert_membership(request).await?;
+    replace_membership(next).await
+}
 
+pub async fn stage_upsert_membership(
+    request: UpsertMembershipRequest,
+) -> Result<(ClusterMembership, ClusterMembership), AppError> {
+    let lock = membership_lock().await;
+    let guard = lock.read().await;
     let next_epoch = match request.epoch {
         Some(epoch) => {
             if epoch <= guard.epoch {
@@ -262,17 +279,20 @@ pub async fn upsert_membership(
         node.epoch = next_epoch;
     }
     validate_membership(&next)?;
-
-    let cfg = n2_runtime_config();
-    write_membership_file(cfg.membership_file.as_path(), &next).await?;
-
-    *guard = next.clone();
-    Ok(next)
+    Ok((guard.clone(), next))
 }
 
+#[allow(dead_code)]
 pub async fn rollback_membership(epoch: u64) -> Result<ClusterMembership, AppError> {
+    let (_, next) = stage_rollback_membership(epoch).await?;
+    replace_membership(next).await
+}
+
+pub async fn stage_rollback_membership(
+    epoch: u64,
+) -> Result<(ClusterMembership, ClusterMembership), AppError> {
     let lock = membership_lock().await;
-    let mut guard = lock.write().await;
+    let guard = lock.read().await;
     if epoch == 0 {
         return Err(AppError::BadRequest("epoch must be >= 1".to_string()));
     }
@@ -292,10 +312,13 @@ pub async fn rollback_membership(epoch: u64) -> Result<ClusterMembership, AppErr
         AppError::InternalServerError(format!("decode n2 membership snapshot failed: {}", e))
     })?;
     validate_membership(&next)?;
-    write_membership_file(cfg.membership_file.as_path(), &next).await?;
+    Ok((guard.clone(), next))
+}
 
-    *guard = next.clone();
-    Ok(next)
+pub async fn apply_membership_snapshot(
+    membership: ClusterMembership,
+) -> Result<ClusterMembership, AppError> {
+    replace_membership(membership).await
 }
 
 pub async fn resolve_placement(

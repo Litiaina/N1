@@ -88,7 +88,6 @@ pub struct CreateUserRequest {
 pub struct SignupRequest {
     pub email: String,
     pub password: String,
-    pub quota_limit_bytes: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -303,6 +302,7 @@ pub struct ListObjectsResponse {
     pub common_prefixes: Vec<String>,
     pub limit: usize,
     pub offset: usize,
+    pub continuation_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

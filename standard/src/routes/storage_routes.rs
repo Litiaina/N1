@@ -400,7 +400,24 @@ pub fn apply_runtime_http_layers(router: Router<Arc<AppState>>) -> Router<Arc<Ap
         .layer(build_cors_layer())
 }
 
-pub fn build_storage_routes_unbound() -> (Router<Arc<AppState>>, Arc<AppState>) {
+#[derive(Clone, Copy, Debug)]
+pub struct StorageRouteOptions {
+    pub include_object_storage: bool,
+    pub include_legacy_fs: bool,
+}
+
+impl Default for StorageRouteOptions {
+    fn default() -> Self {
+        Self {
+            include_object_storage: true,
+            include_legacy_fs: true,
+        }
+    }
+}
+
+pub fn build_storage_routes_unbound_with_options(
+    options: StorageRouteOptions,
+) -> (Router<Arc<AppState>>, Arc<AppState>) {
     let layers = RateLimitLayers::new();
     let ws_manager = WsConnectionManager::new();
     register_global_ws_manager(ws_manager.clone());
@@ -710,7 +727,7 @@ pub fn build_storage_routes_unbound() -> (Router<Arc<AppState>>, Arc<AppState>) 
     let ping_route = Router::new().route("/ping", get(ping));
     let ping_route = layers.layer_global(ping_route);
 
-    let router = Router::new()
+    let mut router = Router::new()
         .merge(ping_route)
         .merge(fragment_auth_route)
         .merge(fs_auth_route)
@@ -719,11 +736,20 @@ pub fn build_storage_routes_unbound() -> (Router<Arc<AppState>>, Arc<AppState>) 
         .merge(list_fragments_route)
         .merge(global_routes)
         .merge(create_fragment_route)
-        .merge(object_storage_routes)
-        .merge(legacy_fs_routes)
         .merge(ws_routes);
 
+    if options.include_object_storage {
+        router = router.merge(object_storage_routes);
+    }
+    if options.include_legacy_fs {
+        router = router.merge(legacy_fs_routes);
+    }
+
     (router, app_state)
+}
+
+pub fn build_storage_routes_unbound() -> (Router<Arc<AppState>>, Arc<AppState>) {
+    build_storage_routes_unbound_with_options(StorageRouteOptions::default())
 }
 
 pub async fn serve_storage_routes() -> Router {

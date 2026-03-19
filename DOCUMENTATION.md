@@ -14,8 +14,8 @@
 > - `N1` is the shared storage engine used by both deployment shapes.
 > - `standard` is the stable single-node deployment path.
 > - `standard` is released at `0.6.2`.
-> - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path in this workspace.
-> - `registry-runtime` (`registry-server`) is the SQLite-backed Registry layer for user/business metadata and is versioned independently at `0.2.0`.
+> - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path in this workspace and is released at `0.1.1`.
+> - `registry-runtime` (`registry-server`) is the SQLite-backed Registry layer for user/business metadata and is versioned independently at `0.2.1`.
 > - `arc` is experimental for raw-device deployments.
 > - See `DEPLOYMENT_PROFILES.md`.
 >
@@ -113,7 +113,7 @@ Registry base URL example:
 Startup note:
 - if `registry.env` is missing in the current working directory, the Registry creates a template automatically and then stops on the first required unset value
 
-Registry routes available in `0.2.0`:
+Registry routes available in `0.2.1`:
 - `GET /health`
 - `POST /v1/admin/bootstrap`
 - `POST /v1/admin/auth/login`
@@ -208,7 +208,7 @@ Request shape:
 ```
 
 Notes:
-- `otp` is only required when the admin account has 2FA enabled
+- `otp` is only required when the account has 2FA enabled
 - successful login returns both access and refresh tokens
 
 ### 1.1.3 Registry session lifecycle

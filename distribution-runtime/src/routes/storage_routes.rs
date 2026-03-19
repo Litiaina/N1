@@ -5,7 +5,7 @@ use crate::n1_core::operation_gate::{
 };
 use crate::n2_core::api::{
     get_n2_cluster_view, get_n2_cluster_view_public, get_n2_membership, put_n2_membership,
-    resolve_n2_placement, rollback_n2_membership,
+    put_n2_internal_membership, resolve_n2_placement, rollback_n2_membership,
 };
 use crate::n2_core::data_plane::{
     delete_n2_object, get_n2_object, list_n2_object_versions, list_n2_objects,
@@ -18,7 +18,9 @@ use axum::Router;
 use axum::middleware::from_fn;
 use axum::routing::{delete, get, post, put};
 pub use standard::routes::storage_routes::AppState;
-use standard::routes::storage_routes::{apply_runtime_http_layers, build_storage_routes_unbound};
+use standard::routes::storage_routes::{
+    StorageRouteOptions, apply_runtime_http_layers, build_storage_routes_unbound_with_options,
+};
 use std::sync::Arc;
 
 fn public_n2_routes(layers: &RateLimitLayers) -> Router<Arc<AppState>> {
@@ -112,14 +114,18 @@ fn internal_n2_routes(layers: &RateLimitLayers) -> Router<Arc<AppState>> {
         .route(
             "/v4/n2/internal/map/{:fragment}",
             delete(n2_internal_delete_map),
-        );
+        )
+        .route("/v4/n2/internal/membership", put(put_n2_internal_membership));
 
     layers.layer_global(routes)
 }
 
 pub async fn serve_storage_routes() -> Router {
     let layers = RateLimitLayers::new();
-    let (base_router, app_state) = build_storage_routes_unbound();
+    let (base_router, app_state) = build_storage_routes_unbound_with_options(StorageRouteOptions {
+        include_object_storage: false,
+        include_legacy_fs: false,
+    });
 
     apply_runtime_http_layers(
         base_router
