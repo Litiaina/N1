@@ -1,6 +1,5 @@
 pub use standard::{
-    enums, fs, fuse, handlers, middleware, n1_core, settings, smb, statics, structs, utils,
-    validation, websocket,
+    enums, fs, fuse, handlers, middleware, n1_core, smb, statics, structs, utils, websocket,
 };
 
 use crate::fs::cleanup_manager::interval_cleanup;
@@ -19,10 +18,6 @@ use crate::n1_core::object_parser::{
     ADAPTIVE_STREAM_TARGET_ATOMIC, STREAM_CHUNK_SIZE_ATOMIC, STREAM_LOCALITY_BIAS_ENABLED_ATOMIC,
     STREAM_MAX_CONCURRENCY, STREAM_READAHEAD_BYTES_ATOMIC,
 };
-use crate::n1_core::prefix_compactor::{
-    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC, PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC,
-};
-use crate::n1_core::retrieve::PREFIX_MAX_DELTA_SEGMENTS_ATOMIC;
 use crate::n1_core::upload::{
     ADAPTIVE_IO_TARGET_ATOMIC, DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC,
     PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC,
@@ -37,8 +32,10 @@ use axum_server::tls_rustls::RustlsConfig;
 use chrono::Local;
 use ini::Ini;
 use std::collections::HashSet;
+use std::fs as stdfs;
+use std::fs::OpenOptions;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::Arc;
@@ -50,6 +47,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 mod n2_core;
 mod routes;
+mod settings;
+mod validation;
 fn detect_cpu_cores() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -321,42 +320,6 @@ fn detect_unique_storage_devices(paths: &[String]) -> usize {
     unique.len().max(1)
 }
 
-fn adaptive_prefix_max_delta_segments(cpu_cores: usize) -> usize {
-    if cpu_cores <= 2 {
-        256
-    } else if cpu_cores <= 4 {
-        512
-    } else if cpu_cores <= 8 {
-        1024
-    } else {
-        2048
-    }
-}
-
-fn adaptive_prefix_compact_trigger_segments(cpu_cores: usize) -> usize {
-    if cpu_cores <= 2 {
-        64
-    } else if cpu_cores <= 4 {
-        128
-    } else if cpu_cores <= 8 {
-        256
-    } else {
-        512
-    }
-}
-
-fn adaptive_prefix_compact_min_interval_seconds(cpu_cores: usize) -> usize {
-    if cpu_cores <= 2 {
-        60
-    } else if cpu_cores <= 4 {
-        45
-    } else if cpu_cores <= 8 {
-        30
-    } else {
-        15
-    }
-}
-
 fn adaptive_concurrency_interval_ms(cpu_cores: usize, ram_bytes: Option<u64>) -> usize {
     if cpu_cores <= 2 || ram_gib(ram_bytes) <= 4 {
         1500
@@ -501,11 +464,134 @@ async fn validate_n2_startup_layout(local_blob_roots: usize) {
     }
 }
 
+fn warn_if_running_as_root(binary: &str) {
+    #[cfg(unix)]
+    unsafe {
+        if libc::geteuid() == 0 {
+            eprintln!(
+                "warning: {binary} is running as root. This is allowed, but a non-root service user is preferred to avoid root-owned runtime state."
+            );
+        }
+    }
+}
+
+fn probe_directory_writable(dir: &Path, label: &str) -> Result<(), String> {
+    let probe_name = format!(
+        ".n2-write-check-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let probe_path = dir.join(probe_name);
+    stdfs::write(&probe_path, b"ok")
+        .map_err(|err| format!("{label} '{}' is not writable: {}", dir.display(), err))?;
+    let _ = stdfs::remove_file(&probe_path);
+    Ok(())
+}
+
+fn ensure_readable_file(path: &Path, label: &str) -> Result<(), String> {
+    let meta = stdfs::metadata(path)
+        .map_err(|err| format!("{label} '{}' is not accessible: {}", path.display(), err))?;
+    if !meta.is_file() {
+        return Err(format!("{label} '{}' is not a file", path.display()));
+    }
+    OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|err| format!("{label} '{}' is not readable: {}", path.display(), err))?;
+    Ok(())
+}
+
+fn ensure_existing_writable_dir(path: &Path, label: &str) -> Result<(), String> {
+    let meta = stdfs::metadata(path)
+        .map_err(|err| format!("{label} '{}' is not accessible: {}", path.display(), err))?;
+    if !meta.is_dir() {
+        return Err(format!("{label} '{}' is not a directory", path.display()));
+    }
+    probe_directory_writable(path, label)
+}
+
+fn ensure_generated_file_target(path: &Path, label: &str) -> Result<(), String> {
+    if path.exists() {
+        return ensure_readable_file(path, label);
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    stdfs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "{label} parent '{}' could not be created: {}",
+            parent.display(),
+            err
+        )
+    })?;
+    probe_directory_writable(parent, &format!("{label} parent"))
+}
+
+fn validate_bootstrap_targets() -> Result<(), String> {
+    ensure_generated_file_target(Path::new(ENV_FILE), "N2 env file")?;
+    ensure_generated_file_target(Path::new(CONFIG_FILE), "N2 config file")?;
+    Ok(())
+}
+
+fn validate_runtime_paths(config: &Ini) -> Result<(), String> {
+    let server_section = config
+        .section(Some("server"))
+        .ok_or_else(|| format!("Missing [server] section in {}", CONFIG_FILE))?;
+    let cert_path = PathBuf::from(server_section.get("cert_path").unwrap_or("cert.pem"));
+    let key_path = PathBuf::from(server_section.get("key_path").unwrap_or("key.pem"));
+    ensure_readable_file(&cert_path, "N2 TLS certificate")?;
+    ensure_readable_file(&key_path, "N2 TLS key")?;
+
+    let disk_section = config.section(Some("disk_config"));
+    let fs_storage_path = PathBuf::from(
+        disk_section
+            .and_then(|s| s.get("fs_storage_path"))
+            .unwrap_or("fs-storage-path"),
+    );
+    ensure_existing_writable_dir(&fs_storage_path, "N2 fs_storage_path")?;
+
+    let refresh_store_root = std::env::var("N1_REFRESH_STORE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| fs_storage_path.join(".auth").join("refresh_sessions"));
+    stdfs::create_dir_all(&refresh_store_root).map_err(|err| {
+        format!(
+            "N2 refresh session store '{}' could not be created: {}",
+            refresh_store_root.display(),
+            err
+        )
+    })?;
+    probe_directory_writable(&refresh_store_root, "N2 refresh session store")?;
+
+    let index_store_str = disk_section
+        .and_then(|s| s.get("index_store_disks"))
+        .ok_or_else(|| "Missing index_store_disks in [disk_config]".to_string())?;
+    for root in index_store_str.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        ensure_existing_writable_dir(Path::new(root), "N2 index_store_disks entry")?;
+    }
+
+    let blob_store_str = disk_section
+        .and_then(|s| s.get("blob_store_disks"))
+        .ok_or_else(|| "Missing blob_store_disks in [disk_config]".to_string())?;
+    for root in blob_store_str.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        ensure_existing_writable_dir(Path::new(root), "N2 blob_store_disks entry")?;
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install 'ring' as the default TLS provider.");
+
+    warn_if_running_as_root("litiaina-n2");
+
+    if let Err(e) = validate_bootstrap_targets() {
+        eprintln!("N2 startup failed: {}", e);
+        return;
+    }
 
     if let Err(e) = ensure_env_file() {
         tracing::error!("Failed to ensure .env file: {}", e);
@@ -551,6 +637,10 @@ async fn main() {
 pub async fn run_server() {
     let config =
         Ini::load_from_file(CONFIG_FILE).expect(format!("Failed to load {}", CONFIG_FILE).as_str());
+
+    if let Err(err) = validate_runtime_paths(&config) {
+        panic!("N2 startup validation failed: {}", err);
+    }
 
     let server_section = config.section(Some("server")).unwrap_or_else(|| {
         panic!("Missing [server] section in {}", CONFIG_FILE);
@@ -868,50 +958,6 @@ pub async fn run_server() {
         "Adaptive concurrency: enabled={} interval_ms={}",
         adaptive_concurrency_enabled,
         adaptive_concurrency_interval_ms
-    );
-
-    let prefix_max_delta_segments = parse_usize_or_auto(
-        upload_section.and_then(|s| s.get("prefix_max_delta_segments")),
-        "prefix_max_delta_segments",
-        adaptive_prefix_max_delta_segments(cpu_cores),
-    )
-    .clamp(32, 65_536);
-
-    PREFIX_MAX_DELTA_SEGMENTS_ATOMIC
-        .set(AtomicUsize::new(prefix_max_delta_segments))
-        .expect("Double initialization of PREFIX_MAX_DELTA_SEGMENTS_ATOMIC");
-
-    tracing::info!(
-        "Prefix tuning: max_delta_segments={}",
-        prefix_max_delta_segments
-    );
-
-    let prefix_compact_trigger_segments = parse_usize_or_auto(
-        upload_section.and_then(|s| s.get("prefix_compact_trigger_segments")),
-        "prefix_compact_trigger_segments",
-        adaptive_prefix_compact_trigger_segments(cpu_cores),
-    )
-    .clamp(8, 131_072);
-
-    PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-        .set(AtomicUsize::new(prefix_compact_trigger_segments))
-        .expect("Double initialization of PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC");
-
-    let prefix_compact_min_interval_seconds = parse_usize_or_auto(
-        upload_section.and_then(|s| s.get("prefix_compact_min_interval_seconds")),
-        "prefix_compact_min_interval_seconds",
-        adaptive_prefix_compact_min_interval_seconds(cpu_cores),
-    )
-    .clamp(1, 3600);
-
-    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-        .set(AtomicU64::new(prefix_compact_min_interval_seconds as u64))
-        .expect("Double initialization of PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC");
-
-    tracing::info!(
-        "Prefix compaction tuning: trigger_segments={} min_interval={}s",
-        prefix_compact_trigger_segments,
-        prefix_compact_min_interval_seconds
     );
 
     let monitor_interval_seconds = parse_usize_or_auto(

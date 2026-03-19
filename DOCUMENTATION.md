@@ -9,12 +9,13 @@
   <p>Unified route reference for the N2 platform. N1 remains the shared node-core engine.</p>
 </div>
 
-> Deployment profile status (2026-03-13):
+> Deployment profile status (2026-03-19):
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used by both deployment shapes.
 > - `standard` is the stable single-node deployment path.
-> - `standard` is released at `0.5.2`.
+> - `standard` is released at `0.6.0`.
 > - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path in this workspace.
+> - `registry-runtime` (`registry-server`) is the SQLite-backed Registry layer for user/business metadata.
 > - `arc` is experimental for raw-device deployments.
 > - See `DEPLOYMENT_PROFILES.md`.
 >
@@ -53,16 +54,15 @@
 > - Each object or session hashes to one metadata partition with one owner root plus one replica root when multiple index roots exist.
 > - The owner root is the synchronous ACK boundary for object/session writes.
 > - Replica roots are replica-behind durability copies and may lag briefly until repair/replay catches them up.
-> - Prefix and delimiter listing are served from a derived root full-key accelerator with inline list payload.
+> - Engine-side object and trash listing are flat scans over authoritative latest-object state.
 > - Legacy mirrored object/session trees are no longer the hot-path authority.
 > - Same-key upload recency comes from the upload session's `created_at`; finalize does not get to reorder versions.
 > - If two versions share the same second-level timestamp, ULID `version_id` order breaks the tie.
 > - Exact-key reads resolve the latest marker and then rehydrate the referenced immutable version record before serving metadata or bytes.
-> - Prefix-serving state may lag, but it must never override or invent visibility that `index` does not contain.
 > - Multipart uploads do not rely on in-memory part state for resumability. Part commits are durably recorded in the `index` WAL/session state and mirrored as per-part metadata files for compatibility and recovery workflows.
 
 > Release status note:
-> - N1 `standard` is stable at `0.5.2`; `arc` is experimental.
+> - N1 `standard` is stable at `0.6.0`; `arc` is experimental.
 > - This document describes the current implementation and current routes.
 > - Request/response details and endpoint layout may still change before `1.0.0` even though the underlying storage model is now fixed.
 
@@ -70,7 +70,7 @@
 
 | Dimension | Standard (`litiaina-n1-standard`) | Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / default (`0.5.2`) | Experimental / raw-device profile |
+| Status | Stable / default (`0.6.0`) | Experimental / raw-device profile |
 | API source of truth | Yes (`standard/src/routes/storage_routes.rs`) | Yes (`arc/src/routes/storage_routes.rs`) |
 | `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw devices / loopback files |
@@ -104,6 +104,89 @@ Arc index note:
 - Most fragment-scoped routes enforce `claims.fragment == {fragment}`
 - Object key path captures use `{*object_key}` and support slash-separated keys
 - Range requests use standard `Range: bytes=start-end`
+
+## 1.1 Registry Runtime (`registry-server`)
+
+Registry base URL example:
+- `https://127.0.0.1:51001`
+
+Startup note:
+- if `registry.env` is missing in the current working directory, the Registry creates a template automatically and then stops on the first required unset value
+
+Registry routes introduced for `0.6.0`:
+- `GET /health`
+- `POST /v1/admin/users`
+- `POST /v1/auth/signup`
+- `POST /v1/auth/login`
+- `GET /v1/me`
+- `GET /v1/fragments`
+- `POST /v1/fragments/link`
+- `POST /v1/storage/session`
+- `POST /v1/objects/register`
+- `POST /v1/objects/finalize`
+- `GET /v1/objects/suggest`
+- `POST /v1/objects/rename`
+- `POST /v1/objects/trash`
+- `POST /v1/objects/recover`
+- `DELETE /v1/objects`
+- `GET /v1/objects`
+- `GET /v1/objects/resolve`
+
+Registry responsibilities:
+- user creation and login
+- user quota accounting
+- ownership metadata
+- logical listing/filtering
+- prefix/delimiter browsing for Registry-backed clients
+- fragment binding to a `single_node` or `multi_node` storage backend
+- brokering short-lived storage sessions so the Drive UI does not need fragment secrets
+- exact-key logical resolution before talking to the storage engine
+
+Current Registry backing store:
+- SQLite in both single-node and multi-node deployments
+
+Registry-backed Drive split:
+- `/drive` talks to the Registry for business behavior and receives short-lived storage sessions
+- `/storage` remains the raw N1 explorer and talks to the engine directly
+
+### 1.1.1 `GET /v1/fragments`
+Purpose:
+- lists the caller's known fragments
+- returns any saved fragment backend bindings for Drive
+
+### 1.1.2 `POST /v1/fragments/link`
+Purpose:
+- binds a fragment to the storage backend Drive should use
+
+Request shape:
+```json
+{
+  "fragment": "<fragment_hash>",
+  "deployment": "single_node",
+  "engine_url_override": "https://optional-backend.example"
+}
+```
+
+Notes:
+- `deployment` must be either `single_node` or `multi_node`
+- `engine_url_override` is optional; if omitted, the Registry uses its configured default backend for that deployment type
+
+### 1.1.3 `POST /v1/storage/session`
+Purpose:
+- asks the Registry to mint a short-lived fragment access session against the linked storage backend
+- used by the Registry-backed Drive UI for upload/download/rename/delete/recover without exposing fragment secrets in the browser
+
+Response shape:
+```json
+{
+  "fragment": "<fragment_hash>",
+  "deployment": "single_node",
+  "engine_url": "https://storage.example",
+  "access_token": "<fragment_jwt>",
+  "token_type": "Bearer",
+  "expires_in": 900
+}
+```
 
 ## 2. Auth APIs
 
@@ -391,27 +474,32 @@ Notes:
 - Internal marker keys (for example `.n1fsd_dir`, `.n1-trash`) are hidden unless `include_internal=true`.
 - Normal serving path uses the root full-key accelerator under `index/__p__/...`.
 - The accelerator stores sorted full-key rows with inline list payload.
-- `delimiter=/` rows are derived at read time from those full keys; the server does not maintain ancestor-prefix buckets on every mutation.
-- If the accelerator is missing, the node rebuilds it from authoritative `index` metadata before serving the request.
-- Non-prefix full listing pagination is partition-native and projected from authoritative index metadata (no legacy hash-tree walk).
-- Prefix rows carry inline list payload, so successful prefix hits avoid reopening object metadata for every returned row.
+- Listing is flat only.
+- Supported query params:
+  - `limit`
+  - `continuation_token`
+  - `include_internal`
+- Unsupported in `0.6.0` engine mode:
+  - `prefix`
+  - `delimiter`
+- Namespace browsing, folder simulation, and filtered views belong in the registry layer above the engine.
 
 Response shape (`ListObjectsResult`):
 - `objects`: array of `ObjectMetadata`
-- `common_prefixes`: array (with delimiter listing)
+- `common_prefixes`: always empty in engine flat-list mode
 - `continuation_token`: optional
 
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/fragment/objects?prefix=videos/2026&delimiter=/&limit=200"
+  "https://127.0.0.1:50001/v4/fragment/objects?limit=200"
 ```
 
 ### 6.4 `GET /v4/fragment/trash`
 Trash listing, same pagination style.
 - Supports the same `include_internal` query behavior as object listing.
 - Trash visibility comes from `index` trash state.
-- Trash listing is partition-native (no legacy hash-tree scan). It projects latest trashed state per key from authoritative index trash metadata.
-- `continuation_token` is opaque. For delimiter trash listing it is a row cursor, so clients must pass it through unchanged.
+- Trash listing is flat only and projects latest trashed state per key from authoritative index trash metadata.
+- `continuation_token` is opaque and must be passed through unchanged.
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/trash?limit=100"

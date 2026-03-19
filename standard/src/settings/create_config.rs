@@ -52,28 +52,12 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("stream_chunk_size", "auto")
         .set("stream_readahead_bytes", "auto")
         .set("stream_locality_bias_enabled", "true")
-        .set("prefix_max_delta_segments", "auto")
-        .set("prefix_compact_trigger_segments", "auto")
-        .set("prefix_compact_min_interval_seconds", "auto")
         .set("monitor_interval_seconds", "auto")
         .set("monitor_deep_scan_interval_seconds", "auto")
         .set("max_part_size", "52428800")
         .set("data_shards", "1")
         .set("parity_shards", "0")
         .set("stripe_block_size", "262144");
-
-    conf.with_section(Some("n2"))
-        .set("node_id", "node-1")
-        .set("node_endpoint", "https://127.0.0.1:50001")
-        .set("cluster_membership_file", "n2_cluster_membership.json")
-        .set("internal_token", "change-me-n2-internal-token")
-        .set("auto_cross_params", "true")
-        .set("cluster_stripe_block_size", "262144")
-        .set("remote_request_timeout_ms", "60000")
-        .set("kc", "1")
-        .set("mc", "0")
-        .set("kd", "1")
-        .set("md", "0");
 
     conf.with_section(Some("smb"))
         .set("enabled", "false")
@@ -125,38 +109,23 @@ mod tests {
     }
 
     #[test]
-    fn default_config_includes_n2_keys() {
+    fn default_config_excludes_n2_section() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "n2-default-config-{}-{}.ini",
+            "n1-default-config-no-n2-{}-{}.ini",
             std::process::id(),
             unique
         ));
 
         create_default_config_ini(&path).expect("create default config");
         let ini = Ini::load_from_file(&path).expect("load generated config");
-        let n2 = ini.section(Some("n2")).expect("n2 section");
-
-        assert_eq!(n2.get("node_id"), Some("node-1"));
-        assert_eq!(n2.get("node_endpoint"), Some("https://127.0.0.1:50001"));
-        assert_eq!(
-            n2.get("cluster_membership_file"),
-            Some("n2_cluster_membership.json")
+        assert!(
+            ini.section(Some("n2")).is_none(),
+            "N1 config should not generate an [n2] section"
         );
-        assert_eq!(
-            n2.get("internal_token"),
-            Some("change-me-n2-internal-token")
-        );
-        assert_eq!(n2.get("auto_cross_params"), Some("true"));
-        assert_eq!(n2.get("cluster_stripe_block_size"), Some("262144"));
-        assert_eq!(n2.get("remote_request_timeout_ms"), Some("60000"));
-        assert_eq!(n2.get("kc"), Some("1"));
-        assert_eq!(n2.get("mc"), Some("0"));
-        assert_eq!(n2.get("kd"), Some("1"));
-        assert_eq!(n2.get("md"), Some("0"));
 
         let _ = fs::remove_file(path);
     }

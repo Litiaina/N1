@@ -45,10 +45,6 @@ use crate::n1_core::disk_manager::{
 };
 use crate::n1_core::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::n1_core::index;
-use crate::n1_core::metadata_parser::get_metadata;
-use crate::n1_core::prefix_updates::{
-    object_key_directory_scopes, write_prefix_entries_update_for_prefix,
-};
 use crate::n1_core::quota_manager::ensure_capacity_available;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -1329,7 +1325,6 @@ pub async fn upload_object_one_shot(
 
     let version_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
-    let had_live_before = matches!(get_metadata(&fragment, &object_key, &fragment).await, Ok(meta) if !meta.is_delete_marker);
     let expected_checksum = query
         .checksum
         .as_deref()
@@ -1372,8 +1367,6 @@ pub async fn upload_object_one_shot(
 
     index::publish_object(&object_meta).await?;
 
-    write_prefix_segments_on_roots(&object_meta, if had_live_before { 0 } else { 1 }).await?;
-
     let response_body = serde_json::to_value(&object_meta).map_err(|e| {
         AppError::InternalServerError(format!("serialize one-shot upload response: {}", e))
     })?;
@@ -1384,25 +1377,6 @@ pub async fn upload_object_one_shot(
     state.emit(&fragment, StorageEventPayload::FileUploaded(stripped_meta));
 
     Ok((StatusCode::CREATED, AxumJson(response_body)).into_response())
-}
-
-async fn write_prefix_segments_on_roots(
-    metadata: &ObjectMetadata,
-    _child_count_delta: i64,
-) -> Result<(), AppError> {
-    let scopes = object_key_directory_scopes(&metadata.object_key);
-    for scope in scopes {
-        write_prefix_entries_update_for_prefix(
-            &metadata.fragment,
-            &scope,
-            &metadata.version_id,
-            vec![crate::n1_core::disk_manager::PrefixIndexEntry::from_metadata(metadata)],
-            false,
-        )
-        .await?;
-    }
-
-    Ok(())
 }
 
 pub async fn finalize_object_upload(
@@ -1421,7 +1395,6 @@ pub async fn finalize_object_upload(
 
     let object_key = key_query.object_key;
     let path_manager = ObjectPathManager::new();
-    let had_live_before = matches!(get_metadata(&fragment, &object_key, &fragment).await, Ok(meta) if !meta.is_delete_marker);
 
     if index::read_object_version(&fragment, &object_key, &version_id)
         .await
@@ -1536,8 +1509,6 @@ pub async fn finalize_object_upload(
     };
 
     index::publish_object(&object_meta).await?;
-
-    write_prefix_segments_on_roots(&object_meta, if had_live_before { 0 } else { 1 }).await?;
 
     let _ = index::remove_session(&fragment, &version_id, "finalized").await;
 

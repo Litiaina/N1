@@ -1,15 +1,16 @@
 # N2 Architecture
 
-> Deployment profile status (2026-03-13):
+> Deployment profile status (2026-03-19):
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used underneath both deployment shapes.
 > - `standard` is the stable single-node deployment profile.
-> - `standard` is released at `0.5.2`.
+> - `standard` is released at `0.6.0`.
 > - `distribution-runtime` is the multi-node N2 deployment profile.
+> - `registry-runtime` is the SQLite-backed Registry/business layer.
 > - `arc` is an experimental raw-device deployment profile.
 > - See `DEPLOYMENT_PROFILES.md`.
 
-N2 has two deployment shapes:
+N2 has three runtime pieces in this workspace:
 
 - single-node N2:
   - run `standard`
@@ -17,26 +18,39 @@ N2 has two deployment shapes:
 - multi-node N2:
   - run `distribution-runtime`
   - use that same N1 engine on each node, then add cluster membership, placement, and peer traffic
+- registry layer:
+  - run `registry-runtime`
+  - keep user/business metadata out of the storage engine
+  - use SQLite for both single-node and multi-node deployments
 
-At the node layer, N1 is a single-node object storage engine with three distinct planes:
+At the node layer, N1 is a single-node object storage engine with two distinct storage planes:
 
 - `index` is the authoritative object, session, and trash metadata plane.
-- The prefix namespace index is a derived serving accelerator for `LIST prefix` and `delimiter=/`.
 - The blob plane is profile-specific:
   - `standard`: filesystem-backed shard files under blob roots.
   - `arc`: raw-device/direct-I/O payload plane with raw index authority.
+
+At the platform layer, `registry-runtime` owns the business plane:
+
+- users
+- ownership
+- quotas
+- logical listing/filtering
+- folder/prefix simulation for clients
+- fragment backend bindings
+- storage-session brokering for Registry-backed clients
 
 This replaces the legacy "full mirrored metadata tree on every index root" model. The node is still single-node, but its metadata authority is now partitioned instead of whole-node mirrored.
 
 ## Freeze Status
 
-The current production architecture baseline is `standard 0.5.2`.
+The current production architecture baseline is `standard 0.6.0`.
 
 That baseline applies to:
 
 - filesystem-backed authoritative `index`
 - partitioned + replicated metadata ownership
-- projected namespace serving derived from `index`
+- registry-owned namespace/business serving above `index`
 - stateless resumability through authoritative session state
 - profile-specific payload substrate (`standard` filesystem-backed blob roots, `arc` raw blob devices)
 
@@ -62,7 +76,7 @@ They are expected to keep the same storage semantics. The difference is backend 
 
 | Dimension | Standard | Arc |
 |---|---|---|
-| Status | Stable/default (`0.5.2`) | Experimental raw-device profile |
+| Status | Stable/default (`0.6.0`) | Experimental raw-device profile |
 | `index_store_disks` | Filesystem directories | Raw devices |
 | `blob_store_disks` | Filesystem directories | Raw devices |
 | Index backend | Partitioned filesystem metadata | Raw index catalog (`block_manager`) |
@@ -76,11 +90,10 @@ Arc development is now targeting a raw-only storage-kernel model (`index` + `blo
 
 ## Platform Truth
 
-- Exact-key reads, finalize, delete, recover, GC, repair, and prefix rebuild all resolve against `index`.
+- Exact-key reads, finalize, delete, recover, GC, repair, redistribution, and flat listing all resolve against `index`.
 - Each object key hashes to one metadata partition. Each partition selects one owning index root and one replica root when more than one root exists.
 - Session state is partitioned separately by `fragment + version_id`, which keeps resumable upload state bounded to the session's selected roots.
 - Multipart part truth stays on disk: part uploads write durable part metadata, and a pending-part receipt covers the crash window before that metadata exists.
-- The prefix index is not the source of truth. It is a rebuildable namespace-serving structure with inline list payload.
 - Blob payload durability (file shards in standard, raw extents in arc) does not make an object visible until `index` publishes the version.
 
 ## Why The Legacy Mirrored Index Had To Go
@@ -89,7 +102,7 @@ The legacy layout made every node-level metadata mutation expensive:
 
 - final publish fanned object metadata out across mirrored roots
 - session and part state lived in a separate mirrored tree
-- prefix listing shared the same metadata surface as exact-key reads
+- namespace-serving logic shared the same metadata surface as exact-key reads
 - repair and GC had to reconcile multiple partially authoritative trees
 
 That model was durable, but once the blob plane became fast enough, the node ceiling moved to the metadata mirrors. The old design improved safety, not write scalability.
@@ -107,15 +120,34 @@ That model was durable, but once the blob plane became fast enough, the node cei
 
 Writes target the partition's selected roots, not every index root in the node.
 
-### 2. Prefix namespace plane
+### 2. Registry plane
 
-The prefix subsystem remains filesystem-backed, but it is no longer authoritative. It exists to serve:
+The Registry plane is where namespace and business logic now belongs:
 
-- `LIST prefix`
-- `LIST prefix delimiter=/`
-- archive selection by prefix
+- `LIST` by logical owner/query
+- folder/prefix simulation
+- metadata filtering
+- quota/accounting
+- exact-key logical lookup before engine access
+- binding a fragment to either a `single_node` or `multi_node` storage backend
+- issuing short-lived storage sessions to browser clients
 
-Prefix rows now carry inline list metadata, and `standard` serves them from a root full-key accelerator. Mutations update only full-key rows; delimiter/common-prefix views are derived during the read path instead of being maintained as ancestor-prefix state. A prefix hit can serve list results without reopening object metadata per row. If the accelerator is missing, the node rebuilds that fragment from authoritative `index` metadata and then serves the request from the rebuilt accelerator.
+In `0.6.0`, the Registry is introduced as a dedicated binary. The engine contract is flat, exact-key-oriented object storage, while client-facing namespace behavior moves into the Registry layer.
+
+Registry-backed Drive flow:
+
+1. user logs in to the Registry with email/password
+2. Drive selects or links a fragment to a storage deployment:
+   - `single_node`
+   - `multi_node`
+3. Drive requests a short-lived storage session from the Registry
+4. Registry authenticates against the linked engine backend using its configured master access
+5. Registry returns:
+   - engine URL
+   - short-lived fragment access token
+6. browser sends object bytes directly to the engine
+
+That keeps the Registry as the control plane and the engine as the direct data plane.
 
 ### 3. Blob plane
 
@@ -154,18 +186,10 @@ Notes:
 - the owner root is the synchronous ACK boundary for object/session state
 - replica writes are intentionally replica-behind and may lag briefly until repair/replay catches up
 
-### Prefix namespace index
+### Engine Listing
 
-The serving index remains under the prefix tree on index disks, but `standard` now treats it as a
-root full-key accelerator instead of one eagerly-maintained bucket per ancestor prefix:
-
-```text
-{INDEX_ROOT}/{fragment}/index/__p__/v1/pfx/{p1}/{p2}/{root_prefix_hash}/
-  compacted.msgpack
-  seg_<id>.msgpack
-```
-
-This plane stores serving snapshots only. Live and trash listing each use one root accelerator bucket, and the node can rebuild that bucket from authoritative `index` whenever serving state needs regeneration.
+The engine no longer carries a prefix-serving plane. Engine-side listing is flat over authoritative
+object state, and namespace browsing is handled by the Registry layer.
 
 ### Blob storage
 
@@ -300,16 +324,16 @@ This keeps image-heavy gallery browsing efficient without changing the core obje
 - no thumbnail entries in normal object listing
 - no extra user-visible object versions
 
-### Prefix and delimiter listing
+### Flat engine listing
 
-`LIST` is intentionally separated from exact-key truth:
+`LIST` in the engine is now intentionally flat:
 
-- normal serving path is the root full-key accelerator
-- rows include inline list metadata
-- delimiter rows materialize the folder illusion without real directories
-- if the accelerator is missing, the node rebuilds it from authoritative `index` metadata before serving the request
+- the storage engine returns object rows only
+- there is no engine-side prefix filtering
+- there is no delimiter or folder simulation
+- registry-backed products own namespace and business filtering above the engine
 
-That keeps exact-key correctness and namespace serving performance independent.
+That keeps exact-key correctness and engine listing on the same authority source: `index`.
 
 ## Maintenance Path
 
@@ -319,13 +343,11 @@ All major maintenance flows now share the same authority source:
 - repair reconciles partition replicas and blob availability from `index`
 - redistribution republishes moved shard addresses through `index`
 - GC expires trash versions and abandoned sessions through `index`
-- prefix rebuild regenerates namespace segments from `index`
 - health reporting reflects partitioned authority instead of expecting full-root mirrored equality
 
 ## Durability Invariants
 
 - A version is visible only after its owner-root `index` publish succeeds.
-- Prefix rows must never invent visibility that `index` does not contain.
 - Raw extents without live session or object metadata are cleanup candidates, not visible data.
 - Replica divergence is repairable, but the owner-acknowledged `index` state wins until replicas reconverge.
 - Full-root byte-for-byte metadata equality is no longer an invariant. Partition ownership and replica survivability are the invariant.
@@ -336,8 +358,6 @@ All major maintenance flows now share the same authority source:
 - When second-level `created_at` timestamps tie, ULID `version_id` order is the tiebreaker for latest selection.
 - Publish may write an immutable version file for an older version, but it must not advance the `latest` marker unless that version actually wins the recency comparison.
 - Exact-key reads treat the `latest` marker as a routing hint and rehydrate the referenced immutable version record before serving metadata or bytes.
-- Prefix and delimiter rows remain derived serving state. They can lag `index`, but they must never override or invent exact-key truth.
-
 ## Why This Design Is More Future-Proof
 
 This architecture gives N1 a better long-term shape than the legacy mirrored tree for five reasons:
@@ -345,11 +365,11 @@ This architecture gives N1 a better long-term shape than the legacy mirrored tre
 1. Metadata write fanout is bounded.
    Publish and session writes hit the owning partition roots, not every index root on the node.
 
-2. Exact-key truth is separated from namespace serving.
-   `GET` and `HEAD` no longer depend on the same structure that powers prefix listing.
+2. Exact-key truth and engine listing share one authority source.
+   `GET`, `HEAD`, and flat `LIST` all resolve from authoritative `index` state.
 
 3. Maintenance has one authority source.
-   Repair, GC, sync, and rebuild no longer need to guess between mirrored object trees and session trees.
+   Repair, GC, and sync no longer need to guess between mirrored object trees and session trees.
 
 4. The model can evolve without another semantic rewrite.
    The current segmented WAL plus partition checkpoints already give a clean path to richer replay, compaction, and replica-repair behavior without changing API-visible behavior.
@@ -362,4 +382,3 @@ This architecture gives N1 a better long-term shape than the legacy mirrored tre
 - Losing one selected partition root is survivable if the other selected root is still readable.
 - Reads prefer the freshest available partition replica.
 - Repair restores missing owner/replica copies from surviving authoritative state.
-- Prefix state can lag or be rebuilt without making exact-key reads incorrect.

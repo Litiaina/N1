@@ -791,12 +791,8 @@ async fn collect_n2_map_paths(root: &StdPath, max_paths: usize) -> Result<Vec<Pa
 
 async fn list_fragment_n2_maps(
     fragment: &str,
-    prefix: Option<&str>,
     max_objects: usize,
 ) -> Result<Vec<N2ObjectMap>, AppError> {
-    let prefix = prefix
-        .map(|v| v.trim().trim_matches('/').to_string())
-        .filter(|v| !v.is_empty());
     let path_manager = ObjectPathManager::new();
     let roots = path_manager.get_all_index_roots();
     if roots.is_empty() {
@@ -836,11 +832,6 @@ async fn list_fragment_n2_maps(
             if map.object.fragment != fragment {
                 continue;
             }
-            if let Some(prefix_value) = prefix.as_ref() {
-                if !map.object.object_key.starts_with(prefix_value.as_str()) {
-                    continue;
-                }
-            }
             out.push(map);
             if out.len() >= max_objects {
                 return Ok(out);
@@ -861,7 +852,7 @@ async fn list_n2_maps_for_object(
         return Ok(Vec::new());
     }
 
-    let mut maps = list_fragment_n2_maps(fragment, Some(key.as_str()), max_versions).await?;
+    let mut maps = list_fragment_n2_maps(fragment, max_versions.saturating_mul(32)).await?;
     maps.retain(|m| m.object.object_key == key);
     maps.sort_by(|a, b| {
         b.committed_at
@@ -3028,14 +3019,9 @@ pub async fn list_n2_objects(
         ));
     }
 
-    let prefix = query
-        .prefix
-        .as_deref()
-        .map(|v| v.trim().trim_matches('/').to_string())
-        .filter(|v| !v.is_empty());
     let limit = query.limit.unwrap_or(256).clamp(1, 10_000);
     let scan_limit = limit.saturating_mul(32).clamp(limit, 100_000);
-    let maps = list_fragment_n2_maps(fragment.as_str(), prefix.as_deref(), scan_limit).await?;
+    let maps = list_fragment_n2_maps(fragment.as_str(), scan_limit).await?;
 
     let mut latest_by_key: HashMap<String, N2ObjectMap> = HashMap::new();
     for map in maps {
@@ -3069,7 +3055,6 @@ pub async fn list_n2_objects(
 
     Ok(AxumJson(N2ListObjectsResponse {
         fragment,
-        prefix,
         limit,
         objects,
     }))
@@ -3430,13 +3415,8 @@ pub async fn reconcile_n2_fragment(
     let cfg = n2_runtime_config();
     let dry_run = query.dry_run.unwrap_or(false);
     let cleanup_orphans = query.cleanup_orphans.unwrap_or(true);
-    let prefix = query
-        .prefix
-        .as_deref()
-        .map(|v| v.trim().trim_matches('/').to_string())
-        .filter(|v| !v.is_empty());
     let max_objects = query.max_objects.unwrap_or(128).clamp(1, 10_000);
-    let maps = list_fragment_n2_maps(fragment.as_str(), prefix.as_deref(), max_objects).await?;
+    let maps = list_fragment_n2_maps(fragment.as_str(), max_objects).await?;
 
     let http_client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -3709,7 +3689,6 @@ pub async fn reconcile_n2_fragment(
 
     Ok(AxumJson(N2ReconcileResponse {
         fragment,
-        prefix,
         dry_run,
         scanned_objects: results.len(),
         updated_objects,
@@ -4905,10 +4884,7 @@ mod tests {
         let listed = list_n2_objects(
             full_claims(fragment.as_str()),
             AxumPath(fragment.clone()),
-            AxumQuery(ListN2ObjectsQuery {
-                prefix: Some("archive".to_string()),
-                limit: Some(100),
-            }),
+            AxumQuery(ListN2ObjectsQuery { limit: Some(100) }),
         )
         .await
         .expect("list n2 objects")
@@ -4958,10 +4934,7 @@ mod tests {
         let after_all = list_n2_objects(
             full_claims(fragment.as_str()),
             AxumPath(fragment.clone()),
-            AxumQuery(ListN2ObjectsQuery {
-                prefix: Some("archive".to_string()),
-                limit: Some(100),
-            }),
+            AxumQuery(ListN2ObjectsQuery { limit: Some(100) }),
         )
         .await
         .expect("list n2 objects after deletes")
@@ -5055,7 +5028,6 @@ mod tests {
             full_claims(fragment.as_str()),
             AxumPath(fragment.clone()),
             AxumQuery(ReconcileFragmentQuery {
-                prefix: Some(object_key.clone()),
                 max_objects: Some(10),
                 dry_run: Some(false),
                 expected_epoch: None,
@@ -5318,7 +5290,6 @@ mod tests {
             full_claims(fragment.as_str()),
             AxumPath(fragment.clone()),
             AxumQuery(ReconcileFragmentQuery {
-                prefix: Some(object_key.clone()),
                 max_objects: Some(10),
                 dry_run: Some(false),
                 expected_epoch: None,

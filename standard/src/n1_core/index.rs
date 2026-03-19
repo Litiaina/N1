@@ -1,8 +1,10 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::disk_manager::{
-    ObjectMetadata, ObjectPathManager, PartMetadata, ReservationReceipt,
+    ListObjectsResult, ObjectMetadata, ObjectPathManager, PartMetadata, ReservationReceipt,
 };
 use crate::n1_core::upload::UploadSessionManifest;
+use base64::Engine;
+use base64::engine::general_purpose;
 use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -69,8 +71,46 @@ struct IndexRoute {
     roots: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FragmentScanCursor {
+    partition_id: u16,
+    bucket_id: u8,
+    after_hash: String,
+}
+
 fn canonical_key(object_key: &str) -> String {
-    ObjectPathManager::canonical_prefix(object_key)
+    ObjectPathManager::canonical_object_key(object_key)
+}
+
+fn is_internal_object_key(object_key: &str) -> bool {
+    let key = canonical_key(object_key);
+    key.split('/')
+        .any(|segment| segment == ".n1fsd_dir" || segment == ".n1-trash")
+}
+
+fn encode_fragment_scan_token(cursor: &FragmentScanCursor) -> String {
+    general_purpose::STANDARD.encode(format!(
+        "scan|{:04x}|{:02x}|{}",
+        cursor.partition_id, cursor.bucket_id, cursor.after_hash
+    ))
+}
+
+fn decode_fragment_scan_token(token: &str) -> Option<FragmentScanCursor> {
+    let bytes = general_purpose::STANDARD.decode(token).ok()?;
+    let raw = String::from_utf8(bytes).ok()?;
+    let mut parts = raw.splitn(4, '|');
+    let kind = parts.next()?;
+    if kind != "scan" {
+        return None;
+    }
+    let partition_id = u16::from_str_radix(parts.next()?, 16).ok()?;
+    let bucket_id = u8::from_str_radix(parts.next()?, 16).ok()?;
+    let after_hash = parts.next()?.to_string();
+    Some(FragmentScanCursor {
+        partition_id,
+        bucket_id,
+        after_hash,
+    })
 }
 
 fn compare_version_id_recency(left: &str, right: &str) -> Ordering {
@@ -152,6 +192,14 @@ fn partition_dir(root: &Path, fragment: &str, partition_id: u16) -> PathBuf {
         .join(INDEX_DIR)
         .join(INDEX_PARTITIONS_DIR)
         .join(format!("{:04x}", partition_id))
+}
+
+fn objects_dir_for_partition(root: &Path, fragment: &str, partition_id: u16, trashed: bool) -> PathBuf {
+    partition_dir(root, fragment, partition_id).join(if trashed {
+        INDEX_TRASH_DIR
+    } else {
+        INDEX_OBJECTS_DIR
+    })
 }
 
 fn object_base_dir(
@@ -1041,6 +1089,154 @@ pub async fn list_fragment_live_objects(fragment: &str) -> Result<Vec<ObjectMeta
     list_fragment_objects_internal(fragment, false).await
 }
 
+pub async fn scan_fragment_live_objects_page(
+    fragment: &str,
+    limit: usize,
+    continuation_token: Option<String>,
+    include_internal: bool,
+) -> Result<ListObjectsResult, AppError> {
+    scan_fragment_objects_page(fragment, false, limit, continuation_token, include_internal).await
+}
+
+pub async fn scan_fragment_trash_objects_page(
+    fragment: &str,
+    limit: usize,
+    continuation_token: Option<String>,
+    include_internal: bool,
+) -> Result<ListObjectsResult, AppError> {
+    scan_fragment_objects_page(fragment, true, limit, continuation_token, include_internal).await
+}
+
+async fn sorted_bucket_object_hashes(bucket_dir: &Path) -> Result<Vec<String>, AppError> {
+    if !fs::try_exists(bucket_dir).await.unwrap_or(false) {
+        return Ok(Vec::new());
+    }
+
+    let mut hashes = Vec::new();
+    let mut entries = fs::read_dir(bucket_dir)
+        .await
+        .map_err(|e| AppError::Io(e, format!("read dir {}", bucket_dir.display())))?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if !entry
+            .file_type()
+            .await
+            .map(|ft| ft.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        hashes.push(entry.file_name().to_string_lossy().to_string());
+    }
+    hashes.sort_unstable();
+    Ok(hashes)
+}
+
+async fn scan_partition_root_base(
+    fragment: &str,
+    partition_id: u16,
+    trashed: bool,
+) -> Result<Option<PathBuf>, AppError> {
+    let route = route_for_partition(partition_id)?;
+    for root in &route.roots {
+        let base = objects_dir_for_partition(root, fragment, partition_id, trashed);
+        if fs::try_exists(&base).await.unwrap_or(false) {
+            return Ok(Some(base));
+        }
+    }
+    Ok(None)
+}
+
+async fn scan_fragment_objects_page(
+    fragment: &str,
+    trashed: bool,
+    limit: usize,
+    continuation_token: Option<String>,
+    include_internal: bool,
+) -> Result<ListObjectsResult, AppError> {
+    let limit = limit.clamp(1, 1000);
+    let cursor = match continuation_token.as_deref() {
+        Some(token) => Some(decode_fragment_scan_token(token).ok_or_else(|| {
+            AppError::BadRequest("invalid flat-list continuation token".to_string())
+        })?),
+        None => None,
+    };
+    let start_partition_id = cursor.as_ref().map(|v| v.partition_id).unwrap_or(0);
+    let start_bucket_id = cursor.as_ref().map(|v| v.bucket_id).unwrap_or(0);
+    let start_after_hash = cursor
+        .as_ref()
+        .map(|v| v.after_hash.clone())
+        .unwrap_or_default();
+
+    let mut objects = Vec::with_capacity(limit);
+
+    for partition_id in start_partition_id..INDEX_PARTITION_COUNT {
+        let Some(base) = scan_partition_root_base(fragment, partition_id, trashed).await? else {
+            continue;
+        };
+
+        let bucket_start = if partition_id == start_partition_id {
+            start_bucket_id
+        } else {
+            0
+        };
+
+        for bucket_id in bucket_start..=u8::MAX {
+            let bucket_dir = base.join(format!("{:02x}", bucket_id));
+            let hashes = sorted_bucket_object_hashes(&bucket_dir).await?;
+            if hashes.is_empty() {
+                continue;
+            }
+
+            for object_hash in hashes {
+                if partition_id == start_partition_id
+                    && bucket_id == start_bucket_id
+                    && !start_after_hash.is_empty()
+                    && object_hash <= start_after_hash
+                {
+                    continue;
+                }
+
+                let latest_path = bucket_dir.join(&object_hash).join(INDEX_LATEST_FILE);
+                let Some(mut metadata) = read_messagepack_if_exists::<IndexLatestState>(&latest_path)
+                    .await?
+                    .map(|state| state.metadata)
+                else {
+                    continue;
+                };
+
+                if metadata.fragment != fragment {
+                    metadata.fragment = fragment.to_string();
+                }
+                if metadata.is_delete_marker {
+                    continue;
+                }
+                if !include_internal && is_internal_object_key(&metadata.object_key) {
+                    continue;
+                }
+
+                objects.push(metadata);
+                if objects.len() >= limit {
+                    return Ok(ListObjectsResult {
+                        objects,
+                        common_prefixes: Vec::new(),
+                        continuation_token: Some(encode_fragment_scan_token(&FragmentScanCursor {
+                            partition_id,
+                            bucket_id,
+                            after_hash: object_hash,
+                        })),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(ListObjectsResult {
+        objects,
+        common_prefixes: Vec::new(),
+        continuation_token: None,
+    })
+}
+
 async fn list_fragment_objects_internal(
     fragment: &str,
     trashed: bool,
@@ -1158,6 +1354,24 @@ pub async fn restore_object_version_from_trash_with_metadata(
     upsert_object_version(&metadata).await?;
     delete_trashed_object_version(fragment, object_key, version_id).await?;
     Ok(metadata)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FragmentScanCursor, decode_fragment_scan_token, encode_fragment_scan_token};
+
+    #[test]
+    fn fragment_scan_token_round_trip() {
+        let token = encode_fragment_scan_token(&FragmentScanCursor {
+            partition_id: 0x002a,
+            bucket_id: 0x7f,
+            after_hash: "abcdef0123456789".to_string(),
+        });
+        let parsed = decode_fragment_scan_token(&token).expect("scan token should parse");
+        assert_eq!(parsed.partition_id, 0x002a);
+        assert_eq!(parsed.bucket_id, 0x7f);
+        assert_eq!(parsed.after_hash, "abcdef0123456789");
+    }
 }
 
 pub async fn move_object_to_trash_fast(

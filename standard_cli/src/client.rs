@@ -3,22 +3,21 @@ use reqwest::{Client, Method};
 use cli_core::client::{
     AuthSession, CreateFragmentRequest, DynError, api_url, authenticate, build_client,
     fetch_json, fetch_json_query, get_base_url, get_secret, print_output,
-    print_response_message, resolve_auth_fragment, send_query_only, send_with_session,
-    send_without_body, watch_rendered,
+    print_response_message, resolve_auth_fragment, send_query_only, send_without_body,
+    watch_rendered,
 };
 use cli_core::models::{
-    GcJobStatus, HealthResponse, ListUploadsResponse, PrefixRebuildJobStatus,
-    RedistributionJobStatus, RepairJobStatus, UploadStatusResponse,
+    GcJobStatus, HealthResponse, ListUploadsResponse, RedistributionJobStatus,
+    RepairJobStatus, UploadStatusResponse,
 };
 
 use crate::args::{
     Cli, Commands, DurabilityArg, ExecutionModeArg, FragmentCommands, JobAction,
-    PrefixRebuildAction, RedistributeAction, RedistributeScopeArg, RepairAction, RepairModeArg,
-    UploadCommands,
+    RedistributeAction, RedistributeScopeArg, RepairAction, RepairModeArg, UploadCommands,
 };
 use crate::output::{
-    format_gc_status, format_health, format_health_watch_line, format_prefix_rebuild_status,
-    format_redistribution_status, format_repair_status, format_upload_list, format_upload_status,
+    format_gc_status, format_health, format_health_watch_line, format_redistribution_status,
+    format_repair_status, format_upload_list, format_upload_status,
 };
 
 pub async fn run(cli: Cli) -> Result<(), DynError> {
@@ -306,64 +305,6 @@ async fn handle_authenticated_command(
                     cli.poll_ms,
                     cli.json,
                     format_redistribution_status,
-                    |_| false,
-                )
-                .await
-            }
-        },
-        Commands::PrefixRebuild { action } => match action {
-            PrefixRebuildAction::Start { fragment } => {
-                send_with_session(client, base_url, session, |token| {
-                    let mut request = client
-                        .post(api_url(base_url, "/v4/maintenance/prefix/rebuild/start"))
-                        .bearer_auth(token);
-                    if let Some(fragment) = fragment.as_deref().or(cli.fragment.as_deref()) {
-                        request = request.query(&[("fragment", fragment)]);
-                    }
-                    request
-                })
-                .await?;
-                watch_rendered::<PrefixRebuildJobStatus, _, _>(
-                    client,
-                    base_url,
-                    session,
-                    &api_url(base_url, "/v4/maintenance/prefix/rebuild/status"),
-                    cli.poll_ms,
-                    cli.json,
-                    format_prefix_rebuild_status,
-                    |status| !status.is_running,
-                )
-                .await
-            }
-            PrefixRebuildAction::Status => {
-                let status: PrefixRebuildJobStatus = fetch_json(
-                    client,
-                    base_url,
-                    session,
-                    &api_url(base_url, "/v4/maintenance/prefix/rebuild/status"),
-                )
-                .await?;
-                print_output(cli.json, &status, &format_prefix_rebuild_status(&status))
-            }
-            PrefixRebuildAction::Stop => {
-                send_without_body(
-                    client,
-                    base_url,
-                    session,
-                    Method::POST,
-                    &api_url(base_url, "/v4/maintenance/prefix/rebuild/stop"),
-                )
-                .await
-            }
-            PrefixRebuildAction::Watch => {
-                watch_rendered::<PrefixRebuildJobStatus, _, _>(
-                    client,
-                    base_url,
-                    session,
-                    &api_url(base_url, "/v4/maintenance/prefix/rebuild/status"),
-                    cli.poll_ms,
-                    cli.json,
-                    format_prefix_rebuild_status,
                     |_| false,
                 )
                 .await

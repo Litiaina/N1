@@ -84,7 +84,6 @@ pub struct GetObjectQuery {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ListN2ObjectsQuery {
-    pub prefix: Option<String>,
     pub limit: Option<usize>,
 }
 
@@ -110,7 +109,6 @@ pub struct RenameN2ObjectRequest {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ReconcileFragmentQuery {
-    pub prefix: Option<String>,
     pub max_objects: Option<usize>,
     pub dry_run: Option<bool>,
     pub expected_epoch: Option<u64>,
@@ -202,7 +200,6 @@ pub struct N2ObjectSummary {
 #[derive(Clone, Debug, Serialize)]
 pub struct N2ListObjectsResponse {
     pub fragment: String,
-    pub prefix: Option<String>,
     pub limit: usize,
     pub objects: Vec<N2ObjectSummary>,
 }
@@ -261,7 +258,6 @@ pub struct N2ReconcileObjectResult {
 #[derive(Clone, Debug, Serialize)]
 pub struct N2ReconcileResponse {
     pub fragment: String,
-    pub prefix: Option<String>,
     pub dry_run: bool,
     pub scanned_objects: usize,
     pub updated_objects: usize,

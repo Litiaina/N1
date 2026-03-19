@@ -5,26 +5,28 @@ This document is the canonical deployment split for N2.
 N2 is the product identity of this workspace.
 N1 is the shared storage engine underneath it.
 
-As of 2026-03-13:
+As of 2026-03-19:
 
-- `standard` (`litiaina-n1-standard`) is the single-node N2 deployment path, the default for production, and released at `0.5.2`.
+- `standard` (`litiaina-n1-standard`) is the single-node N2 deployment path, the default for production, and released at `0.6.0`.
 - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path on top of the same N1 core.
+- `registry-runtime` (`registry-server`) is the SQLite-backed Registry layer used in both deployment shapes.
 - `arc` (`litiaina-n1-arc`) is the experimental raw-device profile.
+- Privilege split: `standard`, `distribution-runtime`, and `registry-runtime` should normally run as non-root services, while `arc` is the only profile that should require root for raw-device workflows.
 - If you are unsure which one to deploy, use `standard`.
 
 ## 1) Deployment Shapes
 
 | Deployment shape | Binary | Uses | Status |
 |---|---|---|---|
-| Single-node N2 | `litiaina-n1-standard` | N1 engine directly | Stable / default |
-| Multi-node N2 | `litiaina-n2` | N1 engine + N2 cluster runtime | Available in this workspace |
+| Single-node N2 | `litiaina-n1-standard` + `registry-server` | N1 engine + Registry | Stable / default |
+| Multi-node N2 | `litiaina-n2` + `registry-server` | N1 engine + N2 cluster runtime + Registry | Available in this workspace |
 | Arc engine testing | `litiaina-n1-arc` | Experimental N1 engine profile | Experimental |
 
 ## 2) Engine Profile Status
 
 | Profile | Binary | Status | Production default |
 |---|---|---|---|
-| Standard | `litiaina-n1-standard` | Stable (`0.5.2`) | Yes |
+| Standard | `litiaina-n1-standard` | Stable (`0.6.0`) | Yes |
 | Arc | `litiaina-n1-arc` | Experimental | No |
 
 ## 3) Architecture Split
@@ -33,8 +35,16 @@ As of 2026-03-13:
 
 - Filesystem-backed authoritative `index` plane.
 - Filesystem-backed blob shard plane (`blob_store_disks` are directory roots).
-- Partitioned metadata authority and derived prefix serving.
+- Partitioned metadata authority and exact-key object serving.
 - Best operator compatibility and lowest deployment risk.
+
+### Registry (new in `0.6.0`)
+
+- SQLite-backed metadata and control plane.
+- Runs in both single-node and multi-node deployments.
+- Owns users, ownership, quotas, logical listing, and logical object lookup.
+- Owns fragment backend binding (`single_node` vs `multi_node`) for Registry-backed Drive.
+- Brokers short-lived storage sessions so the browser does not need fragment secrets for normal Drive usage.
 
 Disk layout snapshot:
 

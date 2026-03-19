@@ -217,7 +217,7 @@ xargs -a keys.txt -I{} -P "$CONCURRENCY" bash -lc 'upload_one "$@"' _ {}
 upload_end="$(epoch_ms)"
 
 list_start="$(epoch_ms)"
-list_json="$(curl -ksS --get "$BASE_URL/v4/fragment/objects" -H "$AUTH_HEADER" --data-urlencode "prefix=$PREFIX/" --data-urlencode 'limit=1000')"
+list_json="$(curl -ksS --get "$BASE_URL/v4/fragment/objects" -H "$AUTH_HEADER" --data-urlencode 'limit=1000')"
 list_end="$(epoch_ms)"
 list_count="$(printf '%s' "$list_json" | python3 -c 'import sys,json; print(len(json.load(sys.stdin).get("objects", [])))')"
 
@@ -235,6 +235,14 @@ meta_json="$(curl -ksS "$BASE_URL/v4/fragment/meta/$sample_key" -H "$AUTH_HEADER
 meta_end="$(epoch_ms)"
 meta_size="$(printf '%s' "$meta_json" | python3 -c 'import sys,json; print(json.load(sys.stdin)["total_size_bytes"])')"
 
+single_delete_start="$(epoch_ms)"
+single_delete_code="$(curl -ksS -o /dev/null -w '%{http_code}' -X DELETE "$BASE_URL/v4/fragment/object/delete/$sample_key" -H "$AUTH_HEADER")"
+single_delete_end="$(epoch_ms)"
+
+single_recover_start="$(epoch_ms)"
+single_recover_code="$(curl -ksS -o /dev/null -w '%{http_code}' -X POST "$BASE_URL/v4/fragment/recover/object/$sample_key" -H "$AUTH_HEADER")"
+single_recover_end="$(epoch_ms)"
+
 bulk_delete_payload="$(python3 - <<PY
 import json
 with open("keys.txt", "r", encoding="utf-8") as f:
@@ -248,7 +256,7 @@ delete_end="$(epoch_ms)"
 delete_succeeded="$(printf '%s' "$bulk_delete_json" | python3 -c 'import sys,json; print(json.load(sys.stdin)["succeeded"])')"
 
 trash_start="$(epoch_ms)"
-trash_json="$(curl -ksS --get "$BASE_URL/v4/fragment/trash" -H "$AUTH_HEADER" --data-urlencode "prefix=$PREFIX/" --data-urlencode 'limit=1000')"
+trash_json="$(curl -ksS --get "$BASE_URL/v4/fragment/trash" -H "$AUTH_HEADER" --data-urlencode 'limit=1000')"
 trash_end="$(epoch_ms)"
 trash_count="$(printf '%s' "$trash_json" | python3 -c 'import sys,json; print(len(json.load(sys.stdin).get("objects", [])))')"
 
@@ -257,7 +265,7 @@ curl -ksSf -X POST "$BASE_URL/v4/fragment/recover/trash/all" -H "$AUTH_HEADER" >
 recover_end="$(epoch_ms)"
 
 list2_start="$(epoch_ms)"
-list2_json="$(curl -ksS --get "$BASE_URL/v4/fragment/objects" -H "$AUTH_HEADER" --data-urlencode "prefix=$PREFIX/" --data-urlencode 'limit=1000')"
+list2_json="$(curl -ksS --get "$BASE_URL/v4/fragment/objects" -H "$AUTH_HEADER" --data-urlencode 'limit=1000')"
 list2_end="$(epoch_ms)"
 list2_count="$(printf '%s' "$list2_json" | python3 -c 'import sys,json; print(len(json.load(sys.stdin).get("objects", [])))')"
 
@@ -305,27 +313,31 @@ summary = {
     "fragment_hash": "$fragment_hash",
     "objects": int("$OBJECTS"),
     "object_size_bytes": int("$OBJECT_SIZE"),
-    "prefix": "$PREFIX/",
+    "scan_mode": "flat-native",
     "concurrency": int("$CONCURRENCY"),
     "operations": {
         "fragment_create_ms": int("$create_end") - int("$create_start"),
         "upload_batch_ms": int("$upload_end") - int("$upload_start"),
         "upload_avg_ms": (int("$upload_end") - int("$upload_start")) / int("$OBJECTS"),
-        "list_prefix_ms": int("$list_end") - int("$list_start"),
-        "list_prefix_count": int("$list_count"),
+        "list_live_ms": int("$list_end") - int("$list_start"),
+        "list_live_count": int("$list_count"),
         "stream_read_batch_ms": int("$stream_end") - int("$stream_start"),
         "stream_read_avg_ms": (int("$stream_end") - int("$stream_start")) / int("$OBJECTS"),
         "update_batch_ms": int("$update_end") - int("$update_start"),
         "update_avg_ms": (int("$update_end") - int("$update_start")) / int("$OBJECTS"),
         "meta_ms": int("$meta_end") - int("$meta_start"),
         "meta_size_bytes": int("$meta_size"),
+        "single_delete_ms": int("$single_delete_end") - int("$single_delete_start"),
+        "single_delete_http": "$single_delete_code",
+        "single_recover_ms": int("$single_recover_end") - int("$single_recover_start"),
+        "single_recover_http": "$single_recover_code",
         "bulk_delete_ms": int("$delete_end") - int("$delete_start"),
         "bulk_delete_succeeded": int("$delete_succeeded"),
         "trash_list_ms": int("$trash_end") - int("$trash_start"),
         "trash_list_count": int("$trash_count"),
         "recover_all_ms": int("$recover_end") - int("$recover_start"),
-        "list_after_recover_ms": int("$list2_end") - int("$list2_start"),
-        "list_after_recover_count": int("$list2_count"),
+        "list_live_after_recover_ms": int("$list2_end") - int("$list2_start"),
+        "list_live_after_recover_count": int("$list2_count"),
         "bulk_delete_round2_ms": int("$delete2_end") - int("$delete2_start"),
         "empty_trash_ms": int("$empty_end") - int("$empty_start"),
         "empty_trash_http": "$empty_code",

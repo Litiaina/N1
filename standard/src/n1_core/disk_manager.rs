@@ -1,7 +1,4 @@
-use crate::n1_core::constants::{
-    METADATA_EXT, PREFIX_INDEX_DIR, PREFIX_INDEX_NAMESPACE, PREFIX_INDEX_VERSION,
-    PREFIX_SEGMENT_EXT,
-};
+use crate::n1_core::constants::METADATA_EXT;
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -79,7 +76,7 @@ impl ObjectPathManager {
     }
 
     fn object_partition_id(fragment_hash: &str, object_key: &str) -> u16 {
-        let canonical = Self::canonical_prefix(object_key);
+        let canonical = Self::canonical_object_key(object_key);
         Self::partition_id_from_hash(Self::route_hash(&["object", fragment_hash, &canonical]))
     }
 
@@ -112,15 +109,8 @@ impl ObjectPathManager {
         hex::encode(hasher.finalize())
     }
 
-    pub fn canonical_prefix(prefix: &str) -> String {
-        prefix.trim_start_matches('/').to_string()
-    }
-
-    pub fn prefix_hash(prefix: &str) -> String {
-        let p = Self::canonical_prefix(prefix);
-        let mut hasher = Sha256::new();
-        hasher.update(p.as_bytes());
-        hex::encode(hasher.finalize())
+    pub fn canonical_object_key(object_key: &str) -> String {
+        object_key.trim_start_matches('/').to_string()
     }
 
     pub fn get_all_metadata_paths(
@@ -163,74 +153,6 @@ impl ObjectPathManager {
                     .join(&key_hash)
                     .join(&filename)
             })
-            .collect()
-    }
-
-    pub fn get_all_prefix_bucket_dirs(&self, fragment_hash: &str, prefix: &str) -> Vec<PathBuf> {
-        self.get_all_prefix_bucket_dirs_scoped(fragment_hash, prefix, false)
-    }
-
-    pub fn get_all_trash_prefix_bucket_dirs(
-        &self,
-        fragment_hash: &str,
-        prefix: &str,
-    ) -> Vec<PathBuf> {
-        self.get_all_prefix_bucket_dirs_scoped(fragment_hash, prefix, true)
-    }
-
-    fn get_all_prefix_bucket_dirs_scoped(
-        &self,
-        fragment_hash: &str,
-        prefix: &str,
-        trashed: bool,
-    ) -> Vec<PathBuf> {
-        let ph = Self::prefix_hash(prefix);
-        let p1 = &ph[0..2];
-        let p2 = &ph[2..4];
-
-        self.get_all_index_roots()
-            .iter()
-            .map(|root| {
-                let base = if trashed {
-                    root.join(fragment_hash).join(".trash").join("index")
-                } else {
-                    root.join(fragment_hash).join("index")
-                };
-                base.join(PREFIX_INDEX_DIR)
-                    .join(PREFIX_INDEX_VERSION)
-                    .join(PREFIX_INDEX_NAMESPACE)
-                    .join(p1)
-                    .join(p2)
-                    .join(&ph)
-            })
-            .collect()
-    }
-
-    pub fn get_all_prefix_compacted_paths(
-        &self,
-        fragment_hash: &str,
-        prefix: &str,
-    ) -> Vec<PathBuf> {
-        self.get_all_prefix_compacted_paths_scoped(fragment_hash, prefix, false)
-    }
-
-    pub fn get_all_trash_prefix_compacted_paths(
-        &self,
-        fragment_hash: &str,
-        prefix: &str,
-    ) -> Vec<PathBuf> {
-        self.get_all_prefix_compacted_paths_scoped(fragment_hash, prefix, true)
-    }
-
-    fn get_all_prefix_compacted_paths_scoped(
-        &self,
-        fragment_hash: &str,
-        prefix: &str,
-        trashed: bool,
-    ) -> Vec<PathBuf> {
-        self.get_all_prefix_bucket_dirs_scoped(fragment_hash, prefix, trashed)
-            .into_iter()
-            .map(|d| d.join(format!("compacted{}", PREFIX_SEGMENT_EXT)))
             .collect()
     }
 
@@ -330,70 +252,6 @@ impl From<ObjectSummary> for ObjectMetadata {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PrefixIndexEntry {
-    pub object_key: String,
-    pub version_id: String,
-    pub created_at: i64,
-    #[serde(default)]
-    pub is_delete_marker: bool,
-    #[serde(default)]
-    pub has_inline_summary: bool,
-    #[serde(default)]
-    pub upload_session_id: String,
-    #[serde(default)]
-    pub owner_uid: String,
-    #[serde(default)]
-    pub content_type: String,
-    #[serde(default)]
-    pub total_size_bytes: u64,
-    #[serde(default = "default_stripe_size")]
-    pub stripe_size_bytes: usize,
-}
-
-impl PrefixIndexEntry {
-    pub fn from_metadata(metadata: &ObjectMetadata) -> Self {
-        Self {
-            object_key: metadata.object_key.clone(),
-            version_id: metadata.version_id.clone(),
-            created_at: metadata.created_at,
-            is_delete_marker: metadata.is_delete_marker,
-            has_inline_summary: true,
-            upload_session_id: metadata.upload_session_id.clone(),
-            owner_uid: metadata.owner_uid.clone(),
-            content_type: metadata.content_type.clone(),
-            total_size_bytes: metadata.total_size_bytes,
-            stripe_size_bytes: metadata.stripe_size_bytes,
-        }
-    }
-
-    pub fn to_object_metadata(&self, fragment: &str) -> Option<ObjectMetadata> {
-        if !self.has_inline_summary {
-            return None;
-        }
-
-        Some(ObjectMetadata {
-            object_key: self.object_key.clone(),
-            fragment: fragment.to_string(),
-            version_id: self.version_id.clone(),
-            upload_session_id: self.upload_session_id.clone(),
-            owner_uid: self.owner_uid.clone(),
-            content_type: self.content_type.clone(),
-            total_size_bytes: self.total_size_bytes,
-            created_at: self.created_at,
-            parts: Vec::new(),
-            is_delete_marker: self.is_delete_marker,
-            stripe_size_bytes: self.stripe_size_bytes,
-        })
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PrefixIndexSegment {
-    pub prefix: String,
-    pub entries: Vec<PrefixIndexEntry>,
-}
-
 #[derive(Deserialize)]
 pub struct InitiateUploadParams {
     pub content_type: Option<String>,
@@ -480,16 +338,7 @@ pub struct UploadPartQuery {
 
 #[derive(serde::Deserialize)]
 pub struct DownloadArchiveRequest {
-    #[serde(default)]
     pub keys: Vec<String>,
-    #[serde(default)]
-    pub prefix: Option<String>,
-    #[serde(default)]
-    pub delimiter: Option<String>,
-    #[serde(default)]
-    pub max_keys: Option<usize>,
-    #[serde(default)]
-    pub continuation_token: Option<String>,
     #[serde(default = "default_format")]
     pub format: String,
     #[serde(default)]

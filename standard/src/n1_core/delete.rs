@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,18 +11,11 @@ use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tracing::{info, warn};
-use ulid::Ulid;
 use walkdir::WalkDir;
 
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::disk_manager::ObjectPathManager;
 use crate::n1_core::index;
-use crate::n1_core::prefix_compactor::{compact_prefix_now, compact_trash_prefix_now};
-use crate::n1_core::prefix_updates::{
-    accelerator_prefix, logical_now, mark_fragment_accelerator_stale,
-    object_key_directory_scopes, synthetic_delete_marker,
-    synthetic_live_entry, write_prefix_entries_update_for_prefix,
-};
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
@@ -30,8 +23,6 @@ use crate::websocket::ws_structs::StorageEventPayload;
 fn get_trash_root(disk_root: &std::path::Path, fragment_hash: &str) -> std::path::PathBuf {
     disk_root.join(fragment_hash).join(".trash")
 }
-
-const ROOT_ACCELERATOR_IMMEDIATE_COMPACT_BATCH_KEYS: usize = 32;
 
 fn is_cross_device_rename(err: &std::io::Error) -> bool {
     #[cfg(unix)]
@@ -184,208 +175,6 @@ async fn remove_blob_versions(
     }
 }
 
-async fn mark_accelerators_stale(fragment: &str, live: bool, trash: bool) {
-    if live {
-        if let Err(e) = mark_fragment_accelerator_stale(fragment, false).await {
-            warn!(
-                "Failed to mark live accelerator stale for fragment {}: {}",
-                fragment, e
-            );
-        }
-    }
-
-    if trash {
-        if let Err(e) = mark_fragment_accelerator_stale(fragment, true).await {
-            warn!(
-                "Failed to mark trash accelerator stale for fragment {}: {}",
-                fragment, e
-            );
-        }
-    }
-}
-
-async fn read_latest_state(
-    fragment: &str,
-    object_key: &str,
-    trashed: bool,
-) -> Result<Option<crate::n1_core::disk_manager::ObjectMetadata>, AppError> {
-    let res = if trashed {
-        index::read_latest_trashed_object(fragment, object_key).await
-    } else {
-        index::read_latest_object(fragment, object_key).await
-    };
-
-    match res {
-        Ok(meta) => Ok(Some(meta)),
-        Err(AppError::NotFound) => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-async fn sync_accelerators_for_object_keys(fragment: &str, object_keys: &[String]) {
-    if object_keys.is_empty() {
-        return;
-    }
-
-    let now = logical_now();
-    let mut live_entries_by_prefix: BTreeMap<String, Vec<crate::n1_core::disk_manager::PrefixIndexEntry>> =
-        BTreeMap::new();
-    let mut trash_entries_by_prefix: BTreeMap<String, Vec<crate::n1_core::disk_manager::PrefixIndexEntry>> =
-        BTreeMap::new();
-    let mut live_stale = false;
-    let mut trash_stale = false;
-
-    for object_key in object_keys {
-        let live_meta = if live_stale {
-            None
-        } else {
-            match read_latest_state(fragment, object_key, false).await {
-                Ok(meta) => meta,
-                Err(e) => {
-                    warn!(
-                        "Failed to read live latest state for accelerator sync {}/{}: {}",
-                        fragment, object_key, e
-                    );
-                    live_stale = true;
-                    None
-                }
-            }
-        };
-
-        let trash_meta = if trash_stale {
-            None
-        } else {
-            match read_latest_state(fragment, object_key, true).await {
-                Ok(meta) => meta,
-                Err(e) => {
-                    warn!(
-                        "Failed to read trash latest state for accelerator sync {}/{}: {}",
-                        fragment, object_key, e
-                    );
-                    trash_stale = true;
-                    None
-                }
-            }
-        };
-
-        let fallback = live_meta.as_ref().or(trash_meta.as_ref());
-        let Some(fallback_meta) = fallback else {
-            continue;
-        };
-        let latest_known_created_at = live_meta
-            .as_ref()
-            .map(|meta| meta.created_at)
-            .into_iter()
-            .chain(trash_meta.as_ref().map(|meta| meta.created_at))
-            .max()
-            .unwrap_or(now);
-        let entry_created_at = now.max(latest_known_created_at.saturating_add(1));
-
-        if !live_stale {
-            let live_entry = match live_meta.as_ref() {
-                Some(meta) if !meta.is_delete_marker => synthetic_live_entry(meta, entry_created_at),
-                _ => synthetic_delete_marker(fallback_meta, entry_created_at),
-            };
-            for prefix in object_key_directory_scopes(object_key) {
-                live_entries_by_prefix
-                    .entry(prefix)
-                    .or_default()
-                    .push(live_entry.clone());
-            }
-        }
-
-        if !trash_stale {
-            let trash_entry = match trash_meta.as_ref() {
-                Some(meta) if !meta.is_delete_marker => {
-                    synthetic_live_entry(meta, entry_created_at)
-                }
-                _ => synthetic_delete_marker(fallback_meta, entry_created_at),
-            };
-            for prefix in object_key_directory_scopes(object_key) {
-                trash_entries_by_prefix
-                    .entry(prefix)
-                    .or_default()
-                    .push(trash_entry.clone());
-            }
-        }
-    }
-
-    let segment_base = Ulid::new().to_string();
-
-    if !live_stale && !live_entries_by_prefix.is_empty() {
-        for (prefix, entries) in live_entries_by_prefix {
-            if let Err(e) = write_prefix_entries_update_for_prefix(
-                fragment,
-                &prefix,
-                &format!("{}-live", segment_base),
-                entries,
-                false,
-            )
-            .await
-            {
-                warn!(
-                    "Failed to write live accelerator delta batch for fragment {} prefix='{}': {}",
-                    fragment, prefix, e
-                );
-                live_stale = true;
-                break;
-            }
-        }
-    }
-
-    if !trash_stale && !trash_entries_by_prefix.is_empty() {
-        for (prefix, entries) in trash_entries_by_prefix {
-            if let Err(e) = write_prefix_entries_update_for_prefix(
-                fragment,
-                &prefix,
-                &format!("{}-trash", segment_base),
-                entries,
-                true,
-            )
-            .await
-            {
-                warn!(
-                    "Failed to write trash accelerator delta batch for fragment {} prefix='{}': {}",
-                    fragment, prefix, e
-                );
-                trash_stale = true;
-                break;
-            }
-        }
-    }
-
-    if live_stale || trash_stale {
-        mark_accelerators_stale(fragment, live_stale, trash_stale).await;
-    }
-}
-
-async fn maybe_compact_listing_accelerators_now(fragment: &str, object_keys: &[String]) {
-    if object_keys.len() < ROOT_ACCELERATOR_IMMEDIATE_COMPACT_BATCH_KEYS {
-        return;
-    }
-
-    let mut prefixes = BTreeSet::new();
-    prefixes.insert(accelerator_prefix().to_string());
-    for object_key in object_keys {
-        prefixes.extend(object_key_directory_scopes(object_key));
-    }
-
-    for prefix in prefixes {
-        if let Err(e) = compact_prefix_now(fragment, &prefix).await {
-            warn!(
-                "Failed to force-compact live accelerator for fragment {} prefix='{}': {}",
-                fragment, prefix, e
-            );
-        }
-        if let Err(e) = compact_trash_prefix_now(fragment, &prefix).await {
-            warn!(
-                "Failed to force-compact trash accelerator for fragment {} prefix='{}': {}",
-                fragment, prefix, e
-            );
-        }
-    }
-}
-
 fn bulk_object_concurrency_limit() -> usize {
     std::thread::available_parallelism()
         .map(|n| (n.get() * 2).clamp(4, 32))
@@ -529,7 +318,6 @@ pub async fn delete_object_version(
         }
         let _ = index::delete_trashed_object_version(&fragment, &object_key, &version_id).await;
         let _ = index::remove_session(&fragment, &version_id, "permanent-delete-version").await;
-        mark_accelerators_stale(&fragment, false, true).await;
         state.emit(
             &fragment,
             StorageEventPayload::FileDeleted {
@@ -561,7 +349,6 @@ pub async fn delete_object_version(
     }
 
     let _ = index::remove_session(&fragment, &version_id, "soft-delete-version").await;
-    sync_accelerators_for_object_keys(&fragment, std::slice::from_ref(&object_key)).await;
 
     info!(
         "Soft deleted (moved to trash) version: {}/{} (v: {})",
@@ -593,7 +380,6 @@ pub async fn delete_object(
     }
 
     let moved_count = delete_object_core(&fragment, &object_key).await?;
-    sync_accelerators_for_object_keys(&fragment, std::slice::from_ref(&object_key)).await;
 
     info!(
         "Soft deleted {} versions for object {}/{}",
@@ -627,7 +413,7 @@ pub async fn delete_objects_bulk(
         .object_keys
         .into_iter()
         .filter(|key| !key.is_empty())
-        .collect::<BTreeSet<_>>()
+        .collect::<BTreeSet<String>>()
         .into_iter()
         .collect();
 
@@ -667,8 +453,6 @@ pub async fn delete_objects_bulk(
     }
 
     if succeeded > 0 {
-        sync_accelerators_for_object_keys(&fragment, &succeeded_keys).await;
-        maybe_compact_listing_accelerators_now(&fragment, &succeeded_keys).await;
         state.emit(&fragment, StorageEventPayload::StateInvalidated);
     }
 
@@ -748,7 +532,6 @@ pub async fn delete_object_permanently(
     for version_id in &versions_to_delete {
         let _ = index::remove_session(&fragment, version_id, "permanent-delete").await;
     }
-    sync_accelerators_for_object_keys(&fragment, std::slice::from_ref(&object_key)).await;
 
     info!(
         "Permanently deleted {} versions for {}/{}",
@@ -807,8 +590,6 @@ pub async fn recover_object_version(
         let _ = move_dir_or_copy(&trash_blob_dir, &live_blob_dir).await;
     }
 
-    mark_accelerators_stale(&fragment, true, true).await;
-
     info!(
         "Recovered object version: {}/{} (v: {})",
         fragment, object_key, version_id
@@ -836,7 +617,6 @@ pub async fn recover_object(
     }
 
     let restored_count = recover_object_core(&fragment, &object_key).await?;
-    sync_accelerators_for_object_keys(&fragment, std::slice::from_ref(&object_key)).await;
 
     info!(
         "Recovered {} versions for object {}/{}",
@@ -865,7 +645,7 @@ pub async fn recover_objects_bulk(
         .object_keys
         .into_iter()
         .filter(|key| !key.is_empty())
-        .collect::<BTreeSet<_>>()
+        .collect::<BTreeSet<String>>()
         .into_iter()
         .collect();
 
@@ -905,8 +685,6 @@ pub async fn recover_objects_bulk(
     }
 
     if succeeded > 0 {
-        sync_accelerators_for_object_keys(&fragment, &succeeded_keys).await;
-        maybe_compact_listing_accelerators_now(&fragment, &succeeded_keys).await;
         state.emit(&fragment, StorageEventPayload::StateInvalidated);
     }
 
@@ -936,7 +714,7 @@ pub async fn recover_all_trash(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let mut trashed_keys = BTreeSet::new();
+    let mut trashed_keys = BTreeSet::<String>::new();
     if let Ok(trashed_latest) = index::list_fragment_trash_objects(&fragment).await {
         for meta in trashed_latest {
             trashed_keys.insert(meta.object_key);
@@ -974,10 +752,7 @@ pub async fn recover_all_trash(
         }
     }
 
-    if recovered_count > 0 {
-        sync_accelerators_for_object_keys(&fragment, &recovered_keys).await;
-        maybe_compact_listing_accelerators_now(&fragment, &recovered_keys).await;
-    }
+    let _ = recovered_keys;
 
     info!(
         "Recovered {} trashed item(s) for fragment {}",

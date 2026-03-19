@@ -10,9 +10,6 @@ use tracing::{info, warn};
 use crate::enums::app_error_enum::AppError;
 use crate::n1_core::disk_manager::{ObjectPathManager, RenameObjectRequest};
 use crate::n1_core::index;
-use crate::n1_core::prefix_updates::{
-    logical_now, synthetic_delete_marker, synthetic_live_entry, write_prefix_entry_update,
-};
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
@@ -160,8 +157,6 @@ pub async fn rename_object(
     if source_versions.is_empty() {
         return Err(AppError::NotFound);
     }
-    let source_latest_before = source_versions.first().cloned();
-
     let blob_roots = path_manager.get_blob_roots();
     let mut affected_versions: HashSet<String> = HashSet::new();
     let mut created_at_by_version: HashMap<String, i64> = HashMap::new();
@@ -236,34 +231,6 @@ pub async fn rename_object(
                 }
             }
         }
-    }
-
-    let ts = logical_now();
-    if let Some(source_anchor) = source_latest_before.as_ref() {
-        let source_tombstone = synthetic_delete_marker(source_anchor, ts);
-        let _ = write_prefix_entry_update(
-            &payload.source_fragment,
-            &payload.source_key,
-            &source_anchor.version_id,
-            source_tombstone,
-            -1,
-            false,
-        )
-        .await;
-    }
-    if let Ok(destination_latest) =
-        index::read_latest_object(&payload.destination_fragment, &payload.destination_key).await
-    {
-        let destination_entry = synthetic_live_entry(&destination_latest, ts.saturating_add(1));
-        let _ = write_prefix_entry_update(
-            &payload.destination_fragment,
-            &payload.destination_key,
-            &destination_latest.version_id,
-            destination_entry,
-            1,
-            false,
-        )
-        .await;
     }
 
     info!(

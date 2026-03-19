@@ -51,9 +51,6 @@ use crate::n1_core::monitoring::{get_system_health, run_system_monitor};
 use crate::n1_core::operation_gate::{
     enforce_quiesced_mode_on_reads, enforce_read_only_fast_mode_on_mutations,
 };
-use crate::n1_core::prefix_rebuilder::{
-    get_prefix_rebuild_status_api, stop_prefix_rebuild_job_api, trigger_prefix_rebuild_job_api,
-};
 use crate::n1_core::redistribution::{
     get_redist_status_api, stop_redistribution_job_api, trigger_redistribution_job_api,
 };
@@ -551,18 +548,6 @@ pub fn build_storage_routes_unbound() -> (Router<Arc<AppState>>, Arc<AppState>) 
             .route(
                 "/v4/maintenance/redistribution/monitor",
                 get(get_redist_status_api),
-            )
-            .route(
-                "/v4/maintenance/prefix/rebuild/start",
-                post(trigger_prefix_rebuild_job_api),
-            )
-            .route(
-                "/v4/maintenance/prefix/rebuild/stop",
-                post(stop_prefix_rebuild_job_api),
-            )
-            .route(
-                "/v4/maintenance/prefix/rebuild/status",
-                get(get_prefix_rebuild_status_api),
             )
             .route("/v4/maintenance/health", get(get_system_health));
 

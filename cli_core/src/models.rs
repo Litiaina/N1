@@ -145,23 +145,6 @@ pub struct RedistributionJobStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct PrefixRebuildJobStatus {
-    pub is_running: bool,
-    pub phase: String,
-    pub total_fragments_scanned: u64,
-    pub total_metadata_scanned: u64,
-    pub total_objects_indexed: u64,
-    pub total_prefixes_written: u64,
-    pub total_entries_written: u64,
-    pub total_errors: u64,
-    pub current_fragment: String,
-    pub duration_seconds: u64,
-    pub scan_rate_per_sec: f64,
-    pub last_error: Option<String>,
-    pub start_timestamp: i64,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
 pub struct GcJobStatus {
     pub is_running: bool,
     pub phase: String,

@@ -4,11 +4,6 @@ use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::n1_core::constants::{GC_SUFFIX, METADATA_EXT, RESERVATION_FILE};
 use crate::n1_core::disk_manager::{FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManager};
 use crate::n1_core::index;
-use crate::n1_core::prefix_updates::mark_fragment_accelerator_stale;
-use crate::n1_core::prefix_updates::{
-    logical_now, object_key_directory_scopes, synthetic_delete_marker, synthetic_live_entry,
-    write_prefix_entries_update_for_prefix,
-};
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
 use crate::structs::auth_structs::Claims;
@@ -28,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::runtime::Handle;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -222,65 +217,6 @@ pub async fn stop_garbage_collector(
 
 fn get_trash_root(disk_root: &std::path::Path, fragment_hash: &str) -> PathBuf {
     disk_root.join(fragment_hash).join(".trash")
-}
-
-async fn sync_trash_accelerators_after_gc(
-    fragment: &str,
-    fallback_by_key: &HashMap<String, ObjectMetadata>,
-) {
-    if fallback_by_key.is_empty() {
-        return;
-    }
-
-    let now = logical_now();
-    let mut entries_by_prefix =
-        HashMap::<String, Vec<crate::n1_core::disk_manager::PrefixIndexEntry>>::new();
-
-    for (object_key, fallback_meta) in fallback_by_key {
-        let latest_trash = match index::read_latest_trashed_object(fragment, object_key).await {
-            Ok(meta) => Some(meta),
-            Err(AppError::NotFound) => None,
-            Err(err) => {
-                warn!(
-                    "Failed to read latest trash state during GC accelerator sync for {}/{}: {}",
-                    fragment, object_key, err
-                );
-                None
-            }
-        };
-
-        let entry_created_at = latest_trash
-            .as_ref()
-            .map(|meta| now.max(meta.created_at.saturating_add(1)))
-            .unwrap_or_else(|| now.max(fallback_meta.created_at.saturating_add(1)));
-
-        let entry = match latest_trash.as_ref() {
-            Some(meta) if !meta.is_delete_marker => synthetic_live_entry(meta, entry_created_at),
-            _ => synthetic_delete_marker(fallback_meta, entry_created_at),
-        };
-
-        for prefix in object_key_directory_scopes(object_key) {
-            entries_by_prefix
-                .entry(prefix)
-                .or_default()
-                .push(entry.clone());
-        }
-    }
-
-    let segment_id = format!("gc-{}", ulid::Ulid::new());
-    for (prefix, entries) in entries_by_prefix {
-        if let Err(err) =
-            write_prefix_entries_update_for_prefix(fragment, &prefix, &segment_id, entries, true)
-                .await
-        {
-            warn!(
-                "Failed to write trash accelerator GC delta for fragment {} prefix='{}': {}",
-                fragment, prefix, err
-            );
-            let _ = mark_fragment_accelerator_stale(fragment, true).await;
-            break;
-        }
-    }
 }
 
 fn should_scan_object_metadata_candidate(path: &Path) -> bool {
@@ -634,23 +570,6 @@ async fn process_fragment_gc(
             if p.exists() {
                 let _ = std::fs::remove_dir_all(p);
             }
-        }
-    }
-
-    if !expired_versions.is_empty() {
-        let mut fallback_by_key = HashMap::<String, ObjectMetadata>::new();
-        for meta in expired_versions.values() {
-            fallback_by_key
-                .entry(meta.object_key.clone())
-                .or_insert_with(|| meta.clone());
-        }
-        sync_trash_accelerators_after_gc(fragment, &fallback_by_key).await;
-
-        if let Err(err) = mark_fragment_accelerator_stale(fragment, true).await {
-            warn!(
-                "Failed to mark trash accelerator stale after GC for fragment {}: {}",
-                fragment, err
-            );
         }
     }
 

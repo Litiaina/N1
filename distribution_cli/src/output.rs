@@ -1,8 +1,8 @@
 use chrono::{Local, TimeZone};
 
 use cli_core::models::{
-    GcJobStatus, HealthResponse, ListUploadsResponse, PrefixRebuildJobStatus,
-    RedistributionJobStatus, RepairJobStatus, UploadStatusResponse,
+    GcJobStatus, HealthResponse, ListUploadsResponse, RedistributionJobStatus,
+    RepairJobStatus, UploadStatusResponse,
 };
 use crate::client::{
     ClusterMembership, N2ClusterViewResponse, NodeDescriptor, ResolvePlacementResponse,
@@ -241,25 +241,6 @@ pub fn format_redistribution_status(status: &RedistributionJobStatus) -> String 
             ("objects_scanned", status.total_objects_scanned.to_string()),
             ("objects_migrated", status.total_objects_migrated.to_string()),
             ("scan_rate", format!("{:.2}/s", status.scan_rate_per_sec)),
-            ("last_error", format_optional_error(&status.last_error)),
-        ],
-    )
-}
-
-pub fn format_prefix_rebuild_status(status: &PrefixRebuildJobStatus) -> String {
-    format_rows(
-        "Prefix Rebuild",
-        &[
-            ("running", status.is_running.to_string()),
-            ("phase", status.phase.clone()),
-            ("fragment", status.current_fragment.clone()),
-            ("duration", format!("{}s", status.duration_seconds)),
-            ("fragments_scanned", status.total_fragments_scanned.to_string()),
-            ("metadata_scanned", status.total_metadata_scanned.to_string()),
-            ("objects_indexed", status.total_objects_indexed.to_string()),
-            ("prefixes_written", status.total_prefixes_written.to_string()),
-            ("entries_written", status.total_entries_written.to_string()),
-            ("errors", status.total_errors.to_string()),
             ("last_error", format_optional_error(&status.last_error)),
         ],
     )

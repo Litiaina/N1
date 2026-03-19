@@ -11,7 +11,6 @@ use crate::n1_core::ec::ErasureStreamWriter;
 use crate::n1_core::fragment_metadata::{read_fragment_metadata, write_fragment_metadata};
 use crate::n1_core::index;
 use crate::n1_core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
-use crate::n1_core::prefix_rebuilder::run_prefix_rebuild_job;
 use crate::n1_core::recovery::read_or_recover_chunk;
 use crate::n1_core::upload::{
     DATA_SHARDS_ATOMIC, DirectWriter, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, create_direct_file,
@@ -729,7 +728,7 @@ fn get_all_metadata_paths_custom(
         return Vec::new();
     }
 
-    let canonical = ObjectPathManager::canonical_prefix(object_key);
+    let canonical = ObjectPathManager::canonical_object_key(object_key);
     let mut route_hasher = Sha256::new();
     for part in ["object", fragment_hash, canonical.as_str()] {
         route_hasher.update(part.as_bytes());
@@ -1741,30 +1740,7 @@ pub async fn run_redistribution_job_with_options(
         }
     }
 
-    if !dry_run
-        && !touched_fragments.is_empty()
-        && !should_stop()
-        && opts.scope != RedistributionScope::Index
-    {
-        {
-            let mut st = REDIST_STATUS.write().await;
-            st.phase = format!(
-                "Rebuilding Prefix Index (fragments={})",
-                touched_fragments.len()
-            );
-            ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
-        }
-
-        let mut frags: Vec<String> = touched_fragments.into_iter().collect();
-        frags.sort();
-
-        for frag in frags {
-            if should_stop() {
-                break;
-            }
-            let _ = run_prefix_rebuild_job(Some(frag), ws_manager.clone()).await;
-        }
-    }
+    let _ = touched_fragments;
 
     {
         let mut st = REDIST_STATUS.write().await;

@@ -1,12 +1,14 @@
 # N2 Deployment Runbook
 
-> Deployment profile status (2026-03-13):
+> Deployment profile status (2026-03-19):
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used underneath both deployment shapes.
 > - Single-node deployment: `standard` (`litiaina-n1-standard`)
-> - `standard` release: `0.5.2`
+> - `standard` release: `0.6.0`
 > - Multi-node deployment: `distribution-runtime` (`litiaina-n2`)
+> - Registry/business deployment: `registry-runtime` (`registry-server`)
 > - Experimental raw-device profile: `arc` (`litiaina-n1-arc`)
+> - Privilege split: prefer a normal service user for `litiaina-n1-standard`, `litiaina-n2`, and `registry-server`. Reserve `root` for `litiaina-n1-arc` raw-device operations only, and let the runtimes validate their writable state paths explicitly.
 > - See `DEPLOYMENT_PROFILES.md` for profile policy.
 
 If you are deploying one node today, use the single-node N2 path on `standard`.
@@ -25,6 +27,8 @@ Current runtime truth:
 - `N2` is the platform identity exposed to operators and deployment docs.
 - `standard`: single-node N2 deployment on the shared N1 engine with filesystem-backed partitioned `index` and blob roots.
 - `distribution-runtime`: multi-node N2 deployment on the same shared N1 engine, with extra `/v4/n2/*` and `/v4/n2/internal/*` APIs for cluster membership and peer data movement.
+- `registry-runtime`: SQLite-backed Registry layer for users, ownership, quotas, and logical listing/filtering across both deployment shapes.
+- `registry-runtime` also brokers short-lived storage sessions for the Registry-backed Drive UI.
 - `arc`: raw partitioned `index` and raw blob devices, experimental only.
 - Auth/session security defaults:
   - access token default TTL: `15 minutes`
@@ -42,15 +46,17 @@ Use the runtime that matches the deployment shape:
 
 - Single-node deployment:
   - run `target/release/litiaina-n1-standard`
+  - run `target/release/registry-server`
   - use `target/release/litiaina-n1-cli` for Standard admin commands
   - use normal mounted filesystem paths for `index_store_disks` and `blob_store_disks`
   - this is the recommended production path for one node
   - this is still N2, just without the cluster layer
 - Multi-node deployment:
   - run `target/release/litiaina-n2`
+  - run `target/release/registry-server`
   - use `target/release/litiaina-n2-cli` for cluster admin commands
   - each node still uses normal mounted filesystem paths for `index_store_disks` and `blob_store_disks`
-  - add an `[n2]` section for node identity, membership file, and internal peer token
+  - configure `n2.env` and `n2_config.ini`
   - use this when the cluster needs cross-node placement, replication, and peer recovery
 - Raw-device engine testing:
   - run `target/release/litiaina-n1-arc`
@@ -58,6 +64,53 @@ Use the runtime that matches the deployment shape:
 
 ## 1. Disk Roles
 
+## Registry Runtime
+
+Run the Registry binary alongside either deployment shape:
+
+- `target/release/registry-server`
+- SQLite path configured with `REGISTRY_SQLITE_PATH`
+- if `registry.env` is missing in the current working directory, the Registry now creates a template automatically and then stops on the first missing required value
+- required env:
+  - `REGISTRY_JWT_SECRET`
+  - `REGISTRY_MASTER_KEY`
+  - `REGISTRY_CERT_PATH`
+  - `REGISTRY_KEY_PATH`
+
+The Registry owns business metadata:
+
+- users
+- ownership
+- quotas
+- logical object listing/filtering
+- logical object resolution by owner + key
+- fragment backend bindings
+- short-lived storage session brokering for Drive
+
+Required env:
+- `REGISTRY_JWT_SECRET`
+- `REGISTRY_MASTER_KEY`
+- `REGISTRY_CERT_PATH`
+- `REGISTRY_KEY_PATH`
+- `REGISTRY_SQLITE_PATH`
+
+Storage-broker env:
+- `REGISTRY_SINGLE_NODE_URL`
+- `REGISTRY_SINGLE_NODE_MASTER_KEY`
+- `REGISTRY_MULTI_NODE_URL`
+- `REGISTRY_MULTI_NODE_MASTER_KEY`
+- `REGISTRY_STORAGE_SESSION_TTL_SECS`
+
+Drive/browser split:
+- `/`
+  - Registry login/signup
+- `/drive`
+  - Registry-backed Drive UI
+  - links fragments to `single_node` or `multi_node`
+  - asks Registry for short-lived storage sessions
+- `/storage`
+  - raw N1 explorer
+  - direct fragment auth and engine-native flat listing
 ### Index disks (`standard`)
 
 Use normal filesystems for:
@@ -65,7 +118,6 @@ Use normal filesystems for:
 - object metadata
 - fragment metadata
 - sessions
-- prefix and delimiter indexes
 - trash index mirrors
 
 Example mountpoints:
@@ -243,7 +295,7 @@ parity_shards=1
 stripe_block_size=4194304
 ```
 
-`n1_config.ini` (multi-node `distribution-runtime` / `litiaina-n2`):
+`n2_config.ini` (multi-node `distribution-runtime` / `litiaina-n2`):
 
 ```ini
 [disk_config]
@@ -278,6 +330,9 @@ Notes for `distribution-runtime`:
 - `auto_cross_params=true` derives `kc/mc` from active node count and `kd/md` from local blob root count at startup.
 - If you want explicit `kc/mc/kd/md`, set `auto_cross_params=false`.
 - Startup now fails early if `kc+mc` exceeds active nodes or `kd` exceeds local blob roots.
+- `data_shards/parity_shards` are still the local shard layout used by the shared N1 engine inside each node.
+- `kc/mc` are the cross-node cluster layout.
+- `kd/md` are the per-node local layout for each cluster shard.
 
 `n1_config.ini` (arc):
 
@@ -297,7 +352,9 @@ Notes:
 
 - `fs_storage_path` is still required for runtime state/staging.
 - Standard stores blob payload files under mounted blob directories.
-- `distribution-runtime` uses the same filesystem-backed disk roles as `standard`, then adds its `[n2]` runtime section for cluster behavior.
+- `standard` uses `n1.env` and `n1_config.ini`.
+- `distribution-runtime` uses `n2.env` and `n2_config.ini`.
+- `distribution-runtime` still uses the same filesystem-backed disk roles as `standard`, then adds its own `[n2]` runtime section for cluster behavior.
 - Arc stores blob payloads on raw devices through `block_manager`.
 
 ## 4. Startup Safeguards
@@ -326,14 +383,18 @@ That is expected. Do not pre-format the device.
 
 ## 6. Systemd Example
 
+`standard` systemd example:
+
 ```ini
 [Unit]
-Description=Litiaina N2
+Description=Litiaina N1 Standard
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
+User=administrator
+Group=administrator
 WorkingDirectory=/opt/n1
 EnvironmentFile=/opt/n1/n1.env
 ExecStart=/opt/n1/target/release/litiaina-n1-standard
@@ -345,7 +406,53 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 ```
 
+`distribution-runtime` systemd example:
+
+```ini
+[Unit]
+Description=Litiaina N2 Distribution Runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=administrator
+Group=administrator
+WorkingDirectory=/opt/n2
+EnvironmentFile=/opt/n2/n2.env
+ExecStart=/opt/n2/target/release/litiaina-n2
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`registry-runtime` systemd example:
+
+```ini
+[Unit]
+Description=Litiaina N2 Registry
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=administrator
+Group=administrator
+WorkingDirectory=/opt/registry
+ExecStart=/opt/registry/target/release/registry-server
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+```
+
 Use `/opt/n1/target/release/litiaina-n1-arc` when deploying the Arc raw-kernel profile.
+Prefer not to run `litiaina-n1-standard`, `litiaina-n2`, or `registry-server` with `sudo`; if you do, make sure their writable state paths such as `.auth`, env/config files, and the Registry database stay intentional and writable for the user that will run the service later.
 
 ## 7. Health And Observability
 
@@ -423,7 +530,7 @@ Scrub is the integrity-check pass for committed shards (raw shards on arc, shard
 
 ## 10. Release Hardening On Target Hardware
 
-Run the release drill harness before production rollout (`standard 0.5.2` stable, `arc` experimental):
+Run the release drill harness before production rollout (`standard 0.6.0` stable, `arc` experimental):
 
 ```bash
 scripts/bench/run_release_drills.sh

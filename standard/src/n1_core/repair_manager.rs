@@ -7,7 +7,6 @@ use crate::n1_core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata,
 };
 use crate::n1_core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
-use crate::n1_core::prefix_rebuilder::run_prefix_rebuild_job;
 use crate::n1_core::recovery::{repair_entire_shard, verify_shard_integrity};
 use crate::n1_core::upload::UploadSessionManifest;
 use crate::routes::storage_routes::AppState;
@@ -1653,22 +1652,7 @@ pub async fn run_repair_job_with_options(
             pending.clear();
         }
 
-        if !cfg.dry_run && fragment_touched && !should_stop() {
-            {
-                let mut status = REPAIR_STATUS.write().await;
-                status.phase = format!("Rebuilding Prefix Index {}", fragment_hash);
-                ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
-            }
-
-            if let Err(e) =
-                run_prefix_rebuild_job(Some(fragment_hash.clone()), ws_manager.clone()).await
-            {
-                warn!(
-                    "Prefix rebuild failed for fragment {}: {}",
-                    fragment_hash, e
-                );
-            }
-        }
+        let _ = fragment_touched;
     }
 
     {

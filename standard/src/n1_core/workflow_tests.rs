@@ -1,13 +1,11 @@
-use super::archive::download_selected_archive;
-use super::constants::PREFIX_SEGMENT_EXT;
 use super::delete::delete_object;
 use super::delete::{
     BulkObjectKeysRequest, delete_object_permanently, delete_object_version, delete_objects_bulk,
     recover_object, recover_object_version, recover_objects_bulk,
 };
 use super::disk_manager::{
-    DownloadArchiveRequest, InitiateUploadParams, ListObjectsResult, ObjectKeyQuery,
-    ObjectPathManager, PrefixIndexSegment, RenameObjectRequest, UploadPartQuery,
+    InitiateUploadParams, ListObjectsResult, ObjectKeyQuery, ObjectPathManager,
+    RenameObjectRequest, UploadPartQuery,
 };
 use super::fragment_metadata::init_fragment_metadata;
 use super::garbage_collector::{get_gc_status_api, run_garbage_collector};
@@ -19,11 +17,6 @@ use super::object_parser::{
     STREAM_READAHEAD_BYTES_ATOMIC,
 };
 use super::operation_gate::MaintenanceAccessMode;
-use super::prefix_compactor::{
-    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC, PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC,
-};
-use super::prefix_rebuilder::run_prefix_rebuild_job;
-use super::prefix_updates::{accelerator_prefix, fragment_accelerator_is_stale};
 use super::quota_manager::init_quota_file;
 use super::recovery::verify_shard_integrity;
 use super::redistribution::{
@@ -33,7 +26,6 @@ use super::redistribution::{
 use super::repair_manager::{
     RepairCheckMode, RepairRunConfig, RepairRunOptions, run_repair_job, run_repair_job_with_options,
 };
-use super::retrieve::PREFIX_MAX_DELTA_SEGMENTS_ATOMIC;
 use super::retrieve::{
     get_object, get_object_metadata, list_objects, list_trash_objects, stream_object,
 };
@@ -259,16 +251,6 @@ fn ensure_upload_runtime_config() {
             .get()
             .expect("STREAM_LOCALITY_BIAS_ENABLED_ATOMIC")
             .store(true, Ordering::Relaxed);
-    }
-    if PREFIX_MAX_DELTA_SEGMENTS_ATOMIC.get().is_none() {
-        PREFIX_MAX_DELTA_SEGMENTS_ATOMIC
-            .set(AtomicUsize::new(512))
-            .expect("set PREFIX_MAX_DELTA_SEGMENTS_ATOMIC");
-    } else {
-        PREFIX_MAX_DELTA_SEGMENTS_ATOMIC
-            .get()
-            .expect("PREFIX_MAX_DELTA_SEGMENTS_ATOMIC")
-            .store(512, Ordering::Relaxed);
     }
 }
 
@@ -675,120 +657,6 @@ async fn run_manual_gc_and_wait(state: Arc<AppState>) {
     }
 }
 
-async fn wait_until_prefix_compacted(fragment: &str, _prefix: &str, timeout_ms: u64) -> bool {
-    let path_manager = ObjectPathManager::new();
-    let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    let compacted_name = format!("compacted{}", PREFIX_SEGMENT_EXT);
-    let accelerator = accelerator_prefix();
-
-    loop {
-        let mut any_bucket = false;
-        let mut all_buckets_compacted = true;
-
-        for bucket in path_manager.get_all_prefix_bucket_dirs(fragment, accelerator) {
-            if !fs::try_exists(&bucket).await.unwrap_or(false) {
-                continue;
-            }
-            any_bucket = true;
-
-            let mut has_compacted = false;
-
-            let mut rd = match fs::read_dir(&bucket).await {
-                Ok(v) => v,
-                Err(_) => {
-                    all_buckets_compacted = false;
-                    break;
-                }
-            };
-
-            while let Ok(Some(ent)) = rd.next_entry().await {
-                let name = ent.file_name().to_string_lossy().to_string();
-                if name == compacted_name {
-                    has_compacted = true;
-                }
-            }
-
-            if !has_compacted {
-                all_buckets_compacted = false;
-                break;
-            }
-        }
-
-        if any_bucket && all_buckets_compacted {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-}
-
-async fn wait_until_root_accelerator_fully_compacted(
-    fragment: &str,
-    trashed: bool,
-    timeout_ms: u64,
-) -> bool {
-    let path_manager = ObjectPathManager::new();
-    let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    let compacted_name = format!("compacted{}", PREFIX_SEGMENT_EXT);
-    let accelerator = accelerator_prefix();
-
-    loop {
-        let mut any_bucket = false;
-        let mut all_buckets_compacted = true;
-
-        let buckets = if trashed {
-            path_manager.get_all_trash_prefix_bucket_dirs(fragment, accelerator)
-        } else {
-            path_manager.get_all_prefix_bucket_dirs(fragment, accelerator)
-        };
-
-        for bucket in buckets {
-            if !fs::try_exists(&bucket).await.unwrap_or(false) {
-                continue;
-            }
-            any_bucket = true;
-
-            let mut has_compacted = false;
-            let mut has_delta_segments = false;
-
-            let mut rd = match fs::read_dir(&bucket).await {
-                Ok(v) => v,
-                Err(_) => {
-                    all_buckets_compacted = false;
-                    break;
-                }
-            };
-
-            while let Ok(Some(ent)) = rd.next_entry().await {
-                let name = ent.file_name().to_string_lossy().to_string();
-                if name == compacted_name {
-                    has_compacted = true;
-                }
-                if name.starts_with("seg_") && name.ends_with(PREFIX_SEGMENT_EXT) {
-                    has_delta_segments = true;
-                }
-            }
-
-            if !has_compacted || has_delta_segments {
-                all_buckets_compacted = false;
-                break;
-            }
-        }
-
-        if any_bucket && all_buckets_compacted {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-}
-
 async fn read_object_bytes(claims: Claims, fragment: String, object_key: String) -> Vec<u8> {
     let Claims {
         fragment: claim_fragment,
@@ -896,9 +764,6 @@ async fn collect_index_tree_hashes(fragment: &str) -> Vec<(String, BTreeMap<Stri
             continue;
         }
 
-        let mut prefix_buckets: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
-
         for entry in walkdir::WalkDir::new(&frag_root)
             .into_iter()
             .filter_map(|e| e.ok())
@@ -919,69 +784,9 @@ async fn collect_index_tree_hashes(fragment: &str) -> Vec<(String, BTreeMap<Stri
                 .to_string_lossy()
                 .replace('\\', "/");
 
-            if rel.starts_with("index/__p__/v1/pfx/") && rel.ends_with(PREFIX_SEGMENT_EXT) {
-                if let Some(parent) = std::path::Path::new(&rel).parent() {
-                    prefix_buckets.insert(parent.to_string_lossy().replace('\\', "/"));
-                }
-                continue;
-            }
-
             if let Ok(bytes) = fs::read(path).await {
                 let digest = Sha256::digest(&bytes);
                 map.insert(rel, hex::encode(digest));
-            }
-        }
-
-        // Prefix index compaction can produce different physical segment layouts per disk.
-        // Canonicalize each prefix bucket to logical "latest entry per object_key" state.
-        for bucket_rel in prefix_buckets {
-            let bucket_abs = frag_root.join(&bucket_rel);
-            let mut latest: std::collections::BTreeMap<String, (String, i64)> =
-                std::collections::BTreeMap::new();
-
-            let mut rd = match fs::read_dir(&bucket_abs).await {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            while let Ok(Some(ent)) = rd.next_entry().await {
-                let name = ent.file_name().to_string_lossy().to_string();
-                if name != format!("compacted{}", PREFIX_SEGMENT_EXT)
-                    && !(name.starts_with("seg_") && name.ends_with(PREFIX_SEGMENT_EXT))
-                {
-                    continue;
-                }
-                let Ok(data) = fs::read(ent.path()).await else {
-                    continue;
-                };
-                let Ok(seg) = rmp_serde::from_slice::<PrefixIndexSegment>(&data) else {
-                    continue;
-                };
-                for e in seg.entries {
-                    match latest.get(&e.object_key) {
-                        None => {
-                            latest.insert(e.object_key, (e.version_id, e.created_at));
-                        }
-                        Some((cur_vid, cur_ts)) => {
-                            if e.created_at > *cur_ts
-                                || (e.created_at == *cur_ts && e.version_id > *cur_vid)
-                            {
-                                latest.insert(e.object_key, (e.version_id, e.created_at));
-                            }
-                        }
-                    }
-                }
-            }
-
-            let mut canonical = Vec::with_capacity(latest.len());
-            for (k, (v, ts)) in latest {
-                canonical.push((k, v, ts));
-            }
-            if let Ok(bytes) = rmp_serde::to_vec(&canonical) {
-                let digest = Sha256::digest(bytes);
-                map.insert(
-                    format!("{}/__logical__.sha256", bucket_rel),
-                    hex::encode(digest),
-                );
             }
         }
 
@@ -1007,41 +812,6 @@ async fn assert_all_index_disks_synchronized(fragment: &str) {
             base_root, root
         );
     }
-}
-
-fn parse_tar_entry_names(tar_bytes: &[u8]) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut off = 0usize;
-
-    while off + 512 <= tar_bytes.len() {
-        let header = &tar_bytes[off..off + 512];
-        if header.iter().all(|b| *b == 0) {
-            break;
-        }
-
-        let name_raw = &header[0..100];
-        let name_end = name_raw
-            .iter()
-            .position(|b| *b == 0)
-            .unwrap_or(name_raw.len());
-        let name = String::from_utf8_lossy(&name_raw[..name_end]).to_string();
-        names.push(name);
-
-        let size_raw = &header[124..136];
-        let size_txt = String::from_utf8_lossy(size_raw)
-            .trim_matches('\0')
-            .trim()
-            .to_string();
-        let size = u64::from_str_radix(size_txt.trim(), 8).unwrap_or(0) as usize;
-        let data_blocks = if size == 0 {
-            0
-        } else {
-            size.div_ceil(512) * 512
-        };
-        off += 512 + data_blocks;
-    }
-
-    names
 }
 
 async fn upload_part(
@@ -1726,576 +1496,6 @@ async fn workflow_upload_read_modify_delete_redistribute_repair() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_prefix_listing_survives_rename_delete_after_compaction() {
-    let _guard = TEST_LOCK.lock().await;
-    let base = TEST_BASE.clone();
-    ensure_global_storage_config(&base).await;
-    ensure_upload_runtime_config();
-
-    let prev_compact_trigger = PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(128);
-    let prev_compact_min_interval = PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(30);
-    let prev_data_shards = DATA_SHARDS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(1);
-    let prev_parity_shards = PARITY_SHARDS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(0);
-    let prev_stripe_size = STRIPE_SIZE_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(4096);
-
-    if PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC.get().is_none() {
-        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-            .set(AtomicUsize::new(1))
-            .expect("set PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC");
-    } else {
-        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-            .get()
-            .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
-            .store(1, Ordering::Relaxed);
-    }
-    if PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC.get().is_none() {
-        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-            .set(AtomicU64::new(1))
-            .expect("set PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC");
-    } else {
-        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-            .get()
-            .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
-            .store(1, Ordering::Relaxed);
-    }
-    DATA_SHARDS_ATOMIC
-        .get()
-        .expect("DATA_SHARDS_ATOMIC")
-        .store(2, Ordering::Relaxed);
-    PARITY_SHARDS_ATOMIC
-        .get()
-        .expect("PARITY_SHARDS_ATOMIC")
-        .store(1, Ordering::Relaxed);
-    STRIPE_SIZE_ATOMIC
-        .get()
-        .expect("STRIPE_SIZE_ATOMIC")
-        .store(256 * 1024, Ordering::Relaxed);
-
-    let fragment = {
-        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
-        hex::encode(digest)
-    };
-    let key_a = "ward/a.bin".to_string();
-    let key_b = "ward/b.bin".to_string();
-    let key_a_renamed = "ward/a-renamed.bin".to_string();
-
-    init_quota_file(&fragment, 64 * 1024 * 1024)
-        .await
-        .expect("init quota");
-    ensure_fragment_blob_directories(&fragment).await;
-    init_fragment_metadata(&fragment, "key")
-        .await
-        .expect("init metadata");
-
-    let state = Arc::new(AppState {
-        ws_manager: WsConnectionManager::new(),
-    });
-
-    put_object(state.clone(), &fragment, &key_a, vec![1u8; 8 * 1024]).await;
-    put_object(state.clone(), &fragment, &key_b, vec![2u8; 8 * 1024]).await;
-
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    run_prefix_rebuild_job(Some(fragment.clone()), Arc::new(WsConnectionManager::new()))
-        .await
-        .expect("run prefix rebuild");
-
-    assert!(
-        wait_until_prefix_compacted(&fragment, "", 5000).await,
-        "root prefix should compact during test setup"
-    );
-    assert!(
-        wait_until_prefix_compacted(&fragment, "ward", 5000).await,
-        "ward prefix should compact during test setup"
-    );
-
-    let rename_resp = rename_object(
-        State(state.clone()),
-        full_claims(&fragment),
-        AxumJson(RenameObjectRequest {
-            source_fragment: fragment.clone(),
-            source_key: key_a.clone(),
-            destination_fragment: fragment.clone(),
-            destination_key: key_a_renamed.clone(),
-        }),
-    )
-    .await
-    .expect("rename object")
-    .into_response();
-    assert_eq!(rename_resp.status(), StatusCode::OK);
-
-    let delete_resp = delete_object(
-        State(state),
-        full_claims(&fragment),
-        AxumPath((fragment.clone(), key_a_renamed.clone())),
-    )
-    .await
-    .expect("delete renamed object")
-    .into_response();
-    assert_eq!(delete_resp.status(), StatusCode::OK);
-
-    let listing = list_objects_json(&fragment, Some("ward"), None).await;
-    let keys = listing["objects"]
-        .as_array()
-        .expect("objects array")
-        .iter()
-        .filter_map(|v| v["object_key"].as_str())
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-
-    assert!(
-        keys.iter().any(|k| k == &key_b),
-        "expected unaffected key to stay listed, got {:?}",
-        keys
-    );
-    assert!(
-        keys.iter().all(|k| k != &key_a_renamed),
-        "deleted key should not stay listed: {:?}",
-        keys
-    );
-
-    let listing_delim = list_objects_json(&fragment, Some("ward"), Some("/")).await;
-    let delim_keys = listing_delim["objects"]
-        .as_array()
-        .expect("delimiter objects array")
-        .iter()
-        .filter_map(|v| v["object_key"].as_str())
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    let delim_prefixes = listing_delim["common_prefixes"]
-        .as_array()
-        .expect("delimiter prefixes array")
-        .iter()
-        .filter_map(|v| v.as_str())
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-
-    assert!(
-        delim_keys.iter().any(|k| k == &key_b),
-        "delimiter listing should keep unaffected key, got {:?}",
-        delim_keys
-    );
-    assert!(
-        delim_keys.iter().all(|k| k != &key_a_renamed),
-        "delimiter listing should exclude deleted key: {:?}",
-        delim_keys
-    );
-    assert!(
-        delim_prefixes.is_empty(),
-        "ward delimiter listing should not emit child prefixes: {:?}",
-        delim_prefixes
-    );
-
-    let root_listing_delim = list_objects_json(&fragment, None, Some("/")).await;
-    let root_prefixes = root_listing_delim["common_prefixes"]
-        .as_array()
-        .expect("root prefixes array")
-        .iter()
-        .filter_map(|v| v.as_str())
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        root_prefixes,
-        vec!["ward/".to_string()],
-        "root delimiter listing should retain only the live ward prefix"
-    );
-
-    PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-        .get()
-        .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
-        .store(prev_compact_trigger, Ordering::Relaxed);
-    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-        .get()
-        .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
-        .store(prev_compact_min_interval, Ordering::Relaxed);
-    DATA_SHARDS_ATOMIC
-        .get()
-        .expect("DATA_SHARDS_ATOMIC")
-        .store(prev_data_shards, Ordering::Relaxed);
-    PARITY_SHARDS_ATOMIC
-        .get()
-        .expect("PARITY_SHARDS_ATOMIC")
-        .store(prev_parity_shards, Ordering::Relaxed);
-    STRIPE_SIZE_ATOMIC
-        .get()
-        .expect("STRIPE_SIZE_ATOMIC")
-        .store(prev_stripe_size, Ordering::Relaxed);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_delimiter_listing_keeps_exact_prefix_object_and_child_prefixes() {
-    let _guard = TEST_LOCK.lock().await;
-    let base = TEST_BASE.clone();
-    ensure_global_storage_config(&base).await;
-    ensure_upload_runtime_config();
-
-    let prev_compact_trigger = PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(128);
-    let prev_compact_min_interval = PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(30);
-
-    if PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC.get().is_none() {
-        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-            .set(AtomicUsize::new(1))
-            .expect("set PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC");
-    } else {
-        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-            .get()
-            .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
-            .store(1, Ordering::Relaxed);
-    }
-    if PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC.get().is_none() {
-        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-            .set(AtomicU64::new(1))
-            .expect("set PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC");
-    } else {
-        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-            .get()
-            .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
-            .store(1, Ordering::Relaxed);
-    }
-
-    let fragment = {
-        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
-        hex::encode(digest)
-    };
-    init_quota_file(&fragment, 64 * 1024 * 1024)
-        .await
-        .expect("init quota");
-    ensure_fragment_blob_directories(&fragment).await;
-    init_fragment_metadata(&fragment, "key")
-        .await
-        .expect("init metadata");
-
-    let state = Arc::new(AppState {
-        ws_manager: WsConnectionManager::new(),
-    });
-
-    for (key, fill) in [
-        ("study", 1u8),
-        ("study/root.bin", 2u8),
-        ("study/reports/q1.bin", 3u8),
-        ("study/series/a.bin", 4u8),
-        ("study/series/b.bin", 5u8),
-        ("study-extra.bin", 6u8),
-    ] {
-        put_object(state.clone(), &fragment, key, vec![fill; 4096]).await;
-    }
-
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    run_prefix_rebuild_job(Some(fragment.clone()), Arc::new(WsConnectionManager::new()))
-        .await
-        .expect("run prefix rebuild");
-
-    assert!(
-        wait_until_prefix_compacted(&fragment, "study", 5000).await,
-        "study prefix should compact during test setup"
-    );
-    let listing = list_objects_json(&fragment, Some("study"), Some("/")).await;
-    let mut object_keys = listing["objects"]
-        .as_array()
-        .expect("objects array")
-        .iter()
-        .filter_map(|v| v["object_key"].as_str())
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    object_keys.sort();
-    let mut common_prefixes = listing["common_prefixes"]
-        .as_array()
-        .expect("common prefixes array")
-        .iter()
-        .filter_map(|v| v.as_str())
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    common_prefixes.sort();
-
-    assert_eq!(
-        object_keys,
-        vec!["study".to_string(), "study/root.bin".to_string()]
-    );
-    assert_eq!(
-        common_prefixes,
-        vec!["study/reports/".to_string(), "study/series/".to_string()]
-    );
-    assert!(listing["continuation_token"].is_null());
-
-    PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-        .get()
-        .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
-        .store(prev_compact_trigger, Ordering::Relaxed);
-    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-        .get()
-        .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
-        .store(prev_compact_min_interval, Ordering::Relaxed);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_delimiter_listing_paginates_without_skipping_rows() {
-    let _guard = TEST_LOCK.lock().await;
-    let base = TEST_BASE.clone();
-    ensure_global_storage_config(&base).await;
-    ensure_upload_runtime_config();
-
-    let prev_compact_trigger = PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(128);
-    let prev_compact_min_interval = PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(30);
-
-    if PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC.get().is_none() {
-        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-            .set(AtomicUsize::new(1))
-            .expect("set PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC");
-    } else {
-        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-            .get()
-            .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
-            .store(1, Ordering::Relaxed);
-    }
-    if PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC.get().is_none() {
-        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-            .set(AtomicU64::new(1))
-            .expect("set PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC");
-    } else {
-        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-            .get()
-            .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
-            .store(1, Ordering::Relaxed);
-    }
-
-    let fragment = {
-        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
-        hex::encode(digest)
-    };
-    init_quota_file(&fragment, 64 * 1024 * 1024)
-        .await
-        .expect("init quota");
-    ensure_fragment_blob_directories(&fragment).await;
-    init_fragment_metadata(&fragment, "key")
-        .await
-        .expect("init metadata");
-
-    let state = Arc::new(AppState {
-        ws_manager: WsConnectionManager::new(),
-    });
-
-    for (key, fill) in [
-        ("page", 1u8),
-        ("page/a.bin", 2u8),
-        ("page/b.bin", 3u8),
-        ("page/sub-a/x.bin", 4u8),
-        ("page/sub-b/y.bin", 5u8),
-    ] {
-        put_object(state.clone(), &fragment, key, vec![fill; 2048]).await;
-    }
-
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    run_prefix_rebuild_job(Some(fragment.clone()), Arc::new(WsConnectionManager::new()))
-        .await
-        .expect("run prefix rebuild");
-
-    assert!(
-        wait_until_prefix_compacted(&fragment, "page", 5000).await,
-        "page prefix should compact during test setup"
-    );
-    let page1 = list_objects_json_page(&fragment, Some("page"), Some("/"), 2, None).await;
-    let token1 = page1["continuation_token"]
-        .as_str()
-        .expect("page1 continuation token")
-        .to_string();
-
-    let page2 = list_objects_json_page(&fragment, Some("page"), Some("/"), 2, Some(token1)).await;
-    let token2 = page2["continuation_token"]
-        .as_str()
-        .expect("page2 continuation token")
-        .to_string();
-
-    let page3 = list_objects_json_page(&fragment, Some("page"), Some("/"), 2, Some(token2)).await;
-
-    let mut rows = Vec::new();
-    for page in [&page1, &page2, &page3] {
-        rows.extend(
-            page["objects"]
-                .as_array()
-                .expect("objects array")
-                .iter()
-                .filter_map(|v| v["object_key"].as_str())
-                .map(|s| format!("object:{s}")),
-        );
-        rows.extend(
-            page["common_prefixes"]
-                .as_array()
-                .expect("common prefixes array")
-                .iter()
-                .filter_map(|v| v.as_str())
-                .map(|s| format!("prefix:{s}")),
-        );
-    }
-
-    assert_eq!(
-        rows,
-        vec![
-            "object:page".to_string(),
-            "object:page/a.bin".to_string(),
-            "object:page/b.bin".to_string(),
-            "prefix:page/sub-a/".to_string(),
-            "prefix:page/sub-b/".to_string(),
-        ]
-    );
-    assert!(page3["continuation_token"].is_null());
-
-    PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-        .get()
-        .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
-        .store(prev_compact_trigger, Ordering::Relaxed);
-    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-        .get()
-        .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
-        .store(prev_compact_min_interval, Ordering::Relaxed);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_delimiter_listing_keeps_direct_files_after_compaction_with_new_deltas() {
-    let _guard = TEST_LOCK.lock().await;
-    let base = TEST_BASE.clone();
-    ensure_global_storage_config(&base).await;
-    ensure_upload_runtime_config();
-
-    let prev_compact_trigger = PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(128);
-    let prev_compact_min_interval = PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or(30);
-
-    if PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC.get().is_none() {
-        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-            .set(AtomicUsize::new(1))
-            .expect("set PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC");
-    } else {
-        PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-            .get()
-            .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
-            .store(1, Ordering::Relaxed);
-    }
-    if PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC.get().is_none() {
-        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-            .set(AtomicU64::new(1))
-            .expect("set PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC");
-    } else {
-        PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-            .get()
-            .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
-            .store(1, Ordering::Relaxed);
-    }
-
-    let fragment = {
-        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
-        hex::encode(digest)
-    };
-    init_quota_file(&fragment, 64 * 1024 * 1024)
-        .await
-        .expect("init quota");
-    ensure_fragment_blob_directories(&fragment).await;
-    init_fragment_metadata(&fragment, "key")
-        .await
-        .expect("init metadata");
-
-    let state = Arc::new(AppState {
-        ws_manager: WsConnectionManager::new(),
-    });
-
-    for (key, fill) in [("videos/a.bin", 1u8), ("videos/b.bin", 2u8)] {
-        put_object(state.clone(), &fragment, key, vec![fill; 2048]).await;
-    }
-
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    run_prefix_rebuild_job(Some(fragment.clone()), Arc::new(WsConnectionManager::new()))
-        .await
-        .expect("run prefix rebuild");
-
-    assert!(
-        wait_until_prefix_compacted(&fragment, "videos", 5000).await,
-        "videos prefix should compact during test setup"
-    );
-    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-        .get()
-        .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
-        .store(3600, Ordering::Relaxed);
-
-    for (key, fill) in [("videos/c.bin", 3u8), ("videos/new-folder/x.bin", 4u8)] {
-        put_object(state.clone(), &fragment, key, vec![fill; 2048]).await;
-    }
-
-    let listing = list_objects_json(&fragment, Some("videos"), Some("/")).await;
-    let mut object_keys = listing["objects"]
-        .as_array()
-        .expect("objects array")
-        .iter()
-        .filter_map(|v| v["object_key"].as_str())
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    object_keys.sort();
-
-    let mut common_prefixes = listing["common_prefixes"]
-        .as_array()
-        .expect("common prefixes array")
-        .iter()
-        .filter_map(|v| v.as_str())
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    common_prefixes.sort();
-
-    assert_eq!(
-        object_keys,
-        vec![
-            "videos/a.bin".to_string(),
-            "videos/b.bin".to_string(),
-            "videos/c.bin".to_string(),
-        ],
-        "direct files disappeared from delimiter listing: {listing:?}"
-    );
-    assert_eq!(
-        common_prefixes,
-        vec!["videos/new-folder/".to_string()],
-        "child folder missing from delimiter listing: {listing:?}"
-    );
-
-    PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC
-        .get()
-        .expect("PREFIX_COMPACT_TRIGGER_SEGMENTS_ATOMIC")
-        .store(prev_compact_trigger, Ordering::Relaxed);
-    PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC
-        .get()
-        .expect("PREFIX_COMPACT_MIN_INTERVAL_SECS_ATOMIC")
-        .store(prev_compact_min_interval, Ordering::Relaxed);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_multipart_finalize_conflict_then_success() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -2867,201 +2067,6 @@ async fn matrix_delete_version_again_permanently_removes_only_trashed_version() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_recover_object_stays_listed_in_prefix_index() {
-    let _guard = TEST_LOCK.lock().await;
-    let base = TEST_BASE.clone();
-    ensure_global_storage_config(&base).await;
-    ensure_upload_runtime_config();
-    DATA_SHARDS_ATOMIC
-        .get()
-        .expect("DATA_SHARDS_ATOMIC")
-        .store(1, Ordering::Relaxed);
-    PARITY_SHARDS_ATOMIC
-        .get()
-        .expect("PARITY_SHARDS_ATOMIC")
-        .store(0, Ordering::Relaxed);
-
-    let fragment = {
-        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
-        hex::encode(digest)
-    };
-    let key_recover = "restore/returned.bin".to_string();
-    let key_keep = "restore/keep.bin".to_string();
-
-    init_quota_file(&fragment, 64 * 1024 * 1024)
-        .await
-        .expect("init quota");
-    ensure_fragment_blob_directories(&fragment).await;
-    init_fragment_metadata(&fragment, "key")
-        .await
-        .expect("init metadata");
-
-    let state = Arc::new(AppState {
-        ws_manager: WsConnectionManager::new(),
-    });
-    put_object(
-        state.clone(),
-        &fragment,
-        &key_recover,
-        vec![0xA1; 12 * 1024],
-    )
-    .await;
-    put_object(state.clone(), &fragment, &key_keep, vec![0xB2; 9 * 1024]).await;
-
-    let del_resp = delete_object(
-        State(state.clone()),
-        full_claims(&fragment),
-        AxumPath((fragment.clone(), key_recover.clone())),
-    )
-    .await
-    .expect("delete recover key")
-    .into_response();
-    assert_eq!(del_resp.status(), StatusCode::OK);
-
-    let rec_resp = recover_object(
-        State(state),
-        full_claims(&fragment),
-        AxumPath((fragment.clone(), key_recover.clone())),
-    )
-    .await
-    .expect("recover key")
-    .into_response();
-    assert_eq!(rec_resp.status(), StatusCode::OK);
-
-    let listing = list_objects_json(&fragment, Some("restore"), None).await;
-    let keys = listing["objects"]
-        .as_array()
-        .expect("objects array")
-        .iter()
-        .filter_map(|v| v["object_key"].as_str())
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-
-    assert!(
-        keys.iter().any(|k| k == &key_recover),
-        "recovered key missing from prefix listing: {:?}",
-        keys
-    );
-    assert!(
-        keys.iter().any(|k| k == &key_keep),
-        "unaffected key missing from prefix listing: {:?}",
-        keys
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_trash_listing_delimiter_and_recover_updates_rows() {
-    let _guard = TEST_LOCK.lock().await;
-    let base = TEST_BASE.clone();
-    ensure_global_storage_config(&base).await;
-    ensure_upload_runtime_config();
-    DATA_SHARDS_ATOMIC
-        .get()
-        .expect("DATA_SHARDS_ATOMIC")
-        .store(1, Ordering::Relaxed);
-    PARITY_SHARDS_ATOMIC
-        .get()
-        .expect("PARITY_SHARDS_ATOMIC")
-        .store(0, Ordering::Relaxed);
-
-    let fragment = {
-        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
-        hex::encode(digest)
-    };
-    init_quota_file(&fragment, 64 * 1024 * 1024)
-        .await
-        .expect("init quota");
-    ensure_fragment_blob_directories(&fragment).await;
-    init_fragment_metadata(&fragment, "key")
-        .await
-        .expect("init metadata");
-
-    let state = Arc::new(AppState {
-        ws_manager: WsConnectionManager::new(),
-    });
-
-    let key_a = "trash/a.bin".to_string();
-    let key_sub = "trash/sub/x.bin".to_string();
-    put_object(state.clone(), &fragment, &key_a, vec![1u8; 2048]).await;
-    put_object(state.clone(), &fragment, &key_sub, vec![2u8; 2048]).await;
-
-    delete_object(
-        State(state.clone()),
-        full_claims(&fragment),
-        AxumPath((fragment.clone(), key_a.clone())),
-    )
-    .await
-    .expect("delete key_a");
-    delete_object(
-        State(state.clone()),
-        full_claims(&fragment),
-        AxumPath((fragment.clone(), key_sub.clone())),
-    )
-    .await
-    .expect("delete key_sub");
-
-    let page1 = list_trash_json_page(&fragment, Some("trash"), Some("/"), 1, None).await;
-    let token1 = page1["continuation_token"]
-        .as_str()
-        .expect("trash page1 continuation")
-        .to_string();
-    let page2 = list_trash_json_page(&fragment, Some("trash"), Some("/"), 1, Some(token1)).await;
-
-    let mut rows = Vec::new();
-    for page in [&page1, &page2] {
-        rows.extend(
-            page["objects"]
-                .as_array()
-                .expect("trash objects array")
-                .iter()
-                .filter_map(|v| v["object_key"].as_str())
-                .map(|s| format!("object:{s}")),
-        );
-        rows.extend(
-            page["common_prefixes"]
-                .as_array()
-                .expect("trash common prefixes array")
-                .iter()
-                .filter_map(|v| v.as_str())
-                .map(|s| format!("prefix:{s}")),
-        );
-    }
-    rows.sort();
-    assert!(
-        rows.iter().any(|r| r == "object:trash/a.bin"),
-        "expected trashed object row in delimiter listing: {:?}",
-        rows
-    );
-    assert!(
-        rows.iter().any(|r| r == "prefix:trash/sub/"),
-        "expected trashed common prefix row in delimiter listing: {:?}",
-        rows
-    );
-
-    recover_object(
-        State(state),
-        full_claims(&fragment),
-        AxumPath((fragment.clone(), key_sub.clone())),
-    )
-    .await
-    .expect("recover key_sub");
-
-    let after_recover = list_trash_json_page(&fragment, Some("trash"), None, 100, None).await;
-    let keys_after = after_recover["objects"]
-        .as_array()
-        .expect("after recover trash objects")
-        .iter()
-        .filter_map(|v| v["object_key"].as_str())
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    assert!(
-        keys_after.iter().all(|k| k != "trash/sub/x.bin"),
-        "recovered object should not stay in trash listing: {:?}",
-        keys_after
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_live_listing_without_prefix_uses_partition_pagination() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -3203,7 +2208,7 @@ async fn matrix_gc_keeps_live_data_and_cleans_trash_in_partition_layout() {
     let live_after = read_object_bytes(full_claims(&fragment), fragment.clone(), key_live).await;
     assert_eq!(live_after, live_payload, "GC must not remove live object");
 
-    let trash_listing = list_trash_json_page(&fragment, Some("gc"), None, 100, None).await;
+    let trash_listing = list_trash_json_page(&fragment, None, None, 100, None).await;
     let trashed_keys = trash_listing["objects"]
         .as_array()
         .expect("trash objects")
@@ -3257,7 +2262,7 @@ async fn matrix_list_objects_hides_internal_keys_unless_requested() {
     .await;
     put_object(state, &fragment, "videos/.n1fsd_dir", vec![0x22]).await;
 
-    let listing_default = list_objects_json(&fragment, Some("videos"), None).await;
+    let listing_default = list_objects_json(&fragment, None, None).await;
     let default_keys = listing_default["objects"]
         .as_array()
         .expect("objects array")
@@ -3277,8 +2282,7 @@ async fn matrix_list_objects_hides_internal_keys_unless_requested() {
         default_keys
     );
 
-    let listing_internal =
-        list_objects_json_with_internal(&fragment, Some("videos"), None, true).await;
+    let listing_internal = list_objects_json_with_internal(&fragment, None, None, true).await;
     let internal_keys = listing_internal["objects"]
         .as_array()
         .expect("objects array")
@@ -6068,295 +5072,6 @@ async fn matrix_stream_sequential_readahead_locality_probe() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_archive_prefix_and_delimiter_tar_stream() {
-    let _guard = TEST_LOCK.lock().await;
-    let base = TEST_BASE.clone();
-    ensure_global_storage_config(&base).await;
-    ensure_upload_runtime_config();
-
-    let fragment = {
-        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
-        hex::encode(digest)
-    };
-    setup_fragment(&fragment).await;
-
-    let state = Arc::new(AppState {
-        ws_manager: WsConnectionManager::new(),
-    });
-
-    let keys = vec![
-        "arch/root-a.bin".to_string(),
-        "arch/root-b.bin".to_string(),
-        "arch/sub/deep-a.bin".to_string(),
-        "arch/sub/deeper/deep-b.bin".to_string(),
-        "other/outside.bin".to_string(),
-    ];
-
-    for (i, key) in keys.iter().enumerate() {
-        let content = (0..(2048 + i * 19))
-            .map(|n| ((n + i) % 251) as u8)
-            .collect::<Vec<u8>>();
-        put_object(state.clone(), &fragment, key, content).await;
-    }
-
-    let resp = download_selected_archive(
-        full_claims(&fragment),
-        AxumPath(fragment.clone()),
-        AxumJson(DownloadArchiveRequest {
-            keys: vec![],
-            prefix: Some("arch".to_string()),
-            delimiter: Some("/".to_string()),
-            max_keys: Some(1000),
-            continuation_token: None,
-            format: "tar".to_string(),
-            filename: Some("by-prefix".to_string()),
-        }),
-    )
-    .await
-    .expect("archive by prefix delimiter")
-    .into_response();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("archive bytes");
-    let mut names = parse_tar_entry_names(&body);
-    names.sort();
-    assert_eq!(
-        names,
-        vec!["arch/root-a.bin".to_string(), "arch/root-b.bin".to_string()]
-    );
-
-    let resp_recursive = download_selected_archive(
-        full_claims(&fragment),
-        AxumPath(fragment.clone()),
-        AxumJson(DownloadArchiveRequest {
-            keys: vec![],
-            prefix: Some("arch".to_string()),
-            delimiter: None,
-            max_keys: Some(1000),
-            continuation_token: None,
-            format: "tar".to_string(),
-            filename: Some("recursive".to_string()),
-        }),
-    )
-    .await
-    .expect("archive recursive prefix")
-    .into_response();
-    assert_eq!(resp_recursive.status(), StatusCode::OK);
-    let body_recursive = to_bytes(resp_recursive.into_body(), usize::MAX)
-        .await
-        .expect("archive recursive bytes");
-    let mut recursive_names = parse_tar_entry_names(&body_recursive);
-    recursive_names.sort();
-    assert_eq!(
-        recursive_names,
-        vec![
-            "arch/root-a.bin".to_string(),
-            "arch/root-b.bin".to_string(),
-            "arch/sub/deep-a.bin".to_string(),
-            "arch/sub/deeper/deep-b.bin".to_string(),
-        ]
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_archive_prefix_pagination_continuation_token() {
-    let _guard = TEST_LOCK.lock().await;
-    let base = TEST_BASE.clone();
-    ensure_global_storage_config(&base).await;
-    ensure_upload_runtime_config();
-
-    let fragment = {
-        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
-        hex::encode(digest)
-    };
-    setup_fragment(&fragment).await;
-
-    let state = Arc::new(AppState {
-        ws_manager: WsConnectionManager::new(),
-    });
-
-    let keys = vec![
-        "page/a.bin".to_string(),
-        "page/b.bin".to_string(),
-        "page/c.bin".to_string(),
-        "page/d.bin".to_string(),
-        "page/e.bin".to_string(),
-    ];
-    for (i, key) in keys.iter().enumerate() {
-        let content = (0..(1024 + i * 7))
-            .map(|n| ((n + i) % 251) as u8)
-            .collect::<Vec<u8>>();
-        put_object(state.clone(), &fragment, key, content).await;
-    }
-
-    let resp1 = download_selected_archive(
-        full_claims(&fragment),
-        AxumPath(fragment.clone()),
-        AxumJson(DownloadArchiveRequest {
-            keys: vec![],
-            prefix: Some("page".to_string()),
-            delimiter: None,
-            max_keys: Some(2),
-            continuation_token: None,
-            format: "tar".to_string(),
-            filename: Some("p1".to_string()),
-        }),
-    )
-    .await
-    .expect("page 1 archive")
-    .into_response();
-    assert_eq!(resp1.status(), StatusCode::OK);
-    let tok1 = resp1
-        .headers()
-        .get("x-n1-archive-next-token")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .expect("page 1 next token");
-    let body1 = to_bytes(resp1.into_body(), usize::MAX)
-        .await
-        .expect("page1 body");
-    let mut names1 = parse_tar_entry_names(&body1);
-    names1.sort();
-    assert_eq!(
-        names1,
-        vec!["page/a.bin".to_string(), "page/b.bin".to_string()]
-    );
-
-    let resp2 = download_selected_archive(
-        full_claims(&fragment),
-        AxumPath(fragment.clone()),
-        AxumJson(DownloadArchiveRequest {
-            keys: vec![],
-            prefix: Some("page".to_string()),
-            delimiter: None,
-            max_keys: Some(2),
-            continuation_token: Some(tok1),
-            format: "tar".to_string(),
-            filename: Some("p2".to_string()),
-        }),
-    )
-    .await
-    .expect("page 2 archive")
-    .into_response();
-    assert_eq!(resp2.status(), StatusCode::OK);
-    let tok2 = resp2
-        .headers()
-        .get("x-n1-archive-next-token")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .expect("page 2 next token");
-    let body2 = to_bytes(resp2.into_body(), usize::MAX)
-        .await
-        .expect("page2 body");
-    let mut names2 = parse_tar_entry_names(&body2);
-    names2.sort();
-    assert_eq!(
-        names2,
-        vec!["page/c.bin".to_string(), "page/d.bin".to_string()]
-    );
-
-    let resp3 = download_selected_archive(
-        full_claims(&fragment),
-        AxumPath(fragment.clone()),
-        AxumJson(DownloadArchiveRequest {
-            keys: vec![],
-            prefix: Some("page".to_string()),
-            delimiter: None,
-            max_keys: Some(2),
-            continuation_token: Some(tok2),
-            format: "tar".to_string(),
-            filename: Some("p3".to_string()),
-        }),
-    )
-    .await
-    .expect("page 3 archive")
-    .into_response();
-    assert_eq!(resp3.status(), StatusCode::OK);
-    assert!(
-        resp3.headers().get("x-n1-archive-next-token").is_none(),
-        "last page should not carry continuation token"
-    );
-    let body3 = to_bytes(resp3.into_body(), usize::MAX)
-        .await
-        .expect("page3 body");
-    let mut names3 = parse_tar_entry_names(&body3);
-    names3.sort();
-    assert_eq!(names3, vec!["page/e.bin".to_string()]);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_archive_prefix_unbounded_streams_all_pages_as_tar() {
-    let _guard = TEST_LOCK.lock().await;
-    let base = TEST_BASE.clone();
-    ensure_global_storage_config(&base).await;
-    ensure_upload_runtime_config();
-
-    let fragment = {
-        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
-        hex::encode(digest)
-    };
-    setup_fragment(&fragment).await;
-
-    let state = Arc::new(AppState {
-        ws_manager: WsConnectionManager::new(),
-    });
-
-    let total = 1_201usize;
-    for i in 0..total {
-        let key = format!("bulk-recover/file-{:04}.bin", i);
-        let content = vec![(i % 251) as u8; 128];
-        put_object(state.clone(), &fragment, &key, content).await;
-    }
-
-    let response = download_selected_archive(
-        full_claims(&fragment),
-        AxumPath(fragment.clone()),
-        AxumJson(DownloadArchiveRequest {
-            keys: vec![],
-            prefix: Some("bulk-recover".to_string()),
-            delimiter: None,
-            max_keys: None,
-            continuation_token: None,
-            format: "zip".to_string(),
-            filename: Some("full-recovery".to_string()),
-        }),
-    )
-    .await
-    .expect("unbounded prefix archive")
-    .into_response();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok()),
-        Some("application/x-tar"),
-        "unbounded prefix mode must force tar"
-    );
-    assert!(
-        response.headers().get("x-n1-archive-next-token").is_none(),
-        "unbounded prefix mode should stream all pages in one response"
-    );
-
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("archive body");
-    let mut names = parse_tar_entry_names(&body);
-    names.sort();
-    assert_eq!(names.len(), total, "all prefix keys should be archived");
-    assert_eq!(
-        names.first().map(String::as_str),
-        Some("bulk-recover/file-0000.bin")
-    );
-    assert_eq!(
-        names.last().map(String::as_str),
-        Some("bulk-recover/file-1200.bin")
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_bulk_delete_and_recover_round_trip() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -6398,33 +5113,11 @@ async fn matrix_bulk_delete_and_recover_round_trip() {
         serde_json::from_slice(&bulk_delete_body).expect("bulk delete json");
     assert_eq!(bulk_delete_json["succeeded"].as_u64(), Some(64));
     assert_eq!(bulk_delete_json["not_found"].as_u64(), Some(0));
-    assert!(
-        !fragment_accelerator_is_stale(&fragment, false).await,
-        "live accelerator should stay warm after bulk delete"
-    );
-    assert!(
-        !fragment_accelerator_is_stale(&fragment, true).await,
-        "trash accelerator should stay warm after bulk delete"
-    );
-    assert!(
-        wait_until_root_accelerator_fully_compacted(&fragment, false, 5000).await,
-        "live root accelerator should be compacted after bulk delete"
-    );
-    assert!(
-        wait_until_root_accelerator_fully_compacted(&fragment, true, 5000).await,
-        "trash root accelerator should be compacted after bulk delete"
-    );
 
     let live_after_delete_resp = list_objects(
         full_claims(&fragment),
         AxumPath(fragment.clone()),
-        Query(HashMap::from([
-            (
-                "prefix".to_string(),
-                "xray/2025/02-02-2026/doctor/files/images/ppacs/".to_string(),
-            ),
-            ("page_size".to_string(), "1000".to_string()),
-        ])),
+        Query(HashMap::from([("limit".to_string(), "1000".to_string())])),
     )
     .await
     .expect("live list after bulk delete")
@@ -6443,13 +5136,7 @@ async fn matrix_bulk_delete_and_recover_round_trip() {
     let trash_after_delete_resp = list_trash_objects(
         full_claims(&fragment),
         AxumPath(fragment.clone()),
-        Query(HashMap::from([
-            (
-                "prefix".to_string(),
-                "xray/2025/02-02-2026/doctor/files/images/ppacs/".to_string(),
-            ),
-            ("page_size".to_string(), "1000".to_string()),
-        ])),
+        Query(HashMap::from([("limit".to_string(), "1000".to_string())])),
     )
     .await
     .expect("trash list after bulk delete")
@@ -6478,33 +5165,11 @@ async fn matrix_bulk_delete_and_recover_round_trip() {
         serde_json::from_slice(&bulk_recover_body).expect("bulk recover json");
     assert_eq!(bulk_recover_json["succeeded"].as_u64(), Some(64));
     assert_eq!(bulk_recover_json["not_found"].as_u64(), Some(0));
-    assert!(
-        !fragment_accelerator_is_stale(&fragment, false).await,
-        "live accelerator should stay warm after bulk recover"
-    );
-    assert!(
-        !fragment_accelerator_is_stale(&fragment, true).await,
-        "trash accelerator should stay warm after bulk recover"
-    );
-    assert!(
-        wait_until_root_accelerator_fully_compacted(&fragment, false, 5000).await,
-        "live root accelerator should be compacted after bulk recover"
-    );
-    assert!(
-        wait_until_root_accelerator_fully_compacted(&fragment, true, 5000).await,
-        "trash root accelerator should be compacted after bulk recover"
-    );
 
     let live_after_recover_resp = list_objects(
         full_claims(&fragment),
         AxumPath(fragment.clone()),
-        Query(HashMap::from([
-            (
-                "prefix".to_string(),
-                "xray/2025/02-02-2026/doctor/files/images/ppacs/".to_string(),
-            ),
-            ("page_size".to_string(), "1000".to_string()),
-        ])),
+        Query(HashMap::from([("limit".to_string(), "1000".to_string())])),
     )
     .await
     .expect("live list after bulk recover")
@@ -6520,13 +5185,7 @@ async fn matrix_bulk_delete_and_recover_round_trip() {
     let trash_after_recover_resp = list_trash_objects(
         full_claims(&fragment),
         AxumPath(fragment.clone()),
-        Query(HashMap::from([
-            (
-                "prefix".to_string(),
-                "xray/2025/02-02-2026/doctor/files/images/ppacs/".to_string(),
-            ),
-            ("page_size".to_string(), "1000".to_string()),
-        ])),
+        Query(HashMap::from([("limit".to_string(), "1000".to_string())])),
     )
     .await
     .expect("trash list after bulk recover")
@@ -6666,17 +5325,16 @@ async fn matrix_repro_delete_multiple_restore_all_listing_blank() {
         ws_manager: WsConnectionManager::new(),
     });
 
-    let prefix = "repro-blank";
     let count = 5;
     let mut keys = Vec::new();
 
     for i in 0..count {
-        let key = format!("{}/obj-{}.bin", prefix, i);
+        let key = format!("repro-blank/obj-{}.bin", i);
         put_object(state.clone(), &fragment, &key, vec![0xAA; 10]).await;
         keys.push(key);
     }
 
-    let initial = list_objects_json(&fragment, Some(prefix), None).await;
+    let initial = list_objects_json(&fragment, None, None).await;
     let initial_keys = initial["objects"].as_array().expect("objects array").len();
     assert_eq!(initial_keys, count, "initial listing mismatch");
 
@@ -6692,7 +5350,7 @@ async fn matrix_repro_delete_multiple_restore_all_listing_blank() {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    let empty = list_objects_json(&fragment, Some(prefix), None).await;
+    let empty = list_objects_json(&fragment, None, None).await;
     let empty_keys = empty["objects"].as_array().map(|v| v.len()).unwrap_or(0);
     assert_eq!(empty_keys, 0, "listing should be empty after delete");
 
@@ -6708,7 +5366,7 @@ async fn matrix_repro_delete_multiple_restore_all_listing_blank() {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    let restored = list_objects_json(&fragment, Some(prefix), None).await;
+    let restored = list_objects_json(&fragment, None, None).await;
     let restored_keys = restored["objects"].as_array().map(|v| v.len()).unwrap_or(0);
 
     assert_eq!(
@@ -6716,13 +5374,33 @@ async fn matrix_repro_delete_multiple_restore_all_listing_blank() {
         "listing should be restored after recover"
     );
 
-    let restored_delim = list_objects_json(&fragment, Some(prefix), Some("/")).await;
-    let restored_delim_keys = restored_delim["objects"]
-        .as_array()
-        .map(|v| v.len())
-        .unwrap_or(0);
-    assert_eq!(
-        restored_delim_keys, count,
-        "listing with delimiter should be restored after recover"
-    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_flat_listing_rejects_prefix_and_delimiter_queries() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let err = list_objects(
+        full_claims(&fragment),
+        AxumPath(fragment.clone()),
+        Query(HashMap::from([
+            ("prefix".to_string(), "patients".to_string()),
+            ("delimiter".to_string(), "/".to_string()),
+        ])),
+    )
+    .await
+    .err()
+    .expect("prefix query should be rejected");
+    let resp = err.into_response();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

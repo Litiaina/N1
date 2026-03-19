@@ -16,13 +16,15 @@
 
 ---
 
-> Deployment profile status (2026-03-13):
+> Deployment profile status (2026-03-19):
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared node-local storage engine used by both deployments.
 > - `standard` (`litiaina-n1-standard`) is the single-node N2 deployment path and the stable default.
-> - `standard` is released at `0.5.2`.
+> - `standard` is released at `0.6.0`.
 > - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path.
+> - `registry-runtime` (`registry-server`) is the SQLite-backed business metadata layer for both deployment shapes.
 > - `arc` (`litiaina-n1-arc`) is the experimental raw-device profile and is not the production default.
+> - Prefer a non-root service user for `litiaina-n1-standard`, `litiaina-n2`, and `registry-server`. Keep `root` for `litiaina-n1-arc` raw-device operations only.
 > - See `DEPLOYMENT_PROFILES.md` for the profile split and architecture guidance.
 > - Operator shortcut: choose the deployment shape in `DEPLOYMENT.md` first, then ignore Arc unless you are explicitly doing raw-device testing.
 
@@ -36,7 +38,6 @@
 - [Architecture (Authority vs Namespace vs Blob)](#architecture-authority-vs-namespace-vs-blob)
 - [On-disk layout](#on-disk-layout)
   - [`index` partitions](#index-partitions)
-  - [Prefix namespace index](#prefix-namespace-index)
   - [Blob storage](#blob-storage)
 - [Write path (multipart upload)](#write-path-multipart-upload)
   - [Initiate upload](#1-initiate-upload)
@@ -75,8 +76,12 @@ For deployment profile guidance, see `DEPLOYMENT_PROFILES.md`.
 N2 deployment split in this workspace:
 - Single-node deployment: run `litiaina-n1-standard` from `standard`.
 - Multi-node deployment: run `litiaina-n2` from `distribution-runtime`.
+- Registry deployment: run `registry-server` from `registry-runtime`.
+- If `registry.env` is missing in the current working directory, `registry-server` creates a template automatically and tells you which required value is still missing.
 - Raw-device testing remains `litiaina-n1-arc` from `arc`.
 - `standard` and `distribution-runtime` now share the same stable `standard/src/n1_core` implementation; `distribution-runtime` only adds cluster-specific `n2_core` and route layers.
+- `registry-runtime` owns business logic and user convenience metadata: users, ownership, quotas, logical listing, and logical object lookup.
+- `registry-runtime` also brokers short-lived storage sessions for the Registry-backed Drive UI, so the browser no longer needs fragment secrets for normal Drive use.
 - Product identity:
   - `N2` is the operator-facing platform identity.
   - `N1` is the shared storage engine underneath both deployment shapes.
@@ -134,13 +139,21 @@ Profile note:
 
 ## Release Status
 
-- `standard` is the stable/default deployment profile at `0.5.2`.
+- `standard` is the stable/default deployment profile at `0.6.0`.
+- `registry-runtime` is introduced in `0.6.0` as the SQLite-backed Registry layer.
 - `arc` is the experimental raw-device profile.
 - Stable architecture baseline (`standard`):
   - filesystem-backed authoritative `index`
   - filesystem-backed `blob_store_disks` shard layout (directory roots)
   - partitioned + replicated metadata
-  - projected prefix namespace serving
+  - fragment-scoped exact-key object serving
+- Registry architecture baseline (`registry-runtime`):
+  - user management and login
+  - ownership and quota accounting
+  - logical listing and filtering
+  - registry-owned object metadata lookup
+  - fragment-to-backend binding for `single_node` and `multi_node` storage targets
+  - storage-session brokering for Registry-backed clients
 - `standard` also exposes `POST /v4/upload/one-shot/{object_key}` for direct small-object upload without session/finalize overhead. The fragment comes from the authenticated claim.
 - `standard` also exposes claim-scoped bulk mutation routes for high-count object workflows:
   - `POST /v4/fragment/object/bulk-delete`
@@ -154,7 +167,7 @@ Profile note:
 
 | Dimension | Standard (`litiaina-n1-standard`) | Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / production default (`0.5.2`) | Experimental / raw-device profile |
+| Status | Stable / production default (`0.6.0`) | Experimental / raw-device profile |
 | `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | Index metadata backend | Partitioned filesystem metadata | Raw index catalog on block-manager media |
@@ -213,10 +226,48 @@ It has two deployment shapes:
 Under both shapes, the node-local storage engine is still **N1**. N1 provides:
 
 - a partitioned metadata authority in `index` (filesystem-backed in `standard`, raw in `arc`)
-- a derived prefix namespace index for fast `LIST`
+- fragment-scoped object storage with exact-key retrieval
 - a profile-specific blob backend:
   - `standard`: filesystem-backed shard files under blob roots
   - `arc`: raw-device/direct-I/O blob plane with raw index authority
+
+Starting in `0.6.0`, user convenience behavior is moving out of the engine and into the Registry layer:
+
+- user management
+- ownership tracking
+- quota enforcement
+- logical listing and filtering
+- folder/prefix simulation for clients
+
+That Registry layer runs as `registry-server` and uses SQLite in both single-node and multi-node deployments.
+
+Registry-backed client flow now looks like this:
+
+- user logs in to the Registry with email/password
+- Drive links a fragment to either:
+  - `single_node`
+  - `multi_node`
+- Drive asks the Registry for a short-lived storage session
+- Registry authenticates against the selected engine backend and returns:
+  - engine URL
+  - short-lived fragment access token
+- browser sends object bytes directly to the storage engine
+- Registry remains the business/control plane
+
+This keeps the data path direct while removing fragment-secret handling from the normal Drive browser flow.
+
+Web surface split:
+
+- `/`
+  - Registry login/signup
+- `/drive`
+  - Registry-backed Drive UI
+  - prefix/delimiter listing, search, ownership, quota, and storage-session brokering
+- `/storage`
+  - raw N1 explorer
+  - direct fragment mount
+  - flat engine-native listing
+  - health/resource view
 
 This is the architectural shift from the legacy node: object and session truth are no longer stored as a whole-node mirrored tree on every index root. Instead, metadata authority is partitioned by hash onto a small selected set of roots, and N2 composes that node-local engine into either a single-node or multi-node deployment.
 
@@ -241,7 +292,7 @@ Operationally, N1 means:
 - fragments are the isolation boundary
 - object versions are immutable
 - `index` is the authoritative source for live objects, trash, and upload sessions
-- prefix and delimiter listing are served from a derived namespace index
+- object listing is flat and exact-key oriented
 - maintenance jobs reconcile from the same authoritative metadata plane
 
 ## Engine Identity And Why Two Variants Exist
@@ -277,11 +328,11 @@ N1 keeps authoritative metadata on profile-specific media: mounted index filesys
 
 **Result:** the node keeps an inspectable on-disk layout while bounding metadata write fanout.
 
-### 2) Exact-key truth separated from namespace serving
+### 2) Exact-key truth without namespace coupling
 
-Exact object visibility comes from `index`. Prefix and delimiter listing are served from a derived namespace index with inline list rows.
+Exact object visibility comes from `index`, and engine-side listing is a flat scan over authoritative latest-object state.
 
-**Result:** `GET` and `HEAD` do not depend on the same structure that serves `LIST`.
+**Result:** `GET`, `HEAD`, and flat `LIST` all resolve from the same storage authority.
 
 ### 3) Immutability as correctness
 
@@ -370,20 +421,7 @@ Each multipart part is encoded into data and parity shards whose payloads are co
 - upload sessions and committed parts
 - WAL records for mutation history
 
-This is the authoritative plane used by exact-key reads, finalize, delete/recover, sync, repair, GC, redistribution, and prefix rebuild.
-
-### Prefix namespace index
-
-The prefix subsystem is a serving accelerator:
-
-- serves `LIST prefix`
-- serves delimiter-based folder illusion
-- stores inline list payload so successful list hits avoid reopening object metadata per entry
-- indexes full object keys in sorted order under one root accelerator bucket per namespace
-- derives delimiter/common-prefix rows at read time instead of maintaining ancestor prefixes on every mutation
-- can be rebuilt from `index`
-
-It is performance-critical, but not correctness-critical.
+This is the authoritative plane used by exact-key reads, finalize, delete/recover, sync, repair, GC, redistribution, and flat listing.
 
 ### Blob plane
 
@@ -425,24 +463,6 @@ Notes:
 - object and session state are partitioned independently
 - writes target the partition's selected roots, not every index root in the node
 - success requires at least one selected root to persist the update
-
-### Prefix namespace index
-
-Prefix-serving state remains under the prefix tree on index disks, but `standard` now treats it as a
-root full-key accelerator rather than one eagerly-maintained bucket per ancestor prefix:
-
-```text
-{INDEX_ROOT}/{fragment}/index/__p__/v1/pfx/{p1}/{p2}/{root_prefix_hash}/
-  compacted.msgpack
-  seg_<id>.msgpack
-```
-
-Notes:
-
-- live listing uses the root accelerator under `index/__p__/...`
-- trash listing uses the same layout under `{INDEX_ROOT}/{fragment}/.trash/index/__p__/...`
-- upload/delete/restore/rename update only full-key rows; they do not synchronously maintain ancestor prefix buckets
-- if the accelerator is missing or stale, the node rebuilds that fragment from authoritative `index` metadata
 
 ### Blob storage (`standard`)
 
@@ -592,7 +612,7 @@ Exact-key reads are driven by `index`:
 3. read shard chunks from the active backend (files in `standard`, raw devices in `arc`)
 4. reconstruct missing data when parity allows
 
-Prefix and delimiter listing use the root full-key accelerator first. If that accelerator is missing, the node rebuilds the fragment’s serving snapshot from authoritative `index` metadata before serving the request. Authoritative partition scans remain a last-resort safety path, not the normal listing strategy.
+Engine-side listing is flat and paginated from authoritative `index` state. Namespace browsing, folder simulation, and prefix filtering belong in the Registry layer.
 
 ---
 
@@ -713,11 +733,11 @@ The legacy mirrored tree was safe, but it scaled badly because every publish and
 1. It bounds write fanout.
    Metadata writes hit the owning partition roots, not every index disk.
 
-2. It separates correctness from acceleration.
-   Exact-key truth lives in `index`; prefix listing is a derived serving layer.
+2. It separates engine storage from business namespace behavior.
+   Exact-key truth lives in `index`; user-facing browsing belongs in the Registry layer.
 
 3. It gives maintenance one source of truth.
-   Repair, GC, sync, archive prefix resolution, and rebuild all converge on the same authority.
+   Repair, GC, sync, and redistribution all converge on the same authority.
 
 4. It provides a clean evolution path.
    The current segmented WAL plus partition checkpoints already provide a clean base for stronger replay, compaction, and replica-repair behavior without another semantic rewrite.
@@ -910,15 +930,6 @@ Flags:
 cargo run -p standard_cli -- redistribute start --fragment <fragment_hash>
 cargo run -p standard_cli -- redistribute status
 cargo run -p standard_cli -- redistribute stop
-```
-
-#### `prefix-rebuild`
-Lifecycle control for prefix rebuild.
-
-```bash
-cargo run -p standard_cli -- prefix-rebuild start --fragment <fragment_hash>
-cargo run -p standard_cli -- prefix-rebuild status
-cargo run -p standard_cli -- prefix-rebuild watch
 ```
 
 ### Watch behavior

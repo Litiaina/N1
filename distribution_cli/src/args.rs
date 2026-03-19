@@ -50,10 +50,6 @@ pub enum Commands {
         #[command(subcommand)]
         action: RedistributeAction,
     },
-    PrefixRebuild {
-        #[command(subcommand)]
-        action: PrefixRebuildAction,
-    },
     ClusterView {
         #[arg(long, default_value_t = false)]
         public: bool,
@@ -154,17 +150,6 @@ pub struct RedistributeStartArgs {
     pub object_concurrency: Option<usize>,
     #[arg(long)]
     pub status_batch: Option<u64>,
-}
-
-#[derive(Subcommand, Debug, Clone)]
-pub enum PrefixRebuildAction {
-    Start {
-        #[arg(long)]
-        fragment: Option<String>,
-    },
-    Status,
-    Stop,
-    Watch,
 }
 
 #[derive(Subcommand, Debug, Clone)]
