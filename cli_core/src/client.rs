@@ -67,7 +67,9 @@ impl AuthSession {
     fn apply_auth_response(&mut self, auth: AuthResponse) {
         self.access_token = auth.access_token;
         self.refresh_token = auth.refresh_token;
-        self.access_expires_at = auth.expires_in.map(|ttl| Instant::now() + Duration::from_secs(ttl));
+        self.access_expires_at = auth
+            .expires_in
+            .map(|ttl| Instant::now() + Duration::from_secs(ttl));
         let _ = auth.refresh_expires_in;
     }
 
@@ -84,7 +86,11 @@ impl AuthSession {
             .unwrap_or(false)
     }
 
-    async fn ensure_access_token(&mut self, client: &Client, base_url: &str) -> Result<(), DynError> {
+    async fn ensure_access_token(
+        &mut self,
+        client: &Client,
+        base_url: &str,
+    ) -> Result<(), DynError> {
         if self.access_token_expires_soon() {
             self.refresh_or_reauthenticate(client, base_url).await?;
         }
@@ -148,7 +154,8 @@ pub fn get_base_url(url_opt: Option<String>) -> String {
         return url.trim_end_matches('/').to_string();
     }
 
-    let config = Ini::load_from_file("n1_config.ini").or_else(|_| Ini::load_from_file("config.ini"));
+    let config =
+        Ini::load_from_file("n1_config.ini").or_else(|_| Ini::load_from_file("config.ini"));
     if let Ok(config) = config
         && let Some(section) = config.section(Some("server"))
     {
@@ -236,7 +243,10 @@ where
     let response = build(session.access_token()).send().await?;
     if response.status() == StatusCode::UNAUTHORIZED {
         session.refresh_or_reauthenticate(client, base_url).await?;
-        return Ok(build(session.access_token()).send().await?.error_for_status()?);
+        return Ok(build(session.access_token())
+            .send()
+            .await?
+            .error_for_status()?);
     }
 
     Ok(response.error_for_status()?)
@@ -319,7 +329,11 @@ pub async fn print_response_message(response: reqwest::Response) -> Result<(), D
     Ok(())
 }
 
-pub fn print_output<T: Serialize>(json_out: bool, value: &T, formatted: &str) -> Result<(), DynError> {
+pub fn print_output<T: Serialize>(
+    json_out: bool,
+    value: &T,
+    formatted: &str,
+) -> Result<(), DynError> {
     if json_out {
         println!("{}", serde_json::to_string_pretty(value)?);
     } else {

@@ -13,7 +13,7 @@
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used by both deployment shapes.
 > - `standard` is the stable single-node deployment path.
-> - `standard` is released at `0.6.0`.
+> - `standard` is released at `0.6.1`.
 > - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path in this workspace.
 > - `registry-runtime` (`registry-server`) is the SQLite-backed Registry layer for user/business metadata.
 > - `arc` is experimental for raw-device deployments.
@@ -62,7 +62,7 @@
 > - Multipart uploads do not rely on in-memory part state for resumability. Part commits are durably recorded in the `index` WAL/session state and mirrored as per-part metadata files for compatibility and recovery workflows.
 
 > Release status note:
-> - N1 `standard` is stable at `0.6.0`; `arc` is experimental.
+> - N1 `standard` is stable at `0.6.1`; `arc` is experimental.
 > - This document describes the current implementation and current routes.
 > - Request/response details and endpoint layout may still change before `1.0.0` even though the underlying storage model is now fixed.
 
@@ -70,7 +70,7 @@
 
 | Dimension | Standard (`litiaina-n1-standard`) | Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / default (`0.6.0`) | Experimental / raw-device profile |
+| Status | Stable / default (`0.6.1`) | Experimental / raw-device profile |
 | API source of truth | Yes (`standard/src/routes/storage_routes.rs`) | Yes (`arc/src/routes/storage_routes.rs`) |
 | `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw devices / loopback files |
@@ -113,7 +113,7 @@ Registry base URL example:
 Startup note:
 - if `registry.env` is missing in the current working directory, the Registry creates a template automatically and then stops on the first required unset value
 
-Registry routes introduced for `0.6.0`:
+Registry routes available in `0.6.1`:
 - `GET /health`
 - `POST /v1/admin/users`
 - `POST /v1/auth/signup`
@@ -479,7 +479,7 @@ Notes:
   - `limit`
   - `continuation_token`
   - `include_internal`
-- Unsupported in `0.6.0` engine mode:
+- Unsupported in `0.6.1` engine mode:
   - `prefix`
   - `delimiter`
 - Namespace browsing, folder simulation, and filtered views belong in the registry layer above the engine.

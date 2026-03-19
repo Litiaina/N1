@@ -109,7 +109,12 @@ fn load_runtime_config() -> N2RuntimeConfig {
         .unwrap_or(defaults.internal_token);
     let auto_cross_params = sec
         .get("auto_cross_params")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(defaults.auto_cross_params);
     let cluster_stripe_block_size = normalize_stripe_block_size(parse_usize_or_default(
         sec.get("cluster_stripe_block_size"),
@@ -224,7 +229,14 @@ pub fn resolve_effective_cross_params(
         if *existing != params {
             return Err(format!(
                 "effective cross params already initialized as kc={} mc={} kd={} md={}, cannot replace with kc={} mc={} kd={} md={}",
-                existing.kc, existing.mc, existing.kd, existing.md, params.kc, params.mc, params.kd, params.md
+                existing.kc,
+                existing.mc,
+                existing.kd,
+                existing.md,
+                params.kc,
+                params.mc,
+                params.kd,
+                params.md
             ));
         }
     } else {

@@ -5,8 +5,6 @@ pub use standard::{
 use crate::fs::cleanup_manager::interval_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
-use crate::n2_core::config::{n2_runtime_config, resolve_effective_cross_params};
-use crate::n2_core::state::get_cluster_view;
 use crate::n1_core::adaptive_concurrency::{
     ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC, ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC,
 };
@@ -23,6 +21,8 @@ use crate::n1_core::upload::{
     PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC,
     UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
 };
+use crate::n2_core::config::{n2_runtime_config, resolve_effective_cross_params};
+use crate::n2_core::state::get_cluster_view;
 use crate::routes::storage_routes::serve_storage_routes;
 use crate::settings::constants::{CONFIG_FILE, ENV_FILE};
 use crate::utils::date_time_formatter::LocalTimer;
@@ -37,8 +37,8 @@ use std::fs::OpenOptions;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::time::Duration;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
@@ -388,9 +388,10 @@ pub fn init_tracing() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
     let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stderr());
 
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            "info,litiaina_n1=trace,axum=info,hyper=info".into()
-        }))
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,litiaina_n1=trace,axum=info,hyper=info".into()),
+        )
         .with(
             fmt::layer()
                 .with_writer(non_blocking)
@@ -566,14 +567,22 @@ fn validate_runtime_paths(config: &Ini) -> Result<(), String> {
     let index_store_str = disk_section
         .and_then(|s| s.get("index_store_disks"))
         .ok_or_else(|| "Missing index_store_disks in [disk_config]".to_string())?;
-    for root in index_store_str.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+    for root in index_store_str
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         ensure_existing_writable_dir(Path::new(root), "N2 index_store_disks entry")?;
     }
 
     let blob_store_str = disk_section
         .and_then(|s| s.get("blob_store_disks"))
         .ok_or_else(|| "Missing blob_store_disks in [disk_config]".to_string())?;
-    for root in blob_store_str.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+    for root in blob_store_str
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         ensure_existing_writable_dir(Path::new(root), "N2 blob_store_disks entry")?;
     }
 

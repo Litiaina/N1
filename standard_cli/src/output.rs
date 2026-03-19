@@ -1,8 +1,8 @@
 use chrono::{Local, TimeZone};
 
 use cli_core::models::{
-    GcJobStatus, HealthResponse, ListUploadsResponse, RedistributionJobStatus,
-    RepairJobStatus, UploadStatusResponse,
+    GcJobStatus, HealthResponse, ListUploadsResponse, RedistributionJobStatus, RepairJobStatus,
+    UploadStatusResponse,
 };
 
 fn format_timestamp(ts: i64) -> String {
@@ -121,7 +121,17 @@ pub fn format_health(response: &HealthResponse) -> String {
             let error = disk.error.clone().unwrap_or_else(|| "-".to_string());
             out.push_str(&format!(
                 "\n{} [{}] {}  latency={}  usage={}  path={}  error={}",
-                disk.role, disk.status, if disk.status == "online" { "healthy" } else { "attention" }, latency, usage, disk.path, error
+                disk.role,
+                disk.status,
+                if disk.status == "online" {
+                    "healthy"
+                } else {
+                    "attention"
+                },
+                latency,
+                usage,
+                disk.path,
+                error
             ));
         }
     }
@@ -177,7 +187,10 @@ pub fn format_upload_list(response: &ListUploadsResponse) -> String {
             session.version_id,
             session.committed_parts,
             human_bytes(session.committed_bytes),
-            session.object_key.clone().unwrap_or_else(|| "-".to_string())
+            session
+                .object_key
+                .clone()
+                .unwrap_or_else(|| "-".to_string())
         ));
     }
     out
@@ -187,9 +200,27 @@ pub fn format_upload_status(response: &UploadStatusResponse) -> String {
     format_rows(
         "Upload Status",
         &[
-            ("session_id", response.session_id.clone().unwrap_or_else(|| "-".to_string())),
-            ("version_id", response.version_id.clone().unwrap_or_else(|| "-".to_string())),
-            ("object_key", response.object_key.clone().unwrap_or_else(|| "-".to_string())),
+            (
+                "session_id",
+                response
+                    .session_id
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            (
+                "version_id",
+                response
+                    .version_id
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            (
+                "object_key",
+                response
+                    .object_key
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
             ("committed_parts", response.committed_parts.to_string()),
             ("committed_bytes", human_bytes(response.committed_bytes)),
             (
@@ -226,10 +257,19 @@ pub fn format_gc_status(status: &GcJobStatus) -> String {
             ("duration", format!("{}s", status.duration_seconds)),
             (
                 "fragments",
-                format!("{}/{}", status.total_fragments_scanned, status.total_fragments),
+                format!(
+                    "{}/{}",
+                    status.total_fragments_scanned, status.total_fragments
+                ),
             ),
-            ("trash_expired", status.total_trash_versions_expired.to_string()),
-            ("orphan_blob_dirs", status.total_orphan_blob_dirs_deleted.to_string()),
+            (
+                "trash_expired",
+                status.total_trash_versions_expired.to_string(),
+            ),
+            (
+                "orphan_blob_dirs",
+                status.total_orphan_blob_dirs_deleted.to_string(),
+            ),
             ("refund_bytes", human_bytes(status.total_refund_bytes)),
             ("errors", status.total_errors.to_string()),
             ("last_error", format_optional_error(&status.last_error)),
@@ -251,7 +291,10 @@ pub fn format_repair_status(status: &RepairJobStatus) -> String {
             ("scan_rate", format!("{:.2}/s", status.scan_rate_per_sec)),
             (
                 "last_repaired",
-                status.last_repaired.clone().unwrap_or_else(|| "-".to_string()),
+                status
+                    .last_repaired
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
             ),
             ("last_error", format_optional_error(&status.last_error)),
         ],
@@ -266,13 +309,19 @@ pub fn format_redistribution_status(status: &RedistributionJobStatus) -> String 
             ("phase", status.phase.clone()),
             ("fragment", status.current_fragment.clone()),
             ("duration", format!("{}s", status.duration_seconds)),
-            ("fragments_scanned", status.total_fragments_scanned.to_string()),
+            (
+                "fragments_scanned",
+                status.total_fragments_scanned.to_string(),
+            ),
             ("objects_scanned", status.total_objects_scanned.to_string()),
             (
                 "objects_need_move",
                 status.total_objects_need_redistribution.to_string(),
             ),
-            ("objects_migrated", status.total_objects_migrated.to_string()),
+            (
+                "objects_migrated",
+                status.total_objects_migrated.to_string(),
+            ),
             ("scan_rate", format!("{:.2}/s", status.scan_rate_per_sec)),
             ("last_error", format_optional_error(&status.last_error)),
         ],

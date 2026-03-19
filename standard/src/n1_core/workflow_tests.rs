@@ -1162,6 +1162,16 @@ async fn init_upload(
     total_size: u64,
     expected_parts: u64,
 ) -> (String, String) {
+    init_upload_with_part_size(fragment, object_key, total_size, expected_parts, None).await
+}
+
+async fn init_upload_with_part_size(
+    fragment: &str,
+    object_key: &str,
+    total_size: u64,
+    expected_parts: u64,
+    part_size_bytes: Option<u64>,
+) -> (String, String) {
     let init_resp = initiate_object_upload(
         full_claims(fragment),
         AxumPath((fragment.to_string(), object_key.to_string())),
@@ -1169,6 +1179,13 @@ async fn init_upload(
             content_type: Some("application/octet-stream".into()),
             total_size_bytes: total_size,
             expected_parts,
+            part_size_bytes: part_size_bytes.or_else(|| {
+                if expected_parts <= 1 {
+                    Some(total_size)
+                } else {
+                    Some(total_size.div_ceil(expected_parts))
+                }
+            }),
         }),
     )
     .await
@@ -1196,6 +1213,29 @@ async fn finalize_upload(
     total_size: u64,
     expected_parts: u64,
 ) -> axum::response::Response {
+    finalize_upload_with_part_size(
+        state,
+        fragment,
+        version_id,
+        session_id,
+        object_key,
+        total_size,
+        expected_parts,
+        None,
+    )
+    .await
+}
+
+async fn finalize_upload_with_part_size(
+    state: Arc<AppState>,
+    fragment: &str,
+    version_id: &str,
+    session_id: &str,
+    object_key: &str,
+    total_size: u64,
+    expected_parts: u64,
+    part_size_bytes: Option<u64>,
+) -> axum::response::Response {
     finalize_object_upload(
         State(state),
         full_claims(fragment),
@@ -1212,6 +1252,13 @@ async fn finalize_upload(
             content_type: Some("application/octet-stream".into()),
             total_size_bytes: total_size,
             expected_parts,
+            part_size_bytes: part_size_bytes.or_else(|| {
+                if expected_parts <= 1 {
+                    Some(total_size)
+                } else {
+                    Some(total_size.div_ceil(expected_parts))
+                }
+            }),
         }),
     )
     .await
@@ -1274,8 +1321,14 @@ async fn put_object_generated_chunked_with_options(
     io_gate: Option<bool>,
 ) -> String {
     let expected_parts = object_bytes.div_ceil(part_bytes) as u64;
-    let (version_id, session_id) =
-        init_upload(fragment, object_key, object_bytes as u64, expected_parts).await;
+    let (version_id, session_id) = init_upload_with_part_size(
+        fragment,
+        object_key,
+        object_bytes as u64,
+        expected_parts,
+        Some(part_bytes as u64),
+    )
+    .await;
 
     for part_index in 0..expected_parts {
         let start = part_index as usize * part_bytes;
@@ -1291,7 +1344,7 @@ async fn put_object_generated_chunked_with_options(
         assert_eq!(put_resp.status(), StatusCode::OK);
     }
 
-    let finalize_resp = finalize_upload(
+    let finalize_resp = finalize_upload_with_part_size(
         state,
         fragment,
         &version_id,
@@ -1299,6 +1352,7 @@ async fn put_object_generated_chunked_with_options(
         object_key,
         object_bytes as u64,
         expected_parts,
+        Some(part_bytes as u64),
     )
     .await;
     assert_eq!(finalize_resp.status(), StatusCode::OK);
@@ -1530,12 +1584,14 @@ async fn matrix_multipart_finalize_conflict_then_success() {
     let state = Arc::new(AppState {
         ws_manager: WsConnectionManager::new(),
     });
-    let (version_id, session_id) = init_upload(&fragment, &key, combined_len, 2).await;
+    let part_size = part0.len() as u64;
+    let (version_id, session_id) =
+        init_upload_with_part_size(&fragment, &key, combined_len, 2, Some(part_size)).await;
 
     let put0 = upload_part(&fragment, &version_id, 0, part0.clone()).await;
     assert_eq!(put0.status(), StatusCode::OK);
 
-    let finalize_conflict = finalize_upload(
+    let finalize_conflict = finalize_upload_with_part_size(
         state.clone(),
         &fragment,
         &version_id,
@@ -1543,6 +1599,7 @@ async fn matrix_multipart_finalize_conflict_then_success() {
         &key,
         combined_len,
         2,
+        Some(part_size),
     )
     .await;
     assert_eq!(finalize_conflict.status(), StatusCode::CONFLICT);
@@ -1552,7 +1609,7 @@ async fn matrix_multipart_finalize_conflict_then_success() {
     let put1 = upload_part(&fragment, &version_id, 1, part1.clone()).await;
     assert_eq!(put1.status(), StatusCode::OK);
 
-    let finalize_ok = finalize_upload(
+    let finalize_ok = finalize_upload_with_part_size(
         state,
         &fragment,
         &version_id,
@@ -1560,6 +1617,7 @@ async fn matrix_multipart_finalize_conflict_then_success() {
         &key,
         combined_len,
         2,
+        Some(part_size),
     )
     .await;
     assert_eq!(finalize_ok.status(), StatusCode::OK);
@@ -1589,10 +1647,11 @@ async fn matrix_upload_resume_status_then_finalize_success() {
         hex::encode(digest)
     };
     let key = "matrix/resume.bin".to_string();
-    let part0 = vec![0x11; 8 * 1024 + 7];
-    let part1 = vec![0x22; 9 * 1024 + 5];
-    let part2 = vec![0x33; 10 * 1024 + 3];
+    let part0 = vec![0x11; 10 * 1024 + 3];
+    let part1 = vec![0x22; 10 * 1024 + 3];
+    let part2 = vec![0x33; 7 * 1024 + 5];
     let total_len = (part0.len() + part1.len() + part2.len()) as u64;
+    let part_size = part0.len() as u64;
 
     init_quota_file(&fragment, 64 * 1024 * 1024)
         .await
@@ -1605,7 +1664,8 @@ async fn matrix_upload_resume_status_then_finalize_success() {
     let state = Arc::new(AppState {
         ws_manager: WsConnectionManager::new(),
     });
-    let (version_id, session_id) = init_upload(&fragment, &key, total_len, 3).await;
+    let (version_id, session_id) =
+        init_upload_with_part_size(&fragment, &key, total_len, 3, Some(part_size)).await;
 
     assert_eq!(
         upload_part(&fragment, &version_id, 0, part0.clone())
@@ -1632,7 +1692,7 @@ async fn matrix_upload_resume_status_then_finalize_success() {
     assert_eq!(status_json["uploaded_parts"][0].as_u64(), Some(0));
     assert_eq!(status_json["uploaded_parts"][1].as_u64(), Some(2));
 
-    let finalize_conflict = finalize_upload(
+    let finalize_conflict = finalize_upload_with_part_size(
         state.clone(),
         &fragment,
         &version_id,
@@ -1640,6 +1700,7 @@ async fn matrix_upload_resume_status_then_finalize_success() {
         &key,
         total_len,
         3,
+        Some(part_size),
     )
     .await;
     assert_eq!(finalize_conflict.status(), StatusCode::CONFLICT);
@@ -1655,7 +1716,7 @@ async fn matrix_upload_resume_status_then_finalize_success() {
         StatusCode::OK
     );
 
-    let finalize_ok = finalize_upload(
+    let finalize_ok = finalize_upload_with_part_size(
         state,
         &fragment,
         &version_id,
@@ -1663,11 +1724,122 @@ async fn matrix_upload_resume_status_then_finalize_success() {
         &key,
         total_len,
         3,
+        Some(part_size),
     )
     .await;
     assert_eq!(finalize_ok.status(), StatusCode::OK);
 
     let expected = [part0, part1, part2].concat();
+    let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+    assert_eq!(got, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_multipart_compact_receipts_present_without_session_part_metadata() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "matrix/compact-receipts.bin".to_string();
+    let part0 = vec![0x41; 9 * 1024 + 7];
+    let part1 = vec![0x52; 9 * 1024 + 7];
+    let total_len = (part0.len() + part1.len()) as u64;
+    let part_size = part0.len() as u64;
+
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+    let (version_id, session_id) =
+        init_upload_with_part_size(&fragment, &key, total_len, 2, Some(part_size)).await;
+
+    assert_eq!(
+        upload_part(&fragment, &version_id, 0, part0.clone())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        upload_part(&fragment, &version_id, 1, part1.clone())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    assert!(
+        index::read_session_part(&fragment, &version_id, 0)
+            .await
+            .expect("read session part 0")
+            .is_none(),
+        "new multipart flow should not persist full session part metadata"
+    );
+    assert!(
+        index::read_session_part(&fragment, &version_id, 1)
+            .await
+            .expect("read session part 1")
+            .is_none(),
+        "new multipart flow should not persist full session part metadata"
+    );
+
+    let manifest = index::load_session(&fragment, &version_id)
+        .await
+        .expect("load session")
+        .expect("session exists")
+        .manifest;
+    let receipts = index::load_session_part_receipts(&fragment, &version_id, &manifest)
+        .await
+        .expect("load compact receipts")
+        .expect("compact receipts exist");
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(
+        receipts[0].as_ref().map(|receipt| receipt.size_bytes),
+        Some(part0.len() as u64)
+    );
+    assert_eq!(
+        receipts[1].as_ref().map(|receipt| receipt.size_bytes),
+        Some(part1.len() as u64)
+    );
+    assert_eq!(
+        receipts[0]
+            .as_ref()
+            .map(|receipt| receipt.shard_checksums.len()),
+        Some(1)
+    );
+
+    let finalize_ok = finalize_upload_with_part_size(
+        state,
+        &fragment,
+        &version_id,
+        &session_id,
+        &key,
+        total_len,
+        2,
+        Some(part_size),
+    )
+    .await;
+    assert_eq!(finalize_ok.status(), StatusCode::OK);
+
+    let expected = [part0, part1].concat();
     let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
     assert_eq!(got, expected);
 }
@@ -5373,7 +5545,6 @@ async fn matrix_repro_delete_multiple_restore_all_listing_blank() {
         restored_keys, count,
         "listing should be restored after recover"
     );
-
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

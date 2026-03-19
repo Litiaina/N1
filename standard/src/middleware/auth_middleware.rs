@@ -1,9 +1,9 @@
-use crate::n1_core::fragment_metadata::{
-    backfill_fragment_nt_hash_if_missing, verify_fragment_key,
-};
 use crate::middleware::refresh_store::{
     RefreshStoreError, SessionPermissions, create_refresh_session, revoke_refresh_session,
     rotate_refresh_session,
+};
+use crate::n1_core::fragment_metadata::{
+    backfill_fragment_nt_hash_if_missing, verify_fragment_key,
 };
 use crate::structs::auth_structs::{
     AuthBody, AuthSessionScope, AuthorizationRequest, Claims, FileSystemClaims, LoginRequest,
@@ -196,38 +196,34 @@ pub async fn refresh_access_token(
         .map_err(map_refresh_error)?;
 
     let body = match rotated.scope {
-        AuthSessionScope::Fragment { fragment } => {
-            AuthBody::new(
-                mint_fragment_access_token(
-                    fragment,
-                    rotated.permissions.read,
-                    rotated.permissions.write,
-                    rotated.permissions.modify,
-                    rotated.permissions.delete,
-                    rotated.access_expires_in,
-                )?,
+        AuthSessionScope::Fragment { fragment } => AuthBody::new(
+            mint_fragment_access_token(
+                fragment,
+                rotated.permissions.read,
+                rotated.permissions.write,
+                rotated.permissions.modify,
+                rotated.permissions.delete,
                 rotated.access_expires_in,
-                None,
-                None,
-            )
-            .with_refresh(rotated.refresh_token, rotated.refresh_expires_in)
-        }
-        AuthSessionScope::FileSystem { path } => {
-            AuthBody::new(
-                mint_fs_access_token(
-                    path,
-                    rotated.permissions.read,
-                    rotated.permissions.write,
-                    rotated.permissions.modify,
-                    rotated.permissions.delete,
-                    rotated.access_expires_in,
-                )?,
+            )?,
+            rotated.access_expires_in,
+            None,
+            None,
+        )
+        .with_refresh(rotated.refresh_token, rotated.refresh_expires_in),
+        AuthSessionScope::FileSystem { path } => AuthBody::new(
+            mint_fs_access_token(
+                path,
+                rotated.permissions.read,
+                rotated.permissions.write,
+                rotated.permissions.modify,
+                rotated.permissions.delete,
                 rotated.access_expires_in,
-                None,
-                None,
-            )
-            .with_refresh(rotated.refresh_token, rotated.refresh_expires_in)
-        }
+            )?,
+            rotated.access_expires_in,
+            None,
+            None,
+        )
+        .with_refresh(rotated.refresh_token, rotated.refresh_expires_in),
     };
 
     Ok(Json(body))
@@ -418,14 +414,7 @@ async fn mint_fs_auth_body(
     delete: bool,
     access_expires_in: u64,
 ) -> Result<AuthBody, AuthError> {
-    let token = mint_fs_access_token(
-        path.clone(),
-        read,
-        write,
-        modify,
-        delete,
-        access_expires_in,
-    )?;
+    let token = mint_fs_access_token(path.clone(), read, write, modify, delete, access_expires_in)?;
 
     let refresh = create_refresh_session(
         AuthSessionScope::FileSystem { path },
@@ -537,10 +526,8 @@ mod tests {
         if std::env::var("REFRESH_TOKEN_TTL_SECS").is_err() {
             unsafe { std::env::set_var("REFRESH_TOKEN_TTL_SECS", "3600") };
         }
-        let isolated_refresh_root = std::env::temp_dir().join(format!(
-            "n1-auth-refresh-tests-{}",
-            std::process::id()
-        ));
+        let isolated_refresh_root =
+            std::env::temp_dir().join(format!("n1-auth-refresh-tests-{}", std::process::id()));
         unsafe {
             std::env::set_var("N1_REFRESH_STORE_ROOT", isolated_refresh_root);
         }
@@ -618,7 +605,9 @@ mod tests {
             expires_in: Some(120),
         };
 
-        let Json(initial) = authorize_fragment(Json(payload)).await.expect("initial auth");
+        let Json(initial) = authorize_fragment(Json(payload))
+            .await
+            .expect("initial auth");
         let initial_refresh = initial
             .refresh_token
             .clone()
@@ -666,7 +655,9 @@ mod tests {
             expires_in: Some(120),
         };
 
-        let Json(initial) = authorize_fragment(Json(payload)).await.expect("initial auth");
+        let Json(initial) = authorize_fragment(Json(payload))
+            .await
+            .expect("initial auth");
         let initial_refresh = initial
             .refresh_token
             .clone()

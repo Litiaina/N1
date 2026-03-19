@@ -1033,7 +1033,8 @@ impl RegistryDb {
             })?;
         }
         let conn = Connection::open(&self.sqlite_path).map_err(sql_err)?;
-        conn.busy_timeout(Duration::from_secs(15)).map_err(sql_err)?;
+        conn.busy_timeout(Duration::from_secs(15))
+            .map_err(sql_err)?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(sql_err)?;
         Ok(conn)
@@ -1176,7 +1177,8 @@ fn scalar_i64<P>(conn: &Connection, sql: &str, params: P) -> Result<i64, Registr
 where
     P: rusqlite::Params,
 {
-    conn.query_row(sql, params, |row| row.get(0)).map_err(sql_err)
+    conn.query_row(sql, params, |row| row.get(0))
+        .map_err(sql_err)
 }
 
 fn map_object_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRecord> {
@@ -1215,7 +1217,10 @@ fn map_fragment_binding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Fragmen
             rusqlite::Error::FromSqlConversionFailure(
                 2,
                 rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, message)),
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    message,
+                )),
             )
         })?,
         engine_url_override: row.get(3)?,
@@ -1272,7 +1277,11 @@ mod tests {
 
         let password_hash = hash_password("secret").expect("hash password");
         let user = db
-            .create_user("owner@example.com".to_string(), password_hash.clone(), Some(10_000))
+            .create_user(
+                "owner@example.com".to_string(),
+                password_hash.clone(),
+                Some(10_000),
+            )
             .await
             .expect("create user");
 
@@ -1389,7 +1398,10 @@ mod tests {
             )
             .await
             .expect("list nested");
-        assert_eq!(nested.common_prefixes, vec!["patients/12-1222/study/".to_string()]);
+        assert_eq!(
+            nested.common_prefixes,
+            vec!["patients/12-1222/study/".to_string()]
+        );
 
         let suggestions = db
             .suggest_object_keys(
@@ -1446,7 +1458,10 @@ mod tests {
             )
             .await
             .expect("rename object");
-        assert_eq!(renamed.object_key, "patients/12-1222/study/file-1-renamed.dcm");
+        assert_eq!(
+            renamed.object_key,
+            "patients/12-1222/study/file-1-renamed.dcm"
+        );
 
         let removed_user = db
             .delete_object(
@@ -1463,13 +1478,18 @@ mod tests {
 
     #[tokio::test]
     async fn listing_prefix_without_trailing_slash_returns_folder_contents() {
-        let path = std::env::temp_dir().join(format!("registry-prefix-test-{}.db", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("registry-prefix-test-{}.db", uuid::Uuid::new_v4()));
         let db = RegistryDb::new(path.clone(), 1024 * 1024);
         db.init().await.expect("init db");
 
         let password_hash = hash_password("secret").expect("hash password");
         let user = db
-            .create_user("folder@example.com".to_string(), password_hash, Some(50_000))
+            .create_user(
+                "folder@example.com".to_string(),
+                password_hash,
+                Some(50_000),
+            )
             .await
             .expect("create user");
 
@@ -1528,7 +1548,8 @@ mod tests {
 
     #[tokio::test]
     async fn bulk_recover_and_empty_trash_keep_registry_state_and_quota_consistent() {
-        let path = std::env::temp_dir().join(format!("registry-bulk-trash-{}.db", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("registry-bulk-trash-{}.db", uuid::Uuid::new_v4()));
         let db = RegistryDb::new(path.clone(), 1024 * 1024);
         db.init().await.expect("init db");
 

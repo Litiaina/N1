@@ -29,7 +29,12 @@ const INDEX_SESSION_SUFFIX: &str = ".session.msgpack";
 const INDEX_SESSION_REMOVED_SUFFIX: &str = ".removed.msgpack";
 const INDEX_PART_META_SUFFIX: &str = ".meta.msgpack";
 const SESSION_MANIFEST_FILE: &str = "session.manifest.msgpack";
+const SESSION_PART_RECEIPTS_FILE: &str = "part.receipts.bin";
 const RESERVATION_FILE: &str = "reservation.msgpack";
+const SESSION_PART_RECEIPTS_MAGIC: &[u8; 8] = b"N1PRT001";
+const SESSION_PART_RECEIPTS_HEADER_SIZE: usize = 24;
+const SESSION_PART_RECEIPTS_SLOT_BASE_SIZE: usize = 28;
+const SESSION_PART_RECEIPTS_STATUS_COMMITTED: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexReplicaWriteMode {
@@ -57,6 +62,15 @@ pub struct RemovedSessionReceipt {
     pub state: IndexSessionState,
     pub removed_at: i64,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPartReceipt {
+    pub part_index: u64,
+    pub size_bytes: u64,
+    pub created_at: i64,
+    pub checksum: Option<u32>,
+    pub shard_checksums: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,7 +208,12 @@ fn partition_dir(root: &Path, fragment: &str, partition_id: u16) -> PathBuf {
         .join(format!("{:04x}", partition_id))
 }
 
-fn objects_dir_for_partition(root: &Path, fragment: &str, partition_id: u16, trashed: bool) -> PathBuf {
+fn objects_dir_for_partition(
+    root: &Path,
+    fragment: &str,
+    partition_id: u16,
+    trashed: bool,
+) -> PathBuf {
     partition_dir(root, fragment, partition_id).join(if trashed {
         INDEX_TRASH_DIR
     } else {
@@ -280,6 +299,228 @@ fn session_compat_dir(root: &Path, fragment: &str, partition_id: u16, version_id
     partition_dir(root, fragment, partition_id)
         .join(INDEX_SESSIONS_DIR)
         .join(version_id)
+}
+
+fn session_part_receipts_path(
+    root: &Path,
+    fragment: &str,
+    partition_id: u16,
+    version_id: &str,
+) -> PathBuf {
+    session_compat_dir(root, fragment, partition_id, version_id).join(SESSION_PART_RECEIPTS_FILE)
+}
+
+fn session_receipt_total_shards(manifest: &UploadSessionManifest) -> Option<usize> {
+    let total = usize::from(manifest.data_shards) + usize::from(manifest.parity_shards);
+    if total == 0 { None } else { Some(total) }
+}
+
+fn session_receipt_slot_size(total_shards: usize) -> Result<usize, AppError> {
+    SESSION_PART_RECEIPTS_SLOT_BASE_SIZE
+        .checked_add(total_shards.checked_mul(4).ok_or_else(|| {
+            AppError::InternalServerError("receipt slot size overflow".to_string())
+        })?)
+        .ok_or_else(|| AppError::InternalServerError("receipt slot size overflow".to_string()))
+}
+
+fn session_receipt_table_len(expected_parts: u64, slot_size: usize) -> Result<u64, AppError> {
+    let payload_len = (expected_parts as u128)
+        .checked_mul(slot_size as u128)
+        .ok_or_else(|| AppError::InternalServerError("receipt table size overflow".to_string()))?;
+    let total_len = (SESSION_PART_RECEIPTS_HEADER_SIZE as u128)
+        .checked_add(payload_len)
+        .ok_or_else(|| AppError::InternalServerError("receipt table size overflow".to_string()))?;
+    u64::try_from(total_len)
+        .map_err(|_| AppError::InternalServerError("receipt table size overflow".to_string()))
+}
+
+fn encode_session_receipt_header(
+    manifest: &UploadSessionManifest,
+    total_shards: usize,
+    slot_size: usize,
+) -> Result<[u8; SESSION_PART_RECEIPTS_HEADER_SIZE], AppError> {
+    let total_shards_u32 = u32::try_from(total_shards)
+        .map_err(|_| AppError::InternalServerError("total shard count too large".to_string()))?;
+    let slot_size_u32 = u32::try_from(slot_size)
+        .map_err(|_| AppError::InternalServerError("receipt slot size too large".to_string()))?;
+
+    let mut header = [0u8; SESSION_PART_RECEIPTS_HEADER_SIZE];
+    header[0..8].copy_from_slice(SESSION_PART_RECEIPTS_MAGIC);
+    header[8..12].copy_from_slice(&total_shards_u32.to_le_bytes());
+    header[12..20].copy_from_slice(&manifest.expected_parts.to_le_bytes());
+    header[20..24].copy_from_slice(&slot_size_u32.to_le_bytes());
+    Ok(header)
+}
+
+fn parse_crc32_hex(value: &str) -> Result<u32, AppError> {
+    u32::from_str_radix(value.trim(), 16).map_err(|e| {
+        AppError::InternalServerError(format!("invalid crc32 value '{}': {}", value, e))
+    })
+}
+
+fn encode_session_part_receipt(
+    part: &PartMetadata,
+    total_shards: usize,
+    slot_size: usize,
+) -> Result<Vec<u8>, AppError> {
+    if part.shards.len() != total_shards {
+        return Err(AppError::InternalServerError(format!(
+            "part {} has {} shards, expected {}",
+            part.part_index,
+            part.shards.len(),
+            total_shards
+        )));
+    }
+
+    let mut slot = vec![0u8; slot_size];
+    slot[0] = SESSION_PART_RECEIPTS_STATUS_COMMITTED;
+    slot[1] = u8::from(part.checksum.is_some());
+    slot[8..16].copy_from_slice(&part.size_bytes.to_le_bytes());
+    slot[16..24].copy_from_slice(&part.created_at.to_le_bytes());
+
+    let whole_checksum = match part.checksum.as_deref() {
+        Some(checksum) => parse_crc32_hex(checksum)?,
+        None => 0,
+    };
+    slot[24..28].copy_from_slice(&whole_checksum.to_le_bytes());
+
+    for (idx, shard) in part.shards.iter().enumerate() {
+        let checksum = parse_crc32_hex(&shard.checksum)?;
+        let start = SESSION_PART_RECEIPTS_SLOT_BASE_SIZE + idx * 4;
+        slot[start..start + 4].copy_from_slice(&checksum.to_le_bytes());
+    }
+
+    Ok(slot)
+}
+
+fn decode_session_part_receipts(
+    bytes: &[u8],
+    manifest: &UploadSessionManifest,
+) -> Result<Option<Vec<Option<SessionPartReceipt>>>, AppError> {
+    if bytes.len() < SESSION_PART_RECEIPTS_HEADER_SIZE {
+        return Ok(None);
+    }
+    if &bytes[0..8] != SESSION_PART_RECEIPTS_MAGIC {
+        return Ok(None);
+    }
+
+    let total_shards = u32::from_le_bytes(bytes[8..12].try_into().unwrap_or([0u8; 4])) as usize;
+    let expected_parts = u64::from_le_bytes(bytes[12..20].try_into().unwrap_or([0u8; 8]));
+    let slot_size = u32::from_le_bytes(bytes[20..24].try_into().unwrap_or([0u8; 4])) as usize;
+
+    if expected_parts != manifest.expected_parts {
+        return Ok(None);
+    }
+
+    if let Some(expected_total_shards) = session_receipt_total_shards(manifest) {
+        if total_shards != expected_total_shards {
+            return Ok(None);
+        }
+    }
+
+    let min_slot_size = session_receipt_slot_size(total_shards)?;
+    if slot_size < min_slot_size {
+        return Ok(None);
+    }
+
+    let expected_len = session_receipt_table_len(expected_parts, slot_size)? as usize;
+    if bytes.len() < expected_len {
+        return Ok(None);
+    }
+
+    let mut receipts = vec![None; expected_parts as usize];
+    for (idx, receipt) in receipts.iter_mut().enumerate() {
+        let offset = SESSION_PART_RECEIPTS_HEADER_SIZE + idx * slot_size;
+        let slot = &bytes[offset..offset + slot_size];
+        if slot.first().copied().unwrap_or_default() != SESSION_PART_RECEIPTS_STATUS_COMMITTED {
+            continue;
+        }
+
+        let has_whole_checksum = slot.get(1).copied().unwrap_or_default() != 0;
+        let size_bytes = u64::from_le_bytes(slot[8..16].try_into().unwrap_or([0u8; 8]));
+        let created_at = i64::from_le_bytes(slot[16..24].try_into().unwrap_or([0u8; 8]));
+        let whole_checksum = u32::from_le_bytes(slot[24..28].try_into().unwrap_or([0u8; 4]));
+
+        let mut shard_checksums = Vec::with_capacity(total_shards);
+        for shard_index in 0..total_shards {
+            let start = SESSION_PART_RECEIPTS_SLOT_BASE_SIZE + shard_index * 4;
+            let checksum =
+                u32::from_le_bytes(slot[start..start + 4].try_into().unwrap_or([0u8; 4]));
+            shard_checksums.push(checksum);
+        }
+
+        *receipt = Some(SessionPartReceipt {
+            part_index: idx as u64,
+            size_bytes,
+            created_at,
+            checksum: if has_whole_checksum {
+                Some(whole_checksum)
+            } else {
+                None
+            },
+            shard_checksums,
+        });
+    }
+
+    Ok(Some(receipts))
+}
+
+async fn initialize_session_receipt_table(
+    path: PathBuf,
+    manifest: &UploadSessionManifest,
+    total_shards: usize,
+    slot_size: usize,
+) -> Result<(), AppError> {
+    let table_len = session_receipt_table_len(manifest.expected_parts, slot_size)?;
+    let header = encode_session_receipt_header(manifest, total_shards, slot_size)?;
+    let error_path = path.clone();
+
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Seek, SeekFrom, Write};
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        file.write_all(&header)?;
+        file.set_len(table_len)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&header)?;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("receipt table init task failed: {}", e)))?
+    .map_err(|e| {
+        AppError::Io(
+            e,
+            format!("initialize receipt table {}", error_path.display()),
+        )
+    })
+}
+
+async fn write_session_receipt_slot(
+    path: PathBuf,
+    offset: u64,
+    slot: Vec<u8>,
+) -> Result<(), AppError> {
+    let error_path = path.clone();
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(&slot)?;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("receipt slot write task failed: {}", e)))?
+    .map_err(|e| AppError::Io(e, format!("write receipt slot {}", error_path.display())))
 }
 
 #[cfg(unix)]
@@ -514,6 +755,11 @@ pub async fn open_session(
             })
         })
         .transpose()?;
+    let receipt_layout = session_receipt_total_shards(manifest)
+        .map(|total_shards| {
+            session_receipt_slot_size(total_shards).map(|slot_size| (total_shards, slot_size))
+        })
+        .transpose()?;
     let mut success = 0usize;
     for root in &route.roots {
         let path = session_state_path(
@@ -540,6 +786,20 @@ pub async fn open_session(
             None => {
                 let _ = fs::remove_file(compat_dir.join(RESERVATION_FILE)).await;
             }
+        }
+        if let Some((total_shards, slot_size)) = receipt_layout {
+            let _ = initialize_session_receipt_table(
+                session_part_receipts_path(
+                    root,
+                    &manifest.fragment,
+                    route.partition_id,
+                    &manifest.version_id,
+                ),
+                manifest,
+                total_shards,
+                slot_size,
+            )
+            .await;
         }
         let removed = removed_session_receipt_path(
             root,
@@ -593,6 +853,47 @@ pub async fn commit_session_part(
     Ok(())
 }
 
+pub async fn commit_session_part_receipt(
+    fragment: &str,
+    version_id: &str,
+    manifest: &UploadSessionManifest,
+    part: &PartMetadata,
+) -> Result<(), AppError> {
+    let Some(total_shards) = session_receipt_total_shards(manifest) else {
+        return Ok(());
+    };
+    let slot_size = session_receipt_slot_size(total_shards)?;
+    let slot = encode_session_part_receipt(part, total_shards, slot_size)?;
+    let offset = (SESSION_PART_RECEIPTS_HEADER_SIZE as u64)
+        .checked_add(
+            (part.part_index as u64)
+                .checked_mul(slot_size as u64)
+                .ok_or_else(|| {
+                    AppError::InternalServerError("receipt slot offset overflow".to_string())
+                })?,
+        )
+        .ok_or_else(|| AppError::InternalServerError("receipt slot offset overflow".to_string()))?;
+
+    let route = session_route(fragment, version_id)?;
+    let mut success = 0usize;
+    for root in &route.roots {
+        let path = session_part_receipts_path(root, fragment, route.partition_id, version_id);
+        if write_session_receipt_slot(path, offset, slot.clone())
+            .await
+            .is_ok()
+        {
+            success += 1;
+        }
+    }
+
+    if success == 0 {
+        return Err(AppError::InternalServerError(
+            "failed to commit session part receipt on index roots".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn load_session(
     fragment: &str,
     version_id: &str,
@@ -641,6 +942,46 @@ pub async fn read_session_part(
         }
     }
     Ok(None)
+}
+
+pub async fn load_session_part_receipts(
+    fragment: &str,
+    version_id: &str,
+    manifest: &UploadSessionManifest,
+) -> Result<Option<Vec<Option<SessionPartReceipt>>>, AppError> {
+    if session_receipt_total_shards(manifest).is_none() {
+        return Ok(None);
+    }
+
+    let route = session_route(fragment, version_id)?;
+    let mut best: Option<Vec<Option<SessionPartReceipt>>> = None;
+    let mut best_count = 0usize;
+
+    for root in &route.roots {
+        let path = session_part_receipts_path(root, fragment, route.partition_id, version_id);
+        if !fs::try_exists(&path).await.unwrap_or(false) {
+            continue;
+        }
+
+        let bytes = match fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+
+        let Some(receipts) = decode_session_part_receipts(&bytes, manifest)? else {
+            continue;
+        };
+        let count = receipts.iter().filter(|entry| entry.is_some()).count();
+        if count > best_count {
+            best_count = count;
+            best = Some(receipts);
+            if count == manifest.expected_parts as usize {
+                break;
+            }
+        }
+    }
+
+    Ok(best)
 }
 
 pub async fn remove_session(
@@ -1197,9 +1538,10 @@ async fn scan_fragment_objects_page(
                 }
 
                 let latest_path = bucket_dir.join(&object_hash).join(INDEX_LATEST_FILE);
-                let Some(mut metadata) = read_messagepack_if_exists::<IndexLatestState>(&latest_path)
-                    .await?
-                    .map(|state| state.metadata)
+                let Some(mut metadata) =
+                    read_messagepack_if_exists::<IndexLatestState>(&latest_path)
+                        .await?
+                        .map(|state| state.metadata)
                 else {
                     continue;
                 };

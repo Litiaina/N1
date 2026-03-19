@@ -67,7 +67,11 @@ impl FsdPath {
             .strip_prefix(FSD_TRASH_DIR_NAME)
             .and_then(|v| v.strip_prefix('/'))
         {
-            format!("{}/{}", FSD_TRASH_DIR_NAME, decode_mount_name(raw_trash_key)?)
+            format!(
+                "{}/{}",
+                FSD_TRASH_DIR_NAME,
+                decode_mount_name(raw_trash_key)?
+            )
         } else if raw_object_key.contains('/') {
             raw_object_key.to_string()
         } else {
@@ -96,7 +100,11 @@ impl FsdPath {
                 encode_virtual_name(trash_key)
             )
         } else {
-            format!("{}/{}", self.fragment, encode_virtual_name(&self.object_key))
+            format!(
+                "{}/{}",
+                self.fragment,
+                encode_virtual_name(&self.object_key)
+            )
         }
     }
 

@@ -43,7 +43,10 @@ pub fn create_registry_env_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     writeln!(file, "REGISTRY_JWT_SECRET=")?;
     writeln!(file)?;
 
-    writeln!(file, "# Registry master key for privileged admin operations")?;
+    writeln!(
+        file,
+        "# Registry master key for privileged admin operations"
+    )?;
     writeln!(file, "REGISTRY_MASTER_KEY=")?;
     writeln!(file)?;
 
@@ -59,27 +62,45 @@ pub fn create_registry_env_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     writeln!(file, "REGISTRY_STORAGE_SESSION_TTL_SECS=900")?;
     writeln!(file)?;
 
-    writeln!(file, "# Default single-node storage endpoint for Drive brokering")?;
+    writeln!(
+        file,
+        "# Default single-node storage endpoint for Drive brokering"
+    )?;
     writeln!(file, "REGISTRY_SINGLE_NODE_URL=")?;
     writeln!(file)?;
 
-    writeln!(file, "# Master key used by Registry to mint fragment sessions against single-node N1")?;
+    writeln!(
+        file,
+        "# Master key used by Registry to mint fragment sessions against single-node N1"
+    )?;
     writeln!(file, "REGISTRY_SINGLE_NODE_MASTER_KEY=")?;
     writeln!(file)?;
 
-    writeln!(file, "# Set true when the single-node backend uses a self-signed or locally-issued TLS cert")?;
+    writeln!(
+        file,
+        "# Set true when the single-node backend uses a self-signed or locally-issued TLS cert"
+    )?;
     writeln!(file, "REGISTRY_SINGLE_NODE_INSECURE_TLS=false")?;
     writeln!(file)?;
 
-    writeln!(file, "# Default multi-node storage endpoint for Drive brokering")?;
+    writeln!(
+        file,
+        "# Default multi-node storage endpoint for Drive brokering"
+    )?;
     writeln!(file, "REGISTRY_MULTI_NODE_URL=")?;
     writeln!(file)?;
 
-    writeln!(file, "# Master key used by Registry to mint fragment sessions against multi-node N2")?;
+    writeln!(
+        file,
+        "# Master key used by Registry to mint fragment sessions against multi-node N2"
+    )?;
     writeln!(file, "REGISTRY_MULTI_NODE_MASTER_KEY=")?;
     writeln!(file)?;
 
-    writeln!(file, "# Set true when the multi-node backend uses a self-signed or locally-issued TLS cert")?;
+    writeln!(
+        file,
+        "# Set true when the multi-node backend uses a self-signed or locally-issued TLS cert"
+    )?;
     writeln!(file, "REGISTRY_MULTI_NODE_INSECURE_TLS=false")?;
     writeln!(file)?;
 

@@ -1,14 +1,13 @@
 use reqwest::{Client, Method};
 
 use cli_core::client::{
-    AuthSession, CreateFragmentRequest, DynError, api_url, authenticate, build_client,
-    fetch_json, fetch_json_query, get_base_url, get_secret, print_output,
-    print_response_message, resolve_auth_fragment, send_query_only, send_without_body,
-    watch_rendered,
+    AuthSession, CreateFragmentRequest, DynError, api_url, authenticate, build_client, fetch_json,
+    fetch_json_query, get_base_url, get_secret, print_output, print_response_message,
+    resolve_auth_fragment, send_query_only, send_without_body, watch_rendered,
 };
 use cli_core::models::{
-    GcJobStatus, HealthResponse, ListUploadsResponse, RedistributionJobStatus,
-    RepairJobStatus, UploadStatusResponse,
+    GcJobStatus, HealthResponse, ListUploadsResponse, RedistributionJobStatus, RepairJobStatus,
+    UploadStatusResponse,
 };
 
 use crate::args::{
@@ -320,11 +319,7 @@ fn push_query_flag(query: &mut Vec<(String, String)>, key: &str, enabled: bool) 
     }
 }
 
-fn push_query_value<T: ToString>(
-    query: &mut Vec<(String, String)>,
-    key: &str,
-    value: Option<T>,
-) {
+fn push_query_value<T: ToString>(query: &mut Vec<(String, String)>, key: &str, value: Option<T>) {
     if let Some(value) = value {
         query.push((key.to_string(), value.to_string()));
     }

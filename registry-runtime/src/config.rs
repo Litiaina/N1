@@ -1,5 +1,5 @@
-use std::fs;
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 
 use crate::create_env::create_registry_env_file;
@@ -26,7 +26,8 @@ pub struct RegistryConfig {
 
 impl RegistryConfig {
     pub fn load() -> Result<Self, String> {
-        ensure_registry_env_file().map_err(|err| format!("failed to ensure registry.env: {}", err))?;
+        ensure_registry_env_file()
+            .map_err(|err| format!("failed to ensure registry.env: {}", err))?;
         let _ = dotenv::from_filename("registry.env");
         let _ = dotenv::dotenv();
 
@@ -38,12 +39,9 @@ impl RegistryConfig {
         let jwt_secret = required("REGISTRY_JWT_SECRET")?;
         let master_key = required("REGISTRY_MASTER_KEY")?;
         let access_token_ttl_secs = parse_or("REGISTRY_ACCESS_TOKEN_TTL_SECS", 900u64)?;
-        let default_quota_bytes = parse_or(
-            "REGISTRY_DEFAULT_QUOTA_BYTES",
-            25_i64 * 1024 * 1024 * 1024,
-        )?;
-        let storage_session_ttl_secs =
-            parse_or("REGISTRY_STORAGE_SESSION_TTL_SECS", 15 * 60u64)?;
+        let default_quota_bytes =
+            parse_or("REGISTRY_DEFAULT_QUOTA_BYTES", 25_i64 * 1024 * 1024 * 1024)?;
+        let storage_session_ttl_secs = parse_or("REGISTRY_STORAGE_SESSION_TTL_SECS", 15 * 60u64)?;
         let single_node_url = optional("REGISTRY_SINGLE_NODE_URL")
             .map(|value| {
                 normalize_backend_url(&value)
@@ -134,9 +132,7 @@ fn repair_common_backend_url_typos(raw: &str) -> String {
     let Some((scheme, remainder)) = trimmed.split_once("://") else {
         return trimmed.to_string();
     };
-    let authority_end = remainder
-        .find(['/', '?', '#'])
-        .unwrap_or(remainder.len());
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
     let authority = &remainder[..authority_end];
     let suffix = &remainder[authority_end..];
 

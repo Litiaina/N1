@@ -262,9 +262,15 @@ pub struct UploadSessionManifest {
     pub session_id: String,
     pub total_size_bytes: u64,
     pub expected_parts: u64,
+    #[serde(default)]
+    pub part_size_bytes: u64,
     pub content_type: String,
     pub created_at: i64,
     pub stripe_size_bytes: usize,
+    #[serde(default)]
+    pub data_shards: u16,
+    #[serde(default)]
+    pub parity_shards: u16,
 }
 
 #[derive(Serialize)]
@@ -643,6 +649,258 @@ async fn read_manifest_any(
     Ok(None)
 }
 
+fn configured_data_shards() -> usize {
+    DATA_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize
+}
+
+fn configured_parity_shards() -> usize {
+    PARITY_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize
+}
+
+fn manifest_data_shards(manifest: &UploadSessionManifest) -> usize {
+    let configured = usize::from(manifest.data_shards);
+    if configured == 0 {
+        configured_data_shards()
+    } else {
+        configured
+    }
+}
+
+fn manifest_parity_shards(manifest: &UploadSessionManifest) -> usize {
+    let configured = usize::from(manifest.parity_shards);
+    if configured == 0 {
+        configured_parity_shards()
+    } else {
+        configured
+    }
+}
+
+fn manifest_total_shards(manifest: &UploadSessionManifest) -> usize {
+    manifest_data_shards(manifest) + manifest_parity_shards(manifest)
+}
+
+fn configured_block_size() -> usize {
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or_else(default_stripe_size)
+}
+
+fn stable_shard_name(part_index: u64, shard_index: usize, data_shards: usize) -> String {
+    let ext = if shard_index >= data_shards {
+        PARITY_SUFFIX
+    } else {
+        SHARD_SUFFIX
+    };
+    format!("part_{}_shard_{}{}", part_index, shard_index, ext)
+}
+
+fn expected_part_size_bytes(manifest: &UploadSessionManifest, part_index: u64) -> Option<u64> {
+    if manifest.expected_parts == 0 || part_index >= manifest.expected_parts {
+        return None;
+    }
+    if manifest.expected_parts == 1 {
+        return Some(manifest.total_size_bytes);
+    }
+    let part_size = manifest.part_size_bytes;
+    if part_size == 0 {
+        return None;
+    }
+    if part_index + 1 < manifest.expected_parts {
+        return Some(part_size);
+    }
+    let prior_bytes = part_size.saturating_mul(manifest.expected_parts.saturating_sub(1));
+    if prior_bytes > manifest.total_size_bytes {
+        return None;
+    }
+    Some(manifest.total_size_bytes - prior_bytes)
+}
+
+fn final_shard_len_for_part(part_size_bytes: u64, data_shards: usize, block_size: usize) -> u64 {
+    let stripe_data_width = block_size as u64 * data_shards as u64;
+    let stripe_count = if stripe_data_width == 0 {
+        0
+    } else {
+        part_size_bytes.div_ceil(stripe_data_width)
+    };
+    stripe_count * block_size as u64
+}
+
+fn shard_specs_for_part(
+    path_manager: &ObjectPathManager,
+    manifest: &UploadSessionManifest,
+    part_index: u64,
+) -> Result<Vec<(usize, bool, PathBuf, String)>, AppError> {
+    let blob_roots = path_manager.get_blob_roots();
+    if blob_roots.is_empty() {
+        return Err(AppError::InternalServerError(
+            "No blob storage disks configured".into(),
+        ));
+    }
+
+    let data_shards = manifest_data_shards(manifest);
+    let total_shards = manifest_total_shards(manifest);
+    let mut out = Vec::with_capacity(total_shards);
+
+    for shard_index in 0..total_shards {
+        let disk_idx = (part_index as usize + shard_index) % blob_roots.len();
+        let disk_root = &blob_roots[disk_idx];
+        let shard_dir =
+            path_manager.get_shard_dir_on_disk(disk_root, &manifest.fragment, &manifest.version_id);
+        let file_name = stable_shard_name(part_index, shard_index, data_shards);
+        let stable_path = shard_dir.join(&file_name);
+        out.push((
+            shard_index,
+            shard_index >= data_shards,
+            stable_path,
+            file_name,
+        ));
+    }
+
+    Ok(out)
+}
+
+async fn part_exists_on_disk(
+    path_manager: &ObjectPathManager,
+    manifest: &UploadSessionManifest,
+    part_index: u64,
+) -> Result<bool, AppError> {
+    let Some(part_size) = expected_part_size_bytes(manifest, part_index) else {
+        return Ok(false);
+    };
+
+    let data_shards = manifest_data_shards(manifest);
+    let block_size = configured_block_size();
+    let expected_shard_len = final_shard_len_for_part(part_size, data_shards, block_size);
+
+    for (_, _, stable_path, _) in shard_specs_for_part(path_manager, manifest, part_index)? {
+        let meta = match tokio_fs::metadata(&stable_path).await {
+            Ok(meta) => meta,
+            Err(_) => return Ok(false),
+        };
+        if meta.len() != expected_shard_len {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+async fn uploaded_parts_from_disk(
+    path_manager: &ObjectPathManager,
+    manifest: &UploadSessionManifest,
+) -> Result<Vec<u64>, AppError> {
+    let mut uploaded_parts = Vec::new();
+    for part_index in 0..manifest.expected_parts {
+        if part_exists_on_disk(path_manager, manifest, part_index).await? {
+            uploaded_parts.push(part_index);
+        }
+    }
+    Ok(uploaded_parts)
+}
+
+async fn reconstruct_part_meta_from_disk(
+    path_manager: &ObjectPathManager,
+    manifest: &UploadSessionManifest,
+    part_index: u64,
+) -> Result<Option<PartMetadata>, AppError> {
+    let Some(part_size) = expected_part_size_bytes(manifest, part_index) else {
+        return Ok(None);
+    };
+
+    let data_shards = manifest_data_shards(manifest);
+    let block_size = configured_block_size();
+    let expected_shard_len = final_shard_len_for_part(part_size, data_shards, block_size);
+
+    let mut shards = Vec::with_capacity(manifest_total_shards(manifest));
+    for (shard_index, is_parity, stable_path, file_name) in
+        shard_specs_for_part(path_manager, manifest, part_index)?
+    {
+        let meta = match tokio_fs::metadata(&stable_path).await {
+            Ok(meta) => meta,
+            Err(_) => return Ok(None),
+        };
+        if meta.len() != expected_shard_len {
+            return Ok(None);
+        }
+        let checksum = crc32_file_hex(&stable_path).await?;
+        shards.push(ShardInfo {
+            shard_index,
+            file_name,
+            absolute_path: stable_path.to_string_lossy().to_string(),
+            size_bytes: expected_shard_len,
+            checksum,
+            is_parity,
+        });
+    }
+
+    Ok(Some(PartMetadata {
+        part_index,
+        size_bytes: part_size,
+        created_at: manifest.created_at,
+        shards,
+        checksum: None,
+    }))
+}
+
+fn format_crc32_u32(value: u32) -> String {
+    format!("{:08x}", value)
+}
+
+async fn reconstruct_part_meta_from_receipt(
+    path_manager: &ObjectPathManager,
+    manifest: &UploadSessionManifest,
+    receipt: &index::SessionPartReceipt,
+) -> Result<Option<PartMetadata>, AppError> {
+    let Some(part_size) = expected_part_size_bytes(manifest, receipt.part_index) else {
+        return Ok(None);
+    };
+    if receipt.size_bytes != part_size {
+        return Ok(None);
+    }
+
+    let data_shards = manifest_data_shards(manifest);
+    let total_shards = manifest_total_shards(manifest);
+    if receipt.shard_checksums.len() != total_shards {
+        return Ok(None);
+    }
+
+    let block_size = configured_block_size();
+    let expected_shard_len = final_shard_len_for_part(part_size, data_shards, block_size);
+
+    let mut shards = Vec::with_capacity(total_shards);
+    for ((shard_index, is_parity, stable_path, file_name), checksum) in
+        shard_specs_for_part(path_manager, manifest, receipt.part_index)?
+            .into_iter()
+            .zip(receipt.shard_checksums.iter())
+    {
+        let meta = match tokio_fs::metadata(&stable_path).await {
+            Ok(meta) => meta,
+            Err(_) => return Ok(None),
+        };
+        if meta.len() != expected_shard_len {
+            return Ok(None);
+        }
+
+        shards.push(ShardInfo {
+            shard_index,
+            file_name,
+            absolute_path: stable_path.to_string_lossy().to_string(),
+            size_bytes: expected_shard_len,
+            checksum: format_crc32_u32(*checksum),
+            is_parity,
+        });
+    }
+
+    Ok(Some(PartMetadata {
+        part_index: receipt.part_index,
+        size_bytes: receipt.size_bytes,
+        created_at: receipt.created_at,
+        shards,
+        checksum: receipt.checksum.map(format_crc32_u32),
+    }))
+}
+
 async fn read_part_meta_any(
     fragment: &str,
     version_id: &str,
@@ -906,35 +1164,6 @@ async fn cleanup_files_best_effort(paths: &[PathBuf]) {
     let _ = join_all(futs).await;
 }
 
-async fn commit_part_meta_lockless(
-    _path_manager: &ObjectPathManager,
-    fragment: &str,
-    version_id: &str,
-    part_index: u64,
-    meta_bytes: &[u8],
-    strict_durability: bool,
-) -> Result<bool, AppError> {
-    if index::read_session_part(fragment, version_id, part_index)
-        .await?
-        .is_some()
-    {
-        return Ok(false);
-    }
-
-    let part_meta: PartMetadata = rmp_serde::from_slice(meta_bytes).map_err(|e| {
-        AppError::InternalServerError(format!("decode part metadata for index commit: {}", e))
-    })?;
-
-    let replica_mode = if strict_durability {
-        index::IndexReplicaWriteMode::SyncBestEffort
-    } else {
-        index::IndexReplicaWriteMode::BackgroundBestEffort
-    };
-
-    index::commit_session_part(fragment, version_id, &part_meta, replica_mode).await?;
-    Ok(true)
-}
-
 async fn crc32_file_hex(path: &Path) -> Result<String, AppError> {
     let mut f = tokio_fs::File::open(path)
         .await
@@ -1062,6 +1291,31 @@ pub async fn initiate_object_upload(
         return Err(AppError::BadRequest("expected_parts must be >= 1".into()));
     }
 
+    let part_size_bytes = if params.expected_parts <= 1 {
+        params.part_size_bytes.unwrap_or(params.total_size_bytes)
+    } else {
+        params
+            .part_size_bytes
+            .filter(|v| *v > 0)
+            .ok_or(AppError::BadRequest(
+                "part_size_bytes is required for multipart uploads".into(),
+            ))?
+    };
+
+    let computed_parts = if params.total_size_bytes == 0 {
+        1
+    } else if part_size_bytes == 0 {
+        1
+    } else {
+        params.total_size_bytes.div_ceil(part_size_bytes)
+    };
+
+    if computed_parts != params.expected_parts.max(1) {
+        return Err(AppError::BadRequest(
+            "expected_parts does not match total_size_bytes and part_size_bytes".into(),
+        ));
+    }
+
     ensure_capacity_available(params.total_size_bytes).await?;
 
     let version_id = Ulid::new().to_string();
@@ -1083,12 +1337,15 @@ pub async fn initiate_object_upload(
         session_id: session_id.clone(),
         total_size_bytes: params.total_size_bytes,
         expected_parts: params.expected_parts.max(1),
+        part_size_bytes,
         content_type: params
             .content_type
             .clone()
             .unwrap_or_else(|| "application/octet-stream".to_string()),
         created_at: Utc::now().timestamp(),
         stripe_size_bytes: stripe_size,
+        data_shards: configured_data_shards() as u16,
+        parity_shards: configured_parity_shards() as u16,
     };
 
     if let Err(e) = index::open_session(&manifest, Some(receipt)).await {
@@ -1171,7 +1428,12 @@ pub async fn get_upload_status(
     }
 
     if let Some(state) = index::load_session(&fragment, &version_id).await? {
-        let mut parts = state.parts.keys().copied().collect::<Vec<_>>();
+        let path_manager = ObjectPathManager::new();
+        let mut parts = if state.manifest.part_size_bytes > 0 {
+            uploaded_parts_from_disk(&path_manager, &state.manifest).await?
+        } else {
+            state.parts.keys().copied().collect::<Vec<_>>()
+        };
         parts.sort_unstable();
         return Ok(AxumJson(UploadStatusResponse {
             uploaded_parts: parts,
@@ -1219,38 +1481,45 @@ pub async fn object_upload_part(
     }
 
     let path_manager = ObjectPathManager::new();
+    let manifest = read_manifest_any(&fragment, &version_id)
+        .await?
+        .ok_or(AppError::BadRequest("Upload session not found".into()))?;
+    if part_index >= manifest.expected_parts {
+        return Ok((StatusCode::BAD_REQUEST, "Part index out of range").into_response());
+    }
+    let expected_size = expected_part_size_bytes(&manifest, part_index);
     let expected_checksum = query
         .checksum
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    if let Ok(Some(existing)) = index::read_session_part(&fragment, &version_id, part_index).await {
-        if existing.size_bytes != content_length {
-            return Ok((
-                StatusCode::CONFLICT,
-                "Part already uploaded but size differs",
-            )
-                .into_response());
-        }
-        if let Some(expected) = expected_checksum {
-            if let Some(existing_checksum) = existing.checksum.as_deref() {
-                if !existing_checksum.eq_ignore_ascii_case(expected) {
-                    return Ok((
-                        StatusCode::CONFLICT,
-                        "Part already uploaded but checksum differs",
-                    )
-                        .into_response());
-                }
-            } else {
+    if part_exists_on_disk(&path_manager, &manifest, part_index).await? {
+        if let Some(expected_size) = expected_size {
+            if content_length != expected_size {
                 return Ok((
                     StatusCode::CONFLICT,
-                    "Part already uploaded without checksum metadata",
+                    "Part already uploaded but size differs",
                 )
                     .into_response());
             }
         }
+        if expected_checksum.is_some() {
+            warn!(
+                "Multipart resume for {}/{} part {} skipped checksum revalidation because session part metadata is not persisted",
+                fragment, version_id, part_index
+            );
+        }
         return Ok((StatusCode::OK, "Part already uploaded").into_response());
+    }
+    if let Some(expected_size) = expected_size {
+        if content_length != expected_size {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                "Part size does not match upload session manifest",
+            )
+                .into_response());
+        }
     }
 
     let part_meta = write_part_blob_to_disk(
@@ -1265,20 +1534,16 @@ pub async fn object_upload_part(
     )
     .await?;
 
-    let meta_bytes = rmp_serde::to_vec(&part_meta)
-        .map_err(|e| AppError::InternalServerError(format!("Serialize part meta: {}", e)))?;
+    if let Err(err) =
+        index::commit_session_part_receipt(&fragment, &version_id, &manifest, &part_meta).await
+    {
+        warn!(
+            "Failed to persist compact multipart receipt for {}/{} part {}: {}",
+            fragment, version_id, part_index, err
+        );
+    }
 
-    let committed = commit_part_meta_lockless(
-        &path_manager,
-        &fragment,
-        &version_id,
-        part_index,
-        &meta_bytes,
-        strict_durability,
-    )
-    .await?;
-
-    if !committed {
+    if part_exists_on_disk(&path_manager, &manifest, part_index).await? {
         return Ok((StatusCode::OK, "Part already uploaded").into_response());
     }
 
@@ -1450,10 +1715,38 @@ pub async fn finalize_object_upload(
     let mut present = BTreeSet::new();
     let mut parts: Vec<PartMetadata> = Vec::with_capacity(expected_parts as usize);
 
-    for i in 0..expected_parts {
-        if let Some(pm) = read_part_meta_any(&fragment, &version_id, i).await {
-            present.insert(i);
-            parts.push(pm);
+    if let Some(m) = manifest.as_ref() {
+        let receipts = index::load_session_part_receipts(&fragment, &version_id, m).await?;
+        for i in 0..expected_parts {
+            let mut resolved = None;
+
+            if let Some(receipt) = receipts
+                .as_ref()
+                .and_then(|items| items.get(i as usize))
+                .and_then(|entry| entry.as_ref())
+            {
+                resolved = reconstruct_part_meta_from_receipt(&path_manager, m, receipt).await?;
+            }
+
+            if resolved.is_none() && m.part_size_bytes > 0 {
+                resolved = reconstruct_part_meta_from_disk(&path_manager, m, i).await?;
+            }
+
+            if resolved.is_none() {
+                resolved = read_part_meta_any(&fragment, &version_id, i).await;
+            }
+
+            if let Some(pm) = resolved {
+                present.insert(i);
+                parts.push(pm);
+            }
+        }
+    } else {
+        for i in 0..expected_parts {
+            if let Some(pm) = read_part_meta_any(&fragment, &version_id, i).await {
+                present.insert(i);
+                parts.push(pm);
+            }
         }
     }
 

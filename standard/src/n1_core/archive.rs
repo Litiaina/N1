@@ -295,10 +295,7 @@ fn create_multipart_reader(
             let data_shards_count = data_shards_info.len() as u64;
 
             if data_shards_count == 0 {
-                return Some((
-                    Err(std::io::Error::other("Corrupt metadata")),
-                    state,
-                ));
+                return Some((Err(std::io::Error::other("Corrupt metadata")), state));
             }
 
             let mut temp_bytes_read = 0;
@@ -336,10 +333,7 @@ fn create_multipart_reader(
                         temp_bytes_read += chunk_len;
                     }
                     Err(e) => {
-                        return Some((
-                            Err(std::io::Error::other(e.to_string())),
-                            state,
-                        ));
+                        return Some((Err(std::io::Error::other(e.to_string())), state));
                     }
                 }
             }

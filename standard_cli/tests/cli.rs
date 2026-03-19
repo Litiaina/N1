@@ -6,11 +6,11 @@ use std::sync::{
 
 use assert_cmd::Command;
 use axum::{
+    Json, Router,
     extract::{Path, Query},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -88,7 +88,11 @@ async fn refresh_handler(
     Json(payload): Json<RefreshPayload>,
 ) -> impl IntoResponse {
     if payload.refresh_token != INITIAL_REFRESH_TOKEN {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "bad refresh"}))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "bad refresh"})),
+        )
+            .into_response();
     }
     refresh_calls.fetch_add(1, Ordering::SeqCst);
     (
@@ -191,7 +195,10 @@ async fn health_handler(headers: HeaderMap, Query(query): Query<HealthQuery>) ->
     (StatusCode::OK, Json(body)).into_response()
 }
 
-async fn upload_status_handler(headers: HeaderMap, Path(version_id): Path<String>) -> impl IntoResponse {
+async fn upload_status_handler(
+    headers: HeaderMap,
+    Path(version_id): Path<String>,
+) -> impl IntoResponse {
     if !authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -247,7 +254,10 @@ async fn fragment_create_uses_direct_route() {
     handle.abort();
 
     assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "fragment created");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "fragment created"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -273,7 +283,11 @@ async fn health_renders_disk_usage_and_health() {
     handle.abort();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stdout={stdout}\nstderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("N1 Standard Health"));
     assert!(stdout.contains("/mnt/DISK0"));
     assert!(stdout.contains("75.00%"));
@@ -305,7 +319,11 @@ async fn uploads_status_can_emit_json() {
 
     handle.abort();
 
-    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(parsed["version_id"], "ver-123");
@@ -338,7 +356,11 @@ async fn health_auto_refreshes_expiring_access_token() {
     handle.abort();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stdout={stdout}\nstderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("N1 Standard Health"));
     assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
 }

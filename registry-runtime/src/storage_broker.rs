@@ -63,16 +63,17 @@ struct ResolvedBackend {
 
 impl StorageBroker {
     pub fn new(config: Arc<RegistryConfig>) -> Result<Self, RegistryError> {
-        let strict_client = Client::builder()
-            .use_rustls_tls()
-            .build()
-            .map_err(|err| RegistryError::internal(format!("storage broker client failed: {}", err)))?;
+        let strict_client = Client::builder().use_rustls_tls().build().map_err(|err| {
+            RegistryError::internal(format!("storage broker client failed: {}", err))
+        })?;
         let insecure_client = Client::builder()
             .use_rustls_tls()
             .danger_accept_invalid_certs(true)
             .danger_accept_invalid_hostnames(true)
             .build()
-            .map_err(|err| RegistryError::internal(format!("storage broker insecure client failed: {}", err)))?;
+            .map_err(|err| {
+                RegistryError::internal(format!("storage broker insecure client failed: {}", err))
+            })?;
         Ok(Self {
             strict_client,
             insecure_client,
@@ -103,10 +104,12 @@ impl StorageBroker {
             })
             .send()
             .await
-            .map_err(|err| RegistryError::bad_gateway(format!(
-                "storage auth request failed for {}: {}",
-                backend.engine_url, err
-            )))?;
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "storage auth request failed for {}: {}",
+                    backend.engine_url, err
+                ))
+            })?;
 
         if !response.status().is_success() {
             let fallback = format!(
@@ -127,10 +130,9 @@ impl StorageBroker {
             ));
         }
 
-        let payload = response
-            .json::<EngineAuthResponse>()
-            .await
-            .map_err(|err| RegistryError::bad_gateway(format!("invalid storage auth response: {}", err)))?;
+        let payload = response.json::<EngineAuthResponse>().await.map_err(|err| {
+            RegistryError::bad_gateway(format!("invalid storage auth response: {}", err))
+        })?;
 
         Ok(StorageSessionResponse {
             fragment: binding.fragment.clone(),
@@ -160,16 +162,20 @@ impl StorageBroker {
             })
             .send()
             .await
-            .map_err(|err| RegistryError::bad_gateway(format!(
-                "storage fragment create failed for {}: {}",
-                backend.engine_url, err
-            )))?;
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "storage fragment create failed for {}: {}",
+                    backend.engine_url, err
+                ))
+            })?;
 
         if response.status().is_success() {
             let payload = response
                 .json::<CreateFragmentResponse>()
                 .await
-                .map_err(|err| RegistryError::bad_gateway(format!("invalid fragment create response: {}", err)))?;
+                .map_err(|err| {
+                    RegistryError::bad_gateway(format!("invalid fragment create response: {}", err))
+                })?;
             return Ok((backend.deployment, payload.fragment_hash));
         }
 
@@ -223,8 +229,9 @@ impl StorageBroker {
                     }
                 })
             })?;
-        let engine_url = normalize_backend_url(&engine_url)
-            .map_err(|err| RegistryError::bad_request(format!("invalid storage backend URL: {}", err)))?;
+        let engine_url = normalize_backend_url(&engine_url).map_err(|err| {
+            RegistryError::bad_request(format!("invalid storage backend URL: {}", err))
+        })?;
         let master_key = master_key.ok_or_else(|| {
             RegistryError::conflict(match binding.deployment {
                 StorageDeployment::SingleNode => {
@@ -355,7 +362,9 @@ mod tests {
 
     #[test]
     fn non_loopback_or_non_https_urls_remain_strict() {
-        assert!(!should_allow_insecure_tls_for_url("https://storage.example.com:50001"));
+        assert!(!should_allow_insecure_tls_for_url(
+            "https://storage.example.com:50001"
+        ));
         assert!(!should_allow_insecure_tls_for_url("http://127.0.0.1:50001"));
         assert!(!should_allow_insecure_tls_for_url("not-a-url"));
     }

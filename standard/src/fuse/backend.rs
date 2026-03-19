@@ -351,6 +351,7 @@ impl InProcessBackend {
                 content_type: Some("application/octet-stream".to_string()),
                 total_size_bytes: total_size,
                 expected_parts,
+                part_size_bytes: Some(part_size),
             }),
         )
         .await?
@@ -423,6 +424,7 @@ impl InProcessBackend {
                 content_type: Some("application/octet-stream".to_string()),
                 total_size_bytes: total_size,
                 expected_parts,
+                part_size_bytes: Some(self.upload_part_size_bytes as u64),
             }),
         )
         .await?
@@ -743,7 +745,11 @@ impl FsdBackend for InProcessBackend {
                 }
 
                 let page = self
-                    .list_trash_page_with_limit(&path.fragment, continuation_token.clone(), page_limit)
+                    .list_trash_page_with_limit(
+                        &path.fragment,
+                        continuation_token.clone(),
+                        page_limit,
+                    )
                     .await?;
                 let entries = page
                     .objects
@@ -869,7 +875,10 @@ impl FsdBackend for InProcessBackend {
                     });
                 }
 
-                if let Some(meta) = self.trash_exact_object_metadata(&path.fragment, &key).await? {
+                if let Some(meta) = self
+                    .trash_exact_object_metadata(&path.fragment, &key)
+                    .await?
+                {
                     return Ok(NodeMetadata {
                         kind: NodeKind::File,
                         size_bytes: meta.total_size_bytes,
@@ -1252,7 +1261,8 @@ impl FsdBackend for InProcessBackend {
                 (None, None) => {}
             }
 
-            self.fetch_object_metadata(&from.fragment, &from.object_key).await?;
+            self.fetch_object_metadata(&from.fragment, &from.object_key)
+                .await?;
             self.rename_live_object(&from.fragment, &from.object_key, &to.object_key)
                 .await
         })

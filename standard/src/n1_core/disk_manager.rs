@@ -257,6 +257,8 @@ pub struct InitiateUploadParams {
     pub content_type: Option<String>,
     pub total_size_bytes: u64,
     pub expected_parts: u64,
+    #[serde(default)]
+    pub part_size_bytes: Option<u64>,
 }
 
 #[derive(Serialize)]

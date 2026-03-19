@@ -684,7 +684,8 @@ pub fn build_storage_routes_unbound() -> (Router<Arc<AppState>>, Arc<AppState>) 
     let fs_auth_route = Router::new().route("/authenticate/fs", post(authorize));
     let fs_auth_route = layers.layer_auth(fs_auth_route);
 
-    let refresh_auth_route = Router::new().route("/authenticate/refresh", post(refresh_access_token));
+    let refresh_auth_route =
+        Router::new().route("/authenticate/refresh", post(refresh_access_token));
     let refresh_auth_route = layers.layer_auth(refresh_auth_route);
 
     let logout_auth_route = Router::new().route("/authenticate/logout", post(logout_refresh_token));

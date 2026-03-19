@@ -558,9 +558,10 @@ pub fn init_tracing() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
     let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stderr());
 
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            "info,litiaina_n1=trace,axum=info,hyper=info".into()
-        }))
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,litiaina_n1=trace,axum=info,hyper=info".into()),
+        )
         .with(
             fmt::layer()
                 .with_writer(non_blocking)

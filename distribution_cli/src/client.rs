@@ -4,20 +4,18 @@ use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
 
 use cli_core::client::{
-    AuthSession, CreateFragmentRequest, DynError, api_url, authenticate, build_client,
-    fetch_json, fetch_json_query, get_base_url, get_secret, print_output,
-    print_response_message, resolve_auth_fragment, send_query_only, send_with_session,
-    send_without_body, watch_rendered,
+    AuthSession, CreateFragmentRequest, DynError, api_url, authenticate, build_client, fetch_json,
+    fetch_json_query, get_base_url, get_secret, print_output, print_response_message,
+    resolve_auth_fragment, send_query_only, send_with_session, send_without_body, watch_rendered,
 };
 use cli_core::models::{
-    GcJobStatus, HealthResponse, ListUploadsResponse, RedistributionJobStatus,
-    RepairJobStatus, UploadStatusResponse,
+    GcJobStatus, HealthResponse, ListUploadsResponse, RedistributionJobStatus, RepairJobStatus,
+    UploadStatusResponse,
 };
 
 use crate::args::{
-    Cli, Commands, DurabilityArg, ExecutionModeArg, FragmentCommands, JobAction,
-    MembershipAction, RedistributeAction, RedistributeScopeArg, RepairAction, RepairModeArg,
-    UploadCommands,
+    Cli, Commands, DurabilityArg, ExecutionModeArg, FragmentCommands, JobAction, MembershipAction,
+    RedistributeAction, RedistributeScopeArg, RepairAction, RepairModeArg, UploadCommands,
 };
 use crate::output::{
     format_cluster_view, format_gc_status, format_health, format_health_watch_line,
@@ -395,18 +393,19 @@ async fn handle_authenticated_command(
             public: false,
             expected_epoch,
         } => {
-            let response: N2ClusterViewResponse = send_with_session(client, base_url, session, |token| {
-                let mut request = client
-                    .get(api_url(base_url, "/v4/n2/cluster/view"))
-                    .bearer_auth(token);
-                if let Some(expected_epoch) = expected_epoch {
-                    request = request.query(&[("expected_epoch", expected_epoch)]);
-                }
-                request
-            })
-            .await?
-            .json()
-            .await?;
+            let response: N2ClusterViewResponse =
+                send_with_session(client, base_url, session, |token| {
+                    let mut request = client
+                        .get(api_url(base_url, "/v4/n2/cluster/view"))
+                        .bearer_auth(token);
+                    if let Some(expected_epoch) = expected_epoch {
+                        request = request.query(&[("expected_epoch", expected_epoch)]);
+                    }
+                    request
+                })
+                .await?
+                .json()
+                .await?;
             print_output(cli.json, &response, &format_cluster_view(&response))
         }
         Commands::Membership { action } => match action {
@@ -434,7 +433,10 @@ async fn handle_authenticated_command(
             MembershipAction::Rollback { epoch } => {
                 let response = send_with_session(client, base_url, session, |token| {
                     client
-                        .post(api_url(base_url, &format!("/v4/n2/membership/rollback/{epoch}")))
+                        .post(api_url(
+                            base_url,
+                            &format!("/v4/n2/membership/rollback/{epoch}"),
+                        ))
                         .bearer_auth(token)
                 })
                 .await?;
@@ -447,25 +449,25 @@ async fn handle_authenticated_command(
             push_query_value(&mut query, "version_id", placement.version_id.clone());
             push_query_value(&mut query, "kc", placement.kc);
             push_query_value(&mut query, "mc", placement.mc);
-            let response: ResolvePlacementResponse = send_with_session(client, base_url, session, |token| {
-                let mut request = client
-                    .get(api_url(
-                        base_url,
-                        &format!(
-                            "/v4/n2/placement/{}/{}",
-                            placement.fragment,
-                            placement.object_key
-                        ),
-                    ))
-                    .bearer_auth(token);
-                if !query.is_empty() {
-                    request = request.query(&query);
-                }
-                request
-            })
-            .await?
-            .json()
-            .await?;
+            let response: ResolvePlacementResponse =
+                send_with_session(client, base_url, session, |token| {
+                    let mut request = client
+                        .get(api_url(
+                            base_url,
+                            &format!(
+                                "/v4/n2/placement/{}/{}",
+                                placement.fragment, placement.object_key
+                            ),
+                        ))
+                        .bearer_auth(token);
+                    if !query.is_empty() {
+                        request = request.query(&query);
+                    }
+                    request
+                })
+                .await?
+                .json()
+                .await?;
             print_output(cli.json, &response, &format_placement(&response))
         }
         Commands::Fragment { .. } => unreachable!(),

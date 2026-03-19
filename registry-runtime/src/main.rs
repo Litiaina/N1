@@ -11,7 +11,9 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use auth::{AuthSettings, claims_from_headers, issue_access_token, require_master_key, verify_password};
+use auth::{
+    AuthSettings, claims_from_headers, issue_access_token, require_master_key, verify_password,
+};
 use axum::extract::{Query, State};
 use axum::http::HeaderName;
 use axum::http::{HeaderMap, StatusCode};
@@ -23,16 +25,15 @@ use db::RegistryDb;
 use error::RegistryError;
 use models::{
     BulkObjectMutationResponse, CreateUserRequest, CreateUserResponse, DeleteObjectQuery,
-    FinalizeObjectRequest, FragmentStateRequest,
-    FragmentListResponse, LinkFragmentRequest, LinkFragmentResponse, ListObjectsQuery,
-    ListObjectsResponse, LoginRequest, LoginResponse, ObjectDeleteResponse,
-    ObjectMutationResponse, ObjectStateRequest, RegisterObjectRequest,
+    FinalizeObjectRequest, FragmentListResponse, FragmentStateRequest, LinkFragmentRequest,
+    LinkFragmentResponse, ListObjectsQuery, ListObjectsResponse, LoginRequest, LoginResponse,
+    ObjectDeleteResponse, ObjectMutationResponse, ObjectStateRequest, RegisterObjectRequest,
     RenameRegistryObjectRequest, ResolveObjectQuery, SignupRequest, SignupResponse,
     StorageSessionRequest, StorageSessionResponse, SuggestObjectsQuery, SuggestObjectsResponse,
     UserRecord,
 };
-use storage_broker::StorageBroker;
 use std::time::Duration;
+use storage_broker::StorageBroker;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
@@ -163,7 +164,9 @@ fn build_cors_layer() -> CorsLayer {
         .max_age(Duration::from_secs(86400))
 }
 
-async fn health(State(state): State<AppState>) -> Result<Json<models::HealthResponse>, RegistryError> {
+async fn health(
+    State(state): State<AppState>,
+) -> Result<Json<models::HealthResponse>, RegistryError> {
     Ok(Json(state.db.health().await?))
 }
 
@@ -185,7 +188,11 @@ async fn create_user(
     let password_hash = auth::hash_password(&req.password)?;
     let user = state
         .db
-        .create_user(req.email.trim().to_lowercase(), password_hash, req.quota_limit_bytes)
+        .create_user(
+            req.email.trim().to_lowercase(),
+            password_hash,
+            req.quota_limit_bytes,
+        )
         .await?;
     let _ = ensure_user_default_fragment(&state, &user).await?;
     Ok((StatusCode::CREATED, Json(CreateUserResponse { user })))
@@ -207,7 +214,11 @@ async fn signup(
     let password_hash = auth::hash_password(&req.password)?;
     let user = state
         .db
-        .create_user(req.email.trim().to_lowercase(), password_hash, req.quota_limit_bytes)
+        .create_user(
+            req.email.trim().to_lowercase(),
+            password_hash,
+            req.quota_limit_bytes,
+        )
         .await?;
     let _ = ensure_user_default_fragment(&state, &user).await?;
     let (access_token, expires_in) = issue_access_token(&user, &state.auth)?;
@@ -259,7 +270,10 @@ async fn list_fragments(
     let claims = claims_from_headers(&headers, &state.auth)?;
     let fragments = state.db.list_fragments(claims.sub.clone()).await?;
     let bindings = state.db.list_fragment_bindings(claims.sub).await?;
-    Ok(Json(FragmentListResponse { fragments, bindings }))
+    Ok(Json(FragmentListResponse {
+        fragments,
+        bindings,
+    }))
 }
 
 async fn link_fragment(
@@ -438,7 +452,9 @@ async fn rename_object(
     }
     let _write_guard = state.write_gate.lock().await;
     if req.source_key.trim().is_empty() || req.destination_key.trim().is_empty() {
-        return Err(RegistryError::bad_request("source_key and destination_key are required"));
+        return Err(RegistryError::bad_request(
+            "source_key and destination_key are required",
+        ));
     }
     let claims = claims_from_headers(&headers, &state.auth)?;
     let (object, user) = state
@@ -707,10 +723,8 @@ mod tests {
     }
 
     async fn test_state(single_url: String, multi_url: String) -> (AppState, String) {
-        let db_path = std::env::temp_dir().join(format!(
-            "registry-router-test-{}.db",
-            uuid::Uuid::new_v4()
-        ));
+        let db_path =
+            std::env::temp_dir().join(format!("registry-router-test-{}.db", uuid::Uuid::new_v4()));
         let db = RegistryDb::new(db_path, 1024 * 1024);
         db.init().await.expect("init registry db");
         let password_hash = auth::hash_password("password123").expect("hash password");
@@ -868,8 +882,7 @@ mod tests {
         let multi_body = axum::body::to_bytes(multi_session_resp.into_body(), usize::MAX)
             .await
             .expect("read multi session body");
-        let multi_json: Value =
-            serde_json::from_slice(&multi_body).expect("parse multi session");
+        let multi_json: Value = serde_json::from_slice(&multi_body).expect("parse multi session");
         assert_eq!(multi_json["deployment"], "multi_node");
         assert_eq!(multi_json["engine_url"], multi_url);
         assert_eq!(multi_json["access_token"], "multi-stub-token");
@@ -934,7 +947,11 @@ mod tests {
                 .expect("serialize signup request"),
             ))
             .expect("signup request");
-        let signup_resp = app.clone().oneshot(signup_req).await.expect("signup response");
+        let signup_resp = app
+            .clone()
+            .oneshot(signup_req)
+            .await
+            .expect("signup response");
         assert_eq!(signup_resp.status(), StatusCode::CREATED);
         let signup_body = axum::body::to_bytes(signup_resp.into_body(), usize::MAX)
             .await
@@ -987,7 +1004,10 @@ mod tests {
                 .expect("serialize storage session request"),
             ))
             .expect("storage session request");
-        let session_resp = app.oneshot(session_req).await.expect("storage session response");
+        let session_resp = app
+            .oneshot(session_req)
+            .await
+            .expect("storage session response");
         assert_eq!(session_resp.status(), StatusCode::OK);
         let session_body = axum::body::to_bytes(session_resp.into_body(), usize::MAX)
             .await

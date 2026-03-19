@@ -6,11 +6,11 @@ use std::sync::{
 
 use assert_cmd::Command;
 use axum::{
+    Json, Router,
     extract::{Path, Query},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -89,7 +89,11 @@ async fn refresh_handler(
     Json(payload): Json<RefreshPayload>,
 ) -> impl IntoResponse {
     if payload.refresh_token != INITIAL_REFRESH_TOKEN {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "bad refresh"}))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "bad refresh"})),
+        )
+            .into_response();
     }
     refresh_calls.fetch_add(1, Ordering::SeqCst);
     (
@@ -248,7 +252,10 @@ async fn spawn_server(router: Router) -> (String, JoinHandle<()>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_cluster_view_skips_auth_and_renders() {
-    let router = Router::new().route("/v4/n2/cluster/view/public", get(public_cluster_view_handler));
+    let router = Router::new().route(
+        "/v4/n2/cluster/view/public",
+        get(public_cluster_view_handler),
+    );
     let (base_url, handle) = spawn_server(router).await;
 
     let output = Command::cargo_bin("litiaina-n2-cli")
@@ -267,7 +274,11 @@ async fn public_cluster_view_skips_auth_and_renders() {
     handle.abort();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stdout={stdout}\nstderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("N2 Cluster View"));
     assert!(stdout.contains("write_ready"));
     assert!(stdout.contains("node-a"));
@@ -296,7 +307,11 @@ async fn membership_get_can_emit_json() {
 
     handle.abort();
 
-    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(parsed["epoch"], 9);
@@ -307,7 +322,10 @@ async fn membership_get_can_emit_json() {
 async fn placement_passes_query_and_renders_targets() {
     let router = Router::new()
         .route("/authenticate/fragment", post(auth_handler))
-        .route("/v4/n2/placement/{fragment}/{object_key}", get(placement_handler));
+        .route(
+            "/v4/n2/placement/{fragment}/{object_key}",
+            get(placement_handler),
+        );
     let (base_url, handle) = spawn_server(router).await;
 
     let output = Command::cargo_bin("litiaina-n2-cli")
@@ -337,7 +355,11 @@ async fn placement_passes_query_and_renders_targets() {
     handle.abort();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stdout={stdout}\nstderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("N2 Placement"));
     assert!(stdout.contains("write_quorum"));
     assert!(stdout.contains("node-c"));
@@ -369,7 +391,11 @@ async fn membership_get_refreshes_after_unauthorized_response() {
 
     handle.abort();
 
-    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(parsed["epoch"], 9);

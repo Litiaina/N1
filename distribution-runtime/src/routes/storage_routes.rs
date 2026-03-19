@@ -14,18 +14,18 @@ use crate::n2_core::data_plane::{
     n2_internal_store_shard, n2_internal_upsert_map, n2_internal_write_shard_chunk, put_n2_object,
     reconcile_n2_fragment, rename_n2_object,
 };
+use axum::Router;
 use axum::middleware::from_fn;
 use axum::routing::{delete, get, post, put};
-use axum::Router;
-use std::sync::Arc;
 pub use standard::routes::storage_routes::AppState;
 use standard::routes::storage_routes::{apply_runtime_http_layers, build_storage_routes_unbound};
+use std::sync::Arc;
 
 fn public_n2_routes(layers: &RateLimitLayers) -> Router<Arc<AppState>> {
-    layers.layer_global(
-        Router::<Arc<AppState>>::new()
-            .route("/v4/n2/cluster/view/public", get(get_n2_cluster_view_public)),
-    )
+    layers.layer_global(Router::<Arc<AppState>>::new().route(
+        "/v4/n2/cluster/view/public",
+        get(get_n2_cluster_view_public),
+    ))
 }
 
 fn protected_n2_routes(layers: &RateLimitLayers) -> Router<Arc<AppState>> {
@@ -41,7 +41,10 @@ fn protected_n2_routes(layers: &RateLimitLayers) -> Router<Arc<AppState>> {
             "/v4/n2/object/versions/{:fragment}/{*object_key}",
             get(list_n2_object_versions),
         )
-        .route("/v4/n2/object/{:fragment}/{*object_key}", get(get_n2_object));
+        .route(
+            "/v4/n2/object/{:fragment}/{*object_key}",
+            get(get_n2_object),
+        );
 
     let read_ops = layers
         .layer_view(read_ops)
@@ -53,7 +56,10 @@ fn protected_n2_routes(layers: &RateLimitLayers) -> Router<Arc<AppState>> {
             "/v4/n2/membership/rollback/{:epoch}",
             post(rollback_n2_membership),
         )
-        .route("/v4/n2/object/{:fragment}/{*object_key}", post(put_n2_object))
+        .route(
+            "/v4/n2/object/{:fragment}/{*object_key}",
+            post(put_n2_object),
+        )
         .route(
             "/v4/n2/object/{:fragment}/{*object_key}",
             delete(delete_n2_object),
