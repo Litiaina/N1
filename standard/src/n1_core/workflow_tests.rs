@@ -5,8 +5,8 @@ use super::delete::{
     recover_object, recover_object_version, recover_objects_bulk,
 };
 use super::disk_manager::{
-    DownloadArchiveManifestQuery, DownloadArchiveRequest, InitiateUploadParams,
-    ListObjectsResult, ObjectKeyQuery, ObjectPathManager, RenameObjectRequest, UploadPartQuery,
+    DownloadArchiveManifestQuery, DownloadArchiveRequest, InitiateUploadParams, ListObjectsResult,
+    ObjectKeyQuery, ObjectPathManager, RenameObjectRequest, UploadPartQuery,
 };
 use super::fragment_metadata::init_fragment_metadata;
 use super::garbage_collector::{get_gc_status_api, run_garbage_collector};
@@ -47,11 +47,11 @@ use crate::structs::auth_structs::Claims;
 use crate::websocket::manager::WsConnectionManager;
 
 use axum::Json as AxumJson;
+use axum::Json;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::response::IntoResponse;
-use axum::Json;
 use futures_util::{StreamExt, stream};
 use image::{ColorType, ImageBuffer, ImageEncoder, Rgba, codecs::png::PngEncoder};
 use once_cell::sync::Lazy;
@@ -2736,7 +2736,13 @@ async fn matrix_archive_export_all_tar_respects_internal_filter() {
     let visible_payload = b"visible-bytes".to_vec();
     let internal_payload = b"internal-marker".to_vec();
 
-    put_object(state.clone(), &fragment, visible_key, visible_payload.clone()).await;
+    put_object(
+        state.clone(),
+        &fragment,
+        visible_key,
+        visible_payload.clone(),
+    )
+    .await;
     put_object(state, &fragment, internal_key, internal_payload.clone()).await;
 
     let export_resp = download_selected_archive(
@@ -2891,11 +2897,13 @@ async fn matrix_archive_manifest_tar_streams_selected_keys() {
     let payload_a = b"alpha".to_vec();
     let payload_b = b"bravo".to_vec();
 
-    put_object(state.clone(), &fragment, key_a, payload_a.clone()).await;
-    put_object(state.clone(), &fragment, key_b, payload_b.clone()).await;
+    let version_a = put_object(state.clone(), &fragment, key_a, payload_a.clone()).await;
+    let version_b = put_object(state.clone(), &fragment, key_b, payload_b.clone()).await;
     put_object(state, &fragment, key_c, b"charlie".to_vec()).await;
 
-    let manifest = format!("{key_b}\nmissing/object.bin\n/{key_a}\n");
+    let manifest = format!(
+        "{version_b}\t{key_b}\nmissing/object.bin\n/{key_a}\n{version_a}\tmissing/versioned.bin\n"
+    );
     let resp = download_manifest_archive(
         full_claims(&fragment),
         AxumPath(fragment),

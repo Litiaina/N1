@@ -767,7 +767,7 @@ impl RegistryDb {
                     .join(", ");
                 let sql = format!(
                     r#"
-                    SELECT object_key
+                    SELECT version_id, object_key
                     FROM objects
                     WHERE owner_uid = ? AND fragment = ? AND status = ? AND object_key IN ({})
                     ORDER BY object_key ASC
@@ -783,11 +783,13 @@ impl RegistryDb {
 
                 let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
                 let rows = stmt
-                    .query_map(params_from_iter(args), |row| row.get::<_, String>(0))
+                    .query_map(params_from_iter(args), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
                     .map_err(sql_err)?;
                 for row in rows {
-                    let key = row.map_err(sql_err)?;
-                    writeln!(writer, "{}", key).map_err(|err| {
+                    let (version_id, key) = row.map_err(sql_err)?;
+                    writeln!(writer, "{}\t{}", version_id, key).map_err(|err| {
                         RegistryError::internal(format!(
                             "failed to write archive manifest entry: {}",
                             err
@@ -809,7 +811,7 @@ impl RegistryDb {
 
                 let mut sql = String::from(
                     r#"
-                    SELECT object_key
+                    SELECT version_id, object_key
                     FROM objects
                     WHERE owner_uid = ? AND fragment = ? AND status = ?
                     "#,
@@ -831,11 +833,13 @@ impl RegistryDb {
 
                 let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
                 let rows = stmt
-                    .query_map(params_from_iter(args), |row| row.get::<_, String>(0))
+                    .query_map(params_from_iter(args), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
                     .map_err(sql_err)?;
                 for row in rows {
-                    let key = row.map_err(sql_err)?;
-                    writeln!(writer, "{}", key).map_err(|err| {
+                    let (version_id, key) = row.map_err(sql_err)?;
+                    writeln!(writer, "{}\t{}", version_id, key).map_err(|err| {
                         RegistryError::internal(format!(
                             "failed to write archive manifest entry: {}",
                             err
@@ -1876,7 +1880,13 @@ mod tests {
         assert_eq!(manifest.selected_count, 2);
 
         let body = std::fs::read_to_string(&manifest.manifest_path).expect("read manifest");
-        assert_eq!(body, "patients/a/one.dcm\npatients/a/two.dcm\n");
+        assert_eq!(
+            body,
+            concat!(
+                "01HARCHMANIFESTVERSION0000000001\tpatients/a/one.dcm\n",
+                "01HARCHMANIFESTVERSION0000000002\tpatients/a/two.dcm\n"
+            )
+        );
 
         let _ = std::fs::remove_file(&manifest.manifest_path);
         let _ = std::fs::remove_file(path);

@@ -28,8 +28,8 @@ use error::RegistryError;
 use models::{
     ArchiveObjectsRequest, BulkObjectMutationResponse, CreateUserRequest, CreateUserResponse,
     DeleteObjectQuery, FinalizeObjectRequest, FragmentListResponse, FragmentStateRequest,
-    LinkFragmentRequest, LinkFragmentResponse, ListObjectsQuery, ListObjectsResponse,
-    LoginRequest, LoginResponse, ObjectDeleteResponse, ObjectMutationResponse, ObjectStateRequest,
+    LinkFragmentRequest, LinkFragmentResponse, ListObjectsQuery, ListObjectsResponse, LoginRequest,
+    LoginResponse, ObjectDeleteResponse, ObjectMutationResponse, ObjectStateRequest,
     RegisterObjectRequest, RenameRegistryObjectRequest, ResolveObjectQuery, SignupRequest,
     SignupResponse, StorageSessionRequest, StorageSessionResponse, SuggestObjectsQuery,
     SuggestObjectsResponse, UserRecord,
@@ -519,15 +519,16 @@ async fn archive_objects(
             ))
             .unwrap_or_else(|_| header::HeaderValue::from_static("attachment"))
         });
-    let status = StatusCode::from_u16(upstream.status().as_u16())
-        .unwrap_or(StatusCode::OK);
+    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::OK);
 
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_DISPOSITION, content_disposition)
         .body(Body::from_stream(upstream.bytes_stream()))
-        .map_err(|err| RegistryError::internal(format!("failed to build archive response: {}", err)))
+        .map_err(|err| {
+            RegistryError::internal(format!("failed to build archive response: {}", err))
+        })
 }
 
 async fn rename_object(
@@ -813,9 +814,7 @@ mod tests {
                                 CONTENT_DISPOSITION,
                                 query
                                     .get("filename")
-                                    .map(|value| {
-                                        format!("attachment; filename=\"{}.tar\"", value)
-                                    })
+                                    .map(|value| format!("attachment; filename=\"{}.tar\"", value))
                                     .unwrap_or_else(|| {
                                         "attachment; filename=\"export.tar\"".to_string()
                                     }),
@@ -1233,8 +1232,8 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "patients/a/one.dcm".to_string(),
-                "patients/a/two.dcm".to_string()
+                "01HARCHIVEVERSION000000000000001\tpatients/a/one.dcm".to_string(),
+                "01HARCHIVEVERSION000000000000002\tpatients/a/two.dcm".to_string()
             ]
         );
     }

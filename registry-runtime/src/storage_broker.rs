@@ -174,12 +174,18 @@ impl StorageBroker {
             .await?;
 
         let file = File::open(manifest_path).await.map_err(|err| {
-            RegistryError::internal(format!("failed to open archive manifest for streaming: {}", err))
+            RegistryError::internal(format!(
+                "failed to open archive manifest for streaming: {}",
+                err
+            ))
         })?;
         let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
         let request = self
             .client_for_backend(&backend)
-            .post(format!("{}/v4/fragment/archive/manifest", backend.engine_url))
+            .post(format!(
+                "{}/v4/fragment/archive/manifest",
+                backend.engine_url
+            ))
             .bearer_auth(payload.access_token)
             .query(&[
                 ("format", "tar"),
@@ -385,10 +391,7 @@ fn normalize_engine_auth_error_message(message: String) -> String {
     trimmed.to_string()
 }
 
-async fn extract_engine_error_message(
-    response: reqwest::Response,
-    fallback: String,
-) -> String {
+async fn extract_engine_error_message(response: reqwest::Response, fallback: String) -> String {
     if let Ok(body) = response.json::<EngineErrorResponse>().await {
         if let Some(message) = body.error.or(body.message) {
             return message;

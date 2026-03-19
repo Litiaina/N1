@@ -31,7 +31,9 @@ use crate::{
         ShardInfo,
     },
     n1_core::{
-        index, metadata_parser::get_metadata, recovery::read_or_recover_chunk,
+        index,
+        metadata_parser::{get_metadata, get_version_metadata},
+        recovery::read_or_recover_chunk,
     },
     structs::auth_structs::Claims,
 };
@@ -66,28 +68,27 @@ pub async fn download_selected_archive(
         ArchiveSelection::ManifestFile(_) => None,
     };
 
-    let (effective_format, content_type, disposition) = if selected_key_count.is_none()
-        || selected_key_count.unwrap_or_default() > 1000
-    {
-        (
-            "tar",
-            "application/x-tar",
-            format!("attachment; filename=\"{}.tar\"", filename),
-        )
-    } else {
-        match req.format.as_str() {
-            "tar" => (
+    let (effective_format, content_type, disposition) =
+        if selected_key_count.is_none() || selected_key_count.unwrap_or_default() > 1000 {
+            (
                 "tar",
                 "application/x-tar",
                 format!("attachment; filename=\"{}.tar\"", filename),
-            ),
-            _ => (
-                "zip",
-                "application/zip",
-                format!("attachment; filename=\"{}.zip\"", filename),
-            ),
-        }
-    };
+            )
+        } else {
+            match req.format.as_str() {
+                "tar" => (
+                    "tar",
+                    "application/x-tar",
+                    format!("attachment; filename=\"{}.tar\"", filename),
+                ),
+                _ => (
+                    "zip",
+                    "application/zip",
+                    format!("attachment; filename=\"{}.zip\"", filename),
+                ),
+            }
+        };
 
     let stream = stream_archive(fragment, selection, effective_format.to_string()).await?;
 
@@ -138,7 +139,8 @@ fn canonical_key(key: &str) -> String {
 }
 
 async fn persist_manifest_body(body: Body) -> Result<PathBuf, AppError> {
-    let manifest_path = std::env::temp_dir().join(format!("n1-archive-manifest-{}.lst", Uuid::new_v4()));
+    let manifest_path =
+        std::env::temp_dir().join(format!("n1-archive-manifest-{}.lst", Uuid::new_v4()));
     let mut file = File::create(&manifest_path)
         .await
         .map_err(|e| AppError::Io(e, "create manifest temp file".into()))?;
@@ -257,6 +259,43 @@ async fn load_archive_metadata_for_key(
     Ok(Some((clean_key, metadata)))
 }
 
+async fn load_archive_metadata_for_manifest_entry(
+    fragment: &str,
+    object_key: &str,
+    version_id: Option<&str>,
+) -> Result<Option<(String, ObjectMetadata)>, AppError> {
+    let clean_key = canonical_key(object_key);
+    if clean_key.is_empty() {
+        return Ok(None);
+    }
+
+    let metadata = match version_id.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(version_id) => {
+            match get_version_metadata(fragment, &clean_key, version_id, fragment).await {
+                Ok(m) if !m.is_delete_marker => m,
+                _ => return Ok(None),
+            }
+        }
+        None => match get_metadata(fragment, &clean_key, fragment).await {
+            Ok(m) if !m.is_delete_marker => m,
+            _ => return Ok(None),
+        },
+    };
+
+    Ok(Some((clean_key, metadata)))
+}
+
+fn parse_manifest_line(line: &str) -> Option<(Option<&str>, &str)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some((version_id, object_key)) = trimmed.split_once('\t') {
+        return Some((Some(version_id), object_key));
+    }
+    Some((None, trimmed))
+}
+
 async fn write_zip_archive(
     fragment: &str,
     selection: ArchiveSelection,
@@ -300,7 +339,8 @@ async fn write_zip_archive(
         }
         ArchiveSelection::FragmentAll { .. } => {
             return Err(AppError::BadRequest(
-                "zip export does not support export_all; use tar for fragment-scale archives".into(),
+                "zip export does not support export_all; use tar for fragment-scale archives"
+                    .into(),
             ));
         }
         ArchiveSelection::ManifestFile(_) => {
@@ -392,12 +432,11 @@ async fn write_tar_archive(
                     .await
                     .map_err(|e| AppError::Io(e, "read archive manifest".into()))?
                 {
-                    let key = canonical_key(&line);
-                    if key.is_empty() {
+                    let Some((version_id, key)) = parse_manifest_line(&line) else {
                         continue;
-                    }
+                    };
                     let Some((archive_path, metadata)) =
-                        load_archive_metadata_for_key(fragment, &key).await?
+                        load_archive_metadata_for_manifest_entry(fragment, key, version_id).await?
                     else {
                         continue;
                     };
