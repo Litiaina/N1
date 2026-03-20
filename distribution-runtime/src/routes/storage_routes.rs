@@ -4,8 +4,8 @@ use crate::n1_core::operation_gate::{
     enforce_quiesced_mode_on_reads, enforce_read_only_fast_mode_on_mutations,
 };
 use crate::n2_core::api::{
-    get_n2_cluster_view, get_n2_cluster_view_public, get_n2_membership, put_n2_membership,
-    put_n2_internal_membership, resolve_n2_placement, rollback_n2_membership,
+    get_n2_cluster_view, get_n2_cluster_view_public, get_n2_membership, put_n2_internal_membership,
+    put_n2_membership, resolve_n2_placement, rollback_n2_membership,
 };
 use crate::n2_core::data_plane::{
     delete_n2_object, get_n2_object, list_n2_object_versions, list_n2_objects,
@@ -115,7 +115,10 @@ fn internal_n2_routes(layers: &RateLimitLayers) -> Router<Arc<AppState>> {
             "/v4/n2/internal/map/{:fragment}",
             delete(n2_internal_delete_map),
         )
-        .route("/v4/n2/internal/membership", put(put_n2_internal_membership));
+        .route(
+            "/v4/n2/internal/membership",
+            put(put_n2_internal_membership),
+        );
 
     layers.layer_global(routes)
 }

@@ -1155,8 +1155,7 @@ impl RegistryDb {
                 }
             }
 
-            let mut extension_stats =
-                std::collections::BTreeMap::<String, (usize, i64)>::new();
+            let mut extension_stats = std::collections::BTreeMap::<String, (usize, i64)>::new();
             let mut total_size_bytes = 0i64;
             for ((_fragment, object_key), size_bytes) in &by_key {
                 total_size_bytes = total_size_bytes.saturating_add(*size_bytes);
@@ -1172,11 +1171,13 @@ impl RegistryDb {
 
             let mut extension_stats = extension_stats
                 .into_iter()
-                .map(|(extension, (object_count, total_size_bytes))| ObjectExtensionStat {
-                    extension,
-                    object_count,
-                    total_size_bytes,
-                })
+                .map(
+                    |(extension, (object_count, total_size_bytes))| ObjectExtensionStat {
+                        extension,
+                        object_count,
+                        total_size_bytes,
+                    },
+                )
                 .collect::<Vec<_>>();
             extension_stats.sort_by(|a, b| {
                 b.total_size_bytes

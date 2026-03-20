@@ -21,12 +21,12 @@
 > - `N1` is the shared node-local storage engine used by both deployments.
 > - `standard` (`litiaina-n1-standard`) is the single-node N2 deployment path and the stable default.
 > - `standard` is released at `0.6.2`.
-> - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path and is released at `0.1.1`.
+> - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path and is released at `0.1.2`.
 > - `registry-runtime` (`registry-server`) is the SQLite-backed business metadata layer for both deployment shapes and is versioned independently at `0.2.1`.
 > - `arc` (`litiaina-n1-arc`) is the experimental raw-device profile and is not the production default.
 > - Prefer a non-root service user for `litiaina-n1-standard`, `litiaina-n2`, and `registry-server`. Keep `root` for `litiaina-n1-arc` raw-device operations only.
 > - See `DEPLOYMENT_PROFILES.md` for the profile split and architecture guidance.
-> - Operator shortcut: choose the deployment shape in `DEPLOYMENT.md` first, then ignore Arc unless you are explicitly doing raw-device testing.
+> - Operator shortcut: choose the deployment shape in `DEPLOYMENT.md` first, then use `N2_DEPLOYMENT.md` for the multi-node runbook.
 
 ## Table of Contents
 
@@ -71,6 +71,7 @@
 For SMB network-drive deployment, see `NETWORK_DRIVE.md`.
 The single-node N2 deployment ships with native SMB-lite via `fsgwd`; the old `fsd_mount + Samba` bridge is now retired.
 For deployment and operator steps, see `DEPLOYMENT.md`.
+For the dedicated multi-node N2 runbook, see `N2_DEPLOYMENT.md`.
 For deployment profile guidance, see `DEPLOYMENT_PROFILES.md`.
 
 N2 deployment split in this workspace:
@@ -93,6 +94,28 @@ N2 deployment split in this workspace:
   - access token default TTL: `15 minutes`
   - access token max TTL: `1 hour`
   - refresh token default TTL: `7 days`
+
+Multi-node N2 operator note from the current 2-node hardware pass:
+- the tested filesystem-backed `distribution-runtime 0.1.2` shape was:
+  - 2 nodes
+  - 2 index roots per node
+  - 2 blob roots per node
+  - `kc=1 mc=1 kd=1 md=1`
+- `litiaina-n2` now auto-creates `n1.env` and `n1_config.ini` compatibility aliases when they are missing beside `n2.env` and `n2_config.ini`
+- current write success means quorum success, not necessarily full `kc+mc` placement
+  - inspect `committed_shards`
+  - run reconcile after degraded periods or peer recovery
+- real-hardware reference from that pass:
+  - `256 MiB` put: `24.86 MiB/s`
+  - local read: `164.96 MiB/s`
+  - remote read: `75.79 MiB/s`
+  - rejoin reconcile: `14.34 s` with `13` objects scanned and `2` updated
+- on low-latency LANs, lower `[n2].remote_request_timeout_ms` if you want faster degraded-mode fallback on black-holed peers
+- multi-node startup now hard-fails on operator-dangerous mistakes like:
+  - missing membership file
+  - placeholder internal token
+  - duplicate peer endpoints
+  - loopback-only multi-node endpoints
 
 Single-node N2 on stable/default `standard` (production):
 - `index_store_disks` and `blob_store_disks` are directory paths.
@@ -144,7 +167,7 @@ Profile note:
 ## Release Status
 
 - `standard` is the stable/default deployment profile at `0.6.2`.
-- `distribution-runtime` is released independently at `0.1.1` as the multi-node N2 layer.
+- `distribution-runtime` is released independently at `0.1.2` as the multi-node N2 layer.
 - `registry-runtime` is released independently at `0.2.1` as the SQLite-backed Registry layer.
 - `arc` is the experimental raw-device profile.
 - Stable architecture baseline (`standard`):

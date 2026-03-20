@@ -14,7 +14,7 @@
 > - `N1` is the shared storage engine used by both deployment shapes.
 > - `standard` is the stable single-node deployment path.
 > - `standard` is released at `0.6.2`.
-> - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path in this workspace and is released at `0.1.1`.
+> - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path in this workspace and is released at `0.1.2`.
 > - `registry-runtime` (`registry-server`) is the SQLite-backed Registry layer for user/business metadata and is versioned independently at `0.2.1`.
 > - `arc` is experimental for raw-device deployments.
 > - See `DEPLOYMENT_PROFILES.md`.
@@ -28,6 +28,7 @@
 > - Single-node N2 deployment runs `standard` (`litiaina-n1-standard`).
 > - Multi-node N2 deployment runs `distribution-runtime` (`litiaina-n2`).
 > - `distribution-runtime` adds `/v4/n2/*` cluster routes and `/v4/n2/internal/*` peer routes on top of the same shared stable N1 node core used by `standard`.
+> - For the multi-node operator runbook, see `N2_DEPLOYMENT.md`.
 > Arc route scope note:
 > - Arc serves v4 object/maintenance APIs and does not expose legacy `/dir/*` routes.
 > - Arc also does not expose `/authenticate/fs`.
@@ -43,6 +44,15 @@
 > - N1 is the node-local storage engine inside N2.
 > - Single-node N2 serves the shared v4 object/maintenance surface directly.
 > - Multi-node N2 serves that same node surface plus the `/v4/n2/*` distributed control/data-plane routes.
+>
+> Multi-node N2 deployment note:
+> - `distribution-runtime` is operational on a tested 2-node filesystem-backed cluster.
+> - In an isolated `litiaina-n2` working directory, the runtime now auto-creates `n1.env` and `n1_config.ini` compatibility aliases beside `n2.env` and `n2_config.ini` when needed.
+> - Current N2 object-write success is quorum success.
+> - Use the `committed_shards` field in the `PUT /v4/n2/object/...` response as the immediate placement truth.
+> - Use `POST /v4/n2/reconcile/{fragment}` after degraded periods or peer recovery to restore missing copies.
+> - On a low-latency LAN, a lower `remote_request_timeout_ms` is usually a better degraded-mode default than the conservative wide-area timeout.
+> - Startup now rejects operator-dangerous multi-node layouts such as placeholder internal tokens, duplicate active endpoints, missing membership files, and loopback-only peer endpoints.
 
 > Engine profile note:
 > - `standard` is the stable/default profile for general-purpose filesystem-backed deployments.

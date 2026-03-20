@@ -2,13 +2,15 @@
 
 This document is the canonical deployment split for N2.
 
+For the dedicated multi-node operator runbook, use [N2_DEPLOYMENT.md](/home/administrator/Development/N1/N2_DEPLOYMENT.md).
+
 N2 is the product identity of this workspace.
 N1 is the shared storage engine underneath it.
 
 As of 2026-03-20:
 
 - `standard` (`litiaina-n1-standard`) is the single-node N2 deployment path, the default for production, and released at `0.6.2`.
-- `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path on top of the same N1 core and is released at `0.1.1`.
+- `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path on top of the same N1 core and is released at `0.1.2`.
 - `registry-runtime` (`registry-server`) is the SQLite-backed Registry layer used in both deployment shapes and released independently at `0.2.1`.
 - `arc` (`litiaina-n1-arc`) is the experimental raw-device profile.
 - Privilege split: `standard`, `distribution-runtime`, and `registry-runtime` should normally run as non-root services, while `arc` is the only profile that should require root for raw-device workflows.
@@ -49,6 +51,25 @@ As of 2026-03-20:
 - Brokers short-lived storage sessions so clients do not need fragment secrets for normal Registry-backed usage.
 - Resolves prefix/search archive selections into exact-key manifests for engine-side tar streaming.
 - Bundled web/admin shells can target this layer, but they are still under development and are not the stable N2 product surface yet.
+
+### Multi-node N2 operational note
+
+- `distribution-runtime` is operational on a tested 2-node filesystem-backed layout.
+- Current deployment reality:
+  - keep `n2.env` + `n2_config.ini` as the profile-owned files
+  - `litiaina-n2` now auto-creates `n1.env` and `n1_config.ini` compatibility aliases beside them when missing
+  - operators should still manage only the N2-owned files directly
+- Current write semantics:
+  - write quorum is `kc`
+  - `committed_shards` in the response is the immediate placement truth
+  - reconcile is the supported way to restore missing peer copies after degraded periods
+- Current timeout tuning note:
+  - conservative defaults are safe
+  - low-latency LAN clusters usually want a lower `remote_request_timeout_ms` for faster degraded fallback
+- Current deployment guardrails:
+  - membership file must exist before startup
+  - placeholder internal tokens are rejected
+  - active multi-node endpoints must be valid `https://host:port` values and must not be loopback-only
 
 Disk layout snapshot:
 

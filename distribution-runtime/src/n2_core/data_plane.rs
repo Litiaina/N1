@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use simd_erasure_core::{ReedSolomonDecoder, ReedSolomonEncoder};
 use std::collections::{HashMap, HashSet};
-use std::pin::Pin;
 use std::path::{Path as StdPath, PathBuf};
+use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::fs::{self, OpenOptions};
@@ -564,9 +564,7 @@ async fn persist_n2_object_map(map: &N2ObjectMap) -> Result<(), AppError> {
     if replicated < required_remote_acks {
         return Err(AppError::Conflict(format!(
             "object committed locally ({} mirrors) but map replication acknowledged only {} remote targets, need {}",
-            local_writes,
-            replicated,
-            required_remote_acks
+            local_writes, replicated, required_remote_acks
         )));
     }
 
@@ -2246,7 +2244,11 @@ fn reconstruct_object_stream_from_cluster_sources(
             let mut seen_indices = HashSet::new();
             sources.retain(|s| seen_indices.insert(s.cluster_shard_index()));
 
-            let max_shard_size = sources.iter().map(ClusterShardReadSource::size_bytes).max().unwrap_or(0);
+            let max_shard_size = sources
+                .iter()
+                .map(ClusterShardReadSource::size_bytes)
+                .max()
+                .unwrap_or(0);
             if max_shard_size == 0 || total_size_bytes == 0 {
                 return Ok(());
             }
@@ -3031,7 +3033,9 @@ pub async fn list_n2_objects(
 
     let has_more = objects.len() > limit;
     let next_continuation = if has_more {
-        objects.get(limit - 1).map(|object| object.object_key.clone())
+        objects
+            .get(limit - 1)
+            .map(|object| object.object_key.clone())
     } else {
         None
     };

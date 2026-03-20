@@ -34,12 +34,11 @@ use models::{
     FinalizeObjectRequest, FragmentListResponse, FragmentStateRequest, LinkFragmentRequest,
     LinkFragmentResponse, ListObjectsQuery, ListObjectsResponse, LoginRequest, LoginResponse,
     ObjectDeleteResponse, ObjectMutationResponse, ObjectStateRequest, ObjectStatsQuery,
-    ObjectStatsResponse, RefreshRequest,
-    RefreshResponse, RegisterObjectRequest, RenameRegistryObjectRequest, ResolveObjectQuery,
-    SetupTwoFactorRequest, SignupRequest, SignupResponse, StorageSessionRequest,
-    StorageSessionResponse, SuggestObjectsQuery, SuggestObjectsResponse, TwoFactorSetupResponse,
-    UpdateCredentialsRequest, UpdateEmailRequest, UpdatePasswordRequest, UpdateQuotaRequest,
-    UserMutationResponse, UserRecord,
+    ObjectStatsResponse, RefreshRequest, RefreshResponse, RegisterObjectRequest,
+    RenameRegistryObjectRequest, ResolveObjectQuery, SetupTwoFactorRequest, SignupRequest,
+    SignupResponse, StorageSessionRequest, StorageSessionResponse, SuggestObjectsQuery,
+    SuggestObjectsResponse, TwoFactorSetupResponse, UpdateCredentialsRequest, UpdateEmailRequest,
+    UpdatePasswordRequest, UpdateQuotaRequest, UserMutationResponse, UserRecord,
 };
 use std::time::Duration;
 use storage_broker::StorageBroker;
@@ -1687,10 +1686,7 @@ mod tests {
                 .expect("serialize signup request"),
             ))
             .expect("signup request");
-        let signup_resp = app
-            .oneshot(signup_req)
-            .await
-            .expect("signup response");
+        let signup_resp = app.oneshot(signup_req).await.expect("signup response");
         assert_eq!(signup_resp.status(), StatusCode::CREATED);
         let signup_body = axum::body::to_bytes(signup_resp.into_body(), usize::MAX)
             .await
@@ -1873,7 +1869,8 @@ mod tests {
         let users = list_json["users"].as_array().expect("users array");
         assert_eq!(users.len(), 2);
         assert!(
-            users.iter()
+            users
+                .iter()
                 .any(|user| user["email"] == "admin@example.com" && user["is_admin"] == true)
         );
     }

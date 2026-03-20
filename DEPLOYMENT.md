@@ -1,19 +1,25 @@
-# N2 Deployment Runbook
+# Deployment Index
 
 > Deployment profile status (2026-03-20):
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used underneath both deployment shapes.
 > - Single-node deployment: `standard` (`litiaina-n1-standard`)
 > - `standard` release: `0.6.2`
-> - Multi-node deployment: `distribution-runtime` (`litiaina-n2`, `0.1.1`)
+> - Multi-node deployment: `distribution-runtime` (`litiaina-n2`, `0.1.2`)
 > - Registry/business deployment: `registry-runtime` (`registry-server`, `0.2.1`)
 > - Experimental raw-device profile: `arc` (`litiaina-n1-arc`)
 > - Privilege split: prefer a normal service user for `litiaina-n1-standard`, `litiaina-n2`, and `registry-server`. Reserve `root` for `litiaina-n1-arc` raw-device operations only, and let the runtimes validate their writable state paths explicitly.
 > - See `DEPLOYMENT_PROFILES.md` for profile policy.
 
+If you are deploying multi-node N2 today, use the dedicated runbook:
+- [N2_DEPLOYMENT.md](/home/administrator/Development/N1/N2_DEPLOYMENT.md)
+
+This document now acts as the umbrella deployment index for the workspace. It keeps the single-node and shared deployment guidance, while the multi-node operator runbook lives in its own document:
+- [N2 multi-node runbook](/home/administrator/Development/N1/N2_DEPLOYMENT.md)
+
 If you are deploying one node today, use the single-node N2 path on `standard`.
 
-This runbook is written N2-first, with the single-node path first because it is the simplest production deployment:
+Single-node/default production path:
 
 - Single-node N2 on `standard` (stable/default):
   - `index_store_disks`: mounted filesystem paths
@@ -358,6 +364,72 @@ Notes for `distribution-runtime`:
 - `data_shards/parity_shards` are still the local shard layout used by the shared N1 engine inside each node.
 - `kc/mc` are the cross-node cluster layout.
 - `kd/md` are the per-node local layout for each cluster shard.
+- Current shared-core compatibility note:
+  - `distribution-runtime` owns `n2.env` and `n2_config.ini`.
+  - `litiaina-n2` now auto-creates `n1.env` and `n1_config.ini` compatibility aliases beside `n2.env` and `n2_config.ini` when they are missing.
+  - Operators should treat `n2.env` and `n2_config.ini` as the owned source files.
+  - Keep those files in the same working directory as `litiaina-n2` until that filename coupling is removed from the shared core.
+- Timeout note:
+  - `remote_request_timeout_ms=60000` is conservative.
+  - On a low-latency LAN, set it lower (`3000` to `10000`) if you want faster degraded-mode fallback when a peer is black-holed instead of cleanly offline.
+- Quorum note:
+  - N2 write quorum is `kc`.
+  - A successful `PUT /v4/n2/object/...` means the write reached quorum, not necessarily every planned target.
+  - Watch `committed_shards` in the response and run reconcile after degraded periods to restore missing copies.
+
+### Validated Two-Node Reference (`distribution-runtime 0.1.2`)
+
+This two-node filesystem-backed layout was exercised on real hardware on `2026-03-20`:
+
+- 2 nodes
+- 2 index roots per node
+- 2 blob roots per node
+- explicit cross params:
+  - `kc=1`
+  - `mc=1`
+  - `kd=1`
+  - `md=1`
+- shared membership epoch file on both nodes
+- shared `internal_token` on both nodes
+- HTTPS peer transport with self-signed certificates
+
+Observed baseline from that run:
+
+- `256 MiB` object upload through local node:
+  - `10.30 s`
+  - `24.86 MiB/s`
+- `256 MiB` object read:
+  - local node: `164.96 MiB/s`
+  - remote node: `75.79 MiB/s`
+- paginated listing with `limit=5`:
+  - page counts: `5 / 5 / 2`
+  - continuation tokens advanced correctly
+- rename:
+  - `402.66 ms`
+- delete:
+  - `236.78 ms`
+- one-node-loss read of the existing `256 MiB` object:
+  - `1.74 s`
+  - `147.45 MiB/s`
+- degraded write while remote node was offline:
+  - `64 MiB`
+  - `2.21 s`
+  - `28.95 MiB/s`
+- reconcile after remote node rejoined:
+  - `14.34 s`
+  - `13` objects scanned
+  - `2` objects updated
+  - `0` failed
+
+Important interpretation:
+
+- The tested `kc=1 mc=1` cluster stayed readable during one-node loss.
+- Degraded writes also succeeded while the remote node was down.
+- Reconcile restored the missing peer shards after rejoin.
+- On that run, one healthy-cluster `PUT` still returned `committed_shards=1`.
+  - Treat `committed_shards` as the immediate placement truth.
+  - Do not assume a successful `PUT` means full `kc+mc` placement has already landed.
+  - Use reconcile as the repair path when a peer copy is missing.
 
 `n1_config.ini` (arc):
 

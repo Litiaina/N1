@@ -22,7 +22,7 @@ use crate::n1_core::upload::{
     UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
 };
 use crate::n2_core::config::{n2_runtime_config, resolve_effective_cross_params};
-use crate::n2_core::state::get_cluster_view;
+use crate::n2_core::state::{get_cluster_view, get_membership};
 use crate::routes::storage_routes::serve_storage_routes;
 use crate::settings::constants::{CONFIG_FILE, ENV_FILE};
 use crate::utils::date_time_formatter::LocalTimer;
@@ -31,6 +31,9 @@ use axum::Router;
 use axum_server::tls_rustls::RustlsConfig;
 use chrono::Local;
 use ini::Ini;
+use standard::settings::constants::{
+    CONFIG_FILE as STANDARD_CONFIG_FILE, ENV_FILE as STANDARD_ENV_FILE,
+};
 use std::collections::HashSet;
 use std::fs as stdfs;
 use std::fs::OpenOptions;
@@ -408,8 +411,117 @@ pub fn init_tracing() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
     Ok(guard)
 }
 
-async fn validate_n2_startup_layout(local_blob_roots: usize) {
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+fn parse_https_url(raw: &str, label: &str) -> Result<reqwest::Url, String> {
+    let parsed = reqwest::Url::parse(raw)
+        .map_err(|e| format!("{label} '{}' is not a valid URL: {}", raw, e))?;
+    if parsed.scheme() != "https" {
+        return Err(format!("{label} '{}' must use https", raw));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("{label} '{}' is missing a host", raw))?;
+    if host.trim().is_empty() {
+        return Err(format!("{label} '{}' is missing a usable host", raw));
+    }
+    if parsed.port_or_known_default().is_none() {
+        return Err(format!("{label} '{}' is missing a port", raw));
+    }
+    Ok(parsed)
+}
+
+fn ensure_standard_compat_alias(source: &Path, alias: &Path, label: &str) -> Result<(), String> {
+    if alias.exists() {
+        return Ok(());
+    }
+    if !source.exists() {
+        return Err(format!("{label} source '{}' is missing", source.display()));
+    }
+    if let Some(parent) = alias.parent() {
+        stdfs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "{label} parent '{}' could not be created: {}",
+                parent.display(),
+                err
+            )
+        })?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        match symlink(source, alias) {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                tracing::warn!(
+                    "N2 compatibility guard could not create symlink '{}' -> '{}': {}. Falling back to a copy.",
+                    alias.display(),
+                    source.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    stdfs::copy(source, alias).map_err(|err| {
+        format!(
+            "{label} '{}' could not be created from '{}': {}",
+            alias.display(),
+            source.display(),
+            err
+        )
+    })?;
+    Ok(())
+}
+
+fn ensure_standard_compat_files() -> Result<(), String> {
+    ensure_standard_compat_alias(
+        Path::new(ENV_FILE),
+        Path::new(STANDARD_ENV_FILE),
+        "N2 env compatibility file",
+    )?;
+    ensure_standard_compat_alias(
+        Path::new(CONFIG_FILE),
+        Path::new(STANDARD_CONFIG_FILE),
+        "N2 config compatibility file",
+    )?;
+    Ok(())
+}
+
+async fn validate_n2_startup_layout(config: &Ini, local_blob_roots: usize) {
     let cfg = n2_runtime_config();
+    if !cfg.membership_file.exists() {
+        panic!(
+            "N2 startup guard requires a membership file at '{}'. Multi-node N2 will not auto-invent membership.",
+            cfg.membership_file.display()
+        );
+    }
+    ensure_readable_file(cfg.membership_file.as_path(), "N2 membership file").unwrap_or_else(|e| {
+        panic!(
+            "N2 startup guard rejected membership file '{}': {}",
+            cfg.membership_file.display(),
+            e
+        )
+    });
+    if cfg.internal_token.trim().is_empty()
+        || cfg.internal_token.trim() == "change-me-n2-internal-token"
+        || cfg.internal_token.trim().len() < 24
+    {
+        panic!(
+            "N2 startup guard requires a non-placeholder [n2].internal_token with at least 24 characters"
+        );
+    }
+    let local_endpoint = parse_https_url(&cfg.node_endpoint, "N2 node_endpoint")
+        .unwrap_or_else(|e| panic!("N2 startup guard rejected node_id='{}': {}", cfg.node_id, e));
     let cluster_view = get_cluster_view(None).await.unwrap_or_else(|e| {
         panic!(
             "N2 startup guard failed to load cluster membership from '{}': {}",
@@ -428,6 +540,86 @@ async fn validate_n2_startup_layout(local_blob_roots: usize) {
             "N2 startup guard rejected node_id='{}' endpoint='{}': {}",
             cfg.node_id, cfg.node_endpoint, reason
         );
+    }
+
+    let membership = get_membership().await.unwrap_or_else(|e| {
+        panic!(
+            "N2 startup guard failed to read membership from '{}': {}",
+            cfg.membership_file.display(),
+            e
+        )
+    });
+
+    let server_section = config
+        .section(Some("server"))
+        .unwrap_or_else(|| panic!("Missing [server] section in {}", CONFIG_FILE));
+    let bind_host = server_section.get("host").unwrap_or("127.0.0.1").trim();
+    if cluster_view.active_nodes > 1 && is_loopback_host(bind_host) {
+        panic!(
+            "N2 startup guard rejected [server].host='{}' for a {}-node cluster. Multi-node N2 must not bind only to loopback.",
+            bind_host, cluster_view.active_nodes
+        );
+    }
+
+    let membership_local = membership
+        .nodes
+        .iter()
+        .find(|node| node.node_id == cfg.node_id)
+        .unwrap_or_else(|| {
+            panic!(
+                "N2 startup guard could not find local node_id='{}' in membership",
+                cfg.node_id
+            )
+        });
+
+    let membership_local_endpoint =
+        parse_https_url(&membership_local.endpoint, "membership local endpoint").unwrap_or_else(
+            |e| {
+                panic!(
+                    "N2 startup guard rejected membership entry for node_id='{}': {}",
+                    cfg.node_id, e
+                )
+            },
+        );
+
+    if membership_local_endpoint.as_str().trim_end_matches('/')
+        != local_endpoint.as_str().trim_end_matches('/')
+    {
+        panic!(
+            "N2 startup guard rejected node_id='{}': [n2].node_endpoint '{}' does not match membership endpoint '{}'",
+            cfg.node_id, cfg.node_endpoint, membership_local.endpoint
+        );
+    }
+
+    if cluster_view.active_nodes > 1 && is_loopback_host(local_endpoint.host_str().unwrap_or("")) {
+        panic!(
+            "N2 startup guard rejected [n2].node_endpoint='{}' for a multi-node cluster. Use a routable LAN/WAN address, not loopback.",
+            cfg.node_endpoint
+        );
+    }
+
+    let mut normalized_endpoints = HashSet::new();
+    for node in membership.nodes.iter().filter(|node| node.active) {
+        let endpoint = parse_https_url(&node.endpoint, "active membership endpoint")
+            .unwrap_or_else(|e| {
+                panic!(
+                    "N2 startup guard rejected active node '{}': {}",
+                    node.node_id, e
+                )
+            });
+        let normalized = endpoint.as_str().trim_end_matches('/').to_ascii_lowercase();
+        if !normalized_endpoints.insert(normalized) {
+            panic!(
+                "N2 startup guard rejected membership: duplicate active endpoint '{}'",
+                node.endpoint
+            );
+        }
+        if cluster_view.active_nodes > 1 && is_loopback_host(endpoint.host_str().unwrap_or("")) {
+            panic!(
+                "N2 startup guard rejected active node '{}': endpoint '{}' is loopback-only in a multi-node cluster",
+                node.node_id, node.endpoint
+            );
+        }
     }
 
     let (resolved, source) =
@@ -615,6 +807,11 @@ async fn main() {
         return;
     }
 
+    if let Err(e) = ensure_standard_compat_files() {
+        eprintln!("N2 startup failed: {}", e);
+        return;
+    }
+
     let _guard = init_tracing().expect("Failed to initialize tracing subscriber");
 
     if std::env::args_os().nth(1).is_some() {
@@ -729,7 +926,7 @@ pub async fn run_server() {
         .set(blob_disks)
         .expect("Double initialization of BLOB_STORE_DISKS!");
 
-    validate_n2_startup_layout(blob_disk_count).await;
+    validate_n2_startup_layout(&config, blob_disk_count).await;
 
     tracing::info!(
         "Storage mode: standard variant is filesystem-backed (directory-only index/blob roots)"

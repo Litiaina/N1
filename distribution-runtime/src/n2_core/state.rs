@@ -28,6 +28,44 @@ fn normalize_endpoint(endpoint: &str) -> String {
     endpoint.trim().trim_end_matches('/').to_ascii_lowercase()
 }
 
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+fn validate_node_endpoint(endpoint: &str) -> Result<String, AppError> {
+    let parsed = reqwest::Url::parse(endpoint).map_err(|e| {
+        AppError::BadRequest(format!("invalid node endpoint '{}': {}", endpoint, e))
+    })?;
+    let host = parsed.host_str().ok_or_else(|| {
+        AppError::BadRequest(format!("node endpoint '{}' is missing a host", endpoint))
+    })?;
+    let allow_loopback_http = parsed.scheme() == "http" && is_loopback_host(host);
+    if parsed.scheme() != "https" && !allow_loopback_http {
+        return Err(AppError::BadRequest(format!(
+            "node endpoint '{}' must use https (loopback http is only allowed for in-process tests)",
+            endpoint
+        )));
+    }
+    if host.trim().is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "node endpoint '{}' is missing a usable host",
+            endpoint
+        )));
+    }
+    if parsed.port_or_known_default().is_none() {
+        return Err(AppError::BadRequest(format!(
+            "node endpoint '{}' is missing a port",
+            endpoint
+        )));
+    }
+    Ok(normalize_endpoint(endpoint))
+}
+
 fn build_cluster_view(
     membership: &ClusterMembership,
     expected_epoch: Option<u64>,
@@ -157,6 +195,7 @@ fn validate_membership(membership: &ClusterMembership) -> Result<(), AppError> {
     }
 
     let mut ids = HashSet::new();
+    let mut endpoints = HashSet::new();
     for node in &membership.nodes {
         if node.node_id.trim().is_empty() {
             return Err(AppError::BadRequest("node_id cannot be empty".to_string()));
@@ -170,6 +209,13 @@ fn validate_membership(membership: &ClusterMembership) -> Result<(), AppError> {
             return Err(AppError::BadRequest(format!(
                 "duplicate node_id in membership: {}",
                 node.node_id
+            )));
+        }
+        let normalized = validate_node_endpoint(&node.endpoint)?;
+        if !endpoints.insert(normalized) {
+            return Err(AppError::BadRequest(format!(
+                "duplicate node endpoint in membership: {}",
+                node.endpoint
             )));
         }
     }
@@ -359,4 +405,54 @@ pub async fn resolve_placement(
         write_quorum: kc,
         targets,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::n2_core::model::NodeDescriptor;
+
+    fn node(node_id: &str, endpoint: &str) -> NodeDescriptor {
+        NodeDescriptor {
+            node_id: node_id.to_string(),
+            endpoint: endpoint.to_string(),
+            epoch: 1,
+            active: true,
+        }
+    }
+
+    #[test]
+    fn validate_membership_rejects_duplicate_normalized_endpoints() {
+        let membership = ClusterMembership {
+            epoch: 1,
+            nodes: vec![
+                node("node-a", "https://192.168.0.10:50001"),
+                node("node-b", "https://192.168.0.10:50001/"),
+            ],
+        };
+
+        let err = validate_membership(&membership).expect_err("duplicate endpoints rejected");
+        match err {
+            AppError::BadRequest(message) => {
+                assert!(message.contains("duplicate node endpoint"));
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_membership_rejects_non_https_endpoints() {
+        let membership = ClusterMembership {
+            epoch: 1,
+            nodes: vec![node("node-a", "http://192.168.0.10:50001")],
+        };
+
+        let err = validate_membership(&membership).expect_err("non-https endpoint rejected");
+        match err {
+            AppError::BadRequest(message) => {
+                assert!(message.contains("must use https"));
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
 }
