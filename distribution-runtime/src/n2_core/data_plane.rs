@@ -12,7 +12,10 @@ use crate::n2_core::model::{
     ReconcileFragmentQuery, RenameN2ObjectRequest,
 };
 use crate::n2_core::state::ensure_cluster_write_ready;
-use crate::n2_core::state::{get_membership, resolve_placement};
+use crate::n2_core::state::{
+    N2_CLUSTER_FINGERPRINT_HEADER, N2_EXPECTED_EPOCH_HEADER, current_cluster_epoch_and_fingerprint,
+    get_membership, resolve_placement, validate_cluster_view_proof,
+};
 use crate::structs::auth_structs::Claims;
 use axum::Json as AxumJson;
 use axum::body::Body;
@@ -478,15 +481,12 @@ async fn replicate_n2_object_map_remote(
     endpoint: &str,
     map: &N2ObjectMap,
 ) -> Result<(), AppError> {
-    let cfg = n2_runtime_config();
     let url = format!(
         "{}/v4/n2/internal/map/upsert",
         endpoint.trim_end_matches('/')
     );
-    let response = http_client
-        .post(url.as_str())
-        .header(N2_INTERNAL_TOKEN_HEADER, cfg.internal_token.as_str())
-        .json(map)
+    let response = add_internal_peer_headers(http_client.post(url.as_str()).json(map))
+        .await?
         .send()
         .await
         .map_err(|e| AppError::InternalServerError(format!("send n2 map upsert failed: {}", e)))?;
@@ -508,19 +508,20 @@ async fn delete_n2_object_map_remote(
     object_key: &str,
     version_id: &str,
 ) -> Result<usize, AppError> {
-    let cfg = n2_runtime_config();
     let url = format!(
         "{}/v4/n2/internal/map/{}",
         endpoint.trim_end_matches('/'),
         fragment
     );
-    let response = http_client
-        .delete(url.as_str())
-        .header(N2_INTERNAL_TOKEN_HEADER, cfg.internal_token.as_str())
-        .query(&[("object_key", object_key), ("version_id", version_id)])
-        .send()
-        .await
-        .map_err(|e| AppError::InternalServerError(format!("send n2 map delete failed: {}", e)))?;
+    let response = add_internal_peer_headers(
+        http_client
+            .delete(url.as_str())
+            .query(&[("object_key", object_key), ("version_id", version_id)]),
+    )
+    .await?
+    .send()
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("send n2 map delete failed: {}", e)))?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -706,7 +707,6 @@ async fn load_n2_object_map_remote(
     object_key: &str,
     version_id: Option<&str>,
 ) -> Result<N2ObjectMap, AppError> {
-    let cfg = n2_runtime_config();
     let url = format!(
         "{}/v4/n2/internal/map/{}",
         endpoint.trim_end_matches('/'),
@@ -714,14 +714,17 @@ async fn load_n2_object_map_remote(
     );
     let mut request = http_client
         .get(url.as_str())
-        .header(N2_INTERNAL_TOKEN_HEADER, cfg.internal_token.as_str())
         .query(&[("object_key", object_key)]);
     if let Some(v) = version_id {
         request = request.query(&[("version_id", v)]);
     }
-    let response = request.send().await.map_err(|e| {
-        AppError::InternalServerError(format!("request remote n2 map failed: {}", e))
-    })?;
+    let response = add_internal_peer_headers(request)
+        .await?
+        .send()
+        .await
+        .map_err(|e| {
+            AppError::InternalServerError(format!("request remote n2 map failed: {}", e))
+        })?;
     if response.status() == StatusCode::NOT_FOUND {
         return Err(AppError::NotFound);
     }
@@ -1092,6 +1095,35 @@ fn validate_internal_token(headers: &HeaderMap) -> Result<(), AppError> {
     Ok(())
 }
 
+async fn validate_internal_peer_request(headers: &HeaderMap) -> Result<(), AppError> {
+    validate_internal_token(headers)?;
+    let expected_epoch = headers
+        .get(N2_EXPECTED_EPOCH_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or_else(|| {
+            AppError::Conflict("missing or invalid internal n2 expected epoch".to_string())
+        })?;
+    let expected_fingerprint = headers
+        .get(N2_CLUSTER_FINGERPRINT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| AppError::Conflict("missing internal n2 cluster fingerprint".to_string()))?;
+    validate_cluster_view_proof(expected_epoch, expected_fingerprint).await
+}
+
+async fn add_internal_peer_headers(
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::RequestBuilder, AppError> {
+    let cfg = n2_runtime_config();
+    let (expected_epoch, cluster_fingerprint) = current_cluster_epoch_and_fingerprint().await?;
+    Ok(request
+        .header(N2_INTERNAL_TOKEN_HEADER, cfg.internal_token.as_str())
+        .header(N2_EXPECTED_EPOCH_HEADER, expected_epoch.to_string())
+        .header(N2_CLUSTER_FINGERPRINT_HEADER, cluster_fingerprint))
+}
+
 fn encode_cluster_stripe_blocks(
     stripe: &[u8],
     kc: usize,
@@ -1416,13 +1448,8 @@ async fn begin_remote_cluster_shard_session(
         md,
         stripe_block_size,
     };
-    let response = client
-        .post(url)
-        .header(
-            N2_INTERNAL_TOKEN_HEADER,
-            n2_runtime_config().internal_token.as_str(),
-        )
-        .query(&query)
+    let response = add_internal_peer_headers(client.post(url).query(&query))
+        .await?
         .send()
         .await
         .map_err(|e| AppError::Timeout(format!("n2 remote begin shard session failed: {}", e)))?;
@@ -1454,13 +1481,8 @@ async fn append_remote_cluster_shard_chunk(
     }
     let base = target.endpoint.trim_end_matches('/');
     let url = format!("{}/v4/n2/internal/session/chunk/{}", base, session_id);
-    let response = client
-        .put(url)
-        .header(
-            N2_INTERNAL_TOKEN_HEADER,
-            n2_runtime_config().internal_token.as_str(),
-        )
-        .body(bytes)
+    let response = add_internal_peer_headers(client.put(url).body(bytes))
+        .await?
         .send()
         .await
         .map_err(|e| AppError::Timeout(format!("n2 remote shard chunk failed: {}", e)))?;
@@ -1488,12 +1510,8 @@ async fn commit_remote_cluster_shard_session(
 ) -> Result<N2ClusterShardRef, AppError> {
     let base = target.endpoint.trim_end_matches('/');
     let url = format!("{}/v4/n2/internal/session/commit/{}", base, session_id);
-    let response = client
-        .post(url)
-        .header(
-            N2_INTERNAL_TOKEN_HEADER,
-            n2_runtime_config().internal_token.as_str(),
-        )
+    let response = add_internal_peer_headers(client.post(url))
+        .await?
         .send()
         .await
         .map_err(|e| AppError::Timeout(format!("n2 remote shard commit failed: {}", e)))?;
@@ -1517,12 +1535,8 @@ async fn abort_remote_cluster_shard_session(
 ) -> Result<(), AppError> {
     let base = target.endpoint.trim_end_matches('/');
     let url = format!("{}/v4/n2/internal/session/abort/{}", base, session_id);
-    let response = client
-        .post(url)
-        .header(
-            N2_INTERNAL_TOKEN_HEADER,
-            n2_runtime_config().internal_token.as_str(),
-        )
+    let response = add_internal_peer_headers(client.post(url))
+        .await?
         .send()
         .await
         .map_err(|e| AppError::Timeout(format!("n2 remote shard abort failed: {}", e)))?;
@@ -1901,14 +1915,8 @@ async fn store_remote_cluster_shard_with_body(
         stripe_block_size,
     };
 
-    let response = client
-        .post(url)
-        .header(
-            N2_INTERNAL_TOKEN_HEADER,
-            n2_runtime_config().internal_token.as_str(),
-        )
-        .query(&query)
-        .body(body)
+    let response = add_internal_peer_headers(client.post(url).query(&query).body(body))
+        .await?
         .send()
         .await
         .map_err(|e| AppError::Timeout(format!("n2 remote store shard request failed: {}", e)))?;
@@ -1939,12 +1947,8 @@ async fn fetch_remote_cluster_shard(
         "{}/v4/n2/internal/read/{}/{}/{}",
         base, fragment, version_id, cluster_shard_index
     );
-    let resp = client
-        .get(url)
-        .header(
-            N2_INTERNAL_TOKEN_HEADER,
-            n2_runtime_config().internal_token.as_str(),
-        )
+    let resp = add_internal_peer_headers(client.get(url))
+        .await?
         .send()
         .await
         .map_err(|e| AppError::Timeout(format!("n2 remote read shard request failed: {}", e)))?;
@@ -1973,12 +1977,8 @@ async fn open_remote_cluster_shard_stream(
         "{}/v4/n2/internal/read/{}/{}/{}",
         base, fragment, version_id, cluster_shard_index
     );
-    let response = client
-        .get(url)
-        .header(
-            N2_INTERNAL_TOKEN_HEADER,
-            n2_runtime_config().internal_token.as_str(),
-        )
+    let response = add_internal_peer_headers(client.get(url))
+        .await?
         .send()
         .await
         .map_err(|e| AppError::Timeout(format!("n2 remote read shard request failed: {}", e)))?;
@@ -2012,12 +2012,8 @@ async fn delete_remote_cluster_shard(
         "{}/v4/n2/internal/delete/{}/{}/{}",
         base, fragment, version_id, cluster_shard_index
     );
-    let response = client
-        .delete(url)
-        .header(
-            N2_INTERNAL_TOKEN_HEADER,
-            n2_runtime_config().internal_token.as_str(),
-        )
+    let response = add_internal_peer_headers(client.delete(url))
+        .await?
         .send()
         .await
         .map_err(|e| AppError::Timeout(format!("n2 remote delete shard request failed: {}", e)))?;
@@ -4045,7 +4041,7 @@ pub async fn n2_internal_begin_shard(
     Path((fragment, version_id, cluster_shard_index)): Path<(String, String, usize)>,
     Query(query): Query<InternalStoreShardQuery>,
 ) -> Result<AxumJson<InternalShardSessionResponse>, AppError> {
-    validate_internal_token(&headers)?;
+    validate_internal_peer_request(&headers).await?;
     if query.kd == 0 {
         return Err(AppError::BadRequest("kd must be >= 1".to_string()));
     }
@@ -4091,7 +4087,7 @@ pub async fn n2_internal_write_shard_chunk(
     Path(session_id): Path<String>,
     body: Body,
 ) -> Result<AxumJson<InternalShardChunkAck>, AppError> {
-    validate_internal_token(&headers)?;
+    validate_internal_peer_request(&headers).await?;
     let temp_file_path = {
         let guard = internal_shard_upload_sessions().lock().await;
         let session = guard.get(session_id.as_str()).ok_or(AppError::NotFound)?;
@@ -4134,7 +4130,7 @@ pub async fn n2_internal_commit_shard(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<AxumJson<N2ClusterShardRef>, AppError> {
-    validate_internal_token(&headers)?;
+    validate_internal_peer_request(&headers).await?;
     let session = internal_shard_upload_sessions()
         .lock()
         .await
@@ -4157,7 +4153,7 @@ pub async fn n2_internal_abort_shard(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<AxumJson<InternalShardAbortResponse>, AppError> {
-    validate_internal_token(&headers)?;
+    validate_internal_peer_request(&headers).await?;
     if let Some(session) = internal_shard_upload_sessions()
         .lock()
         .await
@@ -4177,7 +4173,7 @@ pub async fn n2_internal_store_shard(
     Query(query): Query<InternalStoreShardQuery>,
     body: Body,
 ) -> Result<AxumJson<N2ClusterShardRef>, AppError> {
-    validate_internal_token(&headers)?;
+    validate_internal_peer_request(&headers).await?;
 
     if query.kd == 0 {
         return Err(AppError::BadRequest("kd must be >= 1".to_string()));
@@ -4242,7 +4238,7 @@ pub async fn n2_internal_read_shard(
     headers: HeaderMap,
     Path((fragment, version_id, cluster_shard_index)): Path<(String, String, usize)>,
 ) -> Result<impl IntoResponse, AppError> {
-    validate_internal_token(&headers)?;
+    validate_internal_peer_request(&headers).await?;
     let bytes =
         read_local_cluster_shard(fragment.as_str(), version_id.as_str(), cluster_shard_index)
             .await?;
@@ -4259,7 +4255,7 @@ pub async fn n2_internal_delete_shard(
     headers: HeaderMap,
     Path((fragment, version_id, cluster_shard_index)): Path<(String, String, usize)>,
 ) -> Result<AxumJson<InternalShardDeleteResponse>, AppError> {
-    validate_internal_token(&headers)?;
+    validate_internal_peer_request(&headers).await?;
     let deleted_paths =
         delete_local_cluster_shard(fragment.as_str(), version_id.as_str(), cluster_shard_index)
             .await?;
@@ -4270,7 +4266,7 @@ pub async fn n2_internal_upsert_map(
     headers: HeaderMap,
     AxumJson(map): AxumJson<N2ObjectMap>,
 ) -> Result<AxumJson<InternalMapUpsertResponse>, AppError> {
-    validate_internal_token(&headers)?;
+    validate_internal_peer_request(&headers).await?;
     let writes = persist_n2_object_map_local(&map).await?;
     Ok(AxumJson(InternalMapUpsertResponse {
         local_mirrors_written: writes,
@@ -4282,7 +4278,7 @@ pub async fn n2_internal_read_map(
     Path(fragment): Path<String>,
     Query(query): Query<InternalMapReadQuery>,
 ) -> Result<AxumJson<N2ObjectMap>, AppError> {
-    validate_internal_token(&headers)?;
+    validate_internal_peer_request(&headers).await?;
     let object_key = query.object_key.trim();
     if object_key.is_empty() {
         return Err(AppError::BadRequest(
@@ -4299,7 +4295,7 @@ pub async fn n2_internal_delete_map(
     Path(fragment): Path<String>,
     Query(query): Query<InternalMapDeleteQuery>,
 ) -> Result<AxumJson<InternalMapDeleteResponse>, AppError> {
-    validate_internal_token(&headers)?;
+    validate_internal_peer_request(&headers).await?;
     let object_key = query.object_key.trim();
     let version_id = query.version_id.trim();
     if object_key.is_empty() || version_id.is_empty() {
@@ -4346,12 +4342,24 @@ mod tests {
         }
     }
 
-    fn internal_headers() -> HeaderMap {
+    async fn internal_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
             N2_INTERNAL_TOKEN_HEADER,
             HeaderValue::from_str(n2_runtime_config().internal_token.as_str())
                 .expect("internal token header"),
+        );
+        let (epoch, cluster_fingerprint) = current_cluster_epoch_and_fingerprint()
+            .await
+            .expect("cluster proof");
+        headers.insert(
+            N2_EXPECTED_EPOCH_HEADER,
+            HeaderValue::from_str(epoch.to_string().as_str()).expect("expected epoch header"),
+        );
+        headers.insert(
+            N2_CLUSTER_FINGERPRINT_HEADER,
+            HeaderValue::from_str(cluster_fingerprint.as_str())
+                .expect("cluster fingerprint header"),
         );
         headers
     }
@@ -4737,7 +4745,7 @@ mod tests {
         expected.extend_from_slice(&chunk_b);
 
         let begin = n2_internal_begin_shard(
-            internal_headers(),
+            internal_headers().await,
             AxumPath((fragment.clone(), version_id.clone(), 0usize)),
             AxumQuery(InternalStoreShardQuery {
                 uid: Some(fragment.clone()),
@@ -4752,28 +4760,29 @@ mod tests {
         let session_id = begin.0.session_id.clone();
 
         let _ = n2_internal_write_shard_chunk(
-            internal_headers(),
+            internal_headers().await,
             AxumPath(session_id.clone()),
             Body::from(chunk_a),
         )
         .await
         .expect("write chunk a");
         let _ = n2_internal_write_shard_chunk(
-            internal_headers(),
+            internal_headers().await,
             AxumPath(session_id.clone()),
             Body::from(chunk_b),
         )
         .await
         .expect("write chunk b");
 
-        let committed = n2_internal_commit_shard(internal_headers(), AxumPath(session_id.clone()))
-            .await
-            .expect("commit");
+        let committed =
+            n2_internal_commit_shard(internal_headers().await, AxumPath(session_id.clone()))
+                .await
+                .expect("commit");
         assert_eq!(committed.0.cluster_shard_index, 0);
         assert_eq!(committed.0.size_bytes as usize, expected.len());
 
         let read_resp = n2_internal_read_shard(
-            internal_headers(),
+            internal_headers().await,
             AxumPath((fragment.clone(), version_id.clone(), 0usize)),
         )
         .await
@@ -4785,7 +4794,7 @@ mod tests {
         assert_eq!(read_bytes.as_ref(), expected.as_slice());
 
         let after_commit = n2_internal_write_shard_chunk(
-            internal_headers(),
+            internal_headers().await,
             AxumPath(session_id),
             Body::from(vec![1u8; 32]),
         )
@@ -4805,7 +4814,7 @@ mod tests {
         let fragment = format!("frag-{}", Ulid::new());
         let version_id = Ulid::new().to_string();
         let begin = n2_internal_begin_shard(
-            internal_headers(),
+            internal_headers().await,
             AxumPath((fragment, version_id, 0usize)),
             AxumQuery(InternalStoreShardQuery {
                 uid: None,
@@ -4820,19 +4829,19 @@ mod tests {
         let session_id = begin.0.session_id.clone();
 
         let _ = n2_internal_write_shard_chunk(
-            internal_headers(),
+            internal_headers().await,
             AxumPath(session_id.clone()),
             Body::from(vec![9u8; 2048]),
         )
         .await
         .expect("write chunk before abort");
 
-        let _ = n2_internal_abort_shard(internal_headers(), AxumPath(session_id.clone()))
+        let _ = n2_internal_abort_shard(internal_headers().await, AxumPath(session_id.clone()))
             .await
             .expect("abort");
 
         let chunk_after_abort = n2_internal_write_shard_chunk(
-            internal_headers(),
+            internal_headers().await,
             AxumPath(session_id.clone()),
             Body::from(vec![1u8; 128]),
         )
@@ -4840,7 +4849,7 @@ mod tests {
         assert!(matches!(chunk_after_abort, Err(AppError::NotFound)));
 
         let commit_after_abort =
-            n2_internal_commit_shard(internal_headers(), AxumPath(session_id)).await;
+            n2_internal_commit_shard(internal_headers().await, AxumPath(session_id)).await;
         assert!(matches!(commit_after_abort, Err(AppError::NotFound)));
     }
 
@@ -4867,6 +4876,44 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(AppError::Forbidden(_))));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn internal_session_requires_cluster_view_proof() {
+        let _guard = STORAGE_TEST_LOCK.lock().await;
+        ensure_n2_test_storage_roots().await;
+        ensure_auth_env_for_tests();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            N2_INTERNAL_TOKEN_HEADER,
+            HeaderValue::from_str(n2_runtime_config().internal_token.as_str())
+                .expect("internal token header"),
+        );
+
+        let result = n2_internal_begin_shard(
+            headers,
+            AxumPath((
+                format!("frag-{}", Ulid::new()),
+                Ulid::new().to_string(),
+                0usize,
+            )),
+            AxumQuery(InternalStoreShardQuery {
+                uid: None,
+                object_key: None,
+                kd: 1,
+                md: 0,
+                stripe_block_size: 4096,
+            }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::Conflict(message)) => {
+                assert!(message.contains("expected epoch") || message.contains("fingerprint"));
+            }
+            other => panic!("expected cluster proof conflict, got {:?}", other),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

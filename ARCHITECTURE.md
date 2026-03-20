@@ -18,7 +18,10 @@ N2 has three runtime pieces in this workspace:
   - use the N1 engine directly on one node
 - multi-node N2:
   - run `distribution-runtime`
-  - use that same N1 engine on each node, then add cluster membership, placement, and peer traffic
+  - use that same N1 engine on each node, then add cluster governance, placement, and peer traffic
+  - governance is consensus-scoped only to cluster state
+  - committed membership epochs are snapshotted for rollback
+  - object payload traffic remains direct and bidirectional
 - registry layer:
   - run `registry-runtime`
   - keep user/business metadata out of the storage engine

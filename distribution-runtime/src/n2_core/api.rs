@@ -1,144 +1,27 @@
 use crate::enums::app_error_enum::AppError;
 use crate::middleware::auth_middleware::ADMIN_KEY;
 use crate::n2_core::config::effective_cross_params;
-use crate::n2_core::config::n2_runtime_config;
 use crate::n2_core::data_plane::schedule_n2_auto_maintenance;
+use crate::n2_core::governance::{
+    commit_membership_change, governance_state_view, handle_governance_abort,
+    handle_governance_append, handle_governance_vote,
+};
 use crate::n2_core::model::{
-    ClusterMembership, ClusterViewQuery, ObjectIdentity, ResolvePlacementQuery,
-    UpsertMembershipRequest,
+    ClusterViewQuery, GovernanceAbortRequest, GovernanceAppendRequest, GovernanceVoteRequest,
+    ObjectIdentity, ResolvePlacementQuery, UpsertMembershipRequest,
 };
 use crate::n2_core::state::{
-    apply_membership_snapshot, get_cluster_view, get_membership, resolve_placement,
-    stage_rollback_membership, stage_upsert_membership,
+    get_cluster_view, get_membership, resolve_placement, stage_rollback_membership,
+    stage_upsert_membership,
 };
 use crate::structs::auth_structs::Claims;
 use axum::Json as AxumJson;
 use axum::extract::{Path, Query};
 use axum::http::HeaderMap;
-use std::collections::HashSet;
-use std::time::Duration;
 use ulid::Ulid;
-
-const N2_INTERNAL_TOKEN_HEADER: &str = "x-n2-internal-token";
 
 fn is_admin_claim(claims: &Claims) -> bool {
     claims.fragment == *ADMIN_KEY
-}
-
-fn validate_internal_token(headers: &HeaderMap) -> Result<(), AppError> {
-    let cfg = n2_runtime_config();
-    let Some(token) = headers
-        .get(N2_INTERNAL_TOKEN_HEADER)
-        .and_then(|v| v.to_str().ok())
-    else {
-        return Err(AppError::Forbidden("missing internal n2 token".to_string()));
-    };
-
-    if token != cfg.internal_token {
-        return Err(AppError::Forbidden("invalid internal n2 token".to_string()));
-    }
-    Ok(())
-}
-
-fn normalize_endpoint(endpoint: &str) -> String {
-    endpoint.trim().trim_end_matches('/').to_ascii_lowercase()
-}
-
-async fn propagate_membership_snapshot(
-    previous: &ClusterMembership,
-    next: &ClusterMembership,
-) -> Result<(), AppError> {
-    let cfg = n2_runtime_config();
-    let local_endpoint = normalize_endpoint(&cfg.node_endpoint);
-    let target_majority = next.nodes.iter().filter(|n| n.active).count() / 2 + 1;
-
-    if target_majority <= 1 {
-        return Ok(());
-    }
-
-    let mut endpoints = previous
-        .nodes
-        .iter()
-        .chain(next.nodes.iter())
-        .filter(|node| node.active)
-        .map(|node| node.endpoint.clone())
-        .filter(|endpoint| normalize_endpoint(endpoint) != local_endpoint)
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    endpoints.sort();
-
-    if endpoints.is_empty() {
-        return Err(AppError::Conflict(
-            "membership update requires remote peers but none are reachable from the proposed active set"
-                .to_string(),
-        ));
-    }
-
-    let http_client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_millis(cfg.remote_request_timeout_ms))
-        .build()
-        .map_err(|e| {
-            AppError::InternalServerError(format!("build n2 membership client failed: {}", e))
-        })?;
-
-    let mut acknowledged = Vec::new();
-    for endpoint in &endpoints {
-        let url = format!(
-            "{}/v4/n2/internal/membership",
-            endpoint.trim_end_matches('/')
-        );
-        let response = http_client
-            .put(url)
-            .header(N2_INTERNAL_TOKEN_HEADER, cfg.internal_token.as_str())
-            .json(next)
-            .send()
-            .await;
-        match response {
-            Ok(resp) if resp.status().is_success() => acknowledged.push(endpoint.clone()),
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                tracing::warn!(
-                    "n2 membership propagation failed endpoint={} status={} body={}",
-                    endpoint,
-                    status,
-                    body
-                );
-            }
-            Err(err) => {
-                tracing::warn!(
-                    "n2 membership propagation request failed endpoint={} err={}",
-                    endpoint,
-                    err
-                );
-            }
-        }
-    }
-
-    let total_acks = 1usize.saturating_add(acknowledged.len());
-    if total_acks >= target_majority {
-        return Ok(());
-    }
-
-    for endpoint in &acknowledged {
-        let url = format!(
-            "{}/v4/n2/internal/membership",
-            endpoint.trim_end_matches('/')
-        );
-        let _ = http_client
-            .put(url)
-            .header(N2_INTERNAL_TOKEN_HEADER, cfg.internal_token.as_str())
-            .json(previous)
-            .send()
-            .await;
-    }
-
-    Err(AppError::Conflict(format!(
-        "membership propagation reached only {} acknowledgements, need majority {}",
-        total_acks, target_majority
-    )))
 }
 
 pub async fn get_n2_membership(
@@ -175,9 +58,8 @@ pub async fn put_n2_membership(
             "Admin modify permission required".to_string(),
         ));
     }
-    let (previous, next) = stage_upsert_membership(payload).await?;
-    propagate_membership_snapshot(&previous, &next).await?;
-    let applied = apply_membership_snapshot(next).await?;
+    let (_, next) = stage_upsert_membership(payload).await?;
+    let applied = commit_membership_change(next).await?;
     schedule_n2_auto_maintenance("membership_apply", applied.epoch);
     Ok(AxumJson(applied))
 }
@@ -191,21 +73,49 @@ pub async fn rollback_n2_membership(
             "Admin modify permission required".to_string(),
         ));
     }
-    let (previous, next) = stage_rollback_membership(epoch).await?;
-    propagate_membership_snapshot(&previous, &next).await?;
-    let applied = apply_membership_snapshot(next).await?;
+    let (_, next) = stage_rollback_membership(epoch).await?;
+    let applied = commit_membership_change(next).await?;
     schedule_n2_auto_maintenance("membership_rollback", applied.epoch);
     Ok(AxumJson(applied))
 }
 
-pub async fn put_n2_internal_membership(
+pub async fn get_n2_governance_state(
+    claims: Claims,
+) -> Result<AxumJson<crate::n2_core::model::N2GovernanceStateResponse>, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".to_string()));
+    }
+    Ok(AxumJson(governance_state_view().await?))
+}
+
+pub async fn post_n2_internal_governance_vote(
     headers: HeaderMap,
-    AxumJson(payload): AxumJson<ClusterMembership>,
-) -> Result<AxumJson<crate::n2_core::model::ClusterMembership>, AppError> {
-    validate_internal_token(&headers)?;
-    let applied = apply_membership_snapshot(payload).await?;
-    schedule_n2_auto_maintenance("membership_internal_apply", applied.epoch);
-    Ok(AxumJson(applied))
+    AxumJson(payload): AxumJson<GovernanceVoteRequest>,
+) -> Result<AxumJson<crate::n2_core::model::GovernanceVoteResponse>, AppError> {
+    Ok(AxumJson(handle_governance_vote(&headers, payload).await?))
+}
+
+pub async fn post_n2_internal_governance_append(
+    headers: HeaderMap,
+    AxumJson(payload): AxumJson<GovernanceAppendRequest>,
+) -> Result<AxumJson<crate::n2_core::model::GovernanceAppendResponse>, AppError> {
+    let committed_index = payload
+        .entry
+        .as_ref()
+        .map(|entry| entry.index)
+        .filter(|entry_index| payload.leader_commit_index >= *entry_index);
+    let response = handle_governance_append(&headers, payload).await?;
+    if response.accepted && committed_index.is_some() {
+        schedule_n2_auto_maintenance("governance_append_commit", response.commit_index);
+    }
+    Ok(AxumJson(response))
+}
+
+pub async fn post_n2_internal_governance_abort(
+    headers: HeaderMap,
+    AxumJson(payload): AxumJson<GovernanceAbortRequest>,
+) -> Result<AxumJson<crate::n2_core::model::GovernanceAbortResponse>, AppError> {
+    Ok(AxumJson(handle_governance_abort(&headers, payload).await?))
 }
 
 pub async fn resolve_n2_placement(

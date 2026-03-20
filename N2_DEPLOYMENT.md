@@ -23,7 +23,7 @@ As of `2026-03-20`:
 Multi-node N2 in this workspace is:
 - filesystem-backed on each node
 - bidirectional, with every node able to coordinate client-facing requests
-- built on the shared N1 core, plus N2 placement, membership, peer traffic, and reconcile
+- built on the shared N1 core, plus N2 placement, governance, peer traffic, and reconcile
 
 ## 2. Startup Guardrails
 
@@ -63,6 +63,8 @@ Practical usage:
 - point your CLI, Registry, or load balancer at any healthy N2 node
 - that node becomes the coordinator for the request
 - peer traffic then uses `/v4/n2/internal/*`
+- governance only decides committed cluster state
+- object bytes still move directly node-to-node
 
 ## 4. Files Per Node
 
@@ -70,6 +72,12 @@ Each node should have a working directory containing:
 - `n2.env`
 - `n2_config.ini`
 - `n2_cluster_membership.json`
+
+The runtime now also manages governance state beside the membership file:
+- `n2_cluster_membership.governance-state.json`
+- `n2_cluster_membership.governance-log.jsonl`
+- `n2_cluster_membership.governance-pending.json` only while a proposal is in flight
+- `n2_cluster_membership.epoch-<N>.json` rollback snapshots for committed membership epochs
 
 The runtime now auto-prepares compatibility aliases for:
 - `n1.env`
@@ -79,6 +87,10 @@ So the operator-owned files remain:
 - `n2.env`
 - `n2_config.ini`
 - `n2_cluster_membership.json`
+
+Rollback note:
+- governance bootstrap now materializes the current epoch snapshot before the first topology change
+- `POST /v4/n2/membership/rollback/{epoch}` restores from those `n2_cluster_membership.epoch-<N>.json` files
 
 ## 5. Minimum Safe Config Pattern
 
@@ -167,15 +179,37 @@ On every node:
 Basic checks after startup:
 - `GET /ping`
 - `GET /v4/n2/cluster/view`
+- `GET /v4/n2/governance/state`
 - `GET /v4/n2/placement/{fragment}/{object_key}`
+- verify `n2_cluster_membership.epoch-1.json` exists beside the membership file on a fresh cluster
 
 What you want to see:
 - `write_ready=true`
 - correct `membership_epoch`
+- a stable `cluster_fingerprint` across all healthy nodes on the same epoch
+- a stable governance `commit_index` across all healthy nodes
 - correct `active_nodes`
 - placement target count that matches `kc+mc`
 
-## 8. Current Write Truth
+## 8. Governance Truth
+
+N2 governance is now consensus-scoped only to cluster state.
+
+That means:
+- membership apply and rollback go through majority governance commit
+- any healthy node may receive the admin request and can lead that governance operation
+- governance only commits cluster truth
+- governance does not sit in the object upload, read, delete, rename, or reconcile byte path
+- bidirectional object traffic remains direct
+- rollback consumes the committed `n2_cluster_membership.epoch-<N>.json` snapshots written beside the active membership file
+
+Relevant operator routes:
+- `GET /v4/n2/governance/state`
+- `POST /v4/n2/internal/governance/request-vote`
+- `POST /v4/n2/internal/governance/append`
+- `POST /v4/n2/internal/governance/abort`
+
+## 9. Current Write Truth
 
 Current N2 write semantics are:
 - default `cluster_commit_mode` is `strict_full_placement`
@@ -189,8 +223,12 @@ Operator rule:
 - still watch `committed_shards` and run `POST /v4/n2/reconcile/{fragment}` after outages, degraded windows, or peer rejoin
 - keep `auto_maintenance_mode=off` until you trust the cluster and want bounded automatic healing/redistribution
 - use `observe` first, then promote to `repair_and_redistribute` once you are satisfied with the debt reporting
+- internal N2 peer traffic now carries both the expected membership epoch and a cluster fingerprint
+- peers on stale or drifted cluster views reject internal object/map/session requests instead of silently participating
+- under `strict_full_placement`, writes with too few active nodes are rejected before ingest with `400 insufficient active nodes: need <kc+mc>, have <active>`
+- some naive streaming clients may surface that early reject as a transport EOF while they are still uploading the body; the authoritative server result is still the `400` response
 
-## 9. Tested 2-Node Reference
+## 10. Tested 2-Node Reference
 
 The current real-hardware reference pass used:
 - `2` nodes
@@ -212,10 +250,27 @@ Current operator model:
 - full planned placement is the default write guardrail
 - reconcile is still the repair path after degraded periods, peer outages, or operator-chosen quorum mode
 
-## 10. Recommended Operator Checks
+Current governance validation pass in this workspace:
+- isolated 2-node harness on one host with the production `release` binary
+- baseline write/read passed through both nodes
+- membership apply `epoch 1 -> 2` passed in about `186.56 ms`
+- degraded write rejected under `strict_full_placement`
+- rollback `epoch 2 -> 1` passed in about `97.72 ms`
+- post-rollback write/read passed again
+
+Saved artifact:
+- [governance-summary.json](/home/administrator/DEPLOY_TEST/N2-GOV-LOCAL-20260320-210454/governance-summary.json)
+
+Important scope note:
+- this governance pass is a real runtime validation, but it is still same-host two-process validation
+- cross-machine hardware certification is still recommended before calling the governance layer field-proven
+
+## 11. Recommended Operator Checks
 
 Before production traffic:
 - verify all nodes report the same membership epoch
+- verify all nodes report the same governance `commit_index`
+- verify `last_applied_membership_epoch` matches `membership_epoch`
 - verify `write_ready=true` on all active nodes
 - create one fragment
 - write through node A

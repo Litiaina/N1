@@ -362,11 +362,19 @@ Notes for `distribution-runtime`:
 
 - `node_endpoint` must be the address other nodes use to reach this node.
 - `cluster_membership_file` must be readable and writable by the runtime.
+- governance bootstrap now materializes `n2_cluster_membership.epoch-<N>.json` snapshots so rollback has a durable baseline.
 - `internal_token` protects the `/v4/n2/internal/*` peer APIs and should be rotated like any other secret.
 - `cluster_commit_mode=strict_full_placement` is now the safe multi-node default and requires the planned `kc+mc` target set to commit before `PUT` succeeds.
 - Set `cluster_commit_mode=quorum` only when you explicitly want degraded writes to succeed with fewer than the full planned targets.
 - `auto_maintenance_mode=off|observe|repair_and_redistribute` controls whether N2 reacts automatically to topology epoch changes.
 - Start with `off`, then `observe`, then `repair_and_redistribute` once you trust the cluster behavior.
+- Cluster-state changes now use governance-only majority commit.
+- Governance is scoped only to membership and committed cluster view.
+- Object bytes still move directly peer-to-peer and do not pass through a governance leader.
+- `GET /v4/n2/governance/state` exposes the current governance term, leader hint, commit index, and applied membership epoch.
+- Internal N2 peer traffic now also proves the current cluster view using the expected membership epoch plus a cluster fingerprint.
+- Nodes on stale or drifted cluster views reject internal object/session/map requests instead of silently joining the data path.
+- Under `strict_full_placement`, degraded writes with too few active nodes are rejected before ingest with `400 insufficient active nodes: need <kc+mc>, have <active>`.
 - `auto_cross_params=true` derives `kc/mc` from active node count and `kd/md` from local blob root count at startup.
 - If you want explicit `kc/mc/kd/md`, set `auto_cross_params=false`.
 - Startup now fails early if `kc+mc` exceeds active nodes or `kd` exceeds local blob roots.
@@ -401,6 +409,7 @@ This two-node filesystem-backed layout was exercised on real hardware on `2026-0
   - `kd=1`
   - `md=1`
 - shared membership epoch file on both nodes
+- epoch snapshot files written beside the membership file for rollback
 - shared `internal_token` on both nodes
 - HTTPS peer transport with self-signed certificates
 

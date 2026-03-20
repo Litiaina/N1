@@ -142,13 +142,87 @@ pub struct N2ClusterViewResponse {
     pub node_id: String,
     pub node_endpoint: String,
     pub membership_epoch: u64,
+    pub cluster_fingerprint: String,
     pub expected_epoch: Option<u64>,
     pub total_nodes: usize,
     pub active_nodes: usize,
     pub local_node_present: bool,
     pub local_node_active: bool,
+    pub governance_term: u64,
+    pub governance_commit_index: u64,
+    pub governance_leader_id: Option<String>,
+    pub governance_leader_endpoint: Option<String>,
+    pub governance_pending_index: Option<u64>,
+    pub governance_healthy: bool,
     pub write_ready: bool,
     pub reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct N2GovernanceStateResponse {
+    pub current_term: u64,
+    pub commit_index: u64,
+    pub last_applied_membership_epoch: u64,
+    pub leader_id: Option<String>,
+    pub leader_endpoint: Option<String>,
+    pub pending_index: Option<u64>,
+    pub is_leader: bool,
+    pub leader_lease_valid: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovernanceMembershipEntry {
+    pub index: u64,
+    pub term: u64,
+    pub membership: ClusterMembership,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovernanceVoteRequest {
+    pub term: u64,
+    pub candidate_id: String,
+    pub candidate_endpoint: String,
+    pub last_commit_index: u64,
+    pub last_applied_membership_epoch: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovernanceVoteResponse {
+    pub term: u64,
+    pub vote_granted: bool,
+    pub leader_id: Option<String>,
+    pub leader_endpoint: Option<String>,
+    pub commit_index: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovernanceAppendRequest {
+    pub term: u64,
+    pub leader_id: String,
+    pub leader_endpoint: String,
+    pub prev_commit_index: u64,
+    pub leader_commit_index: u64,
+    pub entry: Option<GovernanceMembershipEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovernanceAppendResponse {
+    pub term: u64,
+    pub accepted: bool,
+    pub commit_index: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovernanceAbortRequest {
+    pub term: u64,
+    pub leader_id: String,
+    pub pending_index: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovernanceAbortResponse {
+    pub term: u64,
+    pub cleared: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]

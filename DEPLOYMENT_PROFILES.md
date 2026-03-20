@@ -69,6 +69,13 @@ As of 2026-03-20:
   - `auto_maintenance_mode=off` is the safe default
   - `observe` reports redistribution/healing debt without mutating placement
   - `repair_and_redistribute` runs bounded automatic reconcile after membership epoch changes
+- Current peer-governance semantics:
+  - internal N2 peer calls carry the expected membership epoch and cluster fingerprint
+  - stale or drifted peers reject object/session/map traffic instead of silently participating
+  - membership apply and rollback now go through governance-only majority commit
+  - committed membership epochs are snapshotted for rollback beside the active membership file
+  - governance protects committed cluster state but does not sit in the object byte path
+  - `GET /v4/n2/governance/state` is the operator view into term, leader hint, commit index, and applied membership epoch
 - Current timeout tuning note:
   - conservative defaults are safe
   - low-latency LAN clusters usually want a lower `remote_request_timeout_ms` for faster degraded fallback

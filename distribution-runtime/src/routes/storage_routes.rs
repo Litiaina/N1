@@ -4,8 +4,10 @@ use crate::n1_core::operation_gate::{
     enforce_quiesced_mode_on_reads, enforce_read_only_fast_mode_on_mutations,
 };
 use crate::n2_core::api::{
-    get_n2_cluster_view, get_n2_cluster_view_public, get_n2_membership, put_n2_internal_membership,
-    put_n2_membership, resolve_n2_placement, rollback_n2_membership,
+    get_n2_cluster_view, get_n2_cluster_view_public, get_n2_governance_state, get_n2_membership,
+    post_n2_internal_governance_abort, post_n2_internal_governance_append,
+    post_n2_internal_governance_vote, put_n2_membership, resolve_n2_placement,
+    rollback_n2_membership,
 };
 use crate::n2_core::data_plane::{
     delete_n2_object, get_n2_object, list_n2_object_versions, list_n2_objects,
@@ -33,6 +35,7 @@ fn public_n2_routes(layers: &RateLimitLayers) -> Router<Arc<AppState>> {
 fn protected_n2_routes(layers: &RateLimitLayers) -> Router<Arc<AppState>> {
     let read_ops = Router::<Arc<AppState>>::new()
         .route("/v4/n2/cluster/view", get(get_n2_cluster_view))
+        .route("/v4/n2/governance/state", get(get_n2_governance_state))
         .route("/v4/n2/membership", get(get_n2_membership))
         .route(
             "/v4/n2/placement/{:fragment}/{*object_key}",
@@ -116,8 +119,16 @@ fn internal_n2_routes(layers: &RateLimitLayers) -> Router<Arc<AppState>> {
             delete(n2_internal_delete_map),
         )
         .route(
-            "/v4/n2/internal/membership",
-            put(put_n2_internal_membership),
+            "/v4/n2/internal/governance/request-vote",
+            post(post_n2_internal_governance_vote),
+        )
+        .route(
+            "/v4/n2/internal/governance/append",
+            post(post_n2_internal_governance_append),
+        )
+        .route(
+            "/v4/n2/internal/governance/abort",
+            post(post_n2_internal_governance_abort),
         );
 
     layers.layer_global(routes)

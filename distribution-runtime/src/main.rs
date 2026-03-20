@@ -23,6 +23,7 @@ use crate::n1_core::upload::{
 };
 use crate::n2_core::config::{n2_runtime_config, resolve_effective_cross_params};
 use crate::n2_core::data_plane::schedule_n2_auto_maintenance;
+use crate::n2_core::governance::{governance_state_view, initialize_governance_runtime};
 use crate::n2_core::state::{get_cluster_view, get_membership};
 use crate::routes::storage_routes::serve_storage_routes;
 use crate::settings::constants::{CONFIG_FILE, ENV_FILE};
@@ -949,7 +950,20 @@ pub async fn run_server() {
             e
         )
     });
+    initialize_governance_runtime()
+        .await
+        .unwrap_or_else(|e| panic!("N2 startup could not initialize governance runtime: {}", e));
+    let governance_state = governance_state_view()
+        .await
+        .unwrap_or_else(|e| panic!("N2 startup could not read governance state: {}", e));
     schedule_n2_auto_maintenance("startup", startup_membership.epoch);
+
+    tracing::info!(
+        "N2 governance: term={} commit_index={} applied_membership_epoch={}",
+        governance_state.current_term,
+        governance_state.commit_index,
+        governance_state.last_applied_membership_epoch
+    );
 
     tracing::info!(
         "Storage mode: standard variant is filesystem-backed (directory-only index/blob roots)"

@@ -1,15 +1,20 @@
 use crate::enums::app_error_enum::AppError;
 use crate::n2_core::config::n2_runtime_config;
 use crate::n2_core::cross::rendezvous_placement;
+use crate::n2_core::governance::governance_cluster_fields;
 use crate::n2_core::model::{
     ClusterMembership, N2ClusterViewResponse, ObjectIdentity, ResolvePlacementResponse,
     UpsertMembershipRequest,
 };
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::OnceLock;
 use tokio::fs;
 use tokio::sync::RwLock;
+
+pub const N2_EXPECTED_EPOCH_HEADER: &str = "x-n2-expected-epoch";
+pub const N2_CLUSTER_FINGERPRINT_HEADER: &str = "x-n2-cluster-fingerprint";
 
 fn default_membership() -> ClusterMembership {
     let cfg = n2_runtime_config();
@@ -69,8 +74,15 @@ fn validate_node_endpoint(endpoint: &str) -> Result<String, AppError> {
 fn build_cluster_view(
     membership: &ClusterMembership,
     expected_epoch: Option<u64>,
+    governance_term: u64,
+    governance_commit_index: u64,
+    governance_leader_id: Option<String>,
+    governance_leader_endpoint: Option<String>,
+    governance_pending_index: Option<u64>,
+    governance_healthy: bool,
 ) -> N2ClusterViewResponse {
     let cfg = n2_runtime_config();
+    let cluster_fingerprint = cluster_fingerprint_for_membership(membership);
     let local_endpoint = normalize_endpoint(&cfg.node_endpoint);
     let mut local_node_present = false;
     let mut local_node_active = false;
@@ -119,14 +131,65 @@ fn build_cluster_view(
         node_id: cfg.node_id.clone(),
         node_endpoint: cfg.node_endpoint.clone(),
         membership_epoch: membership.epoch,
+        cluster_fingerprint,
         expected_epoch,
         total_nodes: membership.nodes.len(),
         active_nodes,
         local_node_present,
         local_node_active,
+        governance_term,
+        governance_commit_index,
+        governance_leader_id,
+        governance_leader_endpoint,
+        governance_pending_index,
+        governance_healthy,
         write_ready: reasons.is_empty(),
         reasons,
     }
+}
+
+fn cluster_fingerprint_for_membership(membership: &ClusterMembership) -> String {
+    let cfg = n2_runtime_config();
+    let mut normalized_nodes = membership
+        .nodes
+        .iter()
+        .map(|node| {
+            serde_json::json!({
+                "node_id": node.node_id,
+                "endpoint": normalize_endpoint(&node.endpoint),
+                "epoch": node.epoch,
+                "active": node.active,
+            })
+        })
+        .collect::<Vec<_>>();
+    normalized_nodes.sort_by(|a, b| {
+        let a_id = a
+            .get("node_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let b_id = b
+            .get("node_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        a_id.cmp(b_id)
+    });
+
+    let payload = serde_json::json!({
+        "membership_epoch": membership.epoch,
+        "nodes": normalized_nodes,
+        "cluster_commit_mode": cfg.cluster_commit_mode.as_str(),
+        "auto_cross_params": cfg.auto_cross_params,
+        "configured_cross_params": {
+            "kc": cfg.cross_params.kc,
+            "mc": cfg.cross_params.mc,
+            "kd": cfg.cross_params.kd,
+            "md": cfg.cross_params.md,
+        },
+        "cluster_stripe_block_size": cfg.cluster_stripe_block_size,
+    });
+    let encoded = serde_json::to_vec(&payload).unwrap_or_default();
+    let digest = Sha256::digest(encoded);
+    hex::encode(digest)
 }
 
 async fn read_membership_file(path: &Path) -> Result<Option<ClusterMembership>, AppError> {
@@ -176,6 +239,22 @@ async fn write_membership_file(
     .await
     .map_err(|e| AppError::Io(e, "write n2 membership snapshot file".to_string()))?;
     Ok(())
+}
+
+pub async fn ensure_membership_artifacts(membership: &ClusterMembership) -> Result<(), AppError> {
+    let cfg = n2_runtime_config();
+    let membership_path = cfg.membership_file.as_path();
+    let snapshot_path = membership_snapshot_path(membership_path, membership.epoch);
+    let membership_exists = fs::try_exists(membership_path)
+        .await
+        .map_err(|e| AppError::Io(e, "check n2 membership file".to_string()))?;
+    let snapshot_exists = fs::try_exists(&snapshot_path)
+        .await
+        .map_err(|e| AppError::Io(e, "check n2 membership snapshot file".to_string()))?;
+    if membership_exists && snapshot_exists {
+        return Ok(());
+    }
+    write_membership_file(membership_path, membership).await
 }
 
 fn membership_snapshot_path(path: &Path, epoch: u64) -> std::path::PathBuf {
@@ -256,6 +335,36 @@ pub async fn get_membership() -> Result<ClusterMembership, AppError> {
     Ok(snapshot)
 }
 
+pub async fn current_cluster_epoch_and_fingerprint() -> Result<(u64, String), AppError> {
+    let membership = get_membership().await?;
+    Ok((
+        membership.epoch,
+        cluster_fingerprint_for_membership(&membership),
+    ))
+}
+
+pub async fn validate_cluster_view_proof(
+    expected_epoch: u64,
+    expected_fingerprint: &str,
+) -> Result<(), AppError> {
+    let membership = get_membership().await?;
+    if membership.epoch != expected_epoch {
+        return Err(AppError::Conflict(format!(
+            "membership epoch mismatch: expected {}, local {}",
+            expected_epoch, membership.epoch
+        )));
+    }
+    let local_fingerprint = cluster_fingerprint_for_membership(&membership);
+    if local_fingerprint != expected_fingerprint.trim() {
+        return Err(AppError::Conflict(format!(
+            "cluster fingerprint mismatch: expected {}, local {}",
+            expected_fingerprint.trim(),
+            local_fingerprint
+        )));
+    }
+    Ok(())
+}
+
 async fn replace_membership(snapshot: ClusterMembership) -> Result<ClusterMembership, AppError> {
     validate_membership(&snapshot)?;
     let lock = membership_lock().await;
@@ -270,7 +379,19 @@ pub async fn get_cluster_view(
     expected_epoch: Option<u64>,
 ) -> Result<N2ClusterViewResponse, AppError> {
     let membership = get_membership().await?;
-    Ok(build_cluster_view(&membership, expected_epoch))
+    let governance = governance_cluster_fields().await?;
+    let governance_healthy =
+        governance.last_applied_membership_epoch == membership.epoch && governance.commit_index > 0;
+    Ok(build_cluster_view(
+        &membership,
+        expected_epoch,
+        governance.current_term,
+        governance.commit_index,
+        governance.leader_id,
+        governance.leader_endpoint,
+        governance.pending_index,
+        governance_healthy,
+    ))
 }
 
 pub async fn ensure_cluster_write_ready(

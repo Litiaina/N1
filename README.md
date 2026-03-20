@@ -110,6 +110,15 @@ Multi-node N2 operator note from the current 2-node hardware pass:
   - `auto_maintenance_mode=off` keeps all healing/redistribution manual
   - `auto_maintenance_mode=observe` reports maintenance debt without mutating placement
   - `auto_maintenance_mode=repair_and_redistribute` runs bounded automatic reconcile after membership epoch changes
+- N2 governance is now consensus-scoped only to cluster state
+  - membership apply and rollback go through majority governance commit
+  - committed membership epochs are snapshotted for rollback as `n2_cluster_membership.epoch-<N>.json`
+  - object upload/download/delete traffic does not pass through a governance leader
+  - `GET /v4/n2/governance/state` exposes term, leader hint, commit index, and applied membership epoch
+- internal N2 peer traffic now also proves the current cluster view
+  - peers carry the expected membership epoch and cluster fingerprint on internal object/session/map requests
+  - drifted or stale nodes reject those requests instead of silently participating
+- under `strict_full_placement`, degraded writes are rejected before ingest with `400 insufficient active nodes: need <kc+mc>, have <active>`
 - real-hardware reference from that pass:
   - `256 MiB` put: `24.86 MiB/s`
   - local read: `164.96 MiB/s`
