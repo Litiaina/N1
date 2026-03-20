@@ -8,6 +8,22 @@ pub struct CrossParams {
     pub md: u8,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterCommitMode {
+    Quorum,
+    StrictFullPlacement,
+}
+
+impl ClusterCommitMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quorum => "quorum",
+            Self::StrictFullPlacement => "strict_full_placement",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct ObjectIdentity {
     pub uid: String,
@@ -182,8 +198,11 @@ pub struct N2PutObjectResponse {
     pub epoch: u64,
     pub version_id: String,
     pub total_size_bytes: u64,
+    pub commit_mode: ClusterCommitMode,
+    pub planned_shards: usize,
     pub committed_shards: usize,
     pub required_quorum: u8,
+    pub required_commit_shards: usize,
     pub object: N2ObjectMap,
 }
 

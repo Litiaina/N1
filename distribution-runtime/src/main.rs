@@ -633,19 +633,33 @@ async fn validate_n2_startup_layout(config: &Ini, local_blob_roots: usize) {
         );
 
     tracing::info!(
-        "N2 layout: source={} membership_epoch={} active_nodes={} resolved kc={} mc={} kd={} md={}",
+        "N2 layout: source={} membership_epoch={} active_nodes={} resolved kc={} mc={} kd={} md={} commit_mode={}",
         source,
         cluster_view.membership_epoch,
         cluster_view.active_nodes,
         resolved.kc,
         resolved.mc,
         resolved.kd,
-        resolved.md
+        resolved.md,
+        cfg.cluster_commit_mode.as_str()
     );
 
     if source == "configured" && cluster_view.active_nodes > 1 && resolved.mc == 0 {
         tracing::warn!(
             "N2 cluster is running with mc=0 across {} active node(s); one node loss can make clustered objects unavailable",
+            cluster_view.active_nodes
+        );
+    }
+    if cluster_view.active_nodes > 1
+        && resolved.mc > 0
+        && matches!(
+            cfg.cluster_commit_mode,
+            crate::n2_core::model::ClusterCommitMode::Quorum
+        )
+    {
+        tracing::warn!(
+            "N2 cluster commit mode is quorum while mc={} across {} active node(s); successful writes may land with fewer immediately committed copies than kc+mc. Set [n2].cluster_commit_mode=strict_full_placement if you want hard placement guardrails.",
+            resolved.mc,
             cluster_view.active_nodes
         );
     }

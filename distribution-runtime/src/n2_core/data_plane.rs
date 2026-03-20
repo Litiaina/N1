@@ -4,12 +4,12 @@ use crate::n1_core::disk_manager::ObjectPathManager;
 use crate::n1_core::modify::sync_dir;
 use crate::n2_core::config::{effective_cross_params, n2_runtime_config};
 use crate::n2_core::model::{
-    CrossParams, DeleteN2ObjectQuery, GetObjectQuery, InternalStoreShardQuery, ListN2ObjectsQuery,
-    ListN2VersionsQuery, N2ClusterShardRef, N2DeleteObjectResponse, N2DiskShardRef,
-    N2ListObjectVersionsResponse, N2ListObjectsResponse, N2ObjectMap, N2ObjectSummary,
-    N2ObjectVersionSummary, N2PutObjectResponse, N2ReconcileObjectResult, N2ReconcileResponse,
-    N2RenameObjectResponse, NodeDescriptor, ObjectIdentity, PutObjectQuery, ReconcileFragmentQuery,
-    RenameN2ObjectRequest,
+    ClusterCommitMode, CrossParams, DeleteN2ObjectQuery, GetObjectQuery, InternalStoreShardQuery,
+    ListN2ObjectsQuery, ListN2VersionsQuery, N2ClusterShardRef, N2DeleteObjectResponse,
+    N2DiskShardRef, N2ListObjectVersionsResponse, N2ListObjectsResponse, N2ObjectMap,
+    N2ObjectSummary, N2ObjectVersionSummary, N2PutObjectResponse, N2ReconcileObjectResult,
+    N2ReconcileResponse, N2RenameObjectResponse, NodeDescriptor, ObjectIdentity, PutObjectQuery,
+    ReconcileFragmentQuery, RenameN2ObjectRequest,
 };
 use crate::n2_core::state::ensure_cluster_write_ready;
 use crate::n2_core::state::{get_membership, resolve_placement};
@@ -2523,6 +2523,106 @@ fn content_type_from_query_or_headers(query: &PutObjectQuery, headers: &HeaderMa
         .to_string()
 }
 
+fn required_cluster_commit_shards(
+    commit_mode: ClusterCommitMode,
+    kc: u8,
+    planned_shards: usize,
+) -> usize {
+    match commit_mode {
+        ClusterCommitMode::Quorum => usize::from(kc),
+        ClusterCommitMode::StrictFullPlacement => planned_shards.max(usize::from(kc)),
+    }
+}
+
+async fn cleanup_committed_cluster_shards(
+    http_client: &reqwest::Client,
+    object: &ObjectIdentity,
+    committed: &[N2ClusterShardRef],
+) {
+    for shard in committed {
+        let target = NodeDescriptor {
+            node_id: shard.node_id.clone(),
+            endpoint: shard.endpoint.clone(),
+            epoch: 0,
+            active: true,
+        };
+        let deleted = if is_local_target(&target) {
+            delete_local_cluster_shard(
+                object.fragment.as_str(),
+                object.version_id.as_str(),
+                shard.cluster_shard_index,
+            )
+            .await
+        } else {
+            delete_remote_cluster_shard(
+                http_client,
+                shard.endpoint.as_str(),
+                object.fragment.as_str(),
+                object.version_id.as_str(),
+                shard.cluster_shard_index,
+            )
+            .await
+        };
+        if let Err(err) = deleted {
+            warn!(
+                "n2 strict cleanup failed fragment={} object_key={} version={} shard={} node={} endpoint={} err={}",
+                object.fragment,
+                object.object_key,
+                object.version_id,
+                shard.cluster_shard_index,
+                shard.node_id,
+                shard.endpoint,
+                err
+            );
+        }
+    }
+}
+
+async fn cleanup_failed_n2_object_map(http_client: &reqwest::Client, map: &N2ObjectMap) {
+    if let Err(err) = delete_n2_object_map_local(
+        map.object.fragment.as_str(),
+        map.object.object_key.as_str(),
+        map.object.version_id.as_str(),
+    )
+    .await
+    {
+        warn!(
+            "n2 strict cleanup local map delete failed fragment={} object_key={} version={} err={}",
+            map.object.fragment, map.object.object_key, map.object.version_id, err
+        );
+    }
+
+    let local_endpoint = normalize_endpoint(&n2_runtime_config().node_endpoint);
+    let mut remote_endpoints = map
+        .shards
+        .iter()
+        .map(|s| s.endpoint.clone())
+        .filter(|endpoint| normalize_endpoint(endpoint) != local_endpoint)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    remote_endpoints.sort();
+
+    for endpoint in remote_endpoints {
+        if let Err(err) = delete_n2_object_map_remote(
+            http_client,
+            endpoint.as_str(),
+            map.object.fragment.as_str(),
+            map.object.object_key.as_str(),
+            map.object.version_id.as_str(),
+        )
+        .await
+        {
+            warn!(
+                "n2 strict cleanup remote map delete failed fragment={} object_key={} version={} endpoint={} err={}",
+                map.object.fragment, map.object.object_key, map.object.version_id, endpoint, err
+            );
+        }
+    }
+
+    cleanup_committed_cluster_shards(http_client, &map.object, &map.shards).await;
+}
+
 pub async fn put_n2_object(
     claims: Claims,
     headers: HeaderMap,
@@ -2547,6 +2647,7 @@ pub async fn put_n2_object(
     let mc = query.mc.unwrap_or(cross_params.mc);
     let kd = query.kd.unwrap_or(cross_params.kd);
     let md = query.md.unwrap_or(cross_params.md);
+    let commit_mode = cfg.cluster_commit_mode;
     let stripe_block_size = normalize_n2_stripe_block_size(
         query
             .stripe_block_size
@@ -2569,6 +2670,7 @@ pub async fn put_n2_object(
     };
     let placement = resolve_placement(object.clone(), kc, mc).await?;
     let nc = usize::from(kc).saturating_add(usize::from(mc));
+    let required_commit_shards = required_cluster_commit_shards(commit_mode, kc, nc);
 
     let http_client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -2625,14 +2727,16 @@ pub async fn put_n2_object(
         }
     }
 
-    if sessions.iter().filter(|s| !s.is_failed()).count() < usize::from(kc) {
+    let ready_sessions = sessions.iter().filter(|s| !s.is_failed()).count();
+    if ready_sessions < required_commit_shards {
         for session in &mut sessions {
             let _ = abort_coordinator_shard_session(&http_client, session).await;
         }
         return Err(AppError::Conflict(format!(
-            "quorum not reached before ingest: required {}, ready {}",
-            kc,
-            sessions.iter().filter(|s| !s.is_failed()).count()
+            "n2 cluster commit policy {} requires {} ready shard sessions before ingest, but only {} are available",
+            commit_mode.as_str(),
+            required_commit_shards,
+            ready_sessions
         )));
     }
 
@@ -2694,13 +2798,15 @@ pub async fn put_n2_object(
                 }
             }
             let active_sessions = sessions.iter().filter(|s| !s.is_failed()).count();
-            if active_sessions < usize::from(kc) {
+            if active_sessions < required_commit_shards {
                 for session in &mut sessions {
                     let _ = abort_coordinator_shard_session(&http_client, session).await;
                 }
                 return Err(AppError::Conflict(format!(
-                    "quorum dropped during ingest: required {}, active {}",
-                    kc, active_sessions
+                    "n2 cluster commit policy {} dropped below the required active shard count during ingest: required {}, active {}",
+                    commit_mode.as_str(),
+                    required_commit_shards,
+                    active_sessions
                 )));
             }
         }
@@ -2811,11 +2917,14 @@ pub async fn put_n2_object(
         }
     }
 
-    if committed.len() < usize::from(kc) {
+    if committed.len() < required_commit_shards {
+        cleanup_committed_cluster_shards(&http_client, &object, &committed).await;
         return Err(AppError::Conflict(format!(
-            "quorum not reached: required {}, committed {}",
-            kc,
-            committed.len()
+            "n2 cluster commit policy {} was not satisfied: required {} committed shards, got {} out of {} planned targets",
+            commit_mode.as_str(),
+            required_commit_shards,
+            committed.len(),
+            nc
         )));
     }
 
@@ -2835,16 +2944,30 @@ pub async fn put_n2_object(
         shards: committed,
     };
 
-    persist_n2_object_map(&object_map).await?;
+    if let Err(err) = persist_n2_object_map(&object_map).await {
+        warn!(
+            "n2 map persistence failed after shard commit fragment={} object_key={} version={} mode={} err={}",
+            object.fragment,
+            object.object_key,
+            object.version_id,
+            commit_mode.as_str(),
+            err
+        );
+        cleanup_failed_n2_object_map(&http_client, &object_map).await;
+        return Err(err);
+    }
 
     info!(
-        "n2 put committed fragment={} object_key={} version={} size={} quorum={} committed={} membership_epoch={}",
+        "n2 put committed fragment={} object_key={} version={} size={} quorum={} required_commit={} planned={} committed={} commit_mode={} membership_epoch={}",
         object.fragment,
         object.object_key,
         object.version_id,
         object_map.total_size_bytes,
         object_map.write_quorum,
+        required_commit_shards,
+        nc,
         object_map.shards.len(),
+        commit_mode.as_str(),
         cluster_view.membership_epoch
     );
 
@@ -2852,8 +2975,11 @@ pub async fn put_n2_object(
         epoch: object_map.epoch,
         version_id,
         total_size_bytes: object_map.total_size_bytes,
+        commit_mode,
+        planned_shards: nc,
         committed_shards: object_map.shards.len(),
         required_quorum: object_map.write_quorum,
+        required_commit_shards,
         object: object_map,
     }))
 }
@@ -4098,6 +4224,66 @@ mod tests {
         (format!("http://{}", addr), join)
     }
 
+    async fn spawn_commit_failure_session_server() -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route(
+                "/v4/n2/internal/session/begin/{fragment}/{version_id}/{cluster_shard_index}",
+                post(
+                    |AxumPath((_fragment, _version_id, _cluster_shard_index)): AxumPath<(
+                        String,
+                        String,
+                        usize,
+                    )>| async move {
+                        Ok::<AxumJson<InternalShardSessionResponse>, StatusCode>(AxumJson(
+                            InternalShardSessionResponse {
+                                session_id: Ulid::new().to_string(),
+                            },
+                        ))
+                    },
+                ),
+            )
+            .route(
+                "/v4/n2/internal/session/chunk/{session_id}",
+                put(|AxumPath(session_id): AxumPath<String>| async move {
+                    Ok::<AxumJson<InternalShardChunkAck>, StatusCode>(AxumJson(
+                        InternalShardChunkAck {
+                            session_id,
+                            written_bytes: 0,
+                        },
+                    ))
+                }),
+            )
+            .route(
+                "/v4/n2/internal/session/commit/{session_id}",
+                post(|| async move {
+                    Err::<AxumJson<N2ClusterShardRef>, StatusCode>(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    )
+                }),
+            )
+            .route(
+                "/v4/n2/internal/session/abort/{session_id}",
+                post(|AxumPath(session_id): AxumPath<String>| async move {
+                    Ok::<AxumJson<InternalShardAbortResponse>, StatusCode>(AxumJson(
+                        InternalShardAbortResponse {
+                            session_id,
+                            aborted: true,
+                        },
+                    ))
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind commit failure server");
+        let addr = listener.local_addr().expect("local addr");
+        let join = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve commit failure routes");
+        });
+        (format!("http://{}", addr), join)
+    }
+
     fn ensure_auth_env_for_tests() {
         // SAFETY: test-only setup before handlers touch these env-backed LazyLocks.
         unsafe {
@@ -4495,7 +4681,13 @@ mod tests {
         )
         .await
         .expect("put n2 object");
+        assert_eq!(
+            put_result.0.commit_mode,
+            ClusterCommitMode::StrictFullPlacement
+        );
+        assert_eq!(put_result.0.planned_shards, 2);
         assert_eq!(put_result.0.required_quorum, 2);
+        assert_eq!(put_result.0.required_commit_shards, 2);
         assert_eq!(put_result.0.committed_shards, 2);
 
         let get_resp = get_n2_object(
@@ -4566,6 +4758,91 @@ mod tests {
             nodes: previous_membership.nodes,
         })
         .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn n2_strict_full_placement_rejects_partial_commit_and_cleans_local_shards() {
+        let _guard = STORAGE_TEST_LOCK.lock().await;
+        ensure_n2_test_storage_roots().await;
+        ensure_auth_env_for_tests();
+
+        let (remote_endpoint, remote_server) = spawn_commit_failure_session_server().await;
+        let previous_membership = get_membership().await.expect("current membership");
+        upsert_membership(UpsertMembershipRequest {
+            epoch: None,
+            nodes: vec![
+                local_node_descriptor(),
+                NodeDescriptor {
+                    node_id: format!("remote-fail-{}", Ulid::new()),
+                    endpoint: remote_endpoint.clone(),
+                    epoch: 0,
+                    active: true,
+                },
+            ],
+        })
+        .await
+        .expect("set two-node membership");
+
+        let fragment = format!("frag-{}", Ulid::new());
+        let object_key = "videos/strict-fail.bin".to_string();
+        let version_id = Ulid::new().to_string();
+        let result = put_n2_object(
+            full_claims(fragment.as_str()),
+            HeaderMap::new(),
+            AxumPath((fragment.clone(), object_key.clone())),
+            AxumQuery(PutObjectQuery {
+                uid: Some(fragment.clone()),
+                version_id: Some(version_id.clone()),
+                expected_epoch: None,
+                kc: Some(1),
+                mc: Some(1),
+                kd: Some(1),
+                md: Some(0),
+                stripe_block_size: Some(128 * 1024),
+                content_type: Some("application/octet-stream".to_string()),
+            }),
+            Body::from(sample_bytes(600_000, 211)),
+        )
+        .await;
+
+        match result {
+            Err(AppError::Conflict(message)) => {
+                assert!(message.contains("strict_full_placement"));
+                assert!(message.contains("required 2"));
+            }
+            other => panic!("expected strict placement conflict, got {:?}", other),
+        }
+
+        let map_result = load_n2_object_map_local(
+            fragment.as_str(),
+            object_key.as_str(),
+            Some(version_id.as_str()),
+        )
+        .await;
+        assert!(
+            matches!(map_result, Err(AppError::NotFound)),
+            "strict failure must not leave an authoritative map behind"
+        );
+
+        for cluster_shard_index in 0..2 {
+            let shard_result = read_local_cluster_shard(
+                fragment.as_str(),
+                version_id.as_str(),
+                cluster_shard_index,
+            )
+            .await;
+            assert!(
+                matches!(shard_result, Err(AppError::NotFound)),
+                "strict failure must clean local shard residue for cluster_shard_index={cluster_shard_index}"
+            );
+        }
+
+        let _ = upsert_membership(UpsertMembershipRequest {
+            epoch: None,
+            nodes: previous_membership.nodes,
+        })
+        .await;
+        remote_server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5120,6 +5397,9 @@ mod tests {
         )
         .await
         .expect("put k2+m1 object");
+        assert_eq!(put.0.commit_mode, ClusterCommitMode::StrictFullPlacement);
+        assert_eq!(put.0.planned_shards, 3);
+        assert_eq!(put.0.required_commit_shards, 3);
         assert_eq!(put.0.committed_shards, 3);
 
         remote_a_server.abort();
@@ -5220,7 +5500,10 @@ mod tests {
         )
         .await
         .expect("put k3+m2 object");
+        assert_eq!(put.0.commit_mode, ClusterCommitMode::StrictFullPlacement);
+        assert_eq!(put.0.planned_shards, 5);
         assert_eq!(put.0.required_quorum, 3);
+        assert_eq!(put.0.required_commit_shards, 5);
         assert_eq!(put.0.committed_shards, 5);
 
         // Simulate two-node outage in a k=3,m=2 layout.

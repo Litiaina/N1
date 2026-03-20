@@ -102,8 +102,9 @@ Multi-node N2 operator note from the current 2-node hardware pass:
   - 2 blob roots per node
   - `kc=1 mc=1 kd=1 md=1`
 - `litiaina-n2` now auto-creates `n1.env` and `n1_config.ini` compatibility aliases when they are missing beside `n2.env` and `n2_config.ini`
-- current write success means quorum success, not necessarily full `kc+mc` placement
-  - inspect `committed_shards`
+- default `[n2].cluster_commit_mode=strict_full_placement` now requires the planned `kc+mc` target set to commit before `PUT` succeeds
+  - inspect `committed_shards` and `required_commit_shards`
+  - switch to `cluster_commit_mode=quorum` only when you intentionally want degraded writes to succeed with less than full placement
   - run reconcile after degraded periods or peer recovery
 - real-hardware reference from that pass:
   - `256 MiB` put: `24.86 MiB/s`

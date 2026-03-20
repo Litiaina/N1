@@ -344,6 +344,7 @@ node_id=node-a
 node_endpoint=https://10.0.0.11:50001
 cluster_membership_file=/etc/litiaina/n2_cluster_membership.json
 internal_token=replace-this-internal-peer-token
+cluster_commit_mode=strict_full_placement
 auto_cross_params=false
 kc=2
 mc=1
@@ -358,6 +359,8 @@ Notes for `distribution-runtime`:
 - `node_endpoint` must be the address other nodes use to reach this node.
 - `cluster_membership_file` must be readable and writable by the runtime.
 - `internal_token` protects the `/v4/n2/internal/*` peer APIs and should be rotated like any other secret.
+- `cluster_commit_mode=strict_full_placement` is now the safe multi-node default and requires the planned `kc+mc` target set to commit before `PUT` succeeds.
+- Set `cluster_commit_mode=quorum` only when you explicitly want degraded writes to succeed with fewer than the full planned targets.
 - `auto_cross_params=true` derives `kc/mc` from active node count and `kd/md` from local blob root count at startup.
 - If you want explicit `kc/mc/kd/md`, set `auto_cross_params=false`.
 - Startup now fails early if `kc+mc` exceeds active nodes or `kd` exceeds local blob roots.
@@ -372,10 +375,12 @@ Notes for `distribution-runtime`:
 - Timeout note:
   - `remote_request_timeout_ms=60000` is conservative.
   - On a low-latency LAN, set it lower (`3000` to `10000`) if you want faster degraded-mode fallback when a peer is black-holed instead of cleanly offline.
-- Quorum note:
-  - N2 write quorum is `kc`.
-  - A successful `PUT /v4/n2/object/...` means the write reached quorum, not necessarily every planned target.
-  - Watch `committed_shards` in the response and run reconcile after degraded periods to restore missing copies.
+- Cluster commit note:
+  - Default `cluster_commit_mode=strict_full_placement` requires the full planned `kc+mc` target set.
+  - The response now exposes both `required_quorum` and `required_commit_shards`.
+  - `committed_shards` remains the immediate placement truth.
+  - Use `cluster_commit_mode=quorum` only if you are intentionally trading immediate full placement for degraded-write availability.
+  - Run reconcile after degraded periods to restore missing copies.
 
 ### Validated Two-Node Reference (`distribution-runtime 0.1.2`)
 

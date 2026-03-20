@@ -101,6 +101,7 @@ node_id=n2-a
 node_endpoint=https://192.168.0.10:50001
 cluster_membership_file=n2_cluster_membership.json
 internal_token=replace-this-with-a-long-random-secret
+cluster_commit_mode=strict_full_placement
 auto_cross_params=true
 cluster_stripe_block_size=262144
 remote_request_timeout_ms=15000
@@ -114,6 +115,8 @@ Notes:
 - prefer `host=0.0.0.0` or a routable interface address for multi-node clusters
 - on low-latency LANs, a lower `remote_request_timeout_ms` usually gives better degraded-mode behavior than the conservative default
 - `auto_cross_params=true` is a good default unless you intentionally want fixed EC policy
+- `cluster_commit_mode=strict_full_placement` is now the safe default for operator-first clusters
+- set `cluster_commit_mode=quorum` only when you explicitly want degraded writes to succeed with less than full planned placement
 
 ## 6. Membership File Pattern
 
@@ -168,16 +171,15 @@ What you want to see:
 ## 8. Current Write Truth
 
 Current N2 write semantics are:
-- write success means quorum success
+- default `cluster_commit_mode` is `strict_full_placement`
+- write success now means the planned `kc+mc` target set committed successfully
 - `committed_shards` is the immediate placement truth
-
-That means:
-- a healthy write can still succeed with fewer immediately committed copies than `kc+mc`
-- reconcile is the supported recovery path after degraded periods or peer rejoin
+- `required_commit_shards` in the response shows the actual success threshold for that write
 
 Operator rule:
-- watch `committed_shards` in `PUT /v4/n2/object/...` responses
-- run `POST /v4/n2/reconcile/{fragment}` after peer outages, degraded writes, or maintenance windows
+- keep `cluster_commit_mode=strict_full_placement` for normal multi-node deployments
+- switch to `cluster_commit_mode=quorum` only as an explicit operator choice when degraded-write availability matters more than immediate full placement
+- still watch `committed_shards` and run `POST /v4/n2/reconcile/{fragment}` after outages, degraded windows, or peer rejoin
 
 ## 9. Tested 2-Node Reference
 
@@ -195,14 +197,11 @@ Reference results from the tested pass:
 - degraded write (`64 MiB`): `28.95 MiB/s`
 - rejoin reconcile: `14.34 s`
 
-Important observed behavior from that pass:
-- one healthy-cluster put still returned `committed_shards=1`
-- reconcile later restored the missing peer copy
-
-So today the operator model is:
+Current operator model:
 - N2 is operational
 - N2 is distributed
-- reconcile is still part of the durability story after degraded periods
+- full planned placement is the default write guardrail
+- reconcile is still the repair path after degraded periods, peer outages, or operator-chosen quorum mode
 
 ## 10. Recommended Operator Checks
 

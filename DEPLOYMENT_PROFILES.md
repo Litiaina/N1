@@ -60,8 +60,10 @@ As of 2026-03-20:
   - `litiaina-n2` now auto-creates `n1.env` and `n1_config.ini` compatibility aliases beside them when missing
   - operators should still manage only the N2-owned files directly
 - Current write semantics:
-  - write quorum is `kc`
+  - default `cluster_commit_mode` is `strict_full_placement`
+  - `required_commit_shards` is the actual success threshold for a `PUT`
   - `committed_shards` in the response is the immediate placement truth
+  - `cluster_commit_mode=quorum` is still available as an explicit operator override for degraded-write acceptance
   - reconcile is the supported way to restore missing peer copies after degraded periods
 - Current timeout tuning note:
   - conservative defaults are safe

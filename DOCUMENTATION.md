@@ -48,8 +48,9 @@
 > Multi-node N2 deployment note:
 > - `distribution-runtime` is operational on a tested 2-node filesystem-backed cluster.
 > - In an isolated `litiaina-n2` working directory, the runtime now auto-creates `n1.env` and `n1_config.ini` compatibility aliases beside `n2.env` and `n2_config.ini` when needed.
-> - Current N2 object-write success is quorum success.
-> - Use the `committed_shards` field in the `PUT /v4/n2/object/...` response as the immediate placement truth.
+> - Default `[n2].cluster_commit_mode=strict_full_placement` now requires the planned `kc+mc` target set before `PUT /v4/n2/object/...` succeeds.
+> - Use `committed_shards` as the immediate placement truth and `required_commit_shards` as the actual success threshold reported by the runtime.
+> - Use `cluster_commit_mode=quorum` only when you explicitly want degraded writes to succeed with less than full planned placement.
 > - Use `POST /v4/n2/reconcile/{fragment}` after degraded periods or peer recovery to restore missing copies.
 > - On a low-latency LAN, a lower `remote_request_timeout_ms` is usually a better degraded-mode default than the conservative wide-area timeout.
 > - Startup now rejects operator-dangerous multi-node layouts such as placeholder internal tokens, duplicate active endpoints, missing membership files, and loopback-only peer endpoints.

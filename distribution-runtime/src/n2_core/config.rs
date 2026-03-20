@@ -1,4 +1,4 @@
-use crate::n2_core::model::CrossParams;
+use crate::n2_core::model::{ClusterCommitMode, CrossParams};
 use crate::settings::constants::CONFIG_FILE;
 use ini::Ini;
 use once_cell::sync::OnceCell;
@@ -10,6 +10,7 @@ pub struct N2RuntimeConfig {
     pub node_endpoint: String,
     pub membership_file: PathBuf,
     pub internal_token: String,
+    pub cluster_commit_mode: ClusterCommitMode,
     pub auto_cross_params: bool,
     pub cluster_stripe_block_size: usize,
     pub remote_request_timeout_ms: u64,
@@ -49,9 +50,27 @@ fn default_auto_cross_params() -> bool {
     false
 }
 
+fn default_cluster_commit_mode() -> ClusterCommitMode {
+    ClusterCommitMode::StrictFullPlacement
+}
+
 fn normalize_stripe_block_size(v: usize) -> usize {
     let clamped = v.clamp(4 * 1024, 4 * 1024 * 1024);
     ((clamped + 4095) / 4096) * 4096
+}
+
+fn parse_cluster_commit_mode(raw: Option<&str>, default: ClusterCommitMode) -> ClusterCommitMode {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) if v.eq_ignore_ascii_case("quorum") => ClusterCommitMode::Quorum,
+        Some(v)
+            if v.eq_ignore_ascii_case("strict_full_placement")
+                || v.eq_ignore_ascii_case("strict")
+                || v.eq_ignore_ascii_case("full_placement") =>
+        {
+            ClusterCommitMode::StrictFullPlacement
+        }
+        _ => default,
+    }
 }
 
 fn resolve_membership_path(raw: &str) -> PathBuf {
@@ -73,6 +92,7 @@ fn load_runtime_config() -> N2RuntimeConfig {
         node_endpoint: default_node_endpoint(),
         membership_file: resolve_membership_path("n2_cluster_membership.json"),
         internal_token: default_internal_token(),
+        cluster_commit_mode: default_cluster_commit_mode(),
         auto_cross_params: default_auto_cross_params(),
         cluster_stripe_block_size: 256 * 1024,
         remote_request_timeout_ms: 60_000,
@@ -107,6 +127,8 @@ fn load_runtime_config() -> N2RuntimeConfig {
         .get("internal_token")
         .map(ToOwned::to_owned)
         .unwrap_or(defaults.internal_token);
+    let cluster_commit_mode =
+        parse_cluster_commit_mode(sec.get("cluster_commit_mode"), defaults.cluster_commit_mode);
     let auto_cross_params = sec
         .get("auto_cross_params")
         .map(|v| {
@@ -137,6 +159,7 @@ fn load_runtime_config() -> N2RuntimeConfig {
         node_endpoint,
         membership_file,
         internal_token,
+        cluster_commit_mode,
         auto_cross_params,
         cluster_stripe_block_size,
         remote_request_timeout_ms,
@@ -294,5 +317,21 @@ mod tests {
         let (kd, md) = auto_local_cross_params(4);
         assert_eq!((kc, mc), (2, 1));
         assert_eq!((kd, md), (3, 1));
+    }
+
+    #[test]
+    fn cluster_commit_mode_parser_accepts_strict_aliases() {
+        assert_eq!(
+            parse_cluster_commit_mode(Some("strict_full_placement"), ClusterCommitMode::Quorum),
+            ClusterCommitMode::StrictFullPlacement
+        );
+        assert_eq!(
+            parse_cluster_commit_mode(Some("strict"), ClusterCommitMode::Quorum),
+            ClusterCommitMode::StrictFullPlacement
+        );
+        assert_eq!(
+            parse_cluster_commit_mode(Some("quorum"), ClusterCommitMode::StrictFullPlacement),
+            ClusterCommitMode::Quorum
+        );
     }
 }

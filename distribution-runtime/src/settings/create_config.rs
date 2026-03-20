@@ -64,6 +64,7 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("node_endpoint", "https://127.0.0.1:50001")
         .set("cluster_membership_file", "n2_cluster_membership.json")
         .set("internal_token", "change-me-n2-internal-token")
+        .set("cluster_commit_mode", "strict_full_placement")
         .set("auto_cross_params", "true")
         .set("cluster_stripe_block_size", "262144")
         .set("remote_request_timeout_ms", "60000")
@@ -121,6 +122,7 @@ mod tests {
             n2.get("internal_token"),
             Some("change-me-n2-internal-token")
         );
+        assert_eq!(n2.get("cluster_commit_mode"), Some("strict_full_placement"));
         assert_eq!(n2.get("auto_cross_params"), Some("true"));
         assert_eq!(n2.get("cluster_stripe_block_size"), Some("262144"));
         assert_eq!(n2.get("remote_request_timeout_ms"), Some("60000"));
