@@ -345,6 +345,10 @@ node_endpoint=https://10.0.0.11:50001
 cluster_membership_file=/etc/litiaina/n2_cluster_membership.json
 internal_token=replace-this-internal-peer-token
 cluster_commit_mode=strict_full_placement
+auto_maintenance_mode=off
+auto_maintenance_max_fragments=64
+auto_maintenance_max_objects_per_fragment=256
+auto_maintenance_cleanup_orphans=true
 auto_cross_params=false
 kc=2
 mc=1
@@ -361,6 +365,8 @@ Notes for `distribution-runtime`:
 - `internal_token` protects the `/v4/n2/internal/*` peer APIs and should be rotated like any other secret.
 - `cluster_commit_mode=strict_full_placement` is now the safe multi-node default and requires the planned `kc+mc` target set to commit before `PUT` succeeds.
 - Set `cluster_commit_mode=quorum` only when you explicitly want degraded writes to succeed with fewer than the full planned targets.
+- `auto_maintenance_mode=off|observe|repair_and_redistribute` controls whether N2 reacts automatically to topology epoch changes.
+- Start with `off`, then `observe`, then `repair_and_redistribute` once you trust the cluster behavior.
 - `auto_cross_params=true` derives `kc/mc` from active node count and `kd/md` from local blob root count at startup.
 - If you want explicit `kc/mc/kd/md`, set `auto_cross_params=false`.
 - Startup now fails early if `kc+mc` exceeds active nodes or `kd` exceeds local blob roots.

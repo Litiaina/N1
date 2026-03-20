@@ -22,6 +22,7 @@ use crate::n1_core::upload::{
     UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
 };
 use crate::n2_core::config::{n2_runtime_config, resolve_effective_cross_params};
+use crate::n2_core::data_plane::schedule_n2_auto_maintenance;
 use crate::n2_core::state::{get_cluster_view, get_membership};
 use crate::routes::storage_routes::serve_storage_routes;
 use crate::settings::constants::{CONFIG_FILE, ENV_FILE};
@@ -633,7 +634,7 @@ async fn validate_n2_startup_layout(config: &Ini, local_blob_roots: usize) {
         );
 
     tracing::info!(
-        "N2 layout: source={} membership_epoch={} active_nodes={} resolved kc={} mc={} kd={} md={} commit_mode={}",
+        "N2 layout: source={} membership_epoch={} active_nodes={} resolved kc={} mc={} kd={} md={} commit_mode={} auto_maintenance_mode={}",
         source,
         cluster_view.membership_epoch,
         cluster_view.active_nodes,
@@ -641,7 +642,8 @@ async fn validate_n2_startup_layout(config: &Ini, local_blob_roots: usize) {
         resolved.mc,
         resolved.kd,
         resolved.md,
-        cfg.cluster_commit_mode.as_str()
+        cfg.cluster_commit_mode.as_str(),
+        cfg.auto_maintenance_mode.as_str()
     );
 
     if source == "configured" && cluster_view.active_nodes > 1 && resolved.mc == 0 {
@@ -941,6 +943,13 @@ pub async fn run_server() {
         .expect("Double initialization of BLOB_STORE_DISKS!");
 
     validate_n2_startup_layout(&config, blob_disk_count).await;
+    let startup_membership = get_membership().await.unwrap_or_else(|e| {
+        panic!(
+            "N2 startup could not load membership after validation completed: {}",
+            e
+        )
+    });
+    schedule_n2_auto_maintenance("startup", startup_membership.epoch);
 
     tracing::info!(
         "Storage mode: standard variant is filesystem-backed (directory-only index/blob roots)"

@@ -52,6 +52,7 @@
 > - Use `committed_shards` as the immediate placement truth and `required_commit_shards` as the actual success threshold reported by the runtime.
 > - Use `cluster_commit_mode=quorum` only when you explicitly want degraded writes to succeed with less than full planned placement.
 > - Use `POST /v4/n2/reconcile/{fragment}` after degraded periods or peer recovery to restore missing copies.
+> - `auto_maintenance_mode=off|observe|repair_and_redistribute` lets operators choose whether topology changes stay fully manual, debt-reporting only, or automatically reconciled.
 > - On a low-latency LAN, a lower `remote_request_timeout_ms` is usually a better degraded-mode default than the conservative wide-area timeout.
 > - Startup now rejects operator-dangerous multi-node layouts such as placeholder internal tokens, duplicate active endpoints, missing membership files, and loopback-only peer endpoints.
 

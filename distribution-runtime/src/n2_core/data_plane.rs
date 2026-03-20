@@ -2,7 +2,7 @@ use crate::enums::app_error_enum::AppError;
 use crate::middleware::auth_middleware::ADMIN_KEY;
 use crate::n1_core::disk_manager::ObjectPathManager;
 use crate::n1_core::modify::sync_dir;
-use crate::n2_core::config::{effective_cross_params, n2_runtime_config};
+use crate::n2_core::config::{N2AutoMaintenanceMode, effective_cross_params, n2_runtime_config};
 use crate::n2_core::model::{
     ClusterCommitMode, CrossParams, DeleteN2ObjectQuery, GetObjectQuery, InternalStoreShardQuery,
     ListN2ObjectsQuery, ListN2VersionsQuery, N2ClusterShardRef, N2DeleteObjectResponse,
@@ -46,6 +46,27 @@ const N2_OBJECT_LATEST_EXT: &str = ".n2latest";
 const N2_LOCAL_CSHARD_META_FILE: &str = "cshard.meta";
 const N2_INTERNAL_TOKEN_HEADER: &str = "x-n2-internal-token";
 const N2_REMOTE_CHUNK_FLUSH_MIN_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Debug, Default)]
+struct AutoMaintenanceSchedulerState {
+    running: bool,
+    pending_epoch: Option<u64>,
+}
+
+type AutoMaintenanceScheduler = Mutex<AutoMaintenanceSchedulerState>;
+static AUTO_MAINTENANCE_SCHEDULER: OnceLock<AutoMaintenanceScheduler> = OnceLock::new();
+
+fn auto_maintenance_scheduler() -> &'static AutoMaintenanceScheduler {
+    AUTO_MAINTENANCE_SCHEDULER.get_or_init(|| Mutex::new(AutoMaintenanceSchedulerState::default()))
+}
+
+#[derive(Clone, Debug, Default)]
+struct AutoMaintenanceRunSummary {
+    fragments_scanned: usize,
+    fragments_with_planned_changes: usize,
+    failed_fragments: usize,
+    dry_run: bool,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct LocalClusterShardMeta {
@@ -984,6 +1005,55 @@ async fn list_fragment_n2_latest_maps(
         }
     }
 
+    Ok(out)
+}
+
+async fn list_n2_fragments(max_fragments: usize) -> Result<Vec<String>, AppError> {
+    let path_manager = ObjectPathManager::new();
+    let roots = path_manager.get_all_index_roots();
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut fragments = HashSet::new();
+    for root in roots {
+        let mut entries = match fs::read_dir(&root).await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| AppError::Io(e, format!("read dir entry {:?}", root)))?
+        {
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .await
+                .map_err(|e| AppError::Io(e, format!("file type {:?}", path)))?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            let Some(fragment) = path.file_name().and_then(|v| v.to_str()) else {
+                continue;
+            };
+            let n2_index = path.join("n2").join("index");
+            let exists = fs::try_exists(&n2_index)
+                .await
+                .map_err(|e| AppError::Io(e, format!("check {:?}", n2_index)))?;
+            if exists {
+                fragments.insert(fragment.to_string());
+                if fragments.len() >= max_fragments {
+                    let mut out = fragments.into_iter().collect::<Vec<_>>();
+                    out.sort();
+                    return Ok(out);
+                }
+            }
+        }
+    }
+
+    let mut out = fragments.into_iter().collect::<Vec<_>>();
+    out.sort();
     Ok(out)
 }
 
@@ -3511,28 +3581,16 @@ pub async fn rename_n2_object(
     }))
 }
 
-pub async fn reconcile_n2_fragment(
-    claims: Claims,
-    Path(fragment): Path<String>,
-    Query(query): Query<ReconcileFragmentQuery>,
-) -> Result<AxumJson<N2ReconcileResponse>, AppError> {
-    if !claims.modify {
-        return Err(AppError::Forbidden(
-            "Modify permission required".to_string(),
-        ));
-    }
-    if !is_admin_claim(&claims) && claims.fragment != fragment {
-        return Err(AppError::Forbidden(
-            "Access denied to this fragment".to_string(),
-        ));
-    }
-    let cluster_view = ensure_cluster_write_ready(query.expected_epoch).await?;
-
+async fn reconcile_n2_fragment_internal(
+    fragment: &str,
+    expected_epoch: Option<u64>,
+    dry_run: bool,
+    cleanup_orphans: bool,
+    max_objects: usize,
+) -> Result<N2ReconcileResponse, AppError> {
+    let cluster_view = ensure_cluster_write_ready(expected_epoch).await?;
     let cfg = n2_runtime_config();
-    let dry_run = query.dry_run.unwrap_or(false);
-    let cleanup_orphans = query.cleanup_orphans.unwrap_or(true);
-    let max_objects = query.max_objects.unwrap_or(128).clamp(1, 10_000);
-    let maps = list_fragment_n2_maps(fragment.as_str(), max_objects).await?;
+    let maps = list_fragment_n2_maps(fragment, max_objects).await?;
 
     let http_client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -3803,14 +3861,183 @@ pub async fn reconcile_n2_fragment(
         cluster_view.membership_epoch
     );
 
-    Ok(AxumJson(N2ReconcileResponse {
-        fragment,
+    Ok(N2ReconcileResponse {
+        fragment: fragment.to_string(),
         dry_run,
         scanned_objects: results.len(),
         updated_objects,
         failed_objects,
         results,
-    }))
+    })
+}
+
+async fn run_n2_auto_maintenance_once(
+    reason: &str,
+    expected_epoch: u64,
+    mode: N2AutoMaintenanceMode,
+    max_fragments: usize,
+    max_objects_per_fragment: usize,
+    cleanup_orphans: bool,
+) -> Result<AutoMaintenanceRunSummary, AppError> {
+    if matches!(mode, N2AutoMaintenanceMode::Off) {
+        return Ok(AutoMaintenanceRunSummary::default());
+    }
+
+    let dry_run = matches!(mode, N2AutoMaintenanceMode::Observe);
+    let fragments = list_n2_fragments(max_fragments).await?;
+    let mut summary = AutoMaintenanceRunSummary {
+        dry_run,
+        ..Default::default()
+    };
+
+    for fragment in fragments {
+        match reconcile_n2_fragment_internal(
+            fragment.as_str(),
+            Some(expected_epoch),
+            dry_run,
+            cleanup_orphans,
+            max_objects_per_fragment,
+        )
+        .await
+        {
+            Ok(response) => {
+                summary.fragments_scanned = summary.fragments_scanned.saturating_add(1);
+                if response.updated_objects > 0 {
+                    summary.fragments_with_planned_changes =
+                        summary.fragments_with_planned_changes.saturating_add(1);
+                }
+                if response.failed_objects > 0 {
+                    summary.failed_fragments = summary.failed_fragments.saturating_add(1);
+                }
+            }
+            Err(AppError::Conflict(message))
+                if message.contains("membership epoch mismatch")
+                    || message.contains("stale n2 cluster view") =>
+            {
+                return Err(AppError::Conflict(message));
+            }
+            Err(err) => {
+                summary.fragments_scanned = summary.fragments_scanned.saturating_add(1);
+                summary.failed_fragments = summary.failed_fragments.saturating_add(1);
+                warn!(
+                    "n2 auto maintenance fragment failed reason={} fragment={} epoch={} mode={} err={}",
+                    reason,
+                    fragment,
+                    expected_epoch,
+                    mode.as_str(),
+                    err
+                );
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+pub fn schedule_n2_auto_maintenance(reason: &'static str, expected_epoch: u64) {
+    if matches!(
+        n2_runtime_config().auto_maintenance_mode,
+        N2AutoMaintenanceMode::Off
+    ) {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let scheduler = auto_maintenance_scheduler();
+        let should_start = {
+            let mut state = scheduler.lock().await;
+            state.pending_epoch = Some(
+                state
+                    .pending_epoch
+                    .map_or(expected_epoch, |current| current.max(expected_epoch)),
+            );
+            if state.running {
+                false
+            } else {
+                state.running = true;
+                true
+            }
+        };
+
+        if !should_start {
+            return;
+        }
+
+        loop {
+            let epoch = {
+                let mut state = scheduler.lock().await;
+                match state.pending_epoch.take() {
+                    Some(epoch) => epoch,
+                    None => {
+                        state.running = false;
+                        return;
+                    }
+                }
+            };
+
+            let cfg = n2_runtime_config();
+            match run_n2_auto_maintenance_once(
+                reason,
+                epoch,
+                cfg.auto_maintenance_mode,
+                cfg.auto_maintenance_max_fragments,
+                cfg.auto_maintenance_max_objects_per_fragment,
+                cfg.auto_maintenance_cleanup_orphans,
+            )
+            .await
+            {
+                Ok(summary) => {
+                    info!(
+                        "n2 auto maintenance completed reason={} epoch={} mode={} dry_run={} fragments_scanned={} fragments_with_changes={} failed_fragments={}",
+                        reason,
+                        epoch,
+                        cfg.auto_maintenance_mode.as_str(),
+                        summary.dry_run,
+                        summary.fragments_scanned,
+                        summary.fragments_with_planned_changes,
+                        summary.failed_fragments
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        "n2 auto maintenance failed reason={} epoch={} mode={} err={}",
+                        reason,
+                        epoch,
+                        cfg.auto_maintenance_mode.as_str(),
+                        err
+                    );
+                }
+            }
+        }
+    });
+}
+
+pub async fn reconcile_n2_fragment(
+    claims: Claims,
+    Path(fragment): Path<String>,
+    Query(query): Query<ReconcileFragmentQuery>,
+) -> Result<AxumJson<N2ReconcileResponse>, AppError> {
+    if !claims.modify {
+        return Err(AppError::Forbidden(
+            "Modify permission required".to_string(),
+        ));
+    }
+    if !is_admin_claim(&claims) && claims.fragment != fragment {
+        return Err(AppError::Forbidden(
+            "Access denied to this fragment".to_string(),
+        ));
+    }
+
+    Ok(AxumJson(
+        reconcile_n2_fragment_internal(
+            fragment.as_str(),
+            query.expected_epoch,
+            query.dry_run.unwrap_or(false),
+            query.cleanup_orphans.unwrap_or(true),
+            query.max_objects.unwrap_or(128).clamp(1, 10_000),
+        )
+        .await?,
+    ))
 }
 
 pub async fn n2_internal_begin_shard(
@@ -4173,6 +4400,23 @@ mod tests {
             FS_STORAGE_ROOT
                 .set(base.to_string_lossy().to_string())
                 .expect("set FS_STORAGE_ROOT");
+        }
+    }
+
+    async fn reset_n2_test_storage_contents() {
+        if let Some(roots) = INDEX_STORE_DISKS.get() {
+            for root in roots {
+                let path = std::path::Path::new(root);
+                let _ = fs::remove_dir_all(path).await;
+                let _ = fs::create_dir_all(path).await;
+            }
+        }
+        if let Some(roots) = BLOB_STORE_DISKS.get() {
+            for root in roots {
+                let path = std::path::Path::new(root);
+                let _ = fs::remove_dir_all(path).await;
+                let _ = fs::create_dir_all(path).await;
+            }
         }
     }
 
@@ -5631,5 +5875,147 @@ mod tests {
         remote_d_server.abort();
         remote_e_server.abort();
         remote_f_server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn n2_auto_maintenance_observe_then_repair_on_topology_change() {
+        let _guard = STORAGE_TEST_LOCK.lock().await;
+        ensure_n2_test_storage_roots().await;
+        reset_n2_test_storage_contents().await;
+        ensure_auth_env_for_tests();
+
+        let (remote_a_endpoint, remote_a_server) = spawn_internal_session_server().await;
+        let (remote_b_endpoint, remote_b_server) = spawn_internal_session_server().await;
+        let previous_membership = get_membership().await.expect("current membership");
+
+        let remote_a_id = format!("remote-a-{}", Ulid::new());
+        let remote_b_id = format!("remote-b-{}", Ulid::new());
+
+        upsert_membership(UpsertMembershipRequest {
+            epoch: None,
+            nodes: vec![
+                local_node_descriptor(),
+                NodeDescriptor {
+                    node_id: remote_a_id.clone(),
+                    endpoint: remote_a_endpoint.clone(),
+                    epoch: 0,
+                    active: true,
+                },
+            ],
+        })
+        .await
+        .expect("set initial two-node membership");
+
+        let fragment = format!("frag-{}", Ulid::new());
+        let object_key = "videos/auto-maintenance.bin".to_string();
+        let payload = sample_bytes(1_400_000, 151);
+        let put = put_n2_object(
+            full_claims(fragment.as_str()),
+            HeaderMap::new(),
+            AxumPath((fragment.clone(), object_key.clone())),
+            AxumQuery(PutObjectQuery {
+                uid: Some(fragment.clone()),
+                version_id: None,
+                expected_epoch: None,
+                kc: Some(1),
+                mc: Some(1),
+                kd: Some(1),
+                md: Some(0),
+                stripe_block_size: Some(256 * 1024),
+                content_type: Some("application/octet-stream".to_string()),
+            }),
+            Body::from(payload.clone()),
+        )
+        .await
+        .expect("put replicated object");
+        assert_eq!(put.0.committed_shards, 2);
+
+        let after_topology_change = upsert_membership(UpsertMembershipRequest {
+            epoch: None,
+            nodes: vec![
+                local_node_descriptor(),
+                NodeDescriptor {
+                    node_id: remote_b_id.clone(),
+                    endpoint: remote_b_endpoint.clone(),
+                    epoch: 0,
+                    active: true,
+                },
+            ],
+        })
+        .await
+        .expect("switch placement target to remote-b");
+
+        let observe = run_n2_auto_maintenance_once(
+            "test-observe",
+            after_topology_change.epoch,
+            N2AutoMaintenanceMode::Observe,
+            16,
+            64,
+            true,
+        )
+        .await
+        .expect("observe auto maintenance");
+        assert!(observe.dry_run);
+        assert_eq!(observe.fragments_scanned, 1);
+        assert_eq!(observe.fragments_with_planned_changes, 1);
+
+        let observed_map = load_n2_object_map_local(
+            fragment.as_str(),
+            object_key.as_str(),
+            Some(put.0.version_id.as_str()),
+        )
+        .await
+        .expect("load observed map");
+        assert_eq!(observed_map.epoch, put.0.object.epoch);
+        assert_eq!(observed_map.shards.len(), put.0.object.shards.len());
+
+        let repair = run_n2_auto_maintenance_once(
+            "test-repair",
+            after_topology_change.epoch,
+            N2AutoMaintenanceMode::RepairAndRedistribute,
+            16,
+            64,
+            true,
+        )
+        .await
+        .expect("repair auto maintenance");
+        assert!(!repair.dry_run);
+        assert_eq!(repair.fragments_scanned, 1);
+        assert_eq!(repair.fragments_with_planned_changes, 1);
+        assert_eq!(repair.failed_fragments, 0);
+
+        let repaired_map = load_n2_object_map_local(
+            fragment.as_str(),
+            object_key.as_str(),
+            Some(put.0.version_id.as_str()),
+        )
+        .await
+        .expect("load repaired map");
+        assert_eq!(repaired_map.epoch, after_topology_change.epoch);
+        assert_eq!(repaired_map.shards.len(), put.0.object.shards.len());
+
+        let response = get_n2_object(
+            full_claims(fragment.as_str()),
+            HeaderMap::new(),
+            AxumPath((fragment.clone(), object_key.clone())),
+            AxumQuery(GetObjectQuery {
+                version_id: Some(put.0.version_id.clone()),
+            }),
+        )
+        .await
+        .expect("read repaired object")
+        .into_response();
+        let got = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read repaired body");
+        assert_eq!(got.as_ref(), payload.as_slice());
+
+        let _ = upsert_membership(UpsertMembershipRequest {
+            epoch: None,
+            nodes: previous_membership.nodes,
+        })
+        .await;
+        remote_a_server.abort();
+        remote_b_server.abort();
     }
 }

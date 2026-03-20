@@ -65,6 +65,10 @@ As of 2026-03-20:
   - `committed_shards` in the response is the immediate placement truth
   - `cluster_commit_mode=quorum` is still available as an explicit operator override for degraded-write acceptance
   - reconcile is the supported way to restore missing peer copies after degraded periods
+- Current automatic maintenance semantics:
+  - `auto_maintenance_mode=off` is the safe default
+  - `observe` reports redistribution/healing debt without mutating placement
+  - `repair_and_redistribute` runs bounded automatic reconcile after membership epoch changes
 - Current timeout tuning note:
   - conservative defaults are safe
   - low-latency LAN clusters usually want a lower `remote_request_timeout_ms` for faster degraded fallback

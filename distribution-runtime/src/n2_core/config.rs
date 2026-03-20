@@ -4,6 +4,23 @@ use ini::Ini;
 use once_cell::sync::OnceCell;
 use std::path::PathBuf;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum N2AutoMaintenanceMode {
+    Off,
+    Observe,
+    RepairAndRedistribute,
+}
+
+impl N2AutoMaintenanceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Observe => "observe",
+            Self::RepairAndRedistribute => "repair_and_redistribute",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct N2RuntimeConfig {
     pub node_id: String,
@@ -11,6 +28,10 @@ pub struct N2RuntimeConfig {
     pub membership_file: PathBuf,
     pub internal_token: String,
     pub cluster_commit_mode: ClusterCommitMode,
+    pub auto_maintenance_mode: N2AutoMaintenanceMode,
+    pub auto_maintenance_max_fragments: usize,
+    pub auto_maintenance_max_objects_per_fragment: usize,
+    pub auto_maintenance_cleanup_orphans: bool,
     pub auto_cross_params: bool,
     pub cluster_stripe_block_size: usize,
     pub remote_request_timeout_ms: u64,
@@ -54,6 +75,10 @@ fn default_cluster_commit_mode() -> ClusterCommitMode {
     ClusterCommitMode::StrictFullPlacement
 }
 
+fn default_auto_maintenance_mode() -> N2AutoMaintenanceMode {
+    N2AutoMaintenanceMode::Off
+}
+
 fn normalize_stripe_block_size(v: usize) -> usize {
     let clamped = v.clamp(4 * 1024, 4 * 1024 * 1024);
     ((clamped + 4095) / 4096) * 4096
@@ -68,6 +93,24 @@ fn parse_cluster_commit_mode(raw: Option<&str>, default: ClusterCommitMode) -> C
                 || v.eq_ignore_ascii_case("full_placement") =>
         {
             ClusterCommitMode::StrictFullPlacement
+        }
+        _ => default,
+    }
+}
+
+fn parse_auto_maintenance_mode(
+    raw: Option<&str>,
+    default: N2AutoMaintenanceMode,
+) -> N2AutoMaintenanceMode {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) if v.eq_ignore_ascii_case("off") => N2AutoMaintenanceMode::Off,
+        Some(v) if v.eq_ignore_ascii_case("observe") => N2AutoMaintenanceMode::Observe,
+        Some(v)
+            if v.eq_ignore_ascii_case("repair")
+                || v.eq_ignore_ascii_case("repair_and_redistribute")
+                || v.eq_ignore_ascii_case("heal") =>
+        {
+            N2AutoMaintenanceMode::RepairAndRedistribute
         }
         _ => default,
     }
@@ -93,6 +136,10 @@ fn load_runtime_config() -> N2RuntimeConfig {
         membership_file: resolve_membership_path("n2_cluster_membership.json"),
         internal_token: default_internal_token(),
         cluster_commit_mode: default_cluster_commit_mode(),
+        auto_maintenance_mode: default_auto_maintenance_mode(),
+        auto_maintenance_max_fragments: 64,
+        auto_maintenance_max_objects_per_fragment: 256,
+        auto_maintenance_cleanup_orphans: true,
         auto_cross_params: default_auto_cross_params(),
         cluster_stripe_block_size: 256 * 1024,
         remote_request_timeout_ms: 60_000,
@@ -129,6 +176,29 @@ fn load_runtime_config() -> N2RuntimeConfig {
         .unwrap_or(defaults.internal_token);
     let cluster_commit_mode =
         parse_cluster_commit_mode(sec.get("cluster_commit_mode"), defaults.cluster_commit_mode);
+    let auto_maintenance_mode = parse_auto_maintenance_mode(
+        sec.get("auto_maintenance_mode"),
+        defaults.auto_maintenance_mode,
+    );
+    let auto_maintenance_max_fragments = parse_usize_or_default(
+        sec.get("auto_maintenance_max_fragments"),
+        defaults.auto_maintenance_max_fragments,
+    )
+    .clamp(1, 4_096);
+    let auto_maintenance_max_objects_per_fragment = parse_usize_or_default(
+        sec.get("auto_maintenance_max_objects_per_fragment"),
+        defaults.auto_maintenance_max_objects_per_fragment,
+    )
+    .clamp(1, 100_000);
+    let auto_maintenance_cleanup_orphans = sec
+        .get("auto_maintenance_cleanup_orphans")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(defaults.auto_maintenance_cleanup_orphans);
     let auto_cross_params = sec
         .get("auto_cross_params")
         .map(|v| {
@@ -160,6 +230,10 @@ fn load_runtime_config() -> N2RuntimeConfig {
         membership_file,
         internal_token,
         cluster_commit_mode,
+        auto_maintenance_mode,
+        auto_maintenance_max_fragments,
+        auto_maintenance_max_objects_per_fragment,
+        auto_maintenance_cleanup_orphans,
         auto_cross_params,
         cluster_stripe_block_size,
         remote_request_timeout_ms,
@@ -332,6 +406,25 @@ mod tests {
         assert_eq!(
             parse_cluster_commit_mode(Some("quorum"), ClusterCommitMode::StrictFullPlacement),
             ClusterCommitMode::Quorum
+        );
+    }
+
+    #[test]
+    fn auto_maintenance_mode_parser_accepts_repair_aliases() {
+        assert_eq!(
+            parse_auto_maintenance_mode(Some("observe"), N2AutoMaintenanceMode::Off),
+            N2AutoMaintenanceMode::Observe
+        );
+        assert_eq!(
+            parse_auto_maintenance_mode(Some("repair"), N2AutoMaintenanceMode::Off),
+            N2AutoMaintenanceMode::RepairAndRedistribute
+        );
+        assert_eq!(
+            parse_auto_maintenance_mode(
+                Some("repair_and_redistribute"),
+                N2AutoMaintenanceMode::Off
+            ),
+            N2AutoMaintenanceMode::RepairAndRedistribute
         );
     }
 }

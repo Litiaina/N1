@@ -106,6 +106,10 @@ Multi-node N2 operator note from the current 2-node hardware pass:
   - inspect `committed_shards` and `required_commit_shards`
   - switch to `cluster_commit_mode=quorum` only when you intentionally want degraded writes to succeed with less than full placement
   - run reconcile after degraded periods or peer recovery
+- N2 now also supports opt-in topology-driven auto maintenance
+  - `auto_maintenance_mode=off` keeps all healing/redistribution manual
+  - `auto_maintenance_mode=observe` reports maintenance debt without mutating placement
+  - `auto_maintenance_mode=repair_and_redistribute` runs bounded automatic reconcile after membership epoch changes
 - real-hardware reference from that pass:
   - `256 MiB` put: `24.86 MiB/s`
   - local read: `164.96 MiB/s`

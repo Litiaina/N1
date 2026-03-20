@@ -2,6 +2,7 @@ use crate::enums::app_error_enum::AppError;
 use crate::middleware::auth_middleware::ADMIN_KEY;
 use crate::n2_core::config::effective_cross_params;
 use crate::n2_core::config::n2_runtime_config;
+use crate::n2_core::data_plane::schedule_n2_auto_maintenance;
 use crate::n2_core::model::{
     ClusterMembership, ClusterViewQuery, ObjectIdentity, ResolvePlacementQuery,
     UpsertMembershipRequest,
@@ -176,7 +177,9 @@ pub async fn put_n2_membership(
     }
     let (previous, next) = stage_upsert_membership(payload).await?;
     propagate_membership_snapshot(&previous, &next).await?;
-    Ok(AxumJson(apply_membership_snapshot(next).await?))
+    let applied = apply_membership_snapshot(next).await?;
+    schedule_n2_auto_maintenance("membership_apply", applied.epoch);
+    Ok(AxumJson(applied))
 }
 
 pub async fn rollback_n2_membership(
@@ -190,7 +193,9 @@ pub async fn rollback_n2_membership(
     }
     let (previous, next) = stage_rollback_membership(epoch).await?;
     propagate_membership_snapshot(&previous, &next).await?;
-    Ok(AxumJson(apply_membership_snapshot(next).await?))
+    let applied = apply_membership_snapshot(next).await?;
+    schedule_n2_auto_maintenance("membership_rollback", applied.epoch);
+    Ok(AxumJson(applied))
 }
 
 pub async fn put_n2_internal_membership(
@@ -198,7 +203,9 @@ pub async fn put_n2_internal_membership(
     AxumJson(payload): AxumJson<ClusterMembership>,
 ) -> Result<AxumJson<crate::n2_core::model::ClusterMembership>, AppError> {
     validate_internal_token(&headers)?;
-    Ok(AxumJson(apply_membership_snapshot(payload).await?))
+    let applied = apply_membership_snapshot(payload).await?;
+    schedule_n2_auto_maintenance("membership_internal_apply", applied.epoch);
+    Ok(AxumJson(applied))
 }
 
 pub async fn resolve_n2_placement(

@@ -102,6 +102,10 @@ node_endpoint=https://192.168.0.10:50001
 cluster_membership_file=n2_cluster_membership.json
 internal_token=replace-this-with-a-long-random-secret
 cluster_commit_mode=strict_full_placement
+auto_maintenance_mode=off
+auto_maintenance_max_fragments=64
+auto_maintenance_max_objects_per_fragment=256
+auto_maintenance_cleanup_orphans=true
 auto_cross_params=true
 cluster_stripe_block_size=262144
 remote_request_timeout_ms=15000
@@ -117,6 +121,9 @@ Notes:
 - `auto_cross_params=true` is a good default unless you intentionally want fixed EC policy
 - `cluster_commit_mode=strict_full_placement` is now the safe default for operator-first clusters
 - set `cluster_commit_mode=quorum` only when you explicitly want degraded writes to succeed with less than full planned placement
+- `auto_maintenance_mode=off` keeps N2 fully operator-driven
+- `auto_maintenance_mode=observe` lets N2 detect redistribution/healing debt on topology changes without mutating data
+- `auto_maintenance_mode=repair_and_redistribute` lets N2 automatically run bounded reconcile after membership epoch changes
 
 ## 6. Membership File Pattern
 
@@ -180,6 +187,8 @@ Operator rule:
 - keep `cluster_commit_mode=strict_full_placement` for normal multi-node deployments
 - switch to `cluster_commit_mode=quorum` only as an explicit operator choice when degraded-write availability matters more than immediate full placement
 - still watch `committed_shards` and run `POST /v4/n2/reconcile/{fragment}` after outages, degraded windows, or peer rejoin
+- keep `auto_maintenance_mode=off` until you trust the cluster and want bounded automatic healing/redistribution
+- use `observe` first, then promote to `repair_and_redistribute` once you are satisfied with the debt reporting
 
 ## 9. Tested 2-Node Reference
 
