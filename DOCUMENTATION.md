@@ -14,8 +14,8 @@
 > - `N1` is the shared storage engine used by both deployment shapes.
 > - `standard` is the stable single-node deployment path.
 > - `standard` is released at `0.6.2`.
-> - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path in this workspace and is released at `0.1.2`.
-> - `registry-runtime` (`registry-server`) is the SQLite-backed Registry layer for user/business metadata and is versioned independently at `0.2.1`.
+> - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path in this workspace and is released at `0.2.0`.
+> - `registry-runtime` (`registry-server`) is the SQLite-backed Registry layer for user/business metadata and is versioned independently at `0.3.0`.
 > - `arc` is experimental for raw-device deployments.
 > - See `DEPLOYMENT_PROFILES.md`.
 >
@@ -132,12 +132,14 @@ Registry base URL example:
 Startup note:
 - if `registry.env` is missing in the current working directory, the Registry creates a template automatically and then stops on the first required unset value
 
-Registry routes available in `0.2.1`:
+Registry routes available in `0.3.0`:
 - `GET /health`
+- `GET /v1/ws`
 - `POST /v1/admin/bootstrap`
 - `POST /v1/admin/auth/login`
 - `POST /v1/admin/users`
 - `GET /v1/admin/users`
+- `GET /v1/admin/stats`
 - `POST /v1/admin/users/{uid}/quota`
 - `POST /v1/admin/users/{uid}/credentials`
 - `POST /v1/admin/users/{uid}/2fa/setup`
@@ -167,18 +169,22 @@ Registry routes available in `0.2.1`:
 - `POST /v1/objects/trash/empty`
 - `DELETE /v1/objects`
 - `GET /v1/objects`
+- `GET /v1/objects/stats`
 - `GET /v1/objects/resolve`
 
 Registry responsibilities:
 - first-administrator bootstrap guarded by `REGISTRY_MASTER_KEY`
 - administrator identity, user administration, and quota control
-- user creation and login
+- administrator-created user/account provisioning plus normal user login/signup
 - rotating browser/client refresh-session management
+- owner-scoped and admin-wide realtime websocket events for Registry-backed clients and admin surfaces
 - self-service account changes (email, password, optional 2FA)
+- registry-wide statistics aggregation for the admin control plane
 - user quota accounting
 - ownership metadata
 - logical listing/filtering
 - prefix/delimiter browsing for Registry-backed clients
+- filtered object statistics for Registry-backed clients and admin-facing insights
 - prefix/search archive selection resolved into exact-key manifests for the storage engine
 - fragment binding to a `single_node` or `multi_node` storage backend
 - brokering short-lived storage sessions for Registry-backed clients and future GUI/web surfaces
@@ -190,6 +196,19 @@ Current Registry backing store:
 Current product surface:
 - CLI + HTTP API are the stable shipped interfaces in this repository today
 - bundled web/admin surfaces exist for development, but they are still under development and are not part of the stable N2 release contract yet
+
+Realtime websocket contract:
+- route: `GET /v1/ws?token=<registry_access_token>`
+- auth: same Registry JWT access token issued by login/signup/refresh/bootstrap
+- envelope:
+  - `HELLO`
+  - `PONG`
+  - `EVENT`
+- current event families:
+  - user/account/admin mutations
+  - fragment link/invalidation events
+  - object register/finalize/rename/trash/recover/delete events
+  - state invalidation events for bulk or lagged consumers
 
 ### 1.1.1 `POST /v1/admin/bootstrap`
 Purpose:
@@ -262,6 +281,7 @@ Notes:
 - refresh tokens are server-tracked and rotate on every successful refresh
 - `POST /v1/auth/logout` revokes the current refresh chain
 - user and admin login both accept `otp` when 2FA is enabled
+- `POST /v1/auth/signup` only accepts `email` and `password`; quota is always server-assigned and cannot be chosen by the caller
 
 ### 1.1.4 Self-service account routes
 Routes:
@@ -287,6 +307,7 @@ TOTP profile:
 Routes:
 - `POST /v1/admin/users`
 - `GET /v1/admin/users`
+- `GET /v1/admin/stats`
 - `POST /v1/admin/users/{uid}/quota`
 - `POST /v1/admin/users/{uid}/credentials`
 - `POST /v1/admin/users/{uid}/2fa/setup`
@@ -295,9 +316,82 @@ Routes:
 
 Notes:
 - these routes require an administrator bearer token
-- `POST /v1/admin/users` can create either normal users or additional admins
+- `POST /v1/admin/users` can create either normal users or additional admins, and can optionally override the default quota for the new account
+- admin-created accounts automatically get the normal Registry-managed default fragment/bootstrap path
+- `GET /v1/admin/stats` returns:
+  - global quota and usage totals
+  - file-type distribution
+  - largest ready objects
+  - currently active users and sessions
+  - top storage-consuming users
 - admin 2FA setup returns a secret, otpauth URI, and QR PNG data URL for the target user
 - deleting a user removes Registry state and deletes linked managed fragments through the storage engine before the account row is removed
+
+Example `POST /v1/admin/users` request:
+```json
+{
+  "email": "staff@example.com",
+  "password": "temporary-password",
+  "quota_limit_bytes": 53687091200,
+  "is_admin": false
+}
+```
+
+Example `GET /v1/admin/stats` response shape:
+```json
+{
+  "generated_at": "2026-03-21T12:34:56Z",
+  "totals": {
+    "total_users": 42,
+    "admin_users": 2,
+    "two_factor_enabled_users": 5,
+    "users_using_storage": 17,
+    "total_quota_bytes": 1099511627776,
+    "total_used_bytes": 268435456000,
+    "total_fragments": 42,
+    "ready_objects": 12844,
+    "trashed_objects": 103,
+    "pending_uploads": 2,
+    "active_sessions": 7,
+    "active_users": 4
+  },
+  "file_types": [],
+  "largest_objects": [],
+  "active_users": [],
+  "top_storage_users": []
+}
+```
+
+### 1.1.5.1 `GET /v1/objects/stats`
+Purpose:
+- returns full Registry-side object totals for the caller's current logical scope
+- intended for Registry-backed client insights panels without relying on the currently paginated page only
+
+Query parameters:
+- `fragment`
+- `prefix`
+- `search`
+- `include_pending`
+- `include_trashed`
+
+Response shape:
+```json
+{
+  "total_objects": 1204,
+  "total_size_bytes": 987654321,
+  "extension_stats": [
+    {
+      "extension": "dcm",
+      "object_count": 903,
+      "total_size_bytes": 812345678
+    }
+  ]
+}
+```
+
+Notes:
+- this route is authenticated with the caller's normal Registry bearer token
+- totals are computed across the full filtered Registry scope, not just the current UI page
 
 ### 1.1.6 `GET /v1/fragments`
 Purpose:

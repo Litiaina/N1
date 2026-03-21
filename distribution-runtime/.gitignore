@@ -33,3 +33,5 @@ config.ini
 # N2 runtime membership state (node-local operational artifacts)
 n2_cluster_membership.json
 n2_cluster_membership.epoch-*.json
+n2_cluster_membership.governance-*.json
+n2_cluster_membership.governance-*.jsonl

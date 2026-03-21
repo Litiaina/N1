@@ -1,6 +1,6 @@
 [package]
 name = "registry-runtime"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 
 [[bin]]
@@ -13,9 +13,12 @@ axum.workspace = true
 axum-server.workspace = true
 base64.workspace = true
 chrono.workspace = true
+dashmap.workspace = true
 dotenv.workspace = true
+futures-util.workspace = true
 hex.workspace = true
 hmac.workspace = true
+hostname.workspace = true
 image = { version = "0.25.6", default-features = false, features = ["png"] }
 jsonwebtoken.workspace = true
 base32 = "0.5.1"
@@ -39,4 +42,5 @@ uuid.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+tokio-tungstenite = "0.28.0"
 tower.workspace = true

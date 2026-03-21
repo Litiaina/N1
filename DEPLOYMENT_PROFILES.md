@@ -10,8 +10,8 @@ N1 is the shared storage engine underneath it.
 As of 2026-03-20:
 
 - `standard` (`litiaina-n1-standard`) is the single-node N2 deployment path, the default for production, and released at `0.6.2`.
-- `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path on top of the same N1 core and is released at `0.1.2`.
-- `registry-runtime` (`registry-server`) is the SQLite-backed Registry layer used in both deployment shapes and released independently at `0.2.1`.
+- `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path on top of the same N1 core and is released at `0.2.0`.
+- `registry-runtime` (`registry-server`) is the SQLite-backed Registry layer used in both deployment shapes and released independently at `0.3.0`.
 - `arc` (`litiaina-n1-arc`) is the experimental raw-device profile.
 - Privilege split: `standard`, `distribution-runtime`, and `registry-runtime` should normally run as non-root services, while `arc` is the only profile that should require root for raw-device workflows.
 - If you are unsure which one to deploy, use `standard`.
@@ -40,13 +40,15 @@ As of 2026-03-20:
 - Partitioned metadata authority and exact-key object serving.
 - Best operator compatibility and lowest deployment risk.
 
-### Registry (`0.2.1` baseline)
+### Registry (`0.3.0` baseline)
 
 - SQLite-backed metadata and control plane.
 - Runs in both single-node and multi-node deployments.
 - Owns first-admin bootstrap through `REGISTRY_MASTER_KEY`.
-- Owns administrator/user identity, rotating refresh sessions, and optional TOTP 2FA.
-- Owns users, ownership, quotas, logical listing, and logical object lookup.
+- Owns administrator/user identity, administrator-created accounts, rotating refresh sessions, and optional TOTP 2FA.
+- Exposes `GET /v1/ws` for owner-scoped and admin-wide realtime Registry updates.
+- Owns users, ownership, quotas, logical listing, logical object lookup, and Registry-wide statistics aggregation.
+- Public signup stays on default/admin-assigned quota only; quota is not caller-controlled.
 - Owns fragment backend binding (`single_node` vs `multi_node`) for Registry-backed clients.
 - Brokers short-lived storage sessions so clients do not need fragment secrets for normal Registry-backed usage.
 - Resolves prefix/search archive selections into exact-key manifests for engine-side tar streaming.

@@ -4,6 +4,7 @@ mod create_env;
 mod db;
 mod error;
 mod models;
+mod realtime;
 mod storage_broker;
 mod totp;
 
@@ -13,38 +14,43 @@ use std::path::Path;
 use std::sync::Arc;
 
 use auth::{
-    AuthSettings, claims_from_headers, issue_access_token, require_admin_claims,
+    AuthSettings, claims_from_headers, claims_from_token, issue_access_token, require_admin_claims,
     require_master_key, verify_password,
 };
 use axum::body::Body;
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{Path as AxumPath, Query, State, WebSocketUpgrade};
 use axum::http::HeaderName;
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use axum_server::tls_rustls::RustlsConfig;
+use chrono::{Local, Utc};
 use config::{RegistryConfig, normalize_backend_url};
 use db::RegistryDb;
 use error::RegistryError;
 use models::{
-    AdminUserListResponse, AdminUserSummary, ArchiveObjectsRequest, BootstrapAdminRequest,
-    BootstrapAdminResponse, BulkObjectMutationResponse, CreateUserRequest, CreateUserResponse,
-    DeleteObjectQuery, DeleteUserResponse, DisableTwoFactorRequest, EnableTwoFactorRequest,
-    FinalizeObjectRequest, FragmentListResponse, FragmentStateRequest, LinkFragmentRequest,
-    LinkFragmentResponse, ListObjectsQuery, ListObjectsResponse, LoginRequest, LoginResponse,
-    ObjectDeleteResponse, ObjectMutationResponse, ObjectStateRequest, ObjectStatsQuery,
-    ObjectStatsResponse, RefreshRequest, RefreshResponse, RegisterObjectRequest,
+    AdminStatsResponse, AdminUserListResponse, AdminUserSummary, ArchiveObjectsRequest,
+    BootstrapAdminRequest, BootstrapAdminResponse, BulkObjectMutationResponse, CreateUserRequest,
+    CreateUserResponse, DeleteObjectQuery, DeleteUserResponse, DisableTwoFactorRequest,
+    EnableTwoFactorRequest, FinalizeObjectRequest, FragmentListResponse, FragmentStateRequest,
+    LinkFragmentRequest, LinkFragmentResponse, ListObjectsQuery, ListObjectsResponse, LoginRequest,
+    LoginResponse, ObjectDeleteResponse, ObjectMutationResponse, ObjectStateRequest,
+    ObjectStatsQuery, ObjectStatsResponse, RefreshRequest, RefreshResponse, RegisterObjectRequest,
     RenameRegistryObjectRequest, ResolveObjectQuery, SetupTwoFactorRequest, SignupRequest,
     SignupResponse, StorageSessionRequest, StorageSessionResponse, SuggestObjectsQuery,
     SuggestObjectsResponse, TwoFactorSetupResponse, UpdateCredentialsRequest, UpdateEmailRequest,
     UpdatePasswordRequest, UpdateQuotaRequest, UserMutationResponse, UserRecord,
 };
+use realtime::{
+    DeleteObjectNotice, DeleteUserNotice, FragmentNotice, RegistryRealtimeHub,
+    RegistryRealtimePayload, RenameObjectNotice, SessionNotice, StateInvalidatedNotice,
+    TwoFactorNotice, WsAuthParams,
+};
 use std::time::Duration;
 use storage_broker::StorageBroker;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Clone)]
@@ -52,11 +58,36 @@ struct AppState {
     db: RegistryDb,
     auth: Arc<AuthSettings>,
     broker: StorageBroker,
+    realtime: RegistryRealtimeHub,
     write_gate: Arc<Mutex<()>>,
 }
 
 fn default_fragment_name(user: &UserRecord) -> String {
     user.email.clone()
+}
+
+fn publish_owner_event(state: &AppState, owner_uid: &str, payload: RegistryRealtimePayload) {
+    state.realtime.publish_owner(owner_uid, payload);
+}
+
+fn publish_owner_invalidation(
+    state: &AppState,
+    owner_uid: &str,
+    fragment: Option<String>,
+    scope: &str,
+) {
+    publish_owner_event(
+        state,
+        owner_uid,
+        RegistryRealtimePayload::StateInvalidated(StateInvalidatedNotice {
+            fragment,
+            scope: scope.to_string(),
+        }),
+    );
+}
+
+fn publish_admin_event(state: &AppState, payload: RegistryRealtimePayload) {
+    state.realtime.publish_admin(payload);
 }
 
 async fn issue_registry_session(
@@ -188,6 +219,24 @@ async fn run() -> Result<(), String> {
     validate_runtime_paths(&config)?;
     init_tracing();
 
+    let current_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    tracing::info!("╔══════════════════════════════════════════════╗");
+    tracing::info!("║         R E G I S T R Y  S E R V E R         ║");
+    tracing::info!("╚══════════════════════════════════════════════╝");
+    tracing::info!("│ Version        : {}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("│ Status         : ONLINE");
+    tracing::info!("│ Start Time     : {}", current_time);
+    tracing::info!("│ PID            : {}", std::process::id());
+    tracing::info!(
+        "│ Hostname       : {}",
+        hostname::get().unwrap_or_default().to_string_lossy()
+    );
+    tracing::info!(
+        "│ Working Dir    : {}",
+        std::env::current_dir().unwrap_or_default().display()
+    );
+    tracing::info!("╞═════════ ACTIVE CONNECTIONS ═════════╡");
+
     let db = RegistryDb::new(config.sqlite_path.clone(), config.default_quota_bytes);
     db.init()
         .await
@@ -203,6 +252,7 @@ async fn run() -> Result<(), String> {
         }),
         broker: StorageBroker::new(Arc::new(config.clone()))
             .map_err(|err| format!("failed to initialize storage broker: {}", err.message))?,
+        realtime: RegistryRealtimeHub::new(),
         write_gate: Arc::new(Mutex::new(())),
     };
 
@@ -214,11 +264,51 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|err| format!("failed to load registry TLS config: {}", err))?;
 
-    info!("registry runtime listening on {}", addr);
-    axum_server::bind_rustls(addr, tls)
-        .serve(app.into_make_service())
+    serve(addr, app, tls)
         .await
         .map_err(|err| format!("registry server failed: {}", err))
+}
+
+async fn serve(socket: SocketAddr, app: Router, cert: RustlsConfig) -> Result<(), std::io::Error> {
+    tracing::info!("Secured port => {} type: https", socket);
+    let handle = Arc::new(axum_server::Handle::new());
+
+    tokio::spawn(shutdown_signal(handle.clone()));
+
+    let mut server = axum_server::bind_rustls(socket, cert).handle((*handle).clone());
+    server.http_builder().http2().enable_connect_protocol();
+
+    server
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+}
+
+pub async fn shutdown_signal(handle: Arc<axum_server::Handle<SocketAddr>>) {
+    #[cfg(unix)]
+    let terminator = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let mut interrupt =
+            signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+
+        tokio::select! {
+            _ = terminate.recv() => {},
+            _ = interrupt.recv() => {},
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminator = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to listen for ctrl+c event");
+    };
+
+    terminator.await;
+
+    tracing::info!("Shutdown signal received. Stopping server...");
+    handle.graceful_shutdown(Some(Duration::from_secs(10)));
 }
 
 fn build_router(state: AppState) -> Router {
@@ -228,6 +318,7 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/admin/auth/login", post(admin_login))
         .route("/v1/admin/users", post(create_user))
         .route("/v1/admin/users", get(list_admin_users))
+        .route("/v1/admin/stats", get(get_admin_stats))
         .route("/v1/admin/users/{uid}/quota", post(update_admin_user_quota))
         .route(
             "/v1/admin/users/{uid}/credentials",
@@ -246,6 +337,7 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/auth/login", post(login))
         .route("/v1/auth/refresh", post(refresh))
         .route("/v1/auth/logout", post(logout))
+        .route("/v1/ws", get(registry_ws))
         .route("/v1/me", get(me))
         .route("/v1/account/email", post(update_account_email))
         .route("/v1/account/password", post(update_account_password))
@@ -297,6 +389,20 @@ async fn health(
     Ok(Json(state.db.health().await?))
 }
 
+async fn registry_ws(
+    ws: WebSocketUpgrade,
+    Query(params): Query<WsAuthParams>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let claims = match claims_from_token(&params.token, &state.auth) {
+        Ok(claims) => claims,
+        Err(err) => return err.into_response(),
+    };
+    let hub = state.realtime.clone();
+    ws.on_upgrade(move |socket| realtime::handle_socket(socket, hub, claims))
+        .into_response()
+}
+
 async fn bootstrap_admin(
     State(state): State<AppState>,
     Json(req): Json<BootstrapAdminRequest>,
@@ -317,9 +423,31 @@ async fn bootstrap_admin(
         .db
         .create_user(email, password_hash, None, true)
         .await?;
-    let _ = ensure_user_default_fragment(&state, &user).await?;
+    let fragment = ensure_user_default_fragment(&state, &user).await?;
     let (access_token, expires_in, refresh_token, refresh_expires_in) =
         issue_registry_session(&state, &user).await?;
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::UserCreated(user.clone()),
+    );
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::FragmentsInvalidated(FragmentNotice {
+            uid: user.uid.clone(),
+            fragment: Some(fragment),
+        }),
+    );
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::AccountSessionUpdated(SessionNotice {
+            uid: user.uid.clone(),
+            email: user.email.clone(),
+            active: true,
+        }),
+    );
     Ok((
         StatusCode::CREATED,
         Json(BootstrapAdminResponse {
@@ -357,6 +485,15 @@ async fn admin_login(
     let _ = ensure_user_default_fragment(&state, &auth_user.user).await?;
     let (access_token, expires_in, refresh_token, refresh_expires_in) =
         issue_registry_session(&state, &auth_user.user).await?;
+    publish_owner_event(
+        &state,
+        &auth_user.user.uid,
+        RegistryRealtimePayload::AccountSessionUpdated(SessionNotice {
+            uid: auth_user.user.uid.clone(),
+            email: auth_user.user.email.clone(),
+            active: true,
+        }),
+    );
     Ok(Json(LoginResponse {
         access_token,
         token_type: "Bearer",
@@ -392,7 +529,20 @@ async fn create_user(
             req.is_admin.unwrap_or(false),
         )
         .await?;
-    let _ = ensure_user_default_fragment(&state, &user).await?;
+    let fragment = ensure_user_default_fragment(&state, &user).await?;
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::UserCreated(user.clone()),
+    );
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::FragmentsInvalidated(FragmentNotice {
+            uid: user.uid.clone(),
+            fragment: Some(fragment),
+        }),
+    );
     Ok((StatusCode::CREATED, Json(CreateUserResponse { user })))
 }
 
@@ -408,9 +558,31 @@ async fn signup(
         .db
         .create_user(email, password_hash, None, false)
         .await?;
-    let _ = ensure_user_default_fragment(&state, &user).await?;
+    let fragment = ensure_user_default_fragment(&state, &user).await?;
     let (access_token, expires_in, refresh_token, refresh_expires_in) =
         issue_registry_session(&state, &user).await?;
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::AccountCreated(user.clone()),
+    );
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::FragmentsInvalidated(FragmentNotice {
+            uid: user.uid.clone(),
+            fragment: Some(fragment),
+        }),
+    );
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::AccountSessionUpdated(SessionNotice {
+            uid: user.uid.clone(),
+            email: user.email.clone(),
+            active: true,
+        }),
+    );
     Ok((
         StatusCode::CREATED,
         Json(SignupResponse {
@@ -440,6 +612,15 @@ async fn login(
     let _ = ensure_user_default_fragment(&state, &auth_user.user).await?;
     let (access_token, expires_in, refresh_token, refresh_expires_in) =
         issue_registry_session(&state, &auth_user.user).await?;
+    publish_owner_event(
+        &state,
+        &auth_user.user.uid,
+        RegistryRealtimePayload::AccountSessionUpdated(SessionNotice {
+            uid: auth_user.user.uid.clone(),
+            email: auth_user.user.email.clone(),
+            active: true,
+        }),
+    );
     Ok(Json(LoginResponse {
         access_token,
         token_type: "Bearer",
@@ -463,6 +644,15 @@ async fn refresh(
         .rotate_refresh_session(req.refresh_token, state.auth.refresh_token_ttl_secs)
         .await?;
     let (access_token, expires_in) = issue_access_token(&user, &state.auth)?;
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::AccountSessionUpdated(SessionNotice {
+            uid: user.uid.clone(),
+            email: user.email.clone(),
+            active: true,
+        }),
+    );
     Ok(Json(RefreshResponse {
         access_token,
         token_type: "Bearer",
@@ -482,6 +672,13 @@ async fn logout(
         return Err(RegistryError::bad_request("refresh token is required"));
     }
     state.db.revoke_refresh_session(req.refresh_token).await?;
+    publish_admin_event(
+        &state,
+        RegistryRealtimePayload::StateInvalidated(StateInvalidatedNotice {
+            fragment: None,
+            scope: "admin_sessions".to_string(),
+        }),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -519,6 +716,22 @@ async fn list_admin_users(
     Ok(Json(AdminUserListResponse { users: summaries }))
 }
 
+async fn get_admin_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminStatsResponse>, RegistryError> {
+    let _claims = require_admin_claims(&headers, &state.auth)?;
+    let stats = state.db.admin_stats().await?;
+    Ok(Json(AdminStatsResponse {
+        generated_at: Utc::now().to_rfc3339(),
+        totals: stats.totals,
+        file_types: stats.file_types,
+        largest_objects: stats.largest_objects,
+        active_users: stats.active_users,
+        top_storage_users: stats.top_storage_users,
+    }))
+}
+
 async fn update_admin_user_quota(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -536,6 +749,11 @@ async fn update_admin_user_quota(
         .db
         .update_user_quota(uid, req.quota_limit_bytes)
         .await?;
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::UserUpdated(user.clone()),
+    );
     Ok(Json(UserMutationResponse { user }))
 }
 
@@ -570,6 +788,20 @@ async fn update_admin_user_credentials(
         .db
         .update_user_credentials(uid, next_email, next_password_hash, req.is_admin)
         .await?;
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::UserUpdated(user.clone()),
+    );
+    publish_owner_invalidation(&state, &user.uid, None, "account_profile");
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::FragmentsInvalidated(FragmentNotice {
+            uid: user.uid.clone(),
+            fragment: None,
+        }),
+    );
     Ok(Json(UserMutationResponse { user }))
 }
 
@@ -594,6 +826,15 @@ async fn admin_setup_user_2fa(
     let otpauth_uri = totp::otpauth_uri(&target.email, &secret);
     let qr_data_url = totp::qr_data_url(&otpauth_uri)
         .map_err(|err| RegistryError::internal(format!("failed to build 2FA QR: {}", err)))?;
+    publish_owner_event(
+        &state,
+        &target.uid,
+        RegistryRealtimePayload::AccountTwoFactorSetup(TwoFactorNotice {
+            uid: target.uid.clone(),
+            email: target.email.clone(),
+            pending: false,
+        }),
+    );
     Ok(Json(TwoFactorSetupResponse {
         secret,
         otpauth_uri,
@@ -618,6 +859,11 @@ async fn admin_disable_user_2fa(
     verify_password(&req.password, &admin_auth.password_hash)?;
     verify_optional_totp(&admin_auth, req.otp.as_deref())?;
     let user = state.db.clear_totp(uid).await?;
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::UserUpdated(user.clone()),
+    );
     Ok(Json(UserMutationResponse { user }))
 }
 
@@ -641,7 +887,16 @@ async fn delete_admin_user(
     for binding in &bindings {
         state.broker.delete_fragment(binding).await?;
     }
+    let deleted_uid = uid.clone();
     state.db.delete_user_cascade(uid).await?;
+    publish_owner_event(
+        &state,
+        &deleted_uid,
+        RegistryRealtimePayload::UserDeleted(DeleteUserNotice {
+            uid: deleted_uid.clone(),
+            deleted_fragments: deleted_fragments.clone(),
+        }),
+    );
     Ok(Json(DeleteUserResponse {
         removed: true,
         deleted_fragments,
@@ -670,6 +925,19 @@ async fn update_account_email(
         .db
         .update_user_credentials(claims.sub, Some(next_email), None, None)
         .await?;
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::AccountUpdated(user.clone()),
+    );
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::FragmentsInvalidated(FragmentNotice {
+            uid: user.uid.clone(),
+            fragment: None,
+        }),
+    );
     Ok(Json(UserMutationResponse { user }))
 }
 
@@ -693,6 +961,11 @@ async fn update_account_password(
         .db
         .update_user_credentials(claims.sub, None, Some(password_hash), None)
         .await?;
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::AccountUpdated(user.clone()),
+    );
     Ok(Json(UserMutationResponse { user }))
 }
 
@@ -722,6 +995,15 @@ async fn setup_account_2fa(
     let otpauth_uri = totp::otpauth_uri(&auth_user.user.email, &secret);
     let qr_data_url = totp::qr_data_url(&otpauth_uri)
         .map_err(|err| RegistryError::internal(format!("failed to build 2FA QR: {}", err)))?;
+    publish_owner_event(
+        &state,
+        &auth_user.user.uid,
+        RegistryRealtimePayload::AccountTwoFactorSetup(TwoFactorNotice {
+            uid: auth_user.user.uid.clone(),
+            email: auth_user.user.email.clone(),
+            pending: true,
+        }),
+    );
     Ok(Json(TwoFactorSetupResponse {
         secret,
         otpauth_uri,
@@ -751,6 +1033,11 @@ async fn enable_account_2fa(
         return Err(RegistryError::unauthorized("invalid OTP"));
     }
     let user = state.db.activate_totp_secret(claims.sub).await?;
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::AccountUpdated(user.clone()),
+    );
     Ok(Json(UserMutationResponse { user }))
 }
 
@@ -769,6 +1056,11 @@ async fn disable_account_2fa(
     verify_password(&req.password, &auth_user.password_hash)?;
     verify_optional_totp(&auth_user, req.otp.as_deref())?;
     let user = state.db.clear_totp(claims.sub).await?;
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::AccountUpdated(user.clone()),
+    );
     Ok(Json(UserMutationResponse { user }))
 }
 
@@ -806,6 +1098,19 @@ async fn link_fragment(
                 .filter(|value| !value.is_empty()),
         )
         .await?;
+    publish_owner_event(
+        &state,
+        &binding.owner_uid,
+        RegistryRealtimePayload::FragmentLinked(binding.clone()),
+    );
+    publish_owner_event(
+        &state,
+        &binding.owner_uid,
+        RegistryRealtimePayload::FragmentsInvalidated(FragmentNotice {
+            uid: binding.owner_uid.clone(),
+            fragment: Some(binding.fragment.clone()),
+        }),
+    );
     Ok((StatusCode::CREATED, Json(LinkFragmentResponse { binding })))
 }
 
@@ -857,6 +1162,17 @@ async fn register_object(
         )
         .await?;
     let user = state.db.get_user(claims.sub).await?;
+    publish_owner_event(
+        &state,
+        &object.owner_uid,
+        RegistryRealtimePayload::FileRegistered(object.clone()),
+    );
+    publish_owner_invalidation(
+        &state,
+        &object.owner_uid,
+        Some(object.fragment.clone()),
+        "objects",
+    );
     Ok((
         StatusCode::CREATED,
         Json(ObjectMutationResponse {
@@ -894,6 +1210,17 @@ async fn finalize_object(
             req.content_type,
         )
         .await?;
+    publish_owner_event(
+        &state,
+        &object.owner_uid,
+        RegistryRealtimePayload::FileUploaded(object.clone()),
+    );
+    publish_owner_invalidation(
+        &state,
+        &object.owner_uid,
+        Some(object.fragment.clone()),
+        "objects",
+    );
     Ok(Json(ObjectMutationResponse {
         object,
         quota_limit_bytes: user.quota_limit_bytes,
@@ -1078,16 +1405,30 @@ async fn rename_object(
             "source_key and destination_key are required",
         ));
     }
+    let fragment = req.fragment.clone();
+    let source_key = req.source_key.trim().to_string();
+    let destination_key = req.destination_key.trim().to_string();
     let claims = claims_from_headers(&headers, &state.auth)?;
     let (object, user) = state
         .db
         .rename_object(
             claims.sub,
-            req.fragment,
-            req.source_key.trim().to_string(),
-            req.destination_key.trim().to_string(),
+            fragment.clone(),
+            source_key.clone(),
+            destination_key.clone(),
         )
         .await?;
+    publish_owner_event(
+        &state,
+        &object.owner_uid,
+        RegistryRealtimePayload::FileRenamed(RenameObjectNotice {
+            source_fragment: fragment.clone(),
+            source_key,
+            destination_fragment: fragment.clone(),
+            destination_key,
+        }),
+    );
+    publish_owner_invalidation(&state, &object.owner_uid, Some(fragment), "objects");
     Ok(Json(ObjectMutationResponse {
         object,
         quota_limit_bytes: user.quota_limit_bytes,
@@ -1102,11 +1443,23 @@ async fn trash_object(
 ) -> Result<Json<ObjectMutationResponse>, RegistryError> {
     validate_fragment_and_key(&req.fragment, &req.object_key)?;
     let _write_guard = state.write_gate.lock().await;
+    let fragment = req.fragment.clone();
+    let object_key = req.object_key.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
     let (object, user) = state
         .db
-        .set_object_status(claims.sub, req.fragment, req.object_key, "trashed")
+        .set_object_status(claims.sub, fragment.clone(), object_key.clone(), "trashed")
         .await?;
+    publish_owner_event(
+        &state,
+        &object.owner_uid,
+        RegistryRealtimePayload::FileDeleted(DeleteObjectNotice {
+            fragment: fragment.clone(),
+            object_key,
+            version_id: None,
+        }),
+    );
+    publish_owner_invalidation(&state, &object.owner_uid, Some(fragment), "objects");
     Ok(Json(ObjectMutationResponse {
         object,
         quota_limit_bytes: user.quota_limit_bytes,
@@ -1121,11 +1474,19 @@ async fn recover_object(
 ) -> Result<Json<ObjectMutationResponse>, RegistryError> {
     validate_fragment_and_key(&req.fragment, &req.object_key)?;
     let _write_guard = state.write_gate.lock().await;
+    let fragment = req.fragment.clone();
+    let object_key = req.object_key.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
     let (object, user) = state
         .db
-        .set_object_status(claims.sub, req.fragment, req.object_key, "ready")
+        .set_object_status(claims.sub, fragment.clone(), object_key, "ready")
         .await?;
+    publish_owner_event(
+        &state,
+        &object.owner_uid,
+        RegistryRealtimePayload::FileUploaded(object.clone()),
+    );
+    publish_owner_invalidation(&state, &object.owner_uid, Some(fragment), "objects");
     Ok(Json(ObjectMutationResponse {
         object,
         quota_limit_bytes: user.quota_limit_bytes,
@@ -1140,11 +1501,23 @@ async fn delete_object(
 ) -> Result<Json<ObjectDeleteResponse>, RegistryError> {
     validate_fragment_and_key(&query.fragment, &query.object_key)?;
     let _write_guard = state.write_gate.lock().await;
+    let fragment = query.fragment.clone();
+    let object_key = query.object_key.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
     let user = state
         .db
-        .delete_object(claims.sub, query.fragment, query.object_key)
+        .delete_object(claims.sub, fragment.clone(), object_key.clone())
         .await?;
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::FileDeleted(DeleteObjectNotice {
+            fragment: fragment.clone(),
+            object_key,
+            version_id: None,
+        }),
+    );
+    publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
     Ok(Json(ObjectDeleteResponse {
         removed: true,
         quota_limit_bytes: user.quota_limit_bytes,
@@ -1159,11 +1532,13 @@ async fn recover_all_objects(
 ) -> Result<Json<BulkObjectMutationResponse>, RegistryError> {
     validate_fragment(&req.fragment)?;
     let _write_guard = state.write_gate.lock().await;
+    let fragment = req.fragment.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
     let (affected, user) = state
         .db
-        .recover_all_trashed(claims.sub, req.fragment)
+        .recover_all_trashed(claims.sub, fragment.clone())
         .await?;
+    publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
     Ok(Json(BulkObjectMutationResponse {
         affected,
         quota_limit_bytes: user.quota_limit_bytes,
@@ -1178,8 +1553,10 @@ async fn empty_trash(
 ) -> Result<Json<BulkObjectMutationResponse>, RegistryError> {
     validate_fragment(&req.fragment)?;
     let _write_guard = state.write_gate.lock().await;
+    let fragment = req.fragment.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
-    let (affected, user) = state.db.empty_trash(claims.sub, req.fragment).await?;
+    let (affected, user) = state.db.empty_trash(claims.sub, fragment.clone()).await?;
+    publish_owner_invalidation(&state, &user.uid, Some(fragment), "trash");
     Ok(Json(BulkObjectMutationResponse {
         affected,
         quota_limit_bytes: user.quota_limit_bytes,
@@ -1307,8 +1684,14 @@ mod tests {
     };
     use axum::http::{Request, StatusCode};
     use axum::routing::post;
+    use futures_util::StreamExt;
+    use reqwest::Client;
     use serde_json::{Value, json};
+    use tokio::time::{Duration, timeout};
+    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
     use tower::ServiceExt;
+
+    type TestWsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
     async fn spawn_storage_stub(token: &'static str) -> String {
         let app = Router::new()
@@ -1411,10 +1794,102 @@ mod tests {
             db,
             auth: auth.clone(),
             broker: StorageBroker::new(config).expect("build broker"),
+            realtime: RegistryRealtimeHub::new(),
             write_gate: Arc::new(Mutex::new(())),
         };
         let (token, _) = issue_access_token(&user, &auth).expect("issue access token");
         (state, token)
+    }
+
+    async fn spawn_registry_server(state: AppState) -> String {
+        let app = build_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind registry test server");
+        let addr = listener.local_addr().expect("registry test server addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve registry test server");
+        });
+        format!("http://{}", addr)
+    }
+
+    async fn connect_registry_ws(base_url: &str, token: &str) -> TestWsStream {
+        let ws_url = format!(
+            "{}/v1/ws?token={}",
+            base_url.replacen("http://", "ws://", 1),
+            token
+        );
+        let (socket, _response) = connect_async(ws_url).await.expect("connect registry ws");
+        socket
+    }
+
+    async fn consume_ws_hello(socket: &mut TestWsStream) {
+        loop {
+            let message = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("hello timeout")
+                .expect("hello frame")
+                .expect("hello message");
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                let json: Value = serde_json::from_str(&text).expect("parse hello message");
+                if json["op"] == "HELLO" {
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn wait_for_event_type(socket: &mut TestWsStream, wanted_type: &str) -> Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let message = timeout(remaining, socket.next())
+                .await
+                .expect("event timeout")
+                .expect("event frame")
+                .expect("event message");
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                let json: Value = serde_json::from_str(&text).expect("parse event json");
+                if json["op"] == "PONG" || json["op"] == "HELLO" {
+                    continue;
+                }
+                if json["op"] == "EVENT" && json["d"]["type"] == wanted_type {
+                    return json["d"].clone();
+                }
+            }
+        }
+    }
+
+    async fn wait_for_state_scope(socket: &mut TestWsStream, wanted_scope: &str) -> Value {
+        loop {
+            let event = wait_for_event_type(socket, "STATE_INVALIDATED").await;
+            if event["data"]["scope"].as_str() == Some(wanted_scope) {
+                return event;
+            }
+        }
+    }
+
+    async fn expect_no_registry_event(socket: &mut TestWsStream, wait_for: Duration) {
+        let start = tokio::time::Instant::now();
+        loop {
+            let remaining = wait_for.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return;
+            }
+            let next = timeout(remaining, socket.next()).await;
+            let Ok(Some(Ok(message))) = next else {
+                return;
+            };
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                let json: Value = serde_json::from_str(&text).expect("parse no-event json");
+                if json["op"] == "HELLO" || json["op"] == "PONG" {
+                    continue;
+                }
+                panic!("unexpected websocket event: {}", json);
+            }
+        }
     }
 
     #[tokio::test]
@@ -1873,6 +2348,457 @@ mod tests {
                 .iter()
                 .any(|user| user["email"] == "admin@example.com" && user["is_admin"] == true)
         );
+    }
+
+    #[tokio::test]
+    async fn admin_stats_expose_usage_and_activity() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, _) = test_state(single_url, multi_url).await;
+        let drive_user = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user")
+            .user;
+        let admin_hash = auth::hash_password("password123").expect("hash admin password");
+        let admin_user = state
+            .db
+            .create_user(
+                "admin@example.com".to_string(),
+                admin_hash,
+                Some(100 * 1024 * 1024),
+                true,
+            )
+            .await
+            .expect("create admin user");
+
+        state
+            .db
+            .upsert_fragment_binding(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment a");
+        state
+            .db
+            .upsert_fragment_binding(
+                drive_user.uid.clone(),
+                "fragment-b".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment b");
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "images/scan1.dcm".to_string(),
+                "01HREGSTATS0000000000000000001".to_string(),
+                4096,
+                Some("application/dicom".to_string()),
+            )
+            .await
+            .expect("finalize scan");
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "reports/report.pdf".to_string(),
+                "01HREGSTATS0000000000000000002".to_string(),
+                2048,
+                Some("application/pdf".to_string()),
+            )
+            .await
+            .expect("finalize report");
+        state
+            .db
+            .register_pending_object(
+                drive_user.uid.clone(),
+                "fragment-b".to_string(),
+                "uploads/pending.bin".to_string(),
+                Some(8192),
+                Some("application/octet-stream".to_string()),
+            )
+            .await
+            .expect("register pending");
+        state
+            .db
+            .create_refresh_session(drive_user.uid.clone(), 3600)
+            .await
+            .expect("create refresh session");
+
+        let (admin_token, _) =
+            issue_access_token(&admin_user, &state.auth).expect("issue admin access token");
+        let app = build_router(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/admin/stats")
+            .header("authorization", format!("Bearer {}", admin_token))
+            .body(Body::empty())
+            .expect("admin stats request");
+        let resp = app
+            .clone()
+            .oneshot(req)
+            .await
+            .expect("admin stats response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read admin stats body");
+        let json: Value = serde_json::from_slice(&body).expect("parse admin stats body");
+
+        assert_eq!(json["totals"]["total_users"], 2);
+        assert_eq!(json["totals"]["admin_users"], 1);
+        assert_eq!(json["totals"]["ready_objects"], 2);
+        assert_eq!(json["totals"]["pending_uploads"], 1);
+        assert_eq!(json["totals"]["active_sessions"], 1);
+        assert_eq!(json["largest_objects"][0]["object_key"], "images/scan1.dcm");
+        assert!(
+            json["file_types"]
+                .as_array()
+                .expect("file types array")
+                .iter()
+                .any(|entry| entry["extension"] == "dcm")
+        );
+        assert!(
+            json["active_users"]
+                .as_array()
+                .expect("active users array")
+                .iter()
+                .any(|entry| entry["email"] == "drive@example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_ws_scopes_owner_events_and_mirrors_to_admin() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, drive_token) = test_state(single_url, multi_url).await;
+        let extra_hash = auth::hash_password("password123").expect("hash extra password");
+        let other_user = state
+            .db
+            .create_user(
+                "other@example.com".to_string(),
+                extra_hash.clone(),
+                Some(50 * 1024 * 1024),
+                false,
+            )
+            .await
+            .expect("create other user");
+        let admin_user = state
+            .db
+            .create_user(
+                "admin@example.com".to_string(),
+                extra_hash,
+                Some(50 * 1024 * 1024),
+                true,
+            )
+            .await
+            .expect("create admin user");
+        let (other_token, _) =
+            issue_access_token(&other_user, &state.auth).expect("issue other token");
+        let (admin_token, _) =
+            issue_access_token(&admin_user, &state.auth).expect("issue admin token");
+
+        let base_url = spawn_registry_server(state.clone()).await;
+        let client = Client::new();
+
+        let mut drive_ws = connect_registry_ws(&base_url, &drive_token).await;
+        let mut other_ws = connect_registry_ws(&base_url, &other_token).await;
+        let mut admin_ws = connect_registry_ws(&base_url, &admin_token).await;
+        consume_ws_hello(&mut drive_ws).await;
+        consume_ws_hello(&mut other_ws).await;
+        consume_ws_hello(&mut admin_ws).await;
+
+        let response = client
+            .post(format!("{}/v1/objects/finalize", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "object_key": "images/scan-001.png",
+                "version_id": "01HREGWS0000000000000000000001",
+                "object_size_bytes": 4096,
+                "content_type": "image/png"
+            }))
+            .send()
+            .await
+            .expect("finalize request");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let drive_event = wait_for_event_type(&mut drive_ws, "FILE_UPLOADED").await;
+        assert_eq!(drive_event["data"]["fragment"], "fragment-a");
+        assert_eq!(drive_event["data"]["object_key"], "images/scan-001.png");
+
+        let admin_event = wait_for_event_type(&mut admin_ws, "FILE_UPLOADED").await;
+        assert_eq!(admin_event["data"]["fragment"], "fragment-a");
+        assert_eq!(admin_event["data"]["object_key"], "images/scan-001.png");
+
+        expect_no_registry_event(&mut other_ws, Duration::from_millis(350)).await;
+    }
+
+    #[tokio::test]
+    async fn registry_ws_emits_mutation_categories_for_admin_consumers() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, drive_token) = test_state(single_url, multi_url).await;
+        let admin_hash = auth::hash_password("password123").expect("hash admin password");
+        let admin_user = state
+            .db
+            .create_user(
+                "admin@example.com".to_string(),
+                admin_hash,
+                Some(100 * 1024 * 1024),
+                true,
+            )
+            .await
+            .expect("create admin user");
+        let (admin_token, _) =
+            issue_access_token(&admin_user, &state.auth).expect("issue admin token");
+
+        let drive_user = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        let base_url = spawn_registry_server(state.clone()).await;
+        let client = Client::new();
+        let mut admin_ws = connect_registry_ws(&base_url, &admin_token).await;
+        consume_ws_hello(&mut admin_ws).await;
+
+        let create_resp = client
+            .post(format!("{}/v1/admin/users", base_url))
+            .bearer_auth(&admin_token)
+            .json(&json!({
+                "email": "created@example.com",
+                "password": "password123",
+                "quota_limit_bytes": 123456,
+                "is_admin": false
+            }))
+            .send()
+            .await
+            .expect("create user request");
+        assert_eq!(create_resp.status(), reqwest::StatusCode::CREATED);
+        let created_event = wait_for_event_type(&mut admin_ws, "USER_CREATED").await;
+        assert_eq!(created_event["data"]["email"], "created@example.com");
+
+        let link_resp = client
+            .post(format!("{}/v1/fragments/link", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "linked-fragment",
+                "deployment": "single_node"
+            }))
+            .send()
+            .await
+            .expect("link fragment request");
+        assert_eq!(link_resp.status(), reqwest::StatusCode::CREATED);
+        let link_event = wait_for_event_type(&mut admin_ws, "FRAGMENT_LINKED").await;
+        assert_eq!(link_event["data"]["fragment"], "linked-fragment");
+
+        let finalize_resp = client
+            .post(format!("{}/v1/objects/finalize", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "linked-fragment",
+                "object_key": "folder/sample.dcm",
+                "version_id": "01HREGWS0000000000000000000002",
+                "object_size_bytes": 8192,
+                "content_type": "application/dicom"
+            }))
+            .send()
+            .await
+            .expect("finalize object request");
+        assert_eq!(finalize_resp.status(), reqwest::StatusCode::OK);
+        let uploaded_event = wait_for_event_type(&mut admin_ws, "FILE_UPLOADED").await;
+        assert_eq!(uploaded_event["data"]["object_key"], "folder/sample.dcm");
+
+        let rename_resp = client
+            .post(format!("{}/v1/objects/rename", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "linked-fragment",
+                "source_key": "folder/sample.dcm",
+                "destination_key": "folder/sample-renamed.dcm"
+            }))
+            .send()
+            .await
+            .expect("rename object request");
+        assert_eq!(rename_resp.status(), reqwest::StatusCode::OK);
+        let renamed_event = wait_for_event_type(&mut admin_ws, "FILE_RENAMED").await;
+        assert_eq!(
+            renamed_event["data"]["destination_key"],
+            "folder/sample-renamed.dcm"
+        );
+
+        let trash_resp = client
+            .post(format!("{}/v1/objects/trash", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "linked-fragment",
+                "object_key": "folder/sample-renamed.dcm"
+            }))
+            .send()
+            .await
+            .expect("trash object request");
+        assert_eq!(trash_resp.status(), reqwest::StatusCode::OK);
+        let deleted_event = wait_for_event_type(&mut admin_ws, "FILE_DELETED").await;
+        assert_eq!(
+            deleted_event["data"]["object_key"],
+            "folder/sample-renamed.dcm"
+        );
+
+        let recover_resp = client
+            .post(format!("{}/v1/objects/recover", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "linked-fragment",
+                "object_key": "folder/sample-renamed.dcm"
+            }))
+            .send()
+            .await
+            .expect("recover object request");
+        assert_eq!(recover_resp.status(), reqwest::StatusCode::OK);
+        let recovered_event = wait_for_event_type(&mut admin_ws, "FILE_UPLOADED").await;
+        assert_eq!(
+            recovered_event["data"]["object_key"],
+            "folder/sample-renamed.dcm"
+        );
+
+        let quota_resp = client
+            .post(format!(
+                "{}/v1/admin/users/{}/quota",
+                base_url, drive_user.uid
+            ))
+            .bearer_auth(&admin_token)
+            .json(&json!({
+                "quota_limit_bytes": 222222
+            }))
+            .send()
+            .await
+            .expect("update quota request");
+        assert_eq!(quota_resp.status(), reqwest::StatusCode::OK);
+        let user_update_event = wait_for_event_type(&mut admin_ws, "USER_UPDATED").await;
+        assert_eq!(
+            user_update_event["data"]["uid"].as_str(),
+            Some(drive_user.uid.as_str())
+        );
+
+        let password_resp = client
+            .post(format!("{}/v1/account/password", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "current_password": "password123",
+                "new_password": "password456",
+                "otp": null
+            }))
+            .send()
+            .await
+            .expect("account password request");
+        assert_eq!(password_resp.status(), reqwest::StatusCode::OK);
+        let account_update_event = wait_for_event_type(&mut admin_ws, "ACCOUNT_UPDATED").await;
+        assert_eq!(
+            account_update_event["data"]["uid"].as_str(),
+            Some(drive_user.uid.as_str())
+        );
+
+        let second_trash_resp = client
+            .post(format!("{}/v1/objects/trash", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "linked-fragment",
+                "object_key": "folder/sample-renamed.dcm"
+            }))
+            .send()
+            .await
+            .expect("second trash object request");
+        assert_eq!(second_trash_resp.status(), reqwest::StatusCode::OK);
+        let _ = wait_for_event_type(&mut admin_ws, "FILE_DELETED").await;
+
+        let recover_all_resp = client
+            .post(format!("{}/v1/objects/recover-all", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "linked-fragment"
+            }))
+            .send()
+            .await
+            .expect("recover all request");
+        assert_eq!(recover_all_resp.status(), reqwest::StatusCode::OK);
+        let recover_all_event = wait_for_state_scope(&mut admin_ws, "objects").await;
+        assert_eq!(recover_all_event["data"]["scope"], "objects");
+
+        let third_trash_resp = client
+            .post(format!("{}/v1/objects/trash", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "linked-fragment",
+                "object_key": "folder/sample-renamed.dcm"
+            }))
+            .send()
+            .await
+            .expect("third trash object request");
+        assert_eq!(third_trash_resp.status(), reqwest::StatusCode::OK);
+        let _ = wait_for_event_type(&mut admin_ws, "FILE_DELETED").await;
+
+        let empty_resp = client
+            .post(format!("{}/v1/objects/trash/empty", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "linked-fragment"
+            }))
+            .send()
+            .await
+            .expect("empty trash request");
+        assert_eq!(empty_resp.status(), reqwest::StatusCode::OK);
+        let empty_event = wait_for_state_scope(&mut admin_ws, "trash").await;
+        assert_eq!(empty_event["data"]["scope"], "trash");
+    }
+
+    #[tokio::test]
+    async fn registry_ws_fans_out_to_many_concurrent_subscribers() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, drive_token) = test_state(single_url, multi_url).await;
+        let base_url = spawn_registry_server(state).await;
+        let client = Client::new();
+
+        let mut sockets = Vec::new();
+        for _ in 0..48 {
+            let mut socket = connect_registry_ws(&base_url, &drive_token).await;
+            consume_ws_hello(&mut socket).await;
+            sockets.push(socket);
+        }
+
+        let response = client
+            .post(format!("{}/v1/objects/finalize", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "object_key": "bulk/concurrency.bin",
+                "version_id": "01HREGWS0000000000000000000099",
+                "object_size_bytes": 16384,
+                "content_type": "application/octet-stream"
+            }))
+            .send()
+            .await
+            .expect("fanout finalize request");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        for socket in &mut sockets {
+            let event = wait_for_event_type(socket, "FILE_UPLOADED").await;
+            assert_eq!(event["data"]["object_key"], "bulk/concurrency.bin");
+        }
     }
 
     #[tokio::test]

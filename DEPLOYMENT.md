@@ -5,8 +5,8 @@
 > - `N1` is the shared storage engine used underneath both deployment shapes.
 > - Single-node deployment: `standard` (`litiaina-n1-standard`)
 > - `standard` release: `0.6.2`
-> - Multi-node deployment: `distribution-runtime` (`litiaina-n2`, `0.1.2`)
-> - Registry/business deployment: `registry-runtime` (`registry-server`, `0.2.1`)
+> - Multi-node deployment: `distribution-runtime` (`litiaina-n2`, `0.2.0`)
+> - Registry/business deployment: `registry-runtime` (`registry-server`, `0.3.0`)
 > - Experimental raw-device profile: `arc` (`litiaina-n1-arc`)
 > - Privilege split: prefer a normal service user for `litiaina-n1-standard`, `litiaina-n2`, and `registry-server`. Reserve `root` for `litiaina-n1-arc` raw-device operations only, and let the runtimes validate their writable state paths explicitly.
 > - See `DEPLOYMENT_PROFILES.md` for profile policy.
@@ -36,6 +36,7 @@ Current runtime truth:
 - `registry-runtime`: SQLite-backed Registry layer for users, ownership, quotas, and logical listing/filtering across both deployment shapes.
 - `registry-runtime` also brokers short-lived storage sessions for Registry-backed clients and future GUI/web surfaces.
 - `registry-runtime` also owns first-admin bootstrap, administrator account control, rotating refresh sessions, and optional TOTP 2FA.
+- `registry-runtime` now also exposes `GET /v1/ws` for Registry-backed realtime events.
 - `arc`: raw partitioned `index` and raw blob devices, experimental only.
 - stable operator surface today is CLI + HTTP API; web/admin surfaces are still under development
 - Auth/session security defaults:
@@ -88,12 +89,14 @@ Run the Registry binary alongside either deployment shape:
 The Registry owns business metadata:
 
 - first-administrator bootstrap and admin login
-- users
+- users and administrator-created accounts
 - rotating refresh sessions
 - self-service account changes (email, password, optional 2FA)
 - ownership
 - quotas
 - logical object listing/filtering
+- registry-wide statistics aggregation for the admin control plane
+- filtered object statistics for Registry-backed client insights
 - logical object resolution by owner + key
 - fragment backend bindings
 - short-lived storage session brokering for Registry-backed clients
@@ -118,6 +121,7 @@ Registry auth/control-plane notes:
   - `POST /v1/auth/refresh`
   - `POST /v1/auth/logout`
 - Optional TOTP 2FA is available for both administrator and normal Registry accounts.
+- Public signup does not accept caller-chosen quota; new accounts always use the server default until an administrator changes them.
 
 Bootstrap the first Registry administrator once the server is running:
 
@@ -135,12 +139,16 @@ Notes:
 - bootstrap only works while the Registry has zero administrator accounts
 - later administrator sign-in uses `POST /v1/admin/auth/login`
 - account/user administration then happens through the Registry admin APIs:
+  - `POST /v1/admin/users`
   - `GET /v1/admin/users`
+  - `GET /v1/admin/stats`
   - `POST /v1/admin/users/{uid}/quota`
   - `POST /v1/admin/users/{uid}/credentials`
   - `POST /v1/admin/users/{uid}/2fa/setup`
   - `POST /v1/admin/users/{uid}/2fa/disable`
   - `DELETE /v1/admin/users/{uid}`
+- Registry-backed client insights can also use:
+  - `GET /v1/objects/stats`
 
 ### Index disks (`standard`)
 
@@ -396,7 +404,7 @@ Notes for `distribution-runtime`:
   - Use `cluster_commit_mode=quorum` only if you are intentionally trading immediate full placement for degraded-write availability.
   - Run reconcile after degraded periods to restore missing copies.
 
-### Validated Two-Node Reference (`distribution-runtime 0.1.2`)
+### Validated Two-Node Reference (`distribution-runtime 0.2.0`)
 
 This two-node filesystem-backed layout was exercised on real hardware on `2026-03-20`:
 

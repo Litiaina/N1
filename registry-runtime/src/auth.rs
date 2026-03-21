@@ -84,6 +84,13 @@ pub fn claims_from_headers(
     let Some(token) = value.strip_prefix("Bearer ") else {
         return Err(RegistryError::unauthorized("missing bearer token"));
     };
+    claims_from_token(token, settings)
+}
+
+pub fn claims_from_token(
+    token: &str,
+    settings: &AuthSettings,
+) -> Result<RegistryClaims, RegistryError> {
     decode::<RegistryClaims>(
         token,
         &DecodingKey::from_secret(settings.jwt_secret.as_bytes()),

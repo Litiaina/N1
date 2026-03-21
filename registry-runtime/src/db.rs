@@ -11,8 +11,9 @@ use uuid::Uuid;
 use crate::auth::hash_refresh_token;
 use crate::error::RegistryError;
 use crate::models::{
-    FragmentBindingRecord, HealthResponse, ObjectExtensionStat, ObjectRecord, StorageDeployment,
-    UserAuthRecord, UserRecord,
+    AdminActivityUserSummary, AdminLargestObjectSummary, AdminStatsTotals, FragmentBindingRecord,
+    HealthResponse, ObjectExtensionStat, ObjectRecord, StorageDeployment, UserAuthRecord,
+    UserRecord,
 };
 
 #[derive(Debug, Clone)]
@@ -27,6 +28,15 @@ pub struct RegistryObjectStats {
     pub total_objects: usize,
     pub total_size_bytes: i64,
     pub extension_stats: Vec<ObjectExtensionStat>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegistryAdminStats {
+    pub totals: AdminStatsTotals,
+    pub file_types: Vec<ObjectExtensionStat>,
+    pub largest_objects: Vec<AdminLargestObjectSummary>,
+    pub active_users: Vec<AdminActivityUserSummary>,
+    pub top_storage_users: Vec<AdminActivityUserSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -316,6 +326,255 @@ impl RegistryDb {
                 out.push(row.map_err(sql_err)?);
             }
             Ok(out)
+        })
+        .await
+    }
+
+    pub async fn admin_stats(&self) -> Result<RegistryAdminStats, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            let now_epoch = Utc::now().timestamp();
+
+            let total_users = scalar_i64(&conn, "SELECT COUNT(*) FROM users", params![])? as usize;
+            let admin_users =
+                scalar_i64(&conn, "SELECT COUNT(*) FROM users WHERE is_admin = 1", params![])?
+                    as usize;
+            let two_factor_enabled_users = scalar_i64(
+                &conn,
+                "SELECT COUNT(*) FROM users WHERE totp_enabled = 1",
+                params![],
+            )? as usize;
+            let users_using_storage = scalar_i64(
+                &conn,
+                "SELECT COUNT(*) FROM users WHERE quota_used_bytes > 0",
+                params![],
+            )? as usize;
+            let total_quota_bytes = scalar_i64(
+                &conn,
+                "SELECT COALESCE(SUM(quota_limit_bytes), 0) FROM users",
+                params![],
+            )?;
+            let total_used_bytes = scalar_i64(
+                &conn,
+                "SELECT COALESCE(SUM(quota_used_bytes), 0) FROM users",
+                params![],
+            )?;
+            let total_fragments =
+                scalar_i64(&conn, "SELECT COUNT(*) FROM fragment_bindings", params![])? as usize;
+            let ready_objects = scalar_i64(
+                &conn,
+                "SELECT COUNT(*) FROM objects WHERE status = 'ready'",
+                params![],
+            )? as usize;
+            let trashed_objects = scalar_i64(
+                &conn,
+                "SELECT COUNT(*) FROM objects WHERE status = 'trashed'",
+                params![],
+            )? as usize;
+            let pending_uploads =
+                scalar_i64(&conn, "SELECT COUNT(*) FROM object_uploads", params![])? as usize;
+            let active_sessions = scalar_i64(
+                &conn,
+                r#"
+                SELECT COUNT(*)
+                FROM registry_refresh_sessions
+                WHERE revoked_at IS NULL AND expires_at > ?1
+                "#,
+                params![now_epoch],
+            )? as usize;
+            let active_users = scalar_i64(
+                &conn,
+                r#"
+                SELECT COUNT(DISTINCT user_uid)
+                FROM registry_refresh_sessions
+                WHERE revoked_at IS NULL AND expires_at > ?1
+                "#,
+                params![now_epoch],
+            )? as usize;
+
+            let mut extension_stats = std::collections::BTreeMap::<String, (usize, i64)>::new();
+            let mut stmt = conn
+                .prepare(
+                    r#"
+                    SELECT object_key, object_size_bytes
+                    FROM objects
+                    WHERE status = 'ready'
+                    "#,
+                )
+                .map_err(sql_err)?;
+            let mut rows = stmt
+                .query_map(params![], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(sql_err)?;
+            while let Some(row) = rows.next().transpose().map_err(sql_err)? {
+                let extension = row
+                    .0
+                    .rsplit_once('.')
+                    .map(|(_, value)| value.trim().to_lowercase())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "_none".to_string());
+                let entry = extension_stats.entry(extension).or_insert((0usize, 0i64));
+                entry.0 += 1;
+                entry.1 = entry.1.saturating_add(row.1.max(0));
+            }
+            let mut file_types = extension_stats
+                .into_iter()
+                .map(
+                    |(extension, (object_count, total_size_bytes))| ObjectExtensionStat {
+                        extension,
+                        object_count,
+                        total_size_bytes,
+                    },
+                )
+                .collect::<Vec<_>>();
+            file_types.sort_by(|a, b| {
+                b.total_size_bytes
+                    .cmp(&a.total_size_bytes)
+                    .then_with(|| b.object_count.cmp(&a.object_count))
+                    .then_with(|| a.extension.cmp(&b.extension))
+            });
+
+            let mut largest_objects = Vec::new();
+            let mut stmt = conn
+                .prepare(
+                    r#"
+                    SELECT o.owner_uid, u.email, o.fragment, o.object_key, o.object_size_bytes, o.content_type, o.updated_at
+                    FROM objects o
+                    JOIN users u ON u.uid = o.owner_uid
+                    WHERE o.status = 'ready'
+                    ORDER BY o.object_size_bytes DESC, o.updated_at DESC, o.object_key ASC
+                    LIMIT 12
+                    "#,
+                )
+                .map_err(sql_err)?;
+            let mut rows = stmt
+                .query_map(params![], |row| {
+                    Ok(AdminLargestObjectSummary {
+                        uid: row.get(0)?,
+                        email: row.get(1)?,
+                        fragment: row.get(2)?,
+                        object_key: row.get(3)?,
+                        object_size_bytes: row.get::<_, i64>(4)?.max(0),
+                        content_type: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                })
+                .map_err(sql_err)?;
+            while let Some(row) = rows.next().transpose().map_err(sql_err)? {
+                largest_objects.push(row);
+            }
+
+            let mut users = Vec::new();
+            let mut stmt = conn
+                .prepare(
+                    r#"
+                    SELECT uid, email, quota_limit_bytes, quota_used_bytes, updated_at, is_admin, totp_enabled
+                    FROM users
+                    ORDER BY quota_used_bytes DESC, updated_at DESC, email ASC
+                    "#,
+                )
+                .map_err(sql_err)?;
+            let mut rows = stmt
+                .query_map(params![], |row| {
+                    Ok(UserRecord {
+                        uid: row.get(0)?,
+                        email: row.get(1)?,
+                        is_admin: row.get::<_, i64>(5)? != 0,
+                        two_factor_enabled: row.get::<_, i64>(6)? != 0,
+                        quota_limit_bytes: row.get(2)?,
+                        quota_used_bytes: row.get(3)?,
+                        created_at: String::new(),
+                        updated_at: row.get(4)?,
+                    })
+                })
+                .map_err(sql_err)?;
+            while let Some(row) = rows.next().transpose().map_err(sql_err)? {
+                users.push(row);
+            }
+
+            let mut user_activity = Vec::with_capacity(users.len());
+            for user in users {
+                let active_session_count = scalar_i64(
+                    &conn,
+                    r#"
+                    SELECT COUNT(*)
+                    FROM registry_refresh_sessions
+                    WHERE user_uid = ?1 AND revoked_at IS NULL AND expires_at > ?2
+                    "#,
+                    params![user.uid.clone(), now_epoch],
+                )? as usize;
+                let fragment_count = scalar_i64(
+                    &conn,
+                    "SELECT COUNT(*) FROM fragment_bindings WHERE owner_uid = ?1",
+                    params![user.uid.clone()],
+                )? as usize;
+                let ready_object_count = scalar_i64(
+                    &conn,
+                    "SELECT COUNT(*) FROM objects WHERE owner_uid = ?1 AND status = 'ready'",
+                    params![user.uid.clone()],
+                )? as usize;
+                user_activity.push(AdminActivityUserSummary {
+                    uid: user.uid,
+                    email: user.email,
+                    is_admin: user.is_admin,
+                    two_factor_enabled: user.two_factor_enabled,
+                    active_sessions: active_session_count,
+                    fragment_count,
+                    ready_object_count,
+                    quota_used_bytes: user.quota_used_bytes.max(0),
+                    quota_limit_bytes: user.quota_limit_bytes.max(0),
+                    updated_at: user.updated_at,
+                });
+            }
+
+            let mut active_user_rows = user_activity
+                .iter()
+                .filter(|user| user.active_sessions > 0)
+                .cloned()
+                .collect::<Vec<_>>();
+            active_user_rows.sort_by(|a, b| {
+                b.active_sessions
+                    .cmp(&a.active_sessions)
+                    .then_with(|| b.quota_used_bytes.cmp(&a.quota_used_bytes))
+                    .then_with(|| a.email.cmp(&b.email))
+            });
+            active_user_rows.truncate(8);
+
+            let mut top_storage_users = user_activity
+                .iter()
+                .filter(|user| user.quota_used_bytes > 0 || user.ready_object_count > 0)
+                .cloned()
+                .collect::<Vec<_>>();
+            top_storage_users.sort_by(|a, b| {
+                b.quota_used_bytes
+                    .cmp(&a.quota_used_bytes)
+                    .then_with(|| b.ready_object_count.cmp(&a.ready_object_count))
+                    .then_with(|| a.email.cmp(&b.email))
+            });
+            top_storage_users.truncate(8);
+
+            Ok(RegistryAdminStats {
+                totals: AdminStatsTotals {
+                    total_users,
+                    admin_users,
+                    two_factor_enabled_users,
+                    users_using_storage,
+                    total_quota_bytes,
+                    total_used_bytes,
+                    total_fragments,
+                    ready_objects,
+                    trashed_objects,
+                    pending_uploads,
+                    active_sessions,
+                    active_users,
+                },
+                file_types,
+                largest_objects,
+                active_users: active_user_rows,
+                top_storage_users,
+            })
         })
         .await
     }

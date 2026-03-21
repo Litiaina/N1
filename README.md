@@ -21,8 +21,8 @@
 > - `N1` is the shared node-local storage engine used by both deployments.
 > - `standard` (`litiaina-n1-standard`) is the single-node N2 deployment path and the stable default.
 > - `standard` is released at `0.6.2`.
-> - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path and is released at `0.1.2`.
-> - `registry-runtime` (`registry-server`) is the SQLite-backed business metadata layer for both deployment shapes and is versioned independently at `0.2.1`.
+> - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path and is released at `0.2.0`.
+> - `registry-runtime` (`registry-server`) is the SQLite-backed business metadata layer for both deployment shapes and is versioned independently at `0.3.0`.
 > - `arc` (`litiaina-n1-arc`) is the experimental raw-device profile and is not the production default.
 > - Prefer a non-root service user for `litiaina-n1-standard`, `litiaina-n2`, and `registry-server`. Keep `root` for `litiaina-n1-arc` raw-device operations only.
 > - See `DEPLOYMENT_PROFILES.md` for the profile split and architecture guidance.
@@ -81,9 +81,11 @@ N2 deployment split in this workspace:
 - If `registry.env` is missing in the current working directory, `registry-server` creates a template automatically and tells you which required value is still missing.
 - Raw-device testing remains `litiaina-n1-arc` from `arc`.
 - `standard` and `distribution-runtime` now share the same stable `standard/src/n1_core` implementation; `distribution-runtime` only adds cluster-specific `n2_core` and route layers.
-- `registry-runtime` owns business logic and user convenience metadata: users, administrators, ownership, quotas, logical listing, logical object lookup, rotating refresh sessions, and optional TOTP 2FA.
+- `registry-runtime` owns business logic and user convenience metadata: users, administrators, admin-created accounts, ownership, quotas, logical listing, logical object lookup, rotating refresh sessions, optional TOTP 2FA, and registry-wide statistics aggregation.
+- `registry-runtime` now also exposes `GET /v1/ws` for owner-scoped and admin-wide realtime Registry events.
 - `registry-runtime` also brokers short-lived storage sessions for Registry-backed clients and future GUI/web surfaces that are still under development.
 - First Registry administrator bootstrap is protected by `REGISTRY_MASTER_KEY` and is only allowed before any admin exists.
+- Public Registry signup no longer accepts client-chosen quota; new accounts always start on the server default or an administrator-assigned quota.
 - Product identity:
   - `N2` is the operator-facing platform identity.
   - `N1` is the shared storage engine underneath both deployment shapes.
@@ -96,7 +98,7 @@ N2 deployment split in this workspace:
   - refresh token default TTL: `7 days`
 
 Multi-node N2 operator note from the current 2-node hardware pass:
-- the tested filesystem-backed `distribution-runtime 0.1.2` shape was:
+- the tested filesystem-backed `distribution-runtime 0.2.0` shape was:
   - 2 nodes
   - 2 index roots per node
   - 2 blob roots per node
@@ -181,8 +183,8 @@ Profile note:
 ## Release Status
 
 - `standard` is the stable/default deployment profile at `0.6.2`.
-- `distribution-runtime` is released independently at `0.1.2` as the multi-node N2 layer.
-- `registry-runtime` is released independently at `0.2.1` as the SQLite-backed Registry layer.
+- `distribution-runtime` is released independently at `0.2.0` as the multi-node N2 layer.
+- `registry-runtime` is released independently at `0.3.0` as the SQLite-backed Registry layer.
 - `arc` is the experimental raw-device profile.
 - Stable architecture baseline (`standard`):
   - filesystem-backed authoritative `index`
@@ -192,11 +194,16 @@ Profile note:
 - Registry architecture baseline (`registry-runtime`):
   - first-admin bootstrap guarded by `REGISTRY_MASTER_KEY`
   - administrator login and account administration
+  - administrator-created user/account provisioning with optional admin role and quota override
   - user management and login
   - rotating refresh-session lifecycle (`/v1/auth/refresh`, `/v1/auth/logout`)
+  - realtime websocket feed (`GET /v1/ws`) with owner-scoped and admin-wide events
   - self-service account updates (email, password, optional 2FA)
+  - public signup fixed to default/admin-assigned quota only
   - ownership and quota accounting
   - logical listing and filtering
+  - registry-wide admin insights (`/v1/admin/stats`)
+  - filtered object statistics for Registry-backed clients (`/v1/objects/stats`)
   - registry-owned object metadata lookup
   - fragment-to-backend binding for `single_node` and `multi_node` storage targets
   - storage-session brokering for Registry-backed clients and future GUI/web integrations

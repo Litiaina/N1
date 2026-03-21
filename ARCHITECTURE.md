@@ -5,8 +5,8 @@
 > - `N1` is the shared storage engine used underneath both deployment shapes.
 > - `standard` is the stable single-node deployment profile.
 > - `standard` is released at `0.6.2`.
-> - `distribution-runtime` is the multi-node N2 deployment profile and is released at `0.1.2`.
-> - `registry-runtime` is the SQLite-backed Registry/business layer and is versioned independently at `0.2.1`.
+> - `distribution-runtime` is the multi-node N2 deployment profile and is released at `0.2.0`.
+> - `registry-runtime` is the SQLite-backed Registry/business layer and is versioned independently at `0.3.0`.
 > - `arc` is an experimental raw-device deployment profile.
 > - See `DEPLOYMENT_PROFILES.md`.
 > - For the multi-node operator runbook, see `N2_DEPLOYMENT.md`.
@@ -40,6 +40,7 @@ At the platform layer, `registry-runtime` owns the business plane:
 - administrator account control
 - users
 - rotating refresh sessions
+- realtime websocket feed (`GET /v1/ws`)
 - self-service account management
 - optional TOTP 2FA
 - ownership
@@ -54,7 +55,7 @@ This replaces the legacy "full mirrored metadata tree on every index root" model
 
 ## Freeze Status
 
-The current production architecture baseline is `standard 0.6.2`, `distribution-runtime 0.1.2`, and `registry-runtime 0.2.1`.
+The current production architecture baseline is `standard 0.6.2`, `distribution-runtime 0.2.0`, and `registry-runtime 0.3.0`.
 
 That baseline applies to:
 
@@ -138,16 +139,19 @@ The Registry plane is where namespace and business logic now belongs:
 - folder/prefix simulation
 - metadata filtering
 - quota/accounting
+- admin-created accounts and quota overrides
+- registry-wide statistics aggregation
 - exact-key logical lookup before engine access
 - binding a fragment to either a `single_node` or `multi_node` storage backend
 - issuing short-lived storage sessions to client applications
 
-In the `0.6.2` / `0.1.2` / `0.2.1` baseline, the Registry is a dedicated binary. The engine contract is flat, exact-key-oriented object storage, while client-facing namespace behavior moves into the Registry layer.
+In the `0.6.2` / `0.2.0` / `0.3.0` baseline, the Registry is a dedicated binary. The engine contract is flat, exact-key-oriented object storage, while client-facing namespace behavior moves into the Registry layer.
 
 Registry identity/session notes:
 - the first administrator is created through a master-key bootstrap flow
 - later browser/client sessions use rotating refresh tokens rather than long-lived bearer tokens
 - 2FA is TOTP-based and enforced at the Registry identity layer, not in the storage engine
+- public signup never sets its own quota; quota is server-default or admin-assigned
 - account deletion cascades through Registry state and removes linked managed fragments through the engine before the user row is deleted
 
 Registry-backed client flow:

@@ -15,9 +15,9 @@ Use other documents for:
 ## 1. Current Runtime Baseline
 
 As of `2026-03-20`:
-- `distribution-runtime` (`litiaina-n2`) is released at `0.1.2`
+- `distribution-runtime` (`litiaina-n2`) is released at `0.2.0`
 - `standard` (`litiaina-n1-standard`) is the stable single-node engine/runtime at `0.6.2`
-- `registry-server` is released independently at `0.2.1`
+- `registry-server` is released independently at `0.3.0`
 - `arc` remains experimental and is not part of this runbook
 
 Multi-node N2 in this workspace is:

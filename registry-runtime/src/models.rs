@@ -173,6 +173,57 @@ pub struct AdminUserSummary {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminStatsTotals {
+    pub total_users: usize,
+    pub admin_users: usize,
+    pub two_factor_enabled_users: usize,
+    pub users_using_storage: usize,
+    pub total_quota_bytes: i64,
+    pub total_used_bytes: i64,
+    pub total_fragments: usize,
+    pub ready_objects: usize,
+    pub trashed_objects: usize,
+    pub pending_uploads: usize,
+    pub active_sessions: usize,
+    pub active_users: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminLargestObjectSummary {
+    pub uid: String,
+    pub email: String,
+    pub fragment: String,
+    pub object_key: String,
+    pub object_size_bytes: i64,
+    pub content_type: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminActivityUserSummary {
+    pub uid: String,
+    pub email: String,
+    pub is_admin: bool,
+    pub two_factor_enabled: bool,
+    pub active_sessions: usize,
+    pub fragment_count: usize,
+    pub ready_object_count: usize,
+    pub quota_used_bytes: i64,
+    pub quota_limit_bytes: i64,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminStatsResponse {
+    pub generated_at: String,
+    pub totals: AdminStatsTotals,
+    pub file_types: Vec<ObjectExtensionStat>,
+    pub largest_objects: Vec<AdminLargestObjectSummary>,
+    pub active_users: Vec<AdminActivityUserSummary>,
+    pub top_storage_users: Vec<AdminActivityUserSummary>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct UpdateQuotaRequest {
     pub quota_limit_bytes: i64,
