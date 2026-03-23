@@ -1,13 +1,13 @@
 [workspace]
 members = [
     "block_manager",
-    "arc",
+    "n1-arc",
     "cli_core",
-    "registry-runtime",
-    "standard",
-    "standard_cli",
-    "distribution-runtime",
-    "distribution_cli",
+    "registry",
+    "n1",
+    "n1_cli",
+    "n2",
+    "n2_cli",
     "simd-erasure-core",
 ]
 resolver = "2"
