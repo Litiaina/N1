@@ -405,6 +405,13 @@ pub struct FragmentStateRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct BulkObjectKeysRequest {
+    pub fragment: String,
+    #[serde(default)]
+    pub object_keys: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RenameRegistryObjectRequest {
     pub fragment: String,
     pub source_key: String,
@@ -463,6 +470,16 @@ pub struct FragmentListResponse {
 #[derive(Debug, Serialize)]
 pub struct BulkObjectMutationResponse {
     pub affected: usize,
+    pub quota_limit_bytes: i64,
+    pub quota_used_bytes: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BulkObjectSelectionResponse {
+    pub requested: usize,
+    pub unique: usize,
+    pub affected: usize,
+    pub not_found: usize,
     pub quota_limit_bytes: i64,
     pub quota_used_bytes: i64,
 }

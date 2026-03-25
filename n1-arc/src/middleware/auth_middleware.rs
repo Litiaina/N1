@@ -1,6 +1,4 @@
-use crate::core::fragment_metadata::{
-    backfill_fragment_nt_hash_if_missing, verify_fragment_key,
-};
+use crate::core::fragment_metadata::{backfill_fragment_nt_hash_if_missing, verify_fragment_key};
 use crate::structs::auth_structs::{AuthBody, AuthorizationRequest, Claims};
 use crate::validation::fragment_validation::does_fragment_exist;
 use axum::body::Body;

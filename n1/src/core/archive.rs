@@ -25,7 +25,6 @@ use tokio_tar::{Builder as TarBuilder, Header as TarHeader};
 use uuid::Uuid;
 
 use crate::{
-    enums::app_error_enum::AppError,
     core::disk_manager::{
         DownloadArchiveManifestQuery, DownloadArchiveRequest, ObjectMetadata, PartMetadata,
         ShardInfo,
@@ -35,6 +34,7 @@ use crate::{
         metadata_parser::{get_metadata, get_version_metadata},
         recovery::read_or_recover_chunk,
     },
+    enums::app_error_enum::AppError,
     structs::auth_structs::Claims,
 };
 
@@ -390,8 +390,10 @@ async fn write_tar_archive(
             let mut continuation_token = None;
 
             loop {
-                let page = index::scan_fragment_live_objects_page(
+                let page = index::scan_fragment_live_metadata_page(
                     fragment,
+                    None,
+                    None,
                     ARCHIVE_SCAN_PAGE_LIMIT,
                     continuation_token.clone(),
                     include_internal,

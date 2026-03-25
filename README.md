@@ -8,9 +8,9 @@
   <h1>Litiaina N2</h1>
   <p>
     Unified object storage platform built on the <code>N1</code> core engine:
-    single-node deployment through <code>standard</code>, multi-node deployment through
-    <code>distribution-runtime</code>, and an experimental raw-device engine profile
-    through <code>arc</code>.
+    single-node deployment through <code>n1</code>, multi-node deployment through
+    <code>n2</code>, and an experimental raw-device engine profile through
+    <code>n1-arc</code>.
   </p>
 </div>
 
@@ -19,12 +19,12 @@
 > Deployment profile status (2026-03-20):
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared node-local storage engine used by both deployments.
-> - `standard` (`litiaina-n1-standard`) is the single-node N2 deployment path and the stable default.
-> - `standard` is released at `0.6.2`.
-> - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path and is released at `0.2.0`.
-> - `registry-runtime` (`registry-server`) is the SQLite-backed business metadata layer for both deployment shapes and is versioned independently at `0.3.0`.
-> - `arc` (`litiaina-n1-arc`) is the experimental raw-device profile and is not the production default.
-> - Prefer a non-root service user for `litiaina-n1-standard`, `litiaina-n2`, and `registry-server`. Keep `root` for `litiaina-n1-arc` raw-device operations only.
+> - `n1` (`litiaina-n1`) is the single-node N2 deployment path and the stable default.
+> - `n1` is released at `0.7.0`.
+> - `n2` (`litiaina-n2`) is the multi-node N2 deployment path and is released at `0.2.0`.
+> - `registry` (`registry-server`) is the SQLite-backed business metadata layer for both deployment shapes and is versioned independently at `0.3.0`.
+> - `n1-arc` (`litiaina-n1-arc`) is the experimental raw-device profile and is not the production default.
+> - Prefer a non-root service user for `litiaina-n1`, `litiaina-n2`, and `registry-server`. Keep `root` for `litiaina-n1-arc` raw-device operations only.
 > - See `DEPLOYMENT_PROFILES.md` for the profile split and architecture guidance.
 > - Operator shortcut: choose the deployment shape in `DEPLOYMENT.md` first, then use `N2_DEPLOYMENT.md` for the multi-node runbook.
 
@@ -53,7 +53,7 @@
   - [Recovery runtime (read and heal)](#recovery-runtime-read-and-heal)
   - [Redistribution](#redistribution)
   - [Garbage collection and trash](#garbage-collection-and-trash)
-  - [Raw blob operations](#raw-blob-operations-Arc-only)
+  - [Raw blob operations](#raw-blob-operations-n1-arc-only)
 - [Why `index` is future-proof](#why-index-is-future-proof)
 - [Operational notes](#operational-notes)
   - [Linux-first + direct I/O](#linux-first--direct-io)
@@ -61,7 +61,7 @@
   - [Directory sync](#directory-sync)
 - [Admin CLIs](#admin-clis)
   - [How to run the CLIs](#how-to-run-the-clis)
-  - [N1 Standard CLI](#n1-standard-cli)
+  - [N1 CLI](#n1-cli)
   - [N2 Runtime CLI](#n2-runtime-cli)
 - [Invariants (must always be true)](#invariants-must-always-be-true)
 - [Glossary](#glossary)
@@ -75,15 +75,15 @@ For the dedicated multi-node N2 runbook, see `N2_DEPLOYMENT.md`.
 For deployment profile guidance, see `DEPLOYMENT_PROFILES.md`.
 
 N2 deployment split in this workspace:
-- Single-node deployment: run `litiaina-n1-standard` from `standard`.
-- Multi-node deployment: run `litiaina-n2` from `distribution-runtime`.
-- Registry deployment: run `registry-server` from `registry-runtime`.
+- Single-node deployment: run `litiaina-n1` from `n1`.
+- Multi-node deployment: run `litiaina-n2` from `n2`.
+- Registry deployment: run `registry-server` from `registry`.
 - If `registry.env` is missing in the current working directory, `registry-server` creates a template automatically and tells you which required value is still missing.
-- Raw-device testing remains `litiaina-n1-arc` from `arc`.
-- `standard` and `distribution-runtime` now share the same stable `standard/src/n1_core` implementation; `distribution-runtime` only adds cluster-specific `n2_core` and route layers.
-- `registry-runtime` owns business logic and user convenience metadata: users, administrators, admin-created accounts, ownership, quotas, logical listing, logical object lookup, rotating refresh sessions, optional TOTP 2FA, and registry-wide statistics aggregation.
-- `registry-runtime` now also exposes `GET /v1/ws` for owner-scoped and admin-wide realtime Registry events.
-- `registry-runtime` also brokers short-lived storage sessions for Registry-backed clients and future GUI/web surfaces that are still under development.
+- Raw-device testing remains `litiaina-n1-arc` from `n1-arc`.
+- `n1` and `n2` now share the same stable `n1/src/n1_core` implementation; `n2` only adds cluster-specific `n2_core` and route layers.
+- `registry` owns business logic and user convenience metadata: users, administrators, admin-created accounts, ownership, quotas, logical listing, logical object lookup, rotating refresh sessions, optional TOTP 2FA, and registry-wide statistics aggregation.
+- `registry` now also exposes `GET /v1/ws` for owner-scoped and admin-wide realtime Registry events.
+- `registry` also brokers short-lived storage sessions for Registry-backed clients and future GUI/web surfaces that are still under development.
 - First Registry administrator bootstrap is protected by `REGISTRY_MASTER_KEY` and is only allowed before any admin exists.
 - Public Registry signup no longer accepts client-chosen quota; new accounts always start on the server default or an administrator-assigned quota.
 - Product identity:
@@ -98,7 +98,7 @@ N2 deployment split in this workspace:
   - refresh token default TTL: `7 days`
 
 Multi-node N2 operator note from the current 2-node hardware pass:
-- the tested filesystem-backed `distribution-runtime 0.2.0` shape was:
+- the tested filesystem-backed `n2 0.2.0` shape was:
   - 2 nodes
   - 2 index roots per node
   - 2 blob roots per node
@@ -133,7 +133,7 @@ Multi-node N2 operator note from the current 2-node hardware pass:
   - duplicate peer endpoints
   - loopback-only multi-node endpoints
 
-Single-node N2 on stable/default `standard` (production):
+Single-node N2 on stable/default `n1` (production):
 - `index_store_disks` and `blob_store_disks` are directory paths.
 - Do not run raw disk format commands.
 - Auth now supports rotating refresh tokens through:
@@ -146,9 +146,9 @@ index_store_disks=/srv/n1/index0,/srv/n1/index1
 blob_store_disks=/srv/n1/blob0,/srv/n1/blob1
 ```
 
-`arc` raw media initialization:
-- `format-blob-device` and `format-index-device` are Arc-only commands.
-- Use the arc binary for the two-step safety flow.
+`n1-arc` raw media initialization:
+- `format-blob-device` and `format-index-device` are `n1-arc`-only commands.
+- Use the n1-arc binary for the two-step safety flow.
 
 ```bash
 sudo target/release/litiaina-n1-arc format-blob-device \
@@ -174,24 +174,24 @@ sudo target/release/litiaina-n1-arc format-index-device \
   --fingerprint <fingerprint-from-prepare>
 ```
 
-If Arc uses one physical raw device for both `index_store_disks` and `blob_store_disks`, format that device once only.
+If `n1-arc` uses one physical raw device for both `index_store_disks` and `blob_store_disks`, format that device once only.
 
 Profile note:
 - `profiles/n1/high-hw.ini` is for multi-disk, high-parallelism deployments.
-- `profiles/n1/single-raw-nvme.ini` is arc-oriented and is the better starting point for one raw Linux-owned NVMe blob device.
+- `profiles/n1/single-raw-nvme.ini` is n1-arc-oriented and is the better starting point for one raw Linux-owned NVMe blob device.
 
 ## Release Status
 
-- `standard` is the stable/default deployment profile at `0.6.2`.
-- `distribution-runtime` is released independently at `0.2.0` as the multi-node N2 layer.
-- `registry-runtime` is released independently at `0.3.0` as the SQLite-backed Registry layer.
-- `arc` is the experimental raw-device profile.
-- Stable architecture baseline (`standard`):
+- `n1` is the stable/default deployment profile at `0.7.0`.
+- `n2` is released independently at `0.2.0` as the multi-node N2 layer.
+- `registry` is released independently at `0.3.0` as the SQLite-backed Registry layer.
+- `n1-arc` is the experimental raw-device profile.
+- Stable architecture baseline (`n1`):
   - filesystem-backed authoritative `index`
   - filesystem-backed `blob_store_disks` shard layout (directory roots)
   - partitioned + replicated metadata
   - fragment-scoped exact-key object serving
-- Registry architecture baseline (`registry-runtime`):
+- Registry architecture baseline (`registry`):
   - first-admin bootstrap guarded by `REGISTRY_MASTER_KEY`
   - administrator login and account administration
   - administrator-created user/account provisioning with optional admin role and quota override
@@ -207,38 +207,33 @@ Profile note:
   - registry-owned object metadata lookup
   - fragment-to-backend binding for `single_node` and `multi_node` storage targets
   - storage-session brokering for Registry-backed clients and future GUI/web integrations
-- `standard` also exposes `POST /v4/upload/one-shot/{object_key}` for direct small-object upload without session/finalize overhead. The fragment comes from the authenticated claim.
-- `standard` also exposes claim-scoped bulk mutation routes for high-count object workflows:
+- `n1` also exposes `POST /v4/upload/one-shot/{object_key}` for direct small-object upload without session/finalize overhead. The fragment comes from the authenticated claim.
+- `n1` also exposes claim-scoped bulk mutation routes for high-count object workflows:
   - `POST /v4/fragment/object/bulk-delete`
   - `POST /v4/fragment/object/bulk-recover`
-- `standard` also exposes `GET /v4/fragment/thumb/{*object_key}` for disk-backed derived image thumbnails. Thumbnails are keyed by object `version_id`, are not listed as normal objects, and are regenerated on demand.
-- On Linux, `standard` prefers `io_uring` on the blob data path when available and falls back to `O_DIRECT` + blocking writes when it is not.
-- Arc is the experimental raw-device profile with raw index/blob media managed by `block_manager`.
+- `n1` also exposes `GET /v4/fragment/thumb/{*object_key}` for disk-backed derived image thumbnails. Thumbnails are keyed by object `version_id`, are not listed as normal objects, and are regenerated on demand.
+- On Linux, `n1` prefers `io_uring` on the blob data path when available and falls back to `O_DIRECT` + blocking writes when it is not.
+- `n1-arc` is the experimental raw-device profile with raw index/blob media managed by `block_manager`.
 - The HTTP/API surface is **not** frozen yet. Route shapes, request fields, and operational endpoints may still change before `1.0.0`.
 
 ## Profile Distinction And Disk Layout (Authoritative)
 
-| Dimension | Standard (`litiaina-n1-standard`) | Arc (`litiaina-n1-arc`) |
+| Dimension | N1 (`litiaina-n1`) | N1-Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / production default (`0.6.2`) | Experimental / raw-device profile |
+| Status | Stable / production default (`0.7.0`) | Experimental / raw-device profile |
 | `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | Index metadata backend | Partitioned filesystem metadata | Raw index catalog on block-manager media |
 | Blob payload backend | Shard files on blob roots | Raw extent allocator (`block_manager`) |
 | Raw format commands | Not used | Required for explicit raw media prep |
 
-### Standard Disk Layout (Current)
+### N1 Disk Layout (Current)
 
 ```text
-{INDEX_ROOT}/{fragment}/index/partitions/{partition_id}/
-  wal/manifest.msgpack
-  wal/segments/{segment_id}.wal
-  checkpoints/latest.msgpack
-  sessions/{version_id}.session.msgpack
-  objects/{hh}/{object_key_sha256}/{version_id}.msgpack
-  objects/{hh}/{object_key_sha256}/latest.latest.msgpack
-  trash/{hh}/{object_key_sha256}/{version_id}.msgpack
-  trash/{hh}/{object_key_sha256}/latest.latest.msgpack
+{INDEX_ROOT}/{fragment}/indexdb/partitions/{partition_id}.ndxdb
+  object_heads
+  object_versions
+  sessions
 
 {BLOB_ROOT}/{fragment}/blob/{version_id}/
   part_{p}_shard_{i}.shard
@@ -247,21 +242,21 @@ Profile note:
 {BLOB_ROOT}/{fragment}/.trash/blob/{version_id}/...
 ```
 
-### Arc Disk Layout (Current)
+### N1-Arc Disk Layout (Current)
 
 ```text
 {RAW_INDEX_DEVICE}
   block-manager superblock + journals + allocation groups
-  raw index catalog allocation (authoritative sessions/versions/fragment metadata)
+  raw index catalog allocation (authoritative sessions/object heads/object versions/fragment metadata)
 
 {RAW_BLOB_DEVICE}
   block-manager superblock + journals + allocation groups
   extents addressed as raw://{device_id}/{allocation_id}
 ```
 
-Arc note:
-- Index and blob are both raw block-manager media in Arc.
-- Arc is experimental and remains under active performance and control-plane hardening.
+N1-Arc note:
+- Index and blob are both raw block-manager media in `n1-arc`.
+- `n1-arc` is experimental and remains under active performance and control-plane hardening.
 
 ## What is N2 (platform architecture)
 
@@ -270,21 +265,21 @@ Arc note:
 It has two deployment shapes:
 
 - **Single-node N2**
-  - runs `standard` (`litiaina-n1-standard`)
+  - runs `n1` (`litiaina-n1`)
   - uses the N1 engine directly on one node
 - **Multi-node N2**
-  - runs `distribution-runtime` (`litiaina-n2`)
+  - runs `n2` (`litiaina-n2`)
   - uses the same N1 engine on every node, then adds cluster membership, placement, and peer data movement
 
 Under both shapes, the node-local storage engine is still **N1**. N1 provides:
 
-- a partitioned metadata authority in `index` (filesystem-backed in `standard`, raw in `arc`)
+- a partitioned metadata authority in `index` (filesystem-backed in `n1`, raw in `n1-arc`)
 - fragment-scoped object storage with exact-key retrieval
 - a profile-specific blob backend:
-  - `standard`: filesystem-backed shard files under blob roots
-  - `arc`: raw-device/direct-I/O blob plane with raw index authority
+  - `n1`: filesystem-backed shard files under blob roots
+  - `n1-arc`: raw-device/direct-I/O blob plane with raw index authority
 
-In the `0.6.2` engine baseline, user convenience behavior moves out of the engine and into the Registry layer:
+In the `0.7.0` engine baseline, user convenience behavior moves out of the engine and into the Registry layer:
 
 - user management
 - ownership tracking
@@ -347,8 +342,8 @@ N1's core identity is a specialized object-storage engine: authoritative on-disk
 
 Both variants exist by design so operators can choose deployment style without changing object semantics:
 
-- `standard`: filesystem-backed N1 for general-purpose deployments where operational simplicity and broad hardware compatibility are the priority.
-- `arc`: raw-device/block-manager-backed N1 for operators that want absolute device control and the highest performance ceiling.
+- `n1`: filesystem-backed N1 for general-purpose deployments where operational simplicity and broad hardware compatibility are the priority.
+- `n1-arc`: raw-device/block-manager-backed N1 for operators that want absolute device control and the highest performance ceiling.
 
 Both keep the same core behavior contracts (init/chunk/finalize semantics, immutable versions, repair/redistribution/GC guarantees). The choice is execution substrate and operational envelope, not storage correctness model.
 
@@ -368,9 +363,9 @@ N1 is **not** "user multi-tenant storage" anymore. The isolation boundary is a *
 
 ### 1) Partitioned metadata authority, profile-specific blob plane
 
-N1 keeps authoritative metadata on profile-specific media: mounted index filesystems in `standard`, raw index catalog media in `arc`. Blob payload backend depends on profile:
-- `standard`: shard files under configured blob root directories.
-- `arc`: raw, unformatted, unmounted devices managed directly by N1.
+N1 keeps authoritative metadata on profile-specific media: mounted index filesystems in `n1`, raw index catalog media in `n1-arc`. Blob payload backend depends on profile:
+- `n1`: shard files under configured blob root directories.
+- `n1-arc`: raw, unformatted, unmounted devices managed directly by N1.
 
 **Result:** the node keeps an inspectable on-disk layout while bounding metadata write fanout.
 
@@ -434,10 +429,10 @@ That routed session state holds:
 
 - upload manifest
 - optional reservation receipt
-- optional upload geometry hints (arc may pre-reserve raw slots)
+- optional upload geometry hints (n1-arc may pre-reserve raw slots)
 - finalized or aborted state
 
-Committed multipart progress is not kept as shared in-memory/session-WAL part state. Each committed part is represented by its own durable part metadata receipt on the routed session roots.
+Committed multipart progress is not kept as shared in-memory/session-WAL part state. Each committed part is represented by a durable compact receipt inside the routed session partition DBs.
 
 ### Partition
 
@@ -451,7 +446,7 @@ A partition is the placement unit for authoritative metadata:
 
 ### Shard
 
-Each multipart part is encoded into data and parity shards whose payloads are committed to the active blob substrate (filesystem files in `standard`, raw extents in `arc`).
+Each multipart part is encoded into data and parity shards whose payloads are committed to the active blob substrate (filesystem files in `n1`, raw extents in `n1-arc`).
 
 ---
 
@@ -461,11 +456,9 @@ Each multipart part is encoded into data and parity shards whose payloads are co
 
 `index` stores:
 
-- live object versions
-- latest markers
-- trash versions
-- upload sessions and committed parts
-- WAL records for mutation history
+- `object_heads`
+- immutable `object_versions`
+- authoritative `sessions`
 
 This is the authoritative plane used by exact-key reads, finalize, delete/recover, sync, repair, GC, redistribution, and flat listing.
 
@@ -473,8 +466,8 @@ This is the authoritative plane used by exact-key reads, finalize, delete/recove
 
 The blob plane stores payload shards on the profile-selected substrate:
 
-- `standard`: filesystem-backed shard files under blob roots
-- `arc`: raw devices and extent allocation
+- `n1`: filesystem-backed shard files under blob roots
+- `n1-arc`: raw devices and extent allocation
 - RS-encoded data + parity shards
 - deterministic placement
 - degraded reads via reconstruction
@@ -484,43 +477,37 @@ The blob plane stores payload shards on the profile-selected substrate:
 
 ## On-disk layout
 
-### `index` partitions (standard)
+### `index` partitions (`n1`)
 
 The authoritative metadata shape is:
 
 ```text
-{INDEX_ROOT}/{fragment}/index/partitions/{partition_id}/
-  wal/manifest.msgpack
-  wal/segments/{segment_id}.wal
-  checkpoints/latest.msgpack
-  sessions/
-    {version_id}.session.msgpack
-  objects/{hh}/{object_key_sha256}/
-    latest.latest.msgpack
-    {version_id}.msgpack
-  trash/{hh}/{object_key_sha256}/
-    latest.latest.msgpack
-    {version_id}.msgpack
+{INDEX_ROOT}/{fragment}/indexdb/partitions/{partition_id}.ndxdb
+  object_heads
+  object_versions
+  sessions
 ```
 
 Notes:
 
 - `partition_id` comes from a stable hash route
 - object and session state are partitioned independently
+- each object key has one authoritative head row
+- immutable object versions are history rows, not current-truth selectors
 - writes target the partition's selected roots, not every index root in the node
 - success requires at least one selected root to persist the update
 
-### Blob storage (`standard`)
+### Blob storage (`n1`)
 
 - `blob_store_disks` point at mounted directory paths (for example `/srv/n1/blob0`)
 - payload shards are files: `part_{p}_shard_{i}.shard|.parity`
 - trash payloads move under `{BLOB_ROOT}/{fragment}/.trash/blob/{version_id}/...`
 
-### Blob storage (`arc`)
+### Blob storage (`n1-arc`)
 
 - `blob_store_disks` point at raw device paths (for example `/dev/disk/by-id/...`)
 - shard metadata stores raw extent addresses (`raw://<device_id>/<allocation_id>`)
-- arc startup rejects mounted blob devices and warns on unstable names like `/dev/sdb`
+- `n1-arc` startup rejects mounted blob devices and warns on unstable names like `/dev/sdb`
 
 **Deterministic placement rule (typical):**
 
@@ -541,19 +528,19 @@ Initiate does:
 
 At this point no object version is visible.
 
-### 1a) One-shot upload (`standard`)
+### 1a) One-shot upload (`n1`)
 
-For small single-request objects, `standard` also exposes `POST /v4/upload/one-shot/{*object_key}`. The fragment is claim-scoped and is not passed in the path.
+For small single-request objects, `n1` also exposes `POST /v4/upload/one-shot/{*object_key}`. The fragment is claim-scoped and is not passed in the path.
 
 That path:
 
 - validates fragment scope and request size
 - checks available filesystem capacity
 - writes the blob once
-- publishes final metadata + latest immediately
+- publishes final metadata + the authoritative head immediately
 - returns without creating an upload session or requiring finalize
 
-For large file-management actions on many keys, `standard` also exposes claim-scoped bulk object mutation routes:
+For large file-management actions on many keys, `n1` also exposes claim-scoped bulk object mutation routes:
 
 - `POST /v4/fragment/object/bulk-delete`
 - `POST /v4/fragment/object/bulk-recover`
@@ -571,9 +558,9 @@ These accept a JSON body of the form:
 
 They are intended for UI or operator flows that need to mutate hundreds or thousands of objects without paying one HTTPS request per object.
 
-### 1b) Derived thumbnails (`standard`)
+### 1b) Derived thumbnails (`n1`)
 
-For image-heavy browsing, `standard` also exposes `GET /v4/fragment/thumb/{*object_key}`.
+For image-heavy browsing, `n1` also exposes `GET /v4/fragment/thumb/{*object_key}`.
 
 That path:
 
@@ -594,12 +581,12 @@ This is a derived cache, not a second user object:
 Part upload remains strict and payload-first:
 
 1. stream request bytes through the RS encoder
-2. place shard payloads using the active backend (`standard` file paths, `arc` raw extents)
+2. place shard payloads using the active backend (`n1` file paths, `n1-arc` raw extents)
 3. write and verify shard payloads
 4. build `PartMetadata`
-5. atomically write the independent part metadata receipt on the routed session roots
+5. atomically commit the compact part receipt into the routed session partition DBs
 
-Upload status, resume checks, and finalize read the committed part receipts from disk. The session manifest remains the authoritative upload manifest; per-part truth lives in durable receipt files, not in a shared multipart coordinator.
+Upload status, resume checks, and finalize read the committed part receipts from `indexdb`. The session row remains the authoritative upload state; per-part truth lives in durable receipt entries, not in a shared multipart coordinator.
 
 ### 3) Finalize upload (publish into `index`)
 
@@ -608,8 +595,8 @@ Finalization is the publish step:
 - load the authoritative session state
 - verify all expected parts exist
 - build immutable `ObjectMetadata`
-- write the object version and latest marker to the selected object-partition roots
-- append the partition WAL record
+- commit the object version row and authoritative head row in the owner partition DB
+- let replica roots catch up behind the owner-acknowledged publish boundary
 
 After this, exact-key reads are visible. Prefix listing is serving state layered on top of that publish.
 
@@ -638,14 +625,14 @@ You may see:
 
 This is safe and resumable. Finalize can be retried.
 
-### Crash after version publish but before prefix state catches up
+### Crash after head publish but before replica catch-up
 
 You may see:
 
-- published object state in `index`
-- stale or missing prefix rows
+- published object head state in `indexdb`
+- follower lag on another routed copy
 
-`GET` and `HEAD` are still correct. `LIST` can use existing namespace rows or fall back to authoritative `index` state and rebuild.
+`GET`, `HEAD`, and `LIST` are still correct from the committed owner partition DB.
 
 ---
 
@@ -655,10 +642,12 @@ Exact-key reads are driven by `index`:
 
 1. resolve the latest or requested version from the object's partition
 2. map the requested range onto parts and shard locations
-3. read shard chunks from the active backend (files in `standard`, raw devices in `arc`)
+3. read shard chunks from the active backend (files in `n1`, raw devices in `n1-arc`)
 4. reconstruct missing data when parity allows
 
-Engine-side listing is flat and paginated from authoritative `index` state. Namespace browsing, folder simulation, and prefix filtering belong in the Registry layer.
+Engine-side listing is driven by authoritative `indexdb` heads. It supports flat pagination,
+exact prefix filters, `/` delimiter folding into `common_prefixes`, and opaque continuation
+tokens. Registry still owns higher-level business filtering and owner-scoped logical views.
 
 ---
 
@@ -686,19 +675,19 @@ A version becomes exact-key visible only after:
 - session part state is committed
 - `index` publishes the object version
 
-Prefix visibility is intentionally softer:
+List visibility comes from committed head rows:
 
-- prefix rows are serving state
-- they may lag or be rebuilt
-- they must never invent visibility that `index` does not contain
+- `object_heads` are the current truth for live and trash state
+- `object_versions` are immutable history
+- `/v4/fragment/objects` and `/v4/fragment/trash` page over head rows, not directory markers
 
 ### Authority rules
 
-- Upload recency is defined by the session manifest's `created_at`, not by when finalize returns.
+- Upload recency is defined by the upload session's `created_at`, not by when finalize returns.
 - If two versions land in the same second-level timestamp bucket, ULID `version_id` order breaks the tie.
-- Publish only advances the latest marker when the candidate is actually newer; a stale finalize must not demote the visible version.
-- Exact-key reads resolve the latest marker and then rehydrate the referenced immutable version record before serving metadata or bytes.
-- Prefix rows are derived serving state only; if they are pending, missing, or stale, `LIST` falls back to authoritative `index` scans for the requested prefix.
+- Publish only advances the authoritative head when the candidate is actually newer; a stale finalize must not demote the visible version.
+- Exact-key reads resolve the head row and then rehydrate the referenced immutable version record before serving metadata or bytes.
+- Prefix/delimiter listing reads head rows directly and never depends on `latest.msgpack` or `latest.latest.msgpack`.
 
 ---
 
@@ -727,7 +716,7 @@ Reads can degrade gracefully. When a shard is missing or corrupt:
 
 - serve bytes by reconstructing them
 - repair the missing shard immediately when this read owns the repair token
-- commit repaired payload to a new backend location (file path in `standard`, raw extent in `arc`)
+- commit repaired payload to a new backend location (file path in `n1`, raw extent in `n1-arc`)
 - preserve authoritative metadata through `index`
 
 ### Redistribution
@@ -764,7 +753,7 @@ N1 still favors safety:
 - abandoned sessions are cleaned through `index`
 - payload artifacts without authoritative metadata are cleanup candidate data
 
-### Raw blob operations (`arc` only)
+### Raw blob operations (`n1-arc` only)
 
 - `GET /v4/maintenance/blob/raw/status` reports device and allocator state
 - scrub verifies committed raw payload
@@ -801,12 +790,12 @@ N1 is Linux-first and uses direct I/O on the blob data path for predictable late
 
 This applies to:
 
-- filesystem-backed blob/staging writes in `standard`, which prefer Linux `io_uring` when available and fall back to `O_DIRECT` + blocking writes when not
-- raw blob devices managed directly by `block_manager` in `arc`
+- filesystem-backed blob/staging writes in `n1`, which prefer Linux `io_uring` when available and fall back to `O_DIRECT` + blocking writes when not
+- raw blob devices managed directly by `block_manager` in `n1-arc`
 
 Metadata and serving state are profile-specific:
-- `standard`: metadata/index/prefix state are filesystem-backed and buffered; capacity monitoring uses live filesystem totals.
-- `arc`: metadata and payload are both raw-device backed via `block_manager`.
+- `n1`: metadata/index/prefix state are filesystem-backed and buffered; capacity monitoring uses live filesystem totals.
+- `n1-arc`: metadata and payload are both raw-device backed via `block_manager`.
 
 ### Preallocation
 
@@ -830,26 +819,26 @@ That discipline is now applied to partition state rather than a whole mirrored m
 
 This workspace now has two dedicated admin shells:
 
-- `litiaina-n1-cli` for `N1 Standard`
-- `litiaina-n2-cli` for `distribution-runtime`
+- `litiaina-n1-cli` for `n1`
+- `litiaina-n2-cli` for `n2`
 
 Runtime binaries are server-only:
 
-- `litiaina-n1-standard`
+- `litiaina-n1`
 - `litiaina-n2`
 
 ### How to run the CLIs
 
-Use the dedicated Standard CLI:
+Use the dedicated N1 CLI:
 
 ```bash
-cargo run -p standard_cli -- <command> [flags]
+cargo run -p n1_cli -- <command> [flags]
 ```
 
 Use the dedicated N2 CLI:
 
 ```bash
-cargo run -p distribution_cli -- <command> [flags]
+cargo run -p n2_cli -- <command> [flags]
 ```
 
 Built binaries:
@@ -862,18 +851,18 @@ Built binaries:
 Server runtime:
 
 ```bash
-cargo run -p standard
+cargo run -p n1
 ```
 
 Or run the built server directly:
 
 ```bash
-./target/release/litiaina-n1-standard
+./target/release/litiaina-n1
 ```
 
-`litiaina-n1-standard` and `litiaina-n2` no longer double as admin CLIs. If you pass command arguments to them, they exit and tell you to use the dedicated CLI binaries.
+`litiaina-n1` and `litiaina-n2` no longer double as admin CLIs. If you pass command arguments to them, they exit and tell you to use the dedicated CLI binaries.
 
-### N1 Standard CLI
+### N1 CLI
 
 ### Global CLI flags
 
@@ -904,7 +893,7 @@ Flags:
 - `--key <KEY>` required
 
 ```bash
-cargo run -p standard_cli -- fragment create --name imaging-a --key supersecretfragmentkey
+cargo run -p n1_cli -- fragment create --name imaging-a --key supersecretfragmentkey
 ```
 
 #### `health`
@@ -921,25 +910,25 @@ Health reports:
 - per-disk health plus total/used/free capacity on every configured index and blob path
 
 ```bash
-cargo run -p standard_cli -- health --watch --deep-scan
+cargo run -p n1_cli -- health --watch --deep-scan
 ```
 
 #### `uploads`
 Inspect active multipart sessions and resumable upload progress.
 
 ```bash
-cargo run -p standard_cli -- uploads list
-cargo run -p standard_cli -- uploads status --version-id <version_id>
+cargo run -p n1_cli -- uploads list
+cargo run -p n1_cli -- uploads status --version-id <version_id>
 ```
 
 #### `gc`
 Lifecycle control for garbage collection.
 
 ```bash
-cargo run -p standard_cli -- gc start
-cargo run -p standard_cli -- gc status
-cargo run -p standard_cli -- gc watch
-cargo run -p standard_cli -- gc stop
+cargo run -p n1_cli -- gc start
+cargo run -p n1_cli -- gc status
+cargo run -p n1_cli -- gc watch
+cargo run -p n1_cli -- gc stop
 ```
 
 #### `repair`
@@ -955,9 +944,9 @@ Flags:
 - `--batch <N>`
 
 ```bash
-cargo run -p standard_cli -- repair start --fragment <fragment_hash> --dry-run
-cargo run -p standard_cli -- repair status
-cargo run -p standard_cli -- repair watch
+cargo run -p n1_cli -- repair start --fragment <fragment_hash> --dry-run
+cargo run -p n1_cli -- repair status
+cargo run -p n1_cli -- repair watch
 ```
 
 #### `redistribute`
@@ -973,14 +962,14 @@ Flags:
 - `--status-batch <N>`
 
 ```bash
-cargo run -p standard_cli -- redistribute start --fragment <fragment_hash>
-cargo run -p standard_cli -- redistribute status
-cargo run -p standard_cli -- redistribute stop
+cargo run -p n1_cli -- redistribute start --fragment <fragment_hash>
+cargo run -p n1_cli -- redistribute status
+cargo run -p n1_cli -- redistribute stop
 ```
 
 ### Watch behavior
 
-The Standard CLI watch path is intentionally lightweight now:
+The N1 CLI watch path is intentionally lightweight now:
 
 - health watch prints one compact line per poll
 - maintenance job watch prints only when the status actually changes
@@ -989,9 +978,9 @@ The Standard CLI watch path is intentionally lightweight now:
 
 ### N2 Runtime CLI
 
-`distribution-runtime` has its own admin CLI:
+`n2` has its own admin CLI:
 
-- crate: `distribution_cli`
+- crate: `n2_cli`
 - binary: `litiaina-n2-cli`
 
 It includes the shared maintenance/admin surface plus N2-specific cluster commands:
@@ -1005,10 +994,10 @@ It includes the shared maintenance/admin surface plus N2-specific cluster comman
 Examples:
 
 ```bash
-cargo run -p distribution_cli -- cluster-view
-cargo run -p distribution_cli -- membership get
-cargo run -p distribution_cli -- membership rollback --epoch 12
-cargo run -p distribution_cli -- placement --fragment imaging-a --object-key scans/ct/0001.dcm
+cargo run -p n2_cli -- cluster-view
+cargo run -p n2_cli -- membership get
+cargo run -p n2_cli -- membership rollback --epoch 12
+cargo run -p n2_cli -- placement --fragment imaging-a --object-key scans/ct/0001.dcm
 ```
 
 Sequential stream probe (readahead/locality):
@@ -1016,23 +1005,23 @@ Sequential stream probe (readahead/locality):
 N1_STREAM_PROBE_OBJECT_BYTES=$((64*1024*1024)) \
 N1_STREAM_PROBE_PART_BYTES=$((4*1024*1024)) \
 N1_STREAM_PROBE_PASSES=2 \
-cargo test -p standard matrix_stream_sequential_readahead_locality_probe -- --ignored --nocapture
+cargo test -p n1 matrix_stream_sequential_readahead_locality_probe -- --ignored --nocapture
 ```
 
 ### General Testing
 
 ```bash
 # Core server test suite
-cargo test -p standard
+cargo test -p n1
 
-# Dedicated Standard CLI
-cargo check -p standard_cli
+# Dedicated N1 CLI
+cargo check -p n1_cli
 
 # Dedicated N2 CLI
-cargo check -p distribution_cli
+cargo check -p n2_cli
 
 # Ignored/manual suites
-cargo test -p standard -- --ignored --nocapture
+cargo test -p n1 -- --ignored --nocapture
 ```
 
 ---
@@ -1121,7 +1110,7 @@ It runs the release-critical storage/repair workflows:
 - blob CRUD + delete/recover/permanent delete
 - live capacity reporting and storage-path reconciliation
 - blob redistribution + repair + recovered read + GC marker cleanup
-- index mirror repair convergence
+- indexdb partition replica convergence
 - HA repair reconvergence with an index disk down
 
 It also optionally chains into the nightly HA chaos harness.
@@ -1152,9 +1141,9 @@ scripts/bench/run_release_drills.sh
 
 Outputs are written under `.n1-bench/release-drills-<timestamp>/`.
 
-## Arc allocator certification harness
+## N1-Arc allocator certification harness
 
-For Arc allocator/formatter closure gates, use:
+For `n1-arc` allocator/formatter closure gates, use:
 
 `scripts/bench/run_arc_allocator_gate.sh`
 

@@ -12,32 +12,32 @@
 > Deployment profile status (2026-03-20):
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used by both deployment shapes.
-> - `standard` is the stable single-node deployment path.
-> - `standard` is released at `0.6.2`.
-> - `distribution-runtime` (`litiaina-n2`) is the multi-node N2 deployment path in this workspace and is released at `0.2.0`.
-> - `registry-runtime` (`registry-server`) is the SQLite-backed Registry layer for user/business metadata and is versioned independently at `0.3.0`.
-> - `arc` is experimental for raw-device deployments.
+> - `n1` is the stable single-node deployment path.
+> - `n1` is released at `0.7.0`.
+> - `n2` (`litiaina-n2`) is the multi-node N2 deployment path in this workspace and is released at `0.2.0`.
+> - `registry` (`registry-server`) is the SQLite-backed Registry layer for user/business metadata and is versioned independently at `0.3.0`.
+> - `n1-arc` is experimental for raw-device deployments.
 > - See `DEPLOYMENT_PROFILES.md`.
 >
-> Source of truth for routing (`standard`, single-node): `standard/src/routes/storage_routes.rs`.
-> Source of truth for routing (`distribution-runtime`, multi-node): `distribution-runtime/src/routes/storage_routes.rs`.
-> Arc route path: `arc/src/routes/storage_routes.rs`.
-> Source of truth for request/response behavior is profile-specific (`standard/src/n1_core` as the shared N1 engine for both `standard` and `distribution-runtime`, and `arc/src/n1_core` for Arc).
-> - unless explicitly labeled otherwise, the route descriptions below document the stable `standard` runtime first
+> Source of truth for routing (`n1`, single-node): `n1/src/routes/storage_routes.rs`.
+> Source of truth for routing (`n2`, multi-node): `n2/src/routes/storage_routes.rs`.
+> N1-Arc route path: `n1-arc/src/routes/storage_routes.rs`.
+> Source of truth for request/response behavior is profile-specific (`n1/src/n1_core` as the shared N1 engine for both `n1` and `n2`, and `n1-arc/src/n1_core` for `n1-arc`).
+> - unless explicitly labeled otherwise, the route descriptions below document the stable `n1` runtime first
 > Runtime split note:
-> - Single-node N2 deployment runs `standard` (`litiaina-n1-standard`).
-> - Multi-node N2 deployment runs `distribution-runtime` (`litiaina-n2`).
-> - `distribution-runtime` adds `/v4/n2/*` cluster routes and `/v4/n2/internal/*` peer routes on top of the same shared stable N1 node core used by `standard`.
+> - Single-node N2 deployment runs `n1` (`litiaina-n1`).
+> - Multi-node N2 deployment runs `n2` (`litiaina-n2`).
+> - `n2` adds `/v4/n2/*` cluster routes and `/v4/n2/internal/*` peer routes on top of the same shared stable N1 node core used by `n1`.
 > - For the multi-node operator runbook, see `N2_DEPLOYMENT.md`.
-> Arc route scope note:
-> - Arc serves v4 object/maintenance APIs and does not expose legacy `/dir/*` routes.
-> - Arc also does not expose `/authenticate/fs`.
+> N1-Arc route scope note:
+> - `n1-arc` serves v4 object/maintenance APIs and does not expose legacy `/dir/*` routes.
+> - `n1-arc` also does not expose `/authenticate/fs`.
 
 > Storage backend note:
-> - `standard` (stable): `index_store_disks` and `blob_store_disks` are mounted filesystem paths (directory roots).
-> - `arc` (experimental raw-device): `index_store_disks` and `blob_store_disks` are raw, unformatted, unmounted device paths managed directly by N1.
-> - `standard` prefers Linux `io_uring` on the blob write path when available and falls back to `O_DIRECT` + blocking writes when it is not.
-> - Payload substrate still differs by profile (filesystem files in standard, raw extents in arc).
+> - `n1` (stable): `index_store_disks` and `blob_store_disks` are mounted filesystem paths (directory roots).
+> - `n1-arc` (experimental raw-device): `index_store_disks` and `blob_store_disks` are raw, unformatted, unmounted device paths managed directly by N1.
+> - `n1` prefers Linux `io_uring` on the blob write path when available and falls back to `O_DIRECT` + blocking writes when it is not.
+> - Payload substrate still differs by profile (filesystem files in `n1`, raw extents in `n1-arc`).
 
 > Platform identity note:
 > - N2 is the operator-facing platform and API identity.
@@ -46,7 +46,7 @@
 > - Multi-node N2 serves that same node surface plus the `/v4/n2/*` distributed control/data-plane routes.
 >
 > Multi-node N2 deployment note:
-> - `distribution-runtime` is operational on a tested 2-node filesystem-backed cluster.
+> - `n2` is operational on a tested 2-node filesystem-backed cluster.
 > - In an isolated `litiaina-n2` working directory, the runtime now auto-creates `n1.env` and `n1_config.ini` compatibility aliases beside `n2.env` and `n2_config.ini` when needed.
 > - Default `[n2].cluster_commit_mode=strict_full_placement` now requires the planned `kc+mc` target set before `PUT /v4/n2/object/...` succeeds.
 > - Use `committed_shards` as the immediate placement truth and `required_commit_shards` as the actual success threshold reported by the runtime.
@@ -64,8 +64,8 @@
 > - Startup now rejects operator-dangerous multi-node layouts such as placeholder internal tokens, duplicate active endpoints, missing membership files, and loopback-only peer endpoints.
 
 > Engine profile note:
-> - `standard` is the stable/default profile for general-purpose filesystem-backed deployments.
-> - `arc` is the experimental raw-device profile for absolute device control and maximum performance ceiling.
+> - `n1` is the stable/default profile for general-purpose filesystem-backed deployments.
+> - `n1-arc` is the experimental raw-device profile for absolute device control and maximum performance ceiling.
 > - Both variants are intended to keep the same object/API semantics; the difference is backend execution model and operations envelope.
 
 > Metadata architecture note:
@@ -77,34 +77,34 @@
 > - Legacy mirrored object/session trees are no longer the hot-path authority.
 > - Same-key upload recency comes from the upload session's `created_at`; finalize does not get to reorder versions.
 > - If two versions share the same second-level timestamp, ULID `version_id` order breaks the tie.
-> - Exact-key reads resolve the latest marker and then rehydrate the referenced immutable version record before serving metadata or bytes.
+> - Exact-key reads resolve the authoritative object head and then rehydrate the referenced immutable version record before serving metadata or bytes.
 > - Multipart uploads do not rely on in-memory part state for resumability. Part commits are durably recorded in the `index` session state through compact per-part receipts, and finalize assembles the authoritative object metadata from those receipts.
 
 > Release status note:
-> - N1 `standard` is stable at `0.6.2`; `arc` is experimental.
+> - N1 `n1` is stable at `0.7.0`; `n1-arc` is experimental.
 > - This document describes the current implementation and current routes.
 > - Request/response details and endpoint layout may still change before `1.0.0` even though the underlying storage model is now fixed.
 
 ## 0. Profile Distinction And Disk Layout
 
-| Dimension | Standard (`litiaina-n1-standard`) | Arc (`litiaina-n1-arc`) |
+| Dimension | N1 (`litiaina-n1`) | N1-Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / default (`0.6.2`) | Experimental / raw-device profile |
-| API source of truth | Yes (`standard/src/routes/storage_routes.rs`) | Yes (`arc/src/routes/storage_routes.rs`) |
+| Status | Stable / default (`0.7.0`) | Experimental / raw-device profile |
+| API source of truth | Yes (`n1/src/routes/storage_routes.rs`) | Yes (`n1-arc/src/routes/storage_routes.rs`) |
 | `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw devices / loopback files |
-| Index metadata layout | Partitioned filesystem index | Raw index catalog on block-manager media |
+| Index metadata layout | Partitioned `indexdb` metadata (`.ndxdb`) | Raw index catalog on block-manager media |
 | Blob payload layout | Shard files on blob roots | Raw extents via `block_manager` |
 
 Standard disk layout:
 
 ```text
-{INDEX_ROOT}/{fragment}/index/partitions/{partition_id}/...
+{INDEX_ROOT}/{fragment}/indexdb/partitions/{partition_id}.ndxdb
 {BLOB_ROOT}/{fragment}/blob/{version_id}/part_{p}_shard_{i}.shard|.parity
 {BLOB_ROOT}/{fragment}/.trash/blob/{version_id}/...
 ```
 
-Arc disk layout:
+N1-Arc disk layout:
 
 ```text
 {RAW_INDEX_DEVICE} -> block_manager allocator/journal metadata + raw index catalog records
@@ -112,9 +112,9 @@ Arc disk layout:
 payload address: raw://{device_id}/{allocation_id}
 ```
 
-Arc index note:
-- Arc index and blob are both raw block-manager media.
-- Arc is experimental.
+N1-Arc index note:
+- `n1-arc` index and blob are both raw block-manager media.
+- `n1-arc` is experimental.
 
 ## 1. Base URL And Conventions
 - Base URL example: `https://127.0.0.1:50001`
@@ -495,17 +495,17 @@ curl -k -X POST "https://127.0.0.1:50001/authenticate/fragment" \
 
 Notes:
 - Master mode no longer requires `ADMIN_KEY`; `MASTER_KEY` alone is the privileged path.
-- `litiaina-n1-cli` is the dedicated Standard admin CLI; `litiaina-n1-standard` now runs the server only.
-- `litiaina-n2-cli` is the dedicated distribution-runtime admin CLI; `litiaina-n2` now runs the server only.
+- `litiaina-n1-cli` is the dedicated n1 admin CLI; `litiaina-n1` now runs the server only.
+- `litiaina-n2-cli` is the dedicated n2 admin CLI; `litiaina-n2` now runs the server only.
 - CLI semantics are split: `--auth-fragment` controls auth context, while `--fragment` is only passed to maintenance start endpoints that support explicit fragment targeting.
-- Standard CLI watch mode is line-oriented and low-overhead: health prints one compact line per poll, and job watches only print when status changes.
+- N1 CLI watch mode is line-oriented and low-overhead: health prints one compact line per poll, and job watches only print when status changes.
 - Health responses now include per-disk total, used, available, usage percentage, and current disk state for each configured index/blob path.
 - Fragment auth now also mints a refresh token for session continuation.
 - `litiaina-n1-cli` and `litiaina-n2-cli` automatically use that refresh token in-memory, so long-running watch/poll sessions can keep operating without manual re-authentication.
 - If `expires_in` is omitted, the server issues a `15 minute` access token by default.
 - If `expires_in` is larger than the configured maximum, the server clamps it before minting the token.
 
-### 2.2 `POST /authenticate/fs` (standard only)
+### 2.2 `POST /authenticate/fs` (n1 only)
 Purpose:
 - Issues legacy FS auth context for `/dir/*` routes.
 
@@ -608,7 +608,8 @@ Response (`InitiateUploadResponse`):
 Notes:
 - `keys` can be an explicit list of exact object keys.
 - Or set `export_all=true` to stream the entire fragment in flat engine order.
-- Prefix/delimiter selection is no longer an engine concern; Registry-backed archive flows resolve exact keys first, then stream them through the engine manifest route.
+- Registry-backed archive flows can still resolve exact keys first, but the N1 engine now also
+  supports authoritative `prefix` and `delimiter=/` listing directly from partition head rows.
 
 ### 4.4 Signed URL Request
 ```json
@@ -685,7 +686,7 @@ All endpoints in this section require a valid fragment JWT with `read=true`.
 For claim-scoped object APIs below, the fragment comes from the JWT claim and is not passed in the path.
 
 ### 6.1 `GET /v4/capacity/usage`
-Returns live filesystem capacity totals visible to the current `standard` node.
+Returns live filesystem capacity totals visible to the current `n1` node.
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/capacity/usage"
@@ -718,21 +719,15 @@ Query:
 
 Notes:
 - Internal marker keys (for example `.n1fsd_dir`, `.n1-trash`) are hidden unless `include_internal=true`.
-- Normal serving path uses the root full-key accelerator under `index/__p__/...`.
-- The accelerator stores sorted full-key rows with inline list payload.
-- Listing is flat only.
-- Supported query params:
-  - `limit`
-  - `continuation_token`
-  - `include_internal`
-- Unsupported in `0.6.2` engine mode:
-  - `prefix`
-  - `delimiter`
-- Namespace browsing, folder simulation, and filtered views belong in the registry layer above the engine.
+- Listing reads authoritative `object_heads` rows from routed `indexdb` partition files.
+- `prefix` is supported directly by the engine.
+- `delimiter=/` is supported directly by the engine and returns folded folder-style entries in `common_prefixes`.
+- `continuation_token` is opaque and must be passed through unchanged.
+- Registry still owns higher-level business filtering and owner-scoped logical listing above storage truth.
 
 Response shape (`ListObjectsResult`):
 - `objects`: array of `ObjectMetadata`
-- `common_prefixes`: always empty in engine flat-list mode
+- `common_prefixes`: optional folded prefixes when `delimiter=/`
 - `continuation_token`: optional
 
 ```bash
@@ -743,8 +738,8 @@ curl -k -H "Authorization: Bearer $TOKEN" \
 ### 6.4 `GET /v4/fragment/trash`
 Trash listing, same pagination style.
 - Supports the same `include_internal` query behavior as object listing.
-- Trash visibility comes from `index` trash state.
-- Trash listing is flat only and projects latest trashed state per key from authoritative index trash metadata.
+- Trash visibility comes from authoritative `object_heads` trash state in `indexdb`.
+- Supports the same `prefix`, `delimiter=/`, and `continuation_token` behavior as live listing.
 - `continuation_token` is opaque and must be passed through unchanged.
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
@@ -853,7 +848,7 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
 ### 6.11.1 `POST /v4/fragment/archive/manifest`
 Purpose:
 - Streams a tar archive from a newline-delimited manifest of exact object keys.
-- Used by the Registry to support prefix/search archive exports without reintroducing prefix logic into the engine.
+- Used by the Registry to stream exact-key archive selections from its own logical catalog, while N1 also supports authoritative `prefix` / `delimiter=/` listing directly from `indexdb` partition heads.
 
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
@@ -904,7 +899,7 @@ curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/fragment/trash/empty"
 ```
 Notes:
-- Empty-trash clears partition trash metadata and removes `.trash` roots directly (`remove_dir_all`) for O(1)-style namespace purge on filesystem-backed standard.
+- Empty-trash clears partition trash metadata and removes `.trash` roots directly (`remove_dir_all`) for O(1)-style namespace purge on filesystem-backed `n1`.
 - Live storage reporting is derived from current filesystem totals on the node.
 
 ### 7.4 `PATCH /v4/fragment/object/rename`
@@ -1052,7 +1047,7 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
   -d '{"content_type":"video/mp4","total_size_bytes":1073741824,"expected_parts":256,"part_size_bytes":4194304}'
 ```
 
-### 8.2 `POST /v4/upload/one-shot/{*object_key}` (standard)
+### 8.2 `POST /v4/upload/one-shot/{*object_key}` (`n1`)
 Direct single-request upload for small objects. This path skips upload session creation, part tracking, and finalize.
 
 Headers:
@@ -1095,8 +1090,8 @@ Notes:
 - Part upload commits shard payload, persists part metadata on disk, then records committed-part state in `index` session state.
 - If upload I/O gating is enabled and the node cannot admit more upload work within the gate timeout, the request is rejected with `503 Service Unavailable` instead of proceeding ungated.
 - The upload hot path does not rely on in-memory part state for resumability.
-- In `standard`, shards are written as files under blob root directories.
-- In `arc`, shards are committed to raw extents.
+- In `n1`, shards are written as files under blob root directories.
+- In `n1-arc`, shards are committed to raw extents.
 - Multipart part commits are unordered across distinct `part_index` values.
 - Client coordination should keep one logical writer per `(version_id, part_index)` and use upload-status checks for stateless resume.
 - A successful part upload does not publish object visibility by itself.
@@ -1201,7 +1196,7 @@ Notes:
 - `mode=strict` makes the node read-only and raises repair aggressiveness to use more of the available I/O width.
 - `mode=scrub` quiesces reads and writes and runs the same integrity-first repair engine at the highest practical aggressiveness.
 - Runtime concurrency is normalized against live blob disks and live index roots, so auto-tuning follows actual reachable hardware instead of static CPU counts alone.
-- Fragment object-version scans are streamed incrementally from partition metadata paths (`index/partitions/.../{objects|trash}`), so repair does not depend on legacy `{hash}#{version}.msgpack` files.
+- Fragment object-version scans are streamed incrementally from routed `indexdb` partition rows, so repair no longer depends on any legacy per-object metadata files.
 - Log severity policy for repair/recovery paths: expected retry/remap steps emit `DEBUG`, successful per-object summaries emit `INFO`, degraded-but-continued outcomes emit `WARN`, and unrecoverable read failures emit `ERROR`.
 - Repair/scrub dry-run no longer aborts when `.raw_gc` markers reference a decommissioned device id; those markers are kept and treated as deferred cleanup state.
 
@@ -1308,12 +1303,12 @@ curl -k -X PATCH -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/maintenance/redistribution/stop"
 ```
 
-### 9.6 Raw blob status endpoint (arc only)
+### 9.6 Raw blob status endpoint (n1-arc only)
 `GET /v4/maintenance/blob/raw/status`
 
 Notes:
-- This endpoint is exposed in arc.
-- Standard route set does not expose `/v4/maintenance/blob/raw/status`.
+- This endpoint is exposed in `n1-arc`.
+- `n1` route set does not expose `/v4/maintenance/blob/raw/status`.
 
 Reports one row per configured blob device:
 
@@ -1342,34 +1337,7 @@ curl -k -X GET -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/maintenance/blob/raw/status"
 ```
 
-### 9.7 Prefix rebuild endpoints
-- `POST /v4/maintenance/prefix/rebuild/start`
-- `POST /v4/maintenance/prefix/rebuild/stop`
-- `GET /v4/maintenance/prefix/rebuild/status`
-
-Notes:
-- Prefix rebuild scans authoritative `index` object state and regenerates namespace-serving segments.
-- Normal prefix maintenance appends full-key rows into the root accelerator; rebuild is the full repair path when the serving plane needs a full regeneration.
-- Prefix state is rebuildable acceleration, not object truth.
-
-Start query params:
-- `fragment=<fragment_hash>` optional
-
-```bash
-curl -k -X POST -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/maintenance/prefix/rebuild/start"
-
-curl -k -X POST -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/maintenance/prefix/rebuild/start?fragment=<fragment_hash>"
-
-curl -k -X GET -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/maintenance/prefix/rebuild/status"
-
-curl -k -X POST -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/v4/maintenance/prefix/rebuild/stop"
-```
-
-### 9.8 System health endpoint
+### 9.7 System health endpoint
 `GET /v4/maintenance/health`
 
 Query params:
@@ -1465,8 +1433,8 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
   -d '{"message":"Maintenance starts","severity":"info"}'
 ```
 
-## 11. Legacy FS API (`/dir/*`, standard only)
-These routes are protected by legacy FS auth middleware and are not exposed by Arc.
+## 11. Legacy FS API (`/dir/*`, n1 only)
+These routes are protected by legacy FS auth middleware and are not exposed by `n1-arc`.
 
 ### 11.1 Directory listing and inspection
 
@@ -1680,7 +1648,7 @@ curl -k -X POST -H "Authorization: Bearer $FS_TOKEN" \
 
 ### Auth
 - `POST /authenticate/fragment`
-- `POST /authenticate/fs` (standard only)
+- `POST /authenticate/fs` (n1 only)
 - `POST /authenticate/refresh`
 - `POST /authenticate/logout`
 
@@ -1761,16 +1729,13 @@ Recommended starting points:
 - `POST /v4/maintenance/redistribution/start`
 - `PATCH /v4/maintenance/redistribution/stop`
 - `GET /v4/maintenance/redistribution/monitor`
-- `POST /v4/maintenance/prefix/rebuild/start`
-- `POST /v4/maintenance/prefix/rebuild/stop`
-- `GET /v4/maintenance/prefix/rebuild/status`
 - `GET /v4/maintenance/health`
 
 ### Websocket/broadcast
 - `GET /ws`
 - `POST /v4/system/broadcast`
 
-### Legacy FS (standard only)
+### Legacy FS (n1 only)
 - `POST /dir/file/upload/`
 - `POST /dir/file/upload/{*path}`
 - `POST /dir/file/upload/v2/`

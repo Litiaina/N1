@@ -6,11 +6,11 @@ use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
 use crate::{
-    enums::app_error_enum::AppError,
     core::{
         disk_manager::ObjectPathManager, index_facade as index, quota_manager::set_storage_used,
         raw_index,
     },
+    enums::app_error_enum::AppError,
     structs::auth_structs::Claims,
 };
 

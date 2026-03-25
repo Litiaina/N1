@@ -1,8 +1,4 @@
-use crate::enums::app_error_enum::AppError;
-use crate::core::constants::{
-    GC_SUFFIX, METADATA_EXT, PARITY_SUFFIX, PART_META_SUFFIX, REDIST_TMP_SUFFIX, RESERVATION_FILE,
-    SHARD_SUFFIX,
-};
+use crate::core::constants::{GC_SUFFIX, PARITY_SUFFIX, REDIST_TMP_SUFFIX, SHARD_SUFFIX};
 use crate::core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo,
     default_stripe_size,
@@ -16,6 +12,7 @@ use crate::core::upload::{
     DATA_SHARDS_ATOMIC, DirectWriter, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, create_direct_file,
     sync_dir,
 };
+use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::manager::WsConnectionManager;
@@ -715,12 +712,10 @@ fn get_shard_dir_custom(
     }
 }
 
-fn get_all_metadata_paths_custom(
+fn get_partition_db_paths_custom(
     index_roots: &[PathBuf],
     fragment_hash: &str,
     object_key: &str,
-    version_id: &str,
-    is_trash: bool,
 ) -> Vec<PathBuf> {
     use sha2::{Digest, Sha256};
 
@@ -747,19 +742,13 @@ fn get_all_metadata_paths_custom(
         }
     }
 
-    let key_hash = ObjectPathManager::object_key_hash(object_key);
-    let filename = format!("{}{}", version_id, METADATA_EXT);
     selected
         .into_iter()
         .map(|root| {
             root.join(fragment_hash)
-                .join("index")
+                .join("indexdb")
                 .join("partitions")
-                .join(format!("{:04x}", partition_id))
-                .join(if is_trash { "trash" } else { "objects" })
-                .join(&key_hash[0..2])
-                .join(&key_hash)
-                .join(&filename)
+                .join(format!("{:04x}.ndxdb", partition_id))
         })
         .collect()
 }
@@ -771,15 +760,18 @@ fn get_all_intent_paths_custom(
     version_id: &str,
     is_trash: bool,
 ) -> Vec<PathBuf> {
-    get_all_metadata_paths_custom(index_roots, fragment_hash, object_key, version_id, is_trash)
+    get_partition_db_paths_custom(index_roots, fragment_hash, object_key)
         .into_iter()
-        .filter_map(|meta_path| {
-            let parent = meta_path.parent()?;
-            Some(
-                parent
-                    .join("__redist__")
-                    .join(format!("{}{}", version_id, REDIST_INTENT_SUFFIX)),
-            )
+        .map(|db_path| {
+            let partition_stem = db_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("partition");
+            let object_hash = ObjectPathManager::object_key_hash(object_key);
+            db_path.with_file_name(format!(
+                "{partition_stem}.{object_hash}.{version_id}.{is_trash}{}",
+                REDIST_INTENT_SUFFIX
+            ))
         })
         .collect()
 }
@@ -1434,70 +1426,11 @@ pub async fn run_redistribution_job_with_options(
         }
 
         let mut seen_meta_ids: HashSet<u64> = HashSet::new();
-        let mut has_partition_layout = false;
-        for root in live_index.iter() {
-            if tokio_fs::try_exists(root.join(&fragment_hash).join("index").join("partitions"))
-                .await
-                .unwrap_or(false)
-            {
-                has_partition_layout = true;
-                break;
-            }
-        }
-        let scan_targets: Vec<(String, bool)> = if has_partition_layout {
-            vec![("index/partitions".to_string(), false)]
-        } else {
-            vec![
-                ("index".to_string(), false),
-                (".trash/index".to_string(), true),
-            ]
-        };
 
-        for (sub_dir, is_trash) in scan_targets {
+        for is_trash in [false, true] {
             if should_stop() {
                 break;
             }
-
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<(PathBuf, bool)>(256);
-
-            let roots = (*live_index).clone();
-            let frag = fragment_hash.clone();
-            let sub = sub_dir.clone();
-
-            tokio::task::spawn_blocking(move || {
-                for root in roots {
-                    let index_dir = root.join(&frag).join(&sub);
-                    if !index_dir.exists() {
-                        continue;
-                    }
-                    let walker = WalkDir::new(index_dir).into_iter();
-                    for entry in walker.filter_map(|e| e.ok()) {
-                        if !entry.file_type().is_file() {
-                            continue;
-                        }
-                        let p = entry.path();
-                        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-                        if name.ends_with(METADATA_EXT)
-                            && !name.ends_with(PART_META_SUFFIX)
-                            && name != RESERVATION_FILE
-                            && name != "latest.msgpack"
-                            && !name.ends_with(".session.msgpack")
-                            && !name.ends_with(".removed.msgpack")
-                        {
-                            let pstr = p.to_string_lossy();
-                            let inferred_trash = is_trash
-                                || pstr.contains("/trash/")
-                                || pstr.contains("\\trash\\")
-                                || pstr.contains("/.trash/")
-                                || pstr.contains("\\.trash\\");
-                            if tx.blocking_send((p.to_path_buf(), inferred_trash)).is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            });
 
             let mut delta = StatusDelta {
                 scanned: 0,
@@ -1508,201 +1441,221 @@ pub async fn run_redistribution_job_with_options(
                 last_error: None,
             };
             let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-
-            while let Some((meta_path, is_trash_flag)) = rx.recv().await {
+            let mut continuation_token = None;
+            loop {
                 if should_stop() {
                     break;
                 }
 
-                let raw = match tokio_fs::read(&meta_path).await {
-                    Ok(d) => d,
-                    Err(_) => continue,
+                let page = if is_trash {
+                    index::scan_fragment_trash_metadata_page(
+                        &fragment_hash,
+                        None,
+                        None,
+                        usize::try_from(status_batch.max(1)).unwrap_or(usize::MAX),
+                        continuation_token.clone(),
+                        true,
+                    )
+                    .await?
+                } else {
+                    index::scan_fragment_live_metadata_page(
+                        &fragment_hash,
+                        None,
+                        None,
+                        usize::try_from(status_batch.max(1)).unwrap_or(usize::MAX),
+                        continuation_token.clone(),
+                        true,
+                    )
+                    .await?
                 };
 
-                let meta = match rmp_serde::from_slice::<ObjectMetadata>(&raw) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
+                for meta in page.objects {
+                    let is_trash_flag = is_trash;
+                    let id = dedupe_id_from_metadata(&meta, is_trash_flag);
+                    if !seen_meta_ids.insert(id) {
+                        continue;
+                    }
 
-                let id = dedupe_id_from_metadata(&meta, is_trash_flag);
-                if !seen_meta_ids.insert(id) {
-                    continue;
-                }
+                    if meta.is_delete_marker {
+                        continue;
+                    }
 
-                if meta.is_delete_marker {
-                    continue;
-                }
-
-                delta.scanned += 1;
-                if delta.scanned >= status_batch {
-                    layout.refresh_if_needed().await;
-                    flush_status_delta(&ws_manager, start_time, &mut delta).await;
-                }
-
-                let needs = check_needs_redistribution(
-                    &meta,
-                    opts.scope,
-                    target_data_shards,
-                    target_parity_shards,
-                    target_stripe_size,
-                    live_blob.len(),
-                    &live_blob,
-                    &live_index,
-                    is_trash_flag,
-                )
-                .await;
-
-                if !needs {
-                    continue;
-                }
-
-                let object_label = format!(
-                    "{}/{} (v:{}) [Trash:{}]",
-                    meta.fragment, meta.object_key, meta.version_id, is_trash_flag
-                );
-                delta.needs += 1;
-                delta.last_object = Some(object_label.clone());
-
-                if dry_run {
-                    delta.migrated += 1;
-                    if delta.needs + delta.migrated + delta.errors >= status_batch {
+                    delta.scanned += 1;
+                    if delta.scanned >= status_batch {
+                        layout.refresh_if_needed().await;
                         flush_status_delta(&ws_manager, start_time, &mut delta).await;
                     }
-                    continue;
-                }
 
-                let live_blob_for_task = live_blob.clone();
-                let live_index_for_task = live_index.clone();
-                let task_strict_durability = strict_durability;
-                let task_scope = opts.scope;
-                in_flight.push(async move {
-                    let mut meta = meta;
-                    let fragment = meta.fragment.clone();
-                    let key = meta.object_key.clone();
-                    let version = meta.version_id.clone();
-                    let intent_paths = get_all_intent_paths_custom(
-                        &live_index_for_task,
-                        &fragment,
-                        &key,
-                        &version,
+                    let needs = check_needs_redistribution(
+                        &meta,
+                        opts.scope,
+                        target_data_shards,
+                        target_parity_shards,
+                        target_stripe_size,
+                        live_blob.len(),
+                        &live_blob,
+                        &live_index,
                         is_trash_flag,
+                    )
+                    .await;
+
+                    if !needs {
+                        continue;
+                    }
+
+                    let object_label = format!(
+                        "{}/{} (v:{}) [Trash:{}]",
+                        meta.fragment, meta.object_key, meta.version_id, is_trash_flag
                     );
-                    let tx_id = Ulid::new().to_string();
-                    let created_ms = Utc::now().timestamp_millis();
-                    let mut intent = RedistributionIntent {
-                        tx_id,
-                        fragment: fragment.clone(),
-                        object_key: key.clone(),
-                        version_id: version.clone(),
-                        is_trash: is_trash_flag,
-                        scope: task_scope.as_str().to_string(),
-                        phase: "prepare".to_string(),
-                        created_at_unix_ms: created_ms,
-                        updated_at_unix_ms: created_ms,
-                    };
+                    delta.needs += 1;
+                    delta.last_object = Some(object_label.clone());
 
-                    if let Err(e) =
-                        write_intent_state(&intent_paths, &intent, task_strict_durability).await
-                    {
-                        return Err((
-                            fragment,
-                            key,
-                            version,
-                            is_trash_flag,
-                            format!("failed to persist redistribution intent: {}", e),
-                        ));
-                    }
-                    intent.phase = "running".to_string();
-                    intent.updated_at_unix_ms = Utc::now().timestamp_millis();
-                    if let Err(e) =
-                        write_intent_state(&intent_paths, &intent, task_strict_durability).await
-                    {
-                        return Err((
-                            fragment,
-                            key,
-                            version,
-                            is_trash_flag,
-                            format!("failed to update redistribution intent: {}", e),
-                        ));
+                    if dry_run {
+                        delta.migrated += 1;
+                        if delta.needs + delta.migrated + delta.errors >= status_batch {
+                            flush_status_delta(&ws_manager, start_time, &mut delta).await;
+                        }
+                        continue;
                     }
 
-                    let result = match task_scope {
-                        RedistributionScope::Index => {
-                            redistribute_object_index_only(
-                                &meta,
-                                &live_index_for_task,
-                                is_trash_flag,
-                                task_strict_durability,
-                            )
-                            .await
-                        }
-                        RedistributionScope::Blob | RedistributionScope::All => {
-                            redistribute_object_streaming(
-                                &mut meta,
-                                target_data_shards,
-                                target_parity_shards,
-                                target_stripe_size,
-                                &live_blob_for_task,
-                                &live_index_for_task,
-                                is_trash_flag,
-                                task_strict_durability,
-                            )
-                            .await
-                        }
-                    };
+                    let live_blob_for_task = live_blob.clone();
+                    let live_index_for_task = live_index.clone();
+                    let task_strict_durability = strict_durability;
+                    let task_scope = opts.scope;
+                    in_flight.push(async move {
+                        let mut meta = meta;
+                        let fragment = meta.fragment.clone();
+                        let key = meta.object_key.clone();
+                        let version = meta.version_id.clone();
+                        let intent_paths = get_all_intent_paths_custom(
+                            &live_index_for_task,
+                            &fragment,
+                            &key,
+                            &version,
+                            is_trash_flag,
+                        );
+                        let tx_id = Ulid::new().to_string();
+                        let created_ms = Utc::now().timestamp_millis();
+                        let mut intent = RedistributionIntent {
+                            tx_id,
+                            fragment: fragment.clone(),
+                            object_key: key.clone(),
+                            version_id: version.clone(),
+                            is_trash: is_trash_flag,
+                            scope: task_scope.as_str().to_string(),
+                            phase: "prepare".to_string(),
+                            created_at_unix_ms: created_ms,
+                            updated_at_unix_ms: created_ms,
+                        };
 
-                    match result {
-                        Ok(_) => {
-                            remove_intent_paths_best_effort(&intent_paths).await;
-                            Ok((fragment, key, version, is_trash_flag))
+                        if let Err(e) =
+                            write_intent_state(&intent_paths, &intent, task_strict_durability).await
+                        {
+                            return Err((
+                                fragment,
+                                key,
+                                version,
+                                is_trash_flag,
+                                format!("failed to persist redistribution intent: {}", e),
+                            ));
                         }
-                        Err(e) => {
-                            let err_text = e.to_string();
-                            if !(should_stop() || is_stopped_error(&err_text)) {
-                                intent.phase = "failed".to_string();
-                                intent.updated_at_unix_ms = Utc::now().timestamp_millis();
-                                let _ = write_intent_state(
-                                    &intent_paths,
-                                    &intent,
+                        intent.phase = "running".to_string();
+                        intent.updated_at_unix_ms = Utc::now().timestamp_millis();
+                        if let Err(e) =
+                            write_intent_state(&intent_paths, &intent, task_strict_durability).await
+                        {
+                            return Err((
+                                fragment,
+                                key,
+                                version,
+                                is_trash_flag,
+                                format!("failed to update redistribution intent: {}", e),
+                            ));
+                        }
+
+                        let result = match task_scope {
+                            RedistributionScope::Index => {
+                                redistribute_object_index_only(
+                                    &meta,
+                                    &live_index_for_task,
+                                    is_trash_flag,
                                     task_strict_durability,
                                 )
-                                .await;
+                                .await
                             }
-                            Err((fragment, key, version, is_trash_flag, err_text))
-                        }
-                    }
-                });
+                            RedistributionScope::Blob | RedistributionScope::All => {
+                                redistribute_object_streaming(
+                                    &mut meta,
+                                    target_data_shards,
+                                    target_parity_shards,
+                                    target_stripe_size,
+                                    &live_blob_for_task,
+                                    &live_index_for_task,
+                                    is_trash_flag,
+                                    task_strict_durability,
+                                )
+                                .await
+                            }
+                        };
 
-                while in_flight.len() >= object_concurrency {
-                    if let Some(res) = in_flight.next().await {
-                        match res {
-                            Ok((fragment, key, version, task_is_trash)) => {
-                                touched_fragments.insert(fragment.clone());
-                                delta.migrated += 1;
-                                delta.last_object = Some(format!(
-                                    "{}/{} (v:{}) [Trash:{}]",
-                                    fragment, key, version, task_is_trash
-                                ));
+                        match result {
+                            Ok(_) => {
+                                remove_intent_paths_best_effort(&intent_paths).await;
+                                Ok((fragment, key, version, is_trash_flag))
                             }
-                            Err((fragment, key, version, task_is_trash, err)) => {
-                                if should_stop() || is_stopped_error(&err) {
-                                    continue;
+                            Err(e) => {
+                                let err_text = e.to_string();
+                                if !(should_stop() || is_stopped_error(&err_text)) {
+                                    intent.phase = "failed".to_string();
+                                    intent.updated_at_unix_ms = Utc::now().timestamp_millis();
+                                    let _ = write_intent_state(
+                                        &intent_paths,
+                                        &intent,
+                                        task_strict_durability,
+                                    )
+                                    .await;
                                 }
-                                warn!(
-                                    "Redistribute failed for {}/{} (v:{}) [Trash:{}]: {}",
-                                    fragment, key, version, task_is_trash, err
-                                );
-                                delta.errors += 1;
-                                delta.last_error = Some(err);
+                                Err((fragment, key, version, is_trash_flag, err_text))
                             }
                         }
-                        if let Some(delay) = pacing_delay {
-                            tokio::time::sleep(delay).await;
+                    });
+
+                    while in_flight.len() >= object_concurrency {
+                        if let Some(res) = in_flight.next().await {
+                            match res {
+                                Ok((fragment, key, version, task_is_trash)) => {
+                                    touched_fragments.insert(fragment.clone());
+                                    delta.migrated += 1;
+                                    delta.last_object = Some(format!(
+                                        "{}/{} (v:{}) [Trash:{}]",
+                                        fragment, key, version, task_is_trash
+                                    ));
+                                }
+                                Err((fragment, key, version, task_is_trash, err)) => {
+                                    if should_stop() || is_stopped_error(&err) {
+                                        continue;
+                                    }
+                                    warn!(
+                                        "Redistribute failed for {}/{} (v:{}) [Trash:{}]: {}",
+                                        fragment, key, version, task_is_trash, err
+                                    );
+                                    delta.errors += 1;
+                                    delta.last_error = Some(err);
+                                }
+                            }
+                            if let Some(delay) = pacing_delay {
+                                tokio::time::sleep(delay).await;
+                            }
+                        }
+                        if delta.needs + delta.migrated + delta.errors >= status_batch {
+                            flush_status_delta(&ws_manager, start_time, &mut delta).await;
                         }
                     }
-                    if delta.needs + delta.migrated + delta.errors >= status_batch {
-                        flush_status_delta(&ws_manager, start_time, &mut delta).await;
-                    }
+                }
+
+                match page.continuation_token {
+                    Some(token) => continuation_token = Some(token),
+                    None => break,
                 }
             }
 
@@ -1740,7 +1693,16 @@ pub async fn run_redistribution_job_with_options(
         }
     }
 
-    let _ = touched_fragments;
+    if !dry_run {
+        for fragment in &touched_fragments {
+            if let Err(err) = index::sync_fragment_partition_replicas(fragment).await {
+                warn!(
+                    "Failed to resynchronize partition db replicas for fragment {}: {}",
+                    fragment, err
+                );
+            }
+        }
+    }
 
     {
         let mut st = REDIST_STATUS.write().await;
@@ -1816,15 +1778,10 @@ async fn check_needs_redistribution(
     }
 
     if check_index {
-        let expected_metadata_paths = get_all_metadata_paths_custom(
-            target_index_roots,
-            &meta.fragment,
-            &meta.object_key,
-            &meta.version_id,
-            is_trash,
-        );
+        let expected_partition_db_paths =
+            get_partition_db_paths_custom(target_index_roots, &meta.fragment, &meta.object_key);
 
-        for path in expected_metadata_paths {
+        for path in expected_partition_db_paths {
             if !tokio_fs::try_exists(&path).await.unwrap_or(false) {
                 return true;
             }
@@ -1859,6 +1816,8 @@ async fn redistribute_object_index_only(
     is_trash: bool,
     strict_durability: bool,
 ) -> Result<(), AppError> {
+    let _object_lock =
+        index::acquire_object_operation_lock(&meta.fragment, &meta.object_key).await?;
     if should_stop() {
         return Err(AppError::InternalServerError("Stopped".into()));
     }
@@ -1949,6 +1908,8 @@ async fn redistribute_object_streaming(
     is_trash: bool,
     strict_durability: bool,
 ) -> Result<(), AppError> {
+    let _object_lock =
+        index::acquire_object_operation_lock(&meta.fragment, &meta.object_key).await?;
     if should_stop() {
         return Err(AppError::InternalServerError("Stopped".into()));
     }

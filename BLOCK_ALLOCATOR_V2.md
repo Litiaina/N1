@@ -3,7 +3,7 @@
 > Scope note:
 > - This document describes the arc allocator track.
 > - Arc is experimental.
-> - Stable/default deployment remains `standard` (`DEPLOYMENT_PROFILES.md`).
+> - Stable/default deployment remains `n1` (`DEPLOYMENT_PROFILES.md`).
 
 This document defines the production target allocator design for N1 raw blob devices.
 
@@ -251,11 +251,11 @@ All modes are I/O-budgeted first, CPU/RAM bounded second.
 
 Primary integration files:
 - `block_manager/src/manager.rs`
-- `arc/src/n1_core/blob_store.rs`
-- `arc/src/n1_core/upload.rs`
-- `arc/src/n1_core/recovery.rs`
-- `arc/src/n1_core/redistribution.rs`
-- `arc/src/n1_core/garbage_collector.rs`
+- `n1-arc/src/n1_core/blob_store.rs`
+- `n1-arc/src/n1_core/upload.rs`
+- `n1-arc/src/n1_core/recovery.rs`
+- `n1-arc/src/n1_core/redistribution.rs`
+- `n1-arc/src/n1_core/garbage_collector.rs`
 
 Required transitions:
 - replace linear free-list allocation with AG + dual indexes

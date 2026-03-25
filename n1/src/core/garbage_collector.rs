@@ -1,9 +1,9 @@
+use crate::core::constants::GC_SUFFIX;
+use crate::core::disk_manager::{FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManager};
+use crate::core::index;
 use crate::enums::app_error_enum::AppError;
 use crate::fs::cleanup_manager::start_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
-use crate::core::constants::{GC_SUFFIX, METADATA_EXT, RESERVATION_FILE};
-use crate::core::disk_manager::{FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManager};
-use crate::core::index;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
 use crate::structs::auth_structs::Claims;
@@ -23,8 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::runtime::Handle;
 use tokio::time::sleep;
-use tracing::{error, info};
-use walkdir::WalkDir;
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct GcJobStatus {
@@ -219,29 +218,19 @@ fn get_trash_root(disk_root: &std::path::Path, fragment_hash: &str) -> PathBuf {
     disk_root.join(fragment_hash).join(".trash")
 }
 
-fn should_scan_object_metadata_candidate(path: &Path) -> bool {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if !name.ends_with(METADATA_EXT) {
-        return false;
-    }
-    if name == RESERVATION_FILE || name == "latest.msgpack" {
-        return false;
-    }
-    if name.ends_with(".session.msgpack")
-        || name.ends_with(".removed.msgpack")
-        || name.ends_with(".meta.msgpack")
-    {
-        return false;
-    }
-    true
-}
-
-fn is_trash_metadata_path(path: &Path) -> bool {
-    let p = path.to_string_lossy();
-    p.contains("/partitions/") && p.contains("/trash/")
-        || p.contains("\\partitions\\") && p.contains("\\trash\\")
-        || p.contains("/.trash/index/")
-        || p.contains("\\.trash\\index\\")
+fn trash_version_age(
+    blob_roots: &[PathBuf],
+    fragment: &str,
+    version_id: &str,
+    now: SystemTime,
+) -> Option<Duration> {
+    blob_roots
+        .iter()
+        .map(|root| get_trash_root(root, fragment).join("blob").join(version_id))
+        .find_map(|path| {
+            let modified = fs::metadata(path).and_then(|m| m.modified()).ok()?;
+            Some(now.duration_since(modified).unwrap_or(Duration::ZERO))
+        })
 }
 
 #[cfg(unix)]
@@ -435,7 +424,6 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
 
         let stats = process_fragment_gc(
             &fragment,
-            &index_roots,
             &blob_roots,
             retention_duration,
             file_ttl,
@@ -474,7 +462,6 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
 
 async fn process_fragment_gc(
     fragment: &str,
-    index_roots: &[PathBuf],
     blob_roots: &[PathBuf],
     retention: Duration,
     file_ttl: Duration,
@@ -487,59 +474,60 @@ async fn process_fragment_gc(
     let mut expired_versions: HashMap<String, ObjectMetadata> = HashMap::new();
 
     let now = SystemTime::now();
-
-    for root in index_roots {
-        if should_stop_gc() {
+    match index::list_fragment_live_objects(fragment).await {
+        Ok(objects) => {
+            for meta in objects {
+                live_versions.insert(meta.version_id);
+            }
+        }
+        Err(err) => {
+            warn!(
+                "GC: failed to load live heads for fragment {} from indexdb: {}",
+                fragment, err
+            );
             return stats;
         }
-        let index_dir = root.join(fragment).join("index");
-        if !index_dir.exists() {
-            continue;
-        }
+    }
 
-        for entry in WalkDir::new(&index_dir).into_iter().filter_map(|e| e.ok()) {
-            if should_stop_gc() {
-                return stats;
-            }
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if !should_scan_object_metadata_candidate(path) {
-                continue;
-            }
-
-            let data = match std::fs::read(path) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let meta = match rmp_serde::from_slice::<ObjectMetadata>(&data) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if meta.fragment != fragment {
-                continue;
-            }
-
-            if is_trash_metadata_path(path) {
-                let modified = entry
-                    .metadata()
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .unwrap_or(now);
-                let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
-                let should_expire = is_manual_run || age > retention;
-
-                if should_expire {
-                    expired_versions
-                        .entry(meta.version_id.clone())
-                        .or_insert(meta.clone());
-                } else {
-                    trash_versions.insert(meta.version_id.clone());
+    match index::list_fragment_trash_objects(fragment).await {
+        Ok(trash_heads) => {
+            for head in trash_heads {
+                if should_stop_gc() {
+                    return stats;
                 }
-            } else {
-                live_versions.insert(meta.version_id.clone());
+                let versions =
+                    match index::list_trashed_object_versions_metadata(fragment, &head.object_key)
+                        .await
+                    {
+                        Ok(versions) => versions,
+                        Err(err) => {
+                            warn!(
+                                "GC: failed to load trash history for {}/{}: {}",
+                                fragment, head.object_key, err
+                            );
+                            continue;
+                        }
+                    };
+                for meta in versions {
+                    let age = trash_version_age(blob_roots, fragment, &meta.version_id, now);
+                    let should_expire = is_manual_run
+                        || age.map(|candidate| candidate > retention).unwrap_or(false);
+                    if should_expire {
+                        expired_versions
+                            .entry(meta.version_id.clone())
+                            .or_insert(meta.clone());
+                    } else {
+                        trash_versions.insert(meta.version_id);
+                    }
+                }
             }
+        }
+        Err(err) => {
+            warn!(
+                "GC: failed to load trash heads for fragment {} from indexdb: {}",
+                fragment, err
+            );
+            return stats;
         }
     }
     stats.live_versions_seen = live_versions.len() as u64;

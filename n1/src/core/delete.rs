@@ -13,9 +13,9 @@ use tokio::fs;
 use tracing::{info, warn};
 use walkdir::WalkDir;
 
-use crate::enums::app_error_enum::AppError;
 use crate::core::disk_manager::ObjectPathManager;
 use crate::core::index;
+use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
@@ -202,6 +202,7 @@ pub struct BulkObjectOperationResponse {
 }
 
 async fn delete_object_core(fragment: &str, object_key: &str) -> Result<usize, AppError> {
+    let _object_lock = index::acquire_object_operation_lock(fragment, object_key).await?;
     let path_manager = ObjectPathManager::new();
     let versions_found = list_object_versions_any(fragment, object_key).await?;
 
@@ -249,6 +250,7 @@ async fn delete_object_core(fragment: &str, object_key: &str) -> Result<usize, A
 }
 
 async fn recover_object_core(fragment: &str, object_key: &str) -> Result<usize, AppError> {
+    let _object_lock = index::acquire_object_operation_lock(fragment, object_key).await?;
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
     purge_delete_markers_for_key(fragment, object_key).await;
@@ -306,6 +308,7 @@ pub async fn delete_object_version(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
+    let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
     if let Ok(_meta) = index::read_trashed_object_version(&fragment, &object_key, &version_id).await
@@ -522,6 +525,7 @@ pub async fn delete_object_permanently(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
+    let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
     let path_manager = ObjectPathManager::new();
     let versions_to_delete = match index::delete_object_fast(&fragment, &object_key).await? {
         Some(version_ids) => version_ids,
@@ -566,6 +570,7 @@ pub async fn recover_object_version(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
+    let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();
     purge_delete_markers_for_key(&fragment, &object_key).await;

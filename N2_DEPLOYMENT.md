@@ -1,10 +1,10 @@
 # N2 Multi-Node Deployment Runbook
 
-This document is the operator runbook for `distribution-runtime` (`litiaina-n2`).
+This document is the operator runbook for `n2` (`litiaina-n2`).
 
 Use this document when:
 - you are deploying `N2` across multiple nodes
-- you want cluster-specific guardrails, not the single-node `standard` path
+- you want cluster-specific guardrails, not the single-node `n1` path
 - you want the tested 2-node reference layout and verification flow
 
 Use other documents for:
@@ -15,10 +15,10 @@ Use other documents for:
 ## 1. Current Runtime Baseline
 
 As of `2026-03-20`:
-- `distribution-runtime` (`litiaina-n2`) is released at `0.2.0`
-- `standard` (`litiaina-n1-standard`) is the stable single-node engine/runtime at `0.6.2`
+- `n2` (`litiaina-n2`) is released at `0.2.0`
+- `n1` (`litiaina-n1`) is the stable single-node engine/runtime at `0.7.0`
 - `registry-server` is released independently at `0.3.0`
-- `arc` remains experimental and is not part of this runbook
+- `n1-arc` remains experimental and is not part of this runbook
 
 Multi-node N2 in this workspace is:
 - filesystem-backed on each node

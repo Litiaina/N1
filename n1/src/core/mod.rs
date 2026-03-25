@@ -10,6 +10,7 @@ pub mod fragment_metadata;
 pub mod garbage_collector;
 pub mod header_parser;
 pub mod index;
+pub mod indexdb_store;
 pub mod maintenance;
 pub mod metadata_parser;
 pub mod modify;

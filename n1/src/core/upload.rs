@@ -36,7 +36,6 @@ use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 
-use crate::enums::app_error_enum::AppError;
 use crate::core::constants::{PARITY_SUFFIX, SHARD_SUFFIX};
 use crate::core::disk_manager::{
     FinalizeIncompleteResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery,
@@ -46,6 +45,7 @@ use crate::core::disk_manager::{
 use crate::core::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::core::index;
 use crate::core::quota_manager::ensure_capacity_available;
+use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
@@ -1795,7 +1795,10 @@ pub async fn finalize_object_upload(
         owner_uid: fragment.clone(),
         content_type,
         total_size_bytes: total_size_calculated,
-        created_at: Utc::now().timestamp(),
+        created_at: manifest
+            .as_ref()
+            .map(|m| m.created_at)
+            .unwrap_or_else(|| Utc::now().timestamp()),
         parts,
         is_delete_marker: false,
         stripe_size_bytes: stripe_size,

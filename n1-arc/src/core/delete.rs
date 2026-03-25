@@ -12,7 +12,6 @@ use tracing::{error, info, warn};
 use ulid::Ulid;
 use walkdir::WalkDir;
 
-use crate::enums::app_error_enum::AppError;
 use crate::core::blob_store::{
     free_raw_shards_for_metadata, metadata_contains_raw_shards,
     raw_index_metadata_roots_for_housekeeping, write_raw_gc_markers,
@@ -23,6 +22,7 @@ use crate::core::disk_manager::{
 use crate::core::index_facade as index;
 use crate::core::metadata_parser::get_metadata;
 use crate::core::quota_manager::update_quota;
+use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;

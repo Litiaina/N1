@@ -1,8 +1,4 @@
-use crate::enums::app_error_enum::AppError;
-use crate::fuse::model::{FsdPath, NodeKind, NodeMetadata, WriteHandle, encode_virtual_name};
-use crate::core::delete::{
-    delete_object, delete_object_permanently, empty_trash, recover_object,
-};
+use crate::core::delete::{delete_object, delete_object_permanently, empty_trash, recover_object};
 use crate::core::disk_manager::{
     ChunkQuery, InitiateUploadParams, ListObjectsResult, ObjectKeyQuery, ObjectMetadata,
     RenameObjectRequest, UploadPartQuery,
@@ -14,6 +10,8 @@ use crate::core::retrieve::{get_object_metadata_direct, list_objects_direct};
 use crate::core::upload::{
     cancel_upload_session, finalize_object_upload, initiate_object_upload, object_upload_part,
 };
+use crate::enums::app_error_enum::AppError;
+use crate::fuse::model::{FsdPath, NodeKind, NodeMetadata, WriteHandle, encode_virtual_name};
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::manager::WsConnectionManager;
@@ -238,6 +236,7 @@ impl InProcessBackend {
         let mut params = HashMap::new();
         params.insert("limit".to_string(), limit.to_string());
         params.insert("include_internal".to_string(), "true".to_string());
+        params.insert("delimiter".to_string(), "/".to_string());
         if let Some(token) = continuation_token {
             params.insert("continuation_token".to_string(), token);
         }
@@ -255,11 +254,35 @@ impl InProcessBackend {
         let mut params = HashMap::new();
         params.insert("limit".to_string(), limit.to_string());
         params.insert("include_internal".to_string(), "true".to_string());
+        params.insert("delimiter".to_string(), "/".to_string());
         if let Some(token) = continuation_token {
             params.insert("continuation_token".to_string(), token);
         }
 
         list_objects_direct(fragment, params, true).await
+    }
+
+    async fn list_scoped_page_with_limit(
+        &self,
+        fragment: &str,
+        prefix: Option<&str>,
+        continuation_token: Option<String>,
+        page_limit: usize,
+        scan_trash: bool,
+    ) -> Result<ListObjectsResult, AppError> {
+        let limit = page_limit.clamp(1, FSD_LIST_PAGE_LIMIT_MAX);
+        let mut params = HashMap::new();
+        params.insert("limit".to_string(), limit.to_string());
+        params.insert("include_internal".to_string(), "true".to_string());
+        params.insert("delimiter".to_string(), "/".to_string());
+        if let Some(prefix) = prefix.filter(|value| !value.trim().is_empty()) {
+            params.insert("prefix".to_string(), prefix.to_string());
+        }
+        if let Some(token) = continuation_token {
+            params.insert("continuation_token".to_string(), token);
+        }
+
+        list_objects_direct(fragment, params, scan_trash).await
     }
 
     async fn fetch_object_metadata(
@@ -287,6 +310,47 @@ impl InProcessBackend {
         Self::split_trash_virtual_key(path.object_key.as_str()).is_some()
     }
 
+    fn directory_listing_prefix(object_key: &str) -> Option<String> {
+        let trimmed = object_key.trim_matches('/');
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(format!("{trimmed}/"))
+        }
+    }
+
+    fn relative_entry_name(prefix: Option<&str>, full_key: &str) -> Option<String> {
+        let normalized_key = full_key.trim_matches('/');
+        if normalized_key.is_empty() {
+            return None;
+        }
+        let relative = if let Some(prefix) = prefix.filter(|value| !value.trim().is_empty()) {
+            let normalized_prefix = prefix.trim_matches('/');
+            normalized_key
+                .strip_prefix(normalized_prefix)?
+                .strip_prefix('/')?
+        } else {
+            normalized_key
+        };
+        let name = relative.split('/').next().unwrap_or_default().trim();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    }
+
+    fn child_object_key(prefix: Option<&str>, child_name: &str) -> String {
+        let clean_name = child_name.trim_matches('/');
+        match prefix
+            .map(|value| value.trim_matches('/'))
+            .filter(|value| !value.is_empty())
+        {
+            Some(prefix) => format!("{prefix}/{clean_name}"),
+            None => clean_name.to_string(),
+        }
+    }
+
     fn to_trash_virtual_path(path: &FsdPath, key: &str) -> FsdPath {
         FsdPath {
             fragment: path.fragment.clone(),
@@ -312,7 +376,141 @@ impl InProcessBackend {
 
     async fn trash_has_entries(&self, fragment: &str) -> Result<bool, AppError> {
         let page = self.list_trash_page_with_limit(fragment, None, 1).await?;
-        Ok(!page.objects.is_empty())
+        Ok(!page.objects.is_empty() || !page.common_prefixes.is_empty())
+    }
+
+    async fn live_directory_exists(
+        &self,
+        fragment: &str,
+        object_key: &str,
+    ) -> Result<bool, AppError> {
+        let Some(prefix) = Self::directory_listing_prefix(object_key) else {
+            return Ok(true);
+        };
+        let page = self
+            .list_scoped_page_with_limit(fragment, Some(prefix.as_str()), None, 1, false)
+            .await?;
+        Ok(!page.objects.is_empty() || !page.common_prefixes.is_empty())
+    }
+
+    async fn trash_directory_exists(
+        &self,
+        fragment: &str,
+        object_key: &str,
+    ) -> Result<bool, AppError> {
+        let Some(prefix) = Self::directory_listing_prefix(object_key) else {
+            return Ok(true);
+        };
+        let page = self
+            .list_scoped_page_with_limit(fragment, Some(prefix.as_str()), None, 1, true)
+            .await?;
+        Ok(!page.objects.is_empty() || !page.common_prefixes.is_empty())
+    }
+
+    fn map_live_page_to_dir_entries(
+        &self,
+        path: &FsdPath,
+        prefix: Option<&str>,
+        page: ListObjectsResult,
+    ) -> Vec<DirEntry> {
+        let mut entries = Vec::new();
+        let mut seen = HashSet::new();
+
+        for common_prefix in page.common_prefixes {
+            let Some(name) = Self::relative_entry_name(prefix, &common_prefix) else {
+                continue;
+            };
+            let dedupe_key = format!("dir:{}", name.to_ascii_lowercase());
+            if !seen.insert(dedupe_key) {
+                continue;
+            }
+            entries.push(DirEntry {
+                name: encode_virtual_name(&name),
+                path: FsdPath {
+                    fragment: path.fragment.clone(),
+                    object_key: Self::child_object_key(prefix, &name),
+                },
+                metadata: NodeMetadata {
+                    kind: NodeKind::Directory,
+                    size_bytes: 0,
+                    modified_at_unix: 0,
+                },
+            });
+        }
+
+        for object in page.objects {
+            let Some(name) = Self::relative_entry_name(prefix, &object.object_key) else {
+                continue;
+            };
+            let dedupe_key = format!("file:{}", name.to_ascii_lowercase());
+            if !seen.insert(dedupe_key) {
+                continue;
+            }
+            entries.push(DirEntry {
+                name: encode_virtual_name(&name),
+                path: FsdPath {
+                    fragment: path.fragment.clone(),
+                    object_key: object.object_key.clone(),
+                },
+                metadata: NodeMetadata {
+                    kind: NodeKind::File,
+                    size_bytes: object.total_size_bytes,
+                    modified_at_unix: object.created_at,
+                },
+            });
+        }
+
+        entries
+    }
+
+    fn map_trash_page_to_dir_entries(
+        &self,
+        path: &FsdPath,
+        prefix: Option<&str>,
+        page: ListObjectsResult,
+    ) -> Vec<DirEntry> {
+        let mut entries = Vec::new();
+        let mut seen = HashSet::new();
+
+        for common_prefix in page.common_prefixes {
+            let Some(name) = Self::relative_entry_name(prefix, &common_prefix) else {
+                continue;
+            };
+            let dedupe_key = format!("dir:{}", name.to_ascii_lowercase());
+            if !seen.insert(dedupe_key) {
+                continue;
+            }
+            entries.push(DirEntry {
+                name: encode_virtual_name(&name),
+                path: Self::to_trash_virtual_path(path, Self::child_object_key(prefix, &name).as_str()),
+                metadata: NodeMetadata {
+                    kind: NodeKind::Directory,
+                    size_bytes: 0,
+                    modified_at_unix: 0,
+                },
+            });
+        }
+
+        for object in page.objects {
+            let Some(name) = Self::relative_entry_name(prefix, &object.object_key) else {
+                continue;
+            };
+            let dedupe_key = format!("file:{}", name.to_ascii_lowercase());
+            if !seen.insert(dedupe_key) {
+                continue;
+            }
+            entries.push(DirEntry {
+                name: encode_virtual_name(&name),
+                path: Self::to_trash_virtual_path(path, &object.object_key),
+                metadata: NodeMetadata {
+                    kind: NodeKind::File,
+                    size_bytes: object.total_size_bytes,
+                    modified_at_unix: object.created_at,
+                },
+            });
+        }
+
+        entries
     }
 
     async fn cleanup_remote_upload_session(
@@ -731,62 +929,76 @@ impl FsdBackend for InProcessBackend {
         Box::pin(async move {
             if let Some(trash_sub_key) = Self::split_trash_virtual_key(path.object_key.as_str()) {
                 let trash_key = trash_sub_key.trim_matches('/').to_string();
-                if !trash_key.is_empty() {
-                    if self
+                if !trash_key.is_empty()
+                    && self
                         .trash_exact_object_metadata(&path.fragment, &trash_key)
                         .await?
                         .is_some()
-                    {
-                        return Err(AppError::BadRequest(
-                            "fsd flat mode does not expose nested directories".to_string(),
-                        ));
-                    }
-                    return Err(AppError::NotFound);
+                {
+                    return Err(AppError::BadRequest(
+                        "fsd path is a file, not a directory".to_string(),
+                    ));
                 }
 
+                let prefix = Self::directory_listing_prefix(&trash_key);
                 let page = self
-                    .list_trash_page_with_limit(
+                    .list_scoped_page_with_limit(
                         &path.fragment,
+                        prefix.as_deref(),
                         continuation_token.clone(),
                         page_limit,
+                        true,
                     )
                     .await?;
-                let entries = page
-                    .objects
-                    .into_iter()
-                    .map(|object| DirEntry {
-                        name: encode_virtual_name(&object.object_key),
-                        path: Self::to_trash_virtual_path(path, &object.object_key),
-                        metadata: NodeMetadata {
-                            kind: NodeKind::File,
-                            size_bytes: object.total_size_bytes,
-                            modified_at_unix: object.created_at,
-                        },
-                    })
-                    .collect();
+                if !trash_key.is_empty()
+                    && continuation_token.is_none()
+                    && page.objects.is_empty()
+                    && page.common_prefixes.is_empty()
+                {
+                    return Err(AppError::NotFound);
+                }
+                let next_token = page.continuation_token.clone();
+                let entries = self.map_trash_page_to_dir_entries(path, prefix.as_deref(), page);
 
                 return Ok(DirListPage {
                     entries,
-                    continuation_token: page.continuation_token,
+                    continuation_token: next_token,
                 });
             }
 
-            if !path.is_fragment_root() {
-                if self
+            if !path.is_fragment_root()
+                && self
                     .fetch_object_metadata(&path.fragment, &path.object_key)
                     .await
                     .is_ok()
-                {
-                    return Err(AppError::BadRequest(
-                        "fsd flat mode does not expose nested directories".to_string(),
-                    ));
-                }
-                return Err(AppError::NotFound);
+            {
+                return Err(AppError::BadRequest(
+                    "fsd path is a file, not a directory".to_string(),
+                ));
             }
 
-            let page = self
-                .list_page_with_limit(&path.fragment, continuation_token.clone(), page_limit)
-                .await?;
+            let prefix = Self::directory_listing_prefix(path.object_key.as_str());
+            let page = if path.is_fragment_root() {
+                self.list_page_with_limit(&path.fragment, continuation_token.clone(), page_limit)
+                    .await?
+            } else {
+                self.list_scoped_page_with_limit(
+                    &path.fragment,
+                    prefix.as_deref(),
+                    continuation_token.clone(),
+                    page_limit,
+                    false,
+                )
+                .await?
+            };
+            if !path.is_fragment_root()
+                && continuation_token.is_none()
+                && page.objects.is_empty()
+                && page.common_prefixes.is_empty()
+            {
+                return Err(AppError::NotFound);
+            }
+            let next_token = page.continuation_token.clone();
             let mut entries = Vec::new();
             if continuation_token.is_none() && self.trash_has_entries(&path.fragment).await? {
                 entries.push(DirEntry {
@@ -802,22 +1014,11 @@ impl FsdBackend for InProcessBackend {
                     },
                 });
             }
-            entries.extend(page.objects.into_iter().map(|object| DirEntry {
-                name: encode_virtual_name(&object.object_key),
-                path: FsdPath {
-                    fragment: path.fragment.clone(),
-                    object_key: object.object_key,
-                },
-                metadata: NodeMetadata {
-                    kind: NodeKind::File,
-                    size_bytes: object.total_size_bytes,
-                    modified_at_unix: object.created_at,
-                },
-            }));
+            entries.extend(self.map_live_page_to_dir_entries(path, prefix.as_deref(), page));
 
             Ok(DirListPage {
                 entries,
-                continuation_token: page.continuation_token,
+                continuation_token: next_token,
             })
         })
     }
@@ -886,6 +1087,14 @@ impl FsdBackend for InProcessBackend {
                     });
                 }
 
+                if self.trash_directory_exists(&path.fragment, &key).await? {
+                    return Ok(NodeMetadata {
+                        kind: NodeKind::Directory,
+                        size_bytes: 0,
+                        modified_at_unix: 0,
+                    });
+                }
+
                 return Err(AppError::NotFound);
             }
 
@@ -898,7 +1107,20 @@ impl FsdBackend for InProcessBackend {
                     size_bytes: meta.total_size_bytes,
                     modified_at_unix: meta.created_at,
                 }),
-                Err(AppError::NotFound) => Err(AppError::NotFound),
+                Err(AppError::NotFound) => {
+                    if self
+                        .live_directory_exists(&path.fragment, &path.object_key)
+                        .await?
+                    {
+                        Ok(NodeMetadata {
+                            kind: NodeKind::Directory,
+                            size_bytes: 0,
+                            modified_at_unix: 0,
+                        })
+                    } else {
+                        Err(AppError::NotFound)
+                    }
+                }
                 Err(e) => Err(e),
             }
         })
@@ -1315,6 +1537,34 @@ mod tests {
         let got = InProcessBackend::to_trash_virtual_path(&base, "a/b/c.mp4");
         assert_eq!(got.fragment, "frag");
         assert_eq!(got.object_key, ".n1-trash/a/b/c.mp4");
+    }
+
+    #[test]
+    fn directory_listing_helpers_preserve_hierarchical_names() {
+        assert_eq!(
+            InProcessBackend::directory_listing_prefix("a/b/c"),
+            Some("a/b/c/".to_string())
+        );
+        assert_eq!(InProcessBackend::directory_listing_prefix(""), None);
+
+        assert_eq!(
+            InProcessBackend::relative_entry_name(Some("a/b/"), "a/b/c.txt"),
+            Some("c.txt".to_string())
+        );
+        assert_eq!(
+            InProcessBackend::relative_entry_name(Some("a/b/"), "a/b/sub/f.txt"),
+            Some("sub".to_string())
+        );
+        assert_eq!(
+            InProcessBackend::relative_entry_name(None, "top-level.bin"),
+            Some("top-level.bin".to_string())
+        );
+
+        assert_eq!(
+            InProcessBackend::child_object_key(Some("a/b/"), "sub"),
+            "a/b/sub"
+        );
+        assert_eq!(InProcessBackend::child_object_key(None, "sub"), "sub");
     }
 
     #[tokio::test]

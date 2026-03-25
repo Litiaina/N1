@@ -1,4 +1,3 @@
-use crate::enums::app_error_enum::AppError;
 use crate::core::constants::{
     BROWSER_CACHE_MAX_AGE, PREFIX_DELIMITER_COMPACTED_FILE, PREFIX_SEGMENT_EXT,
 };
@@ -10,6 +9,7 @@ use crate::core::index_facade as index;
 use crate::core::metadata_parser::get_metadata;
 use crate::core::object_parser::{get_object_logic, stream_object_logic};
 use crate::core::quota_manager::get_quota;
+use crate::enums::app_error_enum::AppError;
 use crate::structs::auth_structs::Claims;
 use axum::{
     Json as AxumJson,

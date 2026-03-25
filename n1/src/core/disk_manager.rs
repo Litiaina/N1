@@ -1,9 +1,10 @@
-use crate::core::constants::METADATA_EXT;
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::OnceLock;
+
+const INDEXDB_PARTITION_EXT: &str = ".ndxdb";
 
 pub fn default_format() -> String {
     "zip".to_string()
@@ -39,13 +40,6 @@ impl ObjectPathManager {
             .get()
             .expect("Blob Store Config not initialized!");
         roots.iter().map(PathBuf::from).collect()
-    }
-
-    pub fn get_all_index_dirs(&self, fragment_hash: &str) -> Vec<PathBuf> {
-        self.get_all_index_roots()
-            .iter()
-            .map(|root| root.join(fragment_hash).join("index"))
-            .collect()
     }
 
     fn route_hash(parts: &[&str]) -> [u8; 32] {
@@ -88,22 +82,22 @@ impl ObjectPathManager {
         Self::partition_id_from_hash(Self::route_hash(&["session", fragment_hash, version_id]))
     }
 
-    fn partition_dir(root: &PathBuf, fragment_hash: &str, partition_id: u16) -> PathBuf {
+    fn partition_db_path(root: &PathBuf, fragment_hash: &str, partition_id: u16) -> PathBuf {
         root.join(fragment_hash)
-            .join("index")
+            .join("indexdb")
             .join("partitions")
-            .join(format!("{:04x}", partition_id))
+            .join(format!("{:04x}{}", partition_id, INDEXDB_PARTITION_EXT))
     }
 
-    pub fn get_all_session_dirs(&self, fragment_hash: &str, version_id: &str) -> Vec<PathBuf> {
+    pub fn get_all_session_partition_db_paths(
+        &self,
+        fragment_hash: &str,
+        version_id: &str,
+    ) -> Vec<PathBuf> {
         let partition_id = Self::session_partition_id(fragment_hash, version_id);
         self.select_partition_roots(partition_id)
             .iter()
-            .map(|root| {
-                Self::partition_dir(root, fragment_hash, partition_id)
-                    .join("sessions")
-                    .join(version_id)
-            })
+            .map(|root| Self::partition_db_path(root, fragment_hash, partition_id))
             .collect()
     }
 
@@ -117,46 +111,15 @@ impl ObjectPathManager {
         object_key.trim_start_matches('/').to_string()
     }
 
-    pub fn get_all_metadata_paths(
+    pub fn get_all_object_partition_db_paths(
         &self,
         fragment_hash: &str,
         object_key: &str,
-        version_id: &str,
     ) -> Vec<PathBuf> {
-        let key_hash = Self::object_key_hash(object_key);
         let partition_id = Self::object_partition_id(fragment_hash, object_key);
-        let filename = format!("{}{}", version_id, METADATA_EXT);
         self.select_partition_roots(partition_id)
             .iter()
-            .map(|root| {
-                Self::partition_dir(root, fragment_hash, partition_id)
-                    .join("objects")
-                    .join(&key_hash[0..2])
-                    .join(&key_hash)
-                    .join(&filename)
-            })
-            .collect()
-    }
-
-    #[allow(dead_code)]
-    pub fn get_all_trashed_metadata_paths(
-        &self,
-        fragment_hash: &str,
-        object_key: &str,
-        version_id: &str,
-    ) -> Vec<PathBuf> {
-        let key_hash = Self::object_key_hash(object_key);
-        let partition_id = Self::object_partition_id(fragment_hash, object_key);
-        let filename = format!("{}{}", version_id, METADATA_EXT);
-        self.select_partition_roots(partition_id)
-            .iter()
-            .map(|root| {
-                Self::partition_dir(root, fragment_hash, partition_id)
-                    .join("trash")
-                    .join(&key_hash[0..2])
-                    .join(&key_hash)
-                    .join(&filename)
-            })
+            .map(|root| Self::partition_db_path(root, fragment_hash, partition_id))
             .collect()
     }
 

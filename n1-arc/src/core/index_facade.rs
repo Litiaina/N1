@@ -1,4 +1,3 @@
-use crate::enums::app_error_enum::AppError;
 use crate::core::disk_manager::{ObjectMetadata, PartMetadata, ReservationReceipt};
 pub use crate::core::index_types::{
     IndexReplicaWriteMode, IndexRuntimeStats, IndexSessionState, RemovedSessionReceipt,
@@ -6,6 +5,7 @@ pub use crate::core::index_types::{
 };
 use crate::core::raw_index;
 use crate::core::upload::UploadSessionManifest;
+use crate::enums::app_error_enum::AppError;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::PathBuf;

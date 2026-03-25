@@ -1,4 +1,3 @@
-use crate::handlers::error_handlers::handler_404;
 use crate::core::adaptive_concurrency::{
     ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC, ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC,
 };
@@ -22,6 +21,7 @@ use crate::core::upload::{
     UPLOAD_IO_GATE_ENABLED_ATOMIC, UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC,
     WRITER_BUFFER_SIZE_ATOMIC,
 };
+use crate::handlers::error_handlers::handler_404;
 use crate::routes::storage_routes::serve_storage_routes;
 use crate::settings::constants::{CONFIG_FILE, ENV_FILE};
 use crate::utils::date_time_formatter::LocalTimer;
@@ -44,11 +44,11 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod core;
 mod enums;
 mod fuse;
 mod handlers;
 mod middleware;
-mod core;
 mod routes;
 mod settings;
 mod smb;

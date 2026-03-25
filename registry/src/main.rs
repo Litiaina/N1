@@ -8,6 +8,7 @@ mod realtime;
 mod storage_broker;
 mod totp;
 
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::net::SocketAddr;
 use std::path::Path;
@@ -31,12 +32,13 @@ use db::RegistryDb;
 use error::RegistryError;
 use models::{
     AdminStatsResponse, AdminUserListResponse, AdminUserSummary, ArchiveObjectsRequest,
-    BootstrapAdminRequest, BootstrapAdminResponse, BulkObjectMutationResponse, CreateUserRequest,
-    CreateUserResponse, DeleteObjectQuery, DeleteUserResponse, DisableTwoFactorRequest,
-    EnableTwoFactorRequest, FinalizeObjectRequest, FragmentListResponse, FragmentStateRequest,
-    LinkFragmentRequest, LinkFragmentResponse, ListObjectsQuery, ListObjectsResponse, LoginRequest,
-    LoginResponse, ObjectDeleteResponse, ObjectMutationResponse, ObjectStateRequest,
-    ObjectStatsQuery, ObjectStatsResponse, RefreshRequest, RefreshResponse, RegisterObjectRequest,
+    BootstrapAdminRequest, BootstrapAdminResponse, BulkObjectKeysRequest,
+    BulkObjectMutationResponse, BulkObjectSelectionResponse, CreateUserRequest, CreateUserResponse,
+    DeleteObjectQuery, DeleteUserResponse, DisableTwoFactorRequest, EnableTwoFactorRequest,
+    FinalizeObjectRequest, FragmentListResponse, FragmentStateRequest, LinkFragmentRequest,
+    LinkFragmentResponse, ListObjectsQuery, ListObjectsResponse, LoginRequest, LoginResponse,
+    ObjectDeleteResponse, ObjectMutationResponse, ObjectStateRequest, ObjectStatsQuery,
+    ObjectStatsResponse, RefreshRequest, RefreshResponse, RegisterObjectRequest,
     RenameRegistryObjectRequest, ResolveObjectQuery, SetupTwoFactorRequest, SignupRequest,
     SignupResponse, StorageSessionRequest, StorageSessionResponse, SuggestObjectsQuery,
     SuggestObjectsResponse, TwoFactorSetupResponse, UpdateCredentialsRequest, UpdateEmailRequest,
@@ -51,6 +53,7 @@ use std::time::Duration;
 use storage_broker::StorageBroker;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
+use tracing::warn;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Clone)]
@@ -90,6 +93,15 @@ fn publish_admin_event(state: &AppState, payload: RegistryRealtimePayload) {
     state.realtime.publish_admin(payload);
 }
 
+fn canonical_bulk_object_keys(keys: Vec<String>) -> Vec<String> {
+    keys.into_iter()
+        .map(|value| value.trim().trim_start_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 async fn issue_registry_session(
     state: &AppState,
     user: &UserRecord,
@@ -118,6 +130,31 @@ async fn ensure_user_default_fragment(
         .upsert_fragment_binding(user.uid.clone(), fragment_hash.clone(), deployment, None)
         .await?;
     Ok(fragment_hash)
+}
+
+async fn create_user_with_default_fragment(
+    state: &AppState,
+    email: String,
+    password_hash: String,
+    quota_limit_bytes: Option<i64>,
+    is_admin: bool,
+) -> Result<(UserRecord, String), RegistryError> {
+    let user = state
+        .db
+        .create_user(email, password_hash, quota_limit_bytes, is_admin)
+        .await?;
+    match ensure_user_default_fragment(state, &user).await {
+        Ok(fragment) => Ok((user, fragment)),
+        Err(err) => {
+            if let Err(cleanup_err) = state.db.delete_user_cascade(user.uid.clone()).await {
+                warn!(
+                    "failed to roll back registry user {} after fragment provisioning error: {}",
+                    user.uid, cleanup_err.message
+                );
+            }
+            Err(err)
+        }
+    }
 }
 
 fn legacy_fragment_name(uid: &str) -> String {
@@ -351,7 +388,9 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/objects/finalize", post(finalize_object))
         .route("/v1/objects/suggest", get(suggest_objects))
         .route("/v1/objects/rename", post(rename_object))
+        .route("/v1/objects/trash/bulk", post(trash_objects_bulk))
         .route("/v1/objects/trash", post(trash_object))
+        .route("/v1/objects/recover/bulk", post(recover_objects_bulk))
         .route("/v1/objects/recover", post(recover_object))
         .route("/v1/objects/recover-all", post(recover_all_objects))
         .route("/v1/objects/trash/empty", post(empty_trash))
@@ -419,11 +458,8 @@ async fn bootstrap_admin(
     let email = normalize_email(&req.email)?;
     validate_new_password(&req.password)?;
     let password_hash = auth::hash_password(&req.password)?;
-    let user = state
-        .db
-        .create_user(email, password_hash, None, true)
-        .await?;
-    let fragment = ensure_user_default_fragment(&state, &user).await?;
+    let (user, fragment) =
+        create_user_with_default_fragment(&state, email, password_hash, None, true).await?;
     let (access_token, expires_in, refresh_token, refresh_expires_in) =
         issue_registry_session(&state, &user).await?;
     publish_owner_event(
@@ -520,16 +556,14 @@ async fn create_user(
     let email = normalize_email(&req.email)?;
     validate_new_password(&req.password)?;
     let password_hash = auth::hash_password(&req.password)?;
-    let user = state
-        .db
-        .create_user(
-            email,
-            password_hash,
-            req.quota_limit_bytes,
-            req.is_admin.unwrap_or(false),
-        )
-        .await?;
-    let fragment = ensure_user_default_fragment(&state, &user).await?;
+    let (user, fragment) = create_user_with_default_fragment(
+        &state,
+        email,
+        password_hash,
+        req.quota_limit_bytes,
+        req.is_admin.unwrap_or(false),
+    )
+    .await?;
     publish_owner_event(
         &state,
         &user.uid,
@@ -554,11 +588,8 @@ async fn signup(
     let email = normalize_email(&req.email)?;
     validate_new_password(&req.password)?;
     let password_hash = auth::hash_password(&req.password)?;
-    let user = state
-        .db
-        .create_user(email, password_hash, None, false)
-        .await?;
-    let fragment = ensure_user_default_fragment(&state, &user).await?;
+    let (user, fragment) =
+        create_user_with_default_fragment(&state, email, password_hash, None, false).await?;
     let (access_token, expires_in, refresh_token, refresh_expires_in) =
         issue_registry_session(&state, &user).await?;
     publish_owner_event(
@@ -1467,6 +1498,38 @@ async fn trash_object(
     }))
 }
 
+async fn trash_objects_bulk(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<BulkObjectKeysRequest>,
+) -> Result<Json<BulkObjectSelectionResponse>, RegistryError> {
+    validate_fragment(&req.fragment)?;
+    let requested = req.object_keys.len();
+    let object_keys = canonical_bulk_object_keys(req.object_keys);
+    if object_keys.is_empty() {
+        return Err(RegistryError::bad_request(
+            "object_keys must include at least one object key",
+        ));
+    }
+
+    let _write_guard = state.write_gate.lock().await;
+    let fragment = req.fragment.clone();
+    let claims = claims_from_headers(&headers, &state.auth)?;
+    let (affected, not_found, user) = state
+        .db
+        .set_objects_status_bulk(claims.sub, fragment.clone(), object_keys.clone(), "trashed")
+        .await?;
+    publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
+    Ok(Json(BulkObjectSelectionResponse {
+        requested,
+        unique: object_keys.len(),
+        affected,
+        not_found,
+        quota_limit_bytes: user.quota_limit_bytes,
+        quota_used_bytes: user.quota_used_bytes,
+    }))
+}
+
 async fn recover_object(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1489,6 +1552,38 @@ async fn recover_object(
     publish_owner_invalidation(&state, &object.owner_uid, Some(fragment), "objects");
     Ok(Json(ObjectMutationResponse {
         object,
+        quota_limit_bytes: user.quota_limit_bytes,
+        quota_used_bytes: user.quota_used_bytes,
+    }))
+}
+
+async fn recover_objects_bulk(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<BulkObjectKeysRequest>,
+) -> Result<Json<BulkObjectSelectionResponse>, RegistryError> {
+    validate_fragment(&req.fragment)?;
+    let requested = req.object_keys.len();
+    let object_keys = canonical_bulk_object_keys(req.object_keys);
+    if object_keys.is_empty() {
+        return Err(RegistryError::bad_request(
+            "object_keys must include at least one object key",
+        ));
+    }
+
+    let _write_guard = state.write_gate.lock().await;
+    let fragment = req.fragment.clone();
+    let claims = claims_from_headers(&headers, &state.auth)?;
+    let (affected, not_found, user) = state
+        .db
+        .set_objects_status_bulk(claims.sub, fragment.clone(), object_keys.clone(), "ready")
+        .await?;
+    publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
+    Ok(Json(BulkObjectSelectionResponse {
+        requested,
+        unique: object_keys.len(),
+        affected,
+        not_found,
         quota_limit_bytes: user.quota_limit_bytes,
         quota_used_bytes: user.quota_used_bytes,
     }))
@@ -1694,15 +1789,34 @@ mod tests {
     type TestWsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
     async fn spawn_storage_stub(token: &'static str) -> String {
+        spawn_storage_stub_with_auth_status(token, StatusCode::OK).await
+    }
+
+    async fn spawn_storage_stub_with_auth_status(
+        token: &'static str,
+        auth_status: StatusCode,
+    ) -> String {
         let app = Router::new()
             .route(
                 "/authenticate/fragment",
                 post(move |Json(_payload): Json<Value>| async move {
-                    Json(json!({
-                        "access_token": token,
-                        "token_type": "Bearer",
-                        "expires_in": 600
-                    }))
+                    if auth_status.is_success() {
+                        (
+                            auth_status,
+                            Json(json!({
+                                "access_token": token,
+                                "token_type": "Bearer",
+                                "expires_in": 600
+                            })),
+                        )
+                    } else {
+                        (
+                            auth_status,
+                            Json(json!({
+                                "message": "fragment not ready"
+                            })),
+                        )
+                    }
                 }),
             )
             .route(
@@ -2139,6 +2253,40 @@ mod tests {
             serde_json::from_slice(&session_body).expect("parse session body");
         assert_eq!(session_json["engine_url"], single_url);
         assert_eq!(session_json["access_token"], "single-stub-token");
+    }
+
+    #[tokio::test]
+    async fn signup_rolls_back_user_when_storage_fragment_is_not_ready() {
+        let single_url =
+            spawn_storage_stub_with_auth_status("single-stub-token", StatusCode::NOT_FOUND).await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, _) = test_state(single_url, multi_url).await;
+        let app = build_router(state.clone());
+
+        let signup_req = Request::builder()
+            .method("POST")
+            .uri("/v1/auth/signup")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "email": "broken-fragment@example.com",
+                    "password": "password123"
+                }))
+                .expect("serialize signup request"),
+            ))
+            .expect("signup request");
+        let signup_resp = app.oneshot(signup_req).await.expect("signup response");
+        assert_eq!(signup_resp.status(), StatusCode::BAD_GATEWAY);
+
+        assert!(
+            state
+                .db
+                .find_user_auth_by_email("broken-fragment@example.com".to_string())
+                .await
+                .expect("lookup failed signup user")
+                .is_none(),
+            "registry user should be rolled back when storage provisioning fails"
+        );
     }
 
     #[tokio::test]
@@ -2799,6 +2947,100 @@ mod tests {
             let event = wait_for_event_type(socket, "FILE_UPLOADED").await;
             assert_eq!(event["data"]["object_key"], "bulk/concurrency.bin");
         }
+    }
+
+    #[tokio::test]
+    async fn bulk_registry_object_mutations_emit_single_state_invalidation() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, drive_token) = test_state(single_url, multi_url).await;
+        let drive_user = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        for (index, key) in ["bulk/a.bin", "bulk/b.bin", "bulk/c.bin"]
+            .iter()
+            .enumerate()
+        {
+            state
+                .db
+                .finalize_object(
+                    drive_user.uid.clone(),
+                    "fragment-a".to_string(),
+                    (*key).to_string(),
+                    format!("01HREGBULK{:020}", index),
+                    2048 + index as i64,
+                    Some("application/octet-stream".to_string()),
+                )
+                .await
+                .expect("finalize seed object");
+        }
+
+        let base_url = spawn_registry_server(state.clone()).await;
+        let client = Client::new();
+        let mut drive_ws = connect_registry_ws(&base_url, &drive_token).await;
+        consume_ws_hello(&mut drive_ws).await;
+
+        let bulk_trash_resp = client
+            .post(format!("{}/v1/objects/trash/bulk", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "object_keys": [
+                    "bulk/a.bin",
+                    "/bulk/a.bin",
+                    "bulk/b.bin",
+                    "bulk/missing.bin"
+                ]
+            }))
+            .send()
+            .await
+            .expect("bulk trash request");
+        assert_eq!(bulk_trash_resp.status(), reqwest::StatusCode::OK);
+        let bulk_trash_json: Value = bulk_trash_resp.json().await.expect("parse bulk trash json");
+        assert_eq!(bulk_trash_json["requested"].as_u64(), Some(4));
+        assert_eq!(bulk_trash_json["unique"].as_u64(), Some(3));
+        assert_eq!(bulk_trash_json["affected"].as_u64(), Some(2));
+        assert_eq!(bulk_trash_json["not_found"].as_u64(), Some(1));
+
+        let trash_event = wait_for_state_scope(&mut drive_ws, "objects").await;
+        assert_eq!(trash_event["data"]["fragment"].as_str(), Some("fragment-a"));
+        expect_no_registry_event(&mut drive_ws, Duration::from_millis(350)).await;
+
+        let bulk_recover_resp = client
+            .post(format!("{}/v1/objects/recover/bulk", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "object_keys": [
+                    "bulk/a.bin",
+                    "bulk/b.bin",
+                    "bulk/missing.bin"
+                ]
+            }))
+            .send()
+            .await
+            .expect("bulk recover request");
+        assert_eq!(bulk_recover_resp.status(), reqwest::StatusCode::OK);
+        let bulk_recover_json: Value = bulk_recover_resp
+            .json()
+            .await
+            .expect("parse bulk recover json");
+        assert_eq!(bulk_recover_json["requested"].as_u64(), Some(3));
+        assert_eq!(bulk_recover_json["unique"].as_u64(), Some(3));
+        assert_eq!(bulk_recover_json["affected"].as_u64(), Some(2));
+        assert_eq!(bulk_recover_json["not_found"].as_u64(), Some(1));
+
+        let recover_event = wait_for_state_scope(&mut drive_ws, "objects").await;
+        assert_eq!(
+            recover_event["data"]["fragment"].as_str(),
+            Some("fragment-a")
+        );
+        expect_no_registry_event(&mut drive_ws, Duration::from_millis(350)).await;
     }
 
     #[tokio::test]

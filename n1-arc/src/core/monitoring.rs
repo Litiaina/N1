@@ -1,4 +1,3 @@
-use crate::enums::app_error_enum::AppError;
 use crate::core::blob_store::{RawBlobDeviceStatus, raw_blob_device_statuses};
 use crate::core::disk_manager::{configured_blob_store_disks, configured_index_store_disks};
 use crate::core::index_facade as index;
@@ -6,6 +5,7 @@ use crate::core::raw_index;
 use crate::core::redistribution::get_redist_status;
 use crate::core::repair_manager::get_repair_status;
 use crate::core::system::{SystemMetrics, get_system_metrics};
+use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;

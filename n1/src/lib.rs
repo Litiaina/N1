@@ -1,9 +1,9 @@
+pub mod core;
 pub mod enums;
 pub mod fs;
 pub mod fuse;
 pub mod handlers;
 pub mod middleware;
-pub mod core;
 pub mod routes;
 pub mod settings;
 pub mod smb;

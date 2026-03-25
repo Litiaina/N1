@@ -3,21 +3,21 @@
 > Deployment profile status (2026-03-09):
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine underneath the deployment shapes.
-> - `standard` (`litiaina-n1-standard`) is the stable/default single-node deployment path.
-> - `distribution-runtime` (`litiaina-n2`) is the multi-node deployment path.
-> - `arc` (`litiaina-n1-arc`) is experimental.
+> - `n1` (`litiaina-n1`) is the stable/default single-node deployment path.
+> - `n2` (`litiaina-n2`) is the multi-node deployment path.
+> - `n1-arc` (`litiaina-n1-arc`) is experimental.
 > - See `DEPLOYMENT_PROFILES.md`.
 
 This guide covers the SMB-lite path for the single-node N2 deployment, which is powered by the N1 engine:
 
-- Native SMB-lite gateway (`smb`) built into `litiaina-n1-standard` (recommended).
+- Native SMB-lite gateway (`smb`) built into `litiaina-n1` (recommended).
 - Legacy `fsd_mount + Samba` bridge note for older deployments; new workspace builds do not ship that bridge.
 
 ## Current Status
 
 `smb` is SMB-lite, not full enterprise SMB.
 
-Implemented in `standard/src/smb/server.rs` (stable profile), with mirrored implementation under `arc/src/smb/server.rs`:
+Implemented in `n1/src/smb/server.rs` (stable profile), with mirrored implementation under `n1-arc/src/smb/server.rs`:
 - auth + signing
 - `list/read/open`
 - query-directory / query-info metadata paths
@@ -105,10 +105,10 @@ Template:
 ### 3) Start N1 server
 
 ```bash
-cargo run -p standard --bin litiaina-n1-standard
+cargo run -p n1 --bin litiaina-n1
 ```
 
-Or run your installed systemd service for `litiaina-n1-standard`.
+Or run your installed systemd service for `litiaina-n1`.
 
 ### 4) Verify listener
 
@@ -142,7 +142,7 @@ macOS:
 
 ## Mode B: Fallback Bridge (`fsd_mount` + Samba)
 
-This legacy bridge path is retired in the current workspace. The supported network-drive path is the native SMB server in `standard`.
+This legacy bridge path is retired in the current workspace. The supported network-drive path is the native SMB server in `n1`.
 
 ### Host setup
 
@@ -198,13 +198,13 @@ This is expected with conservative share-mode handling. Retry after releasing co
 ## Verification Commands
 
 ```bash
-cargo check -p standard
-cargo test -p standard smb::server::tests -- --nocapture
-cargo test -p standard -- --nocapture
+cargo check -p n1
+cargo test -p n1 smb::server::tests -- --nocapture
+cargo test -p n1 -- --nocapture
 ```
 
 Experimental arc track verification:
 
 ```bash
-cargo check -p arc
+cargo check -p n1-arc
 ```

@@ -3,27 +3,27 @@
 > Deployment profile status (2026-03-20):
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used underneath both deployment shapes.
-> - `standard` is the stable single-node deployment profile.
-> - `standard` is released at `0.6.2`.
-> - `distribution-runtime` is the multi-node N2 deployment profile and is released at `0.2.0`.
-> - `registry-runtime` is the SQLite-backed Registry/business layer and is versioned independently at `0.3.0`.
-> - `arc` is an experimental raw-device deployment profile.
+> - `n1` is the stable single-node deployment profile.
+> - `n1` is released at `0.7.0`.
+> - `n2` is the multi-node N2 deployment profile and is released at `0.2.0`.
+> - `registry` is the SQLite-backed Registry/business layer and is versioned independently at `0.3.0`.
+> - `n1-arc` is an experimental raw-device deployment profile.
 > - See `DEPLOYMENT_PROFILES.md`.
 > - For the multi-node operator runbook, see `N2_DEPLOYMENT.md`.
 
 N2 has three runtime pieces in this workspace:
 
 - single-node N2:
-  - run `standard`
+  - run `n1`
   - use the N1 engine directly on one node
 - multi-node N2:
-  - run `distribution-runtime`
+  - run `n2`
   - use that same N1 engine on each node, then add cluster governance, placement, and peer traffic
   - governance is consensus-scoped only to cluster state
   - committed membership epochs are snapshotted for rollback
   - object payload traffic remains direct and bidirectional
 - registry layer:
-  - run `registry-runtime`
+  - run `registry`
   - keep user/business metadata out of the storage engine
   - use SQLite for both single-node and multi-node deployments
 
@@ -31,10 +31,10 @@ At the node layer, N1 is a single-node object storage engine with two distinct s
 
 - `index` is the authoritative object, session, and trash metadata plane.
 - The blob plane is profile-specific:
-  - `standard`: filesystem-backed shard files under blob roots.
-  - `arc`: raw-device/direct-I/O payload plane with raw index authority.
+  - `n1`: filesystem-backed shard files under blob roots.
+  - `n1-arc`: raw-device/direct-I/O payload plane with raw index authority.
 
-At the platform layer, `registry-runtime` owns the business plane:
+At the platform layer, `registry` owns the business plane:
 
 - first-admin bootstrap guarded by `REGISTRY_MASTER_KEY`
 - administrator account control
@@ -55,7 +55,7 @@ This replaces the legacy "full mirrored metadata tree on every index root" model
 
 ## Freeze Status
 
-The current production architecture baseline is `standard 0.6.2`, `distribution-runtime 0.2.0`, and `registry-runtime 0.3.0`.
+The current production architecture baseline is `n1 0.7.0`, `n2 0.2.0`, and `registry 0.3.0`.
 
 That baseline applies to:
 
@@ -63,7 +63,7 @@ That baseline applies to:
 - partitioned + replicated metadata ownership
 - registry-owned namespace/business serving above `index`
 - stateless resumability through authoritative session state
-- profile-specific payload substrate (`standard` filesystem-backed blob roots, `arc` raw blob devices)
+- profile-specific payload substrate (`n1` filesystem-backed blob roots, `n1-arc` raw blob devices)
 
 It does **not** freeze the HTTP/API surface yet. API and operational route details can still change before `1.0.0` while the core storage architecture stays fixed.
 
@@ -78,26 +78,26 @@ N1 is intentionally a specialized object-storage engine, not a general filesyste
 
 At the N1 core layer, two engine variants exist so operators can choose the execution substrate:
 
-- `standard`: filesystem-backed N1 for general-purpose use and broad hardware compatibility.
-- `arc`: raw-device/direct-I/O N1 for absolute device control and maximum throughput ceiling, currently treated as experimental.
+- `n1`: filesystem-backed N1 for general-purpose use and broad hardware compatibility.
+- `n1-arc`: raw-device/direct-I/O N1 for absolute device control and maximum throughput ceiling, currently treated as experimental.
 
 They are expected to keep the same storage semantics. The difference is backend execution model and operational profile, not object correctness guarantees.
 
 ## Profile Distinction (Current Runtime Truth)
 
-| Dimension | Standard | Arc |
+| Dimension | N1 | N1-Arc |
 |---|---|---|
-| Status | Stable/default (`0.6.2`) | Experimental raw-device profile |
+| Status | Stable/default (`0.7.0`) | Experimental raw-device profile |
 | `index_store_disks` | Filesystem directories | Raw devices |
 | `blob_store_disks` | Filesystem directories | Raw devices |
-| Index backend | Partitioned filesystem metadata | Raw index catalog (`block_manager`) |
+| Index backend | Partitioned `indexdb` metadata (`.ndxdb`) | Raw index catalog (`block_manager`) |
 | Blob backend | Filesystem shard files | Raw extent allocator (`block_manager`) |
 
-Arc currently runs raw index and raw blob on managed block-manager media.
+N1-Arc currently runs raw index and raw blob on managed block-manager media.
 
-### Arc Raw-Index Direction
+### N1-Arc Raw-Index Direction
 
-Arc development is now targeting a raw-only storage-kernel model (`index` + `blob` both on raw devices). The staged structure and migration gates are defined in [`ARC_RAW_KERNEL_PLAN.md`](ARC_RAW_KERNEL_PLAN.md).
+N1-Arc development is now targeting a raw-only storage-kernel model (`index` + `blob` both on raw devices). The staged structure and migration gates are defined in [`ARC_RAW_KERNEL_PLAN.md`](ARC_RAW_KERNEL_PLAN.md).
 
 ## Platform Truth
 
@@ -105,7 +105,7 @@ Arc development is now targeting a raw-only storage-kernel model (`index` + `blo
 - Each object key hashes to one metadata partition. Each partition selects one owning index root and one replica root when more than one root exists.
 - Session state is partitioned separately by `fragment + version_id`, which keeps resumable upload state bounded to the session's selected roots.
 - Multipart part truth stays on disk: part uploads write durable part metadata, and a pending-part receipt covers the crash window before that metadata exists.
-- Blob payload durability (file shards in standard, raw extents in arc) does not make an object visible until `index` publishes the version.
+- Blob payload durability (file shards in `n1`, raw extents in `n1-arc`) does not make an object visible until `indexdb` publishes the head.
 
 ## Why The Legacy Mirrored Index Had To Go
 
@@ -145,7 +145,7 @@ The Registry plane is where namespace and business logic now belongs:
 - binding a fragment to either a `single_node` or `multi_node` storage backend
 - issuing short-lived storage sessions to client applications
 
-In the `0.6.2` / `0.2.0` / `0.3.0` baseline, the Registry is a dedicated binary. The engine contract is flat, exact-key-oriented object storage, while client-facing namespace behavior moves into the Registry layer.
+In the `0.7.0` / `0.2.0` / `0.3.0` baseline, the Registry is a dedicated binary. The engine contract is flat, exact-key-oriented object storage, while client-facing namespace behavior moves into the Registry layer.
 
 Registry identity/session notes:
 - the first administrator is created through a master-key bootstrap flow
@@ -173,8 +173,8 @@ That keeps the Registry as the control plane and the engine as the direct data p
 
 Blob payload substrate depends on profile:
 
-- `standard`: multipart parts are RS-encoded into shard files under configured blob root directories.
-- `arc`: multipart parts are RS-encoded and committed to raw extents on managed blob devices.
+- `n1`: multipart parts are RS-encoded into shard files under configured blob root directories.
+- `n1-arc`: multipart parts are RS-encoded and committed to raw extents on managed blob devices.
 - In both profiles, repaired or redistributed payload placement is published through authoritative metadata updates.
 
 ## On-Disk Layout
@@ -184,18 +184,10 @@ Blob payload substrate depends on profile:
 The authoritative metadata shape is:
 
 ```text
-{INDEX_ROOT}/{fragment}/index/partitions/{partition_id}/
-  wal/manifest.msgpack
-  wal/segments/{segment_id}.wal
-  checkpoints/latest.msgpack
-  sessions/
-    {version_id}.session.msgpack
-  objects/{hh}/{object_key_sha256}/
-    latest.latest.msgpack
-    {version_id}.msgpack
-  trash/{hh}/{object_key_sha256}/
-    latest.latest.msgpack
-    {version_id}.msgpack
+{INDEX_ROOT}/{fragment}/indexdb/partitions/{partition_id}.ndxdb
+  object_heads
+  object_versions
+  sessions
 ```
 
 Notes:
@@ -205,18 +197,28 @@ Notes:
 - when multiple index roots exist, a partition writes to one owner root plus one replica root
 - the owner root is the synchronous ACK boundary for object/session state
 - replica writes are intentionally replica-behind and may lag briefly until repair/replay catches up
+- `object_heads` are the current truth for one object key
+- `object_versions` are immutable history rows keyed by object key + version id
+- `sessions` hold authoritative multipart upload state
 
 ### Engine Listing
 
-The engine no longer carries a prefix-serving plane. Engine-side listing is flat over authoritative
-object state, and namespace browsing is handled by the Registry layer.
+Engine-side listing reads authoritative `object_heads` rows. It supports:
+
+- flat pagination
+- `prefix`
+- `delimiter=/`
+- opaque continuation tokens
+
+Registry still owns business filtering, owner-scoped logical listing, and archive selection above
+that storage truth.
 
 ### Blob storage
 
 The payload plane remains:
 
-- `standard`: filesystem-backed blob roots with shard files
-- `arc`: raw blob devices managed by `block_manager`
+- `n1`: filesystem-backed blob roots with shard files
+- `n1-arc`: raw blob devices managed by `block_manager`
 - shard locations are recorded in metadata using the active backend representation
 - direct-I/O writes and reads are applied on the blob path where supported by the active backend
 
@@ -232,11 +234,11 @@ Standard blob layout:
 ```
 
 Thumbnail note:
-- `standard` thumbnails are derived cache files, not user objects.
+- `n1` thumbnails are derived cache files, not user objects.
 - They are keyed by immutable `version_id` plus thumbnail profile (`width`, `height`, `fit`, `format`).
 - They do not appear in object listings and can be regenerated from the original object version at any time.
 
-Arc blob layout:
+N1-Arc blob layout:
 
 ```text
 {RAW_BLOB_DEVICE}
@@ -244,8 +246,8 @@ Arc blob layout:
   shard payload addressed as raw://{device_id}/{allocation_id}
 ```
 
-Arc index note:
-- Index and blob are both raw in Arc.
+N1-Arc index note:
+- Index and blob are both raw in `n1-arc`.
 
 Allocator design note:
 - The target allocator architecture and rollout plan are defined in [`BLOCK_ALLOCATOR_V2.md`](BLOCK_ALLOCATOR_V2.md).
@@ -267,7 +269,7 @@ At this stage no object is visible.
 
 ### 1a. Standard one-shot upload
 
-`standard` also exposes a direct single-request path:
+`n1` also exposes a direct single-request path:
 
 - `POST /v4/upload/one-shot/{*object_key}`
 
@@ -276,7 +278,7 @@ That path skips session state and finalize for small objects:
 1. validate fragment scope and request size
 2. check live filesystem capacity
 3. write blob payload once
-4. publish immutable metadata + latest marker immediately
+4. publish immutable metadata + the authoritative head immediately
 5. return success
 
 ### 2. Upload part
@@ -284,7 +286,7 @@ That path skips session state and finalize for small objects:
 Part upload is still payload-first:
 
 1. stream bytes through RS encode
-2. write bytes to the active payload backend (`standard` shard files, `arc` raw extents)
+2. write bytes to the active payload backend (`n1` shard files, `n1-arc` raw extents)
 3. commit part metadata and session part state
 4. build `PartMetadata`
 5. update the session's `index` state with the committed part
@@ -302,18 +304,19 @@ Finalize is now an authoritative publish into `index`:
 1. load session state from the session partition
 2. verify that all required parts exist
 3. build immutable `ObjectMetadata`
-4. write the version file and latest marker on the object partition's selected roots
-5. append the partition WAL record
-6. return success
+4. commit the new immutable version row into the object partition DB
+5. advance the authoritative object head if the new version wins by recency
+6. mark the session finalized and return success
 
-Exact-key visibility depends on `index` publish, not on legacy mirrored metadata files.
-For the current index model, the owner root is the synchronous publish boundary. Replica roots are durability replicas behind that boundary, not part of the foreground ACK path.
+Exact-key visibility depends on `indexdb` head publish, not on legacy mirrored metadata files.
+For the current index model, the owner root is the synchronous publish boundary. Replica roots are
+durability replicas behind that boundary, not part of the foreground ACK path.
 
 ### Crash matrix
 
 - Crash before part state commit: partial payload artifacts may exist, but no session part state means the part is not complete.
 - Crash after part state commit but before finalize: the upload is resumable and still not visible.
-- Crash after version publish but before prefix maintenance catches up: `GET` and `HEAD` are correct through `index`; `LIST` can serve from existing prefix rows or rebuild from authoritative metadata.
+- Crash after head publish but before replica catch-up: `GET`, `HEAD`, and `LIST` are correct from the committed owner partition DB.
 
 ## Read And List Path
 
@@ -321,13 +324,14 @@ For the current index model, the owner root is the synchronous publish boundary.
 
 `GET`, `HEAD`, metadata lookup, version lookup, delete, recover, and rename resolve through `index`:
 
-- readers probe the selected roots for the partition
-- the freshest readable replica is preferred
+- readers probe the routed partition DB copies for the partition
+- current state resolves through `object_heads`
+- immutable history resolves through `object_versions`
 - blob addresses come from the published `ObjectMetadata`
 
 ### Derived thumbnails
 
-`standard` also exposes a derived image preview path:
+`n1` also exposes a derived image preview path:
 
 - `GET /v4/fragment/thumb/{*object_key}`
 
@@ -346,12 +350,12 @@ This keeps image-heavy gallery browsing efficient without changing the core obje
 
 ### Flat engine listing
 
-`LIST` in the engine is now intentionally flat:
+`LIST` in the engine now pages over authoritative head rows:
 
-- the storage engine returns object rows only
-- there is no engine-side prefix filtering
-- there is no delimiter or folder simulation
-- registry-backed products own namespace and business filtering above the engine
+- object responses come from `object_heads`
+- `prefix` filters are supported directly by the engine
+- `delimiter=/` folds child ranges into `common_prefixes`
+- registry-backed products still own namespace semantics above the storage truth
 
 That keeps exact-key correctness and engine listing on the same authority source: `index`.
 
@@ -395,7 +399,7 @@ This architecture gives N1 a better long-term shape than the legacy mirrored tre
    The current segmented WAL plus partition checkpoints already give a clean path to richer replay, compaction, and replica-repair behavior without changing API-visible behavior.
 
 5. The same node-core model is what N2 runs in both deployment shapes.
-   Single-node N2 exposes it directly through `standard`; multi-node N2 composes it with the distributed control plane in `distribution-runtime`.
+   Single-node N2 exposes it directly through `n1`; multi-node N2 composes it with the distributed control plane in `n2`.
 
 ## HA Model
 

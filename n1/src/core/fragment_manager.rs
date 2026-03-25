@@ -12,8 +12,6 @@ use tokio::fs;
 use tracing::{error, info, warn};
 
 use crate::{
-    enums::app_error_enum::AppError,
-    middleware::auth_middleware::MASTER_KEY,
     core::{
         disk_manager::ObjectPathManager,
         fragment_metadata::{
@@ -22,6 +20,8 @@ use crate::{
         },
         sync::{CreateFragmentRequest, CreateFragmentResponse, ensure_fragment_blob_directories},
     },
+    enums::app_error_enum::AppError,
+    middleware::auth_middleware::MASTER_KEY,
     routes::storage_routes::AppState,
     structs::auth_structs::Claims,
     validation::fragment_validation::does_fragment_exist,
@@ -222,15 +222,13 @@ pub async fn update_fragment(
                 Ok(m) => m,
                 Err(_) => {
                     let old_meta = read_fragment_metadata(&current_hash).await.ok();
-                    old_meta.unwrap_or_else(|| {
-                        crate::core::fragment_metadata::FragmentMetadata {
-                            fragment: new_hash.clone(),
-                            key_phc: String::new(),
-                            nt_hash_hex: None,
-                            created: chrono::Utc::now()
-                                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                            updated: None,
-                        }
+                    old_meta.unwrap_or_else(|| crate::core::fragment_metadata::FragmentMetadata {
+                        fragment: new_hash.clone(),
+                        key_phc: String::new(),
+                        nt_hash_hex: None,
+                        created: chrono::Utc::now()
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        updated: None,
                     })
                 }
             };

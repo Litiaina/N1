@@ -1,29 +1,3 @@
-use crate::enums::app_error_enum::AppError;
-use crate::fs::direct_upload::upload_file;
-use crate::fs::directory_manager::{
-    create_directory, delete_directory, delete_file, get_file_metadata, rename_file_query,
-};
-use crate::fs::directory_viewer::{
-    stream_file, stream_file_v2, stream_hls_file, view_directory, view_file,
-};
-use crate::fs::download_manager::download_file;
-use crate::fs::fragmented_upload::{check_uploaded_fragments, upload_fragments};
-use crate::fs::fs_constants::MAX_FILE_SIZE;
-use crate::fs::stateless_fragmented_upload::{
-    self, finalize_upload_session, initiate_upload_session, upload_chunk_binary,
-    upload_chunk_multipart,
-};
-use crate::fuse::handlers::{
-    fsd_delete, fsd_list_dir, fsd_mkdir, fsd_read, fsd_rename, fsd_rmdir, fsd_stat,
-    fsd_write_abort, fsd_write_begin, fsd_write_chunk, fsd_write_commit,
-};
-use crate::handlers::dir_info_handlers::get_storage_capacity;
-use crate::middleware::auth_middleware::{
-    auth, authorize, authorize_fragment, logout_refresh_token, refresh_access_token,
-    validate_access,
-};
-use crate::middleware::rate_limiter_middleware::RateLimitLayers;
-use crate::middleware::storage_middleware::enforce_storage_limit;
 use crate::core::adaptive_concurrency::run_adaptive_concurrency_loop;
 use crate::core::archive::{
     download_manifest_archive as download_manifest_archive_impl,
@@ -68,9 +42,7 @@ use crate::core::retrieve::{
 use crate::core::sharing::{create_signed_url, get_shared_object};
 use crate::core::storage_capacity_parser::get_capacity_usage as get_capacity_usage_impl;
 use crate::core::sync::initialize_fragment_storage_api;
-use crate::core::thumbnail::{
-    ThumbnailQuery, get_object_thumbnail as get_object_thumbnail_impl,
-};
+use crate::core::thumbnail::{ThumbnailQuery, get_object_thumbnail as get_object_thumbnail_impl};
 use crate::core::upload::{
     cancel_upload_session as cancel_upload_session_impl,
     finalize_object_upload as finalize_object_upload_impl,
@@ -79,6 +51,32 @@ use crate::core::upload::{
     list_active_uploads as list_active_uploads_impl, object_upload_part as object_upload_part_impl,
     upload_object_one_shot as upload_object_one_shot_impl,
 };
+use crate::enums::app_error_enum::AppError;
+use crate::fs::direct_upload::upload_file;
+use crate::fs::directory_manager::{
+    create_directory, delete_directory, delete_file, get_file_metadata, rename_file_query,
+};
+use crate::fs::directory_viewer::{
+    stream_file, stream_file_v2, stream_hls_file, view_directory, view_file,
+};
+use crate::fs::download_manager::download_file;
+use crate::fs::fragmented_upload::{check_uploaded_fragments, upload_fragments};
+use crate::fs::fs_constants::MAX_FILE_SIZE;
+use crate::fs::stateless_fragmented_upload::{
+    self, finalize_upload_session, initiate_upload_session, upload_chunk_binary,
+    upload_chunk_multipart,
+};
+use crate::fuse::handlers::{
+    fsd_delete, fsd_list_dir, fsd_mkdir, fsd_read, fsd_rename, fsd_rmdir, fsd_stat,
+    fsd_write_abort, fsd_write_begin, fsd_write_chunk, fsd_write_commit,
+};
+use crate::handlers::dir_info_handlers::get_storage_capacity;
+use crate::middleware::auth_middleware::{
+    auth, authorize, authorize_fragment, logout_refresh_token, refresh_access_token,
+    validate_access,
+};
+use crate::middleware::rate_limiter_middleware::RateLimitLayers;
+use crate::middleware::storage_middleware::enforce_storage_limit;
 use crate::smb::server::list_transfer_progress_for_fragment;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::handler::{system_broadcast_handler, ws_handler};

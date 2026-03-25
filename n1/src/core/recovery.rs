@@ -1,7 +1,7 @@
-use crate::enums::app_error_enum::AppError;
 use crate::core::constants::GC_SUFFIX;
 use crate::core::disk_manager::{ObjectPathManager, PartMetadata, ShardInfo};
 use crate::core::upload::{DirectWriter, sync_dir};
+use crate::enums::app_error_enum::AppError;
 
 use crc32fast::Hasher;
 use simd_erasure_core::{ReedSolomonDecoder, ReedSolomonEncoder};

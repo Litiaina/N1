@@ -1,9 +1,7 @@
+use crate::core::fragment_metadata::{backfill_fragment_nt_hash_if_missing, verify_fragment_key};
 use crate::middleware::refresh_store::{
     RefreshStoreError, SessionPermissions, create_refresh_session, revoke_refresh_session,
     rotate_refresh_session,
-};
-use crate::core::fragment_metadata::{
-    backfill_fragment_nt_hash_if_missing, verify_fragment_key,
 };
 use crate::structs::auth_structs::{
     AuthBody, AuthSessionScope, AuthorizationRequest, Claims, FileSystemClaims, LoginRequest,
@@ -95,12 +93,12 @@ pub async fn authorize_fragment(
         return Err(AuthError::MissingCredentials);
     }
 
-    if payload.secret != *MASTER_KEY {
-        match does_fragment_exist(&payload.fragment).await {
-            true => {}
-            false => return Err(AuthError::FragmentNotFound),
-        }
+    match does_fragment_exist(&payload.fragment).await {
+        true => {}
+        false => return Err(AuthError::FragmentNotFound),
+    }
 
+    if payload.secret != *MASTER_KEY {
         let ok = verify_fragment_key(&payload.fragment, &payload.secret)
             .await
             .map_err(|_| AuthError::InternalError)?;
@@ -504,6 +502,7 @@ fn map_refresh_error(error: RefreshStoreError) -> AuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
     use crate::middleware::refresh_store::clear_refresh_store_for_tests;
     use jsonwebtoken::Validation;
     use std::sync::{Mutex, OnceLock};
@@ -531,14 +530,37 @@ mod tests {
         unsafe {
             std::env::set_var("N1_REFRESH_STORE_ROOT", isolated_refresh_root);
         }
+        let index_root =
+            std::env::temp_dir().join(format!("n1-auth-index-tests-{}", std::process::id()));
+        let blob_root =
+            std::env::temp_dir().join(format!("n1-auth-blob-tests-{}", std::process::id()));
+        std::fs::create_dir_all(&index_root).expect("create auth index root");
+        std::fs::create_dir_all(&blob_root).expect("create auth blob root");
+        if INDEX_STORE_DISKS.get().is_none() {
+            INDEX_STORE_DISKS
+                .set(vec![index_root.to_string_lossy().to_string()])
+                .expect("set auth index roots");
+        }
+        if BLOB_STORE_DISKS.get().is_none() {
+            BLOB_STORE_DISKS
+                .set(vec![blob_root.to_string_lossy().to_string()])
+                .expect("set auth blob roots");
+        }
+    }
+
+    async fn ensure_auth_test_fragment(fragment: &str) {
+        crate::core::fragment_metadata::init_fragment_metadata(fragment, "fragment-key")
+            .await
+            .expect("init fragment metadata");
     }
 
     #[tokio::test]
-    async fn master_key_accepts_any_auth_fragment_and_mints_claim() {
+    async fn master_key_accepts_existing_fragment_and_mints_claim() {
         let _guard = env_guard().lock().unwrap_or_else(|e| e.into_inner());
         ensure_test_env();
 
         let requested_fragment = "test-admin-context-fragment".to_string();
+        ensure_auth_test_fragment(&requested_fragment).await;
         let payload = AuthorizationRequest {
             fragment: requested_fragment.clone(),
             secret: MASTER_KEY.clone(),
@@ -571,6 +593,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn master_key_rejects_missing_fragment() {
+        let _guard = env_guard().lock().unwrap_or_else(|e| e.into_inner());
+        ensure_test_env();
+
+        let payload = AuthorizationRequest {
+            fragment: "missing-admin-context-fragment".to_string(),
+            secret: MASTER_KEY.clone(),
+            read: true,
+            write: true,
+            modify: true,
+            delete: true,
+            expires_in: Some(60),
+        };
+
+        let res = authorize_fragment(Json(payload)).await;
+        assert!(matches!(res, Err(AuthError::FragmentNotFound)));
+    }
+
+    #[tokio::test]
     async fn empty_fragment_is_rejected_before_auth_mode_selection() {
         let _guard = env_guard().lock().unwrap_or_else(|e| e.into_inner());
         ensure_test_env();
@@ -594,6 +635,7 @@ mod tests {
         let _guard = env_guard().lock().unwrap_or_else(|e| e.into_inner());
         ensure_test_env();
         clear_refresh_store_for_tests().await;
+        ensure_auth_test_fragment("refresh-fragment").await;
 
         let payload = AuthorizationRequest {
             fragment: "refresh-fragment".to_string(),
@@ -644,6 +686,7 @@ mod tests {
         let _guard = env_guard().lock().unwrap_or_else(|e| e.into_inner());
         ensure_test_env();
         clear_refresh_store_for_tests().await;
+        ensure_auth_test_fragment("refresh-fragment").await;
 
         let payload = AuthorizationRequest {
             fragment: "refresh-fragment".to_string(),
@@ -692,6 +735,8 @@ mod tests {
         let _guard = env_guard().lock().unwrap_or_else(|e| e.into_inner());
         ensure_test_env();
         clear_refresh_store_for_tests().await;
+        ensure_auth_test_fragment("default-ttl-fragment").await;
+        ensure_auth_test_fragment("clamped-ttl-fragment").await;
 
         let Json(default_body) = authorize_fragment(Json(AuthorizationRequest {
             fragment: "default-ttl-fragment".to_string(),

@@ -9,6 +9,7 @@ members = [
     "n2",
     "n2_cli",
     "simd-erasure-core",
+    "indexdb",
 ]
 resolver = "2"
 

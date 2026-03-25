@@ -1,4 +1,3 @@
-use crate::enums::app_error_enum::AppError;
 use crate::distribution_core::config::n2_runtime_config;
 use crate::distribution_core::model::{
     ClusterMembership, GovernanceAbortRequest, GovernanceAbortResponse, GovernanceAppendRequest,
@@ -8,6 +7,7 @@ use crate::distribution_core::model::{
 use crate::distribution_core::state::{
     apply_membership_snapshot, ensure_membership_artifacts, get_membership,
 };
+use crate::enums::app_error_enum::AppError;
 use axum::http::HeaderMap;
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
@@ -298,7 +298,9 @@ fn majority(active_nodes: usize) -> usize {
     active_nodes / 2 + 1
 }
 
-fn active_peers(membership: &ClusterMembership) -> Vec<crate::distribution_core::model::NodeDescriptor> {
+fn active_peers(
+    membership: &ClusterMembership,
+) -> Vec<crate::distribution_core::model::NodeDescriptor> {
     let cfg = n2_runtime_config();
     let local_endpoint = normalize_endpoint(cfg.node_endpoint.as_str());
     membership

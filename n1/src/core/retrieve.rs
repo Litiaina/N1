@@ -1,4 +1,3 @@
-use crate::enums::app_error_enum::AppError;
 use crate::core::constants::BROWSER_CACHE_MAX_AGE;
 use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata, ObjectPathManager};
 use crate::core::fragment_manager::is_fragment_hash;
@@ -6,6 +5,7 @@ use crate::core::index;
 use crate::core::metadata_parser::get_metadata;
 use crate::core::object_parser::{get_object_logic, stream_object_logic};
 use crate::core::quota_manager::get_storage_usage;
+use crate::enums::app_error_enum::AppError;
 use crate::structs::auth_structs::Claims;
 use axum::{
     Json as AxumJson,
@@ -21,6 +21,8 @@ use walkdir::WalkDir;
 async fn list_objects_flat_page(
     fragment: &str,
     scan_trash: bool,
+    prefix: Option<String>,
+    delimiter: Option<String>,
     limit: usize,
     continuation_token: Option<String>,
     include_internal: bool,
@@ -28,6 +30,8 @@ async fn list_objects_flat_page(
     if scan_trash {
         index::scan_fragment_trash_objects_page(
             fragment,
+            prefix,
+            delimiter,
             limit,
             continuation_token,
             include_internal,
@@ -36,6 +40,8 @@ async fn list_objects_flat_page(
     } else {
         index::scan_fragment_live_objects_page(
             fragment,
+            prefix,
+            delimiter,
             limit,
             continuation_token,
             include_internal,
@@ -93,13 +99,6 @@ async fn list_objects_internal(
     params: HashMap<String, String>,
     scan_trash: bool,
 ) -> Result<ListObjectsResult, AppError> {
-    if params.contains_key("prefix") || params.contains_key("delimiter") {
-        return Err(AppError::BadRequest(
-            "prefix and delimiter listing were removed in 0.6.0; use the registry layer for namespace queries"
-                .to_string(),
-        ));
-    }
-
     let limit: usize = params
         .get("limit")
         .and_then(|s| s.parse().ok())
@@ -107,6 +106,8 @@ async fn list_objects_internal(
         .min(1000);
 
     let continuation_token = params.get("continuation_token").cloned();
+    let prefix = params.get("prefix").cloned();
+    let delimiter = params.get("delimiter").cloned();
     let include_internal = params
         .get("include_internal")
         .map(|v| {
@@ -120,6 +121,8 @@ async fn list_objects_internal(
     list_objects_flat_page(
         &fragment,
         scan_trash,
+        prefix,
+        delimiter,
         limit,
         continuation_token,
         include_internal,

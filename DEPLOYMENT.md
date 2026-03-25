@@ -3,12 +3,12 @@
 > Deployment profile status (2026-03-20):
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used underneath both deployment shapes.
-> - Single-node deployment: `standard` (`litiaina-n1-standard`)
-> - `standard` release: `0.6.2`
-> - Multi-node deployment: `distribution-runtime` (`litiaina-n2`, `0.2.0`)
-> - Registry/business deployment: `registry-runtime` (`registry-server`, `0.3.0`)
-> - Experimental raw-device profile: `arc` (`litiaina-n1-arc`)
-> - Privilege split: prefer a normal service user for `litiaina-n1-standard`, `litiaina-n2`, and `registry-server`. Reserve `root` for `litiaina-n1-arc` raw-device operations only, and let the runtimes validate their writable state paths explicitly.
+> - Single-node deployment: `n1` (`litiaina-n1`)
+> - `n1` release: `0.7.0`
+> - Multi-node deployment: `n2` (`litiaina-n2`, `0.2.0`)
+> - Registry/business deployment: `registry` (`registry-server`, `0.3.0`)
+> - Experimental raw-device profile: `n1-arc` (`litiaina-n1-arc`)
+> - Privilege split: prefer a normal service user for `litiaina-n1`, `litiaina-n2`, and `registry-server`. Reserve `root` for `litiaina-n1-arc` raw-device operations only, and let the runtimes validate their writable state paths explicitly.
 > - See `DEPLOYMENT_PROFILES.md` for profile policy.
 
 If you are deploying multi-node N2 today, use the dedicated runbook:
@@ -17,27 +17,27 @@ If you are deploying multi-node N2 today, use the dedicated runbook:
 This document now acts as the umbrella deployment index for the workspace. It keeps the single-node and shared deployment guidance, while the multi-node operator runbook lives in its own document:
 - [N2 multi-node runbook](/home/administrator/Development/N1/N2_DEPLOYMENT.md)
 
-If you are deploying one node today, use the single-node N2 path on `standard`.
+If you are deploying one node today, use the single-node N2 path on `n1`.
 
 Single-node/default production path:
 
-- Single-node N2 on `standard` (stable/default):
+- Single-node N2 on `n1` (stable/default):
   - `index_store_disks`: mounted filesystem paths
   - `blob_store_disks`: mounted filesystem paths (directory roots)
   - no raw format commands
 
-Arc still exists, but only as an experimental raw-device appendix at the bottom of this document.
+`n1-arc` still exists, but only as an experimental raw-device appendix at the bottom of this document.
 For deployment profile policy, see `DEPLOYMENT_PROFILES.md`.
 
 Current runtime truth:
 - `N2` is the platform identity exposed to operators and deployment docs.
-- `standard`: single-node N2 deployment on the shared N1 engine with filesystem-backed partitioned `index` and blob roots.
-- `distribution-runtime`: multi-node N2 deployment on the same shared N1 engine, with extra `/v4/n2/*` and `/v4/n2/internal/*` APIs for cluster membership and peer data movement.
-- `registry-runtime`: SQLite-backed Registry layer for users, ownership, quotas, and logical listing/filtering across both deployment shapes.
-- `registry-runtime` also brokers short-lived storage sessions for Registry-backed clients and future GUI/web surfaces.
-- `registry-runtime` also owns first-admin bootstrap, administrator account control, rotating refresh sessions, and optional TOTP 2FA.
-- `registry-runtime` now also exposes `GET /v1/ws` for Registry-backed realtime events.
-- `arc`: raw partitioned `index` and raw blob devices, experimental only.
+- `n1`: single-node N2 deployment on the shared N1 engine with filesystem-backed partitioned `index` and blob roots.
+- `n2`: multi-node N2 deployment on the same shared N1 engine, with extra `/v4/n2/*` and `/v4/n2/internal/*` APIs for cluster membership and peer data movement.
+- `registry`: SQLite-backed Registry layer for users, ownership, quotas, and logical listing/filtering across both deployment shapes.
+- `registry` also brokers short-lived storage sessions for Registry-backed clients and future GUI/web surfaces.
+- `registry` also owns first-admin bootstrap, administrator account control, rotating refresh sessions, and optional TOTP 2FA.
+- `registry` now also exposes `GET /v1/ws` for Registry-backed realtime events.
+- `n1-arc`: raw partitioned `index` and raw blob devices, experimental only.
 - stable operator surface today is CLI + HTTP API; web/admin surfaces are still under development
 - Auth/session security defaults:
   - access token default TTL: `15 minutes`
@@ -54,7 +54,7 @@ Current runtime truth:
 Use the runtime that matches the deployment shape:
 
 - Single-node deployment:
-  - run `target/release/litiaina-n1-standard`
+  - run `target/release/litiaina-n1`
   - run `target/release/registry-server`
   - use `target/release/litiaina-n1-cli` for Standard admin commands
   - use normal mounted filesystem paths for `index_store_disks` and `blob_store_disks`
@@ -150,14 +150,14 @@ Notes:
 - Registry-backed client insights can also use:
   - `GET /v1/objects/stats`
 
-### Index disks (`standard`)
+### Index disks (`n1`)
 
 Use normal filesystems for:
 
-- object metadata
-- fragment metadata
-- sessions
-- trash index mirrors
+- object head metadata
+- immutable object version history
+- upload sessions
+- trash state
 
 Example mountpoints:
 
@@ -166,27 +166,25 @@ Example mountpoints:
 /srv/n1/index1
 ```
 
-Standard index layout:
+N1 index layout:
 
 ```text
-{INDEX_ROOT}/{fragment}/index/partitions/{partition_id}/
-  wal/...
-  checkpoints/...
-  sessions/...
-  objects/...
-  trash/...
+{INDEX_ROOT}/{fragment}/indexdb/partitions/{partition_id}.ndxdb
+  object_heads
+  object_versions
+  sessions
 ```
 
-### Index disks (`arc`)
+### Index disks (`n1-arc`)
 
-Use dedicated raw devices for Arc index authority:
+Use dedicated raw devices for `n1-arc` index authority:
 
 - object metadata
 - session metadata
 - fragment metadata
 - partition WAL/checkpoint data
 
-Arc index layout:
+N1-Arc index layout:
 
 ```text
 {RAW_INDEX_DEVICE}
@@ -194,23 +192,23 @@ Arc index layout:
   raw index catalog records (sessions/objects/trash/fragment)
 ```
 
-### Blob disks (`standard`)
+### Blob disks (`n1`)
 
-Use normal filesystems for blob roots in standard deployment:
+Use normal filesystems for blob roots in `n1` deployment:
 
 ```text
 /srv/n1/blob0
 /srv/n1/blob1
 ```
 
-Standard blob layout:
+N1 blob layout:
 
 ```text
 {BLOB_ROOT}/{fragment}/blob/{version_id}/part_{p}_shard_{i}.shard|.parity
 {BLOB_ROOT}/{fragment}/.trash/blob/{version_id}/...
 ```
 
-### Blob disks (`arc`)
+### Blob disks (`n1-arc`)
 
 Use dedicated raw devices for:
 
@@ -227,7 +225,7 @@ Example device paths:
 /dev/disk/by-id/nvme-Samsung_SSD_3
 ```
 
-Arc blob layout:
+N1-Arc blob layout:
 
 ```text
 {RAW_BLOB_DEVICE}
@@ -242,7 +240,7 @@ Do not:
 - place any filesystem on them
 - share them with another service
 
-Arc rejects startup if a configured raw blob device is mounted.
+`n1-arc` rejects startup if a configured raw blob device is mounted.
 
 ## 2. Prepare The Host
 
@@ -251,14 +249,14 @@ Install or verify:
 - Linux host
 - TLS certificates
 - dedicated index filesystems
-- dedicated raw blob devices (arc only)
+- dedicated raw blob devices (`n1-arc` only)
 
 Recommended:
 
 - use stable `/dev/disk/by-id/*` names
 - avoid `/dev/sdX`, `/dev/vdX`, `/dev/nvmeXnY` if enumeration may drift
 
-Verify raw blob devices are unused (arc only):
+Verify raw blob devices are unused (`n1-arc` only):
 
 ```bash
 lsblk -f
@@ -271,7 +269,7 @@ Verify each blob device shows no mounted filesystem:
 findmnt /dev/disk/by-id/nvme-Samsung_SSD_1 || true
 ```
 
-Prepare explicit raw blob formatting with N1 Arc (returns nonce + fingerprint):
+Prepare explicit raw blob formatting with `n1-arc` (returns nonce + fingerprint):
 
 ```bash
 sudo target/release/litiaina-n1-arc format-blob-device \
@@ -320,7 +318,7 @@ sudo target/release/litiaina-n1-arc format-index-device \
 
 ## 3. Example Configuration
 
-`n1_config.ini` (standard, stable/default):
+`n1_config.ini` (`n1`, stable/default):
 
 ```ini
 [disk_config]
@@ -334,7 +332,7 @@ parity_shards=1
 stripe_block_size=4194304
 ```
 
-`n2_config.ini` (multi-node `distribution-runtime` / `litiaina-n2`):
+`n2_config.ini` (multi-node `n2` / `litiaina-n2`):
 
 ```ini
 [disk_config]
@@ -366,7 +364,7 @@ cluster_stripe_block_size=262144
 remote_request_timeout_ms=60000
 ```
 
-Notes for `distribution-runtime`:
+Notes for `n2`:
 
 - `node_endpoint` must be the address other nodes use to reach this node.
 - `cluster_membership_file` must be readable and writable by the runtime.
@@ -390,7 +388,7 @@ Notes for `distribution-runtime`:
 - `kc/mc` are the cross-node cluster layout.
 - `kd/md` are the per-node local layout for each cluster shard.
 - Current shared-core compatibility note:
-  - `distribution-runtime` owns `n2.env` and `n2_config.ini`.
+  - `n2` owns `n2.env` and `n2_config.ini`.
   - `litiaina-n2` now auto-creates `n1.env` and `n1_config.ini` compatibility aliases beside `n2.env` and `n2_config.ini` when they are missing.
   - Operators should treat `n2.env` and `n2_config.ini` as the owned source files.
   - Keep those files in the same working directory as `litiaina-n2` until that filename coupling is removed from the shared core.
@@ -404,7 +402,7 @@ Notes for `distribution-runtime`:
   - Use `cluster_commit_mode=quorum` only if you are intentionally trading immediate full placement for degraded-write availability.
   - Run reconcile after degraded periods to restore missing copies.
 
-### Validated Two-Node Reference (`distribution-runtime 0.2.0`)
+### Validated Two-Node Reference (`n2 0.2.0`)
 
 This two-node filesystem-backed layout was exercised on real hardware on `2026-03-20`:
 
@@ -459,7 +457,7 @@ Important interpretation:
   - Do not assume a successful `PUT` means full `kc+mc` placement has already landed.
   - Use reconcile as the repair path when a peer copy is missing.
 
-`n1_config.ini` (arc):
+`n1_config.ini` (`n1-arc`):
 
 ```ini
 [disk_config]
@@ -477,10 +475,10 @@ Notes:
 
 - `fs_storage_path` is still required for runtime state/staging.
 - Standard stores blob payload files under mounted blob directories.
-- `standard` uses `n1.env` and `n1_config.ini`.
-- `distribution-runtime` uses `n2.env` and `n2_config.ini`.
-- `distribution-runtime` still uses the same filesystem-backed disk roles as `standard`, then adds its own `[n2]` runtime section for cluster behavior.
-- Arc stores blob payloads on raw devices through `block_manager`.
+- `n1` uses `n1.env` and `n1_config.ini`.
+- `n2` uses `n2.env` and `n2_config.ini`.
+- `n2` still uses the same filesystem-backed disk roles as `n1`, then adds its own `[n2]` runtime section for cluster behavior.
+- `n1-arc` stores blob payloads on raw devices through `block_manager`.
 
 ## 4. Startup Safeguards
 
@@ -495,7 +493,7 @@ If startup fails on a raw blob device, fix the device state before retrying.
 
 ## 5. First Boot On Fresh Blob Devices
 
-Arc fresh raw blob devices may be:
+`n1-arc` fresh raw blob devices may be:
 
 - zeroed
 - empty loopback files for testing
@@ -508,7 +506,7 @@ That is expected. Do not pre-format the device.
 
 ## 6. Systemd Example
 
-`standard` systemd example:
+`n1` systemd example:
 
 ```ini
 [Unit]
@@ -522,7 +520,7 @@ User=administrator
 Group=administrator
 WorkingDirectory=/opt/n1
 EnvironmentFile=/opt/n1/n1.env
-ExecStart=/opt/n1/target/release/litiaina-n1-standard
+ExecStart=/opt/n1/target/release/litiaina-n1
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -531,7 +529,7 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 ```
 
-`distribution-runtime` systemd example:
+`n2` systemd example:
 
 ```ini
 [Unit]
@@ -554,7 +552,7 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 ```
 
-`registry-runtime` systemd example:
+`registry` systemd example:
 
 ```ini
 [Unit]
@@ -576,12 +574,12 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 ```
 
-Use `/opt/n1/target/release/litiaina-n1-arc` when deploying the Arc raw-kernel profile.
-Prefer not to run `litiaina-n1-standard`, `litiaina-n2`, or `registry-server` with `sudo`; if you do, make sure their writable state paths such as `.auth`, env/config files, and the Registry database stay intentional and writable for the user that will run the service later.
+Use `/opt/n1/target/release/litiaina-n1-arc` when deploying the `n1-arc` raw-kernel profile.
+Prefer not to run `litiaina-n1`, `litiaina-n2`, or `registry-server` with `sudo`; if you do, make sure their writable state paths such as `.auth`, env/config files, and the Registry database stay intentional and writable for the user that will run the service later.
 
 ## 7. Health And Observability
 
-### Raw blob status (`arc` only)
+### Raw blob status (`n1-arc` only)
 
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
@@ -624,38 +622,38 @@ curl -k -X POST -H "Authorization: Bearer $TOKEN" \
   https://127.0.0.1:50001/v4/maintenance/scrub/stop
 ```
 
-Scrub is the integrity-check pass for committed shards (raw shards on arc, shard files on standard).
+Scrub is the integrity-check pass for committed shards (raw shards on `n1-arc`, shard files on `n1`).
 
 ## 8. Operational Rules
 
-- For arc: never mount a raw blob device while N1 is configured to use it.
-- For arc: never mount a raw index device while N1 is configured to use it.
-- For arc: never point two N1 instances at the same raw blob device.
+- For `n1-arc`: never mount a raw blob device while N1 is configured to use it.
+- For `n1-arc`: never mount a raw index device while N1 is configured to use it.
+- For `n1-arc`: never point two N1 instances at the same raw blob device.
 - Replace blob devices by:
   1. stopping writes or scheduling maintenance
   2. replacing the failed device
   3. restarting N1
   4. running repair / redistribution as needed
-- Keep profile layout consistent: `standard` index on filesystem paths, `arc` index on raw devices.
+- Keep profile layout consistent: `n1` index on filesystem paths, `n1-arc` index on raw devices.
 
 ## 9. Quick Validation Checklist
 
-- standard: index disks mounted and writable
-- standard: blob root directories mounted and writable
-- arc: index devices raw/unformatted or already N1-managed
-- arc: index devices not mounted
-- arc: `index_store_disks` uses stable `/dev/disk/by-id/*` names
-- arc: blob devices unformatted or already N1-managed
-- arc: blob devices not mounted
-- arc: `blob_store_disks` uses stable `/dev/disk/by-id/*` names
-- arc: `GET /v4/maintenance/blob/raw/status` shows all devices healthy
+- n1: index disks mounted and writable
+- n1: blob root directories mounted and writable
+- n1-arc: index devices raw/unformatted or already N1-managed
+- n1-arc: index devices not mounted
+- n1-arc: `index_store_disks` uses stable `/dev/disk/by-id/*` names
+- n1-arc: blob devices unformatted or already N1-managed
+- n1-arc: blob devices not mounted
+- n1-arc: `blob_store_disks` uses stable `/dev/disk/by-id/*` names
+- n1-arc: `GET /v4/maintenance/blob/raw/status` shows all devices healthy
 - scrub can start and report status
 - authoritative `index` writes ACK on the owner root first; replica roots are expected to reconcile behind that ACK path
 - multipart part uploads are payload-first and disk-backed; committed part metadata remains the resumability source of truth
 
 ## 10. Release Hardening On Target Hardware
 
-Run the release drill harness before production rollout (`standard 0.6.2` stable, `arc` experimental):
+Run the release drill harness before production rollout (`n1 0.7.0` stable, `n1-arc` experimental):
 
 ```bash
 scripts/bench/run_release_drills.sh
@@ -666,7 +664,7 @@ This executes the critical storage workflows:
 - active multipart upload + resume while one replica index disk is down
 - CRUD/delete/recover/permanent delete
 - redistribution + repair + recovered read
-- index mirror repair convergence
+- indexdb partition replica convergence
 - HA repair with an index disk down
 
 For a heavier gate:

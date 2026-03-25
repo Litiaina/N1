@@ -51,6 +51,8 @@ pub struct RegistryDb {
     default_quota_bytes: i64,
 }
 
+const SQLITE_BULK_KEY_CHUNK: usize = 400;
+
 impl RegistryDb {
     pub fn new(sqlite_path: PathBuf, default_quota_bytes: i64) -> Self {
         Self {
@@ -1832,6 +1834,63 @@ impl RegistryDb {
         .await
     }
 
+    pub async fn set_objects_status_bulk(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_keys: Vec<String>,
+        next_status: &'static str,
+    ) -> Result<(usize, usize, UserRecord), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut selected_keys = object_keys
+                .into_iter()
+                .map(|value| canonical_archive_key(&value))
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            selected_keys.sort();
+            selected_keys.dedup();
+
+            if selected_keys.is_empty() {
+                return Err(RegistryError::bad_request(
+                    "object_keys must include at least one object key",
+                ));
+            }
+
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let now = now_rfc3339();
+            let mut affected = 0usize;
+            let mut matched_total = 0usize;
+
+            for chunk in selected_keys.chunks(SQLITE_BULK_KEY_CHUNK) {
+                let existing_keys = select_existing_object_keys(&tx, &owner_uid, &fragment, chunk)?;
+                if existing_keys.is_empty() {
+                    continue;
+                }
+
+                update_object_status_chunk(
+                    &tx,
+                    &owner_uid,
+                    &fragment,
+                    &existing_keys,
+                    next_status,
+                    &now,
+                )?;
+                matched_total = matched_total.saturating_add(existing_keys.len());
+                affected = affected.saturating_add(existing_keys.len());
+            }
+
+            tx.commit().map_err(sql_err)?;
+
+            let conn = db.open_connection()?;
+            let user = user_by_uid(&conn, &owner_uid)?;
+            let not_found = selected_keys.len().saturating_sub(matched_total);
+            Ok((affected, not_found, user))
+        })
+        .await
+    }
+
     pub async fn recover_all_trashed(
         &self,
         owner_uid: String,
@@ -2262,6 +2321,79 @@ fn normalize_listing_prefix(prefix: String, delimiter: Option<&str>) -> String {
 
 fn canonical_archive_key(value: &str) -> String {
     value.trim().trim_start_matches('/').to_string()
+}
+
+fn select_existing_object_keys(
+    conn: &Connection,
+    owner_uid: &str,
+    fragment: &str,
+    object_keys: &[String],
+) -> Result<Vec<String>, RegistryError> {
+    if object_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = std::iter::repeat_n("?", object_keys.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+        SELECT object_key
+        FROM objects
+        WHERE owner_uid = ?1 AND fragment = ?2 AND object_key IN ({})
+        "#,
+        placeholders
+    );
+    let mut args = vec![
+        Value::Text(owner_uid.to_string()),
+        Value::Text(fragment.to_string()),
+    ];
+    args.extend(object_keys.iter().cloned().map(Value::Text));
+
+    let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+    let rows = stmt
+        .query_map(params_from_iter(args), |row| row.get::<_, String>(0))
+        .map_err(sql_err)?;
+    let mut found = Vec::new();
+    for row in rows {
+        found.push(row.map_err(sql_err)?);
+    }
+    Ok(found)
+}
+
+fn update_object_status_chunk(
+    conn: &Connection,
+    owner_uid: &str,
+    fragment: &str,
+    object_keys: &[String],
+    next_status: &str,
+    now: &str,
+) -> Result<(), RegistryError> {
+    if object_keys.is_empty() {
+        return Ok(());
+    }
+
+    let placeholders = std::iter::repeat_n("?", object_keys.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+        UPDATE objects
+        SET status = ?1, updated_at = ?2
+        WHERE owner_uid = ?3 AND fragment = ?4 AND object_key IN ({})
+        "#,
+        placeholders
+    );
+    let mut args = vec![
+        Value::Text(next_status.to_string()),
+        Value::Text(now.to_string()),
+        Value::Text(owner_uid.to_string()),
+        Value::Text(fragment.to_string()),
+    ];
+    args.extend(object_keys.iter().cloned().map(Value::Text));
+    conn.execute(&sql, params_from_iter(args))
+        .map_err(sql_err)?;
+    Ok(())
 }
 
 fn quota_for_user(conn: &Connection, owner_uid: &str) -> Result<(i64, i64), RegistryError> {
@@ -2803,6 +2935,114 @@ mod tests {
             .await
             .expect("list trash after empty");
         assert!(trash_after_empty.objects.is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn bulk_selected_status_updates_dedupe_keys_and_report_not_found() {
+        let path = std::env::temp_dir().join(format!(
+            "registry-bulk-selected-status-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = RegistryDb::new(path.clone(), 1024 * 1024);
+        db.init().await.expect("init db");
+
+        let password_hash = hash_password("secret").expect("hash password");
+        let user = db
+            .create_user(
+                "bulk-selected@example.com".to_string(),
+                password_hash,
+                Some(20_000),
+                false,
+            )
+            .await
+            .expect("create user");
+
+        db.finalize_object(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            "trash/a.png".to_string(),
+            "01HBULKSELECTSTATUS0000000001".to_string(),
+            2048,
+            Some("image/png".to_string()),
+        )
+        .await
+        .expect("finalize a");
+        db.finalize_object(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            "trash/b.png".to_string(),
+            "01HBULKSELECTSTATUS0000000002".to_string(),
+            1024,
+            Some("image/png".to_string()),
+        )
+        .await
+        .expect("finalize b");
+
+        let (affected, not_found, user_after_trash) = db
+            .set_objects_status_bulk(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                vec![
+                    "trash/a.png".to_string(),
+                    "/trash/a.png".to_string(),
+                    "trash/b.png".to_string(),
+                    "trash/missing.png".to_string(),
+                ],
+                "trashed",
+            )
+            .await
+            .expect("bulk trash selected keys");
+        assert_eq!(affected, 2);
+        assert_eq!(not_found, 1);
+        assert_eq!(user_after_trash.quota_used_bytes, 3072);
+
+        let trash_listing = db
+            .list_objects(
+                user.uid.clone(),
+                Some("fragment-a".to_string()),
+                None,
+                None,
+                None,
+                100,
+                0,
+                false,
+                true,
+            )
+            .await
+            .expect("list trash after bulk selected trash");
+        assert_eq!(trash_listing.objects.len(), 2);
+
+        let (recovered, recover_not_found, user_after_recover) = db
+            .set_objects_status_bulk(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                vec!["trash/a.png".to_string(), "trash/missing.png".to_string()],
+                "ready",
+            )
+            .await
+            .expect("bulk recover selected keys");
+        assert_eq!(recovered, 1);
+        assert_eq!(recover_not_found, 1);
+        assert_eq!(user_after_recover.quota_used_bytes, 3072);
+
+        let ready_listing = db
+            .list_objects(
+                user.uid,
+                Some("fragment-a".to_string()),
+                None,
+                None,
+                None,
+                100,
+                0,
+                false,
+                false,
+            )
+            .await
+            .expect("list ready after bulk selected recover");
+        assert_eq!(ready_listing.objects.len(), 1);
+        assert_eq!(ready_listing.objects[0].object_key, "trash/a.png");
 
         let _ = std::fs::remove_file(path);
     }

@@ -3,9 +3,9 @@
 > Deployment profile status (2026-03-09):
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared redistribution/storage engine underneath both deployment shapes.
-> - `standard` is the stable single-node path for redistribution operations.
-> - `distribution-runtime` is the multi-node path and uses the same redistribution core plus cluster routing.
-> - `arc` is experimental for raw-device redistribution operations.
+> - `n1` is the stable single-node path for redistribution operations.
+> - `n2` is the multi-node path and uses the same redistribution core plus cluster routing.
+> - `n1-arc` is experimental for raw-device redistribution operations.
 > - See `DEPLOYMENT_PROFILES.md`.
 
 This document reflects the current redistribution engine and API behavior in N2.

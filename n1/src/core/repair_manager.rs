@@ -1,14 +1,11 @@
-use crate::enums::app_error_enum::AppError;
-use crate::core::constants::{
-    FRAGMENT_METADATA_FILE, METADATA_EXT, PARITY_SUFFIX, PART_META_SUFFIX, RESERVATION_FILE,
-    SESSION_MANIFEST_FILE, SHARD_SUFFIX,
-};
+use crate::core::constants::{FRAGMENT_METADATA_FILE, PARITY_SUFFIX, SHARD_SUFFIX};
 use crate::core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata,
 };
+use crate::core::index;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::{repair_entire_shard, verify_shard_integrity};
-use crate::core::upload::UploadSessionManifest;
+use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::manager::WsConnectionManager;
@@ -29,7 +26,6 @@ use tokio::fs::{self, File};
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{error, info, warn};
 use ulid::Ulid;
-use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct RepairJobStatus {
@@ -697,7 +693,7 @@ async fn replicate_bytes_strict(
                     if !dry_run {
                         atomic_write(p, canonical)
                             .await
-                            .map_err(|e| AppError::Io(e, "repair mirror file".into()))?;
+                            .map_err(|e| AppError::Io(e, "repair replica file".into()))?;
                     }
                 }
             }
@@ -706,7 +702,7 @@ async fn replicate_bytes_strict(
                 if !dry_run {
                     atomic_write(p, canonical)
                         .await
-                        .map_err(|e| AppError::Io(e, "repair mirror file".into()))?;
+                        .map_err(|e| AppError::Io(e, "repair replica file".into()))?;
                 }
             }
         }
@@ -715,7 +711,7 @@ async fn replicate_bytes_strict(
     Ok((missing, divergent))
 }
 
-async fn repair_fragment_metadata_mirrors(
+async fn repair_fragment_metadata_replicas(
     index_roots: &[PathBuf],
     fragment: &str,
     dry_run: bool,
@@ -743,431 +739,69 @@ async fn repair_fragment_metadata_mirrors(
     Ok((m, d, 0))
 }
 
-async fn list_all_session_versions(index_roots: &[PathBuf], fragment: &str) -> Vec<String> {
-    let mut out = HashSet::<String>::new();
-
-    for root in index_roots {
-        let partitions_base = root.join(fragment).join("index").join("partitions");
-        if !fs::try_exists(&partitions_base).await.unwrap_or(false) {
-            continue;
-        }
-
-        let mut partitions = match fs::read_dir(&partitions_base).await {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
-        while let Ok(Some(part)) = partitions.next_entry().await {
-            if !part
-                .file_type()
-                .await
-                .map(|ft| ft.is_dir())
-                .unwrap_or(false)
-            {
-                continue;
-            }
-
-            let sessions_dir = part.path().join("sessions");
-            if !fs::try_exists(&sessions_dir).await.unwrap_or(false) {
-                continue;
-            }
-
-            let mut rd = match fs::read_dir(&sessions_dir).await {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            while let Ok(Some(ent)) = rd.next_entry().await {
-                let name = ent.file_name().to_string_lossy().to_string();
-                if ent.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
-                    if !name.is_empty() {
-                        out.insert(name);
-                    }
-                    continue;
-                }
-                if let Some(vid) = name.strip_suffix(".session.msgpack") {
-                    if !vid.is_empty() {
-                        out.insert(vid.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    let mut v: Vec<String> = out.into_iter().collect();
-    v.sort();
-    v
+fn partition_db_path(root: &Path, fragment: &str, partition_id: u16) -> PathBuf {
+    root.join(fragment)
+        .join("indexdb")
+        .join("partitions")
+        .join(format!("{:04x}.ndxdb", partition_id))
 }
 
-async fn list_part_meta_names(session_dirs: &[PathBuf]) -> HashSet<String> {
-    let mut out = HashSet::<String>::new();
-
-    for d in session_dirs {
-        if !fs::try_exists(d).await.unwrap_or(false) {
-            continue;
-        }
-
-        let mut rd = match fs::read_dir(d).await {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
-        while let Ok(Some(ent)) = rd.next_entry().await {
-            let name = ent.file_name().to_string_lossy().to_string();
-            if name.ends_with(PART_META_SUFFIX) && name.starts_with("part_") {
-                out.insert(name);
-            }
-        }
+fn selected_partition_roots(index_roots: &[PathBuf], partition_id: u16) -> Vec<PathBuf> {
+    if index_roots.is_empty() {
+        return Vec::new();
     }
 
-    out
+    let owner_idx = usize::from(partition_id) % index_roots.len();
+    let mut selected = vec![index_roots[owner_idx].clone()];
+    if index_roots.len() > 1 {
+        let replica_offset = 1 + ((usize::from(partition_id >> 8)) % (index_roots.len() - 1));
+        let replica_idx = (owner_idx + replica_offset) % index_roots.len();
+        if replica_idx != owner_idx {
+            selected.push(index_roots[replica_idx].clone());
+        }
+    }
+    selected
 }
 
-async fn repair_fragment_sessions_strict(
-    fragment: &str,
-    index_roots: &[PathBuf],
-    dry_run: bool,
-) -> Result<(u64, u64, u64), AppError> {
-    let pm = ObjectPathManager::new();
-    let versions = list_all_session_versions(index_roots, fragment).await;
-
-    let mut miss = 0u64;
-    let mut div = 0u64;
-    let mut corrupt = 0u64;
-
-    for version_id in versions {
-        if should_stop() {
-            break;
-        }
-
-        let session_dirs = pm.get_all_session_dirs(fragment, &version_id);
-        for d in &session_dirs {
-            let _ = fs::create_dir_all(d).await;
-        }
-
-        let manifest_paths: Vec<PathBuf> = session_dirs
-            .iter()
-            .map(|d| d.join(SESSION_MANIFEST_FILE))
-            .collect();
-
-        let manifest_valid = |b: &[u8]| -> bool {
-            if let Ok(m) = rmp_serde::from_slice::<UploadSessionManifest>(b) {
-                m.fragment == fragment && m.version_id == version_id
-            } else {
-                false
-            }
-        };
-
-        let mut reps = Vec::with_capacity(manifest_paths.len());
-        for p in &manifest_paths {
-            reps.push(read_raw_replica(p, &manifest_valid).await);
-        }
-
-        let Some(best) = choose_best_raw_replica(&reps) else {
-            let any_exists = reps.iter().any(|r| r.bytes.is_some());
-            if any_exists {
-                corrupt += 1;
-            }
-            continue;
-        };
-
-        let canon_manifest = reps[best].bytes.clone().unwrap();
-        let (m1, d1) = replicate_bytes_strict(&manifest_paths, &canon_manifest, dry_run).await?;
-        miss += m1;
-        div += d1;
-
-        let receipt_paths: Vec<PathBuf> = session_dirs
-            .iter()
-            .map(|d| d.join(RESERVATION_FILE))
-            .collect();
-        let receipt_valid = |b: &[u8]| -> bool {
-            rmp_serde::from_slice::<crate::core::disk_manager::ReservationReceipt>(b).is_ok()
-        };
-
-        let mut reps = Vec::with_capacity(receipt_paths.len());
-        for p in &receipt_paths {
-            reps.push(read_raw_replica(p, &receipt_valid).await);
-        }
-
-        if let Some(best) = choose_best_raw_replica(&reps) {
-            let canon_receipt = reps[best].bytes.clone().unwrap();
-            let (m2, d2) = replicate_bytes_strict(&receipt_paths, &canon_receipt, dry_run).await?;
-            miss += m2;
-            div += d2;
-        }
-
-        let part_names = list_part_meta_names(&session_dirs).await;
-        for name in part_names {
-            if should_stop() {
-                break;
-            }
-
-            let paths: Vec<PathBuf> = session_dirs.iter().map(|d| d.join(&name)).collect();
-            let part_valid =
-                |b: &[u8]| -> bool { rmp_serde::from_slice::<PartMetadata>(b).is_ok() };
-
-            let mut reps = Vec::with_capacity(paths.len());
-            for p in &paths {
-                reps.push(read_raw_replica(p, &part_valid).await);
-            }
-
-            let Some(best) = choose_best_raw_replica(&reps) else {
-                let any_exists = reps.iter().any(|r| r.bytes.is_some());
-                if any_exists {
-                    corrupt += 1;
-                }
-                continue;
-            };
-
-            let canon_part = reps[best].bytes.clone().unwrap();
-            let (m3, d3) = replicate_bytes_strict(&paths, &canon_part, dry_run).await?;
-            miss += m3;
-            div += d3;
-        }
-    }
-
-    Ok((miss, div, corrupt))
-}
-
-#[derive(Clone)]
-struct ReplicaInfo {
-    full_path: PathBuf,
-    bytes: Option<Vec<u8>>,
-    mtime: SystemTime,
-    len: u64,
-    sha256: Option<[u8; 32]>,
-    parsed_ok: bool,
-}
-
-async fn read_replica(full: &Path) -> ReplicaInfo {
-    match fs::read(full).await {
-        Ok(bytes) => {
-            let meta = fs::metadata(full).await.ok();
-            let mtime = meta
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            let len = meta.as_ref().map(|m| m.len()).unwrap_or(bytes.len() as u64);
-            let sha = Some(sha256_bytes(&bytes));
-            let parsed_ok = rmp_serde::from_slice::<ObjectMetadata>(&bytes).is_ok();
-            ReplicaInfo {
-                full_path: full.to_path_buf(),
-                bytes: Some(bytes),
-                mtime,
-                len,
-                sha256: sha,
-                parsed_ok,
-            }
-        }
-        Err(_) => ReplicaInfo {
-            full_path: full.to_path_buf(),
-            bytes: None,
-            mtime: SystemTime::UNIX_EPOCH,
-            len: 0,
-            sha256: None,
-            parsed_ok: false,
-        },
-    }
-}
-
-async fn reconcile_object_metadata_strict(
-    fragment: &str,
-    object_key: &str,
-    version_id: &str,
-    dry_run: bool,
-) -> Result<(Vec<u8>, ObjectMetadata, u64, u64, Option<String>), AppError> {
-    let path_manager = ObjectPathManager::new();
-    let all_paths = path_manager.get_all_metadata_paths(fragment, object_key, version_id);
-
-    if all_paths.is_empty() {
-        return Err(AppError::InternalServerError(
-            "No metadata paths configured".into(),
-        ));
-    }
-
-    let mut replicas: Vec<ReplicaInfo> = Vec::with_capacity(all_paths.len());
-    for p in &all_paths {
-        replicas.push(read_replica(p).await);
-    }
-
-    let mut best_idx: Option<usize> = None;
-    let mut best_meta: Option<ObjectMetadata> = None;
-
-    for (idx, ri) in replicas.iter().enumerate() {
-        if !ri.parsed_ok {
-            continue;
-        }
-        let Some(bytes) = &ri.bytes else {
-            continue;
-        };
-        let Ok(meta) = rmp_serde::from_slice::<ObjectMetadata>(bytes) else {
-            continue;
-        };
-
-        match best_idx {
-            None => {
-                best_idx = Some(idx);
-                best_meta = Some(meta);
-            }
-            Some(cur) => {
-                let cur_ri = &replicas[cur];
-                let take = (ri.mtime > cur_ri.mtime)
-                    || (ri.mtime == cur_ri.mtime && ri.len > cur_ri.len)
-                    || (ri.mtime == cur_ri.mtime
-                        && ri.len == cur_ri.len
-                        && ri.sha256.unwrap_or([0u8; 32]) > cur_ri.sha256.unwrap_or([0u8; 32]));
-                if take {
-                    best_idx = Some(idx);
-                    best_meta = Some(meta);
-                }
-            }
-        }
-    }
-
-    let best_idx = best_idx.ok_or_else(|| {
-        AppError::InternalServerError(format!(
-            "All replicas unreadable/corrupt msgpack for {}/{}/{}",
-            fragment, object_key, version_id
-        ))
-    })?;
-
-    let canonical_bytes = replicas[best_idx]
-        .bytes
-        .clone()
-        .ok_or_else(|| AppError::InternalServerError("Canonical replica missing bytes".into()))?;
-
-    let canonical_meta = best_meta
-        .ok_or_else(|| AppError::InternalServerError("Canonical replica missing meta".into()))?;
-    let canon_sha = sha256_bytes(&canonical_bytes);
-
-    let mut missing_repairs = 0u64;
-    let mut divergent_repairs = 0u64;
-    let mut report_lines: Vec<String> = Vec::new();
-
-    for ri in &replicas {
-        match &ri.bytes {
-            None => {
-                report_lines.push(format!("MISSING path={}", ri.full_path.display()));
-                if !dry_run {
-                    atomic_write(&ri.full_path, &canonical_bytes)
-                        .await
-                        .map_err(|e| AppError::Io(e, "repair missing index meta".into()))?;
-                    missing_repairs += 1;
-                }
-            }
-            Some(b) => {
-                let sha = sha256_bytes(b);
-                if sha != canon_sha {
-                    report_lines.push(format!(
-                        "DIVERGENT path={} len={} canon_path={}",
-                        ri.full_path.display(),
-                        b.len(),
-                        replicas[best_idx].full_path.display()
-                    ));
-                    if !dry_run {
-                        atomic_write(&ri.full_path, &canonical_bytes)
-                            .await
-                            .map_err(|e| AppError::Io(e, "repair divergent index meta".into()))?;
-                        divergent_repairs += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    let report = if report_lines.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "INDEX DISAGREEMENT {}/{}/{}:\n{}",
-            fragment,
-            object_key,
-            version_id,
-            report_lines.join("\n")
-        ))
-    };
-
-    Ok((
-        canonical_bytes,
-        canonical_meta,
-        missing_repairs,
-        divergent_repairs,
-        report,
-    ))
-}
-
-async fn repair_fragment_legacy_object_metadata_mirrors(
+async fn repair_fragment_partition_dbs(
     index_roots: &[PathBuf],
     fragment: &str,
     dry_run: bool,
 ) -> Result<(u64, u64, u64), AppError> {
-    let roots = index_roots.to_vec();
-    let fragment_owned = fragment.to_string();
-    let rel_paths: Vec<String> = tokio::task::spawn_blocking(move || {
-        let mut out: HashSet<String> = HashSet::new();
-        for root in roots {
-            let frag_root = root.join(&fragment_owned);
-            let index_dir = frag_root.join("index");
-            if !index_dir.exists() {
-                continue;
-            }
-            let walker = WalkDir::new(index_dir).into_iter();
-            for entry in walker.filter_map(|e| e.ok()) {
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                let p = entry.path();
-                if !should_scan_object_metadata_file(p) {
-                    continue;
-                }
-                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                // Legacy object metadata filename: {key_hash}#{version}.msgpack
-                if !name.contains('#') {
-                    continue;
-                }
-                let rel = match p.strip_prefix(&frag_root) {
-                    Ok(v) => v.to_string_lossy().replace('\\', "/"),
-                    Err(_) => continue,
-                };
-                out.insert(rel);
-            }
-        }
-        let mut v: Vec<String> = out.into_iter().collect();
-        v.sort();
-        v
-    })
-    .await
-    .unwrap_or_default();
-
-    let valid = |b: &[u8]| -> bool { rmp_serde::from_slice::<ObjectMetadata>(b).is_ok() };
-
+    let valid = |bytes: &[u8]| !bytes.is_empty();
     let mut missing = 0u64;
     let mut divergent = 0u64;
     let mut corrupt = 0u64;
 
-    for rel in rel_paths {
-        let paths: Vec<PathBuf> = index_roots
-            .iter()
-            .map(|root| root.join(fragment).join(&rel))
-            .collect();
-
-        let mut reps = Vec::with_capacity(paths.len());
-        for p in &paths {
-            reps.push(read_raw_replica(p, &valid).await);
+    for partition_id in 0..256u16 {
+        let selected = selected_partition_roots(index_roots, partition_id);
+        if selected.is_empty() {
+            continue;
         }
 
-        let Some(best) = choose_best_raw_replica(&reps) else {
-            let any_exists = reps.iter().any(|r| r.bytes.is_some());
+        let paths: Vec<PathBuf> = selected
+            .iter()
+            .map(|root| partition_db_path(root, fragment, partition_id))
+            .collect();
+        let mut replicas = Vec::with_capacity(paths.len());
+        for path in &paths {
+            replicas.push(read_raw_replica(path, &valid).await);
+        }
+
+        let Some(best) = choose_best_raw_replica(&replicas) else {
+            let any_exists = replicas.iter().any(|replica| replica.bytes.is_some());
             if any_exists {
                 corrupt += 1;
             }
             continue;
         };
 
-        let canon = reps[best].bytes.clone().unwrap_or_default();
-        if canon.is_empty() {
+        let canonical = replicas[best].bytes.clone().unwrap_or_default();
+        if canonical.is_empty() {
             continue;
         }
-        let (m, d) = replicate_bytes_strict(&paths, &canon, dry_run).await?;
+
+        let (m, d) = replicate_bytes_strict(&paths, &canonical, dry_run).await?;
         missing += m;
         divergent += d;
     }
@@ -1275,115 +909,6 @@ async fn process_object_repair(
     }
 
     Ok((repaired_total, corrupt_found, last_repaired))
-}
-
-fn should_scan_object_metadata_file(path: &Path) -> bool {
-    let name = match path.file_name().and_then(|n| n.to_str()) {
-        Some(s) => s,
-        None => return false,
-    };
-
-    if !name.ends_with(METADATA_EXT) {
-        return false;
-    }
-
-    if name.ends_with(PART_META_SUFFIX) {
-        return false;
-    }
-
-    if name == RESERVATION_FILE || name == SESSION_MANIFEST_FILE {
-        return false;
-    }
-
-    if name == "latest.msgpack" {
-        return false;
-    }
-
-    let p = path.to_string_lossy();
-    if p.contains("/sessions/") || p.contains("\\sessions\\") {
-        return false;
-    }
-
-    true
-}
-
-async fn fragment_has_legacy_object_metadata(index_roots: &[PathBuf], fragment: &str) -> bool {
-    let roots = index_roots.to_vec();
-    let frag = fragment.to_string();
-    tokio::task::spawn_blocking(move || {
-        for root in roots {
-            let index_dir = root.join(&frag).join("index");
-            if !index_dir.exists() {
-                continue;
-            }
-            for entry in WalkDir::new(index_dir).into_iter().filter_map(|e| e.ok()) {
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                let p = entry.path();
-                if !should_scan_object_metadata_file(p) {
-                    continue;
-                }
-                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name.contains('#') {
-                    return true;
-                }
-            }
-        }
-        false
-    })
-    .await
-    .unwrap_or(false)
-}
-
-fn object_version_identity_from_meta_path(path: &Path) -> Option<(String, String)> {
-    let filename = path.file_name()?.to_str()?;
-    if !filename.ends_with(METADATA_EXT) {
-        return None;
-    }
-
-    // Legacy layout:
-    // index/{h1}/{h2}/{h3}/{h4}/{sha256(object_key)}#{version}.msgpack
-    if let Some(hash_sep) = filename.find('#') {
-        let key_hash = &filename[..hash_sep];
-        let version_with_ext = &filename[hash_sep + 1..];
-        if key_hash.len() == 64
-            && version_with_ext.len() > METADATA_EXT.len()
-            && version_with_ext.ends_with(METADATA_EXT)
-        {
-            let version_id = &version_with_ext[..version_with_ext.len() - METADATA_EXT.len()];
-            return Some((key_hash.to_string(), version_id.to_string()));
-        }
-    }
-
-    // Partitioned layout:
-    // index/partitions/{pid}/{objects|trash}/{hh}/{key_hash}/{version}.msgpack
-    let mut rev = path.components().rev();
-    let file_component = rev.next()?.as_os_str().to_str()?;
-    let key_hash = rev.next()?.as_os_str().to_str()?;
-    let _hh = rev.next()?.as_os_str().to_str()?;
-    let kind = rev.next()?.as_os_str().to_str()?;
-    let partitions = rev.next()?.as_os_str().to_str()?;
-    let index = rev.next()?.as_os_str().to_str()?;
-
-    if index != "index" || partitions != "partitions" {
-        return None;
-    }
-    if kind != "objects" && kind != "trash" {
-        return None;
-    }
-    if key_hash.len() != 64 {
-        return None;
-    }
-    if file_component == "latest.msgpack" || !file_component.ends_with(METADATA_EXT) {
-        return None;
-    }
-
-    let version_id = &file_component[..file_component.len() - METADATA_EXT.len()];
-    if version_id.is_empty() {
-        return None;
-    }
-    Some((key_hash.to_string(), version_id.to_string()))
 }
 
 #[cfg(test)]
@@ -1506,7 +1031,7 @@ pub async fn run_repair_job_with_options(
         }
 
         let (fmiss, fdiv, fcorrupt) =
-            repair_fragment_metadata_mirrors(&index_roots, &fragment_hash, cfg.dry_run).await?;
+            repair_fragment_metadata_replicas(&index_roots, &fragment_hash, cfg.dry_run).await?;
 
         {
             let mut status = REPAIR_STATUS.write().await;
@@ -1518,98 +1043,56 @@ pub async fn run_repair_job_with_options(
 
         {
             let mut status = REPAIR_STATUS.write().await;
-            status.phase = format!("Repairing upload sessions {}", fragment_hash);
+            status.phase = format!("Repairing partition db replicas {}", fragment_hash);
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 
-        let (smiss, sdiv, scorrupt) =
-            repair_fragment_sessions_strict(&fragment_hash, &index_roots, cfg.dry_run).await?;
+        let (pmiss, pdiv, pcorrupt) =
+            repair_fragment_partition_dbs(&index_roots, &fragment_hash, cfg.dry_run).await?;
 
         {
             let mut status = REPAIR_STATUS.write().await;
-            status.missing_meta_repaired += smiss;
-            status.divergent_meta_repaired += sdiv;
-            status.corrupt_found += scorrupt;
+            status.missing_meta_repaired += pmiss;
+            status.divergent_meta_repaired += pdiv;
+            status.corrupt_found += pcorrupt;
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 
-        let mut scan_index_dirs: Vec<PathBuf> = Vec::new();
-        for root in &index_roots {
-            let idx = root.join(&fragment_hash).join("index");
-            let partitions = idx.join("partitions");
-            if fs::try_exists(&partitions).await.unwrap_or(false) {
-                scan_index_dirs.push(partitions);
-            } else if fs::try_exists(&idx).await.unwrap_or(false) {
-                scan_index_dirs.push(idx);
-            }
-        }
-        if scan_index_dirs.is_empty() {
-            warn!(
-                "No readable index dirs for fragment {}, skipping",
-                fragment_hash
-            );
-            continue;
-        }
-
-        if fragment_has_legacy_object_metadata(&index_roots, &fragment_hash).await {
-            {
-                let mut status = REPAIR_STATUS.write().await;
-                status.phase = format!(
-                    "Reconciling legacy object metadata mirrors {}",
-                    fragment_hash
-                );
-                ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
-            }
-
-            let (omiss, odiv, ocorrupt) = repair_fragment_legacy_object_metadata_mirrors(
-                &index_roots,
-                &fragment_hash,
-                cfg.dry_run,
-            )
-            .await?;
-
-            {
-                let mut status = REPAIR_STATUS.write().await;
-                status.missing_meta_repaired += omiss;
-                status.divergent_meta_repaired += odiv;
-                status.corrupt_found += ocorrupt;
-                ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
-            }
-        }
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<PathBuf>(1024);
-        let scan_dirs_clone = scan_index_dirs.clone();
-
-        tokio::task::spawn_blocking(move || {
-            for scan_dir in scan_dirs_clone {
-                let walker = WalkDir::new(scan_dir).into_iter();
-                for entry in walker.filter_map(|e| e.ok()) {
-                    if !entry.file_type().is_file() {
-                        continue;
-                    }
-                    let p = entry.path();
-                    if should_scan_object_metadata_file(p) {
-                        if tx.blocking_send(p.to_owned()).is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-
-        let mut pending: Vec<PathBuf> = Vec::with_capacity(cfg.meta_batch_size);
-        let mut fragment_touched = false;
-
-        while let Some(meta_path) = rx.recv().await {
+        for is_trash in [false, true] {
             if should_stop() {
                 break;
             }
 
-            pending.push(meta_path);
+            let mut continuation_token = None;
+            loop {
+                let page = if is_trash {
+                    index::scan_fragment_trash_metadata_page(
+                        &fragment_hash,
+                        None,
+                        None,
+                        cfg.meta_batch_size,
+                        continuation_token.clone(),
+                        true,
+                    )
+                    .await?
+                } else {
+                    index::scan_fragment_live_metadata_page(
+                        &fragment_hash,
+                        None,
+                        None,
+                        cfg.meta_batch_size,
+                        continuation_token.clone(),
+                        true,
+                    )
+                    .await?
+                };
 
-            if pending.len() >= cfg.meta_batch_size {
+                if page.objects.is_empty() && page.continuation_token.is_none() {
+                    break;
+                }
+
                 let d = apply_meta_batch(
-                    &pending,
+                    &page.objects,
                     blob_roots.clone(),
                     num_disks,
                     cfg.clone(),
@@ -1620,39 +1103,16 @@ pub async fn run_repair_job_with_options(
                 )
                 .await?;
 
-                if d.repaired_shards > 0
+                let _fragment_touched = d.repaired_shards > 0
                     || d.missing_meta_repaired > 0
-                    || d.divergent_meta_repaired > 0
-                {
-                    fragment_touched = true;
+                    || d.divergent_meta_repaired > 0;
+
+                match page.continuation_token {
+                    Some(token) => continuation_token = Some(token),
+                    None => break,
                 }
-
-                pending.clear();
             }
         }
-
-        if !pending.is_empty() {
-            let d = apply_meta_batch(
-                &pending,
-                blob_roots.clone(),
-                num_disks,
-                cfg.clone(),
-                shard_repair_sem.clone(),
-                batch_pacing,
-                ws_manager.clone(),
-                start_time,
-            )
-            .await?;
-
-            if d.repaired_shards > 0 || d.missing_meta_repaired > 0 || d.divergent_meta_repaired > 0
-            {
-                fragment_touched = true;
-            }
-
-            pending.clear();
-        }
-
-        let _ = fragment_touched;
     }
 
     {
@@ -1681,7 +1141,7 @@ pub async fn run_repair_job_with_options(
 }
 
 async fn apply_meta_batch(
-    batch: &[PathBuf],
+    batch: &[ObjectMetadata],
     blob_roots: Arc<Vec<PathBuf>>,
     num_disks: usize,
     cfg: RepairRunConfig,
@@ -1694,32 +1154,31 @@ async fn apply_meta_batch(
         return Ok(BatchDelta::default());
     }
 
-    // Multiple index mirrors (and legacy + partitioned metadata paths) can surface
-    // the same object-version many times in one batch. Dedupe first to avoid
-    // concurrent reconcile races on the same metadata tuple.
     let mut seen_object_versions: HashSet<String> = HashSet::with_capacity(batch.len());
-    let mut deduped_batch: Vec<PathBuf> = Vec::with_capacity(batch.len());
-    for meta_path in batch {
-        if let Some((key_hash, version_id)) = object_version_identity_from_meta_path(meta_path) {
-            let dedupe_key = format!("{}#{}", key_hash, version_id);
-            if !seen_object_versions.insert(dedupe_key) {
-                continue;
-            }
+    let mut deduped_batch: Vec<ObjectMetadata> = Vec::with_capacity(batch.len());
+    for meta in batch {
+        let dedupe_key = format!(
+            "{}\u{001f}{}\u{001f}{}",
+            meta.fragment, meta.object_key, meta.version_id
+        );
+        if !seen_object_versions.insert(dedupe_key) {
+            continue;
         }
-        deduped_batch.push(meta_path.clone());
+        deduped_batch.push(meta.clone());
     }
 
-    let mut stream = stream::iter(deduped_batch.into_iter())
-        .map(|meta_path| {
-            let blob_roots = blob_roots.clone();
-            let shard_repair_sem = shard_repair_sem.clone();
-            let cfg = cfg.clone();
+    let mut stream =
+        stream::iter(deduped_batch.into_iter())
+            .map(|meta| {
+                let blob_roots = blob_roots.clone();
+                let shard_repair_sem = shard_repair_sem.clone();
+                let cfg = cfg.clone();
 
-            async move {
-                process_one_meta_path(meta_path, blob_roots, num_disks, cfg, shard_repair_sem).await
-            }
-        })
-        .buffer_unordered(cfg.meta_concurrency);
+                async move {
+                    process_one_metadata(meta, blob_roots, num_disks, cfg, shard_repair_sem).await
+                }
+            })
+            .buffer_unordered(cfg.meta_concurrency);
 
     let mut batch_agg = BatchDelta::default();
     let mut pending_update = BatchDelta::default();
@@ -1834,8 +1293,8 @@ async fn apply_meta_batch(
     Ok(batch_agg)
 }
 
-async fn process_one_meta_path(
-    meta_path: PathBuf,
+async fn process_one_metadata(
+    meta: ObjectMetadata,
     blob_roots: Arc<Vec<PathBuf>>,
     num_disks: usize,
     cfg: RepairRunConfig,
@@ -1848,50 +1307,12 @@ async fn process_one_meta_path(
 
     delta.scanned = 1;
 
-    let data = match fs::read(&meta_path).await {
-        Ok(d) => d,
-        Err(_) => return Ok(delta),
-    };
-
-    let meta = match rmp_serde::from_slice::<ObjectMetadata>(&data) {
-        Ok(m) => m,
-        Err(_) => {
-            delta.corrupt_found += 1;
-            return Ok(delta);
-        }
-    };
-
-    let (_canonical_data, canonical_meta, miss_rep, div_rep, report) =
-        reconcile_object_metadata_strict(
-            &meta.fragment,
-            &meta.object_key,
-            &meta.version_id,
-            cfg.dry_run,
-        )
-        .await?;
-
-    delta.missing_meta_repaired += miss_rep;
-    delta.divergent_meta_repaired += div_rep;
-
-    if let Some(r) = report {
-        delta.last_disagreement = Some(r.clone());
-        if cfg.dry_run {
-            warn!("{}", r);
-        }
-    }
-
-    if canonical_meta.is_delete_marker {
+    if meta.is_delete_marker {
         return Ok(delta);
     }
 
-    let (repaired, corrupt, last_rep) = process_object_repair(
-        canonical_meta,
-        &blob_roots,
-        num_disks,
-        cfg,
-        shard_repair_sem,
-    )
-    .await?;
+    let (repaired, corrupt, last_rep) =
+        process_object_repair(meta, &blob_roots, num_disks, cfg, shard_repair_sem).await?;
 
     delta.repaired_shards += repaired as u64;
     delta.corrupt_found += corrupt as u64;

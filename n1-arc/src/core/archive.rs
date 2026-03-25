@@ -21,7 +21,6 @@ use std::sync::Arc;
 use tokio_tar::{Builder as TarBuilder, Header as TarHeader};
 
 use crate::{
-    enums::app_error_enum::AppError,
     core::disk_manager::{
         DownloadArchiveRequest, ObjectMetadata, ObjectPathManager, PartMetadata,
         version_recency_is_newer,
@@ -32,6 +31,7 @@ use crate::{
         object_parser::{data_shards_count, shard_dir_with_locality_hint, shard_dirs_for_version},
         recovery::{ShardFileCache, ShardRepairContext, read_or_recover_chunk_into},
     },
+    enums::app_error_enum::AppError,
     structs::auth_structs::Claims,
 };
 

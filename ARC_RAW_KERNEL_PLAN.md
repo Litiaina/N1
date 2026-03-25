@@ -2,7 +2,7 @@
 
 > Arc engineering note:
 > - This document tracks Arc raw-kernel evolution.
-> - Arc is experimental; `standard` remains the default deployment profile at `0.5.2`.
+> - Arc is experimental; `n1` remains the default deployment profile at `0.5.2`.
 > - See `DEPLOYMENT_PROFILES.md`.
 
 This document defines the target structure for `N1 Arc` as a raw-only storage kernel:
@@ -48,7 +48,7 @@ Prefix/delimiter list acceleration stays derived from index WAL/checkpoints:
 
 ## 2. Module Layout (Arc)
 
-Target module structure under `arc/src/n1_core`:
+Target module structure under `n1-arc/src/n1_core`:
 
 ```text
 n1_core/
@@ -113,7 +113,7 @@ Durability order:
 - Move direct index filesystem reads/writes behind facade impl.
 - Keep existing behavior; no semantic change.
 Status:
-- Added `arc/src/n1_core/index_facade.rs` as the control-plane index boundary.
+- Added `n1-arc/src/n1_core/index_facade.rs` as the control-plane index boundary.
 - Migrated Arc upload path calls (`init/chunk/status/finalize/cancel`) to the facade.
 - Removed Arc upload-side per-part filesystem sidecar metadata writes/reads; part existence/status now resolves from authoritative index session state.
 

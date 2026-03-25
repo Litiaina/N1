@@ -154,10 +154,13 @@ impl StorageBroker {
                 .map_err(|err| {
                     RegistryError::bad_gateway(format!("invalid fragment create response: {}", err))
                 })?;
+            self.verify_fragment_ready(&backend, &payload.fragment_hash)
+                .await?;
             return Ok((backend.deployment, payload.fragment_hash));
         }
 
         if response.status() == reqwest::StatusCode::CONFLICT {
+            self.verify_fragment_ready(&backend, &fragment_hash).await?;
             return Ok((backend.deployment, fragment_hash));
         }
 
@@ -433,6 +436,17 @@ impl StorageBroker {
         } else {
             &self.strict_client
         }
+    }
+
+    async fn verify_fragment_ready(
+        &self,
+        backend: &ResolvedBackend,
+        fragment: &str,
+    ) -> Result<(), RegistryError> {
+        let _ = self
+            .authenticate_fragment(backend, fragment, true, false, false, false)
+            .await?;
+        Ok(())
     }
 
     async fn authenticate_fragment(

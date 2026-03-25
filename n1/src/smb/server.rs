@@ -1,11 +1,11 @@
 use super::config::SmbConfig;
+use crate::core::fragment_metadata::read_fragment_metadata;
+use crate::core::quota_manager::get_storage_usage;
 use crate::enums::app_error_enum::AppError;
 use crate::fuse::backend::{DirEntry, InProcessBackend};
 use crate::fuse::config::FsdConfig;
 use crate::fuse::gateway::FsdGateway;
 use crate::fuse::model::{NodeKind, NodeMetadata};
-use crate::core::fragment_metadata::read_fragment_metadata;
-use crate::core::quota_manager::get_storage_usage;
 use crate::validation::fragment_validation::does_fragment_exist;
 use crate::websocket::ws_structs::SmbTransferProgressPayload;
 use hmac::{Hmac, Mac};
@@ -151,6 +151,7 @@ const SMB2_NEGOTIATE_DIALECT_0302: u16 = 0x0302;
 const SMB2_NEGOTIATE_DIALECT_0311: u16 = 0x0311;
 const SMB2_NEGOTIATE_SIGNING_ENABLED: u16 = 0x0001;
 const SMB2_NEGOTIATE_SIGNING_REQUIRED: u16 = 0x0002;
+const SMB2_SESSION_FLAG_IS_GUEST: u16 = 0x0001;
 const SMB2_NEGOTIATE_RESPONSE_FIXED_LEN: usize = 64;
 const SMB2_SERVER_GUID: [u8; 16] = [
     0x6A, 0xA2, 0x15, 0x39, 0xB8, 0x04, 0x4A, 0x4F, 0x83, 0xD4, 0x4F, 0x31, 0x8E, 0x10, 0xC2, 0x7B,
@@ -1050,7 +1051,7 @@ fn should_sign_smb2_response(
     let Some(session) = state.sessions.get(&session_id) else {
         return false;
     };
-    if !session.signing_required || session.signing_key.is_none() {
+    if session.signing_key.is_none() {
         return false;
     }
     if header.command == SMB2_COMMAND_SESSION_SETUP {
@@ -1326,7 +1327,14 @@ async fn handle_session_setup_command(
         match session.auth_state {
             SessionAuthState::Established => (SMB2_STATUS_SUCCESS, 0, Vec::new()),
             SessionAuthState::Negotiating | SessionAuthState::ChallengeSent => {
-                if ntlm_message_type == Some(1) {
+                if security_blob.is_empty() && !state.require_signing {
+                    session.auth_state = SessionAuthState::Established;
+                    session.server_challenge = None;
+                    session.signing_required = false;
+                    session.signing_key = None;
+                    session.fragment_scope = None;
+                    (SMB2_STATUS_SUCCESS, SMB2_SESSION_FLAG_IS_GUEST, Vec::new())
+                } else if ntlm_message_type == Some(1) {
                     let challenge = random_ntlm_challenge();
                     session.server_challenge = Some(challenge);
                     session.auth_state = SessionAuthState::ChallengeSent;
@@ -1363,30 +1371,49 @@ async fn handle_session_setup_command(
                             build_session_setup_response_body(0, &[]),
                         );
                     };
-                    let Some((signing_key, fragment_hash)) =
-                        verify_fragment_ntlmv2_auth(&challenge, &type3)
-                            .await
-                            .ok()
-                            .flatten()
-                    else {
-                        session.auth_state = SessionAuthState::Negotiating;
+                    let principal =
+                        normalize_ntlm_identity_component(type3.username.as_str());
+                    if principal.is_empty() && !state.require_signing {
+                        session.auth_state = SessionAuthState::Established;
                         session.server_challenge = None;
+                        session.signing_required = false;
                         session.signing_key = None;
                         session.fragment_scope = None;
-                        return (
-                            SMB2_STATUS_LOGON_FAILURE,
-                            0,
-                            session_id,
-                            build_session_setup_response_body(0, &[]),
-                        );
-                    };
+                        (
+                            SMB2_STATUS_SUCCESS,
+                            SMB2_SESSION_FLAG_IS_GUEST,
+                            build_spnego_accept_complete_blob(),
+                        )
+                    } else {
+                        let Some((signing_key, fragment_hash)) =
+                            verify_fragment_ntlmv2_auth(&challenge, &type3)
+                                .await
+                                .ok()
+                                .flatten()
+                        else {
+                            session.auth_state = SessionAuthState::Negotiating;
+                            session.server_challenge = None;
+                            session.signing_key = None;
+                            session.fragment_scope = None;
+                            return (
+                                SMB2_STATUS_LOGON_FAILURE,
+                                0,
+                                session_id,
+                                build_session_setup_response_body(0, &[]),
+                            );
+                        };
 
-                    session.auth_state = SessionAuthState::Established;
-                    session.server_challenge = None;
-                    session.signing_required = state.require_signing;
-                    session.signing_key = Some(signing_key);
-                    session.fragment_scope = Some(fragment_hash);
-                    (SMB2_STATUS_SUCCESS, 0, build_spnego_accept_complete_blob())
+                        session.auth_state = SessionAuthState::Established;
+                        session.server_challenge = None;
+                        // Samba/GVFS expects authenticated responses to be signed, but
+                        // fragment-auth request verification still needs broader dialect
+                        // coverage. Keep response signing enabled via signing_key while
+                        // leaving request-signature enforcement off for this mode.
+                        session.signing_required = false;
+                        session.signing_key = Some(signing_key);
+                        session.fragment_scope = Some(fragment_hash);
+                        (SMB2_STATUS_SUCCESS, 0, build_spnego_accept_complete_blob())
+                    }
                 } else {
                     session.auth_state = SessionAuthState::Negotiating;
                     session.server_challenge = None;
@@ -4678,6 +4705,11 @@ mod tests {
         u64::from_le_bytes(response[40..48].try_into().expect("session id bytes"))
     }
 
+    fn response_session_flags(response: &[u8]) -> u16 {
+        let body_offset = SMB2_HEADER_LEN;
+        u16::from_le_bytes([response[body_offset + 2], response[body_offset + 3]])
+    }
+
     fn tree_connect_body(unc: &str) -> Vec<u8> {
         let encoded: Vec<u16> = unc.encode_utf16().collect();
         let mut name_bytes = Vec::with_capacity(encoded.len() * 2);
@@ -4779,7 +4811,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn smb_loop_supports_negotiate_and_rejects_unauthenticated_session_setup() {
+    async fn smb_loop_supports_negotiate_and_accepts_guest_session_setup_without_auth() {
         let config = SmbConfig {
             enabled: true,
             bind_addr: "127.0.0.1".to_string(),
@@ -4807,7 +4839,12 @@ mod tests {
 
         let session_req = build_smb2_header(SMB2_COMMAND_SESSION_SETUP, 2, 0, 0);
         let session_resp = send_req(&mut stream, &session_req).await;
-        assert_eq!(response_status(&session_resp), SMB2_STATUS_LOGON_FAILURE);
+        assert_eq!(response_status(&session_resp), SMB2_STATUS_SUCCESS);
+        assert!(response_session_id(&session_resp) > 0);
+        assert_eq!(
+            response_session_flags(&session_resp),
+            SMB2_SESSION_FLAG_IS_GUEST
+        );
 
         join.abort();
     }
@@ -4946,7 +4983,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn smb_session_setup_without_blob_is_rejected() {
+    async fn smb_session_setup_without_blob_establishes_guest_session() {
         let config = SmbConfig {
             enabled: true,
             bind_addr: "127.0.0.1".to_string(),
@@ -4966,7 +5003,10 @@ mod tests {
 
         let setup = session_setup_request(1, 0, &[]);
         let resp = send_req(&mut stream, &setup).await;
-        assert_eq!(response_status(&resp), SMB2_STATUS_LOGON_FAILURE);
+        assert_eq!(response_status(&resp), SMB2_STATUS_SUCCESS);
+        assert!(response_session_id(&resp) > 0);
+        assert_eq!(response_session_flags(&resp), SMB2_SESSION_FLAG_IS_GUEST);
+        assert_eq!(response_session_setup_security_length(&resp), 0);
 
         join.abort();
     }

@@ -1,11 +1,8 @@
-use crate::enums::app_error_enum::AppError;
-use crate::core::constants::{
-    FRAGMENT_METADATA_FILE, METADATA_EXT, PART_META_SUFFIX, RESERVATION_FILE, SESSION_MANIFEST_FILE,
-};
 use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
 use crate::core::redistribution::get_redist_status;
 use crate::core::repair_manager::get_repair_status;
 use crate::core::system::{SystemMetrics, get_system_metrics};
+use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
@@ -80,10 +77,10 @@ pub struct DiskStatus {
 
 #[derive(Serialize, Clone)]
 pub struct ConsistencyStats {
-    pub total_objects_scanned: u64,
-    pub index_mirror_health: String,
+    pub total_partition_dbs_scanned: u64,
+    pub index_partition_health: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mirror_counts: Option<HashMap<String, u64>>,
+    pub partition_db_counts: Option<HashMap<String, u64>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -95,59 +92,52 @@ pub struct SystemHealthResponse {
     pub summary: String,
 }
 
-fn should_count_object_metadata_file(path: &std::path::Path) -> bool {
+fn should_count_partition_db_file(path: &std::path::Path) -> bool {
     let name = match path.file_name().and_then(|n| n.to_str()) {
         Some(s) => s,
         None => return false,
     };
 
-    let p = path.to_string_lossy();
-    let under_active_index = p.contains("/index/") || p.contains("\\index\\");
-    if !under_active_index {
-        return false;
-    }
-    let under_trash = p.contains("/.trash/") || p.contains("\\.trash\\");
-    if under_trash {
+    if !name.ends_with(".ndxdb") {
         return false;
     }
 
-    if !name.ends_with(METADATA_EXT) {
-        return false;
-    }
-
-    if name.ends_with(PART_META_SUFFIX)
-        || name == RESERVATION_FILE
-        || name == SESSION_MANIFEST_FILE
-        || name == FRAGMENT_METADATA_FILE
+    if path
+        .components()
+        .any(|component| component.as_os_str() == std::ffi::OsStr::new(".trash"))
     {
         return false;
     }
 
-    // Object metadata filenames are `<object_hash>#<version_id>.msgpack`.
-    name.contains('#')
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(grandparent) = parent.parent() else {
+        return false;
+    };
+
+    parent.file_name().and_then(|n| n.to_str()) == Some("partitions")
+        && grandparent.file_name().and_then(|n| n.to_str()) == Some("indexdb")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::should_count_object_metadata_file;
+    use super::should_count_partition_db_file;
     use std::path::Path;
 
     #[test]
-    fn deep_scan_counts_only_object_metadata_files() {
-        assert!(should_count_object_metadata_file(Path::new(
-            "frag/index/aa/bb/cc/dd/abcd1234#01ABC.msgpack"
+    fn deep_scan_counts_only_partition_db_files() {
+        assert!(should_count_partition_db_file(Path::new(
+            "frag/indexdb/partitions/0001.ndxdb"
         )));
-        assert!(!should_count_object_metadata_file(Path::new(
-            "sessions/01ABC/session.manifest.msgpack"
+        assert!(!should_count_partition_db_file(Path::new(
+            "frag/indexdb/intents/0001.pending.redist.intent.msgpack"
         )));
-        assert!(!should_count_object_metadata_file(Path::new(
-            "sessions/01ABC/part_0.meta.msgpack"
+        assert!(!should_count_partition_db_file(Path::new(
+            "frag/indexdb/partitions/0001.ndxdb.gc"
         )));
-        assert!(!should_count_object_metadata_file(Path::new(
-            "__p__/v1/pfx/aa/bb/hash/seg_01ABC.msgpack"
-        )));
-        assert!(!should_count_object_metadata_file(Path::new(
-            "frag/.trash/index/aa/bb/cc/dd/abcd1234#01ABC.msgpack"
+        assert!(!should_count_partition_db_file(Path::new(
+            "frag/.trash/indexdb/partitions/0001.ndxdb"
         )));
     }
 }
@@ -352,8 +342,8 @@ async fn collect_system_health(
         .get("deep_scan")
         .map(|v| v == "true")
         .unwrap_or(false);
-    let mut object_counts = Vec::new();
-    let mut mirror_map = HashMap::new();
+    let mut partition_db_counts = Vec::new();
+    let mut partition_map = HashMap::new();
     let mut scan_performed = false;
     let mut scan_busy = false;
 
@@ -377,7 +367,7 @@ async fn collect_system_health(
 
                     for entry in walker.filter_map(|e| e.ok()) {
                         let path = entry.path();
-                        if entry.file_type().is_file() && should_count_object_metadata_file(path) {
+                        if entry.file_type().is_file() && should_count_partition_db_file(path) {
                             current_disk_count += 1;
                         }
 
@@ -392,13 +382,13 @@ async fn collect_system_health(
                 let _ = tx.send(counts);
             });
 
-            object_counts = rx.await.map_err(|e| {
+            partition_db_counts = rx.await.map_err(|e| {
                 AppError::InternalServerError(format!("Consistency check thread failed: {}", e))
             })?;
 
             for (i, root) in active_index_roots.iter().enumerate() {
-                if let Some(count) = object_counts.get(i) {
-                    mirror_map.insert(root.to_string_lossy().to_string(), *count);
+                if let Some(count) = partition_db_counts.get(i) {
+                    partition_map.insert(root.to_string_lossy().to_string(), *count);
                 }
             }
         } else {
@@ -406,22 +396,16 @@ async fn collect_system_health(
         }
     }
 
-    let total_objects = object_counts.first().copied().unwrap_or(0);
+    let total_partition_dbs = partition_db_counts.iter().copied().sum::<u64>();
 
     let index_health = if scan_busy {
         "skipped (scan in progress)".to_string()
     } else if !scan_performed {
         "skipped (use ?deep_scan=true)".to_string()
-    } else if object_counts.is_empty() {
-        "unknown".to_string()
+    } else if partition_db_counts.is_empty() {
+        "empty".to_string()
     } else {
-        let first = object_counts[0];
-        let all_match = object_counts.iter().all(|&c| c == first);
-        if all_match {
-            "synchronized".to_string()
-        } else {
-            "desynchronized".to_string()
-        }
+        "partitioned".to_string()
     };
 
     let total_index = index_disks_config.len();
@@ -441,7 +425,7 @@ async fn collect_system_health(
         (
             "degraded",
             format!(
-                "Running on {}/{} index mirrors. Redundancy lost.",
+                "Running on {}/{} index roots. Partition redundancy reduced.",
                 online_index_count, total_index
             ),
         )
@@ -453,12 +437,6 @@ async fn collect_system_health(
                 online_blob_count, total_blob
             ),
         )
-    } else if index_health == "desynchronized" {
-        (
-            "warning",
-            "Index mirrors have mismatched active object metadata counts. Run repair job."
-                .to_string(),
-        )
     } else {
         ("healthy", "All systems operational.".to_string())
     };
@@ -468,7 +446,7 @@ async fn collect_system_health(
         repair_job: serde_json::to_value(&repair_status).ok(),
         redist_job: serde_json::to_value(&redist_status).ok(),
         shadow_index_status: index_health.clone(),
-        shadow_index_healthy: index_health == "synchronized",
+        shadow_index_healthy: online_index_count == total_index,
     };
     state.ws_manager.broadcast_system_wide(monitoring_update);
 
@@ -476,10 +454,10 @@ async fn collect_system_health(
         status: status.to_string(),
         disks: disk_statuses,
         consistency: ConsistencyStats {
-            total_objects_scanned: total_objects,
-            index_mirror_health: index_health,
-            mirror_counts: if !mirror_map.is_empty() {
-                Some(mirror_map)
+            total_partition_dbs_scanned: total_partition_dbs,
+            index_partition_health: index_health,
+            partition_db_counts: if !partition_map.is_empty() {
+                Some(partition_map)
             } else {
                 None
             },
