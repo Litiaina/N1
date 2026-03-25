@@ -244,6 +244,10 @@ impl RegistryDb {
                 })
                 .optional()
                 .map_err(sql_err)?;
+            let mut row = row;
+            if let Some(auth) = row.as_mut() {
+                apply_effective_quota_usage_to_auth(&conn, auth)?;
+            }
             Ok(row)
         })
         .await
@@ -291,6 +295,10 @@ impl RegistryDb {
                 .query_row(params![uid], map_user_auth_row)
                 .optional()
                 .map_err(sql_err)?;
+            let mut row = row;
+            if let Some(auth) = row.as_mut() {
+                apply_effective_quota_usage_to_auth(&conn, auth)?;
+            }
             Ok(row)
         })
         .await
@@ -325,7 +333,9 @@ impl RegistryDb {
                 .map_err(sql_err)?;
             let mut out = Vec::new();
             for row in rows {
-                out.push(row.map_err(sql_err)?);
+                let mut user = row.map_err(sql_err)?;
+                apply_effective_quota_usage(&conn, &mut user)?;
+                out.push(user);
             }
             Ok(out)
         })
@@ -347,19 +357,9 @@ impl RegistryDb {
                 "SELECT COUNT(*) FROM users WHERE totp_enabled = 1",
                 params![],
             )? as usize;
-            let users_using_storage = scalar_i64(
-                &conn,
-                "SELECT COUNT(*) FROM users WHERE quota_used_bytes > 0",
-                params![],
-            )? as usize;
             let total_quota_bytes = scalar_i64(
                 &conn,
                 "SELECT COALESCE(SUM(quota_limit_bytes), 0) FROM users",
-                params![],
-            )?;
-            let total_used_bytes = scalar_i64(
-                &conn,
-                "SELECT COALESCE(SUM(quota_used_bytes), 0) FROM users",
                 params![],
             )?;
             let total_fragments =
@@ -493,7 +493,9 @@ impl RegistryDb {
                 })
                 .map_err(sql_err)?;
             while let Some(row) = rows.next().transpose().map_err(sql_err)? {
-                users.push(row);
+                let mut user = row;
+                apply_effective_quota_usage(&conn, &mut user)?;
+                users.push(user);
             }
 
             let mut user_activity = Vec::with_capacity(users.len());
@@ -557,6 +559,15 @@ impl RegistryDb {
             });
             top_storage_users.truncate(8);
 
+            let users_using_storage = user_activity
+                .iter()
+                .filter(|user| user.quota_used_bytes > 0 || user.ready_object_count > 0)
+                .count();
+            let total_used_bytes = user_activity
+                .iter()
+                .map(|user| user.quota_used_bytes.max(0))
+                .sum();
+
             Ok(RegistryAdminStats {
                 totals: AdminStatsTotals {
                     total_users,
@@ -590,11 +601,7 @@ impl RegistryDb {
         spawn_blocking(move || {
             let mut conn = db.open_connection()?;
             let tx = conn.transaction().map_err(sql_err)?;
-            let quota_used = scalar_i64(
-                &tx,
-                "SELECT quota_used_bytes FROM users WHERE uid = ?1",
-                params![uid.clone()],
-            )?;
+            let quota_used = effective_quota_used_bytes_for_user(&tx, &uid)?;
             if quota_limit_bytes < quota_used {
                 return Err(RegistryError::conflict(
                     "quota limit cannot be lower than current usage",
@@ -993,6 +1000,8 @@ impl RegistryDb {
             let tx = conn.transaction().map_err(sql_err)?;
 
             let (quota_limit, quota_used) = quota_for_user(&tx, &owner_uid)?;
+            let current_reserved =
+                pending_quota_reserved_bytes_for_user(&tx, &owner_uid, None)?;
             let existing_ready_size = tx
                 .query_row(
                     r#"
@@ -1007,10 +1016,21 @@ impl RegistryDb {
                 .map_err(sql_err)?
                 .unwrap_or(0);
 
-            if let Some(expected_size) = expected_size_bytes {
-                let projected_delta = expected_size.saturating_sub(existing_ready_size);
-                let projected_used = quota_used.saturating_add(projected_delta.max(0));
-                if projected_used > quota_limit {
+            if expected_size_bytes.is_some() {
+                let other_reserved = pending_quota_reserved_bytes_for_user(
+                    &tx,
+                    &owner_uid,
+                    Some((&fragment, &object_key)),
+                )?;
+                let projected_delta = expected_size_bytes
+                    .unwrap_or(0)
+                    .max(0)
+                    .saturating_sub(existing_ready_size.max(0));
+                let current_effective = quota_used.saturating_add(current_reserved);
+                let projected_effective = quota_used
+                    .saturating_add(other_reserved)
+                    .saturating_add(projected_delta);
+                if projected_effective > quota_limit && projected_effective > current_effective {
                     return Err(RegistryError::conflict("quota exceeded for pending object"));
                 }
             }
@@ -1070,6 +1090,8 @@ impl RegistryDb {
             let tx = conn.transaction().map_err(sql_err)?;
 
             let (quota_limit, quota_used) = quota_for_user(&tx, &owner_uid)?;
+            let current_reserved =
+                pending_quota_reserved_bytes_for_user(&tx, &owner_uid, None)?;
             let existing = tx
                 .query_row(
                     r#"
@@ -1088,8 +1110,15 @@ impl RegistryDb {
                 .map(|v| v.1.clone())
                 .unwrap_or_else(now_rfc3339);
             let delta = object_size_bytes.saturating_sub(previous_size);
-            let next_used = quota_used.saturating_add(delta);
-            if next_used > quota_limit {
+            let next_used = quota_used.saturating_add(delta).max(0);
+            let other_reserved = pending_quota_reserved_bytes_for_user(
+                &tx,
+                &owner_uid,
+                Some((&fragment, &object_key)),
+            )?;
+            let current_effective = quota_used.saturating_add(current_reserved);
+            let projected_effective = next_used.saturating_add(other_reserved);
+            if projected_effective > quota_limit && projected_effective > current_effective {
                 return Err(RegistryError::conflict("quota exceeded"));
             }
 
@@ -2053,6 +2082,31 @@ impl RegistryDb {
         .await
     }
 
+    pub async fn cancel_pending_object(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_key: String,
+    ) -> Result<(bool, UserRecord), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let removed = tx
+                .execute(
+                    "DELETE FROM object_uploads WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                    params![owner_uid, fragment, object_key],
+                )
+                .map_err(sql_err)?
+                > 0;
+            tx.commit().map_err(sql_err)?;
+            let conn = db.open_connection()?;
+            let user = user_by_uid(&conn, &owner_uid)?;
+            Ok((removed, user))
+        })
+        .await
+    }
+
     pub async fn empty_trash(
         &self,
         owner_uid: String,
@@ -2177,6 +2231,12 @@ where
 }
 
 fn user_by_uid(conn: &Connection, uid: &str) -> Result<UserRecord, RegistryError> {
+    let mut user = user_by_uid_raw(conn, uid)?;
+    apply_effective_quota_usage(conn, &mut user)?;
+    Ok(user)
+}
+
+fn user_by_uid_raw(conn: &Connection, uid: &str) -> Result<UserRecord, RegistryError> {
     conn.query_row(
         r#"
         SELECT uid, email, quota_limit_bytes, quota_used_bytes, created_at, updated_at, is_admin, totp_enabled
@@ -2201,6 +2261,18 @@ fn user_by_uid(conn: &Connection, uid: &str) -> Result<UserRecord, RegistryError
         rusqlite::Error::QueryReturnedNoRows => RegistryError::not_found("user not found"),
         other => sql_err(other),
     })
+}
+
+fn apply_effective_quota_usage(conn: &Connection, user: &mut UserRecord) -> Result<(), RegistryError> {
+    user.quota_used_bytes = effective_quota_used_bytes_for_user(conn, &user.uid)?;
+    Ok(())
+}
+
+fn apply_effective_quota_usage_to_auth(
+    conn: &Connection,
+    auth: &mut UserAuthRecord,
+) -> Result<(), RegistryError> {
+    apply_effective_quota_usage(conn, &mut auth.user)
 }
 
 fn user_auth_by_uid(conn: &Connection, uid: &str) -> Result<Option<UserAuthRecord>, RegistryError> {
@@ -2408,6 +2480,49 @@ fn quota_for_user(conn: &Connection, owner_uid: &str) -> Result<(i64, i64), Regi
     })
 }
 
+fn pending_quota_reserved_bytes_for_user(
+    conn: &Connection,
+    owner_uid: &str,
+    exclude: Option<(&str, &str)>,
+) -> Result<i64, RegistryError> {
+    let (exclude_fragment, exclude_object_key) = exclude
+        .map(|(fragment, object_key)| (Some(fragment), Some(object_key)))
+        .unwrap_or((None, None));
+    conn.query_row(
+        r#"
+        SELECT COALESCE(
+            SUM(
+                CASE
+                    WHEN COALESCE(ou.expected_size_bytes, 0) > COALESCE(o.object_size_bytes, 0)
+                        THEN COALESCE(ou.expected_size_bytes, 0) - COALESCE(o.object_size_bytes, 0)
+                    ELSE 0
+                END
+            ),
+            0
+        )
+        FROM object_uploads ou
+        LEFT JOIN objects o
+          ON o.owner_uid = ou.owner_uid
+         AND o.fragment = ou.fragment
+         AND o.object_key = ou.object_key
+        WHERE ou.owner_uid = ?1
+          AND (?2 IS NULL OR ou.fragment <> ?2 OR ou.object_key <> ?3)
+        "#,
+        params![owner_uid, exclude_fragment, exclude_object_key],
+        |row| row.get(0),
+    )
+    .map_err(sql_err)
+}
+
+fn effective_quota_used_bytes_for_user(
+    conn: &Connection,
+    owner_uid: &str,
+) -> Result<i64, RegistryError> {
+    let (_, quota_used) = quota_for_user(conn, owner_uid)?;
+    let pending_reserved = pending_quota_reserved_bytes_for_user(conn, owner_uid, None)?;
+    Ok(quota_used.saturating_add(pending_reserved).max(0))
+}
+
 fn revoke_refresh_chain(
     conn: &Connection,
     start_hash: &str,
@@ -2537,6 +2652,7 @@ mod tests {
     use super::RegistryDb;
     use crate::auth::{hash_password, verify_password};
     use crate::models::StorageDeployment;
+    use axum::http::StatusCode;
 
     #[tokio::test]
     async fn registry_round_trip_tracks_quota_and_listing() {
@@ -2742,6 +2858,146 @@ mod tests {
             .await
             .expect("delete object");
         assert_eq!(removed_user.quota_used_bytes, 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn pending_quota_reservations_block_overcommit_and_release_on_cancel() {
+        let path = std::env::temp_dir().join(format!(
+            "registry-pending-quota-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = RegistryDb::new(path.clone(), 1024 * 1024);
+        db.init().await.expect("init db");
+
+        let password_hash = hash_password("secret").expect("hash password");
+        let user = db
+            .create_user(
+                "pending-quota@example.com".to_string(),
+                password_hash,
+                Some(10_000),
+                false,
+            )
+            .await
+            .expect("create user");
+
+        db.register_pending_object(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            "uploads/one.bin".to_string(),
+            Some(4_000),
+            Some("application/octet-stream".to_string()),
+        )
+        .await
+        .expect("register first pending");
+        let user_after_first = db.get_user(user.uid.clone()).await.expect("user after first");
+        assert_eq!(user_after_first.quota_used_bytes, 4_000);
+
+        db.register_pending_object(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            "uploads/two.bin".to_string(),
+            Some(5_000),
+            Some("application/octet-stream".to_string()),
+        )
+        .await
+        .expect("register second pending");
+        let user_after_second = db.get_user(user.uid.clone()).await.expect("user after second");
+        assert_eq!(user_after_second.quota_used_bytes, 9_000);
+
+        let err = db
+            .register_pending_object(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                "uploads/three.bin".to_string(),
+                Some(2_000),
+                Some("application/octet-stream".to_string()),
+            )
+            .await
+            .expect_err("third pending should exceed quota");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert!(err.message.contains("quota exceeded"));
+
+        let (removed, user_after_cancel) = db
+            .cancel_pending_object(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                "uploads/two.bin".to_string(),
+            )
+            .await
+            .expect("cancel second pending");
+        assert!(removed);
+        assert_eq!(user_after_cancel.quota_used_bytes, 4_000);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn finalize_object_respects_other_pending_reservations() {
+        let path = std::env::temp_dir().join(format!(
+            "registry-finalize-pending-quota-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = RegistryDb::new(path.clone(), 1024 * 1024);
+        db.init().await.expect("init db");
+
+        let password_hash = hash_password("secret").expect("hash password");
+        let user = db
+            .create_user(
+                "finalize-quota@example.com".to_string(),
+                password_hash,
+                Some(10_000),
+                false,
+            )
+            .await
+            .expect("create user");
+
+        db.register_pending_object(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            "uploads/a.bin".to_string(),
+            Some(4_000),
+            Some("application/octet-stream".to_string()),
+        )
+        .await
+        .expect("register pending a");
+        db.register_pending_object(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            "uploads/b.bin".to_string(),
+            Some(5_000),
+            Some("application/octet-stream".to_string()),
+        )
+        .await
+        .expect("register pending b");
+
+        let err = db
+            .finalize_object(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                "uploads/a.bin".to_string(),
+                "01HFINALIZEPENDINGTEST00000001".to_string(),
+                6_000,
+                Some("application/octet-stream".to_string()),
+            )
+            .await
+            .expect_err("finalize should respect other pending reservations");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert!(err.message.contains("quota exceeded"));
+
+        let (_object, user_after_finalize) = db
+            .finalize_object(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                "uploads/a.bin".to_string(),
+                "01HFINALIZEPENDINGTEST00000002".to_string(),
+                4_500,
+                Some("application/octet-stream".to_string()),
+            )
+            .await
+            .expect("finalize within effective quota");
+        assert_eq!(user_after_finalize.quota_used_bytes, 9_500);
 
         let _ = std::fs::remove_file(path);
     }

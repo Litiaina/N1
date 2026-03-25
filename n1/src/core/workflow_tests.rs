@@ -12,6 +12,7 @@ use super::fragment_metadata::init_fragment_metadata;
 use super::garbage_collector::{get_gc_status_api, run_garbage_collector};
 use super::index;
 use super::indexdb_store;
+use super::maintenance::sync_fragment_metadata;
 use super::metadata_parser::get_metadata;
 use super::modify::rename_object;
 use super::object_parser::{
@@ -1266,6 +1267,203 @@ async fn matrix_capacity_usage_reports_live_filesystem_totals() {
         "available should match allocated-used"
     );
     assert!(filesystems >= 1, "must report at least one filesystem");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_sync_fragment_metadata_preserves_active_multipart_blob_dirs() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let (version_id, _session_id) =
+        init_upload_with_part_size(&fragment, "uploads/pending.bin", 8192, 2, Some(4096)).await;
+    let put_resp = upload_part(&fragment, &version_id, 0, vec![0x5A; 4096]).await;
+    assert_eq!(put_resp.status(), StatusCode::OK);
+
+    let status_before = get_upload_status(
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), version_id.clone())),
+    )
+    .await
+    .expect("upload status before sync")
+    .into_response();
+    assert_eq!(status_before.status(), StatusCode::OK);
+    let status_before_json = read_response_json(status_before).await;
+    assert_eq!(status_before_json["uploaded_parts"].as_array().map(Vec::len), Some(1));
+    assert_eq!(status_before_json["uploaded_parts"][0].as_u64(), Some(0));
+
+    let sync_resp = sync_fragment_metadata(full_claims(&fragment))
+        .await
+        .expect("sync fragment metadata")
+        .into_response();
+    assert_eq!(sync_resp.status(), StatusCode::OK);
+
+    let status_after = get_upload_status(
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), version_id.clone())),
+    )
+    .await
+    .expect("upload status after sync")
+    .into_response();
+    assert_eq!(status_after.status(), StatusCode::OK);
+    let status_after_json = read_response_json(status_after).await;
+    assert_eq!(status_after_json["uploaded_parts"].as_array().map(Vec::len), Some(1));
+    assert_eq!(status_after_json["uploaded_parts"][0].as_u64(), Some(0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_sync_fragment_metadata_preserves_recent_unknown_blob_dirs() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let path_manager = ObjectPathManager::new();
+    let blob_root = path_manager
+        .get_blob_roots()
+        .into_iter()
+        .next()
+        .expect("blob root");
+    let unknown_version_id = Ulid::new().to_string();
+    let unknown_dir = path_manager.get_shard_dir_on_disk(&blob_root, &fragment, &unknown_version_id);
+    fs::create_dir_all(&unknown_dir)
+        .await
+        .expect("create unknown blob dir");
+    fs::write(unknown_dir.join("part_0_shard_0.shard"), b"temporary data")
+        .await
+        .expect("write unknown blob");
+
+    let sync_resp = sync_fragment_metadata(full_claims(&fragment))
+        .await
+        .expect("sync fragment metadata")
+        .into_response();
+    assert_eq!(sync_resp.status(), StatusCode::OK);
+    assert!(
+        fs::try_exists(&unknown_dir).await.expect("unknown dir exists"),
+        "recent unknown blob dir should not be deleted immediately"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_manual_gc_preserves_active_multipart_sessions() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let (version_id, _session_id) =
+        init_upload_with_part_size(&fragment, "uploads/gc-pending.bin", 8192, 2, Some(4096))
+            .await;
+    let put_resp = upload_part(&fragment, &version_id, 0, vec![0x33; 4096]).await;
+    assert_eq!(put_resp.status(), StatusCode::OK);
+
+    run_manual_gc_and_wait(state).await;
+
+    let sessions = index::list_active_sessions(&fragment)
+        .await
+        .expect("list active sessions after manual gc");
+    assert!(
+        sessions
+            .iter()
+            .any(|session| session.manifest.version_id == version_id),
+        "manual GC must preserve active multipart sessions"
+    );
+
+    let status_after = get_upload_status(
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), version_id.clone())),
+    )
+    .await
+    .expect("upload status after manual gc")
+    .into_response();
+    assert_eq!(status_after.status(), StatusCode::OK);
+    let status_after_json = read_response_json(status_after).await;
+    assert_eq!(status_after_json["uploaded_parts"].as_array().map(Vec::len), Some(1));
+    assert_eq!(status_after_json["uploaded_parts"][0].as_u64(), Some(0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_finalize_upload_waits_for_object_operation_lock() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+    let key = "uploads/locked-finalize.bin";
+    let content = vec![0x7C; 4096];
+    let (version_id, session_id) =
+        init_upload_with_part_size(&fragment, key, content.len() as u64, 1, Some(4096)).await;
+    let put_resp = upload_part(&fragment, &version_id, 0, content.clone()).await;
+    assert_eq!(put_resp.status(), StatusCode::OK);
+
+    let object_lock = index::acquire_object_operation_lock(&fragment, key)
+        .await
+        .expect("acquire object lock");
+
+    let state_clone = state.clone();
+    let fragment_clone = fragment.clone();
+    let version_id_clone = version_id.clone();
+    let session_id_clone = session_id.clone();
+    let key_clone = key.to_string();
+    let mut finalize_task = tokio::spawn(async move {
+        finalize_upload(
+            state_clone,
+            &fragment_clone,
+            &version_id_clone,
+            &session_id_clone,
+            &key_clone,
+            4096,
+            1,
+        )
+        .await
+    });
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut finalize_task)
+            .await
+            .is_err(),
+        "finalize should block while another CRUD operation holds the object lock"
+    );
+
+    drop(object_lock);
+
+    let finalize_resp = finalize_task.await.expect("finalize join");
+    assert_eq!(finalize_resp.status(), StatusCode::OK);
+
+    let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.to_string()).await;
+    assert_eq!(got, content);
 }
 
 async fn init_upload(

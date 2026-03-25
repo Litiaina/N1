@@ -386,6 +386,7 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/storage/session", post(issue_storage_session))
         .route("/v1/objects/register", post(register_object))
         .route("/v1/objects/finalize", post(finalize_object))
+        .route("/v1/objects/pending", delete(cancel_pending_object))
         .route("/v1/objects/suggest", get(suggest_objects))
         .route("/v1/objects/rename", post(rename_object))
         .route("/v1/objects/trash/bulk", post(trash_objects_bulk))
@@ -1615,6 +1616,29 @@ async fn delete_object(
     publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
     Ok(Json(ObjectDeleteResponse {
         removed: true,
+        quota_limit_bytes: user.quota_limit_bytes,
+        quota_used_bytes: user.quota_used_bytes,
+    }))
+}
+
+async fn cancel_pending_object(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DeleteObjectQuery>,
+) -> Result<Json<ObjectDeleteResponse>, RegistryError> {
+    validate_fragment_and_key(&query.fragment, &query.object_key)?;
+    let _write_guard = state.write_gate.lock().await;
+    let fragment = query.fragment.clone();
+    let claims = claims_from_headers(&headers, &state.auth)?;
+    let (removed, user) = state
+        .db
+        .cancel_pending_object(claims.sub, fragment.clone(), query.object_key)
+        .await?;
+    if removed {
+        publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
+    }
+    Ok(Json(ObjectDeleteResponse {
+        removed,
         quota_limit_bytes: user.quota_limit_bytes,
         quota_used_bytes: user.quota_used_bytes,
     }))

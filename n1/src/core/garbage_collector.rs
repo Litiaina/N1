@@ -562,14 +562,17 @@ async fn process_fragment_gc(
     }
 
     let now_ts = Utc::now().timestamp();
-    let ttl_secs = file_ttl.as_secs() as i64;
+    let ttl_secs = CONFIG.garbage_collector.file_ttl_seconds as i64;
+    let mut active_session_versions = HashSet::<String>::new();
     let mut sessions_to_delete = Vec::<(String, u64)>::new();
     if let Ok(active_sessions) = index::list_active_sessions(fragment).await {
         for session in active_sessions {
             let idle_secs = now_ts.saturating_sub(session.last_activity_at.max(0));
-            if is_manual_run || idle_secs > ttl_secs {
+            if idle_secs > ttl_secs {
                 let amount = session.reservation.map(|r| r.amount).unwrap_or(0);
                 sessions_to_delete.push((session.manifest.version_id, amount));
+            } else {
+                active_session_versions.insert(session.manifest.version_id);
             }
         }
     }
@@ -611,6 +614,7 @@ async fn process_fragment_gc(
                 if !live_versions.contains(&ver_id)
                     && !trash_versions.contains(&ver_id)
                     && !expired_versions.contains_key(&ver_id)
+                    && !active_session_versions.contains(&ver_id)
                 {
                     let modified = fs::metadata(&path)
                         .and_then(|m| m.modified())

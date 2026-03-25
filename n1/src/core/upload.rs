@@ -1630,6 +1630,7 @@ pub async fn upload_object_one_shot(
         stripe_size_bytes: stripe_size,
     };
 
+    let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
     index::publish_object(&object_meta).await?;
 
     let response_body = serde_json::to_value(&object_meta).map_err(|e| {
@@ -1660,6 +1661,7 @@ pub async fn finalize_object_upload(
 
     let object_key = key_query.object_key;
     let path_manager = ObjectPathManager::new();
+    let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
 
     if index::read_object_version(&fragment, &object_key, &version_id)
         .await
@@ -1833,6 +1835,8 @@ pub async fn cancel_upload_session(
     }
 
     let path_manager = ObjectPathManager::new();
+    let _object_lock =
+        index::acquire_object_operation_lock(&fragment, &key_query.object_key).await?;
 
     if index::read_object_version(&fragment, &key_query.object_key, &version_id)
         .await

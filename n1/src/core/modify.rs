@@ -110,6 +110,32 @@ fn remap_shard_absolute_path_for_fragment_move(
     current_path.to_string()
 }
 
+async fn acquire_rename_locks(
+    source_fragment: &str,
+    source_key: &str,
+    destination_fragment: &str,
+    destination_key: &str,
+) -> Result<Vec<index::ObjectOperationGuard>, AppError> {
+    let mut lock_targets = vec![
+        (
+            source_fragment.to_string(),
+            ObjectPathManager::canonical_object_key(source_key),
+        ),
+        (
+            destination_fragment.to_string(),
+            ObjectPathManager::canonical_object_key(destination_key),
+        ),
+    ];
+    lock_targets.sort();
+    lock_targets.dedup();
+
+    let mut guards = Vec::with_capacity(lock_targets.len());
+    for (fragment, object_key) in lock_targets {
+        guards.push(index::acquire_object_operation_lock(&fragment, &object_key).await?);
+    }
+    Ok(guards)
+}
+
 pub async fn rename_object(
     State(state): State<Arc<AppState>>,
     claims: Claims,
@@ -139,6 +165,14 @@ pub async fn rename_object(
     {
         return Ok(StatusCode::OK);
     }
+
+    let _rename_locks = acquire_rename_locks(
+        &payload.source_fragment,
+        &payload.source_key,
+        &payload.destination_fragment,
+        &payload.destination_key,
+    )
+    .await?;
 
     let destination_versions = index::list_live_object_versions_metadata(
         &payload.destination_fragment,
