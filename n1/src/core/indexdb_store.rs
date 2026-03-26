@@ -505,7 +505,9 @@ fn open_route_db_for_read(
     route: &IndexRoute,
 ) -> Result<Option<Arc<Database>>, AppError> {
     let owner_path = owner_db_path(route, fragment);
+    let owner_available = owner_path.exists();
     let mut best_follower: Option<(u64, Arc<Database>)> = None;
+    let mut best_follower_without_meta: Option<Arc<Database>> = None;
     for root in &route.roots {
         let path = db_path(root, fragment, route.partition_id);
         if path.exists() {
@@ -522,6 +524,10 @@ fn open_route_db_for_read(
             }) else {
                 continue;
             };
+
+            if root != &route.roots[0] && best_follower_without_meta.is_none() {
+                best_follower_without_meta = Some(db.clone());
+            }
 
             let meta = match read_partition_meta_exact(&db) {
                 Ok(Some(meta)) => Some(meta),
@@ -578,7 +584,19 @@ fn open_route_db_for_read(
             }
         }
     }
-    Ok(best_follower.map(|(_, db)| db))
+    if let Some((_, db)) = best_follower {
+        return Ok(Some(db));
+    }
+    if !owner_available {
+        if let Some(db) = best_follower_without_meta {
+            warn!(
+                "indexdb read fallback: owner copy unavailable for fragment {} partition {:04x}; using follower copy without partition metadata",
+                fragment, route.partition_id
+            );
+            return Ok(Some(db));
+        }
+    }
+    Ok(None)
 }
 
 fn owner_db_path(route: &IndexRoute, fragment: &str) -> PathBuf {
@@ -729,6 +747,22 @@ pub fn has_object_partition_db(fragment: &str, object_key: &str) -> Result<bool,
         .roots
         .iter()
         .any(|root| db_path(root, fragment, route.partition_id).exists()))
+}
+
+pub fn ensure_object_owner_partition_available(
+    fragment: &str,
+    object_key: &str,
+) -> Result<(), AppError> {
+    let route = object_route(fragment, object_key)?;
+    let owner_path = owner_db_path(&route, fragment);
+    with_partition_commit_lock(&owner_path, || {
+        if let Some(parent) = owner_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| AppError::Io(e, format!("mkdir {}", parent.display())))?;
+        }
+        let _ = get_or_open_db(&owner_path)?;
+        Ok(())
+    })
 }
 
 pub fn has_session_partition_db(fragment: &str, version_id: &str) -> Result<bool, AppError> {

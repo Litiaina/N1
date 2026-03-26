@@ -71,6 +71,18 @@ pub fn format_health(response: &HealthResponse) -> String {
             human_bytes(response.system.process_resident_bytes),
         ),
         (
+            "process_vmem",
+            human_bytes(response.system.process_virtual_bytes),
+        ),
+        (
+            "open_fds",
+            response
+                .system
+                .process_open_fds
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        (
             "storage",
             format!(
                 "{} free / {} raw",
@@ -94,6 +106,36 @@ pub fn format_health(response: &HealthResponse) -> String {
             format!(
                 "{}/{} online",
                 response.storage.index_roots_online, response.storage.index_roots_total
+            ),
+        ),
+        (
+            "uploads",
+            format!(
+                "{} active, {} reserved, {} committed",
+                response.uploads.active_sessions,
+                human_bytes(response.uploads.reserved_bytes),
+                human_bytes(response.uploads.committed_bytes)
+            ),
+        ),
+        (
+            "maintenance",
+            format!(
+                "repair={} redist={} gc={}",
+                if response.maintenance.repair_running {
+                    response.maintenance.repair_phase.as_str()
+                } else {
+                    "idle"
+                },
+                if response.maintenance.redistribution_running {
+                    response.maintenance.redistribution_phase.as_str()
+                } else {
+                    "idle"
+                },
+                if response.maintenance.gc_running {
+                    response.maintenance.gc_phase.as_str()
+                } else {
+                    "idle"
+                }
             ),
         ),
     ];
@@ -153,14 +195,30 @@ pub fn format_health_watch_line(response: &HealthResponse) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{}  status={} cpu={:.2}% ram={:.2}% uploads={} blob={}/{} disks={} summary={}",
+        "{}  status={} cpu={:.2}% ram={:.2}% rss={} uploads={} blob={}/{} maint=R{}D{}G{} disks={} summary={}",
         format_timestamp(response.sampled_at),
         response.status,
         response.system.cpu_usage_percent,
         response.system.ram_usage_percent,
+        human_bytes(response.system.process_resident_bytes),
         response.uploads.active_sessions,
         response.storage.blob_devices_online,
         response.storage.blob_devices_total,
+        if response.maintenance.repair_running {
+            1
+        } else {
+            0
+        },
+        if response.maintenance.redistribution_running {
+            1
+        } else {
+            0
+        },
+        if response.maintenance.gc_running {
+            1
+        } else {
+            0
+        },
         disk_summary,
         response.summary
     )

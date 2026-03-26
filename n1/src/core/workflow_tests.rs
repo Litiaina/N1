@@ -24,7 +24,8 @@ use super::quota_manager::init_quota_file;
 use super::recovery::verify_shard_integrity;
 use super::redistribution::{
     RedistributionDurabilityMode, RedistributionExecutionMode, RedistributionRunOptions,
-    run_redistribution_job, run_redistribution_job_with_options,
+    replay_pending_intents_for_fragment_now, run_redistribution_job,
+    run_redistribution_job_with_options,
 };
 use super::repair_manager::{
     RepairCheckMode, RepairRunConfig, RepairRunOptions, run_repair_job, run_repair_job_with_options,
@@ -858,6 +859,26 @@ fn object_partition_db_paths_owner_first(
                 .join(format!("{:04x}.ndxdb", partition_id))
         })
         .collect()
+}
+
+fn key_owned_by_index_root(fragment: &str, owner_root: &std::path::Path, prefix: &str) -> String {
+    for candidate in 0..4096usize {
+        let key = format!("{prefix}-{candidate}.bin");
+        let owner_paths = object_partition_db_paths_owner_first(fragment, &key);
+        if owner_paths
+            .first()
+            .map(|path| path.starts_with(owner_root))
+            .unwrap_or(false)
+        {
+            return key;
+        }
+    }
+
+    panic!(
+        "failed to find object key owned by {} for fragment {}",
+        owner_root.display(),
+        fragment
+    );
 }
 
 async fn collect_indexdb_replica_hashes(fragment: &str) -> Vec<(String, BTreeMap<String, String>)> {
@@ -3843,6 +3864,185 @@ async fn matrix_redistribution_read_falls_back_when_primary_indexdb_copy_is_corr
         meta.parts[0].shards.iter().filter(|s| s.is_parity).count(),
         1
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_redistribution_defers_cutover_until_owner_index_restored() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let down_src = base.join("index_2");
+    let key = key_owned_by_index_root(&fragment, &down_src, "ha-redist-owner-down");
+    let content = (0..(48 * 1024 + 19))
+        .map(|i| ((i * 7 + 11) % 251) as u8)
+        .collect::<Vec<u8>>();
+    let version_id = put_object(state, &fragment, &key, content.clone()).await;
+
+    let before_meta = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("metadata before redistribution");
+    assert_eq!(
+        before_meta.parts[0]
+            .shards
+            .iter()
+            .filter(|s| !s.is_parity)
+            .count(),
+        1
+    );
+    assert_eq!(
+        before_meta.parts[0]
+            .shards
+            .iter()
+            .filter(|s| s.is_parity)
+            .count(),
+        0
+    );
+
+    let down_dst = base.join("index_2.down");
+    if fs::try_exists(&down_dst).await.unwrap_or(false) {
+        let _ = fs::remove_dir_all(&down_dst).await;
+    }
+    fs::rename(&down_src, &down_dst)
+        .await
+        .expect("simulate owner index disk down");
+    fs::write(&down_src, b"n1-index-disk-down-blocker")
+        .await
+        .expect("create index down blocker file");
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(2, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(262144, Ordering::Relaxed);
+
+    run_redistribution_job(false, Arc::new(WsConnectionManager::new()))
+        .await
+        .expect("redistribution should finish even when one owner index is down");
+
+    let intent_files = collect_fragment_indexdb_files(&fragment).await;
+    assert!(
+        intent_files.iter().any(|path| {
+            path.contains(&version_id) && path.ends_with(".redist.intent.msgpack")
+        }),
+        "failed redistribution should leave a pending intent for replay"
+    );
+
+    let during_down = read_object_bytes_eventually(fragment.clone(), key.clone(), 24).await;
+    assert_eq!(
+        during_down, content,
+        "object should remain readable while owner index is down"
+    );
+
+    let down_meta = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("metadata should still be readable via replica while owner is down");
+    assert_eq!(
+        down_meta.parts[0]
+            .shards
+            .iter()
+            .filter(|s| !s.is_parity)
+            .count(),
+        1,
+        "blob layout should not cut over before owner metadata commit is possible"
+    );
+    assert_eq!(
+        down_meta.parts[0]
+            .shards
+            .iter()
+            .filter(|s| s.is_parity)
+            .count(),
+        0,
+        "blob layout should not cut over before owner metadata commit is possible"
+    );
+
+    fs::remove_file(&down_src)
+        .await
+        .expect("remove index down blocker file");
+    restore_simulated_index_disk(&down_src, &down_dst, "restore owner index disk").await;
+
+    replay_pending_intents_for_fragment_now(&fragment, true)
+        .await
+        .expect("replay pending redistribution intents after owner restore");
+
+    run_repair_job(
+        RepairRunConfig {
+            dry_run: false,
+            target_fragment: None,
+            check_mode: RepairCheckMode::Scrub,
+            meta_concurrency: 8,
+            shard_repair_concurrency: 2,
+            meta_batch_size: 512,
+        },
+        Arc::new(WsConnectionManager::new()),
+    )
+    .await
+    .expect("repair after owner index restore");
+
+    let remaining_intents = collect_fragment_indexdb_files(&fragment).await;
+    assert!(
+        !remaining_intents.iter().any(|path| {
+            path.contains(&version_id) && path.ends_with(".redist.intent.msgpack")
+        }),
+        "successful replay should clear the pending redistribution intent"
+    );
+
+    let after_repair = read_object_bytes_eventually(fragment.clone(), key.clone(), 24).await;
+    assert_eq!(after_repair, content);
+
+    let repaired_meta = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("metadata after repair");
+    assert_eq!(
+        repaired_meta.parts[0]
+            .shards
+            .iter()
+            .filter(|s| !s.is_parity)
+            .count(),
+        2,
+        "pending redistribution intent should replay after owner restore"
+    );
+    assert_eq!(
+        repaired_meta.parts[0]
+            .shards
+            .iter()
+            .filter(|s| s.is_parity)
+            .count(),
+        1,
+        "pending redistribution intent should replay after owner restore"
+    );
+
+    assert_all_indexdb_replicas_synchronized(&fragment).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

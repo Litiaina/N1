@@ -381,6 +381,13 @@ pub async fn sync_fragment_partition_replicas(fragment: &str) -> Result<(), AppE
     indexdb_store::sync_fragment_partition_replicas(fragment)
 }
 
+pub async fn ensure_object_owner_partition_available(
+    fragment: &str,
+    object_key: &str,
+) -> Result<(), AppError> {
+    indexdb_store::ensure_object_owner_partition_available(fragment, object_key)
+}
+
 pub async fn delete_object_version(
     fragment: &str,
     object_key: &str,

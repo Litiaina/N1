@@ -2,58 +2,73 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct DiskStatus {
     pub path: String,
     pub role: String,
     pub status: String,
+    #[serde(default)]
     pub total_bytes: Option<u64>,
+    #[serde(default)]
     pub used_bytes: Option<u64>,
+    #[serde(default)]
     pub available_bytes: Option<u64>,
+    #[serde(default)]
     pub usage_percent: Option<f64>,
+    #[serde(default)]
     pub latency_ms: Option<u64>,
+    #[serde(default)]
     pub error: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct ConsistencyStats {
+    #[serde(default, alias = "total_partition_dbs_scanned")]
     pub total_objects_scanned: u64,
+    #[serde(default, alias = "index_partition_health")]
     pub index_mirror_health: String,
+    #[serde(default, alias = "partition_db_counts")]
     pub mirror_counts: Option<HashMap<String, u64>>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct SystemMetrics {
     pub cpu_usage_percent: f64,
+    #[serde(default)]
     pub cpu_cores: u64,
     pub ram_total_bytes: u64,
     pub ram_used_bytes: u64,
     pub ram_usage_percent: f64,
     pub load_avg_1m: f64,
+    #[serde(default)]
     pub uptime_seconds: u64,
+    #[serde(default)]
     pub process_resident_bytes: u64,
+    #[serde(default)]
     pub process_virtual_bytes: u64,
+    #[serde(default)]
     pub process_open_fds: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct UploadRuntimeStats {
     pub active_fragments: u64,
     pub active_sessions: u64,
     pub reserved_bytes: u64,
     pub committed_parts: u64,
     pub committed_bytes: u64,
+    #[serde(default)]
     pub oldest_session_age_seconds: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct IndexRuntimeStats {
     pub loaded_partition_runtimes: u64,
     pub wal_appenders: u64,
     pub prefix_projection_fragments_pending: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct StoragePlaneStats {
     pub index_roots_total: u64,
     pub index_roots_online: u64,
@@ -64,48 +79,80 @@ pub struct StoragePlaneStats {
     pub raw_available_bytes: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct MaintenanceRuntimeStats {
+    pub repair_running: bool,
+    pub repair_phase: String,
+    pub redistribution_running: bool,
+    pub redistribution_phase: String,
+    pub gc_running: bool,
+    pub gc_phase: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct ActiveSessionInfo {
     pub session_id: String,
     pub version_id: String,
+    #[serde(default)]
     pub object_key: Option<String>,
     pub created_at: i64,
     pub reserved_size: u64,
+    #[serde(default)]
     pub total_size_bytes: Option<u64>,
+    #[serde(default)]
     pub expected_parts: Option<u64>,
+    #[serde(default)]
     pub committed_parts: u64,
+    #[serde(default)]
     pub committed_bytes: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct ListUploadsResponse {
     pub sessions: Vec<ActiveSessionInfo>,
     pub total: usize,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct UploadStatusResponse {
     pub uploaded_parts: Vec<u64>,
+    #[serde(default)]
     pub committed_parts: u64,
+    #[serde(default)]
     pub committed_bytes: u64,
+    #[serde(default)]
     pub expected_parts: Option<u64>,
+    #[serde(default)]
     pub total_size_bytes: Option<u64>,
+    #[serde(default)]
     pub created_at: Option<i64>,
+    #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
     pub version_id: Option<String>,
+    #[serde(default)]
     pub object_key: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct HealthResponse {
+    #[serde(default)]
     pub sampled_at: i64,
     pub status: String,
+    #[serde(default)]
     pub disks: Vec<DiskStatus>,
+    #[serde(default)]
     pub consistency: ConsistencyStats,
+    #[serde(default)]
     pub system: SystemMetrics,
+    #[serde(default)]
     pub uploads: UploadRuntimeStats,
+    #[serde(default)]
     pub index_runtime: IndexRuntimeStats,
+    #[serde(default)]
     pub storage: StoragePlaneStats,
+    #[serde(default)]
+    pub maintenance: MaintenanceRuntimeStats,
     pub summary: String,
 }
 

@@ -189,6 +189,14 @@ async fn health_handler(headers: HeaderMap, Query(query): Query<HealthQuery>) ->
             "raw_used_bytes": 75_u64,
             "raw_available_bytes": 25_u64
         },
+        "maintenance": {
+            "repair_running": false,
+            "repair_phase": "Idle",
+            "redistribution_running": false,
+            "redistribution_phase": "Idle",
+            "gc_running": false,
+            "gc_phase": "Idle"
+        },
         "summary": "all green"
     });
 

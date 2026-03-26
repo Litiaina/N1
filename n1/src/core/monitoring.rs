@@ -1,4 +1,7 @@
 use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
+use crate::core::fragment_manager::is_fragment_hash;
+use crate::core::garbage_collector::get_gc_status;
+use crate::core::index;
 use crate::core::redistribution::get_redist_status;
 use crate::core::repair_manager::get_repair_status;
 use crate::core::system::{SystemMetrics, get_system_metrics};
@@ -11,10 +14,11 @@ use axum::{
     extract::{Query, State},
     response::IntoResponse,
 };
+use chrono::Utc;
 use futures_util::future::join_all;
 use once_cell::sync::OnceCell;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::ffi::CString;
 #[cfg(unix)]
@@ -83,12 +87,56 @@ pub struct ConsistencyStats {
     pub partition_db_counts: Option<HashMap<String, u64>>,
 }
 
+#[derive(Serialize, Clone, Default)]
+pub struct UploadRuntimeStats {
+    pub active_fragments: u64,
+    pub active_sessions: u64,
+    pub reserved_bytes: u64,
+    pub committed_parts: u64,
+    pub committed_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_session_age_seconds: Option<u64>,
+}
+
+#[derive(Serialize, Clone, Default)]
+pub struct IndexRuntimeStats {
+    pub loaded_partition_runtimes: u64,
+    pub wal_appenders: u64,
+    pub prefix_projection_fragments_pending: u64,
+}
+
+#[derive(Serialize, Clone, Default)]
+pub struct StoragePlaneStats {
+    pub index_roots_total: u64,
+    pub index_roots_online: u64,
+    pub blob_devices_total: u64,
+    pub blob_devices_online: u64,
+    pub raw_total_bytes: u64,
+    pub raw_used_bytes: u64,
+    pub raw_available_bytes: u64,
+}
+
+#[derive(Serialize, Clone, Default)]
+pub struct MaintenanceRuntimeStats {
+    pub repair_running: bool,
+    pub repair_phase: String,
+    pub redistribution_running: bool,
+    pub redistribution_phase: String,
+    pub gc_running: bool,
+    pub gc_phase: String,
+}
+
 #[derive(Serialize, Clone)]
 pub struct SystemHealthResponse {
+    pub sampled_at: i64,
     pub status: String,
     pub disks: Vec<DiskStatus>,
     pub consistency: ConsistencyStats,
     pub system: SystemMetrics,
+    pub uploads: UploadRuntimeStats,
+    pub index_runtime: IndexRuntimeStats,
+    pub storage: StoragePlaneStats,
+    pub maintenance: MaintenanceRuntimeStats,
     pub summary: String,
 }
 
@@ -301,6 +349,7 @@ async fn collect_system_health(
     let system_metrics = get_system_metrics().await;
     let redist_status = get_redist_status().await;
     let repair_status = get_repair_status().await;
+    let gc_status = get_gc_status().await;
 
     let index_disks_config = INDEX_STORE_DISKS
         .get()
@@ -410,6 +459,14 @@ async fn collect_system_health(
 
     let total_index = index_disks_config.len();
     let total_blob = blob_disks_config.len();
+    let uploads = collect_upload_runtime_stats(&active_index_roots).await?;
+    let storage = collect_storage_plane_stats(
+        &disk_statuses,
+        total_index as u64,
+        online_index_count as u64,
+        total_blob as u64,
+        online_blob_count as u64,
+    );
 
     let (status, summary) = if online_index_count == 0 {
         (
@@ -451,6 +508,7 @@ async fn collect_system_health(
     state.ws_manager.broadcast_system_wide(monitoring_update);
 
     Ok(SystemHealthResponse {
+        sampled_at: Utc::now().timestamp(),
         status: status.to_string(),
         disks: disk_statuses,
         consistency: ConsistencyStats {
@@ -463,8 +521,157 @@ async fn collect_system_health(
             },
         },
         system: system_metrics,
+        uploads,
+        index_runtime: IndexRuntimeStats {
+            loaded_partition_runtimes: total_partition_dbs,
+            wal_appenders: online_index_count as u64,
+            prefix_projection_fragments_pending: 0,
+        },
+        storage,
+        maintenance: MaintenanceRuntimeStats {
+            repair_running: repair_status.is_running,
+            repair_phase: repair_status.phase,
+            redistribution_running: redist_status.is_running,
+            redistribution_phase: redist_status.phase,
+            gc_running: gc_status.is_running,
+            gc_phase: gc_status.phase,
+        },
         summary,
     })
+}
+
+async fn collect_upload_runtime_stats(
+    active_index_roots: &[PathBuf],
+) -> Result<UploadRuntimeStats, AppError> {
+    if active_index_roots.is_empty() {
+        return Ok(UploadRuntimeStats::default());
+    }
+
+    let roots = active_index_roots.to_vec();
+    let fragments = tokio::task::spawn_blocking(move || -> Vec<String> {
+        let mut seen = HashSet::new();
+        for root in roots {
+            if !root.exists() {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.filter_map(|entry| entry.ok()) {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_dir() {
+                    continue;
+                }
+                let Some(name) = entry.file_name().to_str().map(|value| value.to_string()) else {
+                    continue;
+                };
+                if is_fragment_hash(&name) {
+                    seen.insert(name);
+                }
+            }
+        }
+        let mut out: Vec<String> = seen.into_iter().collect();
+        out.sort();
+        out
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("upload stats join error: {}", e)))?;
+
+    let now = Utc::now().timestamp();
+    let mut stats = UploadRuntimeStats::default();
+    let mut oldest_created_at: Option<i64> = None;
+
+    for fragment in fragments {
+        let sessions = index::list_active_sessions(&fragment).await?;
+        let mut fragment_has_active = false;
+
+        for session in sessions
+            .into_iter()
+            .filter(|state| state.finalized_at.is_none() && state.aborted_at.is_none())
+        {
+            fragment_has_active = true;
+            stats.active_sessions = stats.active_sessions.saturating_add(1);
+            stats.reserved_bytes = stats.reserved_bytes.saturating_add(
+                session
+                    .reservation
+                    .map(|receipt| receipt.amount)
+                    .unwrap_or(0),
+            );
+
+            if !session.part_receipts.is_empty() {
+                stats.committed_parts = stats
+                    .committed_parts
+                    .saturating_add(session.part_receipts.len() as u64);
+                stats.committed_bytes = stats.committed_bytes.saturating_add(
+                    session
+                        .part_receipts
+                        .values()
+                        .map(|receipt| receipt.size_bytes)
+                        .sum::<u64>(),
+                );
+            } else {
+                stats.committed_parts = stats
+                    .committed_parts
+                    .saturating_add(session.parts.len() as u64);
+                stats.committed_bytes = stats.committed_bytes.saturating_add(
+                    session
+                        .parts
+                        .values()
+                        .map(|part| part.size_bytes)
+                        .sum::<u64>(),
+                );
+            }
+
+            oldest_created_at = Some(match oldest_created_at {
+                Some(current) => current.min(session.manifest.created_at),
+                None => session.manifest.created_at,
+            });
+        }
+
+        if fragment_has_active {
+            stats.active_fragments = stats.active_fragments.saturating_add(1);
+        }
+    }
+
+    stats.oldest_session_age_seconds = oldest_created_at.map(|created_at| {
+        if now > created_at {
+            (now - created_at) as u64
+        } else {
+            0
+        }
+    });
+
+    Ok(stats)
+}
+
+fn collect_storage_plane_stats(
+    disk_statuses: &[DiskStatus],
+    index_roots_total: u64,
+    index_roots_online: u64,
+    blob_devices_total: u64,
+    blob_devices_online: u64,
+) -> StoragePlaneStats {
+    let mut raw_total_bytes = 0u64;
+    let mut raw_used_bytes = 0u64;
+    let mut raw_available_bytes = 0u64;
+
+    for disk in disk_statuses.iter().filter(|disk| disk.role == "blob") {
+        raw_total_bytes = raw_total_bytes.saturating_add(disk.total_bytes.unwrap_or(0));
+        raw_used_bytes = raw_used_bytes.saturating_add(disk.used_bytes.unwrap_or(0));
+        raw_available_bytes = raw_available_bytes.saturating_add(disk.available_bytes.unwrap_or(0));
+    }
+
+    StoragePlaneStats {
+        index_roots_total,
+        index_roots_online,
+        blob_devices_total,
+        blob_devices_online,
+        raw_total_bytes,
+        raw_used_bytes,
+        raw_available_bytes,
+    }
 }
 
 pub async fn run_system_monitor(state: Arc<AppState>) {

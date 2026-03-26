@@ -282,9 +282,25 @@ pub struct ObjectKeyQuery {
     pub version_id: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct UploadStatusResponse {
     pub uploaded_parts: Vec<u64>,
+    #[serde(default)]
+    pub committed_parts: u64,
+    #[serde(default)]
+    pub committed_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_parts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_key: Option<String>,
 }
 
 #[derive(Deserialize)]

@@ -5,6 +5,7 @@ use crate::core::disk_manager::{
 use crate::core::index;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::{repair_entire_shard, verify_shard_integrity};
+use crate::core::redistribution::replay_pending_intents_for_fragment_now;
 use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -1056,6 +1057,15 @@ pub async fn run_repair_job_with_options(
             status.divergent_meta_repaired += pdiv;
             status.corrupt_found += pcorrupt;
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
+        }
+
+        if !cfg.dry_run {
+            if let Err(err) = replay_pending_intents_for_fragment_now(&fragment_hash, true).await {
+                warn!(
+                    "Failed replaying pending redistribution intents for fragment {} during repair: {}",
+                    fragment_hash, err
+                );
+            }
         }
 
         for is_trash in [false, true] {

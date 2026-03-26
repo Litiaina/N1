@@ -72,6 +72,10 @@ fn gc_status_read_clone() -> GcJobStatus {
         .clone()
 }
 
+pub async fn get_gc_status() -> GcJobStatus {
+    gc_status_read_clone()
+}
+
 fn with_gc_status_write<F>(f: F)
 where
     F: FnOnce(&mut GcJobStatus),
@@ -140,7 +144,7 @@ pub async fn get_gc_status_api(
     if !claims.read {
         return Err(AppError::Forbidden("Read permission required".into()));
     }
-    Ok(Json(gc_status_read_clone()))
+    Ok(Json(get_gc_status().await))
 }
 
 pub async fn run_garbage_collector(State(state): State<Arc<AppState>>) -> impl IntoResponse {

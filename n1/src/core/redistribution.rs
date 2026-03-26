@@ -830,14 +830,14 @@ async fn replay_pending_intents_for_fragment(
     target_parity_shards: usize,
     target_stripe_size: usize,
     strict_durability: bool,
-) {
+) -> Result<(), AppError> {
     let mut intent_files = Vec::<PathBuf>::new();
     for root in live_index {
-        let index_dir = root.join(fragment_hash).join("index");
-        if !index_dir.exists() {
+        let indexdb_dir = root.join(fragment_hash).join("indexdb");
+        if !indexdb_dir.exists() {
             continue;
         }
-        for entry in WalkDir::new(index_dir).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(indexdb_dir).into_iter().filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -848,7 +848,7 @@ async fn replay_pending_intents_for_fragment(
         }
     }
     if intent_files.is_empty() {
-        return;
+        return Ok(());
     }
 
     let mut grouped: HashMap<String, (RedistributionIntent, Vec<PathBuf>)> = HashMap::new();
@@ -873,6 +873,7 @@ async fn replay_pending_intents_for_fragment(
             .or_insert_with(|| (intent, vec![path]));
     }
 
+    let mut first_err: Option<AppError> = None;
     for (_, (intent, mut found_paths)) in grouped {
         if should_stop() {
             break;
@@ -975,9 +976,62 @@ async fn replay_pending_intents_for_fragment(
                     "Failed replaying redistribution intent for {}/{} (v:{}) [Trash:{}]: {}",
                     intent.fragment, intent.object_key, intent.version_id, intent.is_trash, e
                 );
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
             }
         }
     }
+
+    if let Some(err) = first_err {
+        return Err(err);
+    }
+
+    Ok(())
+}
+
+pub async fn replay_pending_intents_for_fragment_now(
+    fragment_hash: &str,
+    strict_durability: bool,
+) -> Result<(), AppError> {
+    let index_cfg = INDEX_STORE_DISKS
+        .get()
+        .ok_or(AppError::InternalServerError(
+            "index roots not configured".to_string(),
+        ))?
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let live_index = reachable_roots(&index_cfg).await;
+    if live_index.is_empty() {
+        return Ok(());
+    }
+
+    let live_blob = reachable_roots(&ObjectPathManager::new().get_blob_roots()).await;
+    let target_data_shards = DATA_SHARDS_ATOMIC
+        .get()
+        .map(|value| value.load(Ordering::Relaxed))
+        .unwrap_or(1)
+        .max(1);
+    let target_parity_shards = PARITY_SHARDS_ATOMIC
+        .get()
+        .map(|value| value.load(Ordering::Relaxed))
+        .unwrap_or(0);
+    let target_stripe_size = STRIPE_SIZE_ATOMIC
+        .get()
+        .map(|value| value.load(Ordering::Relaxed))
+        .unwrap_or_else(default_stripe_size);
+
+    replay_pending_intents_for_fragment(
+        fragment_hash,
+        &live_index,
+        &live_blob,
+        target_data_shards,
+        target_parity_shards,
+        target_stripe_size,
+        strict_durability,
+    )
+    .await
 }
 
 async fn reachable_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
@@ -1405,7 +1459,7 @@ pub async fn run_redistribution_job_with_options(
 
         replicate_fragment_metadata_best_effort(&fragment_hash).await;
         if !dry_run {
-            replay_pending_intents_for_fragment(
+            if let Err(err) = replay_pending_intents_for_fragment(
                 &fragment_hash,
                 live_index.as_ref(),
                 live_blob.as_ref(),
@@ -1414,7 +1468,13 @@ pub async fn run_redistribution_job_with_options(
                 target_stripe_size,
                 strict_durability,
             )
-            .await;
+            .await
+            {
+                warn!(
+                    "Failed replaying pending redistribution intents for fragment {} before scan: {}",
+                    fragment_hash, err
+                );
+            }
         }
 
         {
@@ -1898,6 +1958,13 @@ async fn verify_tmp_shard(
     Ok(())
 }
 
+async fn ensure_authoritative_partition_owner_writable(
+    fragment: &str,
+    object_key: &str,
+) -> Result<(), AppError> {
+    index::ensure_object_owner_partition_available(fragment, object_key).await
+}
+
 async fn redistribute_object_streaming(
     meta: &mut ObjectMetadata,
     target_data_shards: usize,
@@ -1913,6 +1980,7 @@ async fn redistribute_object_streaming(
     if should_stop() {
         return Err(AppError::InternalServerError("Stopped".into()));
     }
+    ensure_authoritative_partition_owner_writable(&meta.fragment, &meta.object_key).await?;
 
     let start_time = Instant::now();
     let num_disks = target_blob_roots.len();

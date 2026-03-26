@@ -282,12 +282,30 @@ pub struct ActiveSessionInfo {
     pub reserved_size: u64,
     pub total_size_bytes: Option<u64>,
     pub expected_parts: Option<u64>,
+    pub committed_parts: u64,
+    pub committed_bytes: u64,
 }
 
 #[derive(Serialize)]
 pub struct ListUploadsResponse {
     pub sessions: Vec<ActiveSessionInfo>,
     pub total: usize,
+}
+
+fn committed_session_progress(state: &index::IndexSessionState) -> (u64, u64) {
+    if !state.part_receipts.is_empty() {
+        let committed_parts = state.part_receipts.len() as u64;
+        let committed_bytes = state
+            .part_receipts
+            .values()
+            .map(|receipt| receipt.size_bytes)
+            .sum();
+        return (committed_parts, committed_bytes);
+    }
+
+    let committed_parts = state.parts.len() as u64;
+    let committed_bytes = state.parts.values().map(|part| part.size_bytes).sum();
+    (committed_parts, committed_bytes)
 }
 
 pub struct DirectWriter {
@@ -1428,14 +1446,19 @@ pub async fn list_active_uploads(
         .await?
         .into_iter()
         .filter(|state| state.finalized_at.is_none() && state.aborted_at.is_none())
-        .map(|state| ActiveSessionInfo {
-            session_id: state.manifest.session_id.clone(),
-            version_id: state.manifest.version_id.clone(),
-            object_key: Some(state.manifest.object_key.clone()),
-            created_at: state.manifest.created_at,
-            reserved_size: state.reservation.map(|receipt| receipt.amount).unwrap_or(0),
-            total_size_bytes: Some(state.manifest.total_size_bytes),
-            expected_parts: Some(state.manifest.expected_parts),
+        .map(|state| {
+            let (committed_parts, committed_bytes) = committed_session_progress(&state);
+            ActiveSessionInfo {
+                session_id: state.manifest.session_id.clone(),
+                version_id: state.manifest.version_id.clone(),
+                object_key: Some(state.manifest.object_key.clone()),
+                created_at: state.manifest.created_at,
+                reserved_size: state.reservation.map(|receipt| receipt.amount).unwrap_or(0),
+                total_size_bytes: Some(state.manifest.total_size_bytes),
+                expected_parts: Some(state.manifest.expected_parts),
+                committed_parts,
+                committed_bytes,
+            }
         })
         .collect();
 
@@ -1462,6 +1485,7 @@ pub async fn get_upload_status(
 
     if let Some(state) = index::load_session(&fragment, &version_id).await? {
         let path_manager = ObjectPathManager::new();
+        let (committed_parts, committed_bytes) = committed_session_progress(&state);
         let mut parts = if let Some(receipts) =
             index::load_session_part_receipts(&fragment, &version_id, &state.manifest).await?
         {
@@ -1478,12 +1502,18 @@ pub async fn get_upload_status(
         parts.sort_unstable();
         return Ok(AxumJson(UploadStatusResponse {
             uploaded_parts: parts,
+            committed_parts,
+            committed_bytes,
+            expected_parts: Some(state.manifest.expected_parts),
+            total_size_bytes: Some(state.manifest.total_size_bytes),
+            created_at: Some(state.manifest.created_at),
+            session_id: Some(state.manifest.session_id),
+            version_id: Some(state.manifest.version_id),
+            object_key: Some(state.manifest.object_key),
         }));
     }
 
-    Ok(AxumJson(UploadStatusResponse {
-        uploaded_parts: vec![],
-    }))
+    Ok(AxumJson(UploadStatusResponse::default()))
 }
 
 pub async fn object_upload_part(

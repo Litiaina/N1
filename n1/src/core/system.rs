@@ -6,10 +6,15 @@ use tokio::fs;
 #[derive(Debug, Serialize, Clone, Default)]
 pub struct SystemMetrics {
     pub cpu_usage_percent: f64,
+    pub cpu_cores: u64,
     pub ram_total_bytes: u64,
     pub ram_used_bytes: u64,
     pub ram_usage_percent: f64,
     pub load_avg_1m: f64,
+    pub uptime_seconds: u64,
+    pub process_resident_bytes: u64,
+    pub process_virtual_bytes: u64,
+    pub process_open_fds: Option<u64>,
 }
 
 static PREV_TOTAL: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
@@ -19,6 +24,9 @@ pub async fn get_system_metrics() -> SystemMetrics {
     let (cpu_usage, _) = calculate_cpu_usage().await;
     let (ram_total, ram_available) = get_memory_info().await;
     let load_avg = get_load_avg().await;
+    let uptime_seconds = get_uptime_seconds().await;
+    let (process_resident_bytes, process_virtual_bytes) = get_process_memory_info().await;
+    let process_open_fds = get_process_open_fd_count().await;
 
     let ram_used = ram_total.saturating_sub(ram_available);
     let ram_percent = if ram_total > 0 {
@@ -29,10 +37,17 @@ pub async fn get_system_metrics() -> SystemMetrics {
 
     SystemMetrics {
         cpu_usage_percent: cpu_usage,
+        cpu_cores: std::thread::available_parallelism()
+            .map(|count| count.get() as u64)
+            .unwrap_or(1),
         ram_total_bytes: ram_total,
         ram_used_bytes: ram_used,
         ram_usage_percent: ram_percent,
         load_avg_1m: load_avg,
+        uptime_seconds,
+        process_resident_bytes,
+        process_virtual_bytes,
+        process_open_fds,
     }
 }
 
@@ -106,4 +121,56 @@ async fn get_load_avg() -> f64 {
         }
     }
     0.0
+}
+
+async fn get_uptime_seconds() -> u64 {
+    if let Ok(content) = fs::read_to_string("/proc/uptime").await {
+        if let Some(first) = content.split_whitespace().next() {
+            return first
+                .split('.')
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+    }
+    0
+}
+
+async fn get_process_memory_info() -> (u64, u64) {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page_size = if page_size > 0 {
+        page_size as u64
+    } else {
+        4096
+    };
+
+    if let Ok(content) = fs::read_to_string("/proc/self/statm").await {
+        let mut parts = content.split_whitespace();
+        let virtual_pages = parts
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let resident_pages = parts
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        return (
+            resident_pages.saturating_mul(page_size),
+            virtual_pages.saturating_mul(page_size),
+        );
+    }
+
+    (0, 0)
+}
+
+async fn get_process_open_fd_count() -> Option<u64> {
+    let mut dir = fs::read_dir("/proc/self/fd").await.ok()?;
+    let mut count = 0u64;
+    loop {
+        match dir.next_entry().await {
+            Ok(Some(_)) => count = count.saturating_add(1),
+            Ok(None) => return Some(count),
+            Err(_) => return None,
+        }
+    }
 }
