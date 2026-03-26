@@ -13,7 +13,7 @@
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used by both deployment shapes.
 > - `n1` is the stable single-node deployment path.
-> - `n1` is released at `0.7.2`.
+> - `n1` is released at `0.7.3`.
 > - `n2` (`litiaina-n2`) is the multi-node N2 deployment path in this workspace and is released at `0.2.0`.
 > - `registry` (`registry-server`) is the SQLite-backed Registry layer for user/business metadata and is versioned independently at `0.4.0`.
 > - `n1-arc` is experimental for raw-device deployments.
@@ -81,7 +81,7 @@
 > - Multipart uploads do not rely on in-memory part state for resumability. Part commits are durably recorded in the `index` session state through compact per-part receipts, and finalize assembles the authoritative object metadata from those receipts.
 
 > Release status note:
-> - N1 `n1` is stable at `0.7.2`; `n1-arc` is experimental.
+> - N1 `n1` is stable at `0.7.3`; `n1-arc` is experimental.
 > - This document describes the current implementation and current routes.
 > - Request/response details and endpoint layout may still change before `1.0.0` even though the underlying storage model is now fixed.
 
@@ -89,7 +89,7 @@
 
 | Dimension | N1 (`litiaina-n1`) | N1-Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / default (`0.7.2`) | Experimental / raw-device profile |
+| Status | Stable / default (`0.7.3`) | Experimental / raw-device profile |
 | API source of truth | Yes (`n1/src/routes/storage_routes.rs`) | Yes (`n1-arc/src/routes/storage_routes.rs`) |
 | `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw devices / loopback files |
@@ -1121,6 +1121,7 @@ Query:
 Behavior:
 - Lists active routed multipart sessions from `index` and reports committed progress from session state.
 - Includes committed part/byte progress per session.
+- Sessions that are cancelled through `DELETE /v4/upload/cancel/{version_id}` disappear from this listing immediately after the cancel completes.
 
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
@@ -1146,6 +1147,13 @@ Response:
 - `204 No Content` on successful cancel.
 - If already finalized, returns conflict.
 
+Behavior:
+- Aborts the active multipart session for that `version_id`.
+- Removes the session from `GET /v4/upload/status/list`.
+- Frees the reserved upload budget tracked by the engine.
+- Bundled upload-recovery UIs now use this route for interrupted upload cancellation.
+- In the Registry-backed Drive surface, cancellation also triggers Registry-side pending reservation release before the recovery card is cleared.
+
 ```bash
 curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/upload/cancel/<version_id>"
@@ -1159,6 +1167,7 @@ curl -k -X DELETE -H "Authorization: Bearer $TOKEN" \
 
 Notes:
 - `cleanup/fragment` removes orphaned blob directories and reconciles fragment metadata shape.
+- `cleanup/fragment` now returns a structured result that includes the fragment id, current usage bytes, orphan blob directories removed, and a human-readable message.
 - `init/fragment` ensures fragment blob directories exist and clears stale `.gc` files.
 - Live storage monitoring and `/v4/capacity/usage` use current filesystem totals.
 
@@ -1350,6 +1359,11 @@ Notes:
 - Fast probes are read-oriented and avoid temp-file write/delete churn on every monitor pass.
 - Deep scan reflects the partitioned `index` model; differing per-root object counts are expected outside a partition's owner/replica placements.
 - Health includes system metrics, process RSS/open-FD pressure, active upload/runtime counters, and raw/blob storage totals.
+- Health now also exposes:
+  - maintenance access mode (`availability`, `read_only`, `quiesced`)
+  - stale multipart session count
+  - stale reserved bytes
+  - pending/failed redistribution intent debt
 
 ```bash
 curl -k -X GET -H "Authorization: Bearer $TOKEN" \
@@ -1361,6 +1375,30 @@ curl -k -X GET -H "Authorization: Bearer $TOKEN" \
 curl -k -X GET -H "Authorization: Bearer $TOKEN" \
   "https://127.0.0.1:50001/v4/maintenance/health?deep_scan=true"
 ```
+
+### 9.7.1 Filesystem-backed 2-disk real-hardware validation
+Validated on March 26, 2026 against the IT server `192.168.0.18` using an isolated N1 harness on real `/mnt/DISK2` and `/mnt/DISK3` media with `1D+1P`.
+
+Validated outcomes:
+- CRUD + versioning: one object was written twice under the same key and `GET` served the latest bytes; version listing returned `2`.
+- Degraded read path: with one test disk root forced offline, both `GET` and ranged `STREAM` still returned the expected SHA256 from the surviving copy.
+- Degraded maintenance behavior: availability-mode redistribution and repair completed without fatal errors while one disk root was offline.
+- Policy-cycle redistribution: changing policy from `1D+1P` to `1D+0P` and back completed cleanly; the proof object stayed readable before and after both redistributions.
+- Soft delete lifecycle: trashed object appeared in `/v4/fragment/trash`, then manual GC expired it, removed orphan blob dirs, refunded bytes, and subsequent `GET` returned `404`.
+- Interrupted upload cancel: active multipart session disappeared from `/v4/upload/status/list` immediately after `DELETE /v4/upload/cancel/{version_id}`.
+- Abandoned upload lifecycle: an unfinalized multipart session aged past `file_ttl_seconds`, then GC deleted the session, refunded bytes, and removed all remaining blob dirs.
+
+Reference timings from that run:
+- create/write proof object: `683.06 ms`
+- redistribution while one disk root was offline: `1010.81 ms`
+- repair after restore: `1005.92 ms`
+- redistribution `2-disk -> 1-disk`: `1378.93 ms`
+- redistribution `1-disk -> 2-disk`: `1386.49 ms`
+- soft-delete GC: `4017.16 ms`
+- abandoned-upload GC: `4027.15 ms`
+
+Artifact:
+- `/home/administrator/DEPLOY_TEST/n1-realtest-20260326-154051-summary.json`
 
 ### 9.9 Hotplug HA Validation and Deploy Checklist (arc raw-blob validation)
 Validated on March 5, 2026 (real hardware, raw blob devices, hot-unplug and reattach cycle).

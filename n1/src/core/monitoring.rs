@@ -2,11 +2,15 @@ use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
 use crate::core::fragment_manager::is_fragment_hash;
 use crate::core::garbage_collector::get_gc_status;
 use crate::core::index;
-use crate::core::redistribution::get_redist_status;
+use crate::core::operation_gate::{MaintenanceAccessMode, current_maintenance_access_mode};
+use crate::core::redistribution::{
+    RedistributionIntentDebtSnapshot, collect_redistribution_intent_debt, get_redist_status,
+};
 use crate::core::repair_manager::get_repair_status;
 use crate::core::system::{SystemMetrics, get_system_metrics};
 use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
+use crate::settings::config::CONFIG;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::{
@@ -41,6 +45,10 @@ static HEALTH_CACHE: LazyLock<Arc<tokio::sync::RwLock<Option<SystemHealthRespons
     LazyLock::new(|| Arc::new(tokio::sync::RwLock::new(None)));
 static LAST_DEEP_SCAN_AT: LazyLock<Arc<tokio::sync::RwLock<Option<Instant>>>> =
     LazyLock::new(|| Arc::new(tokio::sync::RwLock::new(None)));
+static REDIST_INTENT_DEBT_CACHE: LazyLock<
+    Arc<tokio::sync::RwLock<Option<CachedRedistributionIntentDebt>>>,
+> = LazyLock::new(|| Arc::new(tokio::sync::RwLock::new(None)));
+const REDIST_INTENT_DEBT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
 fn monitor_interval() -> Duration {
     let secs = MONITOR_INTERVAL_SECS_ATOMIC
@@ -94,8 +102,12 @@ pub struct UploadRuntimeStats {
     pub reserved_bytes: u64,
     pub committed_parts: u64,
     pub committed_bytes: u64,
+    pub stale_sessions: u64,
+    pub stale_reserved_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest_session_age_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_stale_session_age_seconds: Option<u64>,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -118,12 +130,18 @@ pub struct StoragePlaneStats {
 
 #[derive(Serialize, Clone, Default)]
 pub struct MaintenanceRuntimeStats {
+    pub access_mode: String,
     pub repair_running: bool,
     pub repair_phase: String,
     pub redistribution_running: bool,
     pub redistribution_phase: String,
     pub gc_running: bool,
     pub gc_phase: String,
+    pub pending_redistribution_intents: u64,
+    pub failed_redistribution_intents: u64,
+    pub fragments_with_pending_redistribution: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_redistribution_intent_age_seconds: Option<u64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -138,6 +156,12 @@ pub struct SystemHealthResponse {
     pub storage: StoragePlaneStats,
     pub maintenance: MaintenanceRuntimeStats,
     pub summary: String,
+}
+
+#[derive(Clone)]
+struct CachedRedistributionIntentDebt {
+    collected_at: Instant,
+    snapshot: RedistributionIntentDebtSnapshot,
 }
 
 fn should_count_partition_db_file(path: &std::path::Path) -> bool {
@@ -391,6 +415,7 @@ async fn collect_system_health(
         .get("deep_scan")
         .map(|v| v == "true")
         .unwrap_or(false);
+    let force_refresh = params.get("refresh").map(|v| v == "true").unwrap_or(false);
     let mut partition_db_counts = Vec::new();
     let mut partition_map = HashMap::new();
     let mut scan_performed = false;
@@ -460,6 +485,8 @@ async fn collect_system_health(
     let total_index = index_disks_config.len();
     let total_blob = blob_disks_config.len();
     let uploads = collect_upload_runtime_stats(&active_index_roots).await?;
+    let redistribution_debt =
+        load_redistribution_intent_debt(&active_index_roots, force_refresh || deep_scan).await;
     let storage = collect_storage_plane_stats(
         &disk_statuses,
         total_index as u64,
@@ -500,10 +527,29 @@ async fn collect_system_health(
 
     let monitoring_update = StorageEventPayload::MonitoringUpdate {
         system: serde_json::to_value(&system_metrics).unwrap_or(serde_json::Value::Null),
+        uploads: serde_json::to_value(&uploads).ok(),
+        maintenance: serde_json::to_value(MaintenanceRuntimeStats {
+            access_mode: maintenance_access_mode_label(current_maintenance_access_mode()).into(),
+            repair_running: repair_status.is_running,
+            repair_phase: repair_status.phase.clone(),
+            redistribution_running: redist_status.is_running,
+            redistribution_phase: redist_status.phase.clone(),
+            gc_running: gc_status.is_running,
+            gc_phase: gc_status.phase.clone(),
+            pending_redistribution_intents: redistribution_debt.pending_intents,
+            failed_redistribution_intents: redistribution_debt.failed_intents,
+            fragments_with_pending_redistribution: redistribution_debt
+                .fragments_with_pending_intents,
+            oldest_pending_redistribution_intent_age_seconds: redistribution_debt
+                .oldest_pending_intent_age_seconds,
+        })
+        .ok(),
         repair_job: serde_json::to_value(&repair_status).ok(),
         redist_job: serde_json::to_value(&redist_status).ok(),
         shadow_index_status: index_health.clone(),
         shadow_index_healthy: online_index_count == total_index,
+        sampled_at: Some(Utc::now().timestamp()),
+        summary: Some(summary.clone()),
     };
     state.ws_manager.broadcast_system_wide(monitoring_update);
 
@@ -529,15 +575,47 @@ async fn collect_system_health(
         },
         storage,
         maintenance: MaintenanceRuntimeStats {
+            access_mode: maintenance_access_mode_label(current_maintenance_access_mode()).into(),
             repair_running: repair_status.is_running,
             repair_phase: repair_status.phase,
             redistribution_running: redist_status.is_running,
             redistribution_phase: redist_status.phase,
             gc_running: gc_status.is_running,
             gc_phase: gc_status.phase,
+            pending_redistribution_intents: redistribution_debt.pending_intents,
+            failed_redistribution_intents: redistribution_debt.failed_intents,
+            fragments_with_pending_redistribution: redistribution_debt
+                .fragments_with_pending_intents,
+            oldest_pending_redistribution_intent_age_seconds: redistribution_debt
+                .oldest_pending_intent_age_seconds,
         },
         summary,
     })
+}
+
+async fn load_redistribution_intent_debt(
+    active_index_roots: &[PathBuf],
+    force_refresh: bool,
+) -> RedistributionIntentDebtSnapshot {
+    if active_index_roots.is_empty() {
+        return RedistributionIntentDebtSnapshot::default();
+    }
+
+    if !force_refresh {
+        let cached = REDIST_INTENT_DEBT_CACHE.read().await.clone();
+        if let Some(cached) = cached {
+            if cached.collected_at.elapsed() < REDIST_INTENT_DEBT_REFRESH_INTERVAL {
+                return cached.snapshot;
+            }
+        }
+    }
+
+    let snapshot = collect_redistribution_intent_debt(active_index_roots).await;
+    *REDIST_INTENT_DEBT_CACHE.write().await = Some(CachedRedistributionIntentDebt {
+        collected_at: Instant::now(),
+        snapshot: snapshot.clone(),
+    });
+    snapshot
 }
 
 async fn collect_upload_runtime_stats(
@@ -580,8 +658,13 @@ async fn collect_upload_runtime_stats(
     .map_err(|e| AppError::InternalServerError(format!("upload stats join error: {}", e)))?;
 
     let now = Utc::now().timestamp();
+    let stale_after = CONFIG
+        .garbage_collector
+        .file_ttl_seconds
+        .min(i64::MAX as u64) as i64;
     let mut stats = UploadRuntimeStats::default();
     let mut oldest_created_at: Option<i64> = None;
+    let mut oldest_stale_created_at: Option<i64> = None;
 
     for fragment in fragments {
         let sessions = index::list_active_sessions(&fragment).await?;
@@ -591,14 +674,14 @@ async fn collect_upload_runtime_stats(
             .into_iter()
             .filter(|state| state.finalized_at.is_none() && state.aborted_at.is_none())
         {
+            let session_created_at = session.manifest.created_at;
             fragment_has_active = true;
             stats.active_sessions = stats.active_sessions.saturating_add(1);
-            stats.reserved_bytes = stats.reserved_bytes.saturating_add(
-                session
-                    .reservation
-                    .map(|receipt| receipt.amount)
-                    .unwrap_or(0),
-            );
+            let reserved_bytes = session
+                .reservation
+                .map(|receipt| receipt.amount)
+                .unwrap_or(0);
+            stats.reserved_bytes = stats.reserved_bytes.saturating_add(reserved_bytes);
 
             if !session.part_receipts.is_empty() {
                 stats.committed_parts = stats
@@ -624,9 +707,19 @@ async fn collect_upload_runtime_stats(
                 );
             }
 
+            if stale_after > 0 && now.saturating_sub(session.last_activity_at) >= stale_after {
+                stats.stale_sessions = stats.stale_sessions.saturating_add(1);
+                stats.stale_reserved_bytes =
+                    stats.stale_reserved_bytes.saturating_add(reserved_bytes);
+                oldest_stale_created_at = Some(match oldest_stale_created_at {
+                    Some(current) => current.min(session_created_at),
+                    None => session_created_at,
+                });
+            }
+
             oldest_created_at = Some(match oldest_created_at {
-                Some(current) => current.min(session.manifest.created_at),
-                None => session.manifest.created_at,
+                Some(current) => current.min(session_created_at),
+                None => session_created_at,
             });
         }
 
@@ -642,8 +735,23 @@ async fn collect_upload_runtime_stats(
             0
         }
     });
+    stats.oldest_stale_session_age_seconds = oldest_stale_created_at.map(|created_at| {
+        if now > created_at {
+            (now - created_at) as u64
+        } else {
+            0
+        }
+    });
 
     Ok(stats)
+}
+
+fn maintenance_access_mode_label(mode: MaintenanceAccessMode) -> &'static str {
+    match mode {
+        MaintenanceAccessMode::Availability => "availability",
+        MaintenanceAccessMode::ReadOnly => "read_only",
+        MaintenanceAccessMode::Quiesced => "quiesced",
+    }
 }
 
 fn collect_storage_plane_stats(

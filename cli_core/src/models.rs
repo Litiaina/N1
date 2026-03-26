@@ -58,7 +58,13 @@ pub struct UploadRuntimeStats {
     pub committed_parts: u64,
     pub committed_bytes: u64,
     #[serde(default)]
+    pub stale_sessions: u64,
+    #[serde(default)]
+    pub stale_reserved_bytes: u64,
+    #[serde(default)]
     pub oldest_session_age_seconds: Option<u64>,
+    #[serde(default)]
+    pub oldest_stale_session_age_seconds: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -81,12 +87,22 @@ pub struct StoragePlaneStats {
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct MaintenanceRuntimeStats {
+    #[serde(default)]
+    pub access_mode: String,
     pub repair_running: bool,
     pub repair_phase: String,
     pub redistribution_running: bool,
     pub redistribution_phase: String,
     pub gc_running: bool,
     pub gc_phase: String,
+    #[serde(default)]
+    pub pending_redistribution_intents: u64,
+    #[serde(default)]
+    pub failed_redistribution_intents: u64,
+    #[serde(default)]
+    pub fragments_with_pending_redistribution: u64,
+    #[serde(default)]
+    pub oldest_pending_redistribution_intent_age_seconds: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]

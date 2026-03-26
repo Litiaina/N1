@@ -4,7 +4,7 @@
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used underneath both deployment shapes.
 > - Single-node deployment: `n1` (`litiaina-n1`)
-> - `n1` release: `0.7.2`
+> - `n1` release: `0.7.3`
 > - Multi-node deployment: `n2` (`litiaina-n2`, `0.2.0`)
 > - Registry/business deployment: `registry` (`registry-server`, `0.4.0`)
 > - Experimental raw-device profile: `n1-arc` (`litiaina-n1-arc`)
@@ -653,7 +653,7 @@ Scrub is the integrity-check pass for committed shards (raw shards on `n1-arc`, 
 
 ## 10. Release Hardening On Target Hardware
 
-Run the release drill harness before production rollout (`n1 0.7.2` stable, `n1-arc` experimental):
+Run the release drill harness before production rollout (`n1 0.7.3` stable, `n1-arc` experimental):
 
 ```bash
 scripts/bench/run_release_drills.sh
@@ -666,6 +666,16 @@ This executes the critical storage workflows:
 - redistribution + repair + recovered read
 - indexdb partition replica convergence
 - HA repair with an index disk down
+
+Latest filesystem-backed real-hardware reference:
+- validated on March 26, 2026 on the IT server `192.168.0.18`
+- isolated harness used the real `/mnt/DISK2` and `/mnt/DISK3` media
+- degraded `GET` and ranged `STREAM` held while one disk root was forced offline
+- availability-mode redistribution and repair completed cleanly during the degraded window
+- policy-cycle redistribution `2-disk -> 1-disk -> 2-disk` completed with the proof object still readable
+- soft-delete GC completed in about `4.02 s`
+- abandoned-upload GC completed in about `4.03 s`
+- artifact: `/home/administrator/DEPLOY_TEST/n1-realtest-20260326-154051-summary.json`
 
 For a heavier gate:
 

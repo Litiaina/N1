@@ -78,10 +78,18 @@ pub enum StorageEventPayload {
     #[serde(rename = "MONITORING_UPDATE")]
     MonitoringUpdate {
         system: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        uploads: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        maintenance: Option<serde_json::Value>,
         repair_job: Option<serde_json::Value>,
         redist_job: Option<serde_json::Value>,
         shadow_index_status: String,
         shadow_index_healthy: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sampled_at: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
     },
 
     #[serde(rename = "REDISTRIBUTION_UPDATE")]

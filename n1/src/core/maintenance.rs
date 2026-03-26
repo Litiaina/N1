@@ -3,7 +3,8 @@ use crate::core::index;
 use crate::enums::app_error_enum::AppError;
 use crate::settings::config::CONFIG;
 use crate::structs::auth_structs::Claims;
-use axum::{http::StatusCode, response::IntoResponse};
+use axum::{Json, http::StatusCode, response::IntoResponse};
+use serde::Serialize;
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 use tracing::{error, info};
@@ -84,6 +85,14 @@ async fn perform_fragment_cleanup(fragment: &str) -> Result<(u64, i32), AppError
     Ok((total_usage, orphans_removed))
 }
 
+#[derive(Serialize)]
+struct FragmentCleanupResponse {
+    fragment: String,
+    usage_bytes: u64,
+    orphan_blob_dirs_removed: i32,
+    message: String,
+}
+
 pub async fn sync_fragment_metadata(claims: Claims) -> Result<impl IntoResponse, AppError> {
     if !claims.modify {
         return Err(AppError::Forbidden(
@@ -97,5 +106,13 @@ pub async fn sync_fragment_metadata(claims: Claims) -> Result<impl IntoResponse,
         claims.fragment, usage, orphans_removed
     );
 
-    Ok((StatusCode::OK, "Fragment metadata cleanup complete."))
+    Ok((
+        StatusCode::OK,
+        Json(FragmentCleanupResponse {
+            fragment: claims.fragment,
+            usage_bytes: usage,
+            orphan_blob_dirs_removed: orphans_removed,
+            message: "Fragment metadata cleanup complete.".to_string(),
+        }),
+    ))
 }

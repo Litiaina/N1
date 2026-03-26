@@ -64,6 +64,15 @@ pub struct RedistributionJobStatus {
     pub scan_rate_per_sec: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RedistributionIntentDebtSnapshot {
+    pub pending_intents: u64,
+    pub failed_intents: u64,
+    pub fragments_with_pending_intents: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_intent_age_seconds: Option<u64>,
+}
+
 static REDIST_STATUS: LazyLock<Arc<tokio::sync::RwLock<RedistributionJobStatus>>> =
     LazyLock::new(|| Arc::new(tokio::sync::RwLock::new(RedistributionJobStatus::default())));
 
@@ -820,6 +829,116 @@ async fn remove_intent_paths_best_effort(intent_paths: &[PathBuf]) {
     for path in intent_paths {
         let _ = tokio_fs::remove_file(path).await;
     }
+}
+
+pub async fn collect_redistribution_intent_debt(
+    index_roots: &[PathBuf],
+) -> RedistributionIntentDebtSnapshot {
+    if index_roots.is_empty() {
+        return RedistributionIntentDebtSnapshot::default();
+    }
+
+    let roots = index_roots.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let now_ms = Utc::now().timestamp_millis();
+        let mut grouped: HashMap<String, RedistributionIntent> = HashMap::new();
+        let mut fragments = HashSet::new();
+
+        for root in roots {
+            let indexdb_dir = root.join("indexdb");
+            if indexdb_dir.exists() {
+                // Allow callers to point directly at a fragment/indexdb directory if needed.
+                for entry in WalkDir::new(indexdb_dir).into_iter().filter_map(|e| e.ok()) {
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    let name = entry.file_name().to_string_lossy();
+                    if !name.ends_with(REDIST_INTENT_SUFFIX) {
+                        continue;
+                    }
+                    let Ok(bytes) = std::fs::read(entry.path()) else {
+                        continue;
+                    };
+                    let Ok(intent) = rmp_serde::from_slice::<RedistributionIntent>(&bytes) else {
+                        continue;
+                    };
+                    let key = intent_dedupe_key(
+                        &intent.fragment,
+                        &intent.object_key,
+                        &intent.version_id,
+                        intent.is_trash,
+                    );
+                    grouped
+                        .entry(key)
+                        .and_modify(|current| {
+                            if intent.updated_at_unix_ms > current.updated_at_unix_ms {
+                                *current = intent.clone();
+                            }
+                        })
+                        .or_insert(intent);
+                }
+                continue;
+            }
+
+            if !root.exists() {
+                continue;
+            }
+            for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy();
+                if !name.ends_with(REDIST_INTENT_SUFFIX) {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(entry.path()) else {
+                    continue;
+                };
+                let Ok(intent) = rmp_serde::from_slice::<RedistributionIntent>(&bytes) else {
+                    continue;
+                };
+                let key = intent_dedupe_key(
+                    &intent.fragment,
+                    &intent.object_key,
+                    &intent.version_id,
+                    intent.is_trash,
+                );
+                grouped
+                    .entry(key)
+                    .and_modify(|current| {
+                        if intent.updated_at_unix_ms > current.updated_at_unix_ms {
+                            *current = intent.clone();
+                        }
+                    })
+                    .or_insert(intent);
+            }
+        }
+
+        let mut snapshot = RedistributionIntentDebtSnapshot::default();
+        let mut oldest_created_ms: Option<i64> = None;
+        for intent in grouped.values() {
+            snapshot.pending_intents = snapshot.pending_intents.saturating_add(1);
+            if intent.phase.eq_ignore_ascii_case("failed") {
+                snapshot.failed_intents = snapshot.failed_intents.saturating_add(1);
+            }
+            fragments.insert(intent.fragment.clone());
+            oldest_created_ms = Some(match oldest_created_ms {
+                Some(current) => current.min(intent.created_at_unix_ms),
+                None => intent.created_at_unix_ms,
+            });
+        }
+        snapshot.fragments_with_pending_intents = fragments.len() as u64;
+        snapshot.oldest_pending_intent_age_seconds = oldest_created_ms.and_then(|created_at| {
+            if created_at <= 0 || now_ms <= created_at {
+                None
+            } else {
+                Some(((now_ms - created_at) / 1000) as u64)
+            }
+        });
+        snapshot
+    })
+    .await
+    .unwrap_or_default()
 }
 
 async fn replay_pending_intents_for_fragment(

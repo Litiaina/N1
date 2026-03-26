@@ -1970,6 +1970,10 @@ fn share_conflict(
     incoming_share_access: u32,
     incoming_read: bool,
 ) -> bool {
+    if existing.requested_read && incoming_read {
+        return false;
+    }
+
     (incoming_read && (existing.share_access & FILE_SHARE_READ) == 0)
         || (existing.requested_read && (incoming_share_access & FILE_SHARE_READ) == 0)
 }
@@ -5096,12 +5100,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_open_handle_enforces_share_conflicts() {
+    async fn register_open_handle_keeps_true_conflicts_but_allows_read_only_copy_patterns() {
         let shared = Arc::new(Mutex::new(GlobalSmbState::default()));
         let conn_a = 100u64;
         let conn_b = 200u64;
+        let conn_c = 300u64;
         let file_a = [1u8; 16];
         let file_b = [2u8; 16];
+        let file_c = [3u8; 16];
 
         let ok = register_open_handle(
             &shared,
@@ -5130,6 +5136,10 @@ mod tests {
         )
         .await;
         assert!(compatible.is_ok());
+
+        let copy_style_read =
+            register_open_handle(&shared, conn_c, file_c, "frag", "file.bin", 0, true).await;
+        assert!(copy_style_read.is_ok());
     }
 
     #[tokio::test]

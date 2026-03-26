@@ -3952,9 +3952,9 @@ async fn matrix_redistribution_defers_cutover_until_owner_index_restored() {
 
     let intent_files = collect_fragment_indexdb_files(&fragment).await;
     assert!(
-        intent_files.iter().any(|path| {
-            path.contains(&version_id) && path.ends_with(".redist.intent.msgpack")
-        }),
+        intent_files
+            .iter()
+            .any(|path| { path.contains(&version_id) && path.ends_with(".redist.intent.msgpack") }),
         "failed redistribution should leave a pending intent for replay"
     );
 
@@ -4011,9 +4011,9 @@ async fn matrix_redistribution_defers_cutover_until_owner_index_restored() {
 
     let remaining_intents = collect_fragment_indexdb_files(&fragment).await;
     assert!(
-        !remaining_intents.iter().any(|path| {
-            path.contains(&version_id) && path.ends_with(".redist.intent.msgpack")
-        }),
+        !remaining_intents
+            .iter()
+            .any(|path| { path.contains(&version_id) && path.ends_with(".redist.intent.msgpack") }),
         "successful replay should clear the pending redistribution intent"
     );
 

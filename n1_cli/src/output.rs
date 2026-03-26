@@ -28,6 +28,20 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+fn human_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    let rem_seconds = seconds % 60;
+    if minutes < 60 {
+        return format!("{minutes}m {rem_seconds}s");
+    }
+    let hours = minutes / 60;
+    let rem_minutes = minutes % 60;
+    format!("{hours}h {rem_minutes}m")
+}
+
 fn format_rows(title: &str, rows: &[(&str, String)]) -> String {
     let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
     let mut out = String::new();
@@ -118,9 +132,27 @@ pub fn format_health(response: &HealthResponse) -> String {
             ),
         ),
         (
+            "stale_uploads",
+            format!(
+                "{} session(s), {} reserved{}",
+                response.uploads.stale_sessions,
+                human_bytes(response.uploads.stale_reserved_bytes),
+                response
+                    .uploads
+                    .oldest_stale_session_age_seconds
+                    .map(|age| format!(", oldest {}", human_duration(age)))
+                    .unwrap_or_default()
+            ),
+        ),
+        (
             "maintenance",
             format!(
-                "repair={} redist={} gc={}",
+                "mode={} repair={} redist={} gc={}",
+                if response.maintenance.access_mode.is_empty() {
+                    "availability"
+                } else {
+                    response.maintenance.access_mode.as_str()
+                },
                 if response.maintenance.repair_running {
                     response.maintenance.repair_phase.as_str()
                 } else {
@@ -136,6 +168,20 @@ pub fn format_health(response: &HealthResponse) -> String {
                 } else {
                     "idle"
                 }
+            ),
+        ),
+        (
+            "redistribution_debt",
+            format!(
+                "{} pending, {} failed, {} fragment(s){}",
+                response.maintenance.pending_redistribution_intents,
+                response.maintenance.failed_redistribution_intents,
+                response.maintenance.fragments_with_pending_redistribution,
+                response
+                    .maintenance
+                    .oldest_pending_redistribution_intent_age_seconds
+                    .map(|age| format!(", oldest {}", human_duration(age)))
+                    .unwrap_or_default()
             ),
         ),
     ];
@@ -195,15 +241,22 @@ pub fn format_health_watch_line(response: &HealthResponse) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{}  status={} cpu={:.2}% ram={:.2}% rss={} uploads={} blob={}/{} maint=R{}D{}G{} disks={} summary={}",
+        "{}  status={} cpu={:.2}% ram={:.2}% rss={} uploads={} stale={} redist_debt={} blob={}/{} maint={} R{}D{}G{} disks={} summary={}",
         format_timestamp(response.sampled_at),
         response.status,
         response.system.cpu_usage_percent,
         response.system.ram_usage_percent,
         human_bytes(response.system.process_resident_bytes),
         response.uploads.active_sessions,
+        response.uploads.stale_sessions,
+        response.maintenance.pending_redistribution_intents,
         response.storage.blob_devices_online,
         response.storage.blob_devices_total,
+        if response.maintenance.access_mode.is_empty() {
+            "availability"
+        } else {
+            response.maintenance.access_mode.as_str()
+        },
         if response.maintenance.repair_running {
             1
         } else {
