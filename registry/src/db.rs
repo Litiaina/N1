@@ -2,7 +2,7 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use tokio::task;
@@ -15,6 +15,7 @@ use crate::models::{
     HealthResponse, ObjectExtensionStat, ObjectRecord, StorageDeployment, UserAuthRecord,
     UserRecord,
 };
+use crate::storage_broker::EngineObjectMetadata;
 
 #[derive(Debug, Clone)]
 pub struct RegistryListPage {
@@ -1828,6 +1829,133 @@ impl RegistryDb {
         .await
     }
 
+    pub async fn sync_object_from_engine(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_key: String,
+        current: Option<EngineObjectMetadata>,
+        versions: Vec<EngineObjectMetadata>,
+    ) -> Result<(Option<ObjectRecord>, UserRecord), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let (quota_limit, quota_used) = quota_for_user(&tx, &owner_uid)?;
+            let existing = resolve_ready_object(&tx, &owner_uid, &fragment, &object_key)?;
+            let previous_size = existing
+                .as_ref()
+                .map(|record| record.object_size_bytes.max(0))
+                .unwrap_or(0);
+            let now = now_rfc3339();
+
+            let next_used = if let Some(current) = current.clone() {
+                let current_size = current.object_size_bytes.max(0);
+                let created_at = existing
+                    .as_ref()
+                    .map(|record| record.created_at.clone())
+                    .unwrap_or_else(|| rfc3339_from_unix(current.created_at_unix));
+
+                tx.execute(
+                    r#"
+                    INSERT INTO objects (
+                        owner_uid, fragment, object_key, version_id, status, object_size_bytes, content_type, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, 'ready', ?5, ?6, ?7, ?8)
+                    ON CONFLICT(owner_uid, fragment, object_key)
+                    DO UPDATE SET
+                        version_id = excluded.version_id,
+                        status = 'ready',
+                        object_size_bytes = excluded.object_size_bytes,
+                        content_type = excluded.content_type,
+                        updated_at = excluded.updated_at
+                    "#,
+                    params![
+                        owner_uid,
+                        fragment,
+                        object_key,
+                        current.version_id,
+                        current_size,
+                        current.content_type,
+                        created_at,
+                        now
+                    ],
+                )
+                .map_err(sql_err)?;
+
+                tx.execute(
+                    "DELETE FROM object_versions WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                    params![owner_uid, fragment, object_key],
+                )
+                .map_err(sql_err)?;
+
+                let versions_to_store = if versions.is_empty() {
+                    vec![current]
+                } else {
+                    versions
+                };
+                for version in versions_to_store {
+                    tx.execute(
+                        r#"
+                        INSERT OR REPLACE INTO object_versions (
+                            owner_uid, fragment, object_key, version_id, object_size_bytes, content_type, created_at
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                        "#,
+                        params![
+                            owner_uid,
+                            fragment,
+                            object_key,
+                            version.version_id,
+                            version.object_size_bytes.max(0),
+                            version.content_type,
+                            rfc3339_from_unix(version.created_at_unix)
+                        ],
+                    )
+                    .map_err(sql_err)?;
+                }
+
+                quota_used
+                    .saturating_add(current_size - previous_size)
+                    .max(0)
+            } else {
+                tx.execute(
+                    "DELETE FROM objects WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                    params![owner_uid, fragment, object_key],
+                )
+                .map_err(sql_err)?;
+                tx.execute(
+                    "DELETE FROM object_versions WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                    params![owner_uid, fragment, object_key],
+                )
+                .map_err(sql_err)?;
+                tx.execute(
+                    "DELETE FROM object_uploads WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                    params![owner_uid, fragment, object_key],
+                )
+                .map_err(sql_err)?;
+                quota_used.saturating_sub(previous_size)
+            };
+
+            tx.execute(
+                r#"
+                UPDATE users
+                SET quota_used_bytes = ?2, updated_at = ?3
+                WHERE uid = ?1
+                "#,
+                params![owner_uid, next_used, now_rfc3339()],
+            )
+            .map_err(sql_err)?;
+
+            tx.commit().map_err(sql_err)?;
+
+            let conn = db.open_connection()?;
+            let object = resolve_ready_object(&conn, &owner_uid, &fragment, &object_key)?;
+            let mut user = user_by_uid(&conn, &owner_uid)?;
+            user.quota_limit_bytes = quota_limit;
+            Ok((object, user))
+        })
+        .await
+    }
+
     pub async fn set_object_status(
         &self,
         owner_uid: String,
@@ -2263,7 +2391,10 @@ fn user_by_uid_raw(conn: &Connection, uid: &str) -> Result<UserRecord, RegistryE
     })
 }
 
-fn apply_effective_quota_usage(conn: &Connection, user: &mut UserRecord) -> Result<(), RegistryError> {
+fn apply_effective_quota_usage(
+    conn: &Connection,
+    user: &mut UserRecord,
+) -> Result<(), RegistryError> {
     user.quota_used_bytes = effective_quota_used_bytes_for_user(conn, &user.uid)?;
     Ok(())
 }
@@ -2389,6 +2520,13 @@ fn normalize_listing_prefix(prefix: String, delimiter: Option<&str>) -> String {
         return format!("{}/", trimmed);
     }
     trimmed
+}
+
+fn rfc3339_from_unix(value: i64) -> String {
+    Utc.timestamp_opt(value, 0)
+        .single()
+        .map(|ts| ts.to_rfc3339())
+        .unwrap_or_else(now_rfc3339)
 }
 
 fn canonical_archive_key(value: &str) -> String {
@@ -2891,7 +3029,10 @@ mod tests {
         )
         .await
         .expect("register first pending");
-        let user_after_first = db.get_user(user.uid.clone()).await.expect("user after first");
+        let user_after_first = db
+            .get_user(user.uid.clone())
+            .await
+            .expect("user after first");
         assert_eq!(user_after_first.quota_used_bytes, 4_000);
 
         db.register_pending_object(
@@ -2903,7 +3044,10 @@ mod tests {
         )
         .await
         .expect("register second pending");
-        let user_after_second = db.get_user(user.uid.clone()).await.expect("user after second");
+        let user_after_second = db
+            .get_user(user.uid.clone())
+            .await
+            .expect("user after second");
         assert_eq!(user_after_second.quota_used_bytes, 9_000);
 
         let err = db

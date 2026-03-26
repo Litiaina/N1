@@ -786,6 +786,30 @@ async fn part_exists_on_disk(
     Ok(true)
 }
 
+async fn ensure_version_shard_dirs(
+    path_manager: &ObjectPathManager,
+    manifest: &UploadSessionManifest,
+) -> Result<(), AppError> {
+    let create_futs = path_manager.get_blob_roots().into_iter().map(|disk_root| {
+        let shard_dir = path_manager.get_shard_dir_on_disk(
+            &disk_root,
+            &manifest.fragment,
+            &manifest.version_id,
+        );
+        async move {
+            tokio_fs::create_dir_all(&shard_dir)
+                .await
+                .map_err(|e| AppError::Io(e, format!("mkdir shard dir {}", shard_dir.display())))
+        }
+    });
+
+    for result in join_all(create_futs).await {
+        result?;
+    }
+
+    Ok(())
+}
+
 async fn uploaded_parts_from_disk(
     path_manager: &ObjectPathManager,
     manifest: &UploadSessionManifest,
@@ -867,6 +891,11 @@ async fn reconstruct_part_meta_from_receipt(
 
     let block_size = configured_block_size();
     let expected_shard_len = final_shard_len_for_part(part_size, data_shards, block_size);
+    let shard_size_bytes = if receipt.shard_size_bytes == 0 {
+        expected_shard_len
+    } else {
+        receipt.shard_size_bytes
+    };
 
     let mut shards = Vec::with_capacity(total_shards);
     for ((shard_index, is_parity, stable_path, file_name), checksum) in
@@ -874,19 +903,11 @@ async fn reconstruct_part_meta_from_receipt(
             .into_iter()
             .zip(receipt.shard_checksums.iter())
     {
-        let meta = match tokio_fs::metadata(&stable_path).await {
-            Ok(meta) => meta,
-            Err(_) => return Ok(None),
-        };
-        if meta.len() != expected_shard_len {
-            return Ok(None);
-        }
-
         shards.push(ShardInfo {
             shard_index,
             file_name,
             absolute_path: stable_path.to_string_lossy().to_string(),
-            size_bytes: expected_shard_len,
+            size_bytes: shard_size_bytes,
             checksum: format_crc32_u32(*checksum),
             is_parity,
         });
@@ -988,8 +1009,6 @@ async fn write_part_blob_to_disk(
         let disk_idx = (part_index as usize + i) % num_disks;
         let target_disk = &blob_roots[disk_idx];
         let shard_dir = path_manager.get_shard_dir_on_disk(target_disk, fragment, version_id);
-
-        let _ = tokio_fs::create_dir_all(&shard_dir).await;
 
         let tmp_path = shard_dir.join(&tmp_name);
         let stable_path = shard_dir.join(&stable_name);
@@ -1192,28 +1211,39 @@ async fn publish_one_shard(
     expected_len: u64,
     expected_crc32: Option<&str>,
 ) -> Result<(), AppError> {
-    if tokio_fs::try_exists(stable_path).await.unwrap_or(false) {
-        let len_ok = tokio_fs::metadata(stable_path)
-            .await
-            .map(|m| m.len() == expected_len)
-            .unwrap_or(false);
+    if !tokio_fs::try_exists(stable_path).await.unwrap_or(false) {
+        tokio_fs::rename(tmp_path, stable_path).await.map_err(|e| {
+            AppError::Io(
+                e,
+                format!(
+                    "rename tmp->stable {} -> {}",
+                    tmp_path.display(),
+                    stable_path.display()
+                ),
+            )
+        })?;
+        return Ok(());
+    }
 
-        if len_ok {
-            if let Some(exp) = expected_crc32.filter(|s| !s.is_empty()) {
-                let got = crc32_file_hex(stable_path).await?;
-                if got.eq_ignore_ascii_case(exp) {
-                    let _ = tokio_fs::remove_file(tmp_path).await;
-                    return Ok(());
-                }
-            } else {
+    let len_ok = tokio_fs::metadata(stable_path)
+        .await
+        .map(|m| m.len() == expected_len)
+        .unwrap_or(false);
+
+    if len_ok {
+        if let Some(exp) = expected_crc32.filter(|s| !s.is_empty()) {
+            let got = crc32_file_hex(stable_path).await?;
+            if got.eq_ignore_ascii_case(exp) {
                 let _ = tokio_fs::remove_file(tmp_path).await;
                 return Ok(());
             }
+        } else {
+            let _ = tokio_fs::remove_file(tmp_path).await;
+            return Ok(());
         }
-
-        let _ = tokio_fs::remove_file(stable_path).await;
     }
 
+    let _ = tokio_fs::remove_file(stable_path).await;
     tokio_fs::rename(tmp_path, stable_path).await.map_err(|e| {
         AppError::Io(
             e,
@@ -1348,6 +1378,9 @@ pub async fn initiate_object_upload(
         parity_shards: configured_parity_shards() as u16,
     };
 
+    let path_manager = ObjectPathManager::new();
+    ensure_version_shard_dirs(&path_manager, &manifest).await?;
+
     if let Err(e) = index::open_session(&manifest, Some(receipt)).await {
         return Err(AppError::InternalServerError(format!(
             "Failed to initialize partitioned session index: {}",
@@ -1429,10 +1462,18 @@ pub async fn get_upload_status(
 
     if let Some(state) = index::load_session(&fragment, &version_id).await? {
         let path_manager = ObjectPathManager::new();
-        let mut parts = if state.manifest.part_size_bytes > 0 {
+        let mut parts = if let Some(receipts) =
+            index::load_session_part_receipts(&fragment, &version_id, &state.manifest).await?
+        {
+            receipts
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, receipt)| receipt.as_ref().map(|_| idx as u64))
+                .collect()
+        } else if state.manifest.part_size_bytes > 0 {
             uploaded_parts_from_disk(&path_manager, &state.manifest).await?
         } else {
-            state.parts.keys().copied().collect::<Vec<_>>()
+            Vec::new()
         };
         parts.sort_unstable();
         return Ok(AxumJson(UploadStatusResponse {
@@ -1541,10 +1582,6 @@ pub async fn object_upload_part(
             "Failed to persist compact multipart receipt for {}/{} part {}: {}",
             fragment, version_id, part_index, err
         );
-    }
-
-    if part_exists_on_disk(&path_manager, &manifest, part_index).await? {
-        return Ok((StatusCode::OK, "Part already uploaded").into_response());
     }
 
     Ok((StatusCode::OK, "Part uploaded").into_response())

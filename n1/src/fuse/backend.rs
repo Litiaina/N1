@@ -482,7 +482,10 @@ impl InProcessBackend {
             }
             entries.push(DirEntry {
                 name: encode_virtual_name(&name),
-                path: Self::to_trash_virtual_path(path, Self::child_object_key(prefix, &name).as_str()),
+                path: Self::to_trash_virtual_path(
+                    path,
+                    Self::child_object_key(prefix, &name).as_str(),
+                ),
                 metadata: NodeMetadata {
                     kind: NodeKind::Directory,
                     size_bytes: 0,

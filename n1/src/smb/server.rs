@@ -1371,8 +1371,7 @@ async fn handle_session_setup_command(
                             build_session_setup_response_body(0, &[]),
                         );
                     };
-                    let principal =
-                        normalize_ntlm_identity_component(type3.username.as_str());
+                    let principal = normalize_ntlm_identity_component(type3.username.as_str());
                     if principal.is_empty() && !state.require_signing {
                         session.auth_state = SessionAuthState::Established;
                         session.server_challenge = None;

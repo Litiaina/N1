@@ -39,6 +39,7 @@ pub struct IndexSessionState {
 pub struct SessionPartReceipt {
     pub part_index: u64,
     pub size_bytes: u64,
+    pub shard_size_bytes: u64,
     pub created_at: i64,
     pub checksum: Option<u32>,
     pub shard_checksums: Vec<u32>,
@@ -116,6 +117,11 @@ pub async fn commit_session_part_receipt(
     let receipt = SessionPartReceipt {
         part_index: part.part_index,
         size_bytes: part.size_bytes,
+        shard_size_bytes: part
+            .shards
+            .first()
+            .map(|shard| shard.size_bytes)
+            .unwrap_or(0),
         created_at: part.created_at,
         checksum: part.checksum.as_deref().map(parse_crc32_hex).transpose()?,
         shard_checksums: part

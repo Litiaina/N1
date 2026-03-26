@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use hex::encode as hex_encode;
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -67,6 +68,28 @@ struct UpdateFragmentRequest<'a> {
 #[derive(Debug, Deserialize)]
 struct UpdateFragmentResponse {
     fragment_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct EngineObjectState {
+    pub current: Option<EngineObjectMetadata>,
+    pub versions: Vec<EngineObjectMetadata>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EngineObjectMetadata {
+    pub version_id: String,
+    pub object_size_bytes: i64,
+    pub content_type: Option<String>,
+    pub created_at_unix: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct EngineObjectSummary {
+    version_id: String,
+    content_type: String,
+    total_size_bytes: u64,
+    created_at: i64,
 }
 
 #[derive(Debug)]
@@ -322,6 +345,69 @@ impl StorageBroker {
         Ok(())
     }
 
+    pub async fn read_current_object_state(
+        &self,
+        binding: &FragmentBindingRecord,
+        object_key: &str,
+        include_versions: bool,
+    ) -> Result<EngineObjectState, RegistryError> {
+        let backend = self.resolve_backend(binding)?;
+        let payload = self
+            .authenticate_fragment(&backend, &binding.fragment, true, false, false, false)
+            .await?;
+        self.read_object_state_with_token(
+            &backend,
+            &payload.access_token,
+            object_key,
+            include_versions,
+        )
+        .await
+    }
+
+    pub async fn delete_object_version_and_read_state(
+        &self,
+        binding: &FragmentBindingRecord,
+        object_key: &str,
+        version_id: &str,
+    ) -> Result<EngineObjectState, RegistryError> {
+        let backend = self.resolve_backend(binding)?;
+        let payload = self
+            .authenticate_fragment(&backend, &binding.fragment, true, true, false, true)
+            .await?;
+        let encoded_key = encode_object_key_path(object_key);
+        let encoded_version = encode_path_segment(version_id);
+        let response = self
+            .client_for_backend(&backend)
+            .delete(format!(
+                "{}/v4/fragment/version/delete/{}/{}",
+                backend.engine_url, encoded_version, encoded_key
+            ))
+            .bearer_auth(&payload.access_token)
+            .send()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "storage version delete failed for {}: {}",
+                    backend.engine_url, err
+                ))
+            })?;
+
+        if !response.status().is_success() {
+            let fallback = format!(
+                "storage version delete failed against {} backend",
+                match backend.deployment {
+                    StorageDeployment::SingleNode => "single-node",
+                    StorageDeployment::MultiNode => "multi-node",
+                }
+            );
+            let message = extract_engine_error_message(response, fallback).await;
+            return Err(RegistryError::bad_gateway(message));
+        }
+
+        self.read_object_state_with_token(&backend, &payload.access_token, object_key, true)
+            .await
+    }
+
     fn resolve_backend(
         &self,
         binding: &FragmentBindingRecord,
@@ -496,6 +582,163 @@ impl StorageBroker {
         response.json::<EngineAuthResponse>().await.map_err(|err| {
             RegistryError::bad_gateway(format!("invalid storage auth response: {}", err))
         })
+    }
+
+    async fn read_object_state_with_token(
+        &self,
+        backend: &ResolvedBackend,
+        access_token: &str,
+        object_key: &str,
+        include_versions: bool,
+    ) -> Result<EngineObjectState, RegistryError> {
+        let current = self
+            .fetch_object_metadata(backend, access_token, object_key)
+            .await?;
+        let versions = if include_versions {
+            self.fetch_object_versions(backend, access_token, object_key)
+                .await?
+        } else {
+            Vec::new()
+        };
+        Ok(EngineObjectState { current, versions })
+    }
+
+    async fn fetch_object_metadata(
+        &self,
+        backend: &ResolvedBackend,
+        access_token: &str,
+        object_key: &str,
+    ) -> Result<Option<EngineObjectMetadata>, RegistryError> {
+        let encoded_key = encode_object_key_path(object_key);
+        let response = self
+            .client_for_backend(backend)
+            .get(format!(
+                "{}/v4/fragment/meta/{}",
+                backend.engine_url, encoded_key
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "storage object metadata request failed for {}: {}",
+                    backend.engine_url, err
+                ))
+            })?;
+
+        match response.status() {
+            reqwest::StatusCode::OK => {
+                let payload = response
+                    .json::<EngineObjectSummary>()
+                    .await
+                    .map_err(|err| {
+                        RegistryError::bad_gateway(format!(
+                            "invalid storage metadata response: {}",
+                            err
+                        ))
+                    })?;
+                Ok(Some(payload.into()))
+            }
+            reqwest::StatusCode::NOT_FOUND => Ok(None),
+            _ => {
+                let fallback = format!(
+                    "storage object metadata failed against {} backend",
+                    match backend.deployment {
+                        StorageDeployment::SingleNode => "single-node",
+                        StorageDeployment::MultiNode => "multi-node",
+                    }
+                );
+                let message = extract_engine_error_message(response, fallback).await;
+                Err(RegistryError::bad_gateway(message))
+            }
+        }
+    }
+
+    async fn fetch_object_versions(
+        &self,
+        backend: &ResolvedBackend,
+        access_token: &str,
+        object_key: &str,
+    ) -> Result<Vec<EngineObjectMetadata>, RegistryError> {
+        let encoded_key = encode_object_key_path(object_key);
+        let response = self
+            .client_for_backend(backend)
+            .get(format!(
+                "{}/v4/fragment/versions/{}",
+                backend.engine_url, encoded_key
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "storage object versions request failed for {}: {}",
+                    backend.engine_url, err
+                ))
+            })?;
+
+        match response.status() {
+            reqwest::StatusCode::OK => {
+                let payload = response
+                    .json::<Vec<EngineObjectSummary>>()
+                    .await
+                    .map_err(|err| {
+                        RegistryError::bad_gateway(format!(
+                            "invalid storage versions response: {}",
+                            err
+                        ))
+                    })?;
+                Ok(payload.into_iter().map(Into::into).collect())
+            }
+            reqwest::StatusCode::NOT_FOUND => Ok(Vec::new()),
+            _ => {
+                let fallback = format!(
+                    "storage object versions failed against {} backend",
+                    match backend.deployment {
+                        StorageDeployment::SingleNode => "single-node",
+                        StorageDeployment::MultiNode => "multi-node",
+                    }
+                );
+                let message = extract_engine_error_message(response, fallback).await;
+                Err(RegistryError::bad_gateway(message))
+            }
+        }
+    }
+}
+
+const OBJECT_KEY_PATH_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'?')
+    .add(b'[')
+    .add(b']')
+    .add(b'{')
+    .add(b'}');
+
+const PATH_SEGMENT_SET: &AsciiSet = &OBJECT_KEY_PATH_SET.add(b'/');
+
+fn encode_object_key_path(object_key: &str) -> String {
+    object_key
+        .split('/')
+        .map(|segment| utf8_percent_encode(segment, OBJECT_KEY_PATH_SET).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn encode_path_segment(value: &str) -> String {
+    utf8_percent_encode(value, PATH_SEGMENT_SET).to_string()
+}
+
+impl From<EngineObjectSummary> for EngineObjectMetadata {
+    fn from(value: EngineObjectSummary) -> Self {
+        Self {
+            version_id: value.version_id,
+            object_size_bytes: i64::try_from(value.total_size_bytes).unwrap_or(i64::MAX),
+            content_type: Some(value.content_type).filter(|entry| !entry.trim().is_empty()),
+            created_at_unix: value.created_at,
+        }
     }
 }
 

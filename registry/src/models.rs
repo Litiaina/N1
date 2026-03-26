@@ -330,6 +330,22 @@ pub struct ObjectDeleteResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct DeleteObjectVersionRequest {
+    pub fragment: String,
+    pub object_key: String,
+    pub version_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeleteObjectVersionResponse {
+    pub removed: bool,
+    pub object_removed: bool,
+    pub object: Option<ObjectRecord>,
+    pub quota_limit_bytes: i64,
+    pub quota_used_bytes: i64,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ListObjectsQuery {
     pub fragment: Option<String>,
     pub prefix: Option<String>,

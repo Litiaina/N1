@@ -1296,7 +1296,12 @@ async fn matrix_sync_fragment_metadata_preserves_active_multipart_blob_dirs() {
     .into_response();
     assert_eq!(status_before.status(), StatusCode::OK);
     let status_before_json = read_response_json(status_before).await;
-    assert_eq!(status_before_json["uploaded_parts"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        status_before_json["uploaded_parts"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
     assert_eq!(status_before_json["uploaded_parts"][0].as_u64(), Some(0));
 
     let sync_resp = sync_fragment_metadata(full_claims(&fragment))
@@ -1314,7 +1319,10 @@ async fn matrix_sync_fragment_metadata_preserves_active_multipart_blob_dirs() {
     .into_response();
     assert_eq!(status_after.status(), StatusCode::OK);
     let status_after_json = read_response_json(status_after).await;
-    assert_eq!(status_after_json["uploaded_parts"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        status_after_json["uploaded_parts"].as_array().map(Vec::len),
+        Some(1)
+    );
     assert_eq!(status_after_json["uploaded_parts"][0].as_u64(), Some(0));
 }
 
@@ -1338,7 +1346,8 @@ async fn matrix_sync_fragment_metadata_preserves_recent_unknown_blob_dirs() {
         .next()
         .expect("blob root");
     let unknown_version_id = Ulid::new().to_string();
-    let unknown_dir = path_manager.get_shard_dir_on_disk(&blob_root, &fragment, &unknown_version_id);
+    let unknown_dir =
+        path_manager.get_shard_dir_on_disk(&blob_root, &fragment, &unknown_version_id);
     fs::create_dir_all(&unknown_dir)
         .await
         .expect("create unknown blob dir");
@@ -1352,7 +1361,9 @@ async fn matrix_sync_fragment_metadata_preserves_recent_unknown_blob_dirs() {
         .into_response();
     assert_eq!(sync_resp.status(), StatusCode::OK);
     assert!(
-        fs::try_exists(&unknown_dir).await.expect("unknown dir exists"),
+        fs::try_exists(&unknown_dir)
+            .await
+            .expect("unknown dir exists"),
         "recent unknown blob dir should not be deleted immediately"
     );
 }
@@ -1375,8 +1386,7 @@ async fn matrix_manual_gc_preserves_active_multipart_sessions() {
     });
 
     let (version_id, _session_id) =
-        init_upload_with_part_size(&fragment, "uploads/gc-pending.bin", 8192, 2, Some(4096))
-            .await;
+        init_upload_with_part_size(&fragment, "uploads/gc-pending.bin", 8192, 2, Some(4096)).await;
     let put_resp = upload_part(&fragment, &version_id, 0, vec![0x33; 4096]).await;
     assert_eq!(put_resp.status(), StatusCode::OK);
 
@@ -1401,7 +1411,10 @@ async fn matrix_manual_gc_preserves_active_multipart_sessions() {
     .into_response();
     assert_eq!(status_after.status(), StatusCode::OK);
     let status_after_json = read_response_json(status_after).await;
-    assert_eq!(status_after_json["uploaded_parts"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        status_after_json["uploaded_parts"].as_array().map(Vec::len),
+        Some(1)
+    );
     assert_eq!(status_after_json["uploaded_parts"][0].as_u64(), Some(0));
 }
 
@@ -2082,6 +2095,9 @@ async fn matrix_multipart_compact_receipts_present_without_session_part_metadata
     });
     let (version_id, session_id) =
         init_upload_with_part_size(&fragment, &key, total_len, 2, Some(part_size)).await;
+    let session_layout_before = indexdb_store::session_layout_stats(&fragment, &version_id)
+        .expect("session layout before upload")
+        .expect("session layout exists");
 
     assert_eq!(
         upload_part(&fragment, &version_id, 0, part0.clone())
@@ -2089,12 +2105,33 @@ async fn matrix_multipart_compact_receipts_present_without_session_part_metadata
             .status(),
         StatusCode::OK
     );
+    let session_layout_after_part0 = indexdb_store::session_layout_stats(&fragment, &version_id)
+        .expect("session layout after part 0")
+        .expect("session layout exists after part 0");
     assert_eq!(
         upload_part(&fragment, &version_id, 1, part1.clone())
             .await
             .status(),
         StatusCode::OK
     );
+    let session_layout_after_part1 = indexdb_store::session_layout_stats(&fragment, &version_id)
+        .expect("session layout after part 1")
+        .expect("session layout exists after part 1");
+
+    assert_eq!(
+        session_layout_before.session_row_bytes, session_layout_after_part0.session_row_bytes,
+        "session row should stay lean across part uploads"
+    );
+    assert_eq!(
+        session_layout_after_part0.session_row_bytes, session_layout_after_part1.session_row_bytes,
+        "session row should not grow with receipt fan-out"
+    );
+    assert_eq!(session_layout_before.receipt_rows, 0);
+    assert_eq!(session_layout_after_part0.receipt_rows, 1);
+    assert_eq!(session_layout_after_part1.receipt_rows, 2);
+    assert_eq!(session_layout_after_part1.part_rows, 0);
+    assert!(session_layout_before.owner_db_bytes > 0);
+    assert!(session_layout_after_part1.owner_db_bytes > 0);
 
     assert!(
         index::read_session_part(&fragment, &version_id, 0)
@@ -2135,6 +2172,13 @@ async fn matrix_multipart_compact_receipts_present_without_session_part_metadata
             .map(|receipt| receipt.shard_checksums.len()),
         Some(1)
     );
+    assert!(
+        receipts[0]
+            .as_ref()
+            .map(|receipt| receipt.shard_size_bytes > 0)
+            .unwrap_or(false),
+        "compact receipts should persist shard sizing for finalize reconstruction"
+    );
 
     let finalize_ok = finalize_upload_with_part_size(
         state,
@@ -2152,6 +2196,104 @@ async fn matrix_multipart_compact_receipts_present_without_session_part_metadata
     let expected = [part0, part1].concat();
     let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
     assert_eq!(got, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "benchmark-style local multipart stats"]
+async fn matrix_multipart_receipt_indexdb_local_stats() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(64 * 1024, Ordering::Relaxed);
+    MAX_PART_SIZE_ATOMIC
+        .get()
+        .expect("MAX_PART_SIZE_ATOMIC")
+        .store(16 * 1024 * 1024, Ordering::Relaxed);
+    UPLOAD_IO_GATE_ENABLED_ATOMIC
+        .get()
+        .expect("UPLOAD_IO_GATE_ENABLED_ATOMIC")
+        .store(true, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "matrix/receipt-bench.bin".to_string();
+    let part_count = 256u64;
+    let part_size = 64 * 1024u64;
+    let total_len = part_count * part_size;
+    let part_payload = vec![0x5a; part_size as usize];
+
+    init_quota_file(&fragment, 512 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+    let (version_id, session_id) =
+        init_upload_with_part_size(&fragment, &key, total_len, part_count, Some(part_size)).await;
+
+    let layout_before = indexdb_store::session_layout_stats(&fragment, &version_id)
+        .expect("session layout before upload")
+        .expect("session layout exists");
+
+    let upload_started = std::time::Instant::now();
+    for part_index in 0..part_count {
+        let response = upload_part(&fragment, &version_id, part_index, part_payload.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let upload_elapsed = upload_started.elapsed();
+
+    let layout_after_upload = indexdb_store::session_layout_stats(&fragment, &version_id)
+        .expect("session layout after upload")
+        .expect("session layout exists after upload");
+
+    let finalize_started = std::time::Instant::now();
+    let finalize_ok = finalize_upload_with_part_size(
+        state,
+        &fragment,
+        &version_id,
+        &session_id,
+        &key,
+        total_len,
+        part_count,
+        Some(part_size),
+    )
+    .await;
+    let finalize_elapsed = finalize_started.elapsed();
+    assert_eq!(finalize_ok.status(), StatusCode::OK);
+
+    println!(
+        "multipart_receipt_indexdb_local_stats parts={} part_size={} total_bytes={} upload_ms={} avg_part_ms={:.3} finalize_ms={} session_row_before={} session_row_after={} receipt_rows={} part_rows={} owner_db_bytes={}",
+        part_count,
+        part_size,
+        total_len,
+        upload_elapsed.as_millis(),
+        upload_elapsed.as_secs_f64() * 1000.0 / part_count as f64,
+        finalize_elapsed.as_millis(),
+        layout_before.session_row_bytes,
+        layout_after_upload.session_row_bytes,
+        layout_after_upload.receipt_rows,
+        layout_after_upload.part_rows,
+        layout_after_upload.owner_db_bytes
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

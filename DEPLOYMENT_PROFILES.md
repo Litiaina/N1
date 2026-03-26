@@ -9,9 +9,9 @@ N1 is the shared storage engine underneath it.
 
 As of 2026-03-20:
 
-- `n1` (`litiaina-n1`) is the single-node N2 deployment path, the default for production, and released at `0.7.0`.
+- `n1` (`litiaina-n1`) is the single-node N2 deployment path, the default for production, and released at `0.7.2`.
 - `n2` (`litiaina-n2`) is the multi-node N2 deployment path on top of the same N1 core and is released at `0.2.0`.
-- `registry` (`registry-server`) is the SQLite-backed Registry layer used in both deployment shapes and released independently at `0.3.0`.
+- `registry` (`registry-server`) is the SQLite-backed Registry layer used in both deployment shapes and released independently at `0.4.0`.
 - `n1-arc` (`litiaina-n1-arc`) is the experimental raw-device profile.
 - Privilege split: `n1`, `n2`, and `registry` should normally run as non-root services, while `n1-arc` is the only profile that should require root for raw-device workflows.
 - If you are unsure which one to deploy, use `n1`.
@@ -28,7 +28,7 @@ As of 2026-03-20:
 
 | Profile | Binary | Status | Production default |
 |---|---|---|---|
-| N1 | `litiaina-n1` | Stable (`0.7.0`) | Yes |
+| N1 | `litiaina-n1` | Stable (`0.7.2`) | Yes |
 | N1-Arc | `litiaina-n1-arc` | Experimental | No |
 
 ## 3) Architecture Split
@@ -40,7 +40,7 @@ As of 2026-03-20:
 - Partitioned metadata authority and exact-key object serving.
 - Best operator compatibility and lowest deployment risk.
 
-### Registry (`0.3.0` baseline)
+### Registry (`0.4.0` baseline)
 
 - SQLite-backed metadata and control plane.
 - Runs in both single-node and multi-node deployments.

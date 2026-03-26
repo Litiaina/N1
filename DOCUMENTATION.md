@@ -13,9 +13,9 @@
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used by both deployment shapes.
 > - `n1` is the stable single-node deployment path.
-> - `n1` is released at `0.7.0`.
+> - `n1` is released at `0.7.2`.
 > - `n2` (`litiaina-n2`) is the multi-node N2 deployment path in this workspace and is released at `0.2.0`.
-> - `registry` (`registry-server`) is the SQLite-backed Registry layer for user/business metadata and is versioned independently at `0.3.0`.
+> - `registry` (`registry-server`) is the SQLite-backed Registry layer for user/business metadata and is versioned independently at `0.4.0`.
 > - `n1-arc` is experimental for raw-device deployments.
 > - See `DEPLOYMENT_PROFILES.md`.
 >
@@ -81,7 +81,7 @@
 > - Multipart uploads do not rely on in-memory part state for resumability. Part commits are durably recorded in the `index` session state through compact per-part receipts, and finalize assembles the authoritative object metadata from those receipts.
 
 > Release status note:
-> - N1 `n1` is stable at `0.7.0`; `n1-arc` is experimental.
+> - N1 `n1` is stable at `0.7.2`; `n1-arc` is experimental.
 > - This document describes the current implementation and current routes.
 > - Request/response details and endpoint layout may still change before `1.0.0` even though the underlying storage model is now fixed.
 
@@ -89,7 +89,7 @@
 
 | Dimension | N1 (`litiaina-n1`) | N1-Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / default (`0.7.0`) | Experimental / raw-device profile |
+| Status | Stable / default (`0.7.2`) | Experimental / raw-device profile |
 | API source of truth | Yes (`n1/src/routes/storage_routes.rs`) | Yes (`n1-arc/src/routes/storage_routes.rs`) |
 | `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw devices / loopback files |
@@ -132,7 +132,7 @@ Registry base URL example:
 Startup note:
 - if `registry.env` is missing in the current working directory, the Registry creates a template automatically and then stops on the first required unset value
 
-Registry routes available in `0.3.0`:
+Registry routes available in `0.4.0`:
 - `GET /health`
 - `GET /v1/ws`
 - `POST /v1/admin/bootstrap`

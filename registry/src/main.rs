@@ -34,15 +34,16 @@ use models::{
     AdminStatsResponse, AdminUserListResponse, AdminUserSummary, ArchiveObjectsRequest,
     BootstrapAdminRequest, BootstrapAdminResponse, BulkObjectKeysRequest,
     BulkObjectMutationResponse, BulkObjectSelectionResponse, CreateUserRequest, CreateUserResponse,
-    DeleteObjectQuery, DeleteUserResponse, DisableTwoFactorRequest, EnableTwoFactorRequest,
-    FinalizeObjectRequest, FragmentListResponse, FragmentStateRequest, LinkFragmentRequest,
-    LinkFragmentResponse, ListObjectsQuery, ListObjectsResponse, LoginRequest, LoginResponse,
-    ObjectDeleteResponse, ObjectMutationResponse, ObjectStateRequest, ObjectStatsQuery,
-    ObjectStatsResponse, RefreshRequest, RefreshResponse, RegisterObjectRequest,
-    RenameRegistryObjectRequest, ResolveObjectQuery, SetupTwoFactorRequest, SignupRequest,
-    SignupResponse, StorageSessionRequest, StorageSessionResponse, SuggestObjectsQuery,
-    SuggestObjectsResponse, TwoFactorSetupResponse, UpdateCredentialsRequest, UpdateEmailRequest,
-    UpdatePasswordRequest, UpdateQuotaRequest, UserMutationResponse, UserRecord,
+    DeleteObjectQuery, DeleteObjectVersionRequest, DeleteObjectVersionResponse, DeleteUserResponse,
+    DisableTwoFactorRequest, EnableTwoFactorRequest, FinalizeObjectRequest, FragmentListResponse,
+    FragmentStateRequest, LinkFragmentRequest, LinkFragmentResponse, ListObjectsQuery,
+    ListObjectsResponse, LoginRequest, LoginResponse, ObjectDeleteResponse, ObjectMutationResponse,
+    ObjectStateRequest, ObjectStatsQuery, ObjectStatsResponse, RefreshRequest, RefreshResponse,
+    RegisterObjectRequest, RenameRegistryObjectRequest, ResolveObjectQuery, SetupTwoFactorRequest,
+    SignupRequest, SignupResponse, StorageSessionRequest, StorageSessionResponse,
+    SuggestObjectsQuery, SuggestObjectsResponse, TwoFactorSetupResponse, UpdateCredentialsRequest,
+    UpdateEmailRequest, UpdatePasswordRequest, UpdateQuotaRequest, UserMutationResponse,
+    UserRecord,
 };
 use realtime::{
     DeleteObjectNotice, DeleteUserNotice, FragmentNotice, RegistryRealtimeHub,
@@ -389,6 +390,7 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/objects/pending", delete(cancel_pending_object))
         .route("/v1/objects/suggest", get(suggest_objects))
         .route("/v1/objects/rename", post(rename_object))
+        .route("/v1/objects/version/delete", post(delete_object_version))
         .route("/v1/objects/trash/bulk", post(trash_objects_bulk))
         .route("/v1/objects/trash", post(trash_object))
         .route("/v1/objects/recover/bulk", post(recover_objects_bulk))
@@ -1621,6 +1623,66 @@ async fn delete_object(
     }))
 }
 
+async fn delete_object_version(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DeleteObjectVersionRequest>,
+) -> Result<Json<DeleteObjectVersionResponse>, RegistryError> {
+    validate_fragment_and_key(&req.fragment, &req.object_key)?;
+    if req.version_id.trim().is_empty() {
+        return Err(RegistryError::bad_request("version_id is required"));
+    }
+
+    let _write_guard = state.write_gate.lock().await;
+    let fragment = req.fragment.clone();
+    let object_key = req.object_key.clone();
+    let version_id = req.version_id.trim().to_string();
+    let claims = claims_from_headers(&headers, &state.auth)?;
+    let binding = state
+        .db
+        .get_fragment_binding(claims.sub.clone(), fragment.clone())
+        .await?
+        .ok_or_else(|| {
+            RegistryError::conflict(
+                "fragment is not linked to a storage backend yet; link it first",
+            )
+        })?;
+
+    let engine_state = state
+        .broker
+        .delete_object_version_and_read_state(&binding, &object_key, &version_id)
+        .await?;
+    let (object, user) = state
+        .db
+        .sync_object_from_engine(
+            claims.sub,
+            fragment.clone(),
+            object_key.clone(),
+            engine_state.current,
+            engine_state.versions,
+        )
+        .await?;
+
+    publish_owner_event(
+        &state,
+        &user.uid,
+        RegistryRealtimePayload::FileDeleted(DeleteObjectNotice {
+            fragment: fragment.clone(),
+            object_key,
+            version_id: Some(version_id),
+        }),
+    );
+    publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
+
+    Ok(Json(DeleteObjectVersionResponse {
+        removed: true,
+        object_removed: object.is_none(),
+        object,
+        quota_limit_bytes: user.quota_limit_bytes,
+        quota_used_bytes: user.quota_used_bytes,
+    }))
+}
+
 async fn cancel_pending_object(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1692,9 +1754,92 @@ async fn resolve_object(
     let claims = claims_from_headers(&headers, &state.auth)?;
     let object = state
         .db
-        .resolve_object(claims.sub, query.fragment, query.object_key)
+        .resolve_object(
+            claims.sub.clone(),
+            query.fragment.clone(),
+            query.object_key.clone(),
+        )
         .await?
         .ok_or_else(|| RegistryError::not_found("object not found"))?;
+
+    let binding = match state
+        .db
+        .get_fragment_binding(claims.sub.clone(), query.fragment.clone())
+        .await?
+    {
+        Some(binding) => binding,
+        None => return Ok(Json(object)),
+    };
+
+    match state
+        .broker
+        .read_current_object_state(&binding, &query.object_key, false)
+        .await
+    {
+        Ok(engine_state) => {
+            if engine_state.current.is_none() {
+                let _write_guard = state.write_gate.lock().await;
+                let (_synced_object, user) = state
+                    .db
+                    .sync_object_from_engine(
+                        claims.sub,
+                        query.fragment.clone(),
+                        query.object_key.clone(),
+                        None,
+                        Vec::new(),
+                    )
+                    .await?;
+                publish_owner_invalidation(
+                    &state,
+                    &user.uid,
+                    Some(query.fragment.clone()),
+                    "objects",
+                );
+                return Err(RegistryError::not_found("object not found"));
+            }
+
+            if let Some(current) = engine_state.current.as_ref() {
+                let same_head = current.version_id == object.version_id
+                    && current.object_size_bytes == object.object_size_bytes
+                    && current.content_type == object.content_type;
+                if !same_head {
+                    let _write_guard = state.write_gate.lock().await;
+                    let full_state = state
+                        .broker
+                        .read_current_object_state(&binding, &query.object_key, true)
+                        .await?;
+                    let (synced_object, user) = state
+                        .db
+                        .sync_object_from_engine(
+                            claims.sub,
+                            query.fragment.clone(),
+                            query.object_key.clone(),
+                            full_state.current,
+                            full_state.versions,
+                        )
+                        .await?;
+                    publish_owner_invalidation(
+                        &state,
+                        &user.uid,
+                        Some(query.fragment.clone()),
+                        "objects",
+                    );
+                    return synced_object
+                        .map(Json)
+                        .ok_or_else(|| RegistryError::not_found("object not found"));
+                }
+            }
+        }
+        Err(err) => {
+            warn!(
+                fragment = %query.fragment,
+                object_key = %query.object_key,
+                "registry resolve self-check skipped: {}",
+                err
+            );
+        }
+    }
+
     Ok(Json(object))
 }
 
@@ -1796,21 +1941,38 @@ fn init_tracing() {
 mod tests {
     use super::*;
     use axum::body::Body;
+    use axum::extract::Path as StubPath;
     use axum::http::header::{
         ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
         ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD, CONTENT_DISPOSITION,
         CONTENT_TYPE, ORIGIN,
     };
     use axum::http::{Request, StatusCode};
-    use axum::routing::post;
+    use axum::routing::{delete, get, post};
     use futures_util::StreamExt;
     use reqwest::Client;
     use serde_json::{Value, json};
+    use std::collections::HashMap;
+    use tokio::sync::Mutex as TokioMutex;
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
     use tower::ServiceExt;
 
     type TestWsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+    #[derive(Debug, Clone)]
+    struct StubVersion {
+        version_id: String,
+        object_size_bytes: i64,
+        content_type: String,
+        created_at: i64,
+    }
+
+    #[derive(Debug, Clone)]
+    struct StubObjectState {
+        current_visible: bool,
+        versions: Vec<StubVersion>,
+    }
 
     async fn spawn_storage_stub(token: &'static str) -> String {
         spawn_storage_stub_with_auth_status(token, StatusCode::OK).await
@@ -1884,6 +2046,120 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve stub");
+        });
+        format!("http://{}", addr)
+    }
+
+    async fn spawn_storage_version_stub(initial: HashMap<String, StubObjectState>) -> String {
+        let state = Arc::new(TokioMutex::new(initial));
+        let meta_state = state.clone();
+        let versions_state = state.clone();
+        let delete_state = state.clone();
+
+        let app = Router::new()
+            .route(
+                "/authenticate/fragment",
+                post(|Json(_payload): Json<Value>| async move {
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "access_token": "version-stub-token",
+                            "token_type": "Bearer",
+                            "expires_in": 600
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v4/fragment/meta/{*object_key}",
+                get(move |StubPath(object_key): StubPath<String>| {
+                    let meta_state = meta_state.clone();
+                    async move {
+                        let state = meta_state.lock().await;
+                        let response = state.get(&object_key).and_then(|entry| {
+                            if !entry.current_visible {
+                                return None;
+                            }
+                            entry.versions.first().map(|version| {
+                                json!({
+                                    "fragment": "fragment-a",
+                                    "object_key": object_key,
+                                    "version_id": version.version_id,
+                                    "content_type": version.content_type,
+                                    "total_size_bytes": version.object_size_bytes,
+                                    "created_at": version.created_at
+                                })
+                            })
+                        });
+                        response
+                            .map(|payload| (StatusCode::OK, Json(payload)).into_response())
+                            .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+                    }
+                }),
+            )
+            .route(
+                "/v4/fragment/versions/{*object_key}",
+                get(move |StubPath(object_key): StubPath<String>| {
+                    let versions_state = versions_state.clone();
+                    async move {
+                        let state = versions_state.lock().await;
+                        let payload = state
+                            .get(&object_key)
+                            .map(|entry| {
+                                entry
+                                    .versions
+                                    .iter()
+                                    .map(|version| {
+                                        json!({
+                                            "fragment": "fragment-a",
+                                            "object_key": object_key,
+                                            "version_id": version.version_id,
+                                            "content_type": version.content_type,
+                                            "total_size_bytes": version.object_size_bytes,
+                                            "created_at": version.created_at
+                                        })
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        Json(payload)
+                    }
+                }),
+            )
+            .route(
+                "/v4/fragment/version/delete/{version_id}/{*object_key}",
+                delete(
+                    move |StubPath((version_id, object_key)): StubPath<(String, String)>| {
+                        let delete_state = delete_state.clone();
+                        async move {
+                            let mut state = delete_state.lock().await;
+                            let Some(entry) = state.get_mut(&object_key) else {
+                                return StatusCode::NOT_FOUND;
+                            };
+                            let removed_index = entry
+                                .versions
+                                .iter()
+                                .position(|version| version.version_id == version_id);
+                            let Some(index) = removed_index else {
+                                return StatusCode::NOT_FOUND;
+                            };
+                            entry.versions.remove(index);
+                            if index == 0 || entry.versions.is_empty() {
+                                entry.current_visible = false;
+                            }
+                            StatusCode::NO_CONTENT
+                        }
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind version storage stub");
+        let addr = listener.local_addr().expect("version storage local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve version storage stub");
         });
         format!("http://{}", addr)
     }
@@ -3172,6 +3448,211 @@ mod tests {
                 "01HARCHIVEVERSION000000000000001\tpatients/a/one.dcm".to_string(),
                 "01HARCHIVEVERSION000000000000002\tpatients/a/two.dcm".to_string()
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_current_object_version_removes_registry_ghost_head() {
+        let mut objects = HashMap::new();
+        objects.insert(
+            "mhw.mp4".to_string(),
+            StubObjectState {
+                current_visible: true,
+                versions: vec![
+                    StubVersion {
+                        version_id: "01MHW0000000000000000000002".to_string(),
+                        object_size_bytes: 2048,
+                        content_type: "video/mp4".to_string(),
+                        created_at: 200,
+                    },
+                    StubVersion {
+                        version_id: "01MHW0000000000000000000001".to_string(),
+                        object_size_bytes: 1024,
+                        content_type: "video/mp4".to_string(),
+                        created_at: 100,
+                    },
+                ],
+            },
+        );
+
+        let single_url = spawn_storage_version_stub(objects).await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, access_token) = test_state(single_url, multi_url).await;
+        let owner = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                owner.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment");
+        state
+            .db
+            .finalize_object(
+                owner.uid.clone(),
+                "fragment-a".to_string(),
+                "mhw.mp4".to_string(),
+                "01MHW0000000000000000000001".to_string(),
+                1024,
+                Some("video/mp4".to_string()),
+            )
+            .await
+            .expect("finalize version one");
+        state
+            .db
+            .finalize_object(
+                owner.uid,
+                "fragment-a".to_string(),
+                "mhw.mp4".to_string(),
+                "01MHW0000000000000000000002".to_string(),
+                2048,
+                Some("video/mp4".to_string()),
+            )
+            .await
+            .expect("finalize version two");
+
+        let app = build_router(state);
+        let delete_req = Request::builder()
+            .method("POST")
+            .uri("/v1/objects/version/delete")
+            .header("authorization", format!("Bearer {}", access_token))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "fragment": "fragment-a",
+                    "object_key": "mhw.mp4",
+                    "version_id": "01MHW0000000000000000000002"
+                }))
+                .expect("serialize version delete request"),
+            ))
+            .expect("version delete request");
+        let delete_resp = app
+            .clone()
+            .oneshot(delete_req)
+            .await
+            .expect("version delete response");
+        assert_eq!(delete_resp.status(), StatusCode::OK);
+        let delete_body = axum::body::to_bytes(delete_resp.into_body(), usize::MAX)
+            .await
+            .expect("read version delete body");
+        let delete_json: Value =
+            serde_json::from_slice(&delete_body).expect("parse version delete body");
+        assert_eq!(delete_json["removed"], true);
+        assert_eq!(delete_json["object_removed"], true);
+        assert!(delete_json["object"].is_null());
+
+        let resolve_req = Request::builder()
+            .method("GET")
+            .uri("/v1/objects/resolve?fragment=fragment-a&object_key=mhw.mp4")
+            .header("authorization", format!("Bearer {}", access_token))
+            .body(Body::empty())
+            .expect("resolve request");
+        let resolve_resp = app
+            .clone()
+            .oneshot(resolve_req)
+            .await
+            .expect("resolve response");
+        assert_eq!(resolve_resp.status(), StatusCode::NOT_FOUND);
+
+        let list_req = Request::builder()
+            .method("GET")
+            .uri("/v1/objects?fragment=fragment-a")
+            .header("authorization", format!("Bearer {}", access_token))
+            .body(Body::empty())
+            .expect("list request");
+        let list_resp = app.oneshot(list_req).await.expect("list response");
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_body = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+            .await
+            .expect("read list body");
+        let list_json: Value = serde_json::from_slice(&list_body).expect("parse list body");
+        assert_eq!(
+            list_json["objects"]
+                .as_array()
+                .expect("objects array")
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_object_self_heals_stale_registry_ghost() {
+        let single_url = spawn_storage_version_stub(HashMap::new()).await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, access_token) = test_state(single_url, multi_url).await;
+        let owner = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                owner.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment");
+        state
+            .db
+            .finalize_object(
+                owner.uid,
+                "fragment-a".to_string(),
+                "ghost.mp4".to_string(),
+                "01GHOST0000000000000000000001".to_string(),
+                4096,
+                Some("video/mp4".to_string()),
+            )
+            .await
+            .expect("seed ghost object");
+
+        let app = build_router(state);
+        let resolve_req = Request::builder()
+            .method("GET")
+            .uri("/v1/objects/resolve?fragment=fragment-a&object_key=ghost.mp4")
+            .header("authorization", format!("Bearer {}", access_token))
+            .body(Body::empty())
+            .expect("resolve request");
+        let resolve_resp = app
+            .clone()
+            .oneshot(resolve_req)
+            .await
+            .expect("resolve response");
+        assert_eq!(resolve_resp.status(), StatusCode::NOT_FOUND);
+
+        let list_req = Request::builder()
+            .method("GET")
+            .uri("/v1/objects?fragment=fragment-a")
+            .header("authorization", format!("Bearer {}", access_token))
+            .body(Body::empty())
+            .expect("list request");
+        let list_resp = app.oneshot(list_req).await.expect("list response");
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_body = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+            .await
+            .expect("read list body");
+        let list_json: Value = serde_json::from_slice(&list_body).expect("parse list body");
+        assert_eq!(
+            list_json["objects"]
+                .as_array()
+                .expect("objects array")
+                .len(),
+            0
         );
     }
 }

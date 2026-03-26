@@ -30,6 +30,9 @@ const OBJECT_VERSIONS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new
 const OBJECT_VERSION_STATES_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("object_version_states");
 const SESSIONS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("sessions");
+const SESSION_PARTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("session_parts");
+const SESSION_PART_RECEIPTS_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("session_part_receipts");
 const PARTITION_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("partition_meta");
 const PARTITION_META_KEY: &str = "__partition__";
 
@@ -63,6 +66,43 @@ struct VersionStateRecord {
 struct PartitionMeta {
     committed_generation: u64,
     updated_at: i64,
+}
+
+struct VersionUpsertMutation {
+    partition_meta: PartitionMeta,
+    row_key: String,
+    version_bytes: Vec<u8>,
+    state_bytes: Vec<u8>,
+    head_key: String,
+    head_bytes: Option<Vec<u8>>,
+}
+
+struct SessionRemoveMutation {
+    partition_meta: PartitionMeta,
+    expected_parts: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionRow {
+    manifest: UploadSessionManifest,
+    reservation: Option<ReservationReceipt>,
+    last_activity_at: i64,
+    finalized_at: Option<i64>,
+    aborted_at: Option<i64>,
+}
+
+impl SessionRow {
+    fn into_state(self) -> IndexSessionState {
+        IndexSessionState {
+            manifest: self.manifest,
+            reservation: self.reservation,
+            parts: Default::default(),
+            part_receipts: Default::default(),
+            last_activity_at: self.last_activity_at,
+            finalized_at: self.finalized_at,
+            aborted_at: self.aborted_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,6 +420,14 @@ fn parse_version_key(row_key: &str) -> Option<(&str, &str)> {
     row_key.split_once(VERSION_KEY_SEPARATOR_STR)
 }
 
+fn session_part_row_prefix(version_id: &str) -> String {
+    format!("{}{}", version_id, VERSION_KEY_SEPARATOR)
+}
+
+fn session_part_row_key(version_id: &str, part_index: u64) -> String {
+    format!("{}{:020}", session_part_row_prefix(version_id), part_index)
+}
+
 fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, AppError> {
     rmp_serde::to_vec(value)
         .map_err(|e| AppError::InternalServerError(format!("indexdb serialize: {}", e)))
@@ -576,6 +624,88 @@ fn replicate_owner_partition_db(fragment: &str, route: &IndexRoute) -> Result<()
             warn!(
                 "indexdb follower catch-up failed for {} -> {}: {}",
                 owner_path.display(),
+                replica_path.display(),
+                err
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn replicate_session_mutation(
+    fragment: &str,
+    route: &IndexRoute,
+    version_id: &str,
+    row: &SessionRow,
+    part: Option<&PartMetadata>,
+    receipt: Option<&SessionPartReceipt>,
+    partition_meta: &PartitionMeta,
+) -> Result<(), AppError> {
+    if route.roots.len() <= 1 {
+        return Ok(());
+    }
+
+    for replica_root in route.roots.iter().skip(1) {
+        let replica_path = db_path(replica_root, fragment, route.partition_id);
+        let replica_db = match get_or_open_db(&replica_path) {
+            Ok(db) => db,
+            Err(err) => {
+                warn!(
+                    "session replica open failed for {}: {}",
+                    replica_path.display(),
+                    err
+                );
+                continue;
+            }
+        };
+        if let Err(err) = apply_session_mutation_replica_exact(
+            &replica_db,
+            version_id,
+            row,
+            part,
+            receipt,
+            partition_meta,
+        ) {
+            warn!(
+                "session replica update failed for {} on {}: {}",
+                version_id,
+                replica_path.display(),
+                err
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn replicate_session_remove(
+    fragment: &str,
+    route: &IndexRoute,
+    version_id: &str,
+    mutation: &SessionRemoveMutation,
+) -> Result<(), AppError> {
+    if route.roots.len() <= 1 {
+        return Ok(());
+    }
+
+    for replica_root in route.roots.iter().skip(1) {
+        let replica_path = db_path(replica_root, fragment, route.partition_id);
+        let replica_db = match get_or_open_db(&replica_path) {
+            Ok(db) => db,
+            Err(err) => {
+                warn!(
+                    "session replica open failed for {}: {}",
+                    replica_path.display(),
+                    err
+                );
+                continue;
+            }
+        };
+        if let Err(err) = apply_session_remove_replica_exact(&replica_db, version_id, mutation) {
+            warn!(
+                "session replica removal failed for {} on {}: {}",
+                version_id,
                 replica_path.display(),
                 err
             );
@@ -937,11 +1067,11 @@ fn write_version_on_db(
     db: &Database,
     metadata: &ObjectMetadata,
     state: ObjectState,
-) -> Result<(), AppError> {
+) -> Result<VersionUpsertMutation, AppError> {
     let write_txn = db
         .begin_write()
         .map_err(|e| map_indexdb_error("begin_write", e))?;
-    {
+    let mutation = {
         let mut partition_meta = write_txn
             .open_table(PARTITION_META_TABLE)
             .map_err(|e| map_indexdb_error("open partition_meta", e))?;
@@ -979,7 +1109,8 @@ fn write_version_on_db(
             .map_err(|e| map_indexdb_error("head get", e))?
             .map(|value| deserialize::<HeadRecord>(value.value()))
             .transpose()?;
-        if candidate_should_replace_head(current_head.as_ref(), metadata) {
+        let head_key = canonical_key(&metadata.object_key);
+        let head_bytes = if candidate_should_replace_head(current_head.as_ref(), metadata) {
             let head = HeadRecord::from_metadata(
                 metadata,
                 state,
@@ -987,12 +1118,26 @@ fn write_version_on_db(
                 now,
             );
             write_head_exact(&mut heads, &head)?;
+            Some(serialize(&head)?)
+        } else {
+            None
+        };
+        VersionUpsertMutation {
+            partition_meta: PartitionMeta {
+                committed_generation,
+                updated_at: now,
+            },
+            row_key,
+            version_bytes: bytes,
+            state_bytes: visibility_bytes,
+            head_key,
+            head_bytes,
         }
-    }
+    };
     write_txn
         .commit()
         .map_err(|e| map_indexdb_error("commit version write", e))?;
-    Ok(())
+    Ok(mutation)
 }
 
 fn change_version_state_on_db(
@@ -1001,11 +1146,11 @@ fn change_version_state_on_db(
     version_id: &str,
     target_state: ObjectState,
     expected_state: Option<ObjectState>,
-) -> Result<Option<ObjectMetadata>, AppError> {
+) -> Result<Option<(ObjectMetadata, PartitionMeta)>, AppError> {
     let write_txn = db
         .begin_write()
         .map_err(|e| map_indexdb_error("begin_write", e))?;
-    let record = {
+    let (record, partition_meta) = {
         let mut partition_meta = write_txn
             .open_table(PARTITION_META_TABLE)
             .map_err(|e| map_indexdb_error("open partition_meta", e))?;
@@ -1082,12 +1227,18 @@ fn change_version_state_on_db(
             let restored_head = HeadRecord::from_metadata(&metadata, ObjectState::Live, 1, now);
             write_head_exact(&mut heads, &restored_head)?;
         }
-        metadata
+        (
+            metadata,
+            PartitionMeta {
+                committed_generation,
+                updated_at: now,
+            },
+        )
     };
     write_txn
         .commit()
         .map_err(|e| map_indexdb_error("commit version state write", e))?;
-    Ok(Some(record))
+    Ok(Some((record, partition_meta)))
 }
 
 fn delete_version_on_db(
@@ -1095,11 +1246,11 @@ fn delete_version_on_db(
     object_key: &str,
     version_id: &str,
     expected_state: Option<ObjectState>,
-) -> Result<Option<ObjectMetadata>, AppError> {
+) -> Result<Option<(ObjectMetadata, PartitionMeta)>, AppError> {
     let write_txn = db
         .begin_write()
         .map_err(|e| map_indexdb_error("begin_write", e))?;
-    let record = {
+    let (record, partition_meta) = {
         let mut partition_meta = write_txn
             .open_table(PARTITION_META_TABLE)
             .map_err(|e| map_indexdb_error("open partition_meta", e))?;
@@ -1113,7 +1264,7 @@ fn delete_version_on_db(
             .open_table(OBJECT_VERSION_STATES_TABLE)
             .map_err(|e| map_indexdb_error("open object_version_states", e))?;
         let now = Utc::now().timestamp();
-        let _committed_generation = next_partition_generation(&mut partition_meta, now)?;
+        let committed_generation = next_partition_generation(&mut partition_meta, now)?;
         let row_key = version_row_key(object_key, version_id);
         let current_head = heads
             .get(canonical_key(object_key).as_str())
@@ -1162,12 +1313,18 @@ fn delete_version_on_db(
             );
             write_head_exact(&mut heads, &tombstone)?;
         }
-        removed_record
+        (
+            removed_record,
+            PartitionMeta {
+                committed_generation,
+                updated_at: now,
+            },
+        )
     };
     write_txn
         .commit()
         .map_err(|e| map_indexdb_error("commit version delete", e))?;
-    Ok(Some(record.metadata))
+    Ok(Some((record.metadata, partition_meta)))
 }
 
 fn bulk_rewrite_key_state_on_db(
@@ -1175,11 +1332,11 @@ fn bulk_rewrite_key_state_on_db(
     object_key: &str,
     from_state: ObjectState,
     to_state: ObjectState,
-) -> Result<Vec<String>, AppError> {
+) -> Result<Option<(Vec<String>, PartitionMeta)>, AppError> {
     let write_txn = db
         .begin_write()
         .map_err(|e| map_indexdb_error("begin_write", e))?;
-    let touched = {
+    let (touched, partition_meta) = {
         let mut partition_meta = write_txn
             .open_table(PARTITION_META_TABLE)
             .map_err(|e| map_indexdb_error("open partition_meta", e))?;
@@ -1228,7 +1385,7 @@ fn bulk_rewrite_key_state_on_db(
         }
 
         if touched.is_empty() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
         for (row_key, bytes) in &rewrites {
@@ -1250,24 +1407,30 @@ fn bulk_rewrite_key_state_on_db(
                 )));
             }
         }
-        touched
+        (
+            touched,
+            PartitionMeta {
+                committed_generation,
+                updated_at: now,
+            },
+        )
     };
     write_txn
         .commit()
         .map_err(|e| map_indexdb_error("commit bulk version rewrite", e))?;
     let mut touched = touched;
     touched.sort_by(|left, right| compare_version_id_recency(left, right));
-    Ok(touched)
+    Ok(Some((touched, partition_meta)))
 }
 
 fn delete_all_versions_for_key_on_db(
     db: &Database,
     object_key: &str,
-) -> Result<Vec<String>, AppError> {
+) -> Result<Option<(Vec<String>, PartitionMeta)>, AppError> {
     let write_txn = db
         .begin_write()
         .map_err(|e| map_indexdb_error("begin_write", e))?;
-    let version_ids = {
+    let (version_ids, partition_meta) = {
         let mut partition_meta = write_txn
             .open_table(PARTITION_META_TABLE)
             .map_err(|e| map_indexdb_error("open partition_meta", e))?;
@@ -1281,7 +1444,7 @@ fn delete_all_versions_for_key_on_db(
             .open_table(OBJECT_VERSION_STATES_TABLE)
             .map_err(|e| map_indexdb_error("open object_version_states", e))?;
         let now = Utc::now().timestamp();
-        let _committed_generation = next_partition_generation(&mut partition_meta, now)?;
+        let committed_generation = next_partition_generation(&mut partition_meta, now)?;
         let current_head = heads
             .get(canonical_key(object_key).as_str())
             .map_err(|e| map_indexdb_error("head get", e))?
@@ -1311,7 +1474,7 @@ fn delete_all_versions_for_key_on_db(
             row_keys.push(row_key.to_string());
         }
         if row_keys.is_empty() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         for row_key in &row_keys {
             let _ = versions
@@ -1339,58 +1502,47 @@ fn delete_all_versions_for_key_on_db(
             latest_removed.as_ref(),
         );
         write_head_exact(&mut heads, &tombstone)?;
-        version_ids
+        (
+            version_ids,
+            PartitionMeta {
+                committed_generation,
+                updated_at: now,
+            },
+        )
     };
     write_txn
         .commit()
         .map_err(|e| map_indexdb_error("commit delete object", e))?;
     let mut version_ids = version_ids;
     version_ids.sort_by(|left, right| compare_version_id_recency(left, right));
-    Ok(version_ids)
+    Ok(Some((version_ids, partition_meta)))
 }
 
-fn session_receipts_from_state(
-    state: &IndexSessionState,
-    manifest: &UploadSessionManifest,
-) -> Vec<Option<SessionPartReceipt>> {
-    let mut receipts = vec![None; manifest.expected_parts as usize];
-    for (part_index, receipt) in &state.part_receipts {
-        if *part_index >= manifest.expected_parts {
-            continue;
-        }
-        receipts[*part_index as usize] = Some(receipt.clone());
+fn receipt_from_part(part: &PartMetadata) -> Result<SessionPartReceipt, AppError> {
+    let mut shard_checksums = Vec::with_capacity(part.shards.len());
+    for shard in &part.shards {
+        let checksum = u32::from_str_radix(shard.checksum.trim(), 16).unwrap_or_default();
+        shard_checksums.push(checksum);
     }
-    for (part_index, part) in &state.parts {
-        if *part_index >= manifest.expected_parts {
-            continue;
-        }
-        if receipts[*part_index as usize].is_some() {
-            continue;
-        }
-        let mut shard_checksums = Vec::with_capacity(part.shards.len());
-        for shard in &part.shards {
-            let checksum = u32::from_str_radix(shard.checksum.trim(), 16).unwrap_or_default();
-            shard_checksums.push(checksum);
-        }
-        let checksum = part
-            .checksum
-            .as_deref()
-            .and_then(|value| u32::from_str_radix(value.trim(), 16).ok());
-        receipts[*part_index as usize] = Some(SessionPartReceipt {
-            part_index: *part_index,
-            size_bytes: part.size_bytes,
-            created_at: part.created_at,
-            checksum,
-            shard_checksums,
-        });
-    }
-    receipts
+    let checksum = part
+        .checksum
+        .as_deref()
+        .and_then(|value| u32::from_str_radix(value.trim(), 16).ok());
+    Ok(SessionPartReceipt {
+        part_index: part.part_index,
+        size_bytes: part.size_bytes,
+        shard_size_bytes: part
+            .shards
+            .first()
+            .map(|shard| shard.size_bytes)
+            .unwrap_or(0),
+        created_at: part.created_at,
+        checksum,
+        shard_checksums,
+    })
 }
 
-fn load_session_exact(
-    db: &Database,
-    version_id: &str,
-) -> Result<Option<IndexSessionState>, AppError> {
+fn load_session_row_exact(db: &Database, version_id: &str) -> Result<Option<SessionRow>, AppError> {
     let read_txn = db
         .begin_read()
         .map_err(|e| map_indexdb_error("begin_read", e))?;
@@ -1408,10 +1560,84 @@ fn load_session_exact(
     deserialize(value.value()).map(Some)
 }
 
-fn write_session_exact(
+fn load_session_exact(
     db: &Database,
     version_id: &str,
-    state: &IndexSessionState,
+) -> Result<Option<IndexSessionState>, AppError> {
+    Ok(load_session_row_exact(db, version_id)?.map(SessionRow::into_state))
+}
+
+fn write_partition_meta_exact(
+    meta: &mut indexdb::Table<&str, &[u8]>,
+    partition_meta: &PartitionMeta,
+) -> Result<(), AppError> {
+    let bytes = serialize(partition_meta)?;
+    meta.insert(PARTITION_META_KEY, bytes.as_slice())
+        .map_err(|e| map_indexdb_error("partition_meta insert", e))?;
+    Ok(())
+}
+
+fn write_session_mutation_exact(
+    db: &Database,
+    version_id: &str,
+    row: &SessionRow,
+    part: Option<&PartMetadata>,
+    receipt: Option<&SessionPartReceipt>,
+) -> Result<PartitionMeta, AppError> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| map_indexdb_error("begin_write", e))?;
+    let now = Utc::now().timestamp();
+    let partition_meta = {
+        let mut meta = write_txn
+            .open_table(PARTITION_META_TABLE)
+            .map_err(|e| map_indexdb_error("open partition_meta", e))?;
+        let committed_generation = next_partition_generation(&mut meta, now)?;
+        let mut sessions = write_txn
+            .open_table(SESSIONS_TABLE)
+            .map_err(|e| map_indexdb_error("open sessions", e))?;
+        let mut parts = write_txn
+            .open_table(SESSION_PARTS_TABLE)
+            .map_err(|e| map_indexdb_error("open session_parts", e))?;
+        let mut receipts = write_txn
+            .open_table(SESSION_PART_RECEIPTS_TABLE)
+            .map_err(|e| map_indexdb_error("open session_part_receipts", e))?;
+        let row_bytes = serialize(row)?;
+        sessions
+            .insert(version_id, row_bytes.as_slice())
+            .map_err(|e| map_indexdb_error("session insert", e))?;
+        if let Some(part) = part {
+            let part_bytes = serialize(part)?;
+            let part_key = session_part_row_key(version_id, part.part_index);
+            parts
+                .insert(part_key.as_str(), part_bytes.as_slice())
+                .map_err(|e| map_indexdb_error("session_part insert", e))?;
+        }
+        if let Some(receipt) = receipt {
+            let receipt_bytes = serialize(receipt)?;
+            let receipt_key = session_part_row_key(version_id, receipt.part_index);
+            receipts
+                .insert(receipt_key.as_str(), receipt_bytes.as_slice())
+                .map_err(|e| map_indexdb_error("session_part_receipt insert", e))?;
+        }
+        PartitionMeta {
+            committed_generation,
+            updated_at: now,
+        }
+    };
+    write_txn
+        .commit()
+        .map_err(|e| map_indexdb_error("commit session mutation", e))?;
+    Ok(partition_meta)
+}
+
+fn apply_session_mutation_replica_exact(
+    db: &Database,
+    version_id: &str,
+    row: &SessionRow,
+    part: Option<&PartMetadata>,
+    receipt: Option<&SessionPartReceipt>,
+    partition_meta: &PartitionMeta,
 ) -> Result<(), AppError> {
     let write_txn = db
         .begin_write()
@@ -1420,42 +1646,747 @@ fn write_session_exact(
         let mut meta = write_txn
             .open_table(PARTITION_META_TABLE)
             .map_err(|e| map_indexdb_error("open partition_meta", e))?;
-        let mut table = write_txn
+        let mut sessions = write_txn
             .open_table(SESSIONS_TABLE)
             .map_err(|e| map_indexdb_error("open sessions", e))?;
-        let _ = next_partition_generation(&mut meta, Utc::now().timestamp())?;
-        let bytes = serialize(state)?;
-        table
-            .insert(version_id, bytes.as_slice())
+        let mut parts = write_txn
+            .open_table(SESSION_PARTS_TABLE)
+            .map_err(|e| map_indexdb_error("open session_parts", e))?;
+        let mut receipts = write_txn
+            .open_table(SESSION_PART_RECEIPTS_TABLE)
+            .map_err(|e| map_indexdb_error("open session_part_receipts", e))?;
+        write_partition_meta_exact(&mut meta, partition_meta)?;
+        let row_bytes = serialize(row)?;
+        sessions
+            .insert(version_id, row_bytes.as_slice())
             .map_err(|e| map_indexdb_error("session insert", e))?;
+        if let Some(part) = part {
+            let part_bytes = serialize(part)?;
+            let part_key = session_part_row_key(version_id, part.part_index);
+            parts
+                .insert(part_key.as_str(), part_bytes.as_slice())
+                .map_err(|e| map_indexdb_error("session_part insert", e))?;
+        }
+        if let Some(receipt) = receipt {
+            let receipt_bytes = serialize(receipt)?;
+            let receipt_key = session_part_row_key(version_id, receipt.part_index);
+            receipts
+                .insert(receipt_key.as_str(), receipt_bytes.as_slice())
+                .map_err(|e| map_indexdb_error("session_part_receipt insert", e))?;
+        }
     }
     write_txn
         .commit()
-        .map_err(|e| map_indexdb_error("commit session write", e))?;
+        .map_err(|e| map_indexdb_error("commit session replica write", e))?;
     Ok(())
 }
 
-fn remove_session_exact(db: &Database, version_id: &str) -> Result<bool, AppError> {
+fn list_prefixed_keys(
+    db: &Database,
+    table_def: TableDefinition<&str, &[u8]>,
+    prefix: &str,
+) -> Result<Vec<String>, AppError> {
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| map_indexdb_error("begin_read", e))?;
+    let table = match read_txn.open_table(table_def) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(err) => return Err(map_indexdb_error("open prefixed table", err)),
+    };
+    let mut iter = table
+        .range(prefix..)
+        .map_err(|e| map_indexdb_error("prefixed range", e))?;
+    let mut keys = Vec::new();
+    while let Some(entry) = iter.next() {
+        let (key, _value) = entry.map_err(|e| map_indexdb_error("prefixed range next", e))?;
+        let key = key.value();
+        if !key.starts_with(prefix) {
+            break;
+        }
+        keys.push(key.to_string());
+    }
+    Ok(keys)
+}
+
+fn load_session_receipts_exact(
+    db: &Database,
+    version_id: &str,
+) -> Result<Vec<SessionPartReceipt>, AppError> {
+    let prefix = session_part_row_prefix(version_id);
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| map_indexdb_error("begin_read", e))?;
+    let table = match read_txn.open_table(SESSION_PART_RECEIPTS_TABLE) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(err) => return Err(map_indexdb_error("open session_part_receipts", err)),
+    };
+    let mut iter = table
+        .range(prefix.as_str()..)
+        .map_err(|e| map_indexdb_error("session_part_receipt range", e))?;
+    let mut receipts = Vec::new();
+    while let Some(entry) = iter.next() {
+        let (key, value) =
+            entry.map_err(|e| map_indexdb_error("session_part_receipt range next", e))?;
+        let key = key.value();
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        receipts.push(deserialize(value.value())?);
+    }
+    receipts.sort_by_key(|receipt: &SessionPartReceipt| receipt.part_index);
+    Ok(receipts)
+}
+
+fn load_session_parts_exact(
+    db: &Database,
+    version_id: &str,
+) -> Result<Vec<PartMetadata>, AppError> {
+    let prefix = session_part_row_prefix(version_id);
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| map_indexdb_error("begin_read", e))?;
+    let table = match read_txn.open_table(SESSION_PARTS_TABLE) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(err) => return Err(map_indexdb_error("open session_parts", err)),
+    };
+    let mut iter = table
+        .range(prefix.as_str()..)
+        .map_err(|e| map_indexdb_error("session_part range", e))?;
+    let mut parts = Vec::new();
+    while let Some(entry) = iter.next() {
+        let (key, value) = entry.map_err(|e| map_indexdb_error("session_part range next", e))?;
+        let key = key.value();
+        if !key.starts_with(&prefix) {
+            break;
+        }
+        parts.push(deserialize(value.value())?);
+    }
+    parts.sort_by_key(|part: &PartMetadata| part.part_index);
+    Ok(parts)
+}
+
+fn remove_session_exact(
+    db: &Database,
+    version_id: &str,
+) -> Result<Option<SessionRemoveMutation>, AppError> {
+    let row = load_session_row_exact(db, version_id)?;
+    let expected_parts = row.as_ref().map(|row| row.manifest.expected_parts);
+    let has_row = row.is_some();
+    let (part_keys, receipt_keys) = if expected_parts.is_some() {
+        (Vec::new(), Vec::new())
+    } else {
+        let part_prefix = session_part_row_prefix(version_id);
+        (
+            list_prefixed_keys(db, SESSION_PARTS_TABLE, &part_prefix)?,
+            list_prefixed_keys(db, SESSION_PART_RECEIPTS_TABLE, &part_prefix)?,
+        )
+    };
+    if !has_row && part_keys.is_empty() && receipt_keys.is_empty() {
+        return Ok(None);
+    }
+
     let write_txn = db
         .begin_write()
         .map_err(|e| map_indexdb_error("begin_write", e))?;
-    let removed = {
+    let mutation = {
         let mut meta = write_txn
             .open_table(PARTITION_META_TABLE)
             .map_err(|e| map_indexdb_error("open partition_meta", e))?;
-        let mut table = write_txn
+        let mut sessions = write_txn
             .open_table(SESSIONS_TABLE)
             .map_err(|e| map_indexdb_error("open sessions", e))?;
-        let _ = next_partition_generation(&mut meta, Utc::now().timestamp())?;
-        table
+        let mut parts = write_txn
+            .open_table(SESSION_PARTS_TABLE)
+            .map_err(|e| map_indexdb_error("open session_parts", e))?;
+        let mut receipts = write_txn
+            .open_table(SESSION_PART_RECEIPTS_TABLE)
+            .map_err(|e| map_indexdb_error("open session_part_receipts", e))?;
+        let now = Utc::now().timestamp();
+        let committed_generation = next_partition_generation(&mut meta, now)?;
+        let _ = sessions
             .remove(version_id)
-            .map_err(|e| map_indexdb_error("session remove", e))?
-            .is_some()
+            .map_err(|e| map_indexdb_error("session remove", e))?;
+        if let Some(expected_parts) = expected_parts {
+            for part_index in 0..expected_parts {
+                let part_key = session_part_row_key(version_id, part_index);
+                let _ = parts
+                    .remove(part_key.as_str())
+                    .map_err(|e| map_indexdb_error("session_part remove", e))?;
+                let _ = receipts
+                    .remove(part_key.as_str())
+                    .map_err(|e| map_indexdb_error("session_part_receipt remove", e))?;
+            }
+        } else {
+            for key in part_keys {
+                let _ = parts
+                    .remove(key.as_str())
+                    .map_err(|e| map_indexdb_error("session_part remove", e))?;
+            }
+            for key in receipt_keys {
+                let _ = receipts
+                    .remove(key.as_str())
+                    .map_err(|e| map_indexdb_error("session_part_receipt remove", e))?;
+            }
+        }
+        SessionRemoveMutation {
+            partition_meta: PartitionMeta {
+                committed_generation,
+                updated_at: now,
+            },
+            expected_parts,
+        }
     };
     write_txn
         .commit()
         .map_err(|e| map_indexdb_error("commit session remove", e))?;
-    Ok(removed)
+    Ok(Some(mutation))
+}
+
+fn apply_session_remove_replica_exact(
+    db: &Database,
+    version_id: &str,
+    mutation: &SessionRemoveMutation,
+) -> Result<(), AppError> {
+    let (part_keys, receipt_keys) = if mutation.expected_parts.is_some() {
+        (Vec::new(), Vec::new())
+    } else {
+        let part_prefix = session_part_row_prefix(version_id);
+        (
+            list_prefixed_keys(db, SESSION_PARTS_TABLE, &part_prefix)?,
+            list_prefixed_keys(db, SESSION_PART_RECEIPTS_TABLE, &part_prefix)?,
+        )
+    };
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| map_indexdb_error("begin_write", e))?;
+    {
+        let mut meta = write_txn
+            .open_table(PARTITION_META_TABLE)
+            .map_err(|e| map_indexdb_error("open partition_meta", e))?;
+        let mut sessions = write_txn
+            .open_table(SESSIONS_TABLE)
+            .map_err(|e| map_indexdb_error("open sessions", e))?;
+        let mut parts = write_txn
+            .open_table(SESSION_PARTS_TABLE)
+            .map_err(|e| map_indexdb_error("open session_parts", e))?;
+        let mut receipts = write_txn
+            .open_table(SESSION_PART_RECEIPTS_TABLE)
+            .map_err(|e| map_indexdb_error("open session_part_receipts", e))?;
+        write_partition_meta_exact(&mut meta, &mutation.partition_meta)?;
+        let _ = sessions
+            .remove(version_id)
+            .map_err(|e| map_indexdb_error("session remove", e))?;
+        if let Some(expected_parts) = mutation.expected_parts {
+            for part_index in 0..expected_parts {
+                let part_key = session_part_row_key(version_id, part_index);
+                let _ = parts
+                    .remove(part_key.as_str())
+                    .map_err(|e| map_indexdb_error("session_part remove", e))?;
+                let _ = receipts
+                    .remove(part_key.as_str())
+                    .map_err(|e| map_indexdb_error("session_part_receipt remove", e))?;
+            }
+        } else {
+            for key in part_keys {
+                let _ = parts
+                    .remove(key.as_str())
+                    .map_err(|e| map_indexdb_error("session_part remove", e))?;
+            }
+            for key in receipt_keys {
+                let _ = receipts
+                    .remove(key.as_str())
+                    .map_err(|e| map_indexdb_error("session_part_receipt remove", e))?;
+            }
+        }
+    }
+    write_txn
+        .commit()
+        .map_err(|e| map_indexdb_error("commit session replica remove", e))?;
+    Ok(())
+}
+
+fn replicate_object_mutation<F>(
+    fragment: &str,
+    route: &IndexRoute,
+    context: &str,
+    apply: F,
+) -> Result<(), AppError>
+where
+    F: Fn(&Database) -> Result<(), AppError>,
+{
+    if route.roots.len() <= 1 {
+        return Ok(());
+    }
+
+    let owner_path = owner_db_path(route, fragment);
+    if !owner_path.exists() {
+        return Err(AppError::InternalServerError(format!(
+            "owner partition db missing after {}: {}",
+            context,
+            owner_path.display()
+        )));
+    }
+
+    for replica_root in route.roots.iter().skip(1) {
+        let replica_path = db_path(replica_root, fragment, route.partition_id);
+        let apply_result = {
+            let replica_db = match get_or_open_db(&replica_path) {
+                Ok(db) => db,
+                Err(err) => {
+                    warn!(
+                        "object replica open failed for {} during {}: {}",
+                        replica_path.display(),
+                        context,
+                        err
+                    );
+                    evict_cached_db(&replica_path);
+                    if let Err(copy_err) = atomic_copy_db_file(&owner_path, &replica_path) {
+                        warn!(
+                            "object replica catch-up failed for {} -> {} after open failure: {}",
+                            owner_path.display(),
+                            replica_path.display(),
+                            copy_err
+                        );
+                    }
+                    continue;
+                }
+            };
+            let result = apply(&replica_db);
+            drop(replica_db);
+            result
+        };
+
+        if let Err(err) = apply_result {
+            warn!(
+                "object replica logical apply failed for {} during {}: {}; falling back to owner copy",
+                replica_path.display(),
+                context,
+                err
+            );
+            evict_cached_db(&replica_path);
+            if let Err(copy_err) = atomic_copy_db_file(&owner_path, &replica_path) {
+                warn!(
+                    "object replica catch-up failed for {} -> {}: {}",
+                    owner_path.display(),
+                    replica_path.display(),
+                    copy_err
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_write_version_replica_exact(
+    db: &Database,
+    mutation: &VersionUpsertMutation,
+) -> Result<(), AppError> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| map_indexdb_error("begin_write", e))?;
+    {
+        let mut meta = write_txn
+            .open_table(PARTITION_META_TABLE)
+            .map_err(|e| map_indexdb_error("open partition_meta", e))?;
+        let mut heads = write_txn
+            .open_table(OBJECT_HEADS_TABLE)
+            .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut versions = write_txn
+            .open_table(OBJECT_VERSIONS_TABLE)
+            .map_err(|e| map_indexdb_error("open object_versions", e))?;
+        let mut states = write_txn
+            .open_table(OBJECT_VERSION_STATES_TABLE)
+            .map_err(|e| map_indexdb_error("open object_version_states", e))?;
+        write_partition_meta_exact(&mut meta, &mutation.partition_meta)?;
+        versions
+            .insert(mutation.row_key.as_str(), mutation.version_bytes.as_slice())
+            .map_err(|e| map_indexdb_error("version insert", e))?;
+        states
+            .insert(mutation.row_key.as_str(), mutation.state_bytes.as_slice())
+            .map_err(|e| map_indexdb_error("version_state insert", e))?;
+        if let Some(head_bytes) = mutation.head_bytes.as_ref() {
+            heads
+                .insert(mutation.head_key.as_str(), head_bytes.as_slice())
+                .map_err(|e| map_indexdb_error("head insert", e))?;
+        }
+    }
+    write_txn
+        .commit()
+        .map_err(|e| map_indexdb_error("commit version replica write", e))?;
+    Ok(())
+}
+
+fn apply_change_version_state_replica_exact(
+    db: &Database,
+    object_key: &str,
+    version_id: &str,
+    target_state: ObjectState,
+    expected_state: Option<ObjectState>,
+    partition_meta: &PartitionMeta,
+) -> Result<(), AppError> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| map_indexdb_error("begin_write", e))?;
+    {
+        let mut meta = write_txn
+            .open_table(PARTITION_META_TABLE)
+            .map_err(|e| map_indexdb_error("open partition_meta", e))?;
+        let mut heads = write_txn
+            .open_table(OBJECT_HEADS_TABLE)
+            .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let versions = write_txn
+            .open_table(OBJECT_VERSIONS_TABLE)
+            .map_err(|e| map_indexdb_error("open object_versions", e))?;
+        let mut states = write_txn
+            .open_table(OBJECT_VERSION_STATES_TABLE)
+            .map_err(|e| map_indexdb_error("open object_version_states", e))?;
+        write_partition_meta_exact(&mut meta, partition_meta)?;
+        let row_key = version_row_key(object_key, version_id);
+        let current_head = heads
+            .get(canonical_key(object_key).as_str())
+            .map_err(|e| map_indexdb_error("head get", e))?
+            .map(|value| deserialize::<HeadRecord>(value.value()))
+            .transpose()?;
+        let metadata = {
+            let Some(existing) = versions
+                .get(row_key.as_str())
+                .map_err(|e| map_indexdb_error("version get", e))?
+            else {
+                return Err(AppError::InternalServerError(format!(
+                    "replica missing version row for {}:{}",
+                    object_key, version_id
+                )));
+            };
+            deserialize::<VersionRecord>(existing.value())?.metadata
+        };
+        let existing_state = {
+            let Some(existing) = states
+                .get(row_key.as_str())
+                .map_err(|e| map_indexdb_error("version_state get", e))?
+            else {
+                return Err(AppError::InternalServerError(format!(
+                    "replica missing version state for {}:{}",
+                    object_key, version_id
+                )));
+            };
+            deserialize::<VersionStateRecord>(existing.value())?
+        };
+        if let Some(expected) = expected_state {
+            if existing_state.state != expected {
+                return Err(AppError::InternalServerError(format!(
+                    "replica version state mismatch for {}:{} expected {:?} got {:?}",
+                    object_key, version_id, expected, existing_state.state
+                )));
+            }
+        }
+        let next_state = VersionStateRecord {
+            state: target_state,
+            updated_at: partition_meta.updated_at,
+            generation: partition_meta.committed_generation,
+        };
+        let bytes = serialize(&next_state)?;
+        states
+            .insert(row_key.as_str(), bytes.as_slice())
+            .map_err(|e| map_indexdb_error("version_state insert", e))?;
+        if let Some(head) = current_head.as_ref() {
+            if head.version_id == version_id {
+                let next_head = HeadRecord::from_metadata(
+                    &metadata,
+                    target_state,
+                    next_head_generation(current_head.as_ref()),
+                    partition_meta.updated_at,
+                );
+                write_head_exact(&mut heads, &next_head)?;
+            } else if target_state == ObjectState::Live
+                && expected_state == Some(ObjectState::Trash)
+            {
+                let restored_head = HeadRecord::from_metadata(
+                    &metadata,
+                    ObjectState::Live,
+                    next_head_generation(current_head.as_ref()),
+                    partition_meta.updated_at,
+                );
+                write_head_exact(&mut heads, &restored_head)?;
+            }
+        } else if target_state == ObjectState::Live && expected_state == Some(ObjectState::Trash) {
+            let restored_head = HeadRecord::from_metadata(
+                &metadata,
+                ObjectState::Live,
+                1,
+                partition_meta.updated_at,
+            );
+            write_head_exact(&mut heads, &restored_head)?;
+        }
+    }
+    write_txn
+        .commit()
+        .map_err(|e| map_indexdb_error("commit version state replica write", e))?;
+    Ok(())
+}
+
+fn apply_delete_version_replica_exact(
+    db: &Database,
+    object_key: &str,
+    version_id: &str,
+    expected_state: Option<ObjectState>,
+    partition_meta: &PartitionMeta,
+) -> Result<(), AppError> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| map_indexdb_error("begin_write", e))?;
+    {
+        let mut meta = write_txn
+            .open_table(PARTITION_META_TABLE)
+            .map_err(|e| map_indexdb_error("open partition_meta", e))?;
+        let mut heads = write_txn
+            .open_table(OBJECT_HEADS_TABLE)
+            .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut versions = write_txn
+            .open_table(OBJECT_VERSIONS_TABLE)
+            .map_err(|e| map_indexdb_error("open object_versions", e))?;
+        let mut states = write_txn
+            .open_table(OBJECT_VERSION_STATES_TABLE)
+            .map_err(|e| map_indexdb_error("open object_version_states", e))?;
+        write_partition_meta_exact(&mut meta, partition_meta)?;
+        let row_key = version_row_key(object_key, version_id);
+        let current_head = heads
+            .get(canonical_key(object_key).as_str())
+            .map_err(|e| map_indexdb_error("head get", e))?
+            .map(|value| deserialize::<HeadRecord>(value.value()))
+            .transpose()?;
+        let existing_state = states
+            .get(row_key.as_str())
+            .map_err(|e| map_indexdb_error("version_state get", e))?
+            .map(|value| deserialize::<VersionStateRecord>(value.value()))
+            .transpose()?
+            .ok_or_else(|| {
+                AppError::InternalServerError(format!(
+                    "replica missing version state for {}:{}",
+                    object_key, version_id
+                ))
+            })?;
+        if expected_state.is_some() && expected_state != Some(existing_state.state) {
+            return Err(AppError::InternalServerError(format!(
+                "replica version state mismatch for {}:{} expected {:?} got {:?}",
+                object_key, version_id, expected_state, existing_state.state
+            )));
+        }
+        let removed_record = {
+            let Some(existing_value) = versions
+                .remove(row_key.as_str())
+                .map_err(|e| map_indexdb_error("version remove", e))?
+            else {
+                return Err(AppError::InternalServerError(format!(
+                    "replica missing version row for {}:{}",
+                    object_key, version_id
+                )));
+            };
+            deserialize::<VersionRecord>(existing_value.value())?
+        };
+        let _ = states
+            .remove(row_key.as_str())
+            .map_err(|e| map_indexdb_error("version_state remove", e))?;
+        if current_head
+            .as_ref()
+            .map(|head| head.version_id == version_id)
+            .unwrap_or(false)
+        {
+            let fragment = current_head
+                .as_ref()
+                .map(|head| head.fragment.as_str())
+                .unwrap_or(removed_record.metadata.fragment.as_str());
+            let tombstone = HeadRecord::tombstone(
+                fragment,
+                object_key,
+                next_head_generation(current_head.as_ref()),
+                partition_meta.updated_at,
+                current_head.as_ref(),
+                Some(&removed_record.metadata),
+            );
+            write_head_exact(&mut heads, &tombstone)?;
+        }
+    }
+    write_txn
+        .commit()
+        .map_err(|e| map_indexdb_error("commit version replica delete", e))?;
+    Ok(())
+}
+
+fn apply_bulk_rewrite_key_state_replica_exact(
+    db: &Database,
+    object_key: &str,
+    from_state: ObjectState,
+    to_state: ObjectState,
+    partition_meta: &PartitionMeta,
+) -> Result<(), AppError> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| map_indexdb_error("begin_write", e))?;
+    {
+        let mut meta = write_txn
+            .open_table(PARTITION_META_TABLE)
+            .map_err(|e| map_indexdb_error("open partition_meta", e))?;
+        let mut heads = write_txn
+            .open_table(OBJECT_HEADS_TABLE)
+            .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut states = write_txn
+            .open_table(OBJECT_VERSION_STATES_TABLE)
+            .map_err(|e| map_indexdb_error("open object_version_states", e))?;
+        write_partition_meta_exact(&mut meta, partition_meta)?;
+        let current_head = heads
+            .get(canonical_key(object_key).as_str())
+            .map_err(|e| map_indexdb_error("head get", e))?
+            .map(|value| deserialize::<HeadRecord>(value.value()))
+            .transpose()?;
+        let prefix = version_row_prefix(object_key);
+        let mut iter = states
+            .range(prefix.as_str()..)
+            .map_err(|e| map_indexdb_error("version_state range", e))?;
+        let mut rewrites = Vec::new();
+        while let Some(entry) = iter.next() {
+            let (row_key, value) =
+                entry.map_err(|e| map_indexdb_error("version_state range next", e))?;
+            let row_key = row_key.value();
+            if !row_key.starts_with(&prefix) {
+                break;
+            }
+            let record: VersionStateRecord = deserialize(value.value())?;
+            if record.state != from_state {
+                continue;
+            }
+            rewrites.push((
+                row_key.to_string(),
+                serialize(&VersionStateRecord {
+                    state: to_state,
+                    updated_at: partition_meta.updated_at,
+                    generation: partition_meta.committed_generation,
+                })?,
+            ));
+        }
+
+        if rewrites.is_empty() {
+            return Err(AppError::InternalServerError(format!(
+                "replica missing rewritable versions for {} from {:?} to {:?}",
+                object_key, from_state, to_state
+            )));
+        }
+
+        for (row_key, bytes) in &rewrites {
+            states
+                .insert(row_key.as_str(), bytes.as_slice())
+                .map_err(|e| map_indexdb_error("bulk version_state rewrite", e))?;
+        }
+        match current_head.as_ref() {
+            Some(head) if head.state == from_state => {
+                let next_head = head.with_state(
+                    to_state,
+                    next_head_generation(current_head.as_ref()),
+                    partition_meta.updated_at,
+                );
+                write_head_exact(&mut heads, &next_head)?;
+            }
+            Some(_) => {}
+            None => {
+                return Err(AppError::InternalServerError(format!(
+                    "replica missing head for {} while rewriting version visibility",
+                    canonical_key(object_key)
+                )));
+            }
+        }
+    }
+    write_txn
+        .commit()
+        .map_err(|e| map_indexdb_error("commit bulk version replica rewrite", e))?;
+    Ok(())
+}
+
+fn apply_delete_all_versions_for_key_replica_exact(
+    db: &Database,
+    object_key: &str,
+    partition_meta: &PartitionMeta,
+) -> Result<(), AppError> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| map_indexdb_error("begin_write", e))?;
+    {
+        let mut meta = write_txn
+            .open_table(PARTITION_META_TABLE)
+            .map_err(|e| map_indexdb_error("open partition_meta", e))?;
+        let mut heads = write_txn
+            .open_table(OBJECT_HEADS_TABLE)
+            .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut versions = write_txn
+            .open_table(OBJECT_VERSIONS_TABLE)
+            .map_err(|e| map_indexdb_error("open object_versions", e))?;
+        let mut states = write_txn
+            .open_table(OBJECT_VERSION_STATES_TABLE)
+            .map_err(|e| map_indexdb_error("open object_version_states", e))?;
+        write_partition_meta_exact(&mut meta, partition_meta)?;
+        let current_head = heads
+            .get(canonical_key(object_key).as_str())
+            .map_err(|e| map_indexdb_error("head get", e))?
+            .map(|value| deserialize::<HeadRecord>(value.value()))
+            .transpose()?;
+        let prefix = version_row_prefix(object_key);
+        let mut iter = versions
+            .range(prefix.as_str()..)
+            .map_err(|e| map_indexdb_error("version range", e))?;
+        let mut row_keys = Vec::new();
+        let mut latest_removed: Option<ObjectMetadata> = None;
+        while let Some(entry) = iter.next() {
+            let (row_key, value) = entry.map_err(|e| map_indexdb_error("version range next", e))?;
+            let row_key = row_key.value();
+            if !row_key.starts_with(&prefix) {
+                break;
+            }
+            let record: VersionRecord = deserialize(value.value())?;
+            match &latest_removed {
+                Some(current) if !metadata_is_newer(&record.metadata, current) => {}
+                _ => latest_removed = Some(record.metadata.clone()),
+            }
+            row_keys.push(row_key.to_string());
+        }
+        if row_keys.is_empty() {
+            return Err(AppError::InternalServerError(format!(
+                "replica missing versions for object key {}",
+                object_key
+            )));
+        }
+        for row_key in &row_keys {
+            let _ = versions
+                .remove(row_key.as_str())
+                .map_err(|e| map_indexdb_error("version remove", e))?;
+            let _ = states
+                .remove(row_key.as_str())
+                .map_err(|e| map_indexdb_error("version_state remove", e))?;
+        }
+        let fragment = current_head
+            .as_ref()
+            .map(|head| head.fragment.as_str())
+            .or_else(|| {
+                latest_removed
+                    .as_ref()
+                    .map(|metadata| metadata.fragment.as_str())
+            })
+            .unwrap_or_default();
+        let tombstone = HeadRecord::tombstone(
+            fragment,
+            object_key,
+            next_head_generation(current_head.as_ref()),
+            partition_meta.updated_at,
+            current_head.as_ref(),
+            latest_removed.as_ref(),
+        );
+        write_head_exact(&mut heads, &tombstone)?;
+    }
+    write_txn
+        .commit()
+        .map_err(|e| map_indexdb_error("commit delete object replica", e))?;
+    Ok(())
 }
 
 fn max_string(left: Option<&str>, right: Option<&str>) -> Option<String> {
@@ -1802,11 +2733,9 @@ pub fn open_session(
     reservation: Option<ReservationReceipt>,
 ) -> Result<(), AppError> {
     let route = session_route(&manifest.fragment, &manifest.version_id)?;
-    let state = IndexSessionState {
+    let row = SessionRow {
         manifest: manifest.clone(),
         reservation,
-        parts: Default::default(),
-        part_receipts: Default::default(),
         last_activity_at: manifest.created_at,
         finalized_at: None,
         aborted_at: None,
@@ -1814,8 +2743,17 @@ pub fn open_session(
     let owner_path = owner_db_path(&route, &manifest.fragment);
     with_partition_commit_lock(&owner_path, || {
         let owner_db = get_or_open_db(&owner_path)?;
-        write_session_exact(&owner_db, &manifest.version_id, &state)?;
-        replicate_owner_partition_db(&manifest.fragment, &route)?;
+        let partition_meta =
+            write_session_mutation_exact(&owner_db, &manifest.version_id, &row, None, None)?;
+        replicate_session_mutation(
+            &manifest.fragment,
+            &route,
+            &manifest.version_id,
+            &row,
+            None,
+            None,
+            &partition_meta,
+        )?;
         Ok(())
     })
 }
@@ -1829,13 +2767,22 @@ pub fn commit_session_part(
     let owner_path = owner_db_path(&route, fragment);
     with_partition_commit_lock(&owner_path, || {
         let owner_db = get_or_open_db(&owner_path)?;
-        let Some(mut state) = load_session_exact(&owner_db, version_id)? else {
+        let Some(mut row) = load_session_row_exact(&owner_db, version_id)? else {
             return Ok(());
         };
-        state.parts.insert(part.part_index, part.clone());
-        state.last_activity_at = part.created_at.max(state.last_activity_at);
-        write_session_exact(&owner_db, version_id, &state)?;
-        replicate_owner_partition_db(fragment, &route)?;
+        row.last_activity_at = part.created_at.max(row.last_activity_at);
+        let receipt = receipt_from_part(part)?;
+        let partition_meta =
+            write_session_mutation_exact(&owner_db, version_id, &row, Some(part), Some(&receipt))?;
+        replicate_session_mutation(
+            fragment,
+            &route,
+            version_id,
+            &row,
+            Some(part),
+            Some(&receipt),
+            &partition_meta,
+        )?;
         Ok(())
     })
 }
@@ -1849,15 +2796,21 @@ pub fn commit_session_part_receipt(
     let owner_path = owner_db_path(&route, fragment);
     with_partition_commit_lock(&owner_path, || {
         let owner_db = get_or_open_db(&owner_path)?;
-        let Some(mut state) = load_session_exact(&owner_db, version_id)? else {
+        let Some(mut row) = load_session_row_exact(&owner_db, version_id)? else {
             return Ok(());
         };
-        state
-            .part_receipts
-            .insert(receipt.part_index, receipt.clone());
-        state.last_activity_at = receipt.created_at.max(state.last_activity_at);
-        write_session_exact(&owner_db, version_id, &state)?;
-        replicate_owner_partition_db(fragment, &route)?;
+        row.last_activity_at = receipt.created_at.max(row.last_activity_at);
+        let partition_meta =
+            write_session_mutation_exact(&owner_db, version_id, &row, None, Some(receipt))?;
+        replicate_session_mutation(
+            fragment,
+            &route,
+            version_id,
+            &row,
+            None,
+            Some(receipt),
+            &partition_meta,
+        )?;
         Ok(())
     })
 }
@@ -1878,10 +2831,26 @@ pub fn read_session_part(
     version_id: &str,
     part_index: u64,
 ) -> Result<Option<PartMetadata>, AppError> {
-    let Some(state) = load_session(fragment, version_id)? else {
+    let route = session_route(fragment, version_id)?;
+    let Some(db) = open_route_db_for_read(fragment, &route)? else {
         return Ok(None);
     };
-    Ok(state.parts.get(&part_index).cloned())
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| map_indexdb_error("begin_read", e))?;
+    let table = match read_txn.open_table(SESSION_PARTS_TABLE) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(err) => return Err(map_indexdb_error("open session_parts", err)),
+    };
+    let part_key = session_part_row_key(version_id, part_index);
+    let Some(value) = table
+        .get(part_key.as_str())
+        .map_err(|e| map_indexdb_error("session_part get", e))?
+    else {
+        return Ok(None);
+    };
+    deserialize(value.value()).map(Some)
 }
 
 pub fn load_session_part_receipts(
@@ -1889,10 +2858,27 @@ pub fn load_session_part_receipts(
     version_id: &str,
     manifest: &UploadSessionManifest,
 ) -> Result<Option<Vec<Option<SessionPartReceipt>>>, AppError> {
-    let Some(state) = load_session(fragment, version_id)? else {
+    let route = session_route(fragment, version_id)?;
+    let Some(db) = open_route_db_for_read(fragment, &route)? else {
         return Ok(None);
     };
-    let receipts = session_receipts_from_state(&state, manifest);
+    let mut receipts = vec![None; manifest.expected_parts as usize];
+    for receipt in load_session_receipts_exact(&db, version_id)? {
+        let part_index = receipt.part_index;
+        if part_index >= manifest.expected_parts {
+            continue;
+        }
+        receipts[part_index as usize] = Some(receipt);
+    }
+    for part in load_session_parts_exact(&db, version_id)? {
+        if part.part_index >= manifest.expected_parts {
+            continue;
+        }
+        if receipts[part.part_index as usize].is_some() {
+            continue;
+        }
+        receipts[part.part_index as usize] = Some(receipt_from_part(&part)?);
+    }
     if receipts.iter().all(|entry| entry.is_none()) {
         return Ok(None);
     }
@@ -1907,11 +2893,11 @@ pub fn remove_session(fragment: &str, version_id: &str) -> Result<bool, AppError
             return Ok(false);
         }
         let owner_db = get_or_open_db(&owner_path)?;
-        let removed = remove_session_exact(&owner_db, version_id)?;
-        if removed {
-            replicate_owner_partition_db(fragment, &route)?;
-        }
-        Ok(removed)
+        let Some(mutation) = remove_session_exact(&owner_db, version_id)? else {
+            return Ok(false);
+        };
+        replicate_session_remove(fragment, &route, version_id, &mutation)?;
+        Ok(true)
     })
 }
 
@@ -1934,9 +2920,9 @@ pub fn list_active_sessions(fragment: &str) -> Result<Vec<IndexSessionState>, Ap
             .map_err(|e| map_indexdb_error("session iter", e))?;
         while let Some(entry) = iter.next() {
             let (_key, value) = entry.map_err(|e| map_indexdb_error("session iter next", e))?;
-            let state: IndexSessionState = deserialize(value.value())?;
-            if state.finalized_at.is_none() && state.aborted_at.is_none() {
-                out.push(state);
+            let row: SessionRow = deserialize(value.value())?;
+            if row.finalized_at.is_none() && row.aborted_at.is_none() {
+                out.push(row.into_state());
             }
         }
     }
@@ -1955,8 +2941,10 @@ fn write_version_on_owner(metadata: &ObjectMetadata, state: ObjectState) -> Resu
     let owner_path = owner_db_path(&route, &metadata.fragment);
     with_partition_commit_lock(&owner_path, || {
         let owner_db = get_or_open_db(&owner_path)?;
-        write_version_on_db(&owner_db, metadata, state)?;
-        replicate_owner_partition_db(&metadata.fragment, &route)?;
+        let mutation = write_version_on_db(&owner_db, metadata, state)?;
+        replicate_object_mutation(&metadata.fragment, &route, "version upsert", |replica_db| {
+            apply_write_version_replica_exact(replica_db, &mutation)
+        })?;
         Ok(())
     })
 }
@@ -2202,10 +3190,24 @@ pub fn move_object_version_to_trash_with_metadata(
             ObjectState::Trash,
             Some(ObjectState::Live),
         )?;
-        if moved.is_some() {
-            replicate_owner_partition_db(fragment, &route)?;
+        if let Some((_metadata, partition_meta)) = moved.as_ref() {
+            replicate_object_mutation(
+                fragment,
+                &route,
+                "move live version to trash",
+                |replica_db| {
+                    apply_change_version_state_replica_exact(
+                        replica_db,
+                        object_key,
+                        version_id,
+                        ObjectState::Trash,
+                        Some(ObjectState::Live),
+                        partition_meta,
+                    )
+                },
+            )?;
         }
-        Ok(moved)
+        Ok(moved.map(|(metadata, _)| metadata))
     })
 }
 
@@ -2228,10 +3230,24 @@ pub fn restore_object_version_from_trash_with_metadata(
             ObjectState::Live,
             Some(ObjectState::Trash),
         )?;
-        if restored.is_some() {
-            replicate_owner_partition_db(fragment, &route)?;
+        if let Some((_metadata, partition_meta)) = restored.as_ref() {
+            replicate_object_mutation(
+                fragment,
+                &route,
+                "restore trash version to live",
+                |replica_db| {
+                    apply_change_version_state_replica_exact(
+                        replica_db,
+                        object_key,
+                        version_id,
+                        ObjectState::Live,
+                        Some(ObjectState::Trash),
+                        partition_meta,
+                    )
+                },
+            )?;
         }
-        Ok(restored)
+        Ok(restored.map(|(metadata, _)| metadata))
     })
 }
 
@@ -2252,11 +3268,19 @@ pub fn move_object_to_trash_fast(
             ObjectState::Live,
             ObjectState::Trash,
         )?;
-        if moved.is_empty() {
-            Ok(None)
+        if let Some((version_ids, partition_meta)) = moved {
+            replicate_object_mutation(fragment, &route, "move object to trash", |replica_db| {
+                apply_bulk_rewrite_key_state_replica_exact(
+                    replica_db,
+                    object_key,
+                    ObjectState::Live,
+                    ObjectState::Trash,
+                    &partition_meta,
+                )
+            })?;
+            Ok(Some(version_ids))
         } else {
-            replicate_owner_partition_db(fragment, &route)?;
-            Ok(Some(moved))
+            Ok(None)
         }
     })
 }
@@ -2278,11 +3302,24 @@ pub fn restore_object_from_trash_fast(
             ObjectState::Trash,
             ObjectState::Live,
         )?;
-        if restored.is_empty() {
-            Ok(None)
+        if let Some((version_ids, partition_meta)) = restored {
+            replicate_object_mutation(
+                fragment,
+                &route,
+                "restore object from trash",
+                |replica_db| {
+                    apply_bulk_rewrite_key_state_replica_exact(
+                        replica_db,
+                        object_key,
+                        ObjectState::Trash,
+                        ObjectState::Live,
+                        &partition_meta,
+                    )
+                },
+            )?;
+            Ok(Some(version_ids))
         } else {
-            replicate_owner_partition_db(fragment, &route)?;
-            Ok(Some(restored))
+            Ok(None)
         }
     })
 }
@@ -2299,11 +3336,17 @@ pub fn delete_object_fast(
         }
         let owner_db = get_or_open_db(&owner_path)?;
         let deleted = delete_all_versions_for_key_on_db(&owner_db, object_key)?;
-        if deleted.is_empty() {
-            Ok(None)
+        if let Some((version_ids, partition_meta)) = deleted {
+            replicate_object_mutation(fragment, &route, "delete object", |replica_db| {
+                apply_delete_all_versions_for_key_replica_exact(
+                    replica_db,
+                    object_key,
+                    &partition_meta,
+                )
+            })?;
+            Ok(Some(version_ids))
         } else {
-            replicate_owner_partition_db(fragment, &route)?;
-            Ok(Some(deleted))
+            Ok(None)
         }
     })
 }
@@ -2322,11 +3365,21 @@ pub fn delete_live_version(
         let owner_db = get_or_open_db(&owner_path)?;
         let deleted =
             delete_version_on_db(&owner_db, object_key, version_id, Some(ObjectState::Live))?
-                .is_some();
-        if deleted {
-            replicate_owner_partition_db(fragment, &route)?;
+                .map(|(_metadata, partition_meta)| partition_meta);
+        if let Some(partition_meta) = deleted {
+            replicate_object_mutation(fragment, &route, "delete live version", |replica_db| {
+                apply_delete_version_replica_exact(
+                    replica_db,
+                    object_key,
+                    version_id,
+                    Some(ObjectState::Live),
+                    &partition_meta,
+                )
+            })?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(deleted)
     })
 }
 
@@ -2344,11 +3397,21 @@ pub fn delete_trash_version(
         let owner_db = get_or_open_db(&owner_path)?;
         let deleted =
             delete_version_on_db(&owner_db, object_key, version_id, Some(ObjectState::Trash))?
-                .is_some();
-        if deleted {
-            replicate_owner_partition_db(fragment, &route)?;
+                .map(|(_metadata, partition_meta)| partition_meta);
+        if let Some(partition_meta) = deleted {
+            replicate_object_mutation(fragment, &route, "delete trash version", |replica_db| {
+                apply_delete_version_replica_exact(
+                    replica_db,
+                    object_key,
+                    version_id,
+                    Some(ObjectState::Trash),
+                    &partition_meta,
+                )
+            })?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(deleted)
     })
 }
 
@@ -2390,4 +3453,52 @@ pub fn clear_fragment_trash(fragment: &str, object_key: Option<&str>) -> Result<
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct SessionLayoutStats {
+    pub session_row_bytes: usize,
+    pub receipt_rows: usize,
+    pub part_rows: usize,
+    pub owner_db_bytes: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn session_layout_stats(
+    fragment: &str,
+    version_id: &str,
+) -> Result<Option<SessionLayoutStats>, AppError> {
+    let route = session_route(fragment, version_id)?;
+    let owner_path = owner_db_path(&route, fragment);
+    if !owner_path.exists() {
+        return Ok(None);
+    }
+    let db = get_or_open_db(&owner_path)?;
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| map_indexdb_error("begin_read", e))?;
+    let sessions = match read_txn.open_table(SESSIONS_TABLE) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(err) => return Err(map_indexdb_error("open sessions", err)),
+    };
+    let Some(value) = sessions
+        .get(version_id)
+        .map_err(|e| map_indexdb_error("session get", e))?
+    else {
+        return Ok(None);
+    };
+    let prefix = session_part_row_prefix(version_id);
+    let receipt_rows = list_prefixed_keys(&db, SESSION_PART_RECEIPTS_TABLE, &prefix)?.len();
+    let part_rows = list_prefixed_keys(&db, SESSION_PARTS_TABLE, &prefix)?.len();
+    let owner_db_bytes = fs::metadata(owner_path)
+        .map_err(|e| AppError::Io(e, "session layout stats metadata".into()))?
+        .len();
+    Ok(Some(SessionLayoutStats {
+        session_row_bytes: value.value().len(),
+        receipt_rows,
+        part_rows,
+        owner_db_bytes,
+    }))
 }
