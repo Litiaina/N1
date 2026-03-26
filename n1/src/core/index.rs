@@ -249,6 +249,12 @@ pub async fn list_fragment_trash_objects(fragment: &str) -> Result<Vec<ObjectMet
     indexdb_store::list_trash_heads(fragment)
 }
 
+pub async fn list_fragment_object_keys_with_trash_versions(
+    fragment: &str,
+) -> Result<Vec<String>, AppError> {
+    indexdb_store::list_object_keys_with_trash_versions(fragment)
+}
+
 pub async fn list_fragment_live_objects(fragment: &str) -> Result<Vec<ObjectMetadata>, AppError> {
     indexdb_store::list_live_heads(fragment)
 }
@@ -368,6 +374,13 @@ pub async fn restore_object_from_trash_fast(
     object_key: &str,
 ) -> Result<Option<Vec<String>>, AppError> {
     indexdb_store::restore_object_from_trash_fast(fragment, object_key)
+}
+
+pub async fn delete_all_trash_versions_for_key(
+    fragment: &str,
+    object_key: &str,
+) -> Result<Option<Vec<String>>, AppError> {
+    indexdb_store::delete_all_trash_versions_for_key(fragment, object_key)
 }
 
 pub async fn delete_object_fast(

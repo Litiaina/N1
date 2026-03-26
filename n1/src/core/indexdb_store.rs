@@ -12,9 +12,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, Mutex};
 use tracing::warn;
 use ulid::Ulid;
@@ -36,10 +37,12 @@ const SESSION_PART_RECEIPTS_TABLE: TableDefinition<&str, &[u8]> =
 const PARTITION_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("partition_meta");
 const PARTITION_META_KEY: &str = "__partition__";
 
-static DB_CACHE: LazyLock<Mutex<HashMap<PathBuf, Arc<Database>>>> =
+static DB_CACHE: LazyLock<Mutex<HashMap<PathBuf, CachedDatabaseEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static DB_CACHE_TOUCH_TICK: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(1));
 static PARTITION_OP_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+const MAX_CACHED_DBS: usize = 128;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -66,6 +69,11 @@ struct VersionStateRecord {
 struct PartitionMeta {
     committed_generation: u64,
     updated_at: i64,
+}
+
+struct CachedDatabaseEntry {
+    db: Arc<Database>,
+    last_used_tick: u64,
 }
 
 struct VersionUpsertMutation {
@@ -472,11 +480,13 @@ fn atomic_copy_db_file(src: &Path, dst: &Path) -> Result<(), AppError> {
 }
 
 fn get_or_open_db(path: &Path) -> Result<Arc<Database>, AppError> {
+    let touch_tick = DB_CACHE_TOUCH_TICK.fetch_add(1, AtomicOrdering::Relaxed);
     let mut cache = DB_CACHE
         .lock()
         .map_err(|_| AppError::InternalServerError("indexdb cache lock poisoned".to_string()))?;
-    if let Some(db) = cache.get(path) {
-        return Ok(db.clone());
+    if let Some(entry) = cache.get_mut(path) {
+        entry.last_used_tick = touch_tick;
+        return Ok(entry.db.clone());
     }
 
     if let Some(parent) = path.parent() {
@@ -488,7 +498,33 @@ fn get_or_open_db(path: &Path) -> Result<Arc<Database>, AppError> {
         Database::create(path)
             .map_err(|e| map_indexdb_error(&format!("open {}", path.display()), e))?,
     );
-    cache.insert(path.to_path_buf(), db.clone());
+    cache.insert(
+        path.to_path_buf(),
+        CachedDatabaseEntry {
+            db: db.clone(),
+            last_used_tick: touch_tick,
+        },
+    );
+
+    if cache.len() > MAX_CACHED_DBS {
+        let mut evictable: Vec<(PathBuf, u64)> = cache
+            .iter()
+            .filter_map(|(candidate_path, entry)| {
+                (Arc::strong_count(&entry.db) == 1)
+                    .then_some((candidate_path.clone(), entry.last_used_tick))
+            })
+            .collect();
+        evictable.sort_by_key(|(_, last_used_tick)| *last_used_tick);
+
+        while cache.len() > MAX_CACHED_DBS {
+            let Some((candidate_path, _)) = evictable.first().cloned() else {
+                break;
+            };
+            cache.remove(&candidate_path);
+            evictable.remove(0);
+        }
+    }
+
     Ok(db)
 }
 
@@ -1552,6 +1588,132 @@ fn delete_all_versions_for_key_on_db(
     Ok(Some((version_ids, partition_meta)))
 }
 
+fn delete_versions_for_key_with_state_on_db(
+    db: &Database,
+    object_key: &str,
+    target_state: ObjectState,
+) -> Result<Option<(Vec<String>, PartitionMeta)>, AppError> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| map_indexdb_error("begin_write", e))?;
+    let (version_ids, partition_meta) = {
+        let mut partition_meta = write_txn
+            .open_table(PARTITION_META_TABLE)
+            .map_err(|e| map_indexdb_error("open partition_meta", e))?;
+        let mut heads = write_txn
+            .open_table(OBJECT_HEADS_TABLE)
+            .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut versions = write_txn
+            .open_table(OBJECT_VERSIONS_TABLE)
+            .map_err(|e| map_indexdb_error("open object_versions", e))?;
+        let mut states = write_txn
+            .open_table(OBJECT_VERSION_STATES_TABLE)
+            .map_err(|e| map_indexdb_error("open object_version_states", e))?;
+        let now = Utc::now().timestamp();
+        let committed_generation = next_partition_generation(&mut partition_meta, now)?;
+        let current_head = heads
+            .get(canonical_key(object_key).as_str())
+            .map_err(|e| map_indexdb_error("head get", e))?
+            .map(|value| deserialize::<HeadRecord>(value.value()))
+            .transpose()?;
+        let prefix = version_row_prefix(object_key);
+        let mut iter = versions
+            .range(prefix.as_str()..)
+            .map_err(|e| map_indexdb_error("version range", e))?;
+        let mut row_keys_to_delete = Vec::new();
+        let mut version_ids = Vec::new();
+        let mut latest_removed: Option<ObjectMetadata> = None;
+        let mut latest_remaining: Option<(ObjectMetadata, ObjectState)> = None;
+
+        while let Some(entry) = iter.next() {
+            let (row_key, value) = entry.map_err(|e| map_indexdb_error("version range next", e))?;
+            let row_key = row_key.value();
+            if !row_key.starts_with(&prefix) {
+                break;
+            }
+            let metadata = deserialize::<VersionRecord>(value.value())?.metadata;
+            let Some(state_value) = states
+                .get(row_key)
+                .map_err(|e| map_indexdb_error("version_state get", e))?
+            else {
+                continue;
+            };
+            let state = deserialize::<VersionStateRecord>(state_value.value())?.state;
+            if state == target_state {
+                if let Some((_, version_id)) = parse_version_key(row_key) {
+                    version_ids.push(version_id.to_string());
+                }
+                match &latest_removed {
+                    Some(current) if !metadata_is_newer(&metadata, current) => {}
+                    _ => latest_removed = Some(metadata),
+                }
+                row_keys_to_delete.push(row_key.to_string());
+            } else if state != ObjectState::Deleted {
+                match &latest_remaining {
+                    Some((current, _)) if !metadata_is_newer(&metadata, current) => {}
+                    _ => latest_remaining = Some((metadata, state)),
+                }
+            }
+        }
+
+        if row_keys_to_delete.is_empty() {
+            return Ok(None);
+        }
+
+        for row_key in &row_keys_to_delete {
+            let _ = versions
+                .remove(row_key.as_str())
+                .map_err(|e| map_indexdb_error("version remove", e))?;
+            let _ = states
+                .remove(row_key.as_str())
+                .map_err(|e| map_indexdb_error("version_state remove", e))?;
+        }
+
+        if let Some((metadata, state)) = latest_remaining {
+            let next_head = HeadRecord::from_metadata(
+                &metadata,
+                state,
+                next_head_generation(current_head.as_ref()),
+                now,
+            );
+            write_head_exact(&mut heads, &next_head)?;
+        } else {
+            let fragment = current_head
+                .as_ref()
+                .map(|head| head.fragment.as_str())
+                .or_else(|| {
+                    latest_removed
+                        .as_ref()
+                        .map(|metadata| metadata.fragment.as_str())
+                })
+                .unwrap_or_default();
+            let tombstone = HeadRecord::tombstone(
+                fragment,
+                object_key,
+                next_head_generation(current_head.as_ref()),
+                now,
+                current_head.as_ref(),
+                latest_removed.as_ref(),
+            );
+            write_head_exact(&mut heads, &tombstone)?;
+        }
+
+        (
+            version_ids,
+            PartitionMeta {
+                committed_generation,
+                updated_at: now,
+            },
+        )
+    };
+    write_txn
+        .commit()
+        .map_err(|e| map_indexdb_error("commit delete versions by state", e))?;
+    let mut version_ids = version_ids;
+    version_ids.sort_by(|left, right| compare_version_id_recency(left, right));
+    Ok(Some((version_ids, partition_meta)))
+}
+
 fn receipt_from_part(part: &PartMetadata) -> Result<SessionPartReceipt, AppError> {
     let mut shard_checksums = Vec::with_capacity(part.shards.len());
     for shard in &part.shards {
@@ -2423,6 +2585,121 @@ fn apply_delete_all_versions_for_key_replica_exact(
     Ok(())
 }
 
+fn apply_delete_versions_for_key_with_state_replica_exact(
+    db: &Database,
+    object_key: &str,
+    target_state: ObjectState,
+    partition_meta: &PartitionMeta,
+) -> Result<(), AppError> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| map_indexdb_error("begin_write", e))?;
+    {
+        let mut meta = write_txn
+            .open_table(PARTITION_META_TABLE)
+            .map_err(|e| map_indexdb_error("open partition_meta", e))?;
+        let mut heads = write_txn
+            .open_table(OBJECT_HEADS_TABLE)
+            .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut versions = write_txn
+            .open_table(OBJECT_VERSIONS_TABLE)
+            .map_err(|e| map_indexdb_error("open object_versions", e))?;
+        let mut states = write_txn
+            .open_table(OBJECT_VERSION_STATES_TABLE)
+            .map_err(|e| map_indexdb_error("open object_version_states", e))?;
+        write_partition_meta_exact(&mut meta, partition_meta)?;
+        let current_head = heads
+            .get(canonical_key(object_key).as_str())
+            .map_err(|e| map_indexdb_error("head get", e))?
+            .map(|value| deserialize::<HeadRecord>(value.value()))
+            .transpose()?;
+        let prefix = version_row_prefix(object_key);
+        let mut iter = versions
+            .range(prefix.as_str()..)
+            .map_err(|e| map_indexdb_error("version range", e))?;
+        let mut row_keys_to_delete = Vec::new();
+        let mut latest_removed: Option<ObjectMetadata> = None;
+        let mut latest_remaining: Option<(ObjectMetadata, ObjectState)> = None;
+
+        while let Some(entry) = iter.next() {
+            let (row_key, value) = entry.map_err(|e| map_indexdb_error("version range next", e))?;
+            let row_key = row_key.value();
+            if !row_key.starts_with(&prefix) {
+                break;
+            }
+            let metadata = deserialize::<VersionRecord>(value.value())?.metadata;
+            let Some(state_value) = states
+                .get(row_key)
+                .map_err(|e| map_indexdb_error("version_state get", e))?
+            else {
+                continue;
+            };
+            let state = deserialize::<VersionStateRecord>(state_value.value())?.state;
+            if state == target_state {
+                match &latest_removed {
+                    Some(current) if !metadata_is_newer(&metadata, current) => {}
+                    _ => latest_removed = Some(metadata),
+                }
+                row_keys_to_delete.push(row_key.to_string());
+            } else if state != ObjectState::Deleted {
+                match &latest_remaining {
+                    Some((current, _)) if !metadata_is_newer(&metadata, current) => {}
+                    _ => latest_remaining = Some((metadata, state)),
+                }
+            }
+        }
+
+        if row_keys_to_delete.is_empty() {
+            return Err(AppError::InternalServerError(format!(
+                "replica missing {:?} versions for object key {}",
+                target_state, object_key
+            )));
+        }
+
+        for row_key in &row_keys_to_delete {
+            let _ = versions
+                .remove(row_key.as_str())
+                .map_err(|e| map_indexdb_error("version remove", e))?;
+            let _ = states
+                .remove(row_key.as_str())
+                .map_err(|e| map_indexdb_error("version_state remove", e))?;
+        }
+
+        if let Some((metadata, state)) = latest_remaining {
+            let next_head = HeadRecord::from_metadata(
+                &metadata,
+                state,
+                next_head_generation(current_head.as_ref()),
+                partition_meta.updated_at,
+            );
+            write_head_exact(&mut heads, &next_head)?;
+        } else {
+            let fragment = current_head
+                .as_ref()
+                .map(|head| head.fragment.as_str())
+                .or_else(|| {
+                    latest_removed
+                        .as_ref()
+                        .map(|metadata| metadata.fragment.as_str())
+                })
+                .unwrap_or_default();
+            let tombstone = HeadRecord::tombstone(
+                fragment,
+                object_key,
+                next_head_generation(current_head.as_ref()),
+                partition_meta.updated_at,
+                current_head.as_ref(),
+                latest_removed.as_ref(),
+            );
+            write_head_exact(&mut heads, &tombstone)?;
+        }
+    }
+    write_txn
+        .commit()
+        .map_err(|e| map_indexdb_error("commit delete versions by state replica", e))?;
+    Ok(())
+}
+
 fn max_string(left: Option<&str>, right: Option<&str>) -> Option<String> {
     match (left, right) {
         (Some(left), Some(right)) => Some(if left >= right { left } else { right }.to_string()),
@@ -3205,6 +3482,45 @@ pub fn list_trash_heads(fragment: &str) -> Result<Vec<ObjectMetadata>, AppError>
     Ok(out)
 }
 
+fn list_object_keys_with_state(
+    fragment: &str,
+    target_state: ObjectState,
+) -> Result<Vec<String>, AppError> {
+    let mut keys = BTreeSet::new();
+    for partition_id in 0..INDEX_PARTITION_COUNT {
+        let Some(db) = open_partition_db_for_read(fragment, partition_id)? else {
+            continue;
+        };
+        let read_txn = db
+            .begin_read()
+            .map_err(|e| map_indexdb_error("begin_read", e))?;
+        let table = match read_txn.open_table(OBJECT_VERSION_STATES_TABLE) {
+            Ok(table) => table,
+            Err(TableError::TableDoesNotExist(_)) => continue,
+            Err(err) => return Err(map_indexdb_error("open object_version_states", err)),
+        };
+        let mut iter = table
+            .iter()
+            .map_err(|e| map_indexdb_error("version_state iter", e))?;
+        while let Some(entry) = iter.next() {
+            let (row_key, value) =
+                entry.map_err(|e| map_indexdb_error("version_state iter next", e))?;
+            let state: VersionStateRecord = deserialize(value.value())?;
+            if state.state != target_state {
+                continue;
+            }
+            if let Some((object_key, _)) = parse_version_key(row_key.value()) {
+                keys.insert(object_key.to_string());
+            }
+        }
+    }
+    Ok(keys.into_iter().collect())
+}
+
+pub fn list_object_keys_with_trash_versions(fragment: &str) -> Result<Vec<String>, AppError> {
+    list_object_keys_with_state(fragment, ObjectState::Trash)
+}
+
 pub fn move_object_version_to_trash_with_metadata(
     fragment: &str,
     object_key: &str,
@@ -3358,6 +3674,40 @@ pub fn restore_object_from_trash_fast(
     })
 }
 
+pub fn delete_all_trash_versions_for_key(
+    fragment: &str,
+    object_key: &str,
+) -> Result<Option<Vec<String>>, AppError> {
+    let route = object_route(fragment, object_key)?;
+    let owner_path = owner_db_path(&route, fragment);
+    with_partition_commit_lock(&owner_path, || {
+        if !owner_path.exists() {
+            return Ok(None);
+        }
+        let owner_db = get_or_open_db(&owner_path)?;
+        let deleted =
+            delete_versions_for_key_with_state_on_db(&owner_db, object_key, ObjectState::Trash)?;
+        if let Some((version_ids, partition_meta)) = deleted {
+            replicate_object_mutation(
+                fragment,
+                &route,
+                "delete trash versions for key",
+                |replica_db| {
+                    apply_delete_versions_for_key_with_state_replica_exact(
+                        replica_db,
+                        object_key,
+                        ObjectState::Trash,
+                        &partition_meta,
+                    )
+                },
+            )?;
+            Ok(Some(version_ids))
+        } else {
+            Ok(None)
+        }
+    })
+}
+
 pub fn delete_object_fast(
     fragment: &str,
     object_key: &str,
@@ -3451,40 +3801,12 @@ pub fn delete_trash_version(
 
 pub fn clear_fragment_trash(fragment: &str, object_key: Option<&str>) -> Result<(), AppError> {
     if let Some(object_key) = object_key {
-        for metadata in list_trash_versions(fragment, object_key)? {
-            let _ = delete_trash_version(fragment, object_key, &metadata.version_id)?;
-        }
+        let _ = delete_all_trash_versions_for_key(fragment, object_key)?;
         return Ok(());
     }
 
-    for partition_id in 0..INDEX_PARTITION_COUNT {
-        let Some(db) = open_partition_db_for_read(fragment, partition_id)? else {
-            continue;
-        };
-        let read_txn = db
-            .begin_read()
-            .map_err(|e| map_indexdb_error("begin_read", e))?;
-        let table = match read_txn.open_table(OBJECT_HEADS_TABLE) {
-            Ok(table) => table,
-            Err(TableError::TableDoesNotExist(_)) => continue,
-            Err(err) => return Err(map_indexdb_error("open object_heads", err)),
-        };
-        let mut iter = table
-            .iter()
-            .map_err(|e| map_indexdb_error("head iter", e))?;
-        let mut trash_keys = Vec::new();
-        while let Some(entry) = iter.next() {
-            let (_key, value) = entry.map_err(|e| map_indexdb_error("head iter next", e))?;
-            let head: HeadRecord = deserialize(value.value())?;
-            if head.state == ObjectState::Trash {
-                trash_keys.push(head.object_key);
-            }
-        }
-        for object_key in trash_keys {
-            for metadata in list_trash_versions(fragment, &object_key)? {
-                let _ = delete_trash_version(fragment, &object_key, &metadata.version_id)?;
-            }
-        }
+    for object_key in list_object_keys_with_trash_versions(fragment)? {
+        let _ = delete_all_trash_versions_for_key(fragment, &object_key)?;
     }
     Ok(())
 }

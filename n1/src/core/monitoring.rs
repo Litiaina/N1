@@ -1,3 +1,4 @@
+use crate::core::delete::{get_empty_trash_status, get_recover_all_trash_status};
 use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
 use crate::core::fragment_manager::is_fragment_hash;
 use crate::core::garbage_collector::get_gc_status;
@@ -140,6 +141,18 @@ pub struct MaintenanceRuntimeStats {
     pub pending_redistribution_intents: u64,
     pub failed_redistribution_intents: u64,
     pub fragments_with_pending_redistribution: u64,
+    pub trash_recover_running: bool,
+    pub trash_recover_phase: String,
+    pub trash_recover_fragment: String,
+    pub trash_recover_total_objects: u64,
+    pub trash_recover_processed_objects: u64,
+    pub trash_empty_running: bool,
+    pub trash_empty_phase: String,
+    pub trash_empty_fragment: String,
+    pub trash_empty_total_objects: u64,
+    pub trash_empty_processed_objects: u64,
+    pub trash_empty_total_roots: u64,
+    pub trash_empty_processed_roots: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest_pending_redistribution_intent_age_seconds: Option<u64>,
 }
@@ -374,6 +387,8 @@ async fn collect_system_health(
     let redist_status = get_redist_status().await;
     let repair_status = get_repair_status().await;
     let gc_status = get_gc_status().await;
+    let trash_recover_status = get_recover_all_trash_status().await;
+    let trash_empty_status = get_empty_trash_status().await;
 
     let index_disks_config = INDEX_STORE_DISKS
         .get()
@@ -540,6 +555,18 @@ async fn collect_system_health(
             failed_redistribution_intents: redistribution_debt.failed_intents,
             fragments_with_pending_redistribution: redistribution_debt
                 .fragments_with_pending_intents,
+            trash_recover_running: trash_recover_status.is_running,
+            trash_recover_phase: trash_recover_status.phase.clone(),
+            trash_recover_fragment: trash_recover_status.fragment.clone(),
+            trash_recover_total_objects: trash_recover_status.total_objects,
+            trash_recover_processed_objects: trash_recover_status.processed_objects,
+            trash_empty_running: trash_empty_status.is_running,
+            trash_empty_phase: trash_empty_status.phase.clone(),
+            trash_empty_fragment: trash_empty_status.fragment.clone(),
+            trash_empty_total_objects: trash_empty_status.total_objects,
+            trash_empty_processed_objects: trash_empty_status.processed_objects,
+            trash_empty_total_roots: trash_empty_status.total_trash_roots,
+            trash_empty_processed_roots: trash_empty_status.processed_trash_roots,
             oldest_pending_redistribution_intent_age_seconds: redistribution_debt
                 .oldest_pending_intent_age_seconds,
         })
@@ -586,6 +613,18 @@ async fn collect_system_health(
             failed_redistribution_intents: redistribution_debt.failed_intents,
             fragments_with_pending_redistribution: redistribution_debt
                 .fragments_with_pending_intents,
+            trash_recover_running: trash_recover_status.is_running,
+            trash_recover_phase: trash_recover_status.phase,
+            trash_recover_fragment: trash_recover_status.fragment,
+            trash_recover_total_objects: trash_recover_status.total_objects,
+            trash_recover_processed_objects: trash_recover_status.processed_objects,
+            trash_empty_running: trash_empty_status.is_running,
+            trash_empty_phase: trash_empty_status.phase,
+            trash_empty_fragment: trash_empty_status.fragment,
+            trash_empty_total_objects: trash_empty_status.total_objects,
+            trash_empty_processed_objects: trash_empty_status.processed_objects,
+            trash_empty_total_roots: trash_empty_status.total_trash_roots,
+            trash_empty_processed_roots: trash_empty_status.processed_trash_roots,
             oldest_pending_redistribution_intent_age_seconds: redistribution_debt
                 .oldest_pending_intent_age_seconds,
         },

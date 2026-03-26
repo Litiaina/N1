@@ -8,9 +8,10 @@ use crate::core::delete::{
     delete_object_permanently as delete_object_permanently_impl,
     delete_object_version as delete_object_version_impl,
     delete_objects_bulk as delete_objects_bulk_impl, empty_trash as empty_trash_impl,
+    get_empty_trash_status_api, get_recover_all_trash_status_api,
     recover_all_trash as recover_all_trash_impl, recover_object as recover_object_impl,
     recover_object_version as recover_object_version_impl,
-    recover_objects_bulk as recover_objects_bulk_impl,
+    recover_objects_bulk as recover_objects_bulk_impl, resume_persistent_trash_jobs,
 };
 use crate::core::download::{
     download_object as download_object_impl, download_object_chunk as download_object_chunk_impl,
@@ -422,6 +423,22 @@ pub fn build_storage_routes_unbound_with_options(
 
     let app_state = Arc::new(AppState { ws_manager });
 
+    let trash_resume_state = Arc::clone(&app_state);
+    tokio::spawn(async move {
+        match resume_persistent_trash_jobs(trash_resume_state).await {
+            Ok(resumed) if resumed > 0 => {
+                tracing::info!("Resumed {} persistent trash maintenance job(s)", resumed);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to resume persistent trash maintenance jobs: {}",
+                    err
+                );
+            }
+        }
+    });
+
     let lifecycle_state = Arc::clone(&app_state);
     tokio::spawn(async move {
         run_lifecycle_manager(lifecycle_state).await;
@@ -568,6 +585,14 @@ pub fn build_storage_routes_unbound_with_options(
             .route("/v4/maintenance/gc/start", post(run_garbage_collector))
             .route("/v4/maintenance/gc/stop", post(stop_garbage_collector))
             .route("/v4/maintenance/gc/status", get(get_gc_status_api))
+            .route(
+                "/v4/maintenance/trash/recover/status",
+                get(get_recover_all_trash_status_api),
+            )
+            .route(
+                "/v4/maintenance/trash/empty/status",
+                get(get_empty_trash_status_api),
+            )
             .route(
                 "/v4/maintenance/redistribution/start",
                 post(trigger_redistribution_job_api),

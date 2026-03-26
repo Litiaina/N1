@@ -2,7 +2,9 @@ use super::archive::{download_manifest_archive, download_selected_archive};
 use super::delete::delete_object;
 use super::delete::{
     BulkObjectKeysRequest, delete_object_permanently, delete_object_version, delete_objects_bulk,
-    empty_trash, recover_all_trash, recover_object, recover_object_version, recover_objects_bulk,
+    empty_trash, get_empty_trash_status, get_recover_all_trash_status, persistent_trash_job_paths,
+    recover_all_trash, recover_object, recover_object_version, recover_objects_bulk,
+    resume_persistent_trash_jobs,
 };
 use super::disk_manager::{
     DownloadArchiveManifestQuery, DownloadArchiveRequest, InitiateUploadParams, ListObjectsResult,
@@ -69,6 +71,7 @@ use std::time::Instant;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
+use tokio::time::{Duration, sleep};
 use tokio_tar::Archive as TarArchive;
 use ulid::Ulid;
 
@@ -671,6 +674,91 @@ async fn list_trash_json_page(
     .into_response();
     assert_eq!(resp.status(), StatusCode::OK);
     read_response_json(resp).await
+}
+
+async fn wait_for_trash_job_completion(kind: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = if kind == "recover" {
+            get_recover_all_trash_status().await
+        } else {
+            get_empty_trash_status().await
+        };
+        if !status.is_running {
+            assert!(
+                !status.phase.eq_ignore_ascii_case("failed"),
+                "trash job failed: {:?}",
+                status
+            );
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("{} trash job did not finish in time", kind);
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn current_process_rss_kib() -> u64 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            if let Some(value) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                return value;
+            }
+        }
+    }
+    0
+}
+
+async fn wait_for_trash_job_completion_with_peak_rss(kind: &str) -> (u64, u64) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut peak_rss_kib = current_process_rss_kib();
+    loop {
+        peak_rss_kib = peak_rss_kib.max(current_process_rss_kib());
+        let status = if kind == "recover" {
+            get_recover_all_trash_status().await
+        } else {
+            get_empty_trash_status().await
+        };
+        if !status.is_running {
+            assert!(
+                !status.phase.eq_ignore_ascii_case("failed"),
+                "trash job failed: {:?}",
+                status
+            );
+            return (status.duration_seconds, peak_rss_kib);
+        }
+        if Instant::now() >= deadline {
+            panic!("{} trash job did not finish in time", kind);
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn seed_persistent_trash_job(fragment: &str, operation: &str) {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "operation": operation,
+        "fragment": fragment,
+        "started_at": 1_i64,
+    }))
+    .expect("serialize persistent trash job");
+    for path in persistent_trash_job_paths(fragment) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .expect("create persistent trash job parent");
+        }
+        fs::write(&path, &bytes)
+            .await
+            .expect("write persistent trash job");
+    }
 }
 
 async fn run_manual_gc_and_wait(state: Arc<AppState>) {
@@ -6455,7 +6543,8 @@ async fn matrix_indexdb_ndxdb_recover_all_and_empty_trash_fast_paths() {
     .await
     .expect("recover all trash")
     .into_response();
-    assert_eq!(recover_all_resp.status(), StatusCode::OK);
+    assert_eq!(recover_all_resp.status(), StatusCode::ACCEPTED);
+    wait_for_trash_job_completion("recover").await;
 
     let live_after_recover = list_objects_json_page(&fragment, None, None, 100, None).await;
     assert_eq!(
@@ -6493,7 +6582,8 @@ async fn matrix_indexdb_ndxdb_recover_all_and_empty_trash_fast_paths() {
     .await
     .expect("empty trash")
     .into_response();
-    assert_eq!(empty_resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(empty_resp.status(), StatusCode::ACCEPTED);
+    wait_for_trash_job_completion("empty").await;
 
     let live_after_empty = list_objects_json_page(&fragment, None, None, 100, None).await;
     assert!(
@@ -6527,6 +6617,466 @@ async fn matrix_indexdb_ndxdb_recover_all_and_empty_trash_fast_paths() {
             key
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_fragment_wide_trash_jobs_handle_hidden_trash_versions() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let key = "trash-hidden/series.dcm".to_string();
+    let version_a = put_object(state.clone(), &fragment, &key, vec![0x11; 2048]).await;
+    let version_b = put_object(state.clone(), &fragment, &key, vec![0x22; 4096]).await;
+
+    let resp = delete_object_version(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), version_a.clone(), key.clone())),
+    )
+    .await
+    .expect("delete older version")
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    assert_eq!(
+        index::list_fragment_object_keys_with_trash_versions(&fragment)
+            .await
+            .expect("trash keys before recover"),
+        vec![key.clone()]
+    );
+    assert_eq!(
+        index::list_trashed_object_versions_metadata(&fragment, &key)
+            .await
+            .expect("trashed versions before recover")
+            .len(),
+        1
+    );
+    assert_eq!(
+        index::list_live_object_versions_metadata(&fragment, &key)
+            .await
+            .expect("live versions before recover")
+            .len(),
+        1
+    );
+
+    let recover_resp = recover_all_trash(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath(fragment.clone()),
+    )
+    .await
+    .expect("recover all hidden trash")
+    .into_response();
+    assert_eq!(recover_resp.status(), StatusCode::ACCEPTED);
+    wait_for_trash_job_completion("recover").await;
+
+    assert!(
+        index::list_trashed_object_versions_metadata(&fragment, &key)
+            .await
+            .expect("trashed versions after recover")
+            .is_empty()
+    );
+    let live_after_recover = index::list_live_object_versions_metadata(&fragment, &key)
+        .await
+        .expect("live versions after recover");
+    assert_eq!(live_after_recover.len(), 2);
+    assert!(
+        live_after_recover
+            .iter()
+            .any(|meta| meta.version_id == version_a && meta.object_key == key)
+    );
+    assert!(
+        live_after_recover
+            .iter()
+            .any(|meta| meta.version_id == version_b && meta.object_key == key)
+    );
+
+    let delete_again = delete_object_version(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), version_a.clone(), key.clone())),
+    )
+    .await
+    .expect("delete older version again")
+    .into_response();
+    assert_eq!(delete_again.status(), StatusCode::OK);
+
+    let empty_resp = empty_trash(
+        State(state),
+        full_claims(&fragment),
+        AxumPath(fragment.clone()),
+    )
+    .await
+    .expect("empty hidden trash")
+    .into_response();
+    assert_eq!(empty_resp.status(), StatusCode::ACCEPTED);
+    wait_for_trash_job_completion("empty").await;
+
+    assert!(
+        index::list_trashed_object_versions_metadata(&fragment, &key)
+            .await
+            .expect("trashed versions after empty")
+            .is_empty()
+    );
+    let live_after_empty = index::list_live_object_versions_metadata(&fragment, &key)
+        .await
+        .expect("live versions after empty");
+    assert_eq!(live_after_empty.len(), 1);
+    assert_eq!(live_after_empty[0].version_id, version_b);
+    assert!(
+        index::list_fragment_object_keys_with_trash_versions(&fragment)
+            .await
+            .expect("trash keys after empty")
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_recover_all_trash_resumes_from_persistent_journal() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let key = "trash-resume/recover.bin".to_string();
+    let bytes = vec![0x4a; 8192];
+    put_object(state.clone(), &fragment, &key, bytes.clone()).await;
+
+    let delete_resp = delete_object(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), key.clone())),
+    )
+    .await
+    .expect("soft delete for recover resume")
+    .into_response();
+    assert_eq!(delete_resp.status(), StatusCode::OK);
+    assert!(
+        !index::list_fragment_object_keys_with_trash_versions(&fragment)
+            .await
+            .expect("trash keys before resume")
+            .is_empty()
+    );
+
+    seed_persistent_trash_job(&fragment, "recover_all_trash").await;
+    let resumed = resume_persistent_trash_jobs(state.clone())
+        .await
+        .expect("resume persistent recover job");
+    assert_eq!(resumed, 1);
+
+    let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+    assert_eq!(got, bytes);
+    assert!(
+        index::list_fragment_object_keys_with_trash_versions(&fragment)
+            .await
+            .expect("trash keys after resume")
+            .is_empty()
+    );
+    for path in persistent_trash_job_paths(&fragment) {
+        assert!(
+            !fs::try_exists(&path)
+                .await
+                .expect("journal path exists check"),
+            "persistent trash job should be cleared: {}",
+            path.display()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_empty_trash_resumes_from_persistent_journal() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let key = "trash-resume/empty.bin".to_string();
+    put_object(state.clone(), &fragment, &key, vec![0x9b; 4096]).await;
+
+    let delete_resp = delete_object(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), key.clone())),
+    )
+    .await
+    .expect("soft delete for empty resume")
+    .into_response();
+    assert_eq!(delete_resp.status(), StatusCode::OK);
+
+    seed_persistent_trash_job(&fragment, "empty_trash").await;
+    let resumed = resume_persistent_trash_jobs(state.clone())
+        .await
+        .expect("resume persistent empty job");
+    assert_eq!(resumed, 1);
+
+    let req = Request::builder()
+        .uri("/v4/fragment/get")
+        .body(Body::empty())
+        .expect("build get request");
+    assert!(
+        get_object(
+            full_claims(&fragment),
+            AxumPath((fragment.clone(), key.clone())),
+            req,
+        )
+        .await
+        .is_err(),
+        "emptied key should not be readable after journal resume"
+    );
+    assert!(
+        index::list_fragment_object_keys_with_trash_versions(&fragment)
+            .await
+            .expect("trash keys after empty resume")
+            .is_empty()
+    );
+    for path in persistent_trash_job_paths(&fragment) {
+        assert!(
+            !fs::try_exists(&path)
+                .await
+                .expect("journal path exists check"),
+            "persistent trash job should be cleared: {}",
+            path.display()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_recover_object_remains_correct_if_blob_move_happened_before_metadata_restore() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let key = "trash-recover/interrupted.bin".to_string();
+    let bytes = vec![0x5c; 6144];
+    let version_id = put_object(state.clone(), &fragment, &key, bytes.clone()).await;
+
+    let delete_resp = delete_object(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), key.clone())),
+    )
+    .await
+    .expect("soft delete for interrupted recover")
+    .into_response();
+    assert_eq!(delete_resp.status(), StatusCode::OK);
+
+    let path_manager = ObjectPathManager::new();
+    for root in path_manager.get_blob_roots() {
+        let trash_blob_dir = root
+            .join(&fragment)
+            .join(".trash")
+            .join("blob")
+            .join(&version_id);
+        let live_blob_dir = path_manager.get_shard_dir_on_disk(&root, &fragment, &version_id);
+        if fs::try_exists(&trash_blob_dir)
+            .await
+            .expect("trash blob exists check")
+        {
+            if let Some(parent) = live_blob_dir.parent() {
+                fs::create_dir_all(parent)
+                    .await
+                    .expect("create live blob parent");
+            }
+            fs::rename(&trash_blob_dir, &live_blob_dir)
+                .await
+                .expect("simulate interrupted recover blob move");
+        }
+    }
+
+    let recover_resp = recover_object(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), key.clone())),
+    )
+    .await
+    .expect("recover after simulated interrupted move")
+    .into_response();
+    assert_eq!(recover_resp.status(), StatusCode::OK);
+
+    let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+    assert_eq!(got, bytes);
+    assert!(
+        index::list_fragment_object_keys_with_trash_versions(&fragment)
+            .await
+            .expect("trash keys after interrupted recover")
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn matrix_indexdb_trash_jobs_10k_simulation_stats() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let object_count = std::env::var("N1_TRASH_BENCH_OBJECTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(10_000);
+    let object_bytes = std::env::var("N1_TRASH_BENCH_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(64);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let seed_rss_kib = current_process_rss_kib();
+    let put_started = Instant::now();
+    let mut keys = Vec::with_capacity(object_count);
+    for idx in 0..object_count {
+        let key = format!("trash-bench/{:05}.bin", idx);
+        let mut payload = vec![0u8; object_bytes];
+        if !payload.is_empty() {
+            payload[0] = (idx % 251) as u8;
+        }
+        put_object(state.clone(), &fragment, &key, payload).await;
+        keys.push(key);
+    }
+    let put_elapsed = put_started.elapsed();
+    let after_put_rss_kib = current_process_rss_kib();
+
+    let delete_started = Instant::now();
+    let bulk_delete_resp = delete_objects_bulk(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumJson(BulkObjectKeysRequest {
+            object_keys: keys.clone(),
+        }),
+    )
+    .await
+    .expect("bulk delete for recover-all bench")
+    .into_response();
+    assert_eq!(bulk_delete_resp.status(), StatusCode::OK);
+    let delete_elapsed = delete_started.elapsed();
+
+    let recover_request_started = Instant::now();
+    let recover_resp = recover_all_trash(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath(fragment.clone()),
+    )
+    .await
+    .expect("recover all bench")
+    .into_response();
+    assert_eq!(recover_resp.status(), StatusCode::ACCEPTED);
+    let recover_request_elapsed = recover_request_started.elapsed();
+    let recover_job_started = Instant::now();
+    let (_recover_duration_seconds, recover_peak_rss_kib) =
+        wait_for_trash_job_completion_with_peak_rss("recover").await;
+    let recover_job_elapsed = recover_job_started.elapsed();
+
+    let bulk_delete_again_resp = delete_objects_bulk(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumJson(BulkObjectKeysRequest {
+            object_keys: keys.clone(),
+        }),
+    )
+    .await
+    .expect("bulk delete for empty bench")
+    .into_response();
+    assert_eq!(bulk_delete_again_resp.status(), StatusCode::OK);
+
+    let empty_request_started = Instant::now();
+    let empty_resp = empty_trash(
+        State(state),
+        full_claims(&fragment),
+        AxumPath(fragment.clone()),
+    )
+    .await
+    .expect("empty bench")
+    .into_response();
+    assert_eq!(empty_resp.status(), StatusCode::ACCEPTED);
+    let empty_request_elapsed = empty_request_started.elapsed();
+    let empty_job_started = Instant::now();
+    let (_empty_duration_seconds, empty_peak_rss_kib) =
+        wait_for_trash_job_completion_with_peak_rss("empty").await;
+    let empty_job_elapsed = empty_job_started.elapsed();
+
+    let final_rss_kib = current_process_rss_kib();
+
+    println!(
+        "N1 trash bench: objects={} bytes={} put_ms={} delete_ms={} recover_request_ms={} recover_job_ms={} empty_request_ms={} empty_job_ms={} seed_rss_kib={} after_put_rss_kib={} recover_peak_rss_kib={} empty_peak_rss_kib={} final_rss_kib={}",
+        object_count,
+        object_bytes,
+        put_elapsed.as_millis(),
+        delete_elapsed.as_millis(),
+        recover_request_elapsed.as_millis(),
+        recover_job_elapsed.as_millis(),
+        empty_request_elapsed.as_millis(),
+        empty_job_elapsed.as_millis(),
+        seed_rss_kib,
+        after_put_rss_kib,
+        recover_peak_rss_kib,
+        empty_peak_rss_kib,
+        final_rss_kib
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
