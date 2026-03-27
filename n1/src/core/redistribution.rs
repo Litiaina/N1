@@ -521,6 +521,12 @@ struct StatusDelta {
     last_error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RedistributionNeeds {
+    blob: bool,
+    index: bool,
+}
+
 async fn flush_status_delta(
     ws_manager: &Arc<WsConnectionManager>,
     start_time: Instant,
@@ -710,15 +716,8 @@ fn get_shard_dir_custom(
     version_id: &str,
     is_trash: bool,
 ) -> PathBuf {
-    if is_trash {
-        disk_root
-            .join(fragment_hash)
-            .join(".trash")
-            .join("blob")
-            .join(version_id)
-    } else {
-        disk_root.join(fragment_hash).join("blob").join(version_id)
-    }
+    let _ = is_trash;
+    disk_root.join(fragment_hash).join("blob").join(version_id)
 }
 
 fn get_partition_db_paths_custom(
@@ -1055,33 +1054,66 @@ async fn replay_pending_intents_for_fragment(
         )
         .await;
 
-        if !needs {
+        if !needs.blob && !needs.index {
             remove_intent_paths_best_effort(&all_intent_paths).await;
             continue;
         }
 
         let resume_result = match scope {
             RedistributionScope::Index => {
-                redistribute_object_index_only(
-                    &meta,
-                    live_index,
-                    intent.is_trash,
-                    strict_durability,
-                )
-                .await
+                if !needs.index {
+                    Ok(())
+                } else {
+                    redistribute_object_index_only(
+                        &meta,
+                        live_index,
+                        intent.is_trash,
+                        strict_durability,
+                    )
+                    .await
+                }
             }
-            RedistributionScope::Blob | RedistributionScope::All => {
-                redistribute_object_streaming(
-                    &mut meta,
-                    target_data_shards,
-                    target_parity_shards,
-                    target_stripe_size,
-                    live_blob,
-                    live_index,
-                    intent.is_trash,
-                    strict_durability,
-                )
-                .await
+            RedistributionScope::Blob => {
+                if !needs.blob {
+                    Ok(())
+                } else {
+                    redistribute_object_streaming(
+                        &mut meta,
+                        target_data_shards,
+                        target_parity_shards,
+                        target_stripe_size,
+                        live_blob,
+                        live_index,
+                        intent.is_trash,
+                        strict_durability,
+                    )
+                    .await
+                }
+            }
+            RedistributionScope::All => {
+                if needs.blob {
+                    redistribute_object_streaming(
+                        &mut meta,
+                        target_data_shards,
+                        target_parity_shards,
+                        target_stripe_size,
+                        live_blob,
+                        live_index,
+                        intent.is_trash,
+                        strict_durability,
+                    )
+                    .await
+                } else if needs.index {
+                    redistribute_object_index_only(
+                        &meta,
+                        live_index,
+                        intent.is_trash,
+                        strict_durability,
+                    )
+                    .await
+                } else {
+                    Ok(())
+                }
             }
         };
 
@@ -1678,7 +1710,7 @@ pub async fn run_redistribution_job_with_options(
                     )
                     .await;
 
-                    if !needs {
+                    if !needs.blob && !needs.index {
                         continue;
                     }
 
@@ -1701,6 +1733,7 @@ pub async fn run_redistribution_job_with_options(
                     let live_index_for_task = live_index.clone();
                     let task_strict_durability = strict_durability;
                     let task_scope = opts.scope;
+                    let task_needs = needs;
                     in_flight.push(async move {
                         let mut meta = meta;
                         let fragment = meta.fragment.clone();
@@ -1754,6 +1787,9 @@ pub async fn run_redistribution_job_with_options(
 
                         let result = match task_scope {
                             RedistributionScope::Index => {
+                                if !task_needs.index {
+                                    Ok(())
+                                } else {
                                 redistribute_object_index_only(
                                     &meta,
                                     &live_index_for_task,
@@ -1761,19 +1797,49 @@ pub async fn run_redistribution_job_with_options(
                                     task_strict_durability,
                                 )
                                 .await
+                                }
                             }
-                            RedistributionScope::Blob | RedistributionScope::All => {
-                                redistribute_object_streaming(
-                                    &mut meta,
-                                    target_data_shards,
-                                    target_parity_shards,
-                                    target_stripe_size,
-                                    &live_blob_for_task,
-                                    &live_index_for_task,
-                                    is_trash_flag,
-                                    task_strict_durability,
-                                )
-                                .await
+                            RedistributionScope::Blob => {
+                                if !task_needs.blob {
+                                    Ok(())
+                                } else {
+                                    redistribute_object_streaming(
+                                        &mut meta,
+                                        target_data_shards,
+                                        target_parity_shards,
+                                        target_stripe_size,
+                                        &live_blob_for_task,
+                                        &live_index_for_task,
+                                        is_trash_flag,
+                                        task_strict_durability,
+                                    )
+                                    .await
+                                }
+                            }
+                            RedistributionScope::All => {
+                                if task_needs.blob {
+                                    redistribute_object_streaming(
+                                        &mut meta,
+                                        target_data_shards,
+                                        target_parity_shards,
+                                        target_stripe_size,
+                                        &live_blob_for_task,
+                                        &live_index_for_task,
+                                        is_trash_flag,
+                                        task_strict_durability,
+                                    )
+                                    .await
+                                } else if task_needs.index {
+                                    redistribute_object_index_only(
+                                        &meta,
+                                        &live_index_for_task,
+                                        is_trash_flag,
+                                        task_strict_durability,
+                                    )
+                                    .await
+                                } else {
+                                    Ok(())
+                                }
                             }
                         };
 
@@ -1911,17 +1977,18 @@ async fn check_needs_redistribution(
     target_blob_roots: &[PathBuf],
     target_index_roots: &[PathBuf],
     is_trash: bool,
-) -> bool {
+) -> RedistributionNeeds {
     let check_blob = scope != RedistributionScope::Index;
     let check_index = scope != RedistributionScope::Blob;
+    let mut needs = RedistributionNeeds::default();
 
     if check_blob {
         if meta.parts.is_empty() {
-            return false;
+            return needs;
         }
 
         if meta.stripe_size_bytes != target_stripe_size {
-            return true;
+            needs.blob = true;
         }
 
         let part0 = &meta.parts[0];
@@ -1929,28 +1996,36 @@ async fn check_needs_redistribution(
         let cur_parity = part0.shards.iter().filter(|s| s.is_parity).count();
 
         if cur_data != target_data || cur_parity != target_parity {
-            return true;
+            needs.blob = true;
         }
 
         if target_num_disks == 0 {
-            return true;
+            needs.blob = true;
         }
 
-        for part in &meta.parts {
-            for shard in &part.shards {
-                let expected = (part.part_index as usize + shard.shard_index) % target_num_disks;
-                if expected >= target_blob_roots.len() {
-                    return true;
-                }
+        if !needs.blob {
+            for part in &meta.parts {
+                for shard in &part.shards {
+                    let expected = (part.part_index as usize + shard.shard_index) % target_num_disks;
+                    if expected >= target_blob_roots.len() {
+                        needs.blob = true;
+                        break;
+                    }
 
-                let target_disk_path = target_blob_roots[expected].to_string_lossy();
-                if !shard.absolute_path.starts_with(target_disk_path.as_ref()) {
-                    return true;
-                }
+                    let target_disk_path = target_blob_roots[expected].to_string_lossy();
+                    if !shard.absolute_path.starts_with(target_disk_path.as_ref()) {
+                        needs.blob = true;
+                        break;
+                    }
 
-                let in_trash_path = shard.absolute_path.contains(".trash");
-                if is_trash != in_trash_path {
-                    return true;
+                    let in_trash_path = shard.absolute_path.contains(".trash");
+                    if is_trash != in_trash_path {
+                        needs.blob = true;
+                        break;
+                    }
+                }
+                if needs.blob {
+                    break;
                 }
             }
         }
@@ -1962,12 +2037,13 @@ async fn check_needs_redistribution(
 
         for path in expected_partition_db_paths {
             if !tokio_fs::try_exists(&path).await.unwrap_or(false) {
-                return true;
+                needs.index = true;
+                break;
             }
         }
     }
 
-    false
+    needs
 }
 
 async fn cleanup_tmp_files(files: &[PathBuf]) {
@@ -2100,6 +2176,19 @@ async fn redistribute_object_streaming(
         return Err(AppError::InternalServerError("Stopped".into()));
     }
     ensure_authoritative_partition_owner_writable(&meta.fragment, &meta.object_key).await?;
+
+    let still_present = if is_trash {
+        index::read_trashed_object_version(&meta.fragment, &meta.object_key, &meta.version_id)
+            .await
+            .is_ok()
+    } else {
+        index::read_object_version(&meta.fragment, &meta.object_key, &meta.version_id)
+            .await
+            .is_ok()
+    };
+    if !still_present {
+        return Ok(());
+    }
 
     let start_time = Instant::now();
     let num_disks = target_blob_roots.len();

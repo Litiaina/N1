@@ -4,7 +4,7 @@
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used underneath both deployment shapes.
 > - Single-node deployment: `n1` (`litiaina-n1`)
-> - `n1` release: `0.8.0`
+> - `n1` release: `0.9.0`
 > - Multi-node deployment: `n2` (`litiaina-n2`, `0.2.0`)
 > - Registry/business deployment: `registry` (`registry-server`, `0.4.0`)
 > - Experimental raw-device profile: `n1-arc` (`litiaina-n1-arc`)
@@ -653,7 +653,7 @@ Scrub is the integrity-check pass for committed shards (raw shards on `n1-arc`, 
 
 ## 10. Release Hardening On Target Hardware
 
-Run the release drill harness before production rollout (`n1 0.8.0` stable, `n1-arc` experimental):
+Run the release drill harness before production rollout (`n1 0.9.0` stable, `n1-arc` experimental):
 
 ```bash
 scripts/bench/run_release_drills.sh

@@ -1,7 +1,7 @@
 use super::disk_manager::{
     ListObjectsResult, ObjectMetadata, ObjectPathManager, PartMetadata, ReservationReceipt,
 };
-use super::index::{IndexSessionState, SessionPartReceipt};
+use super::index::{IndexSessionState, SessionPartReceipt, TrashCatalogEntry};
 use super::upload::UploadSessionManifest;
 use crate::enums::app_error_enum::AppError;
 use base64::Engine;
@@ -22,8 +22,6 @@ use ulid::Ulid;
 
 const INDEXDB_DIR: &str = "indexdb";
 const INDEXDB_PARTITIONS_DIR: &str = "partitions";
-const TRASHDB_DIR: &str = "trashdb";
-const TRASHDB_FILE: &str = "trash.ndxdb";
 const INDEX_PARTITION_COUNT: u16 = 256;
 const VERSION_KEY_SEPARATOR: char = '\u{001f}';
 const VERSION_KEY_SEPARATOR_STR: &str = "\u{001f}";
@@ -33,10 +31,7 @@ const OBJECT_VERSIONS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new
 const OBJECT_VERSION_STATES_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("object_version_states");
 const TRASH_OBJECTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("trash_objects");
-const TRASH_ACTIVE_PARTITIONS_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("trash_active_partitions");
-const TRASH_CATALOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("trash_catalog");
-const TRASH_VERSIONS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("trash_versions");
+const LIVE_NAMESPACE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("live_namespace");
 const SESSIONS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("sessions");
 const SESSION_PARTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("session_parts");
 const SESSION_PART_RECEIPTS_TABLE: TableDefinition<&str, &[u8]> =
@@ -84,12 +79,6 @@ struct TrashCatalogRecord {
     deleted_at: i64,
     latest_metadata: ObjectMetadata,
     version_ids: Vec<String>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TrashActivePartitionRecord {
-    updated_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,58 +170,6 @@ impl HeadRecord {
         }
     }
 
-    fn tombstone(
-        fragment: &str,
-        object_key: &str,
-        generation: u64,
-        updated_at: i64,
-        previous: Option<&HeadRecord>,
-        removed: Option<&ObjectMetadata>,
-    ) -> Self {
-        let source = removed
-            .map(TombstoneSource::Metadata)
-            .or_else(|| previous.map(TombstoneSource::Head));
-        Self {
-            fragment: fragment.to_string(),
-            object_key: canonical_key(object_key),
-            version_id: source
-                .as_ref()
-                .map(|value| value.version_id().to_string())
-                .unwrap_or_default(),
-            upload_session_id: source
-                .as_ref()
-                .map(|value| value.upload_session_id().to_string())
-                .unwrap_or_default(),
-            owner_uid: source
-                .as_ref()
-                .map(|value| value.owner_uid().to_string())
-                .unwrap_or_else(|| fragment.to_string()),
-            content_type: source
-                .as_ref()
-                .map(|value| value.content_type().to_string())
-                .unwrap_or_default(),
-            total_size_bytes: source
-                .as_ref()
-                .map(|value| value.total_size_bytes())
-                .unwrap_or(0),
-            created_at: source
-                .as_ref()
-                .map(|value| value.created_at())
-                .unwrap_or(updated_at),
-            is_delete_marker: source
-                .as_ref()
-                .map(|value| value.is_delete_marker())
-                .unwrap_or(true),
-            stripe_size_bytes: source
-                .as_ref()
-                .map(|value| value.stripe_size_bytes())
-                .unwrap_or_default(),
-            state: ObjectState::Deleted,
-            generation,
-            updated_at,
-        }
-    }
-
     fn to_summary_metadata(&self) -> ObjectMetadata {
         ObjectMetadata {
             object_key: self.object_key.clone(),
@@ -249,76 +186,12 @@ impl HeadRecord {
         }
     }
 
-    #[allow(dead_code)]
     fn with_state(&self, state: ObjectState, generation: u64, updated_at: i64) -> Self {
         let mut next = self.clone();
         next.state = state;
         next.generation = generation;
         next.updated_at = updated_at;
         next
-    }
-}
-
-enum TombstoneSource<'a> {
-    Metadata(&'a ObjectMetadata),
-    Head(&'a HeadRecord),
-}
-
-impl TombstoneSource<'_> {
-    fn version_id(&self) -> &str {
-        match self {
-            Self::Metadata(metadata) => &metadata.version_id,
-            Self::Head(head) => &head.version_id,
-        }
-    }
-
-    fn upload_session_id(&self) -> &str {
-        match self {
-            Self::Metadata(metadata) => &metadata.upload_session_id,
-            Self::Head(head) => &head.upload_session_id,
-        }
-    }
-
-    fn owner_uid(&self) -> &str {
-        match self {
-            Self::Metadata(metadata) => &metadata.owner_uid,
-            Self::Head(head) => &head.owner_uid,
-        }
-    }
-
-    fn content_type(&self) -> &str {
-        match self {
-            Self::Metadata(metadata) => &metadata.content_type,
-            Self::Head(head) => &head.content_type,
-        }
-    }
-
-    fn total_size_bytes(&self) -> u64 {
-        match self {
-            Self::Metadata(metadata) => metadata.total_size_bytes,
-            Self::Head(head) => head.total_size_bytes,
-        }
-    }
-
-    fn created_at(&self) -> i64 {
-        match self {
-            Self::Metadata(metadata) => metadata.created_at,
-            Self::Head(head) => head.created_at,
-        }
-    }
-
-    fn is_delete_marker(&self) -> bool {
-        match self {
-            Self::Metadata(metadata) => metadata.is_delete_marker,
-            Self::Head(head) => head.is_delete_marker,
-        }
-    }
-
-    fn stripe_size_bytes(&self) -> usize {
-        match self {
-            Self::Metadata(metadata) => metadata.stripe_size_bytes,
-            Self::Head(head) => head.stripe_size_bytes,
-        }
     }
 }
 
@@ -338,9 +211,19 @@ struct ListingItem {
     head: HeadRecord,
 }
 
+struct NamespaceListingItem {
+    object_key: String,
+    summary: ObjectMetadata,
+}
+
 struct PartitionRange {
     iter: indexdb::Range<'static, &'static str, &'static [u8]>,
     next: Option<ListingItem>,
+}
+
+struct NamespacePartitionRange {
+    iter: indexdb::Range<'static, &'static str, &'static [u8]>,
+    next: Option<NamespaceListingItem>,
 }
 
 #[derive(Debug, Clone)]
@@ -432,19 +315,11 @@ fn session_route(fragment: &str, version_id: &str) -> Result<IndexRoute, AppErro
     route_for_hash(hash_key(&["session", fragment, version_id]))
 }
 
-fn trash_control_route(fragment: &str) -> Result<IndexRoute, AppError> {
-    route_for_hash(hash_key(&["trash-control", fragment]))
-}
-
 fn db_path(root: &Path, fragment: &str, partition_id: u16) -> PathBuf {
     root.join(fragment)
         .join(INDEXDB_DIR)
         .join(INDEXDB_PARTITIONS_DIR)
         .join(format!("{:04x}.ndxdb", partition_id))
-}
-
-fn trash_db_path(root: &Path, fragment: &str) -> PathBuf {
-    root.join(fragment).join(TRASHDB_DIR).join(TRASHDB_FILE)
 }
 
 fn version_row_key(object_key: &str, version_id: &str) -> String {
@@ -472,92 +347,10 @@ fn session_part_row_key(version_id: &str, part_index: u64) -> String {
     format!("{}{:020}", session_part_row_prefix(version_id), part_index)
 }
 
-fn partition_row_key(partition_id: u16) -> String {
-    format!("{:04x}", partition_id)
-}
-
 fn destructive_partition_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().clamp(2, 8))
         .unwrap_or(4)
-}
-
-fn open_trash_db_for_read(fragment: &str) -> Result<Option<Arc<Database>>, AppError> {
-    let route = trash_control_route(fragment)?;
-    let mut best_follower: Option<(u64, Arc<Database>)> = None;
-    let mut best_follower_without_meta: Option<Arc<Database>> = None;
-
-    for (idx, root) in route.roots.iter().enumerate() {
-        let path = trash_db_path(root, fragment);
-        if !path.exists() {
-            continue;
-        }
-        match get_or_open_db(&path) {
-            Ok(db) => {
-                let meta = ensure_partition_meta_exact(&db).ok();
-                if idx == 0 {
-                    return Ok(Some(db));
-                }
-                let Some(meta) = meta else {
-                    if best_follower_without_meta.is_none() {
-                        best_follower_without_meta = Some(db);
-                    }
-                    continue;
-                };
-                match &best_follower {
-                    Some((best_generation, _)) if *best_generation >= meta.committed_generation => {
-                    }
-                    _ => best_follower = Some((meta.committed_generation, db)),
-                }
-            }
-            Err(err) => {
-                warn!(
-                    "trashdb read fallback: failed to open {}: {}",
-                    path.display(),
-                    err
-                );
-            }
-        }
-    }
-
-    if let Some((_, db)) = best_follower {
-        return Ok(Some(db));
-    }
-    if let Some(db) = best_follower_without_meta {
-        return Ok(Some(db));
-    }
-    Ok(None)
-}
-
-fn with_trash_commit_lock<T, F>(fragment: &str, op: F) -> Result<T, AppError>
-where
-    F: FnOnce(&Path) -> Result<T, AppError>,
-{
-    let route = trash_control_route(fragment)?;
-    let owner_path = trash_db_path(&route.roots[0], fragment);
-    with_partition_commit_lock(&owner_path, || op(&owner_path))
-}
-
-fn replicate_trash_db(fragment: &str) -> Result<(), AppError> {
-    let route = trash_control_route(fragment)?;
-    if route.roots.len() <= 1 {
-        return Ok(());
-    }
-    let owner_path = trash_db_path(&route.roots[0], fragment);
-    if !owner_path.exists() {
-        for replica_root in route.roots.iter().skip(1) {
-            let replica_path = trash_db_path(replica_root, fragment);
-            evict_cached_db(&replica_path);
-            let _ = fs::remove_file(&replica_path);
-        }
-        return Ok(());
-    }
-    for replica_root in route.roots.iter().skip(1) {
-        let replica_path = trash_db_path(replica_root, fragment);
-        evict_cached_db(&replica_path);
-        atomic_copy_db_file(&owner_path, &replica_path)?;
-    }
-    Ok(())
 }
 
 fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, AppError> {
@@ -583,6 +376,86 @@ fn evict_cached_db(path: &Path) {
 #[cfg(test)]
 pub(crate) fn evict_cached_db_for_test(path: &Path) {
     evict_cached_db(path);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_cached_dbs_for_test() {
+    if let Ok(mut cache) = DB_CACHE.lock() {
+        cache.clear();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn clear_live_namespace_indexes_for_test(fragment: &str) -> Result<(), AppError> {
+    for partition_id in 0..INDEX_PARTITION_COUNT {
+        let route = route_for_partition(partition_id)?;
+        for root in route.roots {
+            let path = db_path(&root, fragment, partition_id);
+            if !path.exists() {
+                continue;
+            }
+            let db = get_or_open_db(&path)?;
+            let write_txn = db
+                .begin_write()
+                .map_err(|e| map_indexdb_error("begin_write", e))?;
+            {
+                let mut table = match write_txn.open_table(LIVE_NAMESPACE_TABLE) {
+                    Ok(table) => table,
+                    Err(TableError::TableDoesNotExist(_)) => continue,
+                    Err(err) => return Err(map_indexdb_error("open live_namespace", err)),
+                };
+                let mut keys = Vec::new();
+                let mut iter = table
+                    .iter()
+                    .map_err(|e| map_indexdb_error("live_namespace iter", e))?;
+                while let Some(entry) = iter.next() {
+                    let (key, _) =
+                        entry.map_err(|e| map_indexdb_error("live_namespace iter next", e))?;
+                    keys.push(key.value().to_string());
+                }
+                for key in keys {
+                    let _ = table
+                        .remove(key.as_str())
+                        .map_err(|e| map_indexdb_error("live_namespace remove", e))?;
+                }
+            }
+            write_txn
+                .commit()
+                .map_err(|e| map_indexdb_error("commit live_namespace clear", e))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn count_live_namespace_rows_for_test(fragment: &str) -> Result<usize, AppError> {
+    let mut total = 0usize;
+    for partition_id in 0..INDEX_PARTITION_COUNT {
+        let route = route_for_partition(partition_id)?;
+        for root in route.roots {
+            let path = db_path(&root, fragment, partition_id);
+            if !path.exists() {
+                continue;
+            }
+            let db = get_or_open_db(&path)?;
+            let read_txn = db
+                .begin_read()
+                .map_err(|e| map_indexdb_error("begin_read", e))?;
+            let table = match read_txn.open_table(LIVE_NAMESPACE_TABLE) {
+                Ok(table) => table,
+                Err(TableError::TableDoesNotExist(_)) => continue,
+                Err(err) => return Err(map_indexdb_error("open live_namespace", err)),
+            };
+            let mut iter = table
+                .iter()
+                .map_err(|e| map_indexdb_error("live_namespace iter", e))?;
+            while let Some(entry) = iter.next() {
+                let _ = entry.map_err(|e| map_indexdb_error("live_namespace iter next", e))?;
+                total = total.saturating_add(1);
+            }
+        }
+    }
+    Ok(total)
 }
 
 fn atomic_copy_db_file(src: &Path, dst: &Path) -> Result<(), AppError> {
@@ -1202,6 +1075,132 @@ fn write_head_exact(
     Ok(())
 }
 
+fn write_live_namespace_exact(
+    live_namespace: &mut indexdb::Table<&str, &[u8]>,
+    metadata: &ObjectMetadata,
+) -> Result<(), AppError> {
+    let bytes = serialize(metadata)?;
+    live_namespace
+        .insert(
+            canonical_key(&metadata.object_key).as_str(),
+            bytes.as_slice(),
+        )
+        .map_err(|e| map_indexdb_error("live_namespace insert", e))?;
+    Ok(())
+}
+
+fn remove_live_namespace_exact(
+    live_namespace: &mut indexdb::Table<&str, &[u8]>,
+    object_key: &str,
+) -> Result<(), AppError> {
+    let _ = live_namespace
+        .remove(canonical_key(object_key).as_str())
+        .map_err(|e| map_indexdb_error("live_namespace remove", e))?;
+    Ok(())
+}
+
+fn sync_live_namespace_from_head_exact(
+    live_namespace: &mut indexdb::Table<&str, &[u8]>,
+    head: &HeadRecord,
+) -> Result<(), AppError> {
+    if head.state == ObjectState::Live {
+        write_live_namespace_exact(live_namespace, &head.to_summary_metadata())
+    } else {
+        remove_live_namespace_exact(live_namespace, &head.object_key)
+    }
+}
+
+fn write_head_with_namespace_exact(
+    heads: &mut indexdb::Table<&str, &[u8]>,
+    live_namespace: &mut indexdb::Table<&str, &[u8]>,
+    head: &HeadRecord,
+) -> Result<(), AppError> {
+    write_head_exact(heads, head)?;
+    sync_live_namespace_from_head_exact(live_namespace, head)
+}
+
+fn remove_head_exact(
+    heads: &mut indexdb::Table<&str, &[u8]>,
+    object_key: &str,
+) -> Result<(), AppError> {
+    let _ = heads
+        .remove(canonical_key(object_key).as_str())
+        .map_err(|e| map_indexdb_error("head remove", e))?;
+    Ok(())
+}
+
+fn remove_head_with_namespace_exact(
+    heads: &mut indexdb::Table<&str, &[u8]>,
+    live_namespace: &mut indexdb::Table<&str, &[u8]>,
+    object_key: &str,
+) -> Result<(), AppError> {
+    remove_head_exact(heads, object_key)?;
+    remove_live_namespace_exact(live_namespace, object_key)
+}
+
+fn load_latest_remaining_version_exact(
+    versions: &indexdb::Table<&str, &[u8]>,
+    states: &indexdb::Table<&str, &[u8]>,
+    object_key: &str,
+) -> Result<Option<(ObjectMetadata, ObjectState)>, AppError> {
+    let prefix = version_row_prefix(object_key);
+    let mut iter = states
+        .range(prefix.as_str()..)
+        .map_err(|e| map_indexdb_error("version_state range", e))?;
+    let mut latest_remaining: Option<(ObjectMetadata, ObjectState)> = None;
+
+    while let Some(entry) = iter.next() {
+        let (row_key, value) =
+            entry.map_err(|e| map_indexdb_error("version_state range next", e))?;
+        let row_key = row_key.value();
+        if !row_key.starts_with(&prefix) {
+            break;
+        }
+        let visibility: VersionStateRecord = deserialize(value.value())?;
+        if visibility.state == ObjectState::Deleted {
+            continue;
+        }
+        let Some(version_value) = versions
+            .get(row_key)
+            .map_err(|e| map_indexdb_error("version get", e))?
+        else {
+            continue;
+        };
+        let metadata = deserialize::<VersionRecord>(version_value.value())?.metadata;
+        match &latest_remaining {
+            Some((current, _)) if !metadata_is_newer(&metadata, current) => {}
+            _ => latest_remaining = Some((metadata, visibility.state)),
+        }
+    }
+
+    Ok(latest_remaining)
+}
+
+fn rewrite_head_from_remaining_versions_exact(
+    heads: &mut indexdb::Table<&str, &[u8]>,
+    live_namespace: &mut indexdb::Table<&str, &[u8]>,
+    versions: &indexdb::Table<&str, &[u8]>,
+    states: &indexdb::Table<&str, &[u8]>,
+    object_key: &str,
+    current_head: Option<&HeadRecord>,
+    updated_at: i64,
+) -> Result<(), AppError> {
+    if let Some((metadata, state)) =
+        load_latest_remaining_version_exact(versions, states, object_key)?
+    {
+        let next_head = HeadRecord::from_metadata(
+            &metadata,
+            state,
+            next_head_generation(current_head),
+            updated_at,
+        );
+        write_head_with_namespace_exact(heads, live_namespace, &next_head)?;
+    } else {
+        remove_head_with_namespace_exact(heads, live_namespace, object_key)?;
+    }
+    Ok(())
+}
+
 fn list_versions_exact(
     db: &Database,
     object_key: &str,
@@ -1276,6 +1275,9 @@ fn write_version_on_db(
         let mut heads = write_txn
             .open_table(OBJECT_HEADS_TABLE)
             .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut live_namespace = write_txn
+            .open_table(LIVE_NAMESPACE_TABLE)
+            .map_err(|e| map_indexdb_error("open live_namespace", e))?;
         let mut versions = write_txn
             .open_table(OBJECT_VERSIONS_TABLE)
             .map_err(|e| map_indexdb_error("open object_versions", e))?;
@@ -1315,7 +1317,7 @@ fn write_version_on_db(
                 next_head_generation(current_head.as_ref()),
                 now,
             );
-            write_head_exact(&mut heads, &head)?;
+            write_head_with_namespace_exact(&mut heads, &mut live_namespace, &head)?;
             Some(serialize(&head)?)
         } else {
             None
@@ -1338,7 +1340,6 @@ fn write_version_on_db(
     Ok(mutation)
 }
 
-#[allow(dead_code)]
 fn change_version_state_on_db(
     db: &Database,
     object_key: &str,
@@ -1356,6 +1357,9 @@ fn change_version_state_on_db(
         let mut heads = write_txn
             .open_table(OBJECT_HEADS_TABLE)
             .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut live_namespace = write_txn
+            .open_table(LIVE_NAMESPACE_TABLE)
+            .map_err(|e| map_indexdb_error("open live_namespace", e))?;
         let versions = write_txn
             .open_table(OBJECT_VERSIONS_TABLE)
             .map_err(|e| map_indexdb_error("open object_versions", e))?;
@@ -1413,7 +1417,7 @@ fn change_version_state_on_db(
                     next_head_generation(current_head.as_ref()),
                     now,
                 );
-                write_head_exact(&mut heads, &next_head)?;
+                write_head_with_namespace_exact(&mut heads, &mut live_namespace, &next_head)?;
             } else if target_state == ObjectState::Live
                 && expected_state == Some(ObjectState::Trash)
             {
@@ -1423,11 +1427,11 @@ fn change_version_state_on_db(
                     next_head_generation(current_head.as_ref()),
                     now,
                 );
-                write_head_exact(&mut heads, &restored_head)?;
+                write_head_with_namespace_exact(&mut heads, &mut live_namespace, &restored_head)?;
             }
         } else if target_state == ObjectState::Live && expected_state == Some(ObjectState::Trash) {
             let restored_head = HeadRecord::from_metadata(&metadata, ObjectState::Live, 1, now);
-            write_head_exact(&mut heads, &restored_head)?;
+            write_head_with_namespace_exact(&mut heads, &mut live_namespace, &restored_head)?;
         }
 
         let trash_key = canonical_key(object_key);
@@ -1508,6 +1512,9 @@ fn delete_version_on_db(
         let mut heads = write_txn
             .open_table(OBJECT_HEADS_TABLE)
             .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut live_namespace = write_txn
+            .open_table(LIVE_NAMESPACE_TABLE)
+            .map_err(|e| map_indexdb_error("open live_namespace", e))?;
         let mut versions = write_txn
             .open_table(OBJECT_VERSIONS_TABLE)
             .map_err(|e| map_indexdb_error("open object_versions", e))?;
@@ -1548,26 +1555,6 @@ fn delete_version_on_db(
         let _ = states
             .remove(row_key.as_str())
             .map_err(|e| map_indexdb_error("version_state remove", e))?;
-        if current_head
-            .as_ref()
-            .map(|head| head.version_id == version_id)
-            .unwrap_or(false)
-        {
-            let fragment = current_head
-                .as_ref()
-                .map(|head| head.fragment.as_str())
-                .unwrap_or(removed_record.metadata.fragment.as_str());
-            let tombstone = HeadRecord::tombstone(
-                fragment,
-                object_key,
-                next_head_generation(current_head.as_ref()),
-                now,
-                current_head.as_ref(),
-                Some(&removed_record.metadata),
-            );
-            write_head_exact(&mut heads, &tombstone)?;
-        }
-
         if existing_state.state == ObjectState::Trash {
             let trash_key = canonical_key(object_key);
             let maybe_existing = trash_objects
@@ -1591,6 +1578,15 @@ fn delete_version_on_db(
                 }
             }
         }
+        rewrite_head_from_remaining_versions_exact(
+            &mut heads,
+            &mut live_namespace,
+            &versions,
+            &states,
+            object_key,
+            current_head.as_ref(),
+            now,
+        )?;
         (
             removed_record,
             PartitionMeta {
@@ -1605,151 +1601,6 @@ fn delete_version_on_db(
     Ok(Some((record.metadata, partition_meta)))
 }
 
-#[allow(dead_code)]
-fn bulk_rewrite_key_state_on_db(
-    db: &Database,
-    object_key: &str,
-    from_state: ObjectState,
-    to_state: ObjectState,
-) -> Result<Option<(Vec<String>, PartitionMeta)>, AppError> {
-    let write_txn = db
-        .begin_write()
-        .map_err(|e| map_indexdb_error("begin_write", e))?;
-    let (touched, partition_meta) = {
-        let mut partition_meta = write_txn
-            .open_table(PARTITION_META_TABLE)
-            .map_err(|e| map_indexdb_error("open partition_meta", e))?;
-        let mut heads = write_txn
-            .open_table(OBJECT_HEADS_TABLE)
-            .map_err(|e| map_indexdb_error("open object_heads", e))?;
-        let mut states = write_txn
-            .open_table(OBJECT_VERSION_STATES_TABLE)
-            .map_err(|e| map_indexdb_error("open object_version_states", e))?;
-        let mut trash_objects = write_txn
-            .open_table(TRASH_OBJECTS_TABLE)
-            .map_err(|e| map_indexdb_error("open trash_objects", e))?;
-        let now = Utc::now().timestamp();
-        let committed_generation = next_partition_generation(&mut partition_meta, now)?;
-        let current_head = heads
-            .get(canonical_key(object_key).as_str())
-            .map_err(|e| map_indexdb_error("head get", e))?
-            .map(|value| deserialize::<HeadRecord>(value.value()))
-            .transpose()?;
-        let prefix = version_row_prefix(object_key);
-        let mut iter = states
-            .range(prefix.as_str()..)
-            .map_err(|e| map_indexdb_error("version_state range", e))?;
-        let mut touched = Vec::new();
-        let mut rewrites = Vec::new();
-        while let Some(entry) = iter.next() {
-            let (row_key, value) =
-                entry.map_err(|e| map_indexdb_error("version_state range next", e))?;
-            let row_key = row_key.value();
-            if !row_key.starts_with(&prefix) {
-                break;
-            }
-            let record: VersionStateRecord = deserialize(value.value())?;
-            if record.state != from_state {
-                continue;
-            }
-            let (_, version_id) = parse_version_key(row_key).ok_or_else(|| {
-                AppError::InternalServerError("invalid version row key".to_string())
-            })?;
-            touched.push(version_id.to_string());
-            rewrites.push((
-                row_key.to_string(),
-                serialize(&VersionStateRecord {
-                    state: to_state,
-                    updated_at: now,
-                    generation: committed_generation,
-                })?,
-            ));
-        }
-
-        if touched.is_empty() {
-            return Ok(None);
-        }
-
-        for (row_key, bytes) in &rewrites {
-            states
-                .insert(row_key.as_str(), bytes.as_slice())
-                .map_err(|e| map_indexdb_error("bulk version_state rewrite", e))?;
-        }
-        match current_head.as_ref() {
-            Some(head) if head.state == from_state => {
-                let next_head =
-                    head.with_state(to_state, next_head_generation(current_head.as_ref()), now);
-                write_head_exact(&mut heads, &next_head)?;
-            }
-            Some(_) => {}
-            None => {
-                return Err(AppError::InternalServerError(format!(
-                    "indexdb missing head for {} while rewriting version visibility",
-                    canonical_key(object_key)
-                )));
-            }
-        }
-
-        let trash_key = canonical_key(object_key);
-        if from_state == ObjectState::Live && to_state == ObjectState::Trash {
-            let mut merged = trash_objects
-                .get(trash_key.as_str())
-                .map_err(|e| map_indexdb_error("trash_objects get", e))?
-                .map(|value| deserialize::<TrashObjectRecord>(value.value()))
-                .transpose()?
-                .unwrap_or(TrashObjectRecord {
-                    version_ids: Vec::new(),
-                    deleted_at: now,
-                });
-            merged.deleted_at = now;
-            merged.version_ids.extend(touched.iter().cloned());
-            merged
-                .version_ids
-                .sort_by(|left, right| compare_version_id_recency(left, right));
-            merged.version_ids.dedup();
-            let bytes = serialize(&merged)?;
-            trash_objects
-                .insert(trash_key.as_str(), bytes.as_slice())
-                .map_err(|e| map_indexdb_error("trash_objects insert", e))?;
-        } else if from_state == ObjectState::Trash && to_state == ObjectState::Live {
-            let maybe_existing = trash_objects
-                .get(trash_key.as_str())
-                .map_err(|e| map_indexdb_error("trash_objects get", e))?
-                .map(|value| deserialize::<TrashObjectRecord>(value.value()))
-                .transpose()?;
-            if let Some(mut existing) = maybe_existing {
-                existing
-                    .version_ids
-                    .retain(|version_id| !touched.iter().any(|candidate| candidate == version_id));
-                if existing.version_ids.is_empty() {
-                    let _ = trash_objects
-                        .remove(trash_key.as_str())
-                        .map_err(|e| map_indexdb_error("trash_objects remove", e))?;
-                } else {
-                    let bytes = serialize(&existing)?;
-                    trash_objects
-                        .insert(trash_key.as_str(), bytes.as_slice())
-                        .map_err(|e| map_indexdb_error("trash_objects insert", e))?;
-                }
-            }
-        }
-        (
-            touched,
-            PartitionMeta {
-                committed_generation,
-                updated_at: now,
-            },
-        )
-    };
-    write_txn
-        .commit()
-        .map_err(|e| map_indexdb_error("commit bulk version rewrite", e))?;
-    let mut touched = touched;
-    touched.sort_by(|left, right| compare_version_id_recency(left, right));
-    Ok(Some((touched, partition_meta)))
-}
-
-#[allow(dead_code)]
 fn bulk_rewrite_keys_state_on_db(
     db: &Database,
     object_keys: &[String],
@@ -1825,6 +1676,9 @@ fn bulk_rewrite_keys_state_on_db(
         let mut heads = write_txn
             .open_table(OBJECT_HEADS_TABLE)
             .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut live_namespace = write_txn
+            .open_table(LIVE_NAMESPACE_TABLE)
+            .map_err(|e| map_indexdb_error("open live_namespace", e))?;
         let mut states = write_txn
             .open_table(OBJECT_VERSION_STATES_TABLE)
             .map_err(|e| map_indexdb_error("open object_version_states", e))?;
@@ -1858,7 +1712,7 @@ fn bulk_rewrite_keys_state_on_db(
                         next_head_generation(current_head.as_ref()),
                         partition_meta.updated_at,
                     );
-                    write_head_exact(&mut heads, &next_head)?;
+                    write_head_with_namespace_exact(&mut heads, &mut live_namespace, &next_head)?;
                 }
                 Some(_) => {}
                 None => {
@@ -1925,7 +1779,6 @@ fn bulk_rewrite_keys_state_on_db(
     Ok((touched, partition_meta))
 }
 
-#[allow(dead_code)]
 fn apply_restore_trash_entries_exact(
     db: &Database,
     object_versions: &HashMap<String, Vec<String>>,
@@ -1946,6 +1799,9 @@ fn apply_restore_trash_entries_exact(
         let mut heads = write_txn
             .open_table(OBJECT_HEADS_TABLE)
             .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut live_namespace = write_txn
+            .open_table(LIVE_NAMESPACE_TABLE)
+            .map_err(|e| map_indexdb_error("open live_namespace", e))?;
         let versions = write_txn
             .open_table(OBJECT_VERSIONS_TABLE)
             .map_err(|e| map_indexdb_error("open object_versions", e))?;
@@ -2036,7 +1892,11 @@ fn apply_restore_trash_entries_exact(
                             next_head_generation(current_head.as_ref()),
                             partition_meta.updated_at,
                         );
-                        write_head_exact(&mut heads, &next_head)?;
+                        write_head_with_namespace_exact(
+                            &mut heads,
+                            &mut live_namespace,
+                            &next_head,
+                        )?;
                     } else if let Some(metadata) = latest_restored.as_ref() {
                         let next_head = HeadRecord::from_metadata(
                             metadata,
@@ -2044,7 +1904,11 @@ fn apply_restore_trash_entries_exact(
                             next_head_generation(current_head.as_ref()),
                             partition_meta.updated_at,
                         );
-                        write_head_exact(&mut heads, &next_head)?;
+                        write_head_with_namespace_exact(
+                            &mut heads,
+                            &mut live_namespace,
+                            &next_head,
+                        )?;
                     }
                 }
                 None => {
@@ -2055,7 +1919,11 @@ fn apply_restore_trash_entries_exact(
                             1,
                             partition_meta.updated_at,
                         );
-                        write_head_exact(&mut heads, &next_head)?;
+                        write_head_with_namespace_exact(
+                            &mut heads,
+                            &mut live_namespace,
+                            &next_head,
+                        )?;
                     }
                 }
                 _ => {}
@@ -2095,7 +1963,6 @@ fn apply_restore_trash_entries_exact(
     Ok(touched)
 }
 
-#[allow(dead_code)]
 fn restore_trash_entries_on_db(
     db: &Database,
     object_versions: &HashMap<String, Vec<String>>,
@@ -2118,7 +1985,6 @@ fn restore_trash_entries_on_db(
     Ok((touched, partition_meta))
 }
 
-#[allow(dead_code)]
 fn apply_restore_trash_entries_replica_exact(
     db: &Database,
     object_versions: &HashMap<String, Vec<String>>,
@@ -2142,6 +2008,9 @@ fn delete_all_versions_for_key_on_db(
         let mut heads = write_txn
             .open_table(OBJECT_HEADS_TABLE)
             .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut live_namespace = write_txn
+            .open_table(LIVE_NAMESPACE_TABLE)
+            .map_err(|e| map_indexdb_error("open live_namespace", e))?;
         let mut versions = write_txn
             .open_table(OBJECT_VERSIONS_TABLE)
             .map_err(|e| map_indexdb_error("open object_versions", e))?;
@@ -2153,28 +2022,18 @@ fn delete_all_versions_for_key_on_db(
             .map_err(|e| map_indexdb_error("open trash_objects", e))?;
         let now = Utc::now().timestamp();
         let committed_generation = next_partition_generation(&mut partition_meta, now)?;
-        let current_head = heads
-            .get(canonical_key(object_key).as_str())
-            .map_err(|e| map_indexdb_error("head get", e))?
-            .map(|value| deserialize::<HeadRecord>(value.value()))
-            .transpose()?;
         let prefix = version_row_prefix(object_key);
         let mut iter = versions
             .range(prefix.as_str()..)
             .map_err(|e| map_indexdb_error("version range", e))?;
         let mut row_keys = Vec::new();
         let mut version_ids = Vec::new();
-        let mut latest_removed: Option<ObjectMetadata> = None;
         while let Some(entry) = iter.next() {
-            let (row_key, value) = entry.map_err(|e| map_indexdb_error("version range next", e))?;
+            let (row_key, _value) =
+                entry.map_err(|e| map_indexdb_error("version range next", e))?;
             let row_key = row_key.value();
             if !row_key.starts_with(&prefix) {
                 break;
-            }
-            let record: VersionRecord = deserialize(value.value())?;
-            match &latest_removed {
-                Some(current) if !metadata_is_newer(&record.metadata, current) => {}
-                _ => latest_removed = Some(record.metadata.clone()),
             }
             if let Some((_, version_id)) = parse_version_key(row_key) {
                 version_ids.push(version_id.to_string());
@@ -2192,24 +2051,7 @@ fn delete_all_versions_for_key_on_db(
                 .remove(row_key.as_str())
                 .map_err(|e| map_indexdb_error("version_state remove", e))?;
         }
-        let fragment = current_head
-            .as_ref()
-            .map(|head| head.fragment.as_str())
-            .or_else(|| {
-                latest_removed
-                    .as_ref()
-                    .map(|metadata| metadata.fragment.as_str())
-            })
-            .unwrap_or_default();
-        let tombstone = HeadRecord::tombstone(
-            fragment,
-            object_key,
-            next_head_generation(current_head.as_ref()),
-            now,
-            current_head.as_ref(),
-            latest_removed.as_ref(),
-        );
-        write_head_exact(&mut heads, &tombstone)?;
+        remove_head_with_namespace_exact(&mut heads, &mut live_namespace, object_key)?;
         let _ = trash_objects
             .remove(canonical_key(object_key).as_str())
             .map_err(|e| map_indexdb_error("trash_objects remove", e))?;
@@ -2229,7 +2071,6 @@ fn delete_all_versions_for_key_on_db(
     Ok(Some((version_ids, partition_meta)))
 }
 
-#[allow(dead_code)]
 fn delete_versions_for_key_with_state_on_db(
     db: &Database,
     object_key: &str,
@@ -2245,6 +2086,9 @@ fn delete_versions_for_key_with_state_on_db(
         let mut heads = write_txn
             .open_table(OBJECT_HEADS_TABLE)
             .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut live_namespace = write_txn
+            .open_table(LIVE_NAMESPACE_TABLE)
+            .map_err(|e| map_indexdb_error("open live_namespace", e))?;
         let mut versions = write_txn
             .open_table(OBJECT_VERSIONS_TABLE)
             .map_err(|e| map_indexdb_error("open object_versions", e))?;
@@ -2267,16 +2111,13 @@ fn delete_versions_for_key_with_state_on_db(
             .map_err(|e| map_indexdb_error("version range", e))?;
         let mut row_keys_to_delete = Vec::new();
         let mut version_ids = Vec::new();
-        let mut latest_removed: Option<ObjectMetadata> = None;
-        let mut latest_remaining: Option<(ObjectMetadata, ObjectState)> = None;
-
         while let Some(entry) = iter.next() {
-            let (row_key, value) = entry.map_err(|e| map_indexdb_error("version range next", e))?;
+            let (row_key, _value) =
+                entry.map_err(|e| map_indexdb_error("version range next", e))?;
             let row_key = row_key.value();
             if !row_key.starts_with(&prefix) {
                 break;
             }
-            let metadata = deserialize::<VersionRecord>(value.value())?.metadata;
             let Some(state_value) = states
                 .get(row_key)
                 .map_err(|e| map_indexdb_error("version_state get", e))?
@@ -2288,16 +2129,7 @@ fn delete_versions_for_key_with_state_on_db(
                 if let Some((_, version_id)) = parse_version_key(row_key) {
                     version_ids.push(version_id.to_string());
                 }
-                match &latest_removed {
-                    Some(current) if !metadata_is_newer(&metadata, current) => {}
-                    _ => latest_removed = Some(metadata),
-                }
                 row_keys_to_delete.push(row_key.to_string());
-            } else if state != ObjectState::Deleted {
-                match &latest_remaining {
-                    Some((current, _)) if !metadata_is_newer(&metadata, current) => {}
-                    _ => latest_remaining = Some((metadata, state)),
-                }
             }
         }
 
@@ -2314,34 +2146,15 @@ fn delete_versions_for_key_with_state_on_db(
                 .map_err(|e| map_indexdb_error("version_state remove", e))?;
         }
 
-        if let Some((metadata, state)) = latest_remaining {
-            let next_head = HeadRecord::from_metadata(
-                &metadata,
-                state,
-                next_head_generation(current_head.as_ref()),
-                now,
-            );
-            write_head_exact(&mut heads, &next_head)?;
-        } else {
-            let fragment = current_head
-                .as_ref()
-                .map(|head| head.fragment.as_str())
-                .or_else(|| {
-                    latest_removed
-                        .as_ref()
-                        .map(|metadata| metadata.fragment.as_str())
-                })
-                .unwrap_or_default();
-            let tombstone = HeadRecord::tombstone(
-                fragment,
-                object_key,
-                next_head_generation(current_head.as_ref()),
-                now,
-                current_head.as_ref(),
-                latest_removed.as_ref(),
-            );
-            write_head_exact(&mut heads, &tombstone)?;
-        }
+        rewrite_head_from_remaining_versions_exact(
+            &mut heads,
+            &mut live_namespace,
+            &versions,
+            &states,
+            object_key,
+            current_head.as_ref(),
+            now,
+        )?;
 
         if target_state == ObjectState::Trash {
             let trash_key = canonical_key(object_key);
@@ -2829,232 +2642,6 @@ where
     Ok(())
 }
 
-#[allow(dead_code)]
-fn list_partition_trash_objects_on_db(
-    db: &Database,
-) -> Result<HashMap<String, TrashObjectRecord>, AppError> {
-    let read_txn = db
-        .begin_read()
-        .map_err(|e| map_indexdb_error("begin_read", e))?;
-    let table = match read_txn.open_table(TRASH_OBJECTS_TABLE) {
-        Ok(table) => table,
-        Err(TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
-        Err(err) => return Err(map_indexdb_error("open trash_objects", err)),
-    };
-    let mut out = HashMap::new();
-    let mut iter = table
-        .iter()
-        .map_err(|e| map_indexdb_error("trash_objects iter", e))?;
-    while let Some(entry) = iter.next() {
-        let (key, value) = entry.map_err(|e| map_indexdb_error("trash_objects iter next", e))?;
-        out.insert(
-            key.value().to_string(),
-            deserialize::<TrashObjectRecord>(value.value())?,
-        );
-    }
-    Ok(out)
-}
-
-#[allow(dead_code)]
-fn partition_has_trash_objects_on_db(db: &Database) -> Result<bool, AppError> {
-    let read_txn = db
-        .begin_read()
-        .map_err(|e| map_indexdb_error("begin_read", e))?;
-    let table = match read_txn.open_table(TRASH_OBJECTS_TABLE) {
-        Ok(table) => table,
-        Err(TableError::TableDoesNotExist(_)) => return Ok(false),
-        Err(err) => return Err(map_indexdb_error("open trash_objects", err)),
-    };
-    let mut iter = table
-        .iter()
-        .map_err(|e| map_indexdb_error("trash_objects iter", e))?;
-    Ok(iter
-        .next()
-        .transpose()
-        .map_err(|e| map_indexdb_error("trash_objects iter next", e))?
-        .is_some())
-}
-
-#[allow(dead_code)]
-fn mark_active_trash_partitions(
-    fragment: &str,
-    partition_ids: &BTreeSet<u16>,
-) -> Result<(), AppError> {
-    if partition_ids.is_empty() {
-        return Ok(());
-    }
-
-    let route = trash_control_route(fragment)?;
-    let owner_path = owner_db_path(&route, fragment);
-    with_partition_commit_lock(&owner_path, || {
-        let owner_db = get_or_open_db(&owner_path)?;
-        let write_txn = owner_db
-            .begin_write()
-            .map_err(|e| map_indexdb_error("begin_write", e))?;
-        let partition_meta = {
-            let mut meta = write_txn
-                .open_table(PARTITION_META_TABLE)
-                .map_err(|e| map_indexdb_error("open partition_meta", e))?;
-            let mut active = write_txn
-                .open_table(TRASH_ACTIVE_PARTITIONS_TABLE)
-                .map_err(|e| map_indexdb_error("open trash_active_partitions", e))?;
-            let now = Utc::now().timestamp();
-            let committed_generation = next_partition_generation(&mut meta, now)?;
-            let partition_meta = PartitionMeta {
-                committed_generation,
-                updated_at: now,
-            };
-            let payload = serialize(&TrashActivePartitionRecord { updated_at: now })?;
-            for partition_id in partition_ids {
-                active
-                    .insert(
-                        partition_row_key(*partition_id).as_str(),
-                        payload.as_slice(),
-                    )
-                    .map_err(|e| map_indexdb_error("trash_active_partitions insert", e))?;
-            }
-            partition_meta
-        };
-        write_txn
-            .commit()
-            .map_err(|e| map_indexdb_error("commit trash active partition mark", e))?;
-        replicate_object_mutation(
-            fragment,
-            &route,
-            "mark active trash partitions",
-            |replica_db| {
-                let write_txn = replica_db
-                    .begin_write()
-                    .map_err(|e| map_indexdb_error("begin_write", e))?;
-                {
-                    let mut meta = write_txn
-                        .open_table(PARTITION_META_TABLE)
-                        .map_err(|e| map_indexdb_error("open partition_meta", e))?;
-                    let mut active = write_txn
-                        .open_table(TRASH_ACTIVE_PARTITIONS_TABLE)
-                        .map_err(|e| map_indexdb_error("open trash_active_partitions", e))?;
-                    write_partition_meta_exact(&mut meta, &partition_meta)?;
-                    let payload = serialize(&TrashActivePartitionRecord {
-                        updated_at: partition_meta.updated_at,
-                    })?;
-                    for partition_id in partition_ids {
-                        active
-                            .insert(
-                                partition_row_key(*partition_id).as_str(),
-                                payload.as_slice(),
-                            )
-                            .map_err(|e| map_indexdb_error("trash_active_partitions insert", e))?;
-                    }
-                }
-                write_txn.commit().map_err(|e| {
-                    map_indexdb_error("commit trash active partition replica mark", e)
-                })?;
-                Ok(())
-            },
-        )
-    })
-}
-
-fn clear_active_trash_partitions(
-    fragment: &str,
-    partition_ids: &BTreeSet<u16>,
-) -> Result<(), AppError> {
-    if partition_ids.is_empty() {
-        return Ok(());
-    }
-
-    let route = trash_control_route(fragment)?;
-    let owner_path = owner_db_path(&route, fragment);
-    with_partition_commit_lock(&owner_path, || {
-        if !owner_path.exists() {
-            return Ok(());
-        }
-        let owner_db = get_or_open_db(&owner_path)?;
-        let write_txn = owner_db
-            .begin_write()
-            .map_err(|e| map_indexdb_error("begin_write", e))?;
-        let partition_meta = {
-            let mut meta = write_txn
-                .open_table(PARTITION_META_TABLE)
-                .map_err(|e| map_indexdb_error("open partition_meta", e))?;
-            let mut active = write_txn
-                .open_table(TRASH_ACTIVE_PARTITIONS_TABLE)
-                .map_err(|e| map_indexdb_error("open trash_active_partitions", e))?;
-            let now = Utc::now().timestamp();
-            let committed_generation = next_partition_generation(&mut meta, now)?;
-            let partition_meta = PartitionMeta {
-                committed_generation,
-                updated_at: now,
-            };
-            for partition_id in partition_ids {
-                let _ = active
-                    .remove(partition_row_key(*partition_id).as_str())
-                    .map_err(|e| map_indexdb_error("trash_active_partitions remove", e))?;
-            }
-            partition_meta
-        };
-        write_txn
-            .commit()
-            .map_err(|e| map_indexdb_error("commit trash active partition clear", e))?;
-        replicate_object_mutation(
-            fragment,
-            &route,
-            "clear active trash partitions",
-            |replica_db| {
-                let write_txn = replica_db
-                    .begin_write()
-                    .map_err(|e| map_indexdb_error("begin_write", e))?;
-                {
-                    let mut meta = write_txn
-                        .open_table(PARTITION_META_TABLE)
-                        .map_err(|e| map_indexdb_error("open partition_meta", e))?;
-                    let mut active = write_txn
-                        .open_table(TRASH_ACTIVE_PARTITIONS_TABLE)
-                        .map_err(|e| map_indexdb_error("open trash_active_partitions", e))?;
-                    write_partition_meta_exact(&mut meta, &partition_meta)?;
-                    for partition_id in partition_ids {
-                        let _ = active
-                            .remove(partition_row_key(*partition_id).as_str())
-                            .map_err(|e| map_indexdb_error("trash_active_partitions remove", e))?;
-                    }
-                }
-                write_txn.commit().map_err(|e| {
-                    map_indexdb_error("commit trash active partition replica clear", e)
-                })?;
-                Ok(())
-            },
-        )
-    })
-}
-
-#[allow(dead_code)]
-fn list_active_trash_partitions(fragment: &str) -> Result<BTreeSet<u16>, AppError> {
-    let route = trash_control_route(fragment)?;
-    let Some(db) = open_route_db_for_read(fragment, &route)? else {
-        return Ok(BTreeSet::new());
-    };
-    let read_txn = db
-        .begin_read()
-        .map_err(|e| map_indexdb_error("begin_read", e))?;
-    let table = match read_txn.open_table(TRASH_ACTIVE_PARTITIONS_TABLE) {
-        Ok(table) => table,
-        Err(TableError::TableDoesNotExist(_)) => return Ok(BTreeSet::new()),
-        Err(err) => return Err(map_indexdb_error("open trash_active_partitions", err)),
-    };
-    let mut out = BTreeSet::new();
-    let mut iter = table
-        .iter()
-        .map_err(|e| map_indexdb_error("trash_active_partitions iter", e))?;
-    while let Some(entry) = iter.next() {
-        let (key, _) =
-            entry.map_err(|e| map_indexdb_error("trash_active_partitions iter next", e))?;
-        if let Ok(partition_id) = u16::from_str_radix(key.value(), 16) {
-            out.insert(partition_id);
-        }
-    }
-    Ok(out)
-}
-
 fn apply_write_version_replica_exact(
     db: &Database,
     mutation: &VersionUpsertMutation,
@@ -3069,6 +2656,9 @@ fn apply_write_version_replica_exact(
         let mut heads = write_txn
             .open_table(OBJECT_HEADS_TABLE)
             .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut live_namespace = write_txn
+            .open_table(LIVE_NAMESPACE_TABLE)
+            .map_err(|e| map_indexdb_error("open live_namespace", e))?;
         let mut versions = write_txn
             .open_table(OBJECT_VERSIONS_TABLE)
             .map_err(|e| map_indexdb_error("open object_versions", e))?;
@@ -3083,9 +2673,11 @@ fn apply_write_version_replica_exact(
             .insert(mutation.row_key.as_str(), mutation.state_bytes.as_slice())
             .map_err(|e| map_indexdb_error("version_state insert", e))?;
         if let Some(head_bytes) = mutation.head_bytes.as_ref() {
+            let head: HeadRecord = deserialize(head_bytes)?;
             heads
                 .insert(mutation.head_key.as_str(), head_bytes.as_slice())
                 .map_err(|e| map_indexdb_error("head insert", e))?;
+            sync_live_namespace_from_head_exact(&mut live_namespace, &head)?;
         }
     }
     write_txn
@@ -3094,7 +2686,6 @@ fn apply_write_version_replica_exact(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn apply_change_version_state_replica_exact(
     db: &Database,
     object_key: &str,
@@ -3113,6 +2704,9 @@ fn apply_change_version_state_replica_exact(
         let mut heads = write_txn
             .open_table(OBJECT_HEADS_TABLE)
             .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut live_namespace = write_txn
+            .open_table(LIVE_NAMESPACE_TABLE)
+            .map_err(|e| map_indexdb_error("open live_namespace", e))?;
         let versions = write_txn
             .open_table(OBJECT_VERSIONS_TABLE)
             .map_err(|e| map_indexdb_error("open object_versions", e))?;
@@ -3175,7 +2769,7 @@ fn apply_change_version_state_replica_exact(
                     next_head_generation(current_head.as_ref()),
                     partition_meta.updated_at,
                 );
-                write_head_exact(&mut heads, &next_head)?;
+                write_head_with_namespace_exact(&mut heads, &mut live_namespace, &next_head)?;
             } else if target_state == ObjectState::Live
                 && expected_state == Some(ObjectState::Trash)
             {
@@ -3185,7 +2779,7 @@ fn apply_change_version_state_replica_exact(
                     next_head_generation(current_head.as_ref()),
                     partition_meta.updated_at,
                 );
-                write_head_exact(&mut heads, &restored_head)?;
+                write_head_with_namespace_exact(&mut heads, &mut live_namespace, &restored_head)?;
             }
         } else if target_state == ObjectState::Live && expected_state == Some(ObjectState::Trash) {
             let restored_head = HeadRecord::from_metadata(
@@ -3194,7 +2788,7 @@ fn apply_change_version_state_replica_exact(
                 1,
                 partition_meta.updated_at,
             );
-            write_head_exact(&mut heads, &restored_head)?;
+            write_head_with_namespace_exact(&mut heads, &mut live_namespace, &restored_head)?;
         }
     }
     write_txn
@@ -3220,6 +2814,9 @@ fn apply_delete_version_replica_exact(
         let mut heads = write_txn
             .open_table(OBJECT_HEADS_TABLE)
             .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut live_namespace = write_txn
+            .open_table(LIVE_NAMESPACE_TABLE)
+            .map_err(|e| map_indexdb_error("open live_namespace", e))?;
         let mut versions = write_txn
             .open_table(OBJECT_VERSIONS_TABLE)
             .map_err(|e| map_indexdb_error("open object_versions", e))?;
@@ -3250,7 +2847,7 @@ fn apply_delete_version_replica_exact(
                 object_key, version_id, expected_state, existing_state.state
             )));
         }
-        let removed_record = {
+        {
             let Some(existing_value) = versions
                 .remove(row_key.as_str())
                 .map_err(|e| map_indexdb_error("version remove", e))?
@@ -3260,30 +2857,20 @@ fn apply_delete_version_replica_exact(
                     object_key, version_id
                 )));
             };
-            deserialize::<VersionRecord>(existing_value.value())?
+            let _ = deserialize::<VersionRecord>(existing_value.value())?;
         };
         let _ = states
             .remove(row_key.as_str())
             .map_err(|e| map_indexdb_error("version_state remove", e))?;
-        if current_head
-            .as_ref()
-            .map(|head| head.version_id == version_id)
-            .unwrap_or(false)
-        {
-            let fragment = current_head
-                .as_ref()
-                .map(|head| head.fragment.as_str())
-                .unwrap_or(removed_record.metadata.fragment.as_str());
-            let tombstone = HeadRecord::tombstone(
-                fragment,
-                object_key,
-                next_head_generation(current_head.as_ref()),
-                partition_meta.updated_at,
-                current_head.as_ref(),
-                Some(&removed_record.metadata),
-            );
-            write_head_exact(&mut heads, &tombstone)?;
-        }
+        rewrite_head_from_remaining_versions_exact(
+            &mut heads,
+            &mut live_namespace,
+            &versions,
+            &states,
+            object_key,
+            current_head.as_ref(),
+            partition_meta.updated_at,
+        )?;
     }
     write_txn
         .commit()
@@ -3291,97 +2878,6 @@ fn apply_delete_version_replica_exact(
     Ok(())
 }
 
-#[allow(dead_code)]
-fn apply_bulk_rewrite_key_state_replica_exact(
-    db: &Database,
-    object_key: &str,
-    from_state: ObjectState,
-    to_state: ObjectState,
-    partition_meta: &PartitionMeta,
-) -> Result<(), AppError> {
-    let write_txn = db
-        .begin_write()
-        .map_err(|e| map_indexdb_error("begin_write", e))?;
-    {
-        let mut meta = write_txn
-            .open_table(PARTITION_META_TABLE)
-            .map_err(|e| map_indexdb_error("open partition_meta", e))?;
-        let mut heads = write_txn
-            .open_table(OBJECT_HEADS_TABLE)
-            .map_err(|e| map_indexdb_error("open object_heads", e))?;
-        let mut states = write_txn
-            .open_table(OBJECT_VERSION_STATES_TABLE)
-            .map_err(|e| map_indexdb_error("open object_version_states", e))?;
-        write_partition_meta_exact(&mut meta, partition_meta)?;
-        let current_head = heads
-            .get(canonical_key(object_key).as_str())
-            .map_err(|e| map_indexdb_error("head get", e))?
-            .map(|value| deserialize::<HeadRecord>(value.value()))
-            .transpose()?;
-        let prefix = version_row_prefix(object_key);
-        let mut iter = states
-            .range(prefix.as_str()..)
-            .map_err(|e| map_indexdb_error("version_state range", e))?;
-        let mut rewrites = Vec::new();
-        while let Some(entry) = iter.next() {
-            let (row_key, value) =
-                entry.map_err(|e| map_indexdb_error("version_state range next", e))?;
-            let row_key = row_key.value();
-            if !row_key.starts_with(&prefix) {
-                break;
-            }
-            let record: VersionStateRecord = deserialize(value.value())?;
-            if record.state != from_state {
-                continue;
-            }
-            rewrites.push((
-                row_key.to_string(),
-                serialize(&VersionStateRecord {
-                    state: to_state,
-                    updated_at: partition_meta.updated_at,
-                    generation: partition_meta.committed_generation,
-                })?,
-            ));
-        }
-        drop(iter);
-
-        if rewrites.is_empty() {
-            return Err(AppError::InternalServerError(format!(
-                "replica missing rewritable versions for {} from {:?} to {:?}",
-                object_key, from_state, to_state
-            )));
-        }
-
-        for (row_key, bytes) in &rewrites {
-            states
-                .insert(row_key.as_str(), bytes.as_slice())
-                .map_err(|e| map_indexdb_error("bulk version_state rewrite", e))?;
-        }
-        match current_head.as_ref() {
-            Some(head) if head.state == from_state => {
-                let next_head = head.with_state(
-                    to_state,
-                    next_head_generation(current_head.as_ref()),
-                    partition_meta.updated_at,
-                );
-                write_head_exact(&mut heads, &next_head)?;
-            }
-            Some(_) => {}
-            None => {
-                return Err(AppError::InternalServerError(format!(
-                    "replica missing head for {} while rewriting version visibility",
-                    canonical_key(object_key)
-                )));
-            }
-        }
-    }
-    write_txn
-        .commit()
-        .map_err(|e| map_indexdb_error("commit bulk version replica rewrite", e))?;
-    Ok(())
-}
-
-#[allow(dead_code)]
 fn apply_bulk_rewrite_keys_state_replica_exact(
     db: &Database,
     object_keys: &[String],
@@ -3450,6 +2946,9 @@ fn apply_bulk_rewrite_keys_state_replica_exact(
         let mut heads = write_txn
             .open_table(OBJECT_HEADS_TABLE)
             .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut live_namespace = write_txn
+            .open_table(LIVE_NAMESPACE_TABLE)
+            .map_err(|e| map_indexdb_error("open live_namespace", e))?;
         let mut states = write_txn
             .open_table(OBJECT_VERSION_STATES_TABLE)
             .map_err(|e| map_indexdb_error("open object_version_states", e))?;
@@ -3474,7 +2973,7 @@ fn apply_bulk_rewrite_keys_state_replica_exact(
                         next_head_generation(current_head.as_ref()),
                         partition_meta.updated_at,
                     );
-                    write_head_exact(&mut heads, &next_head)?;
+                    write_head_with_namespace_exact(&mut heads, &mut live_namespace, &next_head)?;
                 }
                 Some(_) => {}
                 None => {
@@ -3507,6 +3006,9 @@ fn apply_delete_all_versions_for_key_replica_exact(
         let mut heads = write_txn
             .open_table(OBJECT_HEADS_TABLE)
             .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut live_namespace = write_txn
+            .open_table(LIVE_NAMESPACE_TABLE)
+            .map_err(|e| map_indexdb_error("open live_namespace", e))?;
         let mut versions = write_txn
             .open_table(OBJECT_VERSIONS_TABLE)
             .map_err(|e| map_indexdb_error("open object_versions", e))?;
@@ -3514,27 +3016,17 @@ fn apply_delete_all_versions_for_key_replica_exact(
             .open_table(OBJECT_VERSION_STATES_TABLE)
             .map_err(|e| map_indexdb_error("open object_version_states", e))?;
         write_partition_meta_exact(&mut meta, partition_meta)?;
-        let current_head = heads
-            .get(canonical_key(object_key).as_str())
-            .map_err(|e| map_indexdb_error("head get", e))?
-            .map(|value| deserialize::<HeadRecord>(value.value()))
-            .transpose()?;
         let prefix = version_row_prefix(object_key);
         let mut iter = versions
             .range(prefix.as_str()..)
             .map_err(|e| map_indexdb_error("version range", e))?;
         let mut row_keys = Vec::new();
-        let mut latest_removed: Option<ObjectMetadata> = None;
         while let Some(entry) = iter.next() {
-            let (row_key, value) = entry.map_err(|e| map_indexdb_error("version range next", e))?;
+            let (row_key, _value) =
+                entry.map_err(|e| map_indexdb_error("version range next", e))?;
             let row_key = row_key.value();
             if !row_key.starts_with(&prefix) {
                 break;
-            }
-            let record: VersionRecord = deserialize(value.value())?;
-            match &latest_removed {
-                Some(current) if !metadata_is_newer(&record.metadata, current) => {}
-                _ => latest_removed = Some(record.metadata.clone()),
             }
             row_keys.push(row_key.to_string());
         }
@@ -3552,24 +3044,7 @@ fn apply_delete_all_versions_for_key_replica_exact(
                 .remove(row_key.as_str())
                 .map_err(|e| map_indexdb_error("version_state remove", e))?;
         }
-        let fragment = current_head
-            .as_ref()
-            .map(|head| head.fragment.as_str())
-            .or_else(|| {
-                latest_removed
-                    .as_ref()
-                    .map(|metadata| metadata.fragment.as_str())
-            })
-            .unwrap_or_default();
-        let tombstone = HeadRecord::tombstone(
-            fragment,
-            object_key,
-            next_head_generation(current_head.as_ref()),
-            partition_meta.updated_at,
-            current_head.as_ref(),
-            latest_removed.as_ref(),
-        );
-        write_head_exact(&mut heads, &tombstone)?;
+        remove_head_with_namespace_exact(&mut heads, &mut live_namespace, object_key)?;
     }
     write_txn
         .commit()
@@ -3577,7 +3052,6 @@ fn apply_delete_all_versions_for_key_replica_exact(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn apply_delete_versions_for_key_with_state_replica_exact(
     db: &Database,
     object_key: &str,
@@ -3594,6 +3068,9 @@ fn apply_delete_versions_for_key_with_state_replica_exact(
         let mut heads = write_txn
             .open_table(OBJECT_HEADS_TABLE)
             .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut live_namespace = write_txn
+            .open_table(LIVE_NAMESPACE_TABLE)
+            .map_err(|e| map_indexdb_error("open live_namespace", e))?;
         let mut versions = write_txn
             .open_table(OBJECT_VERSIONS_TABLE)
             .map_err(|e| map_indexdb_error("open object_versions", e))?;
@@ -3611,16 +3088,13 @@ fn apply_delete_versions_for_key_with_state_replica_exact(
             .range(prefix.as_str()..)
             .map_err(|e| map_indexdb_error("version range", e))?;
         let mut row_keys_to_delete = Vec::new();
-        let mut latest_removed: Option<ObjectMetadata> = None;
-        let mut latest_remaining: Option<(ObjectMetadata, ObjectState)> = None;
-
         while let Some(entry) = iter.next() {
-            let (row_key, value) = entry.map_err(|e| map_indexdb_error("version range next", e))?;
+            let (row_key, _value) =
+                entry.map_err(|e| map_indexdb_error("version range next", e))?;
             let row_key = row_key.value();
             if !row_key.starts_with(&prefix) {
                 break;
             }
-            let metadata = deserialize::<VersionRecord>(value.value())?.metadata;
             let Some(state_value) = states
                 .get(row_key)
                 .map_err(|e| map_indexdb_error("version_state get", e))?
@@ -3629,16 +3103,7 @@ fn apply_delete_versions_for_key_with_state_replica_exact(
             };
             let state = deserialize::<VersionStateRecord>(state_value.value())?.state;
             if state == target_state {
-                match &latest_removed {
-                    Some(current) if !metadata_is_newer(&metadata, current) => {}
-                    _ => latest_removed = Some(metadata),
-                }
                 row_keys_to_delete.push(row_key.to_string());
-            } else if state != ObjectState::Deleted {
-                match &latest_remaining {
-                    Some((current, _)) if !metadata_is_newer(&metadata, current) => {}
-                    _ => latest_remaining = Some((metadata, state)),
-                }
             }
         }
 
@@ -3658,34 +3123,15 @@ fn apply_delete_versions_for_key_with_state_replica_exact(
                 .map_err(|e| map_indexdb_error("version_state remove", e))?;
         }
 
-        if let Some((metadata, state)) = latest_remaining {
-            let next_head = HeadRecord::from_metadata(
-                &metadata,
-                state,
-                next_head_generation(current_head.as_ref()),
-                partition_meta.updated_at,
-            );
-            write_head_exact(&mut heads, &next_head)?;
-        } else {
-            let fragment = current_head
-                .as_ref()
-                .map(|head| head.fragment.as_str())
-                .or_else(|| {
-                    latest_removed
-                        .as_ref()
-                        .map(|metadata| metadata.fragment.as_str())
-                })
-                .unwrap_or_default();
-            let tombstone = HeadRecord::tombstone(
-                fragment,
-                object_key,
-                next_head_generation(current_head.as_ref()),
-                partition_meta.updated_at,
-                current_head.as_ref(),
-                latest_removed.as_ref(),
-            );
-            write_head_exact(&mut heads, &tombstone)?;
-        }
+        rewrite_head_from_remaining_versions_exact(
+            &mut heads,
+            &mut live_namespace,
+            &versions,
+            &states,
+            object_key,
+            current_head.as_ref(),
+            partition_meta.updated_at,
+        )?;
     }
     write_txn
         .commit()
@@ -3828,6 +3274,450 @@ fn load_current_metadata_for_head(
         return Ok(None);
     };
     Ok(Some(record.metadata))
+}
+
+fn collect_live_namespace_entries_on_db(
+    db: &Database,
+) -> Result<HashMap<String, ObjectMetadata>, AppError> {
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| map_indexdb_error("begin_read", e))?;
+    let heads = match read_txn.open_table(OBJECT_HEADS_TABLE) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
+        Err(err) => return Err(map_indexdb_error("open object_heads", err)),
+    };
+    let mut entries = HashMap::new();
+    let mut iter = heads
+        .iter()
+        .map_err(|e| map_indexdb_error("head iter", e))?;
+    while let Some(entry) = iter.next() {
+        let (key, value) = entry.map_err(|e| map_indexdb_error("head iter next", e))?;
+        let head: HeadRecord = deserialize(value.value())?;
+        if head.state == ObjectState::Live {
+            entries.insert(key.value().to_string(), head.to_summary_metadata());
+        }
+    }
+    Ok(entries)
+}
+
+fn rewrite_live_namespace_on_db(
+    db: &Database,
+    entries: &HashMap<String, ObjectMetadata>,
+) -> Result<(), AppError> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| map_indexdb_error("begin_write", e))?;
+    {
+        let mut table = write_txn
+            .open_table(LIVE_NAMESPACE_TABLE)
+            .map_err(|e| map_indexdb_error("open live_namespace", e))?;
+        let mut existing_keys = Vec::new();
+        let mut iter = table
+            .iter()
+            .map_err(|e| map_indexdb_error("live_namespace iter", e))?;
+        while let Some(entry) = iter.next() {
+            let (key, _) = entry.map_err(|e| map_indexdb_error("live_namespace iter next", e))?;
+            existing_keys.push(key.value().to_string());
+        }
+        for key in existing_keys {
+            let _ = table
+                .remove(key.as_str())
+                .map_err(|e| map_indexdb_error("live_namespace remove", e))?;
+        }
+        for (object_key, metadata) in entries {
+            write_live_namespace_exact(&mut table, metadata)?;
+            debug_assert_eq!(
+                canonical_key(object_key),
+                canonical_key(&metadata.object_key)
+            );
+        }
+    }
+    write_txn
+        .commit()
+        .map_err(|e| map_indexdb_error("commit live_namespace rewrite", e))?;
+    Ok(())
+}
+
+fn ensure_partition_live_namespace_table(
+    fragment: &str,
+    partition_id: u16,
+) -> Result<(), AppError> {
+    let route = route_for_partition(partition_id)?;
+    let owner_path = owner_db_path(&route, fragment);
+    if owner_path.exists() {
+        let db = get_or_open_db(&owner_path)?;
+        let needs_rebuild = {
+            let read_txn = db
+                .begin_read()
+                .map_err(|e| map_indexdb_error("begin_read", e))?;
+            let has_live_heads = match read_txn.open_table(OBJECT_HEADS_TABLE) {
+                Ok(heads) => {
+                    let mut iter = heads
+                        .iter()
+                        .map_err(|e| map_indexdb_error("head iter", e))?;
+                    let mut found = false;
+                    while let Some(entry) = iter.next() {
+                        let (_key, value) =
+                            entry.map_err(|e| map_indexdb_error("head iter next", e))?;
+                        let head: HeadRecord = deserialize(value.value())?;
+                        if head.state == ObjectState::Live {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                }
+                Err(TableError::TableDoesNotExist(_)) => false,
+                Err(err) => return Err(map_indexdb_error("open object_heads", err)),
+            };
+            match read_txn.open_table(LIVE_NAMESPACE_TABLE) {
+                Ok(table) => {
+                    let mut iter = table
+                        .iter()
+                        .map_err(|e| map_indexdb_error("live_namespace iter", e))?;
+                    let namespace_empty = iter
+                        .next()
+                        .transpose()
+                        .map_err(|e| map_indexdb_error("live_namespace iter next", e))?
+                        .is_none();
+                    namespace_empty && has_live_heads
+                }
+                Err(TableError::TableDoesNotExist(_)) => has_live_heads,
+                Err(err) => return Err(map_indexdb_error("open live_namespace", err)),
+            }
+        };
+        if needs_rebuild {
+            let entries = collect_live_namespace_entries_on_db(&db)?;
+            rewrite_live_namespace_on_db(&db, &entries)?;
+            replicate_owner_partition_db(fragment, &route)?;
+        }
+        return Ok(());
+    }
+
+    for root in route.roots.iter().skip(1) {
+        let path = db_path(root, fragment, partition_id);
+        if !path.exists() {
+            continue;
+        }
+        let db = get_or_open_db(&path)?;
+        let needs_rebuild = {
+            let read_txn = db
+                .begin_read()
+                .map_err(|e| map_indexdb_error("begin_read", e))?;
+            let has_live_heads = match read_txn.open_table(OBJECT_HEADS_TABLE) {
+                Ok(heads) => {
+                    let mut iter = heads
+                        .iter()
+                        .map_err(|e| map_indexdb_error("head iter", e))?;
+                    let mut found = false;
+                    while let Some(entry) = iter.next() {
+                        let (_key, value) =
+                            entry.map_err(|e| map_indexdb_error("head iter next", e))?;
+                        let head: HeadRecord = deserialize(value.value())?;
+                        if head.state == ObjectState::Live {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                }
+                Err(TableError::TableDoesNotExist(_)) => false,
+                Err(err) => return Err(map_indexdb_error("open object_heads", err)),
+            };
+            match read_txn.open_table(LIVE_NAMESPACE_TABLE) {
+                Ok(table) => {
+                    let mut iter = table
+                        .iter()
+                        .map_err(|e| map_indexdb_error("live_namespace iter", e))?;
+                    let namespace_empty = iter
+                        .next()
+                        .transpose()
+                        .map_err(|e| map_indexdb_error("live_namespace iter next", e))?
+                        .is_none();
+                    namespace_empty && has_live_heads
+                }
+                Err(TableError::TableDoesNotExist(_)) => has_live_heads,
+                Err(err) => return Err(map_indexdb_error("open live_namespace", err)),
+            }
+        };
+        if needs_rebuild {
+            let entries = collect_live_namespace_entries_on_db(&db)?;
+            rewrite_live_namespace_on_db(&db, &entries)?;
+        }
+        break;
+    }
+    Ok(())
+}
+
+fn advance_namespace_partition(
+    partition: &mut NamespacePartitionRange,
+    prefix: Option<&str>,
+    prefix_children: Option<&str>,
+    include_internal: bool,
+    after_key: Option<&str>,
+) -> Result<(), AppError> {
+    partition.next = None;
+    while let Some(entry) = partition.iter.next() {
+        let (key, value) = entry.map_err(|e| map_indexdb_error("live_namespace next", e))?;
+        let key = key.value();
+        if let Some(after) = after_key {
+            if key <= after {
+                continue;
+            }
+        }
+        if let Some(prefix) = prefix {
+            let matches_prefix = match prefix_children {
+                Some(children_prefix) => key == prefix || key.starts_with(children_prefix),
+                None => key.starts_with(prefix),
+            };
+            if !matches_prefix {
+                if !key.starts_with(prefix) && key > prefix {
+                    return Ok(());
+                }
+                continue;
+            }
+        }
+        if !include_internal && is_internal_object_key(key) {
+            continue;
+        }
+        let summary: ObjectMetadata = deserialize(value.value())?;
+        partition.next = Some(NamespaceListingItem {
+            object_key: key.to_string(),
+            summary,
+        });
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn load_live_namespace_partition_ranges(
+    fragment: &str,
+    prefix: Option<&str>,
+    prefix_children: Option<&str>,
+    include_internal: bool,
+    after_key: Option<&str>,
+) -> Result<Vec<NamespacePartitionRange>, AppError> {
+    let start_hint = max_string(after_key, prefix);
+    let mut out = Vec::new();
+    for partition_id in 0..INDEX_PARTITION_COUNT {
+        ensure_partition_live_namespace_table(fragment, partition_id)?;
+        let Some(db) = open_partition_db_for_read(fragment, partition_id)? else {
+            continue;
+        };
+        let read_txn = db
+            .begin_read()
+            .map_err(|e| map_indexdb_error("begin_read", e))?;
+        let table = match read_txn.open_table(LIVE_NAMESPACE_TABLE) {
+            Ok(table) => table,
+            Err(TableError::TableDoesNotExist(_)) => continue,
+            Err(err) => return Err(map_indexdb_error("open live_namespace", err)),
+        };
+        let start = start_hint.as_deref().unwrap_or("");
+        let iter = table
+            .range(start..)
+            .map_err(|e| map_indexdb_error("live_namespace range", e))?;
+        let mut partition = NamespacePartitionRange { iter, next: None };
+        advance_namespace_partition(
+            &mut partition,
+            prefix,
+            prefix_children,
+            include_internal,
+            after_key,
+        )?;
+        if partition.next.is_some() {
+            out.push(partition);
+        }
+    }
+    Ok(out)
+}
+
+fn scan_live_namespace_page(
+    fragment: &str,
+    prefix: Option<String>,
+    delimiter: Option<String>,
+    limit: usize,
+    continuation_token: Option<String>,
+    include_internal: bool,
+    hydrate_full_metadata: bool,
+) -> Result<ListObjectsResult, AppError> {
+    let delimiter = delimiter
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if delimiter.as_deref() != Some("/") && delimiter.is_some() {
+        return Err(AppError::BadRequest(
+            "only '/' delimiter is supported".to_string(),
+        ));
+    }
+
+    let normalized_prefix = normalize_prefix(prefix, delimiter.as_deref());
+    let prefix_children =
+        prefix_children_prefix(normalized_prefix.as_deref(), delimiter.as_deref());
+    let cursor = continuation_token
+        .map(|token| decode_cursor(&token))
+        .transpose()?;
+    if let Some(cursor) = &cursor {
+        if cursor.state != ObjectState::Live
+            || cursor.prefix != normalized_prefix
+            || cursor.delimiter != delimiter
+            || cursor.include_internal != include_internal
+        {
+            return Err(AppError::BadRequest(
+                "listing continuation token does not match the current query".to_string(),
+            ));
+        }
+    }
+
+    let after_key = cursor.as_ref().and_then(|value| value.last_key.as_deref());
+    let mut skip_prefix = cursor
+        .as_ref()
+        .and_then(|value| value.resume_skip_prefix.clone());
+    let limit = limit.clamp(1, 1000);
+    let mut partitions = load_live_namespace_partition_ranges(
+        fragment,
+        normalized_prefix.as_deref(),
+        prefix_children.as_deref(),
+        include_internal,
+        after_key,
+    )?;
+    let mut objects = Vec::with_capacity(limit);
+    let mut common_prefixes = Vec::new();
+    let mut last_emitted_common_prefix: Option<String> = None;
+    let mut last_key_for_cursor: Option<String> = None;
+    let mut resume_skip_prefix: Option<String> = None;
+    let mut page_full = false;
+
+    loop {
+        let Some((idx, current_key)) = partitions
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, partition)| {
+                partition
+                    .next
+                    .as_ref()
+                    .map(|item| (idx, item.object_key.clone()))
+            })
+            .min_by(|left, right| left.1.cmp(&right.1))
+        else {
+            break;
+        };
+
+        let item = partitions[idx].next.take().ok_or_else(|| {
+            AppError::InternalServerError("namespace listing cursor desync".into())
+        })?;
+
+        if let Some(prefix) = skip_prefix.clone() {
+            if item.object_key.starts_with(&prefix) {
+                advance_namespace_partition(
+                    &mut partitions[idx],
+                    normalized_prefix.as_deref(),
+                    prefix_children.as_deref(),
+                    include_internal,
+                    after_key,
+                )?;
+                continue;
+            }
+            skip_prefix = None;
+        }
+
+        last_key_for_cursor = Some(current_key.clone());
+
+        if delimiter.as_deref() == Some("/") {
+            let suffix = if let Some(prefix) = normalized_prefix.as_deref() {
+                if item.object_key == prefix {
+                    ""
+                } else if let Some(children_prefix) = prefix_children.as_deref() {
+                    item.object_key
+                        .strip_prefix(children_prefix)
+                        .unwrap_or_default()
+                } else {
+                    item.object_key.strip_prefix(prefix).unwrap_or_default()
+                }
+            } else {
+                item.object_key.as_str()
+            };
+            if !suffix.is_empty() {
+                if let Some(pos) = suffix.find('/') {
+                    let common_prefix = format!(
+                        "{}{}",
+                        prefix_children
+                            .as_deref()
+                            .or(normalized_prefix.as_deref())
+                            .unwrap_or(""),
+                        &suffix[..pos + 1]
+                    );
+                    if last_emitted_common_prefix.as_deref() != Some(common_prefix.as_str()) {
+                        common_prefixes.push(common_prefix.clone());
+                        last_emitted_common_prefix = Some(common_prefix.clone());
+                        skip_prefix = Some(common_prefix.clone());
+                        if objects.len() + common_prefixes.len() >= limit {
+                            resume_skip_prefix = Some(common_prefix);
+                            page_full = true;
+                            break;
+                        }
+                    }
+                    advance_namespace_partition(
+                        &mut partitions[idx],
+                        normalized_prefix.as_deref(),
+                        prefix_children.as_deref(),
+                        include_internal,
+                        after_key,
+                    )?;
+                    continue;
+                }
+            }
+        }
+
+        let metadata = if hydrate_full_metadata {
+            match read_live_version(fragment, &item.summary.object_key, &item.summary.version_id)? {
+                Some(metadata) => metadata,
+                None => {
+                    advance_namespace_partition(
+                        &mut partitions[idx],
+                        normalized_prefix.as_deref(),
+                        prefix_children.as_deref(),
+                        include_internal,
+                        after_key,
+                    )?;
+                    continue;
+                }
+            }
+        } else {
+            item.summary
+        };
+        objects.push(metadata);
+        if objects.len() + common_prefixes.len() >= limit {
+            page_full = true;
+            break;
+        }
+
+        advance_namespace_partition(
+            &mut partitions[idx],
+            normalized_prefix.as_deref(),
+            prefix_children.as_deref(),
+            include_internal,
+            after_key,
+        )?;
+    }
+
+    let continuation_token = if page_full {
+        Some(encode_cursor(&ListingCursor {
+            state: ObjectState::Live,
+            prefix: normalized_prefix,
+            delimiter,
+            include_internal,
+            last_key: last_key_for_cursor,
+            resume_skip_prefix,
+        })?)
+    } else {
+        None
+    };
+
+    Ok(ListObjectsResult {
+        objects,
+        common_prefixes,
+        continuation_token,
+    })
 }
 
 fn scan_heads_page(
@@ -4282,718 +4172,79 @@ pub fn read_live_version(
     Ok(Some(record.metadata))
 }
 
-fn load_trash_catalog_entry_exact(
+fn load_partition_trash_catalog_entries_on_db(
     db: &Database,
-    object_key: &str,
-) -> Result<Option<TrashCatalogRecord>, AppError> {
+    partition_id: u16,
+) -> Result<Vec<(String, TrashCatalogRecord)>, AppError> {
     let read_txn = db
         .begin_read()
         .map_err(|e| map_indexdb_error("begin_read", e))?;
-    let table = match read_txn.open_table(TRASH_CATALOG_TABLE) {
-        Ok(table) => table,
-        Err(TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(err) => return Err(map_indexdb_error("open trash_catalog", err)),
-    };
-    let Some(value) = table
-        .get(canonical_key(object_key).as_str())
-        .map_err(|e| map_indexdb_error("trash_catalog get", e))?
-    else {
-        return Ok(None);
-    };
-    deserialize(value.value()).map(Some)
-}
-
-fn load_trash_version_exact(
-    db: &Database,
-    object_key: &str,
-    version_id: &str,
-) -> Result<Option<ObjectMetadata>, AppError> {
-    let read_txn = db
-        .begin_read()
-        .map_err(|e| map_indexdb_error("begin_read", e))?;
-    let table = match read_txn.open_table(TRASH_VERSIONS_TABLE) {
-        Ok(table) => table,
-        Err(TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(err) => return Err(map_indexdb_error("open trash_versions", err)),
-    };
-    let Some(value) = table
-        .get(version_row_key(object_key, version_id).as_str())
-        .map_err(|e| map_indexdb_error("trash_versions get", e))?
-    else {
-        return Ok(None);
-    };
-    let record: VersionRecord = deserialize(value.value())?;
-    Ok(Some(record.metadata))
-}
-
-fn load_trash_versions_exact(
-    db: &Database,
-    object_key: &str,
-) -> Result<Vec<ObjectMetadata>, AppError> {
-    let Some(catalog) = load_trash_catalog_entry_exact(db, object_key)? else {
-        return Ok(Vec::new());
-    };
-    let read_txn = db
-        .begin_read()
-        .map_err(|e| map_indexdb_error("begin_read", e))?;
-    let table = match read_txn.open_table(TRASH_VERSIONS_TABLE) {
+    let trash_objects = match read_txn.open_table(TRASH_OBJECTS_TABLE) {
         Ok(table) => table,
         Err(TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(err) => return Err(map_indexdb_error("open trash_versions", err)),
+        Err(err) => return Err(map_indexdb_error("open trash_objects", err)),
+    };
+    let versions = match read_txn.open_table(OBJECT_VERSIONS_TABLE) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(err) => return Err(map_indexdb_error("open object_versions", err)),
     };
     let mut out = Vec::new();
-    for version_id in &catalog.version_ids {
-        let Some(value) = table
-            .get(version_row_key(object_key, version_id).as_str())
-            .map_err(|e| map_indexdb_error("trash_versions get", e))?
-        else {
-            continue;
-        };
-        let record: VersionRecord = deserialize(value.value())?;
-        out.push(record.metadata);
+    let mut iter = trash_objects
+        .iter()
+        .map_err(|e| map_indexdb_error("trash_objects iter", e))?;
+    while let Some(entry) = iter.next() {
+        let (key, value) = entry.map_err(|e| map_indexdb_error("trash_objects iter next", e))?;
+        let object_key = key.value().to_string();
+        let record: TrashObjectRecord = deserialize(value.value())?;
+        let mut latest_metadata: Option<ObjectMetadata> = None;
+        let mut version_ids = Vec::new();
+        for version_id in &record.version_ids {
+            let row_key = version_row_key(&object_key, version_id);
+            let Some(version_value) = versions
+                .get(row_key.as_str())
+                .map_err(|e| map_indexdb_error("version get", e))?
+            else {
+                continue;
+            };
+            let metadata = deserialize::<VersionRecord>(version_value.value())?.metadata;
+            match &latest_metadata {
+                Some(current) if !metadata_is_newer(&metadata, current) => {}
+                _ => latest_metadata = Some(metadata),
+            }
+            version_ids.push(version_id.clone());
+        }
+        if let Some(latest_metadata) = latest_metadata {
+            version_ids.sort_by(|left, right| compare_version_id_recency(left, right));
+            version_ids.dedup();
+            out.push((
+                object_key,
+                TrashCatalogRecord {
+                    partition_id,
+                    deleted_at: record.deleted_at,
+                    latest_metadata,
+                    version_ids,
+                },
+            ));
+        }
     }
-    out.sort_by(|left, right| {
-        compare_version_recency(
-            right.created_at,
-            &right.version_id,
-            left.created_at,
-            &left.version_id,
-        )
-    });
     Ok(out)
 }
 
 fn load_all_trash_catalog_entries(
     fragment: &str,
 ) -> Result<Vec<(String, TrashCatalogRecord)>, AppError> {
-    let Some(db) = open_trash_db_for_read(fragment)? else {
-        return Ok(Vec::new());
-    };
-    let read_txn = db
-        .begin_read()
-        .map_err(|e| map_indexdb_error("begin_read", e))?;
-    let table = match read_txn.open_table(TRASH_CATALOG_TABLE) {
-        Ok(table) => table,
-        Err(TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(err) => return Err(map_indexdb_error("open trash_catalog", err)),
-    };
     let mut out = Vec::new();
-    let mut iter = table
-        .iter()
-        .map_err(|e| map_indexdb_error("trash_catalog iter", e))?;
-    while let Some(entry) = iter.next() {
-        let (key, value) = entry.map_err(|e| map_indexdb_error("trash_catalog iter next", e))?;
-        out.push((
-            key.value().to_string(),
-            deserialize::<TrashCatalogRecord>(value.value())?,
-        ));
+    for partition_id in 0..INDEX_PARTITION_COUNT {
+        let Some(db) = open_partition_db_for_read(fragment, partition_id)? else {
+            continue;
+        };
+        out.extend(load_partition_trash_catalog_entries_on_db(
+            &db,
+            partition_id,
+        )?);
     }
     Ok(out)
-}
-
-fn upsert_trash_entries_on_db(
-    db: &Database,
-    fragment: &str,
-    entries: &HashMap<String, Vec<ObjectMetadata>>,
-) -> Result<(HashMap<String, Vec<String>>, PartitionMeta), AppError> {
-    if entries.is_empty() {
-        return Ok((
-            HashMap::new(),
-            PartitionMeta {
-                committed_generation: 0,
-                updated_at: 0,
-            },
-        ));
-    }
-
-    let write_txn = db
-        .begin_write()
-        .map_err(|e| map_indexdb_error("begin_write", e))?;
-    let (touched, partition_meta) = {
-        let mut meta = write_txn
-            .open_table(PARTITION_META_TABLE)
-            .map_err(|e| map_indexdb_error("open partition_meta", e))?;
-        let mut catalog = write_txn
-            .open_table(TRASH_CATALOG_TABLE)
-            .map_err(|e| map_indexdb_error("open trash_catalog", e))?;
-        let mut versions = write_txn
-            .open_table(TRASH_VERSIONS_TABLE)
-            .map_err(|e| map_indexdb_error("open trash_versions", e))?;
-        let now = Utc::now().timestamp();
-        let committed_generation = next_partition_generation(&mut meta, now)?;
-        let partition_meta = PartitionMeta {
-            committed_generation,
-            updated_at: now,
-        };
-        let mut touched = HashMap::new();
-
-        for (object_key, metas) in entries {
-            if metas.is_empty() {
-                continue;
-            }
-            let catalog_key = canonical_key(object_key);
-            let mut merged = catalog
-                .get(catalog_key.as_str())
-                .map_err(|e| map_indexdb_error("trash_catalog get", e))?
-                .map(|value| deserialize::<TrashCatalogRecord>(value.value()))
-                .transpose()?
-                .unwrap_or(TrashCatalogRecord {
-                    partition_id: object_partition_id(fragment, object_key)?,
-                    deleted_at: now,
-                    latest_metadata: metas[0].clone(),
-                    version_ids: Vec::new(),
-                });
-            merged.deleted_at = now;
-            let mut added = Vec::new();
-            for metadata in metas {
-                let row_key = version_row_key(object_key, &metadata.version_id);
-                let bytes = serialize(&VersionRecord {
-                    metadata: metadata.clone(),
-                    recorded_at: now,
-                })?;
-                versions
-                    .insert(row_key.as_str(), bytes.as_slice())
-                    .map_err(|e| map_indexdb_error("trash_versions insert", e))?;
-                if !merged
-                    .version_ids
-                    .iter()
-                    .any(|candidate| candidate == &metadata.version_id)
-                {
-                    merged.version_ids.push(metadata.version_id.clone());
-                }
-                if metadata_is_newer(metadata, &merged.latest_metadata) {
-                    merged.latest_metadata = metadata.clone();
-                }
-                added.push(metadata.version_id.clone());
-            }
-            merged
-                .version_ids
-                .sort_by(|left, right| compare_version_id_recency(left, right));
-            merged.version_ids.dedup();
-            let bytes = serialize(&merged)?;
-            catalog
-                .insert(catalog_key.as_str(), bytes.as_slice())
-                .map_err(|e| map_indexdb_error("trash_catalog insert", e))?;
-            added.sort_by(|left, right| compare_version_id_recency(left, right));
-            touched.insert(object_key.clone(), added);
-        }
-
-        (touched, partition_meta)
-    };
-    write_txn
-        .commit()
-        .map_err(|e| map_indexdb_error("commit trash upsert", e))?;
-    Ok((touched, partition_meta))
-}
-
-fn remove_trash_entries_on_db(
-    db: &Database,
-    object_versions: &HashMap<String, Vec<String>>,
-) -> Result<(HashMap<String, Vec<String>>, PartitionMeta), AppError> {
-    if object_versions.is_empty() {
-        return Ok((
-            HashMap::new(),
-            PartitionMeta {
-                committed_generation: 0,
-                updated_at: 0,
-            },
-        ));
-    }
-
-    let write_txn = db
-        .begin_write()
-        .map_err(|e| map_indexdb_error("begin_write", e))?;
-    let (removed, partition_meta) = {
-        let mut meta = write_txn
-            .open_table(PARTITION_META_TABLE)
-            .map_err(|e| map_indexdb_error("open partition_meta", e))?;
-        let mut catalog = write_txn
-            .open_table(TRASH_CATALOG_TABLE)
-            .map_err(|e| map_indexdb_error("open trash_catalog", e))?;
-        let mut versions = write_txn
-            .open_table(TRASH_VERSIONS_TABLE)
-            .map_err(|e| map_indexdb_error("open trash_versions", e))?;
-        let now = Utc::now().timestamp();
-        let committed_generation = next_partition_generation(&mut meta, now)?;
-        let partition_meta = PartitionMeta {
-            committed_generation,
-            updated_at: now,
-        };
-        let mut removed = HashMap::new();
-
-        for (object_key, version_ids) in object_versions {
-            let catalog_key = canonical_key(object_key);
-            let existing_catalog = catalog
-                .get(catalog_key.as_str())
-                .map_err(|e| map_indexdb_error("trash_catalog get", e))?
-                .map(|value| deserialize::<TrashCatalogRecord>(value.value()))
-                .transpose()?;
-            let Some(mut catalog_record) = existing_catalog else {
-                continue;
-            };
-            let mut changed = Vec::new();
-            for version_id in version_ids.iter().collect::<BTreeSet<_>>() {
-                let row_key = version_row_key(object_key, version_id);
-                if versions
-                    .remove(row_key.as_str())
-                    .map_err(|e| map_indexdb_error("trash_versions remove", e))?
-                    .is_some()
-                {
-                    changed.push((*version_id).clone());
-                }
-            }
-            if changed.is_empty() {
-                continue;
-            }
-            catalog_record
-                .version_ids
-                .retain(|version_id| !changed.iter().any(|candidate| candidate == version_id));
-            if let Some(next_latest_id) = catalog_record
-                .version_ids
-                .iter()
-                .max_by(|left, right| compare_version_id_recency(left, right))
-                .cloned()
-            {
-                if let Some(value) = versions
-                    .get(version_row_key(object_key, &next_latest_id).as_str())
-                    .map_err(|e| map_indexdb_error("trash_versions get", e))?
-                {
-                    let record: VersionRecord = deserialize(value.value())?;
-                    catalog_record.latest_metadata = record.metadata;
-                }
-                let bytes = serialize(&catalog_record)?;
-                catalog
-                    .insert(catalog_key.as_str(), bytes.as_slice())
-                    .map_err(|e| map_indexdb_error("trash_catalog insert", e))?;
-            } else {
-                let _ = catalog
-                    .remove(catalog_key.as_str())
-                    .map_err(|e| map_indexdb_error("trash_catalog remove", e))?;
-            }
-            changed.sort_by(|left, right| compare_version_id_recency(left, right));
-            removed.insert(object_key.clone(), changed);
-        }
-
-        (removed, partition_meta)
-    };
-    write_txn
-        .commit()
-        .map_err(|e| map_indexdb_error("commit trash removal", e))?;
-    Ok((removed, partition_meta))
-}
-
-fn clear_trash_db(fragment: &str) -> Result<(), AppError> {
-    let route = trash_control_route(fragment)?;
-    for root in route.roots {
-        let path = trash_db_path(&root, fragment);
-        evict_cached_db(&path);
-        let _ = fs::remove_file(&path);
-    }
-    Ok(())
-}
-
-fn sync_trash_db_after_mutation(fragment: &str, owner_db: &Database) -> Result<(), AppError> {
-    if partition_has_trash_objects_on_db(owner_db)? {
-        replicate_trash_db(fragment)
-    } else {
-        clear_trash_db(fragment)
-    }
-}
-
-fn collect_live_versions_for_keys_on_db(
-    db: &Database,
-    object_keys: &[String],
-) -> Result<HashMap<String, Vec<ObjectMetadata>>, AppError> {
-    if object_keys.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let read_txn = db
-        .begin_read()
-        .map_err(|e| map_indexdb_error("begin_read", e))?;
-    let heads = match read_txn.open_table(OBJECT_HEADS_TABLE) {
-        Ok(table) => Some(table),
-        Err(TableError::TableDoesNotExist(_)) => None,
-        Err(err) => return Err(map_indexdb_error("open object_heads", err)),
-    };
-    let versions = match read_txn.open_table(OBJECT_VERSIONS_TABLE) {
-        Ok(table) => table,
-        Err(TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
-        Err(err) => return Err(map_indexdb_error("open object_versions", err)),
-    };
-    let states = match read_txn.open_table(OBJECT_VERSION_STATES_TABLE) {
-        Ok(table) => table,
-        Err(TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
-        Err(err) => return Err(map_indexdb_error("open object_version_states", err)),
-    };
-
-    let mut out = HashMap::new();
-    for object_key in object_keys {
-        let current_head = match &heads {
-            Some(table) => table
-                .get(canonical_key(object_key).as_str())
-                .map_err(|e| map_indexdb_error("head get", e))?
-                .map(|value| deserialize::<HeadRecord>(value.value()))
-                .transpose()?,
-            None => None,
-        };
-        let prefix = version_row_prefix(object_key);
-        let mut iter = states
-            .range(prefix.as_str()..)
-            .map_err(|e| map_indexdb_error("version_state range", e))?;
-        let mut metas = Vec::new();
-        while let Some(entry) = iter.next() {
-            let (row_key, value) =
-                entry.map_err(|e| map_indexdb_error("version_state range next", e))?;
-            let row_key = row_key.value();
-            if !row_key.starts_with(&prefix) {
-                break;
-            }
-            let visibility: VersionStateRecord = deserialize(value.value())?;
-            if visibility.state != ObjectState::Live {
-                continue;
-            }
-            let Some(version_value) = versions
-                .get(row_key)
-                .map_err(|e| map_indexdb_error("version get", e))?
-            else {
-                continue;
-            };
-            let record: VersionRecord = deserialize(version_value.value())?;
-            if version_is_suppressed_by_tombstone(current_head.as_ref(), &record.metadata) {
-                continue;
-            }
-            metas.push(record.metadata);
-        }
-        metas.sort_by(|left, right| {
-            compare_version_recency(
-                right.created_at,
-                &right.version_id,
-                left.created_at,
-                &left.version_id,
-            )
-        });
-        if !metas.is_empty() {
-            out.insert(object_key.clone(), metas);
-        }
-    }
-    Ok(out)
-}
-
-fn delete_live_entries_on_db(
-    db: &Database,
-    object_keys: &[String],
-    all_entries: &HashMap<String, Vec<ObjectMetadata>>,
-) -> Result<(HashMap<String, Vec<String>>, PartitionMeta), AppError> {
-    if object_keys.is_empty() {
-        return Ok((
-            HashMap::new(),
-            PartitionMeta {
-                committed_generation: 0,
-                updated_at: 0,
-            },
-        ));
-    }
-
-    let write_txn = db
-        .begin_write()
-        .map_err(|e| map_indexdb_error("begin_write", e))?;
-    let (removed, partition_meta) = {
-        let mut partition_meta = write_txn
-            .open_table(PARTITION_META_TABLE)
-            .map_err(|e| map_indexdb_error("open partition_meta", e))?;
-        let mut heads = write_txn
-            .open_table(OBJECT_HEADS_TABLE)
-            .map_err(|e| map_indexdb_error("open object_heads", e))?;
-        let mut versions = write_txn
-            .open_table(OBJECT_VERSIONS_TABLE)
-            .map_err(|e| map_indexdb_error("open object_versions", e))?;
-        let mut states = write_txn
-            .open_table(OBJECT_VERSION_STATES_TABLE)
-            .map_err(|e| map_indexdb_error("open object_version_states", e))?;
-        let mut trash_objects = write_txn
-            .open_table(TRASH_OBJECTS_TABLE)
-            .map_err(|e| map_indexdb_error("open trash_objects", e))?;
-        let now = Utc::now().timestamp();
-        let committed_generation = next_partition_generation(&mut partition_meta, now)?;
-        let partition_meta = PartitionMeta {
-            committed_generation,
-            updated_at: now,
-        };
-        let mut removed = HashMap::with_capacity(object_keys.len());
-
-        for object_key in object_keys {
-            let Some(metas) = all_entries.get(object_key) else {
-                continue;
-            };
-            if metas.is_empty() {
-                continue;
-            }
-            let current_head = heads
-                .get(canonical_key(object_key).as_str())
-                .map_err(|e| map_indexdb_error("head get", e))?
-                .map(|value| deserialize::<HeadRecord>(value.value()))
-                .transpose()?;
-
-            let mut version_ids = Vec::with_capacity(metas.len());
-            let mut latest_removed: Option<ObjectMetadata> = None;
-            for metadata in metas {
-                let row_key = version_row_key(object_key, &metadata.version_id);
-                let _ = versions
-                    .remove(row_key.as_str())
-                    .map_err(|e| map_indexdb_error("version remove", e))?;
-                let _ = states
-                    .remove(row_key.as_str())
-                    .map_err(|e| map_indexdb_error("version_state remove", e))?;
-                version_ids.push(metadata.version_id.clone());
-                match &latest_removed {
-                    Some(current) if !metadata_is_newer(metadata, current) => {}
-                    _ => latest_removed = Some(metadata.clone()),
-                }
-            }
-
-            let fragment = current_head
-                .as_ref()
-                .map(|head| head.fragment.as_str())
-                .or_else(|| {
-                    latest_removed
-                        .as_ref()
-                        .map(|metadata| metadata.fragment.as_str())
-                })
-                .unwrap_or_default();
-            let tombstone = HeadRecord::tombstone(
-                fragment,
-                object_key,
-                next_head_generation(current_head.as_ref()),
-                now,
-                current_head.as_ref(),
-                latest_removed.as_ref(),
-            );
-            write_head_exact(&mut heads, &tombstone)?;
-            let _ = trash_objects
-                .remove(canonical_key(object_key).as_str())
-                .map_err(|e| map_indexdb_error("trash_objects remove", e))?;
-            version_ids.sort_by(|left, right| compare_version_id_recency(left, right));
-            removed.insert(object_key.clone(), version_ids);
-        }
-
-        (removed, partition_meta)
-    };
-    write_txn
-        .commit()
-        .map_err(|e| map_indexdb_error("commit delete live entries", e))?;
-    Ok((removed, partition_meta))
-}
-
-fn apply_delete_live_entries_replica_exact(
-    db: &Database,
-    object_keys: &[String],
-    all_entries: &HashMap<String, Vec<ObjectMetadata>>,
-    partition_meta: &PartitionMeta,
-) -> Result<(), AppError> {
-    if object_keys.is_empty() {
-        return Ok(());
-    }
-
-    let write_txn = db
-        .begin_write()
-        .map_err(|e| map_indexdb_error("begin_write", e))?;
-    {
-        let mut meta = write_txn
-            .open_table(PARTITION_META_TABLE)
-            .map_err(|e| map_indexdb_error("open partition_meta", e))?;
-        let mut heads = write_txn
-            .open_table(OBJECT_HEADS_TABLE)
-            .map_err(|e| map_indexdb_error("open object_heads", e))?;
-        let mut versions = write_txn
-            .open_table(OBJECT_VERSIONS_TABLE)
-            .map_err(|e| map_indexdb_error("open object_versions", e))?;
-        let mut states = write_txn
-            .open_table(OBJECT_VERSION_STATES_TABLE)
-            .map_err(|e| map_indexdb_error("open object_version_states", e))?;
-        let mut trash_objects = write_txn
-            .open_table(TRASH_OBJECTS_TABLE)
-            .map_err(|e| map_indexdb_error("open trash_objects", e))?;
-        write_partition_meta_exact(&mut meta, partition_meta)?;
-
-        for object_key in object_keys {
-            let Some(metas) = all_entries.get(object_key) else {
-                continue;
-            };
-            if metas.is_empty() {
-                continue;
-            }
-            let current_head = heads
-                .get(canonical_key(object_key).as_str())
-                .map_err(|e| map_indexdb_error("head get", e))?
-                .map(|value| deserialize::<HeadRecord>(value.value()))
-                .transpose()?;
-
-            let mut latest_removed: Option<ObjectMetadata> = None;
-            for metadata in metas {
-                let row_key = version_row_key(object_key, &metadata.version_id);
-                let _ = versions
-                    .remove(row_key.as_str())
-                    .map_err(|e| map_indexdb_error("version remove", e))?;
-                let _ = states
-                    .remove(row_key.as_str())
-                    .map_err(|e| map_indexdb_error("version_state remove", e))?;
-                match &latest_removed {
-                    Some(current) if !metadata_is_newer(metadata, current) => {}
-                    _ => latest_removed = Some(metadata.clone()),
-                }
-            }
-
-            let fragment = current_head
-                .as_ref()
-                .map(|head| head.fragment.as_str())
-                .or_else(|| {
-                    latest_removed
-                        .as_ref()
-                        .map(|metadata| metadata.fragment.as_str())
-                })
-                .unwrap_or_default();
-            let tombstone = HeadRecord::tombstone(
-                fragment,
-                object_key,
-                next_head_generation(current_head.as_ref()),
-                partition_meta.updated_at,
-                current_head.as_ref(),
-                latest_removed.as_ref(),
-            );
-            write_head_exact(&mut heads, &tombstone)?;
-            let _ = trash_objects
-                .remove(canonical_key(object_key).as_str())
-                .map_err(|e| map_indexdb_error("trash_objects remove", e))?;
-        }
-    }
-    write_txn
-        .commit()
-        .map_err(|e| map_indexdb_error("commit delete live replica entries", e))?;
-    Ok(())
-}
-
-fn upsert_live_entries_on_db(
-    db: &Database,
-    entries: &HashMap<String, Vec<ObjectMetadata>>,
-) -> Result<(HashMap<String, Vec<String>>, PartitionMeta), AppError> {
-    if entries.is_empty() {
-        return Ok((
-            HashMap::new(),
-            PartitionMeta {
-                committed_generation: 0,
-                updated_at: 0,
-            },
-        ));
-    }
-
-    let write_txn = db
-        .begin_write()
-        .map_err(|e| map_indexdb_error("begin_write", e))?;
-    let (touched, partition_meta) = {
-        let mut meta = write_txn
-            .open_table(PARTITION_META_TABLE)
-            .map_err(|e| map_indexdb_error("open partition_meta", e))?;
-        let mut heads = write_txn
-            .open_table(OBJECT_HEADS_TABLE)
-            .map_err(|e| map_indexdb_error("open object_heads", e))?;
-        let mut versions = write_txn
-            .open_table(OBJECT_VERSIONS_TABLE)
-            .map_err(|e| map_indexdb_error("open object_versions", e))?;
-        let mut states = write_txn
-            .open_table(OBJECT_VERSION_STATES_TABLE)
-            .map_err(|e| map_indexdb_error("open object_version_states", e))?;
-        let now = Utc::now().timestamp();
-        let committed_generation = next_partition_generation(&mut meta, now)?;
-        let partition_meta = PartitionMeta {
-            committed_generation,
-            updated_at: now,
-        };
-        let mut touched = HashMap::new();
-
-        for (object_key, metas) in entries {
-            if metas.is_empty() {
-                continue;
-            }
-            let current_head = heads
-                .get(canonical_key(object_key).as_str())
-                .map_err(|e| map_indexdb_error("head get", e))?
-                .map(|value| deserialize::<HeadRecord>(value.value()))
-                .transpose()?;
-            let mut latest_inserted: Option<ObjectMetadata> = None;
-            let mut version_ids = Vec::new();
-
-            for metadata in metas {
-                let row_key = version_row_key(object_key, &metadata.version_id);
-                let bytes = serialize(&VersionRecord {
-                    metadata: metadata.clone(),
-                    recorded_at: now,
-                })?;
-                versions
-                    .insert(row_key.as_str(), bytes.as_slice())
-                    .map_err(|e| map_indexdb_error("version insert", e))?;
-                let state_bytes = serialize(&VersionStateRecord {
-                    state: ObjectState::Live,
-                    updated_at: now,
-                    generation: committed_generation,
-                })?;
-                states
-                    .insert(row_key.as_str(), state_bytes.as_slice())
-                    .map_err(|e| map_indexdb_error("version_state insert", e))?;
-                match &latest_inserted {
-                    Some(current) if !metadata_is_newer(metadata, current) => {}
-                    _ => latest_inserted = Some(metadata.clone()),
-                }
-                version_ids.push(metadata.version_id.clone());
-            }
-
-            if let Some(latest_inserted) = latest_inserted {
-                let should_replace = match current_head.as_ref() {
-                    None => true,
-                    Some(head) if head.state != ObjectState::Live => true,
-                    Some(head) => {
-                        compare_head_recency(
-                            latest_inserted.created_at,
-                            &latest_inserted.version_id,
-                            head,
-                        ) == Ordering::Greater
-                    }
-                };
-                if should_replace {
-                    let head = HeadRecord::from_metadata(
-                        &latest_inserted,
-                        ObjectState::Live,
-                        next_head_generation(current_head.as_ref()),
-                        now,
-                    );
-                    write_head_exact(&mut heads, &head)?;
-                }
-            }
-
-            version_ids.sort_by(|left, right| compare_version_id_recency(left, right));
-            touched.insert(object_key.clone(), version_ids);
-        }
-
-        (touched, partition_meta)
-    };
-    write_txn
-        .commit()
-        .map_err(|e| map_indexdb_error("commit live restore batch", e))?;
-    Ok((touched, partition_meta))
-}
-
-#[allow(dead_code)]
-fn load_trash_manifest_grouped(
-    fragment: &str,
-) -> Result<HashMap<u16, HashMap<String, Vec<String>>>, AppError> {
-    let mut grouped = HashMap::<u16, HashMap<String, Vec<String>>>::new();
-    for (object_key, record) in load_all_trash_catalog_entries(fragment)? {
-        grouped
-            .entry(record.partition_id)
-            .or_default()
-            .insert(object_key, record.version_ids);
-    }
-    Ok(grouped)
 }
 
 fn scan_trash_catalog_page(
@@ -5131,14 +4382,7 @@ fn scan_trash_catalog_page(
 }
 
 pub fn upsert_trash_version(metadata: &ObjectMetadata) -> Result<(), AppError> {
-    let mut entries = HashMap::new();
-    entries.insert(metadata.object_key.clone(), vec![metadata.clone()]);
-    with_trash_commit_lock(&metadata.fragment, |owner_path| {
-        let owner_db = get_or_open_db(owner_path)?;
-        let _ = upsert_trash_entries_on_db(&owner_db, &metadata.fragment, &entries)?;
-        replicate_trash_db(&metadata.fragment)?;
-        Ok(())
-    })
+    write_version_on_owner(metadata, ObjectState::Trash)
 }
 
 pub fn read_trash_version(
@@ -5146,10 +4390,20 @@ pub fn read_trash_version(
     object_key: &str,
     version_id: &str,
 ) -> Result<Option<ObjectMetadata>, AppError> {
-    let Some(db) = open_trash_db_for_read(fragment)? else {
+    let route = object_route(fragment, object_key)?;
+    let Some(db) = open_route_db_for_read(fragment, &route)? else {
         return Ok(None);
     };
-    load_trash_version_exact(&db, object_key, version_id)
+    let Some(record) = read_version_exact(&db, object_key, version_id)? else {
+        return Ok(None);
+    };
+    let Some(state) = read_version_state_exact(&db, object_key, version_id)? else {
+        return Ok(None);
+    };
+    if state.state != ObjectState::Trash {
+        return Ok(None);
+    }
+    Ok(Some(record.metadata))
 }
 
 pub fn list_live_versions(
@@ -5167,10 +4421,11 @@ pub fn list_trash_versions(
     fragment: &str,
     object_key: &str,
 ) -> Result<Vec<ObjectMetadata>, AppError> {
-    let Some(db) = open_trash_db_for_read(fragment)? else {
+    let route = object_route(fragment, object_key)?;
+    let Some(db) = open_route_db_for_read(fragment, &route)? else {
         return Ok(Vec::new());
     };
-    load_trash_versions_exact(&db, object_key)
+    list_versions_exact(&db, object_key, ObjectState::Trash)
 }
 
 pub fn read_current_live_head(
@@ -5194,10 +4449,9 @@ pub fn read_latest_trash(
     fragment: &str,
     object_key: &str,
 ) -> Result<Option<ObjectMetadata>, AppError> {
-    let Some(db) = open_trash_db_for_read(fragment)? else {
-        return Ok(None);
-    };
-    Ok(load_trash_catalog_entry_exact(&db, object_key)?.map(|record| record.latest_metadata))
+    Ok(list_trash_versions(fragment, object_key)?
+        .into_iter()
+        .next())
 }
 
 pub fn scan_live_heads_page(
@@ -5208,16 +4462,33 @@ pub fn scan_live_heads_page(
     continuation_token: Option<String>,
     include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
-    scan_heads_page(
+    match scan_live_namespace_page(
         fragment,
-        ObjectState::Live,
-        prefix,
-        delimiter,
+        prefix.clone(),
+        delimiter.clone(),
         limit,
-        continuation_token,
+        continuation_token.clone(),
         include_internal,
         false,
-    )
+    ) {
+        Ok(page) => Ok(page),
+        Err(err) => {
+            warn!(
+                "live namespace listing fallback for fragment {}: {}",
+                fragment, err
+            );
+            scan_heads_page(
+                fragment,
+                ObjectState::Live,
+                prefix,
+                delimiter,
+                limit,
+                continuation_token,
+                include_internal,
+                false,
+            )
+        }
+    }
 }
 
 pub fn scan_trash_heads_page(
@@ -5247,16 +4518,33 @@ pub fn scan_live_full_metadata_page(
     continuation_token: Option<String>,
     include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
-    scan_heads_page(
+    match scan_live_namespace_page(
         fragment,
-        ObjectState::Live,
-        prefix,
-        delimiter,
+        prefix.clone(),
+        delimiter.clone(),
         limit,
-        continuation_token,
+        continuation_token.clone(),
         include_internal,
         true,
-    )
+    ) {
+        Ok(page) => Ok(page),
+        Err(err) => {
+            warn!(
+                "live namespace full-metadata fallback for fragment {}: {}",
+                fragment, err
+            );
+            scan_heads_page(
+                fragment,
+                ObjectState::Live,
+                prefix,
+                delimiter,
+                limit,
+                continuation_token,
+                include_internal,
+                true,
+            )
+        }
+    }
 }
 
 pub fn scan_trash_full_metadata_page(
@@ -5324,10 +4612,15 @@ pub fn list_partition_trash_entries(
         .collect())
 }
 
-fn partition_has_trash_entries(fragment: &str, partition_id: u16) -> Result<bool, AppError> {
+pub fn list_trash_catalog(fragment: &str) -> Result<Vec<TrashCatalogEntry>, AppError> {
     Ok(load_all_trash_catalog_entries(fragment)?
         .into_iter()
-        .any(|(_, record)| record.partition_id == partition_id))
+        .map(|(object_key, record)| TrashCatalogEntry {
+            object_key,
+            version_ids: record.version_ids,
+            deleted_at: record.deleted_at,
+        })
+        .collect())
 }
 
 pub fn list_trashed_object_version_ids_batch(
@@ -5335,25 +4628,23 @@ pub fn list_trashed_object_version_ids_batch(
     object_keys: &[String],
 ) -> Result<HashMap<String, Vec<String>>, AppError> {
     let mut out = HashMap::new();
-    let Some(db) = open_trash_db_for_read(fragment)? else {
-        return Ok(out);
-    };
     for key in object_keys {
-        if let Some(record) = load_trash_catalog_entry_exact(&db, key)? {
-            out.insert(key.clone(), record.version_ids);
+        let version_ids = list_trash_versions(fragment, key)?
+            .into_iter()
+            .map(|metadata| metadata.version_id)
+            .collect::<Vec<_>>();
+        if !version_ids.is_empty() {
+            out.insert(key.clone(), version_ids);
         }
     }
     Ok(out)
 }
 
-#[allow(dead_code)]
 struct PartitionTrashClearPlan {
     row_keys_to_delete: Vec<String>,
     touched_keys: BTreeSet<String>,
-    latest_removed: HashMap<String, ObjectMetadata>,
 }
 
-#[allow(dead_code)]
 fn plan_partition_trash_clear(db: &Database) -> Result<PartitionTrashClearPlan, AppError> {
     let read_txn = db
         .begin_read()
@@ -5364,7 +4655,6 @@ fn plan_partition_trash_clear(db: &Database) -> Result<PartitionTrashClearPlan, 
             return Ok(PartitionTrashClearPlan {
                 row_keys_to_delete: Vec::new(),
                 touched_keys: BTreeSet::new(),
-                latest_removed: HashMap::new(),
             });
         }
         Err(err) => return Err(map_indexdb_error("open trash_objects", err)),
@@ -5375,14 +4665,12 @@ fn plan_partition_trash_clear(db: &Database) -> Result<PartitionTrashClearPlan, 
             return Ok(PartitionTrashClearPlan {
                 row_keys_to_delete: Vec::new(),
                 touched_keys: BTreeSet::new(),
-                latest_removed: HashMap::new(),
             });
         }
         Err(err) => return Err(map_indexdb_error("open object_versions", err)),
     };
     let mut row_keys_to_delete = Vec::new();
     let mut touched_keys = BTreeSet::new();
-    let mut latest_removed = HashMap::<String, ObjectMetadata>::new();
     let mut iter = trash_objects
         .iter()
         .map_err(|e| map_indexdb_error("trash_objects iter", e))?;
@@ -5396,19 +4684,12 @@ fn plan_partition_trash_clear(db: &Database) -> Result<PartitionTrashClearPlan, 
         }
         for version_id in &record.version_ids {
             let row_key = version_row_key(&object_key, version_id);
-            let Some(version_value) = versions
+            let Some(_version_value) = versions
                 .get(row_key.as_str())
                 .map_err(|e| map_indexdb_error("version get", e))?
             else {
                 continue;
             };
-            let metadata = deserialize::<VersionRecord>(version_value.value())?.metadata;
-            match latest_removed.get(&object_key) {
-                Some(current) if !metadata_is_newer(&metadata, current) => {}
-                _ => {
-                    latest_removed.insert(object_key.clone(), metadata);
-                }
-            }
             row_keys_to_delete.push(row_key);
         }
         touched_keys.insert(object_key);
@@ -5417,11 +4698,9 @@ fn plan_partition_trash_clear(db: &Database) -> Result<PartitionTrashClearPlan, 
     Ok(PartitionTrashClearPlan {
         row_keys_to_delete,
         touched_keys,
-        latest_removed,
     })
 }
 
-#[allow(dead_code)]
 fn apply_partition_trash_clear_plan(
     db: &Database,
     plan: &PartitionTrashClearPlan,
@@ -5441,6 +4720,9 @@ fn apply_partition_trash_clear_plan(
         let mut heads = write_txn
             .open_table(OBJECT_HEADS_TABLE)
             .map_err(|e| map_indexdb_error("open object_heads", e))?;
+        let mut live_namespace = write_txn
+            .open_table(LIVE_NAMESPACE_TABLE)
+            .map_err(|e| map_indexdb_error("open live_namespace", e))?;
         let mut versions = write_txn
             .open_table(OBJECT_VERSIONS_TABLE)
             .map_err(|e| map_indexdb_error("open object_versions", e))?;
@@ -5507,23 +4789,9 @@ fn apply_partition_trash_clear_plan(
                     next_head_generation(current_head.as_ref()),
                     partition_meta.updated_at,
                 );
-                write_head_exact(&mut heads, &next_head)?;
+                write_head_with_namespace_exact(&mut heads, &mut live_namespace, &next_head)?;
             } else {
-                let latest_removed = plan.latest_removed.get(object_key);
-                let fragment = current_head
-                    .as_ref()
-                    .map(|head| head.fragment.as_str())
-                    .or_else(|| latest_removed.map(|metadata| metadata.fragment.as_str()))
-                    .unwrap_or_default();
-                let tombstone = HeadRecord::tombstone(
-                    fragment,
-                    object_key,
-                    next_head_generation(current_head.as_ref()),
-                    partition_meta.updated_at,
-                    current_head.as_ref(),
-                    latest_removed,
-                );
-                write_head_exact(&mut heads, &tombstone)?;
+                remove_head_with_namespace_exact(&mut heads, &mut live_namespace, object_key)?;
             }
         }
 
@@ -5535,7 +4803,6 @@ fn apply_partition_trash_clear_plan(
     Ok(removed)
 }
 
-#[allow(dead_code)]
 fn clear_partition_trash_on_db(db: &Database) -> Result<(usize, PartitionMeta), AppError> {
     let plan = plan_partition_trash_clear(db)?;
     if plan.row_keys_to_delete.is_empty() {
@@ -5558,7 +4825,6 @@ fn clear_partition_trash_on_db(db: &Database) -> Result<(usize, PartitionMeta), 
     Ok((removed, partition_meta))
 }
 
-#[allow(dead_code)]
 fn apply_clear_partition_trash_replica_exact(
     db: &Database,
     partition_meta: &PartitionMeta,
@@ -5573,21 +4839,41 @@ pub fn move_object_version_to_trash_with_metadata(
     object_key: &str,
     version_id: &str,
 ) -> Result<Option<ObjectMetadata>, AppError> {
-    let Some(metadata) = read_live_version(fragment, object_key, version_id)? else {
-        return Ok(None);
-    };
-    let mut entries = HashMap::new();
-    entries.insert(object_key.to_string(), vec![metadata.clone()]);
-    with_trash_commit_lock(fragment, |owner_path| {
-        let owner_db = get_or_open_db(owner_path)?;
-        let _ = upsert_trash_entries_on_db(&owner_db, fragment, &entries)?;
-        replicate_trash_db(fragment)?;
-        Ok(())
+    let route = object_route(fragment, object_key)?;
+    let owner_path = owner_db_path(&route, fragment);
+    let moved = with_partition_commit_lock(&owner_path, || {
+        if !owner_path.exists() {
+            return Ok(None);
+        }
+        let owner_db = get_or_open_db(&owner_path)?;
+        let changed = change_version_state_on_db(
+            &owner_db,
+            object_key,
+            version_id,
+            ObjectState::Trash,
+            Some(ObjectState::Live),
+        )?;
+        let Some((metadata, partition_meta)) = changed else {
+            return Ok(None);
+        };
+        replicate_object_mutation(
+            fragment,
+            &route,
+            "move object version to trash",
+            |replica_db| {
+                apply_change_version_state_replica_exact(
+                    replica_db,
+                    object_key,
+                    version_id,
+                    ObjectState::Trash,
+                    Some(ObjectState::Live),
+                    &partition_meta,
+                )
+            },
+        )?;
+        Ok(Some(metadata))
     })?;
-    if !delete_live_version(fragment, object_key, version_id)? {
-        return Ok(None);
-    }
-    Ok(Some(metadata))
+    Ok(moved)
 }
 
 pub fn restore_object_version_from_trash_with_metadata(
@@ -5595,22 +4881,41 @@ pub fn restore_object_version_from_trash_with_metadata(
     object_key: &str,
     version_id: &str,
 ) -> Result<Option<ObjectMetadata>, AppError> {
-    let Some(metadata) = read_trash_version(fragment, object_key, version_id)? else {
-        return Ok(None);
-    };
-    upsert_live_version(&metadata)?;
-    let mut removed = HashMap::new();
-    removed.insert(object_key.to_string(), vec![version_id.to_string()]);
-    with_trash_commit_lock(fragment, |owner_path| {
+    let route = object_route(fragment, object_key)?;
+    let owner_path = owner_db_path(&route, fragment);
+    let restored = with_partition_commit_lock(&owner_path, || {
         if !owner_path.exists() {
-            return Ok(());
+            return Ok(None);
         }
-        let owner_db = get_or_open_db(owner_path)?;
-        let _ = remove_trash_entries_on_db(&owner_db, &removed)?;
-        sync_trash_db_after_mutation(fragment, &owner_db)?;
-        Ok(())
+        let owner_db = get_or_open_db(&owner_path)?;
+        let changed = change_version_state_on_db(
+            &owner_db,
+            object_key,
+            version_id,
+            ObjectState::Live,
+            Some(ObjectState::Trash),
+        )?;
+        let Some((metadata, partition_meta)) = changed else {
+            return Ok(None);
+        };
+        replicate_object_mutation(
+            fragment,
+            &route,
+            "restore object version from trash",
+            |replica_db| {
+                apply_change_version_state_replica_exact(
+                    replica_db,
+                    object_key,
+                    version_id,
+                    ObjectState::Live,
+                    Some(ObjectState::Trash),
+                    &partition_meta,
+                )
+            },
+        )?;
+        Ok(Some(metadata))
     })?;
-    Ok(Some(metadata))
+    Ok(restored)
 }
 
 pub fn move_object_to_trash_fast(
@@ -5633,60 +4938,10 @@ pub fn move_objects_to_trash_batch(
     }
     let grouped = grouped.into_iter().collect::<Vec<_>>();
 
-    let mut trash_entries = HashMap::<String, Vec<ObjectMetadata>>::new();
-    let read_parallelism = destructive_partition_parallelism().min(grouped.len().max(1));
-    for chunk in grouped.chunks(read_parallelism) {
-        let fragment = fragment.to_string();
-        let chunk_maps = std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(chunk.len());
-            for (partition_id, keys) in chunk {
-                let fragment = fragment.clone();
-                let keys = keys.clone();
-                let partition_id = *partition_id;
-                handles.push(scope.spawn(
-                    move || -> Result<HashMap<String, Vec<ObjectMetadata>>, AppError> {
-                        let route = route_for_partition(partition_id)?;
-                        let owner_path = owner_db_path(&route, &fragment);
-                        if !owner_path.exists() {
-                            return Ok(HashMap::new());
-                        }
-                        let owner_db = get_or_open_db(&owner_path)?;
-                        collect_live_versions_for_keys_on_db(&owner_db, &keys)
-                    },
-                ));
-            }
-
-            let mut maps = Vec::with_capacity(handles.len());
-            for handle in handles {
-                let map = handle.join().map_err(|_| {
-                    AppError::InternalServerError("indexdb trash read worker panicked".to_string())
-                })??;
-                maps.push(map);
-            }
-            Ok::<Vec<HashMap<String, Vec<ObjectMetadata>>>, AppError>(maps)
-        })?;
-
-        for live_entries in chunk_maps {
-            trash_entries.extend(live_entries);
-        }
-    }
-
-    if trash_entries.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    with_trash_commit_lock(fragment, |owner_path| {
-        let owner_db = get_or_open_db(owner_path)?;
-        let _ = upsert_trash_entries_on_db(&owner_db, fragment, &trash_entries)?;
-        replicate_trash_db(fragment)?;
-        Ok(())
-    })?;
-
     let mut moved = HashMap::new();
     let write_parallelism = destructive_partition_parallelism().min(grouped.len().max(1));
     for chunk in grouped.chunks(write_parallelism) {
         let fragment = fragment.to_string();
-        let trash_entries = &trash_entries;
         let chunk_results = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(chunk.len());
             for (partition_id, keys) in chunk {
@@ -5702,26 +4957,23 @@ pub fn move_objects_to_trash_batch(
                         }
                         with_partition_commit_lock(&owner_path, || {
                             let owner_db = get_or_open_db(&owner_path)?;
-                            let partition_entries = keys
-                                .iter()
-                                .filter_map(|key| {
-                                    trash_entries
-                                        .get(key)
-                                        .map(|metas| (key.clone(), metas.clone()))
-                                })
-                                .collect::<HashMap<_, _>>();
-                            let (changed, partition_meta) =
-                                delete_live_entries_on_db(&owner_db, &keys, &partition_entries)?;
+                            let (changed, partition_meta) = bulk_rewrite_keys_state_on_db(
+                                &owner_db,
+                                &keys,
+                                ObjectState::Live,
+                                ObjectState::Trash,
+                            )?;
                             if !changed.is_empty() {
                                 replicate_object_mutation(
                                     &fragment,
                                     &route,
                                     "move objects to trash batch",
                                     |replica_db| {
-                                        apply_delete_live_entries_replica_exact(
+                                        apply_bulk_rewrite_keys_state_replica_exact(
                                             replica_db,
                                             &keys,
-                                            &partition_entries,
+                                            ObjectState::Live,
+                                            ObjectState::Trash,
                                             &partition_meta,
                                         )
                                     },
@@ -5786,37 +5038,16 @@ pub fn restore_objects_from_trash_manifest_batch(
         return Ok(HashMap::new());
     }
 
-    let Some(trash_db) = open_trash_db_for_read(fragment)? else {
-        return Ok(HashMap::new());
-    };
-
-    let mut metadata_grouped = HashMap::<u16, HashMap<String, Vec<ObjectMetadata>>>::new();
-    let mut removable = HashMap::<String, Vec<String>>::new();
+    let mut grouped_versions = HashMap::<u16, HashMap<String, Vec<String>>>::new();
     for (object_key, version_ids) in object_versions {
-        let mut metas = Vec::new();
-        for version_id in version_ids.iter().collect::<BTreeSet<_>>() {
-            if let Some(metadata) = load_trash_version_exact(&trash_db, object_key, version_id)? {
-                metas.push(metadata);
-            }
-        }
-        if metas.is_empty() {
-            continue;
-        }
         let partition_id = object_partition_id(fragment, object_key)?;
-        metadata_grouped
+        grouped_versions
             .entry(partition_id)
             .or_default()
-            .insert(object_key.clone(), metas.clone());
-        removable.insert(
-            object_key.clone(),
-            metas
-                .into_iter()
-                .map(|metadata| metadata.version_id)
-                .collect(),
-        );
+            .insert(object_key.clone(), version_ids.clone());
     }
 
-    let grouped_entries = metadata_grouped.into_iter().collect::<Vec<_>>();
+    let grouped_entries = grouped_versions.into_iter().collect::<Vec<_>>();
     let mut restored = HashMap::new();
     let restore_parallelism = destructive_partition_parallelism().min(grouped_entries.len().max(1));
     for chunk in grouped_entries.chunks(restore_parallelism) {
@@ -5833,10 +5064,21 @@ pub fn restore_objects_from_trash_manifest_batch(
                         let owner_path = owner_db_path(&route, &fragment);
                         with_partition_commit_lock(&owner_path, || {
                             let owner_db = get_or_open_db(&owner_path)?;
-                            let (changed, _partition_meta) =
-                                upsert_live_entries_on_db(&owner_db, &entries)?;
+                            let (changed, partition_meta) =
+                                restore_trash_entries_on_db(&owner_db, &entries)?;
                             if !changed.is_empty() {
-                                replicate_owner_partition_db(&fragment, &route)?;
+                                replicate_object_mutation(
+                                    &fragment,
+                                    &route,
+                                    "restore objects from trash batch",
+                                    |replica_db| {
+                                        apply_restore_trash_entries_replica_exact(
+                                            replica_db,
+                                            &entries,
+                                            &partition_meta,
+                                        )
+                                    },
+                                )?;
                             }
                             Ok(changed)
                         })
@@ -5861,22 +5103,6 @@ pub fn restore_objects_from_trash_manifest_batch(
         }
     }
 
-    if !restored.is_empty() {
-        let mut actually_removed = HashMap::new();
-        for (object_key, restored_versions) in &restored {
-            actually_removed.insert(object_key.clone(), restored_versions.clone());
-        }
-        with_trash_commit_lock(fragment, |owner_path| {
-            if !owner_path.exists() {
-                return Ok(());
-            }
-            let owner_db = get_or_open_db(owner_path)?;
-            let _ = remove_trash_entries_on_db(&owner_db, &actually_removed)?;
-            sync_trash_db_after_mutation(fragment, &owner_db)?;
-            Ok(())
-        })?;
-    }
-
     Ok(restored)
 }
 
@@ -5884,25 +5110,34 @@ pub fn delete_all_trash_versions_for_key(
     fragment: &str,
     object_key: &str,
 ) -> Result<Option<Vec<String>>, AppError> {
-    let version_ids = list_trash_versions(fragment, object_key)?
-        .into_iter()
-        .map(|metadata| metadata.version_id)
-        .collect::<Vec<_>>();
-    if version_ids.is_empty() {
-        return Ok(None);
-    }
-    let mut removed = HashMap::new();
-    removed.insert(object_key.to_string(), version_ids.clone());
-    with_trash_commit_lock(fragment, |owner_path| {
+    let route = object_route(fragment, object_key)?;
+    let owner_path = owner_db_path(&route, fragment);
+    with_partition_commit_lock(&owner_path, || {
         if !owner_path.exists() {
-            return Ok(());
+            return Ok(None);
         }
-        let owner_db = get_or_open_db(owner_path)?;
-        let _ = remove_trash_entries_on_db(&owner_db, &removed)?;
-        sync_trash_db_after_mutation(fragment, &owner_db)?;
-        Ok(())
-    })?;
-    Ok(Some(version_ids))
+        let owner_db = get_or_open_db(&owner_path)?;
+        let deleted =
+            delete_versions_for_key_with_state_on_db(&owner_db, object_key, ObjectState::Trash)?;
+        if let Some((version_ids, partition_meta)) = deleted {
+            replicate_object_mutation(
+                fragment,
+                &route,
+                "delete trash versions for key",
+                |replica_db| {
+                    apply_delete_versions_for_key_with_state_replica_exact(
+                        replica_db,
+                        object_key,
+                        ObjectState::Trash,
+                        &partition_meta,
+                    )
+                },
+            )?;
+            Ok(Some(version_ids))
+        } else {
+            Ok(None)
+        }
+    })
 }
 
 pub fn delete_object_fast(
@@ -5930,11 +5165,6 @@ pub fn delete_object_fast(
             Ok(None)
         }
     })?;
-    if deleted.is_some() && !partition_has_trash_entries(fragment, route.partition_id)? {
-        let mut cleared = BTreeSet::new();
-        cleared.insert(route.partition_id);
-        let _ = clear_active_trash_partitions(fragment, &cleared);
-    }
     Ok(deleted)
 }
 
@@ -5945,7 +5175,7 @@ pub fn delete_live_version(
 ) -> Result<bool, AppError> {
     let route = object_route(fragment, object_key)?;
     let owner_path = owner_db_path(&route, fragment);
-    with_partition_commit_lock(&owner_path, || {
+    let deleted = with_partition_commit_lock(&owner_path, || {
         if !owner_path.exists() {
             return Ok(false);
         }
@@ -5967,7 +5197,8 @@ pub fn delete_live_version(
         } else {
             Ok(false)
         }
-    })
+    })?;
+    Ok(deleted)
 }
 
 pub fn delete_trash_version(
@@ -5975,18 +5206,29 @@ pub fn delete_trash_version(
     object_key: &str,
     version_id: &str,
 ) -> Result<bool, AppError> {
-    let mut removed = HashMap::new();
-    removed.insert(object_key.to_string(), vec![version_id.to_string()]);
-    let deleted = with_trash_commit_lock(fragment, |owner_path| {
+    let route = object_route(fragment, object_key)?;
+    let owner_path = owner_db_path(&route, fragment);
+    let deleted = with_partition_commit_lock(&owner_path, || {
         if !owner_path.exists() {
             return Ok(false);
         }
-        let owner_db = get_or_open_db(owner_path)?;
-        let (removed, _partition_meta) = remove_trash_entries_on_db(&owner_db, &removed)?;
-        if removed.is_empty() {
+        let owner_db = get_or_open_db(&owner_path)?;
+        let deleted =
+            delete_version_on_db(&owner_db, object_key, version_id, Some(ObjectState::Trash))?
+                .map(|(_metadata, partition_meta)| partition_meta);
+        if let Some(partition_meta) = deleted {
+            replicate_object_mutation(fragment, &route, "delete trash version", |replica_db| {
+                apply_delete_version_replica_exact(
+                    replica_db,
+                    object_key,
+                    version_id,
+                    Some(ObjectState::Trash),
+                    &partition_meta,
+                )
+            })?;
+        } else {
             return Ok(false);
         }
-        sync_trash_db_after_mutation(fragment, &owner_db)?;
         Ok(true)
     })?;
     Ok(deleted)
@@ -5997,7 +5239,9 @@ pub fn clear_fragment_trash(fragment: &str, object_key: Option<&str>) -> Result<
         let _ = delete_all_trash_versions_for_key(fragment, object_key)?;
         return Ok(());
     }
-    clear_trash_db(fragment)
+    let touched_partitions = list_active_trash_partition_ids(fragment)?;
+    let _ = clear_fragment_trash_for_partitions(fragment, &touched_partitions)?;
+    Ok(())
 }
 
 pub fn clear_fragment_trash_for_partitions(
@@ -6007,27 +5251,30 @@ pub fn clear_fragment_trash_for_partitions(
     if touched_partitions.is_empty() {
         return Ok(0);
     }
-
-    let removed = load_all_trash_catalog_entries(fragment)?
-        .into_iter()
-        .filter(|(_, record)| touched_partitions.contains(&record.partition_id))
-        .map(|(object_key, record)| (object_key, record.version_ids))
-        .collect::<HashMap<_, _>>();
-    let total = removed.values().map(|version_ids| version_ids.len()).sum();
-    if removed.is_empty() {
-        return Ok(0);
+    let mut total = 0usize;
+    for partition_id in touched_partitions {
+        let route = route_for_partition(*partition_id)?;
+        let owner_path = owner_db_path(&route, fragment);
+        let removed = with_partition_commit_lock(&owner_path, || {
+            if !owner_path.exists() {
+                return Ok(0usize);
+            }
+            let owner_db = get_or_open_db(&owner_path)?;
+            let (removed, partition_meta) = clear_partition_trash_on_db(&owner_db)?;
+            if removed > 0 {
+                replicate_object_mutation(
+                    fragment,
+                    &route,
+                    "clear partition trash",
+                    |replica_db| {
+                        apply_clear_partition_trash_replica_exact(replica_db, &partition_meta)
+                    },
+                )?;
+            }
+            Ok(removed)
+        })?;
+        total = total.saturating_add(removed);
     }
-
-    with_trash_commit_lock(fragment, |owner_path| {
-        if !owner_path.exists() {
-            return Ok(());
-        }
-        let owner_db = get_or_open_db(owner_path)?;
-        let _ = remove_trash_entries_on_db(&owner_db, &removed)?;
-        sync_trash_db_after_mutation(fragment, &owner_db)?;
-        Ok(())
-    })?;
-
     Ok(total)
 }
 

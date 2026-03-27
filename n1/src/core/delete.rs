@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
-use walkdir::WalkDir;
 
 use crate::core::disk_manager::ObjectPathManager;
 use crate::core::index;
@@ -395,86 +394,6 @@ fn get_trash_root(disk_root: &std::path::Path, fragment_hash: &str) -> std::path
     disk_root.join(fragment_hash).join(".trash")
 }
 
-fn is_cross_device_rename(err: &std::io::Error) -> bool {
-    #[cfg(unix)]
-    {
-        err.raw_os_error() == Some(libc::EXDEV)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = err;
-        false
-    }
-}
-
-async fn move_dir_or_copy(src: &std::path::Path, dst: &std::path::Path) -> Result<(), AppError> {
-    if let Some(parent) = dst.parent() {
-        let _ = fs::create_dir_all(parent).await;
-    }
-
-    match fs::rename(src, dst).await {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            if !is_cross_device_rename(&e) {
-                return Err(AppError::Io(
-                    e,
-                    format!("rename dir {} -> {}", src.display(), dst.display()),
-                ));
-            }
-
-            let src = src.to_path_buf();
-            let dst = dst.to_path_buf();
-
-            tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-                use std::fs as stdfs;
-
-                stdfs::create_dir_all(&dst).map_err(|e| {
-                    AppError::Io(e, format!("mkdir {} (copydir fallback)", dst.display()))
-                })?;
-
-                for entry in WalkDir::new(&src).into_iter().filter_map(|e| e.ok()) {
-                    let p = entry.path();
-                    let rel = match p.strip_prefix(&src) {
-                        Ok(r) => r,
-                        Err(_) => continue,
-                    };
-                    if rel.as_os_str().is_empty() {
-                        continue;
-                    }
-                    let target = dst.join(rel);
-
-                    if entry.file_type().is_dir() {
-                        let _ = stdfs::create_dir_all(&target);
-                        continue;
-                    }
-
-                    if entry.file_type().is_file() {
-                        if let Some(parent) = target.parent() {
-                            let _ = stdfs::create_dir_all(parent);
-                        }
-                        stdfs::copy(p, &target).map_err(|e| {
-                            AppError::Io(e, format!("copy {} -> {}", p.display(), target.display()))
-                        })?;
-                    }
-                }
-
-                stdfs::remove_dir_all(&src).map_err(|e| {
-                    AppError::Io(
-                        e,
-                        format!("remove_dir_all {} (after copydir)", src.display()),
-                    )
-                })?;
-
-                Ok(())
-            })
-            .await
-            .map_err(|e| AppError::InternalServerError(format!("copydir task: {}", e)))??;
-
-            Ok(())
-        }
-    }
-}
-
 async fn retire_trash_roots(
     trash_roots: &[std::path::PathBuf],
 ) -> Vec<(String, Option<std::path::PathBuf>, Option<String>)> {
@@ -544,55 +463,6 @@ async fn purge_delete_markers_for_key(fragment: &str, object_key: &str) {
     }
 }
 
-async fn list_object_versions_any(
-    fragment: &str,
-    object_key: &str,
-) -> Result<Vec<String>, AppError> {
-    index::list_live_object_version_ids(fragment, object_key).await
-}
-
-async fn list_trashed_object_versions_any(
-    fragment: &str,
-    object_key: &str,
-) -> Result<Vec<String>, AppError> {
-    index::list_trashed_object_version_ids(fragment, object_key).await
-}
-
-async fn move_blob_versions_between_states(
-    path_manager: &ObjectPathManager,
-    blob_roots: &[std::path::PathBuf],
-    fragment: &str,
-    version_ids: &[String],
-    from_trash: bool,
-) {
-    let mut moves = Vec::with_capacity(version_ids.len().saturating_mul(blob_roots.len()));
-    for version_id in version_ids {
-        for root in blob_roots {
-            let src = if from_trash {
-                get_trash_root(root, fragment).join("blob").join(version_id)
-            } else {
-                path_manager.get_shard_dir_on_disk(root, fragment, version_id)
-            };
-            let dst = if from_trash {
-                path_manager.get_shard_dir_on_disk(root, fragment, version_id)
-            } else {
-                get_trash_root(root, fragment).join("blob").join(version_id)
-            };
-            moves.push((src, dst));
-        }
-    }
-
-    stream::iter(moves.into_iter().map(|(src, dst)| async move {
-        if !fs::try_exists(&src).await.unwrap_or(false) {
-            return;
-        }
-        let _ = move_dir_or_copy(&src, &dst).await;
-    }))
-    .buffer_unordered(bulk_partition_concurrency_limit())
-    .collect::<Vec<_>>()
-    .await;
-}
-
 async fn remove_blob_versions(
     path_manager: &ObjectPathManager,
     blob_roots: &[std::path::PathBuf],
@@ -620,6 +490,12 @@ async fn remove_blob_versions(
     .buffer_unordered(bulk_partition_concurrency_limit())
     .collect::<Vec<_>>()
     .await;
+}
+
+async fn remove_blob_versions_for_fragment(fragment: &str, version_ids: &[String]) {
+    let path_manager = ObjectPathManager::new();
+    let blob_roots = path_manager.get_blob_roots();
+    remove_blob_versions(&path_manager, &blob_roots, fragment, version_ids).await;
 }
 
 async fn acquire_bulk_object_operation_locks(
@@ -670,89 +546,42 @@ pub struct BulkObjectOperationResponse {
 
 async fn delete_object_core(fragment: &str, object_key: &str) -> Result<usize, AppError> {
     let _object_lock = index::acquire_object_operation_lock(fragment, object_key).await?;
-    let path_manager = ObjectPathManager::new();
-    let versions_found = list_object_versions_any(fragment, object_key).await?;
-
-    if versions_found.is_empty() {
-        return Err(AppError::NotFound);
+    match index::move_object_to_trash_fast(fragment, object_key).await? {
+        Some(version_ids) => Ok(version_ids.len()),
+        None => Err(AppError::NotFound),
     }
-
-    let blob_roots = path_manager.get_blob_roots();
-    let moved_versions = match index::move_object_to_trash_fast(fragment, object_key).await {
-        Ok(Some(version_ids)) => version_ids,
-        Ok(None) => {
-            let versions_found = list_object_versions_any(fragment, object_key).await?;
-            if versions_found.is_empty() {
-                return Err(AppError::NotFound);
-            }
-            let mut moved = Vec::new();
-            for version_id in &versions_found {
-                let _moved_meta = match index::move_object_version_to_trash_with_metadata(
-                    fragment, object_key, version_id,
-                )
-                .await
-                {
-                    Ok(meta) => meta,
-                    Err(e) => {
-                        warn!(
-                            "Partition trash move failed for {}/{}#{}: {}",
-                            fragment, object_key, version_id, e
-                        );
-                        continue;
-                    }
-                };
-                moved.push(version_id.clone());
-            }
-            moved
-        }
-        Err(e) => return Err(e),
-    };
-
-    move_blob_versions_between_states(&path_manager, &blob_roots, fragment, &moved_versions, false)
-        .await;
-    Ok(moved_versions.len())
 }
 
 async fn recover_object_core(fragment: &str, object_key: &str) -> Result<usize, AppError> {
     let _object_lock = index::acquire_object_operation_lock(fragment, object_key).await?;
-    let path_manager = ObjectPathManager::new();
-    let blob_roots = path_manager.get_blob_roots();
     purge_delete_markers_for_key(fragment, object_key).await;
-
-    let mut found_versions = list_trashed_object_versions_any(fragment, object_key).await?;
-    if found_versions.is_empty() {
-        return Err(AppError::NotFound);
+    match index::restore_object_from_trash_fast(fragment, object_key).await? {
+        Some(version_ids) => Ok(version_ids.len()),
+        None => Err(AppError::NotFound),
     }
-    found_versions.sort();
-    found_versions.dedup();
+}
 
-    move_blob_versions_between_states(&path_manager, &blob_roots, fragment, &found_versions, true)
-        .await;
+async fn delete_object_permanently_core(
+    fragment: &str,
+    object_key: &str,
+) -> Result<Vec<String>, AppError> {
+    let _object_lock = index::acquire_object_operation_lock(fragment, object_key).await?;
+    let versions_to_delete =
+        if let Some(version_ids) = index::delete_object_fast(fragment, object_key).await? {
+            version_ids
+        } else if let Some(version_ids) =
+            index::delete_all_trash_versions_for_key(fragment, object_key).await?
+        {
+            version_ids
+        } else {
+            return Err(AppError::NotFound);
+        };
 
-    let restored_versions = match index::restore_object_from_trash_fast(fragment, object_key).await
-    {
-        Ok(Some(version_ids)) => version_ids,
-        Ok(None) => {
-            let mut restored = Vec::new();
-            for version_id in &found_versions {
-                if let Err(e) = index::restore_object_version_from_trash_with_metadata(
-                    fragment, object_key, version_id,
-                )
-                .await
-                {
-                    warn!(
-                        "Partition restore failed for {}/{}#{}: {}",
-                        fragment, object_key, version_id, e
-                    );
-                    continue;
-                }
-                restored.push(version_id.clone());
-            }
-            restored
-        }
-        Err(e) => return Err(e),
-    };
-    Ok(restored_versions.len())
+    remove_blob_versions_for_fragment(fragment, &versions_to_delete).await;
+    for version_id in &versions_to_delete {
+        let _ = index::remove_session(fragment, version_id, "permanent-delete").await;
+    }
+    Ok(versions_to_delete)
 }
 
 pub async fn delete_object_version(
@@ -768,50 +597,19 @@ pub async fn delete_object_version(
     }
 
     let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
-    let path_manager = ObjectPathManager::new();
-    let blob_roots = path_manager.get_blob_roots();
-    if let Ok(_meta) = index::read_trashed_object_version(&fragment, &object_key, &version_id).await
-    {
-        for root in &blob_roots {
-            let trash_blob_dir = get_trash_root(root, &fragment)
-                .join("blob")
-                .join(&version_id);
-            let _ = fs::remove_dir_all(&trash_blob_dir).await;
+    match index::delete_trashed_object_version(&fragment, &object_key, &version_id).await {
+        Ok(()) => {}
+        Err(AppError::NotFound) => {
+            index::delete_object_version(&fragment, &object_key, &version_id).await?;
         }
-        let _ = index::delete_trashed_object_version(&fragment, &object_key, &version_id).await;
-        let _ = index::remove_session(&fragment, &version_id, "permanent-delete-version").await;
-        state.emit(
-            &fragment,
-            StorageEventPayload::FileDeleted {
-                fragment: fragment.clone(),
-                object_key,
-                version_id: Some(version_id),
-            },
-        );
-        return Ok(StatusCode::NO_CONTENT);
+        Err(err) => return Err(err),
     }
 
-    let _moved_meta =
-        index::move_object_version_to_trash_with_metadata(&fragment, &object_key, &version_id)
-            .await?;
-
-    for root in &blob_roots {
-        let src_blob_dir = path_manager.get_shard_dir_on_disk(root, &fragment, &version_id);
-        if !fs::try_exists(&src_blob_dir).await.unwrap_or(false) {
-            continue;
-        }
-
-        let trash_root = get_trash_root(root, &fragment);
-        let dest_blob_dir = trash_root.join("blob").join(&version_id);
-
-        match move_dir_or_copy(&src_blob_dir, &dest_blob_dir).await {
-            Ok(_) => {}
-            Err(e) => warn!("Failed to move blob to trash: {}", e),
-        }
-    }
+    remove_blob_versions_for_fragment(&fragment, std::slice::from_ref(&version_id)).await;
+    let _ = index::remove_session(&fragment, &version_id, "permanent-delete-version").await;
 
     info!(
-        "Soft deleted (moved to trash) version: {}/{} (v: {})",
+        "Permanently deleted version: {}/{} (v: {})",
         fragment, object_key, version_id
     );
 
@@ -824,7 +622,7 @@ pub async fn delete_object_version(
         },
     );
 
-    Ok(StatusCode::OK)
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn delete_object(
@@ -882,8 +680,6 @@ pub async fn delete_objects_bulk(
     }
 
     let _guards = acquire_bulk_object_operation_locks(&fragment, &unique_keys).await?;
-    let path_manager = ObjectPathManager::new();
-    let blob_roots = path_manager.get_blob_roots();
     let mut failed = Vec::new();
     let moved_by_key = match index::move_objects_to_trash_batch(&fragment, &unique_keys).await {
         Ok(changed) => changed,
@@ -898,10 +694,6 @@ pub async fn delete_objects_bulk(
         }
     };
 
-    let version_ids = flatten_version_ids(&moved_by_key);
-    move_blob_versions_between_states(&path_manager, &blob_roots, &fragment, &version_ids, false)
-        .await;
-
     let succeeded = moved_by_key.len();
     let not_found = unique_keys
         .len()
@@ -911,7 +703,7 @@ pub async fn delete_objects_bulk(
         info!(
             "Soft deleted {} object(s) and {} version(s) for fragment {} via bulk manifest",
             succeeded,
-            version_ids.len(),
+            flatten_version_ids(&moved_by_key).len(),
             fragment
         );
     }
@@ -975,10 +767,11 @@ async fn run_empty_trash_job(state: Arc<AppState>, fragment: String) -> Result<(
     })
     .await;
 
-    let total_objects = index::list_fragment_object_keys_with_trash_versions(&fragment)
-        .await
-        .map(|keys| keys.len() as u64)
-        .unwrap_or(0);
+    let trash_keys = index::list_fragment_object_keys_with_trash_versions(&fragment).await?;
+    let total_objects = trash_keys.len() as u64;
+    let trashed_version_ids = flatten_version_ids(
+        &index::list_trashed_object_version_ids_batch(&fragment, &trash_keys).await?,
+    );
 
     let mut trash_targets = BTreeSet::new();
     for root in &index_roots {
@@ -1000,6 +793,13 @@ async fn run_empty_trash_job(state: Arc<AppState>, fragment: String) -> Result<(
     mutate_trash_job_status(&EMPTY_TRASH_STATUS, |status| {
         status.processed_objects = total_objects;
         status.successful_objects = total_objects;
+        status.phase = "Removing trashed blobs".to_string();
+    })
+    .await;
+
+    remove_blob_versions(&path_manager, &blob_roots, &fragment, &trashed_version_ids).await;
+
+    mutate_trash_job_status(&EMPTY_TRASH_STATUS, |status| {
         status.phase = "Retiring trash roots".to_string();
     })
     .await;
@@ -1047,17 +847,7 @@ pub async fn delete_object_permanently(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
-    let path_manager = ObjectPathManager::new();
-    let versions_to_delete = match index::delete_object_fast(&fragment, &object_key).await? {
-        Some(version_ids) => version_ids,
-        None => return Err(AppError::NotFound),
-    };
-    let blob_roots = path_manager.get_blob_roots();
-    remove_blob_versions(&path_manager, &blob_roots, &fragment, &versions_to_delete).await;
-    for version_id in &versions_to_delete {
-        let _ = index::remove_session(&fragment, version_id, "permanent-delete").await;
-    }
+    let versions_to_delete = delete_object_permanently_core(&fragment, &object_key).await?;
 
     info!(
         "Permanently deleted {} versions for {}/{}",
@@ -1078,6 +868,60 @@ pub async fn delete_object_permanently(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn delete_objects_bulk_permanently(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    AxumJson(payload): AxumJson<BulkObjectKeysRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.delete {
+        return Err(AppError::Forbidden("Delete permission required".into()));
+    }
+
+    let fragment = claims.fragment.clone();
+    let requested = payload.object_keys.len();
+    let unique_keys: Vec<String> = payload
+        .object_keys
+        .into_iter()
+        .filter(|key| !key.is_empty())
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect();
+
+    if unique_keys.is_empty() {
+        return Err(AppError::BadRequest("object_keys must not be empty".into()));
+    }
+
+    let mut succeeded = 0usize;
+    let mut not_found = 0usize;
+    let mut failed = Vec::new();
+
+    for object_key in &unique_keys {
+        match delete_object_permanently_core(&fragment, object_key).await {
+            Ok(_) => succeeded = succeeded.saturating_add(1),
+            Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
+            Err(err) => failed.push(BulkObjectFailure {
+                object_key: object_key.clone(),
+                error: err.to_string(),
+            }),
+        }
+    }
+
+    if succeeded > 0 {
+        state.emit(&fragment, StorageEventPayload::StateInvalidated);
+    }
+
+    Ok((
+        StatusCode::OK,
+        AxumJson(BulkObjectOperationResponse {
+            requested,
+            unique: unique_keys.len(),
+            succeeded,
+            not_found,
+            failed,
+        }),
+    ))
+}
+
 pub async fn recover_object_version(
     State(state): State<Arc<AppState>>,
     claims: Claims,
@@ -1092,30 +936,8 @@ pub async fn recover_object_version(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
-    let path_manager = ObjectPathManager::new();
-    let blob_roots = path_manager.get_blob_roots();
     purge_delete_markers_for_key(&fragment, &object_key).await;
-    let _trashed_meta =
-        index::read_trashed_object_version(&fragment, &object_key, &version_id).await?;
-
-    for root in &blob_roots {
-        let trash_blob_dir = get_trash_root(root, &fragment)
-            .join("blob")
-            .join(&version_id);
-
-        if !fs::try_exists(&trash_blob_dir).await.unwrap_or(false) {
-            continue;
-        }
-
-        let live_blob_dir = path_manager.get_shard_dir_on_disk(root, &fragment, &version_id);
-        if let Some(parent) = live_blob_dir.parent() {
-            let _ = fs::create_dir_all(parent).await;
-        }
-
-        let _ = move_dir_or_copy(&trash_blob_dir, &live_blob_dir).await;
-    }
-
+    let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
     let _restored_meta =
         index::restore_object_version_from_trash_with_metadata(&fragment, &object_key, &version_id)
             .await?;
@@ -1184,8 +1006,6 @@ pub async fn recover_objects_bulk(
     }
 
     let _guards = acquire_bulk_object_operation_locks(&fragment, &unique_keys).await?;
-    let path_manager = ObjectPathManager::new();
-    let blob_roots = path_manager.get_blob_roots();
     let mut failed = Vec::new();
     for object_key in &unique_keys {
         purge_delete_markers_for_key(&fragment, object_key).await;
@@ -1198,10 +1018,6 @@ pub async fn recover_objects_bulk(
                 return Err(err);
             }
         };
-
-    let version_ids = flatten_version_ids(&recoverable_versions);
-    move_blob_versions_between_states(&path_manager, &blob_roots, &fragment, &version_ids, true)
-        .await;
 
     let mut restored_by_key = HashMap::<String, Vec<String>>::new();
     match index::restore_objects_from_trash_manifest_batch(&fragment, &recoverable_versions).await {
@@ -1225,7 +1041,7 @@ pub async fn recover_objects_bulk(
         info!(
             "Recovered {} object(s) and {} version(s) for fragment {} via bulk manifest",
             succeeded,
-            version_ids.len(),
+            flatten_version_ids(&restored_by_key).len(),
             fragment
         );
     }
@@ -1308,14 +1124,10 @@ async fn run_recover_all_trash_job(state: Arc<AppState>, fragment: String) -> Re
     })
     .await;
 
-    let path_manager = ObjectPathManager::new();
-    let blob_roots = path_manager.get_blob_roots();
     for object_key in &trash_keys {
         purge_delete_markers_for_key(&fragment, object_key).await;
     }
     let version_ids = flatten_version_ids(&recoverable_versions);
-    move_blob_versions_between_states(&path_manager, &blob_roots, &fragment, &version_ids, true)
-        .await;
 
     let mut recovered_count = 0usize;
     match index::restore_objects_from_trash_manifest_batch(&fragment, &recoverable_versions).await {

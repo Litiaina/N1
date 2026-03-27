@@ -45,6 +45,13 @@ pub struct SessionPartReceipt {
     pub shard_checksums: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrashCatalogEntry {
+    pub object_key: String,
+    pub version_ids: Vec<String>,
+    pub deleted_at: i64,
+}
+
 pub struct ObjectOperationGuard {
     _guard: OwnedMutexGuard<()>,
 }
@@ -266,6 +273,12 @@ pub async fn list_partition_trash_entries(
     partition_id: u16,
 ) -> Result<std::collections::HashMap<String, Vec<String>>, AppError> {
     indexdb_store::list_partition_trash_entries(fragment, partition_id)
+}
+
+pub async fn list_fragment_trash_catalog(
+    fragment: &str,
+) -> Result<Vec<TrashCatalogEntry>, AppError> {
+    indexdb_store::list_trash_catalog(fragment)
 }
 
 pub async fn list_trashed_object_version_ids_batch(

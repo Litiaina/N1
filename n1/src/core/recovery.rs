@@ -141,15 +141,8 @@ fn shard_dir_on_root(
     version_id: &str,
     is_trash: bool,
 ) -> PathBuf {
-    if is_trash {
-        disk_root
-            .join(fragment)
-            .join(".trash")
-            .join("blob")
-            .join(version_id)
-    } else {
-        disk_root.join(fragment).join("blob").join(version_id)
-    }
+    let _ = is_trash;
+    disk_root.join(fragment).join("blob").join(version_id)
 }
 
 async fn create_direct_file_for_repair(path: &PathBuf) -> Result<std::fs::File, AppError> {

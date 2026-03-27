@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -191,9 +191,10 @@ pub async fn rename_object(
     if source_versions.is_empty() {
         return Err(AppError::NotFound);
     }
+    let source_versions_snapshot = source_versions.clone();
     let blob_roots = path_manager.get_blob_roots();
     let mut affected_versions: HashSet<String> = HashSet::new();
-    let mut created_at_by_version: HashMap<String, i64> = HashMap::new();
+    let mut destination_versions_to_write = Vec::new();
     for source_meta in source_versions {
         if source_meta.is_delete_marker {
             continue;
@@ -220,24 +221,55 @@ pub async fn rename_object(
             }
         }
 
-        index::upsert_object_version(&new_meta).await?;
+        destination_versions_to_write.push(new_meta.clone());
         affected_versions.insert(new_meta.version_id.clone());
-        created_at_by_version
-            .entry(new_meta.version_id.clone())
-            .or_insert(new_meta.created_at);
     }
 
     if affected_versions.is_empty() {
         return Err(AppError::NotFound);
     }
 
-    for version_id in &affected_versions {
-        let _ =
-            index::delete_object_version(&payload.source_fragment, &payload.source_key, version_id)
-                .await;
-    }
+    if payload.source_fragment == payload.destination_fragment {
+        for version_id in &affected_versions {
+            let _ = index::delete_object_version(
+                &payload.source_fragment,
+                &payload.source_key,
+                version_id,
+            )
+            .await;
+        }
 
-    if payload.source_fragment != payload.destination_fragment {
+        let mut inserted_destination_versions: Vec<String> = Vec::new();
+        for new_meta in &destination_versions_to_write {
+            if let Err(err) = index::upsert_object_version(new_meta).await {
+                for version_id in &inserted_destination_versions {
+                    let _ = index::delete_object_version(
+                        &payload.destination_fragment,
+                        &payload.destination_key,
+                        version_id,
+                    )
+                    .await;
+                }
+                for source_meta in &source_versions_snapshot {
+                    let _ = index::upsert_object_version(source_meta).await;
+                }
+                return Err(err);
+            }
+            inserted_destination_versions.push(new_meta.version_id.clone());
+        }
+    } else {
+        for new_meta in &destination_versions_to_write {
+            index::upsert_object_version(new_meta).await?;
+        }
+        for version_id in &affected_versions {
+            let _ = index::delete_object_version(
+                &payload.source_fragment,
+                &payload.source_key,
+                version_id,
+            )
+            .await;
+        }
+
         for root in blob_roots {
             for version_id in &affected_versions {
                 let src_blob_dir =

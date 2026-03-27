@@ -7,8 +7,9 @@ use crate::core::delete::{
     delete_object as delete_object_impl,
     delete_object_permanently as delete_object_permanently_impl,
     delete_object_version as delete_object_version_impl,
-    delete_objects_bulk as delete_objects_bulk_impl, empty_trash as empty_trash_impl,
-    get_empty_trash_status_api, get_recover_all_trash_status_api,
+    delete_objects_bulk as delete_objects_bulk_impl,
+    delete_objects_bulk_permanently as delete_objects_bulk_permanently_impl,
+    empty_trash as empty_trash_impl, get_empty_trash_status_api, get_recover_all_trash_status_api,
     recover_all_trash as recover_all_trash_impl, recover_object as recover_object_impl,
     recover_object_version as recover_object_version_impl,
     recover_objects_bulk as recover_objects_bulk_impl, resume_persistent_trash_jobs,
@@ -507,6 +508,10 @@ pub fn build_storage_routes_unbound_with_options(
             .route(
                 "/v4/fragment/object/bulk-delete",
                 post(delete_objects_bulk_impl),
+            )
+            .route(
+                "/v4/fragment/permanent/bulk-delete",
+                post(delete_objects_bulk_permanently_impl),
             )
             .route(
                 "/v4/fragment/object/delete/{*object_key}",

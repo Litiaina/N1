@@ -2,9 +2,9 @@ use super::archive::{download_manifest_archive, download_selected_archive};
 use super::delete::delete_object;
 use super::delete::{
     BulkObjectKeysRequest, delete_object_permanently, delete_object_version, delete_objects_bulk,
-    empty_trash, get_empty_trash_status, get_recover_all_trash_status, persistent_trash_job_paths,
-    recover_all_trash, recover_object, recover_object_version, recover_objects_bulk,
-    resume_persistent_trash_jobs,
+    delete_objects_bulk_permanently, empty_trash, get_empty_trash_status,
+    get_recover_all_trash_status, persistent_trash_job_paths, recover_all_trash, recover_object,
+    recover_object_version, recover_objects_bulk, resume_persistent_trash_jobs,
 };
 use super::disk_manager::{
     DownloadArchiveManifestQuery, DownloadArchiveRequest, InitiateUploadParams, ListObjectsResult,
@@ -99,6 +99,10 @@ fn full_claims(fragment: &str) -> Claims {
 
 async fn ensure_global_storage_config(base: &std::path::Path) {
     ensure_test_config_file();
+
+    indexdb_store::clear_cached_dbs_for_test();
+    let _ = fs::remove_dir_all(base).await;
+    let _ = fs::create_dir_all(base).await;
 
     let index_1 = base.join("index_1");
     let index_2 = base.join("index_2");
@@ -844,6 +848,15 @@ async fn read_object_bytes_eventually(
     object_key: String,
     attempts: usize,
 ) -> Vec<u8> {
+    read_object_bytes_eventually_labeled(fragment, object_key, attempts, "read").await
+}
+
+async fn read_object_bytes_eventually_labeled(
+    fragment: String,
+    object_key: String,
+    attempts: usize,
+    label: &str,
+) -> Vec<u8> {
     for _ in 0..attempts {
         let req = Request::builder()
             .uri("/v4/fragment/get")
@@ -867,9 +880,13 @@ async fn read_object_bytes_eventually(
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 
+    let metadata_after = get_metadata(&fragment, &object_key, &fragment).await;
+    let live_versions_after = index::list_live_object_versions_metadata(&fragment, &object_key).await;
+    let trash_versions_after =
+        index::list_trashed_object_versions_metadata(&fragment, &object_key).await;
     panic!(
-        "object {} in fragment {} was not readable after {} attempts",
-        object_key, fragment, attempts
+        "{}: object {} in fragment {} was not readable after {} attempts; metadata={:?}; live_versions={:?}; trash_versions={:?}",
+        label, object_key, fragment, attempts, metadata_after, live_versions_after, trash_versions_after
     );
 }
 
@@ -2741,17 +2758,17 @@ async fn matrix_delete_recover_and_permanent_delete_flows() {
     .await
     .expect("delete version")
     .into_response();
-    assert_eq!(del_ver.status(), StatusCode::OK);
-
-    let rec_ver = recover_object_version(
-        State(state.clone()),
-        full_claims(&fragment),
-        AxumPath((fragment.clone(), ver1.clone(), key.clone())),
-    )
-    .await
-    .expect("recover version")
-    .into_response();
-    assert_eq!(rec_ver.status(), StatusCode::OK);
+    assert_eq!(del_ver.status(), StatusCode::NO_CONTENT);
+    assert!(
+        recover_object_version(
+            State(state.clone()),
+            full_claims(&fragment),
+            AxumPath((fragment.clone(), ver1.clone(), key.clone())),
+        )
+        .await
+        .is_err(),
+        "directly deleted version should not be recoverable from trash"
+    );
 
     let soft_del = delete_object(
         State(state.clone()),
@@ -2797,6 +2814,150 @@ async fn matrix_delete_recover_and_permanent_delete_flows() {
         .is_err(),
         "object should not be retrievable after permanent delete"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_bulk_permanent_delete_removes_live_and_trashed_objects() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let live_key = "permanent-bulk/live.bin".to_string();
+    let trashed_key = "permanent-bulk/trashed.bin".to_string();
+    put_object(state.clone(), &fragment, &live_key, vec![0x41; 2048]).await;
+    put_object(state.clone(), &fragment, &trashed_key, vec![0x42; 2048]).await;
+
+    let soft_delete = delete_object(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), trashed_key.clone())),
+    )
+    .await
+    .expect("soft delete before permanent bulk delete")
+    .into_response();
+    assert_eq!(soft_delete.status(), StatusCode::OK);
+
+    let resp = delete_objects_bulk_permanently(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumJson(BulkObjectKeysRequest {
+            object_keys: vec![live_key.clone(), trashed_key.clone()],
+        }),
+    )
+    .await
+    .expect("bulk permanent delete")
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("bulk permanent delete body");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&body).expect("bulk permanent delete json");
+    assert_eq!(parsed["succeeded"].as_u64(), Some(2));
+    assert_eq!(parsed["not_found"].as_u64(), Some(0));
+
+    for key in [live_key, trashed_key] {
+        let req = Request::builder()
+            .uri("/v4/fragment/get")
+            .body(Body::empty())
+            .expect("build get request");
+        assert!(
+            get_object(
+                full_claims(&fragment),
+                AxumPath((fragment.clone(), key.clone())),
+                req,
+            )
+            .await
+            .is_err(),
+            "permanent bulk delete should remove {}",
+            key
+        );
+    }
+
+    assert!(
+        index::list_fragment_trash_objects(&fragment)
+            .await
+            .expect("trash list after permanent bulk delete")
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_soft_delete_and_recover_are_metadata_only() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let key = "lifecycle/metadata-only.bin".to_string();
+    let bytes = vec![0x6a; 4096];
+    let version_id = put_object(state.clone(), &fragment, &key, bytes.clone()).await;
+
+    let delete_resp = delete_object(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), key.clone())),
+    )
+    .await
+    .expect("soft delete")
+    .into_response();
+    assert_eq!(delete_resp.status(), StatusCode::OK);
+
+    let path_manager = ObjectPathManager::new();
+    for root in path_manager.get_blob_roots() {
+        let live_blob_dir = path_manager.get_shard_dir_on_disk(&root, &fragment, &version_id);
+        let trash_blob_dir = root
+            .join(&fragment)
+            .join(".trash")
+            .join("blob")
+            .join(&version_id);
+        assert!(
+            fs::try_exists(&live_blob_dir)
+                .await
+                .expect("live blob exists after soft delete"),
+            "soft delete should leave blob in live root"
+        );
+        assert!(
+            !fs::try_exists(&trash_blob_dir)
+                .await
+                .expect("trash blob exists after soft delete"),
+            "soft delete should not move blob into .trash"
+        );
+    }
+
+    let recover_resp = recover_object(
+        State(state),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), key.clone())),
+    )
+    .await
+    .expect("recover metadata-only object")
+    .into_response();
+    assert_eq!(recover_resp.status(), StatusCode::OK);
+
+    let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key).await;
+    assert_eq!(got, bytes);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2881,17 +3042,18 @@ async fn matrix_delete_version_again_permanently_removes_only_trashed_version() 
     .await
     .expect("first delete")
     .into_response();
-    assert_eq!(first_delete.status(), StatusCode::OK);
+    assert_eq!(first_delete.status(), StatusCode::NO_CONTENT);
 
-    let second_delete = delete_object_version(
-        State(state),
-        full_claims(&fragment),
-        AxumPath((fragment.clone(), ver1.clone(), key.clone())),
-    )
-    .await
-    .expect("second delete")
-    .into_response();
-    assert_eq!(second_delete.status(), StatusCode::NO_CONTENT);
+    assert!(
+        delete_object_version(
+            State(state),
+            full_claims(&fragment),
+            AxumPath((fragment.clone(), ver1.clone(), key.clone())),
+        )
+        .await
+        .is_err(),
+        "second direct delete should not find the version anymore"
+    );
 
     let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
     assert_eq!(got, v2, "latest live version should stay readable");
@@ -4867,7 +5029,13 @@ async fn matrix_ha_concurrent_clients_under_maintenance() {
 
                 put_object(state.clone(), &fragment, &key_a, content.clone()).await;
 
-                let got = read_object_bytes_eventually(fragment.clone(), key_a.clone(), 20).await;
+                let got = read_object_bytes_eventually_labeled(
+                    fragment.clone(),
+                    key_a.clone(),
+                    20,
+                    "ha_conc_initial",
+                )
+                .await;
                 assert_eq!(got, content, "initial write mismatch for {}", key_a);
 
                 let rename_resp = rename_object(
@@ -4885,7 +5053,13 @@ async fn matrix_ha_concurrent_clients_under_maintenance() {
                 .into_response();
                 assert_eq!(rename_resp.status(), StatusCode::OK);
 
-                let got = read_object_bytes_eventually(fragment.clone(), key_b.clone(), 20).await;
+                let got = read_object_bytes_eventually_labeled(
+                    fragment.clone(),
+                    key_b.clone(),
+                    20,
+                    "ha_conc_renamed",
+                )
+                .await;
                 assert_eq!(got, content, "renamed read mismatch for {}", key_b);
 
                 let del_resp = delete_object(
@@ -4908,7 +5082,13 @@ async fn matrix_ha_concurrent_clients_under_maintenance() {
                 .into_response();
                 assert_eq!(rec_resp.status(), StatusCode::OK);
 
-                let got = read_object_bytes_eventually(fragment, key_b.clone(), 24).await;
+                let got = read_object_bytes_eventually_labeled(
+                    fragment,
+                    key_b.clone(),
+                    24,
+                    "ha_conc_recovered",
+                )
+                .await;
                 assert_eq!(got, content, "recovered read mismatch for {}", key_b);
             }
         })
@@ -4932,7 +5112,13 @@ async fn matrix_ha_concurrent_clients_under_maintenance() {
     ));
 
     for (key, bytes) in &expected_final {
-        let got = read_object_bytes_eventually(fragment.clone(), key.clone(), 24).await;
+        let got = read_object_bytes_eventually_labeled(
+            fragment.clone(),
+            key.clone(),
+            24,
+            "ha_conc_repair_read",
+        )
+        .await;
         assert_eq!(got, *bytes, "read mismatch during repair for {}", key);
     }
 
@@ -5031,7 +5217,13 @@ async fn matrix_ha_concurrent_clients_with_failure_injection() {
                     .collect::<Vec<u8>>();
 
                 put_object(state.clone(), &fragment, &key_a, content.clone()).await;
-                let got = read_object_bytes_eventually(fragment.clone(), key_a.clone(), 24).await;
+                let got = read_object_bytes_eventually_labeled(
+                    fragment.clone(),
+                    key_a.clone(),
+                    24,
+                    "ha_fi_initial",
+                )
+                .await;
                 assert_eq!(got, content, "initial write mismatch for {}", key_a);
 
                 let rename_resp = rename_object(
@@ -5069,7 +5261,13 @@ async fn matrix_ha_concurrent_clients_with_failure_injection() {
                 .into_response();
                 assert_eq!(rec_resp.status(), StatusCode::OK);
 
-                let got = read_object_bytes_eventually(fragment, key_b.clone(), 24).await;
+                let got = read_object_bytes_eventually_labeled(
+                    fragment,
+                    key_b.clone(),
+                    24,
+                    "ha_fi_recovered",
+                )
+                .await;
                 assert_eq!(got, content, "recovered read mismatch for {}", key_b);
             }
         })
@@ -5128,7 +5326,13 @@ async fn matrix_ha_concurrent_clients_with_failure_injection() {
     ));
 
     for (key, bytes) in &expected_final {
-        let got = read_object_bytes_eventually(fragment.clone(), key.clone(), 24).await;
+        let got = read_object_bytes_eventually_labeled(
+            fragment.clone(),
+            key.clone(),
+            24,
+            "ha_fi_repair_read",
+        )
+        .await;
         assert_eq!(got, *bytes, "read mismatch during repair for {}", key);
     }
 
@@ -6718,7 +6922,7 @@ async fn matrix_indexdb_ndxdb_recover_all_and_empty_trash_fast_paths() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_fragment_wide_trash_jobs_handle_hidden_trash_versions() {
+async fn matrix_version_delete_is_direct_and_skips_trash_plane() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
     ensure_global_storage_config(&base).await;
@@ -6746,20 +6950,19 @@ async fn matrix_fragment_wide_trash_jobs_handle_hidden_trash_versions() {
     .await
     .expect("delete older version")
     .into_response();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     assert_eq!(
         index::list_fragment_object_keys_with_trash_versions(&fragment)
             .await
             .expect("trash keys before recover"),
-        vec![key.clone()]
+        Vec::<String>::new()
     );
-    assert_eq!(
+    assert!(
         index::list_trashed_object_versions_metadata(&fragment, &key)
             .await
             .expect("trashed versions before recover")
-            .len(),
-        1
+            .is_empty()
     );
     assert_eq!(
         index::list_live_object_versions_metadata(&fragment, &key)
@@ -6769,47 +6972,16 @@ async fn matrix_fragment_wide_trash_jobs_handle_hidden_trash_versions() {
         1
     );
 
-    let recover_resp = recover_all_trash(
-        State(state.clone()),
-        full_claims(&fragment),
-        AxumPath(fragment.clone()),
-    )
-    .await
-    .expect("recover all hidden trash")
-    .into_response();
-    assert_eq!(recover_resp.status(), StatusCode::ACCEPTED);
-    wait_for_trash_job_completion("recover").await;
-
     assert!(
-        index::list_trashed_object_versions_metadata(&fragment, &key)
-            .await
-            .expect("trashed versions after recover")
-            .is_empty()
-    );
-    let live_after_recover = index::list_live_object_versions_metadata(&fragment, &key)
+        delete_object_version(
+            State(state.clone()),
+            full_claims(&fragment),
+            AxumPath((fragment.clone(), version_a.clone(), key.clone())),
+        )
         .await
-        .expect("live versions after recover");
-    assert_eq!(live_after_recover.len(), 2);
-    assert!(
-        live_after_recover
-            .iter()
-            .any(|meta| meta.version_id == version_a && meta.object_key == key)
+        .is_err(),
+        "second direct version delete should not find the older version"
     );
-    assert!(
-        live_after_recover
-            .iter()
-            .any(|meta| meta.version_id == version_b && meta.object_key == key)
-    );
-
-    let delete_again = delete_object_version(
-        State(state.clone()),
-        full_claims(&fragment),
-        AxumPath((fragment.clone(), version_a.clone(), key.clone())),
-    )
-    .await
-    .expect("delete older version again")
-    .into_response();
-    assert_eq!(delete_again.status(), StatusCode::OK);
 
     let empty_resp = empty_trash(
         State(state),
@@ -6817,7 +6989,7 @@ async fn matrix_fragment_wide_trash_jobs_handle_hidden_trash_versions() {
         AxumPath(fragment.clone()),
     )
     .await
-    .expect("empty hidden trash")
+    .expect("empty direct-version-delete fragment trash")
     .into_response();
     assert_eq!(empty_resp.status(), StatusCode::ACCEPTED);
     wait_for_trash_job_completion("empty").await;
@@ -7591,7 +7763,100 @@ async fn matrix_live_listing_supports_prefix_and_delimiter_pagination() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_deleted_tombstone_blocks_stale_versions_until_newer_generation_arrives() {
+async fn matrix_live_listing_rebuilds_partition_namespace_index_when_missing() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    for (key, fill) in [
+        ("rebuild", 1u8),
+        ("rebuild/a.bin", 2u8),
+        ("rebuild/b.bin", 3u8),
+        ("rebuild/sub-a/x.bin", 4u8),
+        ("rebuild/sub-b/y.bin", 5u8),
+    ] {
+        put_object(state.clone(), &fragment, key, vec![fill; 2048]).await;
+    }
+
+    indexdb_store::clear_live_namespace_indexes_for_test(&fragment)
+        .expect("clear live namespace indexes");
+    assert_eq!(
+        indexdb_store::count_live_namespace_rows_for_test(&fragment)
+            .expect("count cleared namespace rows"),
+        0
+    );
+
+    let page1 = list_objects_json_page(&fragment, Some("rebuild"), Some("/"), 2, None).await;
+    let token1 = page1["continuation_token"]
+        .as_str()
+        .expect("page1 continuation token")
+        .to_string();
+    let page2 =
+        list_objects_json_page(&fragment, Some("rebuild"), Some("/"), 2, Some(token1)).await;
+    let token2 = page2["continuation_token"]
+        .as_str()
+        .expect("page2 continuation token")
+        .to_string();
+    let page3 =
+        list_objects_json_page(&fragment, Some("rebuild"), Some("/"), 2, Some(token2)).await;
+
+    let mut rows = Vec::new();
+    for page in [&page1, &page2, &page3] {
+        rows.extend(
+            page["objects"]
+                .as_array()
+                .expect("objects array")
+                .iter()
+                .filter_map(|v| v["object_key"].as_str())
+                .map(|s| format!("object:{s}")),
+        );
+        rows.extend(
+            page["common_prefixes"]
+                .as_array()
+                .expect("common prefixes array")
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| format!("prefix:{s}")),
+        );
+    }
+
+    assert_eq!(
+        rows,
+        vec![
+            "object:rebuild".to_string(),
+            "object:rebuild/a.bin".to_string(),
+            "object:rebuild/b.bin".to_string(),
+            "prefix:rebuild/sub-a/".to_string(),
+            "prefix:rebuild/sub-b/".to_string(),
+        ]
+    );
+    assert!(
+        indexdb_store::count_live_namespace_rows_for_test(&fragment)
+            .expect("count rebuilt namespace rows")
+            > 0,
+        "listing should lazily rebuild partition-local live namespace rows"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_permanent_delete_removes_object_and_allows_recreate_without_tombstone_barrier() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
     ensure_global_storage_config(&base).await;
@@ -7630,18 +7895,19 @@ async fn matrix_deleted_tombstone_blocks_stale_versions_until_newer_generation_a
 
     index::upsert_object_version(&old_meta)
         .await
-        .expect("reinsert stale historical version");
+        .expect("reinsert historical version after permanent delete");
 
-    assert!(matches!(
-        get_metadata(&fragment, &key, &fragment).await,
-        Err(AppError::NotFound)
-    ));
-    assert!(
+    let recreated = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("recreated metadata after permanent delete");
+    assert_eq!(recreated.version_id, old_meta.version_id);
+    assert_eq!(
         index::list_live_object_versions_metadata(&fragment, &key)
             .await
-            .expect("list live versions after stale reinsert")
-            .is_empty(),
-        "deleted tombstone should hide stale live versions from current visibility"
+            .expect("list live versions after recreate")
+            .len(),
+        1,
+        "without a tombstone barrier, recreating the object should make it visible again"
     );
 
     let mut newer_meta = old_meta.clone();
@@ -7650,11 +7916,11 @@ async fn matrix_deleted_tombstone_blocks_stale_versions_until_newer_generation_a
     newer_meta.created_at = old_meta.created_at + 1;
     index::upsert_object_version(&newer_meta)
         .await
-        .expect("insert newer version after tombstone");
+        .expect("insert newer version after recreate");
 
     let latest = index::read_latest_object(&fragment, &key)
         .await
-        .expect("newer version should replace tombstone");
+        .expect("newer version should replace recreated historical version");
     assert_eq!(latest.version_id, newer_meta.version_id);
 
     let listed = list_objects_json(&fragment, None, None).await;
@@ -7664,7 +7930,7 @@ async fn matrix_deleted_tombstone_blocks_stale_versions_until_newer_generation_a
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_soft_deleting_current_version_does_not_reveal_older_live_history() {
+async fn matrix_direct_deleting_current_version_rolls_back_to_previous_live_version() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
     ensure_global_storage_config(&base).await;
@@ -7690,7 +7956,6 @@ async fn matrix_soft_deleting_current_version_does_not_reveal_older_live_history
         .expect("list versions before delete");
     assert_eq!(live_versions.len(), 2);
     let current_version_id = live_versions[0].version_id.clone();
-    let older_version_id = live_versions[1].version_id.clone();
 
     let del_resp = delete_object_version(
         State(state.clone()),
@@ -7700,60 +7965,37 @@ async fn matrix_soft_deleting_current_version_does_not_reveal_older_live_history
     .await
     .expect("delete current version")
     .into_response();
-    assert_eq!(del_resp.status(), StatusCode::OK);
-
-    assert!(matches!(
-        get_metadata(&fragment, &key, &fragment).await,
-        Err(AppError::NotFound)
-    ));
-    assert!(matches!(
-        index::read_latest_object(&fragment, &key).await,
-        Err(AppError::NotFound)
-    ));
-    let latest_trash = index::read_latest_trashed_object(&fragment, &key)
-        .await
-        .expect("soft-deleted current version should become current trash head");
-    assert_eq!(latest_trash.version_id, current_version_id);
-    assert_eq!(
-        index::list_live_object_versions_metadata(&fragment, &key)
-            .await
-            .expect("list versions after soft delete")
-            .len(),
-        1,
-        "older history may remain visible by version, but must not become latest current truth"
-    );
-
-    let recover_resp = recover_object_version(
-        State(state),
-        full_claims(&fragment),
-        AxumPath((fragment.clone(), current_version_id.clone(), key.clone())),
-    )
-    .await
-    .expect("recover trashed current version explicitly")
-    .into_response();
-    assert_eq!(recover_resp.status(), StatusCode::OK);
+    assert_eq!(del_resp.status(), StatusCode::NO_CONTENT);
 
     let latest = index::read_latest_object(&fragment, &key)
         .await
-        .expect("explicitly restored version should become current");
-    assert_eq!(latest.version_id, current_version_id);
-    let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
-    assert_eq!(got, v2);
+        .expect("latest object after deleting current version");
+    assert_eq!(latest.object_key, key);
+    let got = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("get rolled-back metadata");
+    assert_eq!(got.version_id, live_versions[1].version_id);
+    assert!(matches!(
+        index::read_latest_trashed_object(&fragment, &key).await,
+        Err(AppError::NotFound)
+    ));
     assert_eq!(
         index::list_live_object_versions_metadata(&fragment, &key)
             .await
-            .expect("list versions after recover")
+            .expect("list versions after direct delete")
             .len(),
-        2,
-        "recovering the trashed current version should restore the visible live set"
+        1,
+        "deleting the current version should roll back to the previous live version"
     );
     assert!(
-        index::list_live_object_versions_metadata(&fragment, &key)
-            .await
-            .expect("list versions after recover")
-            .iter()
-            .any(|metadata| metadata.version_id == older_version_id),
-        "older live history should remain available by version after recovery"
+        recover_object_version(
+            State(state),
+            full_claims(&fragment),
+            AxumPath((fragment.clone(), current_version_id.clone(), key.clone())),
+        )
+        .await
+        .is_err(),
+        "directly deleted current version should not be recoverable from trash"
     );
 }
 

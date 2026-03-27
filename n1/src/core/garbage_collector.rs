@@ -222,19 +222,8 @@ fn get_trash_root(disk_root: &std::path::Path, fragment_hash: &str) -> PathBuf {
     disk_root.join(fragment_hash).join(".trash")
 }
 
-fn trash_version_age(
-    blob_roots: &[PathBuf],
-    fragment: &str,
-    version_id: &str,
-    now: SystemTime,
-) -> Option<Duration> {
-    blob_roots
-        .iter()
-        .map(|root| get_trash_root(root, fragment).join("blob").join(version_id))
-        .find_map(|path| {
-            let modified = fs::metadata(path).and_then(|m| m.modified()).ok()?;
-            Some(now.duration_since(modified).unwrap_or(Duration::ZERO))
-        })
+fn trash_deleted_age(deleted_at: i64, now_unix: i64) -> Duration {
+    Duration::from_secs(now_unix.saturating_sub(deleted_at.max(0)).max(0) as u64)
 }
 
 #[cfg(unix)]
@@ -478,6 +467,7 @@ async fn process_fragment_gc(
     let mut expired_versions: HashMap<String, ObjectMetadata> = HashMap::new();
 
     let now = SystemTime::now();
+    let now_unix = Utc::now().timestamp();
     match index::list_fragment_live_objects(fragment).await {
         Ok(objects) => {
             for meta in objects {
@@ -493,29 +483,28 @@ async fn process_fragment_gc(
         }
     }
 
-    match index::list_fragment_trash_objects(fragment).await {
-        Ok(trash_heads) => {
-            for head in trash_heads {
+    match index::list_fragment_trash_catalog(fragment).await {
+        Ok(trash_entries) => {
+            for entry in trash_entries {
                 if should_stop_gc() {
                     return stats;
                 }
                 let versions =
-                    match index::list_trashed_object_versions_metadata(fragment, &head.object_key)
+                    match index::list_trashed_object_versions_metadata(fragment, &entry.object_key)
                         .await
                     {
                         Ok(versions) => versions,
                         Err(err) => {
                             warn!(
                                 "GC: failed to load trash history for {}/{}: {}",
-                                fragment, head.object_key, err
+                                fragment, entry.object_key, err
                             );
                             continue;
                         }
                     };
+                let age = trash_deleted_age(entry.deleted_at, now_unix);
+                let should_expire = is_manual_run || age > retention;
                 for meta in versions {
-                    let age = trash_version_age(blob_roots, fragment, &meta.version_id, now);
-                    let should_expire = is_manual_run
-                        || age.map(|candidate| candidate > retention).unwrap_or(false);
                     if should_expire {
                         expired_versions
                             .entry(meta.version_id.clone())
@@ -528,7 +517,7 @@ async fn process_fragment_gc(
         }
         Err(err) => {
             warn!(
-                "GC: failed to load trash heads for fragment {} from indexdb: {}",
+                "GC: failed to load trash catalog for fragment {} from indexdb: {}",
                 fragment, err
             );
             return stats;
@@ -553,14 +542,17 @@ async fn process_fragment_gc(
         if should_stop_gc() {
             return stats;
         }
-        let trash_blob_root = get_trash_root(root, fragment).join("blob");
         for ver in expired_versions.keys() {
             if should_stop_gc() {
                 return stats;
             }
-            let p = trash_blob_root.join(ver);
-            if p.exists() {
-                let _ = std::fs::remove_dir_all(p);
+            let live_path = root.join(fragment).join("blob").join(ver);
+            let trash_path = get_trash_root(root, fragment).join("blob").join(ver);
+            if live_path.exists() {
+                let _ = std::fs::remove_dir_all(&live_path);
+            }
+            if trash_path.exists() {
+                let _ = std::fs::remove_dir_all(&trash_path);
             }
         }
     }
