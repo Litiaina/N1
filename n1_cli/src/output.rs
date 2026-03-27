@@ -60,6 +60,33 @@ fn format_optional_error(error: &Option<String>) -> String {
 }
 
 pub fn format_health(response: &HealthResponse) -> String {
+    let placement_limiter = response
+        .storage
+        .placement_limiter_path
+        .as_ref()
+        .map(|path| {
+            let free = response
+                .storage
+                .placement_limiter_available_bytes
+                .map(human_bytes)
+                .unwrap_or_else(|| "unknown".to_string());
+            let usage = response
+                .storage
+                .placement_limiter_usage_percent
+                .map(|value| format!("{value:.2}% used"))
+                .unwrap_or_else(|| "usage unknown".to_string());
+            format!("{path} ({free} free, {usage})")
+        })
+        .unwrap_or_else(|| "-".to_string());
+    let blob_shape = if response.storage.heterogeneous_blob_capacity {
+        response
+            .storage
+            .blob_capacity_imbalance_ratio
+            .map(|ratio| format!("heterogeneous ({ratio:.2}x max/min)"))
+            .unwrap_or_else(|| "heterogeneous".to_string())
+    } else {
+        "balanced".to_string()
+    };
     let rows = vec![
         ("sampled_at", format_timestamp(response.sampled_at)),
         ("status", response.status.clone()),
@@ -115,6 +142,8 @@ pub fn format_health(response: &HealthResponse) -> String {
                 response.storage.blob_devices_online, response.storage.blob_devices_total
             ),
         ),
+        ("blob_shape", blob_shape),
+        ("placement_limiter", placement_limiter),
         (
             "index_roots",
             format!(
@@ -240,8 +269,30 @@ pub fn format_health_watch_line(response: &HealthResponse) -> String {
         })
         .collect::<Vec<_>>()
         .join(",");
+    let limiter_summary = response
+        .storage
+        .placement_limiter_path
+        .as_ref()
+        .map(|path| {
+            let free = response
+                .storage
+                .placement_limiter_available_bytes
+                .map(human_bytes)
+                .unwrap_or_else(|| "?".to_string());
+            format!("{}@{}", path, free)
+        })
+        .unwrap_or_else(|| "-".to_string());
+    let blob_shape = if response.storage.heterogeneous_blob_capacity {
+        response
+            .storage
+            .blob_capacity_imbalance_ratio
+            .map(|ratio| format!("{ratio:.2}x"))
+            .unwrap_or_else(|| "yes".to_string())
+    } else {
+        "balanced".to_string()
+    };
     format!(
-        "{}  status={} cpu={:.2}% ram={:.2}% rss={} uploads={} stale={} redist_debt={} blob={}/{} maint={} R{}D{}G{} disks={} summary={}",
+        "{}  status={} cpu={:.2}% ram={:.2}% rss={} uploads={} stale={} redist_debt={} blob={}/{} shape={} limit={} maint={} R{}D{}G{} disks={} summary={}",
         format_timestamp(response.sampled_at),
         response.status,
         response.system.cpu_usage_percent,
@@ -252,6 +303,8 @@ pub fn format_health_watch_line(response: &HealthResponse) -> String {
         response.maintenance.pending_redistribution_intents,
         response.storage.blob_devices_online,
         response.storage.blob_devices_total,
+        blob_shape,
+        limiter_summary,
         if response.maintenance.access_mode.is_empty() {
             "availability"
         } else {

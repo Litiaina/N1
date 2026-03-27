@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -475,6 +475,64 @@ async fn move_dir_or_copy(src: &std::path::Path, dst: &std::path::Path) -> Resul
     }
 }
 
+async fn retire_trash_roots(
+    trash_roots: &[std::path::PathBuf],
+) -> Vec<(String, Option<std::path::PathBuf>, Option<String>)> {
+    let suffix = format!("{}-{}", Utc::now().timestamp_millis(), std::process::id());
+    stream::iter(trash_roots.iter().cloned().map(|trash_root| {
+        let suffix = suffix.clone();
+        async move {
+            let root_label = trash_root.display().to_string();
+            let Some(fragment_root) = trash_root.parent() else {
+                return (
+                    root_label,
+                    None,
+                    Some("trash root missing parent".to_string()),
+                );
+            };
+            let retired_root = fragment_root.join(
+                trash_root
+                    .file_name()
+                    .map(|name| format!("{}.retired.{}", name.to_string_lossy(), suffix))
+                    .unwrap_or_else(|| format!(".trash.retired.{}", suffix)),
+            );
+            if !fs::try_exists(&trash_root).await.unwrap_or(false) {
+                return (root_label, None, None);
+            }
+            if fs::try_exists(&retired_root).await.unwrap_or(false) {
+                let _ = fs::remove_dir_all(&retired_root).await;
+            }
+            match fs::rename(&trash_root, &retired_root).await {
+                Ok(_) => (root_label, Some(retired_root), None),
+                Err(err) => (root_label, None, Some(err.to_string())),
+            }
+        }
+    }))
+    .buffer_unordered(4)
+    .collect::<Vec<_>>()
+    .await
+}
+
+fn spawn_background_trash_purge(retired_roots: Vec<std::path::PathBuf>) {
+    if retired_roots.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        stream::iter(retired_roots.into_iter().map(|retired_root| async move {
+            if let Err(err) = fs::remove_dir_all(&retired_root).await {
+                warn!(
+                    "Failed to purge retired trash root {}: {}",
+                    retired_root.display(),
+                    err
+                );
+            }
+        }))
+        .buffer_unordered(4)
+        .collect::<Vec<_>>()
+        .await;
+    });
+}
+
 async fn purge_delete_markers_for_key(fragment: &str, object_key: &str) {
     if let Ok(metas) = index::list_live_object_versions_metadata(fragment, object_key).await {
         for meta in metas {
@@ -507,6 +565,7 @@ async fn move_blob_versions_between_states(
     version_ids: &[String],
     from_trash: bool,
 ) {
+    let mut moves = Vec::with_capacity(version_ids.len().saturating_mul(blob_roots.len()));
     for version_id in version_ids {
         for root in blob_roots {
             let src = if from_trash {
@@ -514,19 +573,24 @@ async fn move_blob_versions_between_states(
             } else {
                 path_manager.get_shard_dir_on_disk(root, fragment, version_id)
             };
-            if !fs::try_exists(&src).await.unwrap_or(false) {
-                continue;
-            }
-
             let dst = if from_trash {
                 path_manager.get_shard_dir_on_disk(root, fragment, version_id)
             } else {
                 get_trash_root(root, fragment).join("blob").join(version_id)
             };
-
-            let _ = move_dir_or_copy(&src, &dst).await;
+            moves.push((src, dst));
         }
     }
+
+    stream::iter(moves.into_iter().map(|(src, dst)| async move {
+        if !fs::try_exists(&src).await.unwrap_or(false) {
+            return;
+        }
+        let _ = move_dir_or_copy(&src, &dst).await;
+    }))
+    .buffer_unordered(bulk_partition_concurrency_limit())
+    .collect::<Vec<_>>()
+    .await;
 }
 
 async fn remove_blob_versions(
@@ -535,21 +599,53 @@ async fn remove_blob_versions(
     fragment: &str,
     version_ids: &[String],
 ) {
+    let mut removals = Vec::with_capacity(version_ids.len().saturating_mul(blob_roots.len()));
     for version_id in version_ids {
         for disk in blob_roots {
-            let live_shard = path_manager.get_shard_dir_on_disk(disk, fragment, version_id);
-            let _ = fs::remove_dir_all(&live_shard).await;
-
-            let trash_shard = get_trash_root(disk, fragment).join("blob").join(version_id);
-            let _ = fs::remove_dir_all(&trash_shard).await;
+            removals.push((
+                path_manager.get_shard_dir_on_disk(disk, fragment, version_id),
+                get_trash_root(disk, fragment).join("blob").join(version_id),
+            ));
         }
     }
+
+    stream::iter(
+        removals
+            .into_iter()
+            .map(|(live_shard, trash_shard)| async move {
+                let _ = fs::remove_dir_all(&live_shard).await;
+                let _ = fs::remove_dir_all(&trash_shard).await;
+            }),
+    )
+    .buffer_unordered(bulk_partition_concurrency_limit())
+    .collect::<Vec<_>>()
+    .await;
 }
 
-fn bulk_object_concurrency_limit() -> usize {
+async fn acquire_bulk_object_operation_locks(
+    fragment: &str,
+    object_keys: &[String],
+) -> Result<Vec<index::ObjectOperationGuard>, AppError> {
+    let mut guards = Vec::with_capacity(object_keys.len());
+    for object_key in object_keys {
+        guards.push(index::acquire_object_operation_lock(fragment, object_key).await?);
+    }
+    Ok(guards)
+}
+
+fn flatten_version_ids(version_ids_by_key: &HashMap<String, Vec<String>>) -> Vec<String> {
+    version_ids_by_key
+        .values()
+        .flat_map(|version_ids| version_ids.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn bulk_partition_concurrency_limit() -> usize {
     std::thread::available_parallelism()
-        .map(|n| (n.get() * 2).clamp(4, 32))
-        .unwrap_or(8)
+        .map(|n| (n.get() * 4).clamp(8, 64))
+        .unwrap_or(16)
 }
 
 #[derive(Debug, Deserialize)]
@@ -612,9 +708,6 @@ async fn delete_object_core(fragment: &str, object_key: &str) -> Result<usize, A
         Err(e) => return Err(e),
     };
 
-    for version_id in &moved_versions {
-        let _ = index::remove_session(fragment, version_id, "soft-delete-object").await;
-    }
     move_blob_versions_between_states(&path_manager, &blob_roots, fragment, &moved_versions, false)
         .await;
     Ok(moved_versions.len())
@@ -717,8 +810,6 @@ pub async fn delete_object_version(
         }
     }
 
-    let _ = index::remove_session(&fragment, &version_id, "soft-delete-version").await;
-
     info!(
         "Soft deleted (moved to trash) version: {}/{} (v: {})",
         fragment, object_key, version_id
@@ -790,35 +881,39 @@ pub async fn delete_objects_bulk(
         return Err(AppError::BadRequest("object_keys must not be empty".into()));
     }
 
-    let concurrency = bulk_object_concurrency_limit();
-    let results = stream::iter(unique_keys.iter().cloned().map(|object_key| {
-        let fragment = fragment.clone();
-        async move {
-            let result = delete_object_core(&fragment, &object_key).await;
-            (object_key, result)
-        }
-    }))
-    .buffer_unordered(concurrency)
-    .collect::<Vec<_>>()
-    .await;
-
-    let mut succeeded = 0usize;
-    let mut not_found = 0usize;
+    let _guards = acquire_bulk_object_operation_locks(&fragment, &unique_keys).await?;
+    let path_manager = ObjectPathManager::new();
+    let blob_roots = path_manager.get_blob_roots();
     let mut failed = Vec::new();
-    let mut succeeded_keys = Vec::new();
-
-    for (object_key, result) in results {
-        match result {
-            Ok(_) => {
-                succeeded = succeeded.saturating_add(1);
-                succeeded_keys.push(object_key);
+    let moved_by_key = match index::move_objects_to_trash_batch(&fragment, &unique_keys).await {
+        Ok(changed) => changed,
+        Err(err) => {
+            for object_key in &unique_keys {
+                failed.push(BulkObjectFailure {
+                    object_key: object_key.clone(),
+                    error: err.to_string(),
+                });
             }
-            Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
-            Err(e) => failed.push(BulkObjectFailure {
-                object_key,
-                error: e.to_string(),
-            }),
+            HashMap::new()
         }
+    };
+
+    let version_ids = flatten_version_ids(&moved_by_key);
+    move_blob_versions_between_states(&path_manager, &blob_roots, &fragment, &version_ids, false)
+        .await;
+
+    let succeeded = moved_by_key.len();
+    let not_found = unique_keys
+        .len()
+        .saturating_sub(succeeded.saturating_add(failed.len()));
+
+    if succeeded > 0 {
+        info!(
+            "Soft deleted {} object(s) and {} version(s) for fragment {} via bulk manifest",
+            succeeded,
+            version_ids.len(),
+            fragment
+        );
     }
 
     if succeeded > 0 {
@@ -876,7 +971,7 @@ async fn run_empty_trash_job(state: Arc<AppState>, fragment: String) -> Result<(
     let blob_roots = path_manager.get_blob_roots();
 
     mutate_trash_job_status(&EMPTY_TRASH_STATUS, |status| {
-        status.phase = "Scanning trash keys".to_string();
+        status.phase = "Loading trash control plane".to_string();
     })
     .await;
 
@@ -905,25 +1000,17 @@ async fn run_empty_trash_job(state: Arc<AppState>, fragment: String) -> Result<(
     mutate_trash_job_status(&EMPTY_TRASH_STATUS, |status| {
         status.processed_objects = total_objects;
         status.successful_objects = total_objects;
-        status.phase = "Removing trash roots".to_string();
+        status.phase = "Retiring trash roots".to_string();
     })
     .await;
 
-    let root_results = stream::iter(trash_targets.into_iter().map(|trash_root| async move {
-        let root_label = trash_root.display().to_string();
-        if fs::try_exists(&trash_root).await.unwrap_or(false) {
-            if let Err(e) = fs::remove_dir_all(&trash_root).await {
-                warn!("Failed to empty trash root {:?}: {}", trash_root, e);
-                return (root_label, Some(e.to_string()));
-            }
-        }
-        (root_label, None)
-    }))
-    .buffer_unordered(4)
-    .collect::<Vec<_>>()
-    .await;
+    let root_results = retire_trash_roots(&trash_targets.into_iter().collect::<Vec<_>>()).await;
+    let retired_roots = root_results
+        .iter()
+        .filter_map(|(_, retired_root, _)| retired_root.clone())
+        .collect::<Vec<_>>();
 
-    for (root_label, maybe_error) in root_results {
+    for (root_label, _retired_root, maybe_error) in root_results {
         mutate_trash_job_status(&EMPTY_TRASH_STATUS, |status| {
             status.processed_trash_roots = status.processed_trash_roots.saturating_add(1);
             status.current_object = Some(root_label.clone());
@@ -933,6 +1020,8 @@ async fn run_empty_trash_job(state: Arc<AppState>, fragment: String) -> Result<(
         })
         .await;
     }
+
+    spawn_background_trash_purge(retired_roots);
 
     mutate_trash_job_status(&EMPTY_TRASH_STATUS, |status| {
         status.is_running = false;
@@ -1094,35 +1183,51 @@ pub async fn recover_objects_bulk(
         return Err(AppError::BadRequest("object_keys must not be empty".into()));
     }
 
-    let concurrency = bulk_object_concurrency_limit();
-    let results = stream::iter(unique_keys.iter().cloned().map(|object_key| {
-        let fragment = fragment.clone();
-        async move {
-            let result = recover_object_core(&fragment, &object_key).await;
-            (object_key, result)
-        }
-    }))
-    .buffer_unordered(concurrency)
-    .collect::<Vec<_>>()
-    .await;
-
-    let mut succeeded = 0usize;
-    let mut not_found = 0usize;
+    let _guards = acquire_bulk_object_operation_locks(&fragment, &unique_keys).await?;
+    let path_manager = ObjectPathManager::new();
+    let blob_roots = path_manager.get_blob_roots();
     let mut failed = Vec::new();
-    let mut succeeded_keys = Vec::new();
+    for object_key in &unique_keys {
+        purge_delete_markers_for_key(&fragment, object_key).await;
+    }
 
-    for (object_key, result) in results {
-        match result {
-            Ok(_) => {
-                succeeded = succeeded.saturating_add(1);
-                succeeded_keys.push(object_key);
+    let recoverable_versions =
+        match index::list_trashed_object_version_ids_batch(&fragment, &unique_keys).await {
+            Ok(found) => found,
+            Err(err) => {
+                return Err(err);
             }
-            Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
-            Err(e) => failed.push(BulkObjectFailure {
-                object_key,
-                error: e.to_string(),
-            }),
+        };
+
+    let version_ids = flatten_version_ids(&recoverable_versions);
+    move_blob_versions_between_states(&path_manager, &blob_roots, &fragment, &version_ids, true)
+        .await;
+
+    let mut restored_by_key = HashMap::<String, Vec<String>>::new();
+    match index::restore_objects_from_trash_manifest_batch(&fragment, &recoverable_versions).await {
+        Ok(changed) => restored_by_key.extend(changed),
+        Err(err) => {
+            for object_key in recoverable_versions.keys() {
+                failed.push(BulkObjectFailure {
+                    object_key: object_key.clone(),
+                    error: err.to_string(),
+                });
+            }
         }
+    }
+
+    let succeeded = restored_by_key.len();
+    let not_found = unique_keys
+        .len()
+        .saturating_sub(succeeded.saturating_add(failed.len()));
+
+    if succeeded > 0 {
+        info!(
+            "Recovered {} object(s) and {} version(s) for fragment {} via bulk manifest",
+            succeeded,
+            version_ids.len(),
+            fragment
+        );
     }
 
     if succeeded > 0 {
@@ -1178,12 +1283,16 @@ pub async fn recover_all_trash(
 async fn run_recover_all_trash_job(state: Arc<AppState>, fragment: String) -> Result<(), AppError> {
     let _maintenance_guard = acquire_maintenance_mode(MaintenanceAccessMode::ReadOnly);
     mutate_trash_job_status(&RECOVER_ALL_TRASH_STATUS, |status| {
-        status.phase = "Scanning trash keys".to_string();
+        status.phase = "Loading trash control plane".to_string();
     })
     .await;
 
-    let keys_to_recover = index::list_fragment_object_keys_with_trash_versions(&fragment).await?;
-    if keys_to_recover.is_empty() {
+    let trash_keys = index::list_fragment_object_keys_with_trash_versions(&fragment).await?;
+    let recoverable_versions =
+        index::list_trashed_object_version_ids_batch(&fragment, &trash_keys).await?;
+    let total_objects = recoverable_versions.len() as u64;
+
+    if recoverable_versions.is_empty() {
         mutate_trash_job_status(&RECOVER_ALL_TRASH_STATUS, |status| {
             status.is_running = false;
             status.phase = "Completed".to_string();
@@ -1193,51 +1302,46 @@ async fn run_recover_all_trash_job(state: Arc<AppState>, fragment: String) -> Re
         return Ok(());
     }
 
-    let concurrency = bulk_object_concurrency_limit();
-
     mutate_trash_job_status(&RECOVER_ALL_TRASH_STATUS, |status| {
         status.phase = "Recovering trashed objects".to_string();
-        status.total_objects = keys_to_recover.len() as u64;
+        status.total_objects = total_objects;
     })
     .await;
 
-    let mut results = stream::iter(keys_to_recover.iter().cloned().map(|object_key| {
-        let fragment = fragment.clone();
-        async move {
-            let result = match recover_object_core(&fragment, &object_key).await {
-                Ok(count) => Ok(count),
-                Err(AppError::NotFound) => Ok(0usize),
-                Err(e) => Err(e),
-            };
-            (object_key, result)
-        }
-    }))
-    .buffer_unordered(concurrency);
+    let path_manager = ObjectPathManager::new();
+    let blob_roots = path_manager.get_blob_roots();
+    for object_key in &trash_keys {
+        purge_delete_markers_for_key(&fragment, object_key).await;
+    }
+    let version_ids = flatten_version_ids(&recoverable_versions);
+    move_blob_versions_between_states(&path_manager, &blob_roots, &fragment, &version_ids, true)
+        .await;
 
     let mut recovered_count = 0usize;
-    while let Some((object_key, result)) = results.next().await {
-        match result {
-            Ok(count) => {
-                recovered_count = recovered_count.saturating_add(count);
-                mutate_trash_job_status(&RECOVER_ALL_TRASH_STATUS, |status| {
-                    status.processed_objects = status.processed_objects.saturating_add(1);
-                    status.current_object = Some(object_key.clone());
-                    if count > 0 {
-                        status.successful_objects = status.successful_objects.saturating_add(1);
-                    }
-                })
-                .await;
-            }
-            Err(e) => {
-                warn!("Recover-all failed for {}/{}: {}", fragment, object_key, e);
-                mutate_trash_job_status(&RECOVER_ALL_TRASH_STATUS, |status| {
-                    status.processed_objects = status.processed_objects.saturating_add(1);
-                    status.failed_objects = status.failed_objects.saturating_add(1);
-                    status.current_object = Some(object_key.clone());
-                    status.last_error = Some(e.to_string());
-                })
-                .await;
-            }
+    match index::restore_objects_from_trash_manifest_batch(&fragment, &recoverable_versions).await {
+        Ok(restored) => {
+            recovered_count = version_ids.len();
+            mutate_trash_job_status(&RECOVER_ALL_TRASH_STATUS, |status| {
+                status.processed_objects = total_objects;
+                status.successful_objects = restored.len() as u64;
+                status.current_object = trash_keys.last().cloned();
+            })
+            .await;
+        }
+        Err(err) => {
+            warn!(
+                "Recover-all restore failed for fragment {} keys={} error={}",
+                fragment,
+                trash_keys.len(),
+                err
+            );
+            mutate_trash_job_status(&RECOVER_ALL_TRASH_STATUS, |status| {
+                status.processed_objects = total_objects;
+                status.failed_objects = total_objects;
+                status.current_object = trash_keys.last().cloned();
+                status.last_error = Some(err.to_string());
+            })
+            .await;
         }
     }
 

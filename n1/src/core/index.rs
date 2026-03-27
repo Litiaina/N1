@@ -255,6 +255,30 @@ pub async fn list_fragment_object_keys_with_trash_versions(
     indexdb_store::list_object_keys_with_trash_versions(fragment)
 }
 
+pub async fn list_active_trash_partition_ids(
+    fragment: &str,
+) -> Result<std::collections::BTreeSet<u16>, AppError> {
+    indexdb_store::list_active_trash_partition_ids(fragment)
+}
+
+pub async fn list_partition_trash_entries(
+    fragment: &str,
+    partition_id: u16,
+) -> Result<std::collections::HashMap<String, Vec<String>>, AppError> {
+    indexdb_store::list_partition_trash_entries(fragment, partition_id)
+}
+
+pub async fn list_trashed_object_version_ids_batch(
+    fragment: &str,
+    object_keys: &[String],
+) -> Result<std::collections::HashMap<String, Vec<String>>, AppError> {
+    indexdb_store::list_trashed_object_version_ids_batch(fragment, object_keys)
+}
+
+pub async fn object_partition_id(fragment: &str, object_key: &str) -> Result<u16, AppError> {
+    indexdb_store::object_partition_id(fragment, object_key)
+}
+
 pub async fn list_fragment_live_objects(fragment: &str) -> Result<Vec<ObjectMetadata>, AppError> {
     indexdb_store::list_live_heads(fragment)
 }
@@ -369,11 +393,32 @@ pub async fn move_object_to_trash_fast(
     indexdb_store::move_object_to_trash_fast(fragment, object_key)
 }
 
+pub async fn move_objects_to_trash_batch(
+    fragment: &str,
+    object_keys: &[String],
+) -> Result<HashMap<String, Vec<String>>, AppError> {
+    indexdb_store::move_objects_to_trash_batch(fragment, object_keys)
+}
+
 pub async fn restore_object_from_trash_fast(
     fragment: &str,
     object_key: &str,
 ) -> Result<Option<Vec<String>>, AppError> {
     indexdb_store::restore_object_from_trash_fast(fragment, object_key)
+}
+
+pub async fn restore_objects_from_trash_batch(
+    fragment: &str,
+    object_keys: &[String],
+) -> Result<HashMap<String, Vec<String>>, AppError> {
+    indexdb_store::restore_objects_from_trash_batch(fragment, object_keys)
+}
+
+pub async fn restore_objects_from_trash_manifest_batch(
+    fragment: &str,
+    object_versions: &HashMap<String, Vec<String>>,
+) -> Result<HashMap<String, Vec<String>>, AppError> {
+    indexdb_store::restore_objects_from_trash_manifest_batch(fragment, object_versions)
 }
 
 pub async fn delete_all_trash_versions_for_key(
@@ -430,4 +475,18 @@ pub async fn clear_fragment_trash_in_partitions(
     object_key: Option<&str>,
 ) -> Result<(), AppError> {
     indexdb_store::clear_fragment_trash(fragment, object_key)
+}
+
+pub async fn clear_fragment_trash_for_partitions(
+    fragment: &str,
+    touched_partitions: &std::collections::BTreeSet<u16>,
+) -> Result<usize, AppError> {
+    indexdb_store::clear_fragment_trash_for_partitions(fragment, touched_partitions)
+}
+
+pub async fn clear_fragment_trash_partition(
+    fragment: &str,
+    partition_id: u16,
+) -> Result<usize, AppError> {
+    indexdb_store::clear_fragment_trash_partition(fragment, partition_id)
 }

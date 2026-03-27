@@ -2209,7 +2209,7 @@ dependencies = [
 
 [[package]]
 name = "n1"
-version = "0.7.3"
+version = "0.8.0"
 dependencies = [
  "argon2",
  "async_zip",
@@ -2320,7 +2320,7 @@ dependencies = [
 
 [[package]]
 name = "n1_cli"
-version = "0.7.3"
+version = "0.8.0"
 dependencies = [
  "assert_cmd",
  "axum",

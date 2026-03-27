@@ -44,7 +44,9 @@ use crate::core::disk_manager::{
 };
 use crate::core::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::core::index;
-use crate::core::quota_manager::ensure_capacity_available;
+use crate::core::quota_manager::{
+    ensure_blob_placement_capacity_available_for_parts, ensure_capacity_available,
+};
 use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -734,6 +736,29 @@ fn expected_part_size_bytes(manifest: &UploadSessionManifest, part_index: u64) -
     Some(manifest.total_size_bytes - prior_bytes)
 }
 
+fn planned_part_sizes(
+    total_size_bytes: u64,
+    expected_parts: u64,
+    part_size_bytes: u64,
+) -> Vec<u64> {
+    let mut part_sizes = Vec::with_capacity(expected_parts as usize);
+    if expected_parts == 0 {
+        return part_sizes;
+    }
+    for part_index in 0..expected_parts {
+        let size = if expected_parts == 1 {
+            total_size_bytes
+        } else if part_index + 1 < expected_parts {
+            part_size_bytes
+        } else {
+            let prior_bytes = part_size_bytes.saturating_mul(expected_parts.saturating_sub(1));
+            total_size_bytes.saturating_sub(prior_bytes)
+        };
+        part_sizes.push(size);
+    }
+    part_sizes
+}
+
 fn final_shard_len_for_part(part_size_bytes: u64, data_shards: usize, block_size: usize) -> u64 {
     let stripe_data_width = block_size as u64 * data_shards as u64;
     let stripe_count = if stripe_data_width == 0 {
@@ -999,6 +1024,15 @@ async fn write_part_blob_to_disk(
     let stripe_data_width = block_size as u64 * data_shards as u64;
     let stripe_count = (content_length + stripe_data_width - 1) / stripe_data_width;
     let final_shard_len = stripe_count * block_size as u64;
+
+    ensure_blob_placement_capacity_available_for_parts(
+        part_index,
+        &[content_length],
+        data_shards,
+        parity_shards,
+        block_size,
+    )
+    .await?;
 
     let blob_roots = path_manager.get_blob_roots();
     let num_disks = blob_roots.len();
@@ -1395,6 +1429,19 @@ pub async fn initiate_object_upload(
         data_shards: configured_data_shards() as u16,
         parity_shards: configured_parity_shards() as u16,
     };
+
+    ensure_blob_placement_capacity_available_for_parts(
+        0,
+        &planned_part_sizes(
+            manifest.total_size_bytes,
+            manifest.expected_parts,
+            manifest.part_size_bytes,
+        ),
+        manifest_data_shards(&manifest),
+        manifest_parity_shards(&manifest),
+        manifest.stripe_size_bytes,
+    )
+    .await?;
 
     let path_manager = ObjectPathManager::new();
     ensure_version_shard_dirs(&path_manager, &manifest).await?;

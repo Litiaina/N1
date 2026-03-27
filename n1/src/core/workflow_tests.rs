@@ -2471,6 +2471,104 @@ async fn matrix_upload_part_retry_size_mismatch_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_upload_part_rejects_when_target_blob_disk_becomes_unavailable() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "uploads/disk-loss.bin";
+    let part = vec![0x5Au8; 4096];
+
+    setup_fragment(&fragment).await;
+    let (version_id, _session_id) = init_upload(&fragment, key, part.len() as u64, 1).await;
+
+    let blob1 = base.join("blob_1");
+    let blob1_down = base.join("blob_1.down");
+    if fs::try_exists(&blob1_down).await.unwrap_or(false) {
+        let _ = fs::remove_dir_all(&blob1_down).await;
+    }
+    fs::rename(&blob1, &blob1_down)
+        .await
+        .expect("simulate target blob disk down");
+    fs::write(&blob1, b"offline")
+        .await
+        .expect("block blob root recreation");
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "content-length",
+        HeaderValue::from_str(&part.len().to_string()).expect("content-length"),
+    );
+
+    let upload_result = object_upload_part(
+        full_claims(&fragment),
+        headers,
+        AxumPath((fragment.clone(), version_id.clone(), 0)),
+        Query(UploadPartQuery {
+            checksum: None,
+            durability: None,
+            strict_durability: None,
+            io_gate: None,
+        }),
+        Body::from(part),
+    )
+    .await;
+
+    let status_json = read_response_json(
+        get_upload_status(
+            full_claims(&fragment),
+            AxumPath((fragment.clone(), version_id.clone())),
+        )
+        .await
+        .expect("upload status response")
+        .into_response(),
+    )
+    .await;
+
+    let _ = fs::remove_file(&blob1).await;
+    if fs::try_exists(&blob1_down).await.unwrap_or(false) {
+        fs::rename(&blob1_down, &blob1)
+            .await
+            .expect("restore target blob disk");
+    }
+
+    match upload_result {
+        Err(AppError::ServiceUnavailable(message)) => {
+            assert!(
+                message.contains("Target blob disk"),
+                "unexpected service-unavailable error: {}",
+                message
+            );
+        }
+        Err(other) => panic!("expected service unavailable, got {:?}", other),
+        Ok(_) => panic!("upload should fail when target blob root is unavailable"),
+    }
+
+    assert_eq!(
+        status_json["uploaded_parts"]
+            .as_array()
+            .expect("uploaded_parts array")
+            .len(),
+        0,
+        "failed upload should not commit any part state"
+    );
+    assert_eq!(status_json["committed_parts"].as_u64().unwrap_or(0), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_same_key_new_upload_finalized_while_old_unfinished() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();

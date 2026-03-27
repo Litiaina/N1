@@ -187,7 +187,12 @@ async fn health_handler(headers: HeaderMap, Query(query): Query<HealthQuery>) ->
             "blob_devices_online": 1_u64,
             "raw_total_bytes": 100_u64,
             "raw_used_bytes": 75_u64,
-            "raw_available_bytes": 25_u64
+            "raw_available_bytes": 25_u64,
+            "heterogeneous_blob_capacity": true,
+            "blob_capacity_imbalance_ratio": 4.0_f64,
+            "placement_limiter_path": "/mnt/DISK0",
+            "placement_limiter_available_bytes": 25_u64,
+            "placement_limiter_usage_percent": 75.0_f64
         },
         "maintenance": {
             "repair_running": false,
@@ -300,6 +305,8 @@ async fn health_renders_disk_usage_and_health() {
     assert!(stdout.contains("/mnt/DISK0"));
     assert!(stdout.contains("75.00%"));
     assert!(stdout.contains("healthy"));
+    assert!(stdout.contains("heterogeneous (4.00x max/min)"));
+    assert!(stdout.contains("placement_limiter"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

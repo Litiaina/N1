@@ -83,6 +83,16 @@ pub struct StoragePlaneStats {
     pub raw_total_bytes: u64,
     pub raw_used_bytes: u64,
     pub raw_available_bytes: u64,
+    #[serde(default)]
+    pub heterogeneous_blob_capacity: bool,
+    #[serde(default)]
+    pub blob_capacity_imbalance_ratio: Option<f64>,
+    #[serde(default)]
+    pub placement_limiter_path: Option<String>,
+    #[serde(default)]
+    pub placement_limiter_available_bytes: Option<u64>,
+    #[serde(default)]
+    pub placement_limiter_usage_percent: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]

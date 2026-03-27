@@ -4,7 +4,7 @@
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used underneath both deployment shapes.
 > - `n1` is the stable single-node deployment profile.
-> - `n1` is released at `0.7.3`.
+> - `n1` is released at `0.8.0`.
 > - `n2` is the multi-node N2 deployment profile and is released at `0.2.0`.
 > - `registry` is the SQLite-backed Registry/business layer and is versioned independently at `0.4.0`.
 > - `n1-arc` is an experimental raw-device deployment profile.
@@ -55,7 +55,7 @@ This replaces the legacy "full mirrored metadata tree on every index root" model
 
 ## Freeze Status
 
-The current production architecture baseline is `n1 0.7.3`, `n2 0.2.0`, and `registry 0.4.0`.
+The current production architecture baseline is `n1 0.8.0`, `n2 0.2.0`, and `registry 0.4.0`.
 
 That baseline applies to:
 
@@ -65,7 +65,8 @@ That baseline applies to:
 - stateless resumability through authoritative session state
 - profile-specific payload substrate (`n1` filesystem-backed blob roots, `n1-arc` raw blob devices)
 
-It does **not** freeze the HTTP/API surface yet. API and operational route details can still change before `1.0.0` while the core storage architecture stays fixed.
+It does **not** freeze the HTTP/API surface yet. API, operational route details, and metadata layout can still change before `1.0.0` while the core storage architecture stays fixed.
+Backward compatibility is not guaranteed on the `0.x` line; destructive redesigns remain allowed until the `1.0.0` contract is declared stable.
 
 ## N1 Core Identity And Variant Choice
 
@@ -87,7 +88,7 @@ They are expected to keep the same storage semantics. The difference is backend 
 
 | Dimension | N1 | N1-Arc |
 |---|---|---|
-| Status | Stable/default (`0.7.3`) | Experimental raw-device profile |
+| Status | Stable/default (`0.8.0`) | Experimental raw-device profile |
 | `index_store_disks` | Filesystem directories | Raw devices |
 | `blob_store_disks` | Filesystem directories | Raw devices |
 | Index backend | Partitioned `indexdb` metadata (`.ndxdb`) | Raw index catalog (`block_manager`) |
@@ -146,7 +147,7 @@ The Registry plane is where namespace and business logic now belongs:
 - binding a fragment to either a `single_node` or `multi_node` storage backend
 - issuing short-lived storage sessions to client applications
 
-In the `0.7.3` / `0.2.0` / `0.4.0` baseline, the Registry is a dedicated binary. The engine contract is flat, exact-key-oriented object storage, while client-facing namespace behavior moves into the Registry layer.
+In the `0.8.0` / `0.2.0` / `0.4.0` baseline, the Registry is a dedicated binary. The engine contract is flat, exact-key-oriented object storage, while client-facing namespace behavior moves into the Registry layer.
 
 Registry identity/session notes:
 - the first administrator is created through a master-key bootstrap flow

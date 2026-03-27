@@ -69,6 +69,21 @@ fn deep_scan_interval() -> Duration {
     Duration::from_secs(secs)
 }
 
+pub(crate) fn human_bytes_for_display(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut idx = 0usize;
+    while value >= 1024.0 && idx < UNITS.len() - 1 {
+        value /= 1024.0;
+        idx += 1;
+    }
+    if idx == 0 {
+        format!("{bytes} {}", UNITS[idx])
+    } else {
+        format!("{value:.2} {}", UNITS[idx])
+    }
+}
+
 #[derive(Serialize, Clone)]
 pub struct DiskStatus {
     pub path: String,
@@ -127,6 +142,15 @@ pub struct StoragePlaneStats {
     pub raw_total_bytes: u64,
     pub raw_used_bytes: u64,
     pub raw_available_bytes: u64,
+    pub heterogeneous_blob_capacity: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blob_capacity_imbalance_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement_limiter_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement_limiter_available_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement_limiter_usage_percent: Option<f64>,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -175,6 +199,14 @@ pub struct SystemHealthResponse {
 struct CachedRedistributionIntentDebt {
     collected_at: Instant,
     snapshot: RedistributionIntentDebtSnapshot,
+}
+
+struct BlobPlacementRisk {
+    heterogeneous_blob_capacity: bool,
+    blob_capacity_imbalance_ratio: Option<f64>,
+    placement_limiter_path: Option<String>,
+    placement_limiter_available_bytes: Option<u64>,
+    placement_limiter_usage_percent: Option<f64>,
 }
 
 fn should_count_partition_db_file(path: &std::path::Path) -> bool {
@@ -509,8 +541,23 @@ async fn collect_system_health(
         total_blob as u64,
         online_blob_count as u64,
     );
+    let placement_limiter_low = storage
+        .placement_limiter_available_bytes
+        .map(|bytes| bytes <= 8 * 1024 * 1024 * 1024)
+        .unwrap_or(false);
+    let placement_limiter_summary = storage
+        .placement_limiter_path
+        .as_ref()
+        .zip(storage.placement_limiter_available_bytes)
+        .map(|(path, available)| {
+            format!(
+                "Placement limited by {} ({} free).",
+                path,
+                human_bytes_for_display(available)
+            )
+        });
 
-    let (status, summary) = if online_index_count == 0 {
+    let (status, mut summary) = if online_index_count == 0 {
         (
             "critical",
             "ALL Metadata (Index) disks are offline. System cannot function.".to_string(),
@@ -536,9 +583,32 @@ async fn collect_system_health(
                 online_blob_count, total_blob
             ),
         )
+    } else if placement_limiter_low {
+        (
+            "degraded",
+            placement_limiter_summary.clone().unwrap_or_else(|| {
+                "Blob placement is capacity-limited; uploads may fail before aggregate capacity is exhausted.".to_string()
+            }),
+        )
     } else {
         ("healthy", "All systems operational.".to_string())
     };
+
+    if status == "healthy" {
+        if storage.heterogeneous_blob_capacity {
+            if let Some(ratio) = storage.blob_capacity_imbalance_ratio {
+                let note = if let Some(limit) = placement_limiter_summary.as_ref() {
+                    format!(" Blob disks are size-imbalanced ({ratio:.2}x). {limit}")
+                } else {
+                    format!(" Blob disks are size-imbalanced ({ratio:.2}x).")
+                };
+                summary.push_str(&note);
+            }
+        } else if let Some(limit) = placement_limiter_summary.as_ref() {
+            summary.push(' ');
+            summary.push_str(limit);
+        }
+    }
 
     let monitoring_update = StorageEventPayload::MonitoringUpdate {
         system: serde_json::to_value(&system_metrics).unwrap_or(serde_json::Value::Null),
@@ -810,6 +880,8 @@ fn collect_storage_plane_stats(
         raw_available_bytes = raw_available_bytes.saturating_add(disk.available_bytes.unwrap_or(0));
     }
 
+    let blob_risk = analyze_blob_placement_risk(disk_statuses);
+
     StoragePlaneStats {
         index_roots_total,
         index_roots_online,
@@ -818,6 +890,63 @@ fn collect_storage_plane_stats(
         raw_total_bytes,
         raw_used_bytes,
         raw_available_bytes,
+        heterogeneous_blob_capacity: blob_risk.heterogeneous_blob_capacity,
+        blob_capacity_imbalance_ratio: blob_risk.blob_capacity_imbalance_ratio,
+        placement_limiter_path: blob_risk.placement_limiter_path,
+        placement_limiter_available_bytes: blob_risk.placement_limiter_available_bytes,
+        placement_limiter_usage_percent: blob_risk.placement_limiter_usage_percent,
+    }
+}
+
+fn analyze_blob_placement_risk(disk_statuses: &[DiskStatus]) -> BlobPlacementRisk {
+    let blob_disks: Vec<&DiskStatus> = disk_statuses
+        .iter()
+        .filter(|disk| disk.role == "blob" && disk.total_bytes.unwrap_or(0) > 0)
+        .collect();
+
+    if blob_disks.is_empty() {
+        return BlobPlacementRisk {
+            heterogeneous_blob_capacity: false,
+            blob_capacity_imbalance_ratio: None,
+            placement_limiter_path: None,
+            placement_limiter_available_bytes: None,
+            placement_limiter_usage_percent: None,
+        };
+    }
+
+    let smallest_total = blob_disks
+        .iter()
+        .filter_map(|disk| disk.total_bytes)
+        .min()
+        .unwrap_or(0);
+    let largest_total = blob_disks
+        .iter()
+        .filter_map(|disk| disk.total_bytes)
+        .max()
+        .unwrap_or(0);
+    let blob_capacity_imbalance_ratio = if smallest_total > 0 && largest_total >= smallest_total {
+        Some(largest_total as f64 / smallest_total as f64)
+    } else {
+        None
+    };
+    let heterogeneous_blob_capacity = blob_capacity_imbalance_ratio
+        .map(|ratio| ratio >= 1.5)
+        .unwrap_or(false);
+
+    let limiter = blob_disks
+        .iter()
+        .filter_map(|disk| {
+            disk.available_bytes
+                .map(|available| (available, disk.path.clone(), disk.usage_percent))
+        })
+        .min_by_key(|(available, _, _)| *available);
+
+    BlobPlacementRisk {
+        heterogeneous_blob_capacity,
+        blob_capacity_imbalance_ratio,
+        placement_limiter_path: limiter.as_ref().map(|(_, path, _)| path.clone()),
+        placement_limiter_available_bytes: limiter.as_ref().map(|(available, _, _)| *available),
+        placement_limiter_usage_percent: limiter.and_then(|(_, _, usage)| usage),
     }
 }
 
