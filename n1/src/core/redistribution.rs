@@ -35,7 +35,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -80,6 +80,7 @@ static REDIST_STATUS: LazyLock<Arc<tokio::sync::RwLock<RedistributionJobStatus>>
 
 static STOP_SIGNAL: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
 const REDIST_INTENT_SUFFIX: &str = ".redist.intent.msgpack";
+const ORPHAN_BLOB_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug)]
 pub enum RedistributionDurabilityMode {
@@ -524,9 +525,9 @@ struct StatusDelta {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct RedistributionNeeds {
-    blob: bool,
-    index: bool,
+pub(crate) struct RedistributionNeeds {
+    pub blob: bool,
+    pub index: bool,
 }
 
 async fn flush_status_delta(
@@ -1339,6 +1340,67 @@ async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
     .unwrap_or_default()
 }
 
+async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bool {
+    let fragment = fragment.to_string();
+    let roots = blob_roots.to_vec();
+    let active_session_ids = index::list_active_sessions(&fragment)
+        .await
+        .map(|sessions| {
+            sessions
+                .into_iter()
+                .filter(|session| session.finalized_at.is_none() && session.aborted_at.is_none())
+                .map(|session| session.manifest.version_id)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let now = SystemTime::now();
+    tokio::task::spawn_blocking(move || {
+        for root in roots {
+            let blob_dir = root.join(&fragment).join("blob");
+            let Ok(entries) = std::fs::read_dir(&blob_dir) else {
+                continue;
+            };
+            for entry in entries.filter_map(|entry| entry.ok()) {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let version_id = entry.file_name().to_string_lossy().to_string();
+                if active_session_ids.contains(&version_id) {
+                    continue;
+                }
+                let modified = std::fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .unwrap_or(now);
+                if now.duration_since(modified).unwrap_or(Duration::ZERO) <= ORPHAN_BLOB_GRACE {
+                    continue;
+                }
+                if std::fs::read_dir(&path)
+                    .ok()
+                    .and_then(|mut parts| parts.next())
+                    .is_some()
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
+async fn fragment_has_indexed_payload(fragment: &str) -> Result<bool, AppError> {
+    let live = index::scan_fragment_live_metadata_page(fragment, None, None, 1, None, true).await?;
+    if !live.objects.is_empty() {
+        return Ok(true);
+    }
+
+    let trash =
+        index::scan_fragment_trash_metadata_page(fragment, None, None, 1, None, true).await?;
+    Ok(!trash.objects.is_empty())
+}
+
 struct LiveLayout {
     blob_cfg: Vec<PathBuf>,
     index_cfg: Vec<PathBuf>,
@@ -1639,6 +1701,24 @@ pub async fn run_redistribution_job_with_options(
             st.total_fragments_scanned += 1;
             st.phase = format!("Scanning Fragment {}", fragment_hash);
             ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
+        }
+
+        let has_blob_payload = fragment_has_blob_payload(&fragment_hash, live_blob.as_ref()).await;
+        let has_indexed_payload = fragment_has_indexed_payload(&fragment_hash).await?;
+        if has_blob_payload && !has_indexed_payload {
+            let err = format!(
+                "Fragment {} has blob payload on disk but no indexed live/trash metadata. Redistribution cannot re-encode orphaned blob data.",
+                fragment_hash
+            );
+            warn!("{}", err);
+            total_task_errors = total_task_errors.saturating_add(1);
+            last_task_error = Some(err.clone());
+            let mut st = REDIST_STATUS.write().await;
+            st.total_errors = st.total_errors.saturating_add(1);
+            st.last_error = Some(err);
+            st.phase = format!("Blocked by orphaned blob payload in {}", fragment_hash);
+            ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
+            continue;
         }
 
         let mut seen_meta_ids: HashSet<u64> = HashSet::new();
@@ -2009,7 +2089,7 @@ pub async fn run_redistribution_job_with_options(
     Ok(())
 }
 
-async fn check_needs_redistribution(
+pub(crate) async fn check_needs_redistribution(
     meta: &ObjectMetadata,
     scope: RedistributionScope,
     target_data: usize,
@@ -2057,6 +2137,14 @@ async fn check_needs_redistribution(
 
                     let target_disk_path = target_blob_roots[expected].to_string_lossy();
                     if !shard.absolute_path.starts_with(target_disk_path.as_ref()) {
+                        needs.blob = true;
+                        break;
+                    }
+
+                    if !tokio_fs::try_exists(Path::new(&shard.absolute_path))
+                        .await
+                        .unwrap_or(false)
+                    {
                         needs.blob = true;
                         break;
                     }

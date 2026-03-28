@@ -7,8 +7,10 @@ use crate::core::operation_gate::{MaintenanceAccessMode, current_maintenance_acc
 use crate::core::redistribution::{
     RedistributionIntentDebtSnapshot, collect_redistribution_intent_debt, get_redist_status,
 };
+use crate::core::redistribution::{RedistributionScope, check_needs_redistribution};
 use crate::core::repair_manager::get_repair_status;
 use crate::core::system::{SystemMetrics, get_system_metrics};
+use crate::core::upload::{DATA_SHARDS_ATOMIC, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC};
 use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
@@ -31,7 +33,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::fs;
 use tokio::sync::{Semaphore, oneshot};
 use tokio::time::timeout;
@@ -50,6 +52,7 @@ static REDIST_INTENT_DEBT_CACHE: LazyLock<
     Arc<tokio::sync::RwLock<Option<CachedRedistributionIntentDebt>>>,
 > = LazyLock::new(|| Arc::new(tokio::sync::RwLock::new(None)));
 const REDIST_INTENT_DEBT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+const ORPHAN_BLOB_GRACE: Duration = Duration::from_secs(5);
 
 fn monitor_interval() -> Duration {
     let secs = MONITOR_INTERVAL_SECS_ATOMIC
@@ -209,6 +212,12 @@ struct BlobPlacementRisk {
     placement_limiter_usage_percent: Option<f64>,
 }
 
+#[derive(Default)]
+struct FragmentRedundancyDebt {
+    orphaned_blob_fragments: Vec<String>,
+    sampled_degraded_fragments: Vec<String>,
+}
+
 fn should_count_index_db_file(path: &std::path::Path) -> bool {
     let name = match path.file_name().and_then(|n| n.to_str()) {
         Some(s) => s,
@@ -356,6 +365,230 @@ async fn check_disk_accessibility(path_str: String, role: String) -> DiskStatus 
     }
 }
 
+async fn list_known_fragments(roots: &[PathBuf]) -> Vec<String> {
+    let roots = roots.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let mut seen = HashSet::new();
+        for root in roots {
+            if !root.exists() {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.filter_map(|entry| entry.ok()) {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_dir() {
+                    continue;
+                }
+                let Some(name) = entry.file_name().to_str().map(|value| value.to_string()) else {
+                    continue;
+                };
+                if is_fragment_hash(&name)
+                    && entry
+                        .path()
+                        .join(crate::core::constants::FRAGMENT_METADATA_FILE)
+                        .is_file()
+                {
+                    seen.insert(name);
+                }
+            }
+        }
+        let mut out: Vec<String> = seen.into_iter().collect();
+        out.sort();
+        out
+    })
+    .await
+    .unwrap_or_default()
+}
+
+async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bool {
+    let fragment = fragment.to_string();
+    let roots = blob_roots.to_vec();
+    let active_session_ids = index::list_active_sessions(&fragment)
+        .await
+        .map(|sessions| {
+            sessions
+                .into_iter()
+                .filter(|session| session.finalized_at.is_none() && session.aborted_at.is_none())
+                .map(|session| session.manifest.version_id)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let now = SystemTime::now();
+    tokio::task::spawn_blocking(move || {
+        for root in roots {
+            let blob_dir = root.join(&fragment).join("blob");
+            let Ok(entries) = std::fs::read_dir(&blob_dir) else {
+                continue;
+            };
+            for entry in entries.filter_map(|entry| entry.ok()) {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let version_id = entry.file_name().to_string_lossy().to_string();
+                if active_session_ids.contains(&version_id) {
+                    continue;
+                }
+                let modified = std::fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .unwrap_or(now);
+                if now.duration_since(modified).unwrap_or(Duration::ZERO) <= ORPHAN_BLOB_GRACE {
+                    continue;
+                }
+                if std::fs::read_dir(&path)
+                    .ok()
+                    .and_then(|mut parts| parts.next())
+                    .is_some()
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
+async fn fragment_has_indexed_payload(fragment: &str) -> Result<bool, AppError> {
+    let live = index::scan_fragment_live_metadata_page(fragment, None, None, 1, None, true).await?;
+    if !live.objects.is_empty() {
+        return Ok(true);
+    }
+    let trash =
+        index::scan_fragment_trash_metadata_page(fragment, None, None, 1, None, true).await?;
+    Ok(!trash.objects.is_empty())
+}
+
+async fn fragment_has_sampled_redundancy_debt(
+    fragment: &str,
+    deep_scan: bool,
+    target_data: usize,
+    target_parity: usize,
+    target_stripe_size: usize,
+    active_blob_roots: &[PathBuf],
+    active_index_roots: &[PathBuf],
+) -> Result<bool, AppError> {
+    let page_limit = if deep_scan { 128 } else { 32 };
+    let mut live_token = None;
+    let mut checked = 0usize;
+
+    loop {
+        let page = index::scan_fragment_live_metadata_page(
+            fragment,
+            None,
+            None,
+            page_limit,
+            live_token.clone(),
+            true,
+        )
+        .await?;
+
+        for meta in page.objects {
+            if meta.is_delete_marker {
+                continue;
+            }
+            for part in &meta.parts {
+                for shard in &part.shards {
+                    if !fs::try_exists(&shard.absolute_path).await.unwrap_or(false) {
+                        return Ok(true);
+                    }
+                }
+            }
+
+            let needs = check_needs_redistribution(
+                &meta,
+                RedistributionScope::All,
+                target_data,
+                target_parity,
+                target_stripe_size,
+                active_blob_roots.len(),
+                active_blob_roots,
+                active_index_roots,
+                false,
+            )
+            .await;
+
+            if needs.blob || needs.index {
+                return Ok(true);
+            }
+
+            checked += 1;
+            if !deep_scan && checked >= page_limit {
+                return Ok(false);
+            }
+        }
+
+        match page.continuation_token {
+            Some(token) if deep_scan => live_token = Some(token),
+            _ => break,
+        }
+    }
+
+    Ok(false)
+}
+
+async fn detect_fragment_redundancy_debt(
+    active_index_roots: &[PathBuf],
+    active_blob_roots: &[PathBuf],
+    deep_scan: bool,
+) -> Result<FragmentRedundancyDebt, AppError> {
+    if active_index_roots.is_empty() && active_blob_roots.is_empty() {
+        return Ok(FragmentRedundancyDebt::default());
+    }
+
+    let mut roots = active_index_roots.to_vec();
+    roots.extend_from_slice(active_blob_roots);
+    let fragments = list_known_fragments(&roots).await;
+    if fragments.is_empty() {
+        return Ok(FragmentRedundancyDebt::default());
+    }
+
+    let target_data = DATA_SHARDS_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or(1);
+    let target_parity = PARITY_SHARDS_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or(0);
+    let target_stripe_size = STRIPE_SIZE_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or(262_144);
+
+    let mut debt = FragmentRedundancyDebt::default();
+    for fragment in fragments {
+        let has_indexed_payload = fragment_has_indexed_payload(&fragment).await?;
+        if !has_indexed_payload {
+            if fragment_has_blob_payload(&fragment, active_blob_roots).await {
+                debt.orphaned_blob_fragments.push(fragment);
+            }
+            continue;
+        }
+
+        if fragment_has_sampled_redundancy_debt(
+            &fragment,
+            deep_scan,
+            target_data,
+            target_parity,
+            target_stripe_size,
+            active_blob_roots,
+            active_index_roots,
+        )
+        .await?
+        {
+            debt.sampled_degraded_fragments.push(fragment);
+        }
+    }
+
+    Ok(debt)
+}
+
 #[derive(Clone, Copy)]
 struct DiskCapacitySnapshot {
     total_bytes: u64,
@@ -439,6 +672,7 @@ async fn collect_system_health(
     let mut online_index_count = 0;
     let mut online_blob_count = 0;
     let mut active_index_roots = Vec::new();
+    let mut active_blob_roots = Vec::new();
     let mut disk_statuses = Vec::new();
 
     for stat in disk_results {
@@ -448,6 +682,7 @@ async fn collect_system_health(
                 active_index_roots.push(PathBuf::from(&stat.path));
             } else {
                 online_blob_count += 1;
+                active_blob_roots.push(PathBuf::from(&stat.path));
             }
         }
         disk_statuses.push(stat);
@@ -529,6 +764,8 @@ async fn collect_system_health(
     let uploads = collect_upload_runtime_stats(&active_index_roots).await?;
     let redistribution_debt =
         load_redistribution_intent_debt(&active_index_roots, force_refresh || deep_scan).await;
+    let fragment_redundancy_debt =
+        detect_fragment_redundancy_debt(&active_index_roots, &active_blob_roots, deep_scan).await?;
     let storage = collect_storage_plane_stats(
         &disk_statuses,
         total_index as u64,
@@ -576,6 +813,27 @@ async fn collect_system_health(
             format!(
                 "Running on {}/{} data disks. Performance/capacity reduced.",
                 online_blob_count, total_blob
+            ),
+        )
+    } else if !fragment_redundancy_debt.orphaned_blob_fragments.is_empty() {
+        (
+            "critical",
+            format!(
+                "Fragments with blob payload but no indexed metadata: {}.",
+                fragment_redundancy_debt.orphaned_blob_fragments.join(", ")
+            ),
+        )
+    } else if !fragment_redundancy_debt
+        .sampled_degraded_fragments
+        .is_empty()
+    {
+        (
+            "degraded",
+            format!(
+                "Fragments have missing or out-of-layout shard copies and need repair/redistribution: {}.",
+                fragment_redundancy_debt
+                    .sampled_degraded_fragments
+                    .join(", ")
             ),
         )
     } else if placement_limiter_low {

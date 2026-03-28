@@ -526,7 +526,13 @@ fn get_or_open_db(path: &Path) -> Result<Arc<Database>, AppError> {
     }
 
     let db = Arc::new(
-        Database::create(path)
+        std::panic::catch_unwind(|| Database::create(path))
+            .map_err(|_| {
+                AppError::InternalServerError(format!(
+                    "indexdb open {} panicked",
+                    path.display()
+                ))
+            })?
             .map_err(|e| map_indexdb_error(&format!("open {}", path.display()), e))?,
     );
     cache.insert(
@@ -570,6 +576,7 @@ fn open_route_db_for_read(
 ) -> Result<Option<Arc<Database>>, AppError> {
     let owner_path = owner_db_path(route, fragment);
     let owner_available = owner_path.exists();
+    let mut owner_with_meta: Option<(u64, Arc<Database>)> = None;
     let mut owner_without_meta: Option<Arc<Database>> = None;
     let mut best_follower: Option<(u64, Arc<Database>)> = None;
     let mut best_follower_without_meta: Option<Arc<Database>> = None;
@@ -637,9 +644,13 @@ fn open_route_db_for_read(
 
             if root == &route.roots[0] {
                 if meta.is_some() {
-                    return Ok(Some(db));
+                    owner_with_meta = meta
+                        .as_ref()
+                        .map(|meta| (meta.committed_generation, db.clone()));
                 }
-                owner_without_meta = Some(db);
+                if owner_with_meta.is_none() {
+                    owner_without_meta = Some(db);
+                }
                 continue;
             }
 
@@ -653,8 +664,20 @@ fn open_route_db_for_read(
             }
         }
     }
-    if let Some((_, db)) = best_follower {
-        return Ok(Some(db));
+    match (owner_with_meta, best_follower) {
+        (Some((owner_generation, owner_db)), Some((follower_generation, follower_db))) => {
+            if follower_generation > owner_generation {
+                warn!(
+                    "indexdb read fallback: follower copy for fragment {} partition {:04x} is newer than owner copy (owner_gen={}, follower_gen={}); using follower copy",
+                    fragment, route.partition_id, owner_generation, follower_generation
+                );
+                return Ok(Some(follower_db));
+            }
+            return Ok(Some(owner_db));
+        }
+        (Some((_, owner_db)), None) => return Ok(Some(owner_db)),
+        (None, Some((_, follower_db))) => return Ok(Some(follower_db)),
+        (None, None) => {}
     }
     if let Some(db) = owner_without_meta {
         warn!(
@@ -677,6 +700,72 @@ fn open_route_db_for_read(
 
 fn owner_db_path(route: &IndexRoute, fragment: &str) -> PathBuf {
     db_path(&route.roots[0], fragment, route.partition_id)
+}
+
+fn select_authoritative_partition_db_path(
+    route: &IndexRoute,
+    fragment: &str,
+) -> Result<Option<(PathBuf, u64)>, AppError> {
+    let owner_path = owner_db_path(route, fragment);
+    let mut best: Option<(PathBuf, u64)> = None;
+    let mut first_existing: Option<PathBuf> = None;
+
+    for root in &route.roots {
+        let candidate_path = db_path(root, fragment, route.partition_id);
+        if !candidate_path.exists() {
+            continue;
+        }
+        if first_existing.is_none() {
+            first_existing = Some(candidate_path.clone());
+        }
+
+        let generation = match get_or_open_db(&candidate_path)
+            .and_then(|db| read_partition_meta_exact(&db))
+        {
+            Ok(Some(meta)) => meta.committed_generation,
+            Ok(None) => 0,
+            Err(err) => {
+                warn!(
+                    "indexdb authoritative replica scan failed for {}: {}",
+                    candidate_path.display(),
+                    err
+                );
+                0
+            }
+        };
+
+        match &best {
+            Some((best_path, best_generation))
+                if *best_generation > generation
+                    || (*best_generation == generation && best_path == &owner_path) => {}
+            _ => best = Some((candidate_path, generation)),
+        }
+    }
+
+    Ok(best.or_else(|| first_existing.map(|path| (path, 0))))
+}
+
+fn seed_owner_partition_db_from_authoritative_copy(
+    route: &IndexRoute,
+    fragment: &str,
+) -> Result<(), AppError> {
+    let owner_path = owner_db_path(route, fragment);
+    let Some((source_path, _)) = select_authoritative_partition_db_path(route, fragment)? else {
+        return Ok(());
+    };
+
+    if source_path == owner_path {
+        return Ok(());
+    }
+
+    evict_cached_db(&owner_path);
+    atomic_copy_db_file(&source_path, &owner_path)?;
+    Ok(())
+}
+
+fn open_owner_db_for_write(route: &IndexRoute, fragment: &str) -> Result<Arc<Database>, AppError> {
+    seed_owner_partition_db_from_authoritative_copy(route, fragment)?;
+    get_or_open_db(&owner_db_path(route, fragment))
 }
 
 fn with_partition_commit_lock<T, F>(path: &Path, op: F) -> Result<T, AppError>
@@ -704,20 +793,35 @@ fn replicate_owner_partition_db(fragment: &str, route: &IndexRoute) -> Result<()
     }
 
     let owner_path = owner_db_path(route, fragment);
-    if !owner_path.exists() {
-        return Err(AppError::InternalServerError(format!(
-            "owner partition db missing after commit: {}",
+    let source_path = select_authoritative_partition_db_path(route, fragment)?
+        .map(|(path, _)| path)
+        .ok_or_else(|| {
+        AppError::InternalServerError(format!(
+            "no partition db replicas exist for fragment {} partition {:04x}",
+            fragment, route.partition_id
+        ))
+    })?;
+
+    if source_path != owner_path {
+        warn!(
+            "indexdb replica sync: follower copy for fragment {} partition {:04x} is authoritative (source={}, owner={})",
+            fragment,
+            route.partition_id,
+            source_path.display(),
             owner_path.display()
-        )));
+        );
     }
 
-    for replica_root in route.roots.iter().skip(1) {
+    for replica_root in &route.roots {
         let replica_path = db_path(replica_root, fragment, route.partition_id);
+        if replica_path == source_path {
+            continue;
+        }
         evict_cached_db(&replica_path);
-        if let Err(err) = atomic_copy_db_file(&owner_path, &replica_path) {
+        if let Err(err) = atomic_copy_db_file(&source_path, &replica_path) {
             warn!(
-                "indexdb follower catch-up failed for {} -> {}: {}",
-                owner_path.display(),
+                "indexdb replica catch-up failed for {} -> {}: {}",
+                source_path.display(),
                 replica_path.display(),
                 err
             );
@@ -837,7 +941,7 @@ pub fn ensure_object_owner_partition_available(
                 ))
             })?;
         }
-        let _ = get_or_open_db(&owner_path).map_err(|e| {
+        let _ = open_owner_db_for_write(&route, fragment).map_err(|e| {
             AppError::ServiceUnavailable(format!(
                 "authoritative owner index root unavailable: {}",
                 e
@@ -3695,7 +3799,7 @@ pub fn open_session(
     };
     let owner_path = owner_db_path(&route, &manifest.fragment);
     with_partition_commit_lock(&owner_path, || {
-        let owner_db = get_or_open_db(&owner_path)?;
+        let owner_db = open_owner_db_for_write(&route, &manifest.fragment)?;
         let partition_meta =
             write_session_mutation_exact(&owner_db, &manifest.version_id, &row, None, None)?;
         replicate_session_mutation(
@@ -3719,7 +3823,7 @@ pub fn commit_session_part(
     let route = session_route(fragment, version_id)?;
     let owner_path = owner_db_path(&route, fragment);
     with_partition_commit_lock(&owner_path, || {
-        let owner_db = get_or_open_db(&owner_path)?;
+        let owner_db = open_owner_db_for_write(&route, fragment)?;
         let Some(mut row) = load_session_row_exact(&owner_db, version_id)? else {
             return Ok(());
         };
@@ -3748,7 +3852,7 @@ pub fn commit_session_part_receipt(
     let route = session_route(fragment, version_id)?;
     let owner_path = owner_db_path(&route, fragment);
     with_partition_commit_lock(&owner_path, || {
-        let owner_db = get_or_open_db(&owner_path)?;
+        let owner_db = open_owner_db_for_write(&route, fragment)?;
         let Some(mut row) = load_session_row_exact(&owner_db, version_id)? else {
             return Ok(());
         };
@@ -3845,7 +3949,7 @@ pub fn remove_session(fragment: &str, version_id: &str) -> Result<bool, AppError
         if !owner_path.exists() {
             return Ok(false);
         }
-        let owner_db = get_or_open_db(&owner_path)?;
+        let owner_db = open_owner_db_for_write(&route, fragment)?;
         let Some(mutation) = remove_session_exact(&owner_db, version_id)? else {
             return Ok(false);
         };
@@ -3891,7 +3995,7 @@ fn write_version_on_owner(metadata: &ObjectMetadata, state: ObjectState) -> Resu
     let route = object_route(&metadata.fragment, &metadata.object_key)?;
     let owner_path = owner_db_path(&route, &metadata.fragment);
     with_partition_commit_lock(&owner_path, || {
-        let owner_db = get_or_open_db(&owner_path)?;
+        let owner_db = open_owner_db_for_write(&route, &metadata.fragment)?;
         let mutation = write_version_on_db(&owner_db, metadata, state)?;
         replicate_object_mutation(&metadata.fragment, &route, "version upsert", |replica_db| {
             apply_write_version_replica_exact(replica_db, &mutation)
@@ -4575,7 +4679,7 @@ pub fn move_object_version_to_trash_with_metadata(
         if !owner_path.exists() {
             return Ok(None);
         }
-        let owner_db = get_or_open_db(&owner_path)?;
+        let owner_db = open_owner_db_for_write(&route, fragment)?;
         let changed = change_version_state_on_db(
             &owner_db,
             fragment,
@@ -4619,7 +4723,7 @@ pub fn restore_object_version_from_trash_with_metadata(
         if !owner_path.exists() {
             return Ok(None);
         }
-        let owner_db = get_or_open_db(&owner_path)?;
+        let owner_db = open_owner_db_for_write(&route, fragment)?;
         let changed = change_version_state_on_db(
             &owner_db,
             fragment,
@@ -4690,7 +4794,7 @@ pub fn move_objects_to_trash_batch(
                             return Ok(HashMap::new());
                         }
                         with_partition_commit_lock(&owner_path, || {
-                            let owner_db = get_or_open_db(&owner_path)?;
+                            let owner_db = open_owner_db_for_write(&route, &fragment)?;
                             let (changed, partition_meta) = bulk_rewrite_keys_state_on_db(
                                 &owner_db,
                                 &fragment,
@@ -4799,7 +4903,7 @@ pub fn restore_objects_from_trash_manifest_batch(
                         let route = route_for_partition(&fragment, partition_id)?;
                         let owner_path = owner_db_path(&route, &fragment);
                         with_partition_commit_lock(&owner_path, || {
-                            let owner_db = get_or_open_db(&owner_path)?;
+                            let owner_db = open_owner_db_for_write(&route, &fragment)?;
                             let (changed, partition_meta) =
                                 restore_trash_entries_on_db(&owner_db, &fragment, &entries)?;
                             if !changed.is_empty() {
@@ -4853,7 +4957,7 @@ pub fn delete_all_trash_versions_for_key(
         if !owner_path.exists() {
             return Ok(None);
         }
-        let owner_db = get_or_open_db(&owner_path)?;
+        let owner_db = open_owner_db_for_write(&route, fragment)?;
         let deleted = delete_versions_for_key_with_state_on_db(
             &owner_db,
             fragment,
@@ -4892,7 +4996,7 @@ pub fn delete_object_fast(
         if !owner_path.exists() {
             return Ok(None);
         }
-        let owner_db = get_or_open_db(&owner_path)?;
+        let owner_db = open_owner_db_for_write(&route, fragment)?;
         let deleted = delete_all_versions_for_key_on_db(&owner_db, fragment, object_key)?;
         if let Some((version_ids, partition_meta)) = deleted {
             replicate_object_mutation(fragment, &route, "delete object", |replica_db| {
@@ -4922,7 +5026,7 @@ pub fn delete_live_version(
         if !owner_path.exists() {
             return Ok(false);
         }
-        let owner_db = get_or_open_db(&owner_path)?;
+        let owner_db = open_owner_db_for_write(&route, fragment)?;
         let deleted = delete_version_on_db(
             &owner_db,
             fragment,
@@ -4961,7 +5065,7 @@ pub fn delete_trash_version(
         if !owner_path.exists() {
             return Ok(false);
         }
-        let owner_db = get_or_open_db(&owner_path)?;
+        let owner_db = open_owner_db_for_write(&route, fragment)?;
         let deleted = delete_version_on_db(
             &owner_db,
             fragment,
@@ -5012,7 +5116,7 @@ pub fn clear_fragment_trash_for_partitions(
         if !owner_path.exists() {
             return Ok(0usize);
         }
-        let owner_db = get_or_open_db(&owner_path)?;
+        let owner_db = open_owner_db_for_write(&route, fragment)?;
         let (removed, partition_meta) = clear_partition_trash_on_db(&owner_db, fragment)?;
         if removed > 0 {
             replicate_object_mutation(fragment, &route, "clear fragment trash", |replica_db| {

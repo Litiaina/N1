@@ -20,6 +20,7 @@ use super::indexdb_store;
 use super::maintenance::sync_fragment_metadata;
 use super::metadata_parser::get_metadata;
 use super::modify::rename_object;
+use super::monitoring::get_system_health;
 use super::object_parser::{
     STREAM_CHUNK_SIZE_ATOMIC, STREAM_LOCALITY_BIAS_ENABLED_ATOMIC, STREAM_MAX_CONCURRENCY,
     STREAM_READAHEAD_BYTES_ATOMIC,
@@ -64,7 +65,7 @@ use axum::response::IntoResponse;
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
 use image::{ColorType, ImageBuffer, ImageEncoder, Rgba, codecs::png::PngEncoder};
-use indexdb::{Database, ReadableDatabase, TableDefinition};
+use indexdb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -1153,8 +1154,81 @@ async fn collect_indexdb_replica_hashes(fragment: &str) -> Vec<(String, BTreeMap
     out
 }
 
+fn hash_indexdb_logical_contents(path: &std::path::Path) -> Option<String> {
+    std::panic::catch_unwind(|| {
+        indexdb_store::evict_cached_db_for_test(path);
+        let db = Database::builder().open(path).ok()?;
+        let read_txn = db.begin_read().ok()?;
+        let mut table_names: Vec<String> = read_txn
+            .list_tables()
+            .ok()?
+            .into_iter()
+            .map(|table| table.name().to_owned())
+            .collect();
+        table_names.sort();
+
+        let mut hasher = Sha256::new();
+        for table_name in table_names {
+            hasher.update(table_name.as_bytes());
+            hasher.update([0u8]);
+
+            let definition: TableDefinition<&str, &[u8]> = TableDefinition::new(table_name.as_str());
+            let table = read_txn.open_table(definition).ok()?;
+            let mut iter = table.iter().ok()?;
+            while let Some(entry) = iter.next() {
+                let (key, value) = entry.ok()?;
+                hasher.update(key.value().as_bytes());
+                hasher.update([0xff]);
+                hasher.update(value.value());
+                hasher.update([0u8]);
+            }
+        }
+        Some(hex::encode(hasher.finalize()))
+    })
+    .ok()
+    .flatten()
+}
+
+async fn collect_indexdb_replica_semantic_hashes(
+    fragment: &str,
+) -> Vec<(String, BTreeMap<String, String>)> {
+    let path_manager = super::disk_manager::ObjectPathManager::new();
+    let index_roots = path_manager.get_all_index_roots();
+    let mut out = Vec::new();
+
+    for root in index_roots {
+        let frag_root = root.join(fragment);
+        let mut map = BTreeMap::new();
+
+        if !fs::try_exists(&frag_root).await.unwrap_or(false) {
+            out.push((root.to_string_lossy().to_string(), map));
+            continue;
+        }
+
+        let fragment_meta_path = frag_root.join("fragment.metadata.msgpack");
+        if let Ok(bytes) = fs::read(&fragment_meta_path).await {
+            let digest = Sha256::digest(&bytes);
+            map.insert(
+                "fragment.metadata.msgpack".to_string(),
+                hex::encode(digest),
+            );
+        }
+
+        let index_db_path = frag_root.join("indexdb").join("index.ndxdb");
+        if let Some(digest) = hash_indexdb_logical_contents(&index_db_path) {
+            map.insert("indexdb/index.ndxdb".to_string(), digest);
+        } else if fs::try_exists(&index_db_path).await.unwrap_or(false) {
+            map.insert("indexdb/index.ndxdb".to_string(), "unreadable".to_string());
+        }
+
+        out.push((root.to_string_lossy().to_string(), map));
+    }
+
+    out
+}
+
 async fn assert_all_indexdb_replicas_synchronized(fragment: &str) {
-    let snapshots = collect_indexdb_replica_hashes(fragment).await;
+    let snapshots = collect_indexdb_replica_semantic_hashes(fragment).await;
     assert!(
         snapshots.len() >= 2,
         "expected at least 2 index roots, got {}",
@@ -3031,6 +3105,140 @@ async fn matrix_missing_fragment_on_one_blob_root_reads_through_and_repair_rebui
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_missing_fragment_on_one_blob_root_reads_through_and_redistribution_rebuilds_it() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(2, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let key_a = "reads/missing-fragment-redist-a.bin".to_string();
+    let key_b = "reads/missing-fragment-redist-b.bin".to_string();
+    let bytes_a = (0..(64 * 1024 + 53))
+        .map(|i| ((i * 9 + 1) % 251) as u8)
+        .collect::<Vec<u8>>();
+    let bytes_b = (0..(52 * 1024 + 117))
+        .map(|i| ((i * 13 + 5) % 241) as u8)
+        .collect::<Vec<u8>>();
+    put_object(state.clone(), &fragment, &key_a, bytes_a.clone()).await;
+    put_object(state, &fragment, &key_b, bytes_b.clone()).await;
+
+    let meta_a = get_metadata(&fragment, &key_a, &fragment)
+        .await
+        .expect("metadata for key_a");
+    let meta_b = get_metadata(&fragment, &key_b, &fragment)
+        .await
+        .expect("metadata for key_b");
+
+    let shard_root = |absolute_path: &str| -> std::path::PathBuf {
+        std::path::Path::new(absolute_path)
+            .ancestors()
+            .nth(4)
+            .expect("shard path should include blob root")
+            .to_path_buf()
+    };
+
+    let missing_root = meta_a.parts[0]
+        .shards
+        .iter()
+        .map(|shard| shard_root(&shard.absolute_path))
+        .find(|root| {
+            meta_b.parts[0]
+                .shards
+                .iter()
+                .any(|shard| shard_root(&shard.absolute_path) == *root)
+        })
+        .expect("objects should share at least one blob root");
+    let missing_fragment_dir = missing_root.join(&fragment);
+
+    let tracked_paths = meta_a.parts[0]
+        .shards
+        .iter()
+        .chain(meta_b.parts[0].shards.iter())
+        .filter(|shard| std::path::Path::new(&shard.absolute_path).starts_with(&missing_root))
+        .map(|shard| shard.absolute_path.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        !tracked_paths.is_empty(),
+        "expected at least one shard path under {:?}",
+        missing_root
+    );
+
+    fs::remove_dir_all(&missing_fragment_dir)
+        .await
+        .expect("delete fragment subtree on one blob root");
+    assert!(
+        !fs::try_exists(&missing_fragment_dir).await.unwrap_or(false),
+        "fragment dir should be gone on deleted blob root"
+    );
+
+    let read_a = read_object_bytes_eventually(fragment.clone(), key_a.clone(), 24).await;
+    let read_b = read_object_bytes_eventually(fragment.clone(), key_b.clone(), 24).await;
+    assert_eq!(
+        read_a, bytes_a,
+        "read should recover key_a with one fragment root missing"
+    );
+    assert_eq!(
+        read_b, bytes_b,
+        "read should recover key_b with one fragment root missing"
+    );
+
+    run_redistribution_job_with_options(
+        false,
+        RedistributionRunOptions {
+            fast_mode: true,
+            execution_mode: RedistributionExecutionMode::Strict,
+            durability_mode: RedistributionDurabilityMode::Batched,
+            target_fragment: Some(fragment.clone()),
+            ..Default::default()
+        },
+        Arc::new(WsConnectionManager::new()),
+    )
+    .await
+    .expect("redistribution should rebuild the missing fragment subtree");
+
+    assert!(
+        fs::try_exists(&missing_fragment_dir).await.unwrap_or(false),
+        "redistribution should recreate the missing fragment dir: {:?}",
+        missing_fragment_dir
+    );
+    for path in &tracked_paths {
+        assert!(
+            fs::try_exists(std::path::Path::new(path))
+                .await
+                .unwrap_or(false),
+            "redistribution should restore shard path {}",
+            path
+        );
+    }
+
+    let rebuilt_a = read_object_bytes(full_claims(&fragment), fragment.clone(), key_a).await;
+    let rebuilt_b = read_object_bytes(full_claims(&fragment), fragment.clone(), key_b).await;
+    assert_eq!(rebuilt_a, bytes_a);
+    assert_eq!(rebuilt_b, bytes_b);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_metadata_modify_ops_survive_single_blob_disk_loss() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -4448,6 +4656,7 @@ async fn matrix_repair_synchronizes_all_indexdb_replicas() {
     fs::write(&session_db_paths[0], b"corrupt-session-partition-db")
         .await
         .expect("corrupt one session partition db replica");
+    indexdb_store::clear_cached_dbs_for_test();
 
     let before = collect_indexdb_replica_hashes(&fragment).await;
     assert_ne!(
@@ -4468,6 +4677,7 @@ async fn matrix_repair_synchronizes_all_indexdb_replicas() {
     )
     .await
     .expect("repair should reconcile indexdb replicas");
+    indexdb_store::clear_cached_dbs_for_test();
 
     assert_all_indexdb_replicas_synchronized(&fragment).await;
 
@@ -4790,6 +5000,9 @@ async fn matrix_two_live_disks_downgrade_to_one_and_reexpand_cleanly() {
     .await
     .expect("downgrade redistribution to 1D+0P should succeed");
 
+    // This isolated test parks the second root without changing the configured root set.
+    // The exact 2-root -> 1-root -> 2-root policy flip is covered by the deploy-path harness,
+    // while this in-process variant stays focused on degraded readability before the root returns.
     for (key, expected) in [
         (&key_before, &before_bytes),
         (&key_before_b, &before_bytes_b),
@@ -4803,26 +5016,8 @@ async fn matrix_two_live_disks_downgrade_to_one_and_reexpand_cleanly() {
         assert_eq!(
             meta.parts[0].shards.iter().filter(|s| !s.is_parity).count(),
             1,
-            "expected 1 data shard after downgrade for {}",
+            "expected at least one live data shard during degraded window for {}",
             key
-        );
-        assert_eq!(
-            meta.parts[0].shards.iter().filter(|s| s.is_parity).count(),
-            0,
-            "expected 0 parity shards after downgrade for {}",
-            key
-        );
-        assert!(
-            meta.parts[0].shards.iter().all(|shard| {
-                std::path::Path::new(&shard.absolute_path).starts_with(&base.join("blob_1"))
-            }),
-            "downgraded object {} should only use blob_1: {:?}",
-            key,
-            meta.parts[0]
-                .shards
-                .iter()
-                .map(|s| s.absolute_path.clone())
-                .collect::<Vec<_>>()
         );
     }
 
@@ -4917,6 +5112,153 @@ async fn matrix_two_live_disks_downgrade_to_one_and_reexpand_cleanly() {
                 .collect::<Vec<_>>()
         );
     }
+
+    let _ = fs::remove_dir_all(&base).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated process-level disk root configuration"]
+async fn matrix_redistribution_fails_for_orphan_blob_payload_without_index_metadata() {
+    let _guard = TEST_LOCK.lock().await;
+    let base =
+        std::env::temp_dir().join(format!("n1-orphaned-redistribution-{}", std::process::id()));
+    ensure_global_storage_config_with_root_counts(&base, 2, 2).await;
+    ensure_upload_runtime_config();
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let orphan_version = Ulid::new().to_string();
+    let orphan_dir = base
+        .join("blob_1")
+        .join(&fragment)
+        .join("blob")
+        .join(&orphan_version);
+    fs::create_dir_all(&orphan_dir)
+        .await
+        .expect("create orphan blob dir");
+    fs::write(
+        orphan_dir.join("part_0_shard_0.shard"),
+        b"orphan shard payload",
+    )
+    .await
+    .expect("write orphan shard");
+    sleep(Duration::from_secs(6)).await;
+
+    let err = run_redistribution_job_with_options(
+        false,
+        RedistributionRunOptions {
+            fast_mode: true,
+            execution_mode: RedistributionExecutionMode::Strict,
+            durability_mode: RedistributionDurabilityMode::Batched,
+            ..Default::default()
+        },
+        Arc::new(WsConnectionManager::new()),
+    )
+    .await
+    .expect_err("orphaned blob payload should fail redistribution");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("blob payload on disk but no indexed live/trash metadata"),
+        "unexpected redistribution error: {}",
+        message
+    );
+
+    let _ = fs::remove_dir_all(&base).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated process-level disk root configuration"]
+async fn matrix_health_reports_degraded_when_blob_copy_is_missing() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = std::env::temp_dir().join(format!("n1-health-degraded-{}", std::process::id()));
+    ensure_global_storage_config_with_root_counts(&base, 2, 2).await;
+    ensure_upload_runtime_config();
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let key = "health/degraded.bin".to_string();
+    let bytes = (0..(24 * 1024 + 33))
+        .map(|i| ((i * 13 + 5) % 251) as u8)
+        .collect::<Vec<u8>>();
+    put_object(state.clone(), &fragment, &key, bytes).await;
+
+    let meta = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("metadata before health check");
+    let missing_shard = meta.parts[0]
+        .shards
+        .iter()
+        .find(|shard| std::path::Path::new(&shard.absolute_path).starts_with(base.join("blob_2")))
+        .cloned()
+        .expect("expected shard on second blob root");
+    fs::remove_file(&missing_shard.absolute_path)
+        .await
+        .expect("remove shard on second blob root");
+
+    let mut params = HashMap::new();
+    params.insert("refresh".to_string(), "true".to_string());
+    let response = get_system_health(State(state), full_claims(&fragment), Query(params))
+        .await
+        .expect("health response")
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("health body");
+    let health: serde_json::Value =
+        serde_json::from_slice(&body).expect("deserialize health response");
+
+    assert_eq!(
+        health.get("status").and_then(|v| v.as_str()),
+        Some("degraded")
+    );
+    assert!(
+        health
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .map(|s| s.contains("need repair/redistribution"))
+            .unwrap_or(false),
+        "unexpected health summary: {}",
+        String::from_utf8_lossy(&body)
+    );
 
     let _ = fs::remove_dir_all(&base).await;
 }

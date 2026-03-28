@@ -716,7 +716,9 @@ mod tests {
     async fn read_or_recover_chunk_restores_single_data_shard_for_nine_byte_object() {
         let root = std::env::temp_dir().join(format!("n1-recovery-nine-byte-{}", Ulid::new()));
         let parity_dir = root.join("frag").join("blob").join("ver");
-        fs::create_dir_all(&parity_dir).await.expect("create parity dir");
+        fs::create_dir_all(&parity_dir)
+            .await
+            .expect("create parity dir");
 
         let matrix_base = std::env::temp_dir().join(format!("n1-matrix-{}", std::process::id()));
         let index_roots = vec![
