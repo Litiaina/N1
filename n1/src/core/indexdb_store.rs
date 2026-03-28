@@ -1,6 +1,7 @@
 use super::disk_manager::{
     ListObjectsResult, ObjectMetadata, ObjectPathManager, PartMetadata, ReservationReceipt,
 };
+use super::fragment_metadata::fragment_index_partition_count;
 use super::index::{IndexSessionState, SessionPartReceipt, TrashCatalogEntry};
 use super::upload::UploadSessionManifest;
 use crate::enums::app_error_enum::AppError;
@@ -21,8 +22,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 const INDEXDB_DIR: &str = "indexdb";
-const INDEXDB_PARTITIONS_DIR: &str = "partitions";
-const INDEX_PARTITION_COUNT: u16 = 256;
+const INDEXDB_FILE: &str = "index.ndxdb";
 const VERSION_KEY_SEPARATOR: char = '\u{001f}';
 const VERSION_KEY_SEPARATOR_STR: &str = "\u{001f}";
 
@@ -206,22 +206,13 @@ struct ListingCursor {
 }
 
 #[derive(Debug)]
-struct ListingItem {
-    object_key: String,
-    head: HeadRecord,
-}
-
 struct NamespaceListingItem {
     object_key: String,
     summary: ObjectMetadata,
 }
 
-struct PartitionRange {
-    iter: indexdb::Range<'static, &'static str, &'static [u8]>,
-    next: Option<ListingItem>,
-}
-
 struct NamespacePartitionRange {
+    _db: Arc<Database>,
     iter: indexdb::Range<'static, &'static str, &'static [u8]>,
     next: Option<NamespaceListingItem>,
 }
@@ -278,12 +269,59 @@ fn hash_key(parts: &[&str]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn route_for_hash(hash: [u8; 32]) -> Result<IndexRoute, AppError> {
-    let partition_id = (u16::from(hash[0]) << 8 | u16::from(hash[1])) % INDEX_PARTITION_COUNT;
-    route_for_partition(partition_id)
+fn fragment_partition_count(fragment: &str) -> Result<u16, AppError> {
+    fragment_index_partition_count(fragment)
 }
 
-fn route_for_partition(partition_id: u16) -> Result<IndexRoute, AppError> {
+fn fragment_owner_index(fragment: &str, root_count: usize) -> usize {
+    if root_count <= 1 {
+        return 0;
+    }
+    let hash = hash_key(&["fragment", fragment]);
+    usize::from(u16::from(hash[0]) << 8 | u16::from(hash[1])) % root_count
+}
+
+fn object_bucket_id(fragment: &str, object_key: &str) -> Result<u16, AppError> {
+    let partition_count = fragment_partition_count(fragment)?;
+    let hash = hash_key(&["object", fragment, &canonical_key(object_key)]);
+    Ok((u16::from(hash[0]) << 8 | u16::from(hash[1])) % partition_count)
+}
+
+fn bucket_key_prefix(bucket_id: u16) -> String {
+    format!("{:04x}{}", bucket_id, VERSION_KEY_SEPARATOR)
+}
+
+fn head_row_key(fragment: &str, object_key: &str) -> Result<String, AppError> {
+    Ok(format!(
+        "{}{}",
+        bucket_key_prefix(object_bucket_id(fragment, object_key)?),
+        canonical_key(object_key)
+    ))
+}
+
+fn object_version_row_prefix(fragment: &str, object_key: &str) -> Result<String, AppError> {
+    Ok(format!(
+        "{}{}{}",
+        bucket_key_prefix(object_bucket_id(fragment, object_key)?),
+        canonical_key(object_key),
+        VERSION_KEY_SEPARATOR
+    ))
+}
+
+fn route_for_hash(fragment: &str, hash: [u8; 32]) -> Result<IndexRoute, AppError> {
+    let partition_count = fragment_partition_count(fragment)?;
+    let partition_id = (u16::from(hash[0]) << 8 | u16::from(hash[1])) % partition_count;
+    route_for_partition(fragment, partition_id)
+}
+
+fn route_for_partition(fragment: &str, partition_id: u16) -> Result<IndexRoute, AppError> {
+    let partition_count = fragment_partition_count(fragment)?;
+    if partition_id >= partition_count {
+        return Err(AppError::InternalServerError(format!(
+            "partition {:04x} is out of range for fragment {} with {} partitions",
+            partition_id, fragment, partition_count
+        )));
+    }
     let roots = ObjectPathManager::new().get_all_index_roots();
     if roots.is_empty() {
         return Err(AppError::InternalServerError(
@@ -291,13 +329,12 @@ fn route_for_partition(partition_id: u16) -> Result<IndexRoute, AppError> {
         ));
     }
 
-    let owner_idx = usize::from(partition_id) % roots.len();
-    let mut selected = vec![roots[owner_idx].clone()];
-    if roots.len() > 1 {
-        let replica_offset = 1 + ((usize::from(partition_id >> 8)) % (roots.len() - 1));
-        let replica_idx = (owner_idx + replica_offset) % roots.len();
-        if replica_idx != owner_idx {
-            selected.push(roots[replica_idx].clone());
+    let owner_idx = fragment_owner_index(fragment, roots.len());
+    let mut selected = Vec::with_capacity(roots.len());
+    selected.push(roots[owner_idx].clone());
+    for (idx, root) in roots.into_iter().enumerate() {
+        if idx != owner_idx {
+            selected.push(root);
         }
     }
 
@@ -307,36 +344,39 @@ fn route_for_partition(partition_id: u16) -> Result<IndexRoute, AppError> {
     })
 }
 
+fn fragment_route(fragment: &str) -> Result<IndexRoute, AppError> {
+    route_for_partition(fragment, 0)
+}
+
 fn object_route(fragment: &str, object_key: &str) -> Result<IndexRoute, AppError> {
-    route_for_hash(hash_key(&["object", fragment, &canonical_key(object_key)]))
+    route_for_hash(fragment, hash_key(&["object", fragment, &canonical_key(object_key)]))
 }
 
 fn session_route(fragment: &str, version_id: &str) -> Result<IndexRoute, AppError> {
-    route_for_hash(hash_key(&["session", fragment, version_id]))
+    route_for_hash(fragment, hash_key(&["session", fragment, version_id]))
 }
 
 fn db_path(root: &Path, fragment: &str, partition_id: u16) -> PathBuf {
+    let _ = partition_id;
     root.join(fragment)
         .join(INDEXDB_DIR)
-        .join(INDEXDB_PARTITIONS_DIR)
-        .join(format!("{:04x}.ndxdb", partition_id))
+        .join(INDEXDB_FILE)
 }
 
-fn version_row_key(object_key: &str, version_id: &str) -> String {
-    format!(
-        "{}{}{}",
-        canonical_key(object_key),
-        VERSION_KEY_SEPARATOR,
+fn version_row_key(fragment: &str, object_key: &str, version_id: &str) -> Result<String, AppError> {
+    Ok(format!(
+        "{}{}",
+        object_version_row_prefix(fragment, object_key)?,
         version_id
-    )
+    ))
 }
 
-fn version_row_prefix(object_key: &str) -> String {
-    format!("{}{}", canonical_key(object_key), VERSION_KEY_SEPARATOR)
+fn version_row_prefix(fragment: &str, object_key: &str) -> Result<String, AppError> {
+    object_version_row_prefix(fragment, object_key)
 }
 
 fn parse_version_key(row_key: &str) -> Option<(&str, &str)> {
-    row_key.split_once(VERSION_KEY_SEPARATOR_STR)
+    row_key.rsplit_once(VERSION_KEY_SEPARATOR_STR)
 }
 
 fn session_part_row_prefix(version_id: &str) -> String {
@@ -387,42 +427,40 @@ pub(crate) fn clear_cached_dbs_for_test() {
 
 #[cfg(test)]
 pub(crate) fn clear_live_namespace_indexes_for_test(fragment: &str) -> Result<(), AppError> {
-    for partition_id in 0..INDEX_PARTITION_COUNT {
-        let route = route_for_partition(partition_id)?;
-        for root in route.roots {
-            let path = db_path(&root, fragment, partition_id);
-            if !path.exists() {
-                continue;
-            }
-            let db = get_or_open_db(&path)?;
-            let write_txn = db
-                .begin_write()
-                .map_err(|e| map_indexdb_error("begin_write", e))?;
-            {
-                let mut table = match write_txn.open_table(LIVE_NAMESPACE_TABLE) {
-                    Ok(table) => table,
-                    Err(TableError::TableDoesNotExist(_)) => continue,
-                    Err(err) => return Err(map_indexdb_error("open live_namespace", err)),
-                };
-                let mut keys = Vec::new();
-                let mut iter = table
-                    .iter()
-                    .map_err(|e| map_indexdb_error("live_namespace iter", e))?;
-                while let Some(entry) = iter.next() {
-                    let (key, _) =
-                        entry.map_err(|e| map_indexdb_error("live_namespace iter next", e))?;
-                    keys.push(key.value().to_string());
-                }
-                for key in keys {
-                    let _ = table
-                        .remove(key.as_str())
-                        .map_err(|e| map_indexdb_error("live_namespace remove", e))?;
-                }
-            }
-            write_txn
-                .commit()
-                .map_err(|e| map_indexdb_error("commit live_namespace clear", e))?;
+    let route = fragment_route(fragment)?;
+    for root in route.roots {
+        let path = db_path(&root, fragment, route.partition_id);
+        if !path.exists() {
+            continue;
         }
+        let db = get_or_open_db(&path)?;
+        let write_txn = db
+            .begin_write()
+            .map_err(|e| map_indexdb_error("begin_write", e))?;
+        {
+            let mut table = match write_txn.open_table(LIVE_NAMESPACE_TABLE) {
+                Ok(table) => table,
+                Err(TableError::TableDoesNotExist(_)) => continue,
+                Err(err) => return Err(map_indexdb_error("open live_namespace", err)),
+            };
+            let mut keys = Vec::new();
+            let mut iter = table
+                .iter()
+                .map_err(|e| map_indexdb_error("live_namespace iter", e))?;
+            while let Some(entry) = iter.next() {
+                let (key, _) =
+                    entry.map_err(|e| map_indexdb_error("live_namespace iter next", e))?;
+                keys.push(key.value().to_string());
+            }
+            for key in keys {
+                let _ = table
+                    .remove(key.as_str())
+                    .map_err(|e| map_indexdb_error("live_namespace remove", e))?;
+            }
+        }
+        write_txn
+            .commit()
+            .map_err(|e| map_indexdb_error("commit live_namespace clear", e))?;
     }
     Ok(())
 }
@@ -430,29 +468,24 @@ pub(crate) fn clear_live_namespace_indexes_for_test(fragment: &str) -> Result<()
 #[cfg(test)]
 pub(crate) fn count_live_namespace_rows_for_test(fragment: &str) -> Result<usize, AppError> {
     let mut total = 0usize;
-    for partition_id in 0..INDEX_PARTITION_COUNT {
-        let route = route_for_partition(partition_id)?;
-        for root in route.roots {
-            let path = db_path(&root, fragment, partition_id);
-            if !path.exists() {
-                continue;
-            }
-            let db = get_or_open_db(&path)?;
-            let read_txn = db
-                .begin_read()
-                .map_err(|e| map_indexdb_error("begin_read", e))?;
-            let table = match read_txn.open_table(LIVE_NAMESPACE_TABLE) {
-                Ok(table) => table,
-                Err(TableError::TableDoesNotExist(_)) => continue,
-                Err(err) => return Err(map_indexdb_error("open live_namespace", err)),
-            };
-            let mut iter = table
-                .iter()
-                .map_err(|e| map_indexdb_error("live_namespace iter", e))?;
-            while let Some(entry) = iter.next() {
-                let _ = entry.map_err(|e| map_indexdb_error("live_namespace iter next", e))?;
-                total = total.saturating_add(1);
-            }
+    let route = fragment_route(fragment)?;
+    let path = owner_db_path(&route, fragment);
+    if path.exists() {
+        let db = get_or_open_db(&path)?;
+        let read_txn = db
+            .begin_read()
+            .map_err(|e| map_indexdb_error("begin_read", e))?;
+        let table = match read_txn.open_table(LIVE_NAMESPACE_TABLE) {
+            Ok(table) => table,
+            Err(TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(err) => return Err(map_indexdb_error("open live_namespace", err)),
+        };
+        let mut iter = table
+            .iter()
+            .map_err(|e| map_indexdb_error("live_namespace iter", e))?;
+        while let Some(entry) = iter.next() {
+            let _ = entry.map_err(|e| map_indexdb_error("live_namespace iter next", e))?;
+            total = total.saturating_add(1);
         }
     }
     Ok(total)
@@ -525,11 +558,8 @@ fn get_or_open_db(path: &Path) -> Result<Arc<Database>, AppError> {
     Ok(db)
 }
 
-fn open_partition_db_for_read(
-    fragment: &str,
-    partition_id: u16,
-) -> Result<Option<Arc<Database>>, AppError> {
-    let route = route_for_partition(partition_id)?;
+fn open_fragment_db_for_read(fragment: &str) -> Result<Option<Arc<Database>>, AppError> {
+    let route = fragment_route(fragment)?;
     open_route_db_for_read(fragment, &route)
 }
 
@@ -539,6 +569,7 @@ fn open_route_db_for_read(
 ) -> Result<Option<Arc<Database>>, AppError> {
     let owner_path = owner_db_path(route, fragment);
     let owner_available = owner_path.exists();
+    let mut owner_without_meta: Option<Arc<Database>> = None;
     let mut best_follower: Option<(u64, Arc<Database>)> = None;
     let mut best_follower_without_meta: Option<Arc<Database>> = None;
     for root in &route.roots {
@@ -604,7 +635,11 @@ fn open_route_db_for_read(
             };
 
             if root == &route.roots[0] {
-                return Ok(Some(db));
+                if meta.is_some() {
+                    return Ok(Some(db));
+                }
+                owner_without_meta = Some(db);
+                continue;
             }
 
             let Some(meta) = meta else {
@@ -618,6 +653,13 @@ fn open_route_db_for_read(
         }
     }
     if let Some((_, db)) = best_follower {
+        return Ok(Some(db));
+    }
+    if let Some(db) = owner_without_meta {
+        warn!(
+            "indexdb read fallback: owner copy for fragment {} partition {:04x} is missing valid partition metadata; using owner copy as last resort",
+            fragment, route.partition_id
+        );
         return Ok(Some(db));
     }
     if !owner_available {
@@ -766,14 +808,6 @@ fn replicate_session_remove(
     Ok(())
 }
 
-fn has_partition_db(fragment: &str, partition_id: u16) -> Result<bool, AppError> {
-    let route = route_for_partition(partition_id)?;
-    Ok(route
-        .roots
-        .iter()
-        .any(|root| db_path(root, fragment, partition_id).exists()))
-}
-
 pub fn has_object_partition_db(fragment: &str, object_key: &str) -> Result<bool, AppError> {
     let route = object_route(fragment, object_key)?;
     Ok(route
@@ -811,32 +845,33 @@ pub fn has_session_partition_db(fragment: &str, version_id: &str) -> Result<bool
 }
 
 pub fn has_any_fragment_partition_db(fragment: &str) -> Result<bool, AppError> {
-    for partition_id in 0..INDEX_PARTITION_COUNT {
-        if has_partition_db(fragment, partition_id)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    let route = fragment_route(fragment)?;
+    Ok(route
+        .roots
+        .iter()
+        .any(|root| db_path(root, fragment, route.partition_id).exists()))
 }
 
 pub fn sync_fragment_partition_replicas(fragment: &str) -> Result<(), AppError> {
-    for partition_id in 0..INDEX_PARTITION_COUNT {
-        let route = route_for_partition(partition_id)?;
-        if route.roots.len() <= 1 {
-            continue;
-        }
-        let owner_path = owner_db_path(&route, fragment);
-        with_partition_commit_lock(&owner_path, || {
-            if owner_path.exists() {
-                replicate_owner_partition_db(fragment, &route)?;
-            }
-            Ok(())
-        })?;
+    let route = fragment_route(fragment)?;
+    if route.roots.len() <= 1 {
+        return Ok(());
     }
+    let owner_path = owner_db_path(&route, fragment);
+    with_partition_commit_lock(&owner_path, || {
+        if owner_path.exists() {
+            replicate_owner_partition_db(fragment, &route)?;
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
-fn read_head_exact(db: &Database, object_key: &str) -> Result<Option<HeadRecord>, AppError> {
+fn read_head_exact(
+    db: &Database,
+    fragment: &str,
+    object_key: &str,
+) -> Result<Option<HeadRecord>, AppError> {
     let read_txn = db
         .begin_read()
         .map_err(|e| map_indexdb_error("begin_read", e))?;
@@ -845,8 +880,9 @@ fn read_head_exact(db: &Database, object_key: &str) -> Result<Option<HeadRecord>
         Err(TableError::TableDoesNotExist(_)) => return Ok(None),
         Err(err) => return Err(map_indexdb_error("open object_heads", err)),
     };
+    let key = head_row_key(fragment, object_key)?;
     let Some(value) = table
-        .get(canonical_key(object_key).as_str())
+        .get(key.as_str())
         .map_err(|e| map_indexdb_error("head get", e))?
     else {
         return Ok(None);
@@ -856,6 +892,7 @@ fn read_head_exact(db: &Database, object_key: &str) -> Result<Option<HeadRecord>
 
 fn read_version_exact(
     db: &Database,
+    fragment: &str,
     object_key: &str,
     version_id: &str,
 ) -> Result<Option<VersionRecord>, AppError> {
@@ -867,7 +904,7 @@ fn read_version_exact(
         Err(TableError::TableDoesNotExist(_)) => return Ok(None),
         Err(err) => return Err(map_indexdb_error("open object_versions", err)),
     };
-    let key = version_row_key(object_key, version_id);
+    let key = version_row_key(fragment, object_key, version_id)?;
     let Some(value) = table
         .get(key.as_str())
         .map_err(|e| map_indexdb_error("version get", e))?
@@ -879,6 +916,7 @@ fn read_version_exact(
 
 fn read_version_state_exact(
     db: &Database,
+    fragment: &str,
     object_key: &str,
     version_id: &str,
 ) -> Result<Option<VersionStateRecord>, AppError> {
@@ -890,7 +928,7 @@ fn read_version_state_exact(
         Err(TableError::TableDoesNotExist(_)) => return Ok(None),
         Err(err) => return Err(map_indexdb_error("open object_version_states", err)),
     };
-    let key = version_row_key(object_key, version_id);
+    let key = version_row_key(fragment, object_key, version_id)?;
     let Some(value) = table
         .get(key.as_str())
         .map_err(|e| map_indexdb_error("version_state get", e))?
@@ -1034,10 +1072,14 @@ fn compare_head_recency(
 fn candidate_should_replace_head(
     current_head: Option<&HeadRecord>,
     metadata: &ObjectMetadata,
+    candidate_state: ObjectState,
 ) -> bool {
     match current_head {
         None => true,
         Some(head) if head.version_id == metadata.version_id => head.state != ObjectState::Deleted,
+        Some(head) if candidate_state == ObjectState::Live && head.state != ObjectState::Live => {
+            true
+        }
         Some(head) => {
             compare_head_recency(metadata.created_at, &metadata.version_id, head)
                 == Ordering::Greater
@@ -1069,8 +1111,9 @@ fn write_head_exact(
     head: &HeadRecord,
 ) -> Result<(), AppError> {
     let bytes = serialize(head)?;
+    let key = head_row_key(&head.fragment, &head.object_key)?;
     heads
-        .insert(canonical_key(&head.object_key).as_str(), bytes.as_slice())
+        .insert(key.as_str(), bytes.as_slice())
         .map_err(|e| map_indexdb_error("head insert", e))?;
     Ok(())
 }
@@ -1121,10 +1164,12 @@ fn write_head_with_namespace_exact(
 
 fn remove_head_exact(
     heads: &mut indexdb::Table<&str, &[u8]>,
+    fragment: &str,
     object_key: &str,
 ) -> Result<(), AppError> {
+    let key = head_row_key(fragment, object_key)?;
     let _ = heads
-        .remove(canonical_key(object_key).as_str())
+        .remove(key.as_str())
         .map_err(|e| map_indexdb_error("head remove", e))?;
     Ok(())
 }
@@ -1132,18 +1177,20 @@ fn remove_head_exact(
 fn remove_head_with_namespace_exact(
     heads: &mut indexdb::Table<&str, &[u8]>,
     live_namespace: &mut indexdb::Table<&str, &[u8]>,
+    fragment: &str,
     object_key: &str,
 ) -> Result<(), AppError> {
-    remove_head_exact(heads, object_key)?;
+    remove_head_exact(heads, fragment, object_key)?;
     remove_live_namespace_exact(live_namespace, object_key)
 }
 
 fn load_latest_remaining_version_exact(
     versions: &indexdb::Table<&str, &[u8]>,
     states: &indexdb::Table<&str, &[u8]>,
+    fragment: &str,
     object_key: &str,
 ) -> Result<Option<(ObjectMetadata, ObjectState)>, AppError> {
-    let prefix = version_row_prefix(object_key);
+    let prefix = version_row_prefix(fragment, object_key)?;
     let mut iter = states
         .range(prefix.as_str()..)
         .map_err(|e| map_indexdb_error("version_state range", e))?;
@@ -1181,12 +1228,13 @@ fn rewrite_head_from_remaining_versions_exact(
     live_namespace: &mut indexdb::Table<&str, &[u8]>,
     versions: &indexdb::Table<&str, &[u8]>,
     states: &indexdb::Table<&str, &[u8]>,
+    fragment: &str,
     object_key: &str,
     current_head: Option<&HeadRecord>,
     updated_at: i64,
 ) -> Result<(), AppError> {
     if let Some((metadata, state)) =
-        load_latest_remaining_version_exact(versions, states, object_key)?
+        load_latest_remaining_version_exact(versions, states, fragment, object_key)?
     {
         let next_head = HeadRecord::from_metadata(
             &metadata,
@@ -1196,13 +1244,14 @@ fn rewrite_head_from_remaining_versions_exact(
         );
         write_head_with_namespace_exact(heads, live_namespace, &next_head)?;
     } else {
-        remove_head_with_namespace_exact(heads, live_namespace, object_key)?;
+        remove_head_with_namespace_exact(heads, live_namespace, fragment, object_key)?;
     }
     Ok(())
 }
 
 fn list_versions_exact(
     db: &Database,
+    fragment: &str,
     object_key: &str,
     state: ObjectState,
 ) -> Result<Vec<ObjectMetadata>, AppError> {
@@ -1219,9 +1268,9 @@ fn list_versions_exact(
         Err(TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
         Err(err) => return Err(map_indexdb_error("open object_version_states", err)),
     };
-    let head = read_head_exact(db, object_key)?;
+    let head = read_head_exact(db, fragment, object_key)?;
 
-    let prefix = version_row_prefix(object_key);
+    let prefix = version_row_prefix(fragment, object_key)?;
     let mut iter = states
         .range(prefix.as_str()..)
         .map_err(|e| map_indexdb_error("version_state range", e))?;
@@ -1286,7 +1335,7 @@ fn write_version_on_db(
             .map_err(|e| map_indexdb_error("open object_version_states", e))?;
         let now = Utc::now().timestamp();
         let committed_generation = next_partition_generation(&mut partition_meta, now)?;
-        let row_key = version_row_key(&metadata.object_key, &metadata.version_id);
+        let row_key = version_row_key(&metadata.fragment, &metadata.object_key, &metadata.version_id)?;
         let record = VersionRecord {
             metadata: metadata.clone(),
             recorded_at: now,
@@ -1305,12 +1354,12 @@ fn write_version_on_db(
             .insert(row_key.as_str(), visibility_bytes.as_slice())
             .map_err(|e| map_indexdb_error("version_state insert", e))?;
         let current_head = heads
-            .get(canonical_key(&metadata.object_key).as_str())
+            .get(head_row_key(&metadata.fragment, &metadata.object_key)?.as_str())
             .map_err(|e| map_indexdb_error("head get", e))?
             .map(|value| deserialize::<HeadRecord>(value.value()))
             .transpose()?;
-        let head_key = canonical_key(&metadata.object_key);
-        let head_bytes = if candidate_should_replace_head(current_head.as_ref(), metadata) {
+        let head_key = head_row_key(&metadata.fragment, &metadata.object_key)?;
+        let head_bytes = if candidate_should_replace_head(current_head.as_ref(), metadata, state) {
             let head = HeadRecord::from_metadata(
                 metadata,
                 state,
@@ -1342,6 +1391,7 @@ fn write_version_on_db(
 
 fn change_version_state_on_db(
     db: &Database,
+    fragment: &str,
     object_key: &str,
     version_id: &str,
     target_state: ObjectState,
@@ -1371,9 +1421,9 @@ fn change_version_state_on_db(
             .map_err(|e| map_indexdb_error("open trash_objects", e))?;
         let now = Utc::now().timestamp();
         let committed_generation = next_partition_generation(&mut partition_meta, now)?;
-        let row_key = version_row_key(object_key, version_id);
+        let row_key = version_row_key(fragment, object_key, version_id)?;
         let current_head = heads
-            .get(canonical_key(object_key).as_str())
+            .get(head_row_key(fragment, object_key)?.as_str())
             .map_err(|e| map_indexdb_error("head get", e))?
             .map(|value| deserialize::<HeadRecord>(value.value()))
             .transpose()?;
@@ -1498,6 +1548,7 @@ fn change_version_state_on_db(
 
 fn delete_version_on_db(
     db: &Database,
+    fragment: &str,
     object_key: &str,
     version_id: &str,
     expected_state: Option<ObjectState>,
@@ -1526,9 +1577,9 @@ fn delete_version_on_db(
             .map_err(|e| map_indexdb_error("open trash_objects", e))?;
         let now = Utc::now().timestamp();
         let committed_generation = next_partition_generation(&mut partition_meta, now)?;
-        let row_key = version_row_key(object_key, version_id);
+        let row_key = version_row_key(fragment, object_key, version_id)?;
         let current_head = heads
-            .get(canonical_key(object_key).as_str())
+            .get(head_row_key(fragment, object_key)?.as_str())
             .map_err(|e| map_indexdb_error("head get", e))?
             .map(|value| deserialize::<HeadRecord>(value.value()))
             .transpose()?;
@@ -1583,6 +1634,7 @@ fn delete_version_on_db(
             &mut live_namespace,
             &versions,
             &states,
+            fragment,
             object_key,
             current_head.as_ref(),
             now,
@@ -1603,6 +1655,7 @@ fn delete_version_on_db(
 
 fn bulk_rewrite_keys_state_on_db(
     db: &Database,
+    fragment: &str,
     object_keys: &[String],
     from_state: ObjectState,
     to_state: ObjectState,
@@ -1621,11 +1674,11 @@ fn bulk_rewrite_keys_state_on_db(
 
         for object_key in object_keys {
             let current_head = heads
-                .get(canonical_key(object_key).as_str())
+                .get(head_row_key(fragment, object_key)?.as_str())
                 .map_err(|e| map_indexdb_error("head get", e))?
                 .map(|value| deserialize::<HeadRecord>(value.value()))
                 .transpose()?;
-            let prefix = version_row_prefix(object_key);
+            let prefix = version_row_prefix(fragment, object_key)?;
             let mut iter = states
                 .range(prefix.as_str()..)
                 .map_err(|e| map_indexdb_error("version_state range", e))?;
@@ -1781,6 +1834,7 @@ fn bulk_rewrite_keys_state_on_db(
 
 fn apply_restore_trash_entries_exact(
     db: &Database,
+    fragment: &str,
     object_versions: &HashMap<String, Vec<String>>,
     partition_meta: &PartitionMeta,
     strict: bool,
@@ -1816,7 +1870,7 @@ fn apply_restore_trash_entries_exact(
         let mut touched = HashMap::<String, Vec<String>>::new();
         for (object_key, raw_version_ids) in object_versions {
             let current_head = heads
-                .get(canonical_key(object_key).as_str())
+                .get(head_row_key(fragment, object_key)?.as_str())
                 .map_err(|e| map_indexdb_error("head get", e))?
                 .map(|value| deserialize::<HeadRecord>(value.value()))
                 .transpose()?;
@@ -1824,7 +1878,7 @@ fn apply_restore_trash_entries_exact(
             let mut restored_ids = Vec::new();
             let mut latest_restored: Option<ObjectMetadata> = None;
             for version_id in raw_version_ids.iter().collect::<BTreeSet<_>>() {
-                let row_key = version_row_key(object_key, version_id);
+                let row_key = version_row_key(fragment, object_key, version_id)?;
                 let current_state = {
                     let Some(state_value) = states
                         .get(row_key.as_str())
@@ -1965,6 +2019,7 @@ fn apply_restore_trash_entries_exact(
 
 fn restore_trash_entries_on_db(
     db: &Database,
+    fragment: &str,
     object_versions: &HashMap<String, Vec<String>>,
 ) -> Result<(HashMap<String, Vec<String>>, PartitionMeta), AppError> {
     if object_versions.is_empty() {
@@ -1981,21 +2036,24 @@ fn restore_trash_entries_on_db(
         committed_generation: existing_meta.committed_generation.saturating_add(1),
         updated_at: Utc::now().timestamp(),
     };
-    let touched = apply_restore_trash_entries_exact(db, object_versions, &partition_meta, false)?;
+    let touched =
+        apply_restore_trash_entries_exact(db, fragment, object_versions, &partition_meta, false)?;
     Ok((touched, partition_meta))
 }
 
 fn apply_restore_trash_entries_replica_exact(
     db: &Database,
+    fragment: &str,
     object_versions: &HashMap<String, Vec<String>>,
     partition_meta: &PartitionMeta,
 ) -> Result<(), AppError> {
-    let _ = apply_restore_trash_entries_exact(db, object_versions, partition_meta, true)?;
+    let _ = apply_restore_trash_entries_exact(db, fragment, object_versions, partition_meta, true)?;
     Ok(())
 }
 
 fn delete_all_versions_for_key_on_db(
     db: &Database,
+    fragment: &str,
     object_key: &str,
 ) -> Result<Option<(Vec<String>, PartitionMeta)>, AppError> {
     let write_txn = db
@@ -2022,7 +2080,7 @@ fn delete_all_versions_for_key_on_db(
             .map_err(|e| map_indexdb_error("open trash_objects", e))?;
         let now = Utc::now().timestamp();
         let committed_generation = next_partition_generation(&mut partition_meta, now)?;
-        let prefix = version_row_prefix(object_key);
+        let prefix = version_row_prefix(fragment, object_key)?;
         let mut iter = versions
             .range(prefix.as_str()..)
             .map_err(|e| map_indexdb_error("version range", e))?;
@@ -2051,7 +2109,7 @@ fn delete_all_versions_for_key_on_db(
                 .remove(row_key.as_str())
                 .map_err(|e| map_indexdb_error("version_state remove", e))?;
         }
-        remove_head_with_namespace_exact(&mut heads, &mut live_namespace, object_key)?;
+        remove_head_with_namespace_exact(&mut heads, &mut live_namespace, fragment, object_key)?;
         let _ = trash_objects
             .remove(canonical_key(object_key).as_str())
             .map_err(|e| map_indexdb_error("trash_objects remove", e))?;
@@ -2073,6 +2131,7 @@ fn delete_all_versions_for_key_on_db(
 
 fn delete_versions_for_key_with_state_on_db(
     db: &Database,
+    fragment: &str,
     object_key: &str,
     target_state: ObjectState,
 ) -> Result<Option<(Vec<String>, PartitionMeta)>, AppError> {
@@ -2101,11 +2160,11 @@ fn delete_versions_for_key_with_state_on_db(
         let now = Utc::now().timestamp();
         let committed_generation = next_partition_generation(&mut partition_meta, now)?;
         let current_head = heads
-            .get(canonical_key(object_key).as_str())
+            .get(head_row_key(fragment, object_key)?.as_str())
             .map_err(|e| map_indexdb_error("head get", e))?
             .map(|value| deserialize::<HeadRecord>(value.value()))
             .transpose()?;
-        let prefix = version_row_prefix(object_key);
+        let prefix = version_row_prefix(fragment, object_key)?;
         let mut iter = versions
             .range(prefix.as_str()..)
             .map_err(|e| map_indexdb_error("version range", e))?;
@@ -2151,6 +2210,7 @@ fn delete_versions_for_key_with_state_on_db(
             &mut live_namespace,
             &versions,
             &states,
+            fragment,
             object_key,
             current_head.as_ref(),
             now,
@@ -2688,6 +2748,7 @@ fn apply_write_version_replica_exact(
 
 fn apply_change_version_state_replica_exact(
     db: &Database,
+    fragment: &str,
     object_key: &str,
     version_id: &str,
     target_state: ObjectState,
@@ -2714,9 +2775,9 @@ fn apply_change_version_state_replica_exact(
             .open_table(OBJECT_VERSION_STATES_TABLE)
             .map_err(|e| map_indexdb_error("open object_version_states", e))?;
         write_partition_meta_exact(&mut meta, partition_meta)?;
-        let row_key = version_row_key(object_key, version_id);
+        let row_key = version_row_key(fragment, object_key, version_id)?;
         let current_head = heads
-            .get(canonical_key(object_key).as_str())
+            .get(head_row_key(fragment, object_key)?.as_str())
             .map_err(|e| map_indexdb_error("head get", e))?
             .map(|value| deserialize::<HeadRecord>(value.value()))
             .transpose()?;
@@ -2799,6 +2860,7 @@ fn apply_change_version_state_replica_exact(
 
 fn apply_delete_version_replica_exact(
     db: &Database,
+    fragment: &str,
     object_key: &str,
     version_id: &str,
     expected_state: Option<ObjectState>,
@@ -2824,9 +2886,9 @@ fn apply_delete_version_replica_exact(
             .open_table(OBJECT_VERSION_STATES_TABLE)
             .map_err(|e| map_indexdb_error("open object_version_states", e))?;
         write_partition_meta_exact(&mut meta, partition_meta)?;
-        let row_key = version_row_key(object_key, version_id);
+        let row_key = version_row_key(fragment, object_key, version_id)?;
         let current_head = heads
-            .get(canonical_key(object_key).as_str())
+            .get(head_row_key(fragment, object_key)?.as_str())
             .map_err(|e| map_indexdb_error("head get", e))?
             .map(|value| deserialize::<HeadRecord>(value.value()))
             .transpose()?;
@@ -2867,6 +2929,7 @@ fn apply_delete_version_replica_exact(
             &mut live_namespace,
             &versions,
             &states,
+            fragment,
             object_key,
             current_head.as_ref(),
             partition_meta.updated_at,
@@ -2880,6 +2943,7 @@ fn apply_delete_version_replica_exact(
 
 fn apply_bulk_rewrite_keys_state_replica_exact(
     db: &Database,
+    fragment: &str,
     object_keys: &[String],
     from_state: ObjectState,
     to_state: ObjectState,
@@ -2899,11 +2963,11 @@ fn apply_bulk_rewrite_keys_state_replica_exact(
 
         for object_key in object_keys {
             let current_head = heads
-                .get(canonical_key(object_key).as_str())
+                .get(head_row_key(fragment, object_key)?.as_str())
                 .map_err(|e| map_indexdb_error("head get", e))?
                 .map(|value| deserialize::<HeadRecord>(value.value()))
                 .transpose()?;
-            let prefix = version_row_prefix(object_key);
+            let prefix = version_row_prefix(fragment, object_key)?;
             let mut iter = states
                 .range(prefix.as_str()..)
                 .map_err(|e| map_indexdb_error("version_state range", e))?;
@@ -2993,6 +3057,7 @@ fn apply_bulk_rewrite_keys_state_replica_exact(
 
 fn apply_delete_all_versions_for_key_replica_exact(
     db: &Database,
+    fragment: &str,
     object_key: &str,
     partition_meta: &PartitionMeta,
 ) -> Result<(), AppError> {
@@ -3016,7 +3081,7 @@ fn apply_delete_all_versions_for_key_replica_exact(
             .open_table(OBJECT_VERSION_STATES_TABLE)
             .map_err(|e| map_indexdb_error("open object_version_states", e))?;
         write_partition_meta_exact(&mut meta, partition_meta)?;
-        let prefix = version_row_prefix(object_key);
+        let prefix = version_row_prefix(fragment, object_key)?;
         let mut iter = versions
             .range(prefix.as_str()..)
             .map_err(|e| map_indexdb_error("version range", e))?;
@@ -3044,7 +3109,7 @@ fn apply_delete_all_versions_for_key_replica_exact(
                 .remove(row_key.as_str())
                 .map_err(|e| map_indexdb_error("version_state remove", e))?;
         }
-        remove_head_with_namespace_exact(&mut heads, &mut live_namespace, object_key)?;
+        remove_head_with_namespace_exact(&mut heads, &mut live_namespace, fragment, object_key)?;
     }
     write_txn
         .commit()
@@ -3054,6 +3119,7 @@ fn apply_delete_all_versions_for_key_replica_exact(
 
 fn apply_delete_versions_for_key_with_state_replica_exact(
     db: &Database,
+    fragment: &str,
     object_key: &str,
     target_state: ObjectState,
     partition_meta: &PartitionMeta,
@@ -3079,11 +3145,11 @@ fn apply_delete_versions_for_key_with_state_replica_exact(
             .map_err(|e| map_indexdb_error("open object_version_states", e))?;
         write_partition_meta_exact(&mut meta, partition_meta)?;
         let current_head = heads
-            .get(canonical_key(object_key).as_str())
+            .get(head_row_key(fragment, object_key)?.as_str())
             .map_err(|e| map_indexdb_error("head get", e))?
             .map(|value| deserialize::<HeadRecord>(value.value()))
             .transpose()?;
-        let prefix = version_row_prefix(object_key);
+        let prefix = version_row_prefix(fragment, object_key)?;
         let mut iter = versions
             .range(prefix.as_str()..)
             .map_err(|e| map_indexdb_error("version range", e))?;
@@ -3128,6 +3194,7 @@ fn apply_delete_versions_for_key_with_state_replica_exact(
             &mut live_namespace,
             &versions,
             &states,
+            fragment,
             object_key,
             current_head.as_ref(),
             partition_meta.updated_at,
@@ -3178,87 +3245,6 @@ fn decode_cursor(token: &str) -> Result<ListingCursor, AppError> {
         .map_err(|_| AppError::BadRequest("invalid listing continuation token".to_string()))
 }
 
-fn advance_partition(
-    partition: &mut PartitionRange,
-    prefix: Option<&str>,
-    prefix_children: Option<&str>,
-    include_internal: bool,
-    after_key: Option<&str>,
-) -> Result<(), AppError> {
-    partition.next = None;
-    while let Some(entry) = partition.iter.next() {
-        let (key, value) = entry.map_err(|e| map_indexdb_error("head range next", e))?;
-        let key = key.value();
-        if let Some(after) = after_key {
-            if key <= after {
-                continue;
-            }
-        }
-        if let Some(prefix) = prefix {
-            let matches_prefix = match prefix_children {
-                Some(children_prefix) => key == prefix || key.starts_with(children_prefix),
-                None => key.starts_with(prefix),
-            };
-            if !matches_prefix {
-                if !key.starts_with(prefix) && key > prefix {
-                    return Ok(());
-                }
-                continue;
-            }
-        }
-        if !include_internal && is_internal_object_key(key) {
-            continue;
-        }
-        let head: HeadRecord = deserialize(value.value())?;
-        partition.next = Some(ListingItem {
-            object_key: key.to_string(),
-            head,
-        });
-        return Ok(());
-    }
-    Ok(())
-}
-
-fn load_partition_ranges(
-    fragment: &str,
-    prefix: Option<&str>,
-    prefix_children: Option<&str>,
-    include_internal: bool,
-    after_key: Option<&str>,
-) -> Result<Vec<PartitionRange>, AppError> {
-    let start_hint = max_string(after_key, prefix);
-    let mut out = Vec::new();
-    for partition_id in 0..INDEX_PARTITION_COUNT {
-        let Some(db) = open_partition_db_for_read(fragment, partition_id)? else {
-            continue;
-        };
-        let read_txn = db
-            .begin_read()
-            .map_err(|e| map_indexdb_error("begin_read", e))?;
-        let table = match read_txn.open_table(OBJECT_HEADS_TABLE) {
-            Ok(table) => table,
-            Err(TableError::TableDoesNotExist(_)) => continue,
-            Err(err) => return Err(map_indexdb_error("open object_heads", err)),
-        };
-        let start = start_hint.as_deref().unwrap_or("");
-        let iter = table
-            .range(start..)
-            .map_err(|e| map_indexdb_error("head range", e))?;
-        let mut partition = PartitionRange { iter, next: None };
-        advance_partition(
-            &mut partition,
-            prefix,
-            prefix_children,
-            include_internal,
-            after_key,
-        )?;
-        if partition.next.is_some() {
-            out.push(partition);
-        }
-    }
-    Ok(out)
-}
-
 fn load_current_metadata_for_head(
     fragment: &str,
     head: &HeadRecord,
@@ -3270,7 +3256,7 @@ fn load_current_metadata_for_head(
     let Some(db) = open_route_db_for_read(fragment, &route)? else {
         return Ok(None);
     };
-    let Some(record) = read_version_exact(&db, &head.object_key, &head.version_id)? else {
+    let Some(record) = read_version_exact(&db, fragment, &head.object_key, &head.version_id)? else {
         return Ok(None);
     };
     Ok(Some(record.metadata))
@@ -3292,10 +3278,10 @@ fn collect_live_namespace_entries_on_db(
         .iter()
         .map_err(|e| map_indexdb_error("head iter", e))?;
     while let Some(entry) = iter.next() {
-        let (key, value) = entry.map_err(|e| map_indexdb_error("head iter next", e))?;
+        let (_key, value) = entry.map_err(|e| map_indexdb_error("head iter next", e))?;
         let head: HeadRecord = deserialize(value.value())?;
         if head.state == ObjectState::Live {
-            entries.insert(key.value().to_string(), head.to_summary_metadata());
+            entries.insert(canonical_key(&head.object_key), head.to_summary_metadata());
         }
     }
     Ok(entries)
@@ -3339,55 +3325,52 @@ fn rewrite_live_namespace_on_db(
     Ok(())
 }
 
-fn ensure_partition_live_namespace_table(
-    fragment: &str,
-    partition_id: u16,
-) -> Result<(), AppError> {
-    let route = route_for_partition(partition_id)?;
+fn live_namespace_needs_rebuild(db: &Database) -> Result<bool, AppError> {
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| map_indexdb_error("begin_read", e))?;
+    let has_live_heads = match read_txn.open_table(OBJECT_HEADS_TABLE) {
+        Ok(heads) => {
+            let mut iter = heads
+                .iter()
+                .map_err(|e| map_indexdb_error("head iter", e))?;
+            let mut found = false;
+            while let Some(entry) = iter.next() {
+                let (_key, value) = entry.map_err(|e| map_indexdb_error("head iter next", e))?;
+                let head: HeadRecord = deserialize(value.value())?;
+                if head.state == ObjectState::Live {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        }
+        Err(TableError::TableDoesNotExist(_)) => false,
+        Err(err) => return Err(map_indexdb_error("open object_heads", err)),
+    };
+    match read_txn.open_table(LIVE_NAMESPACE_TABLE) {
+        Ok(table) => {
+            let mut iter = table
+                .iter()
+                .map_err(|e| map_indexdb_error("live_namespace iter", e))?;
+            let namespace_empty = iter
+                .next()
+                .transpose()
+                .map_err(|e| map_indexdb_error("live_namespace iter next", e))?
+                .is_none();
+            Ok(namespace_empty && has_live_heads)
+        }
+        Err(TableError::TableDoesNotExist(_)) => Ok(has_live_heads),
+        Err(err) => Err(map_indexdb_error("open live_namespace", err)),
+    }
+}
+
+fn ensure_fragment_live_namespace_table(fragment: &str) -> Result<(), AppError> {
+    let route = fragment_route(fragment)?;
     let owner_path = owner_db_path(&route, fragment);
     if owner_path.exists() {
         let db = get_or_open_db(&owner_path)?;
-        let needs_rebuild = {
-            let read_txn = db
-                .begin_read()
-                .map_err(|e| map_indexdb_error("begin_read", e))?;
-            let has_live_heads = match read_txn.open_table(OBJECT_HEADS_TABLE) {
-                Ok(heads) => {
-                    let mut iter = heads
-                        .iter()
-                        .map_err(|e| map_indexdb_error("head iter", e))?;
-                    let mut found = false;
-                    while let Some(entry) = iter.next() {
-                        let (_key, value) =
-                            entry.map_err(|e| map_indexdb_error("head iter next", e))?;
-                        let head: HeadRecord = deserialize(value.value())?;
-                        if head.state == ObjectState::Live {
-                            found = true;
-                            break;
-                        }
-                    }
-                    found
-                }
-                Err(TableError::TableDoesNotExist(_)) => false,
-                Err(err) => return Err(map_indexdb_error("open object_heads", err)),
-            };
-            match read_txn.open_table(LIVE_NAMESPACE_TABLE) {
-                Ok(table) => {
-                    let mut iter = table
-                        .iter()
-                        .map_err(|e| map_indexdb_error("live_namespace iter", e))?;
-                    let namespace_empty = iter
-                        .next()
-                        .transpose()
-                        .map_err(|e| map_indexdb_error("live_namespace iter next", e))?
-                        .is_none();
-                    namespace_empty && has_live_heads
-                }
-                Err(TableError::TableDoesNotExist(_)) => has_live_heads,
-                Err(err) => return Err(map_indexdb_error("open live_namespace", err)),
-            }
-        };
-        if needs_rebuild {
+        if live_namespace_needs_rebuild(&db)? {
             let entries = collect_live_namespace_entries_on_db(&db)?;
             rewrite_live_namespace_on_db(&db, &entries)?;
             replicate_owner_partition_db(fragment, &route)?;
@@ -3396,52 +3379,12 @@ fn ensure_partition_live_namespace_table(
     }
 
     for root in route.roots.iter().skip(1) {
-        let path = db_path(root, fragment, partition_id);
+        let path = db_path(root, fragment, route.partition_id);
         if !path.exists() {
             continue;
         }
         let db = get_or_open_db(&path)?;
-        let needs_rebuild = {
-            let read_txn = db
-                .begin_read()
-                .map_err(|e| map_indexdb_error("begin_read", e))?;
-            let has_live_heads = match read_txn.open_table(OBJECT_HEADS_TABLE) {
-                Ok(heads) => {
-                    let mut iter = heads
-                        .iter()
-                        .map_err(|e| map_indexdb_error("head iter", e))?;
-                    let mut found = false;
-                    while let Some(entry) = iter.next() {
-                        let (_key, value) =
-                            entry.map_err(|e| map_indexdb_error("head iter next", e))?;
-                        let head: HeadRecord = deserialize(value.value())?;
-                        if head.state == ObjectState::Live {
-                            found = true;
-                            break;
-                        }
-                    }
-                    found
-                }
-                Err(TableError::TableDoesNotExist(_)) => false,
-                Err(err) => return Err(map_indexdb_error("open object_heads", err)),
-            };
-            match read_txn.open_table(LIVE_NAMESPACE_TABLE) {
-                Ok(table) => {
-                    let mut iter = table
-                        .iter()
-                        .map_err(|e| map_indexdb_error("live_namespace iter", e))?;
-                    let namespace_empty = iter
-                        .next()
-                        .transpose()
-                        .map_err(|e| map_indexdb_error("live_namespace iter next", e))?
-                        .is_none();
-                    namespace_empty && has_live_heads
-                }
-                Err(TableError::TableDoesNotExist(_)) => has_live_heads,
-                Err(err) => return Err(map_indexdb_error("open live_namespace", err)),
-            }
-        };
-        if needs_rebuild {
+        if live_namespace_needs_rebuild(&db)? {
             let entries = collect_live_namespace_entries_on_db(&db)?;
             rewrite_live_namespace_on_db(&db, &entries)?;
         }
@@ -3499,37 +3442,39 @@ fn load_live_namespace_partition_ranges(
     after_key: Option<&str>,
 ) -> Result<Vec<NamespacePartitionRange>, AppError> {
     let start_hint = max_string(after_key, prefix);
-    let mut out = Vec::new();
-    for partition_id in 0..INDEX_PARTITION_COUNT {
-        ensure_partition_live_namespace_table(fragment, partition_id)?;
-        let Some(db) = open_partition_db_for_read(fragment, partition_id)? else {
-            continue;
-        };
-        let read_txn = db
-            .begin_read()
-            .map_err(|e| map_indexdb_error("begin_read", e))?;
-        let table = match read_txn.open_table(LIVE_NAMESPACE_TABLE) {
-            Ok(table) => table,
-            Err(TableError::TableDoesNotExist(_)) => continue,
-            Err(err) => return Err(map_indexdb_error("open live_namespace", err)),
-        };
-        let start = start_hint.as_deref().unwrap_or("");
-        let iter = table
-            .range(start..)
-            .map_err(|e| map_indexdb_error("live_namespace range", e))?;
-        let mut partition = NamespacePartitionRange { iter, next: None };
-        advance_namespace_partition(
-            &mut partition,
-            prefix,
-            prefix_children,
-            include_internal,
-            after_key,
-        )?;
-        if partition.next.is_some() {
-            out.push(partition);
-        }
+    ensure_fragment_live_namespace_table(fragment)?;
+    let Some(db) = open_fragment_db_for_read(fragment)? else {
+        return Ok(Vec::new());
+    };
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| map_indexdb_error("begin_read", e))?;
+    let table = match read_txn.open_table(LIVE_NAMESPACE_TABLE) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(err) => return Err(map_indexdb_error("open live_namespace", err)),
+    };
+    let start = start_hint.as_deref().unwrap_or("");
+    let iter = table
+        .range(start..)
+        .map_err(|e| map_indexdb_error("live_namespace range", e))?;
+    let mut partition = NamespacePartitionRange {
+        _db: db,
+        iter,
+        next: None,
+    };
+    advance_namespace_partition(
+        &mut partition,
+        prefix,
+        prefix_children,
+        include_internal,
+        after_key,
+    )?;
+    if partition.next.is_some() {
+        Ok(vec![partition])
+    } else {
+        Ok(Vec::new())
     }
-    Ok(out)
 }
 
 fn scan_live_namespace_page(
@@ -3720,208 +3665,6 @@ fn scan_live_namespace_page(
     })
 }
 
-fn scan_heads_page(
-    fragment: &str,
-    state: ObjectState,
-    prefix: Option<String>,
-    delimiter: Option<String>,
-    limit: usize,
-    continuation_token: Option<String>,
-    include_internal: bool,
-    hydrate_full_metadata: bool,
-) -> Result<ListObjectsResult, AppError> {
-    let delimiter = delimiter
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    if delimiter.as_deref() != Some("/") && delimiter.is_some() {
-        return Err(AppError::BadRequest(
-            "only '/' delimiter is supported".to_string(),
-        ));
-    }
-
-    let normalized_prefix = normalize_prefix(prefix, delimiter.as_deref());
-    let prefix_children =
-        prefix_children_prefix(normalized_prefix.as_deref(), delimiter.as_deref());
-    let cursor = continuation_token
-        .map(|token| decode_cursor(&token))
-        .transpose()?;
-    if let Some(cursor) = &cursor {
-        if cursor.state != state
-            || cursor.prefix != normalized_prefix
-            || cursor.delimiter != delimiter
-            || cursor.include_internal != include_internal
-        {
-            return Err(AppError::BadRequest(
-                "listing continuation token does not match the current query".to_string(),
-            ));
-        }
-    }
-
-    let limit = limit.clamp(1, 1000);
-    let after_key = cursor.as_ref().and_then(|value| value.last_key.as_deref());
-    let mut skip_prefix = cursor
-        .as_ref()
-        .and_then(|value| value.resume_skip_prefix.clone());
-    let mut partitions = load_partition_ranges(
-        fragment,
-        normalized_prefix.as_deref(),
-        prefix_children.as_deref(),
-        include_internal,
-        after_key,
-    )?;
-
-    let mut objects = Vec::with_capacity(limit);
-    let mut common_prefixes = Vec::new();
-    let mut last_emitted_common_prefix: Option<String> = None;
-    let mut last_key_for_cursor: Option<String> = None;
-    let mut resume_skip_prefix: Option<String> = None;
-    let mut page_full = false;
-
-    loop {
-        let Some((idx, current_key)) = partitions
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, partition)| {
-                partition
-                    .next
-                    .as_ref()
-                    .map(|item| (idx, item.object_key.clone()))
-            })
-            .min_by(|left, right| left.1.cmp(&right.1))
-        else {
-            break;
-        };
-
-        let item = partitions[idx]
-            .next
-            .take()
-            .ok_or_else(|| AppError::InternalServerError("listing cursor desync".to_string()))?;
-        last_key_for_cursor = Some(current_key.clone());
-
-        if item.head.state != state {
-            advance_partition(
-                &mut partitions[idx],
-                normalized_prefix.as_deref(),
-                prefix_children.as_deref(),
-                include_internal,
-                after_key,
-            )?;
-            continue;
-        }
-
-        if let Some(prefix) = skip_prefix.clone() {
-            if item.object_key.starts_with(&prefix) {
-                advance_partition(
-                    &mut partitions[idx],
-                    normalized_prefix.as_deref(),
-                    prefix_children.as_deref(),
-                    include_internal,
-                    after_key,
-                )?;
-                continue;
-            }
-            skip_prefix = None;
-        }
-
-        if delimiter.as_deref() == Some("/") {
-            let suffix = if let Some(prefix) = normalized_prefix.as_deref() {
-                if item.object_key == prefix {
-                    ""
-                } else if let Some(children_prefix) = prefix_children.as_deref() {
-                    item.object_key
-                        .strip_prefix(children_prefix)
-                        .unwrap_or_default()
-                } else {
-                    item.object_key.strip_prefix(prefix).unwrap_or_default()
-                }
-            } else {
-                item.object_key.as_str()
-            };
-            if !suffix.is_empty() {
-                if let Some(pos) = suffix.find('/') {
-                    let common_prefix = format!(
-                        "{}{}",
-                        prefix_children
-                            .as_deref()
-                            .or(normalized_prefix.as_deref())
-                            .unwrap_or(""),
-                        &suffix[..pos + 1]
-                    );
-                    if last_emitted_common_prefix.as_deref() != Some(common_prefix.as_str()) {
-                        common_prefixes.push(common_prefix.clone());
-                        last_emitted_common_prefix = Some(common_prefix.clone());
-                        skip_prefix = Some(common_prefix.clone());
-                        if objects.len() + common_prefixes.len() >= limit {
-                            resume_skip_prefix = Some(common_prefix);
-                            page_full = true;
-                            break;
-                        }
-                    }
-                    advance_partition(
-                        &mut partitions[idx],
-                        normalized_prefix.as_deref(),
-                        prefix_children.as_deref(),
-                        include_internal,
-                        after_key,
-                    )?;
-                    continue;
-                }
-            }
-        }
-
-        let metadata = if hydrate_full_metadata {
-            match load_current_metadata_for_head(fragment, &item.head)? {
-                Some(metadata) => metadata,
-                None => {
-                    advance_partition(
-                        &mut partitions[idx],
-                        normalized_prefix.as_deref(),
-                        prefix_children.as_deref(),
-                        include_internal,
-                        after_key,
-                    )?;
-                    continue;
-                }
-            }
-        } else {
-            item.head.to_summary_metadata()
-        };
-        objects.push(metadata);
-        if objects.len() + common_prefixes.len() >= limit {
-            page_full = true;
-            break;
-        }
-
-        advance_partition(
-            &mut partitions[idx],
-            normalized_prefix.as_deref(),
-            prefix_children.as_deref(),
-            include_internal,
-            after_key,
-        )?;
-    }
-
-    let continuation_token =
-        if page_full || partitions.iter().any(|partition| partition.next.is_some()) {
-            Some(encode_cursor(&ListingCursor {
-                state,
-                prefix: normalized_prefix,
-                delimiter,
-                include_internal,
-                last_key: last_key_for_cursor,
-                resume_skip_prefix,
-            })?)
-        } else {
-            None
-        };
-
-    Ok(ListObjectsResult {
-        objects,
-        common_prefixes,
-        continuation_token,
-    })
-}
-
 pub fn open_session(
     manifest: &UploadSessionManifest,
     reservation: Option<ReservationReceipt>,
@@ -4097,27 +3840,25 @@ pub fn remove_session(fragment: &str, version_id: &str) -> Result<bool, AppError
 
 pub fn list_active_sessions(fragment: &str) -> Result<Vec<IndexSessionState>, AppError> {
     let mut out = Vec::new();
-    for partition_id in 0..INDEX_PARTITION_COUNT {
-        let Some(db) = open_partition_db_for_read(fragment, partition_id)? else {
-            continue;
-        };
-        let read_txn = db
-            .begin_read()
-            .map_err(|e| map_indexdb_error("begin_read", e))?;
-        let table = match read_txn.open_table(SESSIONS_TABLE) {
-            Ok(table) => table,
-            Err(TableError::TableDoesNotExist(_)) => continue,
-            Err(err) => return Err(map_indexdb_error("open sessions", err)),
-        };
-        let mut iter = table
-            .iter()
-            .map_err(|e| map_indexdb_error("session iter", e))?;
-        while let Some(entry) = iter.next() {
-            let (_key, value) = entry.map_err(|e| map_indexdb_error("session iter next", e))?;
-            let row: SessionRow = deserialize(value.value())?;
-            if row.finalized_at.is_none() && row.aborted_at.is_none() {
-                out.push(row.into_state());
-            }
+    let Some(db) = open_fragment_db_for_read(fragment)? else {
+        return Ok(out);
+    };
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| map_indexdb_error("begin_read", e))?;
+    let table = match read_txn.open_table(SESSIONS_TABLE) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return Ok(out),
+        Err(err) => return Err(map_indexdb_error("open sessions", err)),
+    };
+    let mut iter = table
+        .iter()
+        .map_err(|e| map_indexdb_error("session iter", e))?;
+    while let Some(entry) = iter.next() {
+        let (_key, value) = entry.map_err(|e| map_indexdb_error("session iter next", e))?;
+        let row: SessionRow = deserialize(value.value())?;
+        if row.finalized_at.is_none() && row.aborted_at.is_none() {
+            out.push(row.into_state());
         }
     }
     out.sort_by(|left, right| {
@@ -4156,25 +3897,25 @@ pub fn read_live_version(
     let Some(db) = open_route_db_for_read(fragment, &route)? else {
         return Ok(None);
     };
-    let Some(record) = read_version_exact(&db, object_key, version_id)? else {
+    let Some(record) = read_version_exact(&db, fragment, object_key, version_id)? else {
         return Ok(None);
     };
-    let Some(state) = read_version_state_exact(&db, object_key, version_id)? else {
+    let Some(state) = read_version_state_exact(&db, fragment, object_key, version_id)? else {
         return Ok(None);
     };
     if state.state != ObjectState::Live {
         return Ok(None);
     }
-    let head = read_head_exact(&db, object_key)?;
+    let head = read_head_exact(&db, fragment, object_key)?;
     if version_is_suppressed_by_tombstone(head.as_ref(), &record.metadata) {
         return Ok(None);
     }
     Ok(Some(record.metadata))
 }
 
-fn load_partition_trash_catalog_entries_on_db(
+fn load_trash_catalog_entries_on_db(
     db: &Database,
-    partition_id: u16,
+    fragment: &str,
 ) -> Result<Vec<(String, TrashCatalogRecord)>, AppError> {
     let read_txn = db
         .begin_read()
@@ -4200,7 +3941,7 @@ fn load_partition_trash_catalog_entries_on_db(
         let mut latest_metadata: Option<ObjectMetadata> = None;
         let mut version_ids = Vec::new();
         for version_id in &record.version_ids {
-            let row_key = version_row_key(&object_key, version_id);
+            let row_key = version_row_key(fragment, &object_key, version_id)?;
             let Some(version_value) = versions
                 .get(row_key.as_str())
                 .map_err(|e| map_indexdb_error("version get", e))?
@@ -4217,6 +3958,7 @@ fn load_partition_trash_catalog_entries_on_db(
         if let Some(latest_metadata) = latest_metadata {
             version_ids.sort_by(|left, right| compare_version_id_recency(left, right));
             version_ids.dedup();
+            let partition_id = object_partition_id(fragment, &object_key)?;
             out.push((
                 object_key,
                 TrashCatalogRecord {
@@ -4234,17 +3976,10 @@ fn load_partition_trash_catalog_entries_on_db(
 fn load_all_trash_catalog_entries(
     fragment: &str,
 ) -> Result<Vec<(String, TrashCatalogRecord)>, AppError> {
-    let mut out = Vec::new();
-    for partition_id in 0..INDEX_PARTITION_COUNT {
-        let Some(db) = open_partition_db_for_read(fragment, partition_id)? else {
-            continue;
-        };
-        out.extend(load_partition_trash_catalog_entries_on_db(
-            &db,
-            partition_id,
-        )?);
-    }
-    Ok(out)
+    let Some(db) = open_fragment_db_for_read(fragment)? else {
+        return Ok(Vec::new());
+    };
+    load_trash_catalog_entries_on_db(&db, fragment)
 }
 
 fn scan_trash_catalog_page(
@@ -4394,10 +4129,10 @@ pub fn read_trash_version(
     let Some(db) = open_route_db_for_read(fragment, &route)? else {
         return Ok(None);
     };
-    let Some(record) = read_version_exact(&db, object_key, version_id)? else {
+    let Some(record) = read_version_exact(&db, fragment, object_key, version_id)? else {
         return Ok(None);
     };
-    let Some(state) = read_version_state_exact(&db, object_key, version_id)? else {
+    let Some(state) = read_version_state_exact(&db, fragment, object_key, version_id)? else {
         return Ok(None);
     };
     if state.state != ObjectState::Trash {
@@ -4414,7 +4149,7 @@ pub fn list_live_versions(
     let Some(db) = open_route_db_for_read(fragment, &route)? else {
         return Ok(Vec::new());
     };
-    list_versions_exact(&db, object_key, ObjectState::Live)
+    list_versions_exact(&db, fragment, object_key, ObjectState::Live)
 }
 
 pub fn list_trash_versions(
@@ -4425,7 +4160,7 @@ pub fn list_trash_versions(
     let Some(db) = open_route_db_for_read(fragment, &route)? else {
         return Ok(Vec::new());
     };
-    list_versions_exact(&db, object_key, ObjectState::Trash)
+    list_versions_exact(&db, fragment, object_key, ObjectState::Trash)
 }
 
 pub fn read_current_live_head(
@@ -4436,7 +4171,7 @@ pub fn read_current_live_head(
     let Some(db) = open_route_db_for_read(fragment, &route)? else {
         return Ok(None);
     };
-    let Some(head) = read_head_exact(&db, object_key)? else {
+    let Some(head) = read_head_exact(&db, fragment, object_key)? else {
         return Ok(None);
     };
     if head.state != ObjectState::Live {
@@ -4462,33 +4197,16 @@ pub fn scan_live_heads_page(
     continuation_token: Option<String>,
     include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
-    match scan_live_namespace_page(
+    ensure_fragment_live_namespace_table(fragment)?;
+    scan_live_namespace_page(
         fragment,
-        prefix.clone(),
-        delimiter.clone(),
+        prefix,
+        delimiter,
         limit,
-        continuation_token.clone(),
+        continuation_token,
         include_internal,
         false,
-    ) {
-        Ok(page) => Ok(page),
-        Err(err) => {
-            warn!(
-                "live namespace listing fallback for fragment {}: {}",
-                fragment, err
-            );
-            scan_heads_page(
-                fragment,
-                ObjectState::Live,
-                prefix,
-                delimiter,
-                limit,
-                continuation_token,
-                include_internal,
-                false,
-            )
-        }
-    }
+    )
 }
 
 pub fn scan_trash_heads_page(
@@ -4518,33 +4236,16 @@ pub fn scan_live_full_metadata_page(
     continuation_token: Option<String>,
     include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
-    match scan_live_namespace_page(
+    ensure_fragment_live_namespace_table(fragment)?;
+    scan_live_namespace_page(
         fragment,
-        prefix.clone(),
-        delimiter.clone(),
+        prefix,
+        delimiter,
         limit,
-        continuation_token.clone(),
+        continuation_token,
         include_internal,
         true,
-    ) {
-        Ok(page) => Ok(page),
-        Err(err) => {
-            warn!(
-                "live namespace full-metadata fallback for fragment {}: {}",
-                fragment, err
-            );
-            scan_heads_page(
-                fragment,
-                ObjectState::Live,
-                prefix,
-                delimiter,
-                limit,
-                continuation_token,
-                include_internal,
-                true,
-            )
-        }
-    }
+    )
 }
 
 pub fn scan_trash_full_metadata_page(
@@ -4645,7 +4346,10 @@ struct PartitionTrashClearPlan {
     touched_keys: BTreeSet<String>,
 }
 
-fn plan_partition_trash_clear(db: &Database) -> Result<PartitionTrashClearPlan, AppError> {
+fn plan_partition_trash_clear(
+    db: &Database,
+    fragment: &str,
+) -> Result<PartitionTrashClearPlan, AppError> {
     let read_txn = db
         .begin_read()
         .map_err(|e| map_indexdb_error("begin_read", e))?;
@@ -4683,7 +4387,7 @@ fn plan_partition_trash_clear(db: &Database) -> Result<PartitionTrashClearPlan, 
             continue;
         }
         for version_id in &record.version_ids {
-            let row_key = version_row_key(&object_key, version_id);
+            let row_key = version_row_key(fragment, &object_key, version_id)?;
             let Some(_version_value) = versions
                 .get(row_key.as_str())
                 .map_err(|e| map_indexdb_error("version get", e))?
@@ -4703,6 +4407,7 @@ fn plan_partition_trash_clear(db: &Database) -> Result<PartitionTrashClearPlan, 
 
 fn apply_partition_trash_clear_plan(
     db: &Database,
+    fragment: &str,
     plan: &PartitionTrashClearPlan,
     partition_meta: &PartitionMeta,
 ) -> Result<usize, AppError> {
@@ -4748,11 +4453,11 @@ fn apply_partition_trash_clear_plan(
                 .remove(canonical_key(object_key).as_str())
                 .map_err(|e| map_indexdb_error("trash_objects remove", e))?;
             let current_head = heads
-                .get(canonical_key(&object_key).as_str())
+                .get(head_row_key(fragment, object_key)?.as_str())
                 .map_err(|e| map_indexdb_error("head get", e))?
                 .map(|value| deserialize::<HeadRecord>(value.value()))
                 .transpose()?;
-            let prefix = version_row_prefix(&object_key);
+            let prefix = version_row_prefix(fragment, object_key)?;
             let mut remaining_iter = states
                 .range(prefix.as_str()..)
                 .map_err(|e| map_indexdb_error("version_state range", e))?;
@@ -4791,7 +4496,12 @@ fn apply_partition_trash_clear_plan(
                 );
                 write_head_with_namespace_exact(&mut heads, &mut live_namespace, &next_head)?;
             } else {
-                remove_head_with_namespace_exact(&mut heads, &mut live_namespace, object_key)?;
+                remove_head_with_namespace_exact(
+                    &mut heads,
+                    &mut live_namespace,
+                    fragment,
+                    object_key,
+                )?;
             }
         }
 
@@ -4803,8 +4513,11 @@ fn apply_partition_trash_clear_plan(
     Ok(removed)
 }
 
-fn clear_partition_trash_on_db(db: &Database) -> Result<(usize, PartitionMeta), AppError> {
-    let plan = plan_partition_trash_clear(db)?;
+fn clear_partition_trash_on_db(
+    db: &Database,
+    fragment: &str,
+) -> Result<(usize, PartitionMeta), AppError> {
+    let plan = plan_partition_trash_clear(db, fragment)?;
     if plan.row_keys_to_delete.is_empty() {
         return Ok((
             0,
@@ -4821,16 +4534,17 @@ fn clear_partition_trash_on_db(db: &Database) -> Result<(usize, PartitionMeta), 
         updated_at: Utc::now().timestamp(),
     };
 
-    let removed = apply_partition_trash_clear_plan(db, &plan, &partition_meta)?;
+    let removed = apply_partition_trash_clear_plan(db, fragment, &plan, &partition_meta)?;
     Ok((removed, partition_meta))
 }
 
 fn apply_clear_partition_trash_replica_exact(
     db: &Database,
+    fragment: &str,
     partition_meta: &PartitionMeta,
 ) -> Result<(), AppError> {
-    let plan = plan_partition_trash_clear(db)?;
-    let _ = apply_partition_trash_clear_plan(db, &plan, partition_meta)?;
+    let plan = plan_partition_trash_clear(db, fragment)?;
+    let _ = apply_partition_trash_clear_plan(db, fragment, &plan, partition_meta)?;
     Ok(())
 }
 
@@ -4848,6 +4562,7 @@ pub fn move_object_version_to_trash_with_metadata(
         let owner_db = get_or_open_db(&owner_path)?;
         let changed = change_version_state_on_db(
             &owner_db,
+            fragment,
             object_key,
             version_id,
             ObjectState::Trash,
@@ -4863,6 +4578,7 @@ pub fn move_object_version_to_trash_with_metadata(
             |replica_db| {
                 apply_change_version_state_replica_exact(
                     replica_db,
+                    fragment,
                     object_key,
                     version_id,
                     ObjectState::Trash,
@@ -4890,6 +4606,7 @@ pub fn restore_object_version_from_trash_with_metadata(
         let owner_db = get_or_open_db(&owner_path)?;
         let changed = change_version_state_on_db(
             &owner_db,
+            fragment,
             object_key,
             version_id,
             ObjectState::Live,
@@ -4905,6 +4622,7 @@ pub fn restore_object_version_from_trash_with_metadata(
             |replica_db| {
                 apply_change_version_state_replica_exact(
                     replica_db,
+                    fragment,
                     object_key,
                     version_id,
                     ObjectState::Live,
@@ -4950,7 +4668,7 @@ pub fn move_objects_to_trash_batch(
                 let partition_id = *partition_id;
                 handles.push(scope.spawn(
                     move || -> Result<HashMap<String, Vec<String>>, AppError> {
-                        let route = route_for_partition(partition_id)?;
+                        let route = route_for_partition(&fragment, partition_id)?;
                         let owner_path = owner_db_path(&route, &fragment);
                         if !owner_path.exists() {
                             return Ok(HashMap::new());
@@ -4959,6 +4677,7 @@ pub fn move_objects_to_trash_batch(
                             let owner_db = get_or_open_db(&owner_path)?;
                             let (changed, partition_meta) = bulk_rewrite_keys_state_on_db(
                                 &owner_db,
+                                &fragment,
                                 &keys,
                                 ObjectState::Live,
                                 ObjectState::Trash,
@@ -4971,6 +4690,7 @@ pub fn move_objects_to_trash_batch(
                                     |replica_db| {
                                         apply_bulk_rewrite_keys_state_replica_exact(
                                             replica_db,
+                                            &fragment,
                                             &keys,
                                             ObjectState::Live,
                                             ObjectState::Trash,
@@ -5060,12 +4780,12 @@ pub fn restore_objects_from_trash_manifest_batch(
                 let partition_id = *partition_id;
                 handles.push(scope.spawn(
                     move || -> Result<HashMap<String, Vec<String>>, AppError> {
-                        let route = route_for_partition(partition_id)?;
+                        let route = route_for_partition(&fragment, partition_id)?;
                         let owner_path = owner_db_path(&route, &fragment);
                         with_partition_commit_lock(&owner_path, || {
                             let owner_db = get_or_open_db(&owner_path)?;
                             let (changed, partition_meta) =
-                                restore_trash_entries_on_db(&owner_db, &entries)?;
+                                restore_trash_entries_on_db(&owner_db, &fragment, &entries)?;
                             if !changed.is_empty() {
                                 replicate_object_mutation(
                                     &fragment,
@@ -5074,6 +4794,7 @@ pub fn restore_objects_from_trash_manifest_batch(
                                     |replica_db| {
                                         apply_restore_trash_entries_replica_exact(
                                             replica_db,
+                                            &fragment,
                                             &entries,
                                             &partition_meta,
                                         )
@@ -5118,7 +4839,12 @@ pub fn delete_all_trash_versions_for_key(
         }
         let owner_db = get_or_open_db(&owner_path)?;
         let deleted =
-            delete_versions_for_key_with_state_on_db(&owner_db, object_key, ObjectState::Trash)?;
+            delete_versions_for_key_with_state_on_db(
+                &owner_db,
+                fragment,
+                object_key,
+                ObjectState::Trash,
+            )?;
         if let Some((version_ids, partition_meta)) = deleted {
             replicate_object_mutation(
                 fragment,
@@ -5127,6 +4853,7 @@ pub fn delete_all_trash_versions_for_key(
                 |replica_db| {
                     apply_delete_versions_for_key_with_state_replica_exact(
                         replica_db,
+                        fragment,
                         object_key,
                         ObjectState::Trash,
                         &partition_meta,
@@ -5151,11 +4878,12 @@ pub fn delete_object_fast(
             return Ok(None);
         }
         let owner_db = get_or_open_db(&owner_path)?;
-        let deleted = delete_all_versions_for_key_on_db(&owner_db, object_key)?;
+        let deleted = delete_all_versions_for_key_on_db(&owner_db, fragment, object_key)?;
         if let Some((version_ids, partition_meta)) = deleted {
             replicate_object_mutation(fragment, &route, "delete object", |replica_db| {
                 apply_delete_all_versions_for_key_replica_exact(
                     replica_db,
+                    fragment,
                     object_key,
                     &partition_meta,
                 )
@@ -5181,12 +4909,19 @@ pub fn delete_live_version(
         }
         let owner_db = get_or_open_db(&owner_path)?;
         let deleted =
-            delete_version_on_db(&owner_db, object_key, version_id, Some(ObjectState::Live))?
+            delete_version_on_db(
+                &owner_db,
+                fragment,
+                object_key,
+                version_id,
+                Some(ObjectState::Live),
+            )?
                 .map(|(_metadata, partition_meta)| partition_meta);
         if let Some(partition_meta) = deleted {
             replicate_object_mutation(fragment, &route, "delete live version", |replica_db| {
                 apply_delete_version_replica_exact(
                     replica_db,
+                    fragment,
                     object_key,
                     version_id,
                     Some(ObjectState::Live),
@@ -5214,12 +4949,19 @@ pub fn delete_trash_version(
         }
         let owner_db = get_or_open_db(&owner_path)?;
         let deleted =
-            delete_version_on_db(&owner_db, object_key, version_id, Some(ObjectState::Trash))?
+            delete_version_on_db(
+                &owner_db,
+                fragment,
+                object_key,
+                version_id,
+                Some(ObjectState::Trash),
+            )?
                 .map(|(_metadata, partition_meta)| partition_meta);
         if let Some(partition_meta) = deleted {
             replicate_object_mutation(fragment, &route, "delete trash version", |replica_db| {
                 apply_delete_version_replica_exact(
                     replica_db,
+                    fragment,
                     object_key,
                     version_id,
                     Some(ObjectState::Trash),
@@ -5251,31 +4993,21 @@ pub fn clear_fragment_trash_for_partitions(
     if touched_partitions.is_empty() {
         return Ok(0);
     }
-    let mut total = 0usize;
-    for partition_id in touched_partitions {
-        let route = route_for_partition(*partition_id)?;
-        let owner_path = owner_db_path(&route, fragment);
-        let removed = with_partition_commit_lock(&owner_path, || {
-            if !owner_path.exists() {
-                return Ok(0usize);
-            }
-            let owner_db = get_or_open_db(&owner_path)?;
-            let (removed, partition_meta) = clear_partition_trash_on_db(&owner_db)?;
-            if removed > 0 {
-                replicate_object_mutation(
-                    fragment,
-                    &route,
-                    "clear partition trash",
-                    |replica_db| {
-                        apply_clear_partition_trash_replica_exact(replica_db, &partition_meta)
-                    },
-                )?;
-            }
-            Ok(removed)
-        })?;
-        total = total.saturating_add(removed);
-    }
-    Ok(total)
+    let route = fragment_route(fragment)?;
+    let owner_path = owner_db_path(&route, fragment);
+    with_partition_commit_lock(&owner_path, || {
+        if !owner_path.exists() {
+            return Ok(0usize);
+        }
+        let owner_db = get_or_open_db(&owner_path)?;
+        let (removed, partition_meta) = clear_partition_trash_on_db(&owner_db, fragment)?;
+        if removed > 0 {
+            replicate_object_mutation(fragment, &route, "clear fragment trash", |replica_db| {
+                apply_clear_partition_trash_replica_exact(replica_db, fragment, &partition_meta)
+            })?;
+        }
+        Ok(removed)
+    })
 }
 
 pub fn clear_fragment_trash_partition(

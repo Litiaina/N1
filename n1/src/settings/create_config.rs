@@ -16,6 +16,9 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("blob_store_disks", "")
         .set("fs_storage_path", "");
 
+    conf.with_section(Some("index_config"))
+        .set("partition_count", "64");
+
     conf.with_section(Some("garbage_collector"))
         .set("cleanup_interval_seconds", "3600")
         .set("file_ttl_seconds", "3600")

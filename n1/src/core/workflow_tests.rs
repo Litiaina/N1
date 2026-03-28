@@ -8,9 +8,12 @@ use super::delete::{
 };
 use super::disk_manager::{
     DownloadArchiveManifestQuery, DownloadArchiveRequest, InitiateUploadParams, ListObjectsResult,
-    ObjectKeyQuery, ObjectPathManager, RenameObjectRequest, UploadPartQuery,
+    ObjectKeyQuery, ObjectMetadata, ObjectPathManager, RenameObjectRequest, UploadPartQuery,
 };
-use super::fragment_metadata::init_fragment_metadata;
+use super::fragment_metadata::{
+    DEFAULT_INDEX_PARTITION_COUNT, clear_fragment_partition_count_cache_for_test,
+    fragment_index_partition_count, init_fragment_metadata, set_configured_index_partition_count,
+};
 use super::garbage_collector::{get_gc_status_api, run_garbage_collector};
 use super::index;
 use super::indexdb_store;
@@ -58,6 +61,7 @@ use axum::body::{Body, to_bytes};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::response::IntoResponse;
+use chrono::Utc;
 use futures_util::{StreamExt, stream};
 use image::{ColorType, ImageBuffer, ImageEncoder, Rgba, codecs::png::PngEncoder};
 use indexdb::{Database, ReadableDatabase, TableDefinition};
@@ -100,6 +104,9 @@ fn full_claims(fragment: &str) -> Claims {
 async fn ensure_global_storage_config(base: &std::path::Path) {
     ensure_test_config_file();
 
+    set_configured_index_partition_count(DEFAULT_INDEX_PARTITION_COUNT)
+        .expect("reset configured index partition count");
+    clear_fragment_partition_count_cache_for_test();
     indexdb_store::clear_cached_dbs_for_test();
     let _ = fs::remove_dir_all(base).await;
     let _ = fs::create_dir_all(base).await;
@@ -881,12 +888,19 @@ async fn read_object_bytes_eventually_labeled(
     }
 
     let metadata_after = get_metadata(&fragment, &object_key, &fragment).await;
-    let live_versions_after = index::list_live_object_versions_metadata(&fragment, &object_key).await;
+    let live_versions_after =
+        index::list_live_object_versions_metadata(&fragment, &object_key).await;
     let trash_versions_after =
         index::list_trashed_object_versions_metadata(&fragment, &object_key).await;
     panic!(
         "{}: object {} in fragment {} was not readable after {} attempts; metadata={:?}; live_versions={:?}; trash_versions={:?}",
-        label, object_key, fragment, attempts, metadata_after, live_versions_after, trash_versions_after
+        label,
+        object_key,
+        fragment,
+        attempts,
+        metadata_after,
+        live_versions_after,
+        trash_versions_after
     );
 }
 
@@ -928,7 +942,7 @@ async fn collect_fragment_indexdb_files(fragment: &str) -> Vec<String> {
 
 fn object_partition_db_paths_owner_first(
     fragment: &str,
-    object_key: &str,
+    _object_key: &str,
 ) -> Vec<std::path::PathBuf> {
     let path_manager = ObjectPathManager::new();
     let roots = path_manager.get_all_index_roots();
@@ -936,53 +950,44 @@ fn object_partition_db_paths_owner_first(
         return Vec::new();
     }
 
-    let canonical = ObjectPathManager::canonical_object_key(object_key);
     let mut hasher = Sha256::new();
-    for part in ["object", fragment, canonical.as_str()] {
+    for part in ["fragment", fragment] {
         hasher.update(part.as_bytes());
         hasher.update([0u8]);
     }
     let route_hash: [u8; 32] = hasher.finalize().into();
-    let partition_id = (u16::from(route_hash[0]) << 8 | u16::from(route_hash[1])) % 256;
-
-    let owner_idx = usize::from(partition_id) % roots.len();
+    let owner_idx = usize::from(u16::from(route_hash[0]) << 8 | u16::from(route_hash[1]))
+        % roots.len();
     let mut selected = vec![roots[owner_idx].clone()];
-    if roots.len() > 1 {
-        let replica_offset = 1 + ((usize::from(partition_id >> 8)) % (roots.len() - 1));
-        let replica_idx = (owner_idx + replica_offset) % roots.len();
-        if replica_idx != owner_idx {
-            selected.push(roots[replica_idx].clone());
+    for (idx, root) in roots.into_iter().enumerate() {
+        if idx != owner_idx {
+            selected.push(root);
         }
     }
 
     selected
         .into_iter()
-        .map(|root| {
-            root.join(fragment)
-                .join("indexdb")
-                .join("partitions")
-                .join(format!("{:04x}.ndxdb", partition_id))
-        })
+        .map(|root| root.join(fragment).join("indexdb").join("index.ndxdb"))
         .collect()
 }
 
-fn key_owned_by_index_root(fragment: &str, owner_root: &std::path::Path, prefix: &str) -> String {
+fn fragment_owned_by_index_root(owner_root: &std::path::Path, prefix: &str) -> String {
     for candidate in 0..4096usize {
-        let key = format!("{prefix}-{candidate}.bin");
-        let owner_paths = object_partition_db_paths_owner_first(fragment, &key);
+        let fragment = hex::encode(Sha256::digest(format!("{prefix}-{candidate}").as_bytes()));
+        let owner_paths = object_partition_db_paths_owner_first(&fragment, "probe.bin");
         if owner_paths
             .first()
             .map(|path| path.starts_with(owner_root))
             .unwrap_or(false)
         {
-            return key;
+            return fragment;
         }
     }
 
     panic!(
-        "failed to find object key owned by {} for fragment {}",
+        "failed to find fragment owned by {} with prefix {}",
         owner_root.display(),
-        fragment
+        prefix
     );
 }
 
@@ -1135,6 +1140,52 @@ async fn upload_part_with_options(
     .await
     .expect("upload part")
     .into_response()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_fragment_partition_count_is_setup_driven_and_mismatch_is_rejected() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+
+    set_configured_index_partition_count(64).expect("set balanced partition count");
+    clear_fragment_partition_count_cache_for_test();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+
+    init_fragment_metadata(&fragment, "partition-key")
+        .await
+        .expect("init fragment metadata");
+    assert_eq!(
+        fragment_index_partition_count(&fragment).expect("fragment partition count"),
+        64
+    );
+
+    set_configured_index_partition_count(32).expect("set low-hw partition count");
+    clear_fragment_partition_count_cache_for_test();
+
+    match fragment_index_partition_count(&fragment) {
+        Err(AppError::Conflict(message)) => {
+            assert!(
+                message.contains("uses 64 index partitions"),
+                "unexpected mismatch message: {}",
+                message
+            );
+            assert!(
+                message.contains("configured for 32"),
+                "unexpected mismatch message: {}",
+                message
+            );
+        }
+        other => panic!("expected partition-count mismatch conflict, got {:?}", other),
+    }
+
+    set_configured_index_partition_count(DEFAULT_INDEX_PARTITION_COUNT)
+        .expect("restore default partition count");
+    clear_fragment_partition_count_cache_for_test();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1736,6 +1787,41 @@ async fn put_object(
     .await;
     assert_eq!(finalize_resp.status(), StatusCode::OK);
     version_id
+}
+
+async fn seed_live_object_metadata(fragment: &str, object_key: &str, size_bytes: u64) -> String {
+    let version_id = Ulid::new().to_string();
+    let upload_session_id = Ulid::new().to_string();
+    let metadata = ObjectMetadata {
+        object_key: object_key.to_string(),
+        fragment: fragment.to_string(),
+        version_id: version_id.clone(),
+        upload_session_id,
+        owner_uid: fragment.to_string(),
+        content_type: "application/octet-stream".to_string(),
+        total_size_bytes: size_bytes,
+        created_at: Utc::now().timestamp(),
+        parts: Vec::new(),
+        is_delete_marker: false,
+        stripe_size_bytes: 262_144,
+    };
+    index::upsert_object_version(&metadata)
+        .await
+        .expect("seed live object metadata");
+    version_id
+}
+
+fn deep_prefix_key_for_index(idx: usize) -> String {
+    let mut state = (idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut parts = Vec::with_capacity(11);
+    for depth in 1..=10u64 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407u64.wrapping_add(depth));
+        parts.push(format!("pre{depth}-{:03}", state % 211));
+    }
+    parts.push(format!("file-{idx:05}.txt"));
+    parts.join("/")
 }
 
 async fn put_object_generated_chunked(
@@ -3875,7 +3961,9 @@ async fn matrix_repair_synchronizes_all_indexdb_replicas() {
     assert_eq!(put_pending.status(), StatusCode::OK);
 
     let pm = ObjectPathManager::new();
-    let session_db_paths = pm.get_all_session_partition_db_paths(&fragment, &pending_vid);
+    let session_db_paths = pm
+        .get_all_session_partition_db_paths(&fragment, &pending_vid)
+        .expect("session partition db paths");
     assert!(
         session_db_paths.len() >= 2,
         "expected at least two session partition db paths"
@@ -3978,7 +4066,9 @@ async fn matrix_repair_tolerates_missing_trashed_partition_db_replica() {
     );
 
     let pm = ObjectPathManager::new();
-    let marker_paths = pm.get_all_object_partition_db_paths(&fragment, &key);
+    let marker_paths = pm
+        .get_all_object_partition_db_paths(&fragment, &key)
+        .expect("object partition db paths");
     assert!(
         marker_paths.len() >= 2,
         "expected replicated trash partition db paths"
@@ -4132,10 +4222,10 @@ async fn matrix_redistribution_read_falls_back_when_primary_indexdb_copy_is_corr
         .expect("STRIPE_SIZE_ATOMIC")
         .store(4096, Ordering::Relaxed);
 
-    let fragment = {
-        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
-        hex::encode(digest)
-    };
+    let down_src = base.join("index_1");
+    let down_dst = base.join("index_1.down");
+    let owner_root = base.join("index_2");
+    let fragment = fragment_owned_by_index_root(&owner_root, "fragment-ha-index-fallback");
     setup_fragment(&fragment).await;
     let state = Arc::new(AppState {
         ws_manager: WsConnectionManager::new(),
@@ -4147,8 +4237,6 @@ async fn matrix_redistribution_read_falls_back_when_primary_indexdb_copy_is_corr
         .collect::<Vec<u8>>();
     let _version_id = put_object(state, &fragment, &key, content.clone()).await;
 
-    let down_src = base.join("index_1");
-    let down_dst = base.join("index_1.down");
     if fs::try_exists(&down_dst).await.unwrap_or(false) {
         let _ = fs::remove_dir_all(&down_dst).await;
     }
@@ -4180,9 +4268,14 @@ async fn matrix_redistribution_read_falls_back_when_primary_indexdb_copy_is_corr
         .await
         .expect("remove index down blocker file");
     restore_simulated_index_disk(&down_src, &down_dst, "restore primary index disk").await;
+    index::sync_fragment_partition_replicas(&fragment)
+        .await
+        .expect("resync restored follower indexdb replica");
 
     let path_manager = ObjectPathManager::new();
-    let partition_db_paths = path_manager.get_all_object_partition_db_paths(&fragment, &key);
+    let partition_db_paths = path_manager
+        .get_all_object_partition_db_paths(&fragment, &key)
+        .expect("object partition db paths");
     assert!(
         partition_db_paths.len() >= 2,
         "expected replicated indexdb partition paths"
@@ -4234,17 +4327,15 @@ async fn matrix_redistribution_defers_cutover_until_owner_index_restored() {
         .expect("STRIPE_SIZE_ATOMIC")
         .store(4096, Ordering::Relaxed);
 
-    let fragment = {
-        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
-        hex::encode(digest)
-    };
+    let down_src = base.join("index_2");
+    let down_dst = base.join("index_2.down");
+    let fragment = fragment_owned_by_index_root(&down_src, "fragment-ha-redist-owner-down");
     setup_fragment(&fragment).await;
     let state = Arc::new(AppState {
         ws_manager: WsConnectionManager::new(),
     });
 
-    let down_src = base.join("index_2");
-    let key = key_owned_by_index_root(&fragment, &down_src, "ha-redist-owner-down");
+    let key = "ha-redist-owner-down.bin".to_string();
     let content = (0..(48 * 1024 + 19))
         .map(|i| ((i * 7 + 11) % 251) as u8)
         .collect::<Vec<u8>>();
@@ -4270,7 +4361,6 @@ async fn matrix_redistribution_defers_cutover_until_owner_index_restored() {
         0
     );
 
-    let down_dst = base.join("index_2.down");
     if fs::try_exists(&down_dst).await.unwrap_or(false) {
         let _ = fs::remove_dir_all(&down_dst).await;
     }
@@ -7014,6 +7104,134 @@ async fn matrix_version_delete_is_direct_and_skips_trash_plane() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_rename_allows_destination_with_only_trashed_history() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let source_key = "rename/live-source.bin".to_string();
+    let destination_key = "rename/trashed-destination.bin".to_string();
+    let source_bytes = vec![0xAB; 2048];
+    let destination_bytes = vec![0xCD; 1024];
+
+    let source_version =
+        put_object(state.clone(), &fragment, &source_key, source_bytes.clone()).await;
+    let trashed_destination_version = put_object(
+        state.clone(),
+        &fragment,
+        &destination_key,
+        destination_bytes,
+    )
+    .await;
+
+    let delete_resp = delete_object(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), destination_key.clone())),
+    )
+    .await
+    .expect("soft delete destination")
+    .into_response();
+    assert_eq!(delete_resp.status(), StatusCode::OK);
+
+    assert!(
+        index::list_live_object_versions_metadata(&fragment, &destination_key)
+            .await
+            .expect("live destination versions after soft delete")
+            .is_empty(),
+        "destination should have no live versions after soft delete"
+    );
+    assert_eq!(
+        index::list_trashed_object_versions_metadata(&fragment, &destination_key)
+            .await
+            .expect("trashed destination versions after soft delete")
+            .len(),
+        1,
+        "destination should retain one trashed version"
+    );
+
+    let rename_resp = rename_object(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumJson(RenameObjectRequest {
+            source_fragment: fragment.clone(),
+            source_key: source_key.clone(),
+            destination_fragment: fragment.clone(),
+            destination_key: destination_key.clone(),
+        }),
+    )
+    .await
+    .expect("rename onto trashed destination")
+    .into_response();
+    assert_eq!(rename_resp.status(), StatusCode::OK);
+
+    assert!(
+        get_metadata(&fragment, &source_key, &fragment)
+            .await
+            .is_err(),
+        "source key should disappear after rename"
+    );
+
+    let live_destination_versions =
+        index::list_live_object_versions_metadata(&fragment, &destination_key)
+            .await
+            .expect("live destination versions after rename");
+    assert_eq!(live_destination_versions.len(), 1);
+    assert_eq!(live_destination_versions[0].version_id, source_version);
+    let destination_meta = get_metadata(&fragment, &destination_key, &fragment).await;
+    assert!(
+        destination_meta.is_ok(),
+        "destination should have readable live metadata after rename; live={:?}; trashed={:?}",
+        live_destination_versions
+            .iter()
+            .map(|meta| (
+                meta.object_key.clone(),
+                meta.version_id.clone(),
+                meta.is_delete_marker
+            ))
+            .collect::<Vec<_>>(),
+        index::list_trashed_object_versions_metadata(&fragment, &destination_key)
+            .await
+            .expect("trashed destination versions for debug")
+            .iter()
+            .map(|meta| (
+                meta.object_key.clone(),
+                meta.version_id.clone(),
+                meta.is_delete_marker
+            ))
+            .collect::<Vec<_>>()
+    );
+    let moved = read_object_bytes(
+        full_claims(&fragment),
+        fragment.clone(),
+        destination_key.clone(),
+    )
+    .await;
+    assert_eq!(moved, source_bytes);
+
+    let trashed_destination_versions =
+        index::list_trashed_object_versions_metadata(&fragment, &destination_key)
+            .await
+            .expect("trashed destination versions after rename");
+    assert_eq!(trashed_destination_versions.len(), 1);
+    assert_eq!(
+        trashed_destination_versions[0].version_id,
+        trashed_destination_version
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_recover_all_trash_resumes_from_persistent_journal() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -7852,6 +8070,190 @@ async fn matrix_live_listing_rebuilds_partition_namespace_index_when_missing() {
             .expect("count rebuilt namespace rows")
             > 0,
         "listing should lazily rebuild partition-local live namespace rows"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_live_listing_with_delimiter_survives_cache_eviction_after_many_renames() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 512 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let total = 240usize;
+    for idx in 0..total {
+        let source_key =
+            format!("idea-2025.3.2/idea-IU-253.30387.90/dir-{idx:04}/file-{idx:04}.bin");
+        put_object(
+            state.clone(),
+            &fragment,
+            &source_key,
+            vec![(idx % 251) as u8; 32],
+        )
+        .await;
+
+        let response = rename_object(
+            State(state.clone()),
+            full_claims(&fragment),
+            AxumJson(RenameObjectRequest {
+                source_fragment: fragment.clone(),
+                source_key: source_key.clone(),
+                destination_fragment: fragment.clone(),
+                destination_key: format!("sample/{source_key}"),
+            }),
+        )
+        .await
+        .expect("rename object")
+        .into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "rename failed for {source_key}"
+        );
+    }
+
+    indexdb_store::clear_cached_dbs_for_test();
+
+    let page = list_objects_json_page(&fragment, Some("sample"), Some("/"), 1000, None).await;
+    let prefixes = page["common_prefixes"]
+        .as_array()
+        .expect("common prefixes array")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    assert!(
+        prefixes
+            .iter()
+            .any(|prefix| prefix == "sample/idea-2025.3.2/"),
+        "expected renamed tree prefix in delimiter listing, got {:?}",
+        prefixes
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "stress"]
+async fn matrix_massive_same_fragment_folder_rename_10k_deep_prefixes_has_no_conflicts() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 2 * 1024 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let total = 10_000usize;
+    let mut operations = Vec::with_capacity(total);
+    for idx in 0..total {
+        let source_key = deep_prefix_key_for_index(idx);
+        seed_live_object_metadata(&fragment, &source_key, 64).await;
+        operations.push((source_key.clone(), format!("sample/{source_key}")));
+    }
+
+    let errors = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+    stream::iter(operations.clone())
+        .for_each_concurrent(12, {
+            let state = state.clone();
+            let fragment = fragment.clone();
+            let errors = errors.clone();
+            move |(source_key, destination_key)| {
+                let state = state.clone();
+                let fragment = fragment.clone();
+                let errors = errors.clone();
+                async move {
+                    let response = rename_object(
+                        State(state),
+                        full_claims(&fragment),
+                        AxumJson(RenameObjectRequest {
+                            source_fragment: fragment.clone(),
+                            source_key: source_key.clone(),
+                            destination_fragment: fragment.clone(),
+                            destination_key: destination_key.clone(),
+                        }),
+                    )
+                    .await;
+                    match response {
+                        Ok(ok) => {
+                            let response = ok.into_response();
+                            if response.status() != StatusCode::OK {
+                                let mut guard = errors.lock().await;
+                                guard.push(format!(
+                                    "{} -> {} returned {}",
+                                    source_key,
+                                    destination_key,
+                                    response.status()
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            let mut guard = errors.lock().await;
+                            guard.push(format!("{source_key} -> {destination_key}: {err}"));
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+
+    let errors = errors.lock().await.clone();
+    assert!(
+        errors.is_empty(),
+        "expected no rename conflicts/errors during 10k folder-style rename, got {} errors; sample={:?}",
+        errors.len(),
+        errors.iter().take(10).collect::<Vec<_>>()
+    );
+
+    let mut continuation = None;
+    let mut counted = 0usize;
+    loop {
+        let page =
+            list_objects_json_page(&fragment, Some("sample"), None, 1000, continuation).await;
+        counted = counted.saturating_add(page["objects"].as_array().expect("objects array").len());
+        continuation = page["continuation_token"].as_str().map(str::to_string);
+        if continuation.is_none() {
+            break;
+        }
+    }
+    assert_eq!(counted, total, "flat listing count after rename mismatch");
+
+    let delimiter_page =
+        list_objects_json_page(&fragment, Some("sample"), Some("/"), 1000, None).await;
+    assert!(
+        delimiter_page["common_prefixes"]
+            .as_array()
+            .map(|items| !items.is_empty())
+            .unwrap_or(false),
+        "expected delimiter listing to produce common prefixes after 10k folder-style rename"
     );
 }
 

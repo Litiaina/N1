@@ -1,10 +1,11 @@
+use crate::enums::app_error_enum::AppError;
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-const INDEXDB_PARTITION_EXT: &str = ".ndxdb";
+const INDEXDB_FILE: &str = "index.ndxdb";
 
 pub fn default_format() -> String {
     "zip".to_string()
@@ -51,54 +52,46 @@ impl ObjectPathManager {
         hasher.finalize().into()
     }
 
-    fn partition_id_from_hash(hash: [u8; 32]) -> u16 {
-        (u16::from(hash[0]) << 8 | u16::from(hash[1])) % 256
+    fn fragment_owner_index(fragment_hash: &str, root_count: usize) -> usize {
+        if root_count <= 1 {
+            return 0;
+        }
+        let hash = Self::route_hash(&["fragment", fragment_hash]);
+        usize::from(u16::from(hash[0]) << 8 | u16::from(hash[1])) % root_count
     }
 
-    fn select_partition_roots(&self, partition_id: u16) -> Vec<PathBuf> {
+    fn select_fragment_roots(&self, fragment_hash: &str) -> Vec<PathBuf> {
         let roots = self.get_all_index_roots();
         if roots.is_empty() {
             return Vec::new();
         }
-        let owner_idx = usize::from(partition_id) % roots.len();
+
+        let owner_idx = Self::fragment_owner_index(fragment_hash, roots.len());
         let mut selected = vec![roots[owner_idx].clone()];
-        if roots.len() > 1 {
-            let replica_offset = 1 + ((usize::from(partition_id >> 8)) % (roots.len() - 1));
-            let replica_idx = (owner_idx + replica_offset) % roots.len();
-            if replica_idx != owner_idx {
-                selected.push(roots[replica_idx].clone());
+        for (idx, root) in roots.into_iter().enumerate() {
+            if idx != owner_idx {
+                selected.push(root);
             }
         }
-        selected.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
         selected
     }
 
-    fn object_partition_id(fragment_hash: &str, object_key: &str) -> u16 {
-        let canonical = Self::canonical_object_key(object_key);
-        Self::partition_id_from_hash(Self::route_hash(&["object", fragment_hash, &canonical]))
-    }
-
-    fn session_partition_id(fragment_hash: &str, version_id: &str) -> u16 {
-        Self::partition_id_from_hash(Self::route_hash(&["session", fragment_hash, version_id]))
-    }
-
-    fn partition_db_path(root: &PathBuf, fragment_hash: &str, partition_id: u16) -> PathBuf {
+    fn index_db_path(root: &PathBuf, fragment_hash: &str) -> PathBuf {
         root.join(fragment_hash)
             .join("indexdb")
-            .join("partitions")
-            .join(format!("{:04x}{}", partition_id, INDEXDB_PARTITION_EXT))
+            .join(INDEXDB_FILE)
     }
 
     pub fn get_all_session_partition_db_paths(
         &self,
         fragment_hash: &str,
-        version_id: &str,
-    ) -> Vec<PathBuf> {
-        let partition_id = Self::session_partition_id(fragment_hash, version_id);
-        self.select_partition_roots(partition_id)
+        _version_id: &str,
+    ) -> Result<Vec<PathBuf>, AppError> {
+        Ok(self
+            .select_fragment_roots(fragment_hash)
             .iter()
-            .map(|root| Self::partition_db_path(root, fragment_hash, partition_id))
-            .collect()
+            .map(|root| Self::index_db_path(root, fragment_hash))
+            .collect())
     }
 
     pub fn object_key_hash(object_key: &str) -> String {
@@ -114,13 +107,13 @@ impl ObjectPathManager {
     pub fn get_all_object_partition_db_paths(
         &self,
         fragment_hash: &str,
-        object_key: &str,
-    ) -> Vec<PathBuf> {
-        let partition_id = Self::object_partition_id(fragment_hash, object_key);
-        self.select_partition_roots(partition_id)
+        _object_key: &str,
+    ) -> Result<Vec<PathBuf>, AppError> {
+        Ok(self
+            .select_fragment_roots(fragment_hash)
             .iter()
-            .map(|root| Self::partition_db_path(root, fragment_hash, partition_id))
-            .collect()
+            .map(|root| Self::index_db_path(root, fragment_hash))
+            .collect())
     }
 
     pub fn get_shard_dir_on_disk(

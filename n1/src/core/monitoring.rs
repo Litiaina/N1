@@ -209,7 +209,7 @@ struct BlobPlacementRisk {
     placement_limiter_usage_percent: Option<f64>,
 }
 
-fn should_count_partition_db_file(path: &std::path::Path) -> bool {
+fn should_count_index_db_file(path: &std::path::Path) -> bool {
     let name = match path.file_name().and_then(|n| n.to_str()) {
         Some(s) => s,
         None => return false,
@@ -229,32 +229,27 @@ fn should_count_partition_db_file(path: &std::path::Path) -> bool {
     let Some(parent) = path.parent() else {
         return false;
     };
-    let Some(grandparent) = parent.parent() else {
-        return false;
-    };
-
-    parent.file_name().and_then(|n| n.to_str()) == Some("partitions")
-        && grandparent.file_name().and_then(|n| n.to_str()) == Some("indexdb")
+    parent.file_name().and_then(|n| n.to_str()) == Some("indexdb") && name == "index.ndxdb"
 }
 
 #[cfg(test)]
 mod tests {
-    use super::should_count_partition_db_file;
+    use super::should_count_index_db_file;
     use std::path::Path;
 
     #[test]
-    fn deep_scan_counts_only_partition_db_files() {
-        assert!(should_count_partition_db_file(Path::new(
-            "frag/indexdb/partitions/0001.ndxdb"
+    fn deep_scan_counts_only_index_db_files() {
+        assert!(should_count_index_db_file(Path::new(
+            "frag/indexdb/index.ndxdb"
         )));
-        assert!(!should_count_partition_db_file(Path::new(
+        assert!(!should_count_index_db_file(Path::new(
             "frag/indexdb/intents/0001.pending.redist.intent.msgpack"
         )));
-        assert!(!should_count_partition_db_file(Path::new(
-            "frag/indexdb/partitions/0001.ndxdb.gc"
+        assert!(!should_count_index_db_file(Path::new(
+            "frag/indexdb/index.ndxdb.gc"
         )));
-        assert!(!should_count_partition_db_file(Path::new(
-            "frag/.trash/indexdb/partitions/0001.ndxdb"
+        assert!(!should_count_index_db_file(Path::new(
+            "frag/.trash/indexdb/index.ndxdb"
         )));
     }
 }
@@ -488,7 +483,7 @@ async fn collect_system_health(
 
                     for entry in walker.filter_map(|e| e.ok()) {
                         let path = entry.path();
-                        if entry.file_type().is_file() && should_count_partition_db_file(path) {
+                        if entry.file_type().is_file() && should_count_index_db_file(path) {
                             current_disk_count += 1;
                         }
 

@@ -13,7 +13,18 @@ use tokio::fs as tokio_fs;
 use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{LazyLock, Mutex};
+
+pub const DEFAULT_INDEX_PARTITION_COUNT: u16 = 64;
+pub const SUPPORTED_INDEX_PARTITION_COUNTS: [u16; 3] = [32, 64, 256];
+
+static CONFIGURED_INDEX_PARTITION_COUNT: LazyLock<AtomicU16> =
+    LazyLock::new(|| AtomicU16::new(DEFAULT_INDEX_PARTITION_COUNT));
+static FRAGMENT_INDEX_PARTITION_COUNT_CACHE: LazyLock<Mutex<HashMap<String, u16>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FragmentMetadata {
@@ -21,54 +32,54 @@ pub struct FragmentMetadata {
     pub key_phc: String,
     #[serde(default)]
     pub nt_hash_hex: Option<String>,
+    pub index_partition_count: u16,
     pub created: String,
     pub updated: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LegacyFragmentMetadata {
-    fragment: String,
-    key_phc: String,
-    created: String,
-    updated: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LegacyFragmentMetadataTuple(String, String, String, Option<String>);
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum FragmentMetadataCompat {
-    Current(FragmentMetadata),
-    LegacyNamed(LegacyFragmentMetadata),
-    LegacyTuple(LegacyFragmentMetadataTuple),
 }
 
 fn now_utc_rfc3339() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-fn decode_fragment_metadata(raw: &[u8]) -> Result<FragmentMetadata, AppError> {
-    let decoded = rmp_serde::from_slice::<FragmentMetadataCompat>(raw)
-        .map_err(|e| AppError::InternalServerError(format!("decode msgpack: {}", e)))?;
+fn validate_supported_index_partition_count(count: u16) -> Result<(), AppError> {
+    if SUPPORTED_INDEX_PARTITION_COUNTS.contains(&count) {
+        return Ok(());
+    }
 
-    Ok(match decoded {
-        FragmentMetadataCompat::Current(meta) => meta,
-        FragmentMetadataCompat::LegacyNamed(legacy) => FragmentMetadata {
-            fragment: legacy.fragment,
-            key_phc: legacy.key_phc,
-            nt_hash_hex: None,
-            created: legacy.created,
-            updated: legacy.updated,
-        },
-        FragmentMetadataCompat::LegacyTuple(legacy) => FragmentMetadata {
-            fragment: legacy.0,
-            key_phc: legacy.1,
-            nt_hash_hex: None,
-            created: legacy.2,
-            updated: legacy.3,
-        },
-    })
+    Err(AppError::BadRequest(format!(
+        "unsupported index partition count {} (supported: 32, 64, 256)",
+        count
+    )))
+}
+
+pub fn configured_index_partition_count() -> u16 {
+    CONFIGURED_INDEX_PARTITION_COUNT.load(Ordering::Relaxed)
+}
+
+pub fn set_configured_index_partition_count(count: u16) -> Result<(), AppError> {
+    validate_supported_index_partition_count(count)?;
+    CONFIGURED_INDEX_PARTITION_COUNT.store(count, Ordering::Relaxed);
+    Ok(())
+}
+
+fn enforce_fragment_index_partition_count(
+    fragment_hash: &str,
+    partition_count: u16,
+) -> Result<u16, AppError> {
+    validate_supported_index_partition_count(partition_count)?;
+    let configured = configured_index_partition_count();
+    if partition_count != configured {
+        return Err(AppError::Conflict(format!(
+            "fragment {} uses {} index partitions, but this setup is configured for {}; run an index rebalance/migration before reopening it",
+            fragment_hash, partition_count, configured
+        )));
+    }
+    Ok(partition_count)
+}
+
+fn decode_fragment_metadata(raw: &[u8]) -> Result<FragmentMetadata, AppError> {
+    rmp_serde::from_slice::<FragmentMetadata>(raw)
+        .map_err(|e| AppError::InternalServerError(format!("decode msgpack: {}", e)))
 }
 
 fn fragment_meta_path(root: &Path, fragment_hash: &str) -> PathBuf {
@@ -162,6 +173,7 @@ pub async fn init_fragment_metadata(
         fragment: fragment_hash.to_string(),
         key_phc: hash_key_to_phc(key)?,
         nt_hash_hex: Some(hash_key_to_nt_hash_hex(key)),
+        index_partition_count: configured_index_partition_count(),
         created: now_utc_rfc3339(),
         updated: None,
     };
@@ -194,7 +206,44 @@ pub async fn read_fragment_metadata(fragment_hash: &str) -> Result<FragmentMetad
     Err(AppError::NotFound)
 }
 
+pub fn read_fragment_metadata_sync(fragment_hash: &str) -> Result<FragmentMetadata, AppError> {
+    let pm = ObjectPathManager::new();
+    let roots = pm.get_all_index_roots();
+
+    for root in roots {
+        let p = fragment_meta_path(&root, fragment_hash);
+        if !p.exists() {
+            continue;
+        }
+
+        let raw =
+            std::fs::read(&p).map_err(|e| AppError::Io(e, format!("read {}", p.display())))?;
+        let meta = decode_fragment_metadata(&raw)?;
+        if meta.fragment == fragment_hash {
+            return Ok(meta);
+        }
+    }
+
+    Err(AppError::NotFound)
+}
+
+pub fn fragment_index_partition_count(fragment_hash: &str) -> Result<u16, AppError> {
+    if let Ok(cache) = FRAGMENT_INDEX_PARTITION_COUNT_CACHE.lock() {
+        if let Some(count) = cache.get(fragment_hash).copied() {
+            return enforce_fragment_index_partition_count(fragment_hash, count);
+        }
+    }
+
+    let meta = read_fragment_metadata_sync(fragment_hash)?;
+    let count = meta.index_partition_count;
+    if let Ok(mut cache) = FRAGMENT_INDEX_PARTITION_COUNT_CACHE.lock() {
+        cache.insert(fragment_hash.to_string(), count);
+    }
+    enforce_fragment_index_partition_count(fragment_hash, count)
+}
+
 pub async fn write_fragment_metadata(meta: &FragmentMetadata) -> Result<(), AppError> {
+    validate_supported_index_partition_count(meta.index_partition_count)?;
     let pm = ObjectPathManager::new();
     let roots = pm.get_all_index_roots();
 
@@ -216,6 +265,10 @@ pub async fn write_fragment_metadata(meta: &FragmentMetadata) -> Result<(), AppE
         ));
     }
 
+    if let Ok(mut cache) = FRAGMENT_INDEX_PARTITION_COUNT_CACHE.lock() {
+        cache.insert(meta.fragment.clone(), meta.index_partition_count);
+    }
+
     Ok(())
 }
 
@@ -230,6 +283,7 @@ pub async fn rotate_fragment_key(fragment_hash: &str, new_key: &str) -> Result<(
             fragment: fragment_hash.to_string(),
             key_phc: String::new(),
             nt_hash_hex: None,
+            index_partition_count: configured_index_partition_count(),
             created: now_utc_rfc3339(),
             updated: None,
         },
@@ -285,11 +339,15 @@ pub async fn backfill_fragment_nt_hash_if_missing(
 }
 
 #[cfg(test)]
+pub(crate) fn clear_fragment_partition_count_cache_for_test() {
+    if let Ok(mut cache) = FRAGMENT_INDEX_PARTITION_COUNT_CACHE.lock() {
+        cache.clear();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    #[derive(Serialize)]
-    struct LegacyTuple<'a>(&'a str, &'a str, &'a str, Option<&'a str>);
 
     #[test]
     fn decode_fragment_metadata_accepts_current_shape() {
@@ -297,6 +355,7 @@ mod tests {
             fragment: "abc".to_string(),
             key_phc: "phc".to_string(),
             nt_hash_hex: Some("00112233445566778899aabbccddeeff".to_string()),
+            index_partition_count: 64,
             created: "2026-01-01T00:00:00Z".to_string(),
             updated: None,
         };
@@ -308,12 +367,17 @@ mod tests {
     }
 
     #[test]
-    fn decode_fragment_metadata_accepts_legacy_tuple_shape() {
+    fn decode_fragment_metadata_rejects_legacy_tuple_shape() {
+        #[derive(Serialize)]
+        struct LegacyTuple<'a>(&'a str, &'a str, &'a str, Option<&'a str>);
+
         let legacy = LegacyTuple("abc", "phc", "2026-01-01T00:00:00Z", None);
         let raw = rmp_serde::to_vec(&legacy).expect("encode legacy");
-        let decoded = decode_fragment_metadata(&raw).expect("decode legacy");
-        assert_eq!(decoded.fragment, "abc");
-        assert_eq!(decoded.key_phc, "phc");
-        assert_eq!(decoded.nt_hash_hex, None);
+        let err = decode_fragment_metadata(&raw).expect_err("legacy decode should fail");
+        assert!(
+            matches!(err, AppError::InternalServerError(_)),
+            "unexpected legacy decode error: {:?}",
+            err
+        );
     }
 }

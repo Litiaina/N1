@@ -4,7 +4,9 @@ use crate::core::disk_manager::{
     default_stripe_size,
 };
 use crate::core::ec::ErasureStreamWriter;
-use crate::core::fragment_metadata::{read_fragment_metadata, write_fragment_metadata};
+use crate::core::fragment_metadata::{
+    read_fragment_metadata, write_fragment_metadata,
+};
 use crate::core::index;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::read_or_recover_chunk;
@@ -723,7 +725,7 @@ fn get_shard_dir_custom(
 fn get_partition_db_paths_custom(
     index_roots: &[PathBuf],
     fragment_hash: &str,
-    object_key: &str,
+    _object_key: &str,
 ) -> Vec<PathBuf> {
     use sha2::{Digest, Sha256};
 
@@ -731,33 +733,24 @@ fn get_partition_db_paths_custom(
         return Vec::new();
     }
 
-    let canonical = ObjectPathManager::canonical_object_key(object_key);
     let mut route_hasher = Sha256::new();
-    for part in ["object", fragment_hash, canonical.as_str()] {
+    for part in ["fragment", fragment_hash] {
         route_hasher.update(part.as_bytes());
         route_hasher.update([0u8]);
     }
     let route_hash: [u8; 32] = route_hasher.finalize().into();
-    let partition_id = (u16::from(route_hash[0]) << 8 | u16::from(route_hash[1])) % 256;
-
-    let owner_idx = usize::from(partition_id) % index_roots.len();
+    let owner_idx =
+        usize::from(u16::from(route_hash[0]) << 8 | u16::from(route_hash[1])) % index_roots.len();
     let mut selected: Vec<&PathBuf> = vec![&index_roots[owner_idx]];
-    if index_roots.len() > 1 {
-        let replica_offset = 1 + ((usize::from(partition_id >> 8)) % (index_roots.len() - 1));
-        let replica_idx = (owner_idx + replica_offset) % index_roots.len();
-        if replica_idx != owner_idx {
-            selected.push(&index_roots[replica_idx]);
+    for (idx, root) in index_roots.iter().enumerate() {
+        if idx != owner_idx {
+            selected.push(root);
         }
     }
 
     selected
         .into_iter()
-        .map(|root| {
-            root.join(fragment_hash)
-                .join("indexdb")
-                .join("partitions")
-                .join(format!("{:04x}.ndxdb", partition_id))
-        })
+        .map(|root| root.join(fragment_hash).join("indexdb").join("index.ndxdb"))
         .collect()
 }
 
@@ -1790,13 +1783,13 @@ pub async fn run_redistribution_job_with_options(
                                 if !task_needs.index {
                                     Ok(())
                                 } else {
-                                redistribute_object_index_only(
-                                    &meta,
-                                    &live_index_for_task,
-                                    is_trash_flag,
-                                    task_strict_durability,
-                                )
-                                .await
+                                    redistribute_object_index_only(
+                                        &meta,
+                                        &live_index_for_task,
+                                        is_trash_flag,
+                                        task_strict_durability,
+                                    )
+                                    .await
                                 }
                             }
                             RedistributionScope::Blob => {
@@ -2006,7 +1999,8 @@ async fn check_needs_redistribution(
         if !needs.blob {
             for part in &meta.parts {
                 for shard in &part.shards {
-                    let expected = (part.part_index as usize + shard.shard_index) % target_num_disks;
+                    let expected =
+                        (part.part_index as usize + shard.shard_index) % target_num_disks;
                     if expected >= target_blob_roots.len() {
                         needs.blob = true;
                         break;

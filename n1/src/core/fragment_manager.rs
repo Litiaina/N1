@@ -226,6 +226,8 @@ pub async fn update_fragment(
                         fragment: new_hash.clone(),
                         key_phc: String::new(),
                         nt_hash_hex: None,
+                        index_partition_count:
+                            crate::core::fragment_metadata::configured_index_partition_count(),
                         created: chrono::Utc::now()
                             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                         updated: None,

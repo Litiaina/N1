@@ -2094,23 +2094,56 @@ impl RegistryDb {
                 return Ok((object, user));
             }
 
-            let exists = scalar_i64(
+            let destination_pending = scalar_i64(
                 &tx,
                 r#"
-                SELECT COUNT(*) FROM (
-                    SELECT 1 FROM objects
-                    WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
-                    UNION ALL
-                    SELECT 1 FROM object_uploads
-                    WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
-                )
+                SELECT COUNT(*)
+                FROM object_uploads
+                WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
                 "#,
                 params![owner_uid, fragment, destination_key],
             )?;
-            if exists > 0 {
+            if destination_pending > 0 {
                 return Err(RegistryError::conflict(
                     "destination object already exists in registry",
                 ));
+            }
+
+            let destination_current = tx
+                .query_row(
+                    r#"
+                    SELECT owner_uid, fragment, object_key, version_id, status, object_size_bytes, content_type, created_at, updated_at
+                    FROM objects
+                    WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+                    "#,
+                    params![owner_uid, fragment, destination_key],
+                    map_object_row,
+                )
+                .optional()
+                .map_err(sql_err)?;
+            if destination_current
+                .as_ref()
+                .is_some_and(|object| object.status != "trashed")
+            {
+                return Err(RegistryError::conflict(
+                    "destination object already exists in registry",
+                ));
+            }
+
+            let (quota_limit, quota_used) = quota_for_user(&tx, &owner_uid)?;
+            let mut next_used = quota_used;
+            if let Some(destination_trashed) = destination_current {
+                tx.execute(
+                    "DELETE FROM object_versions WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                    params![owner_uid, fragment, destination_key],
+                )
+                .map_err(sql_err)?;
+                tx.execute(
+                    "DELETE FROM objects WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                    params![owner_uid, fragment, destination_key],
+                )
+                .map_err(sql_err)?;
+                next_used = next_used.saturating_sub(destination_trashed.object_size_bytes.max(0));
             }
 
             let now = now_rfc3339();
@@ -2141,16 +2174,28 @@ impl RegistryDb {
                     WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
                     "#,
                     params![owner_uid, fragment, source_key, destination_key, now],
-                )
-                .map_err(sql_err)?;
+            )
+            .map_err(sql_err)?;
             if updated_ready == 0 && updated_pending == 0 {
                 return Err(RegistryError::not_found("object not found"));
+            }
+            if next_used != quota_used {
+                tx.execute(
+                    r#"
+                    UPDATE users
+                    SET quota_used_bytes = ?2, updated_at = ?3
+                    WHERE uid = ?1
+                    "#,
+                    params![owner_uid, next_used, now],
+                )
+                .map_err(sql_err)?;
             }
             tx.commit().map_err(sql_err)?;
             let conn = db.open_connection()?;
             let object = resolve_any_object(&conn, &owner_uid, &fragment, &destination_key)?
                 .ok_or_else(|| RegistryError::internal("renamed object missing"))?;
-            let user = user_by_uid(&conn, &owner_uid)?;
+            let mut user = user_by_uid(&conn, &owner_uid)?;
+            user.quota_limit_bytes = quota_limit;
             Ok((object, user))
         })
         .await
@@ -3073,6 +3118,115 @@ mod tests {
             .expect("cancel second pending");
         assert!(removed);
         assert_eq!(user_after_cancel.quota_used_bytes, 4_000);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn rename_object_replaces_destination_when_it_exists_only_as_trashed() {
+        let path = std::env::temp_dir().join(format!(
+            "registry-rename-trashed-destination-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = RegistryDb::new(path.clone(), 1024 * 1024);
+        db.init().await.expect("init db");
+
+        let password_hash = hash_password("secret").expect("hash password");
+        let user = db
+            .create_user(
+                "rename-trashed@example.com".to_string(),
+                password_hash,
+                Some(50_000),
+                false,
+            )
+            .await
+            .expect("create user");
+
+        db.finalize_object(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            "folder/source.bin".to_string(),
+            "01HRENAMETRASHEDSOURCE0000001".to_string(),
+            1024,
+            Some("application/octet-stream".to_string()),
+        )
+        .await
+        .expect("finalize source");
+        db.finalize_object(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            "folder/destination.bin".to_string(),
+            "01HRENAMETRASHEDDEST00000001".to_string(),
+            2048,
+            Some("application/octet-stream".to_string()),
+        )
+        .await
+        .expect("finalize destination");
+
+        let (trashed, _) = db
+            .set_object_status(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                "folder/destination.bin".to_string(),
+                "trashed",
+            )
+            .await
+            .expect("trash destination");
+        assert_eq!(trashed.status, "trashed");
+
+        let (renamed, updated_user) = db
+            .rename_object(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                "folder/source.bin".to_string(),
+                "folder/destination.bin".to_string(),
+            )
+            .await
+            .expect("registry rename should replace trashed destination");
+        assert_eq!(renamed.object_key, "folder/destination.bin");
+        assert_eq!(renamed.version_id, "01HRENAMETRASHEDSOURCE0000001");
+        assert_eq!(updated_user.quota_used_bytes, 1024);
+
+        let source = db
+            .resolve_object(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                "folder/source.bin".to_string(),
+            )
+            .await
+            .expect("resolve source after rename");
+        assert!(source.is_none(), "source key should be gone after rename");
+
+        let destination = db
+            .resolve_object(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                "folder/destination.bin".to_string(),
+            )
+            .await
+            .expect("resolve renamed destination")
+            .expect("destination should exist after rename");
+        assert!(
+            destination.status == "ready" && destination.version_id == "01HRENAMETRASHEDSOURCE0000001",
+            "unexpected destination after rename: {:?}",
+            destination
+        );
+
+        let trashed_listing = db
+            .list_objects(
+                user.uid.clone(),
+                Some("fragment-a".to_string()),
+                Some("folder/".to_string()),
+                None,
+                None,
+                100,
+                0,
+                false,
+                true,
+            )
+            .await
+            .expect("list trashed destination");
+        assert!(trashed_listing.objects.is_empty(), "trashed destination should be replaced");
 
         let _ = std::fs::remove_file(path);
     }
