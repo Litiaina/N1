@@ -349,7 +349,10 @@ fn fragment_route(fragment: &str) -> Result<IndexRoute, AppError> {
 }
 
 fn object_route(fragment: &str, object_key: &str) -> Result<IndexRoute, AppError> {
-    route_for_hash(fragment, hash_key(&["object", fragment, &canonical_key(object_key)]))
+    route_for_hash(
+        fragment,
+        hash_key(&["object", fragment, &canonical_key(object_key)]),
+    )
 }
 
 fn session_route(fragment: &str, version_id: &str) -> Result<IndexRoute, AppError> {
@@ -358,9 +361,7 @@ fn session_route(fragment: &str, version_id: &str) -> Result<IndexRoute, AppErro
 
 fn db_path(root: &Path, fragment: &str, partition_id: u16) -> PathBuf {
     let _ = partition_id;
-    root.join(fragment)
-        .join(INDEXDB_DIR)
-        .join(INDEXDB_FILE)
+    root.join(fragment).join(INDEXDB_DIR).join(INDEXDB_FILE)
 }
 
 fn version_row_key(fragment: &str, object_key: &str, version_id: &str) -> Result<String, AppError> {
@@ -828,10 +829,20 @@ pub fn ensure_object_owner_partition_available(
     let owner_path = owner_db_path(&route, fragment);
     with_partition_commit_lock(&owner_path, || {
         if let Some(parent) = owner_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| AppError::Io(e, format!("mkdir {}", parent.display())))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                AppError::ServiceUnavailable(format!(
+                    "authoritative owner index root unavailable: mkdir {} failed: {}",
+                    parent.display(),
+                    e
+                ))
+            })?;
         }
-        let _ = get_or_open_db(&owner_path)?;
+        let _ = get_or_open_db(&owner_path).map_err(|e| {
+            AppError::ServiceUnavailable(format!(
+                "authoritative owner index root unavailable: {}",
+                e
+            ))
+        })?;
         Ok(())
     })
 }
@@ -1335,7 +1346,11 @@ fn write_version_on_db(
             .map_err(|e| map_indexdb_error("open object_version_states", e))?;
         let now = Utc::now().timestamp();
         let committed_generation = next_partition_generation(&mut partition_meta, now)?;
-        let row_key = version_row_key(&metadata.fragment, &metadata.object_key, &metadata.version_id)?;
+        let row_key = version_row_key(
+            &metadata.fragment,
+            &metadata.object_key,
+            &metadata.version_id,
+        )?;
         let record = VersionRecord {
             metadata: metadata.clone(),
             recorded_at: now,
@@ -3256,7 +3271,8 @@ fn load_current_metadata_for_head(
     let Some(db) = open_route_db_for_read(fragment, &route)? else {
         return Ok(None);
     };
-    let Some(record) = read_version_exact(&db, fragment, &head.object_key, &head.version_id)? else {
+    let Some(record) = read_version_exact(&db, fragment, &head.object_key, &head.version_id)?
+    else {
         return Ok(None);
     };
     Ok(Some(record.metadata))
@@ -4838,13 +4854,12 @@ pub fn delete_all_trash_versions_for_key(
             return Ok(None);
         }
         let owner_db = get_or_open_db(&owner_path)?;
-        let deleted =
-            delete_versions_for_key_with_state_on_db(
-                &owner_db,
-                fragment,
-                object_key,
-                ObjectState::Trash,
-            )?;
+        let deleted = delete_versions_for_key_with_state_on_db(
+            &owner_db,
+            fragment,
+            object_key,
+            ObjectState::Trash,
+        )?;
         if let Some((version_ids, partition_meta)) = deleted {
             replicate_object_mutation(
                 fragment,
@@ -4908,15 +4923,14 @@ pub fn delete_live_version(
             return Ok(false);
         }
         let owner_db = get_or_open_db(&owner_path)?;
-        let deleted =
-            delete_version_on_db(
-                &owner_db,
-                fragment,
-                object_key,
-                version_id,
-                Some(ObjectState::Live),
-            )?
-                .map(|(_metadata, partition_meta)| partition_meta);
+        let deleted = delete_version_on_db(
+            &owner_db,
+            fragment,
+            object_key,
+            version_id,
+            Some(ObjectState::Live),
+        )?
+        .map(|(_metadata, partition_meta)| partition_meta);
         if let Some(partition_meta) = deleted {
             replicate_object_mutation(fragment, &route, "delete live version", |replica_db| {
                 apply_delete_version_replica_exact(
@@ -4948,15 +4962,14 @@ pub fn delete_trash_version(
             return Ok(false);
         }
         let owner_db = get_or_open_db(&owner_path)?;
-        let deleted =
-            delete_version_on_db(
-                &owner_db,
-                fragment,
-                object_key,
-                version_id,
-                Some(ObjectState::Trash),
-            )?
-                .map(|(_metadata, partition_meta)| partition_meta);
+        let deleted = delete_version_on_db(
+            &owner_db,
+            fragment,
+            object_key,
+            version_id,
+            Some(ObjectState::Trash),
+        )?
+        .map(|(_metadata, partition_meta)| partition_meta);
         if let Some(partition_meta) = deleted {
             replicate_object_mutation(fragment, &route, "delete trash version", |replica_db| {
                 apply_delete_version_replica_exact(

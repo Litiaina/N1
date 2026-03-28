@@ -141,7 +141,7 @@ async fn compute_box_usage() -> Result<StorageUsage, AppError> {
     .map_err(|e| AppError::InternalServerError(format!("capacity stat task: {}", e)))?
 }
 
-// Legacy helper retained only for older tests/helpers during the transition.
+// Test helper for isolated workflow setup.
 #[cfg(test)]
 pub async fn init_quota_file(fragment: &str, _allocated: u64) -> Result<(), AppError> {
     let _ = fragment;
@@ -177,6 +177,16 @@ pub async fn ensure_blob_placement_capacity_available_for_parts(
         return Err(AppError::InternalServerError(
             "data_shards must be greater than zero".into(),
         ));
+    }
+    let total_shards = data_shards.saturating_add(parity_shards);
+    if roots.len() < total_shards {
+        return Err(AppError::ServiceUnavailable(format!(
+            "Configured blob roots ({}) cannot satisfy target layout {}D+{}P requiring {} distinct roots",
+            roots.len(),
+            data_shards,
+            parity_shards,
+            total_shards
+        )));
     }
 
     let required_by_root = placement_required_bytes_by_root(

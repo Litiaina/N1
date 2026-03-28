@@ -572,10 +572,12 @@ async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
             if let Ok(rd) = std::fs::read_dir(&root) {
                 for ent in rd.filter_map(|e| e.ok()) {
                     if ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        let fragment_dir = ent.path();
+                        if !fragment_dir.join(FRAGMENT_METADATA_FILE).is_file() {
+                            continue;
+                        }
                         if let Some(name) = ent.file_name().to_str() {
-                            if !name.starts_with('.') {
-                                out.insert(name.to_string());
-                            }
+                            out.insert(name.to_string());
                         }
                     }
                 }
@@ -587,6 +589,18 @@ async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
     })
     .await
     .unwrap_or_default()
+}
+
+async fn reachable_dir_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for root in roots {
+        if let Ok(meta) = fs::metadata(&root).await {
+            if meta.is_dir() {
+                out.push(root);
+            }
+        }
+    }
+    out
 }
 
 fn sha256_bytes(b: &[u8]) -> [u8; 32] {
@@ -977,9 +991,19 @@ pub async fn run_repair_job_with_options(
             "Index Store Config not initialized".into(),
         ))?;
 
-    let index_roots: Vec<PathBuf> = path_manager.get_all_index_roots().into_iter().collect();
-    let blob_roots = Arc::new(path_manager.get_blob_roots());
+    let index_roots: Vec<PathBuf> = reachable_dir_roots(path_manager.get_all_index_roots()).await;
+    let blob_roots = Arc::new(reachable_dir_roots(path_manager.get_blob_roots()).await);
     let num_disks = blob_roots.len();
+    if index_roots.is_empty() {
+        return Err(AppError::InternalServerError(
+            "No reachable index roots".into(),
+        ));
+    }
+    if num_disks == 0 {
+        return Err(AppError::InternalServerError(
+            "No reachable blob disks".into(),
+        ));
+    }
     let cfg = normalize_repair_cfg_for_layout(cfg, num_disks, index_roots.len());
     info!(
         "Repair runtime caps after layout normalization: mode={:?} meta_conc={} repair_conc={} batch={} blob_disks={} index_roots={}",
@@ -1330,8 +1354,11 @@ async fn process_one_metadata(
 
 #[cfg(test)]
 mod tests {
-    use super::{RepairCheckMode, parse_check_mode};
+    use super::{RepairCheckMode, list_all_fragments, parse_check_mode, reachable_dir_roots};
+    use crate::core::constants::FRAGMENT_METADATA_FILE;
     use std::collections::HashMap;
+    use std::fs;
+    use ulid::Ulid;
 
     #[test]
     fn parse_check_mode_is_case_insensitive_and_accepts_aliases() {
@@ -1354,5 +1381,42 @@ mod tests {
 
         params.insert("access_mode".to_string(), "readonly".to_string());
         assert_eq!(parse_check_mode(&params), RepairCheckMode::Strict);
+    }
+
+    #[tokio::test]
+    async fn list_all_fragments_ignores_filesystem_trash_directories() {
+        let base = std::env::temp_dir().join(format!("n1-repair-fragments-{}", Ulid::new()));
+        let index_root = base.join("index-root");
+        fs::create_dir_all(&index_root).expect("create index root");
+
+        let real_fragment = "real-fragment";
+        let real_fragment_dir = index_root.join(real_fragment);
+        fs::create_dir_all(&real_fragment_dir).expect("create fragment dir");
+        fs::write(real_fragment_dir.join(FRAGMENT_METADATA_FILE), b"fragment")
+            .expect("write fragment metadata marker");
+
+        fs::create_dir_all(index_root.join(".Trash-1000")).expect("create desktop trash dir");
+        fs::create_dir_all(index_root.join("lost+found")).expect("create unrelated dir");
+
+        let fragments = list_all_fragments(&[index_root]).await;
+        assert_eq!(fragments, vec![real_fragment.to_string()]);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn reachable_dir_roots_ignores_blocker_files() {
+        let base = std::env::temp_dir().join(format!("n1-repair-roots-{}", Ulid::new()));
+        let live_root = base.join("live-root");
+        let blocked_root = base.join("blocked-root");
+
+        fs::create_dir_all(&live_root).expect("create live root");
+        fs::create_dir_all(&base).expect("create base");
+        fs::write(&blocked_root, b"down").expect("create blocker file");
+
+        let live = reachable_dir_roots(vec![live_root.clone(), blocked_root.clone()]).await;
+        assert_eq!(live, vec![live_root]);
+
+        let _ = fs::remove_dir_all(base);
     }
 }

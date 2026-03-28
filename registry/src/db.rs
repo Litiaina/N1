@@ -3207,7 +3207,8 @@ mod tests {
             .expect("resolve renamed destination")
             .expect("destination should exist after rename");
         assert!(
-            destination.status == "ready" && destination.version_id == "01HRENAMETRASHEDSOURCE0000001",
+            destination.status == "ready"
+                && destination.version_id == "01HRENAMETRASHEDSOURCE0000001",
             "unexpected destination after rename: {:?}",
             destination
         );
@@ -3226,7 +3227,10 @@ mod tests {
             )
             .await
             .expect("list trashed destination");
-        assert!(trashed_listing.objects.is_empty(), "trashed destination should be replaced");
+        assert!(
+            trashed_listing.objects.is_empty(),
+            "trashed destination should be replaced"
+        );
 
         let _ = std::fs::remove_file(path);
     }

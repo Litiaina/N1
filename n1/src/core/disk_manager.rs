@@ -77,9 +77,7 @@ impl ObjectPathManager {
     }
 
     fn index_db_path(root: &PathBuf, fragment_hash: &str) -> PathBuf {
-        root.join(fragment_hash)
-            .join("indexdb")
-            .join(INDEXDB_FILE)
+        root.join(fragment_hash).join("indexdb").join(INDEXDB_FILE)
     }
 
     pub fn get_all_session_partition_db_paths(

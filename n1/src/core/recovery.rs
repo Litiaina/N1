@@ -145,6 +145,22 @@ fn shard_dir_on_root(
     disk_root.join(fragment).join("blob").join(version_id)
 }
 
+fn owning_blob_root_for_path(path: &Path) -> Option<&'static PathBuf> {
+    BLOB_ROOTS
+        .iter()
+        .filter(|root| path.starts_with(root.as_path()))
+        .max_by_key(|root| root.as_os_str().len())
+}
+
+async fn should_schedule_background_repair(shard: &ShardInfo) -> bool {
+    let stable = strip_tmp_attempt_suffix(&shard.absolute_path);
+    let path = Path::new(stable);
+    match path.parent() {
+        Some(parent) => fs::try_exists(parent).await.unwrap_or(false),
+        None => false,
+    }
+}
+
 async fn create_direct_file_for_repair(path: &PathBuf) -> Result<std::fs::File, AppError> {
     let path_clone = path.clone();
 
@@ -347,7 +363,9 @@ pub async fn read_or_recover_chunk(
         return Err(AppError::InternalServerError("No data shards".into()));
     }
 
-    let mut decoder = ReedSolomonDecoder::new(data_count, parity_count, len)
+    let recovery_len = if len % 2 == 0 { len } else { len + 1 };
+
+    let mut decoder = ReedSolomonDecoder::new(data_count, parity_count, recovery_len)
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
     let mut shards_added = 0usize;
@@ -366,7 +384,7 @@ pub async fn read_or_recover_chunk(
             continue;
         }
 
-        let mut chunk = vec![0u8; len];
+        let mut chunk = vec![0u8; recovery_len];
         if file.read_exact(&mut chunk).await.is_err() {
             continue;
         }
@@ -403,15 +421,19 @@ pub async fn read_or_recover_chunk(
         .1
         .to_vec();
 
-    let part_clone = Arc::clone(&part);
-    let target_idx = target_shard.shard_index;
+    if should_schedule_background_repair(target_shard).await {
+        let part_clone = Arc::clone(&part);
+        let target_idx = target_shard.shard_index;
 
-    RECOVERY_RUNTIME.spawn(async move {
-        if let Err(e) = repair_entire_shard(part_clone, target_idx, block_size).await {
-            warn!("Background repair failed for shard {}: {}", target_idx, e);
-        }
-    });
+        RECOVERY_RUNTIME.spawn(async move {
+            if let Err(e) = repair_entire_shard(part_clone, target_idx, block_size).await {
+                warn!("Background repair failed for shard {}: {}", target_idx, e);
+            }
+        });
+    }
 
+    let mut restored = restored;
+    restored.truncate(len);
     Ok(restored)
 }
 
@@ -447,6 +469,17 @@ pub async fn repair_entire_shard(
         .parent()
         .ok_or(AppError::InternalServerError("Invalid shard path".into()))?
         .to_path_buf();
+
+    if let Some(root) = owning_blob_root_for_path(&final_path) {
+        if !fs::try_exists(root).await.unwrap_or(false) {
+            info!(
+                "Skipping background repair for shard {} because blob root {} is unavailable",
+                target_shard_idx,
+                root.display()
+            );
+            return Ok(());
+        }
+    }
 
     if !fs::try_exists(&parent_dir).await.unwrap_or(false) {
         let _ = fs::create_dir_all(&parent_dir).await;
@@ -662,4 +695,113 @@ pub async fn repair_entire_shard(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::disk_manager::{
+        BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS, PartMetadata, ShardInfo,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn crc32_hex(bytes: &[u8]) -> String {
+        let mut hasher = Hasher::new();
+        hasher.update(bytes);
+        format!("{:08x}", hasher.finalize())
+    }
+
+    #[tokio::test]
+    async fn read_or_recover_chunk_restores_single_data_shard_for_nine_byte_object() {
+        let root = std::env::temp_dir().join(format!("n1-recovery-nine-byte-{}", Ulid::new()));
+        let parity_dir = root.join("frag").join("blob").join("ver");
+        fs::create_dir_all(&parity_dir).await.expect("create parity dir");
+
+        let matrix_base = std::env::temp_dir().join(format!("n1-matrix-{}", std::process::id()));
+        let index_roots = vec![
+            matrix_base.join("index_1").to_string_lossy().to_string(),
+            matrix_base.join("index_2").to_string_lossy().to_string(),
+        ];
+        let blob_roots = vec![
+            matrix_base.join("blob_1").to_string_lossy().to_string(),
+            matrix_base.join("blob_2").to_string_lossy().to_string(),
+            matrix_base.join("blob_3").to_string_lossy().to_string(),
+        ];
+        for root in index_roots.iter().chain(blob_roots.iter()) {
+            fs::create_dir_all(root).await.expect("create suite root");
+        }
+        if INDEX_STORE_DISKS.get().is_none() {
+            INDEX_STORE_DISKS
+                .set(index_roots)
+                .expect("set suite index roots");
+        }
+        if BLOB_STORE_DISKS.get().is_none() {
+            BLOB_STORE_DISKS
+                .set(blob_roots)
+                .expect("set suite blob roots");
+        }
+        if FS_STORAGE_ROOT.get().is_none() {
+            FS_STORAGE_ROOT
+                .set(matrix_base.to_string_lossy().to_string())
+                .expect("set suite fs root");
+        }
+
+        let mut shard_bytes = vec![0u8; 262_144];
+        shard_bytes[..9].copy_from_slice(b"trash-me\n");
+        let checksum = crc32_hex(&shard_bytes);
+
+        let parity_path = parity_dir.join("part_0_shard_1.parity");
+        fs::write(&parity_path, &shard_bytes)
+            .await
+            .expect("write parity shard");
+
+        let part = Arc::new(PartMetadata {
+            part_index: 0,
+            size_bytes: 9,
+            created_at: 0,
+            checksum: None,
+            shards: vec![
+                ShardInfo {
+                    shard_index: 0,
+                    file_name: "part_0_shard_0.shard".to_string(),
+                    absolute_path: root
+                        .join("missing")
+                        .join("frag")
+                        .join("blob")
+                        .join("ver")
+                        .join("part_0_shard_0.shard")
+                        .to_string_lossy()
+                        .to_string(),
+                    size_bytes: 262_144,
+                    checksum: checksum.clone(),
+                    is_parity: false,
+                },
+                ShardInfo {
+                    shard_index: 1,
+                    file_name: "part_0_shard_1.parity".to_string(),
+                    absolute_path: parity_path.to_string_lossy().to_string(),
+                    size_bytes: 262_144,
+                    checksum,
+                    is_parity: true,
+                },
+            ],
+        });
+
+        let bytes = read_or_recover_chunk(
+            &mut HashMap::new(),
+            &root.join("missing").join("frag").join("blob").join("ver"),
+            part,
+            0,
+            0,
+            9,
+            262_144,
+        )
+        .await
+        .expect("recover missing shard");
+
+        assert_eq!(bytes, b"trash-me\n");
+
+        let _ = fs::remove_dir_all(&root).await;
+    }
 }

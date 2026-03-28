@@ -1,12 +1,12 @@
-use crate::core::constants::{GC_SUFFIX, PARITY_SUFFIX, REDIST_TMP_SUFFIX, SHARD_SUFFIX};
+use crate::core::constants::{
+    FRAGMENT_METADATA_FILE, GC_SUFFIX, PARITY_SUFFIX, REDIST_TMP_SUFFIX, SHARD_SUFFIX,
+};
 use crate::core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo,
     default_stripe_size,
 };
 use crate::core::ec::ErasureStreamWriter;
-use crate::core::fragment_metadata::{
-    read_fragment_metadata, write_fragment_metadata,
-};
+use crate::core::fragment_metadata::{read_fragment_metadata, write_fragment_metadata};
 use crate::core::index;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::read_or_recover_chunk;
@@ -576,6 +576,11 @@ fn should_stop() -> bool {
 #[inline]
 fn is_stopped_error(err: &str) -> bool {
     err.contains("Stopped")
+}
+
+#[inline]
+fn is_deferrable_owner_unavailability(err: &AppError) -> bool {
+    matches!(err, AppError::ServiceUnavailable(message) if message.contains("authoritative owner index root unavailable"))
 }
 
 pub async fn get_redist_status() -> RedistributionJobStatus {
@@ -1181,8 +1186,10 @@ pub async fn replay_pending_intents_for_fragment_now(
 async fn reachable_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for r in roots {
-        if tokio_fs::try_exists(r).await.unwrap_or(false) {
-            out.push(r.clone());
+        if let Ok(meta) = tokio_fs::metadata(r).await {
+            if meta.is_dir() {
+                out.push(r.clone());
+            }
         }
     }
     out
@@ -1316,7 +1323,10 @@ async fn list_all_fragments(index_roots: &[PathBuf]) -> Vec<String> {
             for ent in rd.filter_map(|e| e.ok()) {
                 if ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     if let Some(name) = ent.file_name().to_str() {
-                        out.insert(name.to_string());
+                        let metadata_path = ent.path().join(FRAGMENT_METADATA_FILE);
+                        if metadata_path.is_file() {
+                            out.insert(name.to_string());
+                        }
                     }
                 }
             }
@@ -1568,6 +1578,8 @@ pub async fn run_redistribution_job_with_options(
     );
 
     let mut touched_fragments: HashSet<String> = HashSet::new();
+    let mut total_task_errors: u64 = 0;
+    let mut last_task_error: Option<String> = None;
     let fragments = match opts.target_fragment.as_ref() {
         Some(fragment) => vec![fragment.clone()],
         None => list_all_fragments(layout.live_index.as_ref()).await,
@@ -1839,7 +1851,18 @@ pub async fn run_redistribution_job_with_options(
                         match result {
                             Ok(_) => {
                                 remove_intent_paths_best_effort(&intent_paths).await;
-                                Ok((fragment, key, version, is_trash_flag))
+                                Ok(Some((fragment, key, version, is_trash_flag)))
+                            }
+                            Err(e) if is_deferrable_owner_unavailability(&e) => {
+                                intent.phase = "deferred".to_string();
+                                intent.updated_at_unix_ms = Utc::now().timestamp_millis();
+                                let _ = write_intent_state(
+                                    &intent_paths,
+                                    &intent,
+                                    task_strict_durability,
+                                )
+                                .await;
+                                Ok(None)
                             }
                             Err(e) => {
                                 let err_text = e.to_string();
@@ -1861,7 +1884,7 @@ pub async fn run_redistribution_job_with_options(
                     while in_flight.len() >= object_concurrency {
                         if let Some(res) = in_flight.next().await {
                             match res {
-                                Ok((fragment, key, version, task_is_trash)) => {
+                                Ok(Some((fragment, key, version, task_is_trash))) => {
                                     touched_fragments.insert(fragment.clone());
                                     delta.migrated += 1;
                                     delta.last_object = Some(format!(
@@ -1869,6 +1892,7 @@ pub async fn run_redistribution_job_with_options(
                                         fragment, key, version, task_is_trash
                                     ));
                                 }
+                                Ok(None) => {}
                                 Err((fragment, key, version, task_is_trash, err)) => {
                                     if should_stop() || is_stopped_error(&err) {
                                         continue;
@@ -1877,7 +1901,9 @@ pub async fn run_redistribution_job_with_options(
                                         "Redistribute failed for {}/{} (v:{}) [Trash:{}]: {}",
                                         fragment, key, version, task_is_trash, err
                                     );
+                                    total_task_errors = total_task_errors.saturating_add(1);
                                     delta.errors += 1;
+                                    last_task_error = Some(err.clone());
                                     delta.last_error = Some(err);
                                 }
                             }
@@ -1899,7 +1925,7 @@ pub async fn run_redistribution_job_with_options(
 
             while let Some(res) = in_flight.next().await {
                 match res {
-                    Ok((fragment, key, version, task_is_trash)) => {
+                    Ok(Some((fragment, key, version, task_is_trash))) => {
                         touched_fragments.insert(fragment.clone());
                         delta.migrated += 1;
                         delta.last_object = Some(format!(
@@ -1907,6 +1933,7 @@ pub async fn run_redistribution_job_with_options(
                             fragment, key, version, task_is_trash
                         ));
                     }
+                    Ok(None) => {}
                     Err((fragment, key, version, task_is_trash, err)) => {
                         if should_stop() || is_stopped_error(&err) {
                             continue;
@@ -1915,7 +1942,9 @@ pub async fn run_redistribution_job_with_options(
                             "Redistribute failed for {}/{} (v:{}) [Trash:{}]: {}",
                             fragment, key, version, task_is_trash, err
                         );
+                        total_task_errors = total_task_errors.saturating_add(1);
                         delta.errors += 1;
+                        last_task_error = Some(err.clone());
                         delta.last_error = Some(err);
                     }
                 }
@@ -1949,14 +1978,34 @@ pub async fn run_redistribution_job_with_options(
         st.durability_mode = effective_durability.to_string();
         st.phase = if should_stop() {
             "Stopped by User".to_string()
+        } else if total_task_errors > 0 {
+            "Completed with Errors".to_string()
         } else {
             "Completed".to_string()
         };
+        if total_task_errors > 0 {
+            st.total_errors = st.total_errors.max(total_task_errors);
+            st.last_error = last_task_error.clone();
+        }
         st.duration_seconds = start_time.elapsed().as_secs();
         ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
     }
 
     info!("Redistribution Job Ended.");
+    if !should_stop() && total_task_errors > 0 {
+        let message = match last_task_error {
+            Some(last) => format!(
+                "Redistribution finished with {} error(s); last error: {}",
+                total_task_errors, last
+            ),
+            None => format!(
+                "Redistribution finished with {} error(s)",
+                total_task_errors
+            ),
+        };
+        return Err(AppError::InternalServerError(message));
+    }
+
     Ok(())
 }
 
@@ -2188,7 +2237,7 @@ async fn redistribute_object_streaming(
     let num_disks = target_blob_roots.len();
     let total_shards = target_data_shards + target_parity_shards;
 
-    if num_disks < target_data_shards {
+    if num_disks < total_shards {
         return Err(AppError::InsufficientStorage);
     }
 
@@ -2498,10 +2547,14 @@ async fn redistribute_object_streaming(
 mod tests {
     use super::{
         RedistributionDurabilityMode, RedistributionExecutionMode, RedistributionRunOptions,
-        RedistributionScope, default_object_concurrency, default_status_batch,
+        RedistributionScope, default_object_concurrency, default_status_batch, list_all_fragments,
         parse_durability_mode_param, parse_execution_mode_param, parse_scope_param,
+        reachable_roots,
     };
+    use crate::core::constants::FRAGMENT_METADATA_FILE;
     use std::collections::HashMap;
+    use std::fs;
+    use ulid::Ulid;
 
     #[test]
     fn durability_auto_resolves_from_fast_mode() {
@@ -2640,5 +2693,42 @@ mod tests {
 
         params.insert("scope".to_string(), "index_only".to_string());
         assert_eq!(parse_scope_param(&params), RedistributionScope::Index);
+    }
+
+    #[tokio::test]
+    async fn list_all_fragments_ignores_filesystem_trash_directories() {
+        let base = std::env::temp_dir().join(format!("n1-redist-fragments-{}", Ulid::new()));
+        let index_root = base.join("index-root");
+        fs::create_dir_all(&index_root).expect("create index root");
+
+        let real_fragment = "real-fragment";
+        let real_fragment_dir = index_root.join(real_fragment);
+        fs::create_dir_all(&real_fragment_dir).expect("create fragment dir");
+        fs::write(real_fragment_dir.join(FRAGMENT_METADATA_FILE), b"fragment")
+            .expect("write fragment metadata marker");
+
+        fs::create_dir_all(index_root.join(".Trash-1000")).expect("create desktop trash dir");
+        fs::create_dir_all(index_root.join("lost+found")).expect("create unrelated dir");
+
+        let fragments = list_all_fragments(&[index_root]).await;
+        assert_eq!(fragments, vec![real_fragment.to_string()]);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn reachable_roots_ignores_blocker_files() {
+        let base = std::env::temp_dir().join(format!("n1-redist-roots-{}", Ulid::new()));
+        let live_root = base.join("live-root");
+        let blocked_root = base.join("blocked-root");
+
+        fs::create_dir_all(&live_root).expect("create live root");
+        fs::create_dir_all(&base).expect("create base");
+        fs::write(&blocked_root, b"down").expect("create blocker file");
+
+        let live = reachable_roots(&[live_root.clone(), blocked_root.clone()]).await;
+        assert_eq!(live, vec![live_root]);
+
+        let _ = fs::remove_dir_all(base);
     }
 }

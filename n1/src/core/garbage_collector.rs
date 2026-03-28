@@ -1,4 +1,4 @@
-use crate::core::constants::GC_SUFFIX;
+use crate::core::constants::{FRAGMENT_METADATA_FILE, GC_SUFFIX};
 use crate::core::disk_manager::{FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManager};
 use crate::core::index;
 use crate::enums::app_error_enum::AppError;
@@ -366,18 +366,7 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
     let index_roots = path_manager.get_all_index_roots();
     let blob_roots = path_manager.get_blob_roots();
 
-    let mut fragments = HashSet::new();
-    for root in &index_roots {
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    if let Some(name) = entry.file_name().to_str() {
-                        fragments.insert(name.to_string());
-                    }
-                }
-            }
-        }
-    }
+    let fragments = collect_gc_fragments(&index_roots);
 
     info!("GC: Starting scan for {} fragments...", fragments.len());
     let fragment_count = fragments.len() as u64;
@@ -451,6 +440,27 @@ async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<()
         st.duration_seconds = start.elapsed().as_secs();
     });
     Ok(())
+}
+
+fn collect_gc_fragments(index_roots: &[PathBuf]) -> HashSet<String> {
+    let mut fragments = HashSet::new();
+    for root in index_roots {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                let metadata_path = entry.path().join(FRAGMENT_METADATA_FILE);
+                if metadata_path.is_file() {
+                    fragments.insert(name);
+                }
+            }
+        }
+    }
+    fragments
 }
 
 async fn process_fragment_gc(
@@ -633,4 +643,35 @@ async fn process_fragment_gc(
     }
 
     stats
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_gc_fragments;
+    use crate::core::constants::FRAGMENT_METADATA_FILE;
+    use std::fs;
+    use ulid::Ulid;
+
+    #[test]
+    fn gc_fragment_scan_ignores_filesystem_trash_directories() {
+        let base = std::env::temp_dir().join(format!("n1-gc-fragment-scan-{}", Ulid::new()));
+        let index_root = base.join("index-root");
+        fs::create_dir_all(&index_root).expect("create index root");
+
+        let real_fragment = "real-fragment";
+        let real_fragment_dir = index_root.join(real_fragment);
+        fs::create_dir_all(&real_fragment_dir).expect("create fragment dir");
+        fs::write(real_fragment_dir.join(FRAGMENT_METADATA_FILE), b"fragment")
+            .expect("write fragment metadata marker");
+
+        fs::create_dir_all(index_root.join(".Trash-1000")).expect("create desktop trash dir");
+        fs::create_dir_all(index_root.join("lost+found")).expect("create unrelated dir");
+
+        let fragments = collect_gc_fragments(&[index_root]);
+        assert!(fragments.contains(real_fragment));
+        assert!(!fragments.contains(".Trash-1000"));
+        assert!(!fragments.contains("lost+found"));
+
+        let _ = fs::remove_dir_all(base);
+    }
 }

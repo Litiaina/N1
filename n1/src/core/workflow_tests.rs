@@ -150,6 +150,75 @@ async fn ensure_global_storage_config(base: &std::path::Path) {
     }
 }
 
+async fn ensure_global_storage_config_with_root_counts(
+    base: &std::path::Path,
+    index_root_count: usize,
+    blob_root_count: usize,
+) {
+    ensure_test_config_file();
+
+    set_configured_index_partition_count(DEFAULT_INDEX_PARTITION_COUNT)
+        .expect("reset configured index partition count");
+    clear_fragment_partition_count_cache_for_test();
+    indexdb_store::clear_cached_dbs_for_test();
+    let _ = fs::remove_dir_all(base).await;
+    let _ = fs::create_dir_all(base).await;
+
+    let mut index_roots = Vec::new();
+    for idx in 1..=index_root_count {
+        let path = base.join(format!("index_{idx}"));
+        let _ = fs::create_dir_all(&path).await;
+        index_roots.push(path.to_string_lossy().to_string());
+    }
+
+    let mut blob_roots = Vec::new();
+    for idx in 1..=blob_root_count {
+        let path = base.join(format!("blob_{idx}"));
+        let _ = fs::create_dir_all(&path).await;
+        blob_roots.push(path.to_string_lossy().to_string());
+    }
+
+    if INDEX_STORE_DISKS.get().is_none() {
+        INDEX_STORE_DISKS
+            .set(index_roots.clone())
+            .expect("set INDEX_STORE_DISKS");
+    } else {
+        assert_eq!(
+            INDEX_STORE_DISKS
+                .get()
+                .expect("INDEX_STORE_DISKS already set"),
+            &index_roots,
+            "test requires isolated process with matching index roots"
+        );
+    }
+
+    if BLOB_STORE_DISKS.get().is_none() {
+        BLOB_STORE_DISKS
+            .set(blob_roots.clone())
+            .expect("set BLOB_STORE_DISKS");
+    } else {
+        assert_eq!(
+            BLOB_STORE_DISKS
+                .get()
+                .expect("BLOB_STORE_DISKS already set"),
+            &blob_roots,
+            "test requires isolated process with matching blob roots"
+        );
+    }
+
+    if FS_STORAGE_ROOT.get().is_none() {
+        FS_STORAGE_ROOT
+            .set(base.to_string_lossy().to_string())
+            .expect("set FS_STORAGE_ROOT");
+    } else {
+        assert_eq!(
+            FS_STORAGE_ROOT.get().expect("FS_STORAGE_ROOT already set"),
+            &base.to_string_lossy().to_string(),
+            "test requires isolated process with matching storage root"
+        );
+    }
+}
+
 async fn restore_simulated_index_disk(
     down_src: &std::path::Path,
     down_dst: &std::path::Path,
@@ -168,6 +237,50 @@ async fn restore_simulated_index_disk(
     }
 
     fs::rename(down_dst, down_src).await.expect(label);
+}
+
+async fn park_simulated_disk_with_blocker(
+    live_src: &std::path::Path,
+    parked_dst: &std::path::Path,
+    blocker_contents: &[u8],
+    label: &str,
+) {
+    if fs::try_exists(parked_dst).await.unwrap_or(false) {
+        match fs::metadata(parked_dst).await {
+            Ok(meta) if meta.is_dir() => {
+                let _ = fs::remove_dir_all(parked_dst).await;
+            }
+            Ok(_) => {
+                let _ = fs::remove_file(parked_dst).await;
+            }
+            Err(_) => {}
+        }
+    }
+
+    fs::rename(live_src, parked_dst).await.expect(label);
+    fs::write(live_src, blocker_contents)
+        .await
+        .expect("create disk down blocker file");
+}
+
+async fn restore_simulated_disk(
+    live_src: &std::path::Path,
+    parked_dst: &std::path::Path,
+    label: &str,
+) {
+    if fs::try_exists(live_src).await.unwrap_or(false) {
+        match fs::metadata(live_src).await {
+            Ok(meta) if meta.is_dir() => {
+                let _ = fs::remove_dir_all(live_src).await;
+            }
+            Ok(_) => {
+                let _ = fs::remove_file(live_src).await;
+            }
+            Err(_) => {}
+        }
+    }
+
+    fs::rename(parked_dst, live_src).await.expect(label);
 }
 
 fn ensure_upload_runtime_config() {
@@ -956,8 +1069,8 @@ fn object_partition_db_paths_owner_first(
         hasher.update([0u8]);
     }
     let route_hash: [u8; 32] = hasher.finalize().into();
-    let owner_idx = usize::from(u16::from(route_hash[0]) << 8 | u16::from(route_hash[1]))
-        % roots.len();
+    let owner_idx =
+        usize::from(u16::from(route_hash[0]) << 8 | u16::from(route_hash[1])) % roots.len();
     let mut selected = vec![roots[owner_idx].clone()];
     for (idx, root) in roots.into_iter().enumerate() {
         if idx != owner_idx {
@@ -1151,10 +1264,8 @@ async fn matrix_fragment_partition_count_is_setup_driven_and_mismatch_is_rejecte
     set_configured_index_partition_count(64).expect("set balanced partition count");
     clear_fragment_partition_count_cache_for_test();
 
-    let fragment = {
-        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
-        hex::encode(digest)
-    };
+    let owner_root = base.join("index_1");
+    let fragment = fragment_owned_by_index_root(&owner_root, "fragment-two-disk-cycle");
 
     init_fragment_metadata(&fragment, "partition-key")
         .await
@@ -1180,7 +1291,10 @@ async fn matrix_fragment_partition_count_is_setup_driven_and_mismatch_is_rejecte
                 message
             );
         }
-        other => panic!("expected partition-count mismatch conflict, got {:?}", other),
+        other => panic!(
+            "expected partition-count mismatch conflict, got {:?}",
+            other
+        ),
     }
 
     set_configured_index_partition_count(DEFAULT_INDEX_PARTITION_COUNT)
@@ -2672,6 +2786,355 @@ async fn matrix_upload_part_rejects_when_target_blob_disk_becomes_unavailable() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated process-level disk root configuration"]
+async fn matrix_upload_init_rejects_layout_when_blob_roots_are_fewer_than_total_shards() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = std::env::temp_dir().join(format!("n1-upload-layout-{}", std::process::id()));
+    ensure_global_storage_config_with_root_counts(&base, 1, 1).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let init_result = initiate_object_upload(
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), "uploads/layout-reject.bin".to_string())),
+        AxumJson(InitiateUploadParams {
+            content_type: Some("application/octet-stream".into()),
+            total_size_bytes: 4096,
+            expected_parts: 1,
+            part_size_bytes: Some(4096),
+        }),
+    )
+    .await;
+
+    match init_result {
+        Err(AppError::ServiceUnavailable(message)) => {
+            assert!(
+                message.contains("cannot satisfy target layout"),
+                "unexpected upload init failure: {}",
+                message
+            );
+        }
+        Ok(_) => {
+            panic!("expected upload init to reject layout that needs more distinct blob roots")
+        }
+        Err(other) => panic!("expected service unavailable, got {}", other),
+    }
+
+    let _ = fs::remove_dir_all(&base).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_read_survives_single_blob_disk_loss_with_parity() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(2, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let key = "reads/blob-disk-loss.bin".to_string();
+    let content = (0..(72 * 1024 + 37))
+        .map(|i| ((i * 13) % 251) as u8)
+        .collect::<Vec<u8>>();
+
+    setup_fragment(&fragment).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+    put_object(state, &fragment, &key, content.clone()).await;
+
+    let blob_2 = base.join("blob_2");
+    let blob_2_parked = base.join("blob_2.down");
+    park_simulated_disk_with_blocker(
+        &blob_2,
+        &blob_2_parked,
+        b"n1-blob-disk-down-blocker",
+        "park blob_2 for read fallback test",
+    )
+    .await;
+
+    let got = read_object_bytes_eventually(fragment.clone(), key.clone(), 24).await;
+    assert_eq!(got, content);
+
+    let meta = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("metadata should remain readable with one blob disk down");
+    assert_eq!(meta.object_key, key);
+
+    restore_simulated_disk(&blob_2, &blob_2_parked, "restore blob_2 after read test").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_missing_fragment_on_one_blob_root_reads_through_and_repair_rebuilds_it() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(2, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let key_a = "reads/missing-fragment-root-a.bin".to_string();
+    let key_b = "reads/missing-fragment-root-b.bin".to_string();
+    let bytes_a = (0..(64 * 1024 + 17))
+        .map(|i| ((i * 3) % 251) as u8)
+        .collect::<Vec<u8>>();
+    let bytes_b = (0..(48 * 1024 + 91))
+        .map(|i| ((i * 11 + 7) % 241) as u8)
+        .collect::<Vec<u8>>();
+    put_object(state.clone(), &fragment, &key_a, bytes_a.clone()).await;
+    put_object(state, &fragment, &key_b, bytes_b.clone()).await;
+
+    let meta_a = get_metadata(&fragment, &key_a, &fragment)
+        .await
+        .expect("metadata for key_a");
+    let meta_b = get_metadata(&fragment, &key_b, &fragment)
+        .await
+        .expect("metadata for key_b");
+
+    let shard_root = |absolute_path: &str| -> std::path::PathBuf {
+        std::path::Path::new(absolute_path)
+            .ancestors()
+            .nth(4)
+            .expect("shard path should include blob root")
+            .to_path_buf()
+    };
+
+    let missing_root = meta_a.parts[0]
+        .shards
+        .iter()
+        .map(|shard| shard_root(&shard.absolute_path))
+        .find(|root| {
+            meta_b.parts[0]
+                .shards
+                .iter()
+                .any(|shard| shard_root(&shard.absolute_path) == *root)
+        })
+        .expect("objects should share at least one blob root");
+    let missing_fragment_dir = missing_root.join(&fragment);
+
+    let tracked_paths = meta_a.parts[0]
+        .shards
+        .iter()
+        .chain(meta_b.parts[0].shards.iter())
+        .filter(|shard| std::path::Path::new(&shard.absolute_path).starts_with(&missing_root))
+        .map(|shard| shard.absolute_path.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        !tracked_paths.is_empty(),
+        "expected at least one shard path under {:?}",
+        missing_root
+    );
+    assert!(
+        fs::try_exists(&missing_fragment_dir).await.unwrap_or(false),
+        "fragment dir should exist before deletion: {:?}",
+        missing_fragment_dir
+    );
+
+    fs::remove_dir_all(&missing_fragment_dir)
+        .await
+        .expect("delete fragment subtree on one blob root");
+    assert!(
+        !fs::try_exists(&missing_fragment_dir).await.unwrap_or(false),
+        "fragment dir should be gone on deleted blob root"
+    );
+
+    let read_a = read_object_bytes_eventually(fragment.clone(), key_a.clone(), 24).await;
+    let read_b = read_object_bytes_eventually(fragment.clone(), key_b.clone(), 24).await;
+    assert_eq!(
+        read_a, bytes_a,
+        "read should recover key_a with one fragment root missing"
+    );
+    assert_eq!(
+        read_b, bytes_b,
+        "read should recover key_b with one fragment root missing"
+    );
+
+    run_repair_job(
+        RepairRunConfig {
+            dry_run: false,
+            target_fragment: None,
+            check_mode: RepairCheckMode::Scrub,
+            meta_concurrency: 2,
+            shard_repair_concurrency: 2,
+            meta_batch_size: 128,
+        },
+        Arc::new(WsConnectionManager::new()),
+    )
+    .await
+    .expect("repair should rebuild the missing fragment subtree");
+
+    assert!(
+        fs::try_exists(&missing_fragment_dir).await.unwrap_or(false),
+        "repair should recreate the missing fragment dir: {:?}",
+        missing_fragment_dir
+    );
+    for path in &tracked_paths {
+        assert!(
+            fs::try_exists(std::path::Path::new(path))
+                .await
+                .unwrap_or(false),
+            "repair should restore shard path {}",
+            path
+        );
+    }
+
+    let repaired_a = read_object_bytes(full_claims(&fragment), fragment.clone(), key_a).await;
+    let repaired_b = read_object_bytes(full_claims(&fragment), fragment.clone(), key_b).await;
+    assert_eq!(repaired_a, bytes_a);
+    assert_eq!(repaired_b, bytes_b);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_metadata_modify_ops_survive_single_blob_disk_loss() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(2, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    let source_key = "modify/blob-disk-loss/source.bin".to_string();
+    let renamed_key = "modify/blob-disk-loss/renamed.bin".to_string();
+    let content = (0..(48 * 1024 + 11))
+        .map(|i| ((i * 19 + 7) % 251) as u8)
+        .collect::<Vec<u8>>();
+
+    setup_fragment(&fragment).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+    put_object(state.clone(), &fragment, &source_key, content.clone()).await;
+
+    let blob_2 = base.join("blob_2");
+    let blob_2_parked = base.join("blob_2.down");
+    park_simulated_disk_with_blocker(
+        &blob_2,
+        &blob_2_parked,
+        b"n1-blob-disk-down-blocker",
+        "park blob_2 for metadata modify test",
+    )
+    .await;
+
+    let rename_resp = rename_object(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumJson(RenameObjectRequest {
+            source_fragment: fragment.clone(),
+            source_key: source_key.clone(),
+            destination_fragment: fragment.clone(),
+            destination_key: renamed_key.clone(),
+        }),
+    )
+    .await
+    .expect("rename should succeed with one blob disk down")
+    .into_response();
+    assert_eq!(rename_resp.status(), StatusCode::OK);
+
+    assert!(
+        matches!(
+            get_metadata(&fragment, &source_key, &fragment).await,
+            Err(AppError::NotFound)
+        ),
+        "source key should no longer exist after rename"
+    );
+
+    let renamed_meta = get_metadata(&fragment, &renamed_key, &fragment)
+        .await
+        .expect("renamed metadata");
+    assert_eq!(renamed_meta.object_key, renamed_key);
+
+    let delete_resp = delete_object(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), renamed_key.clone())),
+    )
+    .await
+    .expect("soft delete should succeed with one blob disk down")
+    .into_response();
+    assert_eq!(delete_resp.status(), StatusCode::OK);
+
+    let recover_resp = recover_object(
+        State(state),
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), renamed_key.clone())),
+    )
+    .await
+    .expect("recover should succeed with one blob disk down")
+    .into_response();
+    assert_eq!(recover_resp.status(), StatusCode::OK);
+
+    let got = read_object_bytes_eventually(fragment.clone(), renamed_key.clone(), 24).await;
+    assert_eq!(got, content);
+
+    restore_simulated_disk(
+        &blob_2,
+        &blob_2_parked,
+        "restore blob_2 after metadata modify test",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_same_key_new_upload_finalized_while_old_unfinished() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -3460,7 +3923,20 @@ async fn matrix_redistribution_with_one_disk_down() {
     if fs::try_exists(&blob3_down).await.unwrap_or(false) {
         let _ = fs::rename(&blob3_down, &blob3).await;
     }
-    redist_res.expect("redistribution should succeed with one disk down");
+
+    match redist_res {
+        Err(AppError::InternalServerError(message)) => {
+            assert!(
+                message.contains("Insufficient storage"),
+                "unexpected redistribution failure: {}",
+                message
+            );
+        }
+        other => panic!(
+            "expected redistribution to fail when one live blob disk is missing for the target layout, got {:?}",
+            other
+        ),
+    }
 
     let got = read_object_bytes(full_claims(&fragment), fragment, key).await;
     assert_eq!(got, content);
@@ -4200,6 +4676,373 @@ async fn matrix_ha_repair_reconverges_index_after_index_disk_down() {
     let got_b = read_object_bytes(full_claims(&fragment), fragment.clone(), seed_key_b).await;
     assert_eq!(got_a, seed_bytes_a);
     assert_eq!(got_b, seed_bytes_b);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated process-level disk root configuration"]
+async fn matrix_two_live_disks_downgrade_to_one_and_reexpand_cleanly() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = std::env::temp_dir().join(format!("n1-two-disk-cycle-{}", std::process::id()));
+    ensure_global_storage_config_with_root_counts(&base, 2, 2).await;
+    ensure_upload_runtime_config();
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let key_before = "ha-downgrade/before.bin".to_string();
+    let key_before_b = "ha-downgrade/before-b.bin".to_string();
+    let before_bytes = (0..(36 * 1024 + 17))
+        .map(|i| ((i * 5) % 251) as u8)
+        .collect::<Vec<u8>>();
+    let before_bytes_b = (0..(19 * 1024 + 101))
+        .map(|i| ((i * 7 + 3) % 241) as u8)
+        .collect::<Vec<u8>>();
+    put_object(state.clone(), &fragment, &key_before, before_bytes.clone()).await;
+    put_object(
+        state.clone(),
+        &fragment,
+        &key_before_b,
+        before_bytes_b.clone(),
+    )
+    .await;
+
+    for key in [&key_before, &key_before_b] {
+        let meta = get_metadata(&fragment, key, &fragment)
+            .await
+            .expect("metadata before downgrade");
+        assert_eq!(
+            meta.parts[0].shards.iter().filter(|s| !s.is_parity).count(),
+            1,
+            "expected 1 data shard before downgrade for {}",
+            key
+        );
+        assert_eq!(
+            meta.parts[0].shards.iter().filter(|s| s.is_parity).count(),
+            1,
+            "expected 1 parity shard before downgrade for {}",
+            key
+        );
+    }
+
+    let index_2 = base.join("index_2");
+    let index_2_parked = base.join("index_2.down");
+    let blob_2 = base.join("blob_2");
+    let blob_2_parked = base.join("blob_2.down");
+    park_simulated_disk_with_blocker(
+        &index_2,
+        &index_2_parked,
+        b"n1-index-disk-down-blocker",
+        "park second index disk for downgrade",
+    )
+    .await;
+    park_simulated_disk_with_blocker(
+        &blob_2,
+        &blob_2_parked,
+        b"n1-blob-disk-down-blocker",
+        "park second blob disk for downgrade",
+    )
+    .await;
+
+    let got_before = read_object_bytes_eventually(fragment.clone(), key_before.clone(), 24).await;
+    let got_before_b =
+        read_object_bytes_eventually(fragment.clone(), key_before_b.clone(), 24).await;
+    assert_eq!(got_before, before_bytes);
+    assert_eq!(got_before_b, before_bytes_b);
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    run_redistribution_job_with_options(
+        false,
+        RedistributionRunOptions {
+            fast_mode: true,
+            execution_mode: RedistributionExecutionMode::Strict,
+            durability_mode: RedistributionDurabilityMode::Batched,
+            ..Default::default()
+        },
+        Arc::new(WsConnectionManager::new()),
+    )
+    .await
+    .expect("downgrade redistribution to 1D+0P should succeed");
+
+    for (key, expected) in [
+        (&key_before, &before_bytes),
+        (&key_before_b, &before_bytes_b),
+    ] {
+        let got = read_object_bytes_eventually(fragment.clone(), key.to_string(), 24).await;
+        assert_eq!(got, *expected);
+
+        let meta = get_metadata(&fragment, key, &fragment)
+            .await
+            .expect("metadata after downgrade");
+        assert_eq!(
+            meta.parts[0].shards.iter().filter(|s| !s.is_parity).count(),
+            1,
+            "expected 1 data shard after downgrade for {}",
+            key
+        );
+        assert_eq!(
+            meta.parts[0].shards.iter().filter(|s| s.is_parity).count(),
+            0,
+            "expected 0 parity shards after downgrade for {}",
+            key
+        );
+        assert!(
+            meta.parts[0].shards.iter().all(|shard| {
+                std::path::Path::new(&shard.absolute_path).starts_with(&base.join("blob_1"))
+            }),
+            "downgraded object {} should only use blob_1: {:?}",
+            key,
+            meta.parts[0]
+                .shards
+                .iter()
+                .map(|s| s.absolute_path.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    restore_simulated_disk(&index_2, &index_2_parked, "restore second index disk").await;
+    restore_simulated_disk(&blob_2, &blob_2_parked, "restore second blob disk").await;
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+
+    run_redistribution_job_with_options(
+        false,
+        RedistributionRunOptions {
+            fast_mode: true,
+            execution_mode: RedistributionExecutionMode::Strict,
+            durability_mode: RedistributionDurabilityMode::Batched,
+            ..Default::default()
+        },
+        Arc::new(WsConnectionManager::new()),
+    )
+    .await
+    .expect("re-expand redistribution to 1D+1P should succeed");
+
+    run_repair_job_with_options(
+        RepairRunConfig {
+            dry_run: false,
+            target_fragment: None,
+            check_mode: RepairCheckMode::Scrub,
+            meta_concurrency: 8,
+            shard_repair_concurrency: 2,
+            meta_batch_size: 512,
+        },
+        RepairRunOptions {
+            fast_mode: true,
+            access_mode: MaintenanceAccessMode::Quiesced,
+            ..Default::default()
+        },
+        Arc::new(WsConnectionManager::new()),
+    )
+    .await
+    .expect("repair after re-expand should succeed");
+
+    assert_all_indexdb_replicas_synchronized(&fragment).await;
+
+    let key_after = "ha-downgrade/after.bin".to_string();
+    let after_bytes = (0..(14 * 1024 + 29))
+        .map(|i| ((i * 11 + 7) % 251) as u8)
+        .collect::<Vec<u8>>();
+    put_object(state.clone(), &fragment, &key_after, after_bytes.clone()).await;
+    let got_after = read_object_bytes_eventually(fragment.clone(), key_after.clone(), 24).await;
+    assert_eq!(got_after, after_bytes);
+
+    for (key, expected) in [
+        (&key_before, &before_bytes),
+        (&key_before_b, &before_bytes_b),
+        (&key_after, &after_bytes),
+    ] {
+        let got = read_object_bytes_eventually(fragment.clone(), key.to_string(), 24).await;
+        assert_eq!(got, *expected);
+
+        let meta = get_metadata(&fragment, key, &fragment)
+            .await
+            .expect("metadata after re-expand");
+        assert_eq!(
+            meta.parts[0].shards.iter().filter(|s| !s.is_parity).count(),
+            1,
+            "expected 1 data shard after re-expand for {}",
+            key
+        );
+        assert_eq!(
+            meta.parts[0].shards.iter().filter(|s| s.is_parity).count(),
+            1,
+            "expected 1 parity shard after re-expand for {}",
+            key
+        );
+        assert!(
+            meta.parts[0]
+                .shards
+                .iter()
+                .any(|shard| { std::path::Path::new(&shard.absolute_path).starts_with(&blob_2) }),
+            "re-expanded object {} should use restored blob_2: {:?}",
+            key,
+            meta.parts[0]
+                .shards
+                .iter()
+                .map(|s| s.absolute_path.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    let _ = fs::remove_dir_all(&base).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated process-level disk root configuration"]
+async fn matrix_redistribution_fails_when_target_layout_needs_more_live_blob_disks_than_available()
+{
+    let _guard = TEST_LOCK.lock().await;
+    let base = std::env::temp_dir().join(format!("n1-redist-live-roots-{}", std::process::id()));
+    ensure_global_storage_config_with_root_counts(&base, 2, 2).await;
+    ensure_upload_runtime_config();
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(4096, Ordering::Relaxed);
+
+    let owner_root = base.join("index_1");
+    let fragment = fragment_owned_by_index_root(&owner_root, "fragment-redist-missing-blob");
+    setup_fragment(&fragment).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let key = "ha-redist/missing-live-blob.bin".to_string();
+    let content = (0..(22 * 1024 + 13))
+        .map(|i| ((i * 17 + 5) % 251) as u8)
+        .collect::<Vec<u8>>();
+    put_object(state, &fragment, &key, content.clone()).await;
+
+    let blob_2 = base.join("blob_2");
+    let blob_2_parked = base.join("blob_2.down");
+    park_simulated_disk_with_blocker(
+        &blob_2,
+        &blob_2_parked,
+        b"n1-blob-disk-down-blocker",
+        "park second blob disk for insufficient-live-root redistribution test",
+    )
+    .await;
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+
+    let result = run_redistribution_job_with_options(
+        false,
+        RedistributionRunOptions {
+            fast_mode: true,
+            execution_mode: RedistributionExecutionMode::Strict,
+            durability_mode: RedistributionDurabilityMode::Batched,
+            ..Default::default()
+        },
+        Arc::new(WsConnectionManager::new()),
+    )
+    .await;
+
+    let status = super::redistribution::get_redist_status().await;
+
+    restore_simulated_disk(
+        &blob_2,
+        &blob_2_parked,
+        "restore second blob disk after insufficient-live-root test",
+    )
+    .await;
+
+    match result {
+        Err(AppError::InternalServerError(message)) => {
+            assert!(
+                message.contains("Redistribution finished with 1 error(s)")
+                    || message.contains("Insufficient storage"),
+                "unexpected redistribution failure: {}",
+                message
+            );
+        }
+        other => panic!(
+            "expected redistribution to fail when target layout needs more live blob roots, got {:?}",
+            other
+        ),
+    }
+
+    assert_eq!(status.phase, "Completed with Errors");
+    assert!(
+        status.total_errors >= 1,
+        "redistribution status should report object errors: {:?}",
+        status
+    );
+    assert!(
+        status
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Insufficient storage"),
+        "redistribution status should retain the placement failure: {:?}",
+        status
+    );
+
+    let got = read_object_bytes_eventually(fragment.clone(), key.clone(), 24).await;
+    assert_eq!(got, content);
+
+    let meta = get_metadata(&fragment, &key, &fragment)
+        .await
+        .expect("metadata after failed redistribution");
+    assert_eq!(
+        meta.parts[0].shards.iter().filter(|s| !s.is_parity).count(),
+        1
+    );
+    assert_eq!(
+        meta.parts[0].shards.iter().filter(|s| s.is_parity).count(),
+        0
+    );
+
+    let _ = fs::remove_dir_all(&base).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5606,7 +6449,19 @@ async fn run_ha_soak_rounds_under_maintenance(profile: SoakProfile) {
                 let _ = fs::rename(&blob3_down, &blob3).await;
             }
 
-            redist_res.expect("redistribution should tolerate one disk down in soak round");
+            match redist_res {
+                Err(AppError::InternalServerError(message)) => {
+                    assert!(
+                        message.contains("Insufficient storage"),
+                        "unexpected redistribution failure in soak round: {}",
+                        message
+                    );
+                }
+                other => panic!(
+                    "expected redistribution to fail when one live blob disk is missing for the target soak layout, got {:?}",
+                    other
+                ),
+            }
         }
 
         let target_key = expected_round[0].0.clone();

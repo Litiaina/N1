@@ -20,7 +20,7 @@
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared node-local storage engine used by both deployments.
 > - `n1` (`litiaina-n1`) is the single-node N2 deployment path and the stable default.
-> - `n1` is released at `0.9.1`.
+> - `n1` is released at `0.9.2`.
 > - `n2` (`litiaina-n2`) is the multi-node N2 deployment path and is released at `0.2.0`.
 > - `registry` (`registry-server`) is the SQLite-backed business metadata layer for both deployment shapes and is versioned independently at `0.4.0`.
 > - `n1-arc` (`litiaina-n1-arc`) is the experimental raw-device profile and is not the production default.
@@ -182,8 +182,8 @@ Profile note:
 
 ## Release Status
 
-- `n1` is the stable/default deployment profile at `0.9.1`.
-- `litiaina-n1-cli` tracks the same release line as `n1`; current CLI release is `0.9.1`.
+- `n1` is the stable/default deployment profile at `0.9.2`.
+- `litiaina-n1-cli` tracks the same release line as `n1`; current CLI release is `0.9.2`.
 - `n2` is released independently at `0.2.0` as the multi-node N2 layer.
 - `registry` is released independently at `0.4.0` as the SQLite-backed Registry layer.
 - `n1-arc` is the experimental raw-device profile.
@@ -222,7 +222,7 @@ Profile note:
 
 | Dimension | N1 (`litiaina-n1`) | N1-Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / production default (`0.9.1`) | Experimental / raw-device profile |
+| Status | Stable / production default (`0.9.2`) | Experimental / raw-device profile |
 | `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | Index metadata backend | Partitioned filesystem metadata | Raw index catalog on block-manager media |
@@ -281,7 +281,7 @@ Under both shapes, the node-local storage engine is still **N1**. N1 provides:
   - `n1`: filesystem-backed shard files under blob roots
   - `n1-arc`: raw-device/direct-I/O blob plane with raw index authority
 
-In the `0.9.1` engine baseline, user convenience behavior moves out of the engine and into the Registry layer:
+In the `0.9.2` engine baseline, user convenience behavior moves out of the engine and into the Registry layer:
 
 - user management
 - ownership tracking
