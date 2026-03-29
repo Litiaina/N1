@@ -169,10 +169,16 @@ Example mountpoints:
 N1 index layout:
 
 ```text
-{INDEX_ROOT}/{fragment}/indexdb/partitions/{partition_id}.ndxdb
+{INDEX_ROOT}/{fragment}/indexdb/index.ndxdb
   object_heads
   object_versions
+  object_version_states
+  live_namespace
   sessions
+  session_parts
+  session_part_receipts
+  trash_objects
+  partition_meta
 ```
 
 ### Index disks (`n1-arc`)

@@ -90,7 +90,7 @@ As of 2026-03-20:
 Disk layout snapshot:
 
 ```text
-{INDEX_ROOT}/{fragment}/indexdb/partitions/{partition_id}.ndxdb
+{INDEX_ROOT}/{fragment}/indexdb/index.ndxdb
 {BLOB_ROOT}/{fragment}/blob/{version_id}/part_{p}_shard_{i}.shard|.parity
 ```
 

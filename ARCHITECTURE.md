@@ -4,7 +4,7 @@
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used underneath both deployment shapes.
 > - `n1` is the stable single-node deployment profile.
-> - `n1` is released at `0.9.1`.
+> - `n1` is released at `0.9.3`.
 > - `n2` is the multi-node N2 deployment profile and is released at `0.2.0`.
 > - `registry` is the SQLite-backed Registry/business layer and is versioned independently at `0.4.0`.
 > - `n1-arc` is an experimental raw-device deployment profile.
@@ -51,16 +51,16 @@ At the platform layer, `registry` owns the business plane:
 - fragment backend bindings
 - storage-session brokering for Registry-backed clients
 
-This replaces the legacy "full mirrored metadata tree on every index root" model. The node is still single-node, but its metadata authority is now partitioned instead of whole-node mirrored.
+This replaces the legacy "full mirrored metadata tree on every index root" model. The node is still single-node, but its metadata authority is now fragment-local and logically partitioned instead of whole-node mirrored.
 
 ## Freeze Status
 
-The current production architecture baseline is `n1 0.9.1`, `n2 0.2.0`, and `registry 0.4.0`.
+The current production architecture baseline is `n1 0.9.3`, `n2 0.2.0`, and `registry 0.4.0`.
 
 That baseline applies to:
 
 - filesystem-backed authoritative `index`
-- partitioned + replicated metadata ownership
+- replicated fragment-local metadata with logical hash partitioning
 - registry-owned namespace/business serving above `index`
 - stateless resumability through authoritative session state
 - profile-specific payload substrate (`n1` filesystem-backed blob roots, `n1-arc` raw blob devices)
@@ -88,10 +88,10 @@ They are expected to keep the same storage semantics. The difference is backend 
 
 | Dimension | N1 | N1-Arc |
 |---|---|---|
-| Status | Stable/default (`0.9.1`) | Experimental raw-device profile |
+| Status | Stable/default (`0.9.3`) | Experimental raw-device profile |
 | `index_store_disks` | Filesystem directories | Raw devices |
 | `blob_store_disks` | Filesystem directories | Raw devices |
-| Index backend | Partitioned `indexdb` metadata (`.ndxdb`) | Raw index catalog (`block_manager`) |
+| Index backend | Fragment-level `indexdb` metadata (`index.ndxdb`) with logical hash buckets | Raw index catalog (`block_manager`) |
 | Blob backend | Filesystem shard files | Raw extent allocator (`block_manager`) |
 
 N1-Arc currently runs raw index and raw blob on managed block-manager media.
@@ -103,8 +103,8 @@ N1-Arc development is now targeting a raw-only storage-kernel model (`index` + `
 ## Platform Truth
 
 - Exact-key reads, finalize, delete, recover, GC, repair, redistribution, and flat listing all resolve against `index`.
-- Each object key hashes to one metadata partition. Each partition selects one owning index root and one replica root when more than one root exists.
-- Session state is partitioned separately by `fragment + version_id`, which keeps resumable upload state bounded to the session's selected roots.
+- Each fragment replica root stores one authoritative `indexdb/index.ndxdb`. Object and session operations still hash into logical buckets inside that DB, and those logical routes select one owning index root plus one replica root when more than one root exists.
+- Session state is partitioned separately by `fragment + version_id`, which keeps resumable upload state bounded to the session's selected logical routes.
 - Multipart part truth stays on disk: part uploads write durable part metadata, and a pending-part receipt covers the crash window before that metadata exists.
 - Blob payload durability (file shards in `n1`, raw extents in `n1-arc`) does not make an object visible until `indexdb` publishes the head.
 - Health/monitoring now treats maintenance debt as part of engine truth: maintenance access mode, stale upload debt, and redistribution intent debt are surfaced directly from the engine.
@@ -147,7 +147,7 @@ The Registry plane is where namespace and business logic now belongs:
 - binding a fragment to either a `single_node` or `multi_node` storage backend
 - issuing short-lived storage sessions to client applications
 
-In the `0.9.1` / `0.2.0` / `0.4.0` baseline, the Registry is a dedicated binary. The engine contract is flat, exact-key-oriented object storage, while client-facing namespace behavior moves into the Registry layer.
+In the `0.9.3` / `0.2.0` / `0.4.0` baseline, the Registry is a dedicated binary. The engine contract is flat, exact-key-oriented object storage, while client-facing namespace behavior moves into the Registry layer.
 
 Registry identity/session notes:
 - the first administrator is created through a master-key bootstrap flow
@@ -181,26 +181,33 @@ Blob payload substrate depends on profile:
 
 ## On-Disk Layout
 
-### `index` partitions
+### `index` authority layout
 
 The authoritative metadata shape is:
 
 ```text
-{INDEX_ROOT}/{fragment}/indexdb/partitions/{partition_id}.ndxdb
+{INDEX_ROOT}/{fragment}/indexdb/index.ndxdb
   object_heads
   object_versions
+  object_version_states
+  live_namespace
   sessions
+  session_parts
+  session_part_receipts
+  trash_objects
+  partition_meta
 ```
 
 Notes:
 
-- object partitions are chosen from `hash("object", fragment, object_key)`
-- session partitions are chosen from `hash("session", fragment, version_id)`
-- when multiple index roots exist, a partition writes to one owner root plus one replica root
+- object routes are chosen from `hash("object", fragment, object_key)` into a setup-driven logical bucket count
+- session routes are chosen from `hash("session", fragment, version_id)` into that same logical bucket space
+- when multiple index roots exist, a logical route writes to one owner root plus one replica root
 - the owner root is the synchronous ACK boundary for object/session state
 - replica writes are intentionally replica-behind and may lag briefly until repair/replay catches up
 - `object_heads` are the current truth for one object key
 - `object_versions` are immutable history rows keyed by object key + version id
+- `live_namespace` is the lexicographic listing index in the same metadata plane
 - `sessions` hold authoritative multipart upload state
 
 ### Engine Listing

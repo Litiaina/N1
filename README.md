@@ -225,17 +225,23 @@ Profile note:
 | Status | Stable / production default (`0.9.3`) | Experimental / raw-device profile |
 | `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw block devices / loopback files |
-| Index metadata backend | Partitioned filesystem metadata | Raw index catalog on block-manager media |
+| Index metadata backend | Fragment-level `indexdb/index.ndxdb` with logical hash buckets | Raw index catalog on block-manager media |
 | Blob payload backend | Shard files on blob roots | Raw extent allocator (`block_manager`) |
 | Raw format commands | Not used | Required for explicit raw media prep |
 
 ### N1 Disk Layout (Current)
 
 ```text
-{INDEX_ROOT}/{fragment}/indexdb/partitions/{partition_id}.ndxdb
+{INDEX_ROOT}/{fragment}/indexdb/index.ndxdb
   object_heads
   object_versions
+  object_version_states
+  live_namespace
   sessions
+  session_parts
+  session_part_receipts
+  trash_objects
+  partition_meta
 
 {BLOB_ROOT}/{fragment}/blob/{version_id}/
   part_{p}_shard_{i}.shard
@@ -479,24 +485,30 @@ The blob plane stores payload shards on the profile-selected substrate:
 
 ## On-disk layout
 
-### `index` partitions (`n1`)
+### `index` authority (`n1`)
 
 The authoritative metadata shape is:
 
 ```text
-{INDEX_ROOT}/{fragment}/indexdb/partitions/{partition_id}.ndxdb
+{INDEX_ROOT}/{fragment}/indexdb/index.ndxdb
   object_heads
   object_versions
+  object_version_states
+  live_namespace
   sessions
+  session_parts
+  session_part_receipts
+  trash_objects
+  partition_meta
 ```
 
 Notes:
 
-- `partition_id` comes from a stable hash route
-- object and session state are partitioned independently
+- the physical DB is one fragment-local `index.ndxdb` per replica root
+- object and session state are routed into stable logical hash buckets inside that DB
 - each object key has one authoritative head row
 - immutable object versions are history rows, not current-truth selectors
-- writes target the partition's selected roots, not every index root in the node
+- writes target the route's selected roots, not every index root in the node
 - success requires at least one selected root to persist the update
 
 ### Blob storage (`n1`)
