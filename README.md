@@ -20,7 +20,7 @@
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared node-local storage engine used by both deployments.
 > - `n1` (`litiaina-n1`) is the single-node N2 deployment path and the stable default.
-> - `n1` is released at `0.9.3`.
+> - `n1` is released at `1.0.0`.
 > - `n2` (`litiaina-n2`) is the multi-node N2 deployment path and is released at `0.2.0`.
 > - `registry` (`registry-server`) is the SQLite-backed business metadata layer for both deployment shapes and is versioned independently at `0.4.0`.
 > - `n1-arc` (`litiaina-n1-arc`) is the experimental raw-device profile and is not the production default.
@@ -96,6 +96,9 @@ N2 deployment split in this workspace:
   - access token default TTL: `15 minutes`
   - access token max TTL: `1 hour`
   - refresh token default TTL: `7 days`
+- N1 stable API identity:
+  - authenticated fragment-scoped engine routes live under `/n1/*`
+  - business/public features such as share links and derived thumbnails live outside N1 core
 
 Multi-node N2 operator note from the current 2-node hardware pass:
 - the tested filesystem-backed `n2 0.2.0` shape was:
@@ -182,8 +185,8 @@ Profile note:
 
 ## Release Status
 
-- `n1` is the stable/default deployment profile at `0.9.3`.
-- `litiaina-n1-cli` tracks the same release line as `n1`; current CLI release is `0.9.3`.
+- `n1` is the stable/default deployment profile at `1.0.0`.
+- `litiaina-n1-cli` tracks the same release line as `n1`; current CLI release is `1.0.0`.
 - `n2` is released independently at `0.2.0` as the multi-node N2 layer.
 - `registry` is released independently at `0.4.0` as the SQLite-backed Registry layer.
 - `n1-arc` is the experimental raw-device profile.
@@ -208,21 +211,20 @@ Profile note:
   - registry-owned object metadata lookup
   - fragment-to-backend binding for `single_node` and `multi_node` storage targets
   - storage-session brokering for Registry-backed clients and future GUI/web integrations
-- `n1` also exposes `POST /v4/upload/one-shot/{object_key}` for direct small-object upload without session/finalize overhead. The fragment comes from the authenticated claim.
+- `n1` exposes `POST /n1/upload/one-shot/{*object_key}` for direct small-object upload without session/finalize overhead. The fragment comes from the authenticated claim.
 - `n1` also exposes claim-scoped bulk mutation routes for high-count object workflows:
-  - `POST /v4/fragment/object/bulk-delete`
-  - `POST /v4/fragment/object/bulk-recover`
-- `n1` also exposes `GET /v4/fragment/thumb/{*object_key}` for disk-backed derived image thumbnails. Thumbnails are keyed by object `version_id`, are not listed as normal objects, and are regenerated on demand.
+  - `POST /n1/objects/bulk-delete`
+  - `POST /n1/objects/bulk-recover`
 - On Linux, `n1` prefers `io_uring` on the blob data path when available and falls back to `O_DIRECT` + blocking writes when it is not.
 - `n1-arc` is the experimental raw-device profile with raw index/blob media managed by `block_manager`.
-- The HTTP/API surface is **not** frozen yet. Route shapes, request fields, operational endpoints, and metadata layout may still change before `1.0.0`.
-- Backward compatibility is **not** promised on the `0.x` line. Destructive redesigns are allowed until the `1.0.0` contract is frozen.
+- The N1 HTTP/API surface is frozen for `1.0.0` under `/n1/*`.
+- Backward compatibility now follows the `1.x` stable contract for N1 core.
 
 ## Profile Distinction And Disk Layout (Authoritative)
 
 | Dimension | N1 (`litiaina-n1`) | N1-Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / production default (`0.9.3`) | Experimental / raw-device profile |
+| Status | Stable / production default (`1.0.0`) | Experimental / raw-device profile |
 | `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | Index metadata backend | Fragment-level `indexdb/index.ndxdb` with logical hash buckets | Raw index catalog on block-manager media |
@@ -287,7 +289,7 @@ Under both shapes, the node-local storage engine is still **N1**. N1 provides:
   - `n1`: filesystem-backed shard files under blob roots
   - `n1-arc`: raw-device/direct-I/O blob plane with raw index authority
 
-In the `0.9.3` engine baseline, user convenience behavior moves out of the engine and into the Registry layer:
+In the `1.0.0` engine baseline, user convenience behavior moves out of the engine and into the Registry layer:
 
 - user management
 - ownership tracking
@@ -544,7 +546,7 @@ At this point no object version is visible.
 
 ### 1a) One-shot upload (`n1`)
 
-For small single-request objects, `n1` also exposes `POST /v4/upload/one-shot/{*object_key}`. The fragment is claim-scoped and is not passed in the path.
+For small single-request objects, `n1` also exposes `POST /n1/upload/one-shot/{*object_key}`. The fragment is claim-scoped and is not passed in the path.
 
 That path:
 
@@ -556,8 +558,8 @@ That path:
 
 For large file-management actions on many keys, `n1` also exposes claim-scoped bulk object mutation routes:
 
-- `POST /v4/fragment/object/bulk-delete`
-- `POST /v4/fragment/object/bulk-recover`
+- `POST /n1/objects/bulk-delete`
+- `POST /n1/objects/bulk-recover`
 
 These accept a JSON body of the form:
 
@@ -572,23 +574,11 @@ These accept a JSON body of the form:
 
 They are intended for UI or operator flows that need to mutate hundreds or thousands of objects without paying one HTTPS request per object.
 
-### 1b) Derived thumbnails (`n1`)
+### 1b) Derived media
 
-For image-heavy browsing, `n1` also exposes `GET /v4/fragment/thumb/{*object_key}`.
-
-That path:
-
-- validates fragment scope and resolves the current or requested object version
-- loads the original image once
-- generates a bounded thumbnail on demand
-- stores the derived thumbnail on disk under a hidden cache path keyed by `fragment + version_id + profile`
-- serves later requests from that disk cache instead of reloading the full original image
-
-This is a derived cache, not a second user object:
-
-- thumbnails do not appear in normal object listings
-- thumbnails do not create new object versions
-- cache keys are version-aware, so a new upload of the same object key produces a fresh thumbnail path
+Derived media generation is no longer part of N1 core. For `1.0.0`, N1 stays focused on
+authenticated fragment storage, while previews, thumbnails, and share-link behavior are expected
+to live in a higher layer such as Registry or a dedicated accelerator service.
 
 ### 2) Upload part (payload first, metadata second)
 
@@ -693,7 +683,7 @@ List visibility comes from committed head rows:
 
 - `object_heads` are the current truth for live and trash state
 - `object_versions` are immutable history
-- `/v4/fragment/objects` and `/v4/fragment/trash` page over head rows, not directory markers
+- `/n1/objects` and `/n1/trash` page over head rows, not directory markers
 
 ### Authority rules
 

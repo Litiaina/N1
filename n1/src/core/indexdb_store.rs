@@ -528,10 +528,7 @@ fn get_or_open_db(path: &Path) -> Result<Arc<Database>, AppError> {
     let db = Arc::new(
         std::panic::catch_unwind(|| Database::create(path))
             .map_err(|_| {
-                AppError::InternalServerError(format!(
-                    "indexdb open {} panicked",
-                    path.display()
-                ))
+                AppError::InternalServerError(format!("indexdb open {} panicked", path.display()))
             })?
             .map_err(|e| map_indexdb_error(&format!("open {}", path.display()), e))?,
     );
@@ -719,20 +716,19 @@ fn select_authoritative_partition_db_path(
             first_existing = Some(candidate_path.clone());
         }
 
-        let generation = match get_or_open_db(&candidate_path)
-            .and_then(|db| read_partition_meta_exact(&db))
-        {
-            Ok(Some(meta)) => meta.committed_generation,
-            Ok(None) => 0,
-            Err(err) => {
-                warn!(
-                    "indexdb authoritative replica scan failed for {}: {}",
-                    candidate_path.display(),
-                    err
-                );
-                0
-            }
-        };
+        let generation =
+            match get_or_open_db(&candidate_path).and_then(|db| read_partition_meta_exact(&db)) {
+                Ok(Some(meta)) => meta.committed_generation,
+                Ok(None) => 0,
+                Err(err) => {
+                    warn!(
+                        "indexdb authoritative replica scan failed for {}: {}",
+                        candidate_path.display(),
+                        err
+                    );
+                    0
+                }
+            };
 
         match &best {
             Some((best_path, best_generation))
@@ -796,11 +792,11 @@ fn replicate_owner_partition_db(fragment: &str, route: &IndexRoute) -> Result<()
     let source_path = select_authoritative_partition_db_path(route, fragment)?
         .map(|(path, _)| path)
         .ok_or_else(|| {
-        AppError::InternalServerError(format!(
-            "no partition db replicas exist for fragment {} partition {:04x}",
-            fragment, route.partition_id
-        ))
-    })?;
+            AppError::InternalServerError(format!(
+                "no partition db replicas exist for fragment {} partition {:04x}",
+                fragment, route.partition_id
+            ))
+        })?;
 
     if source_path != owner_path {
         warn!(

@@ -243,30 +243,6 @@ pub struct RenameObjectRequest {
     pub destination_key: String,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum SignedUrlDisposition {
-    #[default]
-    View,
-    Stream,
-    Download,
-}
-
-#[derive(Deserialize)]
-pub struct CreateSignedUrlRequest {
-    pub fragment: String,
-    pub object_key: String,
-    pub expires_in: u64,
-    #[serde(default)]
-    pub disposition: SignedUrlDisposition,
-}
-
-#[derive(Serialize)]
-pub struct SignedUrlResponse {
-    pub url: String,
-    pub expires_at: String,
-}
-
 #[derive(Deserialize)]
 pub struct ObjectKeyQuery {
     pub object_key: String,

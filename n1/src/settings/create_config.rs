@@ -8,8 +8,7 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("host", "127.0.0.1")
         .set("https_port", "50001")
         .set("cert_path", "")
-        .set("key_path", "")
-        .set("sharable_url", "");
+        .set("key_path", "");
 
     conf.with_section(Some("disk_config"))
         .set("index_store_disks", "")
@@ -38,8 +37,6 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("view_limit_burst_size", "100")
         .set("upload_limit_per_second", "300")
         .set("upload_limit_burst_size", "3000")
-        .set("sharing_limit_per_second", "50")
-        .set("sharing_limit_burst_size", "100")
         .set("global_limit_per_second", "200")
         .set("global_limit_burst_size", "300");
 

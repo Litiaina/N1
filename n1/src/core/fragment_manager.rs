@@ -51,59 +51,6 @@ pub fn is_fragment_hash(name: &str) -> bool {
         .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
 }
 
-pub async fn list_public_fragments() -> Result<impl IntoResponse, AppError> {
-    let path_manager = ObjectPathManager::new();
-    let index_roots = path_manager.get_all_index_roots();
-
-    let fragments = tokio::task::spawn_blocking(move || -> Result<Vec<String>, std::io::Error> {
-        let mut fragment_hashes = std::collections::HashSet::new();
-
-        for root in index_roots {
-            if !root.exists() {
-                continue;
-            }
-
-            if let Ok(entries) = std::fs::read_dir(root) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    if let Ok(file_type) = entry.file_type() {
-                        if file_type.is_dir() {
-                            if let Some(name) = entry.file_name().to_str() {
-                                if is_fragment_hash(name) {
-                                    fragment_hashes.insert(name.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut sorted_fragments: Vec<String> = fragment_hashes.into_iter().collect();
-        sorted_fragments.sort();
-        Ok(sorted_fragments)
-    })
-    .await
-    .map_err(|e| AppError::InternalServerError(format!("Task join error: {}", e)))?
-    .map_err(|e| AppError::Io(e, "read storage root".into()))?;
-
-    if fragments.is_empty() {
-        return Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "message": "No fragments found",
-                "fragments": []
-            })),
-        ));
-    }
-
-    Ok((
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "fragments": fragments
-        })),
-    ))
-}
-
 pub async fn create_fragment(
     Json(payload): Json<CreateFragmentRequest>,
 ) -> Result<impl IntoResponse, AppError> {

@@ -67,6 +67,50 @@ pub struct FragmentBindingRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareDisposition {
+    #[default]
+    View,
+    Stream,
+    Download,
+}
+
+impl ShareDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::View => "view",
+            Self::Stream => "stream",
+            Self::Download => "download",
+        }
+    }
+
+    pub fn parse_db(value: String) -> Result<Self, String> {
+        match value.as_str() {
+            "view" => Ok(Self::View),
+            "stream" => Ok(Self::Stream),
+            "download" => Ok(Self::Download),
+            other => Err(format!("unknown share disposition '{}'", other)),
+        }
+    }
+
+    pub fn is_download(self) -> bool {
+        matches!(self, Self::Download)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ShareRecord {
+    pub share_id: String,
+    pub owner_uid: String,
+    pub fragment: String,
+    pub object_key: String,
+    pub disposition: ShareDisposition,
+    pub expires_at: String,
+    pub created_at: String,
+    pub revoked_at: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
@@ -361,6 +405,39 @@ pub struct ListObjectsQuery {
 pub struct ResolveObjectQuery {
     pub fragment: String,
     pub object_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateShareRequest {
+    pub fragment: String,
+    pub object_key: String,
+    pub expires_in: u64,
+    #[serde(default)]
+    pub disposition: ShareDisposition,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListSharesQuery {
+    pub fragment: Option<String>,
+    pub include_expired: Option<bool>,
+    pub include_revoked: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateShareResponse {
+    pub share: ShareRecord,
+    pub url: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListSharesResponse {
+    pub shares: Vec<ShareRecord>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RevokeShareResponse {
+    pub revoked: bool,
 }
 
 #[derive(Debug, Serialize)]

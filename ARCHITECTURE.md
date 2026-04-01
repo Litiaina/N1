@@ -4,7 +4,7 @@
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used underneath both deployment shapes.
 > - `n1` is the stable single-node deployment profile.
-> - `n1` is released at `0.9.3`.
+> - `n1` is released at `1.0.0`.
 > - `n2` is the multi-node N2 deployment profile and is released at `0.2.0`.
 > - `registry` is the SQLite-backed Registry/business layer and is versioned independently at `0.4.0`.
 > - `n1-arc` is an experimental raw-device deployment profile.
@@ -55,7 +55,7 @@ This replaces the legacy "full mirrored metadata tree on every index root" model
 
 ## Freeze Status
 
-The current production architecture baseline is `n1 0.9.3`, `n2 0.2.0`, and `registry 0.4.0`.
+The current production architecture baseline is `n1 1.0.0`, `n2 0.2.0`, and `registry 0.4.0`.
 
 That baseline applies to:
 
@@ -88,7 +88,7 @@ They are expected to keep the same storage semantics. The difference is backend 
 
 | Dimension | N1 | N1-Arc |
 |---|---|---|
-| Status | Stable/default (`0.9.3`) | Experimental raw-device profile |
+| Status | Stable/default (`1.0.0`) | Experimental raw-device profile |
 | `index_store_disks` | Filesystem directories | Raw devices |
 | `blob_store_disks` | Filesystem directories | Raw devices |
 | Index backend | Fragment-level `indexdb` metadata (`index.ndxdb`) with logical hash buckets | Raw index catalog (`block_manager`) |
@@ -147,7 +147,7 @@ The Registry plane is where namespace and business logic now belongs:
 - binding a fragment to either a `single_node` or `multi_node` storage backend
 - issuing short-lived storage sessions to client applications
 
-In the `0.9.3` / `0.2.0` / `0.4.0` baseline, the Registry is a dedicated binary. The engine contract is flat, exact-key-oriented object storage, while client-facing namespace behavior moves into the Registry layer.
+In the `1.0.0` / `0.2.0` / `0.4.0` baseline, the Registry is a dedicated binary. The engine contract is flat, exact-key-oriented object storage, while client-facing namespace behavior moves into the Registry layer.
 
 Registry identity/session notes:
 - the first administrator is created through a master-key bootstrap flow
@@ -239,13 +239,7 @@ Standard blob layout:
   part_{p}_shard_{i}.parity
 
 {BLOB_ROOT}/{fragment}/.trash/blob/{version_id}/...
-{BLOB_ROOT}/{fragment}/.thumbs/{version_id}/thumb-{profile}.{ext}
 ```
-
-Thumbnail note:
-- `n1` thumbnails are derived cache files, not user objects.
-- They are keyed by immutable `version_id` plus thumbnail profile (`width`, `height`, `fit`, `format`).
-- They do not appear in object listings and can be regenerated from the original object version at any time.
 
 N1-Arc blob layout:
 
@@ -280,7 +274,7 @@ At this stage no object is visible.
 
 `n1` also exposes a direct single-request path:
 
-- `POST /v4/upload/one-shot/{*object_key}`
+- `POST /n1/upload/one-shot/{*object_key}`
 
 That path skips session state and finalize for small objects:
 
@@ -338,24 +332,11 @@ durability replicas behind that boundary, not part of the foreground ACK path.
 - immutable history resolves through `object_versions`
 - blob addresses come from the published `ObjectMetadata`
 
-### Derived thumbnails
+### Derived media
 
-`n1` also exposes a derived image preview path:
-
-- `GET /v4/fragment/thumb/{*object_key}`
-
-That path resolves the authoritative object version first, then:
-
-- validates that the target is an image object
-- checks for a disk-backed thumbnail cache entry under `.thumbs/{version_id}/...`
-- generates the thumbnail lazily on first request when the cache entry is missing
-- serves later requests from that derived file
-
-This keeps image-heavy gallery browsing efficient without changing the core object model:
-
-- no thumbnail rows in `index`
-- no thumbnail entries in normal object listing
-- no extra user-visible object versions
+For `1.0.0`, N1 no longer owns derived-media generation such as thumbnails. The engine stays
+focused on authenticated fragment storage, while preview/render behavior is expected to live in a
+layer above N1.
 
 ### Flat engine listing
 

@@ -151,7 +151,7 @@ pub async fn run_garbage_collector(State(state): State<Arc<AppState>>) -> impl I
     if GC_RUNNING.swap(true, Ordering::SeqCst) {
         return (
             StatusCode::CONFLICT,
-            "GC is already running. Check /v4/maintenance/gc/status.",
+            "GC is already running. Check /n1/maintenance/gc/status.",
         );
     }
     GC_STOP_SIGNAL.store(false, Ordering::Relaxed);

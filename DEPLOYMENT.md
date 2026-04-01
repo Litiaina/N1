@@ -4,7 +4,7 @@
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared storage engine used underneath both deployment shapes.
 > - Single-node deployment: `n1` (`litiaina-n1`)
-> - `n1` release: `0.9.3`
+> - `n1` release: `1.0.0`
 > - Multi-node deployment: `n2` (`litiaina-n2`, `0.2.0`)
 > - Registry/business deployment: `registry` (`registry-server`, `0.4.0`)
 > - Experimental raw-device profile: `n1-arc` (`litiaina-n1-arc`)
@@ -611,21 +611,21 @@ Start:
 
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
-  https://127.0.0.1:50001/v4/maintenance/scrub/start
+  "https://127.0.0.1:50001/n1/maintenance/repair/start?mode=scrub"
 ```
 
 Status:
 
 ```bash
 curl -k -H "Authorization: Bearer $TOKEN" \
-  https://127.0.0.1:50001/v4/maintenance/scrub/status
+  https://127.0.0.1:50001/n1/maintenance/repair/status
 ```
 
 Stop:
 
 ```bash
 curl -k -X POST -H "Authorization: Bearer $TOKEN" \
-  https://127.0.0.1:50001/v4/maintenance/scrub/stop
+  https://127.0.0.1:50001/n1/maintenance/repair/stop
 ```
 
 Scrub is the integrity-check pass for committed shards (raw shards on `n1-arc`, shard files on `n1`).
@@ -659,7 +659,7 @@ Scrub is the integrity-check pass for committed shards (raw shards on `n1-arc`, 
 
 ## 10. Release Hardening On Target Hardware
 
-Run the release drill harness before production rollout (`n1 0.9.3` stable, `n1-arc` experimental):
+Run the release drill harness before production rollout (`n1 1.0.0` stable, `n1-arc` experimental):
 
 ```bash
 scripts/bench/run_release_drills.sh

@@ -55,8 +55,6 @@ struct RateLimitSettings {
     upload_burst: u32,
     transcode_per_sec: u64,
     transcode_burst: u32,
-    sharing_per_sec: u64,
-    sharing_burst: u32,
     global_per_sec: u64,
     global_burst: u32,
 }
@@ -75,8 +73,6 @@ fn get_rate_limit_config() -> RateLimitSettings {
             upload_burst: 3000,
             transcode_per_sec: 1,
             transcode_burst: 2,
-            sharing_per_sec: 50,
-            sharing_burst: 100,
             global_per_sec: 200,
             global_burst: 300
         };
@@ -115,8 +111,6 @@ fn get_rate_limit_config() -> RateLimitSettings {
                             upload_burst: get_val!("upload_limit_burst_size", defaults.upload_burst),
                             transcode_per_sec: get_val!("transcode_limit_per_second", defaults.transcode_per_sec),
                             transcode_burst: get_val!("transcode_limit_burst_size", defaults.transcode_burst),
-                            sharing_per_sec: get_val!("sharing_limit_per_second", defaults.sharing_per_sec),
-                            sharing_burst: get_val!("sharing_limit_burst_size", defaults.sharing_burst),
                             global_per_sec: get_val!("global_limit_per_second", defaults.global_per_sec),
                             global_burst: get_val!("global_limit_burst_size", defaults.global_burst),
                         }
@@ -139,7 +133,6 @@ pub struct RateLimitLayers {
     pub auth: Option<GovernorLayer<SmartIpKeyExtractor, NoOpMiddleware, Body>>,
     pub view: Option<GovernorLayer<UserKeyExtractor, NoOpMiddleware, Body>>,
     pub upload: Option<GovernorLayer<UserKeyExtractor, NoOpMiddleware, Body>>,
-    pub sharing: Option<GovernorLayer<SmartIpKeyExtractor, NoOpMiddleware, Body>>,
     pub global: Option<GovernorLayer<SmartIpKeyExtractor, NoOpMiddleware, Body>>,
 }
 
@@ -152,7 +145,6 @@ impl RateLimitLayers {
                 auth: None,
                 view: None,
                 upload: None,
-                sharing: None,
                 global: None,
             };
         }
@@ -188,10 +180,6 @@ impl RateLimitLayers {
                 limits.upload_per_sec,
                 limits.upload_burst,
             ))),
-            sharing: Some(GovernorLayer::new(build_ip_conf(
-                limits.sharing_per_sec,
-                limits.sharing_burst,
-            ))),
             global: Some(GovernorLayer::new(build_ip_conf(
                 limits.global_per_sec,
                 limits.global_burst,
@@ -226,17 +214,6 @@ impl RateLimitLayers {
         S: Clone + Send + Sync + 'static,
     {
         if let Some(layer) = &self.upload {
-            router.layer(layer.clone())
-        } else {
-            router
-        }
-    }
-
-    pub fn layer_sharing<S>(&self, router: Router<S>) -> Router<S>
-    where
-        S: Clone + Send + Sync + 'static,
-    {
-        if let Some(layer) = &self.sharing {
             router.layer(layer.clone())
         } else {
             router

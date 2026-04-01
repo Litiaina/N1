@@ -12,7 +12,9 @@ use uuid::Uuid;
 
 use crate::config::{RegistryConfig, normalize_backend_url};
 use crate::error::RegistryError;
-use crate::models::{FragmentBindingRecord, StorageDeployment, StorageSessionResponse};
+use crate::models::{
+    FragmentBindingRecord, ShareDisposition, StorageDeployment, StorageSessionResponse,
+};
 
 #[derive(Clone)]
 pub struct StorageBroker {
@@ -155,7 +157,7 @@ impl StorageBroker {
 
         let response = self
             .client_for_backend(&backend)
-            .post(format!("{}/v4/fragment/create", backend.engine_url))
+            .post(format!("{}/n1/fragments", backend.engine_url))
             .json(&CreateFragmentRequest {
                 name: fragment_name,
                 secret: &backend.master_key,
@@ -224,7 +226,7 @@ impl StorageBroker {
         let request = self
             .client_for_backend(&backend)
             .post(format!(
-                "{}/v4/fragment/archive/manifest",
+                "{}/n1/objects/archive/manifest",
                 backend.engine_url
             ))
             .bearer_auth(payload.access_token)
@@ -258,6 +260,71 @@ impl StorageBroker {
         Ok(response)
     }
 
+    pub async fn stream_shared_object(
+        &self,
+        binding: &FragmentBindingRecord,
+        object_key: &str,
+        disposition: ShareDisposition,
+        request_headers: &axum::http::HeaderMap,
+    ) -> Result<reqwest::Response, RegistryError> {
+        let backend = self.resolve_backend(binding)?;
+        let payload = self
+            .authenticate_fragment(&backend, &binding.fragment, true, false, false, false)
+            .await?;
+        let client = self.client_for_backend(&backend);
+        let mut request = if disposition.is_download() {
+            client
+                .get(format!("{}/n1/objects/download", backend.engine_url))
+                .query(&[("object_key", object_key)])
+        } else {
+            client.get(format!(
+                "{}/n1/objects/get/{}",
+                backend.engine_url,
+                encode_object_key_path(object_key)
+            ))
+        }
+        .bearer_auth(&payload.access_token);
+
+        for header_name in [
+            axum::http::header::RANGE,
+            axum::http::header::IF_RANGE,
+            axum::http::header::IF_NONE_MATCH,
+            axum::http::header::IF_MODIFIED_SINCE,
+            axum::http::header::ACCEPT,
+        ] {
+            if let Some(value) = request_headers.get(&header_name) {
+                if let Ok(value) = value.to_str() {
+                    request = request.header(header_name.as_str(), value);
+                }
+            }
+        }
+
+        let response = request.send().await.map_err(|err| {
+            RegistryError::bad_gateway(format!(
+                "storage share request failed for {}: {}",
+                backend.engine_url, err
+            ))
+        })?;
+
+        if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_MODIFIED
+        {
+            return Ok(response);
+        }
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RegistryError::not_found("shared object not found"));
+        }
+
+        let fallback = format!(
+            "storage shared object failed against {} backend",
+            match backend.deployment {
+                StorageDeployment::SingleNode => "single-node",
+                StorageDeployment::MultiNode => "multi-node",
+            }
+        );
+        let message = extract_engine_error_message(response, fallback).await;
+        Err(RegistryError::bad_gateway(message))
+    }
+
     pub async fn rename_fragment(
         &self,
         binding: &FragmentBindingRecord,
@@ -270,7 +337,7 @@ impl StorageBroker {
         let response = self
             .client_for_backend(&backend)
             .patch(format!(
-                "{}/v4/fragment/modify/{}",
+                "{}/n1/fragments/{}",
                 backend.engine_url, binding.fragment
             ))
             .bearer_auth(payload.access_token)
@@ -319,7 +386,7 @@ impl StorageBroker {
         let response = self
             .client_for_backend(&backend)
             .delete(format!(
-                "{}/v4/fragment/delete/{}",
+                "{}/n1/fragments/{}",
                 backend.engine_url, binding.fragment
             ))
             .bearer_auth(payload.access_token)
@@ -379,7 +446,7 @@ impl StorageBroker {
         let response = self
             .client_for_backend(&backend)
             .delete(format!(
-                "{}/v4/fragment/version/delete/{}/{}",
+                "{}/n1/objects/version/{}/{}",
                 backend.engine_url, encoded_version, encoded_key
             ))
             .bearer_auth(&payload.access_token)
@@ -546,7 +613,7 @@ impl StorageBroker {
     ) -> Result<EngineAuthResponse, RegistryError> {
         let response = self
             .client_for_backend(backend)
-            .post(format!("{}/authenticate/fragment", backend.engine_url))
+            .post(format!("{}/n1/auth/fragment", backend.engine_url))
             .json(&FragmentAuthRequest {
                 fragment,
                 secret: &backend.master_key,
@@ -613,7 +680,7 @@ impl StorageBroker {
         let response = self
             .client_for_backend(backend)
             .get(format!(
-                "{}/v4/fragment/meta/{}",
+                "{}/n1/objects/meta/{}",
                 backend.engine_url, encoded_key
             ))
             .bearer_auth(access_token)
@@ -664,7 +731,7 @@ impl StorageBroker {
         let response = self
             .client_for_backend(backend)
             .get(format!(
-                "{}/v4/fragment/versions/{}",
+                "{}/n1/objects/versions/{}",
                 backend.engine_url, encoded_key
             ))
             .bearer_auth(access_token)

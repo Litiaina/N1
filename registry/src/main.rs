@@ -33,13 +33,15 @@ use error::RegistryError;
 use models::{
     AdminStatsResponse, AdminUserListResponse, AdminUserSummary, ArchiveObjectsRequest,
     BootstrapAdminRequest, BootstrapAdminResponse, BulkObjectKeysRequest,
-    BulkObjectMutationResponse, BulkObjectSelectionResponse, CreateUserRequest, CreateUserResponse,
-    DeleteObjectQuery, DeleteObjectVersionRequest, DeleteObjectVersionResponse, DeleteUserResponse,
+    BulkObjectMutationResponse, BulkObjectSelectionResponse, CreateShareRequest,
+    CreateShareResponse, CreateUserRequest, CreateUserResponse, DeleteObjectQuery,
+    DeleteObjectVersionRequest, DeleteObjectVersionResponse, DeleteUserResponse,
     DisableTwoFactorRequest, EnableTwoFactorRequest, FinalizeObjectRequest, FragmentListResponse,
     FragmentStateRequest, LinkFragmentRequest, LinkFragmentResponse, ListObjectsQuery,
-    ListObjectsResponse, LoginRequest, LoginResponse, ObjectDeleteResponse, ObjectMutationResponse,
-    ObjectStateRequest, ObjectStatsQuery, ObjectStatsResponse, RefreshRequest, RefreshResponse,
-    RegisterObjectRequest, RenameRegistryObjectRequest, ResolveObjectQuery, SetupTwoFactorRequest,
+    ListObjectsResponse, ListSharesQuery, ListSharesResponse, LoginRequest, LoginResponse,
+    ObjectDeleteResponse, ObjectMutationResponse, ObjectStateRequest, ObjectStatsQuery,
+    ObjectStatsResponse, RefreshRequest, RefreshResponse, RegisterObjectRequest,
+    RenameRegistryObjectRequest, ResolveObjectQuery, RevokeShareResponse, SetupTwoFactorRequest,
     SignupRequest, SignupResponse, StorageSessionRequest, StorageSessionResponse,
     SuggestObjectsQuery, SuggestObjectsResponse, TwoFactorSetupResponse, UpdateCredentialsRequest,
     UpdateEmailRequest, UpdatePasswordRequest, UpdateQuotaRequest, UserMutationResponse,
@@ -65,6 +67,8 @@ struct AppState {
     realtime: RegistryRealtimeHub,
     write_gate: Arc<Mutex<()>>,
 }
+
+const MAX_SHARE_EXPIRATION_SECS: u64 = 60 * 60 * 24 * 7;
 
 fn default_fragment_name(user: &UserRecord) -> String {
     user.email.clone()
@@ -385,6 +389,10 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/fragments", get(list_fragments))
         .route("/v1/fragments/link", post(link_fragment))
         .route("/v1/storage/session", post(issue_storage_session))
+        .route("/v1/shares", post(create_share))
+        .route("/v1/shares", get(list_shares))
+        .route("/v1/shares/{share_id}", delete(revoke_share))
+        .route("/v1/public/shares/{token}", get(get_public_share))
         .route("/v1/objects/register", post(register_object))
         .route("/v1/objects/finalize", post(finalize_object))
         .route("/v1/objects/pending", delete(cancel_pending_object))
@@ -423,6 +431,38 @@ fn build_cors_layer() -> CorsLayer {
             axum::http::Method::OPTIONS,
         ])
         .max_age(Duration::from_secs(86400))
+}
+
+fn public_base_url(headers: &HeaderMap) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("https");
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("127.0.0.1:51001");
+    format!("{}://{}", scheme, host)
+}
+
+fn build_public_share_url(headers: &HeaderMap, token: &str) -> String {
+    format!("{}/v1/public/shares/{}", public_base_url(headers), token)
+}
+
+fn copy_upstream_header(
+    builder: axum::http::response::Builder,
+    upstream: &reqwest::Response,
+    header_name: axum::http::header::HeaderName,
+) -> axum::http::response::Builder {
+    if let Some(value) = upstream.headers().get(header_name.as_str()) {
+        if let Ok(value) = axum::http::HeaderValue::from_bytes(value.as_bytes()) {
+            return builder.header(header_name, value);
+        }
+    }
+    builder
 }
 
 async fn health(
@@ -1175,6 +1215,129 @@ async fn issue_storage_session(
         )
         .await?;
     Ok(Json(session))
+}
+
+async fn create_share(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateShareRequest>,
+) -> Result<(StatusCode, Json<CreateShareResponse>), RegistryError> {
+    validate_fragment_and_key(&req.fragment, &req.object_key)?;
+    if req.expires_in == 0 || req.expires_in > MAX_SHARE_EXPIRATION_SECS {
+        return Err(RegistryError::bad_request(format!(
+            "expires_in must be between 1 and {} seconds",
+            MAX_SHARE_EXPIRATION_SECS
+        )));
+    }
+
+    let _write_guard = state.write_gate.lock().await;
+    let claims = claims_from_headers(&headers, &state.auth)?;
+    let (share, token) = state
+        .db
+        .create_share(
+            claims.sub.clone(),
+            req.fragment,
+            req.object_key,
+            req.disposition,
+            req.expires_in,
+        )
+        .await?;
+    publish_owner_invalidation(&state, &claims.sub, Some(share.fragment.clone()), "shares");
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateShareResponse {
+            url: build_public_share_url(&headers, &token),
+            expires_at: share.expires_at.clone(),
+            share,
+        }),
+    ))
+}
+
+async fn list_shares(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ListSharesQuery>,
+) -> Result<Json<ListSharesResponse>, RegistryError> {
+    if let Some(fragment) = query.fragment.as_deref() {
+        validate_fragment(fragment)?;
+    }
+    let claims = claims_from_headers(&headers, &state.auth)?;
+    let shares = state
+        .db
+        .list_shares(
+            claims.sub,
+            query.fragment,
+            query.include_expired.unwrap_or(false),
+            query.include_revoked.unwrap_or(false),
+        )
+        .await?;
+    Ok(Json(ListSharesResponse { shares }))
+}
+
+async fn revoke_share(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(share_id): AxumPath<String>,
+) -> Result<Json<RevokeShareResponse>, RegistryError> {
+    if share_id.trim().is_empty() {
+        return Err(RegistryError::bad_request("share_id is required"));
+    }
+    let _write_guard = state.write_gate.lock().await;
+    let claims = claims_from_headers(&headers, &state.auth)?;
+    let revoked = state.db.revoke_share(claims.sub, share_id).await?;
+    Ok(Json(RevokeShareResponse { revoked }))
+}
+
+async fn get_public_share(
+    State(state): State<AppState>,
+    AxumPath(token): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Response, RegistryError> {
+    if token.trim().is_empty() {
+        return Err(RegistryError::not_found("share not found"));
+    }
+    let share = state
+        .db
+        .resolve_public_share(token)
+        .await?
+        .ok_or_else(|| RegistryError::not_found("share not found"))?;
+    let live_object = state
+        .db
+        .resolve_live_object(
+            share.owner_uid.clone(),
+            share.fragment.clone(),
+            share.object_key.clone(),
+        )
+        .await?;
+    if live_object.is_none() {
+        return Err(RegistryError::not_found("shared object not found"));
+    }
+    let binding = state
+        .db
+        .get_fragment_binding(share.owner_uid.clone(), share.fragment.clone())
+        .await?
+        .ok_or_else(|| RegistryError::not_found("share not found"))?;
+    let upstream = state
+        .broker
+        .stream_shared_object(&binding, &share.object_key, share.disposition, &headers)
+        .await?;
+    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::OK);
+    let mut builder = Response::builder().status(status);
+    for header_name in [
+        header::CONTENT_TYPE,
+        header::CONTENT_DISPOSITION,
+        header::CONTENT_LENGTH,
+        header::ETAG,
+        header::ACCEPT_RANGES,
+        header::CONTENT_RANGE,
+        header::CACHE_CONTROL,
+        header::LAST_MODIFIED,
+    ] {
+        builder = copy_upstream_header(builder, &upstream, header_name);
+    }
+    builder
+        .body(Body::from_stream(upstream.bytes_stream()))
+        .map_err(|err| RegistryError::internal(format!("failed to build share response: {}", err)))
 }
 
 async fn register_object(
@@ -1984,7 +2147,7 @@ mod tests {
     ) -> String {
         let app = Router::new()
             .route(
-                "/authenticate/fragment",
+                "/n1/auth/fragment",
                 post(move |Json(_payload): Json<Value>| async move {
                     if auth_status.is_success() {
                         (
@@ -2006,7 +2169,7 @@ mod tests {
                 }),
             )
             .route(
-                "/v4/fragment/create",
+                "/n1/fragments",
                 post(|Json(payload): Json<Value>| async move {
                     let name = payload["name"].as_str().unwrap_or_default();
                     let mut hasher = sha2::Sha256::new();
@@ -2019,7 +2182,7 @@ mod tests {
                 }),
             )
             .route(
-                "/v4/fragment/archive/manifest",
+                "/n1/objects/archive/manifest",
                 post(
                     |Query(query): Query<std::collections::HashMap<String, String>>,
                      body: String| async move {
@@ -2037,6 +2200,52 @@ mod tests {
                             )
                             .body(Body::from(body))
                             .expect("stub archive response")
+                    },
+                ),
+            )
+            .route(
+                "/n1/objects/get/{*object_key}",
+                get(move |headers: HeaderMap, StubPath(object_key): StubPath<String>| async move {
+                    if headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        != Some(&format!("Bearer {}", token))
+                    {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/octet-stream")
+                        .body(Body::from(format!("view:{object_key}")))
+                        .expect("stub get response")
+                        .into_response()
+                }),
+            )
+            .route(
+                "/n1/objects/download",
+                get(
+                    move |headers: HeaderMap, Query(query): Query<std::collections::HashMap<String, String>>| async move {
+                        if headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            != Some(&format!("Bearer {}", token))
+                        {
+                            return StatusCode::UNAUTHORIZED.into_response();
+                        }
+                        let object_key = query
+                            .get("object_key")
+                            .cloned()
+                            .unwrap_or_else(|| "missing".to_string());
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/octet-stream")
+                            .header(
+                                CONTENT_DISPOSITION,
+                                format!("attachment; filename=\"{}\"", object_key.rsplit('/').next().unwrap_or("download")),
+                            )
+                            .body(Body::from(format!("download:{object_key}")))
+                            .expect("stub download response")
+                            .into_response()
                     },
                 ),
             );
@@ -2058,7 +2267,7 @@ mod tests {
 
         let app = Router::new()
             .route(
-                "/authenticate/fragment",
+                "/n1/auth/fragment",
                 post(|Json(_payload): Json<Value>| async move {
                     (
                         StatusCode::OK,
@@ -2071,7 +2280,7 @@ mod tests {
                 }),
             )
             .route(
-                "/v4/fragment/meta/{*object_key}",
+                "/n1/objects/meta/{*object_key}",
                 get(move |StubPath(object_key): StubPath<String>| {
                     let meta_state = meta_state.clone();
                     async move {
@@ -2098,7 +2307,7 @@ mod tests {
                 }),
             )
             .route(
-                "/v4/fragment/versions/{*object_key}",
+                "/n1/objects/versions/{*object_key}",
                 get(move |StubPath(object_key): StubPath<String>| {
                     let versions_state = versions_state.clone();
                     async move {
@@ -2127,7 +2336,7 @@ mod tests {
                 }),
             )
             .route(
-                "/v4/fragment/version/delete/{version_id}/{*object_key}",
+                "/n1/objects/version/{version_id}/{*object_key}",
                 delete(
                     move |StubPath((version_id, object_key)): StubPath<(String, String)>| {
                         let delete_state = delete_state.clone();
@@ -3341,6 +3550,157 @@ mod tests {
             Some("fragment-a")
         );
         expect_no_registry_event(&mut drive_ws, Duration::from_millis(350)).await;
+    }
+
+    #[tokio::test]
+    async fn share_routes_create_proxy_list_and_revoke_public_access() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, access_token) = test_state(single_url, multi_url).await;
+        let owner = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                owner.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("link fragment");
+        state
+            .db
+            .finalize_object(
+                owner.uid.clone(),
+                "fragment-a".to_string(),
+                "docs/report.pdf".to_string(),
+                "01HREGSHARE0000000000000000001".to_string(),
+                4096,
+                Some("application/pdf".to_string()),
+            )
+            .await
+            .expect("finalize shared object");
+
+        let app = build_router(state.clone());
+        let create_request = Request::builder()
+            .method("POST")
+            .uri("/v1/shares")
+            .header("authorization", format!("Bearer {}", access_token))
+            .header("host", "cloud.example.test")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "fragment": "fragment-a",
+                    "object_key": "docs/report.pdf",
+                    "expires_in": 3600,
+                    "disposition": "download"
+                }))
+                .expect("serialize create share request"),
+            ))
+            .expect("create share request");
+        let create_response = app
+            .clone()
+            .oneshot(create_request)
+            .await
+            .expect("create share response");
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .expect("read create share body");
+        let create_json: Value =
+            serde_json::from_slice(&create_body).expect("parse create share json");
+        let share_id = create_json["share"]["share_id"]
+            .as_str()
+            .expect("share id")
+            .to_string();
+        let public_url = create_json["url"].as_str().expect("public share url");
+        assert!(public_url.starts_with("https://cloud.example.test/v1/public/shares/"));
+        let public_token = public_url
+            .rsplit('/')
+            .next()
+            .expect("share token in url")
+            .to_string();
+
+        let list_request = Request::builder()
+            .method("GET")
+            .uri("/v1/shares?fragment=fragment-a")
+            .header("authorization", format!("Bearer {}", access_token))
+            .body(Body::empty())
+            .expect("list shares request");
+        let list_response = app
+            .clone()
+            .oneshot(list_request)
+            .await
+            .expect("list shares response");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .expect("read list shares body");
+        let list_json: Value = serde_json::from_slice(&list_body).expect("parse list shares json");
+        let shares = list_json["shares"].as_array().expect("shares array");
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0]["share_id"], share_id);
+        assert_eq!(shares[0]["object_key"], "docs/report.pdf");
+        assert_eq!(shares[0]["disposition"], "download");
+
+        let public_request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/public/shares/{}", public_token))
+            .body(Body::empty())
+            .expect("public share request");
+        let public_response = app
+            .clone()
+            .oneshot(public_request)
+            .await
+            .expect("public share response");
+        assert_eq!(public_response.status(), StatusCode::OK);
+        assert_eq!(
+            public_response.headers().get(CONTENT_DISPOSITION),
+            Some(&header::HeaderValue::from_static(
+                "attachment; filename=\"report.pdf\""
+            ))
+        );
+        let public_body = axum::body::to_bytes(public_response.into_body(), usize::MAX)
+            .await
+            .expect("read public share body");
+        assert_eq!(public_body.as_ref(), b"download:docs/report.pdf");
+
+        let revoke_request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/shares/{}", share_id))
+            .header("authorization", format!("Bearer {}", access_token))
+            .body(Body::empty())
+            .expect("revoke share request");
+        let revoke_response = app
+            .clone()
+            .oneshot(revoke_request)
+            .await
+            .expect("revoke share response");
+        assert_eq!(revoke_response.status(), StatusCode::OK);
+        let revoke_body = axum::body::to_bytes(revoke_response.into_body(), usize::MAX)
+            .await
+            .expect("read revoke share body");
+        let revoke_json: Value =
+            serde_json::from_slice(&revoke_body).expect("parse revoke share json");
+        assert_eq!(revoke_json["revoked"].as_bool(), Some(true));
+
+        let after_revoke_request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/public/shares/{}", public_token))
+            .body(Body::empty())
+            .expect("after revoke share request");
+        let after_revoke_response = app
+            .oneshot(after_revoke_request)
+            .await
+            .expect("after revoke share response");
+        assert_eq!(after_revoke_response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

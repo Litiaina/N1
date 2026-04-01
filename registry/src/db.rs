@@ -12,8 +12,8 @@ use crate::auth::hash_refresh_token;
 use crate::error::RegistryError;
 use crate::models::{
     AdminActivityUserSummary, AdminLargestObjectSummary, AdminStatsTotals, FragmentBindingRecord,
-    HealthResponse, ObjectExtensionStat, ObjectRecord, StorageDeployment, UserAuthRecord,
-    UserRecord,
+    HealthResponse, ObjectExtensionStat, ObjectRecord, ShareDisposition, ShareRecord,
+    StorageDeployment, UserAuthRecord, UserRecord,
 };
 use crate::storage_broker::EngineObjectMetadata;
 
@@ -144,6 +144,22 @@ impl RegistryDb {
                 );
                 CREATE INDEX IF NOT EXISTS idx_registry_refresh_sessions_user
                     ON registry_refresh_sessions (user_uid, expires_at);
+
+                CREATE TABLE IF NOT EXISTS object_shares (
+                    share_id TEXT PRIMARY KEY,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    owner_uid TEXT NOT NULL,
+                    fragment TEXT NOT NULL,
+                    object_key TEXT NOT NULL,
+                    disposition TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    revoked_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_object_shares_owner
+                    ON object_shares (owner_uid, fragment, object_key, created_at);
+                CREATE INDEX IF NOT EXISTS idx_object_shares_token
+                    ON object_shares (token_hash, expires_at);
                 "#,
             )
             .map_err(sql_err)?;
@@ -791,6 +807,11 @@ impl RegistryDb {
                 params![owner_uid, old_fragment, new_fragment, now_rfc3339()],
             )
             .map_err(sql_err)?;
+            tx.execute(
+                "UPDATE object_shares SET fragment = ?3 WHERE owner_uid = ?1 AND fragment = ?2",
+                params![owner_uid, old_fragment, new_fragment],
+            )
+            .map_err(sql_err)?;
             tx.commit().map_err(sql_err)?;
             Ok(())
         })
@@ -824,6 +845,11 @@ impl RegistryDb {
             .map_err(sql_err)?;
             tx.execute(
                 "DELETE FROM fragment_bindings WHERE owner_uid = ?1",
+                params![uid.clone()],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                "DELETE FROM object_shares WHERE owner_uid = ?1",
                 params![uid.clone()],
             )
             .map_err(sql_err)?;
@@ -1815,6 +1841,174 @@ impl RegistryDb {
         .await
     }
 
+    pub async fn create_share(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_key: String,
+        disposition: ShareDisposition,
+        expires_in_secs: u64,
+    ) -> Result<(ShareRecord, String), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let live_object = resolve_live_object(&tx, &owner_uid, &fragment, &object_key)?
+                .ok_or_else(|| RegistryError::not_found("object not found"))?;
+            if resolve_fragment_binding(&tx, &owner_uid, &fragment)?.is_none() {
+                return Err(RegistryError::conflict(
+                    "fragment is not linked to a storage backend yet; link it first",
+                ));
+            }
+
+            let created_at = now_rfc3339();
+            let expires_at_unix = now_unix().saturating_add(expires_in_secs as i64);
+            let share_id = Uuid::new_v4().to_string();
+            let share_token = generate_share_token();
+            let token_hash = hash_refresh_token(&share_token);
+
+            tx.execute(
+                r#"
+                INSERT INTO object_shares (
+                    share_id, token_hash, owner_uid, fragment, object_key, disposition, expires_at, created_at, revoked_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
+                "#,
+                params![
+                    share_id,
+                    token_hash,
+                    owner_uid,
+                    fragment,
+                    object_key,
+                    disposition.as_str(),
+                    expires_at_unix,
+                    created_at
+                ],
+            )
+            .map_err(sql_err)?;
+            tx.commit().map_err(sql_err)?;
+
+            Ok((
+                ShareRecord {
+                    share_id,
+                    owner_uid: live_object.owner_uid,
+                    fragment: live_object.fragment,
+                    object_key: live_object.object_key,
+                    disposition,
+                    expires_at: rfc3339_from_unix(expires_at_unix),
+                    created_at,
+                    revoked_at: None,
+                },
+                share_token,
+            ))
+        })
+        .await
+    }
+
+    pub async fn list_shares(
+        &self,
+        owner_uid: String,
+        fragment: Option<String>,
+        include_expired: bool,
+        include_revoked: bool,
+    ) -> Result<Vec<ShareRecord>, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            let mut sql = String::from(
+                r#"
+                SELECT share_id, owner_uid, fragment, object_key, disposition, expires_at, created_at, revoked_at
+                FROM object_shares
+                WHERE owner_uid = ?
+                "#,
+            );
+            let mut args = vec![Value::Text(owner_uid)];
+            if let Some(fragment) = fragment.filter(|value| !value.trim().is_empty()) {
+                sql.push_str(" AND fragment = ?");
+                args.push(Value::Text(fragment));
+            }
+            if !include_expired {
+                sql.push_str(" AND expires_at > ?");
+                args.push(Value::Integer(now_unix()));
+            }
+            if !include_revoked {
+                sql.push_str(" AND revoked_at IS NULL");
+            }
+            sql.push_str(" ORDER BY created_at DESC");
+
+            let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params_from_iter(args), map_share_row)
+                .map_err(sql_err)?;
+            let mut shares = Vec::new();
+            for row in rows {
+                shares.push(row.map_err(sql_err)?);
+            }
+            Ok(shares)
+        })
+        .await
+    }
+
+    pub async fn revoke_share(
+        &self,
+        owner_uid: String,
+        share_id: String,
+    ) -> Result<bool, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            let changed = conn
+                .execute(
+                    r#"
+                    UPDATE object_shares
+                    SET revoked_at = COALESCE(revoked_at, ?3)
+                    WHERE owner_uid = ?1 AND share_id = ?2
+                    "#,
+                    params![owner_uid, share_id, now_rfc3339()],
+                )
+                .map_err(sql_err)?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    pub async fn resolve_public_share(
+        &self,
+        token: String,
+    ) -> Result<Option<ShareRecord>, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            conn.query_row(
+                r#"
+                SELECT share_id, owner_uid, fragment, object_key, disposition, expires_at, created_at, revoked_at
+                FROM object_shares
+                WHERE token_hash = ?1
+                  AND revoked_at IS NULL
+                  AND expires_at > ?2
+                "#,
+                params![hash_refresh_token(token.trim()), now_unix()],
+                map_share_row,
+            )
+            .optional()
+            .map_err(sql_err)
+        })
+        .await
+    }
+
+    pub async fn resolve_live_object(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_key: String,
+    ) -> Result<Option<ObjectRecord>, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            resolve_live_object(&conn, &owner_uid, &fragment, &object_key)
+        })
+        .await
+    }
+
     pub async fn resolve_object(
         &self,
         owner_uid: String,
@@ -1929,6 +2123,11 @@ impl RegistryDb {
                 .map_err(sql_err)?;
                 tx.execute(
                     "DELETE FROM object_uploads WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                    params![owner_uid, fragment, object_key],
+                )
+                .map_err(sql_err)?;
+                tx.execute(
+                    "DELETE FROM object_shares WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
                     params![owner_uid, fragment, object_key],
                 )
                 .map_err(sql_err)?;
@@ -2143,6 +2342,11 @@ impl RegistryDb {
                     params![owner_uid, fragment, destination_key],
                 )
                 .map_err(sql_err)?;
+                tx.execute(
+                    "DELETE FROM object_shares WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                    params![owner_uid, fragment, destination_key],
+                )
+                .map_err(sql_err)?;
                 next_used = next_used.saturating_sub(destination_trashed.object_size_bytes.max(0));
             }
 
@@ -2174,6 +2378,15 @@ impl RegistryDb {
                     WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
                     "#,
                     params![owner_uid, fragment, source_key, destination_key, now],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                r#"
+                UPDATE object_shares
+                SET object_key = ?4
+                WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+                "#,
+                params![owner_uid, fragment, source_key, destination_key],
             )
             .map_err(sql_err)?;
             if updated_ready == 0 && updated_pending == 0 {
@@ -2228,6 +2441,11 @@ impl RegistryDb {
             .map_err(sql_err)?;
             tx.execute(
                 "DELETE FROM object_uploads WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                params![owner_uid, fragment, object_key],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                "DELETE FROM object_shares WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
                 params![owner_uid, fragment, object_key],
             )
             .map_err(sql_err)?;
@@ -2330,6 +2548,21 @@ impl RegistryDb {
             tx.execute(
                 r#"
                 DELETE FROM object_uploads
+                WHERE owner_uid = ?1
+                  AND fragment = ?2
+                  AND object_key IN (
+                    SELECT object_key
+                    FROM objects
+                    WHERE owner_uid = ?1 AND fragment = ?2 AND status = 'trashed'
+                  )
+                "#,
+                params![owner_uid, fragment],
+            )
+            .map_err(sql_err)?;
+
+            tx.execute(
+                r#"
+                DELETE FROM object_shares
                 WHERE owner_uid = ?1
                   AND fragment = ?2
                   AND object_key IN (
@@ -2495,6 +2728,25 @@ fn resolve_ready_object(
         SELECT owner_uid, fragment, object_key, version_id, status, object_size_bytes, content_type, created_at, updated_at
         FROM objects
         WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+        "#,
+        params![owner_uid, fragment, object_key],
+        map_object_row,
+    )
+    .optional()
+    .map_err(sql_err)
+}
+
+fn resolve_live_object(
+    conn: &Connection,
+    owner_uid: &str,
+    fragment: &str,
+    object_key: &str,
+) -> Result<Option<ObjectRecord>, RegistryError> {
+    conn.query_row(
+        r#"
+        SELECT owner_uid, fragment, object_key, version_id, status, object_size_bytes, content_type, created_at, updated_at
+        FROM objects
+        WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3 AND status = 'ready'
         "#,
         params![owner_uid, fragment, object_key],
         map_object_row,
@@ -2788,6 +3040,28 @@ fn map_fragment_binding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Fragmen
     })
 }
 
+fn map_share_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShareRecord> {
+    Ok(ShareRecord {
+        share_id: row.get(0)?,
+        owner_uid: row.get(1)?,
+        fragment: row.get(2)?,
+        object_key: row.get(3)?,
+        disposition: ShareDisposition::parse_db(row.get::<_, String>(4)?).map_err(|message| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    message,
+                )),
+            )
+        })?,
+        expires_at: rfc3339_from_unix(row.get(5)?),
+        created_at: row.get(6)?,
+        revoked_at: row.get(7)?,
+    })
+}
+
 fn map_insert_user_err(err: rusqlite::Error) -> RegistryError {
     match err {
         rusqlite::Error::SqliteFailure(_, Some(message))
@@ -2828,6 +3102,10 @@ fn now_unix() -> i64 {
 
 fn generate_refresh_token() -> String {
     format!("{}.{}", Uuid::new_v4(), Uuid::new_v4())
+}
+
+fn generate_share_token() -> String {
+    format!("share_{}.{}", Uuid::new_v4(), Uuid::new_v4())
 }
 
 #[cfg(test)]

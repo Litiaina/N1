@@ -16,6 +16,7 @@ use axum::extract::State;
 use axum::{Json, extract::Query, http::StatusCode, response::IntoResponse};
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
+use indexdb::Database;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -726,6 +727,36 @@ async fn replicate_bytes_strict(
     Ok((missing, divergent))
 }
 
+async fn validate_indexdb_bytes(bytes: &[u8]) -> bool {
+    let bytes = bytes.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let dir = std::env::temp_dir().join(format!("n1-indexdb-validate-{}", Ulid::new()));
+        let path = dir.join("index.ndxdb");
+
+        let valid = (|| -> bool {
+            if std::fs::create_dir_all(&dir).is_err() {
+                return false;
+            }
+            if std::fs::write(&path, &bytes).is_err() {
+                return false;
+            }
+            match std::panic::catch_unwind(|| Database::create(&path)) {
+                Ok(Ok(db)) => {
+                    drop(db);
+                    true
+                }
+                _ => false,
+            }
+        })();
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        valid
+    })
+    .await
+    .unwrap_or(false)
+}
+
 async fn repair_fragment_metadata_replicas(
     index_roots: &[PathBuf],
     fragment: &str,
@@ -791,7 +822,6 @@ async fn repair_fragment_index_db(
     fragment: &str,
     dry_run: bool,
 ) -> Result<(u64, u64, u64), AppError> {
-    let valid = |bytes: &[u8]| !bytes.is_empty();
     let selected = selected_fragment_roots(index_roots, fragment);
     if selected.is_empty() {
         return Ok((0, 0, 0));
@@ -803,7 +833,12 @@ async fn repair_fragment_index_db(
         .collect();
     let mut replicas = Vec::with_capacity(paths.len());
     for path in &paths {
-        replicas.push(read_raw_replica(path, &valid).await);
+        let replica = read_raw_replica(path, &|bytes| !bytes.is_empty()).await;
+        let valid = match replica.bytes.as_ref() {
+            Some(bytes) => validate_indexdb_bytes(bytes).await,
+            None => false,
+        };
+        replicas.push(RawReplica { valid, ..replica });
     }
 
     let Some(best) = choose_best_raw_replica(&replicas) else {

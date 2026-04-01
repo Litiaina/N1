@@ -41,7 +41,6 @@ use super::retrieve::{
 };
 use super::storage_capacity_parser::get_capacity_usage;
 use super::sync::ensure_fragment_blob_directories;
-use super::thumbnail::{ThumbnailQuery, get_object_thumbnail};
 use super::upload::{
     DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC,
     STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC, UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC,
@@ -64,12 +63,10 @@ use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::response::IntoResponse;
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
-use image::{ColorType, ImageBuffer, ImageEncoder, Rgba, codecs::png::PngEncoder};
 use indexdb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -586,40 +583,6 @@ async fn stream_object_bytes(fragment: String, object_key: String) -> Vec<u8> {
     body.to_vec()
 }
 
-async fn get_thumbnail_response(
-    fragment: &str,
-    object_key: &str,
-    query: ThumbnailQuery,
-) -> Result<axum::response::Response, crate::enums::app_error_enum::AppError> {
-    get_object_thumbnail(
-        full_claims(fragment),
-        AxumPath((fragment.to_string(), object_key.to_string())),
-        Query(query),
-    )
-    .await
-    .map(IntoResponse::into_response)
-}
-
-fn sample_png_bytes(width: u32, height: u32) -> Vec<u8> {
-    let mut image = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width, height);
-    for (x, y, pixel) in image.enumerate_pixels_mut() {
-        *pixel = Rgba([
-            ((x * 17) % 255) as u8,
-            ((y * 31) % 255) as u8,
-            (((x + y) * 7) % 255) as u8,
-            255,
-        ]);
-    }
-
-    let rgba = image.into_raw();
-    let mut out = Cursor::new(Vec::new());
-    let encoder = PngEncoder::new(&mut out);
-    encoder
-        .write_image(&rgba, width, height, ColorType::Rgba8.into())
-        .expect("encode sample png");
-    out.into_inner()
-}
-
 fn print_perf_stage(stage: &PerfStageResult) {
     println!(
         "N1 CRUD probe stage={} ops={} bytes={} wall_s={:.3} cpu_s={} rss_before_mib={} rss_after_mib={} rss_peak_mib={} hwm_mib={}",
@@ -935,7 +898,7 @@ async fn read_object_bytes(claims: Claims, fragment: String, object_key: String)
             exp,
         };
         let req = Request::builder()
-            .uri("/v4/fragment/get")
+            .uri("/n1/objects/get")
             .body(Body::empty())
             .expect("build request");
         if let Ok(resp) = get_object(
@@ -980,7 +943,7 @@ async fn read_object_bytes_eventually_labeled(
 ) -> Vec<u8> {
     for _ in 0..attempts {
         let req = Request::builder()
-            .uri("/v4/fragment/get")
+            .uri("/n1/objects/get")
             .body(Body::empty())
             .expect("build request");
 
@@ -1172,7 +1135,8 @@ fn hash_indexdb_logical_contents(path: &std::path::Path) -> Option<String> {
             hasher.update(table_name.as_bytes());
             hasher.update([0u8]);
 
-            let definition: TableDefinition<&str, &[u8]> = TableDefinition::new(table_name.as_str());
+            let definition: TableDefinition<&str, &[u8]> =
+                TableDefinition::new(table_name.as_str());
             let table = read_txn.open_table(definition).ok()?;
             let mut iter = table.iter().ok()?;
             while let Some(entry) = iter.next() {
@@ -1208,10 +1172,7 @@ async fn collect_indexdb_replica_semantic_hashes(
         let fragment_meta_path = frag_root.join("fragment.metadata.msgpack");
         if let Ok(bytes) = fs::read(&fragment_meta_path).await {
             let digest = Sha256::digest(&bytes);
-            map.insert(
-                "fragment.metadata.msgpack".to_string(),
-                hex::encode(digest),
-            );
+            map.insert("fragment.metadata.msgpack".to_string(), hex::encode(digest));
         }
 
         let index_db_path = frag_root.join("indexdb").join("index.ndxdb");
@@ -1423,116 +1384,6 @@ async fn matrix_upload_part_batched_durability_finalize_ok() {
 
     let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.to_string()).await;
     assert_eq!(got, content);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_thumbnail_endpoint_generates_and_reuses_disk_cache() {
-    let _guard = TEST_LOCK.lock().await;
-    let base = TEST_BASE.clone();
-    ensure_global_storage_config(&base).await;
-    ensure_upload_runtime_config();
-
-    let fragment = {
-        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
-        hex::encode(digest)
-    };
-    setup_fragment(&fragment).await;
-
-    let key = "images/gallery/sample.png";
-    let png = sample_png_bytes(640, 480);
-    let state = Arc::new(AppState {
-        ws_manager: WsConnectionManager::new(),
-    });
-
-    let upload_resp = upload_one_shot(state, &fragment, key, png).await;
-    assert_eq!(upload_resp.status(), StatusCode::CREATED);
-
-    let query = ThumbnailQuery {
-        w: Some(128),
-        h: Some(128),
-        fit: Some("contain".to_string()),
-        format: Some("png".to_string()),
-        version_id: None,
-    };
-
-    let resp1 = get_thumbnail_response(&fragment, key, query.clone())
-        .await
-        .expect("thumbnail response 1");
-    assert_eq!(resp1.status(), StatusCode::OK);
-    assert_eq!(
-        resp1
-            .headers()
-            .get("x-n1-thumbnail-cache")
-            .and_then(|v| v.to_str().ok()),
-        Some("miss")
-    );
-    assert_eq!(
-        resp1.headers().get(header::CONTENT_TYPE),
-        Some(&HeaderValue::from_static("image/png"))
-    );
-    let body1 = to_bytes(resp1.into_body(), usize::MAX)
-        .await
-        .expect("thumbnail body 1");
-    let thumb1 = image::load_from_memory(&body1).expect("decode thumbnail 1");
-    assert_eq!(thumb1.width(), 128);
-    assert_eq!(thumb1.height(), 96);
-
-    let resp2 = get_thumbnail_response(&fragment, key, query)
-        .await
-        .expect("thumbnail response 2");
-    assert_eq!(resp2.status(), StatusCode::OK);
-    assert_eq!(
-        resp2
-            .headers()
-            .get("x-n1-thumbnail-cache")
-            .and_then(|v| v.to_str().ok()),
-        Some("hit")
-    );
-    let body2 = to_bytes(resp2.into_body(), usize::MAX)
-        .await
-        .expect("thumbnail body 2");
-    assert_eq!(body1, body2);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_thumbnail_endpoint_rejects_non_image_objects() {
-    let _guard = TEST_LOCK.lock().await;
-    let base = TEST_BASE.clone();
-    ensure_global_storage_config(&base).await;
-    ensure_upload_runtime_config();
-
-    let fragment = {
-        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
-        hex::encode(digest)
-    };
-    setup_fragment(&fragment).await;
-
-    let key = "docs/readme.txt";
-    let state = Arc::new(AppState {
-        ws_manager: WsConnectionManager::new(),
-    });
-
-    let upload_resp = upload_one_shot(state, &fragment, key, b"hello thumbnail".to_vec()).await;
-    assert_eq!(upload_resp.status(), StatusCode::CREATED);
-
-    let err = get_thumbnail_response(
-        &fragment,
-        key,
-        ThumbnailQuery {
-            w: Some(128),
-            h: Some(128),
-            fit: None,
-            format: None,
-            version_id: None,
-        },
-    )
-    .await
-    .expect_err("non-image thumbnail should fail");
-
-    assert!(matches!(
-        err,
-        crate::enums::app_error_enum::AppError::BadRequest(_)
-    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2147,7 +1998,7 @@ async fn workflow_upload_read_modify_delete_redistribute_repair() {
     assert_eq!(rename_resp.status(), StatusCode::OK);
 
     let old_req = Request::builder()
-        .uri("/v4/fragment/get")
+        .uri("/n1/objects/get")
         .body(Body::empty())
         .expect("build request");
     assert!(
@@ -3558,7 +3409,7 @@ async fn matrix_delete_recover_and_permanent_delete_flows() {
     assert_eq!(perm_del.status(), StatusCode::NO_CONTENT);
 
     let req = Request::builder()
-        .uri("/v4/fragment/get")
+        .uri("/n1/objects/get")
         .body(Body::empty())
         .expect("build request");
     assert!(
@@ -3626,7 +3477,7 @@ async fn matrix_bulk_permanent_delete_removes_live_and_trashed_objects() {
 
     for key in [live_key, trashed_key] {
         let req = Request::builder()
-            .uri("/v4/fragment/get")
+            .uri("/n1/objects/get")
             .body(Body::empty())
             .expect("build get request");
         assert!(
@@ -6078,7 +5929,7 @@ async fn matrix_ha_redistribution_permanent_delete_no_index_desync() {
         .expect("redistribution should succeed after permanent delete");
 
     let req = Request::builder()
-        .uri("/v4/fragment/get")
+        .uri("/n1/objects/get")
         .body(Body::empty())
         .expect("build request");
     assert!(
@@ -6198,7 +6049,7 @@ async fn matrix_ha_repair_permanent_delete_no_index_desync() {
         .expect("repair should succeed after permanent delete");
 
     let req = Request::builder()
-        .uri("/v4/fragment/get")
+        .uri("/n1/objects/get")
         .body(Body::empty())
         .expect("build request");
     assert!(
@@ -7521,7 +7372,7 @@ async fn matrix_crud_cpu_ram_probe() {
                 async move {
                     let key = keys[i].clone();
                     let req = Request::builder()
-                        .uri("/v4/fragment/get")
+                        .uri("/n1/objects/get")
                         .body(Body::empty())
                         .expect("build request");
                     assert!(
@@ -8191,7 +8042,7 @@ async fn matrix_indexdb_ndxdb_recover_all_and_empty_trash_fast_paths() {
 
     for key in keys {
         let req = Request::builder()
-            .uri("/v4/fragment/get")
+            .uri("/n1/objects/get")
             .body(Body::empty())
             .expect("build get request");
         assert!(
@@ -8527,7 +8378,7 @@ async fn matrix_empty_trash_resumes_from_persistent_journal() {
     assert_eq!(resumed, 1);
 
     let req = Request::builder()
-        .uri("/v4/fragment/get")
+        .uri("/n1/objects/get")
         .body(Body::empty())
         .expect("build get request");
     assert!(

@@ -18,8 +18,7 @@ use crate::core::download::{
     download_object as download_object_impl, download_object_chunk as download_object_chunk_impl,
 };
 use crate::core::fragment_manager::{
-    create_fragment, delete_fragment, get_fragment_hash, list_public_fragments, update_fragment,
-    verify_fragment_existence,
+    create_fragment, delete_fragment, get_fragment_hash, update_fragment, verify_fragment_existence,
 };
 use crate::core::garbage_collector::{
     get_gc_status_api, run_garbage_collector, run_lifecycle_manager, stop_garbage_collector,
@@ -41,10 +40,8 @@ use crate::core::retrieve::{
     list_object_versions as list_object_versions_impl, list_objects as list_objects_impl,
     list_trash_objects as list_trash_objects_impl, stream_object as stream_object_impl,
 };
-use crate::core::sharing::{create_signed_url, get_shared_object};
 use crate::core::storage_capacity_parser::get_capacity_usage as get_capacity_usage_impl;
 use crate::core::sync::initialize_fragment_storage_api;
-use crate::core::thumbnail::{ThumbnailQuery, get_object_thumbnail as get_object_thumbnail_impl};
 use crate::core::upload::{
     cancel_upload_session as cancel_upload_session_impl,
     finalize_object_upload as finalize_object_upload_impl,
@@ -54,36 +51,14 @@ use crate::core::upload::{
     upload_object_one_shot as upload_object_one_shot_impl,
 };
 use crate::enums::app_error_enum::AppError;
-use crate::fs::direct_upload::upload_file;
-use crate::fs::directory_manager::{
-    create_directory, delete_directory, delete_file, get_file_metadata, rename_file_query,
-};
-use crate::fs::directory_viewer::{
-    stream_file, stream_file_v2, stream_hls_file, view_directory, view_file,
-};
-use crate::fs::download_manager::download_file;
-use crate::fs::fragmented_upload::{check_uploaded_fragments, upload_fragments};
 use crate::fs::fs_constants::MAX_FILE_SIZE;
-use crate::fs::stateless_fragmented_upload::{
-    self, finalize_upload_session, initiate_upload_session, upload_chunk_binary,
-    upload_chunk_multipart,
-};
-use crate::fuse::handlers::{
-    fsd_delete, fsd_list_dir, fsd_mkdir, fsd_read, fsd_rename, fsd_rmdir, fsd_stat,
-    fsd_write_abort, fsd_write_begin, fsd_write_chunk, fsd_write_commit,
-};
-use crate::handlers::dir_info_handlers::get_storage_capacity;
 use crate::middleware::auth_middleware::{
-    auth, authorize, authorize_fragment, logout_refresh_token, refresh_access_token,
-    validate_access,
+    authorize_fragment, logout_refresh_token, refresh_access_token, validate_access,
 };
 use crate::middleware::rate_limiter_middleware::RateLimitLayers;
-use crate::middleware::storage_middleware::enforce_storage_limit;
-use crate::smb::server::list_transfer_progress_for_fragment;
 use crate::structs::auth_structs::Claims;
-use crate::websocket::handler::{system_broadcast_handler, ws_handler};
+use crate::websocket::handler::ws_handler;
 use crate::websocket::manager::{WsConnectionManager, register_global_ws_manager};
-use crate::websocket::ws_structs::SmbTransferProgressPayload;
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::http::{HeaderName, Method};
 use axum::middleware::from_fn;
@@ -161,15 +136,6 @@ async fn get_object_metadata_scoped(
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
     get_object_metadata_impl(claims, Path((fragment, object_key))).await
-}
-
-async fn get_object_thumbnail_scoped(
-    claims: Claims,
-    Path(object_key): Path<String>,
-    Query(query): Query<ThumbnailQuery>,
-) -> Result<impl IntoResponse, AppError> {
-    let fragment = claims.fragment.clone();
-    get_object_thumbnail_impl(claims, Path((fragment, object_key)), Query(query)).await
 }
 
 async fn download_object_scoped(
@@ -403,14 +369,12 @@ pub fn apply_runtime_http_layers(router: Router<Arc<AppState>>) -> Router<Arc<Ap
 #[derive(Clone, Copy, Debug)]
 pub struct StorageRouteOptions {
     pub include_object_storage: bool,
-    pub include_legacy_fs: bool,
 }
 
 impl Default for StorageRouteOptions {
     fn default() -> Self {
         Self {
             include_object_storage: true,
-            include_legacy_fs: true,
         }
     }
 }
@@ -456,161 +420,132 @@ pub fn build_storage_routes_unbound_with_options(
 
     let object_storage_routes = {
         let read_ops = Router::new()
-            .route("/v4/capacity/usage", get(get_capacity_usage_scoped))
-            .route("/v4/fragment/list", get(list_fragments))
-            .route("/v4/fragment/objects", get(list_objects_scoped))
-            .route("/v4/fragment/trash", get(list_trash_objects_scoped))
+            .route("/n1/capacity/usage", get(get_capacity_usage_scoped))
+            .route("/n1/fragments", get(list_fragments))
+            .route("/n1/objects", get(list_objects_scoped))
+            .route("/n1/trash", get(list_trash_objects_scoped))
             .route(
-                "/v4/fragment/versions/{*object_key}",
+                "/n1/objects/versions/{*object_key}",
                 get(list_object_versions_scoped),
             )
-            .route("/v4/fragment/get/{*object_key}", get(get_object_scoped))
+            .route("/n1/objects/get/{*object_key}", get(get_object_scoped))
             .route(
-                "/v4/fragment/thumb/{*object_key}",
-                get(get_object_thumbnail_scoped),
-            )
-            .route(
-                "/v4/fragment/stream/{*object_key}",
+                "/n1/objects/stream/{*object_key}",
                 get(stream_object_scoped),
             )
             .route(
-                "/v4/fragment/meta/{*object_key}",
+                "/n1/objects/meta/{*object_key}",
                 get(get_object_metadata_scoped),
             )
-            .route("/v4/fragment/download", get(download_object_scoped))
+            .route("/n1/objects/download", get(download_object_scoped))
             .route(
-                "/v4/fragment/download/chunk",
+                "/n1/objects/download/chunk",
                 get(download_object_chunk_scoped),
             )
             .route(
-                "/v4/fragment/archive",
+                "/n1/objects/archive",
                 post(download_selected_archive_scoped),
             )
             .route(
-                "/v4/fragment/archive/manifest",
+                "/n1/objects/archive/manifest",
                 post(download_manifest_archive_scoped),
-            )
-            .route("/v4/share/create", post(create_signed_url))
-            .route("/v4/smb/progress", get(smb_progress))
-            .route("/v4/fsd/list/{*mount_path}", get(fsd_list_dir))
-            .route("/v4/fsd/stat/{*mount_path}", get(fsd_stat))
-            .route("/v4/fsd/read/{*mount_path}", get(fsd_read));
+            );
 
         let read_ops = layers
             .layer_view(read_ops)
             .layer(from_fn(enforce_quiesced_mode_on_reads));
 
         let write_ops = Router::new()
-            .route("/v4/fragment/delete/{:fragment}", delete(delete_fragment))
-            .route("/v4/fragment/modify/{:fragment}", patch(update_fragment))
-            .route("/v4/fragment/trash/empty", delete(empty_trash_scoped))
-            .route("/v4/fragment/object/rename", patch(rename_object))
+            .route("/n1/fragments/{:fragment}", delete(delete_fragment))
+            .route("/n1/fragments/{:fragment}", patch(update_fragment))
+            .route("/n1/trash/empty", delete(empty_trash_scoped))
+            .route("/n1/objects/rename", post(rename_object))
+            .route("/n1/objects/bulk-delete", post(delete_objects_bulk_impl))
             .route(
-                "/v4/fragment/object/bulk-delete",
-                post(delete_objects_bulk_impl),
-            )
-            .route(
-                "/v4/fragment/permanent/bulk-delete",
+                "/n1/objects/permanent/bulk-delete",
                 post(delete_objects_bulk_permanently_impl),
             )
+            .route("/n1/objects/{*object_key}", delete(delete_object_scoped))
             .route(
-                "/v4/fragment/object/delete/{*object_key}",
-                delete(delete_object_scoped),
-            )
-            .route(
-                "/v4/fragment/version/delete/{:version_id}/{*object_key}",
+                "/n1/objects/version/{:version_id}/{*object_key}",
                 delete(delete_object_version_scoped),
             )
             .route(
-                "/v4/fragment/permanent/delete/{*object_key}",
+                "/n1/objects/permanent/{*object_key}",
                 delete(delete_object_permanently_scoped),
             )
             .route(
-                "/v4/fragment/recover/version/{:version_id}/{*object_key}",
+                "/n1/objects/recover/version/{:version_id}/{*object_key}",
                 post(recover_object_version_scoped),
             )
+            .route("/n1/objects/bulk-recover", post(recover_objects_bulk_impl))
             .route(
-                "/v4/fragment/object/bulk-recover",
-                post(recover_objects_bulk_impl),
-            )
-            .route(
-                "/v4/fragment/recover/object/{*object_key}",
+                "/n1/objects/recover/{*object_key}",
                 post(recover_object_scoped),
             )
+            .route("/n1/trash/recover-all", post(recover_all_trash_scoped))
             .route(
-                "/v4/fragment/recover/trash/all",
-                post(recover_all_trash_scoped),
-            )
-            .route(
-                "/v4/upload/init/{*object_key}",
+                "/n1/upload/multipart/init/{*object_key}",
                 post(initiate_object_upload_scoped),
             )
             .route(
-                "/v4/upload/one-shot/{*object_key}",
+                "/n1/upload/one-shot/{*object_key}",
                 post(upload_object_one_shot_scoped),
             )
             .route(
-                "/v4/upload/status/{:version_id}",
+                "/n1/upload/multipart/{:version_id}",
                 get(get_upload_status_scoped),
             )
-            .route("/v4/upload/status/list", get(list_active_uploads_scoped))
+            .route("/n1/upload/multipart", get(list_active_uploads_scoped))
             .route(
-                "/v4/upload/chunk/{:version_id}/{:part_index}",
+                "/n1/upload/multipart/{:version_id}/{:part_index}",
                 put(object_upload_part_scoped),
             )
             .route(
-                "/v4/upload/finalize/{:version_id}/{:session_id}",
+                "/n1/upload/multipart/{:version_id}/{:session_id}/finalize",
                 post(finalize_object_upload_scoped),
             )
             .route(
-                "/v4/upload/cancel/{:version_id}",
+                "/n1/upload/multipart/{:version_id}",
                 delete(cancel_upload_session_scoped),
-            )
-            .route("/v4/fsd/write/begin/{*mount_path}", post(fsd_write_begin))
-            .route("/v4/fsd/write/chunk/{:session_id}", put(fsd_write_chunk))
-            .route("/v4/fsd/write/commit/{:session_id}", post(fsd_write_commit))
-            .route("/v4/fsd/write/abort/{:session_id}", post(fsd_write_abort))
-            .route("/v4/fsd/delete/{*mount_path}", delete(fsd_delete))
-            .route("/v4/fsd/mkdir/{*mount_path}", post(fsd_mkdir))
-            .route("/v4/fsd/rmdir/{*mount_path}", delete(fsd_rmdir))
-            .route("/v4/fsd/rename", patch(fsd_rename));
+            );
 
         let maintenance_ops = Router::new()
             .route(
-                "/v4/maintenance/cleanup/fragment",
+                "/n1/maintenance/fragment/cleanup",
                 post(sync_fragment_metadata),
             )
             .route(
-                "/v4/maintenance/init/fragment",
+                "/n1/maintenance/fragment/init",
                 post(initialize_fragment_storage_api),
             )
-            .route("/v4/maintenance/repair/start", post(trigger_repair_job_api))
-            .route("/v4/maintenance/repair/stop", post(stop_repair_job_api))
-            .route("/v4/maintenance/repair/status", get(get_repair_status_api))
-            .route("/v4/maintenance/gc/start", post(run_garbage_collector))
-            .route("/v4/maintenance/gc/stop", post(stop_garbage_collector))
-            .route("/v4/maintenance/gc/status", get(get_gc_status_api))
+            .route("/n1/maintenance/repair/start", post(trigger_repair_job_api))
+            .route("/n1/maintenance/repair/stop", post(stop_repair_job_api))
+            .route("/n1/maintenance/repair/status", get(get_repair_status_api))
+            .route("/n1/maintenance/gc/start", post(run_garbage_collector))
+            .route("/n1/maintenance/gc/stop", post(stop_garbage_collector))
+            .route("/n1/maintenance/gc/status", get(get_gc_status_api))
             .route(
-                "/v4/maintenance/trash/recover/status",
+                "/n1/maintenance/trash/recover/status",
                 get(get_recover_all_trash_status_api),
             )
             .route(
-                "/v4/maintenance/trash/empty/status",
+                "/n1/maintenance/trash/empty/status",
                 get(get_empty_trash_status_api),
             )
             .route(
-                "/v4/maintenance/redistribution/start",
+                "/n1/maintenance/redistribution/start",
                 post(trigger_redistribution_job_api),
             )
             .route(
-                "/v4/maintenance/redistribution/stop",
-                patch(stop_redistribution_job_api),
+                "/n1/maintenance/redistribution/stop",
+                post(stop_redistribution_job_api),
             )
             .route(
-                "/v4/maintenance/redistribution/monitor",
+                "/n1/maintenance/redistribution/status",
                 get(get_redist_status_api),
             )
-            .route("/v4/maintenance/health", get(get_system_health));
+            .route("/n1/maintenance/health", get(get_system_health));
 
         let maintenance_ops = layers.layer_global(maintenance_ops);
 
@@ -624,153 +559,44 @@ pub fn build_storage_routes_unbound_with_options(
             .merge(maintenance_ops)
             .layer(from_fn(validate_access));
 
-        let public_routes = Router::new().route("/v4/public/share", get(get_shared_object));
-
-        let public_routes = layers
-            .layer_sharing(public_routes)
-            .layer(from_fn(enforce_quiesced_mode_on_reads));
-
-        Router::new().merge(protected_routes).merge(public_routes)
+        Router::new().merge(protected_routes)
     };
 
-    let ws_routes = {
-        let upgrade_route = Router::new().route("/ws", get(ws_handler));
-
-        let broadcast_route = Router::new()
-            .route("/v4/system/broadcast", post(system_broadcast_handler))
-            .layer(from_fn(validate_access));
-
-        let broadcast_route = layers.layer_upload(broadcast_route);
-
-        Router::new().merge(upgrade_route).merge(broadcast_route)
-    };
-
-    let legacy_fs_routes = {
-        let upload_routes = Router::new()
-            .route("/dir/file/upload/", post(upload_file))
-            .route("/dir/file/upload/{*path}", post(upload_file))
-            .route("/dir/file/upload/v2/", post(upload_fragments))
-            .route("/dir/file/upload/v2/{*path}", post(upload_fragments))
-            .route(
-                "/dir/file/upload/v3/initiate/",
-                post(initiate_upload_session),
-            )
-            .route(
-                "/dir/file/upload/v3/initiate/{*path}",
-                post(initiate_upload_session),
-            )
-            .route(
-                "/dir/file/upload/multipart/v3/{:file_id}/{:chunk_index}",
-                put(upload_chunk_multipart),
-            )
-            .route(
-                "/dir/file/upload/v3/{:file_id}/{:chunk_index}",
-                put(upload_chunk_binary),
-            )
-            .route(
-                "/dir/file/upload/v3/{:file_id}/status",
-                get(stateless_fragmented_upload::get_upload_status),
-            )
-            .route(
-                "/dir/file/upload/v3/{:file_id}/finalize",
-                post(finalize_upload_session),
-            )
-            .layer(from_fn(enforce_storage_limit));
-
-        let upload_routes = layers
-            .layer_upload(upload_routes)
-            .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
-
-        let management_ops = Router::new()
-            .route("/dir/create/{*path}", post(create_directory))
-            .route("/dir/delete/{*path}", delete(delete_directory))
-            .route("/dir/file/rename/", put(rename_file_query))
-            .route("/dir/file/rename/{*path}", put(rename_file_query))
-            .route("/dir/file/delete/", delete(delete_file))
-            .route("/dir/file/delete/{*path}", delete(delete_file));
-
-        let management_ops = layers
-            .layer_upload(management_ops)
-            .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
-
-        let read_ops = Router::new()
-            .route("/dir/", get(view_directory))
-            .route("/dir/{*path}", get(view_directory))
-            .route("/dir/capacity", get(get_storage_capacity))
-            .route(
-                "/dir/file/upload/check/{*path}",
-                get(check_uploaded_fragments),
-            )
-            .route("/dir/file/view/{*path}", get(view_file))
-            .route("/dir/file/stream/{*path}", get(stream_file))
-            .route("/dir/file/stream/v2/{*path}", get(stream_file_v2))
-            .route(
-                "/dir/file/transcode/stream/hls/{*path}",
-                get(stream_hls_file),
-            )
-            .route("/dir/file/metadata/", get(get_file_metadata))
-            .route("/dir/file/metadata/{*path}", get(get_file_metadata))
-            .route("/dir/file/download/", get(download_file))
-            .route("/dir/file/download/{*path}", get(download_file));
-
-        let read_ops = layers
-            .layer_view(read_ops)
-            .layer(from_fn(enforce_quiesced_mode_on_reads));
-
-        Router::new()
-            .merge(upload_routes)
-            .merge(management_ops)
-            .merge(read_ops)
-            .layer(from_fn(auth))
-    };
-
-    let list_fragments_route =
-        Router::new().route("/v4/fragment/list/public", get(list_public_fragments));
-    let list_fragments_route = layers.layer_global(list_fragments_route);
+    let ws_routes = { Router::new().route("/ws", get(ws_handler)) };
 
     let global_routes = Router::new()
-        .route("/v4/fragment/check", get(verify_fragment_existence))
-        .route("/v4/fragment/get/hash", get(get_fragment_hash));
+        .route("/n1/fragments/check", get(verify_fragment_existence))
+        .route("/n1/fragments/hash", get(get_fragment_hash));
     let global_routes = layers.layer_global(global_routes);
 
-    let create_fragment_route = Router::new().route("/v4/fragment/create", post(create_fragment));
+    let create_fragment_route = Router::new().route("/n1/fragments", post(create_fragment));
     let create_fragment_route = layers
         .layer_auth(create_fragment_route)
         .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
 
-    let fragment_auth_route =
-        Router::new().route("/authenticate/fragment", post(authorize_fragment));
+    let fragment_auth_route = Router::new().route("/n1/auth/fragment", post(authorize_fragment));
     let fragment_auth_route = layers.layer_auth(fragment_auth_route);
 
-    let fs_auth_route = Router::new().route("/authenticate/fs", post(authorize));
-    let fs_auth_route = layers.layer_auth(fs_auth_route);
-
-    let refresh_auth_route =
-        Router::new().route("/authenticate/refresh", post(refresh_access_token));
+    let refresh_auth_route = Router::new().route("/n1/auth/refresh", post(refresh_access_token));
     let refresh_auth_route = layers.layer_auth(refresh_auth_route);
 
-    let logout_auth_route = Router::new().route("/authenticate/logout", post(logout_refresh_token));
+    let logout_auth_route = Router::new().route("/n1/auth/logout", post(logout_refresh_token));
     let logout_auth_route = layers.layer_auth(logout_auth_route);
 
-    let ping_route = Router::new().route("/ping", get(ping));
+    let ping_route = Router::new().route("/n1/ping", get(ping));
     let ping_route = layers.layer_global(ping_route);
 
     let mut router = Router::new()
         .merge(ping_route)
         .merge(fragment_auth_route)
-        .merge(fs_auth_route)
         .merge(refresh_auth_route)
         .merge(logout_auth_route)
-        .merge(list_fragments_route)
         .merge(global_routes)
         .merge(create_fragment_route)
         .merge(ws_routes);
 
     if options.include_object_storage {
         router = router.merge(object_storage_routes);
-    }
-    if options.include_legacy_fs {
-        router = router.merge(legacy_fs_routes);
     }
 
     (router, app_state)
@@ -787,36 +613,4 @@ pub async fn serve_storage_routes() -> Router {
 
 async fn ping() -> &'static str {
     "pong"
-}
-
-async fn smb_progress(
-    claims: Claims,
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<AxumJson<Vec<SmbTransferProgressPayload>>, AppError> {
-    if !claims.read {
-        return Err(AppError::Forbidden("Read permission required".into()));
-    }
-
-    let fragment = claims.fragment.clone();
-
-    let include_completed = params
-        .get("include_completed")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false);
-    let limit = params
-        .get("limit")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(100)
-        .min(1000);
-
-    Ok(AxumJson(list_transfer_progress_for_fragment(
-        fragment.as_str(),
-        include_completed,
-        limit,
-    )))
 }
