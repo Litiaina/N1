@@ -138,7 +138,6 @@ pub async fn serve_storage_routes() -> Router {
     let layers = RateLimitLayers::new();
     let (base_router, app_state) = build_storage_routes_unbound_with_options(StorageRouteOptions {
         include_object_storage: false,
-        include_legacy_fs: false,
     });
 
     apply_runtime_http_layers(
