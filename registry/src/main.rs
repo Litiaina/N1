@@ -28,7 +28,7 @@ use axum::{Json, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use chrono::{Local, Utc};
 use config::{RegistryConfig, normalize_backend_url};
-use db::RegistryDb;
+use db::{PendingUploadReservation, RegistryDb};
 use error::RegistryError;
 use models::{
     AdminStatsResponse, AdminUserListResponse, AdminUserSummary, ArchiveObjectsRequest,
@@ -40,12 +40,12 @@ use models::{
     FragmentStateRequest, LinkFragmentRequest, LinkFragmentResponse, ListObjectsQuery,
     ListObjectsResponse, ListSharesQuery, ListSharesResponse, LoginRequest, LoginResponse,
     ObjectDeleteResponse, ObjectMutationResponse, ObjectStateRequest, ObjectStatsQuery,
-    ObjectStatsResponse, RefreshRequest, RefreshResponse, RegisterObjectRequest,
-    RenameRegistryObjectRequest, ResolveObjectQuery, RevokeShareResponse, SetupTwoFactorRequest,
-    SignupRequest, SignupResponse, StorageSessionRequest, StorageSessionResponse,
-    SuggestObjectsQuery, SuggestObjectsResponse, TwoFactorSetupResponse, UpdateCredentialsRequest,
-    UpdateEmailRequest, UpdatePasswordRequest, UpdateQuotaRequest, UserMutationResponse,
-    UserRecord,
+    ObjectStatsResponse, PrefixObjectMutationRequest, RefreshRequest, RefreshResponse,
+    RegisterObjectRequest, RenameRegistryObjectRequest, RenameRegistryPrefixRequest,
+    ResolveObjectQuery, RevokeShareResponse, SetupTwoFactorRequest, SignupRequest, SignupResponse,
+    StorageSessionRequest, StorageSessionResponse, SuggestObjectsQuery, SuggestObjectsResponse,
+    TwoFactorSetupResponse, UpdateCredentialsRequest, UpdateEmailRequest, UpdatePasswordRequest,
+    UpdateQuotaRequest, UserMutationResponse, UserRecord,
 };
 use realtime::{
     DeleteObjectNotice, DeleteUserNotice, FragmentNotice, RegistryRealtimeHub,
@@ -53,7 +53,7 @@ use realtime::{
     TwoFactorNotice, WsAuthParams,
 };
 use std::time::Duration;
-use storage_broker::StorageBroker;
+use storage_broker::{EngineUploadSession, StorageBroker};
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::warn;
@@ -66,9 +66,11 @@ struct AppState {
     broker: StorageBroker,
     realtime: RegistryRealtimeHub,
     write_gate: Arc<Mutex<()>>,
+    pending_upload_grace_secs: u64,
 }
 
 const MAX_SHARE_EXPIRATION_SECS: u64 = 60 * 60 * 24 * 7;
+const PENDING_UPLOAD_RECONCILE_INTERVAL_SECS: u64 = 60;
 
 fn default_fragment_name(user: &UserRecord) -> String {
     user.email.clone()
@@ -117,6 +119,147 @@ async fn issue_registry_session(
         .create_refresh_session(user.uid.clone(), state.auth.refresh_token_ttl_secs)
         .await?;
     Ok((access_token, expires_in, refresh_token, refresh_expires_in))
+}
+
+fn normalized_upload_tracking_value(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn pending_upload_age_secs(reservation: &PendingUploadReservation) -> Option<i64> {
+    let parse = |value: &str| chrono::DateTime::parse_from_rfc3339(value).ok();
+    let timestamp = parse(&reservation.updated_at).or_else(|| parse(&reservation.created_at))?;
+    Some(
+        Utc::now()
+            .signed_duration_since(timestamp.with_timezone(&Utc))
+            .num_seconds()
+            .max(0),
+    )
+}
+
+fn reservation_matches_active_session(
+    reservation: &PendingUploadReservation,
+    active_sessions: &[EngineUploadSession],
+) -> bool {
+    if let Some(session_id) = normalized_upload_tracking_value(reservation.session_id.as_deref()) {
+        if active_sessions
+            .iter()
+            .any(|session| session.session_id == session_id)
+        {
+            return true;
+        }
+    }
+    if let Some(version_id) = normalized_upload_tracking_value(reservation.version_id.as_deref()) {
+        if active_sessions
+            .iter()
+            .any(|session| session.version_id == version_id)
+        {
+            return true;
+        }
+    }
+    active_sessions
+        .iter()
+        .any(|session| session.object_key.as_deref() == Some(reservation.object_key.as_str()))
+}
+
+async fn reconcile_pending_uploads(
+    state: &AppState,
+    owner_uid: Option<String>,
+) -> Result<Vec<(String, String)>, RegistryError> {
+    let reservations = state.db.list_pending_upload_reservations(owner_uid).await?;
+    if reservations.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut grouped =
+        std::collections::BTreeMap::<(String, String), Vec<PendingUploadReservation>>::new();
+    for reservation in reservations {
+        grouped
+            .entry((reservation.owner_uid.clone(), reservation.fragment.clone()))
+            .or_default()
+            .push(reservation);
+    }
+
+    let legacy_grace_secs = state.pending_upload_grace_secs.max(300) as i64;
+    let mut stale = Vec::new();
+
+    for ((owner_uid, fragment), group) in grouped {
+        let binding = state
+            .db
+            .get_fragment_binding(owner_uid.clone(), fragment.clone())
+            .await?;
+        let Some(binding) = binding else {
+            stale.extend(group);
+            continue;
+        };
+
+        let active_sessions = match state.broker.list_active_upload_sessions(&binding).await {
+            Ok(active_sessions) => active_sessions,
+            Err(err) => {
+                warn!(
+                    "pending upload reconciliation skipped for {}/{}: {}",
+                    owner_uid, fragment, err.message
+                );
+                continue;
+            }
+        };
+
+        for reservation in group {
+            let has_tracking = normalized_upload_tracking_value(reservation.version_id.as_deref())
+                .is_some()
+                || normalized_upload_tracking_value(reservation.session_id.as_deref()).is_some();
+            let active = reservation_matches_active_session(&reservation, &active_sessions);
+            let should_reap = if has_tracking {
+                !active
+            } else {
+                !active
+                    && pending_upload_age_secs(&reservation).unwrap_or_default()
+                        >= legacy_grace_secs
+            };
+            if should_reap {
+                stale.push(reservation);
+            }
+        }
+    }
+
+    if stale.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    state.db.remove_pending_upload_reservations(stale).await
+}
+
+fn publish_pending_upload_cleanup_invalidations(state: &AppState, scopes: Vec<(String, String)>) {
+    for (owner_uid, fragment) in scopes {
+        publish_owner_invalidation(state, &owner_uid, Some(fragment.clone()), "objects");
+        publish_owner_invalidation(state, &owner_uid, Some(fragment), "account_profile");
+    }
+}
+
+async fn run_pending_upload_reconciler(state: AppState) {
+    let mut interval =
+        tokio::time::interval(Duration::from_secs(PENDING_UPLOAD_RECONCILE_INTERVAL_SECS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        match reconcile_pending_uploads(&state, None).await {
+            Ok(scopes) => {
+                if !scopes.is_empty() {
+                    let removed = scopes.len();
+                    publish_pending_upload_cleanup_invalidations(&state, scopes);
+                    warn!(
+                        "registry pending upload reconciliation removed {} stale reservation scope(s)",
+                        removed
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "registry pending upload reconciliation failed: {}",
+                    err.message
+                );
+            }
+        }
+    }
 }
 
 async fn ensure_user_default_fragment(
@@ -296,7 +439,10 @@ async fn run() -> Result<(), String> {
             .map_err(|err| format!("failed to initialize storage broker: {}", err.message))?,
         realtime: RegistryRealtimeHub::new(),
         write_gate: Arc::new(Mutex::new(())),
+        pending_upload_grace_secs: config.storage_session_ttl_secs,
     };
+
+    tokio::spawn(run_pending_upload_reconciler(state.clone()));
 
     let app = build_router(state);
     let addr: SocketAddr = format!("{}:{}", config.host, config.https_port)
@@ -398,12 +544,16 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/objects/pending", delete(cancel_pending_object))
         .route("/v1/objects/suggest", get(suggest_objects))
         .route("/v1/objects/rename", post(rename_object))
+        .route("/v1/objects/rename-prefix", post(rename_object_prefix))
         .route("/v1/objects/version/delete", post(delete_object_version))
         .route("/v1/objects/trash/bulk", post(trash_objects_bulk))
+        .route("/v1/objects/trash-prefix", post(trash_objects_prefix))
         .route("/v1/objects/trash", post(trash_object))
         .route("/v1/objects/recover/bulk", post(recover_objects_bulk))
+        .route("/v1/objects/recover-prefix", post(recover_objects_prefix))
         .route("/v1/objects/recover", post(recover_object))
         .route("/v1/objects/recover-all", post(recover_all_objects))
+        .route("/v1/objects/permanent-prefix", post(delete_objects_prefix))
         .route("/v1/objects/trash/empty", post(empty_trash))
         .route("/v1/objects", delete(delete_object))
         .route("/v1/objects", get(list_objects))
@@ -421,6 +571,8 @@ fn build_cors_layer() -> CorsLayer {
             HeaderName::from_static("authorization"),
             HeaderName::from_static("content-type"),
             HeaderName::from_static("x-registry-master-key"),
+            HeaderName::from_static("x-forwarded-proto"),
+            HeaderName::from_static("x-forwarded-host"),
         ])
         .allow_methods([
             axum::http::Method::GET,
@@ -761,6 +913,10 @@ async fn me(
     headers: HeaderMap,
 ) -> Result<Json<UserRecord>, RegistryError> {
     let claims = claims_from_headers(&headers, &state.auth)?;
+    let removed_scopes = reconcile_pending_uploads(&state, Some(claims.sub.clone())).await?;
+    if !removed_scopes.is_empty() {
+        publish_pending_upload_cleanup_invalidations(&state, removed_scopes);
+    }
     let user = state.db.get_user(claims.sub).await?;
     Ok(Json(user))
 }
@@ -1319,13 +1475,17 @@ async fn get_public_share(
         .ok_or_else(|| RegistryError::not_found("share not found"))?;
     let upstream = state
         .broker
-        .stream_shared_object(&binding, &share.object_key, share.disposition, &headers)
+        .stream_shared_object(
+            &binding,
+            &share.storage_object_id,
+            share.disposition,
+            &headers,
+        )
         .await?;
     let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::OK);
     let mut builder = Response::builder().status(status);
     for header_name in [
         header::CONTENT_TYPE,
-        header::CONTENT_DISPOSITION,
         header::CONTENT_LENGTH,
         header::ETAG,
         header::ACCEPT_RANGES,
@@ -1334,6 +1494,21 @@ async fn get_public_share(
         header::LAST_MODIFIED,
     ] {
         builder = copy_upstream_header(builder, &upstream, header_name);
+    }
+    if share.disposition.is_download() {
+        let logical_name = share
+            .object_key
+            .rsplit('/')
+            .next()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("download");
+        if let Ok(value) =
+            header::HeaderValue::from_str(&format!("attachment; filename=\"{}\"", logical_name))
+        {
+            builder = builder.header(header::CONTENT_DISPOSITION, value);
+        }
+    } else {
+        builder = copy_upstream_header(builder, &upstream, header::CONTENT_DISPOSITION);
     }
     builder
         .body(Body::from_stream(upstream.bytes_stream()))
@@ -1346,8 +1521,12 @@ async fn register_object(
     Json(req): Json<RegisterObjectRequest>,
 ) -> Result<(StatusCode, Json<ObjectMutationResponse>), RegistryError> {
     validate_fragment_and_key(&req.fragment, &req.object_key)?;
-    let _write_guard = state.write_gate.lock().await;
     let claims = claims_from_headers(&headers, &state.auth)?;
+    let removed_scopes = reconcile_pending_uploads(&state, Some(claims.sub.clone())).await?;
+    if !removed_scopes.is_empty() {
+        publish_pending_upload_cleanup_invalidations(&state, removed_scopes);
+    }
+    let _write_guard = state.write_gate.lock().await;
     let object = state
         .db
         .register_pending_object(
@@ -1356,6 +1535,8 @@ async fn register_object(
             req.object_key,
             req.expected_size_bytes,
             req.content_type,
+            req.version_id,
+            req.session_id,
         )
         .await?;
     let user = state.db.get_user(claims.sub).await?;
@@ -1386,7 +1567,6 @@ async fn finalize_object(
     Json(req): Json<FinalizeObjectRequest>,
 ) -> Result<Json<ObjectMutationResponse>, RegistryError> {
     validate_fragment_and_key(&req.fragment, &req.object_key)?;
-    let _write_guard = state.write_gate.lock().await;
     if req.version_id.trim().is_empty() {
         return Err(RegistryError::bad_request("version_id is required"));
     }
@@ -1396,6 +1576,11 @@ async fn finalize_object(
         ));
     }
     let claims = claims_from_headers(&headers, &state.auth)?;
+    let removed_scopes = reconcile_pending_uploads(&state, Some(claims.sub.clone())).await?;
+    if !removed_scopes.is_empty() {
+        publish_pending_upload_cleanup_invalidations(&state, removed_scopes);
+    }
+    let _write_guard = state.write_gate.lock().await;
     let (object, user) = state
         .db
         .finalize_object(
@@ -1542,9 +1727,9 @@ async fn archive_objects(
             )
         })?;
 
-    let manifest = state
+    let selection = state
         .db
-        .write_archive_manifest(
+        .select_archive_objects(
             claims.sub,
             req.fragment.trim().to_string(),
             req.keys,
@@ -1553,36 +1738,27 @@ async fn archive_objects(
             req.include_trashed.unwrap_or(false),
         )
         .await?;
-    let _selected_count = manifest.selected_count;
     let fallback_filename = req.filename.clone().unwrap_or_else(|| "export".to_string());
-    let upstream = state
+    let archive_file = state
         .broker
-        .stream_manifest_archive(&binding, &manifest.manifest_path, req.filename.as_deref())
+        .stream_logical_archive(&binding, &selection.objects)
         .await?;
-
-    let content_type = upstream
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .cloned()
-        .unwrap_or_else(|| header::HeaderValue::from_static("application/x-tar"));
-    let content_disposition = upstream
-        .headers()
-        .get(header::CONTENT_DISPOSITION)
-        .cloned()
-        .unwrap_or_else(|| {
-            header::HeaderValue::from_str(&format!(
-                "attachment; filename=\"{}.tar\"",
-                fallback_filename
-            ))
-            .unwrap_or_else(|_| header::HeaderValue::from_static("attachment"))
-        });
-    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::OK);
+    let content_disposition = header::HeaderValue::from_str(&format!(
+        "attachment; filename=\"{}.tar\"",
+        fallback_filename
+    ))
+    .unwrap_or_else(|_| header::HeaderValue::from_static("attachment"));
 
     Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, content_type)
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/x-tar"),
+        )
         .header(header::CONTENT_DISPOSITION, content_disposition)
-        .body(Body::from_stream(upstream.bytes_stream()))
+        .body(Body::from_stream(tokio_util::io::ReaderStream::new(
+            archive_file,
+        )))
         .map_err(|err| {
             RegistryError::internal(format!("failed to build archive response: {}", err))
         })
@@ -1633,16 +1809,48 @@ async fn rename_object(
     }))
 }
 
+async fn rename_object_prefix(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<RenameRegistryPrefixRequest>,
+) -> Result<Json<BulkObjectMutationResponse>, RegistryError> {
+    validate_fragment(&req.fragment)?;
+    if req.source_prefix.trim().is_empty() || req.destination_prefix.trim().is_empty() {
+        return Err(RegistryError::bad_request(
+            "source_prefix and destination_prefix are required",
+        ));
+    }
+
+    let fragment = req.fragment.clone();
+    let claims = claims_from_headers(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
+    let (affected, user) = state
+        .db
+        .rename_prefix(
+            claims.sub,
+            fragment.clone(),
+            req.source_prefix,
+            req.destination_prefix,
+        )
+        .await?;
+    publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
+    Ok(Json(BulkObjectMutationResponse {
+        affected,
+        quota_limit_bytes: user.quota_limit_bytes,
+        quota_used_bytes: user.quota_used_bytes,
+    }))
+}
+
 async fn trash_object(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<ObjectStateRequest>,
 ) -> Result<Json<ObjectMutationResponse>, RegistryError> {
     validate_fragment_and_key(&req.fragment, &req.object_key)?;
-    let _write_guard = state.write_gate.lock().await;
     let fragment = req.fragment.clone();
     let object_key = req.object_key.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
     let (object, user) = state
         .db
         .set_object_status(claims.sub, fragment.clone(), object_key.clone(), "trashed")
@@ -1664,6 +1872,31 @@ async fn trash_object(
     }))
 }
 
+async fn trash_objects_prefix(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<PrefixObjectMutationRequest>,
+) -> Result<Json<BulkObjectMutationResponse>, RegistryError> {
+    validate_fragment(&req.fragment)?;
+    if req.prefix.trim().is_empty() {
+        return Err(RegistryError::bad_request("prefix is required"));
+    }
+
+    let fragment = req.fragment.clone();
+    let claims = claims_from_headers(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
+    let (affected, user) = state
+        .db
+        .set_objects_status_by_prefix(claims.sub, fragment.clone(), req.prefix, "trashed")
+        .await?;
+    publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
+    Ok(Json(BulkObjectMutationResponse {
+        affected,
+        quota_limit_bytes: user.quota_limit_bytes,
+        quota_used_bytes: user.quota_used_bytes,
+    }))
+}
+
 async fn trash_objects_bulk(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1678,9 +1911,9 @@ async fn trash_objects_bulk(
         ));
     }
 
-    let _write_guard = state.write_gate.lock().await;
     let fragment = req.fragment.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
     let (affected, not_found, user) = state
         .db
         .set_objects_status_bulk(claims.sub, fragment.clone(), object_keys.clone(), "trashed")
@@ -1702,10 +1935,10 @@ async fn recover_object(
     Json(req): Json<ObjectStateRequest>,
 ) -> Result<Json<ObjectMutationResponse>, RegistryError> {
     validate_fragment_and_key(&req.fragment, &req.object_key)?;
-    let _write_guard = state.write_gate.lock().await;
     let fragment = req.fragment.clone();
     let object_key = req.object_key.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
     let (object, user) = state
         .db
         .set_object_status(claims.sub, fragment.clone(), object_key, "ready")
@@ -1718,6 +1951,31 @@ async fn recover_object(
     publish_owner_invalidation(&state, &object.owner_uid, Some(fragment), "objects");
     Ok(Json(ObjectMutationResponse {
         object,
+        quota_limit_bytes: user.quota_limit_bytes,
+        quota_used_bytes: user.quota_used_bytes,
+    }))
+}
+
+async fn recover_objects_prefix(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<PrefixObjectMutationRequest>,
+) -> Result<Json<BulkObjectMutationResponse>, RegistryError> {
+    validate_fragment(&req.fragment)?;
+    if req.prefix.trim().is_empty() {
+        return Err(RegistryError::bad_request("prefix is required"));
+    }
+
+    let fragment = req.fragment.clone();
+    let claims = claims_from_headers(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
+    let (affected, user) = state
+        .db
+        .set_objects_status_by_prefix(claims.sub, fragment.clone(), req.prefix, "ready")
+        .await?;
+    publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
+    Ok(Json(BulkObjectMutationResponse {
+        affected,
         quota_limit_bytes: user.quota_limit_bytes,
         quota_used_bytes: user.quota_used_bytes,
     }))
@@ -1737,9 +1995,9 @@ async fn recover_objects_bulk(
         ));
     }
 
-    let _write_guard = state.write_gate.lock().await;
     let fragment = req.fragment.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
     let (affected, not_found, user) = state
         .db
         .set_objects_status_bulk(claims.sub, fragment.clone(), object_keys.clone(), "ready")
@@ -1761,10 +2019,24 @@ async fn delete_object(
     Query(query): Query<DeleteObjectQuery>,
 ) -> Result<Json<ObjectDeleteResponse>, RegistryError> {
     validate_fragment_and_key(&query.fragment, &query.object_key)?;
-    let _write_guard = state.write_gate.lock().await;
     let fragment = query.fragment.clone();
     let object_key = query.object_key.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
+    let binding = state
+        .db
+        .get_fragment_binding(claims.sub.clone(), fragment.clone())
+        .await?;
+    let current_object = state
+        .db
+        .resolve_any_object_record(claims.sub.clone(), fragment.clone(), object_key.clone())
+        .await?;
+    if let (Some(binding), Some(current_object)) = (binding.as_ref(), current_object.as_ref()) {
+        state
+            .broker
+            .permanently_delete_objects(binding, [current_object.storage_object_id.clone()])
+            .await?;
+    }
     let user = state
         .db
         .delete_object(claims.sub, fragment.clone(), object_key.clone())
@@ -1786,6 +2058,49 @@ async fn delete_object(
     }))
 }
 
+async fn delete_objects_prefix(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<PrefixObjectMutationRequest>,
+) -> Result<Json<BulkObjectMutationResponse>, RegistryError> {
+    validate_fragment(&req.fragment)?;
+    if req.prefix.trim().is_empty() {
+        return Err(RegistryError::bad_request("prefix is required"));
+    }
+
+    let fragment = req.fragment.clone();
+    let prefix = req.prefix.clone();
+    let claims = claims_from_headers(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
+    let binding = state
+        .db
+        .get_fragment_binding(claims.sub.clone(), fragment.clone())
+        .await?;
+    let storage_ids = state
+        .db
+        .list_objects_by_prefix_any_status(claims.sub.clone(), fragment.clone(), prefix.clone())
+        .await?
+        .into_iter()
+        .map(|object| object.storage_object_id)
+        .collect::<BTreeSet<_>>();
+    if let Some(binding) = binding.as_ref() {
+        state
+            .broker
+            .permanently_delete_objects(binding, storage_ids)
+            .await?;
+    }
+    let (affected, _deleted_storage_ids, user) = state
+        .db
+        .delete_objects_by_prefix(claims.sub, fragment.clone(), prefix)
+        .await?;
+    publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
+    Ok(Json(BulkObjectMutationResponse {
+        affected,
+        quota_limit_bytes: user.quota_limit_bytes,
+        quota_used_bytes: user.quota_used_bytes,
+    }))
+}
+
 async fn delete_object_version(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1801,6 +2116,11 @@ async fn delete_object_version(
     let object_key = req.object_key.clone();
     let version_id = req.version_id.trim().to_string();
     let claims = claims_from_headers(&headers, &state.auth)?;
+    let current_object = state
+        .db
+        .resolve_object(claims.sub.clone(), fragment.clone(), object_key.clone())
+        .await?
+        .ok_or_else(|| RegistryError::not_found("object not found"))?;
     let binding = state
         .db
         .get_fragment_binding(claims.sub.clone(), fragment.clone())
@@ -1813,7 +2133,11 @@ async fn delete_object_version(
 
     let engine_state = state
         .broker
-        .delete_object_version_and_read_state(&binding, &object_key, &version_id)
+        .delete_object_version_and_read_state(
+            &binding,
+            &current_object.storage_object_id,
+            &version_id,
+        )
         .await?;
     let (object, user) = state
         .db
@@ -1821,6 +2145,7 @@ async fn delete_object_version(
             claims.sub,
             fragment.clone(),
             object_key.clone(),
+            current_object.storage_object_id,
             engine_state.current,
             engine_state.versions,
         )
@@ -1852,12 +2177,22 @@ async fn cancel_pending_object(
     Query(query): Query<DeleteObjectQuery>,
 ) -> Result<Json<ObjectDeleteResponse>, RegistryError> {
     validate_fragment_and_key(&query.fragment, &query.object_key)?;
-    let _write_guard = state.write_gate.lock().await;
     let fragment = query.fragment.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
+    let removed_scopes = reconcile_pending_uploads(&state, Some(claims.sub.clone())).await?;
+    if !removed_scopes.is_empty() {
+        publish_pending_upload_cleanup_invalidations(&state, removed_scopes);
+    }
+    let _write_guard = state.write_gate.lock().await;
     let (removed, user) = state
         .db
-        .cancel_pending_object(claims.sub, fragment.clone(), query.object_key)
+        .cancel_pending_object(
+            claims.sub,
+            fragment.clone(),
+            query.object_key,
+            query.version_id,
+            query.session_id,
+        )
         .await?;
     if removed {
         publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
@@ -1875,9 +2210,9 @@ async fn recover_all_objects(
     Json(req): Json<FragmentStateRequest>,
 ) -> Result<Json<BulkObjectMutationResponse>, RegistryError> {
     validate_fragment(&req.fragment)?;
-    let _write_guard = state.write_gate.lock().await;
     let fragment = req.fragment.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
     let (affected, user) = state
         .db
         .recover_all_trashed(claims.sub, fragment.clone())
@@ -1896,9 +2231,27 @@ async fn empty_trash(
     Json(req): Json<FragmentStateRequest>,
 ) -> Result<Json<BulkObjectMutationResponse>, RegistryError> {
     validate_fragment(&req.fragment)?;
-    let _write_guard = state.write_gate.lock().await;
     let fragment = req.fragment.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
+    let _write_guard = state.write_gate.lock().await;
+    if let Some(binding) = state
+        .db
+        .get_fragment_binding(claims.sub.clone(), fragment.clone())
+        .await?
+    {
+        let trashed_objects = state
+            .db
+            .list_objects_with_status(claims.sub.clone(), fragment.clone(), "trashed")
+            .await?;
+        let storage_ids = trashed_objects
+            .into_iter()
+            .map(|object| object.storage_object_id)
+            .collect::<BTreeSet<_>>();
+        state
+            .broker
+            .permanently_delete_objects(&binding, storage_ids)
+            .await?;
+    }
     let (affected, user) = state.db.empty_trash(claims.sub, fragment.clone()).await?;
     publish_owner_invalidation(&state, &user.uid, Some(fragment), "trash");
     Ok(Json(BulkObjectMutationResponse {
@@ -1936,7 +2289,7 @@ async fn resolve_object(
 
     match state
         .broker
-        .read_current_object_state(&binding, &query.object_key, false)
+        .read_current_object_state(&binding, &object.storage_object_id, false)
         .await
     {
         Ok(engine_state) => {
@@ -1948,6 +2301,7 @@ async fn resolve_object(
                         claims.sub,
                         query.fragment.clone(),
                         query.object_key.clone(),
+                        object.storage_object_id.clone(),
                         None,
                         Vec::new(),
                     )
@@ -1969,7 +2323,7 @@ async fn resolve_object(
                     let _write_guard = state.write_gate.lock().await;
                     let full_state = state
                         .broker
-                        .read_current_object_state(&binding, &query.object_key, true)
+                        .read_current_object_state(&binding, &object.storage_object_id, true)
                         .await?;
                     let (synced_object, user) = state
                         .db
@@ -1977,6 +2331,7 @@ async fn resolve_object(
                             claims.sub,
                             query.fragment.clone(),
                             query.object_key.clone(),
+                            object.storage_object_id.clone(),
                             full_state.current,
                             full_state.versions,
                         )
@@ -2248,6 +2603,85 @@ mod tests {
                             .into_response()
                     },
                 ),
+            )
+            .route(
+                "/n1/objects/{*object_key}",
+                delete(|StubPath(_object_key): StubPath<String>| async move {
+                    StatusCode::OK
+                }),
+            )
+            .route(
+                "/n1/objects/bulk-delete",
+                post(|Json(_payload): Json<Value>| async move { StatusCode::OK }),
+            )
+            .route(
+                "/n1/objects/permanent/{*object_key}",
+                delete(|StubPath(_object_key): StubPath<String>| async move {
+                    StatusCode::NO_CONTENT
+                }),
+            )
+            .route(
+                "/n1/objects/recover/version/{version_id}/{*object_key}",
+                post(
+                    |StubPath((_version_id, _object_key)): StubPath<(String, String)>| async move {
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .route(
+                "/n1/trash/recover-all",
+                post(|| async move {
+                    (
+                        StatusCode::ACCEPTED,
+                        Json(json!({
+                            "is_running": false,
+                            "phase": "Completed",
+                            "last_error": null
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/n1/trash/empty",
+                delete(|| async move {
+                    (
+                        StatusCode::ACCEPTED,
+                        Json(json!({
+                            "is_running": false,
+                            "phase": "Completed",
+                            "last_error": null
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/n1/maintenance/trash/recover-all/status",
+                get(|| async move {
+                    Json(json!({
+                        "is_running": false,
+                        "phase": "Completed",
+                        "last_error": null
+                    }))
+                }),
+            )
+            .route(
+                "/n1/maintenance/trash/empty/status",
+                get(|| async move {
+                    Json(json!({
+                        "is_running": false,
+                        "phase": "Completed",
+                        "last_error": null
+                    }))
+                }),
+            )
+            .route(
+                "/n1/upload/multipart",
+                get(|| async move {
+                    Json(json!({
+                        "sessions": [],
+                        "total": 0
+                    }))
+                }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2255,6 +2689,173 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve stub");
+        });
+        format!("http://{}", addr)
+    }
+
+    async fn spawn_storage_recording_stub(
+        token: &'static str,
+        calls: Arc<TokioMutex<Vec<String>>>,
+    ) -> String {
+        let delete_calls = calls.clone();
+        let bulk_calls = calls.clone();
+        let permanent_calls = calls.clone();
+        let recover_calls = calls.clone();
+        let recover_all_calls = calls.clone();
+        let empty_calls = calls.clone();
+        let recover_status_calls = calls.clone();
+        let empty_status_calls = calls.clone();
+
+        let app = Router::new()
+            .route(
+                "/n1/auth/fragment",
+                post(move |Json(_payload): Json<Value>| async move {
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "access_token": token,
+                            "token_type": "Bearer",
+                            "expires_in": 600
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/n1/objects/{*object_key}",
+                delete(move |StubPath(object_key): StubPath<String>| {
+                    let delete_calls = delete_calls.clone();
+                    async move {
+                        delete_calls
+                            .lock()
+                            .await
+                            .push(format!("DELETE /n1/objects/{object_key}"));
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .route(
+                "/n1/objects/bulk-delete",
+                post(move |Json(payload): Json<Value>| {
+                    let bulk_calls = bulk_calls.clone();
+                    async move {
+                        let body = serde_json::to_string(&payload).expect("serialize bulk payload");
+                        bulk_calls
+                            .lock()
+                            .await
+                            .push(format!("POST /n1/objects/bulk-delete {body}"));
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .route(
+                "/n1/objects/permanent/{*object_key}",
+                delete(move |StubPath(object_key): StubPath<String>| {
+                    let permanent_calls = permanent_calls.clone();
+                    async move {
+                        permanent_calls
+                            .lock()
+                            .await
+                            .push(format!("DELETE /n1/objects/permanent/{object_key}"));
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            )
+            .route(
+                "/n1/objects/recover/version/{version_id}/{*object_key}",
+                post(
+                    move |StubPath((version_id, object_key)): StubPath<(String, String)>| {
+                        let recover_calls = recover_calls.clone();
+                        async move {
+                            recover_calls.lock().await.push(format!(
+                                "POST /n1/objects/recover/version/{version_id}/{object_key}"
+                            ));
+                            StatusCode::OK
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/n1/trash/recover-all",
+                post(move || {
+                    let recover_all_calls = recover_all_calls.clone();
+                    async move {
+                        recover_all_calls
+                            .lock()
+                            .await
+                            .push("POST /n1/trash/recover-all".to_string());
+                        (
+                            StatusCode::ACCEPTED,
+                            Json(json!({
+                                "is_running": false,
+                                "phase": "Completed",
+                                "last_error": null
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/n1/trash/empty",
+                delete(move || {
+                    let empty_calls = empty_calls.clone();
+                    async move {
+                        empty_calls
+                            .lock()
+                            .await
+                            .push("DELETE /n1/trash/empty".to_string());
+                        (
+                            StatusCode::ACCEPTED,
+                            Json(json!({
+                                "is_running": false,
+                                "phase": "Completed",
+                                "last_error": null
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/n1/maintenance/trash/recover-all/status",
+                get(move || {
+                    let recover_status_calls = recover_status_calls.clone();
+                    async move {
+                        recover_status_calls
+                            .lock()
+                            .await
+                            .push("GET /n1/maintenance/trash/recover-all/status".to_string());
+                        Json(json!({
+                            "is_running": false,
+                            "phase": "Completed",
+                            "last_error": null
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/n1/maintenance/trash/empty/status",
+                get(move || {
+                    let empty_status_calls = empty_status_calls.clone();
+                    async move {
+                        empty_status_calls
+                            .lock()
+                            .await
+                            .push("GET /n1/maintenance/trash/empty/status".to_string());
+                        Json(json!({
+                            "is_running": false,
+                            "phase": "Completed",
+                            "last_error": null
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind storage recording stub");
+        let addr = listener.local_addr().expect("recording stub addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve recording storage stub");
         });
         format!("http://{}", addr)
     }
@@ -2285,21 +2886,30 @@ mod tests {
                     let meta_state = meta_state.clone();
                     async move {
                         let state = meta_state.lock().await;
-                        let response = state.get(&object_key).and_then(|entry| {
-                            if !entry.current_visible {
-                                return None;
-                            }
-                            entry.versions.first().map(|version| {
-                                json!({
-                                    "fragment": "fragment-a",
-                                    "object_key": object_key,
-                                    "version_id": version.version_id,
-                                    "content_type": version.content_type,
-                                    "total_size_bytes": version.object_size_bytes,
-                                    "created_at": version.created_at
-                                })
+                        let response = state
+                            .get(&object_key)
+                            .or_else(|| {
+                                if state.len() == 1 {
+                                    state.values().next()
+                                } else {
+                                    None
+                                }
                             })
-                        });
+                            .and_then(|entry| {
+                                if !entry.current_visible {
+                                    return None;
+                                }
+                                entry.versions.first().map(|version| {
+                                    json!({
+                                        "fragment": "fragment-a",
+                                        "object_key": object_key,
+                                        "version_id": version.version_id,
+                                        "content_type": version.content_type,
+                                        "total_size_bytes": version.object_size_bytes,
+                                        "created_at": version.created_at
+                                    })
+                                })
+                            });
                         response
                             .map(|payload| (StatusCode::OK, Json(payload)).into_response())
                             .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
@@ -2314,6 +2924,13 @@ mod tests {
                         let state = versions_state.lock().await;
                         let payload = state
                             .get(&object_key)
+                            .or_else(|| {
+                                if state.len() == 1 {
+                                    state.values().next()
+                                } else {
+                                    None
+                                }
+                            })
                             .map(|entry| {
                                 entry
                                     .versions
@@ -2342,7 +2959,17 @@ mod tests {
                         let delete_state = delete_state.clone();
                         async move {
                             let mut state = delete_state.lock().await;
-                            let Some(entry) = state.get_mut(&object_key) else {
+                            let entry_key = if state.contains_key(&object_key) {
+                                Some(object_key.clone())
+                            } else if state.len() == 1 {
+                                state.keys().next().cloned()
+                            } else {
+                                None
+                            };
+                            let Some(entry_key) = entry_key else {
+                                return StatusCode::NOT_FOUND;
+                            };
+                            let Some(entry) = state.get_mut(&entry_key) else {
                                 return StatusCode::NOT_FOUND;
                             };
                             let removed_index = entry
@@ -2419,6 +3046,7 @@ mod tests {
             broker: StorageBroker::new(config).expect("build broker"),
             realtime: RegistryRealtimeHub::new(),
             write_gate: Arc::new(Mutex::new(())),
+            pending_upload_grace_secs: 900,
         };
         let (token, _) = issue_access_token(&user, &auth).expect("issue access token");
         (state, token)
@@ -3083,6 +3711,8 @@ mod tests {
                 "uploads/pending.bin".to_string(),
                 Some(8192),
                 Some("application/octet-stream".to_string()),
+                None,
+                None,
             )
             .await
             .expect("register pending");
@@ -3131,6 +3761,77 @@ mod tests {
                 .expect("active users array")
                 .iter()
                 .any(|entry| entry["email"] == "drive@example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn me_reconciles_stale_pending_upload_reservations_when_engine_session_is_gone() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, access_token) = test_state(single_url, multi_url).await;
+        let drive_user = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment a");
+
+        state
+            .db
+            .register_pending_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "uploads/orphaned.bin".to_string(),
+                Some(8192),
+                Some("application/octet-stream".to_string()),
+                Some("01HPENDINGSESSION000000000000001".to_string()),
+                Some("01HPENDINGSESSION000000000000ABC".to_string()),
+            )
+            .await
+            .expect("register pending multipart");
+
+        let user_before = state
+            .db
+            .get_user(drive_user.uid.clone())
+            .await
+            .expect("user before reconcile");
+        assert_eq!(user_before.quota_used_bytes, 8192);
+
+        let app = build_router(state.clone());
+        let me_req = Request::builder()
+            .method("GET")
+            .uri("/v1/me")
+            .header("authorization", format!("Bearer {}", access_token))
+            .body(Body::empty())
+            .expect("me request");
+        let me_resp = app.clone().oneshot(me_req).await.expect("me response");
+        assert_eq!(me_resp.status(), StatusCode::OK);
+        let me_body = axum::body::to_bytes(me_resp.into_body(), usize::MAX)
+            .await
+            .expect("read me body");
+        let me_json: Value = serde_json::from_slice(&me_body).expect("parse me body");
+        assert_eq!(me_json["quota_used_bytes"].as_i64(), Some(0));
+
+        let pending = state
+            .db
+            .list_pending_upload_reservations(Some(drive_user.uid))
+            .await
+            .expect("list pending uploads after reconcile");
+        assert!(
+            pending.is_empty(),
+            "stale pending reservation should be removed"
         );
     }
 
@@ -3553,6 +4254,496 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bound_registry_mutations_delegate_to_engine_using_storage_object_ids() {
+        let calls = Arc::new(TokioMutex::new(Vec::<String>::new()));
+        let single_url = spawn_storage_recording_stub("single-stub-token", calls.clone()).await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, drive_token) = test_state(single_url, multi_url).await;
+        let drive_user = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment");
+
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "logical/single.bin".to_string(),
+                "01HREGMUTATE0000000000000000001".to_string(),
+                2048,
+                Some("application/octet-stream".to_string()),
+            )
+            .await
+            .expect("finalize single");
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "logical/bulk.bin".to_string(),
+                "01HREGMUTATE0000000000000000002".to_string(),
+                3072,
+                Some("application/octet-stream".to_string()),
+            )
+            .await
+            .expect("finalize bulk");
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "logical/delete.bin".to_string(),
+                "01HREGMUTATE0000000000000000003".to_string(),
+                4096,
+                Some("application/octet-stream".to_string()),
+            )
+            .await
+            .expect("finalize delete");
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "logical/prefix/a.bin".to_string(),
+                "01HREGMUTATE0000000000000000004".to_string(),
+                1024,
+                Some("application/octet-stream".to_string()),
+            )
+            .await
+            .expect("finalize prefix a");
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "logical/prefix/b.bin".to_string(),
+                "01HREGMUTATE0000000000000000005".to_string(),
+                1024,
+                Some("application/octet-stream".to_string()),
+            )
+            .await
+            .expect("finalize prefix b");
+
+        let single_object = state
+            .db
+            .resolve_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "logical/single.bin".to_string(),
+            )
+            .await
+            .expect("resolve single")
+            .expect("single exists");
+        let delete_object = state
+            .db
+            .resolve_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "logical/delete.bin".to_string(),
+            )
+            .await
+            .expect("resolve delete")
+            .expect("delete exists");
+        let prefix_a = state
+            .db
+            .resolve_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "logical/prefix/a.bin".to_string(),
+            )
+            .await
+            .expect("resolve prefix a")
+            .expect("prefix a exists");
+        let prefix_b = state
+            .db
+            .resolve_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "logical/prefix/b.bin".to_string(),
+            )
+            .await
+            .expect("resolve prefix b")
+            .expect("prefix b exists");
+
+        let base_url = spawn_registry_server(state.clone()).await;
+        let client = Client::new();
+
+        let trash_resp = client
+            .post(format!("{}/v1/objects/trash", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "object_key": "logical/single.bin"
+            }))
+            .send()
+            .await
+            .expect("trash request");
+        assert_eq!(trash_resp.status(), reqwest::StatusCode::OK);
+
+        let recover_resp = client
+            .post(format!("{}/v1/objects/recover", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "object_key": "logical/single.bin"
+            }))
+            .send()
+            .await
+            .expect("recover request");
+        assert_eq!(recover_resp.status(), reqwest::StatusCode::OK);
+
+        let bulk_trash_resp = client
+            .post(format!("{}/v1/objects/trash/bulk", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "object_keys": ["logical/single.bin", "logical/bulk.bin"]
+            }))
+            .send()
+            .await
+            .expect("bulk trash request");
+        assert_eq!(bulk_trash_resp.status(), reqwest::StatusCode::OK);
+
+        let recover_all_resp = client
+            .post(format!("{}/v1/objects/recover-all", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a"
+            }))
+            .send()
+            .await
+            .expect("recover all request");
+        assert_eq!(recover_all_resp.status(), reqwest::StatusCode::OK);
+
+        let prefix_trash_resp = client
+            .post(format!("{}/v1/objects/trash-prefix", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "prefix": "logical"
+            }))
+            .send()
+            .await
+            .expect("prefix trash request");
+        assert_eq!(prefix_trash_resp.status(), reqwest::StatusCode::OK);
+
+        let prefix_recover_resp = client
+            .post(format!("{}/v1/objects/recover-prefix", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "prefix": "logical"
+            }))
+            .send()
+            .await
+            .expect("prefix recover request");
+        assert_eq!(prefix_recover_resp.status(), reqwest::StatusCode::OK);
+
+        let delete_resp = client
+            .delete(format!(
+                "{}/v1/objects?fragment=fragment-a&object_key=logical/delete.bin",
+                base_url
+            ))
+            .bearer_auth(&drive_token)
+            .send()
+            .await
+            .expect("delete request");
+        assert_eq!(delete_resp.status(), reqwest::StatusCode::OK);
+
+        let retrash_resp = client
+            .post(format!("{}/v1/objects/trash", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "object_key": "logical/single.bin"
+            }))
+            .send()
+            .await
+            .expect("retrash request");
+        assert_eq!(retrash_resp.status(), reqwest::StatusCode::OK);
+
+        let empty_resp = client
+            .post(format!("{}/v1/objects/trash/empty", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a"
+            }))
+            .send()
+            .await
+            .expect("empty trash request");
+        assert_eq!(empty_resp.status(), reqwest::StatusCode::OK);
+
+        let prefix_delete_resp = client
+            .post(format!("{}/v1/objects/permanent-prefix", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "prefix": "logical/prefix"
+            }))
+            .send()
+            .await
+            .expect("prefix delete request");
+        assert_eq!(prefix_delete_resp.status(), reqwest::StatusCode::OK);
+
+        let recorded = calls.lock().await.clone();
+        assert_eq!(recorded.len(), 4);
+        assert!(recorded.contains(&format!(
+            "DELETE /n1/objects/permanent/{}",
+            delete_object.storage_object_id
+        )));
+        assert!(recorded.contains(&format!(
+            "DELETE /n1/objects/permanent/{}",
+            single_object.storage_object_id
+        )));
+        assert!(recorded.contains(&format!(
+            "DELETE /n1/objects/permanent/{}",
+            prefix_a.storage_object_id
+        )));
+        assert!(recorded.contains(&format!(
+            "DELETE /n1/objects/permanent/{}",
+            prefix_b.storage_object_id
+        )));
+        assert!(
+            !recorded.iter().any(|entry| {
+                entry.starts_with("DELETE /n1/objects/")
+                    && !entry.starts_with("DELETE /n1/objects/permanent/")
+            }),
+            "logical trash should stay in registry: {:?}",
+            recorded
+        );
+        assert!(
+            !recorded
+                .iter()
+                .any(|entry| entry.contains("/recover/version")),
+            "logical recover should stay in registry: {:?}",
+            recorded
+        );
+        assert!(
+            !recorded.iter().any(|entry| entry.contains("/bulk-delete")),
+            "logical bulk trash should stay in registry: {:?}",
+            recorded
+        );
+        assert!(
+            state
+                .db
+                .resolve_any_object_record(
+                    drive_user.uid.clone(),
+                    "fragment-a".to_string(),
+                    "logical/prefix/a.bin".to_string(),
+                )
+                .await
+                .expect("resolve prefix a after delete")
+                .is_none()
+        );
+        assert!(
+            state
+                .db
+                .resolve_any_object_record(
+                    drive_user.uid.clone(),
+                    "fragment-a".to_string(),
+                    "logical/prefix/b.bin".to_string(),
+                )
+                .await
+                .expect("resolve prefix b after delete")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn prefix_namespace_mutations_stay_registry_local_and_move_logical_paths_only() {
+        let calls = Arc::new(TokioMutex::new(Vec::<String>::new()));
+        let single_url = spawn_storage_recording_stub("single-stub-token", calls.clone()).await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, drive_token) = test_state(single_url, multi_url).await;
+        let drive_user = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment");
+
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "folder/a.txt".to_string(),
+                "01HREGPREFIX0000000000000000001".to_string(),
+                100,
+                Some("text/plain".to_string()),
+            )
+            .await
+            .expect("finalize folder a");
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "folder/nested/b.txt".to_string(),
+                "01HREGPREFIX0000000000000000002".to_string(),
+                200,
+                Some("text/plain".to_string()),
+            )
+            .await
+            .expect("finalize folder b");
+
+        let a_before = state
+            .db
+            .resolve_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "folder/a.txt".to_string(),
+            )
+            .await
+            .expect("resolve a before")
+            .expect("a exists");
+
+        let base_url = spawn_registry_server(state.clone()).await;
+        let client = Client::new();
+
+        let rename_resp = client
+            .post(format!("{}/v1/objects/rename-prefix", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "source_prefix": "folder",
+                "destination_prefix": "renamed"
+            }))
+            .send()
+            .await
+            .expect("prefix rename request");
+        assert_eq!(rename_resp.status(), reqwest::StatusCode::OK);
+
+        let renamed_a = state
+            .db
+            .resolve_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "renamed/a.txt".to_string(),
+            )
+            .await
+            .expect("resolve renamed a")
+            .expect("renamed a exists");
+        let renamed_b = state
+            .db
+            .resolve_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "renamed/nested/b.txt".to_string(),
+            )
+            .await
+            .expect("resolve renamed b")
+            .expect("renamed b exists");
+        assert_eq!(renamed_a.storage_object_id, a_before.storage_object_id);
+        assert_eq!(renamed_a.status, "ready");
+        assert_eq!(renamed_b.status, "ready");
+
+        let trash_resp = client
+            .post(format!("{}/v1/objects/trash-prefix", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "prefix": "renamed"
+            }))
+            .send()
+            .await
+            .expect("prefix trash request");
+        assert_eq!(trash_resp.status(), reqwest::StatusCode::OK);
+
+        let trashed_listing = state
+            .db
+            .list_objects(
+                drive_user.uid.clone(),
+                Some("fragment-a".to_string()),
+                Some("renamed".to_string()),
+                None,
+                None,
+                100,
+                0,
+                false,
+                true,
+            )
+            .await
+            .expect("list trashed renamed folder");
+        assert_eq!(trashed_listing.objects.len(), 2);
+        assert!(
+            trashed_listing
+                .objects
+                .iter()
+                .all(|object| object.status == "trashed")
+        );
+
+        let recover_resp = client
+            .post(format!("{}/v1/objects/recover-prefix", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "prefix": "renamed"
+            }))
+            .send()
+            .await
+            .expect("prefix recover request");
+        assert_eq!(recover_resp.status(), reqwest::StatusCode::OK);
+
+        let ready_listing = state
+            .db
+            .list_objects(
+                drive_user.uid.clone(),
+                Some("fragment-a".to_string()),
+                Some("renamed".to_string()),
+                None,
+                None,
+                100,
+                0,
+                false,
+                false,
+            )
+            .await
+            .expect("list recovered renamed folder");
+        assert_eq!(ready_listing.objects.len(), 2);
+        assert!(
+            ready_listing
+                .objects
+                .iter()
+                .all(|object| object.status == "ready")
+        );
+
+        let recorded = calls.lock().await.clone();
+        assert!(
+            recorded.is_empty(),
+            "prefix namespace mutations should stay inside registry: {:?}",
+            recorded
+        );
+    }
+
+    #[tokio::test]
     async fn share_routes_create_proxy_list_and_revoke_public_access() {
         let single_url = spawn_storage_stub("single-stub-token").await;
         let multi_url = spawn_storage_stub("multi-stub-token").await;
@@ -3670,7 +4861,11 @@ mod tests {
         let public_body = axum::body::to_bytes(public_response.into_body(), usize::MAX)
             .await
             .expect("read public share body");
-        assert_eq!(public_body.as_ref(), b"download:docs/report.pdf");
+        assert!(
+            public_body.as_ref().starts_with(b"download:"),
+            "unexpected public share body: {:?}",
+            public_body
+        );
 
         let revoke_request = Request::builder()
             .method("DELETE")
@@ -3701,6 +4896,145 @@ mod tests {
             .await
             .expect("after revoke share response");
         assert_eq!(after_revoke_response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn share_public_token_survives_registry_rename_and_uses_new_logical_name() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, access_token) = test_state(single_url, multi_url).await;
+        let owner = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                owner.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("link fragment");
+        state
+            .db
+            .finalize_object(
+                owner.uid,
+                "fragment-a".to_string(),
+                "docs/report.pdf".to_string(),
+                "01HSHARERENAMEVERSION0000000001".to_string(),
+                1024,
+                Some("application/pdf".to_string()),
+            )
+            .await
+            .expect("finalize shared object");
+
+        let app = build_router(state.clone());
+        let create_request = Request::builder()
+            .method("POST")
+            .uri("/v1/shares")
+            .header("authorization", format!("Bearer {}", access_token))
+            .header("host", "cloud.example.test")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "fragment": "fragment-a",
+                    "object_key": "docs/report.pdf",
+                    "expires_in": 3600,
+                    "disposition": "download"
+                }))
+                .expect("serialize create share request"),
+            ))
+            .expect("create share request");
+        let create_response = app
+            .clone()
+            .oneshot(create_request)
+            .await
+            .expect("create share response");
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let create_body = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .expect("read create share body");
+        let create_json: Value =
+            serde_json::from_slice(&create_body).expect("parse create share json");
+        let public_url = create_json["url"].as_str().expect("public share url");
+        let public_token = public_url
+            .rsplit('/')
+            .next()
+            .expect("share token in url")
+            .to_string();
+
+        let rename_request = Request::builder()
+            .method("POST")
+            .uri("/v1/objects/rename")
+            .header("authorization", format!("Bearer {}", access_token))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "fragment": "fragment-a",
+                    "source_key": "docs/report.pdf",
+                    "destination_key": "docs/report-renamed.pdf"
+                }))
+                .expect("serialize rename request"),
+            ))
+            .expect("rename request");
+        let rename_response = app
+            .clone()
+            .oneshot(rename_request)
+            .await
+            .expect("rename response");
+        assert_eq!(rename_response.status(), StatusCode::OK);
+
+        let list_request = Request::builder()
+            .method("GET")
+            .uri("/v1/shares?fragment=fragment-a")
+            .header("authorization", format!("Bearer {}", access_token))
+            .body(Body::empty())
+            .expect("list shares request");
+        let list_response = app
+            .clone()
+            .oneshot(list_request)
+            .await
+            .expect("list shares response");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .expect("read list shares body");
+        let list_json: Value = serde_json::from_slice(&list_body).expect("parse list shares json");
+        let shares = list_json["shares"].as_array().expect("shares array");
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0]["object_key"], "docs/report-renamed.pdf");
+
+        let public_request = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/public/shares/{}", public_token))
+            .body(Body::empty())
+            .expect("public share request");
+        let public_response = app
+            .clone()
+            .oneshot(public_request)
+            .await
+            .expect("public share response");
+        assert_eq!(public_response.status(), StatusCode::OK);
+        assert_eq!(
+            public_response.headers().get(CONTENT_DISPOSITION),
+            Some(&header::HeaderValue::from_static(
+                "attachment; filename=\"report-renamed.pdf\""
+            ))
+        );
+        let public_body = axum::body::to_bytes(public_response.into_body(), usize::MAX)
+            .await
+            .expect("read public share body");
+        assert!(
+            public_body.as_ref().starts_with(b"download:"),
+            "unexpected public share body after rename: {:?}",
+            public_body
+        );
     }
 
     #[tokio::test]
@@ -3797,18 +5131,44 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("read archive body");
-        let lines = String::from_utf8(body.to_vec())
-            .expect("archive body utf8")
-            .lines()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
+        let reader = tokio_util::io::StreamReader::new(futures_util::stream::iter(vec![Ok::<
+            bytes::Bytes,
+            std::io::Error,
+        >(
+            bytes::Bytes::from(body.to_vec()),
+        )]));
+        let mut archive = tokio_tar::Archive::new(reader);
+        let mut entries = archive.entries().expect("archive entries");
+        let mut paths = Vec::new();
+        let mut contents = Vec::new();
+        use tokio::io::AsyncReadExt;
+        while let Some(entry) = entries.next().await {
+            let mut entry = entry.expect("archive entry");
+            let path = entry
+                .path()
+                .expect("entry path")
+                .to_string_lossy()
+                .to_string();
+            let mut data = Vec::new();
+            entry
+                .read_to_end(&mut data)
+                .await
+                .expect("read archive entry data");
+            paths.push(path);
+            contents.push(String::from_utf8(data).expect("entry utf8"));
+        }
         assert_eq!(
-            lines,
+            paths,
             vec![
-                "01HARCHIVEVERSION000000000000001\tpatients/a/one.dcm".to_string(),
-                "01HARCHIVEVERSION000000000000002\tpatients/a/two.dcm".to_string()
+                "patients/a/one.dcm".to_string(),
+                "patients/a/two.dcm".to_string()
             ]
         );
+        assert_eq!(contents.len(), 2);
+        assert!(contents[0].starts_with("download:"));
+        assert!(contents[1].starts_with("download:"));
+        assert!(!contents[0].contains("patients/a/one.dcm"));
+        assert!(!contents[1].contains("patients/a/two.dcm"));
     }
 
     #[tokio::test]

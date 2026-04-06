@@ -1,10 +1,10 @@
-use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use sha2::{Digest, Sha256};
 use tokio::task;
 use uuid::Uuid;
 
@@ -41,9 +41,19 @@ pub struct RegistryAdminStats {
 }
 
 #[derive(Debug, Clone)]
-pub struct ArchiveManifestResult {
-    pub manifest_path: PathBuf,
-    pub selected_count: usize,
+pub struct PendingUploadReservation {
+    pub owner_uid: String,
+    pub fragment: String,
+    pub object_key: String,
+    pub version_id: Option<String>,
+    pub session_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArchiveObjectSelection {
+    pub objects: Vec<ObjectRecord>,
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +96,7 @@ impl RegistryDb {
                     owner_uid TEXT NOT NULL,
                     fragment TEXT NOT NULL,
                     object_key TEXT NOT NULL,
+                    storage_object_id TEXT NOT NULL,
                     version_id TEXT NOT NULL,
                     status TEXT NOT NULL,
                     object_size_bytes INTEGER NOT NULL,
@@ -99,6 +110,7 @@ impl RegistryDb {
                     owner_uid TEXT NOT NULL,
                     fragment TEXT NOT NULL,
                     object_key TEXT NOT NULL,
+                    storage_object_id TEXT NOT NULL,
                     version_id TEXT NOT NULL,
                     object_size_bytes INTEGER NOT NULL,
                     content_type TEXT,
@@ -110,8 +122,11 @@ impl RegistryDb {
                     owner_uid TEXT NOT NULL,
                     fragment TEXT NOT NULL,
                     object_key TEXT NOT NULL,
+                    storage_object_id TEXT NOT NULL,
                     expected_size_bytes INTEGER,
                     content_type TEXT,
+                    version_id TEXT,
+                    session_id TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (owner_uid, fragment, object_key)
@@ -121,6 +136,8 @@ impl RegistryDb {
                     ON objects (owner_uid, fragment, object_key);
                 CREATE INDEX IF NOT EXISTS idx_object_uploads_owner_prefix
                     ON object_uploads (owner_uid, fragment, object_key);
+                CREATE INDEX IF NOT EXISTS idx_object_uploads_owner_session
+                    ON object_uploads (owner_uid, fragment, version_id, session_id);
                 CREATE TABLE IF NOT EXISTS fragment_bindings (
                     owner_uid TEXT NOT NULL,
                     fragment TEXT NOT NULL,
@@ -151,6 +168,7 @@ impl RegistryDb {
                     owner_uid TEXT NOT NULL,
                     fragment TEXT NOT NULL,
                     object_key TEXT NOT NULL,
+                    storage_object_id TEXT NOT NULL,
                     disposition TEXT NOT NULL,
                     expires_at INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
@@ -168,6 +186,20 @@ impl RegistryDb {
                 "ALTER TABLE users ADD COLUMN totp_secret TEXT",
                 "ALTER TABLE users ADD COLUMN totp_pending_secret TEXT",
                 "ALTER TABLE users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE objects ADD COLUMN storage_object_id TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE object_versions ADD COLUMN storage_object_id TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE object_uploads ADD COLUMN version_id TEXT",
+                "ALTER TABLE object_uploads ADD COLUMN session_id TEXT",
+                "ALTER TABLE object_uploads ADD COLUMN storage_object_id TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE object_shares ADD COLUMN storage_object_id TEXT NOT NULL DEFAULT ''",
+            ] {
+                let _ = conn.execute(statement, params![]);
+            }
+            for statement in [
+                "UPDATE objects SET storage_object_id = object_key WHERE storage_object_id = ''",
+                "UPDATE object_versions SET storage_object_id = object_key WHERE storage_object_id = ''",
+                "UPDATE object_uploads SET storage_object_id = object_key WHERE storage_object_id = ''",
+                "UPDATE object_shares SET storage_object_id = object_key WHERE storage_object_id = ''",
             ] {
                 let _ = conn.execute(statement, params![]);
             }
@@ -1020,6 +1052,8 @@ impl RegistryDb {
         object_key: String,
         expected_size_bytes: Option<i64>,
         content_type: Option<String>,
+        version_id: Option<String>,
+        session_id: Option<String>,
     ) -> Result<ObjectRecord, RegistryError> {
         let db = self.clone();
         spawn_blocking(move || {
@@ -1042,6 +1076,35 @@ impl RegistryDb {
                 .optional()
                 .map_err(sql_err)?
                 .unwrap_or(0);
+            let existing_storage_object_id = tx
+                .query_row(
+                    r#"
+                    SELECT storage_object_id
+                    FROM object_uploads
+                    WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+                    "#,
+                    params![owner_uid, fragment, object_key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(sql_err)?
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    tx.query_row(
+                        r#"
+                        SELECT storage_object_id
+                        FROM objects
+                        WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+                        "#,
+                        params![owner_uid, fragment, object_key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .filter(|value| !value.trim().is_empty())
+                })
+                .unwrap_or_else(generate_storage_object_id);
 
             if expected_size_bytes.is_some() {
                 let other_reserved = pending_quota_reserved_bytes_for_user(
@@ -1066,20 +1129,26 @@ impl RegistryDb {
             tx.execute(
                 r#"
                 INSERT INTO object_uploads (
-                    owner_uid, fragment, object_key, expected_size_bytes, content_type, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    owner_uid, fragment, object_key, storage_object_id, expected_size_bytes, content_type, version_id, session_id, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 ON CONFLICT(owner_uid, fragment, object_key)
                 DO UPDATE SET
+                    storage_object_id = excluded.storage_object_id,
                     expected_size_bytes = excluded.expected_size_bytes,
                     content_type = excluded.content_type,
+                    version_id = excluded.version_id,
+                    session_id = excluded.session_id,
                     updated_at = excluded.updated_at
                 "#,
                 params![
                     owner_uid,
                     fragment,
                     object_key,
+                    existing_storage_object_id,
                     expected_size_bytes,
                     content_type,
+                    version_id,
+                    session_id,
                     now,
                     now
                 ],
@@ -1091,6 +1160,7 @@ impl RegistryDb {
                 owner_uid,
                 fragment,
                 object_key,
+                storage_object_id: existing_storage_object_id,
                 version_id: String::new(),
                 status: "pending".to_string(),
                 object_size_bytes: expected_size_bytes.unwrap_or(0),
@@ -1122,12 +1192,18 @@ impl RegistryDb {
             let existing = tx
                 .query_row(
                     r#"
-                    SELECT object_size_bytes, created_at
+                    SELECT object_size_bytes, created_at, storage_object_id
                     FROM objects
                     WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
                     "#,
                     params![owner_uid, fragment, object_key],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(sql_err)?;
@@ -1136,6 +1212,21 @@ impl RegistryDb {
                 .as_ref()
                 .map(|v| v.1.clone())
                 .unwrap_or_else(now_rfc3339);
+            let storage_object_id = tx
+                .query_row(
+                    r#"
+                    SELECT storage_object_id
+                    FROM object_uploads
+                    WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+                    "#,
+                    params![owner_uid, fragment, object_key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(sql_err)?
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| existing.as_ref().map(|value| value.2.clone()).filter(|value| !value.trim().is_empty()))
+                .unwrap_or_else(generate_storage_object_id);
             let delta = object_size_bytes.saturating_sub(previous_size);
             let next_used = quota_used.saturating_add(delta).max(0);
             let other_reserved = pending_quota_reserved_bytes_for_user(
@@ -1153,10 +1244,11 @@ impl RegistryDb {
             tx.execute(
                 r#"
                 INSERT INTO objects (
-                    owner_uid, fragment, object_key, version_id, status, object_size_bytes, content_type, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, 'ready', ?5, ?6, ?7, ?8)
+                    owner_uid, fragment, object_key, storage_object_id, version_id, status, object_size_bytes, content_type, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, 'ready', ?6, ?7, ?8, ?9)
                 ON CONFLICT(owner_uid, fragment, object_key)
                 DO UPDATE SET
+                    storage_object_id = excluded.storage_object_id,
                     version_id = excluded.version_id,
                     status = 'ready',
                     object_size_bytes = excluded.object_size_bytes,
@@ -1167,6 +1259,7 @@ impl RegistryDb {
                     owner_uid,
                     fragment,
                     object_key,
+                    storage_object_id,
                     version_id,
                     object_size_bytes,
                     content_type,
@@ -1179,13 +1272,14 @@ impl RegistryDb {
             tx.execute(
                 r#"
                 INSERT OR REPLACE INTO object_versions (
-                    owner_uid, fragment, object_key, version_id, object_size_bytes, content_type, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    owner_uid, fragment, object_key, storage_object_id, version_id, object_size_bytes, content_type, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 "#,
                 params![
                     owner_uid,
                     fragment,
                     object_key,
+                    storage_object_id,
                     version_id,
                     object_size_bytes,
                     content_type,
@@ -1259,7 +1353,7 @@ impl RegistryDb {
 
             let mut sql = String::from(
                 r#"
-                SELECT owner_uid, fragment, object_key, version_id, status, object_size_bytes, content_type, created_at, updated_at
+                SELECT owner_uid, fragment, object_key, storage_object_id, version_id, status, object_size_bytes, content_type, created_at, updated_at
                 FROM objects
                 WHERE owner_uid = ?
                 "#,
@@ -1294,7 +1388,7 @@ impl RegistryDb {
             if include_pending && !include_trashed {
                 let mut pending_sql = String::from(
                     r#"
-                    SELECT owner_uid, fragment, object_key, expected_size_bytes, content_type, created_at, updated_at
+                    SELECT owner_uid, fragment, object_key, storage_object_id, expected_size_bytes, content_type, created_at, updated_at
                     FROM object_uploads
                     WHERE owner_uid = ?
                     "#,
@@ -1699,7 +1793,7 @@ impl RegistryDb {
         .await
     }
 
-    pub async fn write_archive_manifest(
+    pub async fn select_archive_objects(
         &self,
         owner_uid: String,
         fragment: String,
@@ -1707,136 +1801,20 @@ impl RegistryDb {
         prefix: Option<String>,
         search: Option<String>,
         include_trashed: bool,
-    ) -> Result<ArchiveManifestResult, RegistryError> {
+    ) -> Result<ArchiveObjectSelection, RegistryError> {
         let db = self.clone();
         spawn_blocking(move || {
             let conn = db.open_connection()?;
-            let manifest_path =
-                std::env::temp_dir().join(format!("registry-archive-{}.lst", Uuid::new_v4()));
-            let file = std::fs::File::create(&manifest_path).map_err(|err| {
-                RegistryError::internal(format!("failed to create archive manifest: {}", err))
-            })?;
-            let mut writer = BufWriter::new(file);
-            let mut selected_count = 0usize;
-            let status = if include_trashed { "trashed" } else { "ready" };
-
-            if !keys.is_empty() {
-                let mut canonical_keys = keys
-                    .into_iter()
-                    .map(|value| canonical_archive_key(&value))
-                    .filter(|value| !value.is_empty())
-                    .collect::<Vec<_>>();
-                canonical_keys.sort();
-                canonical_keys.dedup();
-
-                if canonical_keys.is_empty() {
-                    return Err(RegistryError::bad_request(
-                        "archive request did not include any valid object keys",
-                    ));
-                }
-
-                let placeholders = std::iter::repeat_n("?", canonical_keys.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = format!(
-                    r#"
-                    SELECT version_id, object_key
-                    FROM objects
-                    WHERE owner_uid = ? AND fragment = ? AND status = ? AND object_key IN ({})
-                    ORDER BY object_key ASC
-                    "#,
-                    placeholders
-                );
-                let mut args = vec![
-                    Value::Text(owner_uid),
-                    Value::Text(fragment),
-                    Value::Text(status.to_string()),
-                ];
-                args.extend(canonical_keys.into_iter().map(Value::Text));
-
-                let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
-                let rows = stmt
-                    .query_map(params_from_iter(args), |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })
-                    .map_err(sql_err)?;
-                for row in rows {
-                    let (version_id, key) = row.map_err(sql_err)?;
-                    writeln!(writer, "{}\t{}", version_id, key).map_err(|err| {
-                        RegistryError::internal(format!(
-                            "failed to write archive manifest entry: {}",
-                            err
-                        ))
-                    })?;
-                    selected_count += 1;
-                }
-            } else {
-                let prefix_filter = prefix
-                    .map(|value| normalize_listing_prefix(value, Some("/")))
-                    .filter(|value| !value.is_empty());
-                let prefix_pattern = prefix_filter
-                    .as_ref()
-                    .map(|value| Value::Text(format!("{}%", value)));
-                let search_pattern = search
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-                    .map(|value| Value::Text(format!("%{}%", value)));
-
-                let mut sql = String::from(
-                    r#"
-                    SELECT version_id, object_key
-                    FROM objects
-                    WHERE owner_uid = ? AND fragment = ? AND status = ?
-                    "#,
-                );
-                let mut args = vec![
-                    Value::Text(owner_uid),
-                    Value::Text(fragment),
-                    Value::Text(status.to_string()),
-                ];
-                if let Some(pattern) = prefix_pattern {
-                    sql.push_str(" AND object_key LIKE ?");
-                    args.push(pattern);
-                }
-                if let Some(pattern) = search_pattern {
-                    sql.push_str(" AND object_key LIKE ?");
-                    args.push(pattern);
-                }
-                sql.push_str(" ORDER BY object_key ASC");
-
-                let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
-                let rows = stmt
-                    .query_map(params_from_iter(args), |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })
-                    .map_err(sql_err)?;
-                for row in rows {
-                    let (version_id, key) = row.map_err(sql_err)?;
-                    writeln!(writer, "{}\t{}", version_id, key).map_err(|err| {
-                        RegistryError::internal(format!(
-                            "failed to write archive manifest entry: {}",
-                            err
-                        ))
-                    })?;
-                    selected_count += 1;
-                }
-            }
-
-            writer.flush().map_err(|err| {
-                RegistryError::internal(format!("failed to flush archive manifest: {}", err))
-            })?;
-
-            if selected_count == 0 {
-                let _ = std::fs::remove_file(&manifest_path);
-                return Err(RegistryError::not_found(
-                    "no matching objects found for archive export",
-                ));
-            }
-
-            Ok(ArchiveManifestResult {
-                manifest_path,
-                selected_count,
-            })
+            let objects = select_archive_objects_from_conn(
+                &conn,
+                owner_uid,
+                fragment,
+                keys,
+                prefix,
+                search,
+                include_trashed,
+            )?;
+            Ok(ArchiveObjectSelection { objects })
         })
         .await
     }
@@ -1870,8 +1848,8 @@ impl RegistryDb {
             tx.execute(
                 r#"
                 INSERT INTO object_shares (
-                    share_id, token_hash, owner_uid, fragment, object_key, disposition, expires_at, created_at, revoked_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
+                    share_id, token_hash, owner_uid, fragment, object_key, storage_object_id, disposition, expires_at, created_at, revoked_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)
                 "#,
                 params![
                     share_id,
@@ -1879,6 +1857,7 @@ impl RegistryDb {
                     owner_uid,
                     fragment,
                     object_key,
+                    live_object.storage_object_id,
                     disposition.as_str(),
                     expires_at_unix,
                     created_at
@@ -1893,6 +1872,7 @@ impl RegistryDb {
                     owner_uid: live_object.owner_uid,
                     fragment: live_object.fragment,
                     object_key: live_object.object_key,
+                    storage_object_id: live_object.storage_object_id,
                     disposition,
                     expires_at: rfc3339_from_unix(expires_at_unix),
                     created_at,
@@ -1916,7 +1896,7 @@ impl RegistryDb {
             let conn = db.open_connection()?;
             let mut sql = String::from(
                 r#"
-                SELECT share_id, owner_uid, fragment, object_key, disposition, expires_at, created_at, revoked_at
+                SELECT share_id, owner_uid, fragment, object_key, storage_object_id, disposition, expires_at, created_at, revoked_at
                 FROM object_shares
                 WHERE owner_uid = ?
                 "#,
@@ -1980,7 +1960,7 @@ impl RegistryDb {
             let conn = db.open_connection()?;
             conn.query_row(
                 r#"
-                SELECT share_id, owner_uid, fragment, object_key, disposition, expires_at, created_at, revoked_at
+                SELECT share_id, owner_uid, fragment, object_key, storage_object_id, disposition, expires_at, created_at, revoked_at
                 FROM object_shares
                 WHERE token_hash = ?1
                   AND revoked_at IS NULL
@@ -2023,11 +2003,26 @@ impl RegistryDb {
         .await
     }
 
+    pub async fn resolve_any_object_record(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_key: String,
+    ) -> Result<Option<ObjectRecord>, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            resolve_any_object(&conn, &owner_uid, &fragment, &object_key)
+        })
+        .await
+    }
+
     pub async fn sync_object_from_engine(
         &self,
         owner_uid: String,
         fragment: String,
         object_key: String,
+        storage_object_id: String,
         current: Option<EngineObjectMetadata>,
         versions: Vec<EngineObjectMetadata>,
     ) -> Result<(Option<ObjectRecord>, UserRecord), RegistryError> {
@@ -2053,10 +2048,11 @@ impl RegistryDb {
                 tx.execute(
                     r#"
                     INSERT INTO objects (
-                        owner_uid, fragment, object_key, version_id, status, object_size_bytes, content_type, created_at, updated_at
-                    ) VALUES (?1, ?2, ?3, ?4, 'ready', ?5, ?6, ?7, ?8)
+                        owner_uid, fragment, object_key, storage_object_id, version_id, status, object_size_bytes, content_type, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, 'ready', ?6, ?7, ?8, ?9)
                     ON CONFLICT(owner_uid, fragment, object_key)
                     DO UPDATE SET
+                        storage_object_id = excluded.storage_object_id,
                         version_id = excluded.version_id,
                         status = 'ready',
                         object_size_bytes = excluded.object_size_bytes,
@@ -2067,6 +2063,7 @@ impl RegistryDb {
                         owner_uid,
                         fragment,
                         object_key,
+                        storage_object_id,
                         current.version_id,
                         current_size,
                         current.content_type,
@@ -2091,13 +2088,14 @@ impl RegistryDb {
                     tx.execute(
                         r#"
                         INSERT OR REPLACE INTO object_versions (
-                            owner_uid, fragment, object_key, version_id, object_size_bytes, content_type, created_at
-                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                            owner_uid, fragment, object_key, storage_object_id, version_id, object_size_bytes, content_type, created_at
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                         "#,
                         params![
                             owner_uid,
                             fragment,
                             object_key,
+                            storage_object_id,
                             version.version_id,
                             version.object_size_bytes.max(0),
                             version.content_type,
@@ -2275,6 +2273,322 @@ impl RegistryDb {
         .await
     }
 
+    pub async fn set_objects_status_by_prefix(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        prefix: String,
+        next_status: &'static str,
+    ) -> Result<(usize, UserRecord), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let prefix = normalize_namespace_prefix(prefix);
+            if prefix.is_empty() {
+                return Err(RegistryError::bad_request("prefix is required"));
+            }
+
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let now = now_rfc3339();
+            let affected = tx
+                .execute(
+                    r#"
+                    UPDATE objects
+                    SET status = ?4, updated_at = ?5
+                    WHERE owner_uid = ?1 AND fragment = ?2 AND object_key LIKE ?3
+                    "#,
+                    params![
+                        owner_uid,
+                        fragment,
+                        format!("{}%", prefix),
+                        next_status,
+                        now
+                    ],
+                )
+                .map_err(sql_err)?;
+            if affected == 0 {
+                return Err(RegistryError::not_found("no matching objects found"));
+            }
+            tx.commit().map_err(sql_err)?;
+
+            let conn = db.open_connection()?;
+            let user = user_by_uid(&conn, &owner_uid)?;
+            Ok((affected, user))
+        })
+        .await
+    }
+
+    pub async fn list_objects_by_prefix_any_status(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        prefix: String,
+    ) -> Result<Vec<ObjectRecord>, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let prefix = normalize_namespace_prefix(prefix);
+            if prefix.is_empty() {
+                return Err(RegistryError::bad_request("prefix is required"));
+            }
+
+            let conn = db.open_connection()?;
+            select_objects_by_prefix(&conn, &owner_uid, &fragment, &prefix)
+        })
+        .await
+    }
+
+    pub async fn delete_objects_by_prefix(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        prefix: String,
+    ) -> Result<(usize, Vec<String>, UserRecord), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let prefix = normalize_namespace_prefix(prefix);
+            if prefix.is_empty() {
+                return Err(RegistryError::bad_request("prefix is required"));
+            }
+
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let (quota_limit, quota_used) = quota_for_user(&tx, &owner_uid)?;
+            let objects = select_objects_by_prefix(&tx, &owner_uid, &fragment, &prefix)?;
+            let pending_keys = select_upload_keys_by_prefix(&tx, &owner_uid, &fragment, &prefix)?;
+            if objects.is_empty() && pending_keys.is_empty() {
+                return Err(RegistryError::not_found("no matching objects found"));
+            }
+
+            let reclaimed_bytes = objects
+                .iter()
+                .map(|object| object.object_size_bytes.max(0))
+                .sum::<i64>();
+            let storage_ids = objects
+                .iter()
+                .map(|object| object.storage_object_id.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let affected = objects.len().saturating_add(pending_keys.len());
+            let now = now_rfc3339();
+
+            tx.execute(
+                r#"
+                DELETE FROM object_versions
+                WHERE owner_uid = ?1
+                  AND fragment = ?2
+                  AND object_key IN (
+                    SELECT object_key
+                    FROM objects
+                    WHERE owner_uid = ?1 AND fragment = ?2 AND object_key LIKE ?3
+                  )
+                "#,
+                params![owner_uid, fragment, format!("{}%", prefix)],
+            )
+            .map_err(sql_err)?;
+
+            tx.execute(
+                r#"
+                DELETE FROM object_shares
+                WHERE owner_uid = ?1 AND fragment = ?2 AND object_key LIKE ?3
+                "#,
+                params![owner_uid, fragment, format!("{}%", prefix)],
+            )
+            .map_err(sql_err)?;
+
+            tx.execute(
+                r#"
+                DELETE FROM objects
+                WHERE owner_uid = ?1 AND fragment = ?2 AND object_key LIKE ?3
+                "#,
+                params![owner_uid, fragment, format!("{}%", prefix)],
+            )
+            .map_err(sql_err)?;
+
+            tx.execute(
+                r#"
+                DELETE FROM object_uploads
+                WHERE owner_uid = ?1 AND fragment = ?2 AND object_key LIKE ?3
+                "#,
+                params![owner_uid, fragment, format!("{}%", prefix)],
+            )
+            .map_err(sql_err)?;
+
+            let next_used = quota_used.saturating_sub(reclaimed_bytes);
+            tx.execute(
+                r#"
+                UPDATE users
+                SET quota_used_bytes = ?2, updated_at = ?3
+                WHERE uid = ?1
+                "#,
+                params![owner_uid, next_used, now],
+            )
+            .map_err(sql_err)?;
+
+            tx.commit().map_err(sql_err)?;
+            let conn = db.open_connection()?;
+            let mut user = user_by_uid(&conn, &owner_uid)?;
+            user.quota_limit_bytes = quota_limit;
+            Ok((affected, storage_ids, user))
+        })
+        .await
+    }
+
+    pub async fn rename_prefix(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        source_prefix: String,
+        destination_prefix: String,
+    ) -> Result<(usize, UserRecord), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let source_prefix = normalize_namespace_prefix(source_prefix);
+            let destination_prefix = normalize_namespace_prefix(destination_prefix);
+            if source_prefix.is_empty() || destination_prefix.is_empty() {
+                return Err(RegistryError::bad_request(
+                    "source_prefix and destination_prefix are required",
+                ));
+            }
+            if source_prefix == destination_prefix {
+                let conn = db.open_connection()?;
+                let user = user_by_uid(&conn, &owner_uid)?;
+                return Ok((0, user));
+            }
+            if destination_prefix.starts_with(&source_prefix) {
+                return Err(RegistryError::bad_request(
+                    "destination_prefix cannot be nested inside source_prefix",
+                ));
+            }
+
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let source_objects =
+                select_objects_by_prefix(&tx, &owner_uid, &fragment, &source_prefix)?;
+            let source_upload_keys =
+                select_upload_keys_by_prefix(&tx, &owner_uid, &fragment, &source_prefix)?;
+            if source_objects.is_empty() && source_upload_keys.is_empty() {
+                return Err(RegistryError::not_found("no matching objects found"));
+            }
+
+            let source_keys = source_objects
+                .iter()
+                .map(|object| object.object_key.clone())
+                .chain(source_upload_keys.iter().cloned())
+                .collect::<std::collections::BTreeSet<_>>();
+            let mappings = source_keys
+                .iter()
+                .map(|source_key| {
+                    let suffix = source_key
+                        .strip_prefix(&source_prefix)
+                        .ok_or_else(|| {
+                            RegistryError::internal(
+                                "prefix rename source key did not match source prefix",
+                            )
+                        })?
+                        .to_string();
+                    Ok((
+                        source_key.clone(),
+                        format!("{}{}", destination_prefix, suffix),
+                    ))
+                })
+                .collect::<Result<Vec<_>, RegistryError>>()?;
+
+            let destination_keys = mappings
+                .iter()
+                .map(|(_, destination)| destination.clone())
+                .collect::<Vec<_>>();
+            let destination_objects =
+                select_objects_by_keys(&tx, &owner_uid, &fragment, &destination_keys)?;
+            let destination_upload_keys =
+                select_upload_keys(&tx, &owner_uid, &fragment, &destination_keys)?;
+
+            let mut destination_trashed = Vec::new();
+            for object in destination_objects {
+                if source_keys.contains(&object.object_key) {
+                    continue;
+                }
+                if object.status == "trashed" {
+                    destination_trashed.push(object);
+                    continue;
+                }
+                return Err(RegistryError::conflict(format!(
+                    "destination object already exists in registry: {}",
+                    object.object_key
+                )));
+            }
+            for upload_key in destination_upload_keys {
+                if source_keys.contains(&upload_key) {
+                    continue;
+                }
+                return Err(RegistryError::conflict(format!(
+                    "destination object already exists in registry: {}",
+                    upload_key
+                )));
+            }
+
+            let (quota_limit, quota_used) = quota_for_user(&tx, &owner_uid)?;
+            let mut next_used = quota_used;
+            for trashed in &destination_trashed {
+                delete_object_namespace_rows(&tx, &owner_uid, &fragment, &trashed.object_key)?;
+                next_used = next_used.saturating_sub(trashed.object_size_bytes.max(0));
+            }
+
+            let now = now_rfc3339();
+            let temp_namespace = format!(".__registry_rename_tmp__/{}/", Uuid::new_v4());
+            for (source_key, _) in &mappings {
+                let temp_key = format!(
+                    "{}{}",
+                    temp_namespace,
+                    source_key.strip_prefix(&source_prefix).ok_or_else(|| {
+                        RegistryError::internal(
+                            "prefix rename source key did not match source prefix",
+                        )
+                    })?
+                );
+                rewrite_namespace_key(&tx, &owner_uid, &fragment, source_key, &temp_key, &now)?;
+            }
+            for (source_key, destination_key) in &mappings {
+                let temp_key = format!(
+                    "{}{}",
+                    temp_namespace,
+                    source_key.strip_prefix(&source_prefix).ok_or_else(|| {
+                        RegistryError::internal(
+                            "prefix rename source key did not match source prefix",
+                        )
+                    })?
+                );
+                rewrite_namespace_key(
+                    &tx,
+                    &owner_uid,
+                    &fragment,
+                    &temp_key,
+                    destination_key,
+                    &now,
+                )?;
+            }
+
+            if next_used != quota_used {
+                tx.execute(
+                    r#"
+                    UPDATE users
+                    SET quota_used_bytes = ?2, updated_at = ?3
+                    WHERE uid = ?1
+                    "#,
+                    params![owner_uid, next_used, now],
+                )
+                .map_err(sql_err)?;
+            }
+
+            tx.commit().map_err(sql_err)?;
+            let conn = db.open_connection()?;
+            let mut user = user_by_uid(&conn, &owner_uid)?;
+            user.quota_limit_bytes = quota_limit;
+            Ok((mappings.len(), user))
+        })
+        .await
+    }
+
     pub async fn rename_object(
         &self,
         owner_uid: String,
@@ -2311,7 +2625,7 @@ impl RegistryDb {
             let destination_current = tx
                 .query_row(
                     r#"
-                    SELECT owner_uid, fragment, object_key, version_id, status, object_size_bytes, content_type, created_at, updated_at
+                    SELECT owner_uid, fragment, object_key, storage_object_id, version_id, status, object_size_bytes, content_type, created_at, updated_at
                     FROM objects
                     WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
                     "#,
@@ -2478,22 +2792,136 @@ impl RegistryDb {
         owner_uid: String,
         fragment: String,
         object_key: String,
+        version_id: Option<String>,
+        session_id: Option<String>,
     ) -> Result<(bool, UserRecord), RegistryError> {
         let db = self.clone();
         spawn_blocking(move || {
             let mut conn = db.open_connection()?;
             let tx = conn.transaction().map_err(sql_err)?;
-            let removed = tx
-                .execute(
+            let removed = if version_id.is_some() || session_id.is_some() {
+                tx.execute(
+                    r#"
+                    DELETE FROM object_uploads
+                    WHERE owner_uid = ?1
+                      AND fragment = ?2
+                      AND object_key = ?3
+                      AND (?4 IS NULL OR version_id = ?4)
+                      AND (?5 IS NULL OR session_id = ?5)
+                    "#,
+                    params![owner_uid, fragment, object_key, version_id, session_id],
+                )
+                .map_err(sql_err)?
+                    > 0
+            } else {
+                tx.execute(
                     "DELETE FROM object_uploads WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
                     params![owner_uid, fragment, object_key],
                 )
                 .map_err(sql_err)?
-                > 0;
+                    > 0
+            };
             tx.commit().map_err(sql_err)?;
             let conn = db.open_connection()?;
             let user = user_by_uid(&conn, &owner_uid)?;
             Ok((removed, user))
+        })
+        .await
+    }
+
+    pub async fn list_pending_upload_reservations(
+        &self,
+        owner_uid: Option<String>,
+    ) -> Result<Vec<PendingUploadReservation>, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            let mut sql = String::from(
+                r#"
+                SELECT owner_uid, fragment, object_key, storage_object_id, expected_size_bytes, content_type, version_id, session_id, created_at, updated_at
+                FROM object_uploads
+                "#,
+            );
+            let mut args = Vec::<Value>::new();
+            if let Some(owner_uid) = owner_uid {
+                sql.push_str(" WHERE owner_uid = ?");
+                args.push(Value::Text(owner_uid));
+            }
+            sql.push_str(" ORDER BY owner_uid ASC, fragment ASC, object_key ASC");
+
+            let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params_from_iter(args), |row| {
+                    Ok(PendingUploadReservation {
+                        owner_uid: row.get(0)?,
+                        fragment: row.get(1)?,
+                        object_key: row.get(2)?,
+                        version_id: row.get(6)?,
+                        session_id: row.get(7)?,
+                        created_at: row.get(8)?,
+                        updated_at: row.get(9)?,
+                    })
+                })
+                .map_err(sql_err)?;
+
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(sql_err)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    pub async fn remove_pending_upload_reservations(
+        &self,
+        reservations: Vec<PendingUploadReservation>,
+    ) -> Result<Vec<(String, String)>, RegistryError> {
+        if reservations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let mut removed_scopes = Vec::new();
+
+            for reservation in reservations {
+                let removed = tx
+                    .execute(
+                        r#"
+                        DELETE FROM object_uploads
+                        WHERE owner_uid = ?1
+                          AND fragment = ?2
+                          AND object_key = ?3
+                          AND (
+                                (?4 IS NULL AND version_id IS NULL)
+                             OR (?4 IS NOT NULL AND version_id = ?4)
+                          )
+                          AND (
+                                (?5 IS NULL AND session_id IS NULL)
+                             OR (?5 IS NOT NULL AND session_id = ?5)
+                          )
+                        "#,
+                        params![
+                            reservation.owner_uid,
+                            reservation.fragment,
+                            reservation.object_key,
+                            reservation.version_id,
+                            reservation.session_id,
+                        ],
+                    )
+                    .map_err(sql_err)?;
+                if removed > 0 {
+                    removed_scopes.push((reservation.owner_uid, reservation.fragment));
+                }
+            }
+
+            tx.commit().map_err(sql_err)?;
+            removed_scopes.sort();
+            removed_scopes.dedup();
+            Ok(removed_scopes)
         })
         .await
     }
@@ -2601,6 +3029,37 @@ impl RegistryDb {
             let mut user = user_by_uid(&conn, &owner_uid)?;
             user.quota_limit_bytes = quota_limit;
             Ok((removed_count, user))
+        })
+        .await
+    }
+
+    pub async fn list_objects_with_status(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        status: &'static str,
+    ) -> Result<Vec<ObjectRecord>, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            let mut stmt = conn
+                .prepare(
+                    r#"
+                    SELECT owner_uid, fragment, object_key, storage_object_id, version_id, status, object_size_bytes, content_type, created_at, updated_at
+                    FROM objects
+                    WHERE owner_uid = ?1 AND fragment = ?2 AND status = ?3
+                    ORDER BY object_key ASC
+                    "#,
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params![owner_uid, fragment, status], map_object_row)
+                .map_err(sql_err)?;
+            let mut objects = Vec::new();
+            for row in rows {
+                objects.push(row.map_err(sql_err)?);
+            }
+            Ok(objects)
         })
         .await
     }
@@ -2725,7 +3184,7 @@ fn resolve_ready_object(
 ) -> Result<Option<ObjectRecord>, RegistryError> {
     conn.query_row(
         r#"
-        SELECT owner_uid, fragment, object_key, version_id, status, object_size_bytes, content_type, created_at, updated_at
+        SELECT owner_uid, fragment, object_key, storage_object_id, version_id, status, object_size_bytes, content_type, created_at, updated_at
         FROM objects
         WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
         "#,
@@ -2744,7 +3203,7 @@ fn resolve_live_object(
 ) -> Result<Option<ObjectRecord>, RegistryError> {
     conn.query_row(
         r#"
-        SELECT owner_uid, fragment, object_key, version_id, status, object_size_bytes, content_type, created_at, updated_at
+        SELECT owner_uid, fragment, object_key, storage_object_id, version_id, status, object_size_bytes, content_type, created_at, updated_at
         FROM objects
         WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3 AND status = 'ready'
         "#,
@@ -2764,7 +3223,7 @@ fn resolve_any_object(
     let ready = conn
         .query_row(
             r#"
-            SELECT owner_uid, fragment, object_key, version_id, status, object_size_bytes, content_type, created_at, updated_at
+            SELECT owner_uid, fragment, object_key, storage_object_id, version_id, status, object_size_bytes, content_type, created_at, updated_at
             FROM objects
             WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
             "#,
@@ -2779,7 +3238,7 @@ fn resolve_any_object(
 
     conn.query_row(
         r#"
-        SELECT owner_uid, fragment, object_key, expected_size_bytes, content_type, created_at, updated_at
+        SELECT owner_uid, fragment, object_key, storage_object_id, expected_size_bytes, content_type, created_at, updated_at
         FROM object_uploads
         WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
         "#,
@@ -2817,6 +3276,325 @@ fn normalize_listing_prefix(prefix: String, delimiter: Option<&str>) -> String {
         return format!("{}/", trimmed);
     }
     trimmed
+}
+
+fn normalize_namespace_prefix(prefix: String) -> String {
+    normalize_listing_prefix(prefix, Some("/"))
+}
+
+fn select_objects_by_prefix(
+    conn: &Connection,
+    owner_uid: &str,
+    fragment: &str,
+    prefix: &str,
+) -> Result<Vec<ObjectRecord>, RegistryError> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT owner_uid, fragment, object_key, storage_object_id, version_id, status, object_size_bytes, content_type, created_at, updated_at
+            FROM objects
+            WHERE owner_uid = ?1 AND fragment = ?2 AND object_key LIKE ?3
+            ORDER BY object_key ASC
+            "#,
+        )
+        .map_err(sql_err)?;
+    let rows = stmt
+        .query_map(
+            params![owner_uid, fragment, format!("{}%", prefix)],
+            map_object_row,
+        )
+        .map_err(sql_err)?;
+    let mut objects = Vec::new();
+    for row in rows {
+        objects.push(row.map_err(sql_err)?);
+    }
+    Ok(objects)
+}
+
+fn select_upload_keys_by_prefix(
+    conn: &Connection,
+    owner_uid: &str,
+    fragment: &str,
+    prefix: &str,
+) -> Result<Vec<String>, RegistryError> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT object_key
+            FROM object_uploads
+            WHERE owner_uid = ?1 AND fragment = ?2 AND object_key LIKE ?3
+            ORDER BY object_key ASC
+            "#,
+        )
+        .map_err(sql_err)?;
+    let rows = stmt
+        .query_map(
+            params![owner_uid, fragment, format!("{}%", prefix)],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(sql_err)?;
+    let mut keys = Vec::new();
+    for row in rows {
+        keys.push(row.map_err(sql_err)?);
+    }
+    Ok(keys)
+}
+
+fn select_objects_by_keys(
+    conn: &Connection,
+    owner_uid: &str,
+    fragment: &str,
+    object_keys: &[String],
+) -> Result<Vec<ObjectRecord>, RegistryError> {
+    if object_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = std::iter::repeat_n("?", object_keys.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+        SELECT owner_uid, fragment, object_key, storage_object_id, version_id, status, object_size_bytes, content_type, created_at, updated_at
+        FROM objects
+        WHERE owner_uid = ?1 AND fragment = ?2 AND object_key IN ({})
+        "#,
+        placeholders
+    );
+    let mut args = vec![
+        Value::Text(owner_uid.to_string()),
+        Value::Text(fragment.to_string()),
+    ];
+    args.extend(object_keys.iter().cloned().map(Value::Text));
+
+    let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+    let rows = stmt
+        .query_map(params_from_iter(args), map_object_row)
+        .map_err(sql_err)?;
+    let mut objects = Vec::new();
+    for row in rows {
+        objects.push(row.map_err(sql_err)?);
+    }
+    Ok(objects)
+}
+
+fn select_upload_keys(
+    conn: &Connection,
+    owner_uid: &str,
+    fragment: &str,
+    object_keys: &[String],
+) -> Result<Vec<String>, RegistryError> {
+    if object_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = std::iter::repeat_n("?", object_keys.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+        SELECT object_key
+        FROM object_uploads
+        WHERE owner_uid = ?1 AND fragment = ?2 AND object_key IN ({})
+        "#,
+        placeholders
+    );
+    let mut args = vec![
+        Value::Text(owner_uid.to_string()),
+        Value::Text(fragment.to_string()),
+    ];
+    args.extend(object_keys.iter().cloned().map(Value::Text));
+
+    let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+    let rows = stmt
+        .query_map(params_from_iter(args), |row| row.get::<_, String>(0))
+        .map_err(sql_err)?;
+    let mut keys = Vec::new();
+    for row in rows {
+        keys.push(row.map_err(sql_err)?);
+    }
+    Ok(keys)
+}
+
+fn delete_object_namespace_rows(
+    conn: &Connection,
+    owner_uid: &str,
+    fragment: &str,
+    object_key: &str,
+) -> Result<(), RegistryError> {
+    conn.execute(
+        "DELETE FROM object_versions WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+        params![owner_uid, fragment, object_key],
+    )
+    .map_err(sql_err)?;
+    conn.execute(
+        "DELETE FROM objects WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+        params![owner_uid, fragment, object_key],
+    )
+    .map_err(sql_err)?;
+    conn.execute(
+        "DELETE FROM object_shares WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+        params![owner_uid, fragment, object_key],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+fn rewrite_namespace_key(
+    conn: &Connection,
+    owner_uid: &str,
+    fragment: &str,
+    source_key: &str,
+    destination_key: &str,
+    now: &str,
+) -> Result<(), RegistryError> {
+    conn.execute(
+        r#"
+        UPDATE objects
+        SET object_key = ?4, updated_at = ?5
+        WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+        "#,
+        params![owner_uid, fragment, source_key, destination_key, now],
+    )
+    .map_err(sql_err)?;
+    conn.execute(
+        r#"
+        UPDATE object_versions
+        SET object_key = ?4
+        WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+        "#,
+        params![owner_uid, fragment, source_key, destination_key],
+    )
+    .map_err(sql_err)?;
+    conn.execute(
+        r#"
+        UPDATE object_uploads
+        SET object_key = ?4, updated_at = ?5
+        WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+        "#,
+        params![owner_uid, fragment, source_key, destination_key, now],
+    )
+    .map_err(sql_err)?;
+    conn.execute(
+        r#"
+        UPDATE object_shares
+        SET object_key = ?4
+        WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+        "#,
+        params![owner_uid, fragment, source_key, destination_key],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+fn select_archive_objects_from_conn(
+    conn: &Connection,
+    owner_uid: String,
+    fragment: String,
+    keys: Vec<String>,
+    prefix: Option<String>,
+    search: Option<String>,
+    include_trashed: bool,
+) -> Result<Vec<ObjectRecord>, RegistryError> {
+    let status = if include_trashed { "trashed" } else { "ready" };
+
+    if !keys.is_empty() {
+        let mut canonical_keys = keys
+            .into_iter()
+            .map(|value| canonical_archive_key(&value))
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        canonical_keys.sort();
+        canonical_keys.dedup();
+
+        if canonical_keys.is_empty() {
+            return Err(RegistryError::bad_request(
+                "archive request did not include any valid object keys",
+            ));
+        }
+
+        let placeholders = std::iter::repeat_n("?", canonical_keys.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT owner_uid, fragment, object_key, storage_object_id, version_id, status, object_size_bytes, content_type, created_at, updated_at
+            FROM objects
+            WHERE owner_uid = ? AND fragment = ? AND status = ? AND object_key IN ({})
+            ORDER BY object_key ASC
+            "#,
+            placeholders
+        );
+        let mut args = vec![
+            Value::Text(owner_uid),
+            Value::Text(fragment),
+            Value::Text(status.to_string()),
+        ];
+        args.extend(canonical_keys.into_iter().map(Value::Text));
+
+        let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params_from_iter(args), map_object_row)
+            .map_err(sql_err)?;
+        let mut objects = Vec::new();
+        for row in rows {
+            objects.push(row.map_err(sql_err)?);
+        }
+        if objects.is_empty() {
+            return Err(RegistryError::not_found(
+                "no matching objects found for archive export",
+            ));
+        }
+        return Ok(objects);
+    }
+
+    let prefix_filter = prefix
+        .map(|value| normalize_listing_prefix(value, Some("/")))
+        .filter(|value| !value.is_empty());
+    let prefix_pattern = prefix_filter
+        .as_ref()
+        .map(|value| Value::Text(format!("{}%", value)));
+    let search_pattern = search
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| Value::Text(format!("%{}%", value)));
+
+    let mut sql = String::from(
+        r#"
+        SELECT owner_uid, fragment, object_key, storage_object_id, version_id, status, object_size_bytes, content_type, created_at, updated_at
+        FROM objects
+        WHERE owner_uid = ? AND fragment = ? AND status = ?
+        "#,
+    );
+    let mut args = vec![
+        Value::Text(owner_uid),
+        Value::Text(fragment),
+        Value::Text(status.to_string()),
+    ];
+    if let Some(pattern) = prefix_pattern {
+        sql.push_str(" AND object_key LIKE ?");
+        args.push(pattern);
+    }
+    if let Some(pattern) = search_pattern {
+        sql.push_str(" AND object_key LIKE ?");
+        args.push(pattern);
+    }
+    sql.push_str(" ORDER BY object_key ASC");
+
+    let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+    let rows = stmt
+        .query_map(params_from_iter(args), map_object_row)
+        .map_err(sql_err)?;
+    let mut objects = Vec::new();
+    for row in rows {
+        objects.push(row.map_err(sql_err)?);
+    }
+    if objects.is_empty() {
+        return Err(RegistryError::not_found(
+            "no matching objects found for archive export",
+        ));
+    }
+    Ok(objects)
 }
 
 fn rfc3339_from_unix(value: i64) -> String {
@@ -2997,12 +3775,13 @@ fn map_object_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRecord> {
         owner_uid: row.get(0)?,
         fragment: row.get(1)?,
         object_key: row.get(2)?,
-        version_id: row.get(3)?,
-        status: row.get(4)?,
-        object_size_bytes: row.get(5)?,
-        content_type: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        storage_object_id: row.get(3)?,
+        version_id: row.get(4)?,
+        status: row.get(5)?,
+        object_size_bytes: row.get(6)?,
+        content_type: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 
@@ -3011,12 +3790,13 @@ fn map_pending_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRecord> {
         owner_uid: row.get(0)?,
         fragment: row.get(1)?,
         object_key: row.get(2)?,
+        storage_object_id: row.get(3)?,
         version_id: String::new(),
         status: "pending".to_string(),
-        object_size_bytes: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
-        content_type: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
+        object_size_bytes: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+        content_type: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 
@@ -3046,9 +3826,10 @@ fn map_share_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShareRecord> {
         owner_uid: row.get(1)?,
         fragment: row.get(2)?,
         object_key: row.get(3)?,
-        disposition: ShareDisposition::parse_db(row.get::<_, String>(4)?).map_err(|message| {
+        storage_object_id: row.get(4)?,
+        disposition: ShareDisposition::parse_db(row.get::<_, String>(5)?).map_err(|message| {
             rusqlite::Error::FromSqlConversionFailure(
-                4,
+                5,
                 rusqlite::types::Type::Text,
                 Box::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -3056,10 +3837,16 @@ fn map_share_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShareRecord> {
                 )),
             )
         })?,
-        expires_at: rfc3339_from_unix(row.get(5)?),
-        created_at: row.get(6)?,
-        revoked_at: row.get(7)?,
+        expires_at: rfc3339_from_unix(row.get(6)?),
+        created_at: row.get(7)?,
+        revoked_at: row.get(8)?,
     })
+}
+
+fn generate_storage_object_id() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(Uuid::new_v4().as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 fn map_insert_user_err(err: rusqlite::Error) -> RegistryError {
@@ -3112,7 +3899,7 @@ fn generate_share_token() -> String {
 mod tests {
     use super::RegistryDb;
     use crate::auth::{hash_password, verify_password};
-    use crate::models::StorageDeployment;
+    use crate::models::{ShareDisposition, StorageDeployment};
     use axum::http::StatusCode;
 
     #[tokio::test]
@@ -3163,6 +3950,8 @@ mod tests {
             "patients/12-1222/study/file-1.dcm".to_string(),
             Some(1024),
             Some("application/dicom".to_string()),
+            None,
+            None,
         )
         .await
         .expect("register pending");
@@ -3349,6 +4138,8 @@ mod tests {
             "uploads/one.bin".to_string(),
             Some(4_000),
             Some("application/octet-stream".to_string()),
+            None,
+            None,
         )
         .await
         .expect("register first pending");
@@ -3364,6 +4155,8 @@ mod tests {
             "uploads/two.bin".to_string(),
             Some(5_000),
             Some("application/octet-stream".to_string()),
+            None,
+            None,
         )
         .await
         .expect("register second pending");
@@ -3380,6 +4173,8 @@ mod tests {
                 "uploads/three.bin".to_string(),
                 Some(2_000),
                 Some("application/octet-stream".to_string()),
+                None,
+                None,
             )
             .await
             .expect_err("third pending should exceed quota");
@@ -3391,6 +4186,8 @@ mod tests {
                 user.uid.clone(),
                 "fragment-a".to_string(),
                 "uploads/two.bin".to_string(),
+                None,
+                None,
             )
             .await
             .expect("cancel second pending");
@@ -3463,6 +4260,7 @@ mod tests {
             .expect("registry rename should replace trashed destination");
         assert_eq!(renamed.object_key, "folder/destination.bin");
         assert_eq!(renamed.version_id, "01HRENAMETRASHEDSOURCE0000001");
+        assert_eq!(renamed.storage_object_id.len(), 64);
         assert_eq!(updated_user.quota_used_bytes, 1024);
 
         let source = db
@@ -3490,6 +4288,7 @@ mod tests {
             "unexpected destination after rename: {:?}",
             destination
         );
+        assert_eq!(destination.storage_object_id, renamed.storage_object_id);
 
         let trashed_listing = db
             .list_objects(
@@ -3508,6 +4307,275 @@ mod tests {
         assert!(
             trashed_listing.objects.is_empty(),
             "trashed destination should be replaced"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn rename_prefix_moves_objects_pending_rows_and_shares_without_changing_storage_ids() {
+        let path = std::env::temp_dir().join(format!(
+            "registry-rename-prefix-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = RegistryDb::new(path.clone(), 1024 * 1024);
+        db.init().await.expect("init db");
+
+        let password_hash = hash_password("secret").expect("hash password");
+        let user = db
+            .create_user(
+                "rename-prefix@example.com".to_string(),
+                password_hash,
+                Some(50_000),
+                false,
+            )
+            .await
+            .expect("create user");
+
+        db.finalize_object(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            "photos/2024/a.jpg".to_string(),
+            "01HRENPFX000000000000000000001".to_string(),
+            1024,
+            Some("image/jpeg".to_string()),
+        )
+        .await
+        .expect("finalize source object");
+        db.register_pending_object(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            "photos/2024/pending.jpg".to_string(),
+            Some(512),
+            Some("image/jpeg".to_string()),
+            None,
+            None,
+        )
+        .await
+        .expect("register pending object");
+        db.upsert_fragment_binding(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            StorageDeployment::SingleNode,
+            Some("https://n1.example.test".to_string()),
+        )
+        .await
+        .expect("bind fragment");
+        let share = db
+            .create_share(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                "photos/2024/a.jpg".to_string(),
+                ShareDisposition::Download,
+                3600,
+            )
+            .await
+            .expect("create share");
+
+        let source_before = db
+            .resolve_object(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                "photos/2024/a.jpg".to_string(),
+            )
+            .await
+            .expect("resolve source before")
+            .expect("source exists");
+
+        let (affected, updated_user) = db
+            .rename_prefix(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                "photos/2024".to_string(),
+                "photos/archived".to_string(),
+            )
+            .await
+            .expect("rename prefix");
+        assert_eq!(affected, 2);
+        assert_eq!(updated_user.quota_used_bytes, 1536);
+
+        let source_after = db
+            .resolve_object(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                "photos/2024/a.jpg".to_string(),
+            )
+            .await
+            .expect("resolve source after");
+        assert!(
+            source_after.is_none(),
+            "source key should be gone after prefix rename"
+        );
+
+        let destination = db
+            .resolve_object(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                "photos/archived/a.jpg".to_string(),
+            )
+            .await
+            .expect("resolve destination")
+            .expect("destination exists");
+        assert_eq!(
+            destination.storage_object_id,
+            source_before.storage_object_id
+        );
+
+        let pending = db
+            .list_pending_upload_reservations(Some(user.uid.clone()))
+            .await
+            .expect("list pending after rename");
+        assert_eq!(pending.len(), 1);
+        let pending = &pending[0];
+        assert_eq!(pending.fragment, "fragment-a");
+        assert_eq!(pending.object_key, "photos/archived/pending.jpg");
+
+        let shares = db
+            .list_shares(
+                user.uid.clone(),
+                Some("fragment-a".to_string()),
+                false,
+                false,
+            )
+            .await
+            .expect("list shares");
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].share_id, share.0.share_id);
+        assert_eq!(shares[0].object_key, "photos/archived/a.jpg");
+        assert_eq!(shares[0].storage_object_id, source_before.storage_object_id);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_removes_objects_pending_rows_and_shares_and_returns_storage_ids() {
+        let path = std::env::temp_dir().join(format!(
+            "registry-delete-prefix-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = RegistryDb::new(path.clone(), 1024 * 1024);
+        db.init().await.expect("init db");
+
+        let password_hash = hash_password("secret").expect("hash password");
+        let user = db
+            .create_user(
+                "delete-prefix@example.com".to_string(),
+                password_hash,
+                Some(50_000),
+                false,
+            )
+            .await
+            .expect("create user");
+
+        db.finalize_object(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            "docs/bulk/a.txt".to_string(),
+            "01HDELPFX000000000000000000001".to_string(),
+            1024,
+            Some("text/plain".to_string()),
+        )
+        .await
+        .expect("finalize a");
+        db.finalize_object(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            "docs/bulk/b.txt".to_string(),
+            "01HDELPFX000000000000000000002".to_string(),
+            2048,
+            Some("text/plain".to_string()),
+        )
+        .await
+        .expect("finalize b");
+        db.register_pending_object(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            "docs/bulk/pending.txt".to_string(),
+            Some(512),
+            Some("text/plain".to_string()),
+            None,
+            None,
+        )
+        .await
+        .expect("register pending");
+        db.upsert_fragment_binding(
+            user.uid.clone(),
+            "fragment-a".to_string(),
+            StorageDeployment::SingleNode,
+            Some("https://n1.example.test".to_string()),
+        )
+        .await
+        .expect("bind fragment");
+        let share = db
+            .create_share(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                "docs/bulk/a.txt".to_string(),
+                ShareDisposition::Download,
+                3600,
+            )
+            .await
+            .expect("create share");
+
+        let objects_before = db
+            .list_objects_by_prefix_any_status(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                "docs/bulk".to_string(),
+            )
+            .await
+            .expect("list objects by prefix");
+        assert_eq!(objects_before.len(), 2);
+        let expected_storage_ids = objects_before
+            .iter()
+            .map(|object| object.storage_object_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        let (affected, storage_ids, updated_user) = db
+            .delete_objects_by_prefix(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                "docs/bulk".to_string(),
+            )
+            .await
+            .expect("delete prefix");
+        assert_eq!(affected, 3);
+        assert_eq!(storage_ids, expected_storage_ids);
+        assert_eq!(updated_user.quota_used_bytes, 0);
+
+        let ready_after = db
+            .list_objects(
+                user.uid.clone(),
+                Some("fragment-a".to_string()),
+                Some("docs/".to_string()),
+                None,
+                None,
+                100,
+                0,
+                false,
+                true,
+            )
+            .await
+            .expect("list objects after delete prefix");
+        assert!(ready_after.objects.is_empty());
+
+        let pending_after = db
+            .list_pending_upload_reservations(Some(user.uid.clone()))
+            .await
+            .expect("list pending after delete prefix");
+        assert!(pending_after.is_empty());
+
+        let shares = db
+            .list_shares(user.uid.clone(), Some("fragment-a".to_string()), true, true)
+            .await
+            .expect("list shares after delete prefix");
+        assert!(
+            shares
+                .iter()
+                .all(|entry| entry.share_id != share.0.share_id),
+            "share rows should be removed by prefix delete"
         );
 
         let _ = std::fs::remove_file(path);
@@ -3539,6 +4607,8 @@ mod tests {
             "uploads/a.bin".to_string(),
             Some(4_000),
             Some("application/octet-stream".to_string()),
+            None,
+            None,
         )
         .await
         .expect("register pending a");
@@ -3548,6 +4618,8 @@ mod tests {
             "uploads/b.bin".to_string(),
             Some(5_000),
             Some("application/octet-stream".to_string()),
+            None,
+            None,
         )
         .await
         .expect("register pending b");
@@ -3884,9 +4956,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn archive_manifest_writes_prefix_selected_keys_in_order() {
+    async fn archive_selection_returns_prefix_selected_keys_in_order() {
         let path = std::env::temp_dir().join(format!(
-            "registry-archive-manifest-test-{}.db",
+            "registry-archive-selection-test-{}.db",
             uuid::Uuid::new_v4()
         ));
         let db = RegistryDb::new(path.clone(), 1024 * 1024);
@@ -3934,8 +5006,8 @@ mod tests {
         .await
         .expect("finalize three");
 
-        let manifest = db
-            .write_archive_manifest(
+        let selection = db
+            .select_archive_objects(
                 user.uid,
                 "fragment-a".to_string(),
                 Vec::new(),
@@ -3944,19 +5016,21 @@ mod tests {
                 false,
             )
             .await
-            .expect("write archive manifest");
-        assert_eq!(manifest.selected_count, 2);
-
-        let body = std::fs::read_to_string(&manifest.manifest_path).expect("read manifest");
+            .expect("select archive objects");
+        assert_eq!(selection.objects.len(), 2);
         assert_eq!(
-            body,
-            concat!(
-                "01HARCHMANIFESTVERSION0000000001\tpatients/a/one.dcm\n",
-                "01HARCHMANIFESTVERSION0000000002\tpatients/a/two.dcm\n"
-            )
+            selection.objects[0].version_id,
+            "01HARCHMANIFESTVERSION0000000001"
         );
+        assert_eq!(selection.objects[0].object_key, "patients/a/one.dcm");
+        assert_eq!(selection.objects[0].storage_object_id.len(), 64);
+        assert_eq!(
+            selection.objects[1].version_id,
+            "01HARCHMANIFESTVERSION0000000002"
+        );
+        assert_eq!(selection.objects[1].object_key, "patients/a/two.dcm");
+        assert_eq!(selection.objects[1].storage_object_id.len(), 64);
 
-        let _ = std::fs::remove_file(&manifest.manifest_path);
         let _ = std::fs::remove_file(path);
     }
 

@@ -1,20 +1,25 @@
-use std::sync::Arc;
-
 use hex::encode as hex_encode;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use tempfile::tempfile;
 use tokio::fs::File;
-use tokio_util::io::ReaderStream;
+use tokio::io::AsyncSeekExt;
+use tokio::io::SeekFrom;
+use tokio_tar::{Builder as TarBuilder, Header as TarHeader};
+use tokio_util::io::StreamReader;
 use uuid::Uuid;
 
 use crate::config::{RegistryConfig, normalize_backend_url};
 use crate::error::RegistryError;
 use crate::models::{
-    FragmentBindingRecord, ShareDisposition, StorageDeployment, StorageSessionResponse,
+    FragmentBindingRecord, ObjectRecord, ShareDisposition, StorageDeployment,
+    StorageSessionResponse,
 };
+use futures_util::TryStreamExt;
 
 #[derive(Clone)]
 pub struct StorageBroker {
@@ -92,6 +97,19 @@ struct EngineObjectSummary {
     content_type: String,
     total_size_bytes: u64,
     created_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EngineUploadSession {
+    pub session_id: String,
+    pub version_id: String,
+    pub object_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EngineListUploadsResponse {
+    sessions: Vec<EngineUploadSession>,
+    total: usize,
 }
 
 #[derive(Debug)]
@@ -205,59 +223,124 @@ impl StorageBroker {
         Err(RegistryError::bad_gateway(message))
     }
 
-    pub async fn stream_manifest_archive(
+    pub async fn stream_logical_archive(
         &self,
         binding: &FragmentBindingRecord,
-        manifest_path: &Path,
-        filename: Option<&str>,
-    ) -> Result<reqwest::Response, RegistryError> {
+        objects: &[ObjectRecord],
+    ) -> Result<File, RegistryError> {
         let backend = self.resolve_backend(binding)?;
         let payload = self
             .authenticate_fragment(&backend, &binding.fragment, true, false, false, false)
             .await?;
 
-        let file = File::open(manifest_path).await.map_err(|err| {
-            RegistryError::internal(format!(
-                "failed to open archive manifest for streaming: {}",
-                err
-            ))
+        let std_file = tempfile().map_err(|err| {
+            RegistryError::internal(format!("failed to create archive temp file: {}", err))
         })?;
-        let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
-        let request = self
-            .client_for_backend(&backend)
-            .post(format!(
-                "{}/n1/objects/archive/manifest",
-                backend.engine_url
-            ))
-            .bearer_auth(payload.access_token)
-            .query(&[
-                ("format", "tar"),
-                ("filename", filename.unwrap_or("export")),
-            ])
-            .body(body);
+        let file = File::from_std(std_file);
+        let mut builder = TarBuilder::new(file);
 
-        let response = request.send().await.map_err(|err| {
-            RegistryError::bad_gateway(format!(
-                "storage archive request failed for {}: {}",
-                backend.engine_url, err
-            ))
-        });
-        let _ = tokio::fs::remove_file(manifest_path).await;
-        let response = response?;
+        for object in objects {
+            let response = self
+                .download_object_response(
+                    &backend,
+                    &payload.access_token,
+                    &object.storage_object_id,
+                )
+                .await?;
+            let size = response
+                .content_length()
+                .unwrap_or_else(|| object.object_size_bytes.max(0) as u64);
+            let stream = response
+                .bytes_stream()
+                .map_err(|err| std::io::Error::other(err.to_string()));
+            let reader = StreamReader::new(stream);
 
-        if !response.status().is_success() {
-            let fallback = format!(
-                "storage archive failed against {} backend",
-                match backend.deployment {
-                    StorageDeployment::SingleNode => "single-node",
-                    StorageDeployment::MultiNode => "multi-node",
-                }
-            );
-            let message = extract_engine_error_message(response, fallback).await;
-            return Err(RegistryError::bad_gateway(message));
+            let mut header = TarHeader::new_gnu();
+            header.set_size(size);
+            header.set_mode(0o644);
+            header.set_mtime(parse_rfc3339_unix(&object.updated_at).unwrap_or_else(now_unix_u64));
+            header.set_cksum();
+
+            builder
+                .append_data(
+                    &mut header,
+                    sanitize_archive_path(&object.object_key),
+                    reader,
+                )
+                .await
+                .map_err(|err| {
+                    RegistryError::bad_gateway(format!(
+                        "failed to build archive entry for '{}': {}",
+                        object.object_key, err
+                    ))
+                })?;
         }
 
-        Ok(response)
+        let mut file = builder.into_inner().await.map_err(|err| {
+            RegistryError::internal(format!("failed to finalize tar archive: {}", err))
+        })?;
+        file.seek(SeekFrom::Start(0)).await.map_err(|err| {
+            RegistryError::internal(format!("failed to rewind tar archive: {}", err))
+        })?;
+        Ok(file)
+    }
+
+    pub async fn list_active_upload_sessions(
+        &self,
+        binding: &FragmentBindingRecord,
+    ) -> Result<Vec<EngineUploadSession>, RegistryError> {
+        let backend = self.resolve_backend(binding)?;
+        let payload = self
+            .authenticate_fragment(&backend, &binding.fragment, true, false, false, false)
+            .await?;
+
+        let mut sessions = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let response = self
+                .client_for_backend(&backend)
+                .get(format!("{}/n1/upload/multipart", backend.engine_url))
+                .bearer_auth(&payload.access_token)
+                .query(&[("limit", 100usize), ("offset", offset)])
+                .send()
+                .await
+                .map_err(|err| {
+                    RegistryError::bad_gateway(format!(
+                        "storage upload session listing failed for {}: {}",
+                        backend.engine_url, err
+                    ))
+                })?;
+
+            if !response.status().is_success() {
+                let fallback = format!(
+                    "storage upload session listing failed against {} backend",
+                    match backend.deployment {
+                        StorageDeployment::SingleNode => "single-node",
+                        StorageDeployment::MultiNode => "multi-node",
+                    }
+                );
+                let message = extract_engine_error_message(response, fallback).await;
+                return Err(RegistryError::bad_gateway(message));
+            }
+
+            let payload = response
+                .json::<EngineListUploadsResponse>()
+                .await
+                .map_err(|err| {
+                    RegistryError::bad_gateway(format!(
+                        "invalid storage upload session listing response: {}",
+                        err
+                    ))
+                })?;
+            let page_len = payload.sessions.len();
+            sessions.extend(payload.sessions);
+            offset = sessions.len();
+            if page_len == 0 || offset >= payload.total {
+                break;
+            }
+        }
+
+        Ok(sessions)
     }
 
     pub async fn stream_shared_object(
@@ -473,6 +556,55 @@ impl StorageBroker {
 
         self.read_object_state_with_token(&backend, &payload.access_token, object_key, true)
             .await
+    }
+
+    pub async fn permanently_delete_objects<I, S>(
+        &self,
+        binding: &FragmentBindingRecord,
+        object_keys: I,
+    ) -> Result<(), RegistryError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let backend = self.resolve_backend(binding)?;
+        let payload = self
+            .authenticate_fragment(&backend, &binding.fragment, false, false, false, true)
+            .await?;
+
+        let object_keys = object_keys
+            .into_iter()
+            .map(Into::into)
+            .filter(|value| !value.trim().is_empty())
+            .collect::<BTreeSet<_>>();
+        if object_keys.is_empty() {
+            return Ok(());
+        }
+
+        for object_key in object_keys {
+            let encoded_key = encode_object_key_path(&object_key);
+            let response = self
+                .client_for_backend(&backend)
+                .delete(format!(
+                    "{}/n1/objects/permanent/{}",
+                    backend.engine_url, encoded_key
+                ))
+                .bearer_auth(&payload.access_token)
+                .send()
+                .await
+                .map_err(|err| {
+                    RegistryError::bad_gateway(format!(
+                        "storage permanent delete failed for {}: {}",
+                        backend.engine_url, err
+                    ))
+                })?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                continue;
+            }
+            ensure_engine_success(response, &backend, "storage permanent delete failed").await?;
+        }
+
+        Ok(())
     }
 
     fn resolve_backend(
@@ -771,6 +903,41 @@ impl StorageBroker {
             }
         }
     }
+
+    async fn download_object_response(
+        &self,
+        backend: &ResolvedBackend,
+        access_token: &str,
+        object_key: &str,
+    ) -> Result<reqwest::Response, RegistryError> {
+        let response = self
+            .client_for_backend(backend)
+            .get(format!("{}/n1/objects/download", backend.engine_url))
+            .query(&[("object_key", object_key)])
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "storage object download request failed for {}: {}",
+                    backend.engine_url, err
+                ))
+            })?;
+
+        if response.status().is_success() {
+            return Ok(response);
+        }
+
+        let fallback = format!(
+            "storage object download failed against {} backend",
+            match backend.deployment {
+                StorageDeployment::SingleNode => "single-node",
+                StorageDeployment::MultiNode => "multi-node",
+            }
+        );
+        let message = extract_engine_error_message(response, fallback).await;
+        Err(RegistryError::bad_gateway(message))
+    }
 }
 
 const OBJECT_KEY_PATH_SET: &AsciiSet = &CONTROLS
@@ -796,6 +963,25 @@ fn encode_object_key_path(object_key: &str) -> String {
 
 fn encode_path_segment(value: &str) -> String {
     utf8_percent_encode(value, PATH_SEGMENT_SET).to_string()
+}
+
+fn sanitize_archive_path(path: &str) -> String {
+    let trimmed = path.trim().trim_start_matches('/');
+    if trimmed.is_empty() {
+        "export.bin".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn parse_rfc3339_unix(value: &str) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .and_then(|dt| u64::try_from(dt.timestamp()).ok())
+}
+
+fn now_unix_u64() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0)
 }
 
 impl From<EngineObjectSummary> for EngineObjectMetadata {
@@ -824,6 +1010,27 @@ async fn extract_engine_error_message(response: reqwest::Response, fallback: Str
         }
     }
     fallback
+}
+
+async fn ensure_engine_success(
+    response: reqwest::Response,
+    backend: &ResolvedBackend,
+    fallback_prefix: &str,
+) -> Result<(), RegistryError> {
+    if response.status().is_success() {
+        return Ok(());
+    }
+
+    let fallback = format!(
+        "{} against {} backend",
+        fallback_prefix,
+        match backend.deployment {
+            StorageDeployment::SingleNode => "single-node",
+            StorageDeployment::MultiNode => "multi-node",
+        }
+    );
+    let message = extract_engine_error_message(response, fallback).await;
+    Err(RegistryError::bad_gateway(message))
 }
 
 fn hash_fragment_name(name: &str) -> String {

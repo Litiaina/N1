@@ -22,7 +22,7 @@
 > - `n1` (`litiaina-n1`) is the single-node N2 deployment path and the stable default.
 > - `n1` is released at `1.0.0`.
 > - `n2` (`litiaina-n2`) is the multi-node N2 deployment path and is released at `0.2.0`.
-> - `registry` (`registry-server`) is the SQLite-backed business metadata layer for both deployment shapes and is versioned independently at `0.4.0`.
+> - `registry` (`registry-server`) is the SQLite-backed business metadata layer for both deployment shapes and is versioned independently at `0.5.0`.
 > - `n1-arc` (`litiaina-n1-arc`) is the experimental raw-device profile and is not the production default.
 > - Prefer a non-root service user for `litiaina-n1`, `litiaina-n2`, and `registry-server`. Keep `root` for `litiaina-n1-arc` raw-device operations only.
 > - See `DEPLOYMENT_PROFILES.md` for the profile split and architecture guidance.
@@ -73,6 +73,10 @@ The single-node N2 deployment ships with native SMB-lite via `fsgwd`; the old `f
 For deployment and operator steps, see `DEPLOYMENT.md`.
 For the dedicated multi-node N2 runbook, see `N2_DEPLOYMENT.md`.
 For deployment profile guidance, see `DEPLOYMENT_PROFILES.md`.
+For API references, see:
+- `N1_DOCUMENTATION.md`
+- `N2_DOCUMENTATION.md`
+- `REGISTRY_DOCUMENTATION.md`
 
 N2 deployment split in this workspace:
 - Single-node deployment: run `litiaina-n1` from `n1`.
@@ -188,7 +192,7 @@ Profile note:
 - `n1` is the stable/default deployment profile at `1.0.0`.
 - `litiaina-n1-cli` tracks the same release line as `n1`; current CLI release is `1.0.0`.
 - `n2` is released independently at `0.2.0` as the multi-node N2 layer.
-- `registry` is released independently at `0.4.0` as the SQLite-backed Registry layer.
+- `registry` is released independently at `0.5.0` as the SQLite-backed Registry layer.
 - `n1-arc` is the experimental raw-device profile.
 - Stable architecture baseline (`n1`):
   - filesystem-backed authoritative `index`

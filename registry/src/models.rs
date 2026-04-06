@@ -49,6 +49,7 @@ pub struct ObjectRecord {
     pub owner_uid: String,
     pub fragment: String,
     pub object_key: String,
+    pub storage_object_id: String,
     pub version_id: String,
     pub status: String,
     pub object_size_bytes: i64,
@@ -105,6 +106,8 @@ pub struct ShareRecord {
     pub owner_uid: String,
     pub fragment: String,
     pub object_key: String,
+    #[serde(skip_serializing)]
+    pub storage_object_id: String,
     pub disposition: ShareDisposition,
     pub expires_at: String,
     pub created_at: String,
@@ -336,6 +339,10 @@ pub struct RegisterObjectRequest {
     pub object_key: String,
     pub expected_size_bytes: Option<i64>,
     pub content_type: Option<String>,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -512,9 +519,26 @@ pub struct RenameRegistryObjectRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct PrefixObjectMutationRequest {
+    pub fragment: String,
+    pub prefix: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenameRegistryPrefixRequest {
+    pub fragment: String,
+    pub source_prefix: String,
+    pub destination_prefix: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct DeleteObjectQuery {
     pub fragment: String,
     pub object_key: String,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

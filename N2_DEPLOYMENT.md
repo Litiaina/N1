@@ -10,14 +10,14 @@ Use this document when:
 Use other documents for:
 - single-node deployment: [DEPLOYMENT.md](/home/administrator/Development/N1/DEPLOYMENT.md)
 - profile split: [DEPLOYMENT_PROFILES.md](/home/administrator/Development/N1/DEPLOYMENT_PROFILES.md)
-- HTTP/API reference: [DOCUMENTATION.md](/home/administrator/Development/N1/DOCUMENTATION.md)
+- N2 HTTP/API reference: [N2_DOCUMENTATION.md](/home/administrator/Development/N1/N2_DOCUMENTATION.md)
 
 ## 1. Current Runtime Baseline
 
 As of `2026-03-20`:
 - `n2` (`litiaina-n2`) is released at `0.2.0`
 - `n1` (`litiaina-n1`) is the stable single-node engine/runtime at `1.0.0`
-- `registry-server` is released independently at `0.4.0`
+- `registry-server` is released independently at `0.5.0`
 - `n1-arc` remains experimental and is not part of this runbook
 
 Multi-node N2 in this workspace is:
