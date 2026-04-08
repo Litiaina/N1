@@ -6,19 +6,19 @@
     height="150"
   />
   <h1>Litiaina N1 Documentation</h1>
-  <p>Stable <code>1.0.0</code> reference for the pure N1 fragment-scoped storage engine.</p>
+  <p>Stable <code>1.1.0</code> reference for the pure N1 fragment-scoped storage engine.</p>
 </div>
 
 > Status (2026-04-01):
-> - `n1` (`litiaina-n1`) is stable at `1.0.0`.
+> - `n1` (`litiaina-n1`) is stable at `1.1.0`.
 > - N1 is an authenticated fragment-scoped storage engine.
 > - N1 owns bytes, object metadata, upload state, repair, redistribution, GC, and health.
-> - N1 does not own public sharing, thumbnails, or legacy FS routes in `1.0.0`.
+> - N1 does not own public sharing, thumbnails, or legacy FS routes in `1.1.0`.
 > - Registry, N2, and `n1-arc` are versioned independently and documented separately.
 
 ## 1. Scope
 
-N1 `1.0.0` freezes the engine contract under `/n1/*`.
+N1 `1.1.0` freezes the engine contract under `/n1/*`.
 
 Stable identity:
 - authenticated fragment-scoped object storage
@@ -28,7 +28,7 @@ Stable identity:
 - repair / redistribution / GC / health
 - websocket telemetry for authenticated engine events
 
-Not part of the N1 `1.0.0` HTTP contract:
+Not part of the N1 `1.1.0` HTTP contract:
 - legacy `/dir/*`
 - `/authenticate/fs`
 - public share creation or public share serving
@@ -45,6 +45,9 @@ Ping:
 
 Protected engine routes require:
 - `Authorization: Bearer <fragment_access_token>`
+
+For browser-safe direct media reads, a protected route can mint a short-lived signed URL:
+- `POST /n1/objects/signed-url`
 
 Fragment access tokens carry:
 - `fragment`
@@ -176,14 +179,26 @@ Common list query parameters:
 - `GET /n1/objects/meta/{*object_key}`
 - `GET /n1/objects/download`
 - `GET /n1/objects/download/chunk`
+- `POST /n1/objects/signed-url`
 
 Usage guidance:
 - `get` is the direct object read.
 - `stream` is the streaming read optimized for larger objects.
 - `meta` returns current object metadata only.
 - `download` and `download/chunk` are query-driven helpers for direct download and chunk-range flows.
+- `signed-url` mints a short-lived read URL for browser streaming or download without exposing the bearer token in the browser request URL.
 
-### 5.3 Archive Export
+### 5.3 Signed Read Consumption
+
+- `GET /n1/objects/signed-read`
+
+Usage guidance:
+- consumes a short-lived, object-scoped HMAC-signed read URL
+- intended for browser media playback and direct authenticated download flows
+- supports `stream` and `download` style reads
+- does not replace normal bearer-authenticated API routes
+
+### 5.4 Archive Export
 
 N1 keeps the low-level archive primitive for exact object sets.
 
@@ -252,7 +267,7 @@ Lifecycle model:
 
 ## 7. Upload Routes
 
-N1 `1.0.0` exposes explicit sibling upload modes:
+N1 `1.1.0` exposes explicit sibling upload modes:
 - one-shot
 - multipart
 
@@ -382,7 +397,7 @@ normal object operations because the claim already scopes the request.
 
 ## 11. Stable Contract Notes
 
-N1 `1.0.0` freezes these engine decisions:
+N1 `1.1.0` freezes these engine decisions:
 - route prefix is `/n1/*`
 - exact-key authority lives in fragment-level `indexdb/index.ndxdb`
 - logical hash bucketing stays internal to the metadata plane

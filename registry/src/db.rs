@@ -56,6 +56,15 @@ pub struct ArchiveObjectSelection {
     pub objects: Vec<ObjectRecord>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ObjectPurgeQueueEntry {
+    pub owner_uid: String,
+    pub fragment: String,
+    pub object_key: String,
+    pub storage_object_id: String,
+    pub attempts: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct RegistryDb {
     sqlite_path: PathBuf,
@@ -178,6 +187,21 @@ impl RegistryDb {
                     ON object_shares (owner_uid, fragment, object_key, created_at);
                 CREATE INDEX IF NOT EXISTS idx_object_shares_token
                     ON object_shares (token_hash, expires_at);
+
+                CREATE TABLE IF NOT EXISTS object_purge_queue (
+                    owner_uid TEXT NOT NULL,
+                    fragment TEXT NOT NULL,
+                    object_key TEXT NOT NULL,
+                    storage_object_id TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    available_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (owner_uid, fragment, object_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_object_purge_queue_due
+                    ON object_purge_queue (available_at, created_at);
                 "#,
             )
             .map_err(sql_err)?;
@@ -2017,6 +2041,20 @@ impl RegistryDb {
         .await
     }
 
+    pub async fn resolve_stored_object_record(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_key: String,
+    ) -> Result<Option<ObjectRecord>, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            resolve_stored_object(&conn, &owner_uid, &fragment, &object_key)
+        })
+        .await
+    }
+
     pub async fn sync_object_from_engine(
         &self,
         owner_uid: String,
@@ -2105,6 +2143,12 @@ impl RegistryDb {
                     .map_err(sql_err)?;
                 }
 
+                tx.execute(
+                    "DELETE FROM object_uploads WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                    params![owner_uid, fragment, object_key],
+                )
+                .map_err(sql_err)?;
+
                 quota_used
                     .saturating_add(current_size - previous_size)
                     .max(0)
@@ -2188,6 +2232,41 @@ impl RegistryDb {
         .await
     }
 
+    pub async fn trash_object_if_ready(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_key: String,
+    ) -> Result<(ObjectRecord, UserRecord), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let now = now_rfc3339();
+            let changed = tx
+                .execute(
+                    r#"
+                    UPDATE objects
+                    SET status = 'trashed', updated_at = ?4
+                    WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3 AND status = 'ready'
+                    "#,
+                    params![owner_uid, fragment, object_key, now],
+                )
+                .map_err(sql_err)?;
+            if changed == 0 {
+                return Err(RegistryError::not_found("object not found"));
+            }
+            tx.commit().map_err(sql_err)?;
+            let conn = db.open_connection()?;
+            let object = resolve_any_object(&conn, &owner_uid, &fragment, &object_key)?
+                .ok_or_else(|| RegistryError::internal("updated object missing"))?;
+            let user = user_by_uid(&conn, &owner_uid)?;
+            Ok((object, user))
+        })
+        .await
+    }
+
+    #[cfg(test)]
     pub async fn set_objects_status_bulk(
         &self,
         owner_uid: String,
@@ -2245,6 +2324,122 @@ impl RegistryDb {
         .await
     }
 
+    pub async fn trash_objects_bulk_from_ready(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_keys: Vec<String>,
+    ) -> Result<(usize, usize, UserRecord), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut selected_keys = object_keys
+                .into_iter()
+                .map(|value| canonical_archive_key(&value))
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            selected_keys.sort();
+            selected_keys.dedup();
+
+            if selected_keys.is_empty() {
+                return Err(RegistryError::bad_request(
+                    "object_keys must include at least one object key",
+                ));
+            }
+
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let now = now_rfc3339();
+            let mut affected = 0usize;
+            let mut matched_total = 0usize;
+
+            for chunk in selected_keys.chunks(SQLITE_BULK_KEY_CHUNK) {
+                let existing_keys = select_existing_object_keys_with_status(
+                    &tx, &owner_uid, &fragment, chunk, "ready",
+                )?;
+                if existing_keys.is_empty() {
+                    continue;
+                }
+
+                update_object_status_chunk(
+                    &tx,
+                    &owner_uid,
+                    &fragment,
+                    &existing_keys,
+                    "trashed",
+                    &now,
+                )?;
+                matched_total = matched_total.saturating_add(existing_keys.len());
+                affected = affected.saturating_add(existing_keys.len());
+            }
+
+            tx.commit().map_err(sql_err)?;
+
+            let conn = db.open_connection()?;
+            let user = user_by_uid(&conn, &owner_uid)?;
+            let not_found = selected_keys.len().saturating_sub(matched_total);
+            Ok((affected, not_found, user))
+        })
+        .await
+    }
+
+    pub async fn recover_objects_bulk_from_trash(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_keys: Vec<String>,
+    ) -> Result<(usize, usize, UserRecord), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut selected_keys = object_keys
+                .into_iter()
+                .map(|value| canonical_archive_key(&value))
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            selected_keys.sort();
+            selected_keys.dedup();
+
+            if selected_keys.is_empty() {
+                return Err(RegistryError::bad_request(
+                    "object_keys must include at least one object key",
+                ));
+            }
+
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let now = now_rfc3339();
+            let mut affected = 0usize;
+            let mut matched_total = 0usize;
+
+            for chunk in selected_keys.chunks(SQLITE_BULK_KEY_CHUNK) {
+                let existing_keys = select_existing_object_keys_with_status(
+                    &tx, &owner_uid, &fragment, chunk, "trashed",
+                )?;
+                if existing_keys.is_empty() {
+                    continue;
+                }
+
+                update_object_status_chunk(
+                    &tx,
+                    &owner_uid,
+                    &fragment,
+                    &existing_keys,
+                    "ready",
+                    &now,
+                )?;
+                matched_total = matched_total.saturating_add(existing_keys.len());
+                affected = affected.saturating_add(existing_keys.len());
+            }
+
+            tx.commit().map_err(sql_err)?;
+
+            let conn = db.open_connection()?;
+            let user = user_by_uid(&conn, &owner_uid)?;
+            let not_found = selected_keys.len().saturating_sub(matched_total);
+            Ok((affected, not_found, user))
+        })
+        .await
+    }
+
     pub async fn recover_all_trashed(
         &self,
         owner_uid: String,
@@ -2273,12 +2468,11 @@ impl RegistryDb {
         .await
     }
 
-    pub async fn set_objects_status_by_prefix(
+    pub async fn trash_objects_by_prefix_from_ready(
         &self,
         owner_uid: String,
         fragment: String,
         prefix: String,
-        next_status: &'static str,
     ) -> Result<(usize, UserRecord), RegistryError> {
         let db = self.clone();
         spawn_blocking(move || {
@@ -2294,16 +2488,13 @@ impl RegistryDb {
                 .execute(
                     r#"
                     UPDATE objects
-                    SET status = ?4, updated_at = ?5
-                    WHERE owner_uid = ?1 AND fragment = ?2 AND object_key LIKE ?3
+                    SET status = 'trashed', updated_at = ?5
+                    WHERE owner_uid = ?1
+                      AND fragment = ?2
+                      AND object_key LIKE ?3
+                      AND status = ?4
                     "#,
-                    params![
-                        owner_uid,
-                        fragment,
-                        format!("{}%", prefix),
-                        next_status,
-                        now
-                    ],
+                    params![owner_uid, fragment, format!("{}%", prefix), "ready", now],
                 )
                 .map_err(sql_err)?;
             if affected == 0 {
@@ -2318,6 +2509,48 @@ impl RegistryDb {
         .await
     }
 
+    pub async fn recover_objects_by_prefix_from_trash(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        prefix: String,
+    ) -> Result<(usize, UserRecord), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let prefix = normalize_namespace_prefix(prefix);
+            if prefix.is_empty() {
+                return Err(RegistryError::bad_request("prefix is required"));
+            }
+
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let now = now_rfc3339();
+            let affected = tx
+                .execute(
+                    r#"
+                    UPDATE objects
+                    SET status = 'ready', updated_at = ?5
+                    WHERE owner_uid = ?1
+                      AND fragment = ?2
+                      AND object_key LIKE ?3
+                      AND status = ?4
+                    "#,
+                    params![owner_uid, fragment, format!("{}%", prefix), "trashed", now],
+                )
+                .map_err(sql_err)?;
+            if affected == 0 {
+                return Err(RegistryError::not_found("no matching objects found"));
+            }
+            tx.commit().map_err(sql_err)?;
+
+            let conn = db.open_connection()?;
+            let user = user_by_uid(&conn, &owner_uid)?;
+            Ok((affected, user))
+        })
+        .await
+    }
+
+    #[cfg(test)]
     pub async fn list_objects_by_prefix_any_status(
         &self,
         owner_uid: String,
@@ -2337,6 +2570,7 @@ impl RegistryDb {
         .await
     }
 
+    #[cfg(test)]
     pub async fn delete_objects_by_prefix(
         &self,
         owner_uid: String,
@@ -2728,6 +2962,237 @@ impl RegistryDb {
         .await
     }
 
+    pub async fn purge_object(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_key: String,
+    ) -> Result<(bool, UserRecord), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let (quota_limit, quota_used) = quota_for_user(&tx, &owner_uid)?;
+            let now = now_rfc3339();
+
+            let stored = resolve_stored_object(&tx, &owner_uid, &fragment, &object_key)?;
+            let pending_removed = tx
+                .execute(
+                    "DELETE FROM object_uploads WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                    params![owner_uid, fragment, object_key],
+                )
+                .map_err(sql_err)?;
+
+            let Some(stored) = stored else {
+                if pending_removed == 0 {
+                    return Err(RegistryError::not_found("object not found"));
+                }
+                tx.commit().map_err(sql_err)?;
+                let conn = db.open_connection()?;
+                let mut user = user_by_uid(&conn, &owner_uid)?;
+                user.quota_limit_bytes = quota_limit;
+                return Ok((true, user));
+            };
+
+            tx.execute(
+                "DELETE FROM object_shares WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                params![owner_uid, fragment, object_key],
+            )
+            .map_err(sql_err)?;
+
+            let transitioned = stored.status != "purged";
+            if transitioned {
+                tx.execute(
+                    r#"
+                    UPDATE objects
+                    SET status = 'purged', updated_at = ?4
+                    WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+                    "#,
+                    params![owner_uid, fragment, object_key, now],
+                )
+                .map_err(sql_err)?;
+                enqueue_object_purge(&tx, &stored, &now)?;
+            }
+
+            let size_delta = if transitioned {
+                stored.object_size_bytes.max(0)
+            } else {
+                0
+            };
+            let next_used = quota_used.saturating_sub(size_delta);
+            tx.execute(
+                r#"
+                UPDATE users
+                SET quota_used_bytes = ?2, updated_at = ?3
+                WHERE uid = ?1
+                "#,
+                params![owner_uid, next_used, now],
+            )
+            .map_err(sql_err)?;
+
+            tx.commit().map_err(sql_err)?;
+            let conn = db.open_connection()?;
+            let mut user = user_by_uid(&conn, &owner_uid)?;
+            user.quota_limit_bytes = quota_limit;
+            Ok((true, user))
+        })
+        .await
+    }
+
+    pub async fn purge_objects_by_prefix(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        prefix: String,
+    ) -> Result<(usize, UserRecord), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let prefix = normalize_namespace_prefix(prefix);
+            if prefix.is_empty() {
+                return Err(RegistryError::bad_request("prefix is required"));
+            }
+
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let (quota_limit, quota_used) = quota_for_user(&tx, &owner_uid)?;
+            let now = now_rfc3339();
+
+            let objects = select_objects_by_prefix(&tx, &owner_uid, &fragment, &prefix)?;
+            let pending_keys = select_upload_keys_by_prefix(&tx, &owner_uid, &fragment, &prefix)?;
+            if objects.is_empty() && pending_keys.is_empty() {
+                return Err(RegistryError::not_found("no matching objects found"));
+            }
+
+            tx.execute(
+                r#"
+                DELETE FROM object_uploads
+                WHERE owner_uid = ?1 AND fragment = ?2 AND object_key LIKE ?3
+                "#,
+                params![owner_uid, fragment, format!("{}%", prefix)],
+            )
+            .map_err(sql_err)?;
+
+            tx.execute(
+                r#"
+                DELETE FROM object_shares
+                WHERE owner_uid = ?1 AND fragment = ?2 AND object_key LIKE ?3
+                "#,
+                params![owner_uid, fragment, format!("{}%", prefix)],
+            )
+            .map_err(sql_err)?;
+
+            let mut reclaimed_bytes = 0i64;
+            let mut transitioned = 0usize;
+            for object in &objects {
+                if object.status == "purged" {
+                    continue;
+                }
+                tx.execute(
+                    r#"
+                    UPDATE objects
+                    SET status = 'purged', updated_at = ?4
+                    WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+                    "#,
+                    params![owner_uid, fragment, object.object_key, now],
+                )
+                .map_err(sql_err)?;
+                enqueue_object_purge(&tx, object, &now)?;
+                reclaimed_bytes = reclaimed_bytes.saturating_add(object.object_size_bytes.max(0));
+                transitioned = transitioned.saturating_add(1);
+            }
+
+            let next_used = quota_used.saturating_sub(reclaimed_bytes);
+            tx.execute(
+                r#"
+                UPDATE users
+                SET quota_used_bytes = ?2, updated_at = ?3
+                WHERE uid = ?1
+                "#,
+                params![owner_uid, next_used, now],
+            )
+            .map_err(sql_err)?;
+
+            tx.commit().map_err(sql_err)?;
+            let conn = db.open_connection()?;
+            let mut user = user_by_uid(&conn, &owner_uid)?;
+            user.quota_limit_bytes = quota_limit;
+            Ok((transitioned.saturating_add(pending_keys.len()), user))
+        })
+        .await
+    }
+
+    pub async fn purge_trashed_objects(
+        &self,
+        owner_uid: String,
+        fragment: String,
+    ) -> Result<(usize, UserRecord), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let (quota_limit, quota_used) = quota_for_user(&tx, &owner_uid)?;
+            let now = now_rfc3339();
+
+            let trashed_objects =
+                list_objects_with_status_from_conn(&tx, &owner_uid, &fragment, "trashed")?;
+            if trashed_objects.is_empty() {
+                return Ok((0usize, user_by_uid(&tx, &owner_uid)?));
+            }
+
+            tx.execute(
+                r#"
+                DELETE FROM object_shares
+                WHERE owner_uid = ?1
+                  AND fragment = ?2
+                  AND object_key IN (
+                    SELECT object_key
+                    FROM objects
+                    WHERE owner_uid = ?1 AND fragment = ?2 AND status = 'trashed'
+                  )
+                "#,
+                params![owner_uid, fragment],
+            )
+            .map_err(sql_err)?;
+
+            tx.execute(
+                r#"
+                UPDATE objects
+                SET status = 'purged', updated_at = ?3
+                WHERE owner_uid = ?1 AND fragment = ?2 AND status = 'trashed'
+                "#,
+                params![owner_uid, fragment, now],
+            )
+            .map_err(sql_err)?;
+
+            for object in &trashed_objects {
+                enqueue_object_purge(&tx, object, &now)?;
+            }
+
+            let reclaimed_bytes = trashed_objects
+                .iter()
+                .map(|object| object.object_size_bytes.max(0))
+                .sum::<i64>();
+            let next_used = quota_used.saturating_sub(reclaimed_bytes);
+            tx.execute(
+                r#"
+                UPDATE users
+                SET quota_used_bytes = ?2, updated_at = ?3
+                WHERE uid = ?1
+                "#,
+                params![owner_uid, next_used, now],
+            )
+            .map_err(sql_err)?;
+
+            tx.commit().map_err(sql_err)?;
+            let conn = db.open_connection()?;
+            let mut user = user_by_uid(&conn, &owner_uid)?;
+            user.quota_limit_bytes = quota_limit;
+            Ok((trashed_objects.len(), user))
+        })
+        .await
+    }
+
+    #[cfg(test)]
     pub async fn delete_object(
         &self,
         owner_uid: String,
@@ -2926,6 +3391,7 @@ impl RegistryDb {
         .await
     }
 
+    #[cfg(test)]
     pub async fn empty_trash(
         &self,
         owner_uid: String,
@@ -3033,33 +3499,100 @@ impl RegistryDb {
         .await
     }
 
-    pub async fn list_objects_with_status(
+    pub async fn peek_due_object_purge(
         &self,
-        owner_uid: String,
-        fragment: String,
-        status: &'static str,
-    ) -> Result<Vec<ObjectRecord>, RegistryError> {
+    ) -> Result<Option<ObjectPurgeQueueEntry>, RegistryError> {
         let db = self.clone();
         spawn_blocking(move || {
             let conn = db.open_connection()?;
-            let mut stmt = conn
-                .prepare(
-                    r#"
-                    SELECT owner_uid, fragment, object_key, storage_object_id, version_id, status, object_size_bytes, content_type, created_at, updated_at
-                    FROM objects
-                    WHERE owner_uid = ?1 AND fragment = ?2 AND status = ?3
-                    ORDER BY object_key ASC
-                    "#,
-                )
-                .map_err(sql_err)?;
-            let rows = stmt
-                .query_map(params![owner_uid, fragment, status], map_object_row)
-                .map_err(sql_err)?;
-            let mut objects = Vec::new();
-            for row in rows {
-                objects.push(row.map_err(sql_err)?);
-            }
-            Ok(objects)
+            conn.query_row(
+                r#"
+                SELECT owner_uid, fragment, object_key, storage_object_id, attempts
+                FROM object_purge_queue
+                WHERE available_at <= ?1
+                ORDER BY created_at ASC
+                LIMIT 1
+                "#,
+                params![now_rfc3339()],
+                map_object_purge_queue_row,
+            )
+            .optional()
+            .map_err(sql_err)
+        })
+        .await
+    }
+
+    pub async fn complete_object_purge(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_key: String,
+    ) -> Result<(), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            conn.execute(
+                "DELETE FROM object_purge_queue WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                params![owner_uid, fragment, object_key],
+            )
+            .map_err(sql_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn fail_object_purge(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_key: String,
+        last_error: String,
+        retry_after_secs: i64,
+    ) -> Result<(), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            let now = now_rfc3339();
+            let next_attempt = rfc3339_after_seconds(retry_after_secs.max(1));
+            conn.execute(
+                r#"
+                UPDATE object_purge_queue
+                SET attempts = attempts + 1,
+                    last_error = ?4,
+                    available_at = ?5,
+                    updated_at = ?6
+                WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+                "#,
+                params![
+                    owner_uid,
+                    fragment,
+                    object_key,
+                    last_error,
+                    next_attempt,
+                    now
+                ],
+            )
+            .map_err(sql_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn cancel_object_purge(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_key: String,
+    ) -> Result<(), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            conn.execute(
+                "DELETE FROM object_purge_queue WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                params![owner_uid, fragment, object_key],
+            )
+            .map_err(sql_err)?;
+            Ok(())
         })
         .await
     }
@@ -3186,7 +3719,7 @@ fn resolve_ready_object(
         r#"
         SELECT owner_uid, fragment, object_key, storage_object_id, version_id, status, object_size_bytes, content_type, created_at, updated_at
         FROM objects
-        WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+        WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3 AND status = 'ready'
         "#,
         params![owner_uid, fragment, object_key],
         map_object_row,
@@ -3206,6 +3739,25 @@ fn resolve_live_object(
         SELECT owner_uid, fragment, object_key, storage_object_id, version_id, status, object_size_bytes, content_type, created_at, updated_at
         FROM objects
         WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3 AND status = 'ready'
+        "#,
+        params![owner_uid, fragment, object_key],
+        map_object_row,
+    )
+    .optional()
+    .map_err(sql_err)
+}
+
+fn resolve_stored_object(
+    conn: &Connection,
+    owner_uid: &str,
+    fragment: &str,
+    object_key: &str,
+) -> Result<Option<ObjectRecord>, RegistryError> {
+    conn.query_row(
+        r#"
+        SELECT owner_uid, fragment, object_key, storage_object_id, version_id, status, object_size_bytes, content_type, created_at, updated_at
+        FROM objects
+        WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
         "#,
         params![owner_uid, fragment, object_key],
         map_object_row,
@@ -3303,6 +3855,32 @@ fn select_objects_by_prefix(
             params![owner_uid, fragment, format!("{}%", prefix)],
             map_object_row,
         )
+        .map_err(sql_err)?;
+    let mut objects = Vec::new();
+    for row in rows {
+        objects.push(row.map_err(sql_err)?);
+    }
+    Ok(objects)
+}
+
+fn list_objects_with_status_from_conn(
+    conn: &Connection,
+    owner_uid: &str,
+    fragment: &str,
+    status: &str,
+) -> Result<Vec<ObjectRecord>, RegistryError> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT owner_uid, fragment, object_key, storage_object_id, version_id, status, object_size_bytes, content_type, created_at, updated_at
+            FROM objects
+            WHERE owner_uid = ?1 AND fragment = ?2 AND status = ?3
+            ORDER BY object_key ASC
+            "#,
+        )
+        .map_err(sql_err)?;
+    let rows = stmt
+        .query_map(params![owner_uid, fragment, status], map_object_row)
         .map_err(sql_err)?;
     let mut objects = Vec::new();
     for row in rows {
@@ -3608,6 +4186,7 @@ fn canonical_archive_key(value: &str) -> String {
     value.trim().trim_start_matches('/').to_string()
 }
 
+#[cfg(test)]
 fn select_existing_object_keys(
     conn: &Connection,
     owner_uid: &str,
@@ -3632,6 +4211,46 @@ fn select_existing_object_keys(
     let mut args = vec![
         Value::Text(owner_uid.to_string()),
         Value::Text(fragment.to_string()),
+    ];
+    args.extend(object_keys.iter().cloned().map(Value::Text));
+
+    let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+    let rows = stmt
+        .query_map(params_from_iter(args), |row| row.get::<_, String>(0))
+        .map_err(sql_err)?;
+    let mut found = Vec::new();
+    for row in rows {
+        found.push(row.map_err(sql_err)?);
+    }
+    Ok(found)
+}
+
+fn select_existing_object_keys_with_status(
+    conn: &Connection,
+    owner_uid: &str,
+    fragment: &str,
+    object_keys: &[String],
+    status: &str,
+) -> Result<Vec<String>, RegistryError> {
+    if object_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = std::iter::repeat_n("?", object_keys.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+        SELECT object_key
+        FROM objects
+        WHERE owner_uid = ?1 AND fragment = ?2 AND status = ?3 AND object_key IN ({})
+        "#,
+        placeholders
+    );
+    let mut args = vec![
+        Value::Text(owner_uid.to_string()),
+        Value::Text(fragment.to_string()),
+        Value::Text(status.to_string()),
     ];
     args.extend(object_keys.iter().cloned().map(Value::Text));
 
@@ -3843,6 +4462,47 @@ fn map_share_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShareRecord> {
     })
 }
 
+fn map_object_purge_queue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectPurgeQueueEntry> {
+    Ok(ObjectPurgeQueueEntry {
+        owner_uid: row.get(0)?,
+        fragment: row.get(1)?,
+        object_key: row.get(2)?,
+        storage_object_id: row.get(3)?,
+        attempts: row.get(4)?,
+    })
+}
+
+fn enqueue_object_purge(
+    conn: &Connection,
+    object: &ObjectRecord,
+    now: &str,
+) -> Result<(), RegistryError> {
+    conn.execute(
+        r#"
+        INSERT INTO object_purge_queue (
+            owner_uid, fragment, object_key, storage_object_id, attempts, last_error, created_at, available_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, 0, NULL, ?5, ?6, ?7)
+        ON CONFLICT(owner_uid, fragment, object_key)
+        DO UPDATE SET
+            storage_object_id = excluded.storage_object_id,
+            last_error = NULL,
+            available_at = excluded.available_at,
+            updated_at = excluded.updated_at
+        "#,
+        params![
+            object.owner_uid,
+            object.fragment,
+            object.object_key,
+            object.storage_object_id,
+            now,
+            now,
+            now
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
 fn generate_storage_object_id() -> String {
     let mut hasher = Sha256::new();
     hasher.update(Uuid::new_v4().as_bytes());
@@ -3883,6 +4543,10 @@ fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
 }
 
+fn rfc3339_after_seconds(seconds: i64) -> String {
+    (Utc::now() + chrono::Duration::seconds(seconds.max(0))).to_rfc3339()
+}
+
 fn now_unix() -> i64 {
     Utc::now().timestamp()
 }
@@ -3900,6 +4564,7 @@ mod tests {
     use super::RegistryDb;
     use crate::auth::{hash_password, verify_password};
     use crate::models::{ShareDisposition, StorageDeployment};
+    use crate::storage_broker::EngineObjectMetadata;
     use axum::http::StatusCode;
 
     #[tokio::test]
@@ -4650,6 +5315,73 @@ mod tests {
             .await
             .expect("finalize within effective quota");
         assert_eq!(user_after_finalize.quota_used_bytes, 9_500);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn sync_object_from_engine_clears_pending_reservation_on_success() {
+        let path = std::env::temp_dir().join(format!(
+            "registry-sync-engine-clears-pending-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = RegistryDb::new(path.clone(), 1024 * 1024);
+        db.init().await.expect("init db");
+
+        let password_hash = hash_password("secret").expect("hash password");
+        let user = db
+            .create_user(
+                "sync-engine@example.com".to_string(),
+                password_hash,
+                Some(10_000),
+                false,
+            )
+            .await
+            .expect("create user");
+
+        let pending = db
+            .register_pending_object(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                "videos/demo.mov".to_string(),
+                Some(4_096),
+                Some("video/quicktime".to_string()),
+                Some("01SYNCENGINEPENDING000000000001".to_string()),
+                Some("01SYNCENGINESESSION00000000001".to_string()),
+            )
+            .await
+            .expect("register pending object");
+
+        let (object, updated_user) = db
+            .sync_object_from_engine(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                "videos/demo.mov".to_string(),
+                pending.storage_object_id.clone(),
+                Some(EngineObjectMetadata {
+                    version_id: "01SYNCENGINECOMMITTED000000001".to_string(),
+                    object_size_bytes: 4_096,
+                    content_type: Some("video/quicktime".to_string()),
+                    created_at_unix: 1_775_000_000,
+                }),
+                Vec::new(),
+            )
+            .await
+            .expect("sync object from engine");
+
+        let object = object.expect("object should exist after successful sync");
+        assert_eq!(object.storage_object_id, pending.storage_object_id);
+        assert_eq!(object.status, "ready");
+        assert_eq!(updated_user.quota_used_bytes, 4_096);
+
+        let remaining_pending = db
+            .list_pending_upload_reservations(Some(user.uid.clone()))
+            .await
+            .expect("list pending reservations");
+        assert!(
+            remaining_pending.is_empty(),
+            "successful engine sync should remove the matching pending upload reservation"
+        );
 
         let _ = std::fs::remove_file(path);
     }

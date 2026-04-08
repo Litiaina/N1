@@ -57,6 +57,7 @@ use crate::middleware::auth_middleware::{
 };
 use crate::middleware::rate_limiter_middleware::RateLimitLayers;
 use crate::structs::auth_structs::Claims;
+use crate::url::signed_read::{mint_signed_read_url, read_object_via_signed_url};
 use crate::websocket::handler::ws_handler;
 use crate::websocket::manager::{WsConnectionManager, register_global_ws_manager};
 use crate::websocket::ws_structs::StorageEventPayload;
@@ -423,6 +424,7 @@ pub fn build_storage_routes_unbound_with_options(
             .route("/n1/capacity/usage", get(get_capacity_usage_scoped))
             .route("/n1/fragments", get(list_fragments))
             .route("/n1/objects", get(list_objects_scoped))
+            .route("/n1/objects/signed-url", post(mint_signed_read_url))
             .route("/n1/trash", get(list_trash_objects_scoped))
             .route(
                 "/n1/objects/versions/{*object_key}",
@@ -566,7 +568,8 @@ pub fn build_storage_routes_unbound_with_options(
 
     let global_routes = Router::new()
         .route("/n1/fragments/check", get(verify_fragment_existence))
-        .route("/n1/fragments/hash", get(get_fragment_hash));
+        .route("/n1/fragments/hash", get(get_fragment_hash))
+        .route("/n1/objects/signed-read", get(read_object_via_signed_url));
     let global_routes = layers.layer_global(global_routes);
 
     let create_fragment_route = Router::new().route("/n1/fragments", post(create_fragment));

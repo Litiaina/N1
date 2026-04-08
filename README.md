@@ -16,13 +16,13 @@
 
 ---
 
-> Deployment profile status (2026-03-20):
+> Deployment profile status (2026-04-07):
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared node-local storage engine used by both deployments.
 > - `n1` (`litiaina-n1`) is the single-node N2 deployment path and the stable default.
-> - `n1` is released at `1.0.0`.
+> - `n1` is released at `1.1.0`.
 > - `n2` (`litiaina-n2`) is the multi-node N2 deployment path and is released at `0.2.0`.
-> - `registry` (`registry-server`) is the SQLite-backed business metadata layer for both deployment shapes and is versioned independently at `0.5.0`.
+> - `registry` (`registry-server`) is the SQLite-backed user-owned metadata and POSIX facade layer for both deployment shapes and is versioned independently at `0.7.0`.
 > - `n1-arc` (`litiaina-n1-arc`) is the experimental raw-device profile and is not the production default.
 > - Prefer a non-root service user for `litiaina-n1`, `litiaina-n2`, and `registry-server`. Keep `root` for `litiaina-n1-arc` raw-device operations only.
 > - See `DEPLOYMENT_PROFILES.md` for the profile split and architecture guidance.
@@ -85,10 +85,10 @@ N2 deployment split in this workspace:
 - If `registry.env` is missing in the current working directory, `registry-server` creates a template automatically and tells you which required value is still missing.
 - Raw-device testing remains `litiaina-n1-arc` from `n1-arc`.
 - `n1` and `n2` now share the same stable `n1/src/n1_core` implementation; `n2` only adds cluster-specific `n2_core` and route layers.
-- `registry` owns business logic and user convenience metadata: users, administrators, admin-created accounts, ownership, quotas, logical listing, logical object lookup, rotating refresh sessions, optional TOTP 2FA, and registry-wide statistics aggregation.
+- `registry` owns user-facing metadata and namespace behavior: users, administrators, quotas, logical object identity, folder illusion, shares, logical lifecycle, and registry-wide statistics aggregation.
 - `registry` now also exposes `GET /v1/ws` for owner-scoped and admin-wide realtime Registry events.
-- `registry` also brokers short-lived storage sessions for Registry-backed clients and future GUI/web surfaces that are still under development.
-- First Registry administrator bootstrap is protected by `REGISTRY_MASTER_KEY` and is only allowed before any admin exists.
+- `registry` brokers short-lived storage sessions for Registry-backed clients and stores a stable physical `storage_object_id` for each logical object so N1/N2 stay flat underneath.
+- First Registry administrator bootstrap is protected by `REGISTRY_MASTER_KEY`, is only allowed before any admin exists, and is purely a Registry control-plane action.
 - Public Registry signup no longer accepts client-chosen quota; new accounts always start on the server default or an administrator-assigned quota.
 - Product identity:
   - `N2` is the operator-facing platform identity.
@@ -189,10 +189,10 @@ Profile note:
 
 ## Release Status
 
-- `n1` is the stable/default deployment profile at `1.0.0`.
-- `litiaina-n1-cli` tracks the same release line as `n1`; current CLI release is `1.0.0`.
+- `n1` is the stable/default deployment profile at `1.1.0`.
+- `litiaina-n1-cli` tracks the same release line as `n1`; current CLI release is `1.1.0`.
 - `n2` is released independently at `0.2.0` as the multi-node N2 layer.
-- `registry` is released independently at `0.5.0` as the SQLite-backed Registry layer.
+- `registry` is released independently at `0.7.0` as the SQLite-backed Registry layer.
 - `n1-arc` is the experimental raw-device profile.
 - Stable architecture baseline (`n1`):
   - filesystem-backed authoritative `index`
@@ -200,7 +200,7 @@ Profile note:
   - partitioned + replicated metadata
   - fragment-scoped exact-key object serving
 - Registry architecture baseline (`registry`):
-  - first-admin bootstrap guarded by `REGISTRY_MASTER_KEY`
+  - first-admin bootstrap guarded by `REGISTRY_MASTER_KEY` and not coupled to storage provisioning
   - administrator login and account administration
   - administrator-created user/account provisioning with optional admin role and quota override
   - user management and login
@@ -209,26 +209,29 @@ Profile note:
   - self-service account updates (email, password, optional 2FA)
   - public signup fixed to default/admin-assigned quota only
   - ownership and quota accounting
-  - logical listing and filtering
+  - logical listing, prefix rename, and POSIX-style folder illusion
   - registry-wide admin insights (`/v1/admin/stats`)
   - filtered object statistics for Registry-backed clients (`/v1/objects/stats`)
-  - registry-owned object metadata lookup
+  - registry-owned object metadata lookup keyed by logical `object_key`
+  - stable physical `storage_object_id` mapping so N1/N2 store flat keys instead of logical paths for Registry-backed objects
   - fragment-to-backend binding for `single_node` and `multi_node` storage targets
-  - storage-session brokering for Registry-backed clients and future GUI/web integrations
+  - storage-session brokering for Registry-backed clients
+  - Registry-owned lifecycle states: `ready`, `trashed`, `purged`
+  - background N1/N2 soft delete after logical permanent delete / empty trash
 - `n1` exposes `POST /n1/upload/one-shot/{*object_key}` for direct small-object upload without session/finalize overhead. The fragment comes from the authenticated claim.
 - `n1` also exposes claim-scoped bulk mutation routes for high-count object workflows:
   - `POST /n1/objects/bulk-delete`
   - `POST /n1/objects/bulk-recover`
 - On Linux, `n1` prefers `io_uring` on the blob data path when available and falls back to `O_DIRECT` + blocking writes when it is not.
 - `n1-arc` is the experimental raw-device profile with raw index/blob media managed by `block_manager`.
-- The N1 HTTP/API surface is frozen for `1.0.0` under `/n1/*`.
+- The N1 HTTP/API surface is frozen for `1.1.0` under `/n1/*`.
 - Backward compatibility now follows the `1.x` stable contract for N1 core.
 
 ## Profile Distinction And Disk Layout (Authoritative)
 
 | Dimension | N1 (`litiaina-n1`) | N1-Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / production default (`1.0.0`) | Experimental / raw-device profile |
+| Status | Stable / production default (`1.1.0`) | Experimental / raw-device profile |
 | `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | Index metadata backend | Fragment-level `indexdb/index.ndxdb` with logical hash buckets | Raw index catalog on block-manager media |
@@ -293,7 +296,7 @@ Under both shapes, the node-local storage engine is still **N1**. N1 provides:
   - `n1`: filesystem-backed shard files under blob roots
   - `n1-arc`: raw-device/direct-I/O blob plane with raw index authority
 
-In the `1.0.0` engine baseline, user convenience behavior moves out of the engine and into the Registry layer:
+In the `1.1.0` engine baseline, user convenience behavior moves out of the engine and into the Registry layer:
 
 - user management
 - ownership tracking
@@ -580,7 +583,7 @@ They are intended for UI or operator flows that need to mutate hundreds or thous
 
 ### 1b) Derived media
 
-Derived media generation is no longer part of N1 core. For `1.0.0`, N1 stays focused on
+Derived media generation is no longer part of N1 core. For `1.1.0`, N1 stays focused on
 authenticated fragment storage, while previews, thumbnails, and share-link behavior are expected
 to live in a higher layer such as Registry or a dedicated accelerator service.
 
@@ -919,8 +922,8 @@ Health reports:
 - per-disk health plus total/used/free capacity on every configured index and blob path
 
 Current bundled web-surface behavior:
-- `storage/index.html` is the direct N1 operator view and now lets operators cancel interrupted multipart sessions through the engine cancel route.
-- `drive/index.html` is the Registry-backed business view and now lets users cancel interrupted uploads while also releasing the pending Registry reservation tied to that upload.
+- `storage/index.html` is the direct N1 operator view. It is not the reference surface for Registry namespace invariants and may show direct N1-native objects.
+- `drive/index.html` is the Registry-backed user view. It uses Registry logical keys and flat engine `storage_object_id` mappings underneath.
 
 ```bash
 cargo run -p n1_cli -- health --watch --deep-scan

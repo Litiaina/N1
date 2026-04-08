@@ -3,12 +3,14 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tempfile::tempfile;
 use tokio::fs::File;
 use tokio::io::AsyncSeekExt;
 use tokio::io::SeekFrom;
+use tokio::sync::{Mutex, RwLock};
 use tokio_tar::{Builder as TarBuilder, Header as TarHeader};
 use tokio_util::io::StreamReader;
 use uuid::Uuid;
@@ -26,6 +28,8 @@ pub struct StorageBroker {
     strict_client: Client,
     insecure_client: Client,
     config: Arc<RegistryConfig>,
+    auth_cache: Arc<RwLock<HashMap<AuthCacheKey, CachedAuthSession>>>,
+    auth_locks: Arc<Mutex<HashMap<AuthCacheKey, Arc<Mutex<()>>>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -39,7 +43,7 @@ struct FragmentAuthRequest<'a> {
     expires_in: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct EngineAuthResponse {
     access_token: String,
     token_type: String,
@@ -120,6 +124,22 @@ struct ResolvedBackend {
     insecure_tls: bool,
 }
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct AuthCacheKey {
+    engine_url: String,
+    fragment: String,
+    read: bool,
+    write: bool,
+    modify: bool,
+    delete: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CachedAuthSession {
+    payload: EngineAuthResponse,
+    valid_until: Instant,
+}
+
 impl StorageBroker {
     pub fn new(config: Arc<RegistryConfig>) -> Result<Self, RegistryError> {
         let strict_client = Client::builder().use_rustls_tls().build().map_err(|err| {
@@ -137,6 +157,8 @@ impl StorageBroker {
             strict_client,
             insecure_client,
             config,
+            auth_cache: Arc::new(RwLock::new(HashMap::new())),
+            auth_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -214,12 +236,7 @@ impl StorageBroker {
                 StorageDeployment::MultiNode => "multi-node",
             }
         );
-        let message = response
-            .json::<EngineErrorResponse>()
-            .await
-            .ok()
-            .and_then(|body| body.error.or(body.message))
-            .unwrap_or(fallback);
+        let message = extract_engine_error_message(response, fallback).await;
         Err(RegistryError::bad_gateway(message))
     }
 
@@ -346,7 +363,7 @@ impl StorageBroker {
     pub async fn stream_shared_object(
         &self,
         binding: &FragmentBindingRecord,
-        object_key: &str,
+        storage_object_id: &str,
         disposition: ShareDisposition,
         request_headers: &axum::http::HeaderMap,
     ) -> Result<reqwest::Response, RegistryError> {
@@ -358,12 +375,12 @@ impl StorageBroker {
         let mut request = if disposition.is_download() {
             client
                 .get(format!("{}/n1/objects/download", backend.engine_url))
-                .query(&[("object_key", object_key)])
+                .query(&[("object_key", storage_object_id)])
         } else {
             client.get(format!(
                 "{}/n1/objects/get/{}",
                 backend.engine_url,
-                encode_object_key_path(object_key)
+                encode_object_key_path(storage_object_id)
             ))
         }
         .bearer_auth(&payload.access_token);
@@ -498,7 +515,7 @@ impl StorageBroker {
     pub async fn read_current_object_state(
         &self,
         binding: &FragmentBindingRecord,
-        object_key: &str,
+        storage_object_id: &str,
         include_versions: bool,
     ) -> Result<EngineObjectState, RegistryError> {
         let backend = self.resolve_backend(binding)?;
@@ -508,7 +525,7 @@ impl StorageBroker {
         self.read_object_state_with_token(
             &backend,
             &payload.access_token,
-            object_key,
+            storage_object_id,
             include_versions,
         )
         .await
@@ -517,14 +534,14 @@ impl StorageBroker {
     pub async fn delete_object_version_and_read_state(
         &self,
         binding: &FragmentBindingRecord,
-        object_key: &str,
+        storage_object_id: &str,
         version_id: &str,
     ) -> Result<EngineObjectState, RegistryError> {
         let backend = self.resolve_backend(binding)?;
         let payload = self
             .authenticate_fragment(&backend, &binding.fragment, true, true, false, true)
             .await?;
-        let encoded_key = encode_object_key_path(object_key);
+        let encoded_key = encode_object_key_path(storage_object_id);
         let encoded_version = encode_path_segment(version_id);
         let response = self
             .client_for_backend(&backend)
@@ -554,57 +571,76 @@ impl StorageBroker {
             return Err(RegistryError::bad_gateway(message));
         }
 
-        self.read_object_state_with_token(&backend, &payload.access_token, object_key, true)
+        self.read_object_state_with_token(&backend, &payload.access_token, storage_object_id, true)
             .await
     }
 
-    pub async fn permanently_delete_objects<I, S>(
+    pub async fn soft_delete_object(
         &self,
         binding: &FragmentBindingRecord,
-        object_keys: I,
-    ) -> Result<(), RegistryError>
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
+        storage_object_id: &str,
+    ) -> Result<(), RegistryError> {
         let backend = self.resolve_backend(binding)?;
         let payload = self
-            .authenticate_fragment(&backend, &binding.fragment, false, false, false, true)
+            .authenticate_fragment(&backend, &binding.fragment, false, true, false, false)
             .await?;
+        let encoded_key = encode_object_key_path(storage_object_id);
+        let response = self
+            .client_for_backend(&backend)
+            .delete(format!("{}/n1/objects/{}", backend.engine_url, encoded_key))
+            .bearer_auth(&payload.access_token)
+            .send()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "storage soft delete failed for {}: {}",
+                    backend.engine_url, err
+                ))
+            })?;
 
-        let object_keys = object_keys
-            .into_iter()
-            .map(Into::into)
-            .filter(|value| !value.trim().is_empty())
-            .collect::<BTreeSet<_>>();
-        if object_keys.is_empty() {
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(());
         }
 
-        for object_key in object_keys {
-            let encoded_key = encode_object_key_path(&object_key);
-            let response = self
-                .client_for_backend(&backend)
-                .delete(format!(
-                    "{}/n1/objects/permanent/{}",
-                    backend.engine_url, encoded_key
+        ensure_engine_success(response, &backend, "storage soft delete failed").await?;
+        Ok(())
+    }
+
+    pub async fn recover_object_and_read_state(
+        &self,
+        binding: &FragmentBindingRecord,
+        storage_object_id: &str,
+    ) -> Result<EngineObjectState, RegistryError> {
+        let backend = self.resolve_backend(binding)?;
+        let payload = self
+            .authenticate_fragment(&backend, &binding.fragment, true, true, false, false)
+            .await?;
+        let encoded_key = encode_object_key_path(storage_object_id);
+        let response = self
+            .client_for_backend(&backend)
+            .post(format!(
+                "{}/n1/objects/recover/{}",
+                backend.engine_url, encoded_key
+            ))
+            .bearer_auth(&payload.access_token)
+            .send()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "storage recover failed for {}: {}",
+                    backend.engine_url, err
                 ))
-                .bearer_auth(&payload.access_token)
-                .send()
-                .await
-                .map_err(|err| {
-                    RegistryError::bad_gateway(format!(
-                        "storage permanent delete failed for {}: {}",
-                        backend.engine_url, err
-                    ))
-                })?;
-            if response.status() == reqwest::StatusCode::NOT_FOUND {
-                continue;
-            }
-            ensure_engine_success(response, &backend, "storage permanent delete failed").await?;
+            })?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RegistryError::not_found(
+                "object can no longer be recovered from storage",
+            ));
         }
 
-        Ok(())
+        ensure_engine_success(response, &backend, "storage recover failed").await?;
+        self.read_object_state_with_token(&backend, &payload.access_token, storage_object_id, true)
+            .await
     }
 
     fn resolve_backend(
@@ -743,6 +779,26 @@ impl StorageBroker {
         modify: bool,
         delete: bool,
     ) -> Result<EngineAuthResponse, RegistryError> {
+        let cache_key = AuthCacheKey {
+            engine_url: backend.engine_url.clone(),
+            fragment: fragment.to_string(),
+            read,
+            write,
+            modify,
+            delete,
+        };
+
+        if let Some(cached) = self.cached_auth_session(&cache_key).await {
+            return Ok(cached);
+        }
+
+        let auth_lock = self.auth_lock_for(cache_key.clone()).await;
+        let _guard = auth_lock.lock().await;
+
+        if let Some(cached) = self.cached_auth_session(&cache_key).await {
+            return Ok(cached);
+        }
+
         let response = self
             .client_for_backend(backend)
             .post(format!("{}/n1/auth/fragment", backend.engine_url))
@@ -778,23 +834,55 @@ impl StorageBroker {
             ));
         }
 
-        response.json::<EngineAuthResponse>().await.map_err(|err| {
+        let payload = response.json::<EngineAuthResponse>().await.map_err(|err| {
             RegistryError::bad_gateway(format!("invalid storage auth response: {}", err))
+        })?;
+
+        self.store_cached_auth_session(cache_key, payload.clone())
+            .await;
+        Ok(payload)
+    }
+
+    async fn cached_auth_session(&self, key: &AuthCacheKey) -> Option<EngineAuthResponse> {
+        let cache = self.auth_cache.read().await;
+        cache.get(key).and_then(|cached| {
+            if cached.valid_until > Instant::now() {
+                Some(cached.payload.clone())
+            } else {
+                None
+            }
         })
+    }
+
+    async fn store_cached_auth_session(&self, key: AuthCacheKey, payload: EngineAuthResponse) {
+        let cache_ttl_secs = payload.expires_in.saturating_sub(5).max(1);
+        let cached = CachedAuthSession {
+            payload,
+            valid_until: Instant::now() + Duration::from_secs(cache_ttl_secs),
+        };
+        self.auth_cache.write().await.insert(key, cached);
+    }
+
+    async fn auth_lock_for(&self, key: AuthCacheKey) -> Arc<Mutex<()>> {
+        let mut locks = self.auth_locks.lock().await;
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     async fn read_object_state_with_token(
         &self,
         backend: &ResolvedBackend,
         access_token: &str,
-        object_key: &str,
+        storage_object_id: &str,
         include_versions: bool,
     ) -> Result<EngineObjectState, RegistryError> {
         let current = self
-            .fetch_object_metadata(backend, access_token, object_key)
+            .fetch_object_metadata(backend, access_token, storage_object_id)
             .await?;
         let versions = if include_versions {
-            self.fetch_object_versions(backend, access_token, object_key)
+            self.fetch_object_versions(backend, access_token, storage_object_id)
                 .await?
         } else {
             Vec::new()
@@ -806,9 +894,9 @@ impl StorageBroker {
         &self,
         backend: &ResolvedBackend,
         access_token: &str,
-        object_key: &str,
+        storage_object_id: &str,
     ) -> Result<Option<EngineObjectMetadata>, RegistryError> {
-        let encoded_key = encode_object_key_path(object_key);
+        let encoded_key = encode_object_key_path(storage_object_id);
         let response = self
             .client_for_backend(backend)
             .get(format!(
@@ -857,9 +945,9 @@ impl StorageBroker {
         &self,
         backend: &ResolvedBackend,
         access_token: &str,
-        object_key: &str,
+        storage_object_id: &str,
     ) -> Result<Vec<EngineObjectMetadata>, RegistryError> {
-        let encoded_key = encode_object_key_path(object_key);
+        let encoded_key = encode_object_key_path(storage_object_id);
         let response = self
             .client_for_backend(backend)
             .get(format!(
@@ -908,12 +996,12 @@ impl StorageBroker {
         &self,
         backend: &ResolvedBackend,
         access_token: &str,
-        object_key: &str,
+        storage_object_id: &str,
     ) -> Result<reqwest::Response, RegistryError> {
         let response = self
             .client_for_backend(backend)
             .get(format!("{}/n1/objects/download", backend.engine_url))
-            .query(&[("object_key", object_key)])
+            .query(&[("object_key", storage_object_id)])
             .bearer_auth(access_token)
             .send()
             .await
@@ -1004,12 +1092,23 @@ fn normalize_engine_auth_error_message(message: String) -> String {
 }
 
 async fn extract_engine_error_message(response: reqwest::Response, fallback: String) -> String {
-    if let Ok(body) = response.json::<EngineErrorResponse>().await {
-        if let Some(message) = body.error.or(body.message) {
-            return message;
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(_) => return fallback,
+    };
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return fallback;
+    }
+    if let Ok(parsed) = serde_json::from_str::<EngineErrorResponse>(trimmed) {
+        if let Some(message) = parsed.error.or(parsed.message) {
+            let message = message.trim();
+            if !message.is_empty() {
+                return message.to_string();
+            }
         }
     }
-    fallback
+    trimmed.to_string()
 }
 
 async fn ensure_engine_success(

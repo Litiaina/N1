@@ -10,5 +10,6 @@ pub mod smb;
 pub mod statics;
 pub mod structs;
 pub mod utils;
+pub mod url;
 pub mod validation;
 pub mod websocket;

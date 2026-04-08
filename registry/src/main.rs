@@ -71,6 +71,8 @@ struct AppState {
 
 const MAX_SHARE_EXPIRATION_SECS: u64 = 60 * 60 * 24 * 7;
 const PENDING_UPLOAD_RECONCILE_INTERVAL_SECS: u64 = 60;
+const OBJECT_PURGE_QUEUE_INTERVAL_SECS: u64 = 2;
+const OBJECT_PURGE_QUEUE_RETRY_SECS: i64 = 15;
 
 fn default_fragment_name(user: &UserRecord) -> String {
     user.email.clone()
@@ -107,6 +109,16 @@ fn canonical_bulk_object_keys(keys: Vec<String>) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn infer_latest_engine_head(
+    versions: &[storage_broker::EngineObjectMetadata],
+) -> Option<storage_broker::EngineObjectMetadata> {
+    versions.iter().cloned().max_by(|left, right| {
+        left.created_at_unix
+            .cmp(&right.created_at_unix)
+            .then_with(|| left.version_id.cmp(&right.version_id))
+    })
 }
 
 async fn issue_registry_session(
@@ -262,6 +274,93 @@ async fn run_pending_upload_reconciler(state: AppState) {
     }
 }
 
+async fn process_next_object_purge(state: &AppState) -> Result<bool, RegistryError> {
+    let _write_guard = state.write_gate.lock().await;
+    let Some(entry) = state.db.peek_due_object_purge().await? else {
+        return Ok(false);
+    };
+
+    let binding = state
+        .db
+        .get_fragment_binding(entry.owner_uid.clone(), entry.fragment.clone())
+        .await?;
+
+    match binding {
+        Some(binding) => match state
+            .broker
+            .soft_delete_object(&binding, &entry.storage_object_id)
+            .await
+        {
+            Ok(()) => {
+                state
+                    .db
+                    .complete_object_purge(
+                        entry.owner_uid.clone(),
+                        entry.fragment.clone(),
+                        entry.object_key.clone(),
+                    )
+                    .await?;
+            }
+            Err(err) => {
+                warn!(
+                    "object purge queue failed for {}/{}/{} (attempt {}): {}",
+                    entry.owner_uid,
+                    entry.fragment,
+                    entry.object_key,
+                    entry.attempts.saturating_add(1),
+                    err.message
+                );
+                state
+                    .db
+                    .fail_object_purge(
+                        entry.owner_uid.clone(),
+                        entry.fragment.clone(),
+                        entry.object_key.clone(),
+                        err.message,
+                        OBJECT_PURGE_QUEUE_RETRY_SECS,
+                    )
+                    .await?;
+            }
+        },
+        None => {
+            let message = "fragment is not linked to a storage backend".to_string();
+            warn!(
+                "object purge queue deferred for {}/{}/{}: {}",
+                entry.owner_uid, entry.fragment, entry.object_key, message
+            );
+            state
+                .db
+                .fail_object_purge(
+                    entry.owner_uid.clone(),
+                    entry.fragment.clone(),
+                    entry.object_key.clone(),
+                    message,
+                    OBJECT_PURGE_QUEUE_RETRY_SECS,
+                )
+                .await?;
+        }
+    }
+
+    Ok(true)
+}
+
+async fn run_object_purge_reconciler(state: AppState) {
+    let mut interval = tokio::time::interval(Duration::from_secs(OBJECT_PURGE_QUEUE_INTERVAL_SECS));
+    loop {
+        interval.tick().await;
+        loop {
+            match process_next_object_purge(&state).await {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(err) => {
+                    warn!("object purge reconciler iteration failed: {}", err.message);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 async fn ensure_user_default_fragment(
     state: &AppState,
     user: &UserRecord,
@@ -280,18 +379,28 @@ async fn ensure_user_default_fragment(
     Ok(fragment_hash)
 }
 
-async fn create_user_with_default_fragment(
+async fn ensure_user_default_fragment_if_needed(
+    state: &AppState,
+    user: &UserRecord,
+) -> Result<Option<String>, RegistryError> {
+    if user.is_admin {
+        return Ok(None);
+    }
+    ensure_user_default_fragment(state, user).await.map(Some)
+}
+
+async fn create_user_with_initial_storage_if_needed(
     state: &AppState,
     email: String,
     password_hash: String,
     quota_limit_bytes: Option<i64>,
     is_admin: bool,
-) -> Result<(UserRecord, String), RegistryError> {
+) -> Result<(UserRecord, Option<String>), RegistryError> {
     let user = state
         .db
         .create_user(email, password_hash, quota_limit_bytes, is_admin)
         .await?;
-    match ensure_user_default_fragment(state, &user).await {
+    match ensure_user_default_fragment_if_needed(state, &user).await {
         Ok(fragment) => Ok((user, fragment)),
         Err(err) => {
             if let Err(cleanup_err) = state.db.delete_user_cascade(user.uid.clone()).await {
@@ -443,6 +552,7 @@ async fn run() -> Result<(), String> {
     };
 
     tokio::spawn(run_pending_upload_reconciler(state.clone()));
+    tokio::spawn(run_object_purge_reconciler(state.clone()));
 
     let app = build_router(state);
     let addr: SocketAddr = format!("{}:{}", config.host, config.https_port)
@@ -653,22 +763,16 @@ async fn bootstrap_admin(
     let email = normalize_email(&req.email)?;
     validate_new_password(&req.password)?;
     let password_hash = auth::hash_password(&req.password)?;
-    let (user, fragment) =
-        create_user_with_default_fragment(&state, email, password_hash, None, true).await?;
+    let user = state
+        .db
+        .create_user(email, password_hash, None, true)
+        .await?;
     let (access_token, expires_in, refresh_token, refresh_expires_in) =
         issue_registry_session(&state, &user).await?;
     publish_owner_event(
         &state,
         &user.uid,
         RegistryRealtimePayload::UserCreated(user.clone()),
-    );
-    publish_owner_event(
-        &state,
-        &user.uid,
-        RegistryRealtimePayload::FragmentsInvalidated(FragmentNotice {
-            uid: user.uid.clone(),
-            fragment: Some(fragment),
-        }),
     );
     publish_owner_event(
         &state,
@@ -713,7 +817,6 @@ async fn admin_login(
     }
     verify_password(&req.password, &auth_user.password_hash)?;
     verify_optional_totp(&auth_user, req.otp.as_deref())?;
-    let _ = ensure_user_default_fragment(&state, &auth_user.user).await?;
     let (access_token, expires_in, refresh_token, refresh_expires_in) =
         issue_registry_session(&state, &auth_user.user).await?;
     publish_owner_event(
@@ -751,7 +854,7 @@ async fn create_user(
     let email = normalize_email(&req.email)?;
     validate_new_password(&req.password)?;
     let password_hash = auth::hash_password(&req.password)?;
-    let (user, fragment) = create_user_with_default_fragment(
+    let (user, fragment) = create_user_with_initial_storage_if_needed(
         &state,
         email,
         password_hash,
@@ -764,14 +867,16 @@ async fn create_user(
         &user.uid,
         RegistryRealtimePayload::UserCreated(user.clone()),
     );
-    publish_owner_event(
-        &state,
-        &user.uid,
-        RegistryRealtimePayload::FragmentsInvalidated(FragmentNotice {
-            uid: user.uid.clone(),
-            fragment: Some(fragment),
-        }),
-    );
+    if let Some(fragment) = fragment {
+        publish_owner_event(
+            &state,
+            &user.uid,
+            RegistryRealtimePayload::FragmentsInvalidated(FragmentNotice {
+                uid: user.uid.clone(),
+                fragment: Some(fragment),
+            }),
+        );
+    }
     Ok((StatusCode::CREATED, Json(CreateUserResponse { user })))
 }
 
@@ -784,7 +889,8 @@ async fn signup(
     validate_new_password(&req.password)?;
     let password_hash = auth::hash_password(&req.password)?;
     let (user, fragment) =
-        create_user_with_default_fragment(&state, email, password_hash, None, false).await?;
+        create_user_with_initial_storage_if_needed(&state, email, password_hash, None, false)
+            .await?;
     let (access_token, expires_in, refresh_token, refresh_expires_in) =
         issue_registry_session(&state, &user).await?;
     publish_owner_event(
@@ -792,14 +898,16 @@ async fn signup(
         &user.uid,
         RegistryRealtimePayload::AccountCreated(user.clone()),
     );
-    publish_owner_event(
-        &state,
-        &user.uid,
-        RegistryRealtimePayload::FragmentsInvalidated(FragmentNotice {
-            uid: user.uid.clone(),
-            fragment: Some(fragment),
-        }),
-    );
+    if let Some(fragment) = fragment {
+        publish_owner_event(
+            &state,
+            &user.uid,
+            RegistryRealtimePayload::FragmentsInvalidated(FragmentNotice {
+                uid: user.uid.clone(),
+                fragment: Some(fragment),
+            }),
+        );
+    }
     publish_owner_event(
         &state,
         &user.uid,
@@ -835,7 +943,7 @@ async fn login(
         .ok_or_else(|| RegistryError::unauthorized("invalid credentials"))?;
     verify_password(&req.password, &auth_user.password_hash)?;
     verify_optional_totp(&auth_user, req.otp.as_deref())?;
-    let _ = ensure_user_default_fragment(&state, &auth_user.user).await?;
+    let _ = ensure_user_default_fragment_if_needed(&state, &auth_user.user).await?;
     let (access_token, expires_in, refresh_token, refresh_expires_in) =
         issue_registry_session(&state, &auth_user.user).await?;
     publish_owner_event(
@@ -1581,17 +1689,75 @@ async fn finalize_object(
         publish_pending_upload_cleanup_invalidations(&state, removed_scopes);
     }
     let _write_guard = state.write_gate.lock().await;
-    let (object, user) = state
+    let fragment = req.fragment.clone();
+    let object_key = req.object_key.clone();
+    let owner_uid = claims.sub.clone();
+
+    let binding = state
         .db
-        .finalize_object(
-            claims.sub,
-            req.fragment,
-            req.object_key,
-            req.version_id,
-            req.object_size_bytes,
-            req.content_type,
-        )
+        .get_fragment_binding(owner_uid.clone(), fragment.clone())
         .await?;
+    let pending_or_existing = state
+        .db
+        .resolve_any_object_record(owner_uid.clone(), fragment.clone(), object_key.clone())
+        .await?;
+
+    let (object, user) = if let (Some(binding), Some(stored)) = (binding, pending_or_existing) {
+        let mut engine_state = None;
+        let mut backoff_ms = 75;
+        for attempt in 0..5 {
+            let candidate = state
+                .broker
+                .read_current_object_state(&binding, &stored.storage_object_id, true)
+                .await?;
+            if candidate.current.is_some() {
+                engine_state = Some(candidate);
+                break;
+            }
+            if attempt == 4 {
+                engine_state = Some(candidate);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            backoff_ms *= 2;
+        }
+        let engine_state = engine_state.expect("engine state should be set by finalize retry loop");
+        let current = engine_state
+            .current
+            .or_else(|| infer_latest_engine_head(&engine_state.versions))
+            .ok_or_else(|| {
+            RegistryError::bad_gateway(
+                "storage finalize did not produce a readable committed object",
+            )
+        })?;
+        let (object, user) = state
+            .db
+            .sync_object_from_engine(
+                owner_uid,
+                fragment.clone(),
+                object_key.clone(),
+                stored.storage_object_id,
+                Some(current),
+                engine_state.versions,
+            )
+            .await?;
+        let object = object.ok_or_else(|| {
+            RegistryError::bad_gateway("storage finalize did not produce a committed registry head")
+        })?;
+        (object, user)
+    } else {
+        state
+            .db
+            .finalize_object(
+                claims.sub,
+                req.fragment,
+                req.object_key,
+                req.version_id,
+                req.object_size_bytes,
+                req.content_type,
+            )
+            .await?
+    };
     publish_owner_event(
         &state,
         &object.owner_uid,
@@ -1853,7 +2019,7 @@ async fn trash_object(
     let _write_guard = state.write_gate.lock().await;
     let (object, user) = state
         .db
-        .set_object_status(claims.sub, fragment.clone(), object_key.clone(), "trashed")
+        .trash_object_if_ready(claims.sub, fragment.clone(), object_key.clone())
         .await?;
     publish_owner_event(
         &state,
@@ -1887,7 +2053,7 @@ async fn trash_objects_prefix(
     let _write_guard = state.write_gate.lock().await;
     let (affected, user) = state
         .db
-        .set_objects_status_by_prefix(claims.sub, fragment.clone(), req.prefix, "trashed")
+        .trash_objects_by_prefix_from_ready(claims.sub, fragment.clone(), req.prefix)
         .await?;
     publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
     Ok(Json(BulkObjectMutationResponse {
@@ -1916,7 +2082,7 @@ async fn trash_objects_bulk(
     let _write_guard = state.write_gate.lock().await;
     let (affected, not_found, user) = state
         .db
-        .set_objects_status_bulk(claims.sub, fragment.clone(), object_keys.clone(), "trashed")
+        .trash_objects_bulk_from_ready(claims.sub, fragment.clone(), object_keys.clone())
         .await?;
     publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
     Ok(Json(BulkObjectSelectionResponse {
@@ -1939,10 +2105,63 @@ async fn recover_object(
     let object_key = req.object_key.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
     let _write_guard = state.write_gate.lock().await;
-    let (object, user) = state
+    let stored = state
         .db
-        .set_object_status(claims.sub, fragment.clone(), object_key, "ready")
-        .await?;
+        .resolve_stored_object_record(claims.sub.clone(), fragment.clone(), object_key.clone())
+        .await?
+        .ok_or_else(|| RegistryError::not_found("object not found"))?;
+
+    let (object, user) = if stored.status == "purged" {
+        let binding = state
+            .db
+            .get_fragment_binding(claims.sub.clone(), fragment.clone())
+            .await?
+            .ok_or_else(|| {
+                RegistryError::conflict(
+                    "fragment is not linked to a storage backend yet; link it first",
+                )
+            })?;
+
+        let engine_state = match state
+            .broker
+            .read_current_object_state(&binding, &stored.storage_object_id, true)
+            .await
+        {
+            Ok(engine_state) if engine_state.current.is_some() => engine_state,
+            Ok(_) => {
+                state
+                    .broker
+                    .recover_object_and_read_state(&binding, &stored.storage_object_id)
+                    .await?
+            }
+            Err(err) => return Err(err),
+        };
+
+        state
+            .db
+            .cancel_object_purge(claims.sub.clone(), fragment.clone(), object_key.clone())
+            .await?;
+        let (object, user) = state
+            .db
+            .sync_object_from_engine(
+                claims.sub,
+                fragment.clone(),
+                object_key.clone(),
+                stored.storage_object_id.clone(),
+                engine_state.current,
+                engine_state.versions,
+            )
+            .await?;
+        let object = object.ok_or_else(|| {
+            RegistryError::not_found("object can no longer be recovered from storage")
+        })?;
+        (object, user)
+    } else {
+        state
+            .db
+            .set_object_status(claims.sub, fragment.clone(), object_key.clone(), "ready")
+            .await?
+    };
     publish_owner_event(
         &state,
         &object.owner_uid,
@@ -1971,7 +2190,7 @@ async fn recover_objects_prefix(
     let _write_guard = state.write_gate.lock().await;
     let (affected, user) = state
         .db
-        .set_objects_status_by_prefix(claims.sub, fragment.clone(), req.prefix, "ready")
+        .recover_objects_by_prefix_from_trash(claims.sub, fragment.clone(), req.prefix)
         .await?;
     publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
     Ok(Json(BulkObjectMutationResponse {
@@ -2000,7 +2219,7 @@ async fn recover_objects_bulk(
     let _write_guard = state.write_gate.lock().await;
     let (affected, not_found, user) = state
         .db
-        .set_objects_status_bulk(claims.sub, fragment.clone(), object_keys.clone(), "ready")
+        .recover_objects_bulk_from_trash(claims.sub, fragment.clone(), object_keys.clone())
         .await?;
     publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
     Ok(Json(BulkObjectSelectionResponse {
@@ -2023,23 +2242,9 @@ async fn delete_object(
     let object_key = query.object_key.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
     let _write_guard = state.write_gate.lock().await;
-    let binding = state
+    let (removed, user) = state
         .db
-        .get_fragment_binding(claims.sub.clone(), fragment.clone())
-        .await?;
-    let current_object = state
-        .db
-        .resolve_any_object_record(claims.sub.clone(), fragment.clone(), object_key.clone())
-        .await?;
-    if let (Some(binding), Some(current_object)) = (binding.as_ref(), current_object.as_ref()) {
-        state
-            .broker
-            .permanently_delete_objects(binding, [current_object.storage_object_id.clone()])
-            .await?;
-    }
-    let user = state
-        .db
-        .delete_object(claims.sub, fragment.clone(), object_key.clone())
+        .purge_object(claims.sub, fragment.clone(), object_key.clone())
         .await?;
     publish_owner_event(
         &state,
@@ -2050,9 +2255,11 @@ async fn delete_object(
             version_id: None,
         }),
     );
-    publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
+    publish_owner_invalidation(&state, &user.uid, Some(fragment.clone()), "objects");
+    publish_owner_invalidation(&state, &user.uid, Some(fragment.clone()), "trash");
+    publish_owner_invalidation(&state, &user.uid, Some(fragment), "account_profile");
     Ok(Json(ObjectDeleteResponse {
-        removed: true,
+        removed,
         quota_limit_bytes: user.quota_limit_bytes,
         quota_used_bytes: user.quota_used_bytes,
     }))
@@ -2072,28 +2279,13 @@ async fn delete_objects_prefix(
     let prefix = req.prefix.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
     let _write_guard = state.write_gate.lock().await;
-    let binding = state
+    let (affected, user) = state
         .db
-        .get_fragment_binding(claims.sub.clone(), fragment.clone())
+        .purge_objects_by_prefix(claims.sub, fragment.clone(), prefix)
         .await?;
-    let storage_ids = state
-        .db
-        .list_objects_by_prefix_any_status(claims.sub.clone(), fragment.clone(), prefix.clone())
-        .await?
-        .into_iter()
-        .map(|object| object.storage_object_id)
-        .collect::<BTreeSet<_>>();
-    if let Some(binding) = binding.as_ref() {
-        state
-            .broker
-            .permanently_delete_objects(binding, storage_ids)
-            .await?;
-    }
-    let (affected, _deleted_storage_ids, user) = state
-        .db
-        .delete_objects_by_prefix(claims.sub, fragment.clone(), prefix)
-        .await?;
-    publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
+    publish_owner_invalidation(&state, &user.uid, Some(fragment.clone()), "objects");
+    publish_owner_invalidation(&state, &user.uid, Some(fragment.clone()), "trash");
+    publish_owner_invalidation(&state, &user.uid, Some(fragment), "account_profile");
     Ok(Json(BulkObjectMutationResponse {
         affected,
         quota_limit_bytes: user.quota_limit_bytes,
@@ -2234,26 +2426,13 @@ async fn empty_trash(
     let fragment = req.fragment.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
     let _write_guard = state.write_gate.lock().await;
-    if let Some(binding) = state
+    let (affected, user) = state
         .db
-        .get_fragment_binding(claims.sub.clone(), fragment.clone())
-        .await?
-    {
-        let trashed_objects = state
-            .db
-            .list_objects_with_status(claims.sub.clone(), fragment.clone(), "trashed")
-            .await?;
-        let storage_ids = trashed_objects
-            .into_iter()
-            .map(|object| object.storage_object_id)
-            .collect::<BTreeSet<_>>();
-        state
-            .broker
-            .permanently_delete_objects(&binding, storage_ids)
-            .await?;
-    }
-    let (affected, user) = state.db.empty_trash(claims.sub, fragment.clone()).await?;
-    publish_owner_invalidation(&state, &user.uid, Some(fragment), "trash");
+        .purge_trashed_objects(claims.sub, fragment.clone())
+        .await?;
+    publish_owner_invalidation(&state, &user.uid, Some(fragment.clone()), "trash");
+    publish_owner_invalidation(&state, &user.uid, Some(fragment.clone()), "objects");
+    publish_owner_invalidation(&state, &user.uid, Some(fragment), "account_profile");
     Ok(Json(BulkObjectMutationResponse {
         affected,
         quota_limit_bytes: user.quota_limit_bytes,
@@ -2629,6 +2808,12 @@ mod tests {
                 ),
             )
             .route(
+                "/n1/objects/recover/{*object_key}",
+                post(|StubPath(_object_key): StubPath<String>| async move {
+                    StatusCode::OK
+                }),
+            )
+            .route(
                 "/n1/trash/recover-all",
                 post(|| async move {
                     (
@@ -2701,6 +2886,7 @@ mod tests {
         let bulk_calls = calls.clone();
         let permanent_calls = calls.clone();
         let recover_calls = calls.clone();
+        let recover_object_calls = calls.clone();
         let recover_all_calls = calls.clone();
         let empty_calls = calls.clone();
         let recover_status_calls = calls.clone();
@@ -2773,6 +2959,19 @@ mod tests {
                         }
                     },
                 ),
+            )
+            .route(
+                "/n1/objects/recover/{*object_key}",
+                post(move |StubPath(object_key): StubPath<String>| {
+                    let recover_object_calls = recover_object_calls.clone();
+                    async move {
+                        recover_object_calls
+                            .lock()
+                            .await
+                            .push(format!("POST /n1/objects/recover/{object_key}"));
+                        StatusCode::OK
+                    }
+                }),
             )
             .route(
                 "/n1/trash/recover-all",
@@ -2865,6 +3064,8 @@ mod tests {
         let meta_state = state.clone();
         let versions_state = state.clone();
         let delete_state = state.clone();
+        let soft_delete_state = state.clone();
+        let recover_state = state.clone();
 
         let app = Router::new()
             .route(
@@ -2987,6 +3188,61 @@ mod tests {
                         }
                     },
                 ),
+            );
+        let app = app
+            .route(
+                "/n1/objects/{*object_key}",
+                delete(move |StubPath(object_key): StubPath<String>| {
+                    let soft_delete_state = soft_delete_state.clone();
+                    async move {
+                        let mut state = soft_delete_state.lock().await;
+                        let entry_key = if state.contains_key(&object_key) {
+                            Some(object_key.clone())
+                        } else if state.len() == 1 {
+                            state.keys().next().cloned()
+                        } else {
+                            None
+                        };
+                        let Some(entry_key) = entry_key else {
+                            return StatusCode::NOT_FOUND;
+                        };
+                        let Some(entry) = state.get_mut(&entry_key) else {
+                            return StatusCode::NOT_FOUND;
+                        };
+                        if !entry.current_visible {
+                            return StatusCode::NOT_FOUND;
+                        }
+                        entry.current_visible = false;
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .route(
+                "/n1/objects/recover/{*object_key}",
+                post(move |StubPath(object_key): StubPath<String>| {
+                    let recover_state = recover_state.clone();
+                    async move {
+                        let mut state = recover_state.lock().await;
+                        let entry_key = if state.contains_key(&object_key) {
+                            Some(object_key.clone())
+                        } else if state.len() == 1 {
+                            state.keys().next().cloned()
+                        } else {
+                            None
+                        };
+                        let Some(entry_key) = entry_key else {
+                            return StatusCode::NOT_FOUND;
+                        };
+                        let Some(entry) = state.get_mut(&entry_key) else {
+                            return StatusCode::NOT_FOUND;
+                        };
+                        if entry.versions.is_empty() {
+                            return StatusCode::NOT_FOUND;
+                        }
+                        entry.current_visible = true;
+                        StatusCode::OK
+                    }
+                }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3139,6 +3395,17 @@ mod tests {
                     continue;
                 }
                 panic!("unexpected websocket event: {}", json);
+            }
+        }
+    }
+
+    async fn drain_object_purge_queue(state: &AppState) {
+        loop {
+            let processed = process_next_object_purge(state)
+                .await
+                .expect("process purge queue");
+            if !processed {
+                break;
             }
         }
     }
@@ -3636,6 +3903,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_bootstrap_and_login_do_not_require_storage_provisioning() {
+        let single_url =
+            spawn_storage_stub_with_auth_status("single-stub-token", StatusCode::NOT_FOUND).await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, _) = test_state(single_url, multi_url).await;
+        let app = build_router(state.clone());
+
+        let bootstrap_req = Request::builder()
+            .method("POST")
+            .uri("/v1/admin/bootstrap")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "email": "ops-admin@example.com",
+                    "password": "password123",
+                    "master_key": "registry-master"
+                }))
+                .expect("serialize bootstrap request"),
+            ))
+            .expect("bootstrap request");
+        let bootstrap_resp = app
+            .clone()
+            .oneshot(bootstrap_req)
+            .await
+            .expect("bootstrap response");
+        assert_eq!(bootstrap_resp.status(), StatusCode::CREATED);
+        let bootstrap_body = axum::body::to_bytes(bootstrap_resp.into_body(), usize::MAX)
+            .await
+            .expect("read bootstrap body");
+        let bootstrap_json: Value =
+            serde_json::from_slice(&bootstrap_body).expect("parse bootstrap body");
+        let admin_uid = bootstrap_json["user"]["uid"]
+            .as_str()
+            .expect("bootstrap uid")
+            .to_string();
+        let access_token = bootstrap_json["access_token"]
+            .as_str()
+            .expect("bootstrap access token");
+
+        assert!(
+            state
+                .db
+                .list_fragments(admin_uid)
+                .await
+                .expect("list admin fragments")
+                .is_empty(),
+            "bootstrap admin should not auto-provision a storage fragment"
+        );
+
+        let fragments_req = Request::builder()
+            .method("GET")
+            .uri("/v1/fragments")
+            .header("authorization", format!("Bearer {}", access_token))
+            .body(Body::empty())
+            .expect("fragments request");
+        let fragments_resp = app
+            .clone()
+            .oneshot(fragments_req)
+            .await
+            .expect("fragments response");
+        assert_eq!(fragments_resp.status(), StatusCode::OK);
+        let fragments_body = axum::body::to_bytes(fragments_resp.into_body(), usize::MAX)
+            .await
+            .expect("read fragments body");
+        let fragments_json: Value =
+            serde_json::from_slice(&fragments_body).expect("parse fragments body");
+        assert_eq!(
+            fragments_json["fragments"]
+                .as_array()
+                .expect("fragments array")
+                .len(),
+            0
+        );
+
+        let login_req = Request::builder()
+            .method("POST")
+            .uri("/v1/admin/auth/login")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "email": "ops-admin@example.com",
+                    "password": "password123"
+                }))
+                .expect("serialize admin login request"),
+            ))
+            .expect("admin login request");
+        let login_resp = app.clone().oneshot(login_req).await.expect("admin login response");
+        assert_eq!(login_resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn admin_stats_expose_usage_and_activity() {
         let single_url = spawn_storage_stub("single-stub-token").await;
         let multi_url = spawn_storage_stub("multi-stub-token").await;
@@ -3900,6 +4258,228 @@ mod tests {
         assert_eq!(admin_event["data"]["object_key"], "images/scan-001.png");
 
         expect_no_registry_event(&mut other_ws, Duration::from_millis(350)).await;
+    }
+
+    #[tokio::test]
+    async fn finalize_route_syncs_engine_truth_instead_of_trusting_client_finalize_payload() {
+        let mut objects = HashMap::new();
+        objects.insert(
+            "engine-flat-key".to_string(),
+            StubObjectState {
+                current_visible: true,
+                versions: vec![
+                    StubVersion {
+                        version_id: "01ENGINEFINALIZE0000000000000002".to_string(),
+                        object_size_bytes: 157_230_177,
+                        content_type: "video/quicktime".to_string(),
+                        created_at: 2_000,
+                    },
+                    StubVersion {
+                        version_id: "01ENGINEFINALIZE0000000000000001".to_string(),
+                        object_size_bytes: 157_230_176,
+                        content_type: "video/quicktime".to_string(),
+                        created_at: 1_000,
+                    },
+                ],
+            },
+        );
+
+        let single_url = spawn_storage_version_stub(objects).await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, drive_token) = test_state(single_url, multi_url).await;
+        let drive_user = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment");
+
+        let pending = state
+            .db
+            .register_pending_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "videos/IMG_8634.mov".to_string(),
+                Some(512),
+                Some("application/octet-stream".to_string()),
+                Some("01CLIENTWRONGFINALIZE000000000001".to_string()),
+                Some("session-client-wrong".to_string()),
+            )
+            .await
+            .expect("register pending object");
+
+        let app = build_router(state.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/objects/finalize")
+            .header("authorization", format!("Bearer {}", drive_token))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "fragment": "fragment-a",
+                    "object_key": "videos/IMG_8634.mov",
+                    "version_id": "01CLIENTWRONGFINALIZE000000000099",
+                    "object_size_bytes": 1,
+                    "content_type": "application/octet-stream"
+                }))
+                .expect("serialize finalize request"),
+            ))
+            .expect("build finalize request");
+
+        let response = app.oneshot(request).await.expect("finalize response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read finalize body");
+        let payload: Value = serde_json::from_slice(&body).expect("parse finalize body");
+
+        assert_eq!(
+            payload["object"]["storage_object_id"].as_str(),
+            Some(pending.storage_object_id.as_str())
+        );
+        assert_eq!(
+            payload["object"]["version_id"].as_str(),
+            Some("01ENGINEFINALIZE0000000000000002")
+        );
+        assert_eq!(
+            payload["object"]["object_size_bytes"].as_i64(),
+            Some(157_230_177)
+        );
+        assert_eq!(
+            payload["object"]["content_type"].as_str(),
+            Some("video/quicktime")
+        );
+        assert_eq!(payload["quota_used_bytes"].as_i64(), Some(157_230_177));
+
+        let resolved = state
+            .db
+            .resolve_object(
+                drive_user.uid,
+                "fragment-a".to_string(),
+                "videos/IMG_8634.mov".to_string(),
+            )
+            .await
+            .expect("resolve finalized object")
+            .expect("finalized object exists");
+        assert_eq!(resolved.storage_object_id, pending.storage_object_id);
+        assert_eq!(resolved.version_id, "01ENGINEFINALIZE0000000000000002");
+        assert_eq!(resolved.object_size_bytes, 157_230_177);
+        assert_eq!(resolved.content_type.as_deref(), Some("video/quicktime"));
+    }
+
+    #[tokio::test]
+    async fn finalize_route_can_commit_from_engine_versions_when_head_metadata_lags() {
+        let mut objects = HashMap::new();
+        objects.insert(
+            "engine-flat-key".to_string(),
+            StubObjectState {
+                current_visible: false,
+                versions: vec![
+                    StubVersion {
+                        version_id: "01ENGINEVERSIONSLAG000000000002".to_string(),
+                        object_size_bytes: 4_096,
+                        content_type: "video/quicktime".to_string(),
+                        created_at: 2_000,
+                    },
+                    StubVersion {
+                        version_id: "01ENGINEVERSIONSLAG000000000001".to_string(),
+                        object_size_bytes: 4_095,
+                        content_type: "video/quicktime".to_string(),
+                        created_at: 1_000,
+                    },
+                ],
+            },
+        );
+
+        let single_url = spawn_storage_version_stub(objects).await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, drive_token) = test_state(single_url, multi_url).await;
+        let drive_user = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment");
+
+        let pending = state
+            .db
+            .register_pending_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "videos/IMG_8634.mov".to_string(),
+                Some(4_096),
+                Some("video/quicktime".to_string()),
+                Some("01CLIENTVERSIONSLAG000000000001".to_string()),
+                Some("session-client-versions-lag".to_string()),
+            )
+            .await
+            .expect("register pending object");
+
+        let app = build_router(state.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/objects/finalize")
+            .header("authorization", format!("Bearer {}", drive_token))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "fragment": "fragment-a",
+                    "object_key": "videos/IMG_8634.mov",
+                    "version_id": "01CLIENTVERSIONSLAG000000000099",
+                    "object_size_bytes": 1,
+                    "content_type": "application/octet-stream"
+                }))
+                .expect("serialize finalize request"),
+            ))
+            .expect("build finalize request");
+
+        let response = app.oneshot(request).await.expect("finalize response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read finalize body");
+        let payload: Value = serde_json::from_slice(&body).expect("parse finalize body");
+
+        assert_eq!(
+            payload["object"]["storage_object_id"].as_str(),
+            Some(pending.storage_object_id.as_str())
+        );
+        assert_eq!(
+            payload["object"]["version_id"].as_str(),
+            Some("01ENGINEVERSIONSLAG000000000002")
+        );
+        assert_eq!(
+            payload["object"]["object_size_bytes"].as_i64(),
+            Some(4_096)
+        );
+        assert_eq!(
+            payload["object"]["content_type"].as_str(),
+            Some("video/quicktime")
+        );
     }
 
     #[tokio::test]
@@ -4501,23 +5081,11 @@ mod tests {
         assert_eq!(prefix_delete_resp.status(), reqwest::StatusCode::OK);
 
         let recorded = calls.lock().await.clone();
-        assert_eq!(recorded.len(), 4);
-        assert!(recorded.contains(&format!(
-            "DELETE /n1/objects/permanent/{}",
-            delete_object.storage_object_id
-        )));
-        assert!(recorded.contains(&format!(
-            "DELETE /n1/objects/permanent/{}",
-            single_object.storage_object_id
-        )));
-        assert!(recorded.contains(&format!(
-            "DELETE /n1/objects/permanent/{}",
-            prefix_a.storage_object_id
-        )));
-        assert!(recorded.contains(&format!(
-            "DELETE /n1/objects/permanent/{}",
-            prefix_b.storage_object_id
-        )));
+        assert!(
+            recorded.is_empty(),
+            "request path should stay registry-local before the purge worker runs: {:?}",
+            recorded
+        );
         assert!(
             !recorded.iter().any(|entry| {
                 entry.starts_with("DELETE /n1/objects/")
@@ -4538,30 +5106,797 @@ mod tests {
             "logical bulk trash should stay in registry: {:?}",
             recorded
         );
+
+        let deleted_status = state
+            .db
+            .resolve_any_object_record(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "logical/delete.bin".to_string(),
+            )
+            .await
+            .expect("resolve delete after purge")
+            .expect("delete tombstone exists");
+        assert_eq!(deleted_status.status, "purged");
+        let single_status = state
+            .db
+            .resolve_any_object_record(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "logical/single.bin".to_string(),
+            )
+            .await
+            .expect("resolve single after purge")
+            .expect("single tombstone exists");
+        assert_eq!(single_status.status, "purged");
+        let prefix_a_status = state
+            .db
+            .resolve_any_object_record(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "logical/prefix/a.bin".to_string(),
+            )
+            .await
+            .expect("resolve prefix a after purge")
+            .expect("prefix a tombstone exists");
+        assert_eq!(prefix_a_status.status, "purged");
+        let prefix_b_status = state
+            .db
+            .resolve_any_object_record(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "logical/prefix/b.bin".to_string(),
+            )
+            .await
+            .expect("resolve prefix b after purge")
+            .expect("prefix b tombstone exists");
+        assert_eq!(prefix_b_status.status, "purged");
+
+        drain_object_purge_queue(&state).await;
+
+        let recorded = calls.lock().await.clone();
+        assert_eq!(recorded.len(), 4);
+        assert!(recorded.contains(&format!(
+            "DELETE /n1/objects/{}",
+            delete_object.storage_object_id
+        )));
+        assert!(recorded.contains(&format!(
+            "DELETE /n1/objects/{}",
+            single_object.storage_object_id
+        )));
+        assert!(recorded.contains(&format!(
+            "DELETE /n1/objects/{}",
+            prefix_a.storage_object_id
+        )));
+        assert!(recorded.contains(&format!(
+            "DELETE /n1/objects/{}",
+            prefix_b.storage_object_id
+        )));
+        assert!(
+            !recorded
+                .iter()
+                .any(|entry| entry.starts_with("DELETE /n1/objects/permanent/")),
+            "purge worker should only soft-delete in N1: {:?}",
+            recorded
+        );
+        assert!(
+            state
+                .db
+                .peek_due_object_purge()
+                .await
+                .expect("peek purge queue after drain")
+                .is_none(),
+            "purge queue should be empty after draining"
+        );
+    }
+
+    #[tokio::test]
+    async fn purged_object_can_be_recovered_before_storage_lifecycle_removes_it() {
+        let mut objects = HashMap::new();
+        objects.insert(
+            "stub-storage-key".to_string(),
+            StubObjectState {
+                current_visible: true,
+                versions: vec![StubVersion {
+                    version_id: "01HPURGEDRECOVER000000000000001".to_string(),
+                    object_size_bytes: 2048,
+                    content_type: "application/octet-stream".to_string(),
+                    created_at: 100,
+                }],
+            },
+        );
+
+        let single_url = spawn_storage_version_stub(objects).await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, drive_token) = test_state(single_url, multi_url).await;
+        let drive_user = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment");
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "logical/purged.bin".to_string(),
+                "01HPURGEDRECOVER000000000000001".to_string(),
+                2048,
+                Some("application/octet-stream".to_string()),
+            )
+            .await
+            .expect("finalize object");
+
+        let base_url = spawn_registry_server(state.clone()).await;
+        let client = Client::new();
+
+        let delete_resp = client
+            .delete(format!(
+                "{}/v1/objects?fragment=fragment-a&object_key=logical/purged.bin",
+                base_url
+            ))
+            .bearer_auth(&drive_token)
+            .send()
+            .await
+            .expect("delete request");
+        assert_eq!(delete_resp.status(), reqwest::StatusCode::OK);
+
         assert!(
             state
                 .db
                 .resolve_any_object_record(
                     drive_user.uid.clone(),
                     "fragment-a".to_string(),
-                    "logical/prefix/a.bin".to_string(),
+                    "logical/purged.bin".to_string(),
                 )
                 .await
-                .expect("resolve prefix a after delete")
-                .is_none()
+                .expect("resolve purged object")
+                .is_some_and(|object| object.status == "purged")
         );
+
+        drain_object_purge_queue(&state).await;
+
+        let recover_resp = client
+            .post(format!("{}/v1/objects/recover", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "object_key": "logical/purged.bin"
+            }))
+            .send()
+            .await
+            .expect("recover request");
+        assert_eq!(recover_resp.status(), reqwest::StatusCode::OK);
+        let recover_json: Value = recover_resp.json().await.expect("parse recover response");
+        assert_eq!(recover_json["object"]["object_key"], "logical/purged.bin");
+
+        let restored = state
+            .db
+            .resolve_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "logical/purged.bin".to_string(),
+            )
+            .await
+            .expect("resolve restored object")
+            .expect("restored object exists");
+        assert_eq!(restored.status, "ready");
         assert!(
             state
                 .db
-                .resolve_any_object_record(
-                    drive_user.uid.clone(),
-                    "fragment-a".to_string(),
-                    "logical/prefix/b.bin".to_string(),
-                )
+                .peek_due_object_purge()
                 .await
-                .expect("resolve prefix b after delete")
-                .is_none()
+                .expect("peek purge queue after recover")
+                .is_none(),
+            "recover should cancel the pending purge entry"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_trash_hides_object_immediately_and_leaves_a_purge_tombstone() {
+        let single_url = spawn_storage_recording_stub(
+            "single-stub-token",
+            Arc::new(TokioMutex::new(Vec::new())),
+        )
+        .await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, drive_token) = test_state(single_url, multi_url).await;
+        let drive_user = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment");
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "trash/emptyme.txt".to_string(),
+                "01HEMPTYTRASH000000000000000001".to_string(),
+                1024,
+                Some("text/plain".to_string()),
+            )
+            .await
+            .expect("finalize object");
+
+        let base_url = spawn_registry_server(state.clone()).await;
+        let client = Client::new();
+
+        let trash_resp = client
+            .post(format!("{}/v1/objects/trash", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "object_key": "trash/emptyme.txt"
+            }))
+            .send()
+            .await
+            .expect("trash request");
+        assert_eq!(trash_resp.status(), reqwest::StatusCode::OK);
+
+        let empty_resp = client
+            .post(format!("{}/v1/objects/trash/empty", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a"
+            }))
+            .send()
+            .await
+            .expect("empty trash request");
+        assert_eq!(empty_resp.status(), reqwest::StatusCode::OK);
+
+        let resolve_resp = client
+            .get(format!(
+                "{}/v1/objects/resolve?fragment=fragment-a&object_key=trash/emptyme.txt",
+                base_url
+            ))
+            .bearer_auth(&drive_token)
+            .send()
+            .await
+            .expect("resolve purged object");
+        assert_eq!(resolve_resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+        let stored = state
+            .db
+            .resolve_any_object_record(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "trash/emptyme.txt".to_string(),
+            )
+            .await
+            .expect("resolve tombstone")
+            .expect("tombstone exists");
+        assert_eq!(stored.status, "purged");
+        assert!(
+            state
+                .db
+                .peek_due_object_purge()
+                .await
+                .expect("peek purge queue")
+                .is_some(),
+            "empty trash should enqueue a background N1 soft delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_prefix_restores_only_trashed_objects_not_purged_tombstones() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, drive_token) = test_state(single_url, multi_url).await;
+        let drive_user = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment");
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "folder/trashed.txt".to_string(),
+                "01HRECOVERPREFIX0000000000000001".to_string(),
+                100,
+                Some("text/plain".to_string()),
+            )
+            .await
+            .expect("finalize trashed object");
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "folder/purged.txt".to_string(),
+                "01HRECOVERPREFIX0000000000000002".to_string(),
+                100,
+                Some("text/plain".to_string()),
+            )
+            .await
+            .expect("finalize purged object");
+        state
+            .db
+            .set_object_status(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "folder/trashed.txt".to_string(),
+                "trashed",
+            )
+            .await
+            .expect("trash object");
+        state
+            .db
+            .purge_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "folder/purged.txt".to_string(),
+            )
+            .await
+            .expect("purge object");
+
+        let base_url = spawn_registry_server(state.clone()).await;
+        let client = Client::new();
+
+        let recover_resp = client
+            .post(format!("{}/v1/objects/recover-prefix", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "prefix": "folder"
+            }))
+            .send()
+            .await
+            .expect("recover prefix request");
+        assert_eq!(recover_resp.status(), reqwest::StatusCode::OK);
+        let recover_json: Value = recover_resp.json().await.expect("parse recover prefix");
+        assert_eq!(recover_json["affected"], 1);
+
+        let restored = state
+            .db
+            .resolve_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "folder/trashed.txt".to_string(),
+            )
+            .await
+            .expect("resolve restored trashed object")
+            .expect("restored object exists");
+        assert_eq!(restored.status, "ready");
+
+        let purged = state
+            .db
+            .resolve_any_object_record(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "folder/purged.txt".to_string(),
+            )
+            .await
+            .expect("resolve purged tombstone")
+            .expect("purged tombstone exists");
+        assert_eq!(purged.status, "purged");
+    }
+
+    #[tokio::test]
+    async fn recover_bulk_restores_only_trashed_objects_not_purged_tombstones() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, drive_token) = test_state(single_url, multi_url).await;
+        let drive_user = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment");
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "bulk/trashed.txt".to_string(),
+                "01HRECOVERBULK00000000000000001".to_string(),
+                100,
+                Some("text/plain".to_string()),
+            )
+            .await
+            .expect("finalize trashed object");
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "bulk/purged.txt".to_string(),
+                "01HRECOVERBULK00000000000000002".to_string(),
+                100,
+                Some("text/plain".to_string()),
+            )
+            .await
+            .expect("finalize purged object");
+        state
+            .db
+            .set_object_status(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "bulk/trashed.txt".to_string(),
+                "trashed",
+            )
+            .await
+            .expect("trash object");
+        state
+            .db
+            .purge_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "bulk/purged.txt".to_string(),
+            )
+            .await
+            .expect("purge object");
+
+        let base_url = spawn_registry_server(state.clone()).await;
+        let client = Client::new();
+
+        let recover_resp = client
+            .post(format!("{}/v1/objects/recover/bulk", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "object_keys": ["bulk/trashed.txt", "bulk/purged.txt", "bulk/missing.txt"]
+            }))
+            .send()
+            .await
+            .expect("recover bulk request");
+        assert_eq!(recover_resp.status(), reqwest::StatusCode::OK);
+        let recover_json: Value = recover_resp.json().await.expect("parse recover bulk");
+        assert_eq!(recover_json["affected"], 1);
+        assert_eq!(recover_json["not_found"], 2);
+
+        let restored = state
+            .db
+            .resolve_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "bulk/trashed.txt".to_string(),
+            )
+            .await
+            .expect("resolve restored trashed object")
+            .expect("restored object exists");
+        assert_eq!(restored.status, "ready");
+
+        let purged = state
+            .db
+            .resolve_any_object_record(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "bulk/purged.txt".to_string(),
+            )
+            .await
+            .expect("resolve purged tombstone")
+            .expect("purged tombstone exists");
+        assert_eq!(purged.status, "purged");
+    }
+
+    #[tokio::test]
+    async fn trash_single_does_not_reexpose_purged_tombstones() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, drive_token) = test_state(single_url, multi_url).await;
+        let drive_user = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment");
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "single/purged.txt".to_string(),
+                "01HTRASHSINGLEPURGED00000000001".to_string(),
+                100,
+                Some("text/plain".to_string()),
+            )
+            .await
+            .expect("finalize purged object");
+        state
+            .db
+            .purge_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "single/purged.txt".to_string(),
+            )
+            .await
+            .expect("purge object");
+
+        let base_url = spawn_registry_server(state.clone()).await;
+        let client = Client::new();
+
+        let trash_resp = client
+            .post(format!("{}/v1/objects/trash", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "object_key": "single/purged.txt"
+            }))
+            .send()
+            .await
+            .expect("trash single request");
+        assert_eq!(trash_resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+        let purged = state
+            .db
+            .resolve_any_object_record(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "single/purged.txt".to_string(),
+            )
+            .await
+            .expect("resolve purged tombstone")
+            .expect("purged tombstone exists");
+        assert_eq!(purged.status, "purged");
+    }
+
+    #[tokio::test]
+    async fn trash_prefix_does_not_reexpose_purged_tombstones() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, drive_token) = test_state(single_url, multi_url).await;
+        let drive_user = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment");
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "trash-prefix/ready.txt".to_string(),
+                "01HTRASHPREFIXREADY00000000001".to_string(),
+                100,
+                Some("text/plain".to_string()),
+            )
+            .await
+            .expect("finalize ready object");
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "trash-prefix/purged.txt".to_string(),
+                "01HTRASHPREFIXPURGED0000000001".to_string(),
+                100,
+                Some("text/plain".to_string()),
+            )
+            .await
+            .expect("finalize purged object");
+        state
+            .db
+            .purge_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "trash-prefix/purged.txt".to_string(),
+            )
+            .await
+            .expect("purge object");
+
+        let base_url = spawn_registry_server(state.clone()).await;
+        let client = Client::new();
+
+        let trash_resp = client
+            .post(format!("{}/v1/objects/trash-prefix", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "prefix": "trash-prefix"
+            }))
+            .send()
+            .await
+            .expect("trash prefix request");
+        assert_eq!(trash_resp.status(), reqwest::StatusCode::OK);
+        let trash_json: Value = trash_resp.json().await.expect("parse trash prefix");
+        assert_eq!(trash_json["affected"], 1);
+
+        let ready = state
+            .db
+            .resolve_any_object_record(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "trash-prefix/ready.txt".to_string(),
+            )
+            .await
+            .expect("resolve trashed ready object")
+            .expect("trashed ready object exists");
+        assert_eq!(ready.status, "trashed");
+
+        let purged = state
+            .db
+            .resolve_any_object_record(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "trash-prefix/purged.txt".to_string(),
+            )
+            .await
+            .expect("resolve purged tombstone")
+            .expect("purged tombstone exists");
+        assert_eq!(purged.status, "purged");
+    }
+
+    #[tokio::test]
+    async fn trash_bulk_does_not_reexpose_purged_tombstones() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, drive_token) = test_state(single_url, multi_url).await;
+        let drive_user = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment");
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "trash-bulk/ready.txt".to_string(),
+                "01HTRASHBULKREADY000000000001".to_string(),
+                100,
+                Some("text/plain".to_string()),
+            )
+            .await
+            .expect("finalize ready object");
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "trash-bulk/purged.txt".to_string(),
+                "01HTRASHBULKPURGED00000000001".to_string(),
+                100,
+                Some("text/plain".to_string()),
+            )
+            .await
+            .expect("finalize purged object");
+        state
+            .db
+            .purge_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "trash-bulk/purged.txt".to_string(),
+            )
+            .await
+            .expect("purge object");
+
+        let base_url = spawn_registry_server(state.clone()).await;
+        let client = Client::new();
+
+        let trash_resp = client
+            .post(format!("{}/v1/objects/trash/bulk", base_url))
+            .bearer_auth(&drive_token)
+            .json(&json!({
+                "fragment": "fragment-a",
+                "object_keys": [
+                    "trash-bulk/ready.txt",
+                    "trash-bulk/purged.txt",
+                    "trash-bulk/missing.txt"
+                ]
+            }))
+            .send()
+            .await
+            .expect("trash bulk request");
+        assert_eq!(trash_resp.status(), reqwest::StatusCode::OK);
+        let trash_json: Value = trash_resp.json().await.expect("parse trash bulk");
+        assert_eq!(trash_json["affected"], 1);
+        assert_eq!(trash_json["not_found"], 2);
+
+        let ready = state
+            .db
+            .resolve_any_object_record(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "trash-bulk/ready.txt".to_string(),
+            )
+            .await
+            .expect("resolve trashed ready object")
+            .expect("trashed ready object exists");
+        assert_eq!(ready.status, "trashed");
+
+        let purged = state
+            .db
+            .resolve_any_object_record(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "trash-bulk/purged.txt".to_string(),
+            )
+            .await
+            .expect("resolve purged tombstone")
+            .expect("purged tombstone exists");
+        assert_eq!(purged.status, "purged");
     }
 
     #[tokio::test]
