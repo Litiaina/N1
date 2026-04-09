@@ -1,6 +1,6 @@
 # Registry Documentation
 
-Current `0.7.0` reference for the Registry user-owned metadata and POSIX facade.
+Current `0.8.0` reference for the Registry user-owned metadata and POSIX facade.
 
 Status:
 - `registry-server` is the SQLite-backed control plane above `N1` and `N2`.

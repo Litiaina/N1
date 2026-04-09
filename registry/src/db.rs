@@ -24,6 +24,11 @@ pub struct RegistryListPage {
     pub has_more: bool,
 }
 
+enum RegistryListEntry {
+    Object(ObjectRecord),
+    CommonPrefix(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct RegistryObjectStats {
     pub total_objects: usize,
@@ -1445,9 +1450,9 @@ impl RegistryDb {
             let mut out = by_key.into_values().collect::<Vec<_>>();
             out.sort_by(|a, b| a.object_key.cmp(&b.object_key));
 
-            let mut common_prefixes = std::collections::BTreeSet::new();
-            let objects = if delimiter.as_deref() == Some("/") {
-                let mut direct_children = Vec::new();
+            let entries = if delimiter.as_deref() == Some("/") {
+                let mut emitted_prefixes = std::collections::BTreeSet::new();
+                let mut emitted = Vec::new();
                 for object in out {
                     let suffix = if prefix_filter.is_empty() {
                         object.object_key.as_str()
@@ -1457,33 +1462,47 @@ impl RegistryDb {
                         continue;
                     };
                     if suffix.is_empty() {
-                        direct_children.push(object);
+                        emitted.push(RegistryListEntry::Object(object));
                         continue;
                     }
                     if let Some(idx) = suffix.find('/') {
-                        common_prefixes.insert(format!("{}{}", prefix_filter, &suffix[..idx + 1]));
+                        let common_prefix = format!("{}{}", prefix_filter, &suffix[..idx + 1]);
+                        if emitted_prefixes.insert(common_prefix.clone()) {
+                            emitted.push(RegistryListEntry::CommonPrefix(common_prefix));
+                        }
                         continue;
                     }
-                    direct_children.push(object);
+                    emitted.push(RegistryListEntry::Object(object));
                 }
-                direct_children
+                emitted
             } else {
-                out
+                out.into_iter()
+                    .map(RegistryListEntry::Object)
+                    .collect::<Vec<_>>()
             };
 
-            let mut paged_objects = objects
+            let mut paged_entries = entries
                 .into_iter()
                 .skip(offset)
                 .take(limit.saturating_add(1))
                 .collect::<Vec<_>>();
-            let has_more = paged_objects.len() > limit;
+            let has_more = paged_entries.len() > limit;
             if has_more {
-                paged_objects.truncate(limit);
+                paged_entries.truncate(limit);
+            }
+
+            let mut paged_objects = Vec::new();
+            let mut common_prefixes = Vec::new();
+            for entry in paged_entries {
+                match entry {
+                    RegistryListEntry::Object(object) => paged_objects.push(object),
+                    RegistryListEntry::CommonPrefix(prefix) => common_prefixes.push(prefix),
+                }
             }
 
             Ok(RegistryListPage {
                 objects: paged_objects,
-                common_prefixes: common_prefixes.into_iter().collect(),
+                common_prefixes,
                 has_more,
             })
         })
@@ -5453,6 +5472,95 @@ mod tests {
             ]
         );
         assert!(listing.common_prefixes.is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn delimiter_listing_paginates_objects_and_common_prefixes_together() {
+        let path = std::env::temp_dir().join(format!(
+            "registry-delimiter-pagination-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = RegistryDb::new(path.clone(), 1024 * 1024);
+        db.init().await.expect("init db");
+
+        let password_hash = hash_password("secret").expect("hash password");
+        let user = db
+            .create_user(
+                "delimiter-pagination@example.com".to_string(),
+                password_hash,
+                Some(100_000),
+                false,
+            )
+            .await
+            .expect("create user");
+
+        for (key, version_id) in [
+            ("page/0.bin", "01HDELIMPAGE0000000000000001"),
+            ("page/sub-a/x.bin", "01HDELIMPAGE0000000000000002"),
+            ("page/sub-b/y.bin", "01HDELIMPAGE0000000000000003"),
+            ("page/z.bin", "01HDELIMPAGE0000000000000004"),
+        ] {
+            db.finalize_object(
+                user.uid.clone(),
+                "fragment-a".to_string(),
+                key.to_string(),
+                version_id.to_string(),
+                1024,
+                Some("application/octet-stream".to_string()),
+            )
+            .await
+            .expect("finalize object");
+        }
+
+        let page1 = db
+            .list_objects(
+                user.uid.clone(),
+                Some("fragment-a".to_string()),
+                Some("page".to_string()),
+                Some("/".to_string()),
+                None,
+                2,
+                0,
+                false,
+                false,
+            )
+            .await
+            .expect("list page1");
+        assert_eq!(
+            page1.objects
+                .iter()
+                .map(|object| object.object_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["page/0.bin"]
+        );
+        assert_eq!(page1.common_prefixes, vec!["page/sub-a/".to_string()]);
+        assert!(page1.has_more);
+
+        let page2 = db
+            .list_objects(
+                user.uid,
+                Some("fragment-a".to_string()),
+                Some("page".to_string()),
+                Some("/".to_string()),
+                None,
+                2,
+                2,
+                false,
+                false,
+            )
+            .await
+            .expect("list page2");
+        assert_eq!(
+            page2.objects
+                .iter()
+                .map(|object| object.object_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["page/z.bin"]
+        );
+        assert_eq!(page2.common_prefixes, vec!["page/sub-b/".to_string()]);
+        assert!(!page2.has_more);
 
         let _ = std::fs::remove_file(path);
     }

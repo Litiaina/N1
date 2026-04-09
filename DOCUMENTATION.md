@@ -9,7 +9,7 @@ Use the specialized references instead of treating the whole workspace as one AP
 - [N2_DOCUMENTATION.md](/home/administrator/Development/N1/N2_DOCUMENTATION.md)
   - Current `0.2.0` documentation for the multi-node N2 cluster layer.
 - [REGISTRY_DOCUMENTATION.md](/home/administrator/Development/N1/REGISTRY_DOCUMENTATION.md)
-  - Current `0.7.0` documentation for the Registry user-owned metadata and POSIX facade.
+  - Current `0.8.0` documentation for the Registry user-owned metadata and POSIX facade.
 
 Recommended reading order:
 
