@@ -18,6 +18,7 @@ use crate::{
             init_fragment_metadata, read_fragment_metadata, rotate_fragment_key,
             write_fragment_metadata,
         },
+        indexdb_store::{ensure_fragment_owner_partition_available, evict_fragment_cached_dbs},
         sync::{CreateFragmentRequest, CreateFragmentResponse, ensure_fragment_blob_directories},
     },
     enums::app_error_enum::AppError,
@@ -75,6 +76,7 @@ pub async fn create_fragment(
 
     ensure_fragment_blob_directories(&hash).await;
     let _ = init_fragment_metadata(&hash, &payload.key).await?;
+    ensure_fragment_owner_partition_available(&hash)?;
 
     info!(
         "Created new fragment '{}' with hash: {}",
@@ -237,6 +239,8 @@ pub async fn delete_fragment(
     let fragment_owned = fragment.clone();
 
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        evict_fragment_cached_dbs(&fragment_owned);
+
         for root in index_roots.iter() {
             let fragment_path = root.join(&fragment_owned);
             if fragment_path.exists() {

@@ -16,7 +16,7 @@ Use other documents for:
 
 As of `2026-03-20`:
 - `n2` (`litiaina-n2`) is released at `0.2.0`
-- `n1` (`litiaina-n1`) is the stable single-node engine/runtime at `1.1.0`
+- `n1` (`litiaina-n1`) is the stable single-node engine/runtime at `1.1.1`
 - `registry-server` is released independently at `0.7.0`
 - `n1-arc` remains experimental and is not part of this runbook
 

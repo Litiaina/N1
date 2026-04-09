@@ -10,6 +10,7 @@ use super::disk_manager::{
     DownloadArchiveManifestQuery, DownloadArchiveRequest, InitiateUploadParams, ListObjectsResult,
     ObjectKeyQuery, ObjectMetadata, ObjectPathManager, RenameObjectRequest, UploadPartQuery,
 };
+use super::fragment_manager::delete_fragment;
 use super::fragment_metadata::{
     DEFAULT_INDEX_PARTITION_COUNT, clear_fragment_partition_count_cache_for_test,
     fragment_index_partition_count, init_fragment_metadata, set_configured_index_partition_count,
@@ -1483,6 +1484,83 @@ async fn matrix_capacity_usage_reports_live_filesystem_totals() {
         "available should match allocated-used"
     );
     assert!(filesystems >= 1, "must report at least one filesystem");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_fragment_delete_recreate_same_hash_allows_fresh_upload_without_restart() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment_name = format!("fragment-{}", Ulid::new());
+    let fragment = hex::encode(Sha256::digest(fragment_name.as_bytes()));
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "test-fragment-key")
+        .await
+        .expect("init fragment metadata");
+    indexdb_store::ensure_fragment_owner_partition_available(&fragment)
+        .expect("materialize fragment owner partition db");
+
+    let first_bytes = b"first upload after fragment create".to_vec();
+    let first_resp = upload_one_shot(
+        state.clone(),
+        &fragment,
+        "recreate/first.bin",
+        first_bytes.clone(),
+    )
+    .await;
+    assert_eq!(first_resp.status(), StatusCode::CREATED);
+    let first_got = read_object_bytes(
+        full_claims(&fragment),
+        fragment.clone(),
+        "recreate/first.bin".to_string(),
+    )
+    .await;
+    assert_eq!(first_got, first_bytes);
+
+    let delete_resp = delete_fragment(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath(fragment.clone()),
+    )
+    .await
+    .expect("delete fragment")
+    .into_response();
+    assert_eq!(delete_resp.status(), StatusCode::OK);
+
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "test-fragment-key")
+        .await
+        .expect("recreate fragment metadata");
+    indexdb_store::ensure_fragment_owner_partition_available(&fragment)
+        .expect("materialize recreated fragment owner partition db");
+    assert!(
+        indexdb_store::has_any_fragment_partition_db(&fragment)
+            .expect("check recreated fragment owner db"),
+        "recreated fragment should materialize an owner partition db"
+    );
+
+    let second_bytes = b"second upload after fragment recreate".to_vec();
+    let second_resp = upload_one_shot(
+        state,
+        &fragment,
+        "recreate/second.bin",
+        second_bytes.clone(),
+    )
+    .await;
+    assert_eq!(second_resp.status(), StatusCode::CREATED);
+    let second_got = read_object_bytes(
+        full_claims(&fragment),
+        fragment.clone(),
+        "recreate/second.bin".to_string(),
+    )
+    .await;
+    assert_eq!(second_got, second_bytes);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -5,7 +5,7 @@ This file is the workspace entry point for API documentation.
 Use the specialized references instead of treating the whole workspace as one API:
 
 - [N1_DOCUMENTATION.md](/home/administrator/Development/N1/N1_DOCUMENTATION.md)
-  - Stable `1.1.0` documentation for the pure N1 fragment-scoped storage engine.
+  - Stable `1.1.1` documentation for the pure N1 fragment-scoped storage engine.
 - [N2_DOCUMENTATION.md](/home/administrator/Development/N1/N2_DOCUMENTATION.md)
   - Current `0.2.0` documentation for the multi-node N2 cluster layer.
 - [REGISTRY_DOCUMENTATION.md](/home/administrator/Development/N1/REGISTRY_DOCUMENTATION.md)

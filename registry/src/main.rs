@@ -148,6 +148,17 @@ fn pending_upload_age_secs(reservation: &PendingUploadReservation) -> Option<i64
     )
 }
 
+fn object_record_age_secs(object: &models::ObjectRecord) -> Option<i64> {
+    let parse = |value: &str| chrono::DateTime::parse_from_rfc3339(value).ok();
+    let timestamp = parse(&object.updated_at).or_else(|| parse(&object.created_at))?;
+    Some(
+        Utc::now()
+            .signed_duration_since(timestamp.with_timezone(&Utc))
+            .num_seconds()
+            .max(0),
+    )
+}
+
 fn reservation_matches_active_session(
     reservation: &PendingUploadReservation,
     active_sessions: &[EngineUploadSession],
@@ -1684,10 +1695,6 @@ async fn finalize_object(
         ));
     }
     let claims = claims_from_headers(&headers, &state.auth)?;
-    let removed_scopes = reconcile_pending_uploads(&state, Some(claims.sub.clone())).await?;
-    if !removed_scopes.is_empty() {
-        publish_pending_upload_cleanup_invalidations(&state, removed_scopes);
-    }
     let _write_guard = state.write_gate.lock().await;
     let fragment = req.fragment.clone();
     let object_key = req.object_key.clone();
@@ -2474,15 +2481,34 @@ async fn resolve_object(
         Ok(engine_state) => {
             if engine_state.current.is_none() {
                 let _write_guard = state.write_gate.lock().await;
-                let (_synced_object, user) = state
+                let full_state = state
+                    .broker
+                    .read_current_object_state(&binding, &object.storage_object_id, true)
+                    .await?;
+                let inferred_current = full_state
+                    .current
+                    .clone()
+                    .or_else(|| infer_latest_engine_head(&full_state.versions));
+                if inferred_current.is_none() {
+                    let age_secs = object_record_age_secs(&object).unwrap_or(i64::MAX);
+                    warn!(
+                        fragment = %query.fragment,
+                        object_key = %query.object_key,
+                        storage_object_id = %object.storage_object_id,
+                        age_secs,
+                        "registry resolve saw no readable engine head; preserving existing registry row"
+                    );
+                    return Ok(Json(object));
+                }
+                let (synced_object, user) = state
                     .db
                     .sync_object_from_engine(
                         claims.sub,
                         query.fragment.clone(),
                         query.object_key.clone(),
                         object.storage_object_id.clone(),
-                        None,
-                        Vec::new(),
+                        inferred_current,
+                        full_state.versions,
                     )
                     .await?;
                 publish_owner_invalidation(
@@ -2491,7 +2517,9 @@ async fn resolve_object(
                     Some(query.fragment.clone()),
                     "objects",
                 );
-                return Err(RegistryError::not_found("object not found"));
+                return synced_object
+                    .map(Json)
+                    .ok_or_else(|| RegistryError::not_found("object not found"));
             }
 
             if let Some(current) = engine_state.current.as_ref() {
@@ -3151,6 +3179,15 @@ mod tests {
                             .unwrap_or_default();
                         Json(payload)
                     }
+                }),
+            )
+            .route(
+                "/n1/upload/multipart",
+                get(|| async move {
+                    Json(json!({
+                        "sessions": [],
+                        "total": 0
+                    }))
                 }),
             )
             .route(
@@ -6641,7 +6678,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_object_self_heals_stale_registry_ghost() {
+    async fn resolve_object_preserves_registry_row_when_engine_self_check_is_empty() {
         let single_url = spawn_storage_version_stub(HashMap::new()).await;
         let multi_url = spawn_storage_stub("multi-stub-token").await;
         let (state, access_token) = test_state(single_url, multi_url).await;
@@ -6688,7 +6725,14 @@ mod tests {
             .oneshot(resolve_req)
             .await
             .expect("resolve response");
-        assert_eq!(resolve_resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resolve_resp.status(), StatusCode::OK);
+        let resolve_body = axum::body::to_bytes(resolve_resp.into_body(), usize::MAX)
+            .await
+            .expect("read resolve body");
+        let resolve_json: Value =
+            serde_json::from_slice(&resolve_body).expect("parse resolve body");
+        assert_eq!(resolve_json["object_key"].as_str(), Some("ghost.mp4"));
+        assert!(resolve_json["storage_object_id"].as_str().is_some());
 
         let list_req = Request::builder()
             .method("GET")
@@ -6707,7 +6751,133 @@ mod tests {
                 .as_array()
                 .expect("objects array")
                 .len(),
-            0
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_object_recovers_when_engine_head_metadata_lags_after_finalize() {
+        let mut objects = HashMap::new();
+        objects.insert(
+            "flat-engine-key".to_string(),
+            StubObjectState {
+                current_visible: false,
+                versions: vec![
+                    StubVersion {
+                        version_id: "01RESOLVEHEADLAG00000000000002".to_string(),
+                        object_size_bytes: 15_912_736_534,
+                        content_type: "video/mp4".to_string(),
+                        created_at: 2_000,
+                    },
+                    StubVersion {
+                        version_id: "01RESOLVEHEADLAG00000000000001".to_string(),
+                        object_size_bytes: 15_912_736_000,
+                        content_type: "video/mp4".to_string(),
+                        created_at: 1_000,
+                    },
+                ],
+            },
+        );
+
+        let single_url = spawn_storage_version_stub(objects).await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, access_token) = test_state(single_url, multi_url).await;
+        let owner = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user exists")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                owner.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment");
+
+        let (seeded, _user) = state
+            .db
+            .sync_object_from_engine(
+                owner.uid.clone(),
+                "fragment-a".to_string(),
+                "mhw.mp4".to_string(),
+                "flat-engine-key".to_string(),
+                Some(crate::storage_broker::EngineObjectMetadata {
+                    version_id: "01STALEHEADCLIENTVERSION000000001".to_string(),
+                    object_size_bytes: 1,
+                    content_type: Some("application/octet-stream".to_string()),
+                    created_at_unix: 500,
+                }),
+                vec![crate::storage_broker::EngineObjectMetadata {
+                    version_id: "01STALEHEADCLIENTVERSION000000001".to_string(),
+                    object_size_bytes: 1,
+                    content_type: Some("application/octet-stream".to_string()),
+                    created_at_unix: 500,
+                }],
+            )
+            .await
+            .expect("seed object from engine");
+        assert!(seeded.is_some(), "seeded object should exist");
+
+        let app = build_router(state.clone());
+        let resolve_req = Request::builder()
+            .method("GET")
+            .uri("/v1/objects/resolve?fragment=fragment-a&object_key=mhw.mp4")
+            .header("authorization", format!("Bearer {}", access_token))
+            .body(Body::empty())
+            .expect("resolve request");
+        let resolve_resp = app
+            .clone()
+            .oneshot(resolve_req)
+            .await
+            .expect("resolve response");
+        assert_eq!(resolve_resp.status(), StatusCode::OK);
+        let resolve_body = axum::body::to_bytes(resolve_resp.into_body(), usize::MAX)
+            .await
+            .expect("read resolve body");
+        let resolve_json: Value =
+            serde_json::from_slice(&resolve_body).expect("parse resolve body");
+        assert_eq!(
+            resolve_json["storage_object_id"].as_str(),
+            Some("flat-engine-key")
+        );
+        assert_eq!(
+            resolve_json["version_id"].as_str(),
+            Some("01RESOLVEHEADLAG00000000000002")
+        );
+        assert_eq!(
+            resolve_json["object_size_bytes"].as_i64(),
+            Some(15_912_736_534)
+        );
+        assert_eq!(
+            resolve_json["content_type"].as_str(),
+            Some("video/mp4")
+        );
+
+        let list_req = Request::builder()
+            .method("GET")
+            .uri("/v1/objects?fragment=fragment-a")
+            .header("authorization", format!("Bearer {}", access_token))
+            .body(Body::empty())
+            .expect("list request");
+        let list_resp = app.oneshot(list_req).await.expect("list response");
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_body = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+            .await
+            .expect("read list body");
+        let list_json: Value = serde_json::from_slice(&list_body).expect("parse list body");
+        let objects = list_json["objects"].as_array().expect("objects array");
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0]["object_key"].as_str(), Some("mhw.mp4"));
+        assert_eq!(
+            objects[0]["version_id"].as_str(),
+            Some("01RESOLVEHEADLAG00000000000002")
         );
     }
 }

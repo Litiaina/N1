@@ -6,19 +6,19 @@
     height="150"
   />
   <h1>Litiaina N1 Documentation</h1>
-  <p>Stable <code>1.1.0</code> reference for the pure N1 fragment-scoped storage engine.</p>
+  <p>Stable <code>1.1.1</code> reference for the pure N1 fragment-scoped storage engine.</p>
 </div>
 
-> Status (2026-04-01):
-> - `n1` (`litiaina-n1`) is stable at `1.1.0`.
+> Status (2026-04-09):
+> - `n1` (`litiaina-n1`) is stable at `1.1.1`.
 > - N1 is an authenticated fragment-scoped storage engine.
 > - N1 owns bytes, object metadata, upload state, repair, redistribution, GC, and health.
-> - N1 does not own public sharing, thumbnails, or legacy FS routes in `1.1.0`.
+> - N1 does not own public sharing, thumbnails, or legacy FS routes in `1.1.1`.
 > - Registry, N2, and `n1-arc` are versioned independently and documented separately.
 
 ## 1. Scope
 
-N1 `1.1.0` freezes the engine contract under `/n1/*`.
+N1 `1.1.1` freezes the engine contract under `/n1/*`.
 
 Stable identity:
 - authenticated fragment-scoped object storage
@@ -28,7 +28,7 @@ Stable identity:
 - repair / redistribution / GC / health
 - websocket telemetry for authenticated engine events
 
-Not part of the N1 `1.1.0` HTTP contract:
+Not part of the N1 `1.1.1` HTTP contract:
 - legacy `/dir/*`
 - `/authenticate/fs`
 - public share creation or public share serving
@@ -267,7 +267,7 @@ Lifecycle model:
 
 ## 7. Upload Routes
 
-N1 `1.1.0` exposes explicit sibling upload modes:
+N1 `1.1.1` exposes explicit sibling upload modes:
 - one-shot
 - multipart
 
@@ -397,7 +397,7 @@ normal object operations because the claim already scopes the request.
 
 ## 11. Stable Contract Notes
 
-N1 `1.1.0` freezes these engine decisions:
+N1 `1.1.1` freezes these engine decisions:
 - route prefix is `/n1/*`
 - exact-key authority lives in fragment-level `indexdb/index.ndxdb`
 - logical hash bucketing stays internal to the metadata plane

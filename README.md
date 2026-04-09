@@ -16,11 +16,11 @@
 
 ---
 
-> Deployment profile status (2026-04-07):
+> Deployment profile status (2026-04-09):
 > - `N2` is the product identity of this workspace.
 > - `N1` is the shared node-local storage engine used by both deployments.
 > - `n1` (`litiaina-n1`) is the single-node N2 deployment path and the stable default.
-> - `n1` is released at `1.1.0`.
+> - `n1` is released at `1.1.1`.
 > - `n2` (`litiaina-n2`) is the multi-node N2 deployment path and is released at `0.2.0`.
 > - `registry` (`registry-server`) is the SQLite-backed user-owned metadata and POSIX facade layer for both deployment shapes and is versioned independently at `0.7.0`.
 > - `n1-arc` (`litiaina-n1-arc`) is the experimental raw-device profile and is not the production default.
@@ -189,8 +189,8 @@ Profile note:
 
 ## Release Status
 
-- `n1` is the stable/default deployment profile at `1.1.0`.
-- `litiaina-n1-cli` tracks the same release line as `n1`; current CLI release is `1.1.0`.
+- `n1` is the stable/default deployment profile at `1.1.1`.
+- `litiaina-n1-cli` tracks the same release line as `n1`; current CLI release is `1.1.1`.
 - `n2` is released independently at `0.2.0` as the multi-node N2 layer.
 - `registry` is released independently at `0.7.0` as the SQLite-backed Registry layer.
 - `n1-arc` is the experimental raw-device profile.
@@ -224,14 +224,14 @@ Profile note:
   - `POST /n1/objects/bulk-recover`
 - On Linux, `n1` prefers `io_uring` on the blob data path when available and falls back to `O_DIRECT` + blocking writes when it is not.
 - `n1-arc` is the experimental raw-device profile with raw index/blob media managed by `block_manager`.
-- The N1 HTTP/API surface is frozen for `1.1.0` under `/n1/*`.
+- The N1 HTTP/API surface is frozen for `1.1.1` under `/n1/*`.
 - Backward compatibility now follows the `1.x` stable contract for N1 core.
 
 ## Profile Distinction And Disk Layout (Authoritative)
 
 | Dimension | N1 (`litiaina-n1`) | N1-Arc (`litiaina-n1-arc`) |
 |---|---|---|
-| Status | Stable / production default (`1.1.0`) | Experimental / raw-device profile |
+| Status | Stable / production default (`1.1.1`) | Experimental / raw-device profile |
 | `index_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | `blob_store_disks` | Filesystem directories | Raw block devices / loopback files |
 | Index metadata backend | Fragment-level `indexdb/index.ndxdb` with logical hash buckets | Raw index catalog on block-manager media |
@@ -296,7 +296,7 @@ Under both shapes, the node-local storage engine is still **N1**. N1 provides:
   - `n1`: filesystem-backed shard files under blob roots
   - `n1-arc`: raw-device/direct-I/O blob plane with raw index authority
 
-In the `1.1.0` engine baseline, user convenience behavior moves out of the engine and into the Registry layer:
+In the `1.1.1` engine baseline, user convenience behavior moves out of the engine and into the Registry layer:
 
 - user management
 - ownership tracking
@@ -583,7 +583,7 @@ They are intended for UI or operator flows that need to mutate hundreds or thous
 
 ### 1b) Derived media
 
-Derived media generation is no longer part of N1 core. For `1.1.0`, N1 stays focused on
+Derived media generation is no longer part of N1 core. For `1.1.1`, N1 stays focused on
 authenticated fragment storage, while previews, thumbnails, and share-link behavior are expected
 to live in a higher layer such as Registry or a dedicated accelerator service.
 

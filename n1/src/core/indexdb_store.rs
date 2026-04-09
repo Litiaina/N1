@@ -414,6 +414,22 @@ fn evict_cached_db(path: &Path) {
     }
 }
 
+pub(crate) fn evict_fragment_cached_dbs(fragment: &str) {
+    let fragment_roots: Vec<PathBuf> = ObjectPathManager::new()
+        .get_all_index_roots()
+        .into_iter()
+        .map(|root| root.join(fragment))
+        .collect();
+
+    if let Ok(mut cache) = DB_CACHE.lock() {
+        cache.retain(|path, _| !fragment_roots.iter().any(|root| path.starts_with(root)));
+    }
+
+    if let Ok(mut locks) = PARTITION_OP_LOCKS.lock() {
+        locks.retain(|path, _| !fragment_roots.iter().any(|root| path.starts_with(root)));
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn evict_cached_db_for_test(path: &Path) {
     evict_cached_db(path);
@@ -943,6 +959,31 @@ pub fn ensure_object_owner_partition_available(
                 e
             ))
         })?;
+        Ok(())
+    })
+}
+
+pub fn ensure_fragment_owner_partition_available(fragment: &str) -> Result<(), AppError> {
+    let route = fragment_route(fragment)?;
+    let owner_path = owner_db_path(&route, fragment);
+    with_partition_commit_lock(&owner_path, || {
+        if let Some(parent) = owner_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                AppError::ServiceUnavailable(format!(
+                    "authoritative owner index root unavailable: mkdir {} failed: {}",
+                    parent.display(),
+                    e
+                ))
+            })?;
+        }
+        let owner_db = open_owner_db_for_write(&route, fragment).map_err(|e| {
+            AppError::ServiceUnavailable(format!(
+                "authoritative owner index root unavailable: {}",
+                e
+            ))
+        })?;
+        let _ = ensure_partition_meta_exact(&owner_db)?;
+        replicate_owner_partition_db(fragment, &route)?;
         Ok(())
     })
 }
