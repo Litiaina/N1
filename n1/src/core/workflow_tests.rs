@@ -10,10 +10,11 @@ use super::disk_manager::{
     DownloadArchiveManifestQuery, DownloadArchiveRequest, InitiateUploadParams, ListObjectsResult,
     ObjectKeyQuery, ObjectMetadata, ObjectPathManager, RenameObjectRequest, UploadPartQuery,
 };
-use super::fragment_manager::delete_fragment;
+use super::fragment_manager::{create_fragment, delete_fragment};
 use super::fragment_metadata::{
     DEFAULT_INDEX_PARTITION_COUNT, clear_fragment_partition_count_cache_for_test,
-    fragment_index_partition_count, init_fragment_metadata, set_configured_index_partition_count,
+    fragment_index_partition_count, init_fragment_metadata, read_fragment_metadata,
+    set_configured_index_partition_count,
 };
 use super::garbage_collector::{get_gc_status_api, run_garbage_collector};
 use super::index;
@@ -50,6 +51,8 @@ use super::upload::{
 };
 use crate::core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
 use crate::enums::app_error_enum::AppError;
+use crate::middleware::auth_middleware::MASTER_KEY;
+use crate::namespace::runtime::global_namespace_runtime;
 use crate::routes::storage_routes::AppState;
 use crate::settings::constants::CONFIG_FILE;
 use crate::settings::create_config::create_default_config_ini;
@@ -68,6 +71,8 @@ use indexdb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableH
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+#[cfg(target_family = "unix")]
+use std::os::unix::fs::symlink as symlink_dir;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -81,6 +86,128 @@ use ulid::Ulid;
 static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 static TEST_BASE: Lazy<std::path::PathBuf> =
     Lazy::new(|| std::env::temp_dir().join(format!("n1-matrix-{}", std::process::id())));
+
+fn parse_test_roots(var_name: &str) -> Option<Vec<std::path::PathBuf>> {
+    let raw = std::env::var(var_name).ok()?;
+    let roots = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .collect::<Vec<_>>();
+    if roots.is_empty() { None } else { Some(roots) }
+}
+
+async fn resolve_test_storage_roots(
+    base: &std::path::Path,
+    expected_index_root_count: Option<usize>,
+    expected_blob_root_count: Option<usize>,
+) -> (
+    std::path::PathBuf,
+    Vec<std::path::PathBuf>,
+    Vec<std::path::PathBuf>,
+) {
+    let env_index_roots = parse_test_roots("N1_TEST_INDEX_ROOTS");
+    let env_blob_roots = parse_test_roots("N1_TEST_BLOB_ROOTS");
+    match (env_index_roots, env_blob_roots) {
+        (Some(index_roots), Some(blob_roots)) => {
+            if let Some(expected) = expected_index_root_count {
+                assert_eq!(
+                    index_roots.len(),
+                    expected,
+                    "N1_TEST_INDEX_ROOTS must contain exactly {} root(s)",
+                    expected
+                );
+            }
+            if let Some(expected) = expected_blob_root_count {
+                assert_eq!(
+                    blob_roots.len(),
+                    expected,
+                    "N1_TEST_BLOB_ROOTS must contain exactly {} root(s)",
+                    expected
+                );
+            }
+
+            for root in index_roots.iter().chain(blob_roots.iter()) {
+                assert!(
+                    root != std::path::Path::new("/mnt/DISK0")
+                        && root != std::path::Path::new("/media/administrator/DISK3")
+                        && root != std::path::Path::new("/")
+                        && root.parent().is_some(),
+                    "refusing to use unsafe test root '{}'; point N1_TEST_*_ROOTS at dedicated subdirectories",
+                    root.display()
+                );
+            }
+
+            let fs_root = std::env::var("N1_TEST_FS_ROOT")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| base.join("fs"));
+            let _ = fs::remove_dir_all(base).await;
+            let _ = fs::create_dir_all(base).await;
+            let _ = fs::remove_dir_all(&fs_root).await;
+            let _ = fs::create_dir_all(&fs_root).await;
+
+            for root in index_roots.iter().chain(blob_roots.iter()) {
+                let _ = fs::remove_dir_all(root).await;
+                let _ = fs::create_dir_all(root).await;
+            }
+
+            #[cfg(not(target_family = "unix"))]
+            compile_error!("hardware-backed workflow test roots currently require unix symlinks");
+
+            let fs_link = base.join("fs");
+            let _ = std::fs::remove_file(&fs_link);
+            let _ = std::fs::remove_dir_all(&fs_link);
+            symlink_dir(&fs_root, &fs_link).expect("symlink fs root into test base");
+
+            let mut linked_index_roots = Vec::new();
+            for (idx, target) in index_roots.iter().enumerate() {
+                let link = base.join(format!("index_{}", idx + 1));
+                let _ = std::fs::remove_file(&link);
+                let _ = std::fs::remove_dir_all(&link);
+                symlink_dir(target, &link).expect("symlink index root into test base");
+                linked_index_roots.push(link);
+            }
+
+            let mut linked_blob_roots = Vec::new();
+            for (idx, target) in blob_roots.iter().enumerate() {
+                let link = base.join(format!("blob_{}", idx + 1));
+                let _ = std::fs::remove_file(&link);
+                let _ = std::fs::remove_dir_all(&link);
+                symlink_dir(target, &link).expect("symlink blob root into test base");
+                linked_blob_roots.push(link);
+            }
+
+            (fs_link, linked_index_roots, linked_blob_roots)
+        }
+        (None, None) => {
+            let _ = fs::remove_dir_all(base).await;
+            let _ = fs::create_dir_all(base).await;
+
+            let index_root_count = expected_index_root_count.unwrap_or(2);
+            let blob_root_count = expected_blob_root_count.unwrap_or(3);
+
+            let mut index_roots = Vec::new();
+            for idx in 1..=index_root_count {
+                let path = base.join(format!("index_{idx}"));
+                let _ = fs::create_dir_all(&path).await;
+                index_roots.push(path);
+            }
+
+            let mut blob_roots = Vec::new();
+            for idx in 1..=blob_root_count {
+                let path = base.join(format!("blob_{idx}"));
+                let _ = fs::create_dir_all(&path).await;
+                blob_roots.push(path);
+            }
+
+            (base.to_path_buf(), index_roots, blob_roots)
+        }
+        _ => {
+            panic!("set both N1_TEST_INDEX_ROOTS and N1_TEST_BLOB_ROOTS together, or neither");
+        }
+    }
+}
 
 fn ensure_test_config_file() {
     let config_path = std::path::PathBuf::from(CONFIG_FILE);
@@ -100,6 +227,12 @@ fn full_claims(fragment: &str) -> Claims {
     }
 }
 
+fn ensure_master_key_for_tests() {
+    if std::env::var("MASTER_KEY").is_err() {
+        unsafe { std::env::set_var("MASTER_KEY", "test-master-key") };
+    }
+}
+
 async fn ensure_global_storage_config(base: &std::path::Path) {
     ensure_test_config_file();
 
@@ -107,30 +240,17 @@ async fn ensure_global_storage_config(base: &std::path::Path) {
         .expect("reset configured index partition count");
     clear_fragment_partition_count_cache_for_test();
     indexdb_store::clear_cached_dbs_for_test();
-    let _ = fs::remove_dir_all(base).await;
-    let _ = fs::create_dir_all(base).await;
+    let (fs_root, index_roots, blob_roots) =
+        resolve_test_storage_roots(base, Some(2), Some(3)).await;
 
-    let index_1 = base.join("index_1");
-    let index_2 = base.join("index_2");
-    let blob_1 = base.join("blob_1");
-    let blob_2 = base.join("blob_2");
-    let blob_3 = base.join("blob_3");
-
-    let _ = fs::create_dir_all(&index_1).await;
-    let _ = fs::create_dir_all(&index_2).await;
-    let _ = fs::create_dir_all(&blob_1).await;
-    let _ = fs::create_dir_all(&blob_2).await;
-    let _ = fs::create_dir_all(&blob_3).await;
-
-    let index_roots = vec![
-        index_1.to_string_lossy().to_string(),
-        index_2.to_string_lossy().to_string(),
-    ];
-    let blob_roots = vec![
-        blob_1.to_string_lossy().to_string(),
-        blob_2.to_string_lossy().to_string(),
-        blob_3.to_string_lossy().to_string(),
-    ];
+    let index_roots = index_roots
+        .into_iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let blob_roots = blob_roots
+        .into_iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
 
     if INDEX_STORE_DISKS.get().is_none() {
         INDEX_STORE_DISKS
@@ -144,7 +264,7 @@ async fn ensure_global_storage_config(base: &std::path::Path) {
     }
     if FS_STORAGE_ROOT.get().is_none() {
         FS_STORAGE_ROOT
-            .set(base.to_string_lossy().to_string())
+            .set(fs_root.to_string_lossy().to_string())
             .expect("set FS_STORAGE_ROOT");
     }
 }
@@ -160,22 +280,18 @@ async fn ensure_global_storage_config_with_root_counts(
         .expect("reset configured index partition count");
     clear_fragment_partition_count_cache_for_test();
     indexdb_store::clear_cached_dbs_for_test();
-    let _ = fs::remove_dir_all(base).await;
-    let _ = fs::create_dir_all(base).await;
+    let (fs_root, index_roots, blob_roots) =
+        resolve_test_storage_roots(base, Some(index_root_count), Some(blob_root_count)).await;
 
-    let mut index_roots = Vec::new();
-    for idx in 1..=index_root_count {
-        let path = base.join(format!("index_{idx}"));
-        let _ = fs::create_dir_all(&path).await;
-        index_roots.push(path.to_string_lossy().to_string());
-    }
+    let index_roots = index_roots
+        .into_iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
 
-    let mut blob_roots = Vec::new();
-    for idx in 1..=blob_root_count {
-        let path = base.join(format!("blob_{idx}"));
-        let _ = fs::create_dir_all(&path).await;
-        blob_roots.push(path.to_string_lossy().to_string());
-    }
+    let blob_roots = blob_roots
+        .into_iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
 
     if INDEX_STORE_DISKS.get().is_none() {
         INDEX_STORE_DISKS
@@ -207,12 +323,12 @@ async fn ensure_global_storage_config_with_root_counts(
 
     if FS_STORAGE_ROOT.get().is_none() {
         FS_STORAGE_ROOT
-            .set(base.to_string_lossy().to_string())
+            .set(fs_root.to_string_lossy().to_string())
             .expect("set FS_STORAGE_ROOT");
     } else {
         assert_eq!(
             FS_STORAGE_ROOT.get().expect("FS_STORAGE_ROOT already set"),
-            &base.to_string_lossy().to_string(),
+            &fs_root.to_string_lossy().to_string(),
             "test requires isolated process with matching storage root"
         );
     }
@@ -1564,6 +1680,288 @@ async fn matrix_fragment_delete_recreate_same_hash_allows_fresh_upload_without_r
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_fragment_delete_recreate_same_hash_clears_stale_namespace_views() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+
+    let fragment_name = format!("fragment-{}", Ulid::new());
+    let fragment = hex::encode(Sha256::digest(fragment_name.as_bytes()));
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "test-fragment-key")
+        .await
+        .expect("init fragment metadata");
+    indexdb_store::ensure_fragment_owner_partition_available(&fragment)
+        .expect("materialize fragment owner partition db");
+
+    let first_meta = ObjectMetadata {
+        object_key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        fragment: fragment.clone(),
+        version_id: Ulid::new().to_string(),
+        upload_session_id: String::new(),
+        owner_uid: fragment.clone(),
+        content_type: "application/octet-stream".to_string(),
+        total_size_bytes: 123,
+        created_at: 1_700_000_200,
+        parts: Vec::new(),
+        is_delete_marker: false,
+        stripe_size_bytes: 262_144,
+    };
+    global_namespace_runtime()
+        .finalize_logical_upload(
+            &fragment,
+            "recreate/first.bin",
+            &first_meta.object_key,
+            &first_meta,
+        )
+        .await
+        .expect("seed first logical file");
+
+    assert!(
+        global_namespace_runtime()
+            .entry(&fragment, "recreate/first.bin")
+            .await
+            .expect("lookup first logical entry")
+            .is_some()
+    );
+
+    let delete_resp = delete_fragment(
+        State(state.clone()),
+        full_claims(&fragment),
+        AxumPath(fragment.clone()),
+    )
+    .await
+    .expect("delete fragment")
+    .into_response();
+    assert_eq!(delete_resp.status(), StatusCode::OK);
+
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "test-fragment-key")
+        .await
+        .expect("recreate fragment metadata");
+    indexdb_store::ensure_fragment_owner_partition_available(&fragment)
+        .expect("materialize recreated fragment owner partition db");
+
+    global_namespace_runtime()
+        .mkdir(&fragment, "Images")
+        .await
+        .expect("mkdir on recreated fragment");
+
+    let second_meta = ObjectMetadata {
+        object_key: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        fragment: fragment.clone(),
+        version_id: Ulid::new().to_string(),
+        upload_session_id: String::new(),
+        owner_uid: fragment.clone(),
+        content_type: "application/octet-stream".to_string(),
+        total_size_bytes: 456,
+        created_at: 1_700_000_201,
+        parts: Vec::new(),
+        is_delete_marker: false,
+        stripe_size_bytes: 262_144,
+    };
+    global_namespace_runtime()
+        .finalize_logical_upload(
+            &fragment,
+            "recreate/second.bin",
+            &second_meta.object_key,
+            &second_meta,
+        )
+        .await
+        .expect("seed second logical file");
+
+    let root_entries = global_namespace_runtime()
+        .list_dir(&fragment, "", false)
+        .await
+        .expect("list recreated fragment namespace");
+    let listed_paths = root_entries
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed_paths,
+        vec!["Images".to_string(), "recreate".to_string()],
+        "recreated fragment should not retain stale namespace entries from the deleted fragment"
+    );
+
+    let recreate_entries = global_namespace_runtime()
+        .list_dir(&fragment, "recreate", false)
+        .await
+        .expect("list recreated prefix");
+    let recreate_paths = recreate_entries
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect::<Vec<_>>();
+    assert_eq!(recreate_paths, vec!["recreate/second.bin".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_fragment_create_retry_heals_partial_initialization_instead_of_conflicting() {
+    let _guard = TEST_LOCK.lock().await;
+    ensure_master_key_for_tests();
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment_name = format!("fragment-{}", Ulid::new());
+    let fragment = hex::encode(Sha256::digest(fragment_name.as_bytes()));
+
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "test-fragment-key")
+        .await
+        .expect("seed fragment metadata only");
+    assert!(
+        !indexdb_store::has_any_fragment_partition_db(&fragment)
+            .expect("check missing owner partition db"),
+        "precondition failed: partial fragment should not have owner db yet"
+    );
+
+    let create_resp = create_fragment(Json(super::sync::CreateFragmentRequest {
+        name: fragment_name.clone(),
+        secret: (*MASTER_KEY).clone(),
+        key: "test-fragment-key".to_string(),
+    }))
+    .await
+    .expect("retry create should heal partial fragment")
+    .into_response();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+    assert!(
+        indexdb_store::has_any_fragment_partition_db(&fragment)
+            .expect("check healed owner partition db"),
+        "retry create should materialize owner partition db"
+    );
+
+    let second_resp = create_fragment(Json(super::sync::CreateFragmentRequest {
+        name: fragment_name,
+        secret: (*MASTER_KEY).clone(),
+        key: "test-fragment-key".to_string(),
+    }))
+    .await;
+    assert!(
+        matches!(second_resp, Err(AppError::Conflict(_))),
+        "fully initialized fragment should still conflict on create"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_fragment_create_fails_cleanly_when_index_root_is_blocked() {
+    let _guard = TEST_LOCK.lock().await;
+    ensure_master_key_for_tests();
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment_name = format!("fragment-{}", Ulid::new());
+    let fragment = hex::encode(Sha256::digest(fragment_name.as_bytes()));
+    let index_roots = ObjectPathManager::new().get_all_index_roots();
+    let blocked_root = index_roots
+        .get(0)
+        .expect("at least one index root")
+        .join(&fragment);
+    fs::write(&blocked_root, b"block index root")
+        .await
+        .expect("write index blocker");
+
+    let create_err = match create_fragment(Json(super::sync::CreateFragmentRequest {
+        name: fragment_name.clone(),
+        secret: (*MASTER_KEY).clone(),
+        key: "test-fragment-key".to_string(),
+    }))
+    .await
+    {
+        Ok(_) => panic!("blocked index root should fail fragment create"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(create_err, AppError::ServiceUnavailable(_)),
+        "expected ServiceUnavailable, got {create_err:?}"
+    );
+    assert!(
+        read_fragment_metadata(&fragment).await.is_err(),
+        "metadata should not be committed when index root preflight fails"
+    );
+    assert!(
+        !indexdb_store::has_any_fragment_partition_db(&fragment)
+            .expect("check owner db absence after blocked index create"),
+        "owner db should not be created when index root preflight fails"
+    );
+
+    fs::remove_file(&blocked_root)
+        .await
+        .expect("remove index blocker");
+    let create_resp = create_fragment(Json(super::sync::CreateFragmentRequest {
+        name: fragment_name,
+        secret: (*MASTER_KEY).clone(),
+        key: "test-fragment-key".to_string(),
+    }))
+    .await
+    .expect("retry create after unblocking index root")
+    .into_response();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_fragment_create_fails_cleanly_when_blob_root_is_blocked() {
+    let _guard = TEST_LOCK.lock().await;
+    ensure_master_key_for_tests();
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment_name = format!("fragment-{}", Ulid::new());
+    let fragment = hex::encode(Sha256::digest(fragment_name.as_bytes()));
+    let blob_roots = ObjectPathManager::new().get_blob_roots();
+    let blocked_root = blob_roots
+        .get(0)
+        .expect("at least one blob root")
+        .join(&fragment);
+    fs::write(&blocked_root, b"block blob root")
+        .await
+        .expect("write blob blocker");
+
+    let create_err = match create_fragment(Json(super::sync::CreateFragmentRequest {
+        name: fragment_name.clone(),
+        secret: (*MASTER_KEY).clone(),
+        key: "test-fragment-key".to_string(),
+    }))
+    .await
+    {
+        Ok(_) => panic!("blocked blob root should fail fragment create"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(create_err, AppError::ServiceUnavailable(_)),
+        "expected ServiceUnavailable, got {create_err:?}"
+    );
+    assert!(
+        read_fragment_metadata(&fragment).await.is_err(),
+        "metadata should not be committed when blob root preflight fails"
+    );
+    assert!(
+        !indexdb_store::has_any_fragment_partition_db(&fragment)
+            .expect("check owner db absence after blocked blob create"),
+        "owner db should not be created when blob root preflight fails"
+    );
+
+    fs::remove_file(&blocked_root)
+        .await
+        .expect("remove blob blocker");
+    let create_resp = create_fragment(Json(super::sync::CreateFragmentRequest {
+        name: fragment_name,
+        secret: (*MASTER_KEY).clone(),
+        key: "test-fragment-key".to_string(),
+    }))
+    .await
+    .expect("retry create after unblocking blob root")
+    .into_response();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn matrix_sync_fragment_metadata_preserves_active_multipart_blob_dirs() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
@@ -1864,6 +2262,7 @@ async fn finalize_upload_with_part_size(
         Query(ObjectKeyQuery {
             object_key: object_key.to_string(),
             version_id: None,
+            filename: None,
         }),
         AxumJson(InitiateUploadParams {
             content_type: Some("application/octet-stream".into()),
@@ -1904,6 +2303,21 @@ async fn put_object(
     .await;
     assert_eq!(finalize_resp.status(), StatusCode::OK);
     version_id
+}
+
+async fn bind_logical_path_to_physical_object(
+    fragment: &str,
+    logical_path: &str,
+    physical_object_id: &str,
+) -> ObjectMetadata {
+    let metadata = index::read_latest_object(fragment, physical_object_id)
+        .await
+        .expect("read latest physical object metadata");
+    global_namespace_runtime()
+        .finalize_logical_upload(fragment, logical_path, physical_object_id, &metadata)
+        .await
+        .expect("bind logical namespace entry");
+    metadata
 }
 
 async fn seed_live_object_metadata(fragment: &str, object_key: &str, size_bytes: u64) -> String {
@@ -3898,6 +4312,171 @@ async fn matrix_gc_keeps_live_data_and_cleans_trash_in_partition_layout() {
         trashed_keys.iter().all(|k| *k != "gc/trash.bin"),
         "manual GC should clear trashed object in this test: {:?}",
         trashed_keys
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_namespace_v2_manual_gc_preserves_trashed_objects_until_empty_trash() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let physical_object_id = Ulid::new().to_string();
+    put_object(
+        state.clone(),
+        &fragment,
+        &physical_object_id,
+        vec![0x5a; 4096],
+    )
+    .await;
+    bind_logical_path_to_physical_object(&fragment, "docs/keep.bin", &physical_object_id).await;
+
+    global_namespace_runtime()
+        .trash(&fragment, "docs/keep.bin")
+        .await
+        .expect("trash namespace entry");
+
+    run_manual_gc_and_wait(state).await;
+
+    assert!(
+        global_namespace_runtime()
+            .trashed_entry(&fragment, "docs/keep.bin")
+            .await
+            .expect("trashed namespace entry lookup")
+            .is_some(),
+        "trashed namespace entry must remain recoverable after manual GC"
+    );
+    assert!(
+        index::read_latest_object(&fragment, &physical_object_id)
+            .await
+            .is_ok(),
+        "manual GC must not reclaim namespace-trashed object before empty trash"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_namespace_v2_empty_trash_makes_manual_gc_reclaim_physical_objects() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let physical_object_id = Ulid::new().to_string();
+    let version_id = put_object(
+        state.clone(),
+        &fragment,
+        &physical_object_id,
+        vec![0x33; 4096],
+    )
+    .await;
+    bind_logical_path_to_physical_object(&fragment, "docs/reclaim.bin", &physical_object_id).await;
+
+    global_namespace_runtime()
+        .trash(&fragment, "docs/reclaim.bin")
+        .await
+        .expect("trash namespace entry");
+    global_namespace_runtime()
+        .empty_trash(&fragment)
+        .await
+        .expect("empty namespace trash");
+
+    run_manual_gc_and_wait(state).await;
+
+    assert!(
+        global_namespace_runtime()
+            .entry(&fragment, "docs/reclaim.bin")
+            .await
+            .expect("live namespace entry lookup")
+            .is_none(),
+        "empty trash must remove live namespace entry"
+    );
+    assert!(
+        global_namespace_runtime()
+            .trashed_entry(&fragment, "docs/reclaim.bin")
+            .await
+            .expect("trash namespace entry lookup")
+            .is_none(),
+        "empty trash must remove trash namespace entry"
+    );
+    assert!(
+        index::read_latest_object(&fragment, &physical_object_id)
+            .await
+            .is_err(),
+        "manual GC must reclaim physical object once namespace no longer references it"
+    );
+    assert!(
+        index::list_live_object_versions_metadata(&fragment, &physical_object_id)
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "reclaimed object must not keep live version metadata"
+    );
+
+    for root in ObjectPathManager::new().get_blob_roots() {
+        assert!(
+            !root.join(&fragment).join("blob").join(&version_id).exists(),
+            "reclaimed object blob directory must be removed from {}",
+            root.display()
+        );
+    }
+
+    let gc_status = get_gc_status_api(full_claims("gc-status"))
+        .await
+        .expect("gc status after manual reclaim")
+        .0;
+    assert!(
+        gc_status.total_refund_bytes >= 4096,
+        "manual GC should report refunded bytes after reclaim, got {}",
+        gc_status.total_refund_bytes
     );
 }
 
@@ -9380,6 +9959,164 @@ async fn matrix_massive_same_fragment_folder_rename_10k_deep_prefixes_has_no_con
             .map(|items| !items.is_empty())
             .unwrap_or(false),
         "expected delimiter listing to produce common prefixes after 10k folder-style rename"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "stress"]
+async fn matrix_namespace_v2_single_prefix_rename_and_lifecycle_10k_benchmark() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let runtime = global_namespace_runtime();
+    let object_count = std::env::var("N1_NAMESPACE_BENCH_OBJECTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(10_000);
+
+    let seed_rss_kib = current_process_rss_kib();
+    let seed_started = Instant::now();
+    for idx in 0..object_count {
+        let object_key = format!("images/{}", deep_prefix_key_for_index(idx));
+        seed_live_object_metadata(&fragment, &object_key, 64).await;
+    }
+    let single_source = "images/__bench_single__.bin".to_string();
+    seed_live_object_metadata(&fragment, &single_source, 64).await;
+    let seed_elapsed = seed_started.elapsed();
+    let after_seed_rss_kib = current_process_rss_kib();
+
+    let import_started = Instant::now();
+    let mut import_params = HashMap::new();
+    import_params.insert("limit".to_string(), "1".to_string());
+    let import_page = runtime
+        .list_objects_page(&fragment, &import_params, false)
+        .await
+        .expect("prime namespace runtime import");
+    let import_elapsed = import_started.elapsed();
+    assert!(
+        !import_page.objects.is_empty() || !import_page.common_prefixes.is_empty(),
+        "expected imported namespace to expose seeded content"
+    );
+
+    let rename_object_started = Instant::now();
+    let rename_object_summary = runtime
+        .rename(
+            &fragment,
+            &single_source,
+            "images/__bench_single_renamed__.bin",
+        )
+        .await
+        .expect("rename single logical object");
+    let rename_object_elapsed = rename_object_started.elapsed();
+    assert_eq!(rename_object_summary.affected_paths, 1);
+    assert_eq!(rename_object_summary.affected_objects, 1);
+
+    let rename_prefix_started = Instant::now();
+    let rename_prefix_summary = runtime
+        .rename(&fragment, "images", "media")
+        .await
+        .expect("rename logical prefix");
+    let rename_prefix_elapsed = rename_prefix_started.elapsed();
+
+    let list_after_rename_started = Instant::now();
+    let mut counted = 0usize;
+    let mut continuation = None;
+    loop {
+        let mut params = HashMap::new();
+        params.insert("limit".to_string(), "1000".to_string());
+        params.insert("prefix".to_string(), "media".to_string());
+        if let Some(token) = continuation.clone() {
+            params.insert("continuation_token".to_string(), token);
+        }
+        let page = runtime
+            .list_objects_page(&fragment, &params, false)
+            .await
+            .expect("list renamed namespace page");
+        counted = counted.saturating_add(page.objects.len());
+        continuation = page.continuation_token.clone();
+        if continuation.is_none() {
+            break;
+        }
+    }
+    let list_after_rename_elapsed = list_after_rename_started.elapsed();
+    assert_eq!(counted, object_count + 1);
+
+    let trash_started = Instant::now();
+    let trash_summary = runtime
+        .trash(&fragment, "media")
+        .await
+        .expect("trash renamed namespace subtree");
+    let trash_elapsed = trash_started.elapsed();
+    assert!(trash_summary.affected_paths >= object_count + 1);
+    assert_eq!(trash_summary.affected_objects, object_count + 1);
+
+    let recover_started = Instant::now();
+    let recover_summary = runtime
+        .recover(&fragment, "media")
+        .await
+        .expect("recover renamed namespace subtree");
+    let recover_elapsed = recover_started.elapsed();
+    assert_eq!(recover_summary.affected_objects, object_count + 1);
+
+    let trash_again_started = Instant::now();
+    let trash_again_summary = runtime
+        .trash(&fragment, "media")
+        .await
+        .expect("trash renamed namespace subtree again");
+    let trash_again_elapsed = trash_again_started.elapsed();
+    assert_eq!(trash_again_summary.affected_objects, object_count + 1);
+
+    let empty_trash_started = Instant::now();
+    let empty_summary = runtime
+        .empty_trash(&fragment)
+        .await
+        .expect("empty namespace lifecycle trash");
+    let empty_trash_elapsed = empty_trash_started.elapsed();
+    assert_eq!(empty_summary.affected_objects, object_count + 1);
+
+    let mut trash_params = HashMap::new();
+    trash_params.insert("limit".to_string(), "1000".to_string());
+    trash_params.insert("prefix".to_string(), "media".to_string());
+    let trash_page = runtime
+        .list_objects_page(&fragment, &trash_params, true)
+        .await
+        .expect("list namespace trash after empty");
+    assert!(
+        trash_page.objects.is_empty() && trash_page.common_prefixes.is_empty(),
+        "empty trash should remove trashed namespace entries from trash listing"
+    );
+
+    let final_rss_kib = current_process_rss_kib();
+
+    println!(
+        "N1 namespace v2 bench: objects={} seed_ms={} import_ms={} rename_object_ms={} rename_prefix_ms={} list_after_rename_ms={} trash_ms={} recover_ms={} trash_again_ms={} empty_trash_ms={} rename_prefix_paths={} rename_prefix_objects={} trash_paths={} trash_objects={} empty_paths={} empty_objects={} seed_rss_kib={} after_seed_rss_kib={} final_rss_kib={}",
+        object_count,
+        seed_elapsed.as_millis(),
+        import_elapsed.as_millis(),
+        rename_object_elapsed.as_millis(),
+        rename_prefix_elapsed.as_millis(),
+        list_after_rename_elapsed.as_millis(),
+        trash_elapsed.as_millis(),
+        recover_elapsed.as_millis(),
+        trash_again_elapsed.as_millis(),
+        empty_trash_elapsed.as_millis(),
+        rename_prefix_summary.affected_paths,
+        rename_prefix_summary.affected_objects,
+        trash_summary.affected_paths,
+        trash_summary.affected_objects,
+        empty_summary.affected_paths,
+        empty_summary.affected_objects,
+        seed_rss_kib,
+        after_seed_rss_kib,
+        final_rss_kib
     );
 }
 

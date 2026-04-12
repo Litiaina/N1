@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Json,
@@ -9,25 +10,34 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs;
+use tokio::time::timeout;
 use tracing::{error, info, warn};
 
 use crate::{
     core::{
         disk_manager::ObjectPathManager,
         fragment_metadata::{
-            init_fragment_metadata, read_fragment_metadata, rotate_fragment_key,
+            init_fragment_metadata_strict, read_fragment_metadata, rotate_fragment_key,
             write_fragment_metadata,
         },
-        indexdb_store::{ensure_fragment_owner_partition_available, evict_fragment_cached_dbs},
-        sync::{CreateFragmentRequest, CreateFragmentResponse, ensure_fragment_blob_directories},
+        indexdb_store::{
+            ensure_fragment_owner_partition_available_strict, evict_fragment_cached_dbs,
+            has_any_fragment_partition_db,
+        },
+        sync::{
+            CreateFragmentRequest, CreateFragmentResponse, ensure_fragment_blob_directories_strict,
+        },
     },
     enums::app_error_enum::AppError,
     middleware::auth_middleware::MASTER_KEY,
+    namespace::runtime::global_namespace_runtime,
     routes::storage_routes::AppState,
     structs::auth_structs::Claims,
     validation::fragment_validation::does_fragment_exist,
     websocket::ws_structs::StorageEventPayload,
 };
+
+const FRAGMENT_CREATE_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Deserialize)]
 pub struct UpdateFragmentRequest {
@@ -52,6 +62,61 @@ pub fn is_fragment_hash(name: &str) -> bool {
         .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
 }
 
+async fn prepare_fragment_index_roots_strict(fragment: &str) -> Result<(), AppError> {
+    let path_manager = ObjectPathManager::new();
+    let index_roots = path_manager.get_all_index_roots();
+
+    if index_roots.is_empty() {
+        return Err(AppError::ServiceUnavailable(
+            "no index roots configured for fragment provisioning".into(),
+        ));
+    }
+
+    for root in index_roots {
+        let index_dir = root.join(fragment).join("indexdb");
+        timeout(FRAGMENT_CREATE_IO_TIMEOUT, fs::create_dir_all(&index_dir))
+            .await
+            .map_err(|_| {
+                AppError::ServiceUnavailable(format!(
+                    "timed out preparing index root {}",
+                    index_dir.display()
+                ))
+            })?
+            .map_err(|e| {
+                AppError::ServiceUnavailable(format!(
+                    "failed to prepare index root {}: {}",
+                    index_dir.display(),
+                    e
+                ))
+            })?;
+
+        let metadata = timeout(FRAGMENT_CREATE_IO_TIMEOUT, fs::metadata(&index_dir))
+            .await
+            .map_err(|_| {
+                AppError::ServiceUnavailable(format!(
+                    "timed out verifying index root {}",
+                    index_dir.display()
+                ))
+            })?
+            .map_err(|e| {
+                AppError::ServiceUnavailable(format!(
+                    "failed to verify index root {}: {}",
+                    index_dir.display(),
+                    e
+                ))
+            })?;
+
+        if !metadata.is_dir() {
+            return Err(AppError::ServiceUnavailable(format!(
+                "index root {} is not a directory",
+                index_dir.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn create_fragment(
     Json(payload): Json<CreateFragmentRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -67,21 +132,35 @@ pub async fn create_fragment(
     hasher.update(payload.name.as_bytes());
     let hash = hex::encode(hasher.finalize());
 
-    if does_fragment_exist(&hash).await {
+    global_namespace_runtime().evict_fragment(&hash);
+
+    let metadata_exists = read_fragment_metadata(&hash).await.is_ok();
+    let owner_partition_exists = has_any_fragment_partition_db(&hash)?;
+    if metadata_exists && owner_partition_exists {
         return Err(AppError::Conflict(format!(
             "Fragment already exists: {}",
             hash
         )));
     }
 
-    ensure_fragment_blob_directories(&hash).await;
-    let _ = init_fragment_metadata(&hash, &payload.key).await?;
-    ensure_fragment_owner_partition_available(&hash)?;
+    prepare_fragment_index_roots_strict(&hash).await?;
+    ensure_fragment_blob_directories_strict(&hash).await?;
+    ensure_fragment_owner_partition_available_strict(&hash)?;
+    if !metadata_exists {
+        let _ = init_fragment_metadata_strict(&hash, &payload.key).await?;
+    }
 
-    info!(
-        "Created new fragment '{}' with hash: {}",
-        payload.name, hash
-    );
+    if metadata_exists || owner_partition_exists {
+        info!(
+            "Recovered partial fragment '{}' with hash: {}",
+            payload.name, hash
+        );
+    } else {
+        info!(
+            "Created new fragment '{}' with hash: {}",
+            payload.name, hash
+        );
+    }
 
     Ok((
         StatusCode::CREATED,
@@ -240,6 +319,7 @@ pub async fn delete_fragment(
 
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         evict_fragment_cached_dbs(&fragment_owned);
+        global_namespace_runtime().evict_fragment(&fragment_owned);
 
         for root in index_roots.iter() {
             let fragment_path = root.join(&fragment_owned);

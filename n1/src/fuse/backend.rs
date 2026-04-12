@@ -1,17 +1,17 @@
-use crate::core::delete::{delete_object, delete_object_permanently, empty_trash, recover_object};
+use crate::core::delete::empty_trash;
 use crate::core::disk_manager::{
     ChunkQuery, InitiateUploadParams, ListObjectsResult, ObjectKeyQuery, ObjectMetadata,
-    RenameObjectRequest, UploadPartQuery,
+    UploadPartQuery,
 };
 use crate::core::download::download_object_chunk_direct;
 use crate::core::index;
-use crate::core::modify::rename_object;
-use crate::core::retrieve::{get_object_metadata_direct, list_objects_direct};
 use crate::core::upload::{
     cancel_upload_session, finalize_object_upload, initiate_object_upload, object_upload_part,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::fuse::model::{FsdPath, NodeKind, NodeMetadata, WriteHandle, encode_virtual_name};
+use crate::namespace::models::NamespaceEntryKind;
+use crate::namespace::runtime::global_namespace_runtime;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::manager::WsConnectionManager;
@@ -95,6 +95,7 @@ struct StagedPendingWrite {
 #[derive(Debug, Clone)]
 struct DirectPendingWrite {
     path: FsdPath,
+    physical_object_id: String,
     expected_size_bytes: u64,
     expected_parts: u64,
     upload_session_id: String,
@@ -235,13 +236,14 @@ impl InProcessBackend {
         let limit = page_limit.clamp(1, FSD_LIST_PAGE_LIMIT_MAX);
         let mut params = HashMap::new();
         params.insert("limit".to_string(), limit.to_string());
-        params.insert("include_internal".to_string(), "true".to_string());
         params.insert("delimiter".to_string(), "/".to_string());
         if let Some(token) = continuation_token {
             params.insert("continuation_token".to_string(), token);
         }
 
-        list_objects_direct(fragment, params, false).await
+        global_namespace_runtime()
+            .list_objects_page(fragment, &params, false)
+            .await
     }
 
     async fn list_trash_page_with_limit(
@@ -253,13 +255,14 @@ impl InProcessBackend {
         let limit = page_limit.clamp(1, FSD_LIST_PAGE_LIMIT_MAX);
         let mut params = HashMap::new();
         params.insert("limit".to_string(), limit.to_string());
-        params.insert("include_internal".to_string(), "true".to_string());
         params.insert("delimiter".to_string(), "/".to_string());
         if let Some(token) = continuation_token {
             params.insert("continuation_token".to_string(), token);
         }
 
-        list_objects_direct(fragment, params, true).await
+        global_namespace_runtime()
+            .list_objects_page(fragment, &params, true)
+            .await
     }
 
     async fn list_scoped_page_with_limit(
@@ -273,7 +276,6 @@ impl InProcessBackend {
         let limit = page_limit.clamp(1, FSD_LIST_PAGE_LIMIT_MAX);
         let mut params = HashMap::new();
         params.insert("limit".to_string(), limit.to_string());
-        params.insert("include_internal".to_string(), "true".to_string());
         params.insert("delimiter".to_string(), "/".to_string());
         if let Some(prefix) = prefix.filter(|value| !value.trim().is_empty()) {
             params.insert("prefix".to_string(), prefix.to_string());
@@ -282,15 +284,57 @@ impl InProcessBackend {
             params.insert("continuation_token".to_string(), token);
         }
 
-        list_objects_direct(fragment, params, scan_trash).await
+        global_namespace_runtime()
+            .list_objects_page(fragment, &params, scan_trash)
+            .await
     }
 
-    async fn fetch_object_metadata(
+    async fn fetch_live_object_metadata(
         &self,
         fragment: &str,
         object_key: &str,
     ) -> Result<ObjectMetadata, AppError> {
-        get_object_metadata_direct(fragment, object_key).await
+        let entry = global_namespace_runtime()
+            .entry(fragment, object_key)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        if entry.kind != NamespaceEntryKind::File || !entry.lifecycle.is_live() {
+            return Err(AppError::NotFound);
+        }
+        let head = global_namespace_runtime()
+            .head_for_path(fragment, object_key)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        Ok(ObjectMetadata {
+            object_key: object_key.to_string(),
+            fragment: fragment.to_string(),
+            version_id: head.current_version_id,
+            upload_session_id: String::new(),
+            owner_uid: fragment.to_string(),
+            content_type: head.content_type,
+            total_size_bytes: head.total_size_bytes,
+            created_at: head.updated_at_unix,
+            parts: Vec::new(),
+            is_delete_marker: false,
+            stripe_size_bytes: 0,
+        })
+    }
+
+    async fn resolve_live_read_object_key(
+        &self,
+        fragment: &str,
+        object_key: &str,
+    ) -> Result<String, AppError> {
+        let entry = global_namespace_runtime()
+            .entry(fragment, object_key)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        if entry.kind != NamespaceEntryKind::File || !entry.lifecycle.is_live() {
+            return Err(AppError::NotFound);
+        }
+        entry.object_id.ok_or_else(|| {
+            AppError::InternalServerError("logical file is missing physical object id".to_string())
+        })
     }
 
     fn split_trash_virtual_key<'a>(key: &'a str) -> Option<&'a str> {
@@ -367,10 +411,34 @@ impl InProcessBackend {
         if exact.is_empty() {
             return Ok(None);
         }
-        match index::read_latest_trashed_object(fragment, &exact).await {
-            Ok(meta) => Ok(Some(meta)),
-            Err(AppError::NotFound) => Ok(None),
-            Err(err) => Err(err),
+        match global_namespace_runtime()
+            .trashed_entry(fragment, &exact)
+            .await?
+        {
+            Some(entry)
+                if entry.kind == NamespaceEntryKind::File && entry.lifecycle.is_trashed() =>
+            {
+                let Some(head) = global_namespace_runtime()
+                    .head_for_path(fragment, &exact)
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(ObjectMetadata {
+                    object_key: exact,
+                    fragment: fragment.to_string(),
+                    version_id: head.current_version_id,
+                    upload_session_id: String::new(),
+                    owner_uid: fragment.to_string(),
+                    content_type: head.content_type,
+                    total_size_bytes: head.total_size_bytes,
+                    created_at: head.updated_at_unix,
+                    parts: Vec::new(),
+                    is_delete_marker: false,
+                    stripe_size_bytes: 0,
+                }))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -384,13 +452,13 @@ impl InProcessBackend {
         fragment: &str,
         object_key: &str,
     ) -> Result<bool, AppError> {
-        let Some(prefix) = Self::directory_listing_prefix(object_key) else {
+        if object_key.trim_matches('/').is_empty() {
             return Ok(true);
-        };
-        let page = self
-            .list_scoped_page_with_limit(fragment, Some(prefix.as_str()), None, 1, false)
-            .await?;
-        Ok(!page.objects.is_empty() || !page.common_prefixes.is_empty())
+        }
+        Ok(matches!(
+            global_namespace_runtime().entry(fragment, object_key).await?,
+            Some(entry) if entry.kind == NamespaceEntryKind::Directory && entry.lifecycle.is_live()
+        ))
     }
 
     async fn trash_directory_exists(
@@ -398,13 +466,13 @@ impl InProcessBackend {
         fragment: &str,
         object_key: &str,
     ) -> Result<bool, AppError> {
-        let Some(prefix) = Self::directory_listing_prefix(object_key) else {
+        if object_key.trim_matches('/').is_empty() {
             return Ok(true);
-        };
-        let page = self
-            .list_scoped_page_with_limit(fragment, Some(prefix.as_str()), None, 1, true)
-            .await?;
-        Ok(!page.objects.is_empty() || !page.common_prefixes.is_empty())
+        }
+        Ok(matches!(
+            global_namespace_runtime().trashed_entry(fragment, object_key).await?,
+            Some(entry) if entry.kind == NamespaceEntryKind::Directory && entry.lifecycle.is_trashed()
+        ))
     }
 
     fn map_live_page_to_dir_entries(
@@ -520,24 +588,31 @@ impl InProcessBackend {
         &self,
         fragment: &str,
         version_id: &str,
-        object_key: &str,
+        physical_object_id: &str,
     ) {
         let _ = cancel_upload_session(
             Self::claims_for(fragment),
             AxumPath((fragment.to_string(), version_id.to_string())),
             Query(ObjectKeyQuery {
-                object_key: object_key.to_string(),
+                object_key: physical_object_id.to_string(),
                 version_id: None,
+                filename: None,
             }),
         )
         .await;
+        let _ = global_namespace_runtime()
+            .clear_pending_upload(fragment, version_id)
+            .await;
     }
 
     async fn start_remote_upload(
         &self,
         path: &FsdPath,
         total_size: u64,
-    ) -> Result<(InitiateUploadResponseBody, u64), AppError> {
+    ) -> Result<(InitiateUploadResponseBody, u64, String), AppError> {
+        let physical_object_id = global_namespace_runtime()
+            .select_object_id_for_write(&path.fragment, &path.object_key)
+            .await?;
         let part_size = self.upload_part_size_bytes as u64;
         let expected_parts = if total_size == 0 {
             1
@@ -547,7 +622,7 @@ impl InProcessBackend {
 
         let init_response = initiate_object_upload(
             Self::claims_for(&path.fragment),
-            AxumPath((path.fragment.clone(), path.object_key.clone())),
+            AxumPath((path.fragment.clone(), physical_object_id.clone())),
             AxumJson(InitiateUploadParams {
                 content_type: Some("application/octet-stream".to_string()),
                 total_size_bytes: total_size,
@@ -564,7 +639,17 @@ impl InProcessBackend {
         )
         .await?;
 
-        Ok((init_body, expected_parts))
+        global_namespace_runtime()
+            .bind_pending_upload(
+                &path.fragment,
+                &path.object_key,
+                &physical_object_id,
+                &init_body.version_id,
+                &init_body.session_id,
+            )
+            .await?;
+
+        Ok((init_body, expected_parts, physical_object_id))
     }
 
     async fn upload_remote_part(
@@ -604,6 +689,7 @@ impl InProcessBackend {
     async fn finalize_remote_upload(
         &self,
         path: &FsdPath,
+        physical_object_id: &str,
         version_id: &str,
         session_id: &str,
         total_size: u64,
@@ -618,8 +704,9 @@ impl InProcessBackend {
                 session_id.to_string(),
             )),
             Query(ObjectKeyQuery {
-                object_key: path.object_key.clone(),
+                object_key: physical_object_id.to_string(),
                 version_id: None,
+                filename: None,
             }),
             AxumJson(InitiateUploadParams {
                 content_type: Some("application/octet-stream".to_string()),
@@ -631,7 +718,22 @@ impl InProcessBackend {
         .await?
         .into_response();
 
-        Self::expect_empty_response(finalize_response, &[StatusCode::OK]).await
+        Self::expect_empty_response(finalize_response, &[StatusCode::OK]).await?;
+
+        let metadata =
+            index::read_object_version(&path.fragment, physical_object_id, version_id).await?;
+        global_namespace_runtime()
+            .finalize_logical_upload(
+                &path.fragment,
+                &path.object_key,
+                physical_object_id,
+                &metadata,
+            )
+            .await?;
+        global_namespace_runtime()
+            .clear_pending_upload(&path.fragment, version_id)
+            .await?;
+        Ok(())
     }
 
     async fn commit_direct_write(&self, pending: &mut DirectPendingWrite) -> Result<(), AppError> {
@@ -673,6 +775,7 @@ impl InProcessBackend {
 
         self.finalize_remote_upload(
             &pending.path,
+            pending.physical_object_id.as_str(),
             pending.upload_version_id.as_str(),
             pending.upload_session_id.as_str(),
             pending.expected_size_bytes,
@@ -699,9 +802,8 @@ impl InProcessBackend {
         };
 
         let fragment = pending.path.fragment.clone();
-        let object_key = pending.path.object_key.clone();
-
-        let (init_body, _) = self.start_remote_upload(&pending.path, total_size).await?;
+        let (init_body, _, physical_object_id) =
+            self.start_remote_upload(&pending.path, total_size).await?;
 
         let mut sent = 0u64;
         let mut part_index = 0u64;
@@ -735,8 +837,12 @@ impl InProcessBackend {
                 )
                 .await
             {
-                self.cleanup_remote_upload_session(&fragment, &init_body.version_id, &object_key)
-                    .await;
+                self.cleanup_remote_upload_session(
+                    &fragment,
+                    &init_body.version_id,
+                    &physical_object_id,
+                )
+                .await;
                 return Err(err);
             }
 
@@ -747,6 +853,7 @@ impl InProcessBackend {
         if let Err(err) = self
             .finalize_remote_upload(
                 &pending.path,
+                physical_object_id.as_str(),
                 init_body.version_id.as_str(),
                 init_body.session_id.as_str(),
                 total_size,
@@ -754,8 +861,12 @@ impl InProcessBackend {
             )
             .await
         {
-            self.cleanup_remote_upload_session(&fragment, &init_body.version_id, &object_key)
-                .await;
+            self.cleanup_remote_upload_session(
+                &fragment,
+                &init_body.version_id,
+                &physical_object_id,
+            )
+            .await;
             return Err(err);
         }
 
@@ -856,31 +967,10 @@ impl InProcessBackend {
         fragment: &str,
         object_key: &str,
     ) -> Result<(), AppError> {
-        let soft_delete_result = delete_object(
-            State(Arc::clone(&self.app_state)),
-            Self::claims_for(fragment),
-            AxumPath((fragment.to_string(), object_key.to_string())),
-        )
-        .await;
-
-        match soft_delete_result {
-            Ok(response) => {
-                let response = response.into_response();
-                let (status, body) =
-                    Self::response_bytes(response, FSD_CONTROL_BODY_LIMIT_BYTES).await?;
-                if status == StatusCode::OK {
-                    Ok(())
-                } else if status == StatusCode::CONFLICT {
-                    self.delete_object_permanently(fragment, object_key).await
-                } else {
-                    Err(Self::status_to_error(status, &body))
-                }
-            }
-            Err(AppError::Conflict(_)) => {
-                self.delete_object_permanently(fragment, object_key).await
-            }
-            Err(e) => Err(e),
-        }
+        let _ = global_namespace_runtime()
+            .trash(fragment, object_key)
+            .await?;
+        Ok(())
     }
 
     async fn rename_live_object(
@@ -889,36 +979,10 @@ impl InProcessBackend {
         source_key: &str,
         destination_key: &str,
     ) -> Result<(), AppError> {
-        let response = rename_object(
-            State(Arc::clone(&self.app_state)),
-            Self::claims_for(fragment),
-            AxumJson(RenameObjectRequest {
-                source_fragment: fragment.to_string(),
-                source_key: source_key.to_string(),
-                destination_fragment: fragment.to_string(),
-                destination_key: destination_key.to_string(),
-            }),
-        )
-        .await?
-        .into_response();
-
-        Self::expect_empty_response(response, &[StatusCode::OK]).await
-    }
-
-    async fn delete_object_permanently(
-        &self,
-        fragment: &str,
-        object_key: &str,
-    ) -> Result<(), AppError> {
-        let permanent = delete_object_permanently(
-            State(Arc::clone(&self.app_state)),
-            Self::claims_for(fragment),
-            AxumPath((fragment.to_string(), object_key.to_string())),
-        )
-        .await?
-        .into_response();
-
-        Self::expect_empty_response(permanent, &[StatusCode::OK, StatusCode::NO_CONTENT]).await
+        let _ = global_namespace_runtime()
+            .rename(fragment, source_key, destination_key)
+            .await?;
+        Ok(())
     }
 }
 
@@ -932,6 +996,12 @@ impl FsdBackend for InProcessBackend {
         Box::pin(async move {
             if let Some(trash_sub_key) = Self::split_trash_virtual_key(path.object_key.as_str()) {
                 let trash_key = trash_sub_key.trim_matches('/').to_string();
+                let dir_exists = if trash_key.is_empty() {
+                    true
+                } else {
+                    self.trash_directory_exists(&path.fragment, &trash_key)
+                        .await?
+                };
                 if !trash_key.is_empty()
                     && self
                         .trash_exact_object_metadata(&path.fragment, &trash_key)
@@ -957,6 +1027,7 @@ impl FsdBackend for InProcessBackend {
                     && continuation_token.is_none()
                     && page.objects.is_empty()
                     && page.common_prefixes.is_empty()
+                    && !dir_exists
                 {
                     return Err(AppError::NotFound);
                 }
@@ -969,9 +1040,16 @@ impl FsdBackend for InProcessBackend {
                 });
             }
 
+            let dir_exists = if path.is_fragment_root() {
+                true
+            } else {
+                self.live_directory_exists(&path.fragment, &path.object_key)
+                    .await?
+            };
+
             if !path.is_fragment_root()
                 && self
-                    .fetch_object_metadata(&path.fragment, &path.object_key)
+                    .fetch_live_object_metadata(&path.fragment, &path.object_key)
                     .await
                     .is_ok()
             {
@@ -998,6 +1076,7 @@ impl FsdBackend for InProcessBackend {
                 && continuation_token.is_none()
                 && page.objects.is_empty()
                 && page.common_prefixes.is_empty()
+                && !dir_exists
             {
                 return Err(AppError::NotFound);
             }
@@ -1102,7 +1181,7 @@ impl FsdBackend for InProcessBackend {
             }
 
             match self
-                .fetch_object_metadata(&path.fragment, &path.object_key)
+                .fetch_live_object_metadata(&path.fragment, &path.object_key)
                 .await
             {
                 Ok(meta) => Ok(NodeMetadata {
@@ -1153,11 +1232,14 @@ impl FsdBackend for InProcessBackend {
             }
 
             let capped_len = length.clamp(1, FSD_MAX_READ_BYTES);
+            let resolved_object_key = self
+                .resolve_live_read_object_key(&path.fragment, &path.object_key)
+                .await?;
 
             download_object_chunk_direct(
                 &path.fragment,
                 &ChunkQuery {
-                    object_key: path.object_key.clone(),
+                    object_key: resolved_object_key,
                     offset,
                     chunk_size: capped_len,
                 },
@@ -1186,9 +1268,11 @@ impl FsdBackend for InProcessBackend {
 
             let handle_id = Ulid::new().to_string();
             let pending = if let Some(expected) = expected_size_bytes {
-                let (init_body, expected_parts) = self.start_remote_upload(path, expected).await?;
+                let (init_body, expected_parts, physical_object_id) =
+                    self.start_remote_upload(path, expected).await?;
                 PendingWriteState::Direct(DirectPendingWrite {
                     path: path.clone(),
+                    physical_object_id,
                     expected_size_bytes: expected,
                     expected_parts,
                     upload_session_id: init_body.session_id,
@@ -1305,7 +1389,7 @@ impl FsdBackend for InProcessBackend {
                         self.cleanup_remote_upload_session(
                             direct.path.fragment.as_str(),
                             direct.upload_version_id.as_str(),
-                            direct.path.object_key.as_str(),
+                            direct.physical_object_id.as_str(),
                         )
                         .await;
                     }
@@ -1346,20 +1430,9 @@ impl FsdBackend for InProcessBackend {
                         "invalid trash object path".to_string(),
                     ));
                 }
-
-                let response = delete_object_permanently(
-                    State(Arc::clone(&self.app_state)),
-                    Self::claims_for(&path.fragment),
-                    AxumPath((path.fragment.clone(), object_key)),
-                )
-                .await?
-                .into_response();
-
-                return Self::expect_empty_response(
-                    response,
-                    &[StatusCode::OK, StatusCode::NO_CONTENT],
-                )
-                .await;
+                return Err(AppError::BadRequest(
+                    "Permanent delete was removed in N1 2.0; use empty trash".to_string(),
+                ));
             }
 
             self.delete_active_object_with_fallback(&path.fragment, &path.object_key)
@@ -1367,11 +1440,17 @@ impl FsdBackend for InProcessBackend {
         })
     }
 
-    fn mkdir<'a>(&'a self, _path: &'a FsdPath) -> BoxFuture<'a, Result<(), AppError>> {
+    fn mkdir<'a>(&'a self, path: &'a FsdPath) -> BoxFuture<'a, Result<(), AppError>> {
         Box::pin(async move {
-            Err(AppError::BadRequest(
-                "directories are not supported in fsd flat mode".to_string(),
-            ))
+            if path.is_fragment_root() || Self::is_trash_virtual_path(path) {
+                return Err(AppError::BadRequest(
+                    "cannot create a directory at this virtual path".to_string(),
+                ));
+            }
+            let _ = global_namespace_runtime()
+                .mkdir(&path.fragment, &path.object_key)
+                .await?;
+            Ok(())
         })
     }
 
@@ -1391,9 +1470,15 @@ impl FsdBackend for InProcessBackend {
                 )
                 .await;
             }
-            Err(AppError::BadRequest(
-                "directories are not supported in fsd flat mode".to_string(),
-            ))
+            if Self::is_trash_virtual_path(path) {
+                return Err(AppError::BadRequest(
+                    "Permanent delete was removed in N1 2.0; use empty trash".to_string(),
+                ));
+            }
+            let _ = global_namespace_runtime()
+                .trash(&path.fragment, &path.object_key)
+                .await?;
+            Ok(())
         })
     }
 
@@ -1432,34 +1517,18 @@ impl FsdBackend for InProcessBackend {
                         return Err(AppError::BadRequest("cannot rename trash root".to_string()));
                     }
 
-                    let recover_response = recover_object(
-                        State(Arc::clone(&self.app_state)),
-                        Self::claims_for(&from.fragment),
-                        AxumPath((from.fragment.clone(), from_key.clone())),
-                    )
-                    .await?
-                    .into_response();
-
-                    Self::expect_empty_response(recover_response, &[StatusCode::OK]).await?;
+                    let _ = global_namespace_runtime()
+                        .recover(&from.fragment, &from_key)
+                        .await?;
 
                     if from_key == to.object_key {
                         return Ok(());
                     }
 
-                    let rename_response = rename_object(
-                        State(Arc::clone(&self.app_state)),
-                        Self::claims_for(&from.fragment),
-                        AxumJson(RenameObjectRequest {
-                            source_fragment: from.fragment.clone(),
-                            source_key: from_key,
-                            destination_fragment: to.fragment.clone(),
-                            destination_key: to.object_key.clone(),
-                        }),
-                    )
-                    .await?
-                    .into_response();
-
-                    return Self::expect_empty_response(rename_response, &[StatusCode::OK]).await;
+                    let _ = global_namespace_runtime()
+                        .rename(&from.fragment, &from_key, &to.object_key)
+                        .await?;
+                    return Ok(());
                 }
                 (None, Some(to_key)) => {
                     if to_key != from.object_key {
@@ -1468,15 +1537,10 @@ impl FsdBackend for InProcessBackend {
                         ));
                     }
 
-                    let response = delete_object(
-                        State(Arc::clone(&self.app_state)),
-                        Self::claims_for(&from.fragment),
-                        AxumPath((from.fragment.clone(), from.object_key.clone())),
-                    )
-                    .await?
-                    .into_response();
-
-                    return Self::expect_empty_response(response, &[StatusCode::OK]).await;
+                    let _ = global_namespace_runtime()
+                        .trash(&from.fragment, &from.object_key)
+                        .await?;
+                    return Ok(());
                 }
                 (Some(_), Some(_)) => {
                     return Err(AppError::BadRequest(
@@ -1486,7 +1550,7 @@ impl FsdBackend for InProcessBackend {
                 (None, None) => {}
             }
 
-            self.fetch_object_metadata(&from.fragment, &from.object_key)
+            self.fetch_live_object_metadata(&from.fragment, &from.object_key)
                 .await?;
             self.rename_live_object(&from.fragment, &from.object_key, &to.object_key)
                 .await

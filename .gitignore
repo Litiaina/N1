@@ -30,6 +30,7 @@ Desktop.ini
 .env
 .env.*
 n1.env
+registry.env
 arc/n1.env
 standard/n1.env
 

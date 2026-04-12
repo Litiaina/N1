@@ -1,15 +1,13 @@
 use crate::core::disk_manager::{ObjectKeyQuery, ObjectPathManager};
 use crate::core::download::download_object as download_object_impl;
 use crate::core::metadata_parser::get_version_metadata;
-use crate::core::retrieve::{
-    get_object_metadata_direct, stream_object as stream_object_impl,
-};
+use crate::core::retrieve::{get_object_metadata_direct, stream_object as stream_object_impl};
 use crate::enums::app_error_enum::AppError;
 use crate::structs::auth_structs::Claims;
+use axum::Json as AxumJson;
 use axum::extract::{Path, Query};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
-use axum::Json as AxumJson;
 use hmac::{Hmac, Mac};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
@@ -39,6 +37,8 @@ pub struct SignedReadUrlRequest {
     pub expires_in: Option<u64>,
     #[serde(default)]
     pub version_id: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -50,6 +50,7 @@ pub struct SignedReadUrlResponse {
     pub disposition: String,
     pub expires_at: i64,
     pub version_id: Option<String>,
+    pub filename: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,12 +63,15 @@ pub struct SignedReadObjectQuery {
     pub disposition: Option<String>,
     #[serde(default)]
     pub version_id: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct ValidatedSignedRead {
     disposition: String,
     version_id: Option<String>,
+    filename: Option<String>,
 }
 
 fn current_unix_timestamp_secs() -> Result<i64, AppError> {
@@ -110,14 +114,16 @@ fn signed_read_payload(
     expires: i64,
     disposition: &str,
     version_id: Option<&str>,
+    filename: Option<&str>,
 ) -> String {
     format!(
-        "{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}",
         fragment,
         object_key,
         expires,
         disposition,
-        version_id.unwrap_or("")
+        version_id.unwrap_or(""),
+        filename.unwrap_or("")
     )
 }
 
@@ -128,8 +134,16 @@ fn sign_signed_read_with_secret(
     expires: i64,
     disposition: &str,
     version_id: Option<&str>,
+    filename: Option<&str>,
 ) -> String {
-    let payload = signed_read_payload(fragment, object_key, expires, disposition, version_id);
+    let payload = signed_read_payload(
+        fragment,
+        object_key,
+        expires,
+        disposition,
+        version_id,
+        filename,
+    );
     let mut mac = SignedReadHmac::new_from_slice(secret).expect("valid HMAC key");
     mac.update(payload.as_bytes());
     hex::encode(mac.finalize().into_bytes())
@@ -141,6 +155,7 @@ fn sign_signed_read(
     expires: i64,
     disposition: &str,
     version_id: Option<&str>,
+    filename: Option<&str>,
 ) -> String {
     sign_signed_read_with_secret(
         SIGNED_READ_URL_SECRET.as_slice(),
@@ -149,6 +164,7 @@ fn sign_signed_read(
         expires,
         disposition,
         version_id,
+        filename,
     )
 }
 
@@ -170,6 +186,7 @@ fn validate_signed_read_query_with_secret(
 
     let disposition = normalize_signed_read_disposition(query.disposition.as_deref())?;
     let version_id = normalize_optional_non_empty(query.version_id.as_deref());
+    let filename = normalize_optional_non_empty(query.filename.as_deref());
     if version_id.is_some() && disposition != "download" {
         return Err(AppError::BadRequest(
             "Signed version reads are only supported for download disposition".into(),
@@ -182,6 +199,7 @@ fn validate_signed_read_query_with_secret(
         query.expires,
         disposition,
         version_id.as_deref(),
+        filename.as_deref(),
     );
 
     let signature = hex::decode(query.signature.trim()).map_err(|_| AppError::Unauthorized)?;
@@ -193,10 +211,13 @@ fn validate_signed_read_query_with_secret(
     Ok(ValidatedSignedRead {
         disposition: disposition.to_string(),
         version_id,
+        filename,
     })
 }
 
-fn validate_signed_read_query(query: &SignedReadObjectQuery) -> Result<ValidatedSignedRead, AppError> {
+fn validate_signed_read_query(
+    query: &SignedReadObjectQuery,
+) -> Result<ValidatedSignedRead, AppError> {
     validate_signed_read_query_with_secret(
         SIGNED_READ_URL_SECRET.as_slice(),
         query,
@@ -211,6 +232,7 @@ fn build_signed_read_path(
     disposition: &str,
     signature: &str,
     version_id: Option<&str>,
+    filename: Option<&str>,
 ) -> String {
     let fragment = utf8_percent_encode(fragment, NON_ALPHANUMERIC).to_string();
     let object_key = utf8_percent_encode(object_key, NON_ALPHANUMERIC).to_string();
@@ -225,6 +247,11 @@ fn build_signed_read_path(
     if let Some(version_id) = version_id {
         path.push_str("&version_id=");
         path.push_str(&utf8_percent_encode(version_id, NON_ALPHANUMERIC).to_string());
+    }
+
+    if let Some(filename) = filename {
+        path.push_str("&filename=");
+        path.push_str(&utf8_percent_encode(filename, NON_ALPHANUMERIC).to_string());
     }
 
     path
@@ -260,6 +287,7 @@ pub async fn mint_signed_read_url(
 
     let disposition = normalize_signed_read_disposition(req.disposition.as_deref())?;
     let version_id = normalize_optional_non_empty(req.version_id.as_deref());
+    let filename = normalize_optional_non_empty(req.filename.as_deref());
     if version_id.is_some() && disposition != "download" {
         return Err(AppError::BadRequest(
             "Signed version reads are only supported for download disposition".into(),
@@ -275,6 +303,7 @@ pub async fn mint_signed_read_url(
         expires_at,
         disposition,
         version_id.as_deref(),
+        filename.as_deref(),
     );
     let path = build_signed_read_path(
         &claims.fragment,
@@ -283,6 +312,7 @@ pub async fn mint_signed_read_url(
         disposition,
         &signature,
         version_id.as_deref(),
+        filename.as_deref(),
     );
 
     Ok(AxumJson(SignedReadUrlResponse {
@@ -293,6 +323,7 @@ pub async fn mint_signed_read_url(
         disposition: disposition.to_string(),
         expires_at,
         version_id,
+        filename,
     }))
 }
 
@@ -319,6 +350,7 @@ pub async fn read_object_via_signed_url(
                 Query(ObjectKeyQuery {
                     object_key,
                     version_id: validated.version_id,
+                    filename: validated.filename,
                 }),
                 headers,
             )
@@ -378,8 +410,9 @@ mod tests {
         let fragment = "frag";
         let object_key = "videos/demo.mp4";
         let expires = 1_900_000_000i64;
-        let signature =
-            sign_signed_read_with_secret(secret, fragment, object_key, expires, "stream", None);
+        let signature = sign_signed_read_with_secret(
+            secret, fragment, object_key, expires, "stream", None, None,
+        );
 
         let valid = SignedReadObjectQuery {
             fragment: fragment.to_string(),
@@ -388,6 +421,7 @@ mod tests {
             signature: signature.clone(),
             disposition: Some("stream".to_string()),
             version_id: None,
+            filename: None,
         };
         let validated =
             validate_signed_read_query_with_secret(secret, &valid, expires - 10).expect("valid");
@@ -410,6 +444,7 @@ mod tests {
             signature,
             disposition: Some("stream".to_string()),
             version_id: None,
+            filename: None,
         };
         assert!(matches!(
             validate_signed_read_query_with_secret(secret, &expired, expires + 1),
@@ -431,6 +466,7 @@ mod tests {
             expires,
             "download",
             Some(version_id),
+            None,
         );
 
         let valid = SignedReadObjectQuery {
@@ -440,6 +476,7 @@ mod tests {
             signature,
             disposition: Some("download".to_string()),
             version_id: Some(version_id.to_string()),
+            filename: None,
         };
         assert!(validate_signed_read_query_with_secret(secret, &valid, expires - 5).is_ok());
 
@@ -450,6 +487,7 @@ mod tests {
             expires,
             "stream",
             Some(version_id),
+            None,
         );
         let invalid = SignedReadObjectQuery {
             fragment: fragment.to_string(),
@@ -458,6 +496,7 @@ mod tests {
             signature,
             disposition: Some("stream".to_string()),
             version_id: Some(version_id.to_string()),
+            filename: None,
         };
         assert!(matches!(
             validate_signed_read_query_with_secret(secret, &invalid, expires - 5),
@@ -469,8 +508,8 @@ mod tests {
     fn signed_read_path_contains_encoded_values() {
         let encoded_object_key =
             utf8_percent_encode("folder/video clip.mp4", NON_ALPHANUMERIC).to_string();
-        let encoded_version_id =
-            utf8_percent_encode("ver/1", NON_ALPHANUMERIC).to_string();
+        let encoded_version_id = utf8_percent_encode("ver/1", NON_ALPHANUMERIC).to_string();
+        let encoded_filename = utf8_percent_encode("video clip.mp4", NON_ALPHANUMERIC).to_string();
         let path = build_signed_read_path(
             "frag hash",
             "folder/video clip.mp4",
@@ -478,10 +517,12 @@ mod tests {
             "stream",
             "abc123",
             Some("ver/1"),
+            Some("video clip.mp4"),
         );
         assert!(path.starts_with("/n1/objects/signed-read?"));
         assert!(path.contains("fragment=frag%20hash"));
         assert!(path.contains(&format!("object_key={}", encoded_object_key)));
         assert!(path.contains(&format!("version_id={}", encoded_version_id)));
+        assert!(path.contains(&format!("filename={}", encoded_filename)));
     }
 }

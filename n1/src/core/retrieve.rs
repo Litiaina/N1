@@ -287,5 +287,5 @@ pub async fn stream_object(
         return Err(AppError::NotFound);
     }
 
-    stream_object_logic(headers, metadata, "inline").await
+    stream_object_logic(headers, metadata, "inline", None).await
 }

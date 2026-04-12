@@ -1733,10 +1733,10 @@ async fn finalize_object(
             .current
             .or_else(|| infer_latest_engine_head(&engine_state.versions))
             .ok_or_else(|| {
-            RegistryError::bad_gateway(
-                "storage finalize did not produce a readable committed object",
-            )
-        })?;
+                RegistryError::bad_gateway(
+                    "storage finalize did not produce a readable committed object",
+                )
+            })?;
         let (object, user) = state
             .db
             .sync_object_from_engine(
@@ -1945,7 +1945,6 @@ async fn rename_object(
     if req.fragment.trim().is_empty() {
         return Err(RegistryError::bad_request("fragment is required"));
     }
-    let _write_guard = state.write_gate.lock().await;
     if req.source_key.trim().is_empty() || req.destination_key.trim().is_empty() {
         return Err(RegistryError::bad_request(
             "source_key and destination_key are required",
@@ -1955,6 +1954,11 @@ async fn rename_object(
     let source_key = req.source_key.trim().to_string();
     let destination_key = req.destination_key.trim().to_string();
     let claims = claims_from_headers(&headers, &state.auth)?;
+    let removed_scopes = reconcile_pending_uploads(&state, Some(claims.sub.clone())).await?;
+    if !removed_scopes.is_empty() {
+        publish_pending_upload_cleanup_invalidations(&state, removed_scopes);
+    }
+    let _write_guard = state.write_gate.lock().await;
     let (object, user) = state
         .db
         .rename_object(
@@ -1996,6 +2000,10 @@ async fn rename_object_prefix(
 
     let fragment = req.fragment.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
+    let removed_scopes = reconcile_pending_uploads(&state, Some(claims.sub.clone())).await?;
+    if !removed_scopes.is_empty() {
+        publish_pending_upload_cleanup_invalidations(&state, removed_scopes);
+    }
     let _write_guard = state.write_gate.lock().await;
     let (affected, user) = state
         .db
@@ -4026,7 +4034,11 @@ mod tests {
                 .expect("serialize admin login request"),
             ))
             .expect("admin login request");
-        let login_resp = app.clone().oneshot(login_req).await.expect("admin login response");
+        let login_resp = app
+            .clone()
+            .oneshot(login_req)
+            .await
+            .expect("admin login response");
         assert_eq!(login_resp.status(), StatusCode::OK);
     }
 
@@ -4227,6 +4239,216 @@ mod tests {
         assert!(
             pending.is_empty(),
             "stale pending reservation should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_prefix_reconciles_stale_destination_pending_upload_reservations() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, access_token) = test_state(single_url, multi_url).await;
+        let drive_user = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment a");
+
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "photos/source.jpg".to_string(),
+                "01HRENAMESOURCE000000000000001".to_string(),
+                4096,
+                Some("image/jpeg".to_string()),
+            )
+            .await
+            .expect("finalize source object");
+
+        state
+            .db
+            .register_pending_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "archive/source.jpg".to_string(),
+                Some(4096),
+                Some("image/jpeg".to_string()),
+                Some("01HRENAMEPENDING000000000001".to_string()),
+                Some("01HRENAMEPENDING000000000XYZ".to_string()),
+            )
+            .await
+            .expect("register stale pending destination");
+
+        let app = build_router(state.clone());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/objects/rename-prefix")
+            .header("authorization", format!("Bearer {}", access_token))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "fragment": "fragment-a",
+                    "source_prefix": "photos",
+                    "destination_prefix": "archive"
+                })
+                .to_string(),
+            ))
+            .expect("rename-prefix request");
+        let resp = app
+            .clone()
+            .oneshot(req)
+            .await
+            .expect("rename-prefix response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let renamed = state
+            .db
+            .resolve_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "archive/source.jpg".to_string(),
+            )
+            .await
+            .expect("resolve renamed object")
+            .expect("renamed object exists");
+        assert_eq!(renamed.object_key, "archive/source.jpg");
+
+        let source = state
+            .db
+            .resolve_any_object_record(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "photos/source.jpg".to_string(),
+            )
+            .await
+            .expect("resolve source object after rename");
+        assert!(source.is_none(), "source object should no longer exist");
+
+        let pending = state
+            .db
+            .list_pending_upload_reservations(Some(drive_user.uid))
+            .await
+            .expect("list pending uploads after rename");
+        assert!(
+            pending.is_empty(),
+            "stale pending destination reservation should be removed before rename"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_object_reconciles_stale_destination_pending_upload_reservations() {
+        let single_url = spawn_storage_stub("single-stub-token").await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, access_token) = test_state(single_url, multi_url).await;
+        let drive_user = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user")
+            .user;
+
+        state
+            .db
+            .upsert_fragment_binding(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                crate::models::StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment a");
+
+        state
+            .db
+            .finalize_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "IMG_8634.mov".to_string(),
+                "01HRENAMEFILE000000000000001".to_string(),
+                4096,
+                Some("video/quicktime".to_string()),
+            )
+            .await
+            .expect("finalize source object");
+
+        state
+            .db
+            .register_pending_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "videos/IMG_8634.mov".to_string(),
+                Some(4096),
+                Some("video/quicktime".to_string()),
+                Some("01HRENAMEFILEPENDING000001".to_string()),
+                Some("01HRENAMEFILEPENDING000XYZ".to_string()),
+            )
+            .await
+            .expect("register stale pending destination");
+
+        let app = build_router(state.clone());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/objects/rename")
+            .header("authorization", format!("Bearer {}", access_token))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "fragment": "fragment-a",
+                    "source_key": "IMG_8634.mov",
+                    "destination_key": "videos/IMG_8634.mov"
+                })
+                .to_string(),
+            ))
+            .expect("rename request");
+        let resp = app.clone().oneshot(req).await.expect("rename response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let renamed = state
+            .db
+            .resolve_object(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "videos/IMG_8634.mov".to_string(),
+            )
+            .await
+            .expect("resolve renamed object")
+            .expect("renamed object exists");
+        assert_eq!(renamed.object_key, "videos/IMG_8634.mov");
+
+        let source = state
+            .db
+            .resolve_any_object_record(
+                drive_user.uid.clone(),
+                "fragment-a".to_string(),
+                "IMG_8634.mov".to_string(),
+            )
+            .await
+            .expect("resolve source object after rename");
+        assert!(source.is_none(), "source object should no longer exist");
+
+        let pending = state
+            .db
+            .list_pending_upload_reservations(Some(drive_user.uid))
+            .await
+            .expect("list pending uploads after rename");
+        assert!(
+            pending.is_empty(),
+            "stale pending destination reservation should be removed before rename"
         );
     }
 
@@ -4509,10 +4731,7 @@ mod tests {
             payload["object"]["version_id"].as_str(),
             Some("01ENGINEVERSIONSLAG000000000002")
         );
-        assert_eq!(
-            payload["object"]["object_size_bytes"].as_i64(),
-            Some(4_096)
-        );
+        assert_eq!(payload["object"]["object_size_bytes"].as_i64(), Some(4_096));
         assert_eq!(
             payload["object"]["content_type"].as_str(),
             Some("video/quicktime")
@@ -6855,10 +7074,7 @@ mod tests {
             resolve_json["object_size_bytes"].as_i64(),
             Some(15_912_736_534)
         );
-        assert_eq!(
-            resolve_json["content_type"].as_str(),
-            Some("video/mp4")
-        );
+        assert_eq!(resolve_json["content_type"].as_str(), Some("video/mp4"));
 
         let list_req = Request::builder()
             .method("GET")

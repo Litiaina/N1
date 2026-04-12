@@ -345,7 +345,26 @@ fn route_for_partition(fragment: &str, partition_id: u16) -> Result<IndexRoute, 
 }
 
 fn fragment_route(fragment: &str) -> Result<IndexRoute, AppError> {
-    route_for_partition(fragment, 0)
+    let roots = ObjectPathManager::new().get_all_index_roots();
+    if roots.is_empty() {
+        return Err(AppError::InternalServerError(
+            "No index roots configured".to_string(),
+        ));
+    }
+
+    let owner_idx = fragment_owner_index(fragment, roots.len());
+    let mut selected = Vec::with_capacity(roots.len());
+    selected.push(roots[owner_idx].clone());
+    for (idx, root) in roots.into_iter().enumerate() {
+        if idx != owner_idx {
+            selected.push(root);
+        }
+    }
+
+    Ok(IndexRoute {
+        partition_id: 0,
+        roots: selected,
+    })
 }
 
 fn object_route(fragment: &str, object_key: &str) -> Result<IndexRoute, AppError> {
@@ -800,6 +819,18 @@ where
 }
 
 fn replicate_owner_partition_db(fragment: &str, route: &IndexRoute) -> Result<(), AppError> {
+    replicate_owner_partition_db_with_mode(fragment, route, false)
+}
+
+fn replicate_owner_partition_db_strict(fragment: &str, route: &IndexRoute) -> Result<(), AppError> {
+    replicate_owner_partition_db_with_mode(fragment, route, true)
+}
+
+fn replicate_owner_partition_db_with_mode(
+    fragment: &str,
+    route: &IndexRoute,
+    strict: bool,
+) -> Result<(), AppError> {
     if route.roots.len() <= 1 {
         return Ok(());
     }
@@ -831,6 +862,14 @@ fn replicate_owner_partition_db(fragment: &str, route: &IndexRoute) -> Result<()
         }
         evict_cached_db(&replica_path);
         if let Err(err) = atomic_copy_db_file(&source_path, &replica_path) {
+            if strict {
+                return Err(AppError::ServiceUnavailable(format!(
+                    "indexdb replica catch-up failed for {} -> {}: {}",
+                    source_path.display(),
+                    replica_path.display(),
+                    err
+                )));
+            }
             warn!(
                 "indexdb replica catch-up failed for {} -> {}: {}",
                 source_path.display(),
@@ -984,6 +1023,31 @@ pub fn ensure_fragment_owner_partition_available(fragment: &str) -> Result<(), A
         })?;
         let _ = ensure_partition_meta_exact(&owner_db)?;
         replicate_owner_partition_db(fragment, &route)?;
+        Ok(())
+    })
+}
+
+pub fn ensure_fragment_owner_partition_available_strict(fragment: &str) -> Result<(), AppError> {
+    let route = fragment_route(fragment)?;
+    let owner_path = owner_db_path(&route, fragment);
+    with_partition_commit_lock(&owner_path, || {
+        if let Some(parent) = owner_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                AppError::ServiceUnavailable(format!(
+                    "authoritative owner index root unavailable: mkdir {} failed: {}",
+                    parent.display(),
+                    e
+                ))
+            })?;
+        }
+        let owner_db = open_owner_db_for_write(&route, fragment).map_err(|e| {
+            AppError::ServiceUnavailable(format!(
+                "authoritative owner index root unavailable: {}",
+                e
+            ))
+        })?;
+        let _ = ensure_partition_meta_exact(&owner_db)?;
+        replicate_owner_partition_db_strict(fragment, &route)?;
         Ok(())
     })
 }

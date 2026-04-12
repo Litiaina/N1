@@ -182,6 +182,27 @@ pub async fn init_fragment_metadata(
     Ok(meta)
 }
 
+pub async fn init_fragment_metadata_strict(
+    fragment_hash: &str,
+    key: &str,
+) -> Result<FragmentMetadata, AppError> {
+    if key.is_empty() {
+        return Err(AppError::BadRequest("key must not be empty".into()));
+    }
+
+    let meta = FragmentMetadata {
+        fragment: fragment_hash.to_string(),
+        key_phc: hash_key_to_phc(key)?,
+        nt_hash_hex: Some(hash_key_to_nt_hash_hex(key)),
+        index_partition_count: configured_index_partition_count(),
+        created: now_utc_rfc3339(),
+        updated: None,
+    };
+
+    write_fragment_metadata_strict(&meta).await?;
+    Ok(meta)
+}
+
 pub async fn read_fragment_metadata(fragment_hash: &str) -> Result<FragmentMetadata, AppError> {
     let pm = ObjectPathManager::new();
     let roots = pm.get_all_index_roots();
@@ -243,6 +264,17 @@ pub fn fragment_index_partition_count(fragment_hash: &str) -> Result<u16, AppErr
 }
 
 pub async fn write_fragment_metadata(meta: &FragmentMetadata) -> Result<(), AppError> {
+    write_fragment_metadata_with_policy(meta, false).await
+}
+
+pub async fn write_fragment_metadata_strict(meta: &FragmentMetadata) -> Result<(), AppError> {
+    write_fragment_metadata_with_policy(meta, true).await
+}
+
+async fn write_fragment_metadata_with_policy(
+    meta: &FragmentMetadata,
+    require_all_roots: bool,
+) -> Result<(), AppError> {
     validate_supported_index_partition_count(meta.index_partition_count)?;
     let pm = ObjectPathManager::new();
     let roots = pm.get_all_index_roots();
@@ -251,12 +283,25 @@ pub async fn write_fragment_metadata(meta: &FragmentMetadata) -> Result<(), AppE
         .map_err(|e| AppError::InternalServerError(format!("encode msgpack: {}", e)))?;
 
     let mut any_ok = false;
+    let mut failed_paths = Vec::new();
 
     for root in roots {
         let p = fragment_meta_path(&root, &meta.fragment);
-        if durable_atomic_write(&p, &bytes).await.is_ok() {
-            any_ok = true;
+        match durable_atomic_write(&p, &bytes).await {
+            Ok(()) => {
+                any_ok = true;
+            }
+            Err(err) => {
+                failed_paths.push(format!("{} ({})", p.display(), err));
+            }
         }
+    }
+
+    if require_all_roots && !failed_paths.is_empty() {
+        return Err(AppError::ServiceUnavailable(format!(
+            "failed to write fragment metadata to all index roots: {}",
+            failed_paths.join("; ")
+        )));
     }
 
     if !any_ok {

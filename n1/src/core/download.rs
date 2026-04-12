@@ -38,7 +38,7 @@ pub async fn download_object(
         return Err(AppError::NotFound);
     }
 
-    stream_object_logic(headers, metadata, "attachment").await
+    stream_object_logic(headers, metadata, "attachment", query.filename.clone()).await
 }
 
 pub async fn download_object_chunk(

@@ -44,10 +44,17 @@ const ARCHIVE_DUPLEX_BYTES: usize = 1024 * 1024;
 const ARCHIVE_CHUNK_REQ_SIZE: usize = 256 * 1024;
 const ARCHIVE_SCAN_PAGE_LIMIT: usize = 1000;
 
+#[derive(Clone)]
+pub struct PreparedArchiveEntry {
+    pub archive_path: String,
+    pub metadata: ObjectMetadata,
+}
+
 enum ArchiveSelection {
     Keys(Vec<String>),
     FragmentAll { include_internal: bool },
     ManifestFile(PathBuf),
+    PreparedEntries(Vec<PreparedArchiveEntry>),
 }
 
 pub async fn download_selected_archive(
@@ -66,6 +73,7 @@ pub async fn download_selected_archive(
         ArchiveSelection::Keys(keys) => Some(keys.len()),
         ArchiveSelection::FragmentAll { .. } => None,
         ArchiveSelection::ManifestFile(_) => None,
+        ArchiveSelection::PreparedEntries(entries) => Some(entries.len()),
     };
 
     let (effective_format, content_type, disposition) =
@@ -91,6 +99,49 @@ pub async fn download_selected_archive(
         };
 
     let stream = stream_archive(fragment, selection, effective_format.to_string()).await?;
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .body(Body::from_stream(stream))
+        .unwrap())
+}
+
+pub async fn download_prepared_archive(
+    entries: Vec<PreparedArchiveEntry>,
+    req: DownloadArchiveRequest,
+) -> Result<Response, AppError> {
+    let filename = req.filename.clone().unwrap_or_else(|| "export".to_string());
+    let selected_key_count = Some(entries.len());
+
+    let (effective_format, content_type, disposition) =
+        if selected_key_count.is_none() || selected_key_count.unwrap_or_default() > 1000 {
+            (
+                "tar",
+                "application/x-tar",
+                format!("attachment; filename=\"{}.tar\"", filename),
+            )
+        } else {
+            match req.format.as_str() {
+                "tar" => (
+                    "tar",
+                    "application/x-tar",
+                    format!("attachment; filename=\"{}.tar\"", filename),
+                ),
+                _ => (
+                    "zip",
+                    "application/zip",
+                    format!("attachment; filename=\"{}.zip\"", filename),
+                ),
+            }
+        };
+
+    let stream = stream_archive(
+        String::new(),
+        ArchiveSelection::PreparedEntries(entries),
+        effective_format.to_string(),
+    )
+    .await?;
 
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, content_type)
@@ -348,6 +399,33 @@ async fn write_zip_archive(
                 "zip export does not support manifest mode; use tar".into(),
             ));
         }
+        ArchiveSelection::PreparedEntries(entries) => {
+            for entry in entries {
+                let mut reader = create_multipart_reader(&entry.metadata);
+                let builder = ZipEntryBuilder::new(entry.archive_path.into(), Compression::Stored);
+
+                let mut entry_writer = zip.write_entry_stream(builder).await.map_err(|e| {
+                    AppError::Io(
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                        "zip entry create".into(),
+                    )
+                })?;
+                let mut compat_writer = (&mut entry_writer).compat_write();
+
+                tokio::io::copy(&mut reader, &mut compat_writer)
+                    .await
+                    .map_err(|e| AppError::Io(e, "zip copy".into()))?;
+
+                drop(compat_writer);
+
+                entry_writer.close().await.map_err(|e| {
+                    AppError::Io(
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                        "zip entry close".into(),
+                    )
+                })?;
+            }
+        }
     }
 
     zip.close().await.map_err(|e| {
@@ -457,6 +535,18 @@ async fn write_tar_archive(
             .await;
             let _ = fs::remove_file(&path).await;
             result?;
+        }
+        ArchiveSelection::PreparedEntries(entries) => {
+            for entry in entries {
+                let mut header = TarHeader::new_gnu();
+                header.set_size(entry.metadata.total_size_bytes);
+                header.set_mode(0o644);
+
+                let reader = create_multipart_reader(&entry.metadata);
+                tar.append_data(&mut header, entry.archive_path, reader)
+                    .await
+                    .map_err(|e| AppError::Io(e, "tar append".into()))?;
+            }
         }
     }
 

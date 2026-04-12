@@ -61,6 +61,80 @@ pub async fn ensure_fragment_blob_directories(fragment_hash: &str) {
     }
 }
 
+pub async fn ensure_fragment_blob_directories_strict(fragment_hash: &str) -> Result<(), AppError> {
+    let path_manager = ObjectPathManager::new();
+    let blob_roots = path_manager.get_blob_roots();
+
+    if blob_roots.is_empty() {
+        return Err(AppError::ServiceUnavailable(
+            "no blob roots configured for fragment provisioning".into(),
+        ));
+    }
+
+    for root in blob_roots {
+        let blob_dir = root.join(fragment_hash).join("blob");
+
+        match timeout(DISK_OP_TIMEOUT, tokio::fs::try_exists(&blob_dir)).await {
+            Ok(Ok(false)) => {
+                timeout(DISK_OP_TIMEOUT, tokio::fs::create_dir_all(&blob_dir))
+                    .await
+                    .map_err(|_| {
+                        AppError::ServiceUnavailable(format!(
+                            "timed out creating blob root {}",
+                            blob_dir.display()
+                        ))
+                    })?
+                    .map_err(|e| {
+                        AppError::ServiceUnavailable(format!(
+                            "failed to create blob root {}: {}",
+                            blob_dir.display(),
+                            e
+                        ))
+                    })?;
+            }
+            Ok(Ok(true)) => {}
+            Ok(Err(e)) => {
+                return Err(AppError::ServiceUnavailable(format!(
+                    "failed to inspect blob root {}: {}",
+                    blob_dir.display(),
+                    e
+                )));
+            }
+            Err(_) => {
+                return Err(AppError::ServiceUnavailable(format!(
+                    "timed out inspecting blob root {}",
+                    blob_dir.display()
+                )));
+            }
+        }
+
+        let metadata = timeout(DISK_OP_TIMEOUT, tokio::fs::metadata(&blob_dir))
+            .await
+            .map_err(|_| {
+                AppError::ServiceUnavailable(format!(
+                    "timed out verifying blob root {}",
+                    blob_dir.display()
+                ))
+            })?
+            .map_err(|e| {
+                AppError::ServiceUnavailable(format!(
+                    "failed to verify blob root {}: {}",
+                    blob_dir.display(),
+                    e
+                ))
+            })?;
+
+        if !metadata.is_dir() {
+            return Err(AppError::ServiceUnavailable(format!(
+                "blob root {} is not a directory",
+                blob_dir.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 async fn sweep_fragment_gc_files(fragment_hash: String) {
     let path_manager = ObjectPathManager::new();
     let blob_roots = path_manager.get_blob_roots();

@@ -1,24 +1,42 @@
 # API Documentation Index
 
-This file is the workspace entry point for API documentation.
+This repository now keeps the platform docs split into:
 
-Use the specialized references instead of treating the whole workspace as one API:
+- one platform overview in [README.md](/home/administrator/Development/N1/README.md)
+- one detailed API reference per runtime
+
+## Read This First
+
+- [README.md](/home/administrator/Development/N1/README.md)
+  Platform overview, architecture split, deployment orientation, and high-level operational model.
+
+## Runtime API References
 
 - [N1_DOCUMENTATION.md](/home/administrator/Development/N1/N1_DOCUMENTATION.md)
-  - Stable `1.1.1` documentation for the pure N1 fragment-scoped storage engine.
+  Detailed `N1 2.0.0` storage-kernel reference:
+  fragment provisioning, auth, upload, read, lifecycle, POSIX, maintenance, request parameters, and example payloads.
+
 - [N2_DOCUMENTATION.md](/home/administrator/Development/N1/N2_DOCUMENTATION.md)
-  - Current `0.2.0` documentation for the multi-node N2 cluster layer.
+  Detailed `N2 0.2.0` cluster-layer reference:
+  membership, governance, placement, object APIs, reconcile, and internal peer routes.
+
 - [REGISTRY_DOCUMENTATION.md](/home/administrator/Development/N1/REGISTRY_DOCUMENTATION.md)
-  - Current `0.8.0` documentation for the Registry user-owned metadata and POSIX facade.
+  Detailed `Registry 0.8.0` user-facing reference:
+  auth, admin, fragments, storage sessions, logical objects, shares, trash/recover flows, and example request/response bodies.
 
-Recommended reading order:
+## Which Doc To Use
 
-1. Read [N1_DOCUMENTATION.md](/home/administrator/Development/N1/N1_DOCUMENTATION.md) if you need the stable engine contract.
-2. Read [N2_DOCUMENTATION.md](/home/administrator/Development/N1/N2_DOCUMENTATION.md) if you need cluster governance, placement, or peer APIs.
-3. Read [REGISTRY_DOCUMENTATION.md](/home/administrator/Development/N1/REGISTRY_DOCUMENTATION.md) if you need users, logical objects, quotas, shares, or storage-session brokering.
+- Use `N1` docs when you are talking directly to the storage kernel.
+- Use `N2` docs when you are operating or integrating the clustered storage layer.
+- Use `Registry` docs when you are building the user-facing product/API experience.
 
-Contract boundary:
+## Contract Boundary
 
-- `N1` is the authenticated fragment-scoped storage engine.
-- `N2` is the multi-node cluster and peer-distribution layer built on the shared N1 core.
-- `Registry` is the user-owned metadata, lifecycle, and policy layer above storage.
+- `N1`
+  Physical storage truth, standalone namespace, upload, read, lifecycle, maintenance.
+
+- `N2`
+  Cluster coordination, placement, reconcile, internal peer traffic.
+
+- `Registry`
+  Users, quotas, logical namespace, shares, storage-session brokering, and product-facing metadata.

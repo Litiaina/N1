@@ -1,378 +1,1016 @@
-# Registry Documentation
+# Registry API Documentation
 
-Current `0.8.0` reference for the Registry user-owned metadata and POSIX facade.
+`Registry` is the user-facing logical metadata and policy layer that sits above `N1` or `N2`.
 
-Status:
-- `registry-server` is the SQLite-backed control plane above `N1` and `N2`.
-- Registry owns users, auth, quotas, logical namespace, shares, archive selection, and user-facing lifecycle.
-- `N1` and `N2` own physical storage, durability, repair, redistribution, and GC.
-- `POST /v1/admin/bootstrap` is a pure Registry admin bootstrap route. It does not create a storage fragment.
-- New Registry-backed objects are stored in the engine by stable flat `storage_object_id`, not by logical path.
+Use `Registry` when you need:
 
-## 1. Identity
+- user accounts
+- admin bootstrap and quota management
+- logical object namespace separate from storage identity
+- storage session brokering into `N1` or `N2`
+- trash, recover, rename, and prefix operations at the logical metadata layer
+- public shares
 
-Registry is the place where users and applications see filesystem-like meaning:
-- logical `object_key`
-- prefix and delimiter listing
-- folder illusion
-- rename and prefix rename
-- trash, recover, purge semantics
-- share creation and public share validation
+This document is written for engineers integrating with `Registry` directly.
 
-Registry is not the physical storage engine.
+## Base URL
 
-That split is deliberate:
-- Registry owns logical meaning
-- N1/N2 own physical bytes
+Typical base URL:
 
-## 2. Contract Boundary
+```text
+https://127.0.0.1:7001
+```
 
-Registry owns:
-- super-admin bootstrap and administration
-- user signup, login, refresh, logout, and optional TOTP 2FA
-- quota ownership and registry-wide stats
-- fragment-to-backend bindings
-- logical object metadata
-- stable `storage_object_id` mapping for each logical object
-- share tokens and public share serving
-- archive selection and logical archive path naming
-- logical lifecycle states
-- websocket realtime for owners and admins
+## Auth Model
 
-Registry does not own:
-- shard placement
-- fragment durability
-- repair
-- redistribution
-- engine garbage collection
-- raw physical object storage
+Most routes require:
 
-## 3. Base URL And Auth
+```text
+Authorization: Bearer <registry_access_token>
+```
 
-Base URL example:
-- `https://127.0.0.1:7001`
+Bootstrap is separate and uses the `master_key` field in its request body.
 
-Health:
-- `GET /health`
+## Core Data Shapes
 
-Protected Registry routes require:
-- `Authorization: Bearer <registry_access_token>`
+### User Record
 
-Registry access tokens represent users and administrators, not fragments.
+```json
+{
+  "uid": "01KNYR7QPPQSMW3P5M4N0S6K2P",
+  "email": "user@example.com",
+  "is_admin": false,
+  "two_factor_enabled": false,
+  "quota_limit_bytes": 10737418240,
+  "quota_used_bytes": 1048576,
+  "created_at": "2026-04-12T00:00:00Z",
+  "updated_at": "2026-04-12T00:00:00Z"
+}
+```
 
-## 4. Admin Bootstrap And Admin Control Plane
+### Object Record
 
-### 4.1 Bootstrap
+```json
+{
+  "owner_uid": "01KNYR7QPPQSMW3P5M4N0S6K2P",
+  "fragment": "fragment-a",
+  "object_key": "videos/demo.mp4",
+  "storage_object_id": "a309986ab5...",
+  "version_id": "01KNYR8AB4VYG4JCM5TX9GWV8M",
+  "status": "ready",
+  "object_size_bytes": 10485760,
+  "content_type": "video/mp4",
+  "created_at": "2026-04-12T00:00:00Z",
+  "updated_at": "2026-04-12T00:00:02Z"
+}
+```
 
-- `POST /v1/admin/bootstrap`
+Important distinction:
 
-Bootstrap is for the first Registry administrator only.
+- `object_key` is the logical user-facing path
+- `storage_object_id` is the stable physical identity used against `N1` or `N2`
 
-Required input:
-- `email`
-- `password`
-- `master_key`
+### Fragment Binding Record
 
-Important current behavior:
-- bootstrap is guarded by `REGISTRY_MASTER_KEY`
-- bootstrap is only allowed while no admin exists
-- bootstrap creates the first super admin directly
-- bootstrap does not require a storage backend to be reachable
-- bootstrap does not auto-provision a fragment
+```json
+{
+  "owner_uid": "01KNYR7QPPQSMW3P5M4N0S6K2P",
+  "fragment": "fragment-a",
+  "deployment": "single_node",
+  "engine_url_override": "https://127.0.0.1:50001",
+  "created_at": "2026-04-12T00:00:00Z",
+  "updated_at": "2026-04-12T00:00:00Z"
+}
+```
 
-That makes bootstrap a pure Registry control-plane action.
+### Storage Session Response
 
-### 4.2 Admin Auth
+This is the bridge from `Registry` to `N1` or `N2`.
 
-- `POST /v1/admin/auth/login`
+```json
+{
+  "fragment": "fragment-a",
+  "deployment": "single_node",
+  "engine_url": "https://127.0.0.1:50001",
+  "access_token": "<fragment-access-token>",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "refresh_token": "<optional-fragment-refresh-token>",
+  "refresh_expires_in": 604800
+}
+```
 
-### 4.3 Admin Management Routes
+### Share Record
 
-- `POST /v1/admin/users`
-- `GET /v1/admin/users`
-- `GET /v1/admin/stats`
-- `POST /v1/admin/users/{uid}/quota`
-- `POST /v1/admin/users/{uid}/credentials`
-- `POST /v1/admin/users/{uid}/2fa/setup`
-- `POST /v1/admin/users/{uid}/2fa/disable`
-- `DELETE /v1/admin/users/{uid}`
+```json
+{
+  "share_id": "01KNYRA3T7D7T2D6J9RZ4H7A1D",
+  "owner_uid": "01KNYR7QPPQSMW3P5M4N0S6K2P",
+  "fragment": "fragment-a",
+  "object_key": "docs/report.pdf",
+  "disposition": "download",
+  "expires_at": "2026-04-12T06:00:00Z",
+  "created_at": "2026-04-12T00:00:00Z",
+  "revoked_at": null
+}
+```
 
-Typical admin responsibilities:
-- create users
-- set or change quota
-- rotate credentials
-- inspect global usage
-- reset or disable 2FA
+## Health And Bootstrap
 
-## 5. User Auth And Account Routes
+### `GET /health`
 
-- `POST /v1/auth/signup`
-- `POST /v1/auth/login`
-- `POST /v1/auth/refresh`
-- `POST /v1/auth/logout`
-- `GET /v1/me`
-- `POST /v1/account/email`
-- `POST /v1/account/password`
-- `POST /v1/account/2fa/setup`
-- `POST /v1/account/2fa/enable`
-- `POST /v1/account/2fa/disable`
+Response:
 
-Current behavior:
-- public signup never accepts client-chosen quota
-- new public accounts start on the server default quota unless an admin changes it later
-- normal non-admin signup can auto-provision a default fragment when a storage backend is configured
-- admin bootstrap and admin login do not depend on that storage provisioning path
+```json
+{
+  "status": "ok",
+  "sqlite_path": "/path/to/registry.sqlite3",
+  "users": 3,
+  "objects": 1024,
+  "ready_objects": 1001
+}
+```
 
-## 6. Fragments And Storage Sessions
+### `POST /v1/admin/bootstrap`
 
-- `GET /v1/fragments`
-- `POST /v1/fragments/link`
-- `POST /v1/storage/session`
+Create the initial admin user.
 
-Registry owns the user-facing fragment binding.
+Request body:
 
-Backends today:
-- `single_node` -> `N1`
-- `multi_node` -> `N2`
+```json
+{
+  "email": "admin@example.com",
+  "password": "strong-password",
+  "master_key": "<REGISTRY_MASTER_KEY>"
+}
+```
 
-Storage sessions are short-lived backend bearer tokens that let a Registry-backed client talk directly to the engine for byte transfer.
+Response:
 
-Important boundary:
-- Registry decides which backend and fragment a user may use
-- N1/N2 still enforce fragment-scoped storage permissions
+- same token envelope shape as login/signup
 
-## 7. Object Identity Model
+## Admin API
 
-Registry tracks two different identities for a Registry-backed object:
+### `POST /v1/admin/auth/login`
 
-- logical key in Registry:
-  - `Projects/Alpha/spec.txt`
-- physical key in N1/N2:
-  - `storage_object_id`
-  - for example `2a6af218d2821335ed39d0071abd69086284947d7ec17621ee7446caae7bcc4c`
+Admin login.
+
+Request body:
+
+```json
+{
+  "email": "admin@example.com",
+  "password": "strong-password",
+  "otp": "123456"
+}
+```
+
+Response:
+
+```json
+{
+  "access_token": "<jwt>",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "refresh_token": "<refresh>",
+  "refresh_expires_in": 604800,
+  "user": {
+    "...": "UserRecord"
+  }
+}
+```
+
+### `POST /v1/admin/users`
+
+Create a user.
+
+Request body:
+
+```json
+{
+  "email": "user@example.com",
+  "password": "strong-password",
+  "quota_limit_bytes": 10737418240,
+  "is_admin": false
+}
+```
+
+Response:
+
+```json
+{
+  "user": {
+    "...": "UserRecord"
+  }
+}
+```
+
+### `GET /v1/admin/users`
+
+List users with admin summaries.
+
+Response:
+
+```json
+{
+  "users": [
+    {
+      "uid": "01KNYR7QPPQSMW3P5M4N0S6K2P",
+      "email": "user@example.com",
+      "is_admin": false,
+      "two_factor_enabled": false,
+      "quota_limit_bytes": 10737418240,
+      "quota_used_bytes": 1048576,
+      "fragment_count": 1,
+      "fragments": ["fragment-a"],
+      "created_at": "2026-04-12T00:00:00Z",
+      "updated_at": "2026-04-12T00:00:00Z"
+    }
+  ]
+}
+```
+
+### `GET /v1/admin/stats`
+
+Aggregated admin statistics.
+
+Includes:
+
+- totals
+- file type distribution
+- largest objects
+- active users
+- top storage users
+
+### `POST /v1/admin/users/{uid}/quota`
+
+Request body:
+
+```json
+{
+  "quota_limit_bytes": 21474836480
+}
+```
+
+### `POST /v1/admin/users/{uid}/credentials`
+
+Request body:
+
+```json
+{
+  "email": "new-email@example.com",
+  "password": "new-password",
+  "is_admin": false
+}
+```
+
+### `POST /v1/admin/users/{uid}/2fa/setup`
+
+Admin-initiated 2FA setup for another user.
+
+### `POST /v1/admin/users/{uid}/2fa/disable`
+
+Disable another user's 2FA.
+
+### `DELETE /v1/admin/users/{uid}`
+
+Delete a user and remove their registry-managed fragment associations.
+
+Response:
+
+```json
+{
+  "removed": true,
+  "deleted_fragments": ["fragment-a"]
+}
+```
+
+## User Auth And Account API
+
+### `POST /v1/auth/signup`
+
+Request body:
+
+```json
+{
+  "email": "user@example.com",
+  "password": "strong-password"
+}
+```
+
+Response:
+
+- same token envelope as login
+
+### `POST /v1/auth/login`
+
+Request body:
+
+```json
+{
+  "email": "user@example.com",
+  "password": "strong-password",
+  "otp": "123456"
+}
+```
+
+### `POST /v1/auth/refresh`
+
+```json
+{
+  "refresh_token": "<refresh>"
+}
+```
+
+### `POST /v1/auth/logout`
+
+```json
+{
+  "refresh_token": "<refresh>"
+}
+```
+
+### `GET /v1/me`
+
+Return the authenticated `UserRecord`.
+
+### `POST /v1/account/email`
+
+```json
+{
+  "current_password": "current-password",
+  "new_email": "new@example.com",
+  "otp": "123456"
+}
+```
+
+### `POST /v1/account/password`
+
+```json
+{
+  "current_password": "current-password",
+  "new_password": "new-password",
+  "otp": "123456"
+}
+```
+
+### `POST /v1/account/2fa/setup`
+
+```json
+{
+  "password": "current-password"
+}
+```
+
+Response:
+
+```json
+{
+  "secret": "BASE32SECRET",
+  "otpauth_uri": "otpauth://...",
+  "qr_data_url": "data:image/png;base64,...",
+  "pending": true
+}
+```
+
+### `POST /v1/account/2fa/enable`
+
+```json
+{
+  "password": "current-password",
+  "otp": "123456"
+}
+```
+
+### `POST /v1/account/2fa/disable`
+
+```json
+{
+  "password": "current-password",
+  "otp": "123456"
+}
+```
+
+### `GET /v1/ws`
+
+Registry realtime websocket endpoint.
+
+## Fragment Binding And Storage Session API
+
+### `GET /v1/fragments`
+
+Return linked fragments for the current user.
+
+Response:
+
+```json
+{
+  "fragments": ["fragment-a"],
+  "bindings": [
+    {
+      "...": "FragmentBindingRecord"
+    }
+  ]
+}
+```
+
+### `POST /v1/fragments/link`
+
+Link a fragment to a storage backend deployment.
+
+Request body:
+
+```json
+{
+  "fragment": "fragment-a",
+  "deployment": "single_node",
+  "engine_url_override": "https://127.0.0.1:50001"
+}
+```
+
+`deployment` values:
+
+- `single_node`
+- `multi_node`
+
+Response:
+
+```json
+{
+  "binding": {
+    "...": "FragmentBindingRecord"
+  }
+}
+```
+
+### `POST /v1/storage/session`
+
+Mint a storage session for a linked fragment.
+
+Request body:
+
+```json
+{
+  "fragment": "fragment-a",
+  "read": true,
+  "write": true,
+  "modify": true,
+  "delete": true
+}
+```
+
+Behavior:
+
+- if all four booleans are omitted or false, `Registry` defaults to read access
+- response contains the correct engine URL plus an engine access token
+
+## Share API
+
+### `POST /v1/shares`
+
+Request body:
+
+```json
+{
+  "fragment": "fragment-a",
+  "object_key": "docs/report.pdf",
+  "expires_in": 3600,
+  "disposition": "download"
+}
+```
+
+`disposition` values:
+
+- `view`
+- `stream`
+- `download`
+
+Response:
+
+```json
+{
+  "share": {
+    "...": "ShareRecord"
+  },
+  "url": "https://cloud.example.test/v1/public/shares/<token>",
+  "expires_at": "2026-04-12T06:00:00Z"
+}
+```
+
+### `GET /v1/shares`
+
+Query parameters:
+
+- `fragment` optional
+- `include_expired` optional boolean
+- `include_revoked` optional boolean
+
+Response:
+
+```json
+{
+  "shares": [
+    {
+      "...": "ShareRecord"
+    }
+  ]
+}
+```
+
+### `DELETE /v1/shares/{share_id}`
+
+Response:
+
+```json
+{
+  "revoked": true
+}
+```
+
+### `GET /v1/public/shares/{token}`
+
+Public read-through endpoint. No bearer token required.
+
+Behavior:
+
+- validates token and expiry
+- resolves the logical object
+- streams the object from the linked `N1` or `N2` backend
+- forces download filename to the logical basename for download shares
+
+## Object API
+
+Registry is intentionally two-phase for writes:
+
+1. register the logical object
+2. upload to storage using the issued storage session
+3. finalize back into Registry
+
+### `POST /v1/objects/register`
+
+Register a pending logical object.
+
+Request body:
+
+```json
+{
+  "fragment": "fragment-a",
+  "object_key": "videos/demo.mp4",
+  "expected_size_bytes": 10485760,
+  "content_type": "video/mp4",
+  "version_id": null,
+  "session_id": null
+}
+```
+
+Response:
+
+```json
+{
+  "object": {
+    "...": "ObjectRecord"
+  },
+  "quota_limit_bytes": 10737418240,
+  "quota_used_bytes": 10485760
+}
+```
+
+### `POST /v1/objects/finalize`
+
+Finalize the registered object after the backend upload succeeded.
+
+Request body:
+
+```json
+{
+  "fragment": "fragment-a",
+  "object_key": "videos/demo.mp4",
+  "version_id": "01KNYR8AB4VYG4JCM5TX9GWV8M",
+  "object_size_bytes": 10485760,
+  "content_type": "video/mp4"
+}
+```
+
+Behavior:
+
+- `Registry` reconciles the logical row with live engine state when possible
+- final object status becomes `ready`
+
+### `DELETE /v1/objects/pending`
+
+Cancel a pending registered object.
+
+Query parameters:
+
+- `fragment` required
+- `object_key` required
+- `version_id` optional
+- `session_id` optional
+
+### `GET /v1/objects`
+
+List logical objects.
+
+Query parameters:
+
+- `fragment` optional
+- `prefix` optional
+- `delimiter` optional
+- `search` optional
+- `limit` optional, default `200`, max `5000`
+- `offset` optional, default `0`
+- `include_pending` optional boolean
+- `include_trashed` optional boolean
+
+Response:
+
+```json
+{
+  "objects": [
+    {
+      "...": "ObjectRecord"
+    }
+  ],
+  "common_prefixes": ["videos/"],
+  "limit": 200,
+  "offset": 0,
+  "continuation_token": "200"
+}
+```
+
+### `GET /v1/objects/suggest`
+
+Autocomplete/suggestion route.
+
+Query parameters:
+
+- `fragment` optional
+- `prefix` optional
+- `q` required
+- `limit` optional, default `8`, max `100`
+- `include_trashed` optional boolean
+
+Response:
+
+```json
+{
+  "suggestions": [
+    "videos/demo.mp4",
+    "videos/demo-final.mp4"
+  ]
+}
+```
+
+### `GET /v1/objects/stats`
+
+Query parameters:
+
+- `fragment` optional
+- `prefix` optional
+- `search` optional
+- `include_pending` optional boolean
+- `include_trashed` optional boolean
+
+Response:
+
+```json
+{
+  "total_objects": 42,
+  "total_size_bytes": 987654321,
+  "extension_stats": [
+    {
+      "extension": "mp4",
+      "object_count": 10,
+      "total_size_bytes": 876543210
+    }
+  ]
+}
+```
+
+### `GET /v1/objects/resolve`
+
+Resolve one live logical object.
+
+Query parameters:
+
+- `fragment` required
+- `object_key` required
+
+Response:
+
+- `ObjectRecord`
+
+### `POST /v1/objects/archive`
+
+Archive a selected set of logical objects.
+
+Request body:
+
+```json
+{
+  "fragment": "fragment-a",
+  "keys": ["docs/report.pdf", "videos/demo.mp4"],
+  "prefix": null,
+  "search": null,
+  "filename": "export.tar",
+  "format": "tar",
+  "include_trashed": false
+}
+```
 
 Rules:
-- users and apps see `object_key`
-- engines store and read by `storage_object_id`
-- rename changes the logical key
-- rename does not change the physical key
-- folder move is a prefix rename in Registry, not a physical engine rename
 
-For Registry-backed objects, the engine field named `object_key` is expected to hold the physical flat ID, not the user path.
+- use either `keys` or `prefix/search`, not both
+- current Registry archive surface supports `tar`
 
-Legacy note:
-- older rows may still have `storage_object_id == object_key`
-- new Registry-backed writes are expected to use a generated flat `storage_object_id`
+## Rename, Trash, Recover, And Delete
 
-## 8. Lifecycle Model
+### `POST /v1/objects/rename`
 
-Registry lifecycle states are:
-- `ready`
-- `trashed`
-- `purged`
+Request body:
 
-Meaning:
-- `ready` -> visible in normal listings
-- `trashed` -> hidden from normal listings and visible in recycle-bin style views
-- `purged` -> hidden from normal user listings and pending or following background engine cleanup
+```json
+{
+  "fragment": "fragment-a",
+  "source_key": "videos/demo.mp4",
+  "destination_key": "videos/archive/demo.mp4"
+}
+```
 
-Current lifecycle behavior:
-- trash is Registry metadata only
-- recover from trash is Registry metadata only
-- permanent delete and empty trash move objects to `purged`
-- after purge, Registry schedules background engine soft-delete by `storage_object_id`
-- physical reclaim in N1/N2 can lag behind logical removal
-- a purged object may still be recoverable until the engine lifecycle removes it
+Response:
 
-This is intentional:
-- Registry gives fast user-facing lifecycle transitions
-- N1/N2 handle physical cleanup asynchronously
+- `ObjectMutationResponse`
 
-## 9. Logical Object Routes
+### `POST /v1/objects/rename-prefix`
 
-### 9.1 Upload Registration And Finalization
+Request body:
 
-- `POST /v1/objects/register`
-- `POST /v1/objects/finalize`
-- `DELETE /v1/objects/pending`
+```json
+{
+  "fragment": "fragment-a",
+  "source_prefix": "videos/2025/",
+  "destination_prefix": "videos/archive/2025/"
+}
+```
 
-Registry-backed upload flow:
-1. call `POST /v1/objects/register`
-2. receive logical metadata plus stable `storage_object_id`
-3. request a storage session
-4. upload bytes directly to N1/N2 using `storage_object_id`
-5. call `POST /v1/objects/finalize`
+Response:
 
-This is the core invariant:
-- Registry owns the logical name
-- N1/N2 receive only the flat physical key
+```json
+{
+  "affected": 120,
+  "quota_limit_bytes": 10737418240,
+  "quota_used_bytes": 10485760
+}
+```
 
-### 9.2 Listing And Lookup
+### `POST /v1/objects/trash`
 
-- `GET /v1/objects`
-- `GET /v1/objects/suggest`
-- `GET /v1/objects/stats`
-- `GET /v1/objects/resolve`
+Trash one logical object.
 
-Registry listing is logical and user-facing.
+Request body:
 
-Supported patterns:
-- prefix listing
-- delimiter grouping
-- filtered stats
-- search suggestions
-- include pending
-- include trashed
+```json
+{
+  "fragment": "fragment-a",
+  "object_key": "videos/demo.mp4"
+}
+```
 
-### 9.3 Rename, Folder Move, And Lifecycle
+### `POST /v1/objects/trash/bulk`
 
-- `POST /v1/objects/rename`
-- `POST /v1/objects/rename-prefix`
-- `POST /v1/objects/trash`
-- `POST /v1/objects/trash/bulk`
-- `POST /v1/objects/trash-prefix`
-- `POST /v1/objects/recover`
-- `POST /v1/objects/recover/bulk`
-- `POST /v1/objects/recover-prefix`
-- `POST /v1/objects/recover-all`
-- `POST /v1/objects/permanent-prefix`
-- `POST /v1/objects/trash/empty`
-- `DELETE /v1/objects`
-- `POST /v1/objects/version/delete`
+Trash multiple logical objects.
 
-Current semantics:
-- single rename updates only Registry metadata
-- folder move is `rename-prefix`
-- trash/recover do not rewrite engine paths
-- purge routes operate on Registry lifecycle first
-- engine cleanup happens afterward by `storage_object_id`
+Request body:
 
-## 10. Shares
+```json
+{
+  "fragment": "fragment-a",
+  "object_keys": [
+    "videos/demo-1.mp4",
+    "videos/demo-2.mp4"
+  ]
+}
+```
 
-- `POST /v1/shares`
-- `GET /v1/shares`
-- `DELETE /v1/shares/{share_id}`
-- `GET /v1/public/shares/{token}`
+### `POST /v1/objects/trash-prefix`
 
-Registry owns:
-- share metadata
-- token validation
-- expiry and revoke state
+Trash everything under a prefix.
 
-The engine read still happens through the storage broker using the physical `storage_object_id`.
+Request body:
 
-Important consequence:
-- share URLs remain Registry concerns
-- N1 does not own public sharing policy
+```json
+{
+  "fragment": "fragment-a",
+  "prefix": "videos/2025/"
+}
+```
 
-## 11. Archive
+### `POST /v1/objects/recover`
 
-- `POST /v1/objects/archive`
+Recover one logical object from trash.
 
-Registry owns:
-- which objects are selected
-- logical prefix and filter behavior
-- logical path names inside the archive
+Request body:
 
-N1/N2 own:
-- the physical object reads behind that archive
+```json
+{
+  "fragment": "fragment-a",
+  "object_key": "videos/demo.mp4"
+}
+```
 
-Current archive model:
-- Registry selects objects logically
-- Registry reads engine bytes by `storage_object_id`
-- archive entries are emitted with logical names like `Archive/Alpha-Moved/spec.txt`
+### `POST /v1/objects/recover/bulk`
 
-## 12. WebSocket Realtime
+Recover multiple logical objects.
 
-- `GET /v1/ws`
+Request body:
 
-Registry realtime includes:
-- owner-scoped invalidation events
-- admin-wide mutation visibility
-- rename / delete / upload lifecycle notices
-- session and 2FA notices
+```json
+{
+  "fragment": "fragment-a",
+  "object_keys": [
+    "videos/demo-1.mp4",
+    "videos/demo-2.mp4"
+  ]
+}
+```
 
-## 13. Operator Guide
+### `POST /v1/objects/recover-prefix`
 
-### 13.1 First-Time Bootstrap
+Recover everything under a prefix.
 
-1. Start `registry-server`.
-2. Call `POST /v1/admin/bootstrap` with:
-   - `email`
-   - `password`
-   - `master_key`
-3. Use the returned Registry bearer token for admin routes.
+Request body:
 
-Bootstrap is now safe to perform before a storage backend is online.
+```json
+{
+  "fragment": "fragment-a",
+  "prefix": "videos/2025/"
+}
+```
 
-### 13.2 Create Or Provision Users
+### `POST /v1/objects/recover-all`
 
-Admin options:
-- create users directly with admin routes
-- assign quota explicitly
-- reset credentials or 2FA later
+Recover all trashed objects in the fragment.
 
-Public path:
-- users can sign up through `/v1/auth/signup`
-- Registry may auto-provision their default fragment when backend storage is configured
+Request body:
 
-### 13.3 Registry-Backed Upload
+```json
+{
+  "fragment": "fragment-a"
+}
+```
 
-1. register the object with `/v1/objects/register`
-2. obtain a storage session with `/v1/storage/session`
-3. upload to N1/N2 using the returned `storage_object_id`
-4. finalize through `/v1/objects/finalize`
+### `POST /v1/objects/trash/empty`
 
-Expected result:
-- Registry resolves by logical `object_key`
-- the engine stores by flat physical ID
+Purge all trashed objects in the fragment from the Registry logical plane.
 
-### 13.4 Folder Move
+Request body:
 
-Folder move is a prefix rename:
-- source prefix -> destination prefix
-- Registry metadata updates
-- engine storage IDs stay unchanged
+```json
+{
+  "fragment": "fragment-a"
+}
+```
 
-### 13.5 Trash, Remove, Recover
+### `DELETE /v1/objects`
 
-User-facing behavior:
-- trash hides from normal listings
-- recover restores from trash quickly
-- remove from recycle bin / empty trash hides immediately
-- physical engine cleanup continues in the background
+Purge one object immediately from Registry state.
 
-Operational implication:
-- logical state can move faster than physical reclaim
-- this is by design
+Query parameters:
 
-## 14. Client Surface Truth
+- `fragment` required
+- `object_key` required
+- `version_id` optional
+- `session_id` optional
 
-Current UI split in this workspace:
-- `drive/index.html` is the Registry-backed user surface
-- `storage/index.html` is the direct N1 operator surface
+Response:
 
-That distinction matters:
-- Drive is the reference surface for Registry logical namespace behavior
-- Storage is the reference surface for direct engine/operator behavior
+```json
+{
+  "removed": true,
+  "quota_limit_bytes": 10737418240,
+  "quota_used_bytes": 0
+}
+```
 
-So if direct N1 listing in the Storage console shows path-backed objects, that does not by itself disprove the Registry flat-key model. It means those objects came from direct N1/operator flows or legacy path-backed data.
+### `POST /v1/objects/permanent-prefix`
 
-## 15. Verified Current Truth
+Purge every object under a prefix.
 
-Current release validation on `2026-04-07` confirmed:
-- bootstrap works without a storage backend
-- Registry-backed CRUD works
-- single rename keeps the same `storage_object_id`
-- folder move is `rename-prefix`
-- N1 listing by logical prefix stays empty for Registry-backed objects
-- N1 metadata lookup by the physical ID returns the physical ID as the engine key
-- archive uses logical paths
-- trash, recover, purge, and recover-from-purged work end to end
+Request body:
 
-## 16. Related Docs
+```json
+{
+  "fragment": "fragment-a",
+  "prefix": "videos/old/"
+}
+```
 
-- [DOCUMENTATION.md](/home/administrator/Development/N1/DOCUMENTATION.md)
-- [README.md](/home/administrator/Development/N1/README.md)
-- [N1_DOCUMENTATION.md](/home/administrator/Development/N1/N1_DOCUMENTATION.md)
-- [N2_DOCUMENTATION.md](/home/administrator/Development/N1/N2_DOCUMENTATION.md)
+### `POST /v1/objects/version/delete`
+
+Delete one version from a logical object.
+
+Request body:
+
+```json
+{
+  "fragment": "fragment-a",
+  "object_key": "videos/demo.mp4",
+  "version_id": "01KNYR8AB4VYG4JCM5TX9GWV8M"
+}
+```
+
+Response:
+
+```json
+{
+  "removed": true,
+  "object_removed": false,
+  "object": {
+    "...": "ObjectRecord"
+  },
+  "quota_limit_bytes": 10737418240,
+  "quota_used_bytes": 10485760
+}
+```
+
+## Practical End-To-End Flow
+
+### 1. Sign Up Or Log In
+
+```bash
+curl -k https://127.0.0.1:7001/v1/auth/signup \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "email":"user@example.com",
+    "password":"strong-password"
+  }'
+```
+
+### 2. Link A Fragment
+
+```bash
+curl -k https://127.0.0.1:7001/v1/fragments/link \
+  -H "Authorization: Bearer <registry-token>" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "fragment":"fragment-a",
+    "deployment":"single_node",
+    "engine_url_override":"https://127.0.0.1:50001"
+  }'
+```
+
+### 3. Issue A Storage Session
+
+```bash
+curl -k https://127.0.0.1:7001/v1/storage/session \
+  -H "Authorization: Bearer <registry-token>" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "fragment":"fragment-a",
+    "read":true,
+    "write":true,
+    "modify":true,
+    "delete":true
+  }'
+```
+
+### 4. Register The Logical Object
+
+```bash
+curl -k https://127.0.0.1:7001/v1/objects/register \
+  -H "Authorization: Bearer <registry-token>" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "fragment":"fragment-a",
+    "object_key":"videos/demo.mp4",
+    "expected_size_bytes":10485760,
+    "content_type":"video/mp4"
+  }'
+```
+
+### 5. Upload To N1 Or N2
+
+Use the `engine_url` and `access_token` from `POST /v1/storage/session`.
+
+### 6. Finalize Back Into Registry
+
+```bash
+curl -k https://127.0.0.1:7001/v1/objects/finalize \
+  -H "Authorization: Bearer <registry-token>" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "fragment":"fragment-a",
+    "object_key":"videos/demo.mp4",
+    "version_id":"01KNYR8AB4VYG4JCM5TX9GWV8M",
+    "object_size_bytes":10485760,
+    "content_type":"video/mp4"
+  }'
+```
+
+## Operational Notes
+
+- `Registry` is the correct place for logical path semantics, user ownership, quotas, and shares.
+- `Registry` does not own repair, redistribution, GC, or recover-on-read. Those remain backend responsibilities in `N1` or `N2`.
+- `storage_object_id` is intentionally stable across logical rename and prefix rename operations.
+- Prefix trash, prefix recover, and prefix rename are metadata operations at the Registry plane. They should not be implemented by mutating physical storage ids.
+- For user-facing applications, `Registry` should usually be your entry point. `N1` and `N2` are the storage backends, not the business metadata plane.

@@ -4,6 +4,7 @@ use crate::core::index;
 use crate::enums::app_error_enum::AppError;
 use crate::fs::cleanup_manager::start_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
+use crate::namespace::runtime::global_namespace_runtime;
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
 use crate::structs::auth_structs::Claims;
@@ -475,21 +476,84 @@ async fn process_fragment_gc(
     let mut live_versions = HashSet::<String>::new();
     let mut trash_versions = HashSet::<String>::new();
     let mut expired_versions: HashMap<String, ObjectMetadata> = HashMap::new();
+    let mut namespace_unreferenced_object_ids = std::collections::BTreeSet::<String>::new();
+    let mut namespace_unreferenced_version_ids = HashSet::<String>::new();
 
     let now = SystemTime::now();
     let now_unix = Utc::now().timestamp();
-    match index::list_fragment_live_objects(fragment).await {
-        Ok(objects) => {
-            for meta in objects {
-                live_versions.insert(meta.version_id);
-            }
-        }
+    let physical_live_objects = match index::list_fragment_live_objects(fragment).await {
+        Ok(objects) => objects,
         Err(err) => {
             warn!(
                 "GC: failed to load live heads for fragment {} from indexdb: {}",
                 fragment, err
             );
             return stats;
+        }
+    };
+
+    let namespace_snapshot = match global_namespace_runtime()
+        .reachability_snapshot_if_present(fragment)
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            warn!(
+                "GC: failed to load namespace reachability for fragment {}: {}",
+                fragment, err
+            );
+            None
+        }
+    };
+
+    if let Some(snapshot) = &namespace_snapshot {
+        live_versions.extend(snapshot.referenced_version_ids.iter().cloned());
+        for meta in &physical_live_objects {
+            if snapshot.referenced_object_ids.contains(&meta.object_key) {
+                continue;
+            }
+            let age = now_unix.saturating_sub(meta.created_at.max(0)).max(0) as u64;
+            if !is_manual_run && age <= file_ttl.as_secs() {
+                continue;
+            }
+
+            let version_metas = match index::list_live_object_versions_metadata(
+                fragment,
+                &meta.object_key,
+            )
+            .await
+            {
+                Ok(versions) => versions,
+                Err(err) => {
+                    warn!(
+                        "GC: failed to load live version history for orphaned namespace object {}/{}: {}",
+                        fragment, meta.object_key, err
+                    );
+                    continue;
+                }
+            };
+            let refund_bytes = version_metas
+                .iter()
+                .map(|version| version.total_size_bytes)
+                .sum::<u64>();
+            match index::delete_object_fast(fragment, &meta.object_key).await {
+                Ok(Some(version_ids)) => {
+                    namespace_unreferenced_object_ids.insert(meta.object_key.clone());
+                    namespace_unreferenced_version_ids.extend(version_ids);
+                    stats.refund_bytes = stats.refund_bytes.saturating_add(refund_bytes);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(
+                        "GC: failed to delete orphaned namespace object {}/{}: {}",
+                        fragment, meta.object_key, err
+                    );
+                }
+            }
+        }
+    } else {
+        for meta in &physical_live_objects {
+            live_versions.insert(meta.version_id.clone());
         }
     }
 
@@ -564,6 +628,31 @@ async fn process_fragment_gc(
             if trash_path.exists() {
                 let _ = std::fs::remove_dir_all(&trash_path);
             }
+        }
+        for ver in &namespace_unreferenced_version_ids {
+            if should_stop_gc() {
+                return stats;
+            }
+            let live_path = root.join(fragment).join("blob").join(ver);
+            let trash_path = get_trash_root(root, fragment).join("blob").join(ver);
+            if live_path.exists() {
+                let _ = std::fs::remove_dir_all(&live_path);
+            }
+            if trash_path.exists() {
+                let _ = std::fs::remove_dir_all(&trash_path);
+            }
+        }
+    }
+
+    if !namespace_unreferenced_object_ids.is_empty() {
+        if let Err(err) = global_namespace_runtime()
+            .purge_unreferenced_object_ids(fragment, &namespace_unreferenced_object_ids)
+            .await
+        {
+            warn!(
+                "GC: failed to purge stale namespace object records for fragment {}: {}",
+                fragment, err
+            );
         }
     }
 

@@ -1,79 +1,66 @@
-<div align="center">
-  <img
-    src="https://github.com/Litiaina/litiaina-admin-webpage/blob/master/images/litiaina_icon.png?raw=true"
-    alt="Litiaina Icon"
-    width="150"
-    height="150"
-  />
-  <h1>Litiaina N1 Documentation</h1>
-  <p>Stable <code>1.1.1</code> reference for the pure N1 fragment-scoped storage engine.</p>
-</div>
+# N1 API Documentation
 
-> Status (2026-04-09):
-> - `n1` (`litiaina-n1`) is stable at `1.1.1`.
-> - N1 is an authenticated fragment-scoped storage engine.
-> - N1 owns bytes, object metadata, upload state, repair, redistribution, GC, and health.
-> - N1 does not own public sharing, thumbnails, or legacy FS routes in `1.1.1`.
-> - Registry, N2, and `n1-arc` are versioned independently and documented separately.
+`N1` is the standalone storage kernel in this repository. In `2.0.0`, it exposes:
 
-## 1. Scope
+- fragment provisioning
+- fragment-scoped authentication
+- object upload, read, list, version, trash, recover, and archive flows
+- a standalone mutable namespace layer
+- lifecycle, garbage collection, repair, redistribution, and health endpoints
+- SMB Lite and POSIX-style namespace access on top of the same storage truth
 
-N1 `1.1.1` freezes the engine contract under `/n1/*`.
+This document is written as an operator and integrator reference. It is meant to answer:
 
-Stable identity:
-- authenticated fragment-scoped object storage
-- exact-key reads and flat/prefix listing
-- multipart and one-shot upload
-- metadata-first trash / recover / permanent delete
-- repair / redistribution / GC / health
-- websocket telemetry for authenticated engine events
+- which endpoint to call
+- what headers, query parameters, and JSON body it expects
+- what shape comes back
+- how to combine the endpoints into a real upload, read, or lifecycle flow
 
-Not part of the N1 `1.1.1` HTTP contract:
-- legacy `/dir/*`
-- `/authenticate/fs`
-- public share creation or public share serving
-- thumbnail generation
-- old N1 `/v4/*` routes
+## Base URL
 
-## 2. Base URL And Auth
+Typical standalone `N1` base URL:
 
-Base URL example:
-- `https://127.0.0.1:50001`
+```text
+https://127.0.0.1:50001
+```
 
-Ping:
-- `GET /n1/ping` -> `pong`
+## Authentication Model
 
-Protected engine routes require:
-- `Authorization: Bearer <fragment_access_token>`
+Most `N1` APIs are fragment-scoped.
 
-For browser-safe direct media reads, a protected route can mint a short-lived signed URL:
-- `POST /n1/objects/signed-url`
+1. Create a fragment with `POST /n1/fragments`
+2. Mint a fragment token with `POST /n1/auth/fragment`
+3. Use `Authorization: Bearer <access_token>` on protected routes
 
-Fragment access tokens carry:
-- `fragment`
+### Permission Bits
+
+Fragment tokens carry four booleans:
+
 - `read`
 - `write`
 - `modify`
 - `delete`
-- `exp`
 
-## 3. Authentication
+The route handlers enforce them directly. For example:
 
-### 3.1 `POST /n1/auth/fragment`
+- reads require `read`
+- upload init / write paths require `write`
+- rename / move requires `modify`
+- trash / empty trash / destructive maintenance paths require `delete`
 
-Issues a fragment-scoped access token and refresh token pair.
+### Fragment Auth Request
 
-Request:
+`POST /n1/auth/fragment`
 
 ```json
 {
-  "fragment": "<fragment_hash>",
-  "secret": "<fragment_key_or_master_key>",
+  "fragment": "b77adaff371716fc0de411a88c924c21c6e4e68ab9addfa536fe07ec774aa1fd",
+  "secret": "fragment-or-master-key",
   "read": true,
   "write": true,
   "modify": true,
   "delete": true,
-  "expires_in": 900
+  "expires_in": 3600
 }
 ```
 
@@ -83,382 +70,1088 @@ Response:
 {
   "access_token": "<jwt>",
   "token_type": "Bearer",
-  "expires_in": 900,
-  "refresh_token": "<opaque>",
+  "expires_in": 3600,
+  "refresh_token": "<opaque-refresh-token>",
   "refresh_expires_in": 604800
 }
 ```
 
-### 3.2 `POST /n1/auth/refresh`
+### Refresh And Logout
 
-Rotates a refresh token and returns a new access token pair.
-
-Request:
+`POST /n1/auth/refresh`
 
 ```json
 {
-  "refresh_token": "<opaque>"
+  "refresh_token": "<opaque-refresh-token>"
 }
 ```
 
-### 3.3 `POST /n1/auth/logout`
-
-Revokes a refresh token.
-
-Request:
+`POST /n1/auth/logout`
 
 ```json
 {
-  "refresh_token": "<opaque>"
+  "refresh_token": "<opaque-refresh-token>"
 }
 ```
 
-## 4. Unprotected Engine Routes
+## Common Response Shapes
 
-### 4.1 `GET /n1/ping`
+### Object Metadata
 
-Returns `pong`.
-
-### 4.2 `POST /n1/fragments`
-
-Creates a fragment.
-
-Request:
+Many object routes return the same core shape:
 
 ```json
 {
-  "name": "sample-fragment",
-  "secret": "<MASTER_KEY>",
-  "key": "<fragment_key>"
+  "object_key": "videos/demo.mp4",
+  "fragment": "b77adaff371716fc0de411a88c924c21c6e4e68ab9addfa536fe07ec774aa1fd",
+  "version_id": "01KNYMZC0M0J1E4A74M0J2P8F8",
+  "upload_session_id": "",
+  "owner_uid": "b77adaff371716fc0de411a88c924c21c6e4e68ab9addfa536fe07ec774aa1fd",
+  "content_type": "video/mp4",
+  "total_size_bytes": 10485760,
+  "created_at": 1775900000,
+  "parts": [],
+  "is_delete_marker": false,
+  "stripe_size_bytes": 1048576
 }
 ```
 
-### 4.3 `GET /n1/fragments/check`
+Notes:
 
-Checks whether a fragment exists.
+- In standalone `N1 2.0`, `object_key` is the logical path the caller uses.
+- The immutable physical storage identity is managed under the namespace layer and does not need to be supplied by normal clients.
 
-Expected query parameters:
-- `fragment=<fragment_hash>`
+### Object Listing
 
-### 4.4 `GET /n1/fragments/hash`
-
-Resolves the fragment hash for a fragment name.
-
-Expected query parameters:
-- `name=<fragment_name>`
-
-## 5. Protected Read Routes
-
-All routes in this section require a fragment bearer token.
-
-### 5.1 Capacity And Listing
-
-- `GET /n1/capacity/usage`
-- `GET /n1/fragments`
-- `GET /n1/objects`
-- `GET /n1/trash`
-- `GET /n1/objects/versions/{*object_key}`
-
-Listing notes:
-- `GET /n1/objects` returns live objects only.
-- `GET /n1/trash` returns trashed objects only.
-- prefix/delimiter pagination is supported through query parameters.
-- internal synthetic keys stay hidden unless explicitly requested.
-
-Common list query parameters:
-- `prefix`
-- `delimiter`
-- `limit`
-- `continuation_token`
-- `include_internal`
-
-### 5.2 Object Reads
-
-- `GET /n1/objects/get/{*object_key}`
-- `GET /n1/objects/stream/{*object_key}`
-- `GET /n1/objects/meta/{*object_key}`
-- `GET /n1/objects/download`
-- `GET /n1/objects/download/chunk`
-- `POST /n1/objects/signed-url`
-
-Usage guidance:
-- `get` is the direct object read.
-- `stream` is the streaming read optimized for larger objects.
-- `meta` returns current object metadata only.
-- `download` and `download/chunk` are query-driven helpers for direct download and chunk-range flows.
-- `signed-url` mints a short-lived read URL for browser streaming or download without exposing the bearer token in the browser request URL.
-
-### 5.3 Signed Read Consumption
-
-- `GET /n1/objects/signed-read`
-
-Usage guidance:
-- consumes a short-lived, object-scoped HMAC-signed read URL
-- intended for browser media playback and direct authenticated download flows
-- supports `stream` and `download` style reads
-- does not replace normal bearer-authenticated API routes
-
-### 5.4 Archive Export
-
-N1 keeps the low-level archive primitive for exact object sets.
-
-- `POST /n1/objects/archive`
-- `POST /n1/objects/archive/manifest`
-
-Typical archive request:
+`GET /n1/objects` and `GET /n1/trash` return:
 
 ```json
 {
-  "object_keys": [
-    "a.txt",
-    "nested/path/b.txt"
+  "objects": [
+    {
+      "object_key": "videos/demo.mp4",
+      "fragment": "fragment-hash",
+      "version_id": "01KNYMZC0M0J1E4A74M0J2P8F8",
+      "upload_session_id": "",
+      "owner_uid": "fragment-hash",
+      "content_type": "video/mp4",
+      "total_size_bytes": 10485760,
+      "created_at": 1775900000,
+      "parts": [],
+      "is_delete_marker": false,
+      "stripe_size_bytes": 1048576
+    }
   ],
-  "filename": "export",
-  "format": "tar"
+  "common_prefixes": [
+    "videos/"
+  ],
+  "continuation_token": "videos/demo.mp4"
 }
 ```
 
-## 6. Protected Mutation Routes
+### POSIX List
 
-### 6.1 Fragment Maintenance
-
-- `DELETE /n1/fragments/{fragment}`
-- `PATCH /n1/fragments/{fragment}`
-
-### 6.2 Trash And Object Lifecycle
-
-- `DELETE /n1/trash/empty`
-- `POST /n1/trash/recover-all`
-- `DELETE /n1/objects/{*object_key}`
-- `DELETE /n1/objects/version/{version_id}/{*object_key}`
-- `DELETE /n1/objects/permanent/{*object_key}`
-- `POST /n1/objects/recover/{*object_key}`
-- `POST /n1/objects/recover/version/{version_id}/{*object_key}`
-- `POST /n1/objects/rename`
-- `POST /n1/objects/bulk-delete`
-- `POST /n1/objects/permanent/bulk-delete`
-- `POST /n1/objects/bulk-recover`
-
-Rename request:
+`GET /n1/posix/list`
 
 ```json
 {
-  "source_key": "folder/a.txt",
-  "destination_key": "folder/b.txt"
+  "path": "videos",
+  "scan_trash": false,
+  "entries": [
+    {
+      "name": "demo.mp4",
+      "path": "videos/demo.mp4",
+      "kind": "file",
+      "modified_at_unix": 1775900000
+    },
+    {
+      "name": "clips",
+      "path": "videos/clips",
+      "kind": "directory",
+      "modified_at_unix": 1775900100
+    }
+  ],
+  "continuation_token": null
 }
 ```
 
-Bulk request shape:
+### POSIX Mutation
+
+`POST /n1/posix/mkdir`, `rename`, `trash`, and `recover` all return:
+
+```json
+{
+  "operation": "rename",
+  "kind": "file",
+  "affected": 1,
+  "source_path": "videos/demo.mp4",
+  "destination_path": "videos/demo-final.mp4"
+}
+```
+
+### Upload Status
+
+`GET /n1/upload/multipart/{version_id}`
+
+```json
+{
+  "uploaded_parts": [0, 1, 2],
+  "committed_parts": 3,
+  "committed_bytes": 6291456,
+  "expected_parts": 5,
+  "total_size_bytes": 10485760,
+  "created_at": 1775900200,
+  "session_id": "01KNYN0Q4FC5B7NAT0S6Z2TQ4Q",
+  "version_id": "01KNYN0Q4E4YQ5RDNM5AC7BQ7S",
+  "object_key": "videos/demo.mp4",
+  "physical_object_key": "a309986ab5..."
+}
+```
+
+`object_key` is the logical path for the caller. `physical_object_key` is included only when the underlying storage object id differs and is mainly useful for debugging.
+
+## Public And Helper Endpoints
+
+### `GET /n1/ping`
+
+Simple liveness check.
+
+Response:
+
+```text
+pong
+```
+
+### `GET /n1/fragments/check`
+
+Legacy helper route. It currently expects a JSON body even though the method is `GET`.
+
+Request body:
+
+```json
+{
+  "fragment": "fragment-hash"
+}
+```
+
+Response on success:
+
+```json
+{
+  "fragment": "fragment-hash"
+}
+```
+
+### `GET /n1/fragments/hash`
+
+Legacy helper route. It currently expects a JSON body even though the method is `GET`.
+
+Request body:
+
+```json
+{
+  "fragment": "mainframe"
+}
+```
+
+Response:
+
+```json
+{
+  "fragment": "mainframe",
+  "fragment_hash": "b77adaff371716fc0de411a88c924c21c6e4e68ab9addfa536fe07ec774aa1fd"
+}
+```
+
+### `GET /n1/objects/signed-read`
+
+Public signed-read route. No bearer token is required. The URL is normally minted by `POST /n1/objects/signed-url`.
+
+Query parameters:
+
+- `fragment`
+- `object_key`
+- `expires`
+- `signature`
+- `disposition` optional: `view`, `stream`, or `download`
+- `version_id` optional
+- `filename` optional
+
+## Fragment Provisioning API
+
+### `POST /n1/fragments`
+
+Create a fragment.
+
+Request body:
+
+```json
+{
+  "name": "mainframe",
+  "secret": "<MASTER_KEY>",
+  "key": "fragment-local-secret"
+}
+```
+
+Fields:
+
+- `name`: human input used to derive the deterministic fragment hash
+- `secret`: must match `MASTER_KEY`
+- `key`: fragment secret used later for fragment auth
+
+Response:
+
+```json
+{
+  "fragment_hash": "b77adaff371716fc0de411a88c924c21c6e4e68ab9addfa536fe07ec774aa1fd",
+  "name": "mainframe"
+}
+```
+
+### `GET /n1/fragments`
+
+List fragment hashes visible from configured index roots and include storage totals.
+
+Response:
+
+```json
+[
+  {
+    "fragment": "b77adaff371716fc0de411a88c924c21c6e4e68ab9addfa536fe07ec774aa1fd",
+    "total": 4000787030016,
+    "used": 120449024
+  }
+]
+```
+
+### `PATCH /n1/fragments/{fragment}`
+
+Update fragment metadata or rotate its fragment key.
+
+Request body:
+
+```json
+{
+  "new_name": "mainframe-renamed",
+  "new_key": "new-fragment-secret",
+  "secret": "<MASTER_KEY>"
+}
+```
+
+Notes:
+
+- `new_name` requires the master secret because it changes the fragment hash.
+- `new_key` rotates the fragment secret used by `POST /n1/auth/fragment`.
+
+### `DELETE /n1/fragments/{fragment}`
+
+Delete the fragment control plane and storage directories for that fragment.
+
+Protected by fragment token permissions and admin/master checks inside the handler.
+
+Success response:
+
+```json
+{
+  "status": "success",
+  "message": "Fragment deleted successfully"
+}
+```
+
+### `GET /n1/capacity/usage`
+
+Return aggregate storage capacity from configured storage roots.
+
+Response:
+
+```json
+{
+  "capacity_used": 120449024,
+  "capacity_allocated": 4000787030016,
+  "capacity_available": 3880338004992,
+  "filesystem_count": 4
+}
+```
+
+## Object Listing And Read API
+
+### `GET /n1/objects`
+
+List live objects from the standalone namespace layer.
+
+Query parameters:
+
+- `limit` optional, default `100`, max `1000`
+- `prefix` optional
+- `delimiter` optional, usually `/`
+- `continuation_token` optional
+
+### `GET /n1/trash`
+
+Same query contract as `GET /n1/objects`, but lists trashed objects.
+
+### `GET /n1/objects/versions/{*object_key}`
+
+List versions for a logical object path.
+
+Path parameters:
+
+- `object_key`: logical path such as `videos/demo.mp4`
+
+Response:
+
+- JSON array of `ObjectMetadata`
+
+### `GET /n1/objects/get/{*object_key}`
+
+Read the full object body.
+
+Supports logical paths in standalone `N1 2.0`.
+
+### `GET /n1/objects/stream/{*object_key}`
+
+Stream the object body. This is the better route for large objects or browser playback.
+
+### `GET /n1/objects/meta/{*object_key}`
+
+Return object metadata for the current live head.
+
+### `GET /n1/objects/download`
+
+Download by query instead of path.
+
+Query parameters:
+
+- `object_key` required
+- `version_id` optional
+- `filename` optional
+
+If `filename` is omitted and the logical path differs from the underlying storage object id, `N1 2.0` will derive a browser-friendly download filename from the logical path.
+
+### `GET /n1/objects/download/chunk`
+
+Read a specific byte window.
+
+Query parameters:
+
+- `object_key` required
+- `offset` required
+- `chunk_size` required
+
+### `POST /n1/objects/signed-url`
+
+Mint a time-limited public signed read URL.
+
+Request body:
+
+```json
+{
+  "object_key": "videos/demo.mp4",
+  "disposition": "download",
+  "expires_in": 3600,
+  "version_id": "01KNYMZC0M0J1E4A74M0J2P8F8",
+  "filename": "demo.mp4"
+}
+```
+
+Response:
+
+```json
+{
+  "url": "https://host/n1/objects/signed-read?...",
+  "path": "/n1/objects/signed-read",
+  "fragment": "fragment-hash",
+  "object_key": "videos/demo.mp4",
+  "disposition": "download",
+  "expires_at": 1775903600,
+  "version_id": "01KNYMZC0M0J1E4A74M0J2P8F8",
+  "filename": "demo.mp4"
+}
+```
+
+### `POST /n1/objects/archive`
+
+Download multiple objects as an archive.
+
+Request body:
+
+```json
+{
+  "keys": ["videos/demo.mp4", "docs/readme.txt"],
+  "format": "zip",
+  "filename": "bundle.zip",
+  "export_all": false,
+  "include_internal": false
+}
+```
+
+Fields:
+
+- `keys`: logical paths to include
+- `format`: currently `zip` for selected archive export
+- `filename`: optional download filename
+- `export_all`: if `true`, archive all visible objects
+- `include_internal`: include internal metadata entries when supported
+
+### `GET /n1/objects/archive/manifest`
+
+Stream a manifest-driven archive build.
+
+Query parameters:
+
+- `format` optional, default `tar`
+- `filename` optional
+
+The request body is a manifest payload consumed by the archive builder.
+
+## Upload API
+
+`N1 2.0` supports both one-shot upload and resumable multipart upload.
+
+### Common Upload Parameters
+
+Multipart init and finalize use:
+
+```json
+{
+  "content_type": "video/mp4",
+  "total_size_bytes": 10485760,
+  "expected_parts": 5,
+  "part_size_bytes": 2097152
+}
+```
+
+Fields:
+
+- `content_type` optional
+- `total_size_bytes` required
+- `expected_parts` required
+- `part_size_bytes` optional but strongly recommended for consistent resume behavior
+
+### `POST /n1/upload/one-shot/{*object_key}`
+
+Upload a complete object in one request.
+
+Path parameters:
+
+- `object_key`: logical path, for example `videos/demo.mp4`
+
+Query parameters:
+
+- `checksum` optional
+- `durability` optional
+- `strict_durability` optional boolean
+- `io_gate` optional boolean
+
+Body:
+
+- raw object bytes
+
+Response:
+
+- `201 Created`
+- `ObjectMetadata`
+
+### `POST /n1/upload/multipart/init/{*object_key}`
+
+Start or reuse a multipart upload session for a logical path.
+
+Body:
+
+- `InitiateUploadParams`
+
+Response:
+
+```json
+{
+  "session_id": "01KNYN0Q4FC5B7NAT0S6Z2TQ4Q",
+  "version_id": "01KNYN0Q4E4YQ5RDNM5AC7BQ7S"
+}
+```
+
+If an interrupted multipart session already exists for the same logical path and compatible upload manifest, `N1 2.0` reuses it instead of creating a new one.
+
+### `GET /n1/upload/multipart`
+
+List active multipart sessions.
+
+Query parameters:
+
+- `limit` optional, default `50`, max `100`
+- `offset` optional, default `0`
+
+Response:
+
+```json
+{
+  "sessions": [
+    {
+      "session_id": "01KNYN0Q4FC5B7NAT0S6Z2TQ4Q",
+      "version_id": "01KNYN0Q4E4YQ5RDNM5AC7BQ7S",
+      "object_key": "videos/demo.mp4",
+      "physical_object_key": "a309986ab5...",
+      "created_at": 1775900200,
+      "reserved_size": 10485760,
+      "total_size_bytes": 10485760,
+      "expected_parts": 5,
+      "committed_parts": 3,
+      "committed_bytes": 6291456
+    }
+  ],
+  "total": 1
+}
+```
+
+### `GET /n1/upload/multipart/{version_id}`
+
+Return upload progress for one multipart session.
+
+### `PUT /n1/upload/multipart/{version_id}/{part_index}`
+
+Upload one part.
+
+Path parameters:
+
+- `version_id`
+- `part_index`
+
+Query parameters:
+
+- `checksum` optional
+- `durability` optional
+- `strict_durability` optional
+- `io_gate` optional
+
+Body:
+
+- raw bytes for this part
+
+### `POST /n1/upload/multipart/{version_id}/{session_id}/finalize`
+
+Commit the multipart upload.
+
+Query parameters:
+
+- `object_key` required
+- `version_id` optional
+- `filename` optional but unused by finalize
+
+Body:
+
+- same `InitiateUploadParams` shape used for init
+
+### `DELETE /n1/upload/multipart/{version_id}`
+
+Cancel the multipart session.
+
+Query parameters:
+
+- `object_key` required
+
+## Namespace And POSIX-Style API
+
+These routes operate on the standalone mutable namespace layer in `N1 2.0`.
+
+### `GET /n1/posix/list`
+
+Query parameters:
+
+- `path` optional, default root
+- `limit` optional, default `200`, max `1000`
+- `continuation_token` optional
+- `trash` optional boolean, default `false`
+
+Behavior:
+
+- `trash=false`: live namespace browsing
+- `trash=true`: trash browsing
+
+### `GET /n1/posix/stat`
+
+Query parameters:
+
+- `path` optional, default root
+- `trash` optional boolean
+
+Response:
+
+```json
+{
+  "path": "videos/demo.mp4",
+  "scan_trash": false,
+  "kind": "file",
+  "is_virtual": false,
+  "size_bytes": 10485760,
+  "modified_at_unix": 1775900000,
+  "content_type": "video/mp4",
+  "version_id": "01KNYMZC0M0J1E4A74M0J2P8F8"
+}
+```
+
+### `POST /n1/posix/mkdir`
+
+Request body:
+
+```json
+{
+  "path": "videos/clips"
+}
+```
+
+### `POST /n1/posix/rename`
+
+Request body:
+
+```json
+{
+  "source_path": "videos/demo.mp4",
+  "destination_path": "videos/demo-final.mp4"
+}
+```
+
+### `POST /n1/posix/move`
+
+Alias of `POST /n1/posix/rename`. Same request and response.
+
+### `POST /n1/posix/trash`
+
+Request body:
+
+```json
+{
+  "path": "videos/demo.mp4"
+}
+```
+
+### `POST /n1/posix/recover`
+
+Request body:
+
+```json
+{
+  "path": "videos/demo.mp4"
+}
+```
+
+Important `2.0` behavior:
+
+- if trash listing returns a grouped virtual directory such as `Screenshots` or `videos/2025`, single recover accepts that same `path` and restores the represented trashed children
+- callers do not need to know whether the listed trash entry was an exact trashed node or a grouped directory view
+
+## Lifecycle API
+
+### `POST /n1/objects/rename`
+
+Request body:
+
+```json
+{
+  "source_fragment": "fragment-hash",
+  "source_key": "videos/demo.mp4",
+  "destination_fragment": "fragment-hash",
+  "destination_key": "videos/demo-final.mp4"
+}
+```
+
+For standalone `N1 2.0`, source and destination fragment should normally be the same fragment.
+
+### `DELETE /n1/objects/{*object_key}`
+
+Trash a logical object path.
+
+Response:
+
+```json
+{
+  "operation": "trash",
+  "affected_paths": 1,
+  "affected_objects": 1
+}
+```
+
+### `DELETE /n1/objects/version/{version_id}/{*object_key}`
+
+Delete a specific version from the physical version chain.
+
+### `POST /n1/objects/recover/{*object_key}`
+
+Recover a logical object path from trash.
+
+### `POST /n1/objects/recover/version/{version_id}/{*object_key}`
+
+Recover a specific version.
+
+### `POST /n1/objects/bulk-delete`
+
+Request body:
 
 ```json
 {
   "object_keys": [
-    "a.txt",
-    "nested/path/b.txt"
+    "videos/demo-1.mp4",
+    "videos/demo-2.mp4"
   ]
 }
 ```
 
-Lifecycle model:
-- soft delete is metadata-first
-- recover is metadata-first
-- permanent delete destroys the object version data
-- reads may reconstruct bytes on the fly, but they do not silently rebuild a wiped disk subtree
-
-## 7. Upload Routes
-
-N1 `1.1.1` exposes explicit sibling upload modes:
-- one-shot
-- multipart
-
-### 7.1 One-Shot
-
-- `POST /n1/upload/one-shot/{*object_key}`
-
-Use for small single-request objects when session/finalize overhead is unnecessary.
-
-### 7.2 Multipart
-
-- `POST /n1/upload/multipart/init/{*object_key}`
-- `GET /n1/upload/multipart`
-- `GET /n1/upload/multipart/{version_id}`
-- `PUT /n1/upload/multipart/{version_id}/{part_index}`
-- `POST /n1/upload/multipart/{version_id}/{session_id}/finalize`
-- `DELETE /n1/upload/multipart/{version_id}`
-
-Multipart flow:
-1. init
-2. upload parts
-3. inspect status if needed
-4. finalize
-5. or cancel
-
-Typical init request:
+Response:
 
 ```json
 {
-  "expected_size_bytes": 10485760,
-  "content_type": "video/mp4"
+  "requested": 2,
+  "unique": 2,
+  "succeeded": 2,
+  "not_found": 0,
+  "failed": []
 }
 ```
 
-Typical init response fields:
-- `version_id`
-- `upload_session_id`
-- `stripe_size_bytes`
-- `part_size_bytes`
+### `POST /n1/objects/bulk-recover`
 
-## 8. Maintenance Routes
+Same request shape as bulk delete.
 
-### 8.1 Fragment Storage Maintenance
+### `POST /n1/trash/recover-all`
 
-- `POST /n1/maintenance/fragment/cleanup`
-- `POST /n1/maintenance/fragment/init`
+Recover every currently trashed object in the fragment.
 
-### 8.2 Repair
+No request body.
+
+### `DELETE /n1/trash/empty`
+
+Retire all trashed namespace entries immediately. Physical bytes are reclaimed later by GC.
+
+No request body.
+
+### Permanent Delete Note
+
+`N1 2.0` is lifecycle-first.
+
+- normal delete means move to trash
+- `empty trash` retires namespace visibility
+- GC later reclaims unreachable object versions and blobs
+
+Routes that try to expose immediate permanent delete behavior are no longer the preferred `2.0` contract.
+
+## Maintenance API
+
+### `POST /n1/maintenance/fragment/init`
+
+Ensure blob directory layout exists for the fragment.
+
+Response:
+
+- `202 Accepted`
+
+### `POST /n1/maintenance/fragment/cleanup`
+
+Clean fragment orphan state and return usage.
+
+Response:
+
+```json
+{
+  "fragment": "fragment-hash",
+  "usage_bytes": 10485760,
+  "orphan_blob_dirs_removed": 0,
+  "message": "Fragment metadata cleanup complete."
+}
+```
+
+### Repair
+
+Routes:
 
 - `POST /n1/maintenance/repair/start`
 - `POST /n1/maintenance/repair/stop`
 - `GET /n1/maintenance/repair/status`
 
-Repair modes are selected by query parameters, including:
-- `mode=availability`
-- `mode=strict`
-- `mode=checksum`
-- `mode=scrub`
+`repair/start` query parameters:
 
-Maintenance access model:
-- `availability` keeps normal CRUD available
-- `strict` moves repair toward read-only isolation
-- `scrub` is the heaviest verification mode
+- `mode` or `check_mode` optional: `availability`, `checksum`, `strict`, `scrub`
+- `access_mode` optional
+- `fast_mode` optional boolean
+- `read_only_fast` optional boolean
+- `dry_run` optional boolean
+- `fragment` optional fragment filter
+- `meta_concurrency` optional
+- `repair_concurrency` optional
+- `batch` optional
 
-### 8.3 Garbage Collection
+Status shape:
+
+```json
+{
+  "is_running": true,
+  "phase": "Scanning",
+  "fast_mode": false,
+  "total_scanned": 1024,
+  "total_repaired": 3,
+  "corrupt_found": 3,
+  "missing_meta_repaired": 0,
+  "divergent_meta_repaired": 1,
+  "last_disagreement": null,
+  "current_fragment": "fragment-hash",
+  "last_repaired": "videos/demo.mp4",
+  "last_error": null,
+  "start_timestamp": 1775900400,
+  "duration_seconds": 12,
+  "scan_rate_per_sec": 85.3
+}
+```
+
+### Garbage Collection
+
+Routes:
 
 - `POST /n1/maintenance/gc/start`
 - `POST /n1/maintenance/gc/stop`
 - `GET /n1/maintenance/gc/status`
 
-### 8.4 Trash Job Status
+The GC status route returns:
 
-- `GET /n1/maintenance/trash/recover/status`
-- `GET /n1/maintenance/trash/empty/status`
+```json
+{
+  "is_running": false,
+  "phase": "Completed",
+  "is_manual_run": true,
+  "total_fragments": 1,
+  "total_fragments_scanned": 1,
+  "total_live_versions_seen": 0,
+  "total_trash_versions_expired": 0,
+  "total_sessions_deleted": 0,
+  "total_orphan_blob_dirs_deleted": 4,
+  "total_refund_bytes": 21290008,
+  "total_errors": 0,
+  "current_fragment": "",
+  "last_error": null,
+  "start_timestamp": 1775900500,
+  "duration_seconds": 2
+}
+```
 
-### 8.5 Redistribution
+### Redistribution
+
+Routes:
 
 - `POST /n1/maintenance/redistribution/start`
 - `POST /n1/maintenance/redistribution/stop`
 - `GET /n1/maintenance/redistribution/status`
 
-Redistribution notes:
-- adjusts placement for changed disk/root topology and EC layout
-- handles downgrade and re-expand flows such as `2 roots -> 1 root -> 2 roots`
-- works with the same fragment-scoped metadata authority as CRUD and repair
+`redistribution/start` query parameters:
 
-### 8.6 Health
+- `dry_run` optional boolean
+- `fast_mode` optional boolean
+- `read_only_fast` optional boolean
+- `mode` or execution mode optional: `availability`, `strict`, `scrub`
+- `scope` optional: `all`, `blob`, `index`
+- `fragment` optional
+- `durability_mode` optional
+- `object_concurrency` optional
+- `status_batch` optional
 
-- `GET /n1/maintenance/health`
+Status shape:
 
-Health reports:
-- disk/root status
-- system resource usage
+```json
+{
+  "is_running": true,
+  "phase": "Scanning",
+  "fast_mode": false,
+  "durability_mode": "auto",
+  "scope": "all",
+  "total_fragments_scanned": 1,
+  "total_objects_scanned": 128,
+  "total_objects_need_redistribution": 2,
+  "total_objects_migrated": 2,
+  "total_errors": 0,
+  "current_fragment": "fragment-hash",
+  "last_object": "videos/demo.mp4",
+  "last_error": null,
+  "start_timestamp": 1775900600,
+  "duration_seconds": 6,
+  "scan_rate_per_sec": 21.3
+}
+```
+
+### Trash Job Status
+
+Routes:
+
+- `GET /n1/maintenance/trash/recover/status`
+- `GET /n1/maintenance/trash/empty/status`
+
+These expose background recover-all and empty-trash job progress when persistent trash jobs are in flight.
+
+### `GET /n1/maintenance/health`
+
+System-wide health report combining:
+
+- disk status
+- consistency scan results
+- system metrics
 - upload runtime stats
 - index runtime stats
-- maintenance status
-- degraded / healthy summary
+- storage plane stats
+- maintenance job state
 
-## 9. WebSocket Telemetry
+Response shape:
 
-### 9.1 `GET /ws?token=<fragment_access_token>`
+```json
+{
+  "sampled_at": 1775900700,
+  "status": "healthy",
+  "disks": [
+    {
+      "path": "/mnt/DISK0",
+      "role": "blob",
+      "status": "online",
+      "total_bytes": 1000000000000,
+      "used_bytes": 120449024,
+      "available_bytes": 999879550976,
+      "usage_percent": 0.01,
+      "latency_ms": 2
+    }
+  ],
+  "consistency": {
+    "total_partition_dbs_scanned": 16,
+    "index_partition_health": "healthy"
+  },
+  "system": {
+    "cpu_usage_percent": 5.2,
+    "memory_used_bytes": 123456789
+  },
+  "uploads": {
+    "active_fragments": 0,
+    "active_sessions": 0,
+    "reserved_bytes": 0,
+    "committed_parts": 0,
+    "committed_bytes": 0,
+    "stale_sessions": 0,
+    "stale_reserved_bytes": 0
+  },
+  "index_runtime": {
+    "loaded_partition_runtimes": 8,
+    "wal_appenders": 8,
+    "prefix_projection_fragments_pending": 0
+  },
+  "storage": {
+    "index_roots_total": 2,
+    "index_roots_online": 2,
+    "blob_devices_total": 4,
+    "blob_devices_online": 4,
+    "raw_total_bytes": 4000000000000,
+    "raw_used_bytes": 120449024,
+    "raw_available_bytes": 3999879550976,
+    "heterogeneous_blob_capacity": false
+  },
+  "maintenance": {
+    "access_mode": "availability",
+    "repair_running": false,
+    "repair_phase": "Completed",
+    "redistribution_running": false,
+    "redistribution_phase": "Completed",
+    "gc_running": false,
+    "gc_phase": "Completed",
+    "pending_redistribution_intents": 0,
+    "failed_redistribution_intents": 0,
+    "fragments_with_pending_redistribution": 0,
+    "trash_recover_running": false,
+    "trash_recover_phase": "",
+    "trash_recover_fragment": "",
+    "trash_recover_total_objects": 0,
+    "trash_recover_processed_objects": 0,
+    "trash_empty_running": false,
+    "trash_empty_phase": "",
+    "trash_empty_fragment": "",
+    "trash_empty_total_objects": 0,
+    "trash_empty_processed_objects": 0,
+    "trash_empty_total_roots": 0,
+    "trash_empty_processed_roots": 0
+  },
+  "summary": "All disks online; no maintenance debt."
+}
+```
 
-WebSocket stays in N1 for authenticated engine telemetry only.
+## Recommended Standalone Flow
 
-Typical event families:
-- repair updates
-- redistribution updates
-- monitoring / health updates
-- storage event payloads scoped to the authenticated fragment
-
-## 10. Permission Model
-
-Fragment tokens are capability-scoped:
-- `read`
-- `write`
-- `modify`
-- `delete`
-
-Typical mapping:
-- read/list/stream/meta/download/archive -> `read`
-- upload init/part/finalize/one-shot -> `write`
-- rename / fragment modify -> `modify`
-- delete / recover / trash-empty / permanent delete -> `delete`
-
-The fragment in the token is authoritative. Stable N1 routes do not accept a fragment path for
-normal object operations because the claim already scopes the request.
-
-## 11. Stable Contract Notes
-
-N1 `1.1.1` freezes these engine decisions:
-- route prefix is `/n1/*`
-- exact-key authority lives in fragment-level `indexdb/index.ndxdb`
-- logical hash bucketing stays internal to the metadata plane
-- soft delete and recover are metadata-first lifecycle operations
-- disk-loss / wipe rebuild is owned by repair and redistribution, not by reads
-- reads may reconstruct bytes on the fly, but they do not silently repopulate a lost disk subtree
-
-## 12. Quick Smoke Example
-
-Create fragment:
+### 1. Create A Fragment
 
 ```bash
-curl -k -X POST "https://127.0.0.1:50001/n1/fragments" \
+curl -k https://127.0.0.1:50001/n1/fragments \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name":"mainframe",
+    "secret":"<MASTER_KEY>",
+    "key":"fragment-local-secret"
+  }'
+```
+
+### 2. Mint A Fragment Token
+
+```bash
+curl -k https://127.0.0.1:50001/n1/auth/fragment \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "fragment":"<fragment-hash>",
+    "secret":"fragment-local-secret",
+    "read":true,
+    "write":true,
+    "modify":true,
+    "delete":true,
+    "expires_in":3600
+  }'
+```
+
+### 3. Upload A File
+
+```bash
+curl -k -X POST \
+  "https://127.0.0.1:50001/n1/upload/one-shot/videos/demo.mp4" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: video/mp4" \
+  --data-binary @demo.mp4
+```
+
+### 4. Browse With POSIX Or Object Listing
+
+```bash
+curl -k \
+  "https://127.0.0.1:50001/n1/posix/list?path=videos&limit=200" \
+  -H "Authorization: Bearer <token>"
+```
+
+```bash
+curl -k \
+  "https://127.0.0.1:50001/n1/objects?prefix=videos/&delimiter=/&limit=100" \
+  -H "Authorization: Bearer <token>"
+```
+
+### 5. Trash, Recover, And Reclaim
+
+```bash
+curl -k -X POST https://127.0.0.1:50001/n1/posix/trash \
+  -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
-  -d '{"name":"sample","secret":"<MASTER_KEY>","key":"fragkey"}'
+  -d '{"path":"videos/demo.mp4"}'
 ```
 
-Authenticate:
-
 ```bash
-curl -k -X POST "https://127.0.0.1:50001/n1/auth/fragment" \
+curl -k -X POST https://127.0.0.1:50001/n1/posix/recover \
+  -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
-  -d '{"fragment":"<fragment_hash>","secret":"fragkey","read":true,"write":true,"modify":true,"delete":true}'
+  -d '{"path":"videos/demo.mp4"}'
 ```
-
-One-shot upload:
 
 ```bash
-curl -k -X POST "https://127.0.0.1:50001/n1/upload/one-shot/hello.txt" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: text/plain" \
-  --data-binary 'hello world'
+curl -k -X DELETE https://127.0.0.1:50001/n1/trash/empty \
+  -H "Authorization: Bearer <token>"
+curl -k -X POST https://127.0.0.1:50001/n1/maintenance/gc/start \
+  -H "Authorization: Bearer <token>"
 ```
 
-List objects:
+## Operational Notes
 
-```bash
-curl -k -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/n1/objects"
-```
-
-Get object:
-
-```bash
-curl -k -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/n1/objects/get/hello.txt"
-```
-
-Health:
-
-```bash
-curl -k -H "Authorization: Bearer $TOKEN" \
-  "https://127.0.0.1:50001/n1/maintenance/health"
-```
-
-## 13. Related Docs
-
-- [DOCUMENTATION.md](/home/administrator/Development/N1/DOCUMENTATION.md) for the workspace docs index
-- [README.md](/home/administrator/Development/N1/README.md) for product/runtime overview
-- [ARCHITECTURE.md](/home/administrator/Development/N1/ARCHITECTURE.md) for the storage-engine model
-- [DEPLOYMENT.md](/home/administrator/Development/N1/DEPLOYMENT.md) for operator setup
-- [DEPLOYMENT_PROFILES.md](/home/administrator/Development/N1/DEPLOYMENT_PROFILES.md) for deployment profile split
-- [N2_DOCUMENTATION.md](/home/administrator/Development/N1/N2_DOCUMENTATION.md) for multi-node N2 only
-- [REGISTRY_DOCUMENTATION.md](/home/administrator/Development/N1/REGISTRY_DOCUMENTATION.md) for the Registry layer
+- `N1 2.0` is lifecycle-first. Clients should think in terms of `trash`, `recover`, and `GC`, not immediate physical delete.
+- Standalone namespace routes and raw object routes are both available. New integrations should prefer the namespace-aware `2.0` surfaces unless they specifically need lower-level object semantics.
+- Some helper routes remain legacy-shaped. The most visible example is `GET /n1/fragments/check` and `GET /n1/fragments/hash`, which currently deserialize JSON bodies.
+- Signed-read URLs are the preferred way to expose public view, stream, or download without leaking bearer tokens.
+- SMB Lite and POSIX routes are backed by the same namespace/runtime model, so rename, mkdir, trash, and recover are meant to stay consistent across surfaces.

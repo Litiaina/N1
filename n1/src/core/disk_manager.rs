@@ -219,7 +219,7 @@ pub struct InitiateUploadParams {
     pub part_size_bytes: Option<u64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct InitiateUploadResponse {
     pub session_id: String,
     pub version_id: String,
@@ -247,9 +247,11 @@ pub struct RenameObjectRequest {
 pub struct ObjectKeyQuery {
     pub object_key: String,
     pub version_id: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
 }
 
-#[derive(Serialize, Default)]
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct UploadStatusResponse {
     pub uploaded_parts: Vec<u64>,
     #[serde(default)]
@@ -268,6 +270,8 @@ pub struct UploadStatusResponse {
     pub version_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub object_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_object_key: Option<String>,
 }
 
 #[derive(Deserialize)]

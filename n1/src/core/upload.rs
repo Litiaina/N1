@@ -275,11 +275,13 @@ pub struct UploadSessionManifest {
     pub parity_shards: u16,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveSessionInfo {
     pub session_id: String,
     pub version_id: String,
     pub object_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_object_key: Option<String>,
     pub created_at: i64,
     pub reserved_size: u64,
     pub total_size_bytes: Option<u64>,
@@ -288,7 +290,7 @@ pub struct ActiveSessionInfo {
     pub committed_bytes: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListUploadsResponse {
     pub sessions: Vec<ActiveSessionInfo>,
     pub total: usize,
@@ -1499,6 +1501,7 @@ pub async fn list_active_uploads(
                 session_id: state.manifest.session_id.clone(),
                 version_id: state.manifest.version_id.clone(),
                 object_key: Some(state.manifest.object_key.clone()),
+                physical_object_key: None,
                 created_at: state.manifest.created_at,
                 reserved_size: state.reservation.map(|receipt| receipt.amount).unwrap_or(0),
                 total_size_bytes: Some(state.manifest.total_size_bytes),
@@ -1557,6 +1560,7 @@ pub async fn get_upload_status(
             session_id: Some(state.manifest.session_id),
             version_id: Some(state.manifest.version_id),
             object_key: Some(state.manifest.object_key),
+            physical_object_key: None,
         }));
     }
 

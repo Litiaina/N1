@@ -5529,7 +5529,8 @@ mod tests {
             .await
             .expect("list page1");
         assert_eq!(
-            page1.objects
+            page1
+                .objects
                 .iter()
                 .map(|object| object.object_key.as_str())
                 .collect::<Vec<_>>(),
@@ -5553,7 +5554,8 @@ mod tests {
             .await
             .expect("list page2");
         assert_eq!(
-            page2.objects
+            page2
+                .objects
                 .iter()
                 .map(|object| object.object_key.as_str())
                 .collect::<Vec<_>>(),

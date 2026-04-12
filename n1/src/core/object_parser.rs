@@ -119,7 +119,7 @@ pub async fn get_object_logic(
     req: axum::http::Request<Body>,
 ) -> Result<impl IntoResponse, AppError> {
     let (parts, _body) = req.into_parts();
-    stream_object_logic(parts.headers, metadata, "inline").await
+    stream_object_logic(parts.headers, metadata, "inline", None).await
 }
 
 fn data_shards_count(part: &PartMetadata) -> usize {
@@ -205,6 +205,7 @@ pub async fn stream_object_logic(
     headers: HeaderMap,
     metadata: ObjectMetadata,
     disposition_type: &str,
+    filename_override: Option<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let file_size = metadata.total_size_bytes;
 
@@ -219,11 +220,32 @@ pub async fn stream_object_logic(
         ..
     } = metadata;
 
+    let filename = filename_override
+        .as_deref()
+        .and_then(|value| {
+            std::path::Path::new(value)
+                .file_name()
+                .and_then(|name| name.to_str())
+        })
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            std::path::Path::new(&object_key)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("download")
+                .to_string()
+        });
+
     if file_size == 0 {
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, content_type)
             .header(header::CONTENT_LENGTH, "0")
+            .header(
+                header::CONTENT_DISPOSITION,
+                format!("{}; filename=\"{}\"", disposition_type, filename),
+            )
             .body(Body::empty())
             .unwrap()
             .into_response());
@@ -247,12 +269,6 @@ pub async fn stream_object_logic(
             "No blob roots configured".into(),
         ));
     }
-
-    let filename = std::path::Path::new(&object_key)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("download")
-        .to_string();
 
     struct StreamState {
         pos: u64,
