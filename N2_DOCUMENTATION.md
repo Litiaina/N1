@@ -31,9 +31,15 @@ https://127.0.0.1:50001
 
 `N2` routes live under `/v4/n2/...`.
 
+That route namespace is intentional. `N1` moved its stable standalone surface to `/n1/...`, but the current `N2` cluster API still lives under `/v4/n2/...`.
+
 ## Authentication Model
 
 Protected `N2` routes use the same bearer-token middleware as the shared storage runtime.
+
+In practice, the runtime usually mints those fragment-scoped tokens through the shared storage auth route on the same server:
+
+`POST /n1/auth/fragment`
 
 Typical header:
 
@@ -46,6 +52,19 @@ Practical permission model:
 - read routes require `read`
 - write or mutate routes require `write`, `modify`, or `delete` depending on the route
 - membership and governance mutation routes are operator/admin surfaces
+
+Example auth request:
+
+```json
+{
+  "fragment": "fragment-a",
+  "secret": "fragment-or-master-key",
+  "read": true,
+  "write": true,
+  "modify": true,
+  "delete": true
+}
+```
 
 ## Core Data Shapes
 

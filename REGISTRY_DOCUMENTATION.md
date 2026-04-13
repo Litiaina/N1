@@ -11,6 +11,8 @@ Use `Registry` when you need:
 - trash, recover, rename, and prefix operations at the logical metadata layer
 - public shares
 
+`Registry` is also the correct home for user quotas and account policy. Standalone `N1` is not the user/account quota control plane.
+
 This document is written for engineers integrating with `Registry` directly.
 
 ## Base URL
@@ -99,6 +101,11 @@ This is the bridge from `Registry` to `N1` or `N2`.
   "refresh_expires_in": 604800
 }
 ```
+
+Operational note:
+
+- for standalone `N1 2.0`, `Registry` currently brokers fragment access against the backend engine’s `/n1/auth/fragment` route
+- clients should treat the storage session response as the engine-facing contract and should not re-derive engine auth on their own for normal product flows
 
 ### Share Record
 

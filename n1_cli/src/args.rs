@@ -1,27 +1,30 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 const CLI_LONG_ABOUT: &str = "\
-Operator-first CLI for N1 Standard.
+Operator-first CLI for N1 2.0.
 
 Use this CLI to inspect health, track upload pressure, and run maintenance jobs
 without guessing the HTTP routes behind them. Global flags apply to every
 subcommand, so set the server URL, fragment, and secret once and keep the rest
-focused on the operation you need.";
+focused on the operation you need.
+
+N1 authentication is fragment-scoped. For protected commands, pass either
+--fragment <name-or-hash> or --auth-fragment <name-or-hash>.";
 
 const CLI_AFTER_HELP: &str = "\
 Examples:
-  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> health
-  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> health --watch
-  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> --fragment myfrag uploads list
-  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> repair start --mode availability
-  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> redistribute start --mode strict --durability strict
-  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> gc watch";
+  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> --fragment mainframe health
+  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> --fragment mainframe health --watch
+  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> --fragment mainframe uploads list
+  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> --fragment mainframe repair start --mode availability
+  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> --fragment mainframe redistribute start --mode strict --durability strict
+  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> --fragment mainframe gc watch";
 
 #[derive(Parser, Debug)]
 #[command(
     name = "litiaina-n1-cli",
     version,
-    about = "Operator CLI for N1 Standard",
+    about = "Operator CLI for N1 2.0",
     long_about = CLI_LONG_ABOUT,
     subcommand_required = true,
     arg_required_else_help = true,
@@ -46,7 +49,7 @@ pub struct Cli {
         long,
         global = true,
         help_heading = "Connection",
-        help = "Target fragment for commands that operate on a single fragment."
+        help = "Target fragment name or hash. Also used for authentication when --auth-fragment is omitted."
     )]
     pub fragment: Option<String>,
 
@@ -54,7 +57,7 @@ pub struct Cli {
         long,
         global = true,
         help_heading = "Connection",
-        help = "Override the fragment used only for authentication. Useful when the engine expects a dedicated auth fragment."
+        help = "Override the fragment name or hash used only for authentication."
     )]
     pub auth_fragment: Option<String>,
 

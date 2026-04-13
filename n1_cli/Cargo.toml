@@ -12,6 +12,7 @@ chrono.workspace = true
 cli_core = { path = "../cli_core" }
 clap.workspace = true
 reqwest.workspace = true
+serde.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

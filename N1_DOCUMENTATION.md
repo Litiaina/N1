@@ -32,6 +32,8 @@ Most `N1` APIs are fragment-scoped.
 2. Mint a fragment token with `POST /n1/auth/fragment`
 3. Use `Authorization: Bearer <access_token>` on protected routes
 
+Stable `N1 2.0` API routes and operator routes live under `/n1/...`.
+
 ### Permission Bits
 
 Fragment tokens carry four booleans:
@@ -92,6 +94,132 @@ Response:
 {
   "refresh_token": "<opaque-refresh-token>"
 }
+```
+
+## Operator CLI
+
+[`n1_cli`](/home/administrator/Development/N1/n1_cli) is the operator-facing companion to the stable `N1 2.0` API.
+
+Current CLI scope:
+
+- fragment create
+- health snapshots and watch mode
+- active multipart upload list/status
+- GC start/status/stop/watch
+- repair start/status/stop/watch
+- redistribution start/status/stop/watch
+
+Representative commands:
+
+```bash
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  fragment create --name <fragment_name> --key <fragment_key>
+
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  health --deep-scan
+
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  gc status
+```
+
+Protected CLI commands authenticate through `POST /n1/auth/fragment`, so pass `--fragment <name-or-hash>` or `--auth-fragment <name-or-hash>` when operating a real server.
+
+Complete examples:
+
+```bash
+# Health
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  health
+
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  health --watch --deep-scan
+
+# Multipart uploads
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  uploads list --limit 100 --offset 0
+
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  uploads status --version-id <version_id>
+
+# GC
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  gc status
+
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  gc start
+
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  gc watch
+
+# Repair
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  repair start --dry-run --mode availability
+
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  repair status
+
+# Redistribution
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  redistribute start --dry-run --mode availability --durability auto --scope all
+
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  redistribute status
+
+# JSON output
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  --json repair status
+
+# Different auth fragment
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <target_fragment> \
+  --auth-fragment <auth_fragment> \
+  health
 ```
 
 ## Common Response Shapes

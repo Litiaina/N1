@@ -7,10 +7,10 @@
   />
   <h1>Litiaina N2</h1>
   <p>
-    Unified object storage platform built on the <code>N1</code> core engine:
-    single-node deployment through <code>n1</code>, multi-node deployment through
-    <code>n2</code>, and an experimental raw-device engine profile through
-    <code>n1-arc</code>.
+    Unified storage platform built around <code>N1</code>, <code>N2</code>, and
+    <code>Registry</code>: single-node storage through <code>n1</code>,
+    multi-node placement through <code>n2</code>, and user-facing namespace and
+    policy through <code>registry</code>.
   </p>
 </div>
 
@@ -34,6 +34,12 @@ The platform is designed to separate storage durability from user-facing metadat
 - `N1` owns physical storage truth and maintenance.
 - `N2` adds cluster coordination when storage is distributed across nodes.
 - `Registry` owns user/business metadata and product-facing policies.
+
+Current route namespaces are intentionally split:
+
+- `N1` stable runtime and operator routes live under `/n1/...`
+- `N2` cluster routes live under `/v4/n2/...`
+- `Registry` product-facing routes live under `/v1/...`
 
 The major `2.0` change in `N1` is architectural:
 
@@ -191,7 +197,7 @@ Typical deployments:
 - [`registry`](/home/administrator/Development/N1/registry)
   Registry service
 - [`n1_cli`](/home/administrator/Development/N1/n1_cli)
-  CLI helpers for `N1`
+  Operator CLI for `N1 2.0` maintenance, health, fragment create, and multipart status
 - [`n2_cli`](/home/administrator/Development/N1/n2_cli)
   CLI helpers for `N2`
 - [`indexdb`](/home/administrator/Development/N1/indexdb)
@@ -246,8 +252,9 @@ cargo run -p n1
 curl -k https://127.0.0.1:50001/n1/fragments \
   -H 'Content-Type: application/json' \
   -d '{
-    "name":"mainframe",
-    "secret":"<MASTER_KEY>"
+    "name": "mainframe",
+    "secret": "<MASTER_KEY>",
+    "key": "fragment-local-secret"
   }'
 ```
 
@@ -267,6 +274,112 @@ curl -k https://127.0.0.1:50001/n1/auth/fragment \
 ```
 
 6. Use the token for uploads, reads, POSIX routes, or SMB Lite.
+
+### N1 Operator CLI
+
+`n1_cli` is now aligned with the stable `N1 2.0` surface. It is an operator CLI, not a general file-transfer client.
+
+Protected CLI commands authenticate through `/n1/auth/fragment`, so pass `--fragment <name-or-hash>` or `--auth-fragment <name-or-hash>` when talking to a real server.
+
+Examples:
+
+```bash
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  health --deep-scan
+
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  uploads status --version-id <version_id>
+
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  repair status
+```
+
+Common commands:
+
+```bash
+# Create a fragment
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  fragment create --name <fragment_name> --key <fragment_key>
+
+# Health
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  health
+
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  health --watch --deep-scan
+
+# Multipart uploads
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  uploads list --limit 100 --offset 0
+
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  uploads status --version-id <version_id>
+
+# GC
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  gc status
+
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  gc start
+
+# Repair dry-run
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  repair start --dry-run --mode availability
+
+# Redistribution dry-run
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  redistribute start --dry-run --mode availability --durability auto --scope all
+
+# JSON output
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  --json repair status
+
+# Use a different fragment only for auth
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <secret> \
+  --fragment <target_fragment> \
+  --auth-fragment <auth_fragment> \
+  health
+```
 
 ### Registry + N1
 
@@ -442,6 +555,8 @@ These are storage maintenance flows. They should not depend on namespace mutatio
 3. Registry issues a storage session for `N1` or `N2`
 4. storage engine handles upload/read/lifecycle
 5. Registry finalizes logical metadata after storage commit
+
+Quota and end-user policy live in `Registry`, not in standalone `N1`.
 
 ## Troubleshooting And Notes
 

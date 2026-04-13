@@ -34,9 +34,12 @@ This repository now keeps the platform docs split into:
 
 - `N1`
   Physical storage truth, standalone namespace, upload, read, lifecycle, maintenance.
+  Stable route namespace: `/n1/...`
 
 - `N2`
   Cluster coordination, placement, reconcile, internal peer traffic.
+  Current route namespace: `/v4/n2/...`
 
 - `Registry`
   Users, quotas, logical namespace, shares, storage-session brokering, and product-facing metadata.
+  Public route namespace: `/v1/...`

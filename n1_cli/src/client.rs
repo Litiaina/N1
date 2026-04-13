@@ -1,9 +1,13 @@
-use reqwest::{Client, Method};
+use std::io;
+
+use reqwest::{Client, Method, StatusCode};
+use serde::{Deserialize, Serialize};
 
 use cli_core::client::{
-    AuthSession, CreateFragmentRequest, DynError, api_url, authenticate, build_client, fetch_json,
-    fetch_json_query, get_base_url, get_secret, print_output, print_response_message,
-    resolve_auth_fragment, send_query_only, send_without_body, watch_rendered,
+    AuthSession, CreateFragmentRequest, DynError, N1_AUTH_ROUTES, api_url,
+    authenticate_with_routes, build_client, fetch_json, fetch_json_query, get_base_url,
+    get_secret, print_output, print_response_message, send_query_only, send_without_body,
+    watch_rendered,
 };
 use cli_core::models::{
     GcJobStatus, HealthResponse, ListUploadsResponse, RedistributionJobStatus, RepairJobStatus,
@@ -19,6 +23,75 @@ use crate::output::{
     format_repair_status, format_upload_list, format_upload_status,
 };
 
+#[derive(Deserialize)]
+struct FragmentHashLookupResponse {
+    fragment_hash: String,
+}
+
+#[derive(Serialize)]
+struct FragmentHashLookupRequest {
+    fragment: String,
+}
+
+fn looks_like_fragment_hash(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn resolve_cli_auth_fragment_hint(cli: &Cli) -> Result<String, DynError> {
+    cli.auth_fragment
+        .clone()
+        .or_else(|| cli.fragment.clone())
+        .or_else(|| std::env::var("N1_AUTH_FRAGMENT").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            io::Error::other(
+                "N1 auth is fragment-scoped. Pass --fragment <name-or-hash> or --auth-fragment <name-or-hash>.",
+            )
+            .into()
+        })
+}
+
+async fn resolve_n1_auth_fragment(
+    client: &Client,
+    base_url: &str,
+    fragment_hint: &str,
+) -> Result<String, DynError> {
+    if looks_like_fragment_hash(fragment_hint) {
+        return Ok(fragment_hint.to_string());
+    }
+
+    let response = client
+        .get(api_url(base_url, "/n1/fragments/hash"))
+        .json(&FragmentHashLookupRequest {
+            fragment: fragment_hint.to_string(),
+        })
+        .send()
+        .await?;
+
+    match response.status() {
+        StatusCode::OK => {
+            let parsed: FragmentHashLookupResponse = response.json().await?;
+            Ok(parsed.fragment_hash)
+        }
+        StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST => {
+            let body = response.text().await.unwrap_or_default();
+            Err(io::Error::other(format!(
+                "Could not resolve fragment '{}' for N1 auth. {}",
+                fragment_hint,
+                body.trim()
+            ))
+            .into())
+        }
+        _ => Err(io::Error::other(format!(
+            "Failed to resolve fragment '{}' for N1 auth: {}",
+            fragment_hint,
+            response.status()
+        ))
+        .into()),
+    }
+}
+
 pub async fn run(cli: Cli) -> Result<(), DynError> {
     let base_url = get_base_url(cli.url.clone());
     let client = build_client(cli.insecure)?;
@@ -30,8 +103,11 @@ pub async fn run(cli: Cli) -> Result<(), DynError> {
         }
         _ => {
             let secret = get_secret(cli.secret.clone())?;
-            let auth_fragment = resolve_auth_fragment(cli.auth_fragment.clone());
-            let mut session = authenticate(&client, &base_url, &secret, &auth_fragment).await?;
+            let auth_hint = resolve_cli_auth_fragment_hint(&cli)?;
+            let auth_fragment = resolve_n1_auth_fragment(&client, &base_url, &auth_hint).await?;
+            let mut session =
+                authenticate_with_routes(&client, &base_url, &secret, &auth_fragment, N1_AUTH_ROUTES)
+                    .await?;
             handle_authenticated_command(&client, &base_url, &mut session, &cli).await
         }
     }
@@ -46,7 +122,7 @@ async fn handle_fragment_command(
     match command {
         FragmentCommands::Create(args) => {
             let response = client
-                .post(api_url(base_url, "/v4/fragment/create"))
+                .post(api_url(base_url, "/n1/fragments"))
                 .json(&CreateFragmentRequest {
                     name: args.name.clone(),
                     key: args.key.clone(),
@@ -70,7 +146,7 @@ async fn handle_authenticated_command(
         Commands::Health { watch, deep_scan } => {
             let url = format!(
                 "{}?deep_scan={}",
-                api_url(base_url, "/v4/maintenance/health"),
+                api_url(base_url, "/n1/maintenance/health"),
                 if *deep_scan { "true" } else { "false" }
             );
 
@@ -101,7 +177,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/upload/status/list"),
+                    &api_url(base_url, "/n1/upload/multipart"),
                     &query,
                 )
                 .await?;
@@ -112,7 +188,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, &format!("/v4/upload/status/{version_id}")),
+                    &api_url(base_url, &format!("/n1/upload/multipart/{version_id}")),
                 )
                 .await?;
                 print_output(cli.json, &status, &format_upload_status(&status))
@@ -125,14 +201,14 @@ async fn handle_authenticated_command(
                     base_url,
                     session,
                     Method::POST,
-                    &api_url(base_url, "/v4/maintenance/gc/start"),
+                    &api_url(base_url, "/n1/maintenance/gc/start"),
                 )
                 .await?;
                 watch_rendered::<GcJobStatus, _, _>(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/maintenance/gc/status"),
+                    &api_url(base_url, "/n1/maintenance/gc/status"),
                     cli.poll_ms,
                     cli.json,
                     format_gc_status,
@@ -145,7 +221,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/maintenance/gc/status"),
+                    &api_url(base_url, "/n1/maintenance/gc/status"),
                 )
                 .await?;
                 print_output(cli.json, &status, &format_gc_status(&status))
@@ -156,7 +232,7 @@ async fn handle_authenticated_command(
                     base_url,
                     session,
                     Method::POST,
-                    &api_url(base_url, "/v4/maintenance/gc/stop"),
+                    &api_url(base_url, "/n1/maintenance/gc/stop"),
                 )
                 .await
             }
@@ -165,7 +241,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/maintenance/gc/status"),
+                    &api_url(base_url, "/n1/maintenance/gc/status"),
                     cli.poll_ms,
                     cli.json,
                     format_gc_status,
@@ -191,7 +267,7 @@ async fn handle_authenticated_command(
                     base_url,
                     session,
                     Method::POST,
-                    &api_url(base_url, "/v4/maintenance/repair/start"),
+                    &api_url(base_url, "/n1/maintenance/repair/start"),
                     &query,
                 )
                 .await?;
@@ -199,7 +275,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/maintenance/repair/status"),
+                    &api_url(base_url, "/n1/maintenance/repair/status"),
                     cli.poll_ms,
                     cli.json,
                     format_repair_status,
@@ -212,7 +288,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/maintenance/repair/status"),
+                    &api_url(base_url, "/n1/maintenance/repair/status"),
                 )
                 .await?;
                 print_output(cli.json, &status, &format_repair_status(&status))
@@ -223,7 +299,7 @@ async fn handle_authenticated_command(
                     base_url,
                     session,
                     Method::POST,
-                    &api_url(base_url, "/v4/maintenance/repair/stop"),
+                    &api_url(base_url, "/n1/maintenance/repair/stop"),
                 )
                 .await
             }
@@ -232,7 +308,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/maintenance/repair/status"),
+                    &api_url(base_url, "/n1/maintenance/repair/status"),
                     cli.poll_ms,
                     cli.json,
                     format_repair_status,
@@ -259,7 +335,7 @@ async fn handle_authenticated_command(
                     base_url,
                     session,
                     Method::POST,
-                    &api_url(base_url, "/v4/maintenance/redistribution/start"),
+                    &api_url(base_url, "/n1/maintenance/redistribution/start"),
                     &query,
                 )
                 .await?;
@@ -267,7 +343,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/maintenance/redistribution/monitor"),
+                    &api_url(base_url, "/n1/maintenance/redistribution/status"),
                     cli.poll_ms,
                     cli.json,
                     format_redistribution_status,
@@ -280,7 +356,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/maintenance/redistribution/monitor"),
+                    &api_url(base_url, "/n1/maintenance/redistribution/status"),
                 )
                 .await?;
                 print_output(cli.json, &status, &format_redistribution_status(&status))
@@ -290,8 +366,8 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    Method::PATCH,
-                    &api_url(base_url, "/v4/maintenance/redistribution/stop"),
+                    Method::POST,
+                    &api_url(base_url, "/n1/maintenance/redistribution/stop"),
                 )
                 .await
             }
@@ -300,7 +376,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/maintenance/redistribution/monitor"),
+                    &api_url(base_url, "/n1/maintenance/redistribution/status"),
                     cli.poll_ms,
                     cli.json,
                     format_redistribution_status,

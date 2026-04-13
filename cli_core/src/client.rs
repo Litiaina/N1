@@ -10,6 +10,22 @@ use serde::{Deserialize, Serialize};
 pub type DynError = Box<dyn Error>;
 const ACCESS_REFRESH_SKEW_SECS: u64 = 30;
 
+#[derive(Clone, Copy)]
+pub struct AuthRouteSet {
+    pub fragment_auth_path: &'static str,
+    pub refresh_path: &'static str,
+}
+
+pub const LEGACY_AUTH_ROUTES: AuthRouteSet = AuthRouteSet {
+    fragment_auth_path: "/authenticate/fragment",
+    refresh_path: "/authenticate/refresh",
+};
+
+pub const N1_AUTH_ROUTES: AuthRouteSet = AuthRouteSet {
+    fragment_auth_path: "/n1/auth/fragment",
+    refresh_path: "/n1/auth/refresh",
+};
+
 #[derive(Serialize)]
 struct AuthRequest {
     fragment: String,
@@ -49,16 +65,23 @@ pub struct AuthSession {
     access_expires_at: Option<Instant>,
     secret: String,
     auth_fragment: String,
+    auth_routes: AuthRouteSet,
 }
 
 impl AuthSession {
-    fn from_auth_response(auth: AuthResponse, secret: String, auth_fragment: String) -> Self {
+    fn from_auth_response(
+        auth: AuthResponse,
+        secret: String,
+        auth_fragment: String,
+        auth_routes: AuthRouteSet,
+    ) -> Self {
         let mut session = Self {
             access_token: String::new(),
             refresh_token: None,
             access_expires_at: None,
             secret,
             auth_fragment,
+            auth_routes,
         };
         session.apply_auth_response(auth);
         session
@@ -115,7 +138,7 @@ impl AuthSession {
             .ok_or_else(|| io::Error::other("refresh token unavailable"))?;
 
         let response = client
-            .post(api_url(base_url, "/authenticate/refresh"))
+            .post(api_url(base_url, self.auth_routes.refresh_path))
             .json(&RefreshRequest {
                 refresh_token: &refresh_token,
             })
@@ -129,7 +152,14 @@ impl AuthSession {
     }
 
     async fn reauthenticate(&mut self, client: &Client, base_url: &str) -> Result<(), DynError> {
-        let auth = request_auth(client, base_url, &self.secret, &self.auth_fragment).await?;
+        let auth = request_auth(
+            client,
+            base_url,
+            &self.secret,
+            &self.auth_fragment,
+            self.auth_routes,
+        )
+        .await?;
         self.apply_auth_response(auth);
         Ok(())
     }
@@ -197,9 +227,10 @@ async fn request_auth(
     base_url: &str,
     secret: &str,
     auth_fragment: &str,
+    auth_routes: AuthRouteSet,
 ) -> Result<AuthResponse, DynError> {
     let response = client
-        .post(api_url(base_url, "/authenticate/fragment"))
+        .post(api_url(base_url, auth_routes.fragment_auth_path))
         .json(&AuthRequest {
             fragment: auth_fragment.to_string(),
             secret: secret.to_string(),
@@ -221,11 +252,22 @@ pub async fn authenticate(
     secret: &str,
     auth_fragment: &str,
 ) -> Result<AuthSession, DynError> {
-    let auth = request_auth(client, base_url, secret, auth_fragment).await?;
+    authenticate_with_routes(client, base_url, secret, auth_fragment, LEGACY_AUTH_ROUTES).await
+}
+
+pub async fn authenticate_with_routes(
+    client: &Client,
+    base_url: &str,
+    secret: &str,
+    auth_fragment: &str,
+    auth_routes: AuthRouteSet,
+) -> Result<AuthSession, DynError> {
+    let auth = request_auth(client, base_url, secret, auth_fragment, auth_routes).await?;
     Ok(AuthSession::from_auth_response(
         auth,
         secret.to_string(),
         auth_fragment.to_string(),
+        auth_routes,
     ))
 }
 

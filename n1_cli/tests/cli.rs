@@ -20,6 +20,9 @@ const TOKEN: &str = "cli-token";
 const EXPIRING_TOKEN: &str = "expiring-cli-token";
 const INITIAL_REFRESH_TOKEN: &str = "refresh-token-1";
 const ROTATED_REFRESH_TOKEN: &str = "refresh-token-2";
+const AUTH_FRAGMENT_NAME: &str = "mainframe";
+const AUTH_FRAGMENT_HASH: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 #[derive(serde::Deserialize)]
 struct AuthPayload {
@@ -44,12 +47,17 @@ struct FragmentCreatePayload {
 }
 
 #[derive(serde::Deserialize)]
+struct FragmentHashPayload {
+    fragment: String,
+}
+
+#[derive(serde::Deserialize)]
 struct HealthQuery {
     deep_scan: Option<String>,
 }
 
 async fn auth_handler(Json(payload): Json<AuthPayload>) -> impl IntoResponse {
-    if payload.fragment != "admin"
+    if payload.fragment != AUTH_FRAGMENT_HASH
         || payload.secret != SECRET
         || !payload.read
         || !payload.write
@@ -62,7 +70,7 @@ async fn auth_handler(Json(payload): Json<AuthPayload>) -> impl IntoResponse {
 }
 
 async fn auth_with_refresh_handler(Json(payload): Json<AuthPayload>) -> impl IntoResponse {
-    if payload.fragment != "admin"
+    if payload.fragment != AUTH_FRAGMENT_HASH
         || payload.secret != SECRET
         || !payload.read
         || !payload.write
@@ -111,7 +119,28 @@ async fn create_fragment_handler(Json(payload): Json<FragmentCreatePayload>) -> 
     if payload.name != "clinic" || payload.key != "clinic-key" || payload.secret != SECRET {
         return (StatusCode::BAD_REQUEST, "bad fragment payload").into_response();
     }
-    (StatusCode::OK, "fragment created").into_response()
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "fragment_hash": "clinic-hash",
+            "name": "clinic"
+        })),
+    )
+        .into_response()
+}
+
+async fn fragment_hash_handler(Json(payload): Json<FragmentHashPayload>) -> impl IntoResponse {
+    if payload.fragment != AUTH_FRAGMENT_NAME && payload.fragment != AUTH_FRAGMENT_HASH {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "fragment not found"}))).into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "fragment": payload.fragment,
+            "fragment_hash": AUTH_FRAGMENT_HASH
+        })),
+    )
+        .into_response()
 }
 
 fn authorized(headers: &HeaderMap) -> bool {
@@ -233,6 +262,84 @@ async fn upload_status_handler(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+async fn gc_status_handler(headers: HeaderMap) -> impl IntoResponse {
+    if !authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "is_running": false,
+            "phase": "Completed",
+            "is_manual_run": true,
+            "total_fragments": 1_u64,
+            "total_fragments_scanned": 1_u64,
+            "total_live_versions_seen": 3_u64,
+            "total_trash_versions_expired": 1_u64,
+            "total_sessions_deleted": 0_u64,
+            "total_orphan_blob_dirs_deleted": 0_u64,
+            "total_refund_bytes": 1024_u64,
+            "total_errors": 0_u64,
+            "current_fragment": "frag-a",
+            "last_error": null,
+            "duration_seconds": 2_u64,
+            "start_timestamp": 1_710_000_000_i64
+        })),
+    )
+        .into_response()
+}
+
+async fn repair_status_handler(headers: HeaderMap) -> impl IntoResponse {
+    if !authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "is_running": false,
+            "phase": "Completed",
+            "total_scanned": 10_u64,
+            "total_repaired": 1_u64,
+            "corrupt_found": 0_u64,
+            "missing_meta_repaired": 0_u64,
+            "divergent_meta_repaired": 0_u64,
+            "current_fragment": "frag-a",
+            "duration_seconds": 3_u64,
+            "scan_rate_per_sec": 5.0_f64,
+            "last_repaired": null,
+            "last_disagreement": null,
+            "last_error": null,
+            "start_timestamp": 1_710_000_000_i64
+        })),
+    )
+        .into_response()
+}
+
+async fn redistribution_status_handler(headers: HeaderMap) -> impl IntoResponse {
+    if !authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "is_running": false,
+            "phase": "Completed",
+            "total_fragments_scanned": 1_u64,
+            "total_objects_scanned": 20_u64,
+            "total_objects_need_redistribution": 0_u64,
+            "total_objects_migrated": 0_u64,
+            "total_errors": 0_u64,
+            "current_fragment": "frag-a",
+            "duration_seconds": 4_u64,
+            "scan_rate_per_sec": 5.0_f64,
+            "last_object": null,
+            "last_error": null,
+            "start_timestamp": 1_710_000_000_i64
+        })),
+    )
+        .into_response()
+}
+
 async fn spawn_server(router: Router) -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
@@ -244,7 +351,7 @@ async fn spawn_server(router: Router) -> (String, JoinHandle<()>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fragment_create_uses_direct_route() {
-    let router = Router::new().route("/v4/fragment/create", post(create_fragment_handler));
+    let router = Router::new().route("/n1/fragments", post(create_fragment_handler));
     let (base_url, handle) = spawn_server(router).await;
 
     let output = Command::cargo_bin("litiaina-n1-cli")
@@ -267,17 +374,17 @@ async fn fragment_create_uses_direct_route() {
     handle.abort();
 
     assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "fragment created"
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"fragment_hash\":\"clinic-hash\""));
+    assert!(stdout.contains("\"name\":\"clinic\""));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_renders_disk_usage_and_health() {
     let router = Router::new()
-        .route("/authenticate/fragment", post(auth_handler))
-        .route("/v4/maintenance/health", get(health_handler));
+        .route("/n1/fragments/hash", get(fragment_hash_handler))
+        .route("/n1/auth/fragment", post(auth_handler))
+        .route("/n1/maintenance/health", get(health_handler));
     let (base_url, handle) = spawn_server(router).await;
 
     let output = Command::cargo_bin("litiaina-n1-cli")
@@ -287,6 +394,8 @@ async fn health_renders_disk_usage_and_health() {
             &base_url,
             "--secret",
             SECRET,
+            "--fragment",
+            AUTH_FRAGMENT_NAME,
             "health",
             "--deep-scan",
         ])
@@ -301,7 +410,7 @@ async fn health_renders_disk_usage_and_health() {
         "stdout={stdout}\nstderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("N1 Standard Health"));
+    assert!(stdout.contains("N1 2.0 Health"));
     assert!(stdout.contains("/mnt/DISK0"));
     assert!(stdout.contains("75.00%"));
     assert!(stdout.contains("healthy"));
@@ -312,8 +421,9 @@ async fn health_renders_disk_usage_and_health() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uploads_status_can_emit_json() {
     let router = Router::new()
-        .route("/authenticate/fragment", post(auth_handler))
-        .route("/v4/upload/status/{version_id}", get(upload_status_handler));
+        .route("/n1/fragments/hash", get(fragment_hash_handler))
+        .route("/n1/auth/fragment", post(auth_handler))
+        .route("/n1/upload/multipart/{version_id}", get(upload_status_handler));
     let (base_url, handle) = spawn_server(router).await;
 
     let output = Command::cargo_bin("litiaina-n1-cli")
@@ -323,6 +433,8 @@ async fn uploads_status_can_emit_json() {
             &base_url,
             "--secret",
             SECRET,
+            "--fragment",
+            AUTH_FRAGMENT_NAME,
             "--json",
             "uploads",
             "status",
@@ -349,9 +461,10 @@ async fn uploads_status_can_emit_json() {
 async fn health_auto_refreshes_expiring_access_token() {
     let refresh_calls = Arc::new(AtomicUsize::new(0));
     let router = Router::new()
-        .route("/authenticate/fragment", post(auth_with_refresh_handler))
-        .route("/authenticate/refresh", post(refresh_handler))
-        .route("/v4/maintenance/health", get(health_handler))
+        .route("/n1/fragments/hash", get(fragment_hash_handler))
+        .route("/n1/auth/fragment", post(auth_with_refresh_handler))
+        .route("/n1/auth/refresh", post(refresh_handler))
+        .route("/n1/maintenance/health", get(health_handler))
         .with_state(refresh_calls.clone());
     let (base_url, handle) = spawn_server(router).await;
 
@@ -362,6 +475,8 @@ async fn health_auto_refreshes_expiring_access_token() {
             &base_url,
             "--secret",
             SECRET,
+            "--fragment",
+            AUTH_FRAGMENT_NAME,
             "health",
             "--deep-scan",
         ])
@@ -376,6 +491,92 @@ async fn health_auto_refreshes_expiring_access_token() {
         "stdout={stdout}\nstderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("N1 Standard Health"));
+    assert!(stdout.contains("N1 2.0 Health"));
     assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maintenance_status_commands_use_n1_2_routes() {
+    let router = Router::new()
+        .route("/n1/fragments/hash", get(fragment_hash_handler))
+        .route("/n1/auth/fragment", post(auth_handler))
+        .route("/n1/maintenance/gc/status", get(gc_status_handler))
+        .route("/n1/maintenance/repair/status", get(repair_status_handler))
+        .route(
+            "/n1/maintenance/redistribution/status",
+            get(redistribution_status_handler),
+        );
+    let (base_url, handle) = spawn_server(router).await;
+
+    for args in [
+        vec![
+            "--url",
+            &base_url,
+            "--secret",
+            SECRET,
+            "--fragment",
+            AUTH_FRAGMENT_NAME,
+            "--json",
+            "gc",
+            "status",
+        ],
+        vec![
+            "--url",
+            &base_url,
+            "--secret",
+            SECRET,
+            "--fragment",
+            AUTH_FRAGMENT_NAME,
+            "--json",
+            "repair",
+            "status",
+        ],
+        vec![
+            "--url",
+            &base_url,
+            "--secret",
+            SECRET,
+            "--fragment",
+            AUTH_FRAGMENT_NAME,
+            "--json",
+            "redistribute",
+            "status",
+        ],
+    ] {
+        let output = Command::cargo_bin("litiaina-n1-cli")
+            .unwrap()
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(parsed["is_running"], false);
+        assert_eq!(parsed["phase"], "Completed");
+    }
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protected_commands_require_fragment_or_auth_fragment() {
+    let output = Command::cargo_bin("litiaina-n1-cli")
+        .unwrap()
+        .args([
+            "--url",
+            "https://storage.example.test",
+            "--secret",
+            SECRET,
+            "health",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("N1 auth is fragment-scoped"));
 }
