@@ -6704,12 +6704,91 @@ mod tests {
             smb_close_file(&mut stream, &mut message_id, tree_id, session_id, docs_dir_id).await;
         assert_eq!(response_status(&close_docs_dir), SMB2_STATUS_SUCCESS);
 
+        let rename_docs_open = smb_open_file(
+            &mut stream,
+            &mut message_id,
+            tree_id,
+            session_id,
+            "docs",
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_CREATE_DISPOSITION_OPEN,
+            FILE_DIRECTORY_FILE,
+        )
+        .await;
+        assert_eq!(response_status(&rename_docs_open), SMB2_STATUS_SUCCESS);
+        let rename_docs_id = response_file_id(&rename_docs_open);
+        let rename_docs_request = build_set_info_request(
+            next_message_id(&mut message_id),
+            tree_id,
+            session_id,
+            rename_docs_id,
+            FILE_INFO_CLASS_RENAME_INFORMATION,
+            &build_rename_info_buffer(r"docs-renamed", false),
+        );
+        let rename_docs_response = send_req(&mut stream, &rename_docs_request).await;
+        assert_eq!(response_status(&rename_docs_response), SMB2_STATUS_SUCCESS);
+        let close_renamed_docs =
+            smb_close_file(&mut stream, &mut message_id, tree_id, session_id, rename_docs_id).await;
+        assert_eq!(response_status(&close_renamed_docs), SMB2_STATUS_SUCCESS);
+
+        let old_docs_missing = smb_open_file(
+            &mut stream,
+            &mut message_id,
+            tree_id,
+            session_id,
+            "docs",
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_CREATE_DISPOSITION_OPEN,
+            FILE_DIRECTORY_FILE,
+        )
+        .await;
+        assert_eq!(response_status(&old_docs_missing), SMB2_STATUS_OBJECT_NAME_NOT_FOUND);
+
+        let renamed_docs_open = smb_open_file(
+            &mut stream,
+            &mut message_id,
+            tree_id,
+            session_id,
+            "docs-renamed",
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_CREATE_DISPOSITION_OPEN,
+            FILE_DIRECTORY_FILE,
+        )
+        .await;
+        assert_eq!(response_status(&renamed_docs_open), SMB2_STATUS_SUCCESS);
+        let renamed_docs_dir_id = response_file_id(&renamed_docs_open);
+        let renamed_docs_query = build_query_directory_request(
+            next_message_id(&mut message_id),
+            tree_id,
+            session_id,
+            renamed_docs_dir_id,
+            FILE_INFORMATION_CLASS_FILE_NAMES_INFORMATION,
+            4096,
+            "*",
+        );
+        let renamed_docs_query_response = send_req(&mut stream, &renamed_docs_query).await;
+        assert_eq!(response_status(&renamed_docs_query_response), SMB2_STATUS_SUCCESS);
+        let renamed_docs_names = parse_query_directory_names(&renamed_docs_query_response);
+        assert!(renamed_docs_names.iter().any(|name| name == "alpha.txt"));
+        let close_renamed_docs_dir = smb_close_file(
+            &mut stream,
+            &mut message_id,
+            tree_id,
+            session_id,
+            renamed_docs_dir_id,
+        )
+        .await;
+        assert_eq!(response_status(&close_renamed_docs_dir), SMB2_STATUS_SUCCESS);
+
         let rename_open = smb_open_file(
             &mut stream,
             &mut message_id,
             tree_id,
             session_id,
-            r"docs\alpha.txt",
+            r"docs-renamed\alpha.txt",
             FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_DELETE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             FILE_CREATE_DISPOSITION_OPEN,
@@ -6724,7 +6803,7 @@ mod tests {
             session_id,
             rename_file_id,
             FILE_INFO_CLASS_RENAME_INFORMATION,
-            &build_rename_info_buffer(r"docs\renamed.txt", false),
+            &build_rename_info_buffer(r"docs-renamed\renamed.txt", false),
         );
         let rename_response = send_req(&mut stream, &rename_request).await;
         assert_eq!(response_status(&rename_response), SMB2_STATUS_SUCCESS);
@@ -6737,7 +6816,7 @@ mod tests {
             &mut message_id,
             tree_id,
             session_id,
-            r"docs\renamed.txt",
+            r"docs-renamed\renamed.txt",
             128,
         )
         .await;
@@ -6748,7 +6827,7 @@ mod tests {
             &mut message_id,
             tree_id,
             session_id,
-            r"docs\renamed.txt",
+            r"docs-renamed\renamed.txt",
             FILE_GENERIC_READ | FILE_DELETE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             FILE_CREATE_DISPOSITION_OPEN,
@@ -6776,7 +6855,7 @@ mod tests {
             &mut message_id,
             tree_id,
             session_id,
-            r"docs\renamed.txt",
+            r"docs-renamed\renamed.txt",
             FILE_GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             FILE_CREATE_DISPOSITION_OPEN,
@@ -6814,7 +6893,7 @@ mod tests {
         let trash_root_response = send_req(&mut stream, &trash_root_query).await;
         assert_eq!(response_status(&trash_root_response), SMB2_STATUS_SUCCESS);
         let trash_root_names = parse_query_directory_names(&trash_root_response);
-        assert!(trash_root_names.iter().any(|name| name == "docs"));
+        assert!(trash_root_names.iter().any(|name| name == "docs-renamed"));
         let close_trash_root = smb_close_file(
             &mut stream,
             &mut message_id,
@@ -6830,7 +6909,7 @@ mod tests {
             &mut message_id,
             tree_id,
             session_id,
-            r".n1-trash\docs",
+            r".n1-trash\docs-renamed",
             FILE_GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             FILE_CREATE_DISPOSITION_OPEN,

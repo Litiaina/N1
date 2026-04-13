@@ -1,6 +1,6 @@
 # N1 API Documentation
 
-`N1` is the standalone storage kernel in this repository. In `2.0.0`, it exposes:
+`N1` is the standalone storage kernel in this repository. In `2.0.1`, it exposes:
 
 - fragment provisioning
 - fragment-scoped authentication

@@ -18,7 +18,7 @@
 
 This repository contains the storage platform stack built around three runtime components:
 
-> - `N1` (`2.0.0`)
+> - `N1` (`2.0.1`)
   Single-node storage kernel with an object-storage core, standalone namespace layer, lifecycle, repair, redistribution, GC, recover-on-read, POSIX-style routes, and SMB Lite.
 > - `N2` (`0.2.0`)
   Multi-node clustering and placement layer built on top of the shared `N1` storage core.

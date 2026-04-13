@@ -13,7 +13,7 @@ This repository now keeps the platform docs split into:
 ## Runtime API References
 
 - [N1_DOCUMENTATION.md](/home/administrator/Development/N1/N1_DOCUMENTATION.md)
-  Detailed `N1 2.0.0` storage-kernel reference:
+  Detailed `N1 2.0.1` storage-kernel reference:
   fragment provisioning, auth, upload, read, lifecycle, POSIX, maintenance, request parameters, and example payloads.
 
 - [N2_DOCUMENTATION.md](/home/administrator/Development/N1/N2_DOCUMENTATION.md)

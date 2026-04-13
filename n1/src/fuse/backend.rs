@@ -1550,8 +1550,6 @@ impl FsdBackend for InProcessBackend {
                 (None, None) => {}
             }
 
-            self.fetch_live_object_metadata(&from.fragment, &from.object_key)
-                .await?;
             self.rename_live_object(&from.fragment, &from.object_key, &to.object_key)
                 .await
         })
