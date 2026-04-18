@@ -4809,6 +4809,8 @@ async fn matrix_archive_export_all_tar_respects_internal_filter() {
         AxumPath(fragment.clone()),
         Json(DownloadArchiveRequest {
             keys: Vec::new(),
+            prefix: None,
+            prefixes: Vec::new(),
             format: "zip".to_string(),
             filename: Some("fragment-export".to_string()),
             export_all: true,
@@ -4840,6 +4842,8 @@ async fn matrix_archive_export_all_tar_respects_internal_filter() {
         AxumPath(fragment),
         Json(DownloadArchiveRequest {
             keys: Vec::new(),
+            prefix: None,
+            prefixes: Vec::new(),
             format: "tar".to_string(),
             filename: Some("fragment-export-internal".to_string()),
             export_all: true,
@@ -4894,6 +4898,8 @@ async fn matrix_archive_export_all_tar_scans_multiple_pages() {
         AxumPath(fragment),
         Json(DownloadArchiveRequest {
             keys: Vec::new(),
+            prefix: None,
+            prefixes: Vec::new(),
             format: "tar".to_string(),
             filename: Some("fragment-export-bulk".to_string()),
             export_all: true,
@@ -4990,6 +4996,84 @@ async fn matrix_archive_manifest_tar_streams_selected_keys() {
     assert_eq!(entries.get(key_b), Some(&payload_b));
     assert!(!entries.contains_key("missing/object.bin"));
     assert!(!entries.contains_key(key_c));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_archive_tar_streams_selected_prefixes() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+
+    setup_fragment(&fragment).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    put_object(
+        state.clone(),
+        &fragment,
+        "archive/folder/alpha.bin",
+        b"alpha".to_vec(),
+    )
+    .await;
+    put_object(
+        state.clone(),
+        &fragment,
+        "archive/folder/bravo.bin",
+        b"bravo".to_vec(),
+    )
+    .await;
+    put_object(
+        state,
+        &fragment,
+        "archive/elsewhere.bin",
+        b"elsewhere".to_vec(),
+    )
+    .await;
+
+    let resp = download_selected_archive(
+        full_claims(&fragment),
+        AxumPath(fragment),
+        Json(DownloadArchiveRequest {
+            keys: Vec::new(),
+            prefix: None,
+            prefixes: vec!["archive/folder/".to_string()],
+            format: "tar".to_string(),
+            filename: Some("folder-export".to_string()),
+            export_all: false,
+            include_internal: false,
+        }),
+    )
+    .await
+    .expect("prefix archive export")
+    .into_response();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let entries = read_tar_entries(read_response_bytes(resp).await).await;
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries.get("archive/folder/alpha.bin").map(Vec::as_slice),
+        Some(b"alpha".as_slice())
+    );
+    assert_eq!(
+        entries.get("archive/folder/bravo.bin").map(Vec::as_slice),
+        Some(b"bravo".as_slice())
+    );
+    assert!(!entries.contains_key("archive/elsewhere.bin"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -51,7 +51,11 @@ pub struct PreparedArchiveEntry {
 }
 
 enum ArchiveSelection {
-    Keys(Vec<String>),
+    Explicit {
+        keys: Vec<String>,
+        prefixes: Vec<String>,
+        include_internal: bool,
+    },
     FragmentAll { include_internal: bool },
     ManifestFile(PathBuf),
     PreparedEntries(Vec<PreparedArchiveEntry>),
@@ -70,7 +74,10 @@ pub async fn download_selected_archive(
     let selection = resolve_archive_selection(&req)?;
 
     let selected_key_count = match &selection {
-        ArchiveSelection::Keys(keys) => Some(keys.len()),
+        ArchiveSelection::Explicit {
+            keys, prefixes, ..
+        } if prefixes.is_empty() => Some(keys.len()),
+        ArchiveSelection::Explicit { .. } => None,
         ArchiveSelection::FragmentAll { .. } => None,
         ArchiveSelection::ManifestFile(_) => None,
         ArchiveSelection::PreparedEntries(entries) => Some(entries.len()),
@@ -189,6 +196,15 @@ fn canonical_key(key: &str) -> String {
     key.trim_start_matches('/').to_string()
 }
 
+fn canonical_archive_prefix(prefix: &str) -> String {
+    let trimmed = prefix.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}/")
+    }
+}
+
 async fn persist_manifest_body(body: Body) -> Result<PathBuf, AppError> {
     let manifest_path =
         std::env::temp_dir().join(format!("n1-archive-manifest-{}.lst", Uuid::new_v4()));
@@ -237,13 +253,34 @@ fn resolve_archive_selection(req: &DownloadArchiveRequest) -> Result<ArchiveSele
         }
     }
 
-    if keys.is_empty() {
+    let mut seen_prefixes = HashSet::new();
+    let mut prefixes = Vec::new();
+    for prefix in req
+        .prefix
+        .iter()
+        .cloned()
+        .chain(req.prefixes.iter().cloned())
+    {
+        let canonical = canonical_archive_prefix(&prefix);
+        if canonical.is_empty() {
+            continue;
+        }
+        if seen_prefixes.insert(canonical.clone()) {
+            prefixes.push(canonical);
+        }
+    }
+
+    if keys.is_empty() && prefixes.is_empty() {
         return Err(AppError::BadRequest(
-            "request must include at least one object key or set export_all=true".into(),
+            "request must include object keys or prefixes, or set export_all=true".into(),
         ));
     }
 
-    Ok(ArchiveSelection::Keys(keys))
+    Ok(ArchiveSelection::Explicit {
+        keys,
+        prefixes,
+        include_internal: req.include_internal,
+    })
 }
 
 async fn stream_archive(
@@ -355,7 +392,16 @@ async fn write_zip_archive(
     let mut zip = ZipFileWriter::with_tokio(writer);
 
     match selection {
-        ArchiveSelection::Keys(keys) => {
+        ArchiveSelection::Explicit {
+            keys,
+            prefixes,
+            include_internal: _,
+        } => {
+            if !prefixes.is_empty() {
+                return Err(AppError::BadRequest(
+                    "zip export does not support folder selections; use tar".into(),
+                ));
+            }
             for key in keys {
                 let Some((archive_path, metadata)) =
                     load_archive_metadata_for_key(fragment, &key).await?
@@ -445,13 +491,21 @@ async fn write_tar_archive(
     let mut tar = TarBuilder::new(writer);
 
     match selection {
-        ArchiveSelection::Keys(keys) => {
+        ArchiveSelection::Explicit {
+            keys,
+            prefixes,
+            include_internal,
+        } => {
+            let mut emitted_paths = HashSet::new();
             for key in keys {
                 let Some((archive_path, metadata)) =
                     load_archive_metadata_for_key(fragment, &key).await?
                 else {
                     continue;
                 };
+                if !emitted_paths.insert(archive_path.clone()) {
+                    continue;
+                }
 
                 let mut header = TarHeader::new_gnu();
                 header.set_size(metadata.total_size_bytes);
@@ -462,6 +516,47 @@ async fn write_tar_archive(
                 tar.append_data(&mut header, archive_path, reader)
                     .await
                     .map_err(|e| AppError::Io(e, "tar append".into()))?;
+            }
+
+            for prefix in prefixes {
+                let mut continuation_token = None;
+                loop {
+                    let page = index::scan_fragment_live_metadata_page(
+                        fragment,
+                        Some(prefix.clone()),
+                        None,
+                        ARCHIVE_SCAN_PAGE_LIMIT,
+                        continuation_token.clone(),
+                        include_internal,
+                    )
+                    .await?;
+
+                    for metadata in page.objects {
+                        if metadata.is_delete_marker {
+                            continue;
+                        }
+
+                        let archive_path = canonical_key(&metadata.object_key);
+                        if !emitted_paths.insert(archive_path.clone()) {
+                            continue;
+                        }
+
+                        let mut header = TarHeader::new_gnu();
+                        header.set_size(metadata.total_size_bytes);
+                        header.set_mode(0o644);
+
+                        let reader = create_multipart_reader(&metadata);
+
+                        tar.append_data(&mut header, archive_path, reader)
+                            .await
+                            .map_err(|e| AppError::Io(e, "tar append".into()))?;
+                    }
+
+                    if page.continuation_token.is_none() {
+                        break;
+                    }
+                    continuation_token = page.continuation_token;
+                }
             }
         }
         ArchiveSelection::FragmentAll { include_internal } => {

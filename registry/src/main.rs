@@ -102,6 +102,225 @@ fn publish_admin_event(state: &AppState, payload: RegistryRealtimePayload) {
     state.realtime.publish_admin(payload);
 }
 
+#[derive(Debug)]
+enum EngineListingEntry {
+    Object(models::ObjectRecord),
+    CommonPrefix(String),
+}
+
+fn registry_rfc3339_from_unix(timestamp: i64) -> String {
+    chrono::DateTime::<Utc>::from_timestamp(timestamp, 0)
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339()
+}
+
+fn normalized_optional_query(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+async fn list_objects_via_engine(
+    state: &AppState,
+    owner_uid: &str,
+    binding: &models::FragmentBindingRecord,
+    prefix: Option<&str>,
+    delimiter: Option<&str>,
+    search: Option<&str>,
+    limit: usize,
+    offset: usize,
+    include_trashed: bool,
+) -> Result<db::RegistryListPage, RegistryError> {
+    let fragment = binding.fragment.clone();
+    let search = normalized_optional_query(search);
+    let target_count = offset.saturating_add(limit).saturating_add(1);
+    let page_size = target_count.clamp(1, 1000);
+    let mut entries = Vec::new();
+    let mut seen_prefixes = std::collections::BTreeSet::new();
+    let mut continuation_token = None;
+    let mut has_more = false;
+
+    loop {
+        let page = state
+            .broker
+            .list_logical_objects_page(
+                binding,
+                prefix,
+                delimiter,
+                page_size,
+                continuation_token.as_deref(),
+                include_trashed,
+            )
+            .await?;
+
+        for common_prefix in page.common_prefixes {
+            if let Some(search) = search.as_deref() {
+                if !common_prefix.contains(search) {
+                    continue;
+                }
+            }
+            if seen_prefixes.insert(common_prefix.clone()) {
+                entries.push(EngineListingEntry::CommonPrefix(common_prefix));
+                if entries.len() >= target_count {
+                    has_more = true;
+                    break;
+                }
+            }
+        }
+        if has_more {
+            break;
+        }
+
+        for object in page.objects {
+            if let Some(search) = search.as_deref() {
+                if !object.object_key.contains(search) {
+                    continue;
+                }
+            }
+
+            let stored = state
+                .db
+                .resolve_stored_object_record(
+                    owner_uid.to_string(),
+                    fragment.clone(),
+                    object.object_key.clone(),
+                )
+                .await?;
+            let created_at = stored
+                .as_ref()
+                .map(|record| record.created_at.clone())
+                .unwrap_or_else(|| registry_rfc3339_from_unix(object.created_at_unix));
+            let updated_at = registry_rfc3339_from_unix(object.created_at_unix);
+
+            entries.push(EngineListingEntry::Object(models::ObjectRecord {
+                owner_uid: owner_uid.to_string(),
+                fragment: fragment.clone(),
+                object_key: object.object_key.clone(),
+                storage_object_id: stored
+                    .as_ref()
+                    .map(|record| record.storage_object_id.clone())
+                    .unwrap_or_else(|| object.object_key.clone()),
+                version_id: object.version_id,
+                status: if include_trashed {
+                    "trashed".to_string()
+                } else {
+                    "ready".to_string()
+                },
+                object_size_bytes: object.object_size_bytes.max(0),
+                content_type: object.content_type,
+                created_at,
+                updated_at,
+            }));
+
+            if entries.len() >= target_count {
+                has_more = true;
+                break;
+            }
+        }
+        if has_more {
+            break;
+        }
+
+        continuation_token = page.continuation_token;
+        if continuation_token.is_none() {
+            break;
+        }
+    }
+
+    let paged_entries = entries
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let mut objects = Vec::new();
+    let mut common_prefixes = Vec::new();
+    for entry in paged_entries {
+        match entry {
+            EngineListingEntry::Object(object) => objects.push(object),
+            EngineListingEntry::CommonPrefix(prefix) => common_prefixes.push(prefix),
+        }
+    }
+
+    Ok(db::RegistryListPage {
+        objects,
+        common_prefixes,
+        has_more: has_more || continuation_token.is_some(),
+    })
+}
+
+async fn object_stats_via_engine(
+    state: &AppState,
+    binding: &models::FragmentBindingRecord,
+    prefix: Option<&str>,
+    search: Option<&str>,
+    include_trashed: bool,
+) -> Result<db::RegistryObjectStats, RegistryError> {
+    let search = normalized_optional_query(search);
+    let mut continuation_token = None;
+    let mut total_objects = 0usize;
+    let mut total_size_bytes = 0i64;
+    let mut extension_stats = std::collections::BTreeMap::<String, (usize, i64)>::new();
+
+    loop {
+        let page = state
+            .broker
+            .list_logical_objects_page(
+                binding,
+                prefix,
+                None,
+                1000,
+                continuation_token.as_deref(),
+                include_trashed,
+            )
+            .await?;
+        for object in page.objects {
+            if let Some(search) = search.as_deref() {
+                if !object.object_key.contains(search) {
+                    continue;
+                }
+            }
+            total_objects = total_objects.saturating_add(1);
+            total_size_bytes = total_size_bytes.saturating_add(object.object_size_bytes.max(0));
+            let extension = object
+                .object_key
+                .rsplit_once('.')
+                .map(|(_, value)| value.trim().to_lowercase())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "_none".to_string());
+            let entry = extension_stats.entry(extension).or_insert((0usize, 0i64));
+            entry.0 += 1;
+            entry.1 = entry.1.saturating_add(object.object_size_bytes.max(0));
+        }
+        continuation_token = page.continuation_token;
+        if continuation_token.is_none() {
+            break;
+        }
+    }
+
+    let mut extension_stats = extension_stats
+        .into_iter()
+        .map(
+            |(extension, (object_count, total_size_bytes))| models::ObjectExtensionStat {
+                extension,
+                object_count,
+                total_size_bytes,
+            },
+        )
+        .collect::<Vec<_>>();
+    extension_stats.sort_by(|a, b| {
+        b.total_size_bytes
+            .cmp(&a.total_size_bytes)
+            .then_with(|| a.extension.cmp(&b.extension))
+    });
+
+    Ok(db::RegistryObjectStats {
+        total_objects,
+        total_size_bytes,
+        extension_stats,
+    })
+}
+
 fn canonical_bulk_object_keys(keys: Vec<String>) -> Vec<String> {
     keys.into_iter()
         .map(|value| value.trim().trim_start_matches('/').to_string())
@@ -1791,20 +2010,59 @@ async fn list_objects(
     let claims = claims_from_headers(&headers, &state.auth)?;
     let limit = query.limit.unwrap_or(200).clamp(1, 5000);
     let offset = query.offset.unwrap_or(0);
-    let page = state
-        .db
-        .list_objects(
-            claims.sub,
-            query.fragment,
-            query.prefix,
-            query.delimiter,
-            query.search,
-            limit,
-            offset,
-            query.include_pending.unwrap_or(false),
-            query.include_trashed.unwrap_or(false),
-        )
-        .await?;
+    let include_pending = query.include_pending.unwrap_or(false);
+    let include_trashed = query.include_trashed.unwrap_or(false);
+    let owner_uid = claims.sub.clone();
+    let page = if let Some(fragment) = query.fragment.clone() {
+        let binding = state
+            .db
+            .get_fragment_binding(owner_uid.clone(), fragment.clone())
+            .await?;
+        if let (Some(binding), false) = (binding, include_pending) {
+            list_objects_via_engine(
+                &state,
+                &owner_uid,
+                &binding,
+                query.prefix.as_deref(),
+                query.delimiter.as_deref(),
+                query.search.as_deref(),
+                limit,
+                offset,
+                include_trashed,
+            )
+            .await?
+        } else {
+            state
+                .db
+                .list_objects(
+                    owner_uid,
+                    Some(fragment),
+                    query.prefix,
+                    query.delimiter,
+                    query.search,
+                    limit,
+                    offset,
+                    include_pending,
+                    include_trashed,
+                )
+                .await?
+        }
+    } else {
+        state
+            .db
+            .list_objects(
+                owner_uid,
+                None,
+                query.prefix,
+                query.delimiter,
+                query.search,
+                limit,
+                offset,
+                include_pending,
+                include_trashed,
+            )
+            .await?
+    };
     Ok(Json(ListObjectsResponse {
         objects: page.objects,
         common_prefixes: page.common_prefixes,
@@ -1842,17 +2100,48 @@ async fn object_stats(
     Query(query): Query<ObjectStatsQuery>,
 ) -> Result<Json<ObjectStatsResponse>, RegistryError> {
     let claims = claims_from_headers(&headers, &state.auth)?;
-    let stats = state
-        .db
-        .object_stats(
-            claims.sub,
-            query.fragment,
-            query.prefix,
-            query.search,
-            query.include_pending.unwrap_or(false),
-            query.include_trashed.unwrap_or(false),
-        )
-        .await?;
+    let include_pending = query.include_pending.unwrap_or(false);
+    let include_trashed = query.include_trashed.unwrap_or(false);
+    let stats = if let Some(fragment) = query.fragment.clone() {
+        let binding = state
+            .db
+            .get_fragment_binding(claims.sub.clone(), fragment.clone())
+            .await?;
+        if let (Some(binding), false) = (binding, include_pending) {
+            object_stats_via_engine(
+                &state,
+                &binding,
+                query.prefix.as_deref(),
+                query.search.as_deref(),
+                include_trashed,
+            )
+            .await?
+        } else {
+            state
+                .db
+                .object_stats(
+                    claims.sub,
+                    Some(fragment),
+                    query.prefix,
+                    query.search,
+                    include_pending,
+                    include_trashed,
+                )
+                .await?
+        }
+    } else {
+        state
+            .db
+            .object_stats(
+                claims.sub,
+                None,
+                query.prefix,
+                query.search,
+                include_pending,
+                include_trashed,
+            )
+            .await?
+    };
     Ok(Json(ObjectStatsResponse {
         total_objects: stats.total_objects,
         total_size_bytes: stats.total_size_bytes,
@@ -2673,6 +2962,7 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::StorageDeployment;
     use axum::body::Body;
     use axum::extract::Path as StubPath;
     use axum::http::header::{
@@ -2910,6 +3200,82 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve stub");
+        });
+        format!("http://{}", addr)
+    }
+
+    async fn spawn_storage_listing_stub(
+        token: &'static str,
+        live_payload: Value,
+        trash_payload: Option<Value>,
+    ) -> String {
+        let trash_payload = trash_payload.unwrap_or_else(|| {
+            json!({
+                "objects": [],
+                "common_prefixes": [],
+                "continuation_token": null
+            })
+        });
+        let app = Router::new()
+            .route(
+                "/n1/auth/fragment",
+                post(move |Json(_payload): Json<Value>| async move {
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "access_token": token,
+                            "token_type": "Bearer",
+                            "expires_in": 600
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/n1/objects",
+                get({
+                    let live_payload = live_payload.clone();
+                    move |headers: HeaderMap| {
+                        let live_payload = live_payload.clone();
+                        async move {
+                            if headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                != Some(&format!("Bearer {}", token))
+                            {
+                                return StatusCode::UNAUTHORIZED.into_response();
+                            }
+                            Json(live_payload).into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/n1/trash",
+                get({
+                    let trash_payload = trash_payload.clone();
+                    move |headers: HeaderMap| {
+                        let trash_payload = trash_payload.clone();
+                        async move {
+                            if headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                != Some(&format!("Bearer {}", token))
+                            {
+                                return StatusCode::UNAUTHORIZED.into_response();
+                            }
+                            Json(trash_payload).into_response()
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind storage listing stub");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve storage listing stub");
         });
         format!("http://{}", addr)
     }
@@ -3365,6 +3731,168 @@ mod tests {
                 .expect("serve registry test server");
         });
         format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn list_objects_prefers_engine_namespace_for_bound_fragment() {
+        let single_url = spawn_storage_listing_stub(
+            "single-stub-token",
+            json!({
+                "objects": [
+                    {
+                        "object_key": "live.txt",
+                        "version_id": "01ENGINELIST0000000000000000001",
+                        "content_type": "text/plain",
+                        "total_size_bytes": 1234,
+                        "created_at": 1710000000
+                    }
+                ],
+                "common_prefixes": ["docs/"],
+                "continuation_token": null
+            }),
+            None,
+        )
+        .await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, access_token) = test_state(single_url, multi_url).await;
+        let owner = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user")
+            .user;
+        state
+            .db
+            .upsert_fragment_binding(
+                owner.uid.clone(),
+                "fragment-a".to_string(),
+                StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment");
+        state
+            .db
+            .finalize_object(
+                owner.uid.clone(),
+                "fragment-a".to_string(),
+                "stale.txt".to_string(),
+                "01STALELIST000000000000000000001".to_string(),
+                64,
+                Some("text/plain".to_string()),
+            )
+            .await
+            .expect("finalize stale projection");
+
+        let base_url = spawn_registry_server(state).await;
+        let client = Client::new();
+        let response = client
+            .get(format!("{}/v1/objects?fragment=fragment-a&limit=200", base_url))
+            .bearer_auth(&access_token)
+            .send()
+            .await
+            .expect("list objects request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: Value = response.json().await.expect("parse list objects");
+        assert_eq!(payload["common_prefixes"], json!(["docs/"]));
+        let objects = payload["objects"].as_array().expect("objects array");
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0]["object_key"].as_str(), Some("live.txt"));
+        assert_eq!(objects[0]["object_size_bytes"].as_i64(), Some(1234));
+        assert_eq!(objects[0]["status"].as_str(), Some("ready"));
+    }
+
+    #[tokio::test]
+    async fn object_stats_prefers_engine_namespace_for_bound_fragment() {
+        let single_url = spawn_storage_listing_stub(
+            "single-stub-token",
+            json!({
+                "objects": [
+                    {
+                        "object_key": "live.txt",
+                        "version_id": "01ENGSTATS000000000000000000001",
+                        "content_type": "text/plain",
+                        "total_size_bytes": 1234,
+                        "created_at": 1710000000
+                    },
+                    {
+                        "object_key": "docs/report.pdf",
+                        "version_id": "01ENGSTATS000000000000000000002",
+                        "content_type": "application/pdf",
+                        "total_size_bytes": 2048,
+                        "created_at": 1710000010
+                    }
+                ],
+                "common_prefixes": [],
+                "continuation_token": null
+            }),
+            None,
+        )
+        .await;
+        let multi_url = spawn_storage_stub("multi-stub-token").await;
+        let (state, access_token) = test_state(single_url, multi_url).await;
+        let owner = state
+            .db
+            .find_user_auth_by_email("drive@example.com".to_string())
+            .await
+            .expect("find drive user")
+            .expect("drive user")
+            .user;
+        state
+            .db
+            .upsert_fragment_binding(
+                owner.uid.clone(),
+                "fragment-a".to_string(),
+                StorageDeployment::SingleNode,
+                None,
+            )
+            .await
+            .expect("bind fragment");
+        state
+            .db
+            .finalize_object(
+                owner.uid.clone(),
+                "fragment-a".to_string(),
+                "stale.bin".to_string(),
+                "01STALESTAT00000000000000000001".to_string(),
+                9999,
+                Some("application/octet-stream".to_string()),
+            )
+            .await
+            .expect("finalize stale stats projection");
+
+        let base_url = spawn_registry_server(state).await;
+        let client = Client::new();
+        let response = client
+            .get(format!("{}/v1/objects/stats?fragment=fragment-a", base_url))
+            .bearer_auth(&access_token)
+            .send()
+            .await
+            .expect("object stats request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: Value = response.json().await.expect("parse object stats");
+        assert_eq!(payload["total_objects"].as_u64(), Some(2));
+        assert_eq!(payload["total_size_bytes"].as_i64(), Some(3282));
+        let extensions = payload["extension_stats"]
+            .as_array()
+            .expect("extension stats array");
+        assert!(extensions.iter().any(|entry| {
+            entry["extension"].as_str() == Some("txt")
+                && entry["object_count"].as_u64() == Some(1)
+                && entry["total_size_bytes"].as_i64() == Some(1234)
+        }));
+        assert!(extensions.iter().any(|entry| {
+            entry["extension"].as_str() == Some("pdf")
+                && entry["object_count"].as_u64() == Some(1)
+                && entry["total_size_bytes"].as_i64() == Some(2048)
+        }));
+        assert!(
+            !extensions
+                .iter()
+                .any(|entry| entry["extension"].as_str() == Some("bin")),
+            "stats should come from engine namespace, not stale registry projection"
+        );
     }
 
     async fn connect_registry_ws(base_url: &str, token: &str) -> TestWsStream {

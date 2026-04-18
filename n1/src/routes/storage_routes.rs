@@ -1,7 +1,7 @@
 use crate::core::adaptive_concurrency::run_adaptive_concurrency_loop;
 use crate::core::archive::{
-    PreparedArchiveEntry, download_manifest_archive as download_manifest_archive_impl,
-    download_prepared_archive, download_selected_archive as download_selected_archive_impl,
+    download_manifest_archive as download_manifest_archive_impl, download_prepared_archive,
+    download_selected_archive as download_selected_archive_impl,
 };
 use crate::core::delete::{
     delete_object_version as delete_object_version_impl,
@@ -33,9 +33,8 @@ use crate::core::repair_manager::{
     get_repair_status_api, stop_repair_job_api, trigger_repair_job_api,
 };
 use crate::core::retrieve::{
-    get_object as get_object_impl, get_object_metadata as get_object_metadata_impl,
-    get_object_metadata_direct, list_fragments, list_object_versions as list_object_versions_impl,
-    stream_object as stream_object_impl,
+    get_object as get_object_impl, get_object_metadata as get_object_metadata_impl, list_fragments,
+    list_object_versions as list_object_versions_impl, stream_object as stream_object_impl,
 };
 use crate::core::storage_capacity_parser::get_capacity_usage as get_capacity_usage_impl;
 use crate::core::sync::initialize_fragment_storage_api;
@@ -54,6 +53,7 @@ use crate::middleware::auth_middleware::{
 };
 use crate::middleware::rate_limiter_middleware::RateLimitLayers;
 use crate::namespace::runtime::{global_namespace_runtime, logical_not_found};
+use crate::namespace::scoped_archive::prepare_logical_archive_entries;
 use crate::posix::routes::{build_posix_read_routes, build_posix_write_routes};
 use crate::structs::auth_structs::Claims;
 use crate::url::signed_read::{
@@ -392,23 +392,7 @@ async fn download_selected_archive_scoped(
     AxumJson(req): AxumJson<crate::core::disk_manager::DownloadArchiveRequest>,
 ) -> Result<axum::response::Response, AppError> {
     let fragment = claims.fragment.clone();
-    if !req.export_all && !req.keys.is_empty() {
-        let mut prepared = Vec::new();
-        for logical_key in &req.keys {
-            let physical = match resolve_logical_read_key(&fragment, logical_key).await {
-                Ok(value) => value,
-                Err(AppError::NotFound) => continue,
-                Err(err) => return Err(err),
-            };
-            match get_object_metadata_direct(&fragment, &physical).await {
-                Ok(metadata) => prepared.push(PreparedArchiveEntry {
-                    archive_path: logical_key.trim_start_matches('/').to_string(),
-                    metadata,
-                }),
-                Err(AppError::NotFound) => continue,
-                Err(err) => return Err(err),
-            }
-        }
+    if let Some(prepared) = prepare_logical_archive_entries(&fragment, &req).await? {
         return download_prepared_archive(prepared, req).await;
     }
     Ok(
@@ -1048,14 +1032,16 @@ async fn ping() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        download_filename_for_logical_path, get_upload_status_scoped,
-        initiate_object_upload_scoped, list_active_uploads_scoped,
-        looks_like_flat_storage_object_id, parse_json_response, upload_request_matches_session,
+        AppState, download_filename_for_logical_path, download_selected_archive_scoped,
+        get_upload_status_scoped, initiate_object_upload_scoped, list_active_uploads_scoped,
+        looks_like_flat_storage_object_id, parse_json_response, upload_object_one_shot_scoped,
+        upload_request_matches_session,
     };
     use crate::core::disk_manager::{
-        BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS, InitiateUploadResponse,
+        BLOB_STORE_DISKS, DownloadArchiveRequest, FS_STORAGE_ROOT, INDEX_STORE_DISKS,
+        InitiateUploadResponse,
     };
-    use crate::core::disk_manager::{InitiateUploadParams, ReservationReceipt};
+    use crate::core::disk_manager::{InitiateUploadParams, ReservationReceipt, UploadPartQuery};
     use crate::core::fragment_metadata::{
         DEFAULT_INDEX_PARTITION_COUNT, clear_fragment_partition_count_cache_for_test,
         init_fragment_metadata, set_configured_index_partition_count,
@@ -1069,17 +1055,21 @@ mod tests {
         DATA_SHARDS_ATOMIC, ListUploadsResponse, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC,
         PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
     };
+    use crate::namespace::scoped_archive::prepare_logical_archive_entries;
     use crate::settings::constants::CONFIG_FILE;
     use crate::settings::create_config::create_default_config_ini;
     use crate::structs::auth_structs::Claims;
+    use crate::websocket::manager::WsConnectionManager;
+    use axum::body::Body;
     use axum::Json as AxumJson;
-    use axum::extract::{Path, Query};
+    use axum::extract::{Path, Query, State};
     use axum::response::IntoResponse;
     use once_cell::sync::Lazy;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use tokio::fs;
     use tokio::sync::Mutex;
@@ -1414,5 +1404,74 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| !value.is_empty() && value != logical_path)
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scoped_folder_archive_preparation_resolves_logical_prefixes() {
+        let _guard = TEST_LOCK.lock().await;
+        ensure_storage_config().await;
+        ensure_upload_runtime_config();
+
+        let fragment = {
+            let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+            hex::encode(digest)
+        };
+        setup_fragment(&fragment).await;
+
+        let state = Arc::new(AppState {
+            ws_manager: WsConnectionManager::new(),
+        });
+
+        let payload = "demo-video-payload";
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from_str(&payload.len().to_string())
+                .expect("content-length header"),
+        );
+
+        let upload = upload_object_one_shot_scoped(
+            State(state),
+            full_claims(&fragment),
+            headers,
+            Path("videos/demo.mp4".to_string()),
+            Query(UploadPartQuery {
+                checksum: None,
+                durability: None,
+                strict_durability: None,
+                io_gate: None,
+            }),
+            Body::from(payload),
+        )
+        .await
+        .expect("scoped one-shot upload")
+        .into_response();
+        assert_eq!(upload.status(), axum::http::StatusCode::CREATED);
+
+        let request = DownloadArchiveRequest {
+            keys: Vec::new(),
+            prefix: None,
+            prefixes: vec!["videos/".to_string()],
+            format: "tar".to_string(),
+            filename: Some("videos".to_string()),
+            export_all: false,
+            include_internal: false,
+        };
+
+        let prepared = prepare_logical_archive_entries(&fragment, &request)
+            .await
+            .expect("prepare folder archive")
+            .expect("prepared entries");
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].archive_path, "videos/demo.mp4");
+        assert_ne!(
+            prepared[0].metadata.object_key, prepared[0].archive_path,
+            "prepared archive should resolve the logical path to the physical object id"
+        );
+
+        let response = download_selected_archive_scoped(full_claims(&fragment), AxumJson(request))
+            .await
+            .expect("download folder archive");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
     }
 }

@@ -1,6 +1,6 @@
 # N1 API Documentation
 
-`N1` is the standalone storage kernel in this repository. In `2.0.1`, it exposes:
+`N1` is the standalone storage kernel in this repository. In `2.1.0`, it exposes:
 
 - fragment provisioning
 - fragment-scoped authentication
@@ -33,6 +33,11 @@ Most `N1` APIs are fragment-scoped.
 3. Use `Authorization: Bearer <access_token>` on protected routes
 
 Stable `N1 2.0` API routes and operator routes live under `/n1/...`.
+
+Operational note:
+
+- `namespace_v2` is replicated across configured index roots
+- if the owner namespace disk is lost but another namespace replica survives, `N1` reseeds the owner catalog from the surviving replica before serving logical namespace reads
 
 ### Permission Bits
 
@@ -606,8 +611,9 @@ Request body:
 ```json
 {
   "keys": ["videos/demo.mp4", "docs/readme.txt"],
-  "format": "zip",
-  "filename": "bundle.zip",
+  "prefixes": ["videos/2025/"],
+  "format": "tar",
+  "filename": "bundle.tar",
   "export_all": false,
   "include_internal": false
 }
@@ -615,11 +621,19 @@ Request body:
 
 Fields:
 
-- `keys`: logical paths to include
-- `format`: currently `zip` for selected archive export
+- `keys`: logical paths to include directly
+- `prefix`: optional single logical folder prefix
+- `prefixes`: optional logical folder prefixes for folder/archive export
+- `format`: `tar` for folder, mixed, manifest, and fragment-scale export. `zip` is only valid for explicit selected file keys without folder prefixes or `export_all=true`
 - `filename`: optional download filename
 - `export_all`: if `true`, archive all visible objects
 - `include_internal`: include internal metadata entries when supported
+
+Rules:
+
+- selected folder archive requests are resolved through the logical namespace first, then mapped to physical object ids for streaming
+- `prefix` or `prefixes` can be combined with `keys`
+- `tar` is the safe/default format for large exports and folder exports
 
 ### `GET /n1/objects/archive/manifest`
 

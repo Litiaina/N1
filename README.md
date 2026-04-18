@@ -18,11 +18,11 @@
 
 This repository contains the storage platform stack built around three runtime components:
 
-> - `N1` (`2.0.1`)
+> - `N1` (`2.1.0`)
   Single-node storage kernel with an object-storage core, standalone namespace layer, lifecycle, repair, redistribution, GC, recover-on-read, POSIX-style routes, and SMB Lite.
 > - `N2` (`0.2.0`)
   Multi-node clustering and placement layer built on top of the shared `N1` storage core.
-> - `Registry` (`0.8.0`)
+> - `Registry` (`0.9.0`)
   User-facing logical metadata and policy layer for accounts, quotas, logical namespace, shares, and storage-session brokering.
 
 If you are new to the codebase, start here. This README explains what each component does, how the platform is intended to be used, and how to stand up a practical deployment.
@@ -48,6 +48,12 @@ The major `2.0` change in `N1` is architectural:
 - blob payloads are immutable
 
 That means file and folder semantics such as `mkdir`, rename, move, trash, recover, and browse are handled in the namespace layer, while repair, redistribution, GC, and recover-on-read operate on storage truth and reachability.
+
+Current release notes for the validated `N1 2.1.0` and `Registry 0.9.0` line:
+
+- `namespace_v2` is replicated across configured index roots, and `N1` can reseed the owner namespace catalog from a surviving replica after owner-disk loss.
+- fragment-bound Registry listing and stats now prefer `N1` namespace truth instead of stale SQLite-only projection.
+- Registry quota reservations are tracked as explicit durable pending reservations and reconciled against committed object usage on finalize and cancel paths.
 
 ## Core Concepts
 

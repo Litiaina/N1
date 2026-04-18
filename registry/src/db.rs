@@ -138,6 +138,7 @@ impl RegistryDb {
                     object_key TEXT NOT NULL,
                     storage_object_id TEXT NOT NULL,
                     expected_size_bytes INTEGER,
+                    reserved_bytes INTEGER NOT NULL DEFAULT 0,
                     content_type TEXT,
                     version_id TEXT,
                     session_id TEXT,
@@ -220,6 +221,7 @@ impl RegistryDb {
                 "ALTER TABLE object_uploads ADD COLUMN version_id TEXT",
                 "ALTER TABLE object_uploads ADD COLUMN session_id TEXT",
                 "ALTER TABLE object_uploads ADD COLUMN storage_object_id TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE object_uploads ADD COLUMN reserved_bytes INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE object_shares ADD COLUMN storage_object_id TEXT NOT NULL DEFAULT ''",
             ] {
                 let _ = conn.execute(statement, params![]);
@@ -1134,6 +1136,10 @@ impl RegistryDb {
                     .filter(|value| !value.trim().is_empty())
                 })
                 .unwrap_or_else(generate_storage_object_id);
+            let reserved_bytes = expected_size_bytes
+                .unwrap_or(0)
+                .max(0)
+                .saturating_sub(existing_ready_size.max(0));
 
             if expected_size_bytes.is_some() {
                 let other_reserved = pending_quota_reserved_bytes_for_user(
@@ -1158,12 +1164,13 @@ impl RegistryDb {
             tx.execute(
                 r#"
                 INSERT INTO object_uploads (
-                    owner_uid, fragment, object_key, storage_object_id, expected_size_bytes, content_type, version_id, session_id, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    owner_uid, fragment, object_key, storage_object_id, expected_size_bytes, reserved_bytes, content_type, version_id, session_id, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                 ON CONFLICT(owner_uid, fragment, object_key)
                 DO UPDATE SET
                     storage_object_id = excluded.storage_object_id,
                     expected_size_bytes = excluded.expected_size_bytes,
+                    reserved_bytes = excluded.reserved_bytes,
                     content_type = excluded.content_type,
                     version_id = excluded.version_id,
                     session_id = excluded.session_id,
@@ -1175,6 +1182,7 @@ impl RegistryDb {
                     object_key,
                     existing_storage_object_id,
                     expected_size_bytes,
+                    reserved_bytes,
                     content_type,
                     version_id,
                     session_id,
@@ -1326,15 +1334,7 @@ impl RegistryDb {
             )
             .map_err(sql_err)?;
 
-            tx.execute(
-                r#"
-                UPDATE users
-                SET quota_used_bytes = ?2, updated_at = ?3
-                WHERE uid = ?1
-                "#,
-                params![owner_uid, next_used, now],
-            )
-            .map_err(sql_err)?;
+            refresh_user_quota_used(&tx, &owner_uid, &now)?;
 
             tx.commit().map_err(sql_err)?;
 
@@ -2087,15 +2087,11 @@ impl RegistryDb {
         spawn_blocking(move || {
             let mut conn = db.open_connection()?;
             let tx = conn.transaction().map_err(sql_err)?;
-            let (quota_limit, quota_used) = quota_for_user(&tx, &owner_uid)?;
+            let (quota_limit, _) = quota_for_user(&tx, &owner_uid)?;
             let existing = resolve_ready_object(&tx, &owner_uid, &fragment, &object_key)?;
-            let previous_size = existing
-                .as_ref()
-                .map(|record| record.object_size_bytes.max(0))
-                .unwrap_or(0);
             let now = now_rfc3339();
 
-            let next_used = if let Some(current) = current.clone() {
+            if let Some(current) = current.clone() {
                 let current_size = current.object_size_bytes.max(0);
                 let created_at = existing
                     .as_ref()
@@ -2167,10 +2163,6 @@ impl RegistryDb {
                     params![owner_uid, fragment, object_key],
                 )
                 .map_err(sql_err)?;
-
-                quota_used
-                    .saturating_add(current_size - previous_size)
-                    .max(0)
             } else {
                 tx.execute(
                     "DELETE FROM objects WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
@@ -2192,18 +2184,9 @@ impl RegistryDb {
                     params![owner_uid, fragment, object_key],
                 )
                 .map_err(sql_err)?;
-                quota_used.saturating_sub(previous_size)
-            };
+            }
 
-            tx.execute(
-                r#"
-                UPDATE users
-                SET quota_used_bytes = ?2, updated_at = ?3
-                WHERE uid = ?1
-                "#,
-                params![owner_uid, next_used, now_rfc3339()],
-            )
-            .map_err(sql_err)?;
+            refresh_user_quota_used(&tx, &owner_uid, &now)?;
 
             tx.commit().map_err(sql_err)?;
 
@@ -2605,17 +2588,13 @@ impl RegistryDb {
 
             let mut conn = db.open_connection()?;
             let tx = conn.transaction().map_err(sql_err)?;
-            let (quota_limit, quota_used) = quota_for_user(&tx, &owner_uid)?;
+            let (quota_limit, _) = quota_for_user(&tx, &owner_uid)?;
             let objects = select_objects_by_prefix(&tx, &owner_uid, &fragment, &prefix)?;
             let pending_keys = select_upload_keys_by_prefix(&tx, &owner_uid, &fragment, &prefix)?;
             if objects.is_empty() && pending_keys.is_empty() {
                 return Err(RegistryError::not_found("no matching objects found"));
             }
 
-            let reclaimed_bytes = objects
-                .iter()
-                .map(|object| object.object_size_bytes.max(0))
-                .sum::<i64>();
             let storage_ids = objects
                 .iter()
                 .map(|object| object.storage_object_id.clone())
@@ -2667,16 +2646,7 @@ impl RegistryDb {
             )
             .map_err(sql_err)?;
 
-            let next_used = quota_used.saturating_sub(reclaimed_bytes);
-            tx.execute(
-                r#"
-                UPDATE users
-                SET quota_used_bytes = ?2, updated_at = ?3
-                WHERE uid = ?1
-                "#,
-                params![owner_uid, next_used, now],
-            )
-            .map_err(sql_err)?;
+            refresh_user_quota_used(&tx, &owner_uid, &now)?;
 
             tx.commit().map_err(sql_err)?;
             let conn = db.open_connection()?;
@@ -2780,11 +2750,9 @@ impl RegistryDb {
                 )));
             }
 
-            let (quota_limit, quota_used) = quota_for_user(&tx, &owner_uid)?;
-            let mut next_used = quota_used;
+            let (quota_limit, _) = quota_for_user(&tx, &owner_uid)?;
             for trashed in &destination_trashed {
                 delete_object_namespace_rows(&tx, &owner_uid, &fragment, &trashed.object_key)?;
-                next_used = next_used.saturating_sub(trashed.object_size_bytes.max(0));
             }
 
             let now = now_rfc3339();
@@ -2821,16 +2789,8 @@ impl RegistryDb {
                 )?;
             }
 
-            if next_used != quota_used {
-                tx.execute(
-                    r#"
-                    UPDATE users
-                    SET quota_used_bytes = ?2, updated_at = ?3
-                    WHERE uid = ?1
-                    "#,
-                    params![owner_uid, next_used, now],
-                )
-                .map_err(sql_err)?;
+            if !destination_trashed.is_empty() {
+                refresh_user_quota_used(&tx, &owner_uid, &now)?;
             }
 
             tx.commit().map_err(sql_err)?;
@@ -2896,9 +2856,8 @@ impl RegistryDb {
                 ));
             }
 
-            let (quota_limit, quota_used) = quota_for_user(&tx, &owner_uid)?;
-            let mut next_used = quota_used;
-            if let Some(destination_trashed) = destination_current {
+            let (quota_limit, _) = quota_for_user(&tx, &owner_uid)?;
+            if destination_current.as_ref().is_some() {
                 tx.execute(
                     "DELETE FROM object_versions WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
                     params![owner_uid, fragment, destination_key],
@@ -2914,7 +2873,6 @@ impl RegistryDb {
                     params![owner_uid, fragment, destination_key],
                 )
                 .map_err(sql_err)?;
-                next_used = next_used.saturating_sub(destination_trashed.object_size_bytes.max(0));
             }
 
             let now = now_rfc3339();
@@ -2959,16 +2917,8 @@ impl RegistryDb {
             if updated_ready == 0 && updated_pending == 0 {
                 return Err(RegistryError::not_found("object not found"));
             }
-            if next_used != quota_used {
-                tx.execute(
-                    r#"
-                    UPDATE users
-                    SET quota_used_bytes = ?2, updated_at = ?3
-                    WHERE uid = ?1
-                    "#,
-                    params![owner_uid, next_used, now],
-                )
-                .map_err(sql_err)?;
+            if destination_current.is_some() {
+                refresh_user_quota_used(&tx, &owner_uid, &now)?;
             }
             tx.commit().map_err(sql_err)?;
             let conn = db.open_connection()?;
@@ -2991,7 +2941,7 @@ impl RegistryDb {
         spawn_blocking(move || {
             let mut conn = db.open_connection()?;
             let tx = conn.transaction().map_err(sql_err)?;
-            let (quota_limit, quota_used) = quota_for_user(&tx, &owner_uid)?;
+            let (quota_limit, _) = quota_for_user(&tx, &owner_uid)?;
             let now = now_rfc3339();
 
             let stored = resolve_stored_object(&tx, &owner_uid, &fragment, &object_key)?;
@@ -3033,21 +2983,7 @@ impl RegistryDb {
                 enqueue_object_purge(&tx, &stored, &now)?;
             }
 
-            let size_delta = if transitioned {
-                stored.object_size_bytes.max(0)
-            } else {
-                0
-            };
-            let next_used = quota_used.saturating_sub(size_delta);
-            tx.execute(
-                r#"
-                UPDATE users
-                SET quota_used_bytes = ?2, updated_at = ?3
-                WHERE uid = ?1
-                "#,
-                params![owner_uid, next_used, now],
-            )
-            .map_err(sql_err)?;
+            refresh_user_quota_used(&tx, &owner_uid, &now)?;
 
             tx.commit().map_err(sql_err)?;
             let conn = db.open_connection()?;
@@ -3073,7 +3009,7 @@ impl RegistryDb {
 
             let mut conn = db.open_connection()?;
             let tx = conn.transaction().map_err(sql_err)?;
-            let (quota_limit, quota_used) = quota_for_user(&tx, &owner_uid)?;
+            let (quota_limit, _) = quota_for_user(&tx, &owner_uid)?;
             let now = now_rfc3339();
 
             let objects = select_objects_by_prefix(&tx, &owner_uid, &fragment, &prefix)?;
@@ -3100,7 +3036,6 @@ impl RegistryDb {
             )
             .map_err(sql_err)?;
 
-            let mut reclaimed_bytes = 0i64;
             let mut transitioned = 0usize;
             for object in &objects {
                 if object.status == "purged" {
@@ -3116,20 +3051,9 @@ impl RegistryDb {
                 )
                 .map_err(sql_err)?;
                 enqueue_object_purge(&tx, object, &now)?;
-                reclaimed_bytes = reclaimed_bytes.saturating_add(object.object_size_bytes.max(0));
                 transitioned = transitioned.saturating_add(1);
             }
-
-            let next_used = quota_used.saturating_sub(reclaimed_bytes);
-            tx.execute(
-                r#"
-                UPDATE users
-                SET quota_used_bytes = ?2, updated_at = ?3
-                WHERE uid = ?1
-                "#,
-                params![owner_uid, next_used, now],
-            )
-            .map_err(sql_err)?;
+            refresh_user_quota_used(&tx, &owner_uid, &now)?;
 
             tx.commit().map_err(sql_err)?;
             let conn = db.open_connection()?;
@@ -3149,7 +3073,7 @@ impl RegistryDb {
         spawn_blocking(move || {
             let mut conn = db.open_connection()?;
             let tx = conn.transaction().map_err(sql_err)?;
-            let (quota_limit, quota_used) = quota_for_user(&tx, &owner_uid)?;
+            let (quota_limit, _) = quota_for_user(&tx, &owner_uid)?;
             let now = now_rfc3339();
 
             let trashed_objects =
@@ -3187,20 +3111,7 @@ impl RegistryDb {
                 enqueue_object_purge(&tx, object, &now)?;
             }
 
-            let reclaimed_bytes = trashed_objects
-                .iter()
-                .map(|object| object.object_size_bytes.max(0))
-                .sum::<i64>();
-            let next_used = quota_used.saturating_sub(reclaimed_bytes);
-            tx.execute(
-                r#"
-                UPDATE users
-                SET quota_used_bytes = ?2, updated_at = ?3
-                WHERE uid = ?1
-                "#,
-                params![owner_uid, next_used, now],
-            )
-            .map_err(sql_err)?;
+            refresh_user_quota_used(&tx, &owner_uid, &now)?;
 
             tx.commit().map_err(sql_err)?;
             let conn = db.open_connection()?;
@@ -3222,9 +3133,8 @@ impl RegistryDb {
         spawn_blocking(move || {
             let mut conn = db.open_connection()?;
             let tx = conn.transaction().map_err(sql_err)?;
-            let (quota_limit, quota_used) = quota_for_user(&tx, &owner_uid)?;
-            let existing = resolve_any_object(&tx, &owner_uid, &fragment, &object_key)?;
-            let Some(existing) = existing else {
+            let (quota_limit, _) = quota_for_user(&tx, &owner_uid)?;
+            let Some(_) = resolve_any_object(&tx, &owner_uid, &fragment, &object_key)? else {
                 return Err(RegistryError::not_found("object not found"));
             };
             tx.execute(
@@ -3247,21 +3157,7 @@ impl RegistryDb {
                 params![owner_uid, fragment, object_key],
             )
             .map_err(sql_err)?;
-            let size_delta = if existing.status == "pending" {
-                0
-            } else {
-                existing.object_size_bytes.max(0)
-            };
-            let next_used = quota_used.saturating_sub(size_delta);
-            tx.execute(
-                r#"
-                UPDATE users
-                SET quota_used_bytes = ?2, updated_at = ?3
-                WHERE uid = ?1
-                "#,
-                params![owner_uid, next_used, now_rfc3339()],
-            )
-            .map_err(sql_err)?;
+            refresh_user_quota_used(&tx, &owner_uid, &now_rfc3339())?;
             tx.commit().map_err(sql_err)?;
             let conn = db.open_connection()?;
             let mut user = user_by_uid(&conn, &owner_uid)?;
@@ -3420,7 +3316,7 @@ impl RegistryDb {
         spawn_blocking(move || {
             let mut conn = db.open_connection()?;
             let tx = conn.transaction().map_err(sql_err)?;
-            let (quota_limit, quota_used) = quota_for_user(&tx, &owner_uid)?;
+            let (quota_limit, _) = quota_for_user(&tx, &owner_uid)?;
 
             let removed_count = scalar_i64(
                 &tx,
@@ -3431,17 +3327,6 @@ impl RegistryDb {
                 "#,
                 params![owner_uid, fragment],
             )? as usize;
-
-            let reclaimed_bytes = scalar_i64(
-                &tx,
-                r#"
-                SELECT COALESCE(SUM(object_size_bytes), 0)
-                FROM objects
-                WHERE owner_uid = ?1 AND fragment = ?2 AND status = 'trashed'
-                "#,
-                params![owner_uid, fragment],
-            )?
-            .max(0);
 
             tx.execute(
                 r#"
@@ -3497,16 +3382,7 @@ impl RegistryDb {
             )
             .map_err(sql_err)?;
 
-            let next_used = quota_used.saturating_sub(reclaimed_bytes);
-            tx.execute(
-                r#"
-                UPDATE users
-                SET quota_used_bytes = ?2, updated_at = ?3
-                WHERE uid = ?1
-                "#,
-                params![owner_uid, next_used, now_rfc3339()],
-            )
-            .map_err(sql_err)?;
+            refresh_user_quota_used(&tx, &owner_uid, &now_rfc3339())?;
 
             tx.commit().map_err(sql_err)?;
 
@@ -4320,15 +4196,53 @@ fn update_object_status_chunk(
 }
 
 fn quota_for_user(conn: &Connection, owner_uid: &str) -> Result<(i64, i64), RegistryError> {
-    conn.query_row(
+    let quota_limit = conn
+        .query_row(
         "SELECT quota_limit_bytes, quota_used_bytes FROM users WHERE uid = ?1",
         params![owner_uid],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| row.get(0),
     )
     .map_err(|err| match err {
         rusqlite::Error::QueryReturnedNoRows => RegistryError::not_found("user not found"),
         other => sql_err(other),
-    })
+    })?;
+    Ok((quota_limit, committed_quota_used_bytes_for_user(conn, owner_uid)?))
+}
+
+fn committed_quota_used_bytes_for_user(
+    conn: &Connection,
+    owner_uid: &str,
+) -> Result<i64, RegistryError> {
+    conn.query_row(
+        r#"
+        SELECT COALESCE(SUM(object_size_bytes), 0)
+        FROM objects
+        WHERE owner_uid = ?1
+          AND status != 'purged'
+        "#,
+        params![owner_uid],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value.max(0))
+    .map_err(sql_err)
+}
+
+fn refresh_user_quota_used(
+    conn: &Connection,
+    owner_uid: &str,
+    updated_at: &str,
+) -> Result<i64, RegistryError> {
+    let next_used = committed_quota_used_bytes_for_user(conn, owner_uid)?;
+    conn.execute(
+        r#"
+        UPDATE users
+        SET quota_used_bytes = ?2, updated_at = ?3
+        WHERE uid = ?1
+        "#,
+        params![owner_uid, next_used, updated_at],
+    )
+    .map_err(sql_err)?;
+    Ok(next_used)
 }
 
 fn pending_quota_reserved_bytes_for_user(
@@ -4341,21 +4255,8 @@ fn pending_quota_reserved_bytes_for_user(
         .unwrap_or((None, None));
     conn.query_row(
         r#"
-        SELECT COALESCE(
-            SUM(
-                CASE
-                    WHEN COALESCE(ou.expected_size_bytes, 0) > COALESCE(o.object_size_bytes, 0)
-                        THEN COALESCE(ou.expected_size_bytes, 0) - COALESCE(o.object_size_bytes, 0)
-                    ELSE 0
-                END
-            ),
-            0
-        )
+        SELECT COALESCE(SUM(COALESCE(ou.reserved_bytes, 0)), 0)
         FROM object_uploads ou
-        LEFT JOIN objects o
-          ON o.owner_uid = ou.owner_uid
-         AND o.fragment = ou.fragment
-         AND o.object_key = ou.object_key
         WHERE ou.owner_uid = ?1
           AND (?2 IS NULL OR ou.fragment <> ?2 OR ou.object_key <> ?3)
         "#,

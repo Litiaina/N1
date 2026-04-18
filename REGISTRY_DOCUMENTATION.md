@@ -13,6 +13,11 @@ Use `Registry` when you need:
 
 `Registry` is also the correct home for user quotas and account policy. Standalone `N1` is not the user/account quota control plane.
 
+Current `0.9.0` behavior that matters operationally:
+
+- for fragment-bound object listing and stats, Registry reads logical namespace truth from the bound `N1` engine instead of trusting stale SQLite projection alone
+- pending quota reservations are stored durably in `object_uploads` and reconciled against committed object usage during finalize/cancel flows
+
 This document is written for engineers integrating with `Registry` directly.
 
 ## Base URL
@@ -645,6 +650,11 @@ Response:
 }
 ```
 
+Operational note:
+
+- when `fragment` is provided and bound to an engine, committed object listing is sourced from the live `N1` namespace and then decorated with Registry metadata
+- SQLite remains the Registry policy store, but not the authoritative file-tree source for bound-fragment committed listings
+
 ### `GET /v1/objects/suggest`
 
 Autocomplete/suggestion route.
@@ -694,6 +704,10 @@ Response:
 }
 ```
 
+Operational note:
+
+- fragment-bound stats are computed from the engine namespace view, not from stale Registry-only projection rows
+
 ### `GET /v1/objects/resolve`
 
 Resolve one live logical object.
@@ -729,6 +743,12 @@ Rules:
 
 - use either `keys` or `prefix/search`, not both
 - current Registry archive surface supports `tar`
+
+Quota note:
+
+- Registry keeps committed usage separate from pending reservations
+- pending uploads reserve quota durably before finalize
+- cancel/finalize paths release or convert those reservations so quota accounting stays atomic at the Registry layer
 
 ## Rename, Trash, Recover, And Delete
 

@@ -1,6 +1,7 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
 use axum::http::StatusCode;
@@ -41,6 +42,13 @@ pub struct NamespaceRuntime {
     dbs: DashMap<PathBuf, Arc<Database>>,
 }
 
+#[derive(Debug, Clone)]
+struct NamespaceReplicaFileInfo {
+    path: PathBuf,
+    modified_at: std::time::SystemTime,
+    len: u64,
+}
+
 static GLOBAL_NAMESPACE_RUNTIME: LazyLock<NamespaceRuntime> = LazyLock::new(NamespaceRuntime::new);
 
 pub fn global_namespace_runtime() -> &'static NamespaceRuntime {
@@ -57,8 +65,10 @@ impl NamespaceRuntime {
 
     pub fn evict_fragment(&self, fragment: &str) {
         self.catalogs.remove(fragment);
-        if let Ok(path) = namespace_db_path(fragment) {
-            self.dbs.remove(&path);
+        if let Ok(paths) = namespace_db_paths(fragment) {
+            for path in paths {
+                self.dbs.remove(&path);
+            }
         }
     }
 
@@ -408,6 +418,7 @@ impl NamespaceRuntime {
         write_txn
             .commit()
             .map_err(|e| map_indexdb_error("namespace pending commit", e))?;
+        self.replicate_namespace_db(fragment)?;
         Ok(())
     }
 
@@ -501,6 +512,7 @@ impl NamespaceRuntime {
         write_txn
             .commit()
             .map_err(|e| map_indexdb_error("namespace pending clear commit", e))?;
+        self.replicate_namespace_db(fragment)?;
         Ok(())
     }
 
@@ -562,7 +574,9 @@ impl NamespaceRuntime {
     }
 
     fn open_db(&self, fragment: &str) -> Result<Arc<Database>, AppError> {
-        let path = namespace_db_path(fragment)?;
+        let path = self
+            .ensure_owner_namespace_db(fragment)?
+            .unwrap_or(namespace_db_path(fragment)?);
         if let Some(existing) = self.dbs.get(&path) {
             return Ok(existing.clone());
         }
@@ -579,7 +593,9 @@ impl NamespaceRuntime {
     }
 
     fn open_existing_db(&self, fragment: &str) -> Result<Option<Arc<Database>>, AppError> {
-        let path = namespace_db_path(fragment)?;
+        let Some(path) = self.ensure_owner_namespace_db(fragment)? else {
+            return Ok(None);
+        };
         if let Some(existing) = self.dbs.get(&path) {
             return Ok(Some(existing.clone()));
         }
@@ -599,7 +615,7 @@ impl NamespaceRuntime {
         fragment: &str,
     ) -> Result<Arc<AsyncMutex<NamespaceCatalog>>, AppError> {
         if let Some(existing) = self.catalogs.get(fragment) {
-            if namespace_db_path(fragment)?.exists() {
+            if self.ensure_owner_namespace_db(fragment)?.is_some() {
                 return Ok(existing.clone());
             }
             drop(existing);
@@ -705,6 +721,34 @@ impl NamespaceRuntime {
         write_txn
             .commit()
             .map_err(|e| map_indexdb_error("namespace catalog commit", e))?;
+        self.replicate_namespace_db(fragment)?;
+        Ok(())
+    }
+
+    fn ensure_owner_namespace_db(&self, fragment: &str) -> Result<Option<PathBuf>, AppError> {
+        let owner_path = namespace_db_path(fragment)?;
+        if owner_path.exists() {
+            return Ok(Some(owner_path));
+        }
+
+        let Some(replica_path) = best_existing_namespace_db_path(fragment)? else {
+            return Ok(None);
+        };
+        if replica_path == owner_path {
+            return Ok(Some(owner_path));
+        }
+        copy_namespace_db_file(&replica_path, &owner_path)?;
+        Ok(Some(owner_path))
+    }
+
+    fn replicate_namespace_db(&self, fragment: &str) -> Result<(), AppError> {
+        let owner_path = namespace_db_path(fragment)?;
+        if !owner_path.exists() {
+            return Ok(());
+        }
+        for replica_path in namespace_db_paths(fragment)?.into_iter().skip(1) {
+            copy_namespace_db_file(&owner_path, &replica_path)?;
+        }
         Ok(())
     }
 }
@@ -765,6 +809,114 @@ fn namespace_db_path(fragment: &str) -> Result<PathBuf, AppError> {
         .join(NAMESPACE_V2_FILE))
 }
 
+fn namespace_db_paths(fragment: &str) -> Result<Vec<PathBuf>, AppError> {
+    let manager = ObjectPathManager;
+    let roots = manager.get_all_index_roots();
+    if roots.is_empty() {
+        return Err(AppError::InternalServerError(
+            "no index roots configured for namespace v2".to_string(),
+        ));
+    }
+    let owner_idx = namespace_owner_index(fragment, roots.len());
+    let mut ordered = Vec::with_capacity(roots.len());
+    ordered.push(
+        roots[owner_idx]
+            .join(fragment)
+            .join(NAMESPACE_V2_DIR)
+            .join(NAMESPACE_V2_FILE),
+    );
+    for (idx, root) in roots.into_iter().enumerate() {
+        if idx == owner_idx {
+            continue;
+        }
+        ordered.push(root.join(fragment).join(NAMESPACE_V2_DIR).join(NAMESPACE_V2_FILE));
+    }
+    Ok(ordered)
+}
+
+fn best_existing_namespace_db_path(fragment: &str) -> Result<Option<PathBuf>, AppError> {
+    let mut best: Option<NamespaceReplicaFileInfo> = None;
+    for path in namespace_db_paths(fragment)? {
+        let Some(info) = inspect_namespace_db_file(&path)? else {
+            continue;
+        };
+        let replace = match best.as_ref() {
+            Some(current) => compare_namespace_replica_info(&info, current) == Ordering::Greater,
+            None => true,
+        };
+        if replace {
+            best = Some(info);
+        }
+    }
+    Ok(best.map(|info| info.path))
+}
+
+fn inspect_namespace_db_file(path: &Path) -> Result<Option<NamespaceReplicaFileInfo>, AppError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(AppError::Io(err, format!("stat {}", path.display()))),
+    };
+    let modified_at = metadata
+        .modified()
+        .map_err(|err| AppError::Io(err, format!("mtime {}", path.display())))?;
+    Ok(Some(NamespaceReplicaFileInfo {
+        path: path.to_path_buf(),
+        modified_at,
+        len: metadata.len(),
+    }))
+}
+
+fn compare_namespace_replica_info(
+    candidate: &NamespaceReplicaFileInfo,
+    current: &NamespaceReplicaFileInfo,
+) -> Ordering {
+    candidate
+        .modified_at
+        .cmp(&current.modified_at)
+        .then_with(|| candidate.len.cmp(&current.len))
+        .then_with(|| candidate.path.cmp(&current.path))
+}
+
+fn copy_namespace_db_file(source: &Path, destination: &Path) -> Result<(), AppError> {
+    if source == destination {
+        return Ok(());
+    }
+    let Some(parent) = destination.parent() else {
+        return Err(AppError::InternalServerError(format!(
+            "namespace destination '{}' has no parent",
+            destination.display()
+        )));
+    };
+    fs::create_dir_all(parent).map_err(|err| AppError::Io(err, format!("mkdir {}", parent.display())))?;
+    let temp_path = destination.with_extension(format!(
+        "{}.tmp-{}",
+        destination
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("ndxdb"),
+        Ulid::new()
+    ));
+    fs::copy(source, &temp_path).map_err(|err| {
+        AppError::Io(
+            err,
+            format!("copy namespace {} -> {}", source.display(), temp_path.display()),
+        )
+    })?;
+    fs::rename(&temp_path, destination).map_err(|err| {
+        let _ = fs::remove_file(&temp_path);
+        AppError::Io(
+            err,
+            format!(
+                "rename namespace replica {} -> {}",
+                temp_path.display(),
+                destination.display()
+            ),
+        )
+    })?;
+    Ok(())
+}
+
 fn namespace_owner_index(fragment: &str, root_count: usize) -> usize {
     if root_count <= 1 {
         return 0;
@@ -811,4 +963,150 @@ pub fn logical_not_found() -> AppError {
 
 pub fn unexpected_response(status: StatusCode, context: &str) -> AppError {
     AppError::InternalServerError(format!("{context} returned unexpected status {status}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{global_namespace_runtime, namespace_db_path, namespace_db_paths};
+    use crate::core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS, ObjectMetadata};
+    use crate::core::fragment_metadata::{
+        DEFAULT_INDEX_PARTITION_COUNT, clear_fragment_partition_count_cache_for_test,
+        set_configured_index_partition_count,
+    };
+    use crate::core::indexdb_store;
+    use crate::core::quota_manager::init_quota_file;
+    use crate::core::sync::ensure_fragment_blob_directories;
+    use crate::settings::constants::CONFIG_FILE;
+    use crate::settings::create_config::create_default_config_ini;
+    use once_cell::sync::Lazy;
+    use std::path::PathBuf;
+    use tokio::fs;
+    use tokio::sync::Mutex;
+    use ulid::Ulid;
+
+    static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    fn ensure_test_config_file() {
+        let config_path = PathBuf::from(CONFIG_FILE);
+        if !config_path.exists() {
+            create_default_config_ini(&config_path).expect("create default test config");
+        }
+    }
+
+    async fn ensure_storage_config() {
+        ensure_test_config_file();
+        set_configured_index_partition_count(DEFAULT_INDEX_PARTITION_COUNT)
+            .expect("reset configured index partition count");
+        clear_fragment_partition_count_cache_for_test();
+        indexdb_store::clear_cached_dbs_for_test();
+
+        let base = std::env::temp_dir().join(format!("n1-namespace-runtime-{}", std::process::id()));
+        let index_roots = if let Some(existing) = INDEX_STORE_DISKS.get() {
+            existing.iter().map(PathBuf::from).collect::<Vec<_>>()
+        } else {
+            vec![base.join("index_1"), base.join("index_2")]
+        };
+        let blob_roots = if let Some(existing) = BLOB_STORE_DISKS.get() {
+            existing.iter().map(PathBuf::from).collect::<Vec<_>>()
+        } else {
+            vec![base.join("blob_1"), base.join("blob_2")]
+        };
+        let fs_root = if let Some(existing) = FS_STORAGE_ROOT.get() {
+            PathBuf::from(existing)
+        } else {
+            base.join("fs")
+        };
+
+        for root in index_roots
+            .iter()
+            .chain(blob_roots.iter())
+            .chain(std::iter::once(&fs_root))
+        {
+            let _ = fs::create_dir_all(root).await;
+        }
+
+        if INDEX_STORE_DISKS.get().is_none() {
+            INDEX_STORE_DISKS
+                .set(
+                    index_roots
+                        .iter()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect(),
+                )
+                .expect("set INDEX_STORE_DISKS");
+        }
+        if BLOB_STORE_DISKS.get().is_none() {
+            BLOB_STORE_DISKS
+                .set(
+                    blob_roots
+                        .iter()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect(),
+                )
+                .expect("set BLOB_STORE_DISKS");
+        }
+        if FS_STORAGE_ROOT.get().is_none() {
+            FS_STORAGE_ROOT
+                .set(fs_root.to_string_lossy().to_string())
+                .expect("set FS_STORAGE_ROOT");
+        }
+    }
+
+    async fn setup_fragment(fragment: &str) {
+        ensure_storage_config().await;
+        let _ = ensure_fragment_blob_directories(fragment).await;
+        let _ = init_quota_file(fragment, 0).await;
+        global_namespace_runtime().evict_fragment(fragment);
+    }
+
+    #[tokio::test]
+    async fn namespace_v2_reseeds_owner_from_replica_after_owner_disk_loss() {
+        let _guard = TEST_LOCK.lock().await;
+        let fragment = format!("namespace-replica-{}", Ulid::new());
+        setup_fragment(&fragment).await;
+
+        let metadata = ObjectMetadata {
+            object_key: "docs/report.txt".to_string(),
+            fragment: fragment.clone(),
+            version_id: Ulid::new().to_string(),
+            upload_session_id: String::new(),
+            owner_uid: fragment.clone(),
+            content_type: "text/plain".to_string(),
+            total_size_bytes: 4096,
+            created_at: 1_710_000_000,
+            parts: Vec::new(),
+            is_delete_marker: false,
+            stripe_size_bytes: 262_144,
+        };
+
+        global_namespace_runtime()
+            .finalize_logical_upload(&fragment, "docs/report.txt", "physical-object-1", &metadata)
+            .await
+            .expect("finalize logical upload");
+
+        let paths = namespace_db_paths(&fragment).expect("namespace db paths");
+        assert!(paths.len() >= 2, "test needs at least two index roots");
+        for path in &paths {
+            assert!(path.exists(), "replica missing at {}", path.display());
+        }
+
+        let owner_path = namespace_db_path(&fragment).expect("namespace owner path");
+        fs::remove_file(&owner_path)
+            .await
+            .expect("remove owner namespace db to simulate disk loss");
+        global_namespace_runtime().evict_fragment(&fragment);
+
+        let entries = global_namespace_runtime()
+            .list_dir(&fragment, "docs", false)
+            .await
+            .expect("list logical namespace from surviving replica");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "docs/report.txt");
+        assert_eq!(entries[0].name, "report.txt");
+        assert_eq!(entries[0].object_id.as_deref(), Some("physical-object-1"));
+        assert!(
+            owner_path.exists(),
+            "owner namespace db should be reseeded from surviving replica"
+        );
+    }
 }

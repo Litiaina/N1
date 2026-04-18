@@ -88,6 +88,22 @@ pub struct EngineObjectState {
 }
 
 #[derive(Debug, Clone)]
+pub struct EngineLogicalObject {
+    pub object_key: String,
+    pub version_id: String,
+    pub object_size_bytes: i64,
+    pub content_type: Option<String>,
+    pub created_at_unix: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct EngineLogicalListPage {
+    pub objects: Vec<EngineLogicalObject>,
+    pub common_prefixes: Vec<String>,
+    pub continuation_token: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct EngineObjectMetadata {
     pub version_id: String,
     pub object_size_bytes: i64,
@@ -97,10 +113,20 @@ pub struct EngineObjectMetadata {
 
 #[derive(Debug, Deserialize)]
 struct EngineObjectSummary {
+    #[serde(default)]
+    object_key: String,
     version_id: String,
     content_type: String,
     total_size_bytes: u64,
     created_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct EngineListObjectsResponse {
+    objects: Vec<EngineObjectSummary>,
+    #[serde(default)]
+    common_prefixes: Vec<String>,
+    continuation_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -358,6 +384,80 @@ impl StorageBroker {
         }
 
         Ok(sessions)
+    }
+
+    pub async fn list_logical_objects_page(
+        &self,
+        binding: &FragmentBindingRecord,
+        prefix: Option<&str>,
+        delimiter: Option<&str>,
+        limit: usize,
+        continuation_token: Option<&str>,
+        include_trashed: bool,
+    ) -> Result<EngineLogicalListPage, RegistryError> {
+        let backend = self.resolve_backend(binding)?;
+        let payload = self
+            .authenticate_fragment(&backend, &binding.fragment, true, false, false, false)
+            .await?;
+
+        let route = if include_trashed {
+            "/n1/trash"
+        } else {
+            "/n1/objects"
+        };
+        let mut request = self
+            .client_for_backend(&backend)
+            .get(format!("{}{}", backend.engine_url, route))
+            .bearer_auth(&payload.access_token)
+            .query(&[("limit", limit.clamp(1, 1000))]);
+
+        if let Some(prefix) = prefix.map(str::trim).filter(|value| !value.is_empty()) {
+            request = request.query(&[("prefix", prefix)]);
+        }
+        if let Some(delimiter) = delimiter.map(str::trim).filter(|value| !value.is_empty()) {
+            request = request.query(&[("delimiter", delimiter)]);
+        }
+        if let Some(token) = continuation_token
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            request = request.query(&[("continuation_token", token)]);
+        }
+
+        let response = request.send().await.map_err(|err| {
+            RegistryError::bad_gateway(format!(
+                "storage logical list request failed for {}: {}",
+                backend.engine_url, err
+            ))
+        })?;
+
+        if !response.status().is_success() {
+            let fallback = format!(
+                "storage logical list failed against {} backend",
+                match backend.deployment {
+                    StorageDeployment::SingleNode => "single-node",
+                    StorageDeployment::MultiNode => "multi-node",
+                }
+            );
+            let message = extract_engine_error_message(response, fallback).await;
+            return Err(RegistryError::bad_gateway(message));
+        }
+
+        let payload = response
+            .json::<EngineListObjectsResponse>()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "invalid storage logical list response: {}",
+                    err
+                ))
+            })?;
+
+        Ok(EngineLogicalListPage {
+            objects: payload.objects.into_iter().map(Into::into).collect(),
+            common_prefixes: payload.common_prefixes,
+            continuation_token: payload.continuation_token,
+        })
     }
 
     pub async fn stream_shared_object(
@@ -1075,6 +1175,18 @@ fn now_unix_u64() -> u64 {
 impl From<EngineObjectSummary> for EngineObjectMetadata {
     fn from(value: EngineObjectSummary) -> Self {
         Self {
+            version_id: value.version_id,
+            object_size_bytes: i64::try_from(value.total_size_bytes).unwrap_or(i64::MAX),
+            content_type: Some(value.content_type).filter(|entry| !entry.trim().is_empty()),
+            created_at_unix: value.created_at,
+        }
+    }
+}
+
+impl From<EngineObjectSummary> for EngineLogicalObject {
+    fn from(value: EngineObjectSummary) -> Self {
+        Self {
+            object_key: value.object_key,
             version_id: value.version_id,
             object_size_bytes: i64::try_from(value.total_size_bytes).unwrap_or(i64::MAX),
             content_type: Some(value.content_type).filter(|entry| !entry.trim().is_empty()),

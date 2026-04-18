@@ -296,6 +296,10 @@ pub struct UploadPartQuery {
 pub struct DownloadArchiveRequest {
     #[serde(default)]
     pub keys: Vec<String>,
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub prefixes: Vec<String>,
     #[serde(default = "default_format")]
     pub format: String,
     #[serde(default)]
