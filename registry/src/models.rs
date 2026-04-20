@@ -106,7 +106,9 @@ pub struct ShareRecord {
     pub owner_uid: String,
     pub fragment: String,
     pub object_key: String,
+    // Retained for internal share persistence parity even though Registry now addresses N1 by logical key.
     #[serde(skip_serializing)]
+    #[allow(dead_code)]
     pub storage_object_id: String,
     pub disposition: ShareDisposition,
     pub expires_at: String,

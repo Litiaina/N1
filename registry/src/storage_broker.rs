@@ -284,11 +284,7 @@ impl StorageBroker {
 
         for object in objects {
             let response = self
-                .download_object_response(
-                    &backend,
-                    &payload.access_token,
-                    &object.storage_object_id,
-                )
+                .download_object_response(&backend, &payload.access_token, &object.object_key)
                 .await?;
             let size = response
                 .content_length()
@@ -463,7 +459,7 @@ impl StorageBroker {
     pub async fn stream_shared_object(
         &self,
         binding: &FragmentBindingRecord,
-        storage_object_id: &str,
+        object_key: &str,
         disposition: ShareDisposition,
         request_headers: &axum::http::HeaderMap,
     ) -> Result<reqwest::Response, RegistryError> {
@@ -475,12 +471,12 @@ impl StorageBroker {
         let mut request = if disposition.is_download() {
             client
                 .get(format!("{}/n1/objects/download", backend.engine_url))
-                .query(&[("object_key", storage_object_id)])
+                .query(&[("object_key", object_key)])
         } else {
             client.get(format!(
                 "{}/n1/objects/get/{}",
                 backend.engine_url,
-                encode_object_key_path(storage_object_id)
+                encode_object_key_path(object_key)
             ))
         }
         .bearer_auth(&payload.access_token);
@@ -615,7 +611,7 @@ impl StorageBroker {
     pub async fn read_current_object_state(
         &self,
         binding: &FragmentBindingRecord,
-        storage_object_id: &str,
+        object_key: &str,
         include_versions: bool,
     ) -> Result<EngineObjectState, RegistryError> {
         let backend = self.resolve_backend(binding)?;
@@ -625,7 +621,7 @@ impl StorageBroker {
         self.read_object_state_with_token(
             &backend,
             &payload.access_token,
-            storage_object_id,
+            object_key,
             include_versions,
         )
         .await
@@ -634,14 +630,14 @@ impl StorageBroker {
     pub async fn delete_object_version_and_read_state(
         &self,
         binding: &FragmentBindingRecord,
-        storage_object_id: &str,
+        object_key: &str,
         version_id: &str,
     ) -> Result<EngineObjectState, RegistryError> {
         let backend = self.resolve_backend(binding)?;
         let payload = self
             .authenticate_fragment(&backend, &binding.fragment, true, true, false, true)
             .await?;
-        let encoded_key = encode_object_key_path(storage_object_id);
+        let encoded_key = encode_object_key_path(object_key);
         let encoded_version = encode_path_segment(version_id);
         let response = self
             .client_for_backend(&backend)
@@ -671,20 +667,20 @@ impl StorageBroker {
             return Err(RegistryError::bad_gateway(message));
         }
 
-        self.read_object_state_with_token(&backend, &payload.access_token, storage_object_id, true)
+        self.read_object_state_with_token(&backend, &payload.access_token, object_key, true)
             .await
     }
 
     pub async fn soft_delete_object(
         &self,
         binding: &FragmentBindingRecord,
-        storage_object_id: &str,
+        object_key: &str,
     ) -> Result<(), RegistryError> {
         let backend = self.resolve_backend(binding)?;
         let payload = self
             .authenticate_fragment(&backend, &binding.fragment, false, true, false, false)
             .await?;
-        let encoded_key = encode_object_key_path(storage_object_id);
+        let encoded_key = encode_object_key_path(object_key);
         let response = self
             .client_for_backend(&backend)
             .delete(format!("{}/n1/objects/{}", backend.engine_url, encoded_key))
@@ -709,13 +705,13 @@ impl StorageBroker {
     pub async fn recover_object_and_read_state(
         &self,
         binding: &FragmentBindingRecord,
-        storage_object_id: &str,
+        object_key: &str,
     ) -> Result<EngineObjectState, RegistryError> {
         let backend = self.resolve_backend(binding)?;
         let payload = self
             .authenticate_fragment(&backend, &binding.fragment, true, true, false, false)
             .await?;
-        let encoded_key = encode_object_key_path(storage_object_id);
+        let encoded_key = encode_object_key_path(object_key);
         let response = self
             .client_for_backend(&backend)
             .post(format!(
@@ -739,7 +735,7 @@ impl StorageBroker {
         }
 
         ensure_engine_success(response, &backend, "storage recover failed").await?;
-        self.read_object_state_with_token(&backend, &payload.access_token, storage_object_id, true)
+        self.read_object_state_with_token(&backend, &payload.access_token, object_key, true)
             .await
     }
 
@@ -975,14 +971,14 @@ impl StorageBroker {
         &self,
         backend: &ResolvedBackend,
         access_token: &str,
-        storage_object_id: &str,
+        object_key: &str,
         include_versions: bool,
     ) -> Result<EngineObjectState, RegistryError> {
         let current = self
-            .fetch_object_metadata(backend, access_token, storage_object_id)
+            .fetch_object_metadata(backend, access_token, object_key)
             .await?;
         let versions = if include_versions {
-            self.fetch_object_versions(backend, access_token, storage_object_id)
+            self.fetch_object_versions(backend, access_token, object_key)
                 .await?
         } else {
             Vec::new()
@@ -994,9 +990,9 @@ impl StorageBroker {
         &self,
         backend: &ResolvedBackend,
         access_token: &str,
-        storage_object_id: &str,
+        object_key: &str,
     ) -> Result<Option<EngineObjectMetadata>, RegistryError> {
-        let encoded_key = encode_object_key_path(storage_object_id);
+        let encoded_key = encode_object_key_path(object_key);
         let response = self
             .client_for_backend(backend)
             .get(format!(
@@ -1045,9 +1041,9 @@ impl StorageBroker {
         &self,
         backend: &ResolvedBackend,
         access_token: &str,
-        storage_object_id: &str,
+        object_key: &str,
     ) -> Result<Vec<EngineObjectMetadata>, RegistryError> {
-        let encoded_key = encode_object_key_path(storage_object_id);
+        let encoded_key = encode_object_key_path(object_key);
         let response = self
             .client_for_backend(backend)
             .get(format!(
@@ -1096,12 +1092,12 @@ impl StorageBroker {
         &self,
         backend: &ResolvedBackend,
         access_token: &str,
-        storage_object_id: &str,
+        object_key: &str,
     ) -> Result<reqwest::Response, RegistryError> {
         let response = self
             .client_for_backend(backend)
             .get(format!("{}/n1/objects/download", backend.engine_url))
-            .query(&[("object_key", storage_object_id)])
+            .query(&[("object_key", object_key)])
             .bearer_auth(access_token)
             .send()
             .await

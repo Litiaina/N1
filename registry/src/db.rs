@@ -66,7 +66,6 @@ pub struct ObjectPurgeQueueEntry {
     pub owner_uid: String,
     pub fragment: String,
     pub object_key: String,
-    pub storage_object_id: String,
     pub attempts: i64,
 }
 
@@ -3402,7 +3401,7 @@ impl RegistryDb {
             let conn = db.open_connection()?;
             conn.query_row(
                 r#"
-                SELECT owner_uid, fragment, object_key, storage_object_id, attempts
+                SELECT owner_uid, fragment, object_key, attempts
                 FROM object_purge_queue
                 WHERE available_at <= ?1
                 ORDER BY created_at ASC
@@ -4390,8 +4389,7 @@ fn map_object_purge_queue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Objec
         owner_uid: row.get(0)?,
         fragment: row.get(1)?,
         object_key: row.get(2)?,
-        storage_object_id: row.get(3)?,
-        attempts: row.get(4)?,
+        attempts: row.get(3)?,
     })
 }
 

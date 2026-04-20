@@ -518,7 +518,7 @@ async fn process_next_object_purge(state: &AppState) -> Result<bool, RegistryErr
     match binding {
         Some(binding) => match state
             .broker
-            .soft_delete_object(&binding, &entry.storage_object_id)
+            .soft_delete_object(&binding, &entry.object_key)
             .await
         {
             Ok(()) => {
@@ -1813,12 +1813,7 @@ async fn get_public_share(
         .ok_or_else(|| RegistryError::not_found("share not found"))?;
     let upstream = state
         .broker
-        .stream_shared_object(
-            &binding,
-            &share.storage_object_id,
-            share.disposition,
-            &headers,
-        )
+        .stream_shared_object(&binding, &share.object_key, share.disposition, &headers)
         .await?;
     let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::OK);
     let mut builder = Response::builder().status(status);
@@ -1934,7 +1929,7 @@ async fn finalize_object(
         for attempt in 0..5 {
             let candidate = state
                 .broker
-                .read_current_object_state(&binding, &stored.storage_object_id, true)
+                .read_current_object_state(&binding, &object_key, true)
                 .await?;
             if candidate.current.is_some() {
                 engine_state = Some(candidate);
@@ -2428,14 +2423,14 @@ async fn recover_object(
 
         let engine_state = match state
             .broker
-            .read_current_object_state(&binding, &stored.storage_object_id, true)
+            .read_current_object_state(&binding, &object_key, true)
             .await
         {
             Ok(engine_state) if engine_state.current.is_some() => engine_state,
             Ok(_) => {
                 state
                     .broker
-                    .recover_object_and_read_state(&binding, &stored.storage_object_id)
+                    .recover_object_and_read_state(&binding, &object_key)
                     .await?
             }
             Err(err) => return Err(err),
@@ -2629,11 +2624,7 @@ async fn delete_object_version(
 
     let engine_state = state
         .broker
-        .delete_object_version_and_read_state(
-            &binding,
-            &current_object.storage_object_id,
-            &version_id,
-        )
+        .delete_object_version_and_read_state(&binding, &object_key, &version_id)
         .await?;
     let (object, user) = state
         .db
@@ -2772,7 +2763,7 @@ async fn resolve_object(
 
     match state
         .broker
-        .read_current_object_state(&binding, &object.storage_object_id, false)
+        .read_current_object_state(&binding, &query.object_key, false)
         .await
     {
         Ok(engine_state) => {
@@ -2780,7 +2771,7 @@ async fn resolve_object(
                 let _write_guard = state.write_gate.lock().await;
                 let full_state = state
                     .broker
-                    .read_current_object_state(&binding, &object.storage_object_id, true)
+                    .read_current_object_state(&binding, &query.object_key, true)
                     .await?;
                 let inferred_current = full_state
                     .current
@@ -2827,7 +2818,7 @@ async fn resolve_object(
                     let _write_guard = state.write_gate.lock().await;
                     let full_state = state
                         .broker
-                        .read_current_object_state(&binding, &object.storage_object_id, true)
+                        .read_current_object_state(&binding, &query.object_key, true)
                         .await?;
                     let (synced_object, user) = state
                         .db
@@ -3463,6 +3454,7 @@ mod tests {
 
     async fn spawn_storage_version_stub(initial: HashMap<String, StubObjectState>) -> String {
         let state = Arc::new(TokioMutex::new(initial));
+        let list_state = state.clone();
         let meta_state = state.clone();
         let versions_state = state.clone();
         let delete_state = state.clone();
@@ -3563,6 +3555,110 @@ mod tests {
                         "total": 0
                     }))
                 }),
+            )
+            .route(
+                "/n1/objects",
+                get(
+                    move |Query(params): Query<std::collections::HashMap<String, String>>| {
+                        let list_state = list_state.clone();
+                        async move {
+                            let state = list_state.lock().await;
+                            let prefix = params
+                                .get("prefix")
+                                .map(|value| value.trim().trim_start_matches('/').to_string())
+                                .filter(|value| !value.is_empty());
+                            let delimiter = params
+                                .get("delimiter")
+                                .map(|value| value.trim().to_string())
+                                .filter(|value| !value.is_empty());
+                            let limit = params
+                                .get("limit")
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .unwrap_or(200)
+                                .clamp(1, 1000);
+
+                            let mut objects = Vec::new();
+                            let mut common_prefixes = std::collections::BTreeSet::new();
+
+                            for (object_key, entry) in state.iter() {
+                                let Some(version) = entry.versions.first() else {
+                                    continue;
+                                };
+                                if let Some(prefix) = prefix.as_deref() {
+                                    if !object_key.starts_with(prefix) {
+                                        continue;
+                                    }
+                                }
+
+                                if delimiter.as_deref() == Some("/") {
+                                    let suffix = prefix
+                                        .as_deref()
+                                        .and_then(|value| object_key.strip_prefix(value))
+                                        .unwrap_or(object_key.as_str());
+                                    if let Some(index) = suffix.find('/') {
+                                        let base = prefix.clone().unwrap_or_default();
+                                        common_prefixes.insert(format!(
+                                            "{}{}/",
+                                            base,
+                                            &suffix[..index]
+                                        ));
+                                        continue;
+                                    }
+                                }
+
+                                objects.push(json!({
+                                    "fragment": "fragment-a",
+                                    "object_key": object_key,
+                                    "version_id": version.version_id,
+                                    "content_type": version.content_type,
+                                    "total_size_bytes": version.object_size_bytes,
+                                    "created_at": version.created_at
+                                }));
+                            }
+
+                            objects.sort_by(|a, b| {
+                                a["object_key"].as_str().cmp(&b["object_key"].as_str())
+                            });
+                            let mut common_prefixes =
+                                common_prefixes.into_iter().collect::<Vec<_>>();
+                            common_prefixes.sort();
+
+                            let total_items = objects.len().saturating_add(common_prefixes.len());
+                            if total_items > limit {
+                                let mut remaining = limit;
+                                let mut limited_prefixes = Vec::new();
+                                for prefix in common_prefixes.into_iter() {
+                                    if remaining == 0 {
+                                        break;
+                                    }
+                                    limited_prefixes.push(prefix);
+                                    remaining -= 1;
+                                }
+
+                                let mut limited_objects = Vec::new();
+                                for object in objects.into_iter() {
+                                    if remaining == 0 {
+                                        break;
+                                    }
+                                    limited_objects.push(object);
+                                    remaining -= 1;
+                                }
+
+                                return Json(json!({
+                                    "objects": limited_objects,
+                                    "common_prefixes": limited_prefixes,
+                                    "continuation_token": "stub-more"
+                                }));
+                            }
+
+                            Json(json!({
+                                "objects": objects,
+                                "common_prefixes": common_prefixes,
+                                "continuation_token": Value::Null
+                            }))
+                        }
+                    },
+                ),
             )
             .route(
                 "/n1/objects/version/{version_id}/{*object_key}",
@@ -5054,7 +5150,7 @@ mod tests {
     async fn finalize_route_syncs_engine_truth_instead_of_trusting_client_finalize_payload() {
         let mut objects = HashMap::new();
         objects.insert(
-            "engine-flat-key".to_string(),
+            "videos/IMG_8634.mov".to_string(),
             StubObjectState {
                 current_visible: true,
                 versions: vec![
@@ -5173,7 +5269,7 @@ mod tests {
     async fn finalize_route_can_commit_from_engine_versions_when_head_metadata_lags() {
         let mut objects = HashMap::new();
         objects.insert(
-            "engine-flat-key".to_string(),
+            "videos/IMG_8634.mov".to_string(),
             StubObjectState {
                 current_visible: false,
                 versions: vec![
@@ -5621,7 +5717,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bound_registry_mutations_delegate_to_engine_using_storage_object_ids() {
+    async fn bound_registry_mutations_delegate_to_engine_using_logical_object_keys() {
         let calls = Arc::new(TokioMutex::new(Vec::<String>::new()));
         let single_url = spawn_storage_recording_stub("single-stub-token", calls.clone()).await;
         let multi_url = spawn_storage_stub("multi-stub-token").await;
@@ -5943,22 +6039,10 @@ mod tests {
 
         let recorded = calls.lock().await.clone();
         assert_eq!(recorded.len(), 4);
-        assert!(recorded.contains(&format!(
-            "DELETE /n1/objects/{}",
-            delete_object.storage_object_id
-        )));
-        assert!(recorded.contains(&format!(
-            "DELETE /n1/objects/{}",
-            single_object.storage_object_id
-        )));
-        assert!(recorded.contains(&format!(
-            "DELETE /n1/objects/{}",
-            prefix_a.storage_object_id
-        )));
-        assert!(recorded.contains(&format!(
-            "DELETE /n1/objects/{}",
-            prefix_b.storage_object_id
-        )));
+        assert!(recorded.contains(&format!("DELETE /n1/objects/{}", delete_object.object_key)));
+        assert!(recorded.contains(&format!("DELETE /n1/objects/{}", single_object.object_key)));
+        assert!(recorded.contains(&format!("DELETE /n1/objects/{}", prefix_a.object_key)));
+        assert!(recorded.contains(&format!("DELETE /n1/objects/{}", prefix_b.object_key)));
         assert!(
             !recorded
                 .iter()
@@ -5981,7 +6065,7 @@ mod tests {
     async fn purged_object_can_be_recovered_before_storage_lifecycle_removes_it() {
         let mut objects = HashMap::new();
         objects.insert(
-            "stub-storage-key".to_string(),
+            "logical/purged.bin".to_string(),
             StubObjectState {
                 current_visible: true,
                 versions: vec![StubVersion {
@@ -7509,7 +7593,7 @@ mod tests {
     async fn resolve_object_recovers_when_engine_head_metadata_lags_after_finalize() {
         let mut objects = HashMap::new();
         objects.insert(
-            "flat-engine-key".to_string(),
+            "mhw.mp4".to_string(),
             StubObjectState {
                 current_visible: false,
                 versions: vec![
