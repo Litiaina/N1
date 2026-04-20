@@ -33,16 +33,30 @@ async fn posix_list(
             query.continuation_token.as_deref(),
         )
         .await?;
+    let object_ids = entries
+        .iter()
+        .filter_map(|entry| {
+            (entry.kind == NamespaceEntryKind::File)
+                .then(|| entry.object_id.clone())
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    let heads = global_namespace_runtime()
+        .object_heads(&claims.fragment, &object_ids)
+        .await?;
     let mut mapped = entries
         .into_iter()
         .map(|entry| PosixEntry {
+            size_bytes: entry
+                .object_id
+                .as_ref()
+                .and_then(|object_id| heads.get(object_id).map(|head| head.total_size_bytes)),
             name: entry.name,
             path: entry.path,
             kind: match entry.kind {
                 NamespaceEntryKind::File => PosixNodeKind::File,
                 NamespaceEntryKind::Directory => PosixNodeKind::Directory,
             },
-            size_bytes: None,
             modified_at_unix: Some(entry.updated_at_unix),
             content_type: None,
             version_id: None,
@@ -466,6 +480,13 @@ mod tests {
                 .map(|entry| entry.path.as_str())
                 .collect::<Vec<_>>(),
             vec!["notes.txt", "video.mp4"]
+        );
+        assert!(
+            initial
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == crate::posix::models::PosixNodeKind::File)
+                .all(|entry| entry.size_bytes == Some(1024))
         );
         assert!(
             initial

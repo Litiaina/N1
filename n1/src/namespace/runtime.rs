@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -166,6 +166,28 @@ impl NamespaceRuntime {
             return Ok(None);
         };
         Ok(guard.object_head(object_id))
+    }
+
+    pub async fn object_heads(
+        &self,
+        fragment: &str,
+        object_ids: &[String],
+    ) -> Result<HashMap<String, ObjectHead>, AppError> {
+        if object_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let catalog = self.load_catalog(fragment).await?;
+        let guard = catalog.lock().await;
+        let mut heads = HashMap::new();
+
+        for object_id in object_ids.iter().cloned().collect::<BTreeSet<_>>() {
+            if let Some(head) = guard.object_head(&object_id) {
+                heads.insert(object_id, head);
+            }
+        }
+
+        Ok(heads)
     }
 
     pub async fn mkdir(&self, fragment: &str, path: &str) -> Result<bool, AppError> {
