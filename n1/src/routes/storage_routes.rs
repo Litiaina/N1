@@ -1060,8 +1060,8 @@ mod tests {
     use crate::settings::create_config::create_default_config_ini;
     use crate::structs::auth_structs::Claims;
     use crate::websocket::manager::WsConnectionManager;
-    use axum::body::Body;
     use axum::Json as AxumJson;
+    use axum::body::Body;
     use axum::extract::{Path, Query, State};
     use axum::response::IntoResponse;
     use once_cell::sync::Lazy;

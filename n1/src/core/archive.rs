@@ -56,7 +56,9 @@ enum ArchiveSelection {
         prefixes: Vec<String>,
         include_internal: bool,
     },
-    FragmentAll { include_internal: bool },
+    FragmentAll {
+        include_internal: bool,
+    },
     ManifestFile(PathBuf),
     PreparedEntries(Vec<PreparedArchiveEntry>),
 }
@@ -74,9 +76,9 @@ pub async fn download_selected_archive(
     let selection = resolve_archive_selection(&req)?;
 
     let selected_key_count = match &selection {
-        ArchiveSelection::Explicit {
-            keys, prefixes, ..
-        } if prefixes.is_empty() => Some(keys.len()),
+        ArchiveSelection::Explicit { keys, prefixes, .. } if prefixes.is_empty() => {
+            Some(keys.len())
+        }
         ArchiveSelection::Explicit { .. } => None,
         ArchiveSelection::FragmentAll { .. } => None,
         ArchiveSelection::ManifestFile(_) => None,

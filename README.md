@@ -18,7 +18,7 @@
 
 This repository contains the storage platform stack built around three runtime components:
 
-> - `N1` (`2.1.0`)
+> - `N1` (`2.1.1`)
   Single-node storage kernel with an object-storage core, standalone namespace layer, lifecycle, repair, redistribution, GC, recover-on-read, POSIX-style routes, and SMB Lite.
 > - `N2` (`0.2.0`)
   Multi-node clustering and placement layer built on top of the shared `N1` storage core.
@@ -49,7 +49,7 @@ The major `2.0` change in `N1` is architectural:
 
 That means file and folder semantics such as `mkdir`, rename, move, trash, recover, and browse are handled in the namespace layer, while repair, redistribution, GC, and recover-on-read operate on storage truth and reachability.
 
-Current release notes for the validated `N1 2.1.0` and `Registry 0.9.0` line:
+Current release notes for the validated `N1 2.1.1` and `Registry 0.9.0` line:
 
 - `namespace_v2` is replicated across configured index roots, and `N1` can reseed the owner namespace catalog from a surviving replica after owner-disk loss.
 - fragment-bound Registry listing and stats now prefer `N1` namespace truth instead of stale SQLite-only projection.
@@ -592,7 +592,7 @@ The `2.0` namespace routes are the source of truth for standalone namespace beha
 - `POST /n1/posix/trash`
 - `POST /n1/posix/recover`
 
-For trash browsing, listed grouped directories are recoverable as listed.
+For trash browsing, the root trash list now returns actual trashed item paths. If a deleted item is a directory, it appears as a directory entry. If a deleted item is a nested file such as `videos/video.mp4`, the trash list returns that full file path directly.
 
 ### Self-Signed TLS
 

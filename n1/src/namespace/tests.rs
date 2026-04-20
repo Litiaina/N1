@@ -243,7 +243,7 @@ fn recover_all_and_empty_trash_follow_the_new_lifecycle_model() {
 }
 
 #[test]
-fn trash_listing_materializes_virtual_images_directory_for_nested_files() {
+fn trash_root_lists_actual_nested_file_anchor_for_single_deleted_file() {
     let mut catalog = NamespaceCatalog::new("fragment-a");
     catalog
         .put_file(
@@ -262,16 +262,16 @@ fn trash_listing_materializes_virtual_images_directory_for_nested_files() {
 
     let trash_root = catalog.list_dir("", true).unwrap();
     assert_eq!(trash_root.len(), 1);
-    assert_eq!(trash_root[0].path, "images");
-    assert_eq!(trash_root[0].kind, NamespaceEntryKind::Directory);
-    assert_eq!(trash_root[0].object_id, None);
-    assert!(catalog.trashed_entry("images").unwrap().is_some());
+    assert_eq!(trash_root[0].path, "images/photo.jpg");
+    assert_eq!(trash_root[0].kind, NamespaceEntryKind::File);
+    assert_eq!(trash_root[0].object_id.as_deref(), Some("obj-image"));
 
     let images_dir = catalog.list_dir("images", true).unwrap();
     assert_eq!(images_dir.len(), 1);
     assert_eq!(images_dir[0].path, "images/photo.jpg");
     assert_eq!(images_dir[0].kind, NamespaceEntryKind::File);
     assert_eq!(images_dir[0].object_id.as_deref(), Some("obj-image"));
+    assert!(catalog.trashed_entry("images").unwrap().is_some());
 }
 
 #[test]
@@ -306,6 +306,34 @@ fn recover_and_empty_trash_clean_up_virtual_images_directory() {
 }
 
 #[test]
+fn purge_trash_path_removes_single_nested_file_anchor() {
+    let mut catalog = NamespaceCatalog::new("fragment-a");
+    catalog
+        .put_file(
+            "images/photo.jpg",
+            "obj-image",
+            "ver-image",
+            "storage-image",
+            "image/jpeg",
+            1_024,
+            262_144,
+            100,
+        )
+        .unwrap();
+
+    catalog.trash_path("images/photo.jpg", 200).unwrap();
+    let summary = catalog.purge_trash_path("images/photo.jpg", 260).unwrap();
+
+    assert_eq!(summary.operation, "purge_trash");
+    assert_eq!(summary.kind, NamespaceEntryKind::File);
+    assert_eq!(summary.affected_paths, 1);
+    assert_eq!(summary.affected_objects, 1);
+    assert!(catalog.list_dir("", true).unwrap().is_empty());
+    assert!(catalog.trashed_entry("images/photo.jpg").unwrap().is_none());
+    assert!(catalog.object_head("obj-image").is_none());
+}
+
+#[test]
 fn recover_virtual_screenshots_directory_restores_single_deleted_child() {
     let mut catalog = NamespaceCatalog::new("fragment-a");
     catalog
@@ -332,7 +360,7 @@ fn recover_virtual_screenshots_directory_restores_single_deleted_child() {
 }
 
 #[test]
-fn recover_virtual_screenshots_directory_restores_multiple_deleted_children() {
+fn trash_root_lists_multiple_deleted_children_as_actual_paths() {
     let mut catalog = NamespaceCatalog::new("fragment-a");
     for (path, object_id, version_id, storage_object_id) in [
         (
@@ -364,9 +392,11 @@ fn recover_virtual_screenshots_directory_restores_multiple_deleted_children() {
     }
 
     let trash_root = catalog.list_dir("", true).unwrap();
-    assert_eq!(trash_root.len(), 1);
-    assert_eq!(trash_root[0].path, "Screenshots");
-    assert_eq!(trash_root[0].kind, NamespaceEntryKind::Directory);
+    assert_eq!(trash_root.len(), 2);
+    assert_eq!(trash_root[0].path, "Screenshots/shot-1.png");
+    assert_eq!(trash_root[0].kind, NamespaceEntryKind::File);
+    assert_eq!(trash_root[1].path, "Screenshots/shot-2.png");
+    assert_eq!(trash_root[1].kind, NamespaceEntryKind::File);
 
     let recover = catalog.recover_path("Screenshots", 260).unwrap();
     assert_eq!(recover.operation, "recover");
@@ -419,7 +449,48 @@ fn empty_trash_removes_children_represented_by_virtual_screenshots_directory() {
 }
 
 #[test]
-fn trash_listing_materializes_virtual_directory_chain_for_deep_paths() {
+fn purge_trash_path_removes_deleted_directory_subtree() {
+    let mut catalog = NamespaceCatalog::new("fragment-a");
+    catalog
+        .put_file(
+            "videos/clip-a.mp4",
+            "obj-video-a",
+            "ver-video-a",
+            "storage-video-a",
+            "video/mp4",
+            4_096,
+            262_144,
+            100,
+        )
+        .unwrap();
+    catalog
+        .put_file(
+            "videos/clip-b.mp4",
+            "obj-video-b",
+            "ver-video-b",
+            "storage-video-b",
+            "video/mp4",
+            4_096,
+            262_144,
+            101,
+        )
+        .unwrap();
+
+    catalog.trash_path("videos", 200).unwrap();
+    let summary = catalog.purge_trash_path("videos", 260).unwrap();
+
+    assert_eq!(summary.operation, "purge_trash");
+    assert_eq!(summary.kind, NamespaceEntryKind::Directory);
+    assert_eq!(summary.affected_paths, 3);
+    assert_eq!(summary.affected_objects, 2);
+    assert!(catalog.list_dir("", true).unwrap().is_empty());
+    assert!(catalog.trashed_entry("videos").unwrap().is_none());
+    assert!(catalog.object_head("obj-video-a").is_none());
+    assert!(catalog.object_head("obj-video-b").is_none());
+}
+
+#[test]
+fn trash_root_lists_actual_deep_file_anchor_instead_of_parent_chain() {
     let mut catalog = NamespaceCatalog::new("fragment-a");
     catalog
         .put_file(
@@ -440,9 +511,9 @@ fn trash_listing_materializes_virtual_directory_chain_for_deep_paths() {
 
     let trash_root = catalog.list_dir("", true).unwrap();
     assert_eq!(trash_root.len(), 1);
-    assert_eq!(trash_root[0].path, "videos");
-    assert_eq!(trash_root[0].kind, NamespaceEntryKind::Directory);
-    assert!(catalog.trashed_entry("videos").unwrap().is_some());
+    assert_eq!(trash_root[0].path, "videos/2025/My Videos/clip.mp4");
+    assert_eq!(trash_root[0].kind, NamespaceEntryKind::File);
+    assert_eq!(trash_root[0].object_id.as_deref(), Some("obj-video"));
 
     let videos_dir = catalog.list_dir("videos", true).unwrap();
     assert_eq!(videos_dir.len(), 1);

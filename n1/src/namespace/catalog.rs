@@ -634,6 +634,33 @@ impl NamespaceCatalog {
         )))
     }
 
+    pub fn purge_trash_path(
+        &mut self,
+        path: &str,
+        changed_at_unix: i64,
+    ) -> Result<NamespaceMutationSummary, NamespaceError> {
+        let normalized = normalize_path(path)?;
+        if normalized.is_empty() {
+            return Err(NamespaceError::InvalidPath(
+                "root path cannot be purged from trash".to_string(),
+            ));
+        }
+        let entry = self.trashed_entry(&normalized)?.ok_or_else(|| {
+            NamespaceError::NotFound(format!("path '{normalized}' is not in trash"))
+        })?;
+        if let Some(node_id) = self.resolve_trashed_node_id(&normalized)? {
+            return self.purge_resolved_trashed_path(&normalized, entry, &node_id, changed_at_unix);
+        }
+
+        if entry.kind == NamespaceEntryKind::Directory {
+            return self.purge_virtual_trash_directory(&normalized, changed_at_unix);
+        }
+
+        Err(NamespaceError::NotFound(format!(
+            "path '{normalized}' is not in trash"
+        )))
+    }
+
     fn recover_resolved_trashed_path(
         &mut self,
         normalized: &str,
@@ -696,6 +723,28 @@ impl NamespaceCatalog {
         })
     }
 
+    fn purge_resolved_trashed_path(
+        &mut self,
+        normalized: &str,
+        entry: NamespaceEntry,
+        node_id: &str,
+        changed_at_unix: i64,
+    ) -> Result<NamespaceMutationSummary, NamespaceError> {
+        let _ = changed_at_unix;
+        let node_id = node_id.to_string();
+        let (affected_paths, affected_objects) = self.subtree_counts(&node_id)?;
+        self.remove_subtree(&node_id)?;
+
+        Ok(NamespaceMutationSummary {
+            operation: "purge_trash".to_string(),
+            kind: entry.kind,
+            affected_paths,
+            affected_objects,
+            source_path: Some(normalized.to_string()),
+            destination_path: None,
+        })
+    }
+
     fn recover_virtual_trash_directory(
         &mut self,
         path: &str,
@@ -730,6 +779,44 @@ impl NamespaceCatalog {
 
         Ok(NamespaceMutationSummary {
             operation: "recover".to_string(),
+            kind: NamespaceEntryKind::Directory,
+            affected_paths,
+            affected_objects,
+            source_path: Some(normalized),
+            destination_path: None,
+        })
+    }
+
+    fn purge_virtual_trash_directory(
+        &mut self,
+        path: &str,
+        changed_at_unix: i64,
+    ) -> Result<NamespaceMutationSummary, NamespaceError> {
+        let normalized = normalize_path(path)?;
+        let anchor_paths = self.collect_trash_anchor_paths_under(&normalized);
+        if anchor_paths.is_empty() {
+            return Err(NamespaceError::NotFound(format!(
+                "path '{normalized}' is not in trash"
+            )));
+        }
+
+        let mut affected_paths = 0usize;
+        let mut affected_objects = 0usize;
+        for anchor_path in anchor_paths {
+            let entry = self.trashed_entry(&anchor_path)?.ok_or_else(|| {
+                NamespaceError::NotFound(format!("path '{anchor_path}' is not in trash"))
+            })?;
+            let node_id = self.resolve_trashed_node_id(&anchor_path)?.ok_or_else(|| {
+                NamespaceError::NotFound(format!("path '{anchor_path}' is not in trash"))
+            })?;
+            let summary =
+                self.purge_resolved_trashed_path(&anchor_path, entry, &node_id, changed_at_unix)?;
+            affected_paths = affected_paths.saturating_add(summary.affected_paths);
+            affected_objects = affected_objects.saturating_add(summary.affected_objects);
+        }
+
+        Ok(NamespaceMutationSummary {
+            operation: "purge_trash".to_string(),
             kind: NamespaceEntryKind::Directory,
             affected_paths,
             affected_objects,
@@ -911,8 +998,40 @@ impl NamespaceCatalog {
 
     fn list_trash_dir(&self, path: &str) -> Result<Vec<NamespaceListEntry>, NamespaceError> {
         let normalized = normalize_path(path)?;
+        if normalized.is_empty() {
+            return self.list_trash_root_entries();
+        }
+
+        self.list_nested_trash_dir(&normalized)
+    }
+
+    fn list_trash_root_entries(&self) -> Result<Vec<NamespaceListEntry>, NamespaceError> {
+        let mut out = Vec::with_capacity(self.trash_anchor_index.len());
+        for (anchor_path, anchor_id) in &self.trash_anchor_index {
+            let node = self
+                .nodes
+                .get(anchor_id)
+                .ok_or_else(|| self.missing_node_error(anchor_id))?;
+            let lifecycle = self.trashed_lifecycle_for_node(anchor_id)?;
+            out.push(NamespaceListEntry {
+                name: base_name(anchor_path),
+                path: anchor_path.clone(),
+                kind: node.kind,
+                lifecycle,
+                object_id: node.object_id.clone(),
+                created_at_unix: node.created_at_unix,
+                updated_at_unix: node.updated_at_unix,
+            });
+        }
+        Ok(out)
+    }
+
+    fn list_nested_trash_dir(
+        &self,
+        normalized: &str,
+    ) -> Result<Vec<NamespaceListEntry>, NamespaceError> {
         if !normalized.is_empty() {
-            match self.trashed_entry(&normalized)? {
+            match self.trashed_entry(normalized)? {
                 Some(entry) if entry.kind == NamespaceEntryKind::Directory => {}
                 Some(_) => {
                     return Err(NamespaceError::Conflict(format!(
@@ -928,12 +1047,10 @@ impl NamespaceCatalog {
         }
 
         let mut out = BTreeMap::<String, NamespaceListEntry>::new();
-        for entry in self.visible_entries_under_prefix(true, &normalized)? {
-            let relative = if normalized.is_empty() {
-                entry.path.clone()
-            } else if entry.path == normalized {
+        for entry in self.visible_entries_under_prefix(true, normalized)? {
+            let relative = if entry.path == normalized {
                 String::new()
-            } else if let Some(suffix) = entry.path.strip_prefix(&(normalized.clone() + "/")) {
+            } else if let Some(suffix) = entry.path.strip_prefix(&(normalized.to_string() + "/")) {
                 suffix.to_string()
             } else {
                 continue;
@@ -943,7 +1060,7 @@ impl NamespaceCatalog {
             }
 
             if let Some((segment, _)) = relative.split_once('/') {
-                let virtual_path = join_visible_path(&normalized, segment);
+                let virtual_path = join_visible_path(normalized, segment);
                 Self::upsert_virtual_trash_directory(
                     &mut out,
                     &virtual_path,

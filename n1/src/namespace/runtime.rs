@@ -247,6 +247,21 @@ impl NamespaceRuntime {
         Ok(summary)
     }
 
+    pub async fn purge_trash_path(
+        &self,
+        fragment: &str,
+        path: &str,
+    ) -> Result<crate::namespace::models::NamespaceMutationSummary, AppError> {
+        let changed_at = Utc::now().timestamp();
+        let catalog = self.load_catalog(fragment).await?;
+        let mut guard = catalog.lock().await;
+        let summary = guard
+            .purge_trash_path(path, changed_at)
+            .map_err(namespace_error_to_app)?;
+        self.persist_catalog(fragment, &guard).await?;
+        Ok(summary)
+    }
+
     pub async fn recover_all(
         &self,
         fragment: &str,
@@ -851,7 +866,11 @@ fn namespace_db_paths(fragment: &str) -> Result<Vec<PathBuf>, AppError> {
         if idx == owner_idx {
             continue;
         }
-        ordered.push(root.join(fragment).join(NAMESPACE_V2_DIR).join(NAMESPACE_V2_FILE));
+        ordered.push(
+            root.join(fragment)
+                .join(NAMESPACE_V2_DIR)
+                .join(NAMESPACE_V2_FILE),
+        );
     }
     Ok(ordered)
 }
@@ -910,7 +929,8 @@ fn copy_namespace_db_file(source: &Path, destination: &Path) -> Result<(), AppEr
             destination.display()
         )));
     };
-    fs::create_dir_all(parent).map_err(|err| AppError::Io(err, format!("mkdir {}", parent.display())))?;
+    fs::create_dir_all(parent)
+        .map_err(|err| AppError::Io(err, format!("mkdir {}", parent.display())))?;
     let temp_path = destination.with_extension(format!(
         "{}.tmp-{}",
         destination
@@ -922,7 +942,11 @@ fn copy_namespace_db_file(source: &Path, destination: &Path) -> Result<(), AppEr
     fs::copy(source, &temp_path).map_err(|err| {
         AppError::Io(
             err,
-            format!("copy namespace {} -> {}", source.display(), temp_path.display()),
+            format!(
+                "copy namespace {} -> {}",
+                source.display(),
+                temp_path.display()
+            ),
         )
     })?;
     fs::rename(&temp_path, destination).map_err(|err| {
@@ -990,7 +1014,9 @@ pub fn unexpected_response(status: StatusCode, context: &str) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::{global_namespace_runtime, namespace_db_path, namespace_db_paths};
-    use crate::core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS, ObjectMetadata};
+    use crate::core::disk_manager::{
+        BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS, ObjectMetadata,
+    };
     use crate::core::fragment_metadata::{
         DEFAULT_INDEX_PARTITION_COUNT, clear_fragment_partition_count_cache_for_test,
         set_configured_index_partition_count,
@@ -1022,7 +1048,8 @@ mod tests {
         clear_fragment_partition_count_cache_for_test();
         indexdb_store::clear_cached_dbs_for_test();
 
-        let base = std::env::temp_dir().join(format!("n1-namespace-runtime-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("n1-namespace-runtime-{}", std::process::id()));
         let index_roots = if let Some(existing) = INDEX_STORE_DISKS.get() {
             existing.iter().map(PathBuf::from).collect::<Vec<_>>()
         } else {

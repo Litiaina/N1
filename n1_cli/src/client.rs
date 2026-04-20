@@ -5,9 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use cli_core::client::{
     AuthSession, CreateFragmentRequest, DynError, N1_AUTH_ROUTES, api_url,
-    authenticate_with_routes, build_client, fetch_json, fetch_json_query, get_base_url,
-    get_secret, print_output, print_response_message, send_query_only, send_without_body,
-    watch_rendered,
+    authenticate_with_routes, build_client, fetch_json, fetch_json_query, get_base_url, get_secret,
+    print_output, print_response_message, send_query_only, send_without_body, watch_rendered,
 };
 use cli_core::models::{
     GcJobStatus, HealthResponse, ListUploadsResponse, RedistributionJobStatus, RepairJobStatus,
@@ -105,9 +104,14 @@ pub async fn run(cli: Cli) -> Result<(), DynError> {
             let secret = get_secret(cli.secret.clone())?;
             let auth_hint = resolve_cli_auth_fragment_hint(&cli)?;
             let auth_fragment = resolve_n1_auth_fragment(&client, &base_url, &auth_hint).await?;
-            let mut session =
-                authenticate_with_routes(&client, &base_url, &secret, &auth_fragment, N1_AUTH_ROUTES)
-                    .await?;
+            let mut session = authenticate_with_routes(
+                &client,
+                &base_url,
+                &secret,
+                &auth_fragment,
+                N1_AUTH_ROUTES,
+            )
+            .await?;
             handle_authenticated_command(&client, &base_url, &mut session, &cli).await
         }
     }

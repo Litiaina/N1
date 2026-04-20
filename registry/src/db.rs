@@ -4198,15 +4198,18 @@ fn update_object_status_chunk(
 fn quota_for_user(conn: &Connection, owner_uid: &str) -> Result<(i64, i64), RegistryError> {
     let quota_limit = conn
         .query_row(
-        "SELECT quota_limit_bytes, quota_used_bytes FROM users WHERE uid = ?1",
-        params![owner_uid],
-        |row| row.get(0),
-    )
-    .map_err(|err| match err {
-        rusqlite::Error::QueryReturnedNoRows => RegistryError::not_found("user not found"),
-        other => sql_err(other),
-    })?;
-    Ok((quota_limit, committed_quota_used_bytes_for_user(conn, owner_uid)?))
+            "SELECT quota_limit_bytes, quota_used_bytes FROM users WHERE uid = ?1",
+            params![owner_uid],
+            |row| row.get(0),
+        )
+        .map_err(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => RegistryError::not_found("user not found"),
+            other => sql_err(other),
+        })?;
+    Ok((
+        quota_limit,
+        committed_quota_used_bytes_for_user(conn, owner_uid)?,
+    ))
 }
 
 fn committed_quota_used_bytes_for_user(

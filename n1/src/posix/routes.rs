@@ -215,6 +215,32 @@ async fn posix_recover(
     }))
 }
 
+async fn posix_purge(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Json(req): Json<PosixPathRequest>,
+) -> Result<Json<PosixMutationResponse>, AppError> {
+    let _ = state;
+    if !claims.delete {
+        return Err(AppError::Forbidden("Delete permission required".into()));
+    }
+    let summary = global_namespace_runtime()
+        .purge_trash_path(&claims.fragment, &req.path)
+        .await?;
+    Ok(Json(PosixMutationResponse {
+        operation: summary.operation,
+        kind: match summary.kind {
+            NamespaceEntryKind::File => PosixNodeKind::File,
+            NamespaceEntryKind::Directory => PosixNodeKind::Directory,
+        },
+        affected: summary.affected_paths,
+        path: summary.source_path,
+        source_path: None,
+        destination_path: None,
+        created: None,
+    }))
+}
+
 pub fn build_posix_read_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/n1/posix/list", get(posix_list))
@@ -228,11 +254,12 @@ pub fn build_posix_write_routes() -> Router<Arc<AppState>> {
         .route("/n1/posix/move", post(posix_rename))
         .route("/n1/posix/trash", post(posix_trash))
         .route("/n1/posix/recover", post(posix_recover))
+        .route("/n1/posix/purge", post(posix_purge))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{posix_list, posix_mkdir, posix_recover, posix_trash};
+    use super::{posix_list, posix_mkdir, posix_purge, posix_recover, posix_trash};
     use crate::core::disk_manager::{
         BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS, ObjectMetadata,
     };
@@ -565,7 +592,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn posix_trash_list_shows_virtual_images_directory_and_nested_file() {
+    async fn posix_trash_root_lists_actual_nested_file_path() {
         let _guard = TEST_LOCK.lock().await;
         ensure_storage_config().await;
 
@@ -608,10 +635,10 @@ mod tests {
         .expect("trash root list")
         .0;
         assert_eq!(trash_root.entries.len(), 1);
-        assert_eq!(trash_root.entries[0].path, "images");
+        assert_eq!(trash_root.entries[0].path, "images/photo.jpg");
         assert_eq!(
             trash_root.entries[0].kind,
-            crate::posix::models::PosixNodeKind::Directory
+            crate::posix::models::PosixNodeKind::File
         );
 
         let trash_images = posix_list(
@@ -659,7 +686,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn posix_trash_list_shows_virtual_directory_chain_for_deep_paths() {
+    async fn posix_trash_root_lists_actual_deep_file_path() {
         let _guard = TEST_LOCK.lock().await;
         ensure_storage_config().await;
 
@@ -702,10 +729,10 @@ mod tests {
         .expect("trash root list")
         .0;
         assert_eq!(trash_root.entries.len(), 1);
-        assert_eq!(trash_root.entries[0].path, "videos");
+        assert_eq!(trash_root.entries[0].path, "videos/2025/My Videos/clip.mp4");
         assert_eq!(
             trash_root.entries[0].kind,
-            crate::posix::models::PosixNodeKind::Directory
+            crate::posix::models::PosixNodeKind::File
         );
 
         let videos_page = posix_list(
@@ -794,7 +821,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn posix_recover_accepts_virtual_screenshots_directory_from_trash_listing() {
+    async fn posix_trash_root_lists_actual_screenshot_paths_for_selective_recover() {
         let _guard = TEST_LOCK.lock().await;
         ensure_storage_config().await;
 
@@ -845,28 +872,25 @@ mod tests {
         .await
         .expect("trash root list")
         .0;
-        assert_eq!(trash_root.entries.len(), 1);
-        assert_eq!(trash_root.entries[0].path, "Screenshots");
-        assert_eq!(
-            trash_root.entries[0].kind,
-            crate::posix::models::PosixNodeKind::Directory
-        );
+        assert_eq!(trash_root.entries.len(), 2);
+        assert_eq!(trash_root.entries[0].path, "Screenshots/shot-1.png");
+        assert_eq!(trash_root.entries[1].path, "Screenshots/shot-2.png");
 
         let recover = posix_recover(
             State(state.clone()),
             full_claims(&fragment),
             Json(PosixPathRequest {
-                path: "Screenshots".to_string(),
+                path: "Screenshots/shot-1.png".to_string(),
             }),
         )
         .await
-        .expect("recover screenshots group")
+        .expect("recover selected screenshot")
         .0;
         assert_eq!(recover.operation, "recover");
-        assert_eq!(recover.affected, 2);
-        assert_eq!(recover.path.as_deref(), Some("Screenshots"));
+        assert_eq!(recover.affected, 1);
+        assert_eq!(recover.path.as_deref(), Some("Screenshots/shot-1.png"));
 
-        let empty_trash = posix_list(
+        let remaining_trash = posix_list(
             full_claims(&fragment),
             Query(PosixListQuery {
                 path: None,
@@ -876,9 +900,20 @@ mod tests {
             }),
         )
         .await
-        .expect("trash list after recover")
+        .expect("trash list after selective recover")
         .0;
-        assert!(empty_trash.entries.is_empty());
+        assert_eq!(remaining_trash.entries.len(), 1);
+        assert_eq!(remaining_trash.entries[0].path, "Screenshots/shot-2.png");
+
+        let _ = posix_recover(
+            State(state.clone()),
+            full_claims(&fragment),
+            Json(PosixPathRequest {
+                path: "Screenshots/shot-2.png".to_string(),
+            }),
+        )
+        .await
+        .expect("recover second screenshot");
 
         let live_screenshots = posix_list(
             full_claims(&fragment),
@@ -895,5 +930,65 @@ mod tests {
         assert_eq!(live_screenshots.entries.len(), 2);
         assert_eq!(live_screenshots.entries[0].path, "Screenshots/shot-1.png");
         assert_eq!(live_screenshots.entries[1].path, "Screenshots/shot-2.png");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn posix_purge_removes_single_trashed_item_from_listing() {
+        let _guard = TEST_LOCK.lock().await;
+        ensure_storage_config().await;
+
+        let fragment = hex::encode(Sha256::digest(
+            format!("fragment-{}", Ulid::new()).as_bytes(),
+        ));
+        setup_fragment(&fragment).await;
+
+        seed_logical_file(
+            &fragment,
+            "videos/video.mp4",
+            "abababababababababababababababababababababababababababababababab",
+            1_700_000_200,
+        )
+        .await;
+
+        let state = Arc::new(AppState {
+            ws_manager: WsConnectionManager::new(),
+        });
+        let _ = posix_trash(
+            State(state.clone()),
+            full_claims(&fragment),
+            Json(PosixPathRequest {
+                path: "videos/video.mp4".to_string(),
+            }),
+        )
+        .await
+        .expect("trash item before purge");
+
+        let purge = posix_purge(
+            State(state),
+            full_claims(&fragment),
+            Json(PosixPathRequest {
+                path: "videos/video.mp4".to_string(),
+            }),
+        )
+        .await
+        .expect("purge trashed item")
+        .0;
+        assert_eq!(purge.operation, "purge_trash");
+        assert_eq!(purge.affected, 1);
+        assert_eq!(purge.path.as_deref(), Some("videos/video.mp4"));
+
+        let empty_trash = posix_list(
+            full_claims(&fragment),
+            Query(PosixListQuery {
+                path: None,
+                limit: Some(200),
+                continuation_token: None,
+                trash: Some(true),
+            }),
+        )
+        .await
+        .expect("trash list after purge")
+        .0;
+        assert!(empty_trash.entries.is_empty());
     }
 }

@@ -3788,7 +3788,10 @@ mod tests {
         let base_url = spawn_registry_server(state).await;
         let client = Client::new();
         let response = client
-            .get(format!("{}/v1/objects?fragment=fragment-a&limit=200", base_url))
+            .get(format!(
+                "{}/v1/objects?fragment=fragment-a&limit=200",
+                base_url
+            ))
             .bearer_auth(&access_token)
             .send()
             .await

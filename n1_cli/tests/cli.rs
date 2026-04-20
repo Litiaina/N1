@@ -21,8 +21,7 @@ const EXPIRING_TOKEN: &str = "expiring-cli-token";
 const INITIAL_REFRESH_TOKEN: &str = "refresh-token-1";
 const ROTATED_REFRESH_TOKEN: &str = "refresh-token-2";
 const AUTH_FRAGMENT_NAME: &str = "mainframe";
-const AUTH_FRAGMENT_HASH: &str =
-    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const AUTH_FRAGMENT_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 #[derive(serde::Deserialize)]
 struct AuthPayload {
@@ -131,7 +130,11 @@ async fn create_fragment_handler(Json(payload): Json<FragmentCreatePayload>) -> 
 
 async fn fragment_hash_handler(Json(payload): Json<FragmentHashPayload>) -> impl IntoResponse {
     if payload.fragment != AUTH_FRAGMENT_NAME && payload.fragment != AUTH_FRAGMENT_HASH {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "fragment not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "fragment not found"})),
+        )
+            .into_response();
     }
     (
         StatusCode::OK,
@@ -423,7 +426,10 @@ async fn uploads_status_can_emit_json() {
     let router = Router::new()
         .route("/n1/fragments/hash", get(fragment_hash_handler))
         .route("/n1/auth/fragment", post(auth_handler))
-        .route("/n1/upload/multipart/{version_id}", get(upload_status_handler));
+        .route(
+            "/n1/upload/multipart/{version_id}",
+            get(upload_status_handler),
+        );
     let (base_url, handle) = spawn_server(router).await;
 
     let output = Command::cargo_bin("litiaina-n1-cli")

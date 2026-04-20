@@ -16,7 +16,10 @@ pub async fn prepare_logical_archive_entries(
         return Ok(None);
     }
 
-    let has_prefixes = req.prefix.as_deref().is_some_and(|value| !value.trim().is_empty())
+    let has_prefixes = req
+        .prefix
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
         || !req.prefixes.is_empty();
     if req.keys.is_empty() && !has_prefixes {
         return Ok(None);
@@ -34,7 +37,8 @@ pub async fn prepare_logical_archive_entries(
     }
 
     for prefix in archive_prefixes(req)? {
-        for logical_path in collect_logical_file_paths(fragment, &prefix, req.include_internal).await?
+        for logical_path in
+            collect_logical_file_paths(fragment, &prefix, req.include_internal).await?
         {
             if let Some(entry) = prepare_logical_archive_entry(fragment, &logical_path).await? {
                 if seen_paths.insert(entry.archive_path.clone()) {
@@ -113,7 +117,10 @@ async fn prepare_logical_archive_entry(
         return Ok(None);
     }
 
-    let Some(entry) = global_namespace_runtime().entry(fragment, &normalized).await? else {
+    let Some(entry) = global_namespace_runtime()
+        .entry(fragment, &normalized)
+        .await?
+    else {
         return Ok(None);
     };
     if entry.kind != NamespaceEntryKind::File || !entry.lifecycle.is_live() {

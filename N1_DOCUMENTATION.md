@@ -1,6 +1,6 @@
 # N1 API Documentation
 
-`N1` is the standalone storage kernel in this repository. In `2.1.0`, it exposes:
+`N1` is the standalone storage kernel in this repository. In `2.1.1`, it exposes:
 
 - fragment provisioning
 - fragment-scoped authentication
@@ -807,6 +807,8 @@ Behavior:
 
 - `trash=false`: live namespace browsing
 - `trash=true`: trash browsing
+- when `path` is omitted or empty and `trash=true`, the response is an item-based trash inventory:
+  deleted files are listed by their real logical file path, and deleted directories are listed as directories
 
 ### `GET /n1/posix/stat`
 
@@ -875,10 +877,29 @@ Request body:
 }
 ```
 
-Important `2.0` behavior:
+Important `2.1.1` behavior:
 
-- if trash listing returns a grouped virtual directory such as `Screenshots` or `videos/2025`, single recover accepts that same `path` and restores the represented trashed children
-- callers do not need to know whether the listed trash entry was an exact trashed node or a grouped directory view
+- root trash listing returns recoverable trashed items directly
+- recovering a listed file uses that exact file path
+- recovering a listed directory restores the deleted directory subtree
+
+### `POST /n1/posix/purge`
+
+Remove a single trashed file or trashed directory subtree from the trash lifecycle.
+
+Request body:
+
+```json
+{
+  "path": "videos/demo.mp4"
+}
+```
+
+Behavior:
+
+- the item stops being recoverable immediately
+- underlying immutable storage is still reclaimed later by garbage collection
+- deleting a trashed directory path removes the entire deleted subtree represented by that directory
 
 ## Lifecycle API
 

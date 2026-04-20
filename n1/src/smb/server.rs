@@ -2131,9 +2131,7 @@ async fn move_lock_registration(
             if *owner_connection == connection_id && *owner_file_id == file_id
     ) {
         smb_state.locks.remove(old_path.as_str());
-        smb_state
-            .locks
-            .insert(new_path, (connection_id, file_id));
+        smb_state.locks.insert(new_path, (connection_id, file_id));
     }
 }
 
@@ -3331,10 +3329,7 @@ async fn handle_set_info(
     match file_info_class {
         FILE_INFO_CLASS_RENAME_INFORMATION => {
             if current.object_key.is_empty() {
-                return (
-                    SMB2_STATUS_ACCESS_DENIED,
-                    build_not_supported_error_body(),
-                );
+                return (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body());
             }
             if current.write_handle.is_some() {
                 return (SMB2_STATUS_ACCESS_DENIED, build_not_supported_error_body());
@@ -5090,8 +5085,8 @@ mod tests {
     use crate::core::sync::ensure_fragment_blob_directories;
     use crate::core::upload::{
         DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC,
-        STRIPE_SIZE_ATOMIC, UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC,
-        WRITER_BUFFER_SIZE_ATOMIC, upload_object_one_shot,
+        STRIPE_SIZE_ATOMIC, UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
+        upload_object_one_shot,
     };
     use crate::routes::storage_routes::AppState;
     use crate::settings::constants::CONFIG_FILE;
@@ -5751,7 +5746,12 @@ mod tests {
             pattern_bytes.extend_from_slice(&ch.to_le_bytes());
         }
 
-        let mut req = build_smb2_header(SMB2_COMMAND_QUERY_DIRECTORY, message_id, tree_id, session_id);
+        let mut req = build_smb2_header(
+            SMB2_COMMAND_QUERY_DIRECTORY,
+            message_id,
+            tree_id,
+            session_id,
+        );
         let mut body = vec![0u8; 32 + pattern_bytes.len()];
         body[0..2].copy_from_slice(&33u16.to_le_bytes());
         body[2] = file_info_class;
@@ -5774,10 +5774,16 @@ mod tests {
 
     fn parse_query_directory_names(response: &[u8]) -> Vec<String> {
         let body_offset = SMB2_HEADER_LEN;
-        let data_offset =
-            u16::from_le_bytes(response[body_offset + 2..body_offset + 4].try_into().expect("dir data offset")) as usize;
-        let data_length =
-            u32::from_le_bytes(response[body_offset + 4..body_offset + 8].try_into().expect("dir data length")) as usize;
+        let data_offset = u16::from_le_bytes(
+            response[body_offset + 2..body_offset + 4]
+                .try_into()
+                .expect("dir data offset"),
+        ) as usize;
+        let data_length = u32::from_le_bytes(
+            response[body_offset + 4..body_offset + 8]
+                .try_into()
+                .expect("dir data length"),
+        ) as usize;
         if data_offset == 0 || data_length == 0 {
             return Vec::new();
         }
@@ -5785,11 +5791,16 @@ mod tests {
         let mut cursor = data_offset;
         let end = data_offset + data_length;
         while cursor < end {
-            let next_offset =
-                u32::from_le_bytes(response[cursor..cursor + 4].try_into().expect("next offset")) as usize;
-            let name_len =
-                u32::from_le_bytes(response[cursor + 8..cursor + 12].try_into().expect("name len"))
-                    as usize;
+            let next_offset = u32::from_le_bytes(
+                response[cursor..cursor + 4]
+                    .try_into()
+                    .expect("next offset"),
+            ) as usize;
+            let name_len = u32::from_le_bytes(
+                response[cursor + 8..cursor + 12]
+                    .try_into()
+                    .expect("name len"),
+            ) as usize;
             let name_start = cursor + 12;
             let name_end = name_start + name_len;
             let mut utf16 = Vec::with_capacity(name_len / 2);
@@ -6586,19 +6597,43 @@ mod tests {
             Some(SMB2_STATUS_SUCCESS)
         );
         assert_eq!(
-            set_info_status(FILE_INFO_CLASS_DISPOSITION_INFORMATION, false, false, true, true),
+            set_info_status(
+                FILE_INFO_CLASS_DISPOSITION_INFORMATION,
+                false,
+                false,
+                true,
+                true
+            ),
             Some(SMB2_STATUS_SUCCESS)
         );
         assert_eq!(
-            set_info_status(FILE_INFO_CLASS_RENAME_INFORMATION, false, false, true, false),
+            set_info_status(
+                FILE_INFO_CLASS_RENAME_INFORMATION,
+                false,
+                false,
+                true,
+                false
+            ),
             Some(SMB2_STATUS_ACCESS_DENIED)
         );
         assert_eq!(
-            set_info_status(FILE_INFO_CLASS_ALLOCATION_INFORMATION, false, false, true, false),
+            set_info_status(
+                FILE_INFO_CLASS_ALLOCATION_INFORMATION,
+                false,
+                false,
+                true,
+                false
+            ),
             Some(SMB2_STATUS_SUCCESS)
         );
         assert_eq!(
-            set_info_status(FILE_INFO_CLASS_ALLOCATION_INFORMATION, false, false, false, false),
+            set_info_status(
+                FILE_INFO_CLASS_ALLOCATION_INFORMATION,
+                false,
+                false,
+                false,
+                false
+            ),
             Some(SMB2_STATUS_ACCESS_DENIED)
         );
     }
@@ -6627,8 +6662,14 @@ mod tests {
         .await;
         assert_eq!(response_status(&create_dir), SMB2_STATUS_SUCCESS);
         let docs_dir_id = response_file_id(&create_dir);
-        let close_docs_dir =
-            smb_close_file(&mut stream, &mut message_id, tree_id, session_id, docs_dir_id).await;
+        let close_docs_dir = smb_close_file(
+            &mut stream,
+            &mut message_id,
+            tree_id,
+            session_id,
+            docs_dir_id,
+        )
+        .await;
         assert_eq!(response_status(&close_docs_dir), SMB2_STATUS_SUCCESS);
 
         let root_dir_open = smb_open_file(
@@ -6658,8 +6699,14 @@ mod tests {
         assert_eq!(response_status(&root_query_response), SMB2_STATUS_SUCCESS);
         let root_names = parse_query_directory_names(&root_query_response);
         assert!(root_names.iter().any(|name| name == "docs"));
-        let close_root_dir =
-            smb_close_file(&mut stream, &mut message_id, tree_id, session_id, root_dir_id).await;
+        let close_root_dir = smb_close_file(
+            &mut stream,
+            &mut message_id,
+            tree_id,
+            session_id,
+            root_dir_id,
+        )
+        .await;
         assert_eq!(response_status(&close_root_dir), SMB2_STATUS_SUCCESS);
 
         smb_write_all(
@@ -6700,8 +6747,14 @@ mod tests {
         assert_eq!(response_status(&docs_query_response), SMB2_STATUS_SUCCESS);
         let docs_names = parse_query_directory_names(&docs_query_response);
         assert!(docs_names.iter().any(|name| name == "alpha.txt"));
-        let close_docs_dir =
-            smb_close_file(&mut stream, &mut message_id, tree_id, session_id, docs_dir_id).await;
+        let close_docs_dir = smb_close_file(
+            &mut stream,
+            &mut message_id,
+            tree_id,
+            session_id,
+            docs_dir_id,
+        )
+        .await;
         assert_eq!(response_status(&close_docs_dir), SMB2_STATUS_SUCCESS);
 
         let rename_docs_open = smb_open_file(
@@ -6728,8 +6781,14 @@ mod tests {
         );
         let rename_docs_response = send_req(&mut stream, &rename_docs_request).await;
         assert_eq!(response_status(&rename_docs_response), SMB2_STATUS_SUCCESS);
-        let close_renamed_docs =
-            smb_close_file(&mut stream, &mut message_id, tree_id, session_id, rename_docs_id).await;
+        let close_renamed_docs = smb_close_file(
+            &mut stream,
+            &mut message_id,
+            tree_id,
+            session_id,
+            rename_docs_id,
+        )
+        .await;
         assert_eq!(response_status(&close_renamed_docs), SMB2_STATUS_SUCCESS);
 
         let old_docs_missing = smb_open_file(
@@ -6744,7 +6803,10 @@ mod tests {
             FILE_DIRECTORY_FILE,
         )
         .await;
-        assert_eq!(response_status(&old_docs_missing), SMB2_STATUS_OBJECT_NAME_NOT_FOUND);
+        assert_eq!(
+            response_status(&old_docs_missing),
+            SMB2_STATUS_OBJECT_NAME_NOT_FOUND
+        );
 
         let renamed_docs_open = smb_open_file(
             &mut stream,
@@ -6770,7 +6832,10 @@ mod tests {
             "*",
         );
         let renamed_docs_query_response = send_req(&mut stream, &renamed_docs_query).await;
-        assert_eq!(response_status(&renamed_docs_query_response), SMB2_STATUS_SUCCESS);
+        assert_eq!(
+            response_status(&renamed_docs_query_response),
+            SMB2_STATUS_SUCCESS
+        );
         let renamed_docs_names = parse_query_directory_names(&renamed_docs_query_response);
         assert!(renamed_docs_names.iter().any(|name| name == "alpha.txt"));
         let close_renamed_docs_dir = smb_close_file(
@@ -6781,7 +6846,10 @@ mod tests {
             renamed_docs_dir_id,
         )
         .await;
-        assert_eq!(response_status(&close_renamed_docs_dir), SMB2_STATUS_SUCCESS);
+        assert_eq!(
+            response_status(&close_renamed_docs_dir),
+            SMB2_STATUS_SUCCESS
+        );
 
         let rename_open = smb_open_file(
             &mut stream,
@@ -6807,8 +6875,14 @@ mod tests {
         );
         let rename_response = send_req(&mut stream, &rename_request).await;
         assert_eq!(response_status(&rename_response), SMB2_STATUS_SUCCESS);
-        let close_renamed =
-            smb_close_file(&mut stream, &mut message_id, tree_id, session_id, rename_file_id).await;
+        let close_renamed = smb_close_file(
+            &mut stream,
+            &mut message_id,
+            tree_id,
+            session_id,
+            rename_file_id,
+        )
+        .await;
         assert_eq!(response_status(&close_renamed), SMB2_STATUS_SUCCESS);
 
         let renamed = smb_read_all(
@@ -6846,8 +6920,14 @@ mod tests {
         );
         let trash_response = send_req(&mut stream, &trash_request).await;
         assert_eq!(response_status(&trash_response), SMB2_STATUS_SUCCESS);
-        let close_trash =
-            smb_close_file(&mut stream, &mut message_id, tree_id, session_id, trash_file_id).await;
+        let close_trash = smb_close_file(
+            &mut stream,
+            &mut message_id,
+            tree_id,
+            session_id,
+            trash_file_id,
+        )
+        .await;
         assert_eq!(response_status(&close_trash), SMB2_STATUS_SUCCESS);
 
         let missing_after_trash = smb_open_file(
