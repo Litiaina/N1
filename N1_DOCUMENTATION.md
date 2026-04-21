@@ -1,6 +1,6 @@
 # N1 API Documentation
 
-`N1` is the standalone storage kernel in this repository. In `2.1.1`, it exposes:
+`N1` is the standalone storage kernel in this repository. In `2.1.2`, it exposes:
 
 - fragment provisioning
 - fragment-scoped authentication
@@ -38,6 +38,8 @@ Operational note:
 
 - `namespace_v2` is replicated across configured index roots
 - if the owner namespace disk is lost but another namespace replica survives, `N1` reseeds the owner catalog from the surviving replica before serving logical namespace reads
+- health reports namespace_v2 replica debt under `consistency.namespace_v2`
+- repair reconciles missing, divergent, or corrupt namespace_v2 catalog replicas across reachable index roots
 
 ### Permission Bits
 
@@ -877,11 +879,27 @@ Request body:
 }
 ```
 
-Important `2.1.1` behavior:
+Important `2.1.1+` behavior:
 
 - root trash listing returns recoverable trashed items directly
 - recovering a listed file uses that exact file path
 - recovering a listed directory restores the deleted directory subtree
+
+Important `2.1.2` behavior:
+
+- each trash root has a stable `trash_entry_id`
+- repeated deletes of the same visible path produce separate trash generations
+- recover and purge should send `trash_entry_id` when it is present in list/stat responses
+- path-only recover or purge remains available for legacy callers, but ambiguous same-path trash generations must be resolved by `trash_entry_id`
+
+Request body for an exact trash generation:
+
+```json
+{
+  "path": "videos/demo.mp4",
+  "trash_entry_id": "01K..."
+}
+```
 
 ### `POST /n1/posix/purge`
 
@@ -891,7 +909,8 @@ Request body:
 
 ```json
 {
-  "path": "videos/demo.mp4"
+  "path": "videos/demo.mp4",
+  "trash_entry_id": "01K..."
 }
 ```
 

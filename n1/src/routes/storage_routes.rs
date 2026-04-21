@@ -277,6 +277,18 @@ async fn commit_logical_upload_from_meta(
         .await
 }
 
+fn emit_logical_file_uploaded(
+    state: &Arc<AppState>,
+    fragment: &str,
+    metadata: &crate::core::disk_manager::ObjectMetadata,
+    logical_path: &str,
+) {
+    let mut event_meta = metadata.clone();
+    event_meta.object_key = logical_path.to_string();
+    event_meta.parts.clear();
+    state.emit(fragment, StorageEventPayload::FileUploaded(event_meta));
+}
+
 async fn mint_signed_read_url_scoped(
     claims: Claims,
     AxumJson(mut req): AxumJson<SignedReadUrlRequest>,
@@ -427,6 +439,8 @@ async fn empty_trash_scoped(
             "operation": summary.operation,
             "affected_paths": summary.affected_paths,
             "affected_objects": summary.affected_objects,
+            "trash_entry_id": summary.trash_entry_id,
+            "deleted_at_unix": summary.deleted_at_unix,
         })),
     ))
 }
@@ -447,6 +461,8 @@ async fn delete_object_scoped(
             "operation": summary.operation,
             "affected_paths": summary.affected_paths,
             "affected_objects": summary.affected_objects,
+            "trash_entry_id": summary.trash_entry_id,
+            "deleted_at_unix": summary.deleted_at_unix,
         })),
     ))
 }
@@ -605,7 +621,7 @@ async fn upload_object_one_shot_scoped(
     let fragment = claims.fragment.clone();
     let physical = resolve_logical_write_key(&fragment, &object_key).await?;
     let response = upload_object_one_shot_impl(
-        State(state),
+        State(state.clone()),
         claims,
         headers,
         Path((fragment.clone(), physical.clone())),
@@ -621,6 +637,7 @@ async fn upload_object_one_shot_scoped(
         parse_json_response(response, "one-shot upload").await?;
     commit_logical_upload_from_meta(&fragment, &object_key, &physical, &parsed).await?;
     parsed.object_key = object_key;
+    emit_logical_file_uploaded(&state, &fragment, &parsed, &parsed.object_key);
     Ok((StatusCode::CREATED, AxumJson(parsed)).into_response())
 }
 
@@ -686,7 +703,7 @@ async fn finalize_object_upload_scoped(
         .map(|value| value.physical_object_id.clone())
         .unwrap_or_else(|| key_query.object_key.clone());
     let response = finalize_object_upload_impl(
-        State(state),
+        State(state.clone()),
         claims,
         Path((fragment.clone(), version_id.clone(), session_id)),
         Query(crate::core::disk_manager::ObjectKeyQuery {
@@ -711,6 +728,7 @@ async fn finalize_object_upload_scoped(
         .clear_pending_upload(&parsed.fragment, &parsed.version_id)
         .await?;
     parsed.object_key = logical_path;
+    emit_logical_file_uploaded(&state, &fragment, &parsed, &parsed.object_key);
     Ok((StatusCode::OK, AxumJson(parsed)).into_response())
 }
 
@@ -1060,6 +1078,7 @@ mod tests {
     use crate::settings::create_config::create_default_config_ini;
     use crate::structs::auth_structs::Claims;
     use crate::websocket::manager::WsConnectionManager;
+    use crate::websocket::ws_structs::StorageEventPayload;
     use axum::Json as AxumJson;
     use axum::body::Body;
     use axum::extract::{Path, Query, State};
@@ -1473,5 +1492,61 @@ mod tests {
             .await
             .expect("download folder archive");
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scoped_one_shot_upload_websocket_emits_logical_path() {
+        let _guard = TEST_LOCK.lock().await;
+        ensure_storage_config().await;
+        ensure_upload_runtime_config();
+
+        let fragment = {
+            let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+            hex::encode(digest)
+        };
+        setup_fragment(&fragment).await;
+
+        let state = Arc::new(AppState {
+            ws_manager: WsConnectionManager::new(),
+        });
+        let mut events = state.ws_manager.subscribe(&fragment);
+
+        let payload = "logical-ws-demo";
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from_str(&payload.len().to_string())
+                .expect("content-length header"),
+        );
+
+        let upload = upload_object_one_shot_scoped(
+            State(Arc::clone(&state)),
+            full_claims(&fragment),
+            headers,
+            Path("videos/demo.mp4".to_string()),
+            Query(UploadPartQuery {
+                checksum: None,
+                durability: None,
+                strict_durability: None,
+                io_gate: None,
+            }),
+            Body::from(payload),
+        )
+        .await
+        .expect("scoped one-shot upload")
+        .into_response();
+        assert_eq!(upload.status(), axum::http::StatusCode::CREATED);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("websocket event timeout")
+            .expect("websocket event");
+        match event.payload {
+            StorageEventPayload::FileUploaded(meta) => {
+                assert_eq!(meta.object_key, "videos/demo.mp4");
+                assert!(meta.parts.is_empty());
+            }
+            other => panic!("unexpected websocket payload: {:?}", other),
+        }
     }
 }

@@ -9,6 +9,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use indexdb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableError};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as AsyncMutex;
 use ulid::Ulid;
 
@@ -20,6 +21,7 @@ use crate::namespace::models::{
     NamespaceEntry, NamespaceEntryKind, NamespaceError, NamespaceReachabilitySnapshot, ObjectHead,
 };
 use crate::namespace::paths::normalize_path;
+use crate::namespace::replica::namespace_catalog_semantic_hash;
 
 const NAMESPACE_V2_DIR: &str = "namespace_v2";
 const NAMESPACE_V2_FILE: &str = "catalog.ndxdb";
@@ -47,6 +49,7 @@ struct NamespaceReplicaFileInfo {
     path: PathBuf,
     modified_at: std::time::SystemTime,
     len: u64,
+    catalog_hash: [u8; 32],
 }
 
 static GLOBAL_NAMESPACE_RUNTIME: LazyLock<NamespaceRuntime> = LazyLock::new(NamespaceRuntime::new);
@@ -93,6 +96,8 @@ impl NamespaceRuntime {
                 kind: entry.kind,
                 object_id: entry.object_id,
                 lifecycle: entry.lifecycle,
+                trash_entry_id: entry.trash_entry_id,
+                deleted_at_unix: entry.deleted_at_unix,
                 created_at_unix: entry.created_at_unix,
                 updated_at_unix: entry.updated_at_unix,
             })
@@ -123,6 +128,8 @@ impl NamespaceRuntime {
                     kind: entry.kind,
                     object_id: entry.object_id,
                     lifecycle: entry.lifecycle,
+                    trash_entry_id: entry.trash_entry_id,
+                    deleted_at_unix: entry.deleted_at_unix,
                     created_at_unix: entry.created_at_unix,
                     updated_at_unix: entry.updated_at_unix,
                 })
@@ -247,6 +254,21 @@ impl NamespaceRuntime {
         Ok(summary)
     }
 
+    pub async fn recover_trash_entry_id(
+        &self,
+        fragment: &str,
+        trash_entry_id: &str,
+    ) -> Result<crate::namespace::models::NamespaceMutationSummary, AppError> {
+        let changed_at = Utc::now().timestamp();
+        let catalog = self.load_catalog(fragment).await?;
+        let mut guard = catalog.lock().await;
+        let summary = guard
+            .recover_trash_entry_id(trash_entry_id, changed_at)
+            .map_err(namespace_error_to_app)?;
+        self.persist_catalog(fragment, &guard).await?;
+        Ok(summary)
+    }
+
     pub async fn purge_trash_path(
         &self,
         fragment: &str,
@@ -257,6 +279,21 @@ impl NamespaceRuntime {
         let mut guard = catalog.lock().await;
         let summary = guard
             .purge_trash_path(path, changed_at)
+            .map_err(namespace_error_to_app)?;
+        self.persist_catalog(fragment, &guard).await?;
+        Ok(summary)
+    }
+
+    pub async fn purge_trash_entry_id(
+        &self,
+        fragment: &str,
+        trash_entry_id: &str,
+    ) -> Result<crate::namespace::models::NamespaceMutationSummary, AppError> {
+        let changed_at = Utc::now().timestamp();
+        let catalog = self.load_catalog(fragment).await?;
+        let mut guard = catalog.lock().await;
+        let summary = guard
+            .purge_trash_entry_id(trash_entry_id, changed_at)
             .map_err(namespace_error_to_app)?;
         self.persist_catalog(fragment, &guard).await?;
         Ok(summary)
@@ -876,20 +913,60 @@ fn namespace_db_paths(fragment: &str) -> Result<Vec<PathBuf>, AppError> {
 }
 
 fn best_existing_namespace_db_path(fragment: &str) -> Result<Option<PathBuf>, AppError> {
-    let mut best: Option<NamespaceReplicaFileInfo> = None;
-    for path in namespace_db_paths(fragment)? {
-        let Some(info) = inspect_namespace_db_file(&path)? else {
-            continue;
-        };
+    let infos = namespace_db_paths(fragment)?
+        .into_iter()
+        .filter_map(|path| match inspect_namespace_db_file(&path) {
+            Ok(Some(info)) => Some(Ok(info)),
+            Ok(None) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    let mut hash_counts: HashMap<[u8; 32], usize> = HashMap::new();
+    for info in &infos {
+        *hash_counts.entry(info.catalog_hash).or_default() += 1;
+    }
+    let Some(canonical_hash) = choose_canonical_catalog_hash(&hash_counts) else {
+        if infos.is_empty() {
+            return Ok(None);
+        }
+        return Err(AppError::InternalServerError(
+            "ambiguous namespace_v2 catalog replicas; no semantic majority exists".to_string(),
+        ));
+    };
+
+    let mut best: Option<&NamespaceReplicaFileInfo> = None;
+    for info in infos
+        .iter()
+        .filter(|info| info.catalog_hash == canonical_hash)
+    {
         let replace = match best.as_ref() {
-            Some(current) => compare_namespace_replica_info(&info, current) == Ordering::Greater,
+            Some(current) => compare_namespace_replica_info(info, current) == Ordering::Greater,
             None => true,
         };
         if replace {
             best = Some(info);
         }
     }
-    Ok(best.map(|info| info.path))
+    Ok(best.map(|info| info.path.clone()))
+}
+
+fn choose_canonical_catalog_hash(hash_counts: &HashMap<[u8; 32], usize>) -> Option<[u8; 32]> {
+    let mut counts = hash_counts
+        .iter()
+        .map(|(hash, count)| (*hash, *count))
+        .collect::<Vec<_>>();
+    counts.sort_by(|(left_hash, left_count), (right_hash, right_count)| {
+        left_count
+            .cmp(right_count)
+            .then_with(|| left_hash.cmp(right_hash))
+    });
+    let (best_hash, best_count) = *counts.last()?;
+    let tied = counts
+        .iter()
+        .rev()
+        .skip(1)
+        .any(|(_, count)| *count == best_count);
+    if tied { None } else { Some(best_hash) }
 }
 
 fn inspect_namespace_db_file(path: &Path) -> Result<Option<NamespaceReplicaFileInfo>, AppError> {
@@ -901,10 +978,16 @@ fn inspect_namespace_db_file(path: &Path) -> Result<Option<NamespaceReplicaFileI
     let modified_at = metadata
         .modified()
         .map_err(|err| AppError::Io(err, format!("mtime {}", path.display())))?;
+    let bytes =
+        fs::read(path).map_err(|err| AppError::Io(err, format!("read {}", path.display())))?;
+    let Some(catalog_hash) = namespace_catalog_semantic_hash(&bytes) else {
+        return Ok(None);
+    };
     Ok(Some(NamespaceReplicaFileInfo {
         path: path.to_path_buf(),
         modified_at,
         len: metadata.len(),
+        catalog_hash,
     }))
 }
 
@@ -916,6 +999,7 @@ fn compare_namespace_replica_info(
         .modified_at
         .cmp(&current.modified_at)
         .then_with(|| candidate.len.cmp(&current.len))
+        .then_with(|| candidate.catalog_hash.cmp(&current.catalog_hash))
         .then_with(|| candidate.path.cmp(&current.path))
 }
 
@@ -967,7 +1051,6 @@ fn namespace_owner_index(fragment: &str, root_count: usize) -> usize {
     if root_count <= 1 {
         return 0;
     }
-    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(b"namespace-v2");
     hasher.update([0u8]);
@@ -1024,6 +1107,10 @@ mod tests {
     use crate::core::indexdb_store;
     use crate::core::quota_manager::init_quota_file;
     use crate::core::sync::ensure_fragment_blob_directories;
+    use crate::namespace::replica::{
+        inspect_namespace_replicas, namespace_catalog_semantic_hash, namespace_db_path_for_root,
+        repair_namespace_replicas,
+    };
     use crate::settings::constants::CONFIG_FILE;
     use crate::settings::create_config::create_default_config_ini;
     use once_cell::sync::Lazy;
@@ -1156,6 +1243,254 @@ mod tests {
         assert!(
             owner_path.exists(),
             "owner namespace db should be reseeded from surviving replica"
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_v2_repair_replicates_missing_catalog_copy() {
+        let _guard = TEST_LOCK.lock().await;
+        let fragment = format!("namespace-repair-{}", Ulid::new());
+        setup_fragment(&fragment).await;
+
+        let metadata = ObjectMetadata {
+            object_key: "images/photo.jpg".to_string(),
+            fragment: fragment.clone(),
+            version_id: Ulid::new().to_string(),
+            upload_session_id: String::new(),
+            owner_uid: fragment.clone(),
+            content_type: "image/jpeg".to_string(),
+            total_size_bytes: 8192,
+            created_at: 1_710_000_001,
+            parts: Vec::new(),
+            is_delete_marker: false,
+            stripe_size_bytes: 262_144,
+        };
+
+        global_namespace_runtime()
+            .finalize_logical_upload(
+                &fragment,
+                "images/photo.jpg",
+                "physical-object-2",
+                &metadata,
+            )
+            .await
+            .expect("finalize logical upload");
+
+        let paths = namespace_db_paths(&fragment).expect("namespace db paths");
+        assert!(paths.len() >= 2, "test needs at least two index roots");
+        fs::remove_file(&paths[1])
+            .await
+            .expect("remove follower namespace db to simulate rebuilt disk");
+
+        let index_roots = INDEX_STORE_DISKS
+            .get()
+            .expect("index roots")
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        let before = inspect_namespace_replicas(&fragment, &index_roots)
+            .await
+            .expect("inspect missing namespace replica");
+        assert_eq!(before.missing_replicas, 1);
+        assert!(!before.healthy);
+
+        let report = repair_namespace_replicas(&fragment, &index_roots, false)
+            .await
+            .expect("repair namespace replicas");
+        assert_eq!(report.missing_repaired, 1);
+
+        let after = inspect_namespace_replicas(&fragment, &index_roots)
+            .await
+            .expect("inspect repaired namespace replicas");
+        assert!(
+            after.healthy,
+            "namespace_v2 replicas should be healthy after repair: {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_v2_repair_prefers_majority_over_newer_stale_replica() {
+        let _guard = TEST_LOCK.lock().await;
+        let fragment = format!("namespace-majority-{}", Ulid::new());
+        setup_fragment(&fragment).await;
+
+        let first_metadata = ObjectMetadata {
+            object_key: "docs/old.txt".to_string(),
+            fragment: fragment.clone(),
+            version_id: Ulid::new().to_string(),
+            upload_session_id: String::new(),
+            owner_uid: fragment.clone(),
+            content_type: "text/plain".to_string(),
+            total_size_bytes: 1024,
+            created_at: 1_710_000_002,
+            parts: Vec::new(),
+            is_delete_marker: false,
+            stripe_size_bytes: 262_144,
+        };
+
+        global_namespace_runtime()
+            .finalize_logical_upload(&fragment, "docs/old.txt", "physical-old", &first_metadata)
+            .await
+            .expect("finalize first logical upload");
+
+        let paths = namespace_db_paths(&fragment).expect("namespace db paths");
+        assert!(paths.len() >= 2, "test needs at least two index roots");
+        let stale_bytes = fs::read(&paths[0]).await.expect("read old catalog");
+
+        let second_metadata = ObjectMetadata {
+            object_key: "docs/new.txt".to_string(),
+            fragment: fragment.clone(),
+            version_id: Ulid::new().to_string(),
+            upload_session_id: String::new(),
+            owner_uid: fragment.clone(),
+            content_type: "text/plain".to_string(),
+            total_size_bytes: 2048,
+            created_at: 1_710_000_003,
+            parts: Vec::new(),
+            is_delete_marker: false,
+            stripe_size_bytes: 262_144,
+        };
+
+        global_namespace_runtime()
+            .finalize_logical_upload(&fragment, "docs/new.txt", "physical-new", &second_metadata)
+            .await
+            .expect("finalize second logical upload");
+
+        let majority_bytes = fs::read(&paths[0]).await.expect("read majority catalog");
+        assert_ne!(
+            stale_bytes, majority_bytes,
+            "test setup should create different catalog generations"
+        );
+
+        fs::write(&paths[1], &stale_bytes)
+            .await
+            .expect("write newer stale replica");
+
+        let mut index_roots = INDEX_STORE_DISKS
+            .get()
+            .expect("index roots")
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        let extra_majority_root =
+            std::env::temp_dir().join(format!("n1-namespace-majority-extra-{}", Ulid::new()));
+        let extra_majority_path = namespace_db_path_for_root(&extra_majority_root, &fragment);
+        fs::create_dir_all(extra_majority_path.parent().expect("extra majority parent"))
+            .await
+            .expect("create extra majority parent");
+        fs::write(&extra_majority_path, &majority_bytes)
+            .await
+            .expect("write extra majority replica");
+        index_roots.push(extra_majority_root);
+
+        let before = inspect_namespace_replicas(&fragment, &index_roots)
+            .await
+            .expect("inspect stale namespace replica");
+        assert_eq!(before.divergent_replicas, 1);
+
+        let report = repair_namespace_replicas(&fragment, &index_roots, false)
+            .await
+            .expect("repair namespace replicas");
+        assert_eq!(report.divergent_repaired, 1);
+
+        let repaired_bytes = fs::read(&paths[1]).await.expect("read repaired replica");
+        assert_eq!(
+            namespace_catalog_semantic_hash(&repaired_bytes),
+            namespace_catalog_semantic_hash(&majority_bytes),
+            "repair must copy the semantic majority catalog, not the newer stale replica"
+        );
+
+        let after = inspect_namespace_replicas(&fragment, &index_roots)
+            .await
+            .expect("inspect repaired namespace replicas");
+        assert!(
+            after.healthy,
+            "namespace_v2 replicas should be healthy after majority repair: {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_v2_repair_refuses_split_brain_without_majority() {
+        let _guard = TEST_LOCK.lock().await;
+        let fragment = format!("namespace-split-{}", Ulid::new());
+        setup_fragment(&fragment).await;
+
+        let first_metadata = ObjectMetadata {
+            object_key: "docs/old.txt".to_string(),
+            fragment: fragment.clone(),
+            version_id: Ulid::new().to_string(),
+            upload_session_id: String::new(),
+            owner_uid: fragment.clone(),
+            content_type: "text/plain".to_string(),
+            total_size_bytes: 1024,
+            created_at: 1_710_000_004,
+            parts: Vec::new(),
+            is_delete_marker: false,
+            stripe_size_bytes: 262_144,
+        };
+        global_namespace_runtime()
+            .finalize_logical_upload(&fragment, "docs/old.txt", "physical-old", &first_metadata)
+            .await
+            .expect("finalize first logical upload");
+
+        let paths = namespace_db_paths(&fragment).expect("namespace db paths");
+        assert_eq!(
+            paths.len(),
+            2,
+            "test expects the two-root split-brain setup"
+        );
+        let stale_bytes = fs::read(&paths[0]).await.expect("read old catalog");
+
+        let second_metadata = ObjectMetadata {
+            object_key: "docs/new.txt".to_string(),
+            fragment: fragment.clone(),
+            version_id: Ulid::new().to_string(),
+            upload_session_id: String::new(),
+            owner_uid: fragment.clone(),
+            content_type: "text/plain".to_string(),
+            total_size_bytes: 2048,
+            created_at: 1_710_000_005,
+            parts: Vec::new(),
+            is_delete_marker: false,
+            stripe_size_bytes: 262_144,
+        };
+        global_namespace_runtime()
+            .finalize_logical_upload(&fragment, "docs/new.txt", "physical-new", &second_metadata)
+            .await
+            .expect("finalize second logical upload");
+
+        let newer_bytes = fs::read(&paths[0]).await.expect("read newer catalog");
+        fs::write(&paths[1], &stale_bytes)
+            .await
+            .expect("write divergent stale replica");
+
+        let index_roots = INDEX_STORE_DISKS
+            .get()
+            .expect("index roots")
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        let before = inspect_namespace_replicas(&fragment, &index_roots)
+            .await
+            .expect("inspect split namespace replicas");
+        assert_eq!(before.divergent_replicas, 2);
+        assert!(before.canonical_path.is_none());
+
+        let report = repair_namespace_replicas(&fragment, &index_roots, false)
+            .await
+            .expect("repair namespace replicas");
+        assert!(report.selected_source.is_none());
+        assert_eq!(report.divergent_repaired, 0);
+
+        assert_eq!(
+            namespace_catalog_semantic_hash(&fs::read(&paths[0]).await.expect("read path 0")),
+            namespace_catalog_semantic_hash(&newer_bytes),
+            "split-brain repair must not overwrite the newer catalog without a majority"
+        );
+        assert_eq!(
+            namespace_catalog_semantic_hash(&fs::read(&paths[1]).await.expect("read path 1")),
+            namespace_catalog_semantic_hash(&stale_bytes),
+            "split-brain repair must not overwrite the stale catalog without a majority"
         );
     }
 }

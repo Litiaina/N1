@@ -50,7 +50,6 @@ use crate::core::quota_manager::{
 use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
-use crate::websocket::ws_structs::StorageEventPayload;
 
 pub static MAX_PART_SIZE_ATOMIC: OnceCell<AtomicU64> = OnceCell::new();
 pub static DATA_SHARDS_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
@@ -1669,7 +1668,7 @@ pub async fn object_upload_part(
 }
 
 pub async fn upload_object_one_shot(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     claims: Claims,
     headers: HeaderMap,
     AxumPath((fragment, object_key)): AxumPath<(String, String)>,
@@ -1754,17 +1753,11 @@ pub async fn upload_object_one_shot(
     let response_body = serde_json::to_value(&object_meta).map_err(|e| {
         AppError::InternalServerError(format!("serialize one-shot upload response: {}", e))
     })?;
-    let stripped_meta = ObjectMetadata {
-        parts: Vec::new(),
-        ..object_meta
-    };
-    state.emit(&fragment, StorageEventPayload::FileUploaded(stripped_meta));
-
     Ok((StatusCode::CREATED, AxumJson(response_body)).into_response())
 }
 
 pub async fn finalize_object_upload(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     claims: Claims,
     AxumPath((fragment, version_id, session_id)): AxumPath<(String, String, String)>,
     Query(key_query): Query<ObjectKeyQuery>,
@@ -1931,12 +1924,6 @@ pub async fn finalize_object_upload(
     let response_body = serde_json::to_value(&object_meta).map_err(|e| {
         AppError::InternalServerError(format!("serialize finalized upload response: {}", e))
     })?;
-    let stripped_meta = ObjectMetadata {
-        parts: Vec::new(),
-        ..object_meta
-    };
-    state.emit(&fragment, StorageEventPayload::FileUploaded(stripped_meta));
-
     Ok((StatusCode::OK, AxumJson(response_body)).into_response())
 }
 

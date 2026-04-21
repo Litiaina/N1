@@ -330,6 +330,79 @@ fn canonical_bulk_object_keys(keys: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+fn canonical_namespace_prefix(prefix: &str) -> String {
+    let normalized = prefix.trim().trim_start_matches('/').trim_end_matches('/');
+    if normalized.is_empty() {
+        String::new()
+    } else {
+        format!("{normalized}/")
+    }
+}
+
+async fn list_all_engine_object_keys(
+    state: &AppState,
+    binding: &models::FragmentBindingRecord,
+    prefix: Option<&str>,
+    include_trashed: bool,
+) -> Result<Vec<String>, RegistryError> {
+    let normalized_prefix = prefix.and_then(|value| {
+        let normalized = canonical_namespace_prefix(value);
+        (!normalized.is_empty()).then_some(normalized)
+    });
+    let mut continuation_token = None;
+    let mut object_keys = BTreeSet::new();
+
+    loop {
+        let page = state
+            .broker
+            .list_logical_objects_page(
+                binding,
+                normalized_prefix.as_deref(),
+                None,
+                1000,
+                continuation_token.as_deref(),
+                include_trashed,
+            )
+            .await?;
+
+        for object in page.objects {
+            object_keys.insert(object.object_key);
+        }
+
+        if page.continuation_token.is_none() {
+            break;
+        }
+        continuation_token = page.continuation_token;
+    }
+
+    Ok(object_keys.into_iter().collect())
+}
+
+async fn soft_delete_engine_keys(
+    state: &AppState,
+    binding: &models::FragmentBindingRecord,
+    object_keys: &[String],
+) -> Result<(), RegistryError> {
+    for object_key in object_keys {
+        state.broker.soft_delete_object(binding, object_key).await?;
+    }
+    Ok(())
+}
+
+async fn recover_engine_keys(
+    state: &AppState,
+    binding: &models::FragmentBindingRecord,
+    object_keys: &[String],
+) -> Result<(), RegistryError> {
+    for object_key in object_keys {
+        state
+            .broker
+            .recover_object_and_read_state(binding, object_key)
+            .await?;
+    }
+    Ok(())
+}
+
 fn infer_latest_engine_head(
     versions: &[storage_broker::EngineObjectMetadata],
 ) -> Option<storage_broker::EngineObjectMetadata> {
@@ -2316,6 +2389,21 @@ async fn trash_object(
     let object_key = req.object_key.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
     let _write_guard = state.write_gate.lock().await;
+    state
+        .db
+        .resolve_object(claims.sub.clone(), fragment.clone(), object_key.clone())
+        .await?
+        .ok_or_else(|| RegistryError::not_found("object not found"))?;
+    if let Some(binding) = state
+        .db
+        .get_fragment_binding(claims.sub.clone(), fragment.clone())
+        .await?
+    {
+        state
+            .broker
+            .soft_delete_object(&binding, &object_key)
+            .await?;
+    }
     let (object, user) = state
         .db
         .trash_object_if_ready(claims.sub, fragment.clone(), object_key.clone())
@@ -2330,6 +2418,12 @@ async fn trash_object(
         }),
     );
     publish_owner_invalidation(&state, &object.owner_uid, Some(fragment), "objects");
+    publish_owner_invalidation(
+        &state,
+        &object.owner_uid,
+        Some(req.fragment.clone()),
+        "trash",
+    );
     Ok(Json(ObjectMutationResponse {
         object,
         quota_limit_bytes: user.quota_limit_bytes,
@@ -2350,11 +2444,30 @@ async fn trash_objects_prefix(
     let fragment = req.fragment.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
     let _write_guard = state.write_gate.lock().await;
-    let (affected, user) = state
+    let binding = state
         .db
-        .trash_objects_by_prefix_from_ready(claims.sub, fragment.clone(), req.prefix)
+        .get_fragment_binding(claims.sub.clone(), fragment.clone())
         .await?;
+    let (affected, user) = if let Some(binding) = binding {
+        let object_keys =
+            list_all_engine_object_keys(&state, &binding, Some(&req.prefix), false).await?;
+        if object_keys.is_empty() {
+            return Err(RegistryError::not_found("no matching objects found"));
+        }
+        soft_delete_engine_keys(&state, &binding, &object_keys).await?;
+        let (affected, _not_found, user) = state
+            .db
+            .trash_objects_bulk_from_ready(claims.sub, fragment.clone(), object_keys)
+            .await?;
+        (affected, user)
+    } else {
+        state
+            .db
+            .trash_objects_by_prefix_from_ready(claims.sub, fragment.clone(), req.prefix)
+            .await?
+    };
     publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
+    publish_owner_invalidation(&state, &user.uid, Some(req.fragment.clone()), "trash");
     Ok(Json(BulkObjectMutationResponse {
         affected,
         quota_limit_bytes: user.quota_limit_bytes,
@@ -2379,11 +2492,19 @@ async fn trash_objects_bulk(
     let fragment = req.fragment.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
     let _write_guard = state.write_gate.lock().await;
+    if let Some(binding) = state
+        .db
+        .get_fragment_binding(claims.sub.clone(), fragment.clone())
+        .await?
+    {
+        soft_delete_engine_keys(&state, &binding, &object_keys).await?;
+    }
     let (affected, not_found, user) = state
         .db
         .trash_objects_bulk_from_ready(claims.sub, fragment.clone(), object_keys.clone())
         .await?;
     publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
+    publish_owner_invalidation(&state, &user.uid, Some(req.fragment.clone()), "trash");
     Ok(Json(BulkObjectSelectionResponse {
         requested,
         unique: object_keys.len(),
@@ -2410,51 +2531,44 @@ async fn recover_object(
         .await?
         .ok_or_else(|| RegistryError::not_found("object not found"))?;
 
-    let (object, user) = if stored.status == "purged" {
-        let binding = state
-            .db
-            .get_fragment_binding(claims.sub.clone(), fragment.clone())
-            .await?
-            .ok_or_else(|| {
-                RegistryError::conflict(
-                    "fragment is not linked to a storage backend yet; link it first",
-                )
-            })?;
+    let binding = state
+        .db
+        .get_fragment_binding(claims.sub.clone(), fragment.clone())
+        .await?;
+    let (object, user) = if let (Some(binding), status) = (binding, stored.status.as_str()) {
+        if matches!(status, "trashed" | "purged") {
+            let engine_state = state
+                .broker
+                .recover_object_and_read_state(&binding, &object_key)
+                .await?;
 
-        let engine_state = match state
-            .broker
-            .read_current_object_state(&binding, &object_key, true)
-            .await
-        {
-            Ok(engine_state) if engine_state.current.is_some() => engine_state,
-            Ok(_) => {
+            if status == "purged" {
                 state
-                    .broker
-                    .recover_object_and_read_state(&binding, &object_key)
-                    .await?
+                    .db
+                    .cancel_object_purge(claims.sub.clone(), fragment.clone(), object_key.clone())
+                    .await?;
             }
-            Err(err) => return Err(err),
-        };
-
-        state
-            .db
-            .cancel_object_purge(claims.sub.clone(), fragment.clone(), object_key.clone())
-            .await?;
-        let (object, user) = state
-            .db
-            .sync_object_from_engine(
-                claims.sub,
-                fragment.clone(),
-                object_key.clone(),
-                stored.storage_object_id.clone(),
-                engine_state.current,
-                engine_state.versions,
-            )
-            .await?;
-        let object = object.ok_or_else(|| {
-            RegistryError::not_found("object can no longer be recovered from storage")
-        })?;
-        (object, user)
+            let (object, user) = state
+                .db
+                .sync_object_from_engine(
+                    claims.sub,
+                    fragment.clone(),
+                    object_key.clone(),
+                    stored.storage_object_id.clone(),
+                    engine_state.current,
+                    engine_state.versions,
+                )
+                .await?;
+            let object = object.ok_or_else(|| {
+                RegistryError::not_found("object can no longer be recovered from storage")
+            })?;
+            (object, user)
+        } else {
+            state
+                .db
+                .set_object_status(claims.sub, fragment.clone(), object_key.clone(), "ready")
+                .await?
+        }
     } else {
         state
             .db
@@ -2467,6 +2581,12 @@ async fn recover_object(
         RegistryRealtimePayload::FileUploaded(object.clone()),
     );
     publish_owner_invalidation(&state, &object.owner_uid, Some(fragment), "objects");
+    publish_owner_invalidation(
+        &state,
+        &object.owner_uid,
+        Some(req.fragment.clone()),
+        "trash",
+    );
     Ok(Json(ObjectMutationResponse {
         object,
         quota_limit_bytes: user.quota_limit_bytes,
@@ -2487,11 +2607,30 @@ async fn recover_objects_prefix(
     let fragment = req.fragment.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
     let _write_guard = state.write_gate.lock().await;
-    let (affected, user) = state
+    let binding = state
         .db
-        .recover_objects_by_prefix_from_trash(claims.sub, fragment.clone(), req.prefix)
+        .get_fragment_binding(claims.sub.clone(), fragment.clone())
         .await?;
+    let (affected, user) = if let Some(binding) = binding {
+        let object_keys =
+            list_all_engine_object_keys(&state, &binding, Some(&req.prefix), true).await?;
+        if object_keys.is_empty() {
+            return Err(RegistryError::not_found("no matching objects found"));
+        }
+        recover_engine_keys(&state, &binding, &object_keys).await?;
+        let (affected, _not_found, user) = state
+            .db
+            .recover_objects_bulk_from_trash(claims.sub, fragment.clone(), object_keys)
+            .await?;
+        (affected, user)
+    } else {
+        state
+            .db
+            .recover_objects_by_prefix_from_trash(claims.sub, fragment.clone(), req.prefix)
+            .await?
+    };
     publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
+    publish_owner_invalidation(&state, &user.uid, Some(req.fragment.clone()), "trash");
     Ok(Json(BulkObjectMutationResponse {
         affected,
         quota_limit_bytes: user.quota_limit_bytes,
@@ -2516,11 +2655,41 @@ async fn recover_objects_bulk(
     let fragment = req.fragment.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
     let _write_guard = state.write_gate.lock().await;
-    let (affected, not_found, user) = state
+    let (affected, not_found, user) = if let Some(binding) = state
         .db
-        .recover_objects_bulk_from_trash(claims.sub, fragment.clone(), object_keys.clone())
-        .await?;
+        .get_fragment_binding(claims.sub.clone(), fragment.clone())
+        .await?
+    {
+        let recoverable = list_all_engine_object_keys(&state, &binding, None, true)
+            .await?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let recoverable_keys = object_keys
+            .iter()
+            .filter(|key| recoverable.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !recoverable_keys.is_empty() {
+            recover_engine_keys(&state, &binding, &recoverable_keys).await?;
+        }
+        let (affected, db_not_found, user) = state
+            .db
+            .recover_objects_bulk_from_trash(claims.sub, fragment.clone(), recoverable_keys)
+            .await?;
+        let not_found = db_not_found.saturating_add(
+            object_keys
+                .len()
+                .saturating_sub(affected.saturating_add(db_not_found)),
+        );
+        (affected, not_found, user)
+    } else {
+        state
+            .db
+            .recover_objects_bulk_from_trash(claims.sub, fragment.clone(), object_keys.clone())
+            .await?
+    };
     publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
+    publish_owner_invalidation(&state, &user.uid, Some(req.fragment.clone()), "trash");
     Ok(Json(BulkObjectSelectionResponse {
         requested,
         unique: object_keys.len(),
@@ -2700,11 +2869,31 @@ async fn recover_all_objects(
     let fragment = req.fragment.clone();
     let claims = claims_from_headers(&headers, &state.auth)?;
     let _write_guard = state.write_gate.lock().await;
-    let (affected, user) = state
+    let binding = state
         .db
-        .recover_all_trashed(claims.sub, fragment.clone())
+        .get_fragment_binding(claims.sub.clone(), fragment.clone())
         .await?;
+    let (affected, user) = if let Some(binding) = binding {
+        let object_keys = list_all_engine_object_keys(&state, &binding, None, true).await?;
+        if object_keys.is_empty() {
+            let user = state.db.get_user(claims.sub.clone()).await?;
+            (0, user)
+        } else {
+            recover_engine_keys(&state, &binding, &object_keys).await?;
+            let (affected, _not_found, user) = state
+                .db
+                .recover_objects_bulk_from_trash(claims.sub, fragment.clone(), object_keys)
+                .await?;
+            (affected, user)
+        }
+    } else {
+        state
+            .db
+            .recover_all_trashed(claims.sub, fragment.clone())
+            .await?
+    };
     publish_owner_invalidation(&state, &user.uid, Some(fragment), "objects");
+    publish_owner_invalidation(&state, &user.uid, Some(req.fragment.clone()), "trash");
     Ok(Json(BulkObjectMutationResponse {
         affected,
         quota_limit_bytes: user.quota_limit_bytes,
@@ -3275,6 +3464,21 @@ mod tests {
         token: &'static str,
         calls: Arc<TokioMutex<Vec<String>>>,
     ) -> String {
+        spawn_storage_recording_stub_with_state(token, calls, HashMap::new()).await
+    }
+
+    async fn spawn_storage_recording_stub_with_state(
+        token: &'static str,
+        calls: Arc<TokioMutex<Vec<String>>>,
+        initial: HashMap<String, StubObjectState>,
+    ) -> String {
+        let state = Arc::new(TokioMutex::new(initial));
+        let list_state = state.clone();
+        let trash_state = state.clone();
+        let meta_state = state.clone();
+        let versions_state = state.clone();
+        let delete_state = state.clone();
+        let recover_object_state = state.clone();
         let delete_calls = calls.clone();
         let bulk_calls = calls.clone();
         let permanent_calls = calls.clone();
@@ -3300,15 +3504,241 @@ mod tests {
                 }),
             )
             .route(
+                "/n1/objects",
+                get(
+                    move |Query(params): Query<std::collections::HashMap<String, String>>| {
+                        let list_state = list_state.clone();
+                        async move {
+                            let state = list_state.lock().await;
+                            let prefix = params
+                                .get("prefix")
+                                .map(|value| value.trim().trim_start_matches('/').to_string())
+                                .filter(|value| !value.is_empty());
+                            let delimiter = params
+                                .get("delimiter")
+                                .map(|value| value.trim().to_string())
+                                .filter(|value| !value.is_empty());
+                            let limit = params
+                                .get("limit")
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .unwrap_or(200)
+                                .clamp(1, 1000);
+
+                            let mut objects = Vec::new();
+                            let mut common_prefixes = std::collections::BTreeSet::new();
+
+                            for (object_key, entry) in state.iter() {
+                                let Some(version) = entry.versions.first() else {
+                                    continue;
+                                };
+                                if !entry.current_visible {
+                                    continue;
+                                }
+                                if let Some(prefix) = prefix.as_deref() {
+                                    if !object_key.starts_with(prefix) {
+                                        continue;
+                                    }
+                                }
+
+                                if delimiter.as_deref() == Some("/") {
+                                    let suffix = prefix
+                                        .as_deref()
+                                        .and_then(|value| object_key.strip_prefix(value))
+                                        .unwrap_or(object_key.as_str());
+                                    if let Some(index) = suffix.find('/') {
+                                        let base = prefix.clone().unwrap_or_default();
+                                        common_prefixes.insert(format!(
+                                            "{}{}/",
+                                            base,
+                                            &suffix[..index]
+                                        ));
+                                        continue;
+                                    }
+                                }
+
+                                objects.push(json!({
+                                    "fragment": "fragment-a",
+                                    "object_key": object_key,
+                                    "version_id": version.version_id,
+                                    "content_type": version.content_type,
+                                    "total_size_bytes": version.object_size_bytes,
+                                    "created_at": version.created_at
+                                }));
+                            }
+
+                            objects.sort_by(|a, b| {
+                                a["object_key"].as_str().cmp(&b["object_key"].as_str())
+                            });
+                            let mut common_prefixes =
+                                common_prefixes.into_iter().collect::<Vec<_>>();
+                            common_prefixes.sort();
+
+                            let total_items = objects.len().saturating_add(common_prefixes.len());
+                            if total_items > limit {
+                                let mut remaining = limit;
+                                let mut limited_prefixes = Vec::new();
+                                for prefix in common_prefixes.into_iter() {
+                                    if remaining == 0 {
+                                        break;
+                                    }
+                                    limited_prefixes.push(prefix);
+                                    remaining -= 1;
+                                }
+
+                                let mut limited_objects = Vec::new();
+                                for object in objects.into_iter() {
+                                    if remaining == 0 {
+                                        break;
+                                    }
+                                    limited_objects.push(object);
+                                    remaining -= 1;
+                                }
+
+                                return Json(json!({
+                                    "objects": limited_objects,
+                                    "common_prefixes": limited_prefixes,
+                                    "continuation_token": "stub-more"
+                                }));
+                            }
+
+                            Json(json!({
+                                "objects": objects,
+                                "common_prefixes": common_prefixes,
+                                "continuation_token": Value::Null
+                            }))
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/n1/trash",
+                get(
+                    move |Query(params): Query<std::collections::HashMap<String, String>>| {
+                        let trash_state = trash_state.clone();
+                        async move {
+                            let state = trash_state.lock().await;
+                            let prefix = params
+                                .get("prefix")
+                                .map(|value| value.trim().trim_start_matches('/').to_string())
+                                .filter(|value| !value.is_empty());
+                            let limit = params
+                                .get("limit")
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .unwrap_or(200)
+                                .clamp(1, 1000);
+
+                            let mut objects = Vec::new();
+                            for (object_key, entry) in state.iter() {
+                                let Some(version) = entry.versions.first() else {
+                                    continue;
+                                };
+                                if entry.current_visible {
+                                    continue;
+                                }
+                                if let Some(prefix) = prefix.as_deref() {
+                                    if !object_key.starts_with(prefix) {
+                                        continue;
+                                    }
+                                }
+                                objects.push(json!({
+                                    "fragment": "fragment-a",
+                                    "object_key": object_key,
+                                    "version_id": version.version_id,
+                                    "content_type": version.content_type,
+                                    "total_size_bytes": version.object_size_bytes,
+                                    "created_at": version.created_at
+                                }));
+                            }
+                            objects.sort_by(|a, b| {
+                                a["object_key"].as_str().cmp(&b["object_key"].as_str())
+                            });
+                            objects.truncate(limit);
+                            Json(json!({
+                                "objects": objects,
+                                "common_prefixes": [],
+                                "continuation_token": Value::Null
+                            }))
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/n1/objects/meta/{*object_key}",
+                get(move |StubPath(object_key): StubPath<String>| {
+                    let meta_state = meta_state.clone();
+                    async move {
+                        let state = meta_state.lock().await;
+                        let response = state.get(&object_key).and_then(|entry| {
+                            if !entry.current_visible {
+                                return None;
+                            }
+                            entry.versions.first().map(|version| {
+                                json!({
+                                    "fragment": "fragment-a",
+                                    "object_key": object_key,
+                                    "version_id": version.version_id,
+                                    "content_type": version.content_type,
+                                    "total_size_bytes": version.object_size_bytes,
+                                    "created_at": version.created_at
+                                })
+                            })
+                        });
+                        response
+                            .map(|payload| (StatusCode::OK, Json(payload)).into_response())
+                            .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+                    }
+                }),
+            )
+            .route(
+                "/n1/objects/versions/{*object_key}",
+                get(move |StubPath(object_key): StubPath<String>| {
+                    let versions_state = versions_state.clone();
+                    async move {
+                        let state = versions_state.lock().await;
+                        let payload = state
+                            .get(&object_key)
+                            .map(|entry| {
+                                entry
+                                    .versions
+                                    .iter()
+                                    .map(|version| {
+                                        json!({
+                                            "fragment": "fragment-a",
+                                            "object_key": object_key,
+                                            "version_id": version.version_id,
+                                            "content_type": version.content_type,
+                                            "total_size_bytes": version.object_size_bytes,
+                                            "created_at": version.created_at
+                                        })
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        Json(payload)
+                    }
+                }),
+            )
+            .route(
                 "/n1/objects/{*object_key}",
                 delete(move |StubPath(object_key): StubPath<String>| {
                     let delete_calls = delete_calls.clone();
+                    let delete_state = delete_state.clone();
                     async move {
                         delete_calls
                             .lock()
                             .await
                             .push(format!("DELETE /n1/objects/{object_key}"));
-                        StatusCode::OK
+                        let mut entries = delete_state.lock().await;
+                        if let Some(entry) = entries.get_mut(&object_key) {
+                            if entry.current_visible {
+                                entry.current_visible = false;
+                                StatusCode::OK
+                            } else {
+                                StatusCode::NOT_FOUND
+                            }
+                        } else {
+                            StatusCode::NOT_FOUND
+                        }
                     }
                 }),
             )
@@ -3357,12 +3787,23 @@ mod tests {
                 "/n1/objects/recover/{*object_key}",
                 post(move |StubPath(object_key): StubPath<String>| {
                     let recover_object_calls = recover_object_calls.clone();
+                    let recover_object_state = recover_object_state.clone();
                     async move {
                         recover_object_calls
                             .lock()
                             .await
                             .push(format!("POST /n1/objects/recover/{object_key}"));
-                        StatusCode::OK
+                        let mut entries = recover_object_state.lock().await;
+                        if let Some(entry) = entries.get_mut(&object_key) {
+                            if entry.versions.is_empty() {
+                                StatusCode::NOT_FOUND
+                            } else {
+                                entry.current_visible = true;
+                                StatusCode::OK
+                            }
+                        } else {
+                            StatusCode::NOT_FOUND
+                        }
                     }
                 }),
             )
@@ -3455,6 +3896,7 @@ mod tests {
     async fn spawn_storage_version_stub(initial: HashMap<String, StubObjectState>) -> String {
         let state = Arc::new(TokioMutex::new(initial));
         let list_state = state.clone();
+        let trash_state = state.clone();
         let meta_state = state.clone();
         let versions_state = state.clone();
         let delete_state = state.clone();
@@ -3654,6 +4096,60 @@ mod tests {
                             Json(json!({
                                 "objects": objects,
                                 "common_prefixes": common_prefixes,
+                                "continuation_token": Value::Null
+                            }))
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/n1/trash",
+                get(
+                    move |Query(params): Query<std::collections::HashMap<String, String>>| {
+                        let trash_state = trash_state.clone();
+                        async move {
+                            let state = trash_state.lock().await;
+                            let prefix = params
+                                .get("prefix")
+                                .map(|value| value.trim().trim_start_matches('/').to_string())
+                                .filter(|value| !value.is_empty());
+                            let limit = params
+                                .get("limit")
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .unwrap_or(200)
+                                .clamp(1, 1000);
+
+                            let mut objects = Vec::new();
+                            for (object_key, entry) in state.iter() {
+                                let Some(version) = entry.versions.first() else {
+                                    continue;
+                                };
+                                if entry.current_visible {
+                                    continue;
+                                }
+                                if let Some(prefix) = prefix.as_deref() {
+                                    if !object_key.starts_with(prefix) {
+                                        continue;
+                                    }
+                                }
+                                objects.push(json!({
+                                    "fragment": "fragment-a",
+                                    "object_key": object_key,
+                                    "version_id": version.version_id,
+                                    "content_type": version.content_type,
+                                    "total_size_bytes": version.object_size_bytes,
+                                    "created_at": version.created_at
+                                }));
+                            }
+
+                            objects.sort_by(|a, b| {
+                                a["object_key"].as_str().cmp(&b["object_key"].as_str())
+                            });
+                            objects.truncate(limit);
+
+                            Json(json!({
+                                "objects": objects,
+                                "common_prefixes": [],
                                 "continuation_token": Value::Null
                             }))
                         }
@@ -5719,7 +6215,70 @@ mod tests {
     #[tokio::test]
     async fn bound_registry_mutations_delegate_to_engine_using_logical_object_keys() {
         let calls = Arc::new(TokioMutex::new(Vec::<String>::new()));
-        let single_url = spawn_storage_recording_stub("single-stub-token", calls.clone()).await;
+        let mut objects = HashMap::new();
+        objects.insert(
+            "logical/single.bin".to_string(),
+            StubObjectState {
+                current_visible: true,
+                versions: vec![StubVersion {
+                    version_id: "01HREGMUTATE0000000000000000001".to_string(),
+                    object_size_bytes: 2048,
+                    content_type: "application/octet-stream".to_string(),
+                    created_at: 100,
+                }],
+            },
+        );
+        objects.insert(
+            "logical/bulk.bin".to_string(),
+            StubObjectState {
+                current_visible: true,
+                versions: vec![StubVersion {
+                    version_id: "01HREGMUTATE0000000000000000002".to_string(),
+                    object_size_bytes: 3072,
+                    content_type: "application/octet-stream".to_string(),
+                    created_at: 101,
+                }],
+            },
+        );
+        objects.insert(
+            "logical/delete.bin".to_string(),
+            StubObjectState {
+                current_visible: true,
+                versions: vec![StubVersion {
+                    version_id: "01HREGMUTATE0000000000000000003".to_string(),
+                    object_size_bytes: 4096,
+                    content_type: "application/octet-stream".to_string(),
+                    created_at: 102,
+                }],
+            },
+        );
+        objects.insert(
+            "logical/prefix/a.bin".to_string(),
+            StubObjectState {
+                current_visible: true,
+                versions: vec![StubVersion {
+                    version_id: "01HREGMUTATE0000000000000000004".to_string(),
+                    object_size_bytes: 1024,
+                    content_type: "application/octet-stream".to_string(),
+                    created_at: 103,
+                }],
+            },
+        );
+        objects.insert(
+            "logical/prefix/b.bin".to_string(),
+            StubObjectState {
+                current_visible: true,
+                versions: vec![StubVersion {
+                    version_id: "01HREGMUTATE0000000000000000005".to_string(),
+                    object_size_bytes: 1024,
+                    content_type: "application/octet-stream".to_string(),
+                    created_at: 104,
+                }],
+            },
+        );
+        let single_url =
+            spawn_storage_recording_stub_with_state("single-stub-token", calls.clone(), objects)
+                .await;
         let multi_url = spawn_storage_stub("multi-stub-token").await;
         let (state, drive_token) = test_state(single_url, multi_url).await;
         let drive_user = state
@@ -5963,32 +6522,41 @@ mod tests {
             .expect("prefix delete request");
         assert_eq!(prefix_delete_resp.status(), reqwest::StatusCode::OK);
 
-        let recorded = calls.lock().await.clone();
+        let recorded_before_drain = calls.lock().await.clone();
         assert!(
-            recorded.is_empty(),
-            "request path should stay registry-local before the purge worker runs: {:?}",
-            recorded
+            recorded_before_drain
+                .contains(&format!("DELETE /n1/objects/{}", single_object.object_key)),
+            "single trash should delegate to N1 immediately: {:?}",
+            recorded_before_drain
         );
         assert!(
-            !recorded.iter().any(|entry| {
-                entry.starts_with("DELETE /n1/objects/")
-                    && !entry.starts_with("DELETE /n1/objects/permanent/")
-            }),
-            "logical trash should stay in registry: {:?}",
-            recorded
+            recorded_before_drain.contains(&format!(
+                "POST /n1/objects/recover/{}",
+                single_object.object_key
+            )),
+            "single recover should delegate to N1 immediately: {:?}",
+            recorded_before_drain
         );
         assert!(
-            !recorded
+            recorded_before_drain.contains(&format!("DELETE /n1/objects/{}", prefix_a.object_key)),
+            "prefix trash should enumerate logical keys through N1: {:?}",
+            recorded_before_drain
+        );
+        assert!(
+            recorded_before_drain
+                .contains(&format!("POST /n1/objects/recover/{}", prefix_b.object_key)),
+            "prefix recover should enumerate logical trash keys through N1: {:?}",
+            recorded_before_drain
+        );
+        assert!(
+            !recorded_before_drain
                 .iter()
-                .any(|entry| entry.contains("/recover/version")),
-            "logical recover should stay in registry: {:?}",
-            recorded
+                .any(|entry| entry.starts_with("DELETE /n1/objects/permanent/")),
+            "immediate trash/recover must stay logical, not permanent: {:?}",
+            recorded_before_drain
         );
-        assert!(
-            !recorded.iter().any(|entry| entry.contains("/bulk-delete")),
-            "logical bulk trash should stay in registry: {:?}",
-            recorded
-        );
+
+        calls.lock().await.clear();
 
         let deleted_status = state
             .db
@@ -6277,7 +6845,20 @@ mod tests {
 
     #[tokio::test]
     async fn recover_prefix_restores_only_trashed_objects_not_purged_tombstones() {
-        let single_url = spawn_storage_stub("single-stub-token").await;
+        let mut objects = HashMap::new();
+        objects.insert(
+            "folder/trashed.txt".to_string(),
+            StubObjectState {
+                current_visible: false,
+                versions: vec![StubVersion {
+                    version_id: "01HRECOVERPREFIX0000000000000001".to_string(),
+                    object_size_bytes: 100,
+                    content_type: "text/plain".to_string(),
+                    created_at: 100,
+                }],
+            },
+        );
+        let single_url = spawn_storage_version_stub(objects).await;
         let multi_url = spawn_storage_stub("multi-stub-token").await;
         let (state, drive_token) = test_state(single_url, multi_url).await;
         let drive_user = state
@@ -6386,7 +6967,20 @@ mod tests {
 
     #[tokio::test]
     async fn recover_bulk_restores_only_trashed_objects_not_purged_tombstones() {
-        let single_url = spawn_storage_stub("single-stub-token").await;
+        let mut objects = HashMap::new();
+        objects.insert(
+            "bulk/trashed.txt".to_string(),
+            StubObjectState {
+                current_visible: false,
+                versions: vec![StubVersion {
+                    version_id: "01HRECOVERBULK00000000000000001".to_string(),
+                    object_size_bytes: 100,
+                    content_type: "text/plain".to_string(),
+                    created_at: 100,
+                }],
+            },
+        );
+        let single_url = spawn_storage_version_stub(objects).await;
         let multi_url = spawn_storage_stub("multi-stub-token").await;
         let (state, drive_token) = test_state(single_url, multi_url).await;
         let drive_user = state
@@ -6569,7 +7163,20 @@ mod tests {
 
     #[tokio::test]
     async fn trash_prefix_does_not_reexpose_purged_tombstones() {
-        let single_url = spawn_storage_stub("single-stub-token").await;
+        let mut objects = HashMap::new();
+        objects.insert(
+            "trash-prefix/ready.txt".to_string(),
+            StubObjectState {
+                current_visible: true,
+                versions: vec![StubVersion {
+                    version_id: "01HTRASHPREFIXREADY00000000001".to_string(),
+                    object_size_bytes: 100,
+                    content_type: "text/plain".to_string(),
+                    created_at: 100,
+                }],
+            },
+        );
+        let single_url = spawn_storage_version_stub(objects).await;
         let multi_url = spawn_storage_stub("multi-stub-token").await;
         let (state, drive_token) = test_state(single_url, multi_url).await;
         let drive_user = state

@@ -7,6 +7,8 @@ use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mod
 use crate::core::recovery::{repair_entire_shard, verify_shard_integrity};
 use crate::core::redistribution::replay_pending_intents_for_fragment_now;
 use crate::enums::app_error_enum::AppError;
+use crate::namespace::replica::repair_namespace_replicas;
+use crate::namespace::runtime::global_namespace_runtime;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::manager::WsConnectionManager;
@@ -1113,6 +1115,38 @@ pub async fn run_repair_job_with_options(
             status.divergent_meta_repaired += pdiv;
             status.corrupt_found += pcorrupt;
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
+        }
+
+        {
+            let mut status = REPAIR_STATUS.write().await;
+            status.phase = format!("Repairing namespace_v2 catalog replicas {}", fragment_hash);
+            ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
+        }
+
+        let namespace_report =
+            repair_namespace_replicas(&fragment_hash, &index_roots, cfg.dry_run).await?;
+
+        {
+            let mut status = REPAIR_STATUS.write().await;
+            status.missing_meta_repaired += namespace_report.missing_repaired;
+            status.divergent_meta_repaired += namespace_report.divergent_repaired;
+            status.corrupt_found += namespace_report.corrupt_found;
+            if namespace_report.missing_repaired > 0
+                || namespace_report.divergent_repaired > 0
+                || namespace_report.corrupt_found > 0
+            {
+                status.last_repaired = Some(format!("namespace_v2:{}", fragment_hash));
+                status.last_disagreement = namespace_report.selected_source.clone();
+            }
+            ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
+        }
+
+        if !cfg.dry_run
+            && (namespace_report.missing_repaired > 0
+                || namespace_report.divergent_repaired > 0
+                || namespace_report.corrupt_found > 0)
+        {
+            global_namespace_runtime().evict_fragment(&fragment_hash);
         }
 
         if !cfg.dry_run {

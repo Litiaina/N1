@@ -235,6 +235,8 @@ fn map_listing_entries(path: &str, page: ListObjectsResult) -> Result<Vec<PosixE
                 modified_at_unix: Some(object.created_at),
                 content_type: None,
                 version_id: Some(object.version_id.clone()),
+                trash_entry_id: None,
+                deleted_at_unix: None,
             };
             match entries.get(&name) {
                 Some(existing) if existing.kind == PosixNodeKind::Directory => continue,
@@ -260,6 +262,8 @@ fn map_listing_entries(path: &str, page: ListObjectsResult) -> Result<Vec<PosixE
                 modified_at_unix: Some(object.created_at),
                 content_type: Some(object.content_type.clone()),
                 version_id: Some(object.version_id.clone()),
+                trash_entry_id: None,
+                deleted_at_unix: None,
             };
             match entries.get(&name) {
                 Some(existing) if existing.kind == PosixNodeKind::File => continue,
@@ -289,6 +293,8 @@ fn map_listing_entries(path: &str, page: ListObjectsResult) -> Result<Vec<PosixE
             modified_at_unix: None,
             content_type: None,
             version_id: None,
+            trash_entry_id: None,
+            deleted_at_unix: None,
         };
         match entries.get(&name) {
             Some(existing) if existing.kind == PosixNodeKind::Directory => continue,
@@ -506,6 +512,8 @@ pub async fn stat_path(
             modified_at_unix: None,
             content_type: None,
             version_id: None,
+            trash_entry_id: None,
+            deleted_at_unix: None,
         }),
         PathClassification::File(meta) => Ok(PosixStatResponse {
             path,
@@ -516,6 +524,8 @@ pub async fn stat_path(
             modified_at_unix: Some(meta.created_at),
             content_type: Some(meta.content_type),
             version_id: Some(meta.version_id),
+            trash_entry_id: None,
+            deleted_at_unix: None,
         }),
         PathClassification::Directory {
             marker,
@@ -534,6 +544,8 @@ pub async fn stat_path(
                 modified_at_unix,
                 content_type: None,
                 version_id: marker.map(|meta| meta.version_id),
+                trash_entry_id: None,
+                deleted_at_unix: None,
             })
         }
         PathClassification::Conflict => Err(AppError::Conflict(
@@ -569,6 +581,8 @@ pub async fn mkdir_path(
                 source_path: None,
                 destination_path: None,
                 created: Some(false),
+                trash_entry_id: None,
+                deleted_at_unix: None,
             });
         }
         PathClassification::File(_) | PathClassification::Conflict => {
@@ -589,6 +603,8 @@ pub async fn mkdir_path(
         source_path: None,
         destination_path: None,
         created: Some(true),
+        trash_entry_id: None,
+        deleted_at_unix: None,
     })
 }
 
@@ -664,6 +680,8 @@ pub async fn rename_path(
             source_path: Some(source_path),
             destination_path: Some(destination_path),
             created: None,
+            trash_entry_id: None,
+            deleted_at_unix: None,
         });
     }
 
@@ -687,6 +705,8 @@ pub async fn rename_path(
                 source_path: Some(source_path),
                 destination_path: Some(destination_path),
                 created: None,
+                trash_entry_id: None,
+                deleted_at_unix: None,
             })
         }
         PathClassification::Directory { .. } => {
@@ -732,6 +752,8 @@ pub async fn rename_path(
                 source_path: Some(source_path),
                 destination_path: Some(destination_path),
                 created: None,
+                trash_entry_id: None,
+                deleted_at_unix: None,
             })
         }
         PathClassification::Conflict => Err(AppError::Conflict(
@@ -806,6 +828,8 @@ pub async fn trash_path(
         source_path: None,
         destination_path: None,
         created: None,
+        trash_entry_id: None,
+        deleted_at_unix: None,
     })
 }
 
@@ -833,6 +857,8 @@ pub async fn recover_path(
         source_path: None,
         destination_path: None,
         created: None,
+        trash_entry_id: None,
+        deleted_at_unix: None,
     })
 }
 
@@ -860,5 +886,7 @@ pub async fn permanently_delete_path(
         source_path: None,
         destination_path: None,
         created: None,
+        trash_entry_id: None,
+        deleted_at_unix: None,
     })
 }

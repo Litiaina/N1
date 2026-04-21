@@ -2157,7 +2157,7 @@ dependencies = [
 
 [[package]]
 name = "n1"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "argon2",
  "async_zip",

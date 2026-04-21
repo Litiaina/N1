@@ -14,6 +14,13 @@ use super::paths::{base_name, normalize_path, parent_path};
 const LIVE_ROOT_NODE_ID: &str = "__live_root__";
 const TRASH_ROOT_NODE_ID: &str = "__trash_root__";
 
+#[derive(Debug, Clone)]
+struct TrashAnchorRef {
+    visible_path: String,
+    trash_entry_id: String,
+    node_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamespaceCatalog {
     fragment: String,
@@ -25,7 +32,9 @@ pub struct NamespaceCatalog {
     object_versions: BTreeMap<(String, String), ObjectVersionRecord>,
     object_nodes: BTreeMap<String, String>,
     #[serde(skip, default)]
-    trash_anchor_index: BTreeMap<String, String>,
+    trash_anchor_index: BTreeMap<String, BTreeSet<String>>,
+    #[serde(skip, default)]
+    trash_entry_index: BTreeMap<String, String>,
     #[serde(skip, default)]
     subtree_path_counts: BTreeMap<String, usize>,
     #[serde(skip, default)]
@@ -53,6 +62,7 @@ impl NamespaceCatalog {
                 object_id: None,
                 head_version_id: None,
                 trashed_at_unix: None,
+                trash_entry_id: None,
                 restore_parent_path: None,
                 restore_name: None,
                 created_at_unix: 0,
@@ -70,6 +80,7 @@ impl NamespaceCatalog {
                 object_id: None,
                 head_version_id: None,
                 trashed_at_unix: None,
+                trash_entry_id: None,
                 restore_parent_path: None,
                 restore_name: None,
                 created_at_unix: 0,
@@ -86,6 +97,7 @@ impl NamespaceCatalog {
             object_versions: BTreeMap::new(),
             object_nodes: BTreeMap::new(),
             trash_anchor_index: BTreeMap::new(),
+            trash_entry_index: BTreeMap::new(),
             subtree_path_counts: BTreeMap::new(),
             subtree_object_counts: BTreeMap::new(),
         }
@@ -97,12 +109,19 @@ impl NamespaceCatalog {
 
     pub fn rebuild_secondary_indices(&mut self) -> Result<(), NamespaceError> {
         self.trash_anchor_index.clear();
+        self.trash_entry_index.clear();
         self.subtree_path_counts.clear();
         self.subtree_object_counts.clear();
 
         for anchor_id in self.sorted_child_ids(&self.trash_root_node_id) {
             let anchor_path = self.anchor_visible_path(&anchor_id)?;
-            self.trash_anchor_index.insert(anchor_path, anchor_id);
+            let trash_entry_id = self.ensure_trash_entry_id(&anchor_id)?;
+            self.trash_entry_index
+                .insert(trash_entry_id.clone(), anchor_id);
+            self.trash_anchor_index
+                .entry(anchor_path)
+                .or_default()
+                .insert(trash_entry_id);
         }
 
         self.rebuild_subtree_stats()?;
@@ -139,6 +158,7 @@ impl NamespaceCatalog {
             object_id: None,
             head_version_id: None,
             trashed_at_unix: None,
+            trash_entry_id: None,
             restore_parent_path: None,
             restore_name: None,
             created_at_unix: changed_at_unix,
@@ -232,6 +252,7 @@ impl NamespaceCatalog {
                 object_id: Some(object_id.to_string()),
                 head_version_id: Some(version_id.to_string()),
                 trashed_at_unix: None,
+                trash_entry_id: None,
                 restore_parent_path: None,
                 restore_name: None,
                 created_at_unix: changed_at_unix,
@@ -271,15 +292,15 @@ impl NamespaceCatalog {
         let mut has_more = false;
         let mut last_path = None::<String>;
 
-        for entry in entries
-            .into_iter()
-            .filter(|entry| entry.path.as_str() > continuation)
-        {
+        for entry in entries.into_iter().filter(|entry| {
+            let sort_key = list_entry_sort_key(entry, include_trashed);
+            sort_key.as_str() > continuation
+        }) {
             if page.len() >= limit {
                 has_more = true;
                 break;
             }
-            last_path = Some(entry.path.clone());
+            last_path = Some(list_entry_sort_key(&entry, include_trashed));
             page.push(entry);
         }
 
@@ -557,6 +578,8 @@ impl NamespaceCatalog {
             affected_objects,
             source_path: Some(source),
             destination_path: Some(destination),
+            trash_entry_id: None,
+            deleted_at_unix: None,
         })
     }
 
@@ -579,21 +602,26 @@ impl NamespaceCatalog {
             NamespaceError::NotFound(format!("path '{normalized}' does not exist"))
         })?;
         let (affected_paths, affected_objects) = self.subtree_counts(&source_id)?;
+        let trash_entry_id = Ulid::new().to_string();
+        self.trash_entry_index
+            .insert(trash_entry_id.clone(), source_id.clone());
         self.trash_anchor_index
-            .insert(normalized.clone(), source_id.clone());
+            .entry(normalized.clone())
+            .or_default()
+            .insert(trash_entry_id.clone());
 
         let Some(source_node) = self.nodes.get_mut(&source_id) else {
             return Err(self.missing_node_error(&source_id));
         };
         source_node.trashed_at_unix = Some(changed_at_unix);
+        source_node.trash_entry_id = Some(trash_entry_id.clone());
         source_node.restore_parent_path = Some(parent_path(&normalized));
         source_node.restore_name = Some(source_node.name.clone());
 
-        let trash_slot = Ulid::new().to_string();
         self.rebind_node(
             &source_id,
             &self.trash_root_node_id.clone(),
-            &trash_slot,
+            &trash_entry_id,
             changed_at_unix,
         )?;
 
@@ -604,6 +632,8 @@ impl NamespaceCatalog {
             affected_objects,
             source_path: Some(normalized),
             destination_path: None,
+            trash_entry_id: Some(trash_entry_id),
+            deleted_at_unix: Some(changed_at_unix),
         })
     }
 
@@ -613,10 +643,9 @@ impl NamespaceCatalog {
         changed_at_unix: i64,
     ) -> Result<NamespaceMutationSummary, NamespaceError> {
         let normalized = normalize_path(path)?;
-        let entry = self.trashed_entry(&normalized)?.ok_or_else(|| {
-            NamespaceError::NotFound(format!("path '{normalized}' is not in trash"))
-        })?;
         if let Some(node_id) = self.resolve_trashed_node_id(&normalized)? {
+            let lifecycle = self.trashed_lifecycle_for_node(&node_id)?;
+            let entry = self.node_view(&node_id, &normalized, lifecycle)?;
             return self.recover_resolved_trashed_path(
                 &normalized,
                 entry,
@@ -625,6 +654,11 @@ impl NamespaceCatalog {
             );
         }
 
+        let entry = self
+            .synthetic_trashed_directory_entry(&normalized)?
+            .ok_or_else(|| {
+                NamespaceError::NotFound(format!("path '{normalized}' is not in trash"))
+            })?;
         if entry.kind == NamespaceEntryKind::Directory {
             return self.recover_virtual_trash_directory(&normalized, changed_at_unix);
         }
@@ -632,6 +666,30 @@ impl NamespaceCatalog {
         Err(NamespaceError::NotFound(format!(
             "path '{normalized}' is not in trash"
         )))
+    }
+
+    pub fn recover_trash_entry_id(
+        &mut self,
+        trash_entry_id: &str,
+        changed_at_unix: i64,
+    ) -> Result<NamespaceMutationSummary, NamespaceError> {
+        let trash_entry_id = trash_entry_id.trim();
+        if trash_entry_id.is_empty() {
+            return Err(NamespaceError::InvalidPath(
+                "trash_entry_id is required".to_string(),
+            ));
+        }
+        let node_id = self
+            .trash_entry_index
+            .get(trash_entry_id)
+            .cloned()
+            .ok_or_else(|| {
+                NamespaceError::NotFound(format!("trash entry '{trash_entry_id}' does not exist"))
+            })?;
+        let visible_path = self.anchor_visible_path(&node_id)?;
+        let lifecycle = self.trashed_lifecycle_for_node(&node_id)?;
+        let entry = self.node_view(&node_id, &visible_path, lifecycle)?;
+        self.recover_resolved_trashed_path(&visible_path, entry, &node_id, changed_at_unix)
     }
 
     pub fn purge_trash_path(
@@ -645,13 +703,17 @@ impl NamespaceCatalog {
                 "root path cannot be purged from trash".to_string(),
             ));
         }
-        let entry = self.trashed_entry(&normalized)?.ok_or_else(|| {
-            NamespaceError::NotFound(format!("path '{normalized}' is not in trash"))
-        })?;
         if let Some(node_id) = self.resolve_trashed_node_id(&normalized)? {
+            let lifecycle = self.trashed_lifecycle_for_node(&node_id)?;
+            let entry = self.node_view(&node_id, &normalized, lifecycle)?;
             return self.purge_resolved_trashed_path(&normalized, entry, &node_id, changed_at_unix);
         }
 
+        let entry = self
+            .synthetic_trashed_directory_entry(&normalized)?
+            .ok_or_else(|| {
+                NamespaceError::NotFound(format!("path '{normalized}' is not in trash"))
+            })?;
         if entry.kind == NamespaceEntryKind::Directory {
             return self.purge_virtual_trash_directory(&normalized, changed_at_unix);
         }
@@ -659,6 +721,30 @@ impl NamespaceCatalog {
         Err(NamespaceError::NotFound(format!(
             "path '{normalized}' is not in trash"
         )))
+    }
+
+    pub fn purge_trash_entry_id(
+        &mut self,
+        trash_entry_id: &str,
+        changed_at_unix: i64,
+    ) -> Result<NamespaceMutationSummary, NamespaceError> {
+        let trash_entry_id = trash_entry_id.trim();
+        if trash_entry_id.is_empty() {
+            return Err(NamespaceError::InvalidPath(
+                "trash_entry_id is required".to_string(),
+            ));
+        }
+        let node_id = self
+            .trash_entry_index
+            .get(trash_entry_id)
+            .cloned()
+            .ok_or_else(|| {
+                NamespaceError::NotFound(format!("trash entry '{trash_entry_id}' does not exist"))
+            })?;
+        let visible_path = self.anchor_visible_path(&node_id)?;
+        let lifecycle = self.trashed_lifecycle_for_node(&node_id)?;
+        let entry = self.node_view(&node_id, &visible_path, lifecycle)?;
+        self.purge_resolved_trashed_path(&visible_path, entry, &node_id, changed_at_unix)
     }
 
     fn recover_resolved_trashed_path(
@@ -690,17 +776,29 @@ impl NamespaceCatalog {
             .ok_or_else(|| self.missing_node_error(&node_id))?
             .trashed_at_unix
             .is_some();
+        let trash_entry_id = self
+            .nodes
+            .get(&node_id)
+            .ok_or_else(|| self.missing_node_error(&node_id))?
+            .trash_entry_id
+            .clone();
+        let deleted_at_unix = self
+            .nodes
+            .get(&node_id)
+            .ok_or_else(|| self.missing_node_error(&node_id))?
+            .trashed_at_unix;
 
         {
             let Some(node) = self.nodes.get_mut(&node_id) else {
                 return Err(self.missing_node_error(&node_id));
             };
             node.trashed_at_unix = None;
+            node.trash_entry_id = None;
             node.restore_parent_path = None;
             node.restore_name = None;
         }
         if was_anchor {
-            self.trash_anchor_index.remove(normalized);
+            self.clear_anchor_for_node(&node_id);
         }
         self.rebind_node(
             &node_id,
@@ -720,6 +818,8 @@ impl NamespaceCatalog {
             affected_objects,
             source_path: Some(normalized.to_string()),
             destination_path: None,
+            trash_entry_id,
+            deleted_at_unix,
         })
     }
 
@@ -733,6 +833,17 @@ impl NamespaceCatalog {
         let _ = changed_at_unix;
         let node_id = node_id.to_string();
         let (affected_paths, affected_objects) = self.subtree_counts(&node_id)?;
+        let trash_entry_id = self
+            .nodes
+            .get(&node_id)
+            .ok_or_else(|| self.missing_node_error(&node_id))?
+            .trash_entry_id
+            .clone();
+        let deleted_at_unix = self
+            .nodes
+            .get(&node_id)
+            .ok_or_else(|| self.missing_node_error(&node_id))?
+            .trashed_at_unix;
         self.remove_subtree(&node_id)?;
 
         Ok(NamespaceMutationSummary {
@@ -742,6 +853,8 @@ impl NamespaceCatalog {
             affected_objects,
             source_path: Some(normalized.to_string()),
             destination_path: None,
+            trash_entry_id,
+            deleted_at_unix,
         })
     }
 
@@ -751,28 +864,35 @@ impl NamespaceCatalog {
         changed_at_unix: i64,
     ) -> Result<NamespaceMutationSummary, NamespaceError> {
         let normalized = normalize_path(path)?;
-        let anchor_paths = self.collect_trash_anchor_paths_under(&normalized);
-        if anchor_paths.is_empty() {
+        let anchor_refs = self.collect_trash_anchor_refs_under(&normalized)?;
+        if anchor_refs.is_empty() {
             return Err(NamespaceError::NotFound(format!(
                 "path '{normalized}' is not in trash"
             )));
         }
 
-        for anchor_path in &anchor_paths {
-            self.preflight_recover_destination(anchor_path)?;
+        let mut destination_paths = BTreeSet::new();
+        for anchor_ref in &anchor_refs {
+            if !destination_paths.insert(anchor_ref.visible_path.clone()) {
+                return Err(NamespaceError::Conflict(format!(
+                    "multiple trash entries restore to '{}'; recover by trash_entry_id instead",
+                    anchor_ref.visible_path
+                )));
+            }
+            self.preflight_recover_destination(&anchor_ref.visible_path)?;
         }
 
         let mut affected_paths = 0usize;
         let mut affected_objects = 0usize;
-        for anchor_path in anchor_paths {
-            let entry = self.trashed_entry(&anchor_path)?.ok_or_else(|| {
-                NamespaceError::NotFound(format!("path '{anchor_path}' is not in trash"))
-            })?;
-            let node_id = self.resolve_trashed_node_id(&anchor_path)?.ok_or_else(|| {
-                NamespaceError::NotFound(format!("path '{anchor_path}' is not in trash"))
-            })?;
-            let summary =
-                self.recover_resolved_trashed_path(&anchor_path, entry, &node_id, changed_at_unix)?;
+        for anchor_ref in anchor_refs {
+            let lifecycle = self.trashed_lifecycle_for_node(&anchor_ref.node_id)?;
+            let entry = self.node_view(&anchor_ref.node_id, &anchor_ref.visible_path, lifecycle)?;
+            let summary = self.recover_resolved_trashed_path(
+                &anchor_ref.visible_path,
+                entry,
+                &anchor_ref.node_id,
+                changed_at_unix,
+            )?;
             affected_paths = affected_paths.saturating_add(summary.affected_paths);
             affected_objects = affected_objects.saturating_add(summary.affected_objects);
         }
@@ -784,6 +904,8 @@ impl NamespaceCatalog {
             affected_objects,
             source_path: Some(normalized),
             destination_path: None,
+            trash_entry_id: None,
+            deleted_at_unix: None,
         })
     }
 
@@ -793,8 +915,8 @@ impl NamespaceCatalog {
         changed_at_unix: i64,
     ) -> Result<NamespaceMutationSummary, NamespaceError> {
         let normalized = normalize_path(path)?;
-        let anchor_paths = self.collect_trash_anchor_paths_under(&normalized);
-        if anchor_paths.is_empty() {
+        let anchor_refs = self.collect_trash_anchor_refs_under(&normalized)?;
+        if anchor_refs.is_empty() {
             return Err(NamespaceError::NotFound(format!(
                 "path '{normalized}' is not in trash"
             )));
@@ -802,15 +924,15 @@ impl NamespaceCatalog {
 
         let mut affected_paths = 0usize;
         let mut affected_objects = 0usize;
-        for anchor_path in anchor_paths {
-            let entry = self.trashed_entry(&anchor_path)?.ok_or_else(|| {
-                NamespaceError::NotFound(format!("path '{anchor_path}' is not in trash"))
-            })?;
-            let node_id = self.resolve_trashed_node_id(&anchor_path)?.ok_or_else(|| {
-                NamespaceError::NotFound(format!("path '{anchor_path}' is not in trash"))
-            })?;
-            let summary =
-                self.purge_resolved_trashed_path(&anchor_path, entry, &node_id, changed_at_unix)?;
+        for anchor_ref in anchor_refs {
+            let lifecycle = self.trashed_lifecycle_for_node(&anchor_ref.node_id)?;
+            let entry = self.node_view(&anchor_ref.node_id, &anchor_ref.visible_path, lifecycle)?;
+            let summary = self.purge_resolved_trashed_path(
+                &anchor_ref.visible_path,
+                entry,
+                &anchor_ref.node_id,
+                changed_at_unix,
+            )?;
             affected_paths = affected_paths.saturating_add(summary.affected_paths);
             affected_objects = affected_objects.saturating_add(summary.affected_objects);
         }
@@ -822,6 +944,8 @@ impl NamespaceCatalog {
             affected_objects,
             source_path: Some(normalized),
             destination_path: None,
+            trash_entry_id: None,
+            deleted_at_unix: None,
         })
     }
 
@@ -846,6 +970,8 @@ impl NamespaceCatalog {
             affected_objects,
             source_path: None,
             destination_path: None,
+            trash_entry_id: None,
+            deleted_at_unix: None,
         }
     }
 
@@ -903,9 +1029,11 @@ impl NamespaceCatalog {
     pub fn recover_all(&mut self, changed_at_unix: i64) -> NamespaceMutationSummary {
         let mut affected_paths = 0usize;
         let mut affected_objects = 0usize;
-        let anchors = self.trash_anchor_index.keys().cloned().collect::<Vec<_>>();
-        for anchor_path in anchors {
-            if let Ok(summary) = self.recover_path(&anchor_path, changed_at_unix) {
+        let anchors = self.collect_trash_anchor_refs_under("").unwrap_or_default();
+        for anchor in anchors {
+            if let Ok(summary) =
+                self.recover_trash_entry_id(&anchor.trash_entry_id, changed_at_unix)
+            {
                 affected_paths = affected_paths.saturating_add(summary.affected_paths);
                 affected_objects = affected_objects.saturating_add(summary.affected_objects);
             }
@@ -917,6 +1045,8 @@ impl NamespaceCatalog {
             affected_objects,
             source_path: None,
             destination_path: None,
+            trash_entry_id: None,
+            deleted_at_unix: None,
         }
     }
 
@@ -989,6 +1119,8 @@ impl NamespaceCatalog {
                 kind: child.kind,
                 lifecycle: LifecycleState::live(),
                 object_id: child.object_id.clone(),
+                trash_entry_id: None,
+                deleted_at_unix: None,
                 created_at_unix: child.created_at_unix,
                 updated_at_unix: child.updated_at_unix,
             });
@@ -1006,23 +1138,32 @@ impl NamespaceCatalog {
     }
 
     fn list_trash_root_entries(&self) -> Result<Vec<NamespaceListEntry>, NamespaceError> {
-        let mut out = Vec::with_capacity(self.trash_anchor_index.len());
-        for (anchor_path, anchor_id) in &self.trash_anchor_index {
+        let anchors = self.collect_trash_anchor_refs_under("")?;
+        let mut out = Vec::with_capacity(anchors.len());
+        for anchor_ref in anchors {
             let node = self
                 .nodes
-                .get(anchor_id)
-                .ok_or_else(|| self.missing_node_error(anchor_id))?;
-            let lifecycle = self.trashed_lifecycle_for_node(anchor_id)?;
+                .get(&anchor_ref.node_id)
+                .ok_or_else(|| self.missing_node_error(&anchor_ref.node_id))?;
+            let lifecycle = self.trashed_lifecycle_for_node(&anchor_ref.node_id)?;
             out.push(NamespaceListEntry {
-                name: base_name(anchor_path),
-                path: anchor_path.clone(),
+                name: base_name(&anchor_ref.visible_path),
+                path: anchor_ref.visible_path,
                 kind: node.kind,
                 lifecycle,
                 object_id: node.object_id.clone(),
+                trash_entry_id: Some(anchor_ref.trash_entry_id),
+                deleted_at_unix: node.trashed_at_unix,
                 created_at_unix: node.created_at_unix,
                 updated_at_unix: node.updated_at_unix,
             });
         }
+        out.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.deleted_at_unix.cmp(&right.deleted_at_unix))
+                .then_with(|| left.trash_entry_id.cmp(&right.trash_entry_id))
+        });
         Ok(out)
     }
 
@@ -1087,6 +1228,8 @@ impl NamespaceCatalog {
                     kind: node.kind,
                     lifecycle,
                     object_id: node.object_id.clone(),
+                    trash_entry_id: entry.trash_entry_id,
+                    deleted_at_unix: entry.deleted_at_unix,
                     created_at_unix: node.created_at_unix,
                     updated_at_unix: node.updated_at_unix,
                 },
@@ -1095,17 +1238,20 @@ impl NamespaceCatalog {
         Ok(out.into_values().collect())
     }
 
-    fn collect_trash_anchor_paths_under(&self, path: &str) -> Vec<String> {
+    fn collect_trash_anchor_refs_under(
+        &self,
+        path: &str,
+    ) -> Result<Vec<TrashAnchorRef>, NamespaceError> {
         let normalized = normalize_path(path).unwrap_or_default();
         let prefix = if normalized.is_empty() {
             None
         } else {
             Some(format!("{normalized}/"))
         };
-        let mut anchor_paths = self
+        let mut refs = self
             .trash_anchor_index
-            .keys()
-            .filter(|anchor_path| {
+            .iter()
+            .filter(|(anchor_path, _)| {
                 if normalized.is_empty() {
                     true
                 } else {
@@ -1115,10 +1261,37 @@ impl NamespaceCatalog {
                             .is_some_and(|prefix| anchor_path.starts_with(prefix))
                 }
             })
-            .cloned()
-            .collect::<Vec<_>>();
-        anchor_paths.sort_by_key(|path| (path.matches('/').count(), path.clone()));
-        anchor_paths
+            .flat_map(|(anchor_path, entry_ids)| {
+                entry_ids
+                    .iter()
+                    .map(move |trash_entry_id| (anchor_path.clone(), trash_entry_id.clone()))
+            })
+            .map(|(visible_path, trash_entry_id)| {
+                let node_id = self
+                    .trash_entry_index
+                    .get(&trash_entry_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        NamespaceError::Invariant(format!(
+                            "trash entry '{}' is missing an anchor node",
+                            trash_entry_id
+                        ))
+                    })?;
+                Ok(TrashAnchorRef {
+                    visible_path,
+                    trash_entry_id,
+                    node_id,
+                })
+            })
+            .collect::<Result<Vec<_>, NamespaceError>>()?;
+        refs.sort_by_key(|anchor| {
+            (
+                anchor.visible_path.matches('/').count(),
+                anchor.visible_path.clone(),
+                anchor.trash_entry_id.clone(),
+            )
+        });
+        Ok(refs)
     }
 
     fn synthetic_trashed_directory_entry(
@@ -1155,6 +1328,8 @@ impl NamespaceCatalog {
             kind: NamespaceEntryKind::Directory,
             object_id: None,
             lifecycle,
+            trash_entry_id: None,
+            deleted_at_unix: None,
             created_at_unix: if created_at_unix == i64::MAX {
                 0
             } else {
@@ -1301,14 +1476,14 @@ impl NamespaceCatalog {
     ) -> Result<Vec<NamespaceEntry>, NamespaceError> {
         let normalized = normalize_path(prefix)?;
         let mut entries = Vec::new();
-        for (anchor_path, anchor_id) in &self.trash_anchor_index {
-            if !subtrees_intersect(anchor_path, &normalized) {
+        for anchor_ref in self.collect_trash_anchor_refs_under("")? {
+            if !subtrees_intersect(&anchor_ref.visible_path, &normalized) {
                 continue;
             }
-            let lifecycle = self.trashed_lifecycle_for_node(anchor_id)?;
+            let lifecycle = self.trashed_lifecycle_for_node(&anchor_ref.node_id)?;
             self.collect_visible_subtree_entries(
-                anchor_id,
-                anchor_path,
+                &anchor_ref.node_id,
+                &anchor_ref.visible_path,
                 lifecycle,
                 &normalized,
                 &mut entries,
@@ -1332,6 +1507,18 @@ impl NamespaceCatalog {
                 .get(&node_id)
                 .ok_or_else(|| self.missing_node_error(&node_id))?;
             if !path.is_empty() && (prefix_filter.is_empty() || path.starts_with(prefix_filter)) {
+                let (trash_entry_id, deleted_at_unix) = match &lifecycle {
+                    LifecycleState::Live => (None, None),
+                    LifecycleState::Trashed { changed_at_unix } => {
+                        let anchor_id = self.trash_anchor_for_node(&node_id)?;
+                        let entry_id = anchor_id.as_deref().and_then(|anchor_id| {
+                            self.nodes
+                                .get(anchor_id)
+                                .and_then(|anchor| anchor.trash_entry_id.clone())
+                        });
+                        (entry_id, Some(*changed_at_unix))
+                    }
+                };
                 out.push(NamespaceEntry {
                     fragment: self.fragment.clone(),
                     parent_path: parent_path(&path),
@@ -1340,6 +1527,8 @@ impl NamespaceCatalog {
                     kind: node.kind,
                     object_id: node.object_id.clone(),
                     lifecycle: lifecycle.clone(),
+                    trash_entry_id,
+                    deleted_at_unix,
                     created_at_unix: node.created_at_unix,
                     updated_at_unix: node.updated_at_unix,
                 });
@@ -1391,6 +1580,18 @@ impl NamespaceCatalog {
             .nodes
             .get(node_id)
             .ok_or_else(|| self.missing_node_error(node_id))?;
+        let (trash_entry_id, deleted_at_unix) = match &lifecycle {
+            LifecycleState::Live => (None, None),
+            LifecycleState::Trashed { changed_at_unix } => {
+                let anchor_id = self.trash_anchor_for_node(node_id)?;
+                let entry_id = anchor_id.as_deref().and_then(|anchor_id| {
+                    self.nodes
+                        .get(anchor_id)
+                        .and_then(|anchor| anchor.trash_entry_id.clone())
+                });
+                (entry_id, Some(*changed_at_unix))
+            }
+        };
         Ok(NamespaceEntry {
             fragment: self.fragment.clone(),
             path: path.to_string(),
@@ -1399,6 +1600,8 @@ impl NamespaceCatalog {
             kind: node.kind,
             object_id: node.object_id.clone(),
             lifecycle,
+            trash_entry_id,
+            deleted_at_unix,
             created_at_unix: node.created_at_unix,
             updated_at_unix: node.updated_at_unix,
         })
@@ -1413,29 +1616,50 @@ impl NamespaceCatalog {
     }
 
     fn resolve_trashed_node_id(&self, path: &str) -> Result<Option<String>, NamespaceError> {
-        let normalized = normalize_path(path)?;
-        if let Some(anchor_id) = self.trash_anchor_index.get(&normalized) {
-            return Ok(Some(anchor_id.clone()));
+        let mut matches = self.resolve_trashed_node_ids(path)?;
+        if matches.len() > 1 {
+            let normalized = normalize_path(path)?;
+            return Err(NamespaceError::Conflict(format!(
+                "multiple trash entries match path '{normalized}'; use trash_entry_id"
+            )));
         }
+        Ok(matches.pop())
+    }
+
+    fn resolve_trashed_node_ids(&self, path: &str) -> Result<Vec<String>, NamespaceError> {
+        let normalized = normalize_path(path)?;
+        let mut out = BTreeMap::<String, String>::new();
 
         let mut current = normalized.clone();
         loop {
-            if let Some(anchor_id) = self.trash_anchor_index.get(&current) {
-                let suffix = normalized
-                    .strip_prefix(&current)
-                    .unwrap_or_default()
-                    .trim_start_matches('/');
-                if suffix.is_empty() {
-                    return Ok(Some(anchor_id.clone()));
+            if let Some(entry_ids) = self.trash_anchor_index.get(&current) {
+                for trash_entry_id in entry_ids {
+                    let Some(anchor_id) = self.trash_entry_index.get(trash_entry_id) else {
+                        return Err(NamespaceError::Invariant(format!(
+                            "trash entry '{}' is missing an anchor node",
+                            trash_entry_id
+                        )));
+                    };
+                    let suffix = normalized
+                        .strip_prefix(&current)
+                        .unwrap_or_default()
+                        .trim_start_matches('/');
+                    let resolved = if suffix.is_empty() {
+                        Some(anchor_id.clone())
+                    } else {
+                        self.resolve_node_id_from_root(anchor_id, suffix)?
+                    };
+                    if let Some(node_id) = resolved {
+                        out.insert(trash_entry_id.clone(), node_id);
+                    }
                 }
-                return self.resolve_node_id_from_root(anchor_id, suffix);
             }
             if current.is_empty() {
                 break;
             }
             current = parent_path(&current);
         }
-        Ok(None)
+        Ok(out.into_values().collect())
     }
 
     fn resolve_trashed_node_id_by_visible_path(
@@ -1549,6 +1773,7 @@ impl NamespaceCatalog {
                 object_id: None,
                 head_version_id: None,
                 trashed_at_unix: None,
+                trash_entry_id: None,
                 restore_parent_path: None,
                 restore_name: None,
                 created_at_unix: changed_at_unix,
@@ -1956,14 +2181,25 @@ impl NamespaceCatalog {
     }
 
     fn clear_anchor_for_node(&mut self, node_id: &str) {
-        let anchor_paths = self
-            .trash_anchor_index
+        let entry_ids = self
+            .trash_entry_index
             .iter()
             .filter(|(_, anchor_id)| *anchor_id == node_id)
-            .map(|(path, _)| path.clone())
+            .map(|(entry_id, _)| entry_id.clone())
             .collect::<Vec<_>>();
-        for path in anchor_paths {
-            self.trash_anchor_index.remove(&path);
+        for entry_id in entry_ids {
+            self.trash_entry_index.remove(&entry_id);
+            let empty_paths = self
+                .trash_anchor_index
+                .iter_mut()
+                .filter_map(|(path, entry_ids)| {
+                    entry_ids.remove(&entry_id);
+                    entry_ids.is_empty().then(|| path.clone())
+                })
+                .collect::<Vec<_>>();
+            for path in empty_paths {
+                self.trash_anchor_index.remove(&path);
+            }
         }
     }
 
@@ -1989,6 +2225,8 @@ impl NamespaceCatalog {
                     kind: NamespaceEntryKind::Directory,
                     lifecycle,
                     object_id: None,
+                    trash_entry_id: None,
+                    deleted_at_unix: None,
                     created_at_unix,
                     updated_at_unix,
                 });
@@ -2006,10 +2244,36 @@ impl NamespaceCatalog {
             anchor.restore_name.as_deref().unwrap_or_default(),
         ))
     }
+
+    fn ensure_trash_entry_id(&mut self, anchor_id: &str) -> Result<String, NamespaceError> {
+        let Some(anchor) = self.nodes.get_mut(anchor_id) else {
+            return Err(self.missing_node_error(anchor_id));
+        };
+        if let Some(existing) = anchor.trash_entry_id.clone() {
+            return Ok(existing);
+        }
+        // Legacy 2.1.1 catalogs had path-based trash anchors only. The anchor
+        // node id is already stable and unique, so it becomes the migration id.
+        let migrated = anchor_id.to_string();
+        anchor.trash_entry_id = Some(migrated.clone());
+        Ok(migrated)
+    }
 }
 
 fn child_index_key(parent_id: &str, name: &str) -> String {
     format!("{parent_id}\u{0000}{name}")
+}
+
+fn list_entry_sort_key(entry: &NamespaceListEntry, include_trashed: bool) -> String {
+    if include_trashed {
+        format!(
+            "{}\u{0000}{}",
+            entry.path,
+            entry.trash_entry_id.as_deref().unwrap_or_default()
+        )
+    } else {
+        entry.path.clone()
+    }
 }
 
 fn path_in_subtree(path: &str, prefix: &str) -> bool {

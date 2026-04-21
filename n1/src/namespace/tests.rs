@@ -88,6 +88,148 @@ fn trash_and_recover_preserve_visible_paths_and_object_identity() {
 }
 
 #[test]
+fn trash_allows_timestamped_generations_for_same_visible_path() {
+    let mut catalog = NamespaceCatalog::new("fragment-a");
+    catalog
+        .put_file(
+            "images/original.jpg",
+            "obj-original",
+            "ver-original",
+            "storage-original",
+            "image/jpeg",
+            4_096,
+            262_144,
+            100,
+        )
+        .unwrap();
+
+    let first = catalog.trash_path("images", 200).unwrap();
+    assert_eq!(first.operation, "trash");
+    let first_entry_id = first.trash_entry_id.clone().unwrap();
+    assert_eq!(first.deleted_at_unix, Some(200));
+    assert!(catalog.entry("images").unwrap().is_none());
+    assert!(catalog.trashed_entry("images").unwrap().is_some());
+
+    catalog
+        .put_file(
+            "images/recreated.jpg",
+            "obj-recreated",
+            "ver-recreated",
+            "storage-recreated",
+            "image/jpeg",
+            4_096,
+            262_144,
+            210,
+        )
+        .unwrap();
+
+    let second = catalog.trash_path("images", 220).unwrap();
+    let second_entry_id = second.trash_entry_id.clone().unwrap();
+    assert_ne!(first_entry_id, second_entry_id);
+    assert_eq!(second.deleted_at_unix, Some(220));
+
+    let trash_root = catalog.list_dir("", true).unwrap();
+    assert_eq!(trash_root.len(), 2);
+    assert_eq!(trash_root[0].path, "images");
+    assert_eq!(
+        trash_root[0].trash_entry_id.as_deref(),
+        Some(first_entry_id.as_str())
+    );
+    assert_eq!(trash_root[0].deleted_at_unix, Some(200));
+    assert_eq!(trash_root[1].path, "images");
+    assert_eq!(
+        trash_root[1].trash_entry_id.as_deref(),
+        Some(second_entry_id.as_str())
+    );
+    assert_eq!(trash_root[1].deleted_at_unix, Some(220));
+
+    let err = catalog
+        .recover_path("images", 230)
+        .expect_err("path-only recover must be ambiguous with duplicate trash generations");
+    assert!(
+        err.to_string().contains("multiple trash entries"),
+        "unexpected ambiguity message: {err}"
+    );
+
+    let recover_second = catalog
+        .recover_trash_entry_id(&second_entry_id, 240)
+        .unwrap();
+    assert_eq!(
+        recover_second.trash_entry_id.as_deref(),
+        Some(second_entry_id.as_str())
+    );
+    assert!(catalog.entry("images/recreated.jpg").unwrap().is_some());
+    assert!(
+        catalog
+            .trashed_entry("images/original.jpg")
+            .unwrap()
+            .is_some()
+    );
+
+    let purge_first = catalog.purge_trash_entry_id(&first_entry_id, 260).unwrap();
+    assert_eq!(
+        purge_first.trash_entry_id.as_deref(),
+        Some(first_entry_id.as_str())
+    );
+    assert!(
+        catalog
+            .trashed_entry("images/original.jpg")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn recover_by_trash_entry_id_rejects_existing_live_destination() {
+    let mut catalog = NamespaceCatalog::new("fragment-a");
+    catalog
+        .put_file(
+            "images/original.jpg",
+            "obj-original",
+            "ver-original",
+            "storage-original",
+            "image/jpeg",
+            4_096,
+            262_144,
+            100,
+        )
+        .unwrap();
+
+    let trash = catalog.trash_path("images", 200).unwrap();
+    let trash_entry_id = trash.trash_entry_id.unwrap();
+
+    catalog
+        .put_file(
+            "images/live.jpg",
+            "obj-live",
+            "ver-live",
+            "storage-live",
+            "image/jpeg",
+            4_096,
+            262_144,
+            220,
+        )
+        .unwrap();
+
+    let err = catalog
+        .recover_trash_entry_id(&trash_entry_id, 240)
+        .expect_err("recover must not merge into an existing live path");
+    assert!(
+        err.to_string()
+            .contains("destination path 'images' already exists"),
+        "unexpected recover conflict: {err}"
+    );
+
+    assert!(catalog.entry("images/live.jpg").unwrap().is_some());
+    assert!(
+        catalog
+            .trashed_entry("images/original.jpg")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
 fn explicit_directories_exist_without_marker_objects() {
     let mut catalog = NamespaceCatalog::new("fragment-a");
     assert!(catalog.mkdir("empty", 10).unwrap());

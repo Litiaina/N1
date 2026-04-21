@@ -60,6 +60,8 @@ async fn posix_list(
             modified_at_unix: Some(entry.updated_at_unix),
             content_type: None,
             version_id: None,
+            trash_entry_id: entry.trash_entry_id,
+            deleted_at_unix: entry.deleted_at_unix,
         })
         .collect::<Vec<_>>();
     mapped.sort_by(|left, right| left.path.cmp(&right.path));
@@ -117,6 +119,8 @@ async fn posix_stat(
         modified_at_unix: Some(entry.updated_at_unix),
         content_type,
         version_id,
+        trash_entry_id: entry.trash_entry_id,
+        deleted_at_unix: entry.deleted_at_unix,
     }))
 }
 
@@ -140,6 +144,8 @@ async fn posix_mkdir(
         source_path: None,
         destination_path: None,
         created: Some(created),
+        trash_entry_id: None,
+        deleted_at_unix: None,
     }))
 }
 
@@ -166,6 +172,8 @@ async fn posix_rename(
         source_path: summary.source_path,
         destination_path: summary.destination_path,
         created: None,
+        trash_entry_id: summary.trash_entry_id,
+        deleted_at_unix: summary.deleted_at_unix,
     }))
 }
 
@@ -189,6 +197,8 @@ async fn posix_trash(
         source_path: None,
         destination_path: None,
         created: None,
+        trash_entry_id: summary.trash_entry_id,
+        deleted_at_unix: summary.deleted_at_unix,
     }))
 }
 
@@ -198,9 +208,18 @@ async fn posix_recover(
     Json(req): Json<PosixPathRequest>,
 ) -> Result<Json<PosixMutationResponse>, AppError> {
     let _ = state;
-    let summary = global_namespace_runtime()
-        .recover(&claims.fragment, &req.path)
-        .await?;
+    let summary = match req.trash_entry_id.as_deref().map(str::trim) {
+        Some(trash_entry_id) if !trash_entry_id.is_empty() => {
+            global_namespace_runtime()
+                .recover_trash_entry_id(&claims.fragment, trash_entry_id)
+                .await?
+        }
+        _ => {
+            global_namespace_runtime()
+                .recover(&claims.fragment, &req.path)
+                .await?
+        }
+    };
     Ok(Json(PosixMutationResponse {
         operation: summary.operation,
         kind: match summary.kind {
@@ -212,6 +231,8 @@ async fn posix_recover(
         source_path: None,
         destination_path: None,
         created: None,
+        trash_entry_id: summary.trash_entry_id,
+        deleted_at_unix: summary.deleted_at_unix,
     }))
 }
 
@@ -224,9 +245,18 @@ async fn posix_purge(
     if !claims.delete {
         return Err(AppError::Forbidden("Delete permission required".into()));
     }
-    let summary = global_namespace_runtime()
-        .purge_trash_path(&claims.fragment, &req.path)
-        .await?;
+    let summary = match req.trash_entry_id.as_deref().map(str::trim) {
+        Some(trash_entry_id) if !trash_entry_id.is_empty() => {
+            global_namespace_runtime()
+                .purge_trash_entry_id(&claims.fragment, trash_entry_id)
+                .await?
+        }
+        _ => {
+            global_namespace_runtime()
+                .purge_trash_path(&claims.fragment, &req.path)
+                .await?
+        }
+    };
     Ok(Json(PosixMutationResponse {
         operation: summary.operation,
         kind: match summary.kind {
@@ -238,6 +268,8 @@ async fn posix_purge(
         source_path: None,
         destination_path: None,
         created: None,
+        trash_entry_id: summary.trash_entry_id,
+        deleted_at_unix: summary.deleted_at_unix,
     }))
 }
 
@@ -553,6 +585,7 @@ mod tests {
             full_claims(&fragment),
             Json(PosixPathRequest {
                 path: "Images".to_string(),
+                trash_entry_id: None,
             }),
         )
         .await
@@ -617,6 +650,7 @@ mod tests {
             full_claims(&fragment),
             Json(PosixPathRequest {
                 path: "images/photo.jpg".to_string(),
+                trash_entry_id: None,
             }),
         )
         .await
@@ -665,6 +699,7 @@ mod tests {
             full_claims(&fragment),
             Json(PosixPathRequest {
                 path: "images/photo.jpg".to_string(),
+                trash_entry_id: None,
             }),
         )
         .await
@@ -711,6 +746,7 @@ mod tests {
             full_claims(&fragment),
             Json(PosixPathRequest {
                 path: "videos/2025/My Videos/clip.mp4".to_string(),
+                trash_entry_id: None,
             }),
         )
         .await
@@ -800,6 +836,7 @@ mod tests {
             full_claims(&fragment),
             Json(PosixPathRequest {
                 path: "videos/2025/My Videos/clip.mp4".to_string(),
+                trash_entry_id: None,
             }),
         )
         .await
@@ -854,6 +891,7 @@ mod tests {
                 full_claims(&fragment),
                 Json(PosixPathRequest {
                     path: path.to_string(),
+                    trash_entry_id: None,
                 }),
             )
             .await
@@ -881,6 +919,7 @@ mod tests {
             full_claims(&fragment),
             Json(PosixPathRequest {
                 path: "Screenshots/shot-1.png".to_string(),
+                trash_entry_id: None,
             }),
         )
         .await
@@ -910,6 +949,7 @@ mod tests {
             full_claims(&fragment),
             Json(PosixPathRequest {
                 path: "Screenshots/shot-2.png".to_string(),
+                trash_entry_id: None,
             }),
         )
         .await
@@ -958,6 +998,7 @@ mod tests {
             full_claims(&fragment),
             Json(PosixPathRequest {
                 path: "videos/video.mp4".to_string(),
+                trash_entry_id: None,
             }),
         )
         .await
@@ -968,6 +1009,7 @@ mod tests {
             full_claims(&fragment),
             Json(PosixPathRequest {
                 path: "videos/video.mp4".to_string(),
+                trash_entry_id: None,
             }),
         )
         .await
@@ -988,6 +1030,167 @@ mod tests {
         )
         .await
         .expect("trash list after purge")
+        .0;
+        assert!(empty_trash.entries.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn posix_trash_supports_same_path_generations_by_trash_entry_id() {
+        let _guard = TEST_LOCK.lock().await;
+        ensure_storage_config().await;
+
+        let fragment = hex::encode(Sha256::digest(
+            format!("fragment-{}", Ulid::new()).as_bytes(),
+        ));
+        setup_fragment(&fragment).await;
+
+        seed_logical_file(
+            &fragment,
+            "images/first.jpg",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            1_700_000_300,
+        )
+        .await;
+
+        let state = Arc::new(AppState {
+            ws_manager: WsConnectionManager::new(),
+        });
+        let first_trash = posix_trash(
+            State(state.clone()),
+            full_claims(&fragment),
+            Json(PosixPathRequest {
+                path: "images".to_string(),
+                trash_entry_id: None,
+            }),
+        )
+        .await
+        .expect("trash first images generation")
+        .0;
+        let first_entry_id = first_trash
+            .trash_entry_id
+            .clone()
+            .expect("first trash entry id");
+
+        seed_logical_file(
+            &fragment,
+            "images/second.jpg",
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            1_700_000_301,
+        )
+        .await;
+        let second_trash = posix_trash(
+            State(state.clone()),
+            full_claims(&fragment),
+            Json(PosixPathRequest {
+                path: "images".to_string(),
+                trash_entry_id: None,
+            }),
+        )
+        .await
+        .expect("trash second images generation")
+        .0;
+        let second_entry_id = second_trash
+            .trash_entry_id
+            .clone()
+            .expect("second trash entry id");
+        assert_ne!(first_entry_id, second_entry_id);
+
+        let trash_root = posix_list(
+            full_claims(&fragment),
+            Query(PosixListQuery {
+                path: None,
+                limit: Some(200),
+                continuation_token: None,
+                trash: Some(true),
+            }),
+        )
+        .await
+        .expect("trash root list")
+        .0;
+        assert_eq!(trash_root.entries.len(), 2);
+        assert_eq!(trash_root.entries[0].path, "images");
+        assert_eq!(
+            trash_root.entries[0].trash_entry_id.as_deref(),
+            Some(first_entry_id.as_str())
+        );
+        assert_eq!(trash_root.entries[1].path, "images");
+        assert_eq!(
+            trash_root.entries[1].trash_entry_id.as_deref(),
+            Some(second_entry_id.as_str())
+        );
+
+        let recover_by_path = posix_recover(
+            State(state.clone()),
+            full_claims(&fragment),
+            Json(PosixPathRequest {
+                path: "images".to_string(),
+                trash_entry_id: None,
+            }),
+        )
+        .await;
+        assert!(
+            recover_by_path.is_err(),
+            "path-only recover must be ambiguous for duplicate trash generations"
+        );
+
+        let recovered = posix_recover(
+            State(state.clone()),
+            full_claims(&fragment),
+            Json(PosixPathRequest {
+                path: "images".to_string(),
+                trash_entry_id: Some(second_entry_id.clone()),
+            }),
+        )
+        .await
+        .expect("recover second generation by id")
+        .0;
+        assert_eq!(
+            recovered.trash_entry_id.as_deref(),
+            Some(second_entry_id.as_str())
+        );
+
+        let live_images = posix_list(
+            full_claims(&fragment),
+            Query(PosixListQuery {
+                path: Some("images".to_string()),
+                limit: Some(200),
+                continuation_token: None,
+                trash: Some(false),
+            }),
+        )
+        .await
+        .expect("live images list after id recover")
+        .0;
+        assert_eq!(live_images.entries.len(), 1);
+        assert_eq!(live_images.entries[0].path, "images/second.jpg");
+
+        let purged = posix_purge(
+            State(state),
+            full_claims(&fragment),
+            Json(PosixPathRequest {
+                path: "images".to_string(),
+                trash_entry_id: Some(first_entry_id.clone()),
+            }),
+        )
+        .await
+        .expect("purge first generation by id")
+        .0;
+        assert_eq!(
+            purged.trash_entry_id.as_deref(),
+            Some(first_entry_id.as_str())
+        );
+
+        let empty_trash = posix_list(
+            full_claims(&fragment),
+            Query(PosixListQuery {
+                path: None,
+                limit: Some(200),
+                continuation_token: None,
+                trash: Some(true),
+            }),
+        )
+        .await
+        .expect("trash list after id purge")
         .0;
         assert!(empty_trash.entries.is_empty());
     }

@@ -20,6 +20,10 @@ pub struct PosixEntry {
     pub content_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trash_entry_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at_unix: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,6 +48,10 @@ pub struct PosixStatResponse {
     pub content_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trash_entry_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at_unix: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +77,8 @@ pub struct PosixStatQuery {
 #[derive(Debug, Deserialize)]
 pub struct PosixPathRequest {
     pub path: String,
+    #[serde(default)]
+    pub trash_entry_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,4 +100,8 @@ pub struct PosixMutationResponse {
     pub destination_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trash_entry_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at_unix: Option<i64>,
 }

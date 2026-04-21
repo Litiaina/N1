@@ -41,6 +41,8 @@ pub struct NamespaceNode {
     pub object_id: Option<String>,
     pub head_version_id: Option<String>,
     pub trashed_at_unix: Option<i64>,
+    #[serde(default)]
+    pub trash_entry_id: Option<String>,
     pub restore_parent_path: Option<String>,
     pub restore_name: Option<String>,
     pub created_at_unix: i64,
@@ -76,6 +78,10 @@ pub struct NamespaceEntry {
     pub kind: NamespaceEntryKind,
     pub object_id: Option<String>,
     pub lifecycle: LifecycleState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trash_entry_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at_unix: Option<i64>,
     pub created_at_unix: i64,
     pub updated_at_unix: i64,
 }
@@ -100,6 +106,10 @@ pub struct NamespaceListEntry {
     pub kind: NamespaceEntryKind,
     pub lifecycle: LifecycleState,
     pub object_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trash_entry_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at_unix: Option<i64>,
     pub created_at_unix: i64,
     pub updated_at_unix: i64,
 }
@@ -125,6 +135,10 @@ pub struct NamespaceMutationSummary {
     pub affected_objects: usize,
     pub source_path: Option<String>,
     pub destination_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trash_entry_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at_unix: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
