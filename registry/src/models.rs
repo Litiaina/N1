@@ -52,8 +52,14 @@ pub struct ObjectRecord {
     pub storage_object_id: String,
     pub version_id: String,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub object_size_bytes: i64,
     pub content_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trash_entry_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at_unix: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -114,6 +120,43 @@ pub struct ShareRecord {
     pub expires_at: String,
     pub created_at: String,
     pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditEventRecord {
+    pub event_id: String,
+    pub owner_uid: String,
+    pub actor_uid: String,
+    pub event_type: String,
+    pub fragment: Option<String>,
+    pub object_key: Option<String>,
+    pub details_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ObjectOverlayRecord {
+    pub owner_uid: String,
+    pub fragment: String,
+    pub object_key: String,
+    pub favorite: bool,
+    pub tags: Vec<String>,
+    pub labels: Vec<String>,
+    pub comment_count: usize,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ObjectCommentRecord {
+    pub comment_id: String,
+    pub owner_uid: String,
+    pub actor_uid: String,
+    pub fragment: String,
+    pub object_key: String,
+    pub body: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub deleted_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -444,6 +487,67 @@ pub struct ListSharesResponse {
     pub shares: Vec<ShareRecord>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ActivityQuery {
+    pub owner_uid: Option<String>,
+    pub fragment: Option<String>,
+    pub object_key: Option<String>,
+    pub event_type: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ActivityResponse {
+    pub events: Vec<AuditEventRecord>,
+    pub limit: usize,
+    pub offset: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ObjectOverlayQuery {
+    pub fragment: String,
+    pub object_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateObjectOverlayRequest {
+    pub fragment: String,
+    pub object_key: String,
+    pub favorite: Option<bool>,
+    pub tags: Option<Vec<String>>,
+    pub labels: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ObjectOverlayResponse {
+    pub overlay: ObjectOverlayRecord,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddObjectCommentRequest {
+    pub fragment: String,
+    pub object_key: String,
+    pub body: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListObjectCommentsQuery {
+    pub fragment: String,
+    pub object_key: String,
+    pub include_deleted: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ObjectCommentsResponse {
+    pub comments: Vec<ObjectCommentRecord>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeleteObjectCommentResponse {
+    pub removed: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RevokeShareResponse {
     pub revoked: bool,
@@ -499,6 +603,8 @@ pub struct SuggestObjectsResponse {
 pub struct ObjectStateRequest {
     pub fragment: String,
     pub object_key: String,
+    #[serde(default)]
+    pub trash_entry_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -524,6 +630,8 @@ pub struct RenameRegistryObjectRequest {
 pub struct PrefixObjectMutationRequest {
     pub fragment: String,
     pub prefix: String,
+    #[serde(default)]
+    pub trash_entry_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -541,6 +649,8 @@ pub struct DeleteObjectQuery {
     pub version_id: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub trash_entry_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

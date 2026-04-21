@@ -4,16 +4,17 @@ use std::time::Duration;
 use chrono::{TimeZone, Utc};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
-use sha2::{Digest, Sha256};
+use serde_json::Value as JsonValue;
 use tokio::task;
 use uuid::Uuid;
 
 use crate::auth::hash_refresh_token;
 use crate::error::RegistryError;
 use crate::models::{
-    AdminActivityUserSummary, AdminLargestObjectSummary, AdminStatsTotals, FragmentBindingRecord,
-    HealthResponse, ObjectExtensionStat, ObjectRecord, ShareDisposition, ShareRecord,
-    StorageDeployment, UserAuthRecord, UserRecord,
+    AdminActivityUserSummary, AdminLargestObjectSummary, AdminStatsTotals, AuditEventRecord,
+    FragmentBindingRecord, HealthResponse, ObjectCommentRecord, ObjectExtensionStat,
+    ObjectOverlayRecord, ObjectRecord, ShareDisposition, ShareRecord, StorageDeployment,
+    UserAuthRecord, UserRecord,
 };
 use crate::storage_broker::EngineObjectMetadata;
 
@@ -207,6 +208,51 @@ impl RegistryDb {
                 );
                 CREATE INDEX IF NOT EXISTS idx_object_purge_queue_due
                     ON object_purge_queue (available_at, created_at);
+
+                CREATE TABLE IF NOT EXISTS audit_events (
+                    event_id TEXT PRIMARY KEY,
+                    owner_uid TEXT NOT NULL,
+                    actor_uid TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    fragment TEXT,
+                    object_key TEXT,
+                    details_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_audit_events_owner_created
+                    ON audit_events (owner_uid, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_audit_events_object
+                    ON audit_events (owner_uid, fragment, object_key, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_audit_events_type
+                    ON audit_events (event_type, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS object_overlays (
+                    owner_uid TEXT NOT NULL,
+                    fragment TEXT NOT NULL,
+                    object_key TEXT NOT NULL,
+                    favorite INTEGER NOT NULL DEFAULT 0,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    labels_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (owner_uid, fragment, object_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_object_overlays_owner
+                    ON object_overlays (owner_uid, fragment, object_key);
+
+                CREATE TABLE IF NOT EXISTS object_comments (
+                    comment_id TEXT PRIMARY KEY,
+                    owner_uid TEXT NOT NULL,
+                    actor_uid TEXT NOT NULL,
+                    fragment TEXT NOT NULL,
+                    object_key TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    deleted_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_object_comments_object
+                    ON object_comments (owner_uid, fragment, object_key, created_at);
                 "#,
             )
             .map_err(sql_err)?;
@@ -417,6 +463,286 @@ impl RegistryDb {
                 out.push(user);
             }
             Ok(out)
+        })
+        .await
+    }
+
+    pub async fn record_audit_event(
+        &self,
+        owner_uid: String,
+        actor_uid: String,
+        event_type: String,
+        fragment: Option<String>,
+        object_key: Option<String>,
+        details: JsonValue,
+    ) -> Result<AuditEventRecord, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            let event_id = Uuid::new_v4().to_string();
+            let created_at = now_rfc3339();
+            let details_json = serde_json::to_string(&details)
+                .map_err(|err| RegistryError::internal(format!("encode audit details: {err}")))?;
+            conn.execute(
+                r#"
+                INSERT INTO audit_events (
+                    event_id, owner_uid, actor_uid, event_type, fragment, object_key, details_json, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+                params![
+                    event_id,
+                    owner_uid,
+                    actor_uid,
+                    event_type,
+                    fragment,
+                    object_key,
+                    details_json,
+                    created_at
+                ],
+            )
+            .map_err(sql_err)?;
+            Ok(AuditEventRecord {
+                event_id,
+                owner_uid,
+                actor_uid,
+                event_type,
+                fragment,
+                object_key,
+                details_json,
+                created_at,
+            })
+        })
+        .await
+    }
+
+    pub async fn list_audit_events(
+        &self,
+        owner_uid: Option<String>,
+        fragment: Option<String>,
+        object_key: Option<String>,
+        event_type: Option<String>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<AuditEventRecord>, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            let mut sql = String::from(
+                r#"
+                SELECT event_id, owner_uid, actor_uid, event_type, fragment, object_key, details_json, created_at
+                FROM audit_events
+                WHERE 1 = 1
+                "#,
+            );
+            let mut args = Vec::<Value>::new();
+            if let Some(owner_uid) = owner_uid.filter(|value| !value.trim().is_empty()) {
+                sql.push_str(" AND owner_uid = ?");
+                args.push(Value::Text(owner_uid));
+            }
+            if let Some(fragment) = fragment.filter(|value| !value.trim().is_empty()) {
+                sql.push_str(" AND fragment = ?");
+                args.push(Value::Text(fragment));
+            }
+            if let Some(object_key) = object_key.filter(|value| !value.trim().is_empty()) {
+                sql.push_str(" AND object_key = ?");
+                args.push(Value::Text(object_key));
+            }
+            if let Some(event_type) = event_type.filter(|value| !value.trim().is_empty()) {
+                sql.push_str(" AND event_type = ?");
+                args.push(Value::Text(event_type));
+            }
+            sql.push_str(" ORDER BY created_at DESC, event_id DESC LIMIT ? OFFSET ?");
+            args.push(Value::Integer(limit as i64));
+            args.push(Value::Integer(offset as i64));
+
+            let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params_from_iter(args), map_audit_event_row)
+                .map_err(sql_err)?;
+            let mut events = Vec::new();
+            for row in rows {
+                events.push(row.map_err(sql_err)?);
+            }
+            Ok(events)
+        })
+        .await
+    }
+
+    pub async fn get_object_overlay(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_key: String,
+    ) -> Result<ObjectOverlayRecord, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            resolve_overlay(&conn, &owner_uid, &fragment, &object_key)
+        })
+        .await
+    }
+
+    pub async fn update_object_overlay(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_key: String,
+        favorite: Option<bool>,
+        tags: Option<Vec<String>>,
+        labels: Option<Vec<String>>,
+    ) -> Result<ObjectOverlayRecord, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            let current = resolve_overlay(&conn, &owner_uid, &fragment, &object_key)?;
+            let next_favorite = favorite.unwrap_or(current.favorite);
+            let next_tags = tags
+                .map(sanitize_overlay_values)
+                .unwrap_or_else(|| current.tags.clone());
+            let next_labels = labels
+                .map(sanitize_overlay_values)
+                .unwrap_or_else(|| current.labels.clone());
+            let tags_json = serde_json::to_string(&next_tags)
+                .map_err(|err| RegistryError::internal(format!("encode tags: {err}")))?;
+            let labels_json = serde_json::to_string(&next_labels)
+                .map_err(|err| RegistryError::internal(format!("encode labels: {err}")))?;
+            let now = now_rfc3339();
+            conn.execute(
+                r#"
+                INSERT INTO object_overlays (
+                    owner_uid, fragment, object_key, favorite, tags_json, labels_json, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                ON CONFLICT(owner_uid, fragment, object_key)
+                DO UPDATE SET
+                    favorite = excluded.favorite,
+                    tags_json = excluded.tags_json,
+                    labels_json = excluded.labels_json,
+                    updated_at = excluded.updated_at
+                "#,
+                params![
+                    owner_uid,
+                    fragment,
+                    object_key,
+                    if next_favorite { 1 } else { 0 },
+                    tags_json,
+                    labels_json,
+                    now,
+                    now
+                ],
+            )
+            .map_err(sql_err)?;
+            resolve_overlay(&conn, &owner_uid, &fragment, &object_key)
+        })
+        .await
+    }
+
+    pub async fn add_object_comment(
+        &self,
+        owner_uid: String,
+        actor_uid: String,
+        fragment: String,
+        object_key: String,
+        body: String,
+    ) -> Result<ObjectCommentRecord, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let body = body.trim().to_string();
+            if body.is_empty() {
+                return Err(RegistryError::bad_request("comment body is required"));
+            }
+            if body.len() > 8192 {
+                return Err(RegistryError::bad_request(
+                    "comment body cannot exceed 8192 bytes",
+                ));
+            }
+            let conn = db.open_connection()?;
+            let comment_id = Uuid::new_v4().to_string();
+            let now = now_rfc3339();
+            conn.execute(
+                r#"
+                INSERT INTO object_comments (
+                    comment_id, owner_uid, actor_uid, fragment, object_key, body, created_at, updated_at, deleted_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
+                "#,
+                params![
+                    comment_id,
+                    owner_uid,
+                    actor_uid,
+                    fragment,
+                    object_key,
+                    body,
+                    now,
+                    now
+                ],
+            )
+            .map_err(sql_err)?;
+            conn.query_row(
+                r#"
+                SELECT comment_id, owner_uid, actor_uid, fragment, object_key, body, created_at, updated_at, deleted_at
+                FROM object_comments
+                WHERE comment_id = ?1
+                "#,
+                params![comment_id],
+                map_object_comment_row,
+            )
+            .map_err(sql_err)
+        })
+        .await
+    }
+
+    pub async fn list_object_comments(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_key: String,
+        include_deleted: bool,
+    ) -> Result<Vec<ObjectCommentRecord>, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            let mut sql = String::from(
+                r#"
+                SELECT comment_id, owner_uid, actor_uid, fragment, object_key, body, created_at, updated_at, deleted_at
+                FROM object_comments
+                WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+                "#,
+            );
+            if !include_deleted {
+                sql.push_str(" AND deleted_at IS NULL");
+            }
+            sql.push_str(" ORDER BY created_at ASC, comment_id ASC");
+            let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params![owner_uid, fragment, object_key], map_object_comment_row)
+                .map_err(sql_err)?;
+            let mut comments = Vec::new();
+            for row in rows {
+                comments.push(row.map_err(sql_err)?);
+            }
+            Ok(comments)
+        })
+        .await
+    }
+
+    pub async fn delete_object_comment(
+        &self,
+        owner_uid: String,
+        comment_id: String,
+    ) -> Result<bool, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let conn = db.open_connection()?;
+            let changed = conn
+                .execute(
+                    r#"
+                    UPDATE object_comments
+                    SET deleted_at = COALESCE(deleted_at, ?3), updated_at = ?3
+                    WHERE owner_uid = ?1 AND comment_id = ?2
+                    "#,
+                    params![owner_uid, comment_id, now_rfc3339()],
+                )
+                .map_err(sql_err)?;
+            Ok(changed > 0)
         })
         .await
     }
@@ -915,6 +1241,21 @@ impl RegistryDb {
                 params![uid.clone()],
             )
             .map_err(sql_err)?;
+            tx.execute(
+                "DELETE FROM object_overlays WHERE owner_uid = ?1",
+                params![uid.clone()],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                "DELETE FROM object_comments WHERE owner_uid = ?1",
+                params![uid.clone()],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                "DELETE FROM audit_events WHERE owner_uid = ?1 OR actor_uid = ?1",
+                params![uid.clone()],
+            )
+            .map_err(sql_err)?;
             let removed = tx
                 .execute("DELETE FROM users WHERE uid = ?1", params![uid.clone()])
                 .map_err(sql_err)?;
@@ -1134,7 +1475,7 @@ impl RegistryDb {
                     .flatten()
                     .filter(|value| !value.trim().is_empty())
                 })
-                .unwrap_or_else(generate_storage_object_id);
+                .unwrap_or_else(|| object_key.clone());
             let reserved_bytes = expected_size_bytes
                 .unwrap_or(0)
                 .max(0)
@@ -1199,8 +1540,11 @@ impl RegistryDb {
                 storage_object_id: existing_storage_object_id,
                 version_id: String::new(),
                 status: "pending".to_string(),
+                kind: Some("file".to_string()),
                 object_size_bytes: expected_size_bytes.unwrap_or(0),
                 content_type,
+                trash_entry_id: None,
+                deleted_at_unix: None,
                 created_at: now.clone(),
                 updated_at: now,
             })
@@ -1262,7 +1606,7 @@ impl RegistryDb {
                 .map_err(sql_err)?
                 .filter(|value| !value.trim().is_empty())
                 .or_else(|| existing.as_ref().map(|value| value.2.clone()).filter(|value| !value.trim().is_empty()))
-                .unwrap_or_else(generate_storage_object_id);
+                .unwrap_or_else(|| object_key.clone());
             let delta = object_size_bytes.saturating_sub(previous_size);
             let next_used = quota_used.saturating_add(delta).max(0);
             let other_reserved = pending_quota_reserved_bytes_for_user(
@@ -2017,20 +2361,6 @@ impl RegistryDb {
         .await
     }
 
-    pub async fn resolve_live_object(
-        &self,
-        owner_uid: String,
-        fragment: String,
-        object_key: String,
-    ) -> Result<Option<ObjectRecord>, RegistryError> {
-        let db = self.clone();
-        spawn_blocking(move || {
-            let conn = db.open_connection()?;
-            resolve_live_object(&conn, &owner_uid, &fragment, &object_key)
-        })
-        .await
-    }
-
     pub async fn resolve_object(
         &self,
         owner_uid: String,
@@ -2088,6 +2418,30 @@ impl RegistryDb {
             let tx = conn.transaction().map_err(sql_err)?;
             let (quota_limit, _) = quota_for_user(&tx, &owner_uid)?;
             let existing = resolve_ready_object(&tx, &owner_uid, &fragment, &object_key)?;
+            let storage_object_id = (!storage_object_id.trim().is_empty())
+                .then_some(storage_object_id)
+                .or_else(|| {
+                    tx.query_row(
+                        r#"
+                        SELECT storage_object_id
+                        FROM object_uploads
+                        WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+                        "#,
+                        params![owner_uid, fragment, object_key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .filter(|value| !value.trim().is_empty())
+                })
+                .or_else(|| {
+                    existing
+                        .as_ref()
+                        .map(|record| record.storage_object_id.clone())
+                        .filter(|value| !value.trim().is_empty())
+                })
+                .unwrap_or_else(|| object_key.clone());
             let now = now_rfc3339();
 
             if let Some(current) = current.clone() {
@@ -2551,6 +2905,26 @@ impl RegistryDb {
         .await
     }
 
+    pub async fn list_object_keys_by_prefix_with_status(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        prefix: String,
+        status: String,
+    ) -> Result<Vec<String>, RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let prefix = normalize_namespace_prefix(prefix);
+            if prefix.is_empty() {
+                return Err(RegistryError::bad_request("prefix is required"));
+            }
+
+            let conn = db.open_connection()?;
+            select_object_keys_by_prefix_with_status(&conn, &owner_uid, &fragment, &prefix, &status)
+        })
+        .await
+    }
+
     #[cfg(test)]
     pub async fn list_objects_by_prefix_any_status(
         &self,
@@ -2621,6 +2995,22 @@ impl RegistryDb {
             tx.execute(
                 r#"
                 DELETE FROM object_shares
+                WHERE owner_uid = ?1 AND fragment = ?2 AND object_key LIKE ?3
+                "#,
+                params![owner_uid, fragment, format!("{}%", prefix)],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                r#"
+                DELETE FROM object_overlays
+                WHERE owner_uid = ?1 AND fragment = ?2 AND object_key LIKE ?3
+                "#,
+                params![owner_uid, fragment, format!("{}%", prefix)],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                r#"
+                DELETE FROM object_comments
                 WHERE owner_uid = ?1 AND fragment = ?2 AND object_key LIKE ?3
                 "#,
                 params![owner_uid, fragment, format!("{}%", prefix)],
@@ -2879,7 +3269,7 @@ impl RegistryDb {
                 .execute(
                     r#"
                     UPDATE objects
-                    SET object_key = ?4, updated_at = ?5
+                    SET object_key = ?4, storage_object_id = ?4, updated_at = ?5
                     WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
                     "#,
                     params![owner_uid, fragment, source_key, destination_key, now],
@@ -2888,7 +3278,7 @@ impl RegistryDb {
             tx.execute(
                 r#"
                 UPDATE object_versions
-                SET object_key = ?4
+                SET object_key = ?4, storage_object_id = ?4
                 WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
                 "#,
                 params![owner_uid, fragment, source_key, destination_key],
@@ -2898,7 +3288,7 @@ impl RegistryDb {
                 .execute(
                     r#"
                     UPDATE object_uploads
-                    SET object_key = ?4, updated_at = ?5
+                    SET object_key = ?4, storage_object_id = ?4, updated_at = ?5
                     WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
                     "#,
                     params![owner_uid, fragment, source_key, destination_key, now],
@@ -2907,10 +3297,28 @@ impl RegistryDb {
             tx.execute(
                 r#"
                 UPDATE object_shares
-                SET object_key = ?4
+                SET object_key = ?4, storage_object_id = ?4
                 WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
                 "#,
                 params![owner_uid, fragment, source_key, destination_key],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                r#"
+                UPDATE object_overlays
+                SET object_key = ?4, updated_at = ?5
+                WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+                "#,
+                params![owner_uid, fragment, source_key, destination_key, now],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                r#"
+                UPDATE object_comments
+                SET object_key = ?4, updated_at = ?5
+                WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+                "#,
+                params![owner_uid, fragment, source_key, destination_key, now],
             )
             .map_err(sql_err)?;
             if updated_ready == 0 && updated_pending == 0 {
@@ -2967,6 +3375,16 @@ impl RegistryDb {
                 params![owner_uid, fragment, object_key],
             )
             .map_err(sql_err)?;
+            tx.execute(
+                "DELETE FROM object_overlays WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                params![owner_uid, fragment, object_key],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                "DELETE FROM object_comments WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                params![owner_uid, fragment, object_key],
+            )
+            .map_err(sql_err)?;
 
             let transitioned = stored.status != "purged";
             if transitioned {
@@ -2980,6 +3398,77 @@ impl RegistryDb {
                 )
                 .map_err(sql_err)?;
                 enqueue_object_purge(&tx, &stored, &now)?;
+            }
+
+            refresh_user_quota_used(&tx, &owner_uid, &now)?;
+
+            tx.commit().map_err(sql_err)?;
+            let conn = db.open_connection()?;
+            let mut user = user_by_uid(&conn, &owner_uid)?;
+            user.quota_limit_bytes = quota_limit;
+            Ok((true, user))
+        })
+        .await
+    }
+
+    pub async fn mark_object_purged_without_queue(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_key: String,
+    ) -> Result<(bool, UserRecord), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let (quota_limit, _) = quota_for_user(&tx, &owner_uid)?;
+            let now = now_rfc3339();
+
+            let stored = resolve_stored_object(&tx, &owner_uid, &fragment, &object_key)?;
+            let pending_removed = tx
+                .execute(
+                    "DELETE FROM object_uploads WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                    params![owner_uid, fragment, object_key],
+                )
+                .map_err(sql_err)?;
+
+            let Some(stored) = stored else {
+                if pending_removed == 0 {
+                    return Err(RegistryError::not_found("object not found"));
+                }
+                tx.commit().map_err(sql_err)?;
+                let conn = db.open_connection()?;
+                let mut user = user_by_uid(&conn, &owner_uid)?;
+                user.quota_limit_bytes = quota_limit;
+                return Ok((true, user));
+            };
+
+            tx.execute(
+                "DELETE FROM object_shares WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                params![owner_uid, fragment, object_key],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                "DELETE FROM object_overlays WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                params![owner_uid, fragment, object_key],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                "DELETE FROM object_comments WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+                params![owner_uid, fragment, object_key],
+            )
+            .map_err(sql_err)?;
+
+            if stored.status != "purged" {
+                tx.execute(
+                    r#"
+                    UPDATE objects
+                    SET status = 'purged', updated_at = ?4
+                    WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+                    "#,
+                    params![owner_uid, fragment, object_key, now],
+                )
+                .map_err(sql_err)?;
             }
 
             refresh_user_quota_used(&tx, &owner_uid, &now)?;
@@ -3063,6 +3552,90 @@ impl RegistryDb {
         .await
     }
 
+    pub async fn mark_objects_purged_without_queue(
+        &self,
+        owner_uid: String,
+        fragment: String,
+        object_keys: Vec<String>,
+    ) -> Result<(usize, UserRecord), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut selected_keys = object_keys
+                .into_iter()
+                .map(|value| canonical_archive_key(&value))
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            selected_keys.sort();
+            selected_keys.dedup();
+
+            if selected_keys.is_empty() {
+                return Err(RegistryError::bad_request(
+                    "object_keys must include at least one object key",
+                ));
+            }
+
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let (quota_limit, _) = quota_for_user(&tx, &owner_uid)?;
+            let now = now_rfc3339();
+            let mut affected = 0usize;
+
+            for chunk in selected_keys.chunks(SQLITE_BULK_KEY_CHUNK) {
+                let existing_keys = select_existing_object_keys(&tx, &owner_uid, &fragment, chunk)?;
+                if existing_keys.is_empty() {
+                    continue;
+                }
+
+                delete_rows_for_object_keys_chunk(
+                    &tx,
+                    "object_uploads",
+                    &owner_uid,
+                    &fragment,
+                    &existing_keys,
+                )?;
+                delete_rows_for_object_keys_chunk(
+                    &tx,
+                    "object_shares",
+                    &owner_uid,
+                    &fragment,
+                    &existing_keys,
+                )?;
+                delete_rows_for_object_keys_chunk(
+                    &tx,
+                    "object_overlays",
+                    &owner_uid,
+                    &fragment,
+                    &existing_keys,
+                )?;
+                delete_rows_for_object_keys_chunk(
+                    &tx,
+                    "object_comments",
+                    &owner_uid,
+                    &fragment,
+                    &existing_keys,
+                )?;
+                update_object_status_chunk(
+                    &tx,
+                    &owner_uid,
+                    &fragment,
+                    &existing_keys,
+                    "purged",
+                    &now,
+                )?;
+                affected = affected.saturating_add(existing_keys.len());
+            }
+
+            refresh_user_quota_used(&tx, &owner_uid, &now)?;
+
+            tx.commit().map_err(sql_err)?;
+            let conn = db.open_connection()?;
+            let mut user = user_by_uid(&conn, &owner_uid)?;
+            user.quota_limit_bytes = quota_limit;
+            Ok((affected, user))
+        })
+        .await
+    }
+
     pub async fn purge_trashed_objects(
         &self,
         owner_uid: String,
@@ -3095,6 +3668,34 @@ impl RegistryDb {
                 params![owner_uid, fragment],
             )
             .map_err(sql_err)?;
+            tx.execute(
+                r#"
+                DELETE FROM object_overlays
+                WHERE owner_uid = ?1
+                  AND fragment = ?2
+                  AND object_key IN (
+                    SELECT object_key
+                    FROM objects
+                    WHERE owner_uid = ?1 AND fragment = ?2 AND status = 'trashed'
+                  )
+                "#,
+                params![owner_uid, fragment],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                r#"
+                DELETE FROM object_comments
+                WHERE owner_uid = ?1
+                  AND fragment = ?2
+                  AND object_key IN (
+                    SELECT object_key
+                    FROM objects
+                    WHERE owner_uid = ?1 AND fragment = ?2 AND status = 'trashed'
+                  )
+                "#,
+                params![owner_uid, fragment],
+            )
+            .map_err(sql_err)?;
 
             tx.execute(
                 r#"
@@ -3109,6 +3710,87 @@ impl RegistryDb {
             for object in &trashed_objects {
                 enqueue_object_purge(&tx, object, &now)?;
             }
+
+            refresh_user_quota_used(&tx, &owner_uid, &now)?;
+
+            tx.commit().map_err(sql_err)?;
+            let conn = db.open_connection()?;
+            let mut user = user_by_uid(&conn, &owner_uid)?;
+            user.quota_limit_bytes = quota_limit;
+            Ok((trashed_objects.len(), user))
+        })
+        .await
+    }
+
+    pub async fn purge_trashed_objects_without_queue(
+        &self,
+        owner_uid: String,
+        fragment: String,
+    ) -> Result<(usize, UserRecord), RegistryError> {
+        let db = self.clone();
+        spawn_blocking(move || {
+            let mut conn = db.open_connection()?;
+            let tx = conn.transaction().map_err(sql_err)?;
+            let (quota_limit, _) = quota_for_user(&tx, &owner_uid)?;
+            let now = now_rfc3339();
+
+            let trashed_objects =
+                list_objects_with_status_from_conn(&tx, &owner_uid, &fragment, "trashed")?;
+            if trashed_objects.is_empty() {
+                return Ok((0usize, user_by_uid(&tx, &owner_uid)?));
+            }
+
+            tx.execute(
+                r#"
+                DELETE FROM object_shares
+                WHERE owner_uid = ?1
+                  AND fragment = ?2
+                  AND object_key IN (
+                    SELECT object_key
+                    FROM objects
+                    WHERE owner_uid = ?1 AND fragment = ?2 AND status = 'trashed'
+                  )
+                "#,
+                params![owner_uid, fragment],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                r#"
+                DELETE FROM object_overlays
+                WHERE owner_uid = ?1
+                  AND fragment = ?2
+                  AND object_key IN (
+                    SELECT object_key
+                    FROM objects
+                    WHERE owner_uid = ?1 AND fragment = ?2 AND status = 'trashed'
+                  )
+                "#,
+                params![owner_uid, fragment],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                r#"
+                DELETE FROM object_comments
+                WHERE owner_uid = ?1
+                  AND fragment = ?2
+                  AND object_key IN (
+                    SELECT object_key
+                    FROM objects
+                    WHERE owner_uid = ?1 AND fragment = ?2 AND status = 'trashed'
+                  )
+                "#,
+                params![owner_uid, fragment],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                r#"
+                UPDATE objects
+                SET status = 'purged', updated_at = ?3
+                WHERE owner_uid = ?1 AND fragment = ?2 AND status = 'trashed'
+                "#,
+                params![owner_uid, fragment, now],
+            )
+            .map_err(sql_err)?;
 
             refresh_user_quota_used(&tx, &owner_uid, &now)?;
 
@@ -3757,6 +4439,39 @@ fn select_objects_by_prefix(
     Ok(objects)
 }
 
+fn select_object_keys_by_prefix_with_status(
+    conn: &Connection,
+    owner_uid: &str,
+    fragment: &str,
+    prefix: &str,
+    status: &str,
+) -> Result<Vec<String>, RegistryError> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT object_key
+            FROM objects
+            WHERE owner_uid = ?1
+              AND fragment = ?2
+              AND object_key LIKE ?3
+              AND status = ?4
+            ORDER BY object_key ASC
+            "#,
+        )
+        .map_err(sql_err)?;
+    let rows = stmt
+        .query_map(
+            params![owner_uid, fragment, format!("{}%", prefix), status],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(sql_err)?;
+    let mut object_keys = Vec::new();
+    for row in rows {
+        object_keys.push(row.map_err(sql_err)?);
+    }
+    Ok(object_keys)
+}
+
 fn list_objects_with_status_from_conn(
     conn: &Connection,
     owner_uid: &str,
@@ -3909,6 +4624,16 @@ fn delete_object_namespace_rows(
         params![owner_uid, fragment, object_key],
     )
     .map_err(sql_err)?;
+    conn.execute(
+        "DELETE FROM object_overlays WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+        params![owner_uid, fragment, object_key],
+    )
+    .map_err(sql_err)?;
+    conn.execute(
+        "DELETE FROM object_comments WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3",
+        params![owner_uid, fragment, object_key],
+    )
+    .map_err(sql_err)?;
     Ok(())
 }
 
@@ -3923,7 +4648,7 @@ fn rewrite_namespace_key(
     conn.execute(
         r#"
         UPDATE objects
-        SET object_key = ?4, updated_at = ?5
+        SET object_key = ?4, storage_object_id = ?4, updated_at = ?5
         WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
         "#,
         params![owner_uid, fragment, source_key, destination_key, now],
@@ -3932,7 +4657,7 @@ fn rewrite_namespace_key(
     conn.execute(
         r#"
         UPDATE object_versions
-        SET object_key = ?4
+        SET object_key = ?4, storage_object_id = ?4
         WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
         "#,
         params![owner_uid, fragment, source_key, destination_key],
@@ -3941,7 +4666,7 @@ fn rewrite_namespace_key(
     conn.execute(
         r#"
         UPDATE object_uploads
-        SET object_key = ?4, updated_at = ?5
+        SET object_key = ?4, storage_object_id = ?4, updated_at = ?5
         WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
         "#,
         params![owner_uid, fragment, source_key, destination_key, now],
@@ -3950,10 +4675,28 @@ fn rewrite_namespace_key(
     conn.execute(
         r#"
         UPDATE object_shares
-        SET object_key = ?4
+        SET object_key = ?4, storage_object_id = ?4
         WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
         "#,
         params![owner_uid, fragment, source_key, destination_key],
+    )
+    .map_err(sql_err)?;
+    conn.execute(
+        r#"
+        UPDATE object_overlays
+        SET object_key = ?4, updated_at = ?5
+        WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+        "#,
+        params![owner_uid, fragment, source_key, destination_key, now],
+    )
+    .map_err(sql_err)?;
+    conn.execute(
+        r#"
+        UPDATE object_comments
+        SET object_key = ?4, updated_at = ?5
+        WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+        "#,
+        params![owner_uid, fragment, source_key, destination_key, now],
     )
     .map_err(sql_err)?;
     Ok(())
@@ -4080,7 +4823,6 @@ fn canonical_archive_key(value: &str) -> String {
     value.trim().trim_start_matches('/').to_string()
 }
 
-#[cfg(test)]
 fn select_existing_object_keys(
     conn: &Connection,
     owner_uid: &str,
@@ -4185,6 +4927,36 @@ fn update_object_status_chunk(
     let mut args = vec![
         Value::Text(next_status.to_string()),
         Value::Text(now.to_string()),
+        Value::Text(owner_uid.to_string()),
+        Value::Text(fragment.to_string()),
+    ];
+    args.extend(object_keys.iter().cloned().map(Value::Text));
+    conn.execute(&sql, params_from_iter(args))
+        .map_err(sql_err)?;
+    Ok(())
+}
+
+fn delete_rows_for_object_keys_chunk(
+    conn: &Connection,
+    table: &str,
+    owner_uid: &str,
+    fragment: &str,
+    object_keys: &[String],
+) -> Result<(), RegistryError> {
+    if object_keys.is_empty() {
+        return Ok(());
+    }
+
+    let placeholders = std::iter::repeat_n("?", object_keys.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+        DELETE FROM {table}
+        WHERE owner_uid = ?1 AND fragment = ?2 AND object_key IN ({placeholders})
+        "#
+    );
+    let mut args = vec![
         Value::Text(owner_uid.to_string()),
         Value::Text(fragment.to_string()),
     ];
@@ -4319,8 +5091,11 @@ fn map_object_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRecord> {
         storage_object_id: row.get(3)?,
         version_id: row.get(4)?,
         status: row.get(5)?,
+        kind: Some("file".to_string()),
         object_size_bytes: row.get(6)?,
         content_type: row.get(7)?,
+        trash_entry_id: None,
+        deleted_at_unix: None,
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
     })
@@ -4334,8 +5109,11 @@ fn map_pending_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRecord> {
         storage_object_id: row.get(3)?,
         version_id: String::new(),
         status: "pending".to_string(),
+        kind: Some("file".to_string()),
         object_size_bytes: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
         content_type: row.get(5)?,
+        trash_entry_id: None,
+        deleted_at_unix: None,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
     })
@@ -4384,6 +5162,33 @@ fn map_share_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShareRecord> {
     })
 }
 
+fn map_audit_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEventRecord> {
+    Ok(AuditEventRecord {
+        event_id: row.get(0)?,
+        owner_uid: row.get(1)?,
+        actor_uid: row.get(2)?,
+        event_type: row.get(3)?,
+        fragment: row.get(4)?,
+        object_key: row.get(5)?,
+        details_json: row.get(6)?,
+        created_at: row.get(7)?,
+    })
+}
+
+fn map_object_comment_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectCommentRecord> {
+    Ok(ObjectCommentRecord {
+        comment_id: row.get(0)?,
+        owner_uid: row.get(1)?,
+        actor_uid: row.get(2)?,
+        fragment: row.get(3)?,
+        object_key: row.get(4)?,
+        body: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        deleted_at: row.get(8)?,
+    })
+}
+
 fn map_object_purge_queue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectPurgeQueueEntry> {
     Ok(ObjectPurgeQueueEntry {
         owner_uid: row.get(0)?,
@@ -4391,6 +5196,83 @@ fn map_object_purge_queue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Objec
         object_key: row.get(2)?,
         attempts: row.get(3)?,
     })
+}
+
+fn sanitize_overlay_values(values: Vec<String>) -> Vec<String> {
+    let mut values = values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values.truncate(100);
+    values
+}
+
+fn parse_overlay_json(value: String) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(&value)
+        .map(sanitize_overlay_values)
+        .unwrap_or_default()
+}
+
+fn resolve_overlay(
+    conn: &Connection,
+    owner_uid: &str,
+    fragment: &str,
+    object_key: &str,
+) -> Result<ObjectOverlayRecord, RegistryError> {
+    let row = conn
+        .query_row(
+            r#"
+            SELECT favorite, tags_json, labels_json, updated_at
+            FROM object_overlays
+            WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3
+            "#,
+            params![owner_uid, fragment, object_key],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? != 0,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_err)?;
+    let comment_count = scalar_i64(
+        conn,
+        r#"
+        SELECT COUNT(*)
+        FROM object_comments
+        WHERE owner_uid = ?1 AND fragment = ?2 AND object_key = ?3 AND deleted_at IS NULL
+        "#,
+        params![owner_uid, fragment, object_key],
+    )? as usize;
+
+    match row {
+        Some((favorite, tags_json, labels_json, updated_at)) => Ok(ObjectOverlayRecord {
+            owner_uid: owner_uid.to_string(),
+            fragment: fragment.to_string(),
+            object_key: object_key.to_string(),
+            favorite,
+            tags: parse_overlay_json(tags_json),
+            labels: parse_overlay_json(labels_json),
+            comment_count,
+            updated_at,
+        }),
+        None => Ok(ObjectOverlayRecord {
+            owner_uid: owner_uid.to_string(),
+            fragment: fragment.to_string(),
+            object_key: object_key.to_string(),
+            favorite: false,
+            tags: Vec::new(),
+            labels: Vec::new(),
+            comment_count,
+            updated_at: now_rfc3339(),
+        }),
+    }
 }
 
 fn enqueue_object_purge(
@@ -4422,12 +5304,6 @@ fn enqueue_object_purge(
     )
     .map_err(sql_err)?;
     Ok(())
-}
-
-fn generate_storage_object_id() -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(Uuid::new_v4().as_bytes());
-    hex::encode(hasher.finalize())
 }
 
 fn map_insert_user_err(err: rusqlite::Error) -> RegistryError {
@@ -4846,7 +5722,7 @@ mod tests {
             .expect("registry rename should replace trashed destination");
         assert_eq!(renamed.object_key, "folder/destination.bin");
         assert_eq!(renamed.version_id, "01HRENAMETRASHEDSOURCE0000001");
-        assert_eq!(renamed.storage_object_id.len(), 64);
+        assert_eq!(renamed.storage_object_id, "folder/destination.bin");
         assert_eq!(updated_user.quota_used_bytes, 1024);
 
         let source = db
@@ -4958,16 +5834,6 @@ mod tests {
             .await
             .expect("create share");
 
-        let source_before = db
-            .resolve_object(
-                user.uid.clone(),
-                "fragment-a".to_string(),
-                "photos/2024/a.jpg".to_string(),
-            )
-            .await
-            .expect("resolve source before")
-            .expect("source exists");
-
         let (affected, updated_user) = db
             .rename_prefix(
                 user.uid.clone(),
@@ -5002,10 +5868,7 @@ mod tests {
             .await
             .expect("resolve destination")
             .expect("destination exists");
-        assert_eq!(
-            destination.storage_object_id,
-            source_before.storage_object_id
-        );
+        assert_eq!(destination.storage_object_id, "photos/archived/a.jpg");
 
         let pending = db
             .list_pending_upload_reservations(Some(user.uid.clone()))
@@ -5028,7 +5891,7 @@ mod tests {
         assert_eq!(shares.len(), 1);
         assert_eq!(shares[0].share_id, share.0.share_id);
         assert_eq!(shares[0].object_key, "photos/archived/a.jpg");
-        assert_eq!(shares[0].storage_object_id, source_before.storage_object_id);
+        assert_eq!(shares[0].storage_object_id, "photos/archived/a.jpg");
 
         let _ = std::fs::remove_file(path);
     }
@@ -5767,13 +6630,13 @@ mod tests {
             "01HARCHMANIFESTVERSION0000000001"
         );
         assert_eq!(selection.objects[0].object_key, "patients/a/one.dcm");
-        assert_eq!(selection.objects[0].storage_object_id.len(), 64);
+        assert_eq!(selection.objects[0].storage_object_id, "patients/a/one.dcm");
         assert_eq!(
             selection.objects[1].version_id,
             "01HARCHMANIFESTVERSION0000000002"
         );
         assert_eq!(selection.objects[1].object_key, "patients/a/two.dcm");
-        assert_eq!(selection.objects[1].storage_object_id.len(), 64);
+        assert_eq!(selection.objects[1].storage_object_id, "patients/a/two.dcm");
 
         let _ = std::fs::remove_file(path);
     }

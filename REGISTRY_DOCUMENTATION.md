@@ -6,17 +6,22 @@ Use `Registry` when you need:
 
 - user accounts
 - admin bootstrap and quota management
-- logical object namespace separate from storage identity
+- user-facing policy around an `N1` or `N2` logical object namespace
 - storage session brokering into `N1` or `N2`
 - trash, recover, rename, and prefix operations at the logical metadata layer
 - public shares
+- audit/activity
+- user metadata overlays such as favorites, tags, labels, and comments
 
 `Registry` is also the correct home for user quotas and account policy. Standalone `N1` is not the user/account quota control plane.
 
-Current `0.9.0` behavior that matters operationally:
+Current `0.9.1` behavior that matters operationally:
 
 - for fragment-bound object listing and stats, Registry reads logical namespace truth from the bound `N1` engine instead of trusting stale SQLite projection alone
+- Registry object APIs for bound fragments use the engine namespace as the file-tree authority; Registry SQLite is a durable business/policy projection
 - pending quota reservations are stored durably in `object_uploads` and reconciled against committed object usage during finalize/cancel flows
+- shares, audit events, favorites, tags, labels, and comments remain Registry-owned business metadata keyed by logical `object_key`
+- Drive/RAD ARC should treat `/v1/objects` results as the DICOM scan source for N1-bound fragments; direct `.dcm` objects and nested `common_prefixes` are both valid folder contents.
 
 This document is written for engineers integrating with `Registry` directly.
 
@@ -62,7 +67,7 @@ Bootstrap is separate and uses the `master_key` field in its request body.
   "owner_uid": "01KNYR7QPPQSMW3P5M4N0S6K2P",
   "fragment": "fragment-a",
   "object_key": "videos/demo.mp4",
-  "storage_object_id": "a309986ab5...",
+  "storage_object_id": "videos/demo.mp4",
   "version_id": "01KNYR8AB4VYG4JCM5TX9GWV8M",
   "status": "ready",
   "object_size_bytes": 10485760,
@@ -75,7 +80,37 @@ Bootstrap is separate and uses the `master_key` field in its request body.
 Important distinction:
 
 - `object_key` is the logical user-facing path
-- `storage_object_id` is the stable physical identity used against `N1` or `N2`
+- `storage_object_id` is retained for Registry compatibility and non-engine projections; for `N1` 2.1-bound fragments, Registry addresses N1 by logical `object_key`
+
+### Audit Event Record
+
+```json
+{
+  "event_id": "2c7b4f5d-2f2f-4c2e-88d8-5346f4a3a4e1",
+  "owner_uid": "01KNYR7QPPQSMW3P5M4N0S6K2P",
+  "actor_uid": "01KNYR7QPPQSMW3P5M4N0S6K2P",
+  "event_type": "object_overlay_updated",
+  "fragment": "fragment-a",
+  "object_key": "docs/report.pdf",
+  "details_json": "{\"favorite\":true}",
+  "created_at": "2026-04-21T00:00:00Z"
+}
+```
+
+### Object Overlay Record
+
+```json
+{
+  "owner_uid": "01KNYR7QPPQSMW3P5M4N0S6K2P",
+  "fragment": "fragment-a",
+  "object_key": "docs/report.pdf",
+  "favorite": true,
+  "tags": ["finance", "review"],
+  "labels": ["important"],
+  "comment_count": 2,
+  "updated_at": "2026-04-21T00:00:00Z"
+}
+```
 
 ### Fragment Binding Record
 
@@ -253,6 +288,35 @@ Includes:
 - largest objects
 - active users
 - top storage users
+
+For bound fragments, object counts, largest objects, and file type distribution are reconciled from the N1 namespace when the engine is reachable. Registry still owns user, quota, session, and share statistics.
+
+### `GET /v1/admin/activity`
+
+List Registry audit/activity events across users.
+
+Query parameters:
+
+- `owner_uid` optional
+- `fragment` optional
+- `object_key` optional
+- `event_type` optional
+- `limit` optional, default `100`, max `1000`
+- `offset` optional, default `0`
+
+Response:
+
+```json
+{
+  "events": [
+    {
+      "...": "AuditEventRecord"
+    }
+  ],
+  "limit": 100,
+  "offset": 0
+}
+```
 
 ### `POST /v1/admin/users/{uid}/quota`
 
@@ -550,6 +614,49 @@ Behavior:
 - streams the object from the linked `N1` or `N2` backend
 - forces download filename to the logical basename for download shares
 
+## Activity API
+
+### `GET /v1/activity`
+
+List the current user’s Registry activity events.
+
+Query parameters:
+
+- `fragment` optional
+- `object_key` optional
+- `event_type` optional
+- `limit` optional, default `100`, max `500`
+- `offset` optional, default `0`
+
+Response:
+
+```json
+{
+  "events": [
+    {
+      "...": "AuditEventRecord"
+    }
+  ],
+  "limit": 100,
+  "offset": 0
+}
+```
+
+Typical event types include:
+
+- `fragment_linked`
+- `share_created`
+- `share_revoked`
+- `object_registered`
+- `object_finalized`
+- `object_renamed`
+- `object_trashed`
+- `object_recovered`
+- `object_purged`
+- `object_overlay_updated`
+- `object_comment_added`
+- `object_comment_deleted`
+
 ## Object API
 
 Registry is intentionally two-phase for writes:
@@ -721,6 +828,112 @@ Response:
 
 - `ObjectRecord`
 
+### `GET /v1/objects/overlay`
+
+Read Registry-owned business metadata for a live object.
+
+Query parameters:
+
+- `fragment` required
+- `object_key` required
+
+Response:
+
+```json
+{
+  "overlay": {
+    "...": "ObjectOverlayRecord"
+  }
+}
+```
+
+For bound fragments, Registry validates the object against the live N1 namespace before returning overlay metadata. A stale Registry projection row is not enough.
+
+### `POST /v1/objects/overlay`
+
+Update Registry-owned business metadata for a live object.
+
+Request body:
+
+```json
+{
+  "fragment": "fragment-a",
+  "object_key": "docs/report.pdf",
+  "favorite": true,
+  "tags": ["finance", "review"],
+  "labels": ["important"]
+}
+```
+
+Fields are patch-like:
+
+- `favorite` optional boolean
+- `tags` optional full replacement array
+- `labels` optional full replacement array
+
+Tags and labels are trimmed, deduplicated, sorted, and capped to 100 values each.
+
+### `GET /v1/objects/comments`
+
+List Registry-owned comments for a live object.
+
+Query parameters:
+
+- `fragment` required
+- `object_key` required
+- `include_deleted` optional boolean
+
+Response:
+
+```json
+{
+  "comments": [
+    {
+      "comment_id": "9e1b5f7e-37f9-48a7-bf98-b0793be42df0",
+      "owner_uid": "01KNYR7QPPQSMW3P5M4N0S6K2P",
+      "actor_uid": "01KNYR7QPPQSMW3P5M4N0S6K2P",
+      "fragment": "fragment-a",
+      "object_key": "docs/report.pdf",
+      "body": "Needs review",
+      "created_at": "2026-04-21T00:00:00Z",
+      "updated_at": "2026-04-21T00:00:00Z",
+      "deleted_at": null
+    }
+  ]
+}
+```
+
+### `POST /v1/objects/comments`
+
+Add a comment.
+
+Request body:
+
+```json
+{
+  "fragment": "fragment-a",
+  "object_key": "docs/report.pdf",
+  "body": "Needs review"
+}
+```
+
+Response:
+
+- status `201`
+- `ObjectCommentsResponse` containing the created comment
+
+### `DELETE /v1/objects/comments/{comment_id}`
+
+Soft-delete one comment owned by the current user.
+
+Response:
+
+```json
+{
+  "removed": true
+}
+```
+
 ### `POST /v1/objects/archive`
 
 Archive a selected set of logical objects.
@@ -821,7 +1034,7 @@ Request body:
 
 ### `POST /v1/objects/trash-prefix`
 
-Trash everything under a prefix.
+Trash a logical folder/prefix. For fragments bound to N1, Registry delegates the folder lifecycle operation to N1 POSIX namespace trash (`/n1/posix/trash`) and only uses Registry rows as a quota/business projection. This is intentionally namespace-based, so empty N1 directories can be trashed even when Registry has no object rows for the folder.
 
 Request body:
 
@@ -888,7 +1101,7 @@ Request body:
 
 ### `POST /v1/objects/trash/empty`
 
-Purge all trashed objects in the fragment from the Registry logical plane.
+Purge all trashed objects in the fragment from the Registry logical plane. For N1-bound fragments, Registry first calls N1 `/n1/trash/empty`; Registry state is purged only after N1 accepts the lifecycle operation.
 
 Request body:
 
@@ -1036,8 +1249,10 @@ curl -k https://127.0.0.1:7001/v1/objects/finalize \
 
 ## Operational Notes
 
-- `Registry` is the correct place for logical path semantics, user ownership, quotas, and shares.
+- `Registry` is the correct place for user ownership, quotas, shares, audit/activity, and product metadata overlays.
+- For `N1` 2.1-bound fragments, object listing, stats, suggestions, archive selection, and object existence checks are sourced from N1 namespace truth.
 - `Registry` does not own repair, redistribution, GC, or recover-on-read. Those remain backend responsibilities in `N1` or `N2`.
-- `storage_object_id` is intentionally stable across logical rename and prefix rename operations.
-- Prefix trash, prefix recover, and prefix rename are metadata operations at the Registry plane. They should not be implemented by mutating physical storage ids.
+- `storage_object_id` remains in the Registry schema for compatibility, but N1-bound object operations should use logical `object_key`.
+- Prefix trash, prefix recover, and prefix rename must delegate to the bound engine when the fragment is engine-backed.
+- Registry audit/overlay/comment rows are business metadata. They must not be treated as proof that an object exists if the bound N1 namespace says it does not.
 - For user-facing applications, `Registry` should usually be your entry point. `N1` and `N2` are the storage backends, not the business metadata plane.

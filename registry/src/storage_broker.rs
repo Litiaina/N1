@@ -103,6 +103,38 @@ pub struct EngineLogicalListPage {
     pub continuation_token: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnginePosixNodeKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnginePosixEntry {
+    pub name: String,
+    pub path: String,
+    pub kind: EnginePosixNodeKind,
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+    #[serde(default)]
+    pub modified_at_unix: Option<i64>,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    #[serde(default)]
+    pub trash_entry_id: Option<String>,
+    #[serde(default)]
+    pub deleted_at_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnginePosixListPage {
+    pub entries: Vec<EnginePosixEntry>,
+    pub continuation_token: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct EngineObjectMetadata {
     pub version_id: String,
@@ -126,6 +158,36 @@ struct EngineListObjectsResponse {
     objects: Vec<EngineObjectSummary>,
     #[serde(default)]
     common_prefixes: Vec<String>,
+    continuation_token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RenameObjectRequest<'a> {
+    source_fragment: &'a str,
+    source_key: &'a str,
+    destination_fragment: &'a str,
+    destination_key: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct PosixPathRequest<'a> {
+    path: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trash_entry_id: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnginePosixMutationResponse {
+    affected: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnginePosixListResponse {
+    #[serde(rename = "path")]
+    _path: String,
+    #[serde(rename = "scan_trash")]
+    _scan_trash: bool,
+    entries: Vec<EnginePosixEntry>,
     continuation_token: Option<String>,
 }
 
@@ -456,6 +518,73 @@ impl StorageBroker {
         })
     }
 
+    pub async fn list_namespace_page(
+        &self,
+        binding: &FragmentBindingRecord,
+        path: Option<&str>,
+        limit: usize,
+        continuation_token: Option<&str>,
+        scan_trash: bool,
+    ) -> Result<EnginePosixListPage, RegistryError> {
+        let backend = self.resolve_backend(binding)?;
+        let payload = self
+            .authenticate_fragment(&backend, &binding.fragment, true, false, false, false)
+            .await?;
+
+        let mut request = self
+            .client_for_backend(&backend)
+            .get(format!("{}/n1/posix/list", backend.engine_url))
+            .bearer_auth(&payload.access_token)
+            .query(&[("limit", limit.clamp(1, 1000))]);
+
+        if let Some(path) = path.map(str::trim).filter(|value| !value.is_empty()) {
+            request = request.query(&[("path", path)]);
+        }
+        if let Some(token) = continuation_token
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            request = request.query(&[("continuation_token", token)]);
+        }
+        if scan_trash {
+            request = request.query(&[("trash", true)]);
+        }
+
+        let response = request.send().await.map_err(|err| {
+            RegistryError::bad_gateway(format!(
+                "storage namespace list request failed for {}: {}",
+                backend.engine_url, err
+            ))
+        })?;
+
+        if !response.status().is_success() {
+            let fallback = format!(
+                "storage namespace list failed against {} backend",
+                match backend.deployment {
+                    StorageDeployment::SingleNode => "single-node",
+                    StorageDeployment::MultiNode => "multi-node",
+                }
+            );
+            let message = extract_engine_error_message(response, fallback).await;
+            return Err(RegistryError::bad_gateway(message));
+        }
+
+        let payload = response
+            .json::<EnginePosixListResponse>()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "invalid storage namespace list response: {}",
+                    err
+                ))
+            })?;
+
+        Ok(EnginePosixListPage {
+            entries: payload.entries,
+            continuation_token: payload.continuation_token,
+        })
+    }
+
     pub async fn stream_shared_object(
         &self,
         binding: &FragmentBindingRecord,
@@ -675,7 +804,7 @@ impl StorageBroker {
         &self,
         binding: &FragmentBindingRecord,
         object_key: &str,
-    ) -> Result<(), RegistryError> {
+    ) -> Result<bool, RegistryError> {
         let backend = self.resolve_backend(binding)?;
         let payload = self
             .authenticate_fragment(&backend, &binding.fragment, false, true, false, false)
@@ -695,10 +824,267 @@ impl StorageBroker {
             })?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(());
+            return Ok(false);
         }
 
         ensure_engine_success(response, &backend, "storage soft delete failed").await?;
+        Ok(true)
+    }
+
+    pub async fn trash_namespace_path(
+        &self,
+        binding: &FragmentBindingRecord,
+        path: &str,
+    ) -> Result<usize, RegistryError> {
+        let backend = self.resolve_backend(binding)?;
+        let payload = self
+            .authenticate_fragment(&backend, &binding.fragment, false, true, false, false)
+            .await?;
+        let response = self
+            .client_for_backend(&backend)
+            .post(format!("{}/n1/posix/trash", backend.engine_url))
+            .bearer_auth(&payload.access_token)
+            .json(&PosixPathRequest {
+                path,
+                trash_entry_id: None,
+            })
+            .send()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "storage namespace trash failed for {}: {}",
+                    backend.engine_url, err
+                ))
+            })?;
+
+        if !response.status().is_success() {
+            let fallback = format!(
+                "storage namespace trash failed against {} backend",
+                match backend.deployment {
+                    StorageDeployment::SingleNode => "single-node",
+                    StorageDeployment::MultiNode => "multi-node",
+                }
+            );
+            let message = extract_engine_error_message(response, fallback).await;
+            return Err(RegistryError::bad_gateway(message));
+        }
+
+        let payload = response
+            .json::<EnginePosixMutationResponse>()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "invalid storage namespace trash response: {}",
+                    err
+                ))
+            })?;
+        Ok(payload.affected)
+    }
+
+    pub async fn mkdir_namespace_path(
+        &self,
+        binding: &FragmentBindingRecord,
+        path: &str,
+    ) -> Result<usize, RegistryError> {
+        let backend = self.resolve_backend(binding)?;
+        let payload = self
+            .authenticate_fragment(&backend, &binding.fragment, false, true, false, false)
+            .await?;
+        let response = self
+            .client_for_backend(&backend)
+            .post(format!("{}/n1/posix/mkdir", backend.engine_url))
+            .bearer_auth(&payload.access_token)
+            .json(&PosixPathRequest {
+                path,
+                trash_entry_id: None,
+            })
+            .send()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "storage namespace mkdir failed for {}: {}",
+                    backend.engine_url, err
+                ))
+            })?;
+
+        if !response.status().is_success() {
+            let fallback = format!(
+                "storage namespace mkdir failed against {} backend",
+                match backend.deployment {
+                    StorageDeployment::SingleNode => "single-node",
+                    StorageDeployment::MultiNode => "multi-node",
+                }
+            );
+            let message = extract_engine_error_message(response, fallback).await;
+            return Err(RegistryError::bad_gateway(message));
+        }
+
+        let payload = response
+            .json::<EnginePosixMutationResponse>()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "invalid storage namespace mkdir response: {}",
+                    err
+                ))
+            })?;
+        Ok(payload.affected)
+    }
+
+    pub async fn recover_namespace_path(
+        &self,
+        binding: &FragmentBindingRecord,
+        path: &str,
+        trash_entry_id: Option<&str>,
+    ) -> Result<usize, RegistryError> {
+        let backend = self.resolve_backend(binding)?;
+        let payload = self
+            .authenticate_fragment(&backend, &binding.fragment, false, true, false, false)
+            .await?;
+        let response = self
+            .client_for_backend(&backend)
+            .post(format!("{}/n1/posix/recover", backend.engine_url))
+            .bearer_auth(&payload.access_token)
+            .json(&PosixPathRequest {
+                path,
+                trash_entry_id,
+            })
+            .send()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "storage namespace recover failed for {}: {}",
+                    backend.engine_url, err
+                ))
+            })?;
+
+        if !response.status().is_success() {
+            let fallback = format!(
+                "storage namespace recover failed against {} backend",
+                match backend.deployment {
+                    StorageDeployment::SingleNode => "single-node",
+                    StorageDeployment::MultiNode => "multi-node",
+                }
+            );
+            let message = extract_engine_error_message(response, fallback).await;
+            return Err(RegistryError::bad_gateway(message));
+        }
+
+        let payload = response
+            .json::<EnginePosixMutationResponse>()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "invalid storage namespace recover response: {}",
+                    err
+                ))
+            })?;
+        Ok(payload.affected)
+    }
+
+    pub async fn purge_namespace_path(
+        &self,
+        binding: &FragmentBindingRecord,
+        path: &str,
+        trash_entry_id: Option<&str>,
+    ) -> Result<usize, RegistryError> {
+        let backend = self.resolve_backend(binding)?;
+        let payload = self
+            .authenticate_fragment(&backend, &binding.fragment, false, true, false, true)
+            .await?;
+        let response = self
+            .client_for_backend(&backend)
+            .post(format!("{}/n1/posix/purge", backend.engine_url))
+            .bearer_auth(&payload.access_token)
+            .json(&PosixPathRequest {
+                path,
+                trash_entry_id,
+            })
+            .send()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "storage namespace purge failed for {}: {}",
+                    backend.engine_url, err
+                ))
+            })?;
+
+        if !response.status().is_success() {
+            let fallback = format!(
+                "storage namespace purge failed against {} backend",
+                match backend.deployment {
+                    StorageDeployment::SingleNode => "single-node",
+                    StorageDeployment::MultiNode => "multi-node",
+                }
+            );
+            let message = extract_engine_error_message(response, fallback).await;
+            return Err(RegistryError::bad_gateway(message));
+        }
+
+        let payload = response
+            .json::<EnginePosixMutationResponse>()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "invalid storage namespace purge response: {}",
+                    err
+                ))
+            })?;
+        Ok(payload.affected)
+    }
+
+    pub async fn empty_trash(&self, binding: &FragmentBindingRecord) -> Result<(), RegistryError> {
+        let backend = self.resolve_backend(binding)?;
+        let payload = self
+            .authenticate_fragment(&backend, &binding.fragment, false, false, false, true)
+            .await?;
+        let response = self
+            .client_for_backend(&backend)
+            .delete(format!("{}/n1/trash/empty", backend.engine_url))
+            .bearer_auth(&payload.access_token)
+            .send()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "storage empty trash failed for {}: {}",
+                    backend.engine_url, err
+                ))
+            })?;
+
+        ensure_engine_success(response, &backend, "storage empty trash failed").await?;
+        Ok(())
+    }
+
+    pub async fn rename_object(
+        &self,
+        binding: &FragmentBindingRecord,
+        source_key: &str,
+        destination_key: &str,
+    ) -> Result<(), RegistryError> {
+        let backend = self.resolve_backend(binding)?;
+        let payload = self
+            .authenticate_fragment(&backend, &binding.fragment, false, false, true, false)
+            .await?;
+        let response = self
+            .client_for_backend(&backend)
+            .post(format!("{}/n1/objects/rename", backend.engine_url))
+            .bearer_auth(&payload.access_token)
+            .json(&RenameObjectRequest {
+                source_fragment: &binding.fragment,
+                source_key,
+                destination_fragment: &binding.fragment,
+                destination_key,
+            })
+            .send()
+            .await
+            .map_err(|err| {
+                RegistryError::bad_gateway(format!(
+                    "storage rename failed for {}: {}",
+                    backend.engine_url, err
+                ))
+            })?;
+
+        ensure_engine_success(response, &backend, "storage rename failed").await?;
         Ok(())
     }
 

@@ -22,7 +22,7 @@ This repository contains the storage platform stack built around three runtime c
   Single-node storage kernel with an object-storage core, standalone namespace layer, lifecycle, repair, redistribution, GC, recover-on-read, POSIX-style routes, and SMB Lite.
 > - `N2` (`0.2.0`)
   Multi-node clustering and placement layer built on top of the shared `N1` storage core.
-> - `Registry` (`0.9.0`)
+> - `Registry` (`0.9.1`)
   User-facing logical metadata and policy layer for accounts, quotas, logical namespace, shares, and storage-session brokering.
 
 If you are new to the codebase, start here. This README explains what each component does, how the platform is intended to be used, and how to stand up a practical deployment.
@@ -49,12 +49,15 @@ The major `2.0` change in `N1` is architectural:
 
 That means file and folder semantics such as `mkdir`, rename, move, trash, recover, and browse are handled in the namespace layer, while repair, redistribution, GC, and recover-on-read operate on storage truth and reachability.
 
-Current release notes for the validated `N1 2.1.2` and `Registry 0.9.0` line:
+Current release notes for the validated `N1 2.1.2` and `Registry 0.9.1` line:
 
 - `namespace_v2` is replicated across configured index roots, monitored by health, and repaired by the repair manager when a rebuilt index disk is missing or has a stale catalog copy.
 - Trash entries are generation-addressed with `trash_entry_id`, so repeated deletes of the same visible path remain individually recoverable or purgeable without path ambiguity.
 - fragment-bound Registry listing and stats now prefer `N1` namespace truth instead of stale SQLite-only projection.
+- Registry folder trash/recover delegates to N1 POSIX namespace lifecycle, including empty folders, instead of emulating directory delete with object-key prefix loops.
 - Registry quota reservations are tracked as explicit durable pending reservations and reconciled against committed object usage on finalize and cancel paths.
+- Registry now keeps product metadata separate from object truth: shares, audit/activity, favorites, tags, labels, and comments live in Registry while file existence/listing comes from N1 for bound fragments.
+- Drive/RAD ARC folder scans consume the Registry/N1 namespace response directly and tolerate both direct DICOM files and nested `common_prefixes` under the selected folder.
 
 ## Core Concepts
 
@@ -105,11 +108,13 @@ It owns:
 - users and admin bootstrap
 - login, refresh, logout, 2FA
 - quotas and stats
-- logical object namespace
+- policy around the backend logical object namespace
 - shares and public links
 - storage-session issuance
+- audit/activity
+- favorites, tags, labels, and comments
 
-Registry maps user-visible logical paths to stable storage identities in `N1` or `N2`. It is the right layer for user ownership, quotas, and product policy. It is not the layer that should repair shards, rebalance disks, or reclaim orphaned physical payloads.
+Registry keeps user/business metadata around logical paths owned by `N1` or `N2`. It is the right layer for user ownership, quotas, shares, product policy, and UI overlays. It is not the layer that should own the authoritative file tree, repair shards, rebalance disks, or reclaim orphaned physical payloads.
 
 ## Architecture Overview
 
