@@ -40,6 +40,7 @@ pub struct SmbConfig {
     pub smb_port: u16,
     pub max_sessions: usize,
     pub max_frame_bytes: usize,
+    pub memory_budget_bytes: usize,
     pub async_close_commit: bool,
     pub async_close_threshold_bytes: u64,
     pub require_signing: bool,
@@ -75,6 +76,12 @@ impl Default for SmbConfig {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(16 * 1024 * 1024)
             .clamp(4 * 1024, 64 * 1024 * 1024);
+        let memory_budget_bytes = env::var("N1_SMB_MEMORY_BUDGET_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(128 * 1024 * 1024)
+            .clamp(8 * 1024 * 1024, 4 * 1024 * 1024 * 1024usize)
+            .max(max_frame_bytes);
         let async_close_commit = env::var("N1_SMB_ASYNC_CLOSE_COMMIT")
             .ok()
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
@@ -121,6 +128,7 @@ impl Default for SmbConfig {
             smb_port,
             max_sessions,
             max_frame_bytes,
+            memory_budget_bytes,
             async_close_commit,
             async_close_threshold_bytes,
             require_signing,

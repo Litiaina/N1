@@ -314,35 +314,18 @@ fn detect_unique_storage_devices(paths: &[String]) -> usize {
 }
 
 fn adaptive_concurrency_interval_ms(cpu_cores: usize, ram_bytes: Option<u64>) -> usize {
-    if cpu_cores <= 2 || ram_gib(ram_bytes) <= 4 {
-        1500
-    } else if cpu_cores <= 4 || ram_gib(ram_bytes) <= 8 {
-        1200
-    } else if cpu_cores <= 8 {
-        1000
-    } else {
-        750
-    }
+    let _ = (cpu_cores, ram_bytes);
+    60_000
 }
 
 fn adaptive_monitor_interval_seconds(cpu_cores: usize, ram_bytes: Option<u64>) -> usize {
-    if cpu_cores <= 2 || ram_gib(ram_bytes) <= 4 {
-        5
-    } else if cpu_cores <= 4 || ram_gib(ram_bytes) <= 8 {
-        3
-    } else {
-        2
-    }
+    let _ = (cpu_cores, ram_bytes);
+    300
 }
 
 fn adaptive_monitor_deep_scan_interval_seconds(cpu_cores: usize, ram_bytes: Option<u64>) -> usize {
-    if cpu_cores <= 2 || ram_gib(ram_bytes) <= 4 {
-        180
-    } else if cpu_cores <= 4 || ram_gib(ram_bytes) <= 8 {
-        120
-    } else {
-        60
-    }
+    let _ = (cpu_cores, ram_bytes);
+    3600
 }
 
 fn parse_usize_or_auto(raw: Option<&str>, key: &str, auto_value: usize) -> usize {
@@ -999,6 +982,14 @@ pub async fn run_server() {
             .and_then(|v| v.parse::<usize>().ok())
         {
             smb_config.max_frame_bytes = v.clamp(4 * 1024, 64 * 1024 * 1024);
+        }
+        if let Some(v) = smb_section
+            .get("memory_budget_bytes")
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            smb_config.memory_budget_bytes = v
+                .clamp(8 * 1024 * 1024, 4 * 1024 * 1024 * 1024usize)
+                .max(smb_config.max_frame_bytes);
         }
         if let Some(v) = smb_section.get("async_close_commit") {
             smb_config.async_close_commit =

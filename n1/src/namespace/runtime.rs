@@ -16,7 +16,7 @@ use ulid::Ulid;
 use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata, ObjectPathManager};
 use crate::core::retrieve::list_objects_direct;
 use crate::enums::app_error_enum::AppError;
-use crate::namespace::catalog::NamespaceCatalog;
+use crate::namespace::catalog::{NamespaceCatalog, NamespaceCatalogRuntimeStats};
 use crate::namespace::models::{
     NamespaceEntry, NamespaceEntryKind, NamespaceError, NamespaceReachabilitySnapshot, ObjectHead,
 };
@@ -42,6 +42,55 @@ pub struct PendingUploadBinding {
 pub struct NamespaceRuntime {
     catalogs: DashMap<String, Arc<AsyncMutex<NamespaceCatalog>>>,
     dbs: DashMap<PathBuf, Arc<Database>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct NamespaceRuntimeStats {
+    pub loaded_catalogs: u64,
+    pub sampled_catalogs: u64,
+    pub busy_catalogs: u64,
+    pub loaded_namespace_dbs: u64,
+    pub nodes: u64,
+    pub child_index_entries: u64,
+    pub objects: u64,
+    pub object_versions: u64,
+    pub object_nodes: u64,
+    pub trash_anchor_entries: u64,
+    pub trash_entry_entries: u64,
+    pub subtree_path_counters: u64,
+    pub subtree_object_counters: u64,
+    pub largest_catalog_nodes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub largest_catalog_fragment: Option<String>,
+}
+
+impl NamespaceRuntimeStats {
+    fn add_catalog(&mut self, fragment: &str, stats: NamespaceCatalogRuntimeStats) {
+        self.nodes = self.nodes.saturating_add(stats.nodes);
+        self.child_index_entries = self
+            .child_index_entries
+            .saturating_add(stats.child_index_entries);
+        self.objects = self.objects.saturating_add(stats.objects);
+        self.object_versions = self.object_versions.saturating_add(stats.object_versions);
+        self.object_nodes = self.object_nodes.saturating_add(stats.object_nodes);
+        self.trash_anchor_entries = self
+            .trash_anchor_entries
+            .saturating_add(stats.trash_anchor_entries);
+        self.trash_entry_entries = self
+            .trash_entry_entries
+            .saturating_add(stats.trash_entry_entries);
+        self.subtree_path_counters = self
+            .subtree_path_counters
+            .saturating_add(stats.subtree_path_counters);
+        self.subtree_object_counters = self
+            .subtree_object_counters
+            .saturating_add(stats.subtree_object_counters);
+
+        if stats.nodes > self.largest_catalog_nodes {
+            self.largest_catalog_nodes = stats.nodes;
+            self.largest_catalog_fragment = Some(fragment.to_string());
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +122,29 @@ impl NamespaceRuntime {
                 self.dbs.remove(&path);
             }
         }
+    }
+
+    pub fn runtime_stats(&self) -> NamespaceRuntimeStats {
+        let mut stats = NamespaceRuntimeStats {
+            loaded_catalogs: self.catalogs.len() as u64,
+            loaded_namespace_dbs: self.dbs.len() as u64,
+            ..NamespaceRuntimeStats::default()
+        };
+
+        for entry in self.catalogs.iter() {
+            let catalog = match entry.value().try_lock() {
+                Ok(catalog) => catalog,
+                Err(_) => {
+                    stats.busy_catalogs = stats.busy_catalogs.saturating_add(1);
+                    continue;
+                }
+            };
+            stats.sampled_catalogs = stats.sampled_catalogs.saturating_add(1);
+            let catalog_stats = catalog.runtime_stats();
+            stats.add_catalog(entry.key(), catalog_stats);
+        }
+
+        stats
     }
 
     pub async fn list_dir(

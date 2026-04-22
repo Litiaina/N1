@@ -65,6 +65,7 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("smb_port", "445")
         .set("max_sessions", "4096")
         .set("max_frame_bytes", "16777216")
+        .set("memory_budget_bytes", "134217728")
         .set("async_close_commit", "false")
         .set("async_close_threshold_bytes", "67108864")
         .set("require_signing", "false")
@@ -99,6 +100,7 @@ mod tests {
         let smb = ini.section(Some("smb")).expect("smb section");
 
         assert_eq!(smb.get("query_directory_page_limit"), Some("1000"));
+        assert_eq!(smb.get("memory_budget_bytes"), Some("134217728"));
         assert_eq!(
             smb.get("query_directory_max_buffered_entries"),
             Some("4096")

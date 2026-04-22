@@ -23,7 +23,7 @@ fn interval_ms() -> u64 {
         .get()
         .map(|v| v.load(Ordering::Relaxed))
         .unwrap_or(1000)
-        .clamp(100, 10_000)
+        .clamp(1000, 300_000)
 }
 
 fn clamp_next(cur: usize, min_v: usize, max_v: usize, down_pct: usize, up_pct: usize) -> usize {

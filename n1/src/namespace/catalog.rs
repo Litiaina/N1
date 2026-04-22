@@ -21,6 +21,19 @@ struct TrashAnchorRef {
     node_id: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct NamespaceCatalogRuntimeStats {
+    pub nodes: u64,
+    pub child_index_entries: u64,
+    pub objects: u64,
+    pub object_versions: u64,
+    pub object_nodes: u64,
+    pub trash_anchor_entries: u64,
+    pub trash_entry_entries: u64,
+    pub subtree_path_counters: u64,
+    pub subtree_object_counters: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamespaceCatalog {
     fragment: String,
@@ -105,6 +118,20 @@ impl NamespaceCatalog {
 
     pub fn fragment(&self) -> &str {
         &self.fragment
+    }
+
+    pub fn runtime_stats(&self) -> NamespaceCatalogRuntimeStats {
+        NamespaceCatalogRuntimeStats {
+            nodes: self.nodes.len() as u64,
+            child_index_entries: self.child_index.len() as u64,
+            objects: self.objects.len() as u64,
+            object_versions: self.object_versions.len() as u64,
+            object_nodes: self.object_nodes.len() as u64,
+            trash_anchor_entries: self.trash_anchor_index.len() as u64,
+            trash_entry_entries: self.trash_entry_index.len() as u64,
+            subtree_path_counters: self.subtree_path_counts.len() as u64,
+            subtree_object_counters: self.subtree_object_counts.len() as u64,
+        }
     }
 
     pub fn rebuild_secondary_indices(&mut self) -> Result<(), NamespaceError> {

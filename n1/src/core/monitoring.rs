@@ -13,6 +13,7 @@ use crate::core::system::{SystemMetrics, get_system_metrics};
 use crate::core::upload::{DATA_SHARDS_ATOMIC, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC};
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::replica::inspect_namespace_replicas;
+use crate::namespace::runtime::{NamespaceRuntimeStats, global_namespace_runtime};
 use crate::routes::storage_routes::AppState;
 use crate::settings::config::CONFIG;
 use crate::structs::auth_structs::Claims;
@@ -207,6 +208,7 @@ pub struct SystemHealthResponse {
     pub system: SystemMetrics,
     pub uploads: UploadRuntimeStats,
     pub index_runtime: IndexRuntimeStats,
+    pub namespace_runtime: NamespaceRuntimeStats,
     pub storage: StoragePlaneStats,
     pub maintenance: MaintenanceRuntimeStats,
     pub summary: String,
@@ -824,6 +826,7 @@ async fn collect_system_health(
     let total_index = index_disks_config.len();
     let total_blob = blob_disks_config.len();
     let uploads = collect_upload_runtime_stats(&active_index_roots).await?;
+    let namespace_runtime = global_namespace_runtime().runtime_stats();
     let redistribution_debt =
         load_redistribution_intent_debt(&active_index_roots, force_refresh || deep_scan).await;
     let fragment_redundancy_debt =
@@ -947,6 +950,7 @@ async fn collect_system_health(
     let monitoring_update = StorageEventPayload::MonitoringUpdate {
         system: serde_json::to_value(&system_metrics).unwrap_or(serde_json::Value::Null),
         uploads: serde_json::to_value(&uploads).ok(),
+        namespace_runtime: serde_json::to_value(&namespace_runtime).ok(),
         maintenance: serde_json::to_value(MaintenanceRuntimeStats {
             access_mode: maintenance_access_mode_label(current_maintenance_access_mode()).into(),
             repair_running: repair_status.is_running,
@@ -1005,6 +1009,7 @@ async fn collect_system_health(
             wal_appenders: online_index_count as u64,
             prefix_projection_fragments_pending: 0,
         },
+        namespace_runtime,
         storage,
         maintenance: MaintenanceRuntimeStats {
             access_mode: maintenance_access_mode_label(current_maintenance_access_mode()).into(),

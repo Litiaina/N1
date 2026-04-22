@@ -81,6 +81,8 @@ pub enum StorageEventPayload {
         #[serde(skip_serializing_if = "Option::is_none")]
         uploads: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        namespace_runtime: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         maintenance: Option<serde_json::Value>,
         repair_job: Option<serde_json::Value>,
         redist_job: Option<serde_json::Value>,
