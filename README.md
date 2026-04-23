@@ -19,7 +19,7 @@
 
 This repository contains the storage platform stack built around four runtime components:
 
-> - `N1` (`2.2.0`)
+> - `N1` (`2.2.2`)
   Single-node storage kernel with an object-storage core, standalone namespace layer, lifecycle, repair, redistribution, GC, recover-on-read, and POSIX-style routes.
 > - `N2` (`0.2.0`)
   Multi-node clustering and placement layer built on top of the shared `N1` storage core.
@@ -54,8 +54,9 @@ The major `2.0` change in `N1` is architectural:
 
 That means file and folder semantics such as `mkdir`, rename, move, trash, recover, and browse are handled in the namespace layer, while repair, redistribution, GC, and recover-on-read operate on storage truth and reachability.
 
-Current release notes for the validated `N1 2.2.0`, `NS 1.0.0`, and `Registry 0.9.1` line:
+Current release notes for the validated `N1 2.2.2`, `NS 1.0.0`, and `Registry 0.9.1` line:
 
+- `N1 2.2.2` adds bounded namespace catalog/database residency and lean auto-tuning so cold fragments are evicted LRU and default cache/buffer growth stays conservative.
 - SMB/NAS serving has moved out of `N1` into standalone `NS`, keeping `N1` focused on storage-kernel responsibilities.
 - `NS 1.0.0` keeps the live SMB path local to disk, uses dynamic fragment authentication, supports recursive folder deletion semantics expected by Windows clients, and cold-syncs large files to `N1` through multipart upload.
 - `namespace_v2` is replicated across configured index roots, monitored by health, and repaired by the repair manager when a rebuilt index disk is missing or has a stale catalog copy.

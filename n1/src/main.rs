@@ -21,6 +21,7 @@ use crate::core::upload::{
 use crate::fs::cleanup_manager::interval_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
+use crate::namespace::runtime::configure_namespace_cache;
 use crate::routes::storage_routes::serve_storage_routes;
 use crate::settings::constants::{CONFIG_FILE, ENV_FILE};
 use crate::utils::date_time_formatter::LocalTimer;
@@ -65,17 +66,16 @@ fn adaptive_max_concurrent_io(
     blob_disks: usize,
     ram_bytes: Option<u64>,
 ) -> usize {
-    let core_cap = (cpu_cores.saturating_mul(6)).clamp(6, 192);
-    let disk_cap = (blob_disks.max(1).saturating_mul(12)).clamp(6, 192);
+    let core_cap = (cpu_cores.saturating_mul(4)).clamp(4, 64);
+    let disk_cap = (blob_disks.max(1).saturating_mul(8)).clamp(4, 64);
     let ram_cap = match ram_gib(ram_bytes) {
         0..=4 => 8,
-        5..=8 => 16,
-        9..=16 => 24,
-        17..=32 => 32,
-        33..=64 => 48,
-        _ => 64,
+        5..=8 => 12,
+        9..=16 => 16,
+        17..=32 => 20,
+        _ => 24,
     };
-    core_cap.min(disk_cap).min(ram_cap).clamp(4, 192)
+    core_cap.min(disk_cap).min(ram_cap).clamp(4, 64)
 }
 
 fn adaptive_writer_buffer_size(
@@ -137,47 +137,44 @@ fn adaptive_upload_memory_budget_bytes(
     total_shards: usize,
 ) -> usize {
     let mut budget: usize = match ram_gib(ram_bytes) {
-        0..=4 => 48usize * 1024 * 1024,
-        5..=8 => 64usize * 1024 * 1024,
-        9..=16 => 96usize * 1024 * 1024,
-        17..=32 => 128usize * 1024 * 1024,
-        33..=64 => 192usize * 1024 * 1024,
-        _ => 256usize * 1024 * 1024,
+        0..=4 => 32usize * 1024 * 1024,
+        5..=8 => 48usize * 1024 * 1024,
+        9..=16 => 64usize * 1024 * 1024,
+        17..=32 => 80usize * 1024 * 1024,
+        _ => 96usize * 1024 * 1024,
     };
 
     if cpu_cores >= 24 {
-        budget = budget.saturating_add(32usize * 1024 * 1024);
+        budget = budget.saturating_add(16usize * 1024 * 1024);
     }
     if total_shards >= 4 {
-        budget = budget.saturating_add(32usize * 1024 * 1024);
+        budget = budget.saturating_add(16usize * 1024 * 1024);
     }
 
     if blob_disks <= 1 {
-        budget = budget.min(96usize * 1024 * 1024);
+        budget = budget.min(64usize * 1024 * 1024);
     } else if blob_disks == 2 {
-        budget = budget.min(160usize * 1024 * 1024);
+        budget = budget.min(96usize * 1024 * 1024);
     }
 
-    budget.clamp(48usize * 1024 * 1024, 384usize * 1024 * 1024)
+    budget.clamp(32usize * 1024 * 1024, 128usize * 1024 * 1024)
 }
 
 fn adaptive_indexdb_max_cached_dbs(ram_bytes: Option<u64>) -> usize {
     match ram_gib(ram_bytes) {
-        0..=4 => 16,
-        5..=8 => 24,
-        9..=16 => 32,
-        17..=64 => 48,
-        _ => 64,
+        0..=4 => 12,
+        5..=8 => 16,
+        9..=16 => 24,
+        _ => 32,
     }
 }
 
 fn adaptive_indexdb_cache_budget_bytes(ram_bytes: Option<u64>) -> usize {
     match ram_gib(ram_bytes) {
-        0..=4 => 64 * 1024 * 1024,
-        5..=8 => 96 * 1024 * 1024,
-        9..=16 => 128 * 1024 * 1024,
-        17..=64 => 192 * 1024 * 1024,
-        _ => 256 * 1024 * 1024,
+        0..=4 => 48 * 1024 * 1024,
+        5..=8 => 64 * 1024 * 1024,
+        9..=16 => 96 * 1024 * 1024,
+        _ => 128 * 1024 * 1024,
     }
 }
 
@@ -185,6 +182,19 @@ fn adaptive_indexdb_per_db_cache_bytes(ram_bytes: Option<u64>) -> usize {
     let max_cached_dbs = adaptive_indexdb_max_cached_dbs(ram_bytes).max(1);
     let budget = adaptive_indexdb_cache_budget_bytes(ram_bytes);
     (budget / max_cached_dbs).clamp(1024 * 1024, 8 * 1024 * 1024)
+}
+
+fn adaptive_namespace_max_loaded_catalogs(ram_bytes: Option<u64>) -> usize {
+    match ram_gib(ram_bytes) {
+        0..=4 => 8,
+        5..=8 => 12,
+        9..=16 => 16,
+        _ => 24,
+    }
+}
+
+fn adaptive_namespace_max_loaded_dbs(ram_bytes: Option<u64>) -> usize {
+    adaptive_namespace_max_loaded_catalogs(ram_bytes).saturating_mul(2)
 }
 
 fn normalize_indexdb_per_db_cache_bytes(value: usize) -> usize {
@@ -239,12 +249,11 @@ fn adaptive_stream_readahead_bytes(chunk_size: usize, ram_bytes: Option<u64>) ->
 
 fn adaptive_stream_memory_budget_bytes(ram_bytes: Option<u64>) -> usize {
     match ram_gib(ram_bytes) {
-        0..=4 => 48 * 1024 * 1024,
-        5..=8 => 64 * 1024 * 1024,
-        9..=16 => 96 * 1024 * 1024,
-        17..=32 => 128 * 1024 * 1024,
-        33..=64 => 192 * 1024 * 1024,
-        _ => 256 * 1024 * 1024,
+        0..=4 => 32 * 1024 * 1024,
+        5..=8 => 48 * 1024 * 1024,
+        9..=16 => 64 * 1024 * 1024,
+        17..=32 => 80 * 1024 * 1024,
+        _ => 96 * 1024 * 1024,
     }
 }
 
@@ -255,14 +264,14 @@ fn adaptive_stream_max_concurrency(
     chunk_size: usize,
     readahead_bytes: usize,
 ) -> usize {
-    let core_cap = (cpu_cores.saturating_mul(12)).clamp(12, 768);
-    let disk_cap = (blob_disks.max(1).saturating_mul(64)).clamp(16, 768);
+    let core_cap = (cpu_cores.saturating_mul(8)).clamp(8, 256);
+    let disk_cap = (blob_disks.max(1).saturating_mul(32)).clamp(8, 256);
     let per_stream = chunk_size
         .saturating_add(readahead_bytes)
         .saturating_add(64 * 1024)
         .max(1);
-    let mem_cap = (adaptive_stream_memory_budget_bytes(ram_bytes) / per_stream).clamp(8, 768);
-    core_cap.min(disk_cap).min(mem_cap).clamp(8, 768)
+    let mem_cap = (adaptive_stream_memory_budget_bytes(ram_bytes) / per_stream).clamp(4, 256);
+    core_cap.min(disk_cap).min(mem_cap).clamp(4, 256)
 }
 
 fn normalize_fs_backed_disk_paths(role: &str, paths: Vec<String>) -> Vec<String> {
@@ -729,6 +738,27 @@ pub async fn run_server() {
         indexdb_per_db_cache_bytes / (1024 * 1024),
         indexdb_max_cached_dbs,
         indexdb_per_db_cache_bytes.saturating_mul(indexdb_max_cached_dbs) / (1024 * 1024)
+    );
+
+    let namespace_section = config.section(Some("namespace_config"));
+    let namespace_max_loaded_catalogs = parse_usize_or_auto(
+        namespace_section.and_then(|s| s.get("max_loaded_catalogs")),
+        "namespace_config.max_loaded_catalogs",
+        adaptive_namespace_max_loaded_catalogs(detected_ram_bytes),
+    )
+    .clamp(1, 512);
+    let namespace_max_loaded_dbs = parse_usize_or_auto(
+        namespace_section.and_then(|s| s.get("max_loaded_dbs")),
+        "namespace_config.max_loaded_dbs",
+        adaptive_namespace_max_loaded_dbs(detected_ram_bytes),
+    )
+    .clamp(1, 1024);
+    configure_namespace_cache(namespace_max_loaded_catalogs, namespace_max_loaded_dbs);
+
+    tracing::info!(
+        "Namespace cache: max_loaded_catalogs={}, max_loaded_dbs={} (cold catalogs/dbs are evicted LRU to keep N1 IO-bound)",
+        namespace_max_loaded_catalogs,
+        namespace_max_loaded_dbs
     );
 
     let upload_section = config.section(Some("upload_config"));

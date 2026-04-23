@@ -20,6 +20,10 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("per_db_cache_bytes", "auto")
         .set("max_cached_dbs", "auto");
 
+    conf.with_section(Some("namespace_config"))
+        .set("max_loaded_catalogs", "auto")
+        .set("max_loaded_dbs", "auto");
+
     conf.with_section(Some("garbage_collector"))
         .set("cleanup_interval_seconds", "3600")
         .set("file_ttl_seconds", "3600")

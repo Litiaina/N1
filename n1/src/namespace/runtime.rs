@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock};
 
 use axum::http::StatusCode;
@@ -42,15 +43,19 @@ pub struct PendingUploadBinding {
 
 pub struct NamespaceRuntime {
     catalogs: DashMap<String, Arc<AsyncMutex<NamespaceCatalog>>>,
+    catalog_touch_ticks: DashMap<String, u64>,
     dbs: DashMap<PathBuf, Arc<Database>>,
+    db_touch_ticks: DashMap<PathBuf, u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct NamespaceRuntimeStats {
     pub loaded_catalogs: u64,
+    pub max_loaded_catalogs: u64,
     pub sampled_catalogs: u64,
     pub busy_catalogs: u64,
     pub loaded_namespace_dbs: u64,
+    pub max_loaded_namespace_dbs: u64,
     pub nodes: u64,
     pub child_index_entries: u64,
     pub objects: u64,
@@ -103,32 +108,67 @@ struct NamespaceReplicaFileInfo {
 }
 
 static GLOBAL_NAMESPACE_RUNTIME: LazyLock<NamespaceRuntime> = LazyLock::new(NamespaceRuntime::new);
+static NAMESPACE_CACHE_TOUCH_TICK: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(1));
+static NAMESPACE_MAX_LOADED_CATALOGS: LazyLock<AtomicUsize> =
+    LazyLock::new(|| AtomicUsize::new(DEFAULT_NAMESPACE_MAX_LOADED_CATALOGS));
+static NAMESPACE_MAX_LOADED_DBS: LazyLock<AtomicUsize> =
+    LazyLock::new(|| AtomicUsize::new(DEFAULT_NAMESPACE_MAX_LOADED_DBS));
+
+pub const DEFAULT_NAMESPACE_MAX_LOADED_CATALOGS: usize = 16;
+pub const DEFAULT_NAMESPACE_MAX_LOADED_DBS: usize = 16;
 
 pub fn global_namespace_runtime() -> &'static NamespaceRuntime {
     &GLOBAL_NAMESPACE_RUNTIME
+}
+
+pub fn configure_namespace_cache(max_loaded_catalogs: usize, max_loaded_dbs: usize) {
+    NAMESPACE_MAX_LOADED_CATALOGS.store(max_loaded_catalogs.max(1), AtomicOrdering::Relaxed);
+    NAMESPACE_MAX_LOADED_DBS.store(max_loaded_dbs.max(1), AtomicOrdering::Relaxed);
+}
+
+pub fn namespace_cache_config() -> (usize, usize) {
+    (
+        NAMESPACE_MAX_LOADED_CATALOGS
+            .load(AtomicOrdering::Relaxed)
+            .max(1),
+        NAMESPACE_MAX_LOADED_DBS
+            .load(AtomicOrdering::Relaxed)
+            .max(1),
+    )
+}
+
+fn next_namespace_cache_tick() -> u64 {
+    NAMESPACE_CACHE_TOUCH_TICK.fetch_add(1, AtomicOrdering::Relaxed)
 }
 
 impl NamespaceRuntime {
     pub fn new() -> Self {
         Self {
             catalogs: DashMap::new(),
+            catalog_touch_ticks: DashMap::new(),
             dbs: DashMap::new(),
+            db_touch_ticks: DashMap::new(),
         }
     }
 
     pub fn evict_fragment(&self, fragment: &str) {
         self.catalogs.remove(fragment);
+        self.catalog_touch_ticks.remove(fragment);
         if let Ok(paths) = namespace_db_paths(fragment) {
             for path in paths {
                 self.dbs.remove(&path);
+                self.db_touch_ticks.remove(&path);
             }
         }
     }
 
     pub fn runtime_stats(&self) -> NamespaceRuntimeStats {
+        let (max_loaded_catalogs, max_loaded_namespace_dbs) = namespace_cache_config();
         let mut stats = NamespaceRuntimeStats {
             loaded_catalogs: self.catalogs.len() as u64,
+            max_loaded_catalogs: max_loaded_catalogs as u64,
             loaded_namespace_dbs: self.dbs.len() as u64,
+            max_loaded_namespace_dbs: max_loaded_namespace_dbs as u64,
             ..NamespaceRuntimeStats::default()
         };
 
@@ -146,6 +186,82 @@ impl NamespaceRuntime {
         }
 
         stats
+    }
+
+    fn touch_catalog_cache(&self, fragment: &str) {
+        self.catalog_touch_ticks
+            .insert(fragment.to_string(), next_namespace_cache_tick());
+    }
+
+    fn touch_db_cache(&self, path: &Path) {
+        self.db_touch_ticks
+            .insert(path.to_path_buf(), next_namespace_cache_tick());
+    }
+
+    fn prune_catalog_cache(&self) {
+        let max_loaded_catalogs = namespace_cache_config().0;
+        if self.catalogs.len() <= max_loaded_catalogs {
+            return;
+        }
+
+        let mut evictable = self
+            .catalogs
+            .iter()
+            .filter_map(|entry| {
+                if Arc::strong_count(entry.value()) > 1 {
+                    return None;
+                }
+                let fragment = entry.key().clone();
+                let touch = self
+                    .catalog_touch_ticks
+                    .get(&fragment)
+                    .map(|value| *value)
+                    .unwrap_or(0);
+                Some((fragment, touch))
+            })
+            .collect::<Vec<_>>();
+        evictable.sort_by_key(|(_, touch)| *touch);
+
+        for (fragment, _) in evictable {
+            if self.catalogs.len() <= max_loaded_catalogs {
+                break;
+            }
+            self.catalogs.remove(&fragment);
+            self.catalog_touch_ticks.remove(&fragment);
+        }
+    }
+
+    fn prune_db_cache(&self) {
+        let max_loaded_dbs = namespace_cache_config().1;
+        if self.dbs.len() <= max_loaded_dbs {
+            return;
+        }
+
+        let mut evictable = self
+            .dbs
+            .iter()
+            .filter_map(|entry| {
+                if Arc::strong_count(entry.value()) > 1 {
+                    return None;
+                }
+                let path = entry.key().clone();
+                let touch = self
+                    .db_touch_ticks
+                    .get(&path)
+                    .map(|value| *value)
+                    .unwrap_or(0);
+                Some((path, touch))
+            })
+            .collect::<Vec<_>>();
+        evictable.sort_by_key(|(_, touch)| *touch);
+
+        for (path, _) in evictable {
+            if self.dbs.len() <= max_loaded_dbs {
+                break;
+            }
+            self.dbs.remove(&path);
+            self.db_touch_ticks.remove(&path);
+        }
     }
 
     pub async fn list_dir(
@@ -401,6 +517,7 @@ impl NamespaceRuntime {
         fragment: &str,
     ) -> Result<Option<NamespaceReachabilitySnapshot>, AppError> {
         if let Some(existing) = self.catalogs.get(fragment) {
+            self.touch_catalog_cache(fragment);
             let guard = existing.lock().await;
             return Ok(Some(guard.reachability_snapshot()));
         }
@@ -725,6 +842,7 @@ impl NamespaceRuntime {
             .ensure_owner_namespace_db(fragment)?
             .unwrap_or(namespace_db_path(fragment)?);
         if let Some(existing) = self.dbs.get(&path) {
+            self.touch_db_cache(&path);
             return Ok(existing.clone());
         }
         if let Some(parent) = path.parent() {
@@ -732,7 +850,9 @@ impl NamespaceRuntime {
                 .map_err(|e| AppError::Io(e, format!("mkdir {}", parent.display())))?;
         }
         let db = Arc::new(open_n1_indexdb(&path)?);
-        self.dbs.insert(path, db.clone());
+        self.dbs.insert(path.clone(), db.clone());
+        self.touch_db_cache(&path);
+        self.prune_db_cache();
         Ok(db)
     }
 
@@ -741,13 +861,16 @@ impl NamespaceRuntime {
             return Ok(None);
         };
         if let Some(existing) = self.dbs.get(&path) {
+            self.touch_db_cache(&path);
             return Ok(Some(existing.clone()));
         }
         if !path.exists() {
             return Ok(None);
         }
         let db = Arc::new(open_n1_indexdb(&path)?);
-        self.dbs.insert(path, db.clone());
+        self.dbs.insert(path.clone(), db.clone());
+        self.touch_db_cache(&path);
+        self.prune_db_cache();
         Ok(Some(db))
     }
 
@@ -757,6 +880,7 @@ impl NamespaceRuntime {
     ) -> Result<Arc<AsyncMutex<NamespaceCatalog>>, AppError> {
         if let Some(existing) = self.catalogs.get(fragment) {
             if self.ensure_owner_namespace_db(fragment)?.is_some() {
+                self.touch_catalog_cache(fragment);
                 return Ok(existing.clone());
             }
             drop(existing);
@@ -764,11 +888,16 @@ impl NamespaceRuntime {
         }
         let catalog = self.read_or_import_catalog(fragment).await?;
         let wrapped = Arc::new(AsyncMutex::new(catalog));
-        let entry = self
-            .catalogs
-            .entry(fragment.to_string())
-            .or_insert_with(|| wrapped.clone());
-        Ok(entry.clone())
+        let catalog = {
+            let entry = self
+                .catalogs
+                .entry(fragment.to_string())
+                .or_insert_with(|| wrapped.clone());
+            entry.clone()
+        };
+        self.touch_catalog_cache(fragment);
+        self.prune_catalog_cache();
+        Ok(catalog)
     }
 
     async fn load_catalog_if_present(
@@ -776,6 +905,7 @@ impl NamespaceRuntime {
         fragment: &str,
     ) -> Result<Option<Arc<AsyncMutex<NamespaceCatalog>>>, AppError> {
         if let Some(existing) = self.catalogs.get(fragment) {
+            self.touch_catalog_cache(fragment);
             return Ok(Some(existing.clone()));
         }
         let db = match self.open_existing_db(fragment)? {
@@ -806,11 +936,16 @@ impl NamespaceRuntime {
             .rebuild_secondary_indices()
             .map_err(namespace_error_to_app)?;
         let wrapped = Arc::new(AsyncMutex::new(catalog));
-        let entry = self
-            .catalogs
-            .entry(fragment.to_string())
-            .or_insert_with(|| wrapped.clone());
-        Ok(Some(entry.clone()))
+        let catalog = {
+            let entry = self
+                .catalogs
+                .entry(fragment.to_string())
+                .or_insert_with(|| wrapped.clone());
+            entry.clone()
+        };
+        self.touch_catalog_cache(fragment);
+        self.prune_catalog_cache();
+        Ok(Some(catalog))
     }
 
     async fn read_or_import_catalog(&self, fragment: &str) -> Result<NamespaceCatalog, AppError> {
@@ -1163,7 +1298,10 @@ pub fn unexpected_response(status: StatusCode, context: &str) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{global_namespace_runtime, namespace_db_path, namespace_db_paths};
+    use super::{
+        configure_namespace_cache, global_namespace_runtime, namespace_cache_config,
+        namespace_db_path, namespace_db_paths,
+    };
     use crate::core::disk_manager::{
         BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS, ObjectMetadata,
     };
@@ -1257,6 +1395,79 @@ mod tests {
         let _ = ensure_fragment_blob_directories(fragment).await;
         let _ = init_quota_file(fragment, 0).await;
         global_namespace_runtime().evict_fragment(fragment);
+    }
+
+    fn test_object_metadata(fragment: &str, object_key: &str) -> ObjectMetadata {
+        ObjectMetadata {
+            object_key: object_key.to_string(),
+            fragment: fragment.to_string(),
+            version_id: Ulid::new().to_string(),
+            upload_session_id: String::new(),
+            owner_uid: fragment.to_string(),
+            content_type: "application/octet-stream".to_string(),
+            total_size_bytes: 4096,
+            created_at: 1_710_000_000,
+            parts: Vec::new(),
+            is_delete_marker: false,
+            stripe_size_bytes: 262_144,
+        }
+    }
+
+    struct NamespaceCacheConfigGuard {
+        max_loaded_catalogs: usize,
+        max_loaded_dbs: usize,
+    }
+
+    impl NamespaceCacheConfigGuard {
+        fn set(max_loaded_catalogs: usize, max_loaded_dbs: usize) -> Self {
+            let (previous_catalogs, previous_dbs) = namespace_cache_config();
+            configure_namespace_cache(max_loaded_catalogs, max_loaded_dbs);
+            Self {
+                max_loaded_catalogs: previous_catalogs,
+                max_loaded_dbs: previous_dbs,
+            }
+        }
+    }
+
+    impl Drop for NamespaceCacheConfigGuard {
+        fn drop(&mut self) {
+            configure_namespace_cache(self.max_loaded_catalogs, self.max_loaded_dbs);
+        }
+    }
+
+    #[tokio::test]
+    async fn namespace_cache_evicts_idle_catalogs_and_dbs() {
+        let _guard = global_test_lock().lock().await;
+        let _cache_guard = NamespaceCacheConfigGuard::set(1, 1);
+
+        let fragment_a = format!("namespace-cache-a-{}", Ulid::new());
+        let fragment_b = format!("namespace-cache-b-{}", Ulid::new());
+        setup_fragment(&fragment_a).await;
+        setup_fragment(&fragment_b).await;
+
+        let metadata_a = test_object_metadata(&fragment_a, "docs/a.txt");
+        global_namespace_runtime()
+            .finalize_logical_upload(&fragment_a, "docs/a.txt", "physical-a", &metadata_a)
+            .await
+            .expect("finalize fragment a");
+        let metadata_b = test_object_metadata(&fragment_b, "docs/b.txt");
+        global_namespace_runtime()
+            .finalize_logical_upload(&fragment_b, "docs/b.txt", "physical-b", &metadata_b)
+            .await
+            .expect("finalize fragment b");
+
+        let stats = global_namespace_runtime().runtime_stats();
+        assert!(
+            stats.loaded_catalogs <= 1,
+            "idle catalog cache should be bounded: {stats:?}"
+        );
+        assert!(
+            stats.loaded_namespace_dbs <= 1,
+            "idle namespace db cache should be bounded: {stats:?}"
+        );
+
+        global_namespace_runtime().evict_fragment(&fragment_a);
+        global_namespace_runtime().evict_fragment(&fragment_b);
     }
 
     #[tokio::test]

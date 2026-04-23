@@ -1,6 +1,6 @@
 # N1 API Documentation
 
-`N1` is the standalone storage kernel in this repository. In `2.2.1`, it exposes:
+`N1` is the standalone storage kernel in this repository. In `2.2.2`, it exposes:
 
 - fragment provisioning
 - fragment-scoped authentication
@@ -28,16 +28,22 @@ https://127.0.0.1:50001
 
 ## Memory Tuning
 
-`N1 2.2.1` bounds its embedded indexdb cache for small servers. The upstream indexdb default cache is `1GiB` per opened database; N1 overrides that with `[index_config]` so a 4GB host does not retain excessive resident memory during long runs.
+`N1 2.2.2` bounds embedded indexdb and namespace runtime residency for small servers. The upstream indexdb default cache is `1GiB` per opened database; N1 overrides that with `[index_config]` so the process does not retain excessive resident memory during long runs.
 
 ```ini
 [index_config]
 partition_count=64
 per_db_cache_bytes=auto
 max_cached_dbs=auto
+
+[namespace_config]
+max_loaded_catalogs=auto
+max_loaded_dbs=auto
 ```
 
-Defaults are adaptive. On 4GB-class hosts, `auto` targets a small per-database cache and a limited number of cached partition handles. Increase these only for machines with enough RAM and heavy index scan workloads.
+Defaults are adaptive but intentionally lean. `auto` favors bounded RSS over maximum cache residency even on larger hosts: indexdb, namespace catalogs, upload buffers, and stream buffers are capped conservatively so N1 remains closer to an IO-bound storage kernel. Cold namespace catalogs are evicted LRU and reloaded from disk when needed, keeping the on-disk format unchanged.
+
+Increase these only when deliberately running a high-performance profile on machines with enough RAM and heavy namespace/index scan workloads.
 
 ## Authentication Model
 
