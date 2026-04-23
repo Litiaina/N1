@@ -1,6 +1,4 @@
-pub use n1::{
-    core, enums, fs, fuse, handlers, middleware, smb, statics, structs, utils, websocket,
-};
+pub use n1::{core, enums, fs, handlers, middleware, statics, structs, utils, websocket};
 
 use crate::core::adaptive_concurrency::{
     ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC, ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC,
@@ -1242,90 +1240,6 @@ pub async fn run_server() {
     tokio::spawn(async move {
         interval_cleanup(&fs_root).await;
     });
-
-    let mut smb_config = crate::smb::config::SmbConfig::default();
-    if let Some(smb_section) = config
-        .section(Some("smb"))
-        .or_else(|| config.section(Some("fsgwd")))
-    {
-        if let Some(v) = smb_section.get("enabled") {
-            smb_config.enabled = parse_bool_or_default(Some(v), smb_config.enabled);
-        }
-        if let Some(v) = smb_section.get("bind_addr") {
-            let trimmed = v.trim();
-            if !trimmed.is_empty() {
-                smb_config.bind_addr = trimmed.to_string();
-            }
-        }
-        if let Some(v) = smb_section
-            .get("smb_port")
-            .and_then(|v| v.parse::<u16>().ok())
-        {
-            smb_config.smb_port = v;
-        }
-        if let Some(v) = smb_section
-            .get("max_sessions")
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            smb_config.max_sessions = v.clamp(64, 65_536);
-        }
-        if let Some(v) = smb_section
-            .get("max_frame_bytes")
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            smb_config.max_frame_bytes = v.clamp(4 * 1024, 64 * 1024 * 1024);
-        }
-        if let Some(v) = smb_section.get("async_close_commit") {
-            smb_config.async_close_commit =
-                parse_bool_or_default(Some(v), smb_config.async_close_commit);
-        }
-        if let Some(v) = smb_section
-            .get("async_close_threshold_bytes")
-            .and_then(|v| v.parse::<u64>().ok())
-        {
-            smb_config.async_close_threshold_bytes =
-                v.clamp(1 * 1024 * 1024, 1024 * 1024 * 1024 * 1024);
-        }
-        if let Some(v) = smb_section.get("require_signing") {
-            smb_config.require_signing = parse_bool_or_default(Some(v), smb_config.require_signing);
-        }
-        if let Some(v) = smb_section
-            .get("query_directory_page_limit")
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            smb_config.query_directory_page_limit =
-                crate::smb::config::clamp_query_directory_page_limit(v);
-        }
-        if let Some(v) = smb_section
-            .get("query_directory_max_buffered_entries")
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            smb_config.query_directory_max_buffered_entries =
-                crate::smb::config::clamp_query_directory_max_buffered_entries(v);
-        }
-        if let Some(v) = smb_section
-            .get("query_directory_max_seeded_entries")
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            smb_config.query_directory_max_seeded_entries =
-                crate::smb::config::clamp_query_directory_max_seeded_entries(
-                    v,
-                    smb_config.query_directory_max_buffered_entries,
-                );
-        }
-    }
-
-    let mut _smb_join = None;
-    match crate::smb::start(smb_config).await {
-        Ok(Some(runtime)) => {
-            tracing::info!("smb listener online at {}", runtime.addr);
-            _smb_join = Some(runtime.join);
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!("failed to start smb listener: {}", e);
-        }
-    }
 
     serve(storage_addr, serve_storage, cert).await;
 }

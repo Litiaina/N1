@@ -13,8 +13,12 @@ This repository now keeps the platform docs split into:
 ## Runtime API References
 
 - [N1_DOCUMENTATION.md](/home/administrator/Development/N1/N1_DOCUMENTATION.md)
-  Detailed `N1 2.0.1` storage-kernel reference:
+  Detailed `N1 2.2.0` storage-kernel reference:
   fragment provisioning, auth, upload, read, lifecycle, POSIX, maintenance, request parameters, and example payloads.
+
+- [NS_DOCUMENTATION.md](/home/administrator/Development/N1/NS_DOCUMENTATION.md)
+  Detailed `NS 1.0.0` NAS Lite deployment reference:
+  SMB listener setup, dynamic N1 fragment auth, share roots, staging, capacity behavior, and optional cold sync to `N1`.
 
 - [N2_DOCUMENTATION.md](/home/administrator/Development/N1/N2_DOCUMENTATION.md)
   Detailed `N2 0.2.0` cluster-layer reference:
@@ -27,6 +31,7 @@ This repository now keeps the platform docs split into:
 ## Which Doc To Use
 
 - Use `N1` docs when you are talking directly to the storage kernel.
+- Use `NS` docs when you are deploying standalone NAS/SMB file serving.
 - Use `N2` docs when you are operating or integrating the clustered storage layer.
 - Use `Registry` docs when you are building the user-facing product/API experience.
 
@@ -35,6 +40,10 @@ This repository now keeps the platform docs split into:
 - `N1`
   Physical storage truth, standalone namespace, upload, read, lifecycle, maintenance.
   Stable route namespace: `/n1/...`
+
+- `NS`
+  Standalone NAS Lite / SMB file serving, dynamic fragment shares, N1-backed auth, backing-filesystem capacity, and optional cold sync to `N1`.
+  Network surface: configured SMB bind address and port.
 
 - `N2`
   Cluster coordination, placement, reconcile, internal peer traffic.

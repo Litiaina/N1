@@ -16,7 +16,9 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("fs_storage_path", "");
 
     conf.with_section(Some("index_config"))
-        .set("partition_count", "64");
+        .set("partition_count", "64")
+        .set("per_db_cache_bytes", "auto")
+        .set("max_cached_dbs", "auto");
 
     conf.with_section(Some("garbage_collector"))
         .set("cleanup_interval_seconds", "3600")
@@ -59,20 +61,6 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("parity_shards", "0")
         .set("stripe_block_size", "262144");
 
-    conf.with_section(Some("smb"))
-        .set("enabled", "false")
-        .set("bind_addr", "0.0.0.0")
-        .set("smb_port", "445")
-        .set("max_sessions", "4096")
-        .set("max_frame_bytes", "16777216")
-        .set("memory_budget_bytes", "134217728")
-        .set("async_close_commit", "false")
-        .set("async_close_threshold_bytes", "67108864")
-        .set("require_signing", "false")
-        .set("query_directory_page_limit", "1000")
-        .set("query_directory_max_buffered_entries", "4096")
-        .set("query_directory_max_seeded_entries", "512");
-
     conf.write_to_file(path)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }
@@ -82,33 +70,6 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn default_config_includes_smb_directory_tuning_keys() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "n1-default-config-{}-{}.ini",
-            std::process::id(),
-            unique
-        ));
-
-        create_default_config_ini(&path).expect("create default config");
-        let ini = Ini::load_from_file(&path).expect("load generated config");
-        let smb = ini.section(Some("smb")).expect("smb section");
-
-        assert_eq!(smb.get("query_directory_page_limit"), Some("1000"));
-        assert_eq!(smb.get("memory_budget_bytes"), Some("134217728"));
-        assert_eq!(
-            smb.get("query_directory_max_buffered_entries"),
-            Some("4096")
-        );
-        assert_eq!(smb.get("query_directory_max_seeded_entries"), Some("512"));
-
-        let _ = fs::remove_file(path);
-    }
 
     #[test]
     fn default_config_excludes_n2_section() {
@@ -128,6 +89,12 @@ mod tests {
             ini.section(Some("n2")).is_none(),
             "N1 config should not generate an [n2] section"
         );
+        let index = ini
+            .section(Some("index_config"))
+            .expect("index_config section");
+        assert_eq!(index.get("partition_count"), Some("64"));
+        assert_eq!(index.get("per_db_cache_bytes"), Some("auto"));
+        assert_eq!(index.get("max_cached_dbs"), Some("auto"));
 
         let _ = fs::remove_file(path);
     }

@@ -44,6 +44,8 @@ pub struct SmbConfig {
     pub async_close_commit: bool,
     pub async_close_threshold_bytes: u64,
     pub require_signing: bool,
+    pub auth_domain: String,
+    pub allow_guest: bool,
     pub query_directory_page_limit: usize,
     pub query_directory_max_buffered_entries: usize,
     pub query_directory_max_seeded_entries: usize,
@@ -51,67 +53,77 @@ pub struct SmbConfig {
 
 impl Default for SmbConfig {
     fn default() -> Self {
-        let enabled = env::var("N1_SMB_ENABLED")
+        let enabled = env::var("NS_SMB_ENABLED")
             .ok()
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-            .unwrap_or(false);
+            .unwrap_or(true);
 
-        let bind_addr = env::var("N1_SMB_BIND_ADDR")
+        let bind_addr = env::var("NS_SMB_BIND_ADDR")
             .ok()
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| "0.0.0.0".to_string());
 
-        let smb_port = env::var("N1_SMB_PORT")
+        let smb_port = env::var("NS_SMB_PORT")
             .ok()
             .and_then(|v| v.parse::<u16>().ok())
             .unwrap_or(445);
 
-        let max_sessions = env::var("N1_SMB_MAX_SESSIONS")
+        let max_sessions = env::var("NS_SMB_MAX_SESSIONS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(4096)
             .clamp(64, 65_536);
-        let max_frame_bytes = env::var("N1_SMB_MAX_FRAME_BYTES")
+        let max_frame_bytes = env::var("NS_SMB_MAX_FRAME_BYTES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(16 * 1024 * 1024)
             .clamp(4 * 1024, 64 * 1024 * 1024);
-        let memory_budget_bytes = env::var("N1_SMB_MEMORY_BUDGET_BYTES")
+        let memory_budget_bytes = env::var("NS_SMB_MEMORY_BUDGET_BYTES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(128 * 1024 * 1024)
             .clamp(8 * 1024 * 1024, 4 * 1024 * 1024 * 1024usize)
             .max(max_frame_bytes);
-        let async_close_commit = env::var("N1_SMB_ASYNC_CLOSE_COMMIT")
+        let async_close_commit = env::var("NS_SMB_ASYNC_CLOSE_COMMIT")
             .ok()
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
             .unwrap_or(false);
-        let async_close_threshold_bytes = env::var("N1_SMB_ASYNC_CLOSE_THRESHOLD_BYTES")
+        let async_close_threshold_bytes = env::var("NS_SMB_ASYNC_CLOSE_THRESHOLD_BYTES")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(64 * 1024 * 1024)
             .clamp(1 * 1024 * 1024, 1024 * 1024 * 1024 * 1024);
 
-        let require_signing = env::var("N1_SMB_REQUIRE_SIGNING")
+        let require_signing = env::var("NS_SMB_REQUIRE_SIGNING")
             .ok()
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
             .unwrap_or(false);
 
-        let query_directory_page_limit = env::var("N1_SMB_QUERY_DIRECTORY_PAGE_LIMIT")
+        let auth_domain = env::var("NS_SMB_AUTH_DOMAIN")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "LITI".to_string());
+
+        let allow_guest = env::var("NS_SMB_ALLOW_GUEST")
+            .ok()
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false);
+
+        let query_directory_page_limit = env::var("NS_SMB_QUERY_DIRECTORY_PAGE_LIMIT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .map(clamp_query_directory_page_limit)
             .unwrap_or(1000);
 
         let query_directory_max_buffered_entries =
-            env::var("N1_SMB_QUERY_DIRECTORY_MAX_BUFFERED_ENTRIES")
+            env::var("NS_SMB_QUERY_DIRECTORY_MAX_BUFFERED_ENTRIES")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .map(clamp_query_directory_max_buffered_entries)
                 .unwrap_or(4096);
 
         let query_directory_max_seeded_entries =
-            env::var("N1_SMB_QUERY_DIRECTORY_MAX_SEEDED_ENTRIES")
+            env::var("NS_SMB_QUERY_DIRECTORY_MAX_SEEDED_ENTRIES")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .map(|v| {
@@ -132,6 +144,8 @@ impl Default for SmbConfig {
             async_close_commit,
             async_close_threshold_bytes,
             require_signing,
+            auth_domain,
+            allow_guest,
             query_directory_page_limit,
             query_directory_max_buffered_entries,
             query_directory_max_seeded_entries,

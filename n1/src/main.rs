@@ -5,6 +5,7 @@ use crate::core::adaptive_concurrency::{
 };
 use crate::core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
 use crate::core::fragment_metadata::set_configured_index_partition_count;
+use crate::core::indexdb_store::configure_indexdb_cache;
 use crate::core::monitoring::{
     MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC, MONITOR_INTERVAL_SECS_ATOMIC,
 };
@@ -158,6 +159,40 @@ fn adaptive_upload_memory_budget_bytes(
     }
 
     budget.clamp(48usize * 1024 * 1024, 384usize * 1024 * 1024)
+}
+
+fn adaptive_indexdb_max_cached_dbs(ram_bytes: Option<u64>) -> usize {
+    match ram_gib(ram_bytes) {
+        0..=4 => 16,
+        5..=8 => 24,
+        9..=16 => 32,
+        17..=64 => 48,
+        _ => 64,
+    }
+}
+
+fn adaptive_indexdb_cache_budget_bytes(ram_bytes: Option<u64>) -> usize {
+    match ram_gib(ram_bytes) {
+        0..=4 => 64 * 1024 * 1024,
+        5..=8 => 96 * 1024 * 1024,
+        9..=16 => 128 * 1024 * 1024,
+        17..=64 => 192 * 1024 * 1024,
+        _ => 256 * 1024 * 1024,
+    }
+}
+
+fn adaptive_indexdb_per_db_cache_bytes(ram_bytes: Option<u64>) -> usize {
+    let max_cached_dbs = adaptive_indexdb_max_cached_dbs(ram_bytes).max(1);
+    let budget = adaptive_indexdb_cache_budget_bytes(ram_bytes);
+    (budget / max_cached_dbs).clamp(1024 * 1024, 8 * 1024 * 1024)
+}
+
+fn normalize_indexdb_per_db_cache_bytes(value: usize) -> usize {
+    if value == 0 {
+        0
+    } else {
+        align_up_4k(value).clamp(256 * 1024, 64 * 1024 * 1024)
+    }
 }
 
 fn estimate_upload_part_working_set_bytes(
@@ -665,20 +700,38 @@ pub async fn run_server() {
         "Storage mode: standard variant is filesystem-backed (directory-only index/blob roots)"
     );
 
+    let cpu_cores = detect_cpu_cores();
+    let detected_ram_bytes = detect_total_ram_bytes();
+    let detected_ram_gib = ram_gib(detected_ram_bytes);
+
     let index_section = config.section(Some("index_config"));
     let configured_index_partition_count =
         parse_index_partition_count(index_section.and_then(|s| s.get("partition_count")));
     set_configured_index_partition_count(configured_index_partition_count)
         .expect("index_config.partition_count must be one of: 32, 64, 256");
+
+    let indexdb_max_cached_dbs = parse_usize_or_auto(
+        index_section.and_then(|s| s.get("max_cached_dbs")),
+        "index_config.max_cached_dbs",
+        adaptive_indexdb_max_cached_dbs(detected_ram_bytes),
+    )
+    .clamp(1, 256);
+    let indexdb_per_db_cache_bytes = normalize_indexdb_per_db_cache_bytes(parse_usize_or_auto(
+        index_section.and_then(|s| s.get("per_db_cache_bytes")),
+        "index_config.per_db_cache_bytes",
+        adaptive_indexdb_per_db_cache_bytes(detected_ram_bytes),
+    ));
+    configure_indexdb_cache(indexdb_per_db_cache_bytes, indexdb_max_cached_dbs);
+
     tracing::info!(
-        "Index layout: configured partition_count={}",
-        configured_index_partition_count
+        "Index layout: configured partition_count={}, indexdb_per_db_cache={}MiB, indexdb_max_cached_dbs={}, indexdb_cache_worst_case={}MiB",
+        configured_index_partition_count,
+        indexdb_per_db_cache_bytes / (1024 * 1024),
+        indexdb_max_cached_dbs,
+        indexdb_per_db_cache_bytes.saturating_mul(indexdb_max_cached_dbs) / (1024 * 1024)
     );
 
     let upload_section = config.section(Some("upload_config"));
-    let cpu_cores = detect_cpu_cores();
-    let detected_ram_bytes = detect_total_ram_bytes();
-    let detected_ram_gib = ram_gib(detected_ram_bytes);
 
     let data_shards_value = upload_section
         .and_then(|s| s.get("data_shards"))
@@ -950,98 +1003,6 @@ pub async fn run_server() {
     tokio::spawn(async move {
         interval_cleanup(&fs_root).await;
     });
-
-    let mut smb_config = crate::smb::config::SmbConfig::default();
-    if let Some(smb_section) = config
-        .section(Some("smb"))
-        .or_else(|| config.section(Some("fsgwd")))
-    {
-        if let Some(v) = smb_section.get("enabled") {
-            smb_config.enabled = parse_bool_or_default(Some(v), smb_config.enabled);
-        }
-        if let Some(v) = smb_section.get("bind_addr") {
-            let trimmed = v.trim();
-            if !trimmed.is_empty() {
-                smb_config.bind_addr = trimmed.to_string();
-            }
-        }
-        if let Some(v) = smb_section
-            .get("smb_port")
-            .and_then(|v| v.parse::<u16>().ok())
-        {
-            smb_config.smb_port = v;
-        }
-        if let Some(v) = smb_section
-            .get("max_sessions")
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            smb_config.max_sessions = v.clamp(64, 65_536);
-        }
-        if let Some(v) = smb_section
-            .get("max_frame_bytes")
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            smb_config.max_frame_bytes = v.clamp(4 * 1024, 64 * 1024 * 1024);
-        }
-        if let Some(v) = smb_section
-            .get("memory_budget_bytes")
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            smb_config.memory_budget_bytes = v
-                .clamp(8 * 1024 * 1024, 4 * 1024 * 1024 * 1024usize)
-                .max(smb_config.max_frame_bytes);
-        }
-        if let Some(v) = smb_section.get("async_close_commit") {
-            smb_config.async_close_commit =
-                parse_bool_or_default(Some(v), smb_config.async_close_commit);
-        }
-        if let Some(v) = smb_section
-            .get("async_close_threshold_bytes")
-            .and_then(|v| v.parse::<u64>().ok())
-        {
-            smb_config.async_close_threshold_bytes =
-                v.clamp(1 * 1024 * 1024, 1024 * 1024 * 1024 * 1024);
-        }
-        if let Some(v) = smb_section.get("require_signing") {
-            smb_config.require_signing = parse_bool_or_default(Some(v), smb_config.require_signing);
-        }
-        if let Some(v) = smb_section
-            .get("query_directory_page_limit")
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            smb_config.query_directory_page_limit =
-                crate::smb::config::clamp_query_directory_page_limit(v);
-        }
-        if let Some(v) = smb_section
-            .get("query_directory_max_buffered_entries")
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            smb_config.query_directory_max_buffered_entries =
-                crate::smb::config::clamp_query_directory_max_buffered_entries(v);
-        }
-        if let Some(v) = smb_section
-            .get("query_directory_max_seeded_entries")
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            smb_config.query_directory_max_seeded_entries =
-                crate::smb::config::clamp_query_directory_max_seeded_entries(
-                    v,
-                    smb_config.query_directory_max_buffered_entries,
-                );
-        }
-    }
-
-    let mut _smb_join = None;
-    match crate::smb::start(smb_config).await {
-        Ok(Some(runtime)) => {
-            tracing::info!("smb listener online at {}", runtime.addr);
-            _smb_join = Some(runtime.join);
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!("failed to start smb listener: {}", e);
-        }
-    }
 
     serve(storage_addr, serve_storage, cert).await;
 }

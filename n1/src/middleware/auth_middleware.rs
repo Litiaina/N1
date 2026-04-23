@@ -504,13 +504,8 @@ mod tests {
     use super::*;
     use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
     use crate::middleware::refresh_store::clear_refresh_store_for_tests;
+    use crate::test_support::global_test_lock;
     use jsonwebtoken::Validation;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_guard() -> &'static Mutex<()> {
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(()))
-    }
 
     fn ensure_test_env() {
         if std::env::var("JWT_SECRET").is_err() {
@@ -556,7 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn master_key_accepts_existing_fragment_and_mints_claim() {
-        let _guard = env_guard().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = global_test_lock().lock().await;
         ensure_test_env();
 
         let requested_fragment = "test-admin-context-fragment".to_string();
@@ -594,7 +589,7 @@ mod tests {
 
     #[tokio::test]
     async fn master_key_rejects_missing_fragment() {
-        let _guard = env_guard().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = global_test_lock().lock().await;
         ensure_test_env();
 
         let payload = AuthorizationRequest {
@@ -613,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_fragment_is_rejected_before_auth_mode_selection() {
-        let _guard = env_guard().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = global_test_lock().lock().await;
         ensure_test_env();
 
         let payload = AuthorizationRequest {
@@ -632,7 +627,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_rotates_token_and_logout_revokes_session() {
-        let _guard = env_guard().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = global_test_lock().lock().await;
         ensure_test_env();
         clear_refresh_store_for_tests().await;
         ensure_auth_test_fragment("refresh-fragment").await;
@@ -683,7 +678,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_reuse_detection_revokes_rotated_session() {
-        let _guard = env_guard().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = global_test_lock().lock().await;
         ensure_test_env();
         clear_refresh_store_for_tests().await;
         ensure_auth_test_fragment("refresh-fragment").await;
@@ -732,7 +727,7 @@ mod tests {
 
     #[tokio::test]
     async fn omitted_expiration_uses_short_default_and_requested_ttl_is_clamped() {
-        let _guard = env_guard().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = global_test_lock().lock().await;
         ensure_test_env();
         clear_refresh_store_for_tests().await;
         ensure_auth_test_fragment("default-ttl-fragment").await;

@@ -77,19 +77,6 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("kd", "1")
         .set("md", "0");
 
-    conf.with_section(Some("smb"))
-        .set("enabled", "false")
-        .set("bind_addr", "0.0.0.0")
-        .set("smb_port", "445")
-        .set("max_sessions", "4096")
-        .set("max_frame_bytes", "16777216")
-        .set("async_close_commit", "false")
-        .set("async_close_threshold_bytes", "67108864")
-        .set("require_signing", "false")
-        .set("query_directory_page_limit", "1000")
-        .set("query_directory_max_buffered_entries", "4096")
-        .set("query_directory_max_seeded_entries", "512");
-
     conf.write_to_file(path)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }

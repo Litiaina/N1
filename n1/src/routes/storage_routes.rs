@@ -1077,13 +1077,13 @@ mod tests {
     use crate::settings::constants::CONFIG_FILE;
     use crate::settings::create_config::create_default_config_ini;
     use crate::structs::auth_structs::Claims;
+    use crate::test_support::global_test_lock;
     use crate::websocket::manager::WsConnectionManager;
     use crate::websocket::ws_structs::StorageEventPayload;
     use axum::Json as AxumJson;
     use axum::body::Body;
     use axum::extract::{Path, Query, State};
     use axum::response::IntoResponse;
-    use once_cell::sync::Lazy;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use std::collections::HashMap;
@@ -1091,10 +1091,17 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use tokio::fs;
-    use tokio::sync::Mutex;
     use ulid::Ulid;
 
-    static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    struct SharedTestLock;
+
+    impl SharedTestLock {
+        async fn lock(&self) -> tokio::sync::MutexGuard<'static, ()> {
+            global_test_lock().lock().await
+        }
+    }
+
+    static TEST_LOCK: SharedTestLock = SharedTestLock;
 
     fn ensure_test_config_file() {
         let config_path = PathBuf::from(CONFIG_FILE);

@@ -1,13 +1,15 @@
 # N1 API Documentation
 
-`N1` is the standalone storage kernel in this repository. In `2.1.2`, it exposes:
+`N1` is the standalone storage kernel in this repository. In `2.2.1`, it exposes:
 
 - fragment provisioning
 - fragment-scoped authentication
 - object upload, read, list, version, trash, recover, and archive flows
 - a standalone mutable namespace layer
 - lifecycle, garbage collection, repair, redistribution, and health endpoints
-- SMB Lite and POSIX-style namespace access on top of the same storage truth
+- POSIX-style namespace access on top of the same storage truth
+
+SMB/NAS serving has moved to standalone `Litiaina NS`. `N1` no longer embeds the SMB server; keep `N1` focused on storage-kernel durability, namespace truth, repair, redistribution, and lifecycle.
 
 This document is written as an operator and integrator reference. It is meant to answer:
 
@@ -23,6 +25,19 @@ Typical standalone `N1` base URL:
 ```text
 https://127.0.0.1:50001
 ```
+
+## Memory Tuning
+
+`N1 2.2.1` bounds its embedded indexdb cache for small servers. The upstream indexdb default cache is `1GiB` per opened database; N1 overrides that with `[index_config]` so a 4GB host does not retain excessive resident memory during long runs.
+
+```ini
+[index_config]
+partition_count=64
+per_db_cache_bytes=auto
+max_cached_dbs=auto
+```
+
+Defaults are adaptive. On 4GB-class hosts, `auto` targets a small per-database cache and a limited number of cached partition handles. Increase these only for machines with enough RAM and heavy index scan workloads.
 
 ## Authentication Model
 
@@ -885,7 +900,7 @@ Important `2.1.1+` behavior:
 - recovering a listed file uses that exact file path
 - recovering a listed directory restores the deleted directory subtree
 
-Important `2.1.2` behavior:
+Important `2.1.2+` behavior:
 
 - each trash root has a stable `trash_entry_id`
 - repeated deletes of the same visible path produce separate trash generations
@@ -1336,4 +1351,4 @@ curl -k -X POST https://127.0.0.1:50001/n1/maintenance/gc/start \
 - Standalone namespace routes and raw object routes are both available. New integrations should prefer the namespace-aware `2.0` surfaces unless they specifically need lower-level object semantics.
 - Some helper routes remain legacy-shaped. The most visible example is `GET /n1/fragments/check` and `GET /n1/fragments/hash`, which currently deserialize JSON bodies.
 - Signed-read URLs are the preferred way to expose public view, stream, or download without leaking bearer tokens.
-- SMB Lite and POSIX routes are backed by the same namespace/runtime model, so rename, mkdir, trash, and recover are meant to stay consistent across surfaces.
+- SMB/NAS workflows are handled by standalone `Litiaina NS`. `N1` remains the storage kernel and exposes POSIX-style namespace routes directly.

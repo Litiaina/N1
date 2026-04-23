@@ -1,7 +1,8 @@
+use crate::core::indexdb_store::open_n1_indexdb;
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::catalog::NamespaceCatalog;
 
-use indexdb::{Database, ReadableDatabase, TableDefinition, TableError};
+use indexdb::{ReadableDatabase, TableDefinition, TableError};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -300,8 +301,8 @@ pub fn namespace_catalog_semantic_hash(bytes: &[u8]) -> Option<[u8; 32]> {
         if std::fs::write(&path, bytes).is_err() {
             return None;
         }
-        let db = match std::panic::catch_unwind(|| Database::create(&path)) {
-            Ok(Ok(db)) => db,
+        let db = match open_n1_indexdb(&path) {
+            Ok(db) => db,
             _ => return None,
         };
         let read_txn = match db.begin_read() {

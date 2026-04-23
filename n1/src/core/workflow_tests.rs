@@ -57,6 +57,7 @@ use crate::routes::storage_routes::AppState;
 use crate::settings::constants::CONFIG_FILE;
 use crate::settings::create_config::create_default_config_ini;
 use crate::structs::auth_structs::Claims;
+use crate::test_support::global_test_lock;
 use crate::websocket::manager::WsConnectionManager;
 
 use axum::Json as AxumJson;
@@ -78,12 +79,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
 use tokio_tar::Archive as TarArchive;
 use ulid::Ulid;
 
-static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+struct SharedTestLock;
+
+impl SharedTestLock {
+    async fn lock(&self) -> tokio::sync::MutexGuard<'static, ()> {
+        global_test_lock().lock().await
+    }
+}
+
+static TEST_LOCK: SharedTestLock = SharedTestLock;
 static TEST_BASE: Lazy<std::path::PathBuf> =
     Lazy::new(|| std::env::temp_dir().join(format!("n1-matrix-{}", std::process::id())));
 

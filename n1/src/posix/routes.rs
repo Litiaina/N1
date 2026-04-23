@@ -307,18 +307,15 @@ mod tests {
     use crate::settings::constants::CONFIG_FILE;
     use crate::settings::create_config::create_default_config_ini;
     use crate::structs::auth_structs::Claims;
+    use crate::test_support::global_test_lock;
     use crate::websocket::manager::WsConnectionManager;
     use axum::Json;
     use axum::extract::{Query, State};
-    use once_cell::sync::Lazy;
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::fs;
-    use tokio::sync::Mutex;
     use ulid::Ulid;
-
-    static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     fn ensure_test_config_file() {
         let config_path = PathBuf::from(CONFIG_FILE);
@@ -442,7 +439,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn posix_list_respects_limit_and_continuation_tokens() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = global_test_lock().lock().await;
         ensure_storage_config().await;
 
         let fragment = hex::encode(Sha256::digest(
@@ -497,7 +494,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn posix_list_survives_restart_and_mkdir_without_degrading_to_object_ids() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = global_test_lock().lock().await;
         ensure_storage_config().await;
 
         let fragment = hex::encode(Sha256::digest(
@@ -626,7 +623,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn posix_trash_root_lists_actual_nested_file_path() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = global_test_lock().lock().await;
         ensure_storage_config().await;
 
         let fragment = hex::encode(Sha256::digest(
@@ -722,7 +719,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn posix_trash_root_lists_actual_deep_file_path() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = global_test_lock().lock().await;
         ensure_storage_config().await;
 
         let fragment = hex::encode(Sha256::digest(
@@ -859,7 +856,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn posix_trash_root_lists_actual_screenshot_paths_for_selective_recover() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = global_test_lock().lock().await;
         ensure_storage_config().await;
 
         let fragment = hex::encode(Sha256::digest(
@@ -974,7 +971,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn posix_purge_removes_single_trashed_item_from_listing() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = global_test_lock().lock().await;
         ensure_storage_config().await;
 
         let fragment = hex::encode(Sha256::digest(
@@ -1036,7 +1033,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn posix_trash_supports_same_path_generations_by_trash_entry_id() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = global_test_lock().lock().await;
         ensure_storage_config().await;
 
         let fragment = hex::encode(Sha256::digest(

@@ -1,5 +1,5 @@
 use crate::enums::app_error_enum::AppError;
-use crate::fuse::backend::{DirEntry, DirListPage, FsdBackend};
+use crate::fuse::backend::{DirListPage, FsdBackend};
 use crate::fuse::model::{FsdPath, NodeMetadata, WriteHandle};
 use std::sync::Arc;
 
@@ -15,11 +15,6 @@ impl<B: FsdBackend> FsdGateway<B> {
 
     pub fn resolve_path(&self, mount_relative_path: &str) -> Result<FsdPath, AppError> {
         FsdPath::parse(mount_relative_path)
-    }
-
-    pub async fn list_dir(&self, mount_relative_path: &str) -> Result<Vec<DirEntry>, AppError> {
-        let path = self.resolve_path(mount_relative_path)?;
-        self.backend.list_dir(&path).await
     }
 
     pub async fn list_dir_page(

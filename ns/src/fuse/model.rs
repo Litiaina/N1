@@ -1,6 +1,9 @@
 use crate::enums::app_error_enum::AppError;
-use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
+use percent_encoding::percent_decode_str;
+#[cfg(test)]
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 
+#[cfg(test)]
 const FSD_ESCAPED_NAME_SET: &AsciiSet = &CONTROLS
     .add(b'%')
     .add(b'/')
@@ -22,6 +25,7 @@ fn decode_mount_name(raw: &str) -> Result<String, AppError> {
         .map_err(|_| AppError::BadRequest("invalid percent-encoded fsd path".to_string()))
 }
 
+#[cfg(test)]
 pub fn encode_virtual_name(name: &str) -> String {
     utf8_percent_encode(name, FSD_ESCAPED_NAME_SET).to_string()
 }
@@ -83,6 +87,7 @@ impl FsdPath {
         })
     }
 
+    #[cfg(test)]
     pub fn mount_relative(&self) -> String {
         if self.object_key.is_empty() {
             self.fragment.clone()
@@ -106,10 +111,6 @@ impl FsdPath {
                 encode_virtual_name(&self.object_key)
             )
         }
-    }
-
-    pub fn is_fragment_root(&self) -> bool {
-        self.object_key.is_empty()
     }
 }
 

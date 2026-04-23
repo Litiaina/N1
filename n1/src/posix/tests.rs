@@ -9,7 +9,6 @@ use axum::response::IntoResponse;
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use tokio::fs;
-use tokio::sync::Mutex;
 use ulid::Ulid;
 
 use crate::core::disk_manager::{
@@ -39,9 +38,18 @@ use crate::routes::storage_routes::AppState;
 use crate::settings::constants::CONFIG_FILE;
 use crate::settings::create_config::create_default_config_ini;
 use crate::structs::auth_structs::Claims;
+use crate::test_support::global_test_lock;
 use crate::websocket::manager::WsConnectionManager;
 
-static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+struct SharedTestLock;
+
+impl SharedTestLock {
+    async fn lock(&self) -> tokio::sync::MutexGuard<'static, ()> {
+        global_test_lock().lock().await
+    }
+}
+
+static TEST_LOCK: SharedTestLock = SharedTestLock;
 static TEST_BASE: Lazy<PathBuf> =
     Lazy::new(|| std::env::temp_dir().join(format!("n1-posix-{}", std::process::id())));
 

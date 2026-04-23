@@ -7,21 +7,24 @@
   />
   <h1>Litiaina N2</h1>
   <p>
-    Unified storage platform built around <code>N1</code>, <code>N2</code>, and
-    <code>Registry</code>: single-node storage through <code>n1</code>,
-    multi-node placement through <code>n2</code>, and user-facing namespace and
-    policy through <code>registry</code>.
+    Unified storage platform built around <code>N1</code>, <code>N2</code>,
+    <code>NS</code>, and <code>Registry</code>: single-node storage through
+    <code>n1</code>, multi-node placement through <code>n2</code>,
+    standalone NAS/SMB access through <code>ns</code>, and user-facing namespace
+    and policy through <code>registry</code>.
   </p>
 </div>
 
 ---
 
-This repository contains the storage platform stack built around three runtime components:
+This repository contains the storage platform stack built around four runtime components:
 
-> - `N1` (`2.1.3`)
-  Single-node storage kernel with an object-storage core, standalone namespace layer, lifecycle, repair, redistribution, GC, recover-on-read, POSIX-style routes, and SMB Lite.
+> - `N1` (`2.2.0`)
+  Single-node storage kernel with an object-storage core, standalone namespace layer, lifecycle, repair, redistribution, GC, recover-on-read, and POSIX-style routes.
 > - `N2` (`0.2.0`)
   Multi-node clustering and placement layer built on top of the shared `N1` storage core.
+> - `NS` (`1.0.0`)
+  Standalone NAS Lite / SMB service with fragment-backed auth, configurable share roots, backing-filesystem capacity, and optional cold-sync backup to `N1`.
 > - `Registry` (`0.9.1`)
   User-facing logical metadata and policy layer for accounts, quotas, logical namespace, shares, and storage-session brokering.
 
@@ -33,12 +36,14 @@ The platform is designed to separate storage durability from user-facing metadat
 
 - `N1` owns physical storage truth and maintenance.
 - `N2` adds cluster coordination when storage is distributed across nodes.
+- `NS` owns NAS/SMB live file-serving without coupling that hot path to `N1`.
 - `Registry` owns user/business metadata and product-facing policies.
 
 Current route namespaces are intentionally split:
 
 - `N1` stable runtime and operator routes live under `/n1/...`
 - `N2` cluster routes live under `/v4/n2/...`
+- `NS` exposes SMB on its configured TCP bind address and port.
 - `Registry` product-facing routes live under `/v1/...`
 
 The major `2.0` change in `N1` is architectural:
@@ -49,8 +54,10 @@ The major `2.0` change in `N1` is architectural:
 
 That means file and folder semantics such as `mkdir`, rename, move, trash, recover, and browse are handled in the namespace layer, while repair, redistribution, GC, and recover-on-read operate on storage truth and reachability.
 
-Current release notes for the validated `N1 2.1.3` and `Registry 0.9.1` line:
+Current release notes for the validated `N1 2.2.0`, `NS 1.0.0`, and `Registry 0.9.1` line:
 
+- SMB/NAS serving has moved out of `N1` into standalone `NS`, keeping `N1` focused on storage-kernel responsibilities.
+- `NS 1.0.0` keeps the live SMB path local to disk, uses dynamic fragment authentication, supports recursive folder deletion semantics expected by Windows clients, and cold-syncs large files to `N1` through multipart upload.
 - `namespace_v2` is replicated across configured index roots, monitored by health, and repaired by the repair manager when a rebuilt index disk is missing or has a stale catalog copy.
 - Trash entries are generation-addressed with `trash_entry_id`, so repeated deletes of the same visible path remain individually recoverable or purgeable without path ambiguity.
 - fragment-bound Registry listing and stats now prefer `N1` namespace truth instead of stale SQLite-only projection.
@@ -77,13 +84,15 @@ It is responsible for:
 - redistribution
 - repair and recover-on-read
 - standalone namespace routes
-- SMB Lite namespace access
+- POSIX-style namespace access
 
 `N1 2.0` is best thought of as:
 
 `object storage core + mutable namespace database`
 
 It is not the user/account control plane and it is not the business metadata layer.
+
+SMB/NAS access is no longer embedded in `N1`. Use standalone `NS` when Windows/macOS/Linux file-manager SMB workflows are needed.
 
 ### N2
 
@@ -98,6 +107,20 @@ It extends the shared storage core with:
 - reconcile behavior
 
 Use `N2` when storage needs to span multiple nodes with cluster-managed placement and reconcile behavior. Use standalone `N1` when you want a single-node engine.
+
+### NS
+
+`NS` is the standalone NAS Lite service.
+
+It owns:
+
+- SMB-compatible file serving
+- configurable local share roots
+- fragment-backed authentication such as `\\server\my-fragment` with username `my-fragment`
+- backing-filesystem capacity instead of logical quota enforcement
+- optional cold-sync backup to `N1`
+
+`NS` deliberately uses its own directories and metadata store. Do not point `NS` share roots into `N1` index or blob directories.
 
 ### Registry
 
@@ -123,14 +146,10 @@ At a high level, the platform looks like this:
 ```text
 Clients / UI / CLI
         |
-        v
-   Registry (optional)
+        +--> Registry (optional) --> N1 or N2 --> index roots + blob roots
         |
-        v
-     N1 or N2
-        |
-        v
-  index roots + blob roots
+        +--> NS (SMB/NAS) --------> local share roots
+                                    optional cold sync to N1
 ```
 
 For standalone `N1 2.0`, the internal model is:
@@ -178,7 +197,7 @@ This split is why `N1 2.0` is materially different from the older path-as-identi
 - POSIX-style browse, stat, mkdir, rename, move
 - trash and recover for files and directories
 - signed reads and downloads
-- SMB Lite namespace access for normal file-manager flows
+- standalone `NS` SMB/NAS access for normal file-manager flows
 
 ### Product And Control Plane
 
@@ -197,6 +216,7 @@ This workspace is meant for building storage systems where:
 Typical deployments:
 
 - standalone `N1` for a single-node storage appliance or service
+- standalone `NS` when a lightweight NAS/SMB appliance is needed
 - `Registry + N1` for user-facing single-node product deployments
 - `Registry + N2` for clustered deployments with centralized logical metadata
 
@@ -206,6 +226,8 @@ Typical deployments:
   `N1` server and storage kernel
 - [`n2`](/home/administrator/Development/N1/n2)
   `N2` cluster layer
+- [`ns`](/home/administrator/Development/N1/ns)
+  Litiaina NS standalone NAS Lite / SMB service
 - [`registry`](/home/administrator/Development/N1/registry)
   Registry service
 - [`n1_cli`](/home/administrator/Development/N1/n1_cli)
@@ -221,6 +243,7 @@ Additional docs:
 
 - [`DOCUMENTATION.md`](/home/administrator/Development/N1/DOCUMENTATION.md)
 - [`N1_DOCUMENTATION.md`](/home/administrator/Development/N1/N1_DOCUMENTATION.md)
+- [`NS_DOCUMENTATION.md`](/home/administrator/Development/N1/NS_DOCUMENTATION.md)
 - [`N2_DOCUMENTATION.md`](/home/administrator/Development/N1/N2_DOCUMENTATION.md)
 - [`REGISTRY_DOCUMENTATION.md`](/home/administrator/Development/N1/REGISTRY_DOCUMENTATION.md)
 
@@ -240,8 +263,6 @@ Key sections:
   `index_store_disks`, `blob_store_disks`, optional `fs_storage_path`
 - `[upload_config]`
   durability and throughput knobs
-- `[smb]`
-  SMB Lite listener settings
 
 2. Create or edit an env file for secrets.
 
@@ -285,7 +306,7 @@ curl -k https://127.0.0.1:50001/n1/auth/fragment \
   }'
 ```
 
-6. Use the token for uploads, reads, POSIX routes, or SMB Lite.
+6. Use the token for uploads, reads, or POSIX routes.
 
 ### N1 Operator CLI
 
@@ -518,26 +539,15 @@ curl -k \
   "https://127.0.0.1:50001/n1/objects/signed-read?fragment=<fragment>&object_key=docs/new.txt&secret=<MASTER_KEY>"
 ```
 
-### SMB Lite
+### Standalone NS
 
-Enable SMB in `n1_config.ini`:
+Use `NS` when SMB/NAS access is required. `NS` has its own `ns_config.ini`, local share roots, metadata store, backing-filesystem capacity model, and fragment-backed SMB auth that is verified locally from N1 fragment metadata instead of extending `N1`'s stable API surface.
 
-```ini
-[smb]
-enabled=true
-bind_addr=0.0.0.0
-smb_port=445
+```bash
+cargo run -p ns --bin litiaina-ns
 ```
 
-SMB Lite is intended for normal namespace operations:
-
-- open/read/write
-- mkdir
-- rename/move
-- delete to trash
-- directory traversal
-
-It is not a full Unix filesystem implementation with symlinks, hard links, xattrs, or full POSIX locking semantics.
+See [`NS_DOCUMENTATION.md`](/home/administrator/Development/N1/NS_DOCUMENTATION.md) for deployment, disk-layout, SMB port, auth, capacity behavior, and optional cold-sync configuration.
 
 ## Operational Flows
 
@@ -604,9 +614,9 @@ For trash browsing, the root trash list now returns actual trashed item paths. I
 
 Many local deployments use self-signed or locally issued certificates. Use `curl -k` for local testing or configure trusted certificates in your client environment.
 
-### SMB Lite Scope
+### NS Scope
 
-SMB Lite now supports normal namespace operations, but it is intentionally narrower than a general-purpose Unix filesystem server.
+SMB/NAS workflows are handled by standalone `NS`, not embedded in `N1`. Keep `NS` share roots separate from `N1` index/blob roots so live NAS file serving cannot destabilize storage-kernel state.
 
 ## Development Notes
 
@@ -615,6 +625,7 @@ Useful workspace commands:
 ```bash
 cargo check -p n1
 cargo test -p n1 -- --test-threads=1
+cargo test -p ns
 cargo test -p registry -- --test-threads=1
 ```
 
@@ -626,6 +637,6 @@ High-signal release tests used for `N1 2.0` include:
 - repair rebuilding missing blob/index state
 - redistribution with disk loss
 - POSIX pagination, mkdir, rename, trash, recover
-- SMB Lite read/write/mkdir/rename/trash/copy flows
+- NS SMB read/write/mkdir/rename/delete flows
 
 If you are touching a subsystem boundary, prefer adding a focused regression test in that subsystem plus a workflow test when the behavior spans storage, namespace, and maintenance.

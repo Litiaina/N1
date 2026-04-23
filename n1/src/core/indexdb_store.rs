@@ -16,7 +16,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, Mutex};
 use tracing::warn;
 use ulid::Ulid;
@@ -44,7 +44,13 @@ static DB_CACHE: LazyLock<Mutex<HashMap<PathBuf, CachedDatabaseEntry>>> =
 static DB_CACHE_TOUCH_TICK: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(1));
 static PARTITION_OP_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-const MAX_CACHED_DBS: usize = 128;
+static INDEXDB_PER_DB_CACHE_BYTES: LazyLock<AtomicUsize> =
+    LazyLock::new(|| AtomicUsize::new(DEFAULT_INDEXDB_PER_DB_CACHE_BYTES));
+static INDEXDB_MAX_CACHED_DBS: LazyLock<AtomicUsize> =
+    LazyLock::new(|| AtomicUsize::new(DEFAULT_INDEXDB_MAX_CACHED_DBS));
+
+pub const DEFAULT_INDEXDB_PER_DB_CACHE_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_INDEXDB_MAX_CACHED_DBS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -90,6 +96,29 @@ struct PartitionMeta {
 struct CachedDatabaseEntry {
     db: Arc<Database>,
     last_used_tick: u64,
+}
+
+pub fn configure_indexdb_cache(per_db_cache_bytes: usize, max_cached_dbs: usize) {
+    INDEXDB_PER_DB_CACHE_BYTES.store(per_db_cache_bytes, AtomicOrdering::Relaxed);
+    INDEXDB_MAX_CACHED_DBS.store(max_cached_dbs.max(1), AtomicOrdering::Relaxed);
+}
+
+pub fn indexdb_cache_config() -> (usize, usize) {
+    (
+        INDEXDB_PER_DB_CACHE_BYTES.load(AtomicOrdering::Relaxed),
+        INDEXDB_MAX_CACHED_DBS.load(AtomicOrdering::Relaxed).max(1),
+    )
+}
+
+pub(crate) fn open_n1_indexdb(path: &Path) -> Result<Database, AppError> {
+    let (per_db_cache_bytes, _) = indexdb_cache_config();
+    let mut builder = Database::builder();
+    builder.set_cache_size(per_db_cache_bytes);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| builder.create(path)))
+        .map_err(|_| {
+            AppError::InternalServerError(format!("indexdb open {} panicked", path.display()))
+        })?
+        .map_err(|e| map_indexdb_error(&format!("open {}", path.display()), e))
 }
 
 struct VersionUpsertMutation {
@@ -560,13 +589,7 @@ fn get_or_open_db(path: &Path) -> Result<Arc<Database>, AppError> {
             .map_err(|e| AppError::Io(e, format!("mkdir {}", parent.display())))?;
     }
 
-    let db = Arc::new(
-        std::panic::catch_unwind(|| Database::create(path))
-            .map_err(|_| {
-                AppError::InternalServerError(format!("indexdb open {} panicked", path.display()))
-            })?
-            .map_err(|e| map_indexdb_error(&format!("open {}", path.display()), e))?,
-    );
+    let db = Arc::new(open_n1_indexdb(path)?);
     cache.insert(
         path.to_path_buf(),
         CachedDatabaseEntry {
@@ -575,7 +598,8 @@ fn get_or_open_db(path: &Path) -> Result<Arc<Database>, AppError> {
         },
     );
 
-    if cache.len() > MAX_CACHED_DBS {
+    let max_cached_dbs = indexdb_cache_config().1;
+    if cache.len() > max_cached_dbs {
         let mut evictable: Vec<(PathBuf, u64)> = cache
             .iter()
             .filter_map(|(candidate_path, entry)| {
@@ -585,7 +609,7 @@ fn get_or_open_db(path: &Path) -> Result<Arc<Database>, AppError> {
             .collect();
         evictable.sort_by_key(|(_, last_used_tick)| *last_used_tick);
 
-        while cache.len() > MAX_CACHED_DBS {
+        while cache.len() > max_cached_dbs {
             let Some((candidate_path, _)) = evictable.first().cloned() else {
                 break;
             };

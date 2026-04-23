@@ -14,6 +14,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use ulid::Ulid;
 
 use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata, ObjectPathManager};
+use crate::core::indexdb_store::open_n1_indexdb;
 use crate::core::retrieve::list_objects_direct;
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::catalog::{NamespaceCatalog, NamespaceCatalogRuntimeStats};
@@ -730,10 +731,7 @@ impl NamespaceRuntime {
             fs::create_dir_all(parent)
                 .map_err(|e| AppError::Io(e, format!("mkdir {}", parent.display())))?;
         }
-        let db = Arc::new(
-            Database::create(&path)
-                .map_err(|e| map_indexdb_error(&format!("open {}", path.display()), e))?,
-        );
+        let db = Arc::new(open_n1_indexdb(&path)?);
         self.dbs.insert(path, db.clone());
         Ok(db)
     }
@@ -748,10 +746,7 @@ impl NamespaceRuntime {
         if !path.exists() {
             return Ok(None);
         }
-        let db = Arc::new(
-            Database::create(&path)
-                .map_err(|e| map_indexdb_error(&format!("open {}", path.display()), e))?,
-        );
+        let db = Arc::new(open_n1_indexdb(&path)?);
         self.dbs.insert(path, db.clone());
         Ok(Some(db))
     }
@@ -1185,13 +1180,10 @@ mod tests {
     };
     use crate::settings::constants::CONFIG_FILE;
     use crate::settings::create_config::create_default_config_ini;
-    use once_cell::sync::Lazy;
+    use crate::test_support::global_test_lock;
     use std::path::PathBuf;
     use tokio::fs;
-    use tokio::sync::Mutex;
     use ulid::Ulid;
-
-    static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     fn ensure_test_config_file() {
         let config_path = PathBuf::from(CONFIG_FILE);
@@ -1269,7 +1261,7 @@ mod tests {
 
     #[tokio::test]
     async fn namespace_v2_reseeds_owner_from_replica_after_owner_disk_loss() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = global_test_lock().lock().await;
         let fragment = format!("namespace-replica-{}", Ulid::new());
         setup_fragment(&fragment).await;
 
@@ -1320,7 +1312,7 @@ mod tests {
 
     #[tokio::test]
     async fn namespace_v2_repair_replicates_missing_catalog_copy() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = global_test_lock().lock().await;
         let fragment = format!("namespace-repair-{}", Ulid::new());
         setup_fragment(&fragment).await;
 
@@ -1382,7 +1374,7 @@ mod tests {
 
     #[tokio::test]
     async fn namespace_v2_repair_prefers_majority_over_newer_stale_replica() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = global_test_lock().lock().await;
         let fragment = format!("namespace-majority-{}", Ulid::new());
         setup_fragment(&fragment).await;
 
@@ -1483,7 +1475,7 @@ mod tests {
 
     #[tokio::test]
     async fn namespace_v2_repair_refuses_split_brain_without_majority() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = global_test_lock().lock().await;
         let fragment = format!("namespace-split-{}", Ulid::new());
         setup_fragment(&fragment).await;
 

@@ -3,6 +3,7 @@ use crate::core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata,
 };
 use crate::core::index;
+use crate::core::indexdb_store::open_n1_indexdb;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::{repair_entire_shard, verify_shard_integrity};
 use crate::core::redistribution::replay_pending_intents_for_fragment_now;
@@ -18,7 +19,6 @@ use axum::extract::State;
 use axum::{Json, extract::Query, http::StatusCode, response::IntoResponse};
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
-use indexdb::Database;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -742,8 +742,8 @@ async fn validate_indexdb_bytes(bytes: &[u8]) -> bool {
             if std::fs::write(&path, &bytes).is_err() {
                 return false;
             }
-            match std::panic::catch_unwind(|| Database::create(&path)) {
-                Ok(Ok(db)) => {
+            match open_n1_indexdb(&path) {
+                Ok(db) => {
                     drop(db);
                     true
                 }
