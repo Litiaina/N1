@@ -594,11 +594,35 @@ Response:
 }
 ```
 
+### `GET /n1/capacity/quota`
+
+Return quota usage for the authenticated fragment.
+
+Response:
+
+```json
+{
+  "fragment": "fragment-hash",
+  "state": "active",
+  "quota_bytes": 536870912000,
+  "committed_bytes": 3221225472,
+  "reserved_bytes": 0,
+  "trash_bytes": 1073741824,
+  "used_bytes": 4294967296,
+  "available_bytes": 532575944704,
+  "usage_percent": 0.8,
+  "created_at_unix": 1777440000,
+  "updated_at_unix": 1777443600
+}
+```
+
+`used_bytes` is `committed_bytes + reserved_bytes + trash_bytes`.
+
 ## Object Listing And Read API
 
 ### `GET /n1/objects`
 
-List live objects from the standalone namespace layer.
+List live objects from the authenticated fragment namespace in indexdb.
 
 Query parameters:
 
@@ -692,7 +716,7 @@ Response:
 
 ### `POST /n1/objects/archive`
 
-Download multiple objects as an archive.
+Stream selected logical paths or folders as an archive.
 
 Request body:
 
@@ -701,7 +725,7 @@ Request body:
   "keys": ["videos/demo.mp4", "docs/readme.txt"],
   "prefixes": ["videos/2025/"],
   "format": "tar",
-  "filename": "bundle.tar",
+  "filename": "bundle",
   "export_all": false,
   "include_internal": false
 }
@@ -713,13 +737,13 @@ Fields:
 - `prefix`: optional single logical folder prefix
 - `prefixes`: optional logical folder prefixes for folder/archive export
 - `format`: `tar` for folder, mixed, manifest, and fragment-scale export. `zip` is only valid for explicit selected file keys without folder prefixes or `export_all=true`
-- `filename`: optional download filename
+- `filename`: optional download filename; `.tar` or `.zip` is appended when omitted
 - `export_all`: if `true`, archive all visible objects
 - `include_internal`: include internal metadata entries when supported
 
 Rules:
 
-- selected folder archive requests are resolved through the logical namespace first, then mapped to physical object ids for streaming
+- selected folder archive requests walk namespace pages and stream each file by physical object id without prebuilding the full folder in memory
 - `prefix` or `prefixes` can be combined with `keys`
 - `tar` is the safe/default format for large exports and folder exports
 

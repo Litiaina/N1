@@ -18,7 +18,7 @@ use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use tokio_util::io::{ReaderStream, StreamReader};
 
 use async_zip::{Compression, ZipEntryBuilder, tokio::write::ZipFileWriter};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_tar::{Builder as TarBuilder, Header as TarHeader};
@@ -33,8 +33,12 @@ use crate::{
         index,
         metadata_parser::{get_metadata, get_version_metadata},
         recovery::read_or_recover_chunk,
+        retrieve::get_object_metadata_direct,
     },
     enums::app_error_enum::AppError,
+    namespace::{
+        models::NamespaceEntryKind, paths::normalize_path, runtime::global_namespace_runtime,
+    },
     structs::auth_structs::Claims,
 };
 
@@ -43,12 +47,6 @@ const ARCHIVE_STREAM_CHANNEL: usize = 32;
 const ARCHIVE_DUPLEX_BYTES: usize = 1024 * 1024;
 const ARCHIVE_CHUNK_REQ_SIZE: usize = 256 * 1024;
 const ARCHIVE_SCAN_PAGE_LIMIT: usize = 1000;
-
-#[derive(Clone)]
-pub struct PreparedArchiveEntry {
-    pub archive_path: String,
-    pub metadata: ObjectMetadata,
-}
 
 enum ArchiveSelection {
     Explicit {
@@ -60,7 +58,11 @@ enum ArchiveSelection {
         include_internal: bool,
     },
     ManifestFile(PathBuf),
-    PreparedEntries(Vec<PreparedArchiveEntry>),
+    LogicalNamespace {
+        keys: Vec<String>,
+        prefixes: Vec<String>,
+        include_internal: bool,
+    },
 }
 
 pub async fn download_selected_archive(
@@ -82,7 +84,10 @@ pub async fn download_selected_archive(
         ArchiveSelection::Explicit { .. } => None,
         ArchiveSelection::FragmentAll { .. } => None,
         ArchiveSelection::ManifestFile(_) => None,
-        ArchiveSelection::PreparedEntries(entries) => Some(entries.len()),
+        ArchiveSelection::LogicalNamespace { prefixes, keys, .. } if prefixes.is_empty() => {
+            Some(keys.len())
+        }
+        ArchiveSelection::LogicalNamespace { .. } => None,
     };
 
     let (effective_format, content_type, disposition) =
@@ -90,19 +95,19 @@ pub async fn download_selected_archive(
             (
                 "tar",
                 "application/x-tar",
-                format!("attachment; filename=\"{}.tar\"", filename),
+                archive_content_disposition(&filename, ".tar"),
             )
         } else {
             match req.format.as_str() {
                 "tar" => (
                     "tar",
                     "application/x-tar",
-                    format!("attachment; filename=\"{}.tar\"", filename),
+                    archive_content_disposition(&filename, ".tar"),
                 ),
                 _ => (
                     "zip",
                     "application/zip",
-                    format!("attachment; filename=\"{}.zip\"", filename),
+                    archive_content_disposition(&filename, ".zip"),
                 ),
             }
         };
@@ -116,38 +121,47 @@ pub async fn download_selected_archive(
         .unwrap())
 }
 
-pub async fn download_prepared_archive(
-    entries: Vec<PreparedArchiveEntry>,
+pub async fn download_logical_archive(
+    fragment: String,
     req: DownloadArchiveRequest,
 ) -> Result<Response, AppError> {
     let filename = req.filename.clone().unwrap_or_else(|| "export".to_string());
-    let selected_key_count = Some(entries.len());
+    let (keys, prefixes) = resolve_logical_archive_selection(&req)?;
+    let selected_key_count = if prefixes.is_empty() {
+        Some(keys.len())
+    } else {
+        None
+    };
 
     let (effective_format, content_type, disposition) =
         if selected_key_count.is_none() || selected_key_count.unwrap_or_default() > 1000 {
             (
                 "tar",
                 "application/x-tar",
-                format!("attachment; filename=\"{}.tar\"", filename),
+                archive_content_disposition(&filename, ".tar"),
             )
         } else {
             match req.format.as_str() {
                 "tar" => (
                     "tar",
                     "application/x-tar",
-                    format!("attachment; filename=\"{}.tar\"", filename),
+                    archive_content_disposition(&filename, ".tar"),
                 ),
                 _ => (
                     "zip",
                     "application/zip",
-                    format!("attachment; filename=\"{}.zip\"", filename),
+                    archive_content_disposition(&filename, ".zip"),
                 ),
             }
         };
 
     let stream = stream_archive(
-        String::new(),
-        ArchiveSelection::PreparedEntries(entries),
+        fragment,
+        ArchiveSelection::LogicalNamespace {
+            keys,
+            prefixes,
+            include_internal: req.include_internal,
+        },
         effective_format.to_string(),
     )
     .await?;
@@ -188,7 +202,7 @@ pub async fn download_manifest_archive(
         .header(header::CONTENT_TYPE, "application/x-tar")
         .header(
             header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}.tar\"", filename),
+            archive_content_disposition(&filename, ".tar"),
         )
         .body(Body::from_stream(stream))
         .unwrap())
@@ -196,6 +210,21 @@ pub async fn download_manifest_archive(
 
 fn canonical_key(key: &str) -> String {
     key.trim_start_matches('/').to_string()
+}
+
+fn archive_content_disposition(filename: &str, extension: &str) -> String {
+    let filename = filename.trim();
+    let filename = if filename.is_empty() {
+        "export"
+    } else {
+        filename
+    };
+    let with_extension = if filename.to_lowercase().ends_with(&extension.to_lowercase()) {
+        filename.to_string()
+    } else {
+        format!("{filename}{extension}")
+    };
+    format!("attachment; filename=\"{}\"", with_extension)
 }
 
 fn canonical_archive_prefix(prefix: &str) -> String {
@@ -283,6 +312,93 @@ fn resolve_archive_selection(req: &DownloadArchiveRequest) -> Result<ArchiveSele
         prefixes,
         include_internal: req.include_internal,
     })
+}
+
+fn normalize_logical_archive_key(key: &str) -> Result<Option<String>, AppError> {
+    let normalized = normalize_path(key).map_err(namespace_error_to_app)?;
+    if normalized.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(normalized))
+    }
+}
+
+fn resolve_logical_archive_selection(
+    req: &DownloadArchiveRequest,
+) -> Result<(Vec<String>, Vec<String>), AppError> {
+    let mut seen_keys = HashSet::new();
+    let mut keys = Vec::new();
+    for key in &req.keys {
+        let Some(normalized) = normalize_logical_archive_key(key)? else {
+            continue;
+        };
+        if seen_keys.insert(normalized.clone()) {
+            keys.push(normalized);
+        }
+        if keys.len() > MAX_ARCHIVE_KEYS {
+            return Err(AppError::BadRequest(format!(
+                "selected archive key count exceeds {}; use export_all tar mode for large exports",
+                MAX_ARCHIVE_KEYS
+            )));
+        }
+    }
+
+    let mut seen_prefixes = HashSet::new();
+    let mut prefixes = Vec::new();
+    for prefix in req
+        .prefix
+        .iter()
+        .cloned()
+        .chain(req.prefixes.iter().cloned())
+    {
+        let Some(normalized) = normalize_logical_archive_key(&prefix)? else {
+            continue;
+        };
+        if seen_prefixes.insert(normalized.clone()) {
+            prefixes.push(normalized);
+        }
+    }
+
+    prefixes.sort();
+    let mut roots: Vec<String> = Vec::new();
+    'outer: for prefix in prefixes {
+        for root in &roots {
+            if prefix == *root
+                || prefix
+                    .strip_prefix(root)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            {
+                continue 'outer;
+            }
+        }
+        roots.push(prefix);
+    }
+
+    if keys.is_empty() && roots.is_empty() {
+        return Err(AppError::BadRequest(
+            "request must include object keys or prefixes, or set export_all=true".into(),
+        ));
+    }
+
+    Ok((keys, roots))
+}
+
+fn is_internal_namespace_path(path: &str) -> bool {
+    path.split('/')
+        .any(|segment| segment == ".n1fsd_dir" || segment == ".n1-trash")
+}
+
+fn namespace_error_to_app(error: crate::namespace::models::NamespaceError) -> AppError {
+    match error {
+        crate::namespace::models::NamespaceError::InvalidPath(message) => {
+            AppError::BadRequest(message)
+        }
+        crate::namespace::models::NamespaceError::Conflict(message) => AppError::Conflict(message),
+        crate::namespace::models::NamespaceError::NotFound(_) => AppError::NotFound,
+        crate::namespace::models::NamespaceError::Invariant(message) => {
+            AppError::InternalServerError(message)
+        }
+    }
 }
 
 async fn stream_archive(
@@ -375,6 +491,47 @@ async fn load_archive_metadata_for_manifest_entry(
     Ok(Some((clean_key, metadata)))
 }
 
+async fn load_archive_metadata_for_logical_path(
+    fragment: &str,
+    logical_path: &str,
+    include_internal: bool,
+) -> Result<Option<(String, ObjectMetadata)>, AppError> {
+    let Some(normalized) = normalize_logical_archive_key(logical_path)? else {
+        return Ok(None);
+    };
+    if !include_logical_archive_path(&normalized, include_internal) {
+        return Ok(None);
+    }
+
+    let Some(entry) = global_namespace_runtime()
+        .entry(fragment, &normalized)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if entry.kind != NamespaceEntryKind::File || !entry.lifecycle.is_live() {
+        return Ok(None);
+    }
+    let Some(object_id) = entry.object_id else {
+        return Err(AppError::InternalServerError(format!(
+            "logical file '{}' is missing physical object id",
+            normalized
+        )));
+    };
+
+    let metadata = match get_object_metadata_direct(fragment, &object_id).await {
+        Ok(metadata) => metadata,
+        Err(AppError::NotFound) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+
+    Ok(Some((normalized, metadata)))
+}
+
+fn include_logical_archive_path(path: &str, include_internal: bool) -> bool {
+    include_internal || !is_internal_namespace_path(path)
+}
+
 fn parse_manifest_line(line: &str) -> Option<(Option<&str>, &str)> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -447,10 +604,26 @@ async fn write_zip_archive(
                 "zip export does not support manifest mode; use tar".into(),
             ));
         }
-        ArchiveSelection::PreparedEntries(entries) => {
-            for entry in entries {
-                let mut reader = create_multipart_reader(&entry.metadata);
-                let builder = ZipEntryBuilder::new(entry.archive_path.into(), Compression::Stored);
+        ArchiveSelection::LogicalNamespace {
+            keys,
+            prefixes,
+            include_internal,
+        } => {
+            if !prefixes.is_empty() {
+                return Err(AppError::BadRequest(
+                    "zip export does not support folder selections; use tar".into(),
+                ));
+            }
+            for key in keys {
+                let Some((archive_path, metadata)) =
+                    load_archive_metadata_for_logical_path(fragment, &key, include_internal)
+                        .await?
+                else {
+                    continue;
+                };
+
+                let mut reader = create_multipart_reader(&metadata);
+                let builder = ZipEntryBuilder::new(archive_path.into(), Compression::Stored);
 
                 let mut entry_writer = zip.write_entry_stream(builder).await.map_err(|e| {
                     AppError::Io(
@@ -482,6 +655,101 @@ async fn write_zip_archive(
             "zip finish".into(),
         )
     })?;
+    Ok(())
+}
+
+async fn append_tar_metadata(
+    tar: &mut TarBuilder<DuplexStream>,
+    archive_path: String,
+    metadata: &ObjectMetadata,
+) -> Result<(), AppError> {
+    let mut header = TarHeader::new_gnu();
+    header.set_size(metadata.total_size_bytes);
+    header.set_mode(0o644);
+
+    let reader = create_multipart_reader(metadata);
+    tar.append_data(&mut header, archive_path, reader)
+        .await
+        .map_err(|e| AppError::Io(e, "tar append".into()))
+}
+
+async fn write_logical_namespace_tar_entries(
+    fragment: &str,
+    keys: Vec<String>,
+    prefixes: Vec<String>,
+    include_internal: bool,
+    tar: &mut TarBuilder<DuplexStream>,
+) -> Result<(), AppError> {
+    let mut emitted_explicit_paths = HashSet::new();
+    for key in keys {
+        let Some((archive_path, metadata)) =
+            load_archive_metadata_for_logical_path(fragment, &key, include_internal).await?
+        else {
+            continue;
+        };
+        if !emitted_explicit_paths.insert(archive_path.clone()) {
+            continue;
+        }
+        append_tar_metadata(tar, archive_path, &metadata).await?;
+    }
+
+    let mut pending_dirs: VecDeque<String> = prefixes.into();
+    let mut seen_dirs = HashSet::new();
+    while let Some(dir) = pending_dirs.pop_front() {
+        if !seen_dirs.insert(dir.clone()) {
+            continue;
+        }
+
+        let mut continuation_token: Option<String> = None;
+        loop {
+            let (entries, next_token) = global_namespace_runtime()
+                .list_dir_page(
+                    fragment,
+                    &dir,
+                    false,
+                    ARCHIVE_SCAN_PAGE_LIMIT,
+                    continuation_token.as_deref(),
+                )
+                .await?;
+
+            for entry in entries {
+                if !include_logical_archive_path(&entry.path, include_internal) {
+                    continue;
+                }
+
+                match entry.kind {
+                    NamespaceEntryKind::Directory if entry.lifecycle.is_live() => {
+                        pending_dirs.push_back(entry.path);
+                    }
+                    NamespaceEntryKind::File if entry.lifecycle.is_live() => {
+                        if emitted_explicit_paths.contains(&entry.path) {
+                            continue;
+                        }
+                        let Some(object_id) = entry.object_id else {
+                            return Err(AppError::InternalServerError(format!(
+                                "logical file '{}' is missing physical object id",
+                                entry.path
+                            )));
+                        };
+                        let metadata = match get_object_metadata_direct(fragment, &object_id).await
+                        {
+                            Ok(metadata) => metadata,
+                            Err(AppError::NotFound) => continue,
+                            Err(err) => return Err(err),
+                        };
+                        append_tar_metadata(tar, entry.path, &metadata).await?;
+                    }
+                    _ => {}
+                }
+            }
+
+            let Some(next) = next_token else {
+                break;
+            };
+            continuation_token = Some(next);
+        }
+    }
+
     Ok(())
 }
 
@@ -633,17 +901,19 @@ async fn write_tar_archive(
             let _ = fs::remove_file(&path).await;
             result?;
         }
-        ArchiveSelection::PreparedEntries(entries) => {
-            for entry in entries {
-                let mut header = TarHeader::new_gnu();
-                header.set_size(entry.metadata.total_size_bytes);
-                header.set_mode(0o644);
-
-                let reader = create_multipart_reader(&entry.metadata);
-                tar.append_data(&mut header, entry.archive_path, reader)
-                    .await
-                    .map_err(|e| AppError::Io(e, "tar append".into()))?;
-            }
+        ArchiveSelection::LogicalNamespace {
+            keys,
+            prefixes,
+            include_internal,
+        } => {
+            write_logical_namespace_tar_entries(
+                fragment,
+                keys,
+                prefixes,
+                include_internal,
+                &mut tar,
+            )
+            .await?;
         }
     }
 

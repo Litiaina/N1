@@ -1,6 +1,7 @@
 use crate::core::adaptive_concurrency::run_adaptive_concurrency_loop;
 use crate::core::archive::{
-    download_manifest_archive as download_manifest_archive_impl, download_prepared_archive,
+    download_logical_archive as download_logical_archive_impl,
+    download_manifest_archive as download_manifest_archive_impl,
     download_selected_archive as download_selected_archive_impl,
 };
 use crate::core::delete::{
@@ -36,7 +37,10 @@ use crate::core::retrieve::{
     get_object as get_object_impl, get_object_metadata as get_object_metadata_impl, list_fragments,
     list_object_versions as list_object_versions_impl, stream_object as stream_object_impl,
 };
-use crate::core::storage_capacity_parser::get_capacity_usage as get_capacity_usage_impl;
+use crate::core::storage_capacity_parser::{
+    get_capacity_usage as get_capacity_usage_impl,
+    get_fragment_quota_usage as get_fragment_quota_usage_impl,
+};
 use crate::core::sync::initialize_fragment_storage_api;
 use crate::core::upload::{
     cancel_upload_session as cancel_upload_session_impl,
@@ -53,7 +57,6 @@ use crate::middleware::auth_middleware::{
 };
 use crate::middleware::rate_limiter_middleware::RateLimitLayers;
 use crate::namespace::runtime::{global_namespace_runtime, logical_not_found};
-use crate::namespace::scoped_archive::prepare_logical_archive_entries;
 use crate::posix::routes::{build_posix_read_routes, build_posix_write_routes};
 use crate::structs::auth_structs::Claims;
 use crate::url::signed_read::{
@@ -307,6 +310,10 @@ async fn get_capacity_usage_scoped(claims: Claims) -> Result<impl IntoResponse, 
     get_capacity_usage_impl(claims, Path(fragment)).await
 }
 
+async fn get_fragment_quota_usage_scoped(claims: Claims) -> Result<impl IntoResponse, AppError> {
+    get_fragment_quota_usage_impl(claims).await
+}
+
 async fn list_objects_scoped(
     claims: Claims,
     Query(params): Query<HashMap<String, String>>,
@@ -404,8 +411,15 @@ async fn download_selected_archive_scoped(
     AxumJson(req): AxumJson<crate::core::disk_manager::DownloadArchiveRequest>,
 ) -> Result<axum::response::Response, AppError> {
     let fragment = claims.fragment.clone();
-    if let Some(prepared) = prepare_logical_archive_entries(&fragment, &req).await? {
-        return download_prepared_archive(prepared, req).await;
+    if !req.export_all
+        && (!req.keys.is_empty()
+            || req
+                .prefix
+                .as_deref()
+                .is_some_and(|prefix| !prefix.trim().is_empty())
+            || req.prefixes.iter().any(|prefix| !prefix.trim().is_empty()))
+    {
+        return download_logical_archive_impl(fragment, req).await;
     }
     Ok(
         download_selected_archive_impl(claims, Path(fragment), AxumJson(req))
@@ -849,6 +863,7 @@ pub fn build_storage_routes_unbound_with_options(
     let object_storage_routes = {
         let read_ops = Router::new()
             .route("/n1/capacity/usage", get(get_capacity_usage_scoped))
+            .route("/n1/capacity/quota", get(get_fragment_quota_usage_scoped))
             .route("/n1/fragments", get(list_fragments))
             .route("/n1/objects", get(list_objects_scoped))
             .route("/n1/objects/signed-url", post(mint_signed_read_url_scoped))
@@ -1073,7 +1088,6 @@ mod tests {
         DATA_SHARDS_ATOMIC, ListUploadsResponse, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC,
         PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
     };
-    use crate::namespace::scoped_archive::prepare_logical_archive_entries;
     use crate::settings::constants::CONFIG_FILE;
     use crate::settings::create_config::create_default_config_ini;
     use crate::structs::auth_structs::Claims;
@@ -1091,6 +1105,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use tokio::fs;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_stream::StreamExt;
+    use tokio_tar::Archive as TarArchive;
     use ulid::Ulid;
 
     struct SharedTestLock;
@@ -1243,6 +1260,43 @@ mod tests {
             delete: true,
             exp: usize::MAX,
         }
+    }
+
+    async fn read_response_bytes(response: axum::response::Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body")
+            .to_vec()
+    }
+
+    async fn read_tar_entries(bytes: Vec<u8>) -> BTreeMap<String, Vec<u8>> {
+        let (mut writer, reader) = tokio::io::duplex(bytes.len().max(4096));
+        tokio::spawn(async move {
+            writer
+                .write_all(&bytes)
+                .await
+                .expect("write tar bytes into duplex");
+        });
+        let mut archive = TarArchive::new(reader);
+        let mut entries = archive.entries().expect("tar entries");
+        let mut out = BTreeMap::new();
+
+        while let Some(entry) = entries.next().await {
+            let mut entry = entry.expect("tar entry");
+            let path = entry
+                .path()
+                .expect("tar path")
+                .to_string_lossy()
+                .to_string();
+            let mut body = Vec::new();
+            entry
+                .read_to_end(&mut body)
+                .await
+                .expect("read tar entry body");
+            out.insert(path, body);
+        }
+
+        out
     }
 
     fn sample_upload_params() -> InitiateUploadParams {
@@ -1433,7 +1487,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scoped_folder_archive_preparation_resolves_logical_prefixes() {
+    async fn scoped_folder_archive_download_resolves_logical_prefixes() {
         let _guard = TEST_LOCK.lock().await;
         ensure_storage_config().await;
         ensure_upload_runtime_config();
@@ -1484,21 +1538,28 @@ mod tests {
             include_internal: false,
         };
 
-        let prepared = prepare_logical_archive_entries(&fragment, &request)
-            .await
-            .expect("prepare folder archive")
-            .expect("prepared entries");
-        assert_eq!(prepared.len(), 1);
-        assert_eq!(prepared[0].archive_path, "videos/demo.mp4");
-        assert_ne!(
-            prepared[0].metadata.object_key, prepared[0].archive_path,
-            "prepared archive should resolve the logical path to the physical object id"
-        );
-
         let response = download_selected_archive_scoped(full_claims(&fragment), AxumJson(request))
             .await
             .expect("download folder archive");
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/x-tar")
+        );
+
+        let entries = read_tar_entries(read_response_bytes(response).await).await;
+        assert_eq!(
+            entries.get("videos/demo.mp4").map(Vec::as_slice),
+            Some(payload.as_bytes())
+        );
+        assert_eq!(
+            entries.len(),
+            1,
+            "scoped POSIX folder archive should contain only the selected live namespace subtree"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
