@@ -680,3 +680,4 @@ curl -k -X POST \
 - Membership changes are operator workflows. Treat them like control-plane operations, not end-user object operations.
 - Internal peer routes are intentionally low-level and should not be used as an application integration surface.
 - `Registry` remains the right layer for user-facing logical namespace, quota, share, and account behavior above `N2`.
+- `N2` reuses the `N1 3.0` storage core. Per-fragment metadata authority is still `<index_root>/<fragment_hash>/indexdb/index.ndxdb`; old N1 namespace catalog or redb index files are not active runtime inputs.

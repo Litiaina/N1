@@ -1,11 +1,13 @@
 # N1 API Documentation
 
-`N1` is the standalone storage kernel in this repository. In `2.2.2`, it exposes:
+Current version: `3.0.0`
+
+`N1` is the standalone storage kernel in this repository. In `3.0.0`, it exposes:
 
 - fragment provisioning
 - fragment-scoped authentication
 - object upload, read, list, version, trash, recover, and archive flows
-- a standalone mutable namespace layer
+- a POSIX/object-key namespace facade backed by the per-fragment `index.ndxdb`
 - lifecycle, garbage collection, repair, redistribution, and health endpoints
 - POSIX-style namespace access on top of the same storage truth
 
@@ -26,9 +28,66 @@ Typical standalone `N1` base URL:
 https://127.0.0.1:50001
 ```
 
+## N1 3.0 Breaking Metadata Rewrite
+
+`N1 3.0` is not runtime-compatible with the `N1 2.x` active metadata layout.
+
+The only active metadata authority for a fragment is:
+
+```text
+<index_root>/<fragment_hash>/indexdb/index.ndxdb
+```
+
+Inside that single per-fragment indexdb, `N1` owns:
+
+- `indexdb_meta`
+- `fragment_meta`
+- `namespace_entries`
+- `object_heads`
+- `object_versions`
+- `object_parts`
+- `part_shards`
+- `object_version_states`
+- `upload_sessions`
+- `upload_parts`
+- `pending_upload_bindings`
+- `trash_entries`
+- `quota_reservations`
+- `maintenance_state`
+- `replica_meta`
+
+The following files are not active runtime authorities in `N1 3.0`:
+
+- `namespace_v2/catalog.ndxdb`
+- `catalog.ndxdb`
+- `namespace.ndxdb`
+- `namespace.sqlite`
+- any separate namespace database
+- any separate catalog database
+- any redb-derived active index database
+- any serialized `ObjectMetadata` blob as the main persisted object record
+
+Old files may be read only by explicit one-time migration/import tooling. After import, runtime must use only `indexdb/index.ndxdb`; old files should be ignored or renamed aside.
+
+The blob layout is unchanged:
+
+```text
+<blob_root>/<fragment_hash>/blob/<version_id>/<shard-or-parity-file>
+```
+
+Rename, trash, and recover do not move blobs. The N1 metadata database stores metadata and references only; GC later removes unreachable blob files.
+
+## Namespace And Object Metadata Model
+
+Namespace is the POSIX/object-key front tier inside `indexdb`. The namespace module remains an API facade, but it does not own persistence and does not open a separate catalog file. Namespace persistence is `indexdb.namespace_entries`.
+
+Object metadata remains shaped as `ObjectMetadata { parts: Vec<PartMetadata> }` at the Rust/API boundary, but persisted storage is split across `object_versions`, `object_parts`, and `part_shards`.
+
+Listing APIs use summary rows and must not load `object_parts`, `part_shards`, or deserialize full part maps. Full `ObjectMetadata.parts` is reconstructed only for download, repair, verify, GC, explicit full metadata requests, or recovery paths that need shard maps.
+
 ## Memory Tuning
 
-`N1 2.2.2` bounds embedded indexdb and namespace runtime residency for small servers. The upstream indexdb default cache is `1GiB` per opened database; N1 overrides that with `[index_config]` so the process does not retain excessive resident memory during long runs.
+`N1 3.0` is designed to be IO-bound and bounded-memory. Metadata calls are routed through blocking work, listing uses cursor queries, and cold DB handles are evicted LRU instead of keeping a full namespace catalog resident in memory.
 
 ```ini
 [index_config]
@@ -37,13 +96,15 @@ per_db_cache_bytes=auto
 max_cached_dbs=auto
 
 [namespace_config]
-max_loaded_catalogs=auto
+max_loaded_facades=auto
 max_loaded_dbs=auto
 ```
 
-Defaults are adaptive but intentionally lean. `auto` favors bounded RSS over maximum cache residency even on larger hosts: indexdb, namespace catalogs, upload buffers, and stream buffers are capped conservatively so N1 remains closer to an IO-bound storage kernel. Cold namespace catalogs are evicted LRU and reloaded from disk when needed, keeping the on-disk format unchanged.
+Defaults are adaptive but intentionally lean. `auto` favors bounded RSS over maximum cache residency even on larger hosts: indexdb DB handles, namespace facades, upload buffers, and stream buffers are capped conservatively so N1 remains closer to an IO-bound storage kernel.
 
 Increase these only when deliberately running a high-performance profile on machines with enough RAM and heavy namespace/index scan workloads.
+
+Upload writer note: N1 uses the direct writer by default and routes blocking writes through worker threads. `N1_IO_URING_ENABLED=1` opts into the current experimental ring writer; leave it unset for the stable direct-write path unless specifically benchmarking that implementation.
 
 ## Authentication Model
 
@@ -53,14 +114,14 @@ Most `N1` APIs are fragment-scoped.
 2. Mint a fragment token with `POST /n1/auth/fragment`
 3. Use `Authorization: Bearer <access_token>` on protected routes
 
-Stable `N1 2.0` API routes and operator routes live under `/n1/...`.
+Stable `N1 3.0` API routes and operator routes live under `/n1/...`.
 
 Operational note:
 
-- `namespace_v2` is replicated across configured index roots
-- if the owner namespace disk is lost but another namespace replica survives, `N1` reseeds the owner catalog from the surviving replica before serving logical namespace reads
-- health reports namespace_v2 replica debt under `consistency.namespace_v2`
-- repair reconciles missing, divergent, or corrupt namespace_v2 catalog replicas across reachable index roots
+- per-fragment `index.ndxdb` is replicated across configured index roots
+- if the owner index disk is lost but another `index.ndxdb` replica survives, `N1` reseeds the owner copy from the surviving replica before serving metadata reads
+- health reports per-fragment index replica debt
+- repair reconciles missing, divergent, or corrupt `index.ndxdb` replicas across reachable index roots
 
 ### Permission Bits
 
@@ -126,7 +187,7 @@ Response:
 
 ## Operator CLI
 
-[`n1_cli`](/home/administrator/Development/N1/n1_cli) is the operator-facing companion to the stable `N1 2.0` API.
+[`n1_cli`](n1_cli) is the operator-facing companion to the stable `N1 3.0` API.
 
 Current CLI scope:
 
@@ -143,7 +204,7 @@ Representative commands:
 cargo run -p n1_cli -- \
   --url <url> \
   --secret <secret> \
-  fragment create --name <fragment_name> --key <fragment_key>
+  fragment create --name <fragment_name> --key <fragment_key> --quota-bytes <bytes>
 
 cargo run -p n1_cli -- \
   --url <url> \
@@ -274,7 +335,7 @@ Many object routes return the same core shape:
 
 Notes:
 
-- In standalone `N1 2.0`, `object_key` is the logical path the caller uses.
+- In standalone `N1 3.0`, `object_key` is the logical path the caller uses.
 - The immutable physical storage identity is managed under the namespace layer and does not need to be supplied by normal clients.
 
 ### Object Listing
@@ -445,7 +506,8 @@ Request body:
 {
   "name": "mainframe",
   "secret": "<MASTER_KEY>",
-  "key": "fragment-local-secret"
+  "key": "fragment-local-secret",
+  "quota_bytes": 536870912000
 }
 ```
 
@@ -454,6 +516,9 @@ Fields:
 - `name`: human input used to derive the deterministic fragment hash
 - `secret`: must match `MASTER_KEY`
 - `key`: fragment secret used later for fragment auth
+- `quota_bytes`: required non-zero fragment quota in bytes. A fragment is a quota-bound virtual partition; creation is rejected if active fragment quotas plus the requested quota exceed usable configured storage capacity.
+
+The standalone Storage console uses this same contract and requires a quota amount before submitting fragment creation.
 
 Response:
 
@@ -562,7 +627,7 @@ Response:
 
 Read the full object body.
 
-Supports logical paths in standalone `N1 2.0`.
+Supports logical paths in standalone `N1 3.0`.
 
 ### `GET /n1/objects/stream/{*object_key}`
 
@@ -582,7 +647,7 @@ Query parameters:
 - `version_id` optional
 - `filename` optional
 
-If `filename` is omitted and the logical path differs from the underlying storage object id, `N1 2.0` will derive a browser-friendly download filename from the logical path.
+If `filename` is omitted and the logical path differs from the underlying storage object id, `N1 3.0` will derive a browser-friendly download filename from the logical path.
 
 ### `GET /n1/objects/download/chunk`
 
@@ -671,7 +736,7 @@ The request body is a manifest payload consumed by the archive builder.
 
 ## Upload API
 
-`N1 2.0` supports both one-shot upload and resumable multipart upload.
+`N1 3.0` supports both one-shot upload and resumable multipart upload.
 
 ### Common Upload Parameters
 
@@ -734,7 +799,9 @@ Response:
 }
 ```
 
-If an interrupted multipart session already exists for the same logical path and compatible upload manifest, `N1 2.0` reuses it instead of creating a new one.
+If an interrupted multipart session already exists for the same logical path and compatible upload manifest, `N1 3.0` reuses it instead of creating a new one.
+
+Multipart resumability is persistent. Each uploaded part writes raw part bytes to the blob plane, then records a compact receipt in the fragment indexdb. The full session row is not rewritten for every part; activity is flushed periodically while each part receipt remains durable. If a retry finds the part bytes already present, N1 treats the part as uploaded and refreshes the missing receipt when needed.
 
 ### `GET /n1/upload/multipart`
 
@@ -815,7 +882,7 @@ Query parameters:
 
 ## Namespace And POSIX-Style API
 
-These routes operate on the standalone mutable namespace layer in `N1 2.0`.
+These routes operate on the namespace facade backed by `indexdb.namespace_entries` in `N1 3.0`.
 
 ### `GET /n1/posix/list`
 
@@ -900,13 +967,13 @@ Request body:
 }
 ```
 
-Important `2.1.1+` behavior:
+Trash listing behavior:
 
 - root trash listing returns recoverable trashed items directly
 - recovering a listed file uses that exact file path
 - recovering a listed directory restores the deleted directory subtree
 
-Important `2.1.2+` behavior:
+Trash generation behavior:
 
 - each trash root has a stable `trash_entry_id`
 - repeated deletes of the same visible path produce separate trash generations
@@ -956,7 +1023,7 @@ Request body:
 }
 ```
 
-For standalone `N1 2.0`, source and destination fragment should normally be the same fragment.
+For standalone `N1 3.0`, source and destination fragment should normally be the same fragment.
 
 ### `DELETE /n1/objects/{*object_key}`
 
@@ -1027,13 +1094,13 @@ No request body.
 
 ### Permanent Delete Note
 
-`N1 2.0` is lifecycle-first.
+`N1 3.0` is lifecycle-first.
 
 - normal delete means move to trash
 - `empty trash` retires namespace visibility
 - GC later reclaims unreachable object versions and blobs
 
-Routes that try to expose immediate permanent delete behavior are no longer the preferred `2.0` contract.
+Routes that try to expose immediate permanent delete behavior are no longer the preferred `3.0` contract.
 
 ## Maintenance API
 
@@ -1284,7 +1351,8 @@ curl -k https://127.0.0.1:50001/n1/fragments \
   -d '{
     "name":"mainframe",
     "secret":"<MASTER_KEY>",
-    "key":"fragment-local-secret"
+    "key":"fragment-local-secret",
+    "quota_bytes":536870912000
   }'
 ```
 
@@ -1353,8 +1421,8 @@ curl -k -X POST https://127.0.0.1:50001/n1/maintenance/gc/start \
 
 ## Operational Notes
 
-- `N1 2.0` is lifecycle-first. Clients should think in terms of `trash`, `recover`, and `GC`, not immediate physical delete.
-- Standalone namespace routes and raw object routes are both available. New integrations should prefer the namespace-aware `2.0` surfaces unless they specifically need lower-level object semantics.
+- `N1 3.0` is lifecycle-first. Clients should think in terms of `trash`, `recover`, and `GC`, not immediate physical delete.
+- Standalone namespace routes and raw object routes are both available. New integrations should prefer the namespace-aware `3.0` surfaces unless they specifically need lower-level object semantics.
 - Some helper routes remain legacy-shaped. The most visible example is `GET /n1/fragments/check` and `GET /n1/fragments/hash`, which currently deserialize JSON bodies.
 - Signed-read URLs are the preferred way to expose public view, stream, or download without leaking bearer tokens.
 - SMB/NAS workflows are handled by standalone `Litiaina NS`. `N1` remains the storage kernel and exposes POSIX-style namespace routes directly.

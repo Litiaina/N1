@@ -19,8 +19,8 @@
 
 This repository contains the storage platform stack built around four runtime components:
 
-> - `N1` (`2.2.2`)
-  Single-node storage kernel with an object-storage core, standalone namespace layer, lifecycle, repair, redistribution, GC, recover-on-read, and POSIX-style routes.
+> - `N1` (`3.0.0`)
+  Single-node storage kernel with an object-storage core, per-fragment `index.ndxdb` metadata authority, lifecycle, repair, redistribution, GC, recover-on-read, and POSIX-style routes.
 > - `N2` (`0.2.0`)
   Multi-node clustering and placement layer built on top of the shared `N1` storage core.
 > - `NS` (`1.0.0`)
@@ -46,22 +46,28 @@ Current route namespaces are intentionally split:
 - `NS` exposes SMB on its configured TCP bind address and port.
 - `Registry` product-facing routes live under `/v1/...`
 
-The major `2.0` change in `N1` is architectural:
+The major `3.0` change in `N1` is a breaking metadata rewrite:
 
-- the namespace is now a separate mutable database
-- object metadata is immutable
+- each fragment has one active metadata authority at `<index_root>/<fragment_hash>/indexdb/index.ndxdb`
+- namespace state lives inside `index.ndxdb` as `namespace_entries`; there is no active `namespace_v2/catalog.ndxdb`
+- object metadata is persisted as summary/version/part/shard rows instead of one serialized `ObjectMetadata` blob
+- upload sessions, pending namespace bindings, trash state, quota state, repair state, and replica metadata live in the same per-fragment `index.ndxdb`
+- object/version metadata is immutable after commit except lifecycle state
 - blob payloads are immutable
 
-That means file and folder semantics such as `mkdir`, rename, move, trash, recover, and browse are handled in the namespace layer, while repair, redistribution, GC, and recover-on-read operate on storage truth and reachability.
+That means file and folder semantics such as `mkdir`, rename, move, trash, recover, and browse are handled by the namespace facade over `indexdb.namespace_entries`, while repair, redistribution, GC, and recover-on-read operate on storage truth and reachability.
 
-Current release notes for the validated `N1 2.2.2`, `NS 1.0.0`, and `Registry 0.9.1` line:
+Current release notes for the validated `N1 3.0.0`, `NS 1.0.0`, and `Registry 0.9.1` line:
 
-- `N1 2.2.2` adds bounded namespace catalog/database residency and lean auto-tuning so cold fragments are evicted LRU and default cache/buffer growth stays conservative.
+- `N1 3.0.0` removes the old redb-derived active index and the active `namespace_v2/catalog.ndxdb` authority. The only active per-fragment metadata file is `indexdb/index.ndxdb`.
+- `N1 3.0.0` is not runtime-compatible with `N1 2.x` metadata directories. Old files may be imported by explicit migration tooling, then ignored or renamed aside.
+- `N1 3.0.0` keeps the blob layout unchanged: `<blob_root>/<fragment_hash>/blob/<version_id>/<shard-or-parity-file>`.
+- `N1 3.0.0` is designed to be IO-bound and bounded-memory: listing uses cursor queries and summary rows, cold DB handles are evicted LRU, and full part/shard metadata is loaded only for download, repair, verify, GC, explicit full metadata reads, or recovery.
 - SMB/NAS serving has moved out of `N1` into standalone `NS`, keeping `N1` focused on storage-kernel responsibilities.
 - `NS 1.0.0` keeps the live SMB path local to disk, uses dynamic fragment authentication, supports recursive folder deletion semantics expected by Windows clients, and cold-syncs large files to `N1` through multipart upload.
-- `namespace_v2` is replicated across configured index roots, monitored by health, and repaired by the repair manager when a rebuilt index disk is missing or has a stale catalog copy.
+- Per-fragment `index.ndxdb` replicas are copied across configured index roots, monitored by health, and repaired when a rebuilt index disk is missing or stale.
 - Trash entries are generation-addressed with `trash_entry_id`, so repeated deletes of the same visible path remain individually recoverable or purgeable without path ambiguity.
-- fragment-bound Registry listing and stats now prefer `N1` namespace truth instead of stale SQLite-only projection.
+- fragment-bound Registry listing and stats now prefer `N1` namespace truth instead of stale Registry projection.
 - Registry folder trash/recover delegates to N1 POSIX namespace lifecycle, including empty folders, instead of emulating directory delete with object-key prefix loops.
 - Registry quota reservations are tracked as explicit durable pending reservations and reconciled against committed object usage on finalize and cancel paths.
 - Registry now keeps product metadata separate from object truth: shares, audit/activity, favorites, tags, labels, and comments live in Registry while file existence/listing comes from N1 for bound fragments.
@@ -76,8 +82,10 @@ Current release notes for the validated `N1 2.2.2`, `NS 1.0.0`, and `Registry 0.
 It is responsible for:
 
 - fragments and storage tenancy boundaries
+- fragment quota state
 - immutable object/version metadata
 - immutable blob payload placement
+- per-fragment `index.ndxdb` metadata authority
 - one-shot and multipart upload
 - logical reads and downloads
 - lifecycle-first delete, trash, and recover
@@ -87,9 +95,9 @@ It is responsible for:
 - standalone namespace routes
 - POSIX-style namespace access
 
-`N1 2.0` is best thought of as:
+`N1 3.0` is best thought of as:
 
-`object storage core + mutable namespace database`
+`object storage core + POSIX namespace front tier inside per-fragment indexdb`
 
 It is not the user/account control plane and it is not the business metadata layer.
 
@@ -153,31 +161,31 @@ Clients / UI / CLI
                                     optional cold sync to N1
 ```
 
-For standalone `N1 2.0`, the internal model is:
+For standalone `N1 3.0`, the internal model is:
 
 ```text
-namespace DB (mutable)
-  - paths
-  - directories
-  - rename / move
-  - trash / recover
+index_root/<fragment_hash>/indexdb/index.ndxdb
+  - indexdb_meta / fragment_meta
+  - namespace_entries
+  - object_heads / object_versions / object_version_states
+  - object_parts / part_shards
+  - upload_sessions / upload_parts / pending_upload_bindings
+  - trash_entries / quota_reservations
+  - maintenance_state / replica_meta
 
-object metadata (immutable)
-  - object_id
-  - version lineage
-  - size / hash / content metadata
-
-blob storage (immutable)
+blob_root/<fragment_hash>/blob/<version_id>/
   - payload shards / parity
   - placement
 ```
 
-This split is why `N1 2.0` is materially different from the older path-as-identity design:
+This split is why `N1 3.0` is materially different from the older path-as-identity and redb-backed design:
 
 - path changes do not rewrite immutable object or blob truth
+- namespace is the POSIX/object-key face, but indexdb owns persistence
 - delete becomes lifecycle-first
 - GC is driven by reachability
 - repair and redistribution stay storage-focused
+- object listing does not deserialize part or shard maps
 
 ## Features And Capabilities
 
@@ -223,30 +231,30 @@ Typical deployments:
 
 ## Repository Layout
 
-- [`n1`](/home/administrator/Development/N1/n1)
+- [`n1`](n1)
   `N1` server and storage kernel
-- [`n2`](/home/administrator/Development/N1/n2)
+- [`n2`](n2)
   `N2` cluster layer
-- [`ns`](/home/administrator/Development/N1/ns)
+- [`ns`](ns)
   Litiaina NS standalone NAS Lite / SMB service
-- [`registry`](/home/administrator/Development/N1/registry)
+- [`registry`](registry)
   Registry service
-- [`n1_cli`](/home/administrator/Development/N1/n1_cli)
-  Operator CLI for `N1 2.0` maintenance, health, fragment create, and multipart status
-- [`n2_cli`](/home/administrator/Development/N1/n2_cli)
+- [`n1_cli`](n1_cli)
+  Operator CLI for `N1 3.0` maintenance, health, fragment create, and multipart status
+- [`n2_cli`](n2_cli)
   CLI helpers for `N2`
-- [`indexdb`](/home/administrator/Development/N1/indexdb)
-  Index database crate used by the storage stack
-- [`simd-erasure-core`](/home/administrator/Development/N1/simd-erasure-core)
+- [`indexdb`](indexdb)
+  Internal per-fragment metadata crate used by `N1`
+- [`simd-erasure-core`](simd-erasure-core)
   Erasure and shard primitives
 
 Additional docs:
 
-- [`DOCUMENTATION.md`](/home/administrator/Development/N1/DOCUMENTATION.md)
-- [`N1_DOCUMENTATION.md`](/home/administrator/Development/N1/N1_DOCUMENTATION.md)
-- [`NS_DOCUMENTATION.md`](/home/administrator/Development/N1/NS_DOCUMENTATION.md)
-- [`N2_DOCUMENTATION.md`](/home/administrator/Development/N1/N2_DOCUMENTATION.md)
-- [`REGISTRY_DOCUMENTATION.md`](/home/administrator/Development/N1/REGISTRY_DOCUMENTATION.md)
+- [`DOCUMENTATION.md`](DOCUMENTATION.md)
+- [`N1_DOCUMENTATION.md`](N1_DOCUMENTATION.md)
+- [`NS_DOCUMENTATION.md`](NS_DOCUMENTATION.md)
+- [`N2_DOCUMENTATION.md`](N2_DOCUMENTATION.md)
+- [`REGISTRY_DOCUMENTATION.md`](REGISTRY_DOCUMENTATION.md)
 
 ## Deployment Example
 
@@ -254,7 +262,7 @@ Additional docs:
 
 1. Prepare a config file.
 
-Use [`standard/n1_config.ini`](/home/administrator/Development/N1/standard/n1_config.ini) or [`n1_config.ini`](/home/administrator/Development/N1/n1_config.ini) as the template.
+`N1` creates `n1_config.ini` with defaults when the runtime config does not already exist. Use that generated file as the local template.
 
 Key sections:
 
@@ -288,7 +296,8 @@ curl -k https://127.0.0.1:50001/n1/fragments \
   -d '{
     "name": "mainframe",
     "secret": "<MASTER_KEY>",
-    "key": "fragment-local-secret"
+    "key": "fragment-local-secret",
+    "quota_bytes": 536870912000
   }'
 ```
 
@@ -311,7 +320,7 @@ curl -k https://127.0.0.1:50001/n1/auth/fragment \
 
 ### N1 Operator CLI
 
-`n1_cli` is now aligned with the stable `N1 2.0` surface. It is an operator CLI, not a general file-transfer client.
+`n1_cli` is aligned with the stable `/n1/...` surface. It is an operator CLI, not a general file-transfer client.
 
 Protected CLI commands authenticate through `/n1/auth/fragment`, so pass `--fragment <name-or-hash>` or `--auth-fragment <name-or-hash>` when talking to a real server.
 
@@ -344,7 +353,7 @@ Common commands:
 cargo run -p n1_cli -- \
   --url <url> \
   --secret <secret> \
-  fragment create --name <fragment_name> --key <fragment_key>
+  fragment create --name <fragment_name> --key <fragment_key> --quota-bytes <bytes>
 
 # Health
 cargo run -p n1_cli -- \
@@ -446,7 +455,7 @@ Use `N2` when you need cluster-managed placement instead of a single storage nod
 
 ### N1 Config
 
-The main runtime file is [`n1_config.ini`](/home/administrator/Development/N1/n1_config.ini).
+The main runtime file is `n1_config.ini`.
 
 Important settings:
 
@@ -456,7 +465,8 @@ Important settings:
 - `disk_config.blob_store_disks`
 - `garbage_collector.retention_seconds`
 - `upload_config.data_shards`, `upload_config.parity_shards`
-- `smb.enabled`, `smb.smb_port`
+- `index_config.partition_count`, `index_config.per_db_cache_bytes`, `index_config.max_cached_dbs`
+- `namespace_config.max_loaded_facades`, `namespace_config.max_loaded_dbs`
 
 Notes:
 
@@ -548,7 +558,7 @@ Use `NS` when SMB/NAS access is required. `NS` has its own `ns_config.ini`, loca
 cargo run -p ns --bin litiaina-ns
 ```
 
-See [`NS_DOCUMENTATION.md`](/home/administrator/Development/N1/NS_DOCUMENTATION.md) for deployment, disk-layout, SMB port, auth, capacity behavior, and optional cold-sync configuration.
+See [`NS_DOCUMENTATION.md`](NS_DOCUMENTATION.md) for deployment, disk-layout, SMB port, auth, capacity behavior, and optional cold-sync configuration.
 
 ## Operational Flows
 
@@ -587,7 +597,7 @@ Quota and end-user policy live in `Registry`, not in standalone `N1`.
 
 That is expected.
 
-`N1 2.0` is lifecycle-first:
+`N1 3.0` is lifecycle-first:
 
 - trash hides objects from the live namespace
 - empty trash retires namespace visibility
@@ -597,11 +607,21 @@ If you need immediate space reclamation, empty trash and then run GC.
 
 ### Fragment Already Exists After Reusing The Same Name
 
-Fragment names hash deterministically. Reusing the same name recreates the same fragment hash. If you want a brand-new fragment identity, use a different name. If a fragment was partially initialized, current `2.0` fragment create logic heals partial state on retry instead of false-conflicting.
+Fragment names hash deterministically. Reusing the same name recreates the same fragment hash. If you want a brand-new fragment identity, use a different name. If a fragment was partially initialized, current `3.0` fragment create logic heals partial state on retry instead of false-conflicting.
+
+### Active Metadata Files
+
+For `N1 3.0`, the only active per-fragment metadata authority is:
+
+```text
+<index_root>/<fragment_hash>/indexdb/index.ndxdb
+```
+
+Do not restore or point runtime code at old `namespace_v2/catalog.ndxdb`, `catalog.ndxdb`, `namespace.ndxdb`, `namespace.sqlite`, redb index files, or serialized `ObjectMetadata` blobs as authority. Those belong only to one-time migration/import tooling.
 
 ### Listing Or Trash Views Look Wrong
 
-The `2.0` namespace routes are the source of truth for standalone namespace behavior:
+The `3.0` namespace routes are the source of truth for standalone namespace behavior:
 
 - `GET /n1/posix/list`
 - `POST /n1/posix/mkdir`
@@ -630,7 +650,7 @@ cargo test -p ns
 cargo test -p registry -- --test-threads=1
 ```
 
-High-signal release tests used for `N1 2.0` include:
+High-signal release tests used for `N1 3.0` include:
 
 - CRUD upload/read/delete/recover flows
 - GC reclaim after empty trash

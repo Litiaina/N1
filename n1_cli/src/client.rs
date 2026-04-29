@@ -131,6 +131,7 @@ async fn handle_fragment_command(
                     name: args.name.clone(),
                     key: args.key.clone(),
                     secret,
+                    quota_bytes: Some(args.quota_bytes),
                 })
                 .send()
                 .await?;

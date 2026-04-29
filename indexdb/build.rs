@@ -1,10 +1,16 @@
 fn main() {
-    println!("cargo:rustc-check-cfg=cfg(fuzzing)");
+    cc::Build::new()
+        .file("sqlite/sqlite3.c")
+        .define("SQLITE_THREADSAFE", "1")
+        .define("SQLITE_OMIT_LOAD_EXTENSION", None)
+        .define("SQLITE_DEFAULT_MEMSTATUS", "0")
+        .define("SQLITE_USE_URI", "1")
+        .define("SQLITE_ENABLE_DBSTAT_VTAB", None)
+        .warnings(false)
+        .compile("n1_indexdb");
 
-    if std::env::var("CARGO_CFG_FUZZING").is_ok()
-        && std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")
-    {
-        println!("cargo:rustc-cdylib-link-arg=-undefined");
-        println!("cargo:rustc-cdylib-link-arg=dynamic_lookup");
-    }
+    println!("cargo:rerun-if-changed=sqlite/sqlite3.c");
+    println!("cargo:rerun-if-changed=sqlite/sqlite3.h");
+    println!("cargo:rerun-if-changed=sqlite/sqlite3ext.h");
+    println!("cargo:rerun-if-changed=sqlite/VERSION.txt");
 }

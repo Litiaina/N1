@@ -3,7 +3,6 @@ use crate::core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata,
 };
 use crate::core::index;
-use crate::core::indexdb_store::open_n1_indexdb;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::{repair_entire_shard, verify_shard_integrity};
 use crate::core::redistribution::replay_pending_intents_for_fragment_now;
@@ -729,36 +728,6 @@ async fn replicate_bytes_strict(
     Ok((missing, divergent))
 }
 
-async fn validate_indexdb_bytes(bytes: &[u8]) -> bool {
-    let bytes = bytes.to_vec();
-    tokio::task::spawn_blocking(move || {
-        let dir = std::env::temp_dir().join(format!("n1-indexdb-validate-{}", Ulid::new()));
-        let path = dir.join("index.ndxdb");
-
-        let valid = (|| -> bool {
-            if std::fs::create_dir_all(&dir).is_err() {
-                return false;
-            }
-            if std::fs::write(&path, &bytes).is_err() {
-                return false;
-            }
-            match open_n1_indexdb(&path) {
-                Ok(db) => {
-                    drop(db);
-                    true
-                }
-                _ => false,
-            }
-        })();
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(&dir);
-        valid
-    })
-    .await
-    .unwrap_or(false)
-}
-
 async fn repair_fragment_metadata_replicas(
     index_roots: &[PathBuf],
     fragment: &str,
@@ -787,75 +756,16 @@ async fn repair_fragment_metadata_replicas(
     Ok((m, d, 0))
 }
 
-fn fragment_db_path(root: &Path, fragment: &str) -> PathBuf {
-    root.join(fragment).join("indexdb").join("index.ndxdb")
-}
-
-fn fragment_owner_index(fragment: &str, root_count: usize) -> usize {
-    if root_count <= 1 {
-        return 0;
-    }
-    let mut hasher = Sha256::new();
-    for part in ["fragment", fragment] {
-        hasher.update(part.as_bytes());
-        hasher.update([0u8]);
-    }
-    let hash: [u8; 32] = hasher.finalize().into();
-    usize::from(u16::from(hash[0]) << 8 | u16::from(hash[1])) % root_count
-}
-
-fn selected_fragment_roots(index_roots: &[PathBuf], fragment: &str) -> Vec<PathBuf> {
-    if index_roots.is_empty() {
-        return Vec::new();
-    }
-
-    let owner_idx = fragment_owner_index(fragment, index_roots.len());
-    let mut selected = vec![index_roots[owner_idx].clone()];
-    for (idx, root) in index_roots.iter().enumerate() {
-        if idx != owner_idx {
-            selected.push(root.clone());
-        }
-    }
-    selected
-}
-
 async fn repair_fragment_index_db(
-    index_roots: &[PathBuf],
-    fragment: &str,
-    dry_run: bool,
+    _index_roots: &[PathBuf],
+    _fragment: &str,
+    _dry_run: bool,
 ) -> Result<(u64, u64, u64), AppError> {
-    let selected = selected_fragment_roots(index_roots, fragment);
-    if selected.is_empty() {
-        return Ok((0, 0, 0));
-    }
-
-    let paths: Vec<PathBuf> = selected
-        .iter()
-        .map(|root| fragment_db_path(root, fragment))
-        .collect();
-    let mut replicas = Vec::with_capacity(paths.len());
-    for path in &paths {
-        let replica = read_raw_replica(path, &|bytes| !bytes.is_empty()).await;
-        let valid = match replica.bytes.as_ref() {
-            Some(bytes) => validate_indexdb_bytes(bytes).await,
-            None => false,
-        };
-        replicas.push(RawReplica { valid, ..replica });
-    }
-
-    let Some(best) = choose_best_raw_replica(&replicas) else {
-        let any_exists = replicas.iter().any(|replica| replica.bytes.is_some());
-        let corrupt = if any_exists { 1 } else { 0 };
-        return Ok((0, 0, corrupt));
-    };
-
-    let canonical = replicas[best].bytes.clone().unwrap_or_default();
-    if canonical.is_empty() {
-        return Ok((0, 0, 0));
-    }
-
-    let (missing, divergent) = replicate_bytes_strict(&paths, &canonical, dry_run).await?;
-    Ok((missing, divergent, 0))
+    // N1 3.0 stores fragment metadata in a WAL-backed index.ndxdb.
+    // Raw byte-copy repair can miss live WAL frames and corrupt an active DB.
+    // The namespace/indexdb replica pass below uses engine backup semantics for
+    // the same file, so this legacy partition repair lane is intentionally inert.
+    Ok((0, 0, 0))
 }
 
 async fn process_object_repair(
@@ -1119,7 +1029,7 @@ pub async fn run_repair_job_with_options(
 
         {
             let mut status = REPAIR_STATUS.write().await;
-            status.phase = format!("Repairing namespace_v2 catalog replicas {}", fragment_hash);
+            status.phase = format!("Repairing namespace indexdb replicas {}", fragment_hash);
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 
@@ -1135,7 +1045,7 @@ pub async fn run_repair_job_with_options(
                 || namespace_report.divergent_repaired > 0
                 || namespace_report.corrupt_found > 0
             {
-                status.last_repaired = Some(format!("namespace_v2:{}", fragment_hash));
+                status.last_repaired = Some(format!("namespace_indexdb:{}", fragment_hash));
                 status.last_disagreement = namespace_report.selected_source.clone();
             }
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));

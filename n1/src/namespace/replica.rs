@@ -1,8 +1,8 @@
 use crate::core::indexdb_store::open_n1_indexdb;
 use crate::enums::app_error_enum::AppError;
-use crate::namespace::catalog::NamespaceCatalog;
 
-use indexdb::{ReadableDatabase, TableDefinition, TableError};
+use indexdb::Database;
+use indexdb::n1 as n1_indexdb;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -11,11 +11,8 @@ use std::time::SystemTime;
 use tokio::fs;
 use ulid::Ulid;
 
-pub const NAMESPACE_V2_DIR: &str = "namespace_v2";
-pub const NAMESPACE_V2_FILE: &str = "catalog.ndxdb";
-
-const CATALOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("catalog");
-const CATALOG_ROW_KEY: &str = "catalog";
+pub const INDEXDB_DIR: &str = "indexdb";
+pub const INDEXDB_FILE: &str = "index.ndxdb";
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct NamespaceReplicaInspection {
@@ -43,17 +40,15 @@ pub struct NamespaceReplicaRepairReport {
 #[derive(Clone)]
 struct RawNamespaceReplica {
     path: PathBuf,
-    bytes: Option<Vec<u8>>,
+    present: bool,
     mtime: SystemTime,
     len: u64,
-    catalog_hash: Option<[u8; 32]>,
+    metadata_hash: Option<[u8; 32]>,
     valid: bool,
 }
 
 pub fn namespace_db_path_for_root(root: &Path, fragment: &str) -> PathBuf {
-    root.join(fragment)
-        .join(NAMESPACE_V2_DIR)
-        .join(NAMESPACE_V2_FILE)
+    root.join(fragment).join(INDEXDB_DIR).join(INDEXDB_FILE)
 }
 
 pub fn namespace_db_paths_for_roots(fragment: &str, roots: &[PathBuf]) -> Vec<PathBuf> {
@@ -84,53 +79,51 @@ pub async fn repair_namespace_replicas(
             expected_replicas: replicas.len() as u64,
             corrupt_found: replicas
                 .iter()
-                .filter(|replica| replica.bytes.is_some() && !replica.valid)
+                .filter(|replica| replica.present && !replica.valid)
                 .count() as u64,
             ..NamespaceReplicaRepairReport::default()
         });
     };
 
-    let canonical = replicas[best_index].bytes.clone().unwrap_or_default();
-    let canonical_hash = replicas[best_index].catalog_hash;
+    let canonical_hash = replicas[best_index].metadata_hash;
+    let source_path = replicas[best_index].path.clone();
     let mut report = NamespaceReplicaRepairReport {
         fragment: fragment.to_string(),
         expected_replicas: replicas.len() as u64,
-        selected_source: Some(replicas[best_index].path.to_string_lossy().to_string()),
+        selected_source: Some(source_path.to_string_lossy().to_string()),
         ..NamespaceReplicaRepairReport::default()
     };
 
     for replica in replicas {
-        match replica.bytes {
-            None => {
-                report.missing_repaired += 1;
-                if !dry_run {
-                    atomic_write(&replica.path, &canonical)
-                        .await
-                        .map_err(|err| {
-                            AppError::Io(
-                                err,
-                                format!("repair namespace replica {}", replica.path.display()),
-                            )
-                        })?;
-                }
+        if !replica.present {
+            report.missing_repaired += 1;
+            if !dry_run {
+                copy_namespace_db_file(&source_path, &replica.path)
+                    .await
+                    .map_err(|err| {
+                        AppError::Io(
+                            err,
+                            format!("repair namespace replica {}", replica.path.display()),
+                        )
+                    })?;
             }
-            Some(_) => {
-                if !replica.valid {
-                    report.corrupt_found += 1;
-                }
-                if replica.catalog_hash != canonical_hash {
-                    report.divergent_repaired += 1;
-                    if !dry_run {
-                        atomic_write(&replica.path, &canonical)
-                            .await
-                            .map_err(|err| {
-                                AppError::Io(
-                                    err,
-                                    format!("repair namespace replica {}", replica.path.display()),
-                                )
-                            })?;
-                    }
-                }
+            continue;
+        }
+
+        if !replica.valid {
+            report.corrupt_found += 1;
+        }
+        if replica.metadata_hash != canonical_hash {
+            report.divergent_repaired += 1;
+            if !dry_run {
+                copy_namespace_db_file(&source_path, &replica.path)
+                    .await
+                    .map_err(|err| {
+                        AppError::Io(
+                            err,
+                            format!("repair namespace replica {}", replica.path.display()),
+                        )
+                    })?;
             }
         }
     }
@@ -150,34 +143,26 @@ async fn read_namespace_replicas(
 }
 
 async fn read_namespace_replica(path: PathBuf) -> RawNamespaceReplica {
-    match fs::read(&path).await {
-        Ok(bytes) => {
-            let meta = fs::metadata(&path).await.ok();
-            let mtime = meta
-                .as_ref()
-                .and_then(|meta| meta.modified().ok())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            let len = meta
-                .as_ref()
-                .map(|meta| meta.len())
-                .unwrap_or(bytes.len() as u64);
-            let catalog_hash = read_namespace_catalog_hash(&bytes).await;
-            let valid = catalog_hash.is_some();
+    match fs::metadata(&path).await {
+        Ok(meta) => {
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let len = meta.len();
+            let hash = namespace_indexdb_semantic_hash(path.clone()).await;
             RawNamespaceReplica {
                 path,
-                bytes: Some(bytes),
+                present: true,
                 mtime,
                 len,
-                catalog_hash,
-                valid,
+                metadata_hash: hash,
+                valid: hash.is_some(),
             }
         }
         Err(_) => RawNamespaceReplica {
             path,
-            bytes: None,
+            present: false,
             mtime: SystemTime::UNIX_EPOCH,
             len: 0,
-            catalog_hash: None,
+            metadata_hash: None,
             valid: false,
         },
     }
@@ -186,15 +171,15 @@ async fn read_namespace_replica(path: PathBuf) -> RawNamespaceReplica {
 fn choose_best_namespace_replica(replicas: &[RawNamespaceReplica]) -> Option<usize> {
     let mut hash_counts: HashMap<[u8; 32], usize> = HashMap::new();
     for replica in replicas.iter().filter(|replica| replica.valid) {
-        if let Some(hash) = replica.catalog_hash {
+        if let Some(hash) = replica.metadata_hash {
             *hash_counts.entry(hash).or_default() += 1;
         }
     }
-    let canonical_hash = choose_canonical_catalog_hash(&hash_counts)?;
+    let canonical_hash = choose_canonical_metadata_hash(&hash_counts)?;
 
     let mut best: Option<usize> = None;
     for (idx, replica) in replicas.iter().enumerate() {
-        if !replica.valid || replica.catalog_hash != Some(canonical_hash) {
+        if !replica.valid || replica.metadata_hash != Some(canonical_hash) {
             continue;
         }
 
@@ -217,7 +202,7 @@ fn choose_best_namespace_replica(replicas: &[RawNamespaceReplica]) -> Option<usi
     best
 }
 
-fn choose_canonical_catalog_hash(hash_counts: &HashMap<[u8; 32], usize>) -> Option<[u8; 32]> {
+fn choose_canonical_metadata_hash(hash_counts: &HashMap<[u8; 32], usize>) -> Option<[u8; 32]> {
     let mut counts = hash_counts
         .iter()
         .map(|(hash, count)| (*hash, *count))
@@ -241,7 +226,7 @@ fn build_inspection(
     replicas: &[RawNamespaceReplica],
     best: Option<usize>,
 ) -> NamespaceReplicaInspection {
-    let canonical_hash = best.and_then(|idx| replicas[idx].catalog_hash);
+    let canonical_hash = best.and_then(|idx| replicas[idx].metadata_hash);
     let mut hash_counts: HashMap<[u8; 32], usize> = HashMap::new();
     let mut inspection = NamespaceReplicaInspection {
         fragment: fragment.to_string(),
@@ -251,24 +236,23 @@ fn build_inspection(
     };
 
     for replica in replicas {
-        match replica.bytes.as_ref() {
-            None => inspection.missing_replicas += 1,
-            Some(_) => {
-                inspection.present_replicas += 1;
-                if replica.valid {
-                    inspection.valid_replicas += 1;
-                    if let Some(hash) = replica.catalog_hash {
-                        *hash_counts.entry(hash).or_default() += 1;
-                    }
-                    if let Some(hash) = canonical_hash {
-                        if replica.catalog_hash != Some(hash) {
-                            inspection.divergent_replicas += 1;
-                        }
-                    }
-                } else {
-                    inspection.corrupt_replicas += 1;
+        if !replica.present {
+            inspection.missing_replicas += 1;
+            continue;
+        }
+        inspection.present_replicas += 1;
+        if replica.valid {
+            inspection.valid_replicas += 1;
+            if let Some(hash) = replica.metadata_hash {
+                *hash_counts.entry(hash).or_default() += 1;
+            }
+            if let Some(hash) = canonical_hash {
+                if replica.metadata_hash != Some(hash) {
+                    inspection.divergent_replicas += 1;
                 }
             }
+        } else {
+            inspection.corrupt_replicas += 1;
         }
     }
     if canonical_hash.is_none() && hash_counts.len() > 1 {
@@ -283,74 +267,184 @@ fn build_inspection(
     inspection
 }
 
-async fn read_namespace_catalog_hash(bytes: &[u8]) -> Option<[u8; 32]> {
-    let bytes = bytes.to_vec();
-    tokio::task::spawn_blocking(move || namespace_catalog_semantic_hash(&bytes))
-        .await
-        .unwrap_or(None)
+async fn namespace_indexdb_semantic_hash(path: PathBuf) -> Option<[u8; 32]> {
+    tokio::task::spawn_blocking(move || {
+        let db = open_n1_indexdb(&path).ok()?;
+        namespace_indexdb_semantic_hash_blocking(&db).ok()
+    })
+    .await
+    .unwrap_or(None)
 }
 
-pub fn namespace_catalog_semantic_hash(bytes: &[u8]) -> Option<[u8; 32]> {
-    let dir = std::env::temp_dir().join(format!("n1-namespace-v2-validate-{}", Ulid::new()));
-    let path = dir.join(NAMESPACE_V2_FILE);
-
-    let hash = (|| -> Option<[u8; 32]> {
-        if std::fs::create_dir_all(&dir).is_err() {
-            return None;
-        }
-        if std::fs::write(&path, bytes).is_err() {
-            return None;
-        }
-        let db = match open_n1_indexdb(&path) {
-            Ok(db) => db,
-            _ => return None,
-        };
-        let read_txn = match db.begin_read() {
-            Ok(txn) => txn,
-            Err(_) => return None,
-        };
-        let table = match read_txn.open_table(CATALOG_TABLE) {
-            Ok(table) => table,
-            Err(TableError::TableDoesNotExist(_)) => return None,
-            Err(_) => return None,
-        };
-        let Some(row) = table.get(CATALOG_ROW_KEY).ok().flatten() else {
-            return None;
-        };
-        let mut catalog = match rmp_serde::from_slice::<NamespaceCatalog>(row.value()) {
-            Ok(catalog) => catalog,
-            Err(_) => return None,
-        };
-        if catalog.rebuild_secondary_indices().is_err() {
-            return None;
-        }
-        rmp_serde::to_vec(&catalog)
-            .ok()
-            .map(|canonical| sha256_bytes(&canonical))
-    })();
-
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_dir_all(&dir);
-    hash
-}
-
-async fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).await?;
-    let temp_path = parent.join(format!(
-        ".{}.tmp.{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(NAMESPACE_V2_FILE),
-        Ulid::new()
-    ));
-    fs::write(&temp_path, data).await?;
-    fs::rename(&temp_path, path).await?;
-    Ok(())
-}
-
-fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+fn namespace_indexdb_semantic_hash_blocking(db: &Database) -> Result<[u8; 32], AppError> {
     let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher.finalize().into()
+    let mut after = None;
+    loop {
+        let nodes = db
+            .n1_list_namespace_nodes(after.as_deref(), 1000)
+            .map_err(|err| AppError::InternalServerError(format!("namespace hash scan: {err}")))?;
+        if nodes.is_empty() {
+            break;
+        }
+        after = nodes.last().map(|node| node.node_id.clone());
+        for node in nodes {
+            hash_field(&mut hasher, "namespace-node");
+            hash_field(&mut hasher, &node.node_id);
+            hash_field(&mut hasher, node.parent_node_id.as_deref().unwrap_or(""));
+            hash_field(&mut hasher, &node.name);
+            hash_field(&mut hasher, namespace_kind(node.kind));
+            hash_field(&mut hasher, node.object_id.as_deref().unwrap_or(""));
+            hash_field(&mut hasher, node.head_version_id.as_deref().unwrap_or(""));
+            hash_field(&mut hasher, &node.created_at_unix.to_string());
+            hash_field(&mut hasher, &node.updated_at_unix.to_string());
+        }
+    }
+
+    let mut after = None;
+    loop {
+        let roots = db
+            .n1_list_namespace_trash_roots_all(after.as_deref(), 1000)
+            .map_err(|err| {
+                AppError::InternalServerError(format!("namespace trash hash scan: {err}"))
+            })?;
+        if roots.is_empty() {
+            break;
+        }
+        after = roots.last().map(|root| root.trash_entry_id.clone());
+        for root in roots {
+            hash_field(&mut hasher, "namespace-trash-root");
+            hash_field(&mut hasher, &root.trash_entry_id);
+            hash_field(&mut hasher, &root.root_node_id);
+            hash_field(&mut hasher, &root.original_parent_node_id);
+            hash_field(&mut hasher, &root.original_name);
+            hash_field(&mut hasher, &root.original_path);
+            hash_field(&mut hasher, namespace_kind(root.kind));
+            hash_field(&mut hasher, root.object_id.as_deref().unwrap_or(""));
+            hash_field(&mut hasher, root.head_version_id.as_deref().unwrap_or(""));
+            hash_field(&mut hasher, &root.deleted_at_unix.to_string());
+            hash_field(
+                &mut hasher,
+                &root
+                    .retired_at_unix
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            );
+            hash_field(
+                &mut hasher,
+                &root
+                    .purged_at_unix
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            );
+            hash_field(&mut hasher, trash_state(root.state));
+        }
+    }
+
+    for state in [
+        n1_indexdb::ObjectState::Live,
+        n1_indexdb::ObjectState::Trash,
+        n1_indexdb::ObjectState::Deleted,
+    ] {
+        let mut after = None;
+        loop {
+            let rows = db
+                .n1_list_object_heads(state, None, after.as_deref(), 1000)
+                .map_err(|err| {
+                    AppError::InternalServerError(format!("object head hash scan: {err}"))
+                })?;
+            if rows.is_empty() {
+                break;
+            }
+            after = rows.last().map(|head| head.object_key.clone());
+            for head in rows {
+                hash_field(&mut hasher, "head");
+                hash_field(&mut hasher, &head.object_id);
+                hash_field(&mut hasher, &head.object_key);
+                hash_field(&mut hasher, &head.head_version_id);
+                hash_field(&mut hasher, &head.owner_uid);
+                hash_field(&mut hasher, &head.content_type);
+                hash_field(&mut hasher, &head.total_size_bytes.to_string());
+                hash_field(&mut hasher, object_state(head.state));
+                hash_field(&mut hasher, &head.generation.to_string());
+                hash_field(&mut hasher, &head.created_at_unix.to_string());
+                hash_field(&mut hasher, &head.updated_at_unix.to_string());
+            }
+        }
+    }
+
+    Ok(hasher.finalize().into())
+}
+
+fn namespace_kind(kind: n1_indexdb::NamespaceEntryKind) -> &'static str {
+    match kind {
+        n1_indexdb::NamespaceEntryKind::File => "file",
+        n1_indexdb::NamespaceEntryKind::Directory => "directory",
+    }
+}
+
+fn trash_state(state: n1_indexdb::TrashEntryState) -> &'static str {
+    match state {
+        n1_indexdb::TrashEntryState::Trashed => "trashed",
+        n1_indexdb::TrashEntryState::Retired => "retired",
+        n1_indexdb::TrashEntryState::Purged => "purged",
+    }
+}
+
+fn object_state(state: n1_indexdb::ObjectState) -> &'static str {
+    match state {
+        n1_indexdb::ObjectState::Live => "live",
+        n1_indexdb::ObjectState::Trash => "trash",
+        n1_indexdb::ObjectState::Deleted => "deleted",
+    }
+}
+
+fn hash_field(hasher: &mut Sha256, value: &str) {
+    hasher.update(value.as_bytes());
+    hasher.update([0]);
+}
+
+async fn copy_namespace_db_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let source = source.to_path_buf();
+    let destination = destination.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let temp_path = parent.join(format!(
+            ".{}.tmp.{}",
+            destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(INDEXDB_FILE),
+            Ulid::new()
+        ));
+        remove_indexdb_file_set(&temp_path)?;
+        let db = open_n1_indexdb(&source).map_err(|err| std::io::Error::other(err.to_string()))?;
+        db.backup_to_path(&temp_path)
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        remove_indexdb_file_set(&destination)?;
+        std::fs::rename(&temp_path, &destination)?;
+        remove_indexdb_file_set(&temp_path)?;
+        Ok(())
+    })
+    .await
+    .unwrap_or_else(|err| Err(std::io::Error::other(err.to_string())))
+}
+
+fn remove_indexdb_file_set(path: &Path) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(INDEXDB_FILE);
+    for candidate in [
+        path.to_path_buf(),
+        path.with_file_name(format!("{file_name}-wal")),
+        path.with_file_name(format!("{file_name}-shm")),
+    ] {
+        match std::fs::remove_file(&candidate) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }

@@ -43,6 +43,7 @@ struct FragmentCreatePayload {
     name: String,
     key: String,
     secret: String,
+    quota_bytes: u64,
 }
 
 #[derive(serde::Deserialize)]
@@ -115,7 +116,11 @@ async fn refresh_handler(
 }
 
 async fn create_fragment_handler(Json(payload): Json<FragmentCreatePayload>) -> impl IntoResponse {
-    if payload.name != "clinic" || payload.key != "clinic-key" || payload.secret != SECRET {
+    if payload.name != "clinic"
+        || payload.key != "clinic-key"
+        || payload.secret != SECRET
+        || payload.quota_bytes != 1_048_576
+    {
         return (StatusCode::BAD_REQUEST, "bad fragment payload").into_response();
     }
     (
@@ -370,6 +375,8 @@ async fn fragment_create_uses_direct_route() {
             "clinic",
             "--key",
             "clinic-key",
+            "--quota-bytes",
+            "1048576",
         ])
         .output()
         .unwrap();
@@ -413,7 +420,7 @@ async fn health_renders_disk_usage_and_health() {
         "stdout={stdout}\nstderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("N1 2.0 Health"));
+    assert!(stdout.contains("N1 3.0 Health"));
     assert!(stdout.contains("/mnt/DISK0"));
     assert!(stdout.contains("75.00%"));
     assert!(stdout.contains("healthy"));
@@ -497,12 +504,12 @@ async fn health_auto_refreshes_expiring_access_token() {
         "stdout={stdout}\nstderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("N1 2.0 Health"));
+    assert!(stdout.contains("N1 3.0 Health"));
     assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn maintenance_status_commands_use_n1_2_routes() {
+async fn maintenance_status_commands_use_n1_3_routes() {
     let router = Router::new()
         .route("/n1/fragments/hash", get(fragment_hash_handler))
         .route("/n1/auth/fragment", post(auth_handler))

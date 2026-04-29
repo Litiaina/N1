@@ -68,6 +68,8 @@ const UPLOAD_IO_GATE_TIMEOUT_SECS: u64 = 2;
 
 #[cfg(target_os = "linux")]
 static IO_URING_ENABLED: Lazy<bool> = Lazy::new(|| {
+    // The current ring path constructs a short-lived ring per direct write. Keep
+    // it opt-in until this writer owns a reusable ring per file/worker.
     let enabled = std::env::var("N1_IO_URING_ENABLED")
         .ok()
         .map(|v| {
@@ -76,7 +78,7 @@ static IO_URING_ENABLED: Lazy<bool> = Lazy::new(|| {
                 "0" | "false" | "off" | "no"
             )
         })
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     if !enabled {
         return false;
@@ -867,6 +869,37 @@ async fn uploaded_parts_from_disk(
     Ok(uploaded_parts)
 }
 
+fn uploaded_part_bytes(manifest: &UploadSessionManifest, parts: &BTreeSet<u64>) -> u64 {
+    parts
+        .iter()
+        .filter_map(|part_index| expected_part_size_bytes(manifest, *part_index))
+        .sum()
+}
+
+async fn persist_missing_receipt_from_disk(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    version_id: &str,
+    manifest: &UploadSessionManifest,
+    part_index: u64,
+) -> Result<(), AppError> {
+    let receipt_exists = index::load_session_part_receipts(fragment, version_id, manifest)
+        .await?
+        .and_then(|receipts| receipts.get(part_index as usize).cloned().flatten())
+        .is_some();
+    if receipt_exists {
+        return Ok(());
+    }
+
+    if let Some(part_meta) =
+        reconstruct_part_meta_from_disk(path_manager, manifest, part_index).await?
+    {
+        index::commit_session_part_receipt(fragment, version_id, manifest, &part_meta).await?;
+    }
+
+    Ok(())
+}
+
 async fn reconstruct_part_meta_from_disk(
     path_manager: &ObjectPathManager,
     manifest: &UploadSessionManifest,
@@ -1447,12 +1480,7 @@ pub async fn initiate_object_upload(
     let path_manager = ObjectPathManager::new();
     ensure_version_shard_dirs(&path_manager, &manifest).await?;
 
-    if let Err(e) = index::open_session(&manifest, Some(receipt)).await {
-        return Err(AppError::InternalServerError(format!(
-            "Failed to initialize partitioned session index: {}",
-            e
-        )));
-    }
+    index::open_session(&manifest, Some(receipt)).await?;
 
     info!(
         "Initiated upload: {}/{} (v: {}, s: {})",
@@ -1534,21 +1562,29 @@ pub async fn get_upload_status(
 
     if let Some(state) = index::load_session(&fragment, &version_id).await? {
         let path_manager = ObjectPathManager::new();
-        let (committed_parts, committed_bytes) = committed_session_progress(&state);
-        let mut parts = if let Some(receipts) =
+        let (mut committed_parts, mut committed_bytes) = committed_session_progress(&state);
+        let mut part_set = BTreeSet::new();
+        if let Some(receipts) =
             index::load_session_part_receipts(&fragment, &version_id, &state.manifest).await?
         {
-            receipts
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, receipt)| receipt.as_ref().map(|_| idx as u64))
-                .collect()
-        } else if state.manifest.part_size_bytes > 0 {
-            uploaded_parts_from_disk(&path_manager, &state.manifest).await?
-        } else {
-            Vec::new()
-        };
-        parts.sort_unstable();
+            part_set.extend(
+                receipts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, receipt)| receipt.as_ref().map(|_| idx as u64)),
+            );
+        }
+        if state.manifest.part_size_bytes > 0
+            && part_set.len() < state.manifest.expected_parts as usize
+        {
+            part_set.extend(uploaded_parts_from_disk(&path_manager, &state.manifest).await?);
+        }
+        let disk_backed_bytes = uploaded_part_bytes(&state.manifest, &part_set);
+        if disk_backed_bytes > committed_bytes {
+            committed_parts = part_set.len() as u64;
+            committed_bytes = disk_backed_bytes;
+        }
+        let parts = part_set.into_iter().collect();
         return Ok(AxumJson(UploadStatusResponse {
             uploaded_parts: parts,
             committed_parts,
@@ -1629,6 +1665,20 @@ pub async fn object_upload_part(
             warn!(
                 "Multipart resume for {}/{} part {} skipped checksum revalidation because session part metadata is not persisted",
                 fragment, version_id, part_index
+            );
+        }
+        if let Err(err) = persist_missing_receipt_from_disk(
+            &path_manager,
+            &fragment,
+            &version_id,
+            &manifest,
+            part_index,
+        )
+        .await
+        {
+            warn!(
+                "Multipart resume for {}/{} part {} could not refresh compact receipt: {}",
+                fragment, version_id, part_index, err
             );
         }
         return Ok((StatusCode::OK, "Part already uploaded").into_response());
@@ -1716,7 +1766,9 @@ pub async fn upload_object_one_shot(
         request_content_type(&headers).unwrap_or_else(|| "application/octet-stream".to_string());
 
     let path_manager = ObjectPathManager::new();
-    let part_meta = write_part_blob_to_disk(
+    index::reserve_upload_quota(&fragment, &object_key, &version_id, content_length).await?;
+
+    let part_meta = match write_part_blob_to_disk(
         &path_manager,
         &fragment,
         &version_id,
@@ -1726,7 +1778,14 @@ pub async fn upload_object_one_shot(
         expected_checksum,
         strict_durability,
     )
-    .await?;
+    .await
+    {
+        Ok(part_meta) => part_meta,
+        Err(err) => {
+            let _ = index::release_upload_quota(&fragment, &version_id).await;
+            return Err(err);
+        }
+    };
 
     let stripe_size = STRIPE_SIZE_ATOMIC
         .get()
@@ -1747,8 +1806,17 @@ pub async fn upload_object_one_shot(
         stripe_size_bytes: stripe_size,
     };
 
-    let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
-    index::publish_object(&object_meta).await?;
+    let _object_lock = match index::acquire_object_operation_lock(&fragment, &object_key).await {
+        Ok(lock) => lock,
+        Err(err) => {
+            let _ = index::release_upload_quota(&fragment, &version_id).await;
+            return Err(err);
+        }
+    };
+    if let Err(err) = index::publish_object(&object_meta).await {
+        let _ = index::release_upload_quota(&fragment, &version_id).await;
+        return Err(err);
+    }
 
     let response_body = serde_json::to_value(&object_meta).map_err(|e| {
         AppError::InternalServerError(format!("serialize one-shot upload response: {}", e))

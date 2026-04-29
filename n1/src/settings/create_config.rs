@@ -21,7 +21,7 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("max_cached_dbs", "auto");
 
     conf.with_section(Some("namespace_config"))
-        .set("max_loaded_catalogs", "auto")
+        .set("max_loaded_facades", "auto")
         .set("max_loaded_dbs", "auto");
 
     conf.with_section(Some("garbage_collector"))

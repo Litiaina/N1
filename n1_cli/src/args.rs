@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 const CLI_LONG_ABOUT: &str = "\
-Operator-first CLI for N1 2.0.
+Operator-first CLI for N1 3.0.
 
 Use this CLI to inspect health, track upload pressure, and run maintenance jobs
 without guessing the HTTP routes behind them. Global flags apply to every
@@ -24,7 +24,7 @@ Examples:
 #[command(
     name = "litiaina-n1-cli",
     version,
-    about = "Operator CLI for N1 2.0",
+    about = "Operator CLI for N1 3.0",
     long_about = CLI_LONG_ABOUT,
     subcommand_required = true,
     arg_required_else_help = true,
@@ -177,6 +177,9 @@ pub struct FragmentCreateArgs {
 
     #[arg(long, help = "Secret key that protects the fragment.")]
     pub key: String,
+
+    #[arg(long, help = "Fragment quota in bytes.")]
+    pub quota_bytes: u64,
 }
 
 #[derive(Subcommand, Debug, Clone)]

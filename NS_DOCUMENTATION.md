@@ -19,6 +19,8 @@ Use `NS` when clients need Windows/macOS/Linux file-manager access. Use `N1` as 
 
 Do not point `NS` share roots, metadata, or staging paths at `N1` index roots or blob roots. They are separate products and must not share internal storage directories.
 
+For `N1 3.0`, the N1 index roots contain per-fragment metadata databases at `<index_root>/<fragment_hash>/indexdb/index.ndxdb`. `NS` may read those roots for fragment authentication metadata, but it must not treat old `namespace_v2` or redb-era files as active N1 authority.
+
 ## Build And Run
 
 From the workspace root:
@@ -100,7 +102,7 @@ query_directory_max_buffered_entries=4096
 query_directory_max_seeded_entries=512
 ```
 
-No per-fragment config is required. `NS` reads N1 fragment metadata from the configured `index_roots`, verifies the SMB NTLMv2 login locally, and then creates the local NAS share automatically.
+No per-fragment config is required. `NS` reads N1 fragment metadata from the configured `index_roots`, verifies the SMB NTLMv2 login locally, and then creates the local NAS share automatically. For `N1 3.0`, those roots are expected to contain the per-fragment `indexdb/index.ndxdb` layout.
 
 Example:
 

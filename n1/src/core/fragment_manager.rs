@@ -21,9 +21,10 @@ use crate::{
             write_fragment_metadata,
         },
         indexdb_store::{
-            ensure_fragment_owner_partition_available_strict, evict_fragment_cached_dbs,
-            has_any_fragment_partition_db,
+            active_fragment_quota_bytes, ensure_fragment_owner_partition_available_strict,
+            evict_fragment_cached_dbs, has_any_fragment_partition_db, set_fragment_quota,
         },
+        quota_manager::get_storage_usage,
         sync::{
             CreateFragmentRequest, CreateFragmentResponse, ensure_fragment_blob_directories_strict,
         },
@@ -117,6 +118,20 @@ async fn prepare_fragment_index_roots_strict(fragment: &str) -> Result<(), AppEr
     Ok(())
 }
 
+async fn enforce_fragment_quota_request(requested_quota: u64) -> Result<(), AppError> {
+    if requested_quota == 0 {
+        return Ok(());
+    }
+    let usage = get_storage_usage().await?;
+    let active_quota = tokio::task::spawn_blocking(active_fragment_quota_bytes)
+        .await
+        .map_err(|err| AppError::InternalServerError(format!("quota scan task: {err}")))??;
+    if active_quota.saturating_add(requested_quota) > usage.capacity_allocated {
+        return Err(AppError::InsufficientStorage);
+    }
+    Ok(())
+}
+
 pub async fn create_fragment(
     Json(payload): Json<CreateFragmentRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -143,9 +158,23 @@ pub async fn create_fragment(
         )));
     }
 
+    let requested_quota = payload.quota_bytes.ok_or_else(|| {
+        AppError::BadRequest(
+            "quota_bytes is required when creating a fragment; fragments are quota-bound virtual partitions"
+                .to_string(),
+        )
+    })?;
+    if requested_quota == 0 {
+        return Err(AppError::BadRequest(
+            "quota_bytes must be greater than 0".to_string(),
+        ));
+    }
+    enforce_fragment_quota_request(requested_quota).await?;
+
     prepare_fragment_index_roots_strict(&hash).await?;
     ensure_fragment_blob_directories_strict(&hash).await?;
     ensure_fragment_owner_partition_available_strict(&hash)?;
+    set_fragment_quota(&hash, requested_quota)?;
     if !metadata_exists {
         let _ = init_fragment_metadata_strict(&hash, &payload.key).await?;
     }

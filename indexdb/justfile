@@ -1,8 +1,0 @@
-fmt:
-    cargo fmt --manifest-path Cargo.toml --all
-
-check:
-    cargo check --manifest-path Cargo.toml
-
-test:
-    cargo test --manifest-path Cargo.toml --lib

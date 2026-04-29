@@ -63,6 +63,7 @@ struct CreateFragmentRequest<'a> {
     name: &'a str,
     secret: &'a str,
     key: &'a str,
+    quota_bytes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,6 +279,7 @@ impl StorageBroker {
     pub async fn ensure_default_fragment(
         &self,
         fragment_name: &str,
+        quota_bytes: u64,
     ) -> Result<(StorageDeployment, String), RegistryError> {
         let backend = self.resolve_default_backend()?;
         let fragment_hash = hash_fragment_name(fragment_name);
@@ -290,6 +292,7 @@ impl StorageBroker {
                 name: fragment_name,
                 secret: &backend.master_key,
                 key: &fragment_key,
+                quota_bytes,
             })
             .send()
             .await

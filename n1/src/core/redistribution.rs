@@ -2477,7 +2477,7 @@ async fn redistribute_object_streaming(
                 break;
             }
 
-            let chunk = read_or_recover_chunk(
+            let chunk = match read_or_recover_chunk(
                 &mut file_cache,
                 Path::new(""),
                 old_part_arc.clone(),
@@ -2486,7 +2486,34 @@ async fn redistribute_object_streaming(
                 to_read,
                 old_block_size,
             )
-            .await?;
+            .await
+            {
+                Ok(chunk) => chunk,
+                Err(err) => {
+                    let still_present = if is_trash {
+                        index::read_trashed_object_version(
+                            &meta.fragment,
+                            &meta.object_key,
+                            &meta.version_id,
+                        )
+                        .await
+                        .is_ok()
+                    } else {
+                        index::read_object_version(
+                            &meta.fragment,
+                            &meta.object_key,
+                            &meta.version_id,
+                        )
+                        .await
+                        .is_ok()
+                    };
+                    if !still_present {
+                        cleanup_tmp_files(&created_tmps).await;
+                        return Ok(());
+                    }
+                    return Err(err);
+                }
+            };
 
             batch.extend_from_slice(&chunk);
 

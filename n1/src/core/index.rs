@@ -85,11 +85,44 @@ fn parse_crc32_hex(value: &str) -> Result<u32, AppError> {
     })
 }
 
+async fn run_indexdb_blocking<T>(
+    op: impl FnOnce() -> Result<T, AppError> + Send + 'static,
+) -> Result<T, AppError>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(op).await.map_err(|err| {
+        AppError::InternalServerError(format!("indexdb blocking worker failed: {err}"))
+    })?
+}
+
 pub async fn open_session(
     manifest: &UploadSessionManifest,
     reservation: Option<ReservationReceipt>,
 ) -> Result<(), AppError> {
-    indexdb_store::open_session(manifest, reservation)
+    let manifest = manifest.clone();
+    run_indexdb_blocking(move || indexdb_store::open_session(&manifest, reservation)).await
+}
+
+pub async fn reserve_upload_quota(
+    fragment: &str,
+    object_key: &str,
+    version_id: &str,
+    reserved_bytes: u64,
+) -> Result<(), AppError> {
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    let version_id = version_id.to_string();
+    run_indexdb_blocking(move || {
+        indexdb_store::reserve_upload_quota(&fragment, &object_key, &version_id, reserved_bytes)
+    })
+    .await
+}
+
+pub async fn release_upload_quota(fragment: &str, version_id: &str) -> Result<(), AppError> {
+    let fragment = fragment.to_string();
+    let version_id = version_id.to_string();
+    run_indexdb_blocking(move || indexdb_store::release_upload_quota(&fragment, &version_id)).await
 }
 
 pub async fn commit_session_part(
@@ -98,7 +131,11 @@ pub async fn commit_session_part(
     part: &PartMetadata,
     _replica_write_mode: IndexReplicaWriteMode,
 ) -> Result<(), AppError> {
-    indexdb_store::commit_session_part(fragment, version_id, part)
+    let fragment = fragment.to_string();
+    let version_id = version_id.to_string();
+    let part = part.clone();
+    run_indexdb_blocking(move || indexdb_store::commit_session_part(&fragment, &version_id, &part))
+        .await
 }
 
 pub async fn commit_session_part_receipt(
@@ -137,14 +174,21 @@ pub async fn commit_session_part_receipt(
             .map(|shard| parse_crc32_hex(&shard.checksum))
             .collect::<Result<Vec<_>, _>>()?,
     };
-    indexdb_store::commit_session_part_receipt(fragment, version_id, &receipt)
+    let fragment = fragment.to_string();
+    let version_id = version_id.to_string();
+    run_indexdb_blocking(move || {
+        indexdb_store::commit_session_part_receipt(&fragment, &version_id, &receipt)
+    })
+    .await
 }
 
 pub async fn load_session(
     fragment: &str,
     version_id: &str,
 ) -> Result<Option<IndexSessionState>, AppError> {
-    indexdb_store::load_session(fragment, version_id)
+    let fragment = fragment.to_string();
+    let version_id = version_id.to_string();
+    run_indexdb_blocking(move || indexdb_store::load_session(&fragment, &version_id)).await
 }
 
 pub async fn read_session_part(
@@ -152,7 +196,12 @@ pub async fn read_session_part(
     version_id: &str,
     part_index: u64,
 ) -> Result<Option<PartMetadata>, AppError> {
-    indexdb_store::read_session_part(fragment, version_id, part_index)
+    let fragment = fragment.to_string();
+    let version_id = version_id.to_string();
+    run_indexdb_blocking(move || {
+        indexdb_store::read_session_part(&fragment, &version_id, part_index)
+    })
+    .await
 }
 
 pub async fn load_session_part_receipts(
@@ -160,7 +209,13 @@ pub async fn load_session_part_receipts(
     version_id: &str,
     manifest: &UploadSessionManifest,
 ) -> Result<Option<Vec<Option<SessionPartReceipt>>>, AppError> {
-    indexdb_store::load_session_part_receipts(fragment, version_id, manifest)
+    let fragment = fragment.to_string();
+    let version_id = version_id.to_string();
+    let manifest = manifest.clone();
+    run_indexdb_blocking(move || {
+        indexdb_store::load_session_part_receipts(&fragment, &version_id, &manifest)
+    })
+    .await
 }
 
 pub async fn remove_session(
@@ -168,24 +223,33 @@ pub async fn remove_session(
     version_id: &str,
     _reason: &str,
 ) -> Result<(), AppError> {
-    let _ = indexdb_store::remove_session(fragment, version_id)?;
-    Ok(())
+    let fragment = fragment.to_string();
+    let version_id = version_id.to_string();
+    run_indexdb_blocking(move || {
+        let _ = indexdb_store::remove_session(&fragment, &version_id)?;
+        Ok(())
+    })
+    .await
 }
 
 pub async fn list_active_sessions(fragment: &str) -> Result<Vec<IndexSessionState>, AppError> {
-    indexdb_store::list_active_sessions(fragment)
+    let fragment = fragment.to_string();
+    run_indexdb_blocking(move || indexdb_store::list_active_sessions(&fragment)).await
 }
 
 pub async fn publish_object(metadata: &ObjectMetadata) -> Result<(), AppError> {
-    indexdb_store::upsert_live_version(metadata)
+    let metadata = metadata.clone();
+    run_indexdb_blocking(move || indexdb_store::upsert_live_version(&metadata)).await
 }
 
 pub async fn upsert_object_version(metadata: &ObjectMetadata) -> Result<(), AppError> {
-    indexdb_store::upsert_live_version(metadata)
+    let metadata = metadata.clone();
+    run_indexdb_blocking(move || indexdb_store::upsert_live_version(&metadata)).await
 }
 
 pub async fn upsert_trashed_object_version(metadata: &ObjectMetadata) -> Result<(), AppError> {
-    indexdb_store::upsert_trash_version(metadata)
+    let metadata = metadata.clone();
+    run_indexdb_blocking(move || indexdb_store::upsert_trash_version(&metadata)).await
 }
 
 pub async fn read_object_version(
@@ -193,7 +257,14 @@ pub async fn read_object_version(
     object_key: &str,
     version_id: &str,
 ) -> Result<ObjectMetadata, AppError> {
-    indexdb_store::read_live_version(fragment, object_key, version_id)?.ok_or(AppError::NotFound)
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    let version_id = version_id.to_string();
+    run_indexdb_blocking(move || {
+        indexdb_store::read_live_version(&fragment, &object_key, &version_id)?
+            .ok_or(AppError::NotFound)
+    })
+    .await
 }
 
 pub async fn read_trashed_object_version(
@@ -201,99 +272,147 @@ pub async fn read_trashed_object_version(
     object_key: &str,
     version_id: &str,
 ) -> Result<ObjectMetadata, AppError> {
-    indexdb_store::read_trash_version(fragment, object_key, version_id)?.ok_or(AppError::NotFound)
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    let version_id = version_id.to_string();
+    run_indexdb_blocking(move || {
+        indexdb_store::read_trash_version(&fragment, &object_key, &version_id)?
+            .ok_or(AppError::NotFound)
+    })
+    .await
 }
 
 pub async fn list_live_object_versions_metadata(
     fragment: &str,
     object_key: &str,
 ) -> Result<Vec<ObjectMetadata>, AppError> {
-    indexdb_store::list_live_versions(fragment, object_key)
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    run_indexdb_blocking(move || indexdb_store::list_live_versions(&fragment, &object_key)).await
 }
 
 pub async fn list_trashed_object_versions_metadata(
     fragment: &str,
     object_key: &str,
 ) -> Result<Vec<ObjectMetadata>, AppError> {
-    indexdb_store::list_trash_versions(fragment, object_key)
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    run_indexdb_blocking(move || indexdb_store::list_trash_versions(&fragment, &object_key)).await
 }
 
 pub async fn list_live_object_version_ids(
     fragment: &str,
     object_key: &str,
 ) -> Result<Vec<String>, AppError> {
-    Ok(indexdb_store::list_live_versions(fragment, object_key)?
-        .into_iter()
-        .map(|metadata| metadata.version_id)
-        .collect())
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    run_indexdb_blocking(move || {
+        Ok(indexdb_store::list_live_versions(&fragment, &object_key)?
+            .into_iter()
+            .map(|metadata| metadata.version_id)
+            .collect())
+    })
+    .await
 }
 
 pub async fn list_trashed_object_version_ids(
     fragment: &str,
     object_key: &str,
 ) -> Result<Vec<String>, AppError> {
-    Ok(indexdb_store::list_trash_versions(fragment, object_key)?
-        .into_iter()
-        .map(|metadata| metadata.version_id)
-        .collect())
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    run_indexdb_blocking(move || {
+        Ok(indexdb_store::list_trash_versions(&fragment, &object_key)?
+            .into_iter()
+            .map(|metadata| metadata.version_id)
+            .collect())
+    })
+    .await
 }
 
 pub async fn read_latest_object(
     fragment: &str,
     object_key: &str,
 ) -> Result<ObjectMetadata, AppError> {
-    indexdb_store::read_current_live_head(fragment, object_key)?.ok_or(AppError::NotFound)
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    run_indexdb_blocking(move || {
+        indexdb_store::read_current_live_head(&fragment, &object_key)?.ok_or(AppError::NotFound)
+    })
+    .await
 }
 
 pub async fn read_latest_trashed_object(
     fragment: &str,
     object_key: &str,
 ) -> Result<ObjectMetadata, AppError> {
-    indexdb_store::read_latest_trash(fragment, object_key)?.ok_or(AppError::NotFound)
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    run_indexdb_blocking(move || {
+        indexdb_store::read_latest_trash(&fragment, &object_key)?.ok_or(AppError::NotFound)
+    })
+    .await
 }
 
 pub async fn list_fragment_trash_objects(fragment: &str) -> Result<Vec<ObjectMetadata>, AppError> {
-    indexdb_store::list_trash_heads(fragment)
+    let fragment = fragment.to_string();
+    run_indexdb_blocking(move || indexdb_store::list_trash_heads(&fragment)).await
 }
 
 pub async fn list_fragment_object_keys_with_trash_versions(
     fragment: &str,
 ) -> Result<Vec<String>, AppError> {
-    indexdb_store::list_object_keys_with_trash_versions(fragment)
+    let fragment = fragment.to_string();
+    run_indexdb_blocking(move || indexdb_store::list_object_keys_with_trash_versions(&fragment))
+        .await
 }
 
 pub async fn list_active_trash_partition_ids(
     fragment: &str,
 ) -> Result<std::collections::BTreeSet<u16>, AppError> {
-    indexdb_store::list_active_trash_partition_ids(fragment)
+    let fragment = fragment.to_string();
+    run_indexdb_blocking(move || indexdb_store::list_active_trash_partition_ids(&fragment)).await
 }
 
 pub async fn list_partition_trash_entries(
     fragment: &str,
     partition_id: u16,
 ) -> Result<std::collections::HashMap<String, Vec<String>>, AppError> {
-    indexdb_store::list_partition_trash_entries(fragment, partition_id)
+    let fragment = fragment.to_string();
+    run_indexdb_blocking(move || {
+        indexdb_store::list_partition_trash_entries(&fragment, partition_id)
+    })
+    .await
 }
 
 pub async fn list_fragment_trash_catalog(
     fragment: &str,
 ) -> Result<Vec<TrashCatalogEntry>, AppError> {
-    indexdb_store::list_trash_catalog(fragment)
+    let fragment = fragment.to_string();
+    run_indexdb_blocking(move || indexdb_store::list_trash_catalog(&fragment)).await
 }
 
 pub async fn list_trashed_object_version_ids_batch(
     fragment: &str,
     object_keys: &[String],
 ) -> Result<std::collections::HashMap<String, Vec<String>>, AppError> {
-    indexdb_store::list_trashed_object_version_ids_batch(fragment, object_keys)
+    let fragment = fragment.to_string();
+    let object_keys = object_keys.to_vec();
+    run_indexdb_blocking(move || {
+        indexdb_store::list_trashed_object_version_ids_batch(&fragment, &object_keys)
+    })
+    .await
 }
 
 pub async fn object_partition_id(fragment: &str, object_key: &str) -> Result<u16, AppError> {
-    indexdb_store::object_partition_id(fragment, object_key)
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    run_indexdb_blocking(move || indexdb_store::object_partition_id(&fragment, &object_key)).await
 }
 
 pub async fn list_fragment_live_objects(fragment: &str) -> Result<Vec<ObjectMetadata>, AppError> {
-    indexdb_store::list_live_heads(fragment)
+    let fragment = fragment.to_string();
+    run_indexdb_blocking(move || indexdb_store::list_live_heads(&fragment)).await
 }
 
 pub async fn scan_fragment_live_objects_page(
@@ -304,14 +423,18 @@ pub async fn scan_fragment_live_objects_page(
     continuation_token: Option<String>,
     include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
-    indexdb_store::scan_live_heads_page(
-        fragment,
-        prefix,
-        delimiter,
-        limit,
-        continuation_token,
-        include_internal,
-    )
+    let fragment = fragment.to_string();
+    run_indexdb_blocking(move || {
+        indexdb_store::scan_live_heads_page(
+            &fragment,
+            prefix,
+            delimiter,
+            limit,
+            continuation_token,
+            include_internal,
+        )
+    })
+    .await
 }
 
 pub async fn scan_fragment_live_metadata_page(
@@ -322,14 +445,18 @@ pub async fn scan_fragment_live_metadata_page(
     continuation_token: Option<String>,
     include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
-    indexdb_store::scan_live_full_metadata_page(
-        fragment,
-        prefix,
-        delimiter,
-        limit,
-        continuation_token,
-        include_internal,
-    )
+    let fragment = fragment.to_string();
+    run_indexdb_blocking(move || {
+        indexdb_store::scan_live_full_metadata_page(
+            &fragment,
+            prefix,
+            delimiter,
+            limit,
+            continuation_token,
+            include_internal,
+        )
+    })
+    .await
 }
 
 pub async fn scan_fragment_trash_objects_page(
@@ -340,14 +467,18 @@ pub async fn scan_fragment_trash_objects_page(
     continuation_token: Option<String>,
     include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
-    indexdb_store::scan_trash_heads_page(
-        fragment,
-        prefix,
-        delimiter,
-        limit,
-        continuation_token,
-        include_internal,
-    )
+    let fragment = fragment.to_string();
+    run_indexdb_blocking(move || {
+        indexdb_store::scan_trash_heads_page(
+            &fragment,
+            prefix,
+            delimiter,
+            limit,
+            continuation_token,
+            include_internal,
+        )
+    })
+    .await
 }
 
 pub async fn scan_fragment_trash_metadata_page(
@@ -358,14 +489,18 @@ pub async fn scan_fragment_trash_metadata_page(
     continuation_token: Option<String>,
     include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
-    indexdb_store::scan_trash_full_metadata_page(
-        fragment,
-        prefix,
-        delimiter,
-        limit,
-        continuation_token,
-        include_internal,
-    )
+    let fragment = fragment.to_string();
+    run_indexdb_blocking(move || {
+        indexdb_store::scan_trash_full_metadata_page(
+            &fragment,
+            prefix,
+            delimiter,
+            limit,
+            continuation_token,
+            include_internal,
+        )
+    })
+    .await
 }
 
 pub async fn move_object_version_to_trash_with_metadata(
@@ -373,8 +508,18 @@ pub async fn move_object_version_to_trash_with_metadata(
     object_key: &str,
     version_id: &str,
 ) -> Result<ObjectMetadata, AppError> {
-    indexdb_store::move_object_version_to_trash_with_metadata(fragment, object_key, version_id)?
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    let version_id = version_id.to_string();
+    run_indexdb_blocking(move || {
+        indexdb_store::move_object_version_to_trash_with_metadata(
+            &fragment,
+            &object_key,
+            &version_id,
+        )?
         .ok_or(AppError::NotFound)
+    })
+    .await
 }
 
 #[allow(dead_code)]
@@ -393,70 +538,114 @@ pub async fn restore_object_version_from_trash_with_metadata(
     object_key: &str,
     version_id: &str,
 ) -> Result<ObjectMetadata, AppError> {
-    indexdb_store::restore_object_version_from_trash_with_metadata(
-        fragment, object_key, version_id,
-    )?
-    .ok_or(AppError::NotFound)
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    let version_id = version_id.to_string();
+    run_indexdb_blocking(move || {
+        indexdb_store::restore_object_version_from_trash_with_metadata(
+            &fragment,
+            &object_key,
+            &version_id,
+        )?
+        .ok_or(AppError::NotFound)
+    })
+    .await
 }
 
 pub async fn move_object_to_trash_fast(
     fragment: &str,
     object_key: &str,
 ) -> Result<Option<Vec<String>>, AppError> {
-    indexdb_store::move_object_to_trash_fast(fragment, object_key)
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    run_indexdb_blocking(move || indexdb_store::move_object_to_trash_fast(&fragment, &object_key))
+        .await
 }
 
 pub async fn move_objects_to_trash_batch(
     fragment: &str,
     object_keys: &[String],
 ) -> Result<HashMap<String, Vec<String>>, AppError> {
-    indexdb_store::move_objects_to_trash_batch(fragment, object_keys)
+    let fragment = fragment.to_string();
+    let object_keys = object_keys.to_vec();
+    run_indexdb_blocking(move || {
+        indexdb_store::move_objects_to_trash_batch(&fragment, &object_keys)
+    })
+    .await
 }
 
 pub async fn restore_object_from_trash_fast(
     fragment: &str,
     object_key: &str,
 ) -> Result<Option<Vec<String>>, AppError> {
-    indexdb_store::restore_object_from_trash_fast(fragment, object_key)
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    run_indexdb_blocking(move || {
+        indexdb_store::restore_object_from_trash_fast(&fragment, &object_key)
+    })
+    .await
 }
 
 pub async fn restore_objects_from_trash_batch(
     fragment: &str,
     object_keys: &[String],
 ) -> Result<HashMap<String, Vec<String>>, AppError> {
-    indexdb_store::restore_objects_from_trash_batch(fragment, object_keys)
+    let fragment = fragment.to_string();
+    let object_keys = object_keys.to_vec();
+    run_indexdb_blocking(move || {
+        indexdb_store::restore_objects_from_trash_batch(&fragment, &object_keys)
+    })
+    .await
 }
 
 pub async fn restore_objects_from_trash_manifest_batch(
     fragment: &str,
     object_versions: &HashMap<String, Vec<String>>,
 ) -> Result<HashMap<String, Vec<String>>, AppError> {
-    indexdb_store::restore_objects_from_trash_manifest_batch(fragment, object_versions)
+    let fragment = fragment.to_string();
+    let object_versions = object_versions.clone();
+    run_indexdb_blocking(move || {
+        indexdb_store::restore_objects_from_trash_manifest_batch(&fragment, &object_versions)
+    })
+    .await
 }
 
 pub async fn delete_all_trash_versions_for_key(
     fragment: &str,
     object_key: &str,
 ) -> Result<Option<Vec<String>>, AppError> {
-    indexdb_store::delete_all_trash_versions_for_key(fragment, object_key)
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    run_indexdb_blocking(move || {
+        indexdb_store::delete_all_trash_versions_for_key(&fragment, &object_key)
+    })
+    .await
 }
 
 pub async fn delete_object_fast(
     fragment: &str,
     object_key: &str,
 ) -> Result<Option<Vec<String>>, AppError> {
-    indexdb_store::delete_object_fast(fragment, object_key)
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    run_indexdb_blocking(move || indexdb_store::delete_object_fast(&fragment, &object_key)).await
 }
 
 pub async fn sync_fragment_partition_replicas(fragment: &str) -> Result<(), AppError> {
-    indexdb_store::sync_fragment_partition_replicas(fragment)
+    let fragment = fragment.to_string();
+    run_indexdb_blocking(move || indexdb_store::sync_fragment_partition_replicas(&fragment)).await
 }
 
 pub async fn ensure_object_owner_partition_available(
     fragment: &str,
     object_key: &str,
 ) -> Result<(), AppError> {
-    indexdb_store::ensure_object_owner_partition_available(fragment, object_key)
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    run_indexdb_blocking(move || {
+        indexdb_store::ensure_object_owner_partition_available(&fragment, &object_key)
+    })
+    .await
 }
 
 pub async fn delete_object_version(
@@ -464,11 +653,17 @@ pub async fn delete_object_version(
     object_key: &str,
     version_id: &str,
 ) -> Result<(), AppError> {
-    if indexdb_store::delete_live_version(fragment, object_key, version_id)? {
-        Ok(())
-    } else {
-        Err(AppError::NotFound)
-    }
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    let version_id = version_id.to_string();
+    run_indexdb_blocking(move || {
+        if indexdb_store::delete_live_version(&fragment, &object_key, &version_id)? {
+            Ok(())
+        } else {
+            Err(AppError::NotFound)
+        }
+    })
+    .await
 }
 
 pub async fn delete_trashed_object_version(
@@ -476,30 +671,50 @@ pub async fn delete_trashed_object_version(
     object_key: &str,
     version_id: &str,
 ) -> Result<(), AppError> {
-    if indexdb_store::delete_trash_version(fragment, object_key, version_id)? {
-        Ok(())
-    } else {
-        Err(AppError::NotFound)
-    }
+    let fragment = fragment.to_string();
+    let object_key = object_key.to_string();
+    let version_id = version_id.to_string();
+    run_indexdb_blocking(move || {
+        if indexdb_store::delete_trash_version(&fragment, &object_key, &version_id)? {
+            Ok(())
+        } else {
+            Err(AppError::NotFound)
+        }
+    })
+    .await
 }
 
 pub async fn clear_fragment_trash_in_partitions(
     fragment: &str,
     object_key: Option<&str>,
 ) -> Result<(), AppError> {
-    indexdb_store::clear_fragment_trash(fragment, object_key)
+    let fragment = fragment.to_string();
+    let object_key = object_key.map(ToOwned::to_owned);
+    run_indexdb_blocking(move || {
+        indexdb_store::clear_fragment_trash(&fragment, object_key.as_deref())
+    })
+    .await
 }
 
 pub async fn clear_fragment_trash_for_partitions(
     fragment: &str,
     touched_partitions: &std::collections::BTreeSet<u16>,
 ) -> Result<usize, AppError> {
-    indexdb_store::clear_fragment_trash_for_partitions(fragment, touched_partitions)
+    let fragment = fragment.to_string();
+    let touched_partitions = touched_partitions.clone();
+    run_indexdb_blocking(move || {
+        indexdb_store::clear_fragment_trash_for_partitions(&fragment, &touched_partitions)
+    })
+    .await
 }
 
 pub async fn clear_fragment_trash_partition(
     fragment: &str,
     partition_id: u16,
 ) -> Result<usize, AppError> {
-    indexdb_store::clear_fragment_trash_partition(fragment, partition_id)
+    let fragment = fragment.to_string();
+    run_indexdb_blocking(move || {
+        indexdb_store::clear_fragment_trash_partition(&fragment, partition_id)
+    })
+    .await
 }

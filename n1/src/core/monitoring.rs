@@ -112,13 +112,13 @@ pub struct DiskStatus {
 pub struct ConsistencyStats {
     pub total_partition_dbs_scanned: u64,
     pub index_partition_health: String,
-    pub namespace_v2: NamespaceV2HealthStats,
+    pub namespace_indexdb: NamespaceIndexDbHealthStats,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partition_db_counts: Option<HashMap<String, u64>>,
 }
 
 #[derive(Serialize, Clone, Default)]
-pub struct NamespaceV2HealthStats {
+pub struct NamespaceIndexDbHealthStats {
     pub fragments_checked: u64,
     pub fragments_degraded: u64,
     pub fragments_critical: u64,
@@ -605,16 +605,16 @@ async fn detect_fragment_redundancy_debt(
     Ok(debt)
 }
 
-async fn detect_namespace_v2_debt(
+async fn detect_namespace_indexdb_debt(
     active_index_roots: &[PathBuf],
     deep_scan: bool,
-) -> Result<NamespaceV2HealthStats, AppError> {
+) -> Result<NamespaceIndexDbHealthStats, AppError> {
     if active_index_roots.is_empty() {
-        return Ok(NamespaceV2HealthStats::default());
+        return Ok(NamespaceIndexDbHealthStats::default());
     }
 
     let fragments = list_known_fragments(active_index_roots).await;
-    let mut stats = NamespaceV2HealthStats::default();
+    let mut stats = NamespaceIndexDbHealthStats::default();
 
     for fragment in fragments {
         let inspection = inspect_namespace_replicas(&fragment, active_index_roots).await?;
@@ -831,7 +831,8 @@ async fn collect_system_health(
         load_redistribution_intent_debt(&active_index_roots, force_refresh || deep_scan).await;
     let fragment_redundancy_debt =
         detect_fragment_redundancy_debt(&active_index_roots, &active_blob_roots, deep_scan).await?;
-    let namespace_v2_debt = detect_namespace_v2_debt(&active_index_roots, deep_scan).await?;
+    let namespace_indexdb_debt =
+        detect_namespace_indexdb_debt(&active_index_roots, deep_scan).await?;
     let storage = collect_storage_plane_stats(
         &disk_statuses,
         total_index as u64,
@@ -902,22 +903,22 @@ async fn collect_system_health(
                     .join(", ")
             ),
         )
-    } else if namespace_v2_debt.fragments_critical > 0 {
+    } else if namespace_indexdb_debt.fragments_critical > 0 {
         (
             "critical",
             format!(
-                "Namespace v2 catalog has no valid replica for {} fragment(s): {}.",
-                namespace_v2_debt.fragments_critical,
-                namespace_v2_debt.degraded_fragments.join(", ")
+                "Namespace indexdb has no valid replica for {} fragment(s): {}.",
+                namespace_indexdb_debt.fragments_critical,
+                namespace_indexdb_debt.degraded_fragments.join(", ")
             ),
         )
-    } else if namespace_v2_debt.fragments_degraded > 0 {
+    } else if namespace_indexdb_debt.fragments_degraded > 0 {
         (
             "degraded",
             format!(
-                "Namespace v2 catalog replicas need repair for {} fragment(s): {}.",
-                namespace_v2_debt.fragments_degraded,
-                namespace_v2_debt.degraded_fragments.join(", ")
+                "Namespace indexdb replicas need repair for {} fragment(s): {}.",
+                namespace_indexdb_debt.fragments_degraded,
+                namespace_indexdb_debt.degraded_fragments.join(", ")
             ),
         )
     } else if placement_limiter_low {
@@ -995,7 +996,7 @@ async fn collect_system_health(
         consistency: ConsistencyStats {
             total_partition_dbs_scanned: total_partition_dbs,
             index_partition_health: index_health,
-            namespace_v2: namespace_v2_debt,
+            namespace_indexdb: namespace_indexdb_debt,
             partition_db_counts: if !partition_map.is_empty() {
                 Some(partition_map)
             } else {

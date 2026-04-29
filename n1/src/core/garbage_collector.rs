@@ -10,7 +10,7 @@ use crate::settings::config::CONFIG;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use chrono::Utc;
@@ -87,11 +87,16 @@ where
     f(&mut st);
 }
 
-async fn run_gc_scan_offthread(state: Arc<AppState>, is_manual_run: bool) -> Result<(), AppError> {
+async fn run_gc_scan_offthread(
+    state: Arc<AppState>,
+    is_manual_run: bool,
+    target_fragment: Option<String>,
+) -> Result<(), AppError> {
     let handle = Handle::current();
-    let join =
-        tokio::task::spawn_blocking(move || handle.block_on(perform_gc_scan(state, is_manual_run)))
-            .await;
+    let join = tokio::task::spawn_blocking(move || {
+        handle.block_on(perform_gc_scan(state, is_manual_run, target_fragment))
+    })
+    .await;
 
     match join {
         Ok(res) => res,
@@ -117,7 +122,7 @@ pub async fn run_lifecycle_manager(state: Arc<AppState>) {
         }
         GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
 
-        if let Err(err) = run_gc_scan_offthread(state.clone(), false).await {
+        if let Err(err) = run_gc_scan_offthread(state.clone(), false, None).await {
             error!("Lifecycle Manager Scan failed: {}", err);
             with_gc_status_write(|st| {
                 st.total_errors += 1;
@@ -148,11 +153,33 @@ pub async fn get_gc_status_api(
     Ok(Json(get_gc_status().await))
 }
 
-pub async fn run_garbage_collector(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+fn parse_gc_target_fragment(params: &HashMap<String, String>) -> Option<String> {
+    params
+        .get("fragment")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+pub async fn run_garbage_collector(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let target_fragment = parse_gc_target_fragment(&params);
+    if let Some(fragment) = target_fragment.as_ref() {
+        let path_manager = ObjectPathManager::new();
+        if !collect_gc_fragments(&path_manager.get_all_index_roots()).contains(fragment) {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("Fragment {} was not found.", fragment),
+            );
+        }
+    }
+
     if GC_RUNNING.swap(true, Ordering::SeqCst) {
         return (
             StatusCode::CONFLICT,
-            "GC is already running. Check /n1/maintenance/gc/status.",
+            "GC is already running. Check /n1/maintenance/gc/status.".to_string(),
         );
     }
     GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
@@ -164,13 +191,14 @@ pub async fn run_garbage_collector(State(state): State<Arc<AppState>>) -> impl I
                     is_running: true,
                     phase: "Initializing".to_string(),
                     is_manual_run: true,
+                    current_fragment: target_fragment.clone().unwrap_or_default(),
                     start_timestamp: Utc::now().timestamp(),
                     ..Default::default()
                 };
             });
         }
 
-        if let Err(err) = run_gc_scan_offthread(state.clone(), true).await {
+        if let Err(err) = run_gc_scan_offthread(state.clone(), true, target_fragment).await {
             error!("Manual GC Scan failed: {}", err);
             with_gc_status_write(|st| {
                 st.total_errors += 1;
@@ -191,7 +219,7 @@ pub async fn run_garbage_collector(State(state): State<Arc<AppState>>) -> impl I
         GC_RUNNING.store(false, Ordering::SeqCst);
     });
 
-    (StatusCode::ACCEPTED, "GC started")
+    (StatusCode::ACCEPTED, "GC started".to_string())
 }
 
 pub async fn stop_garbage_collector(
@@ -362,12 +390,25 @@ fn gc_cleanup_version_dir_unix(
 ) {
 }
 
-async fn perform_gc_scan(state: Arc<AppState>, is_manual_run: bool) -> Result<(), AppError> {
+async fn perform_gc_scan(
+    state: Arc<AppState>,
+    is_manual_run: bool,
+    target_fragment: Option<String>,
+) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
     let index_roots = path_manager.get_all_index_roots();
     let blob_roots = path_manager.get_blob_roots();
 
-    let fragments = collect_gc_fragments(&index_roots);
+    let mut fragments = collect_gc_fragments(&index_roots)
+        .into_iter()
+        .collect::<Vec<_>>();
+    fragments.sort();
+    if let Some(target) = target_fragment {
+        if !fragments.iter().any(|fragment| fragment == &target) {
+            return Err(AppError::NotFound);
+        }
+        fragments.retain(|fragment| fragment == &target);
+    }
 
     info!("GC: Starting scan for {} fragments...", fragments.len());
     let fragment_count = fragments.len() as u64;

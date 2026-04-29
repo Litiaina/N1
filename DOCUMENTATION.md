@@ -2,30 +2,30 @@
 
 This repository now keeps the platform docs split into:
 
-- one platform overview in [README.md](/home/administrator/Development/N1/README.md)
+- one platform overview in [README.md](README.md)
 - one detailed API reference per runtime
 
 ## Read This First
 
-- [README.md](/home/administrator/Development/N1/README.md)
+- [README.md](README.md)
   Platform overview, architecture split, deployment orientation, and high-level operational model.
 
 ## Runtime API References
 
-- [N1_DOCUMENTATION.md](/home/administrator/Development/N1/N1_DOCUMENTATION.md)
-  Detailed `N1 2.2.2` storage-kernel reference:
-  fragment provisioning, auth, upload, read, lifecycle, POSIX, maintenance, request parameters, and example payloads.
+- [N1_DOCUMENTATION.md](N1_DOCUMENTATION.md)
+  Detailed `N1 3.0.0` storage-kernel reference:
+  breaking metadata rewrite, fragment provisioning, auth, upload, read, lifecycle, POSIX, maintenance, request parameters, and example payloads.
 
-- [NS_DOCUMENTATION.md](/home/administrator/Development/N1/NS_DOCUMENTATION.md)
+- [NS_DOCUMENTATION.md](NS_DOCUMENTATION.md)
   Detailed `NS 1.0.0` NAS Lite deployment reference:
   SMB listener setup, dynamic N1 fragment auth, share roots, staging, capacity behavior, and optional cold sync to `N1`.
 
-- [N2_DOCUMENTATION.md](/home/administrator/Development/N1/N2_DOCUMENTATION.md)
+- [N2_DOCUMENTATION.md](N2_DOCUMENTATION.md)
   Detailed `N2 0.2.0` cluster-layer reference:
   membership, governance, placement, object APIs, reconcile, and internal peer routes.
 
-- [REGISTRY_DOCUMENTATION.md](/home/administrator/Development/N1/REGISTRY_DOCUMENTATION.md)
-  Detailed `Registry 0.8.0` user-facing reference:
+- [REGISTRY_DOCUMENTATION.md](REGISTRY_DOCUMENTATION.md)
+  Detailed `Registry 0.9.1` user-facing reference:
   auth, admin, fragments, storage sessions, logical objects, shares, trash/recover flows, and example request/response bodies.
 
 ## Which Doc To Use
@@ -38,7 +38,7 @@ This repository now keeps the platform docs split into:
 ## Contract Boundary
 
 - `N1`
-  Physical storage truth, standalone namespace, upload, read, lifecycle, maintenance.
+  Physical storage truth, per-fragment `index.ndxdb` namespace/metadata authority, upload, read, lifecycle, maintenance.
   Stable route namespace: `/n1/...`
 
 - `NS`

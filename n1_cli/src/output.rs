@@ -215,7 +215,7 @@ pub fn format_health(response: &HealthResponse) -> String {
         ),
     ];
 
-    let mut out = format_rows("N1 2.0 Health", &rows);
+    let mut out = format_rows("N1 3.0 Health", &rows);
 
     if !response.disks.is_empty() {
         out.push_str("\n\ndisks");

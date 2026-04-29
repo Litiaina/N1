@@ -184,7 +184,7 @@ fn adaptive_indexdb_per_db_cache_bytes(ram_bytes: Option<u64>) -> usize {
     (budget / max_cached_dbs).clamp(1024 * 1024, 8 * 1024 * 1024)
 }
 
-fn adaptive_namespace_max_loaded_catalogs(ram_bytes: Option<u64>) -> usize {
+fn adaptive_namespace_max_loaded_facades(ram_bytes: Option<u64>) -> usize {
     match ram_gib(ram_bytes) {
         0..=4 => 8,
         5..=8 => 12,
@@ -194,7 +194,7 @@ fn adaptive_namespace_max_loaded_catalogs(ram_bytes: Option<u64>) -> usize {
 }
 
 fn adaptive_namespace_max_loaded_dbs(ram_bytes: Option<u64>) -> usize {
-    adaptive_namespace_max_loaded_catalogs(ram_bytes).saturating_mul(2)
+    adaptive_namespace_max_loaded_facades(ram_bytes).saturating_mul(2)
 }
 
 fn normalize_indexdb_per_db_cache_bytes(value: usize) -> usize {
@@ -741,10 +741,10 @@ pub async fn run_server() {
     );
 
     let namespace_section = config.section(Some("namespace_config"));
-    let namespace_max_loaded_catalogs = parse_usize_or_auto(
-        namespace_section.and_then(|s| s.get("max_loaded_catalogs")),
-        "namespace_config.max_loaded_catalogs",
-        adaptive_namespace_max_loaded_catalogs(detected_ram_bytes),
+    let namespace_max_loaded_facades = parse_usize_or_auto(
+        namespace_section.and_then(|s| s.get("max_loaded_facades")),
+        "namespace_config.max_loaded_facades",
+        adaptive_namespace_max_loaded_facades(detected_ram_bytes),
     )
     .clamp(1, 512);
     let namespace_max_loaded_dbs = parse_usize_or_auto(
@@ -753,11 +753,11 @@ pub async fn run_server() {
         adaptive_namespace_max_loaded_dbs(detected_ram_bytes),
     )
     .clamp(1, 1024);
-    configure_namespace_cache(namespace_max_loaded_catalogs, namespace_max_loaded_dbs);
+    configure_namespace_cache(namespace_max_loaded_facades, namespace_max_loaded_dbs);
 
     tracing::info!(
-        "Namespace cache: max_loaded_catalogs={}, max_loaded_dbs={} (cold catalogs/dbs are evicted LRU to keep N1 IO-bound)",
-        namespace_max_loaded_catalogs,
+        "Namespace cache: max_loaded_facades={}, max_loaded_dbs={} (cold DB handles are evicted LRU to keep N1 IO-bound)",
+        namespace_max_loaded_facades,
         namespace_max_loaded_dbs
     );
 

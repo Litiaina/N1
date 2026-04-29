@@ -486,7 +486,7 @@ async fn delete_object_permanently_scoped(
     let _ = claims;
     let _ = object_key;
     Err::<axum::response::Response, AppError>(AppError::BadRequest(
-        "Permanent delete was removed in N1 2.0; use lifecycle trash and garbage collection"
+        "Immediate permanent delete is not part of N1 3.0; use lifecycle trash and garbage collection"
             .to_string(),
     ))
 }

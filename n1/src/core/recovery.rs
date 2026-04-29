@@ -10,10 +10,11 @@ use std::fs::OpenOptions as StdOpenOptions;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
+use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
 use ulid::Ulid;
 
@@ -23,6 +24,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::windows::fs::OpenOptionsExt;
 
 static RECOVERY_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
+static REPAIR_INFLIGHT: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 static RECOVERY_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
@@ -54,6 +57,27 @@ static RECOVERY_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 
 static BLOB_ROOTS: LazyLock<Vec<PathBuf>> =
     LazyLock::new(|| ObjectPathManager::new().get_blob_roots());
+
+struct RepairInflightGuard {
+    path: PathBuf,
+}
+
+impl Drop for RepairInflightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut inflight) = REPAIR_INFLIGHT.lock() {
+            inflight.remove(&self.path);
+        }
+    }
+}
+
+fn acquire_repair_inflight(path: &Path) -> Option<RepairInflightGuard> {
+    let mut inflight = REPAIR_INFLIGHT.lock().ok()?;
+    let path = path.to_path_buf();
+    if !inflight.insert(path.clone()) {
+        return None;
+    }
+    Some(RepairInflightGuard { path })
+}
 
 #[inline]
 fn strip_tmp_attempt_suffix(s: &str) -> &str {
@@ -155,10 +179,16 @@ fn owning_blob_root_for_path(path: &Path) -> Option<&'static PathBuf> {
 async fn should_schedule_background_repair(shard: &ShardInfo) -> bool {
     let stable = strip_tmp_attempt_suffix(&shard.absolute_path);
     let path = Path::new(stable);
-    match path.parent() {
-        Some(parent) => fs::try_exists(parent).await.unwrap_or(false),
-        None => false,
+    if let Some(parent) = path.parent() {
+        if fs::try_exists(parent).await.unwrap_or(false) {
+            return true;
+        }
     }
+    if let Some(root) = owning_blob_root_for_path(path) {
+        return fs::try_exists(root).await.unwrap_or(false);
+    }
+
+    false
 }
 
 async fn create_direct_file_for_repair(path: &PathBuf) -> Result<std::fs::File, AppError> {
@@ -249,6 +279,31 @@ async fn try_open_verified(path: &str, checksum: &str) -> Option<File> {
     None
 }
 
+async fn preexisting_gc_candidates(path: &str) -> Vec<String> {
+    let path = Path::new(path);
+    let Some(parent) = path.parent() else {
+        return Vec::new();
+    };
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{file_name}.preexisting.");
+    let mut out = Vec::new();
+    let Ok(mut entries) = fs::read_dir(parent).await else {
+        return out;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if name.starts_with(&prefix) && name.ends_with(GC_SUFFIX) {
+            out.push(entry.path().to_string_lossy().to_string());
+        }
+    }
+    out.sort();
+    out
+}
+
 async fn get_or_open_shard_ha(
     file_cache: &mut HashMap<String, File>,
     shard_info: &ShardInfo,
@@ -302,6 +357,18 @@ async fn get_or_open_shard_ha(
             if let Ok(cloned) = f.try_clone().await {
                 file_cache.insert(shard_info.file_name.clone(), cloned);
                 return Some(f);
+            }
+        }
+
+        for preexisting in preexisting_gc_candidates(&cand).await {
+            if !tried.insert(preexisting.clone()) {
+                continue;
+            }
+            if let Some(f) = try_open_verified(&preexisting, &shard_info.checksum).await {
+                if let Ok(cloned) = f.try_clone().await {
+                    file_cache.insert(shard_info.file_name.clone(), cloned);
+                    return Some(f);
+                }
             }
         }
     }
@@ -442,11 +509,6 @@ pub async fn repair_entire_shard(
     target_shard_idx: usize,
     block_size: usize,
 ) -> Result<(), AppError> {
-    let _permit = RECOVERY_SEMAPHORE
-        .acquire()
-        .await
-        .map_err(|_| AppError::InternalServerError("Semaphore error".into()))?;
-
     let target_shard = part
         .shards
         .iter()
@@ -485,11 +547,27 @@ pub async fn repair_entire_shard(
         let _ = fs::create_dir_all(&parent_dir).await;
     }
 
-    let temp_path = parent_dir.join(format!(
-        "{}.tmp.repair.{}",
-        strip_tmp_attempt_suffix(&target_shard.file_name),
-        Ulid::new().to_string()
-    ));
+    if fs::try_exists(&final_path).await.unwrap_or(false) {
+        if let Ok(mut f) = File::open(&final_path).await {
+            if verify_shard_integrity(&mut f, &target_shard.checksum).await {
+                return Ok(());
+            }
+        }
+    }
+
+    let _repair_guard = loop {
+        if let Some(guard) = acquire_repair_inflight(&final_path) {
+            break guard;
+        }
+        if fs::try_exists(&final_path).await.unwrap_or(false) {
+            if let Ok(mut f) = File::open(&final_path).await {
+                if verify_shard_integrity(&mut f, &target_shard.checksum).await {
+                    return Ok(());
+                }
+            }
+        }
+        sleep(Duration::from_millis(50)).await;
+    };
 
     if fs::try_exists(&final_path).await.unwrap_or(false) {
         if let Ok(mut f) = File::open(&final_path).await {
@@ -498,6 +576,17 @@ pub async fn repair_entire_shard(
             }
         }
     }
+
+    let temp_path = parent_dir.join(format!(
+        "{}.tmp.repair.{}",
+        strip_tmp_attempt_suffix(&target_shard.file_name),
+        Ulid::new().to_string()
+    ));
+
+    let _permit = RECOVERY_SEMAPHORE
+        .acquire()
+        .await
+        .map_err(|_| AppError::InternalServerError("Semaphore error".into()))?;
 
     let std_file = match create_direct_file_for_repair(&temp_path).await {
         Ok(f) => f,

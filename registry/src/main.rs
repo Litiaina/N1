@@ -1482,7 +1482,12 @@ async fn ensure_user_default_fragment(
     }
 
     let fragment_name = default_fragment_name(user);
-    let (deployment, fragment_hash) = state.broker.ensure_default_fragment(&fragment_name).await?;
+    let quota_bytes = u64::try_from(user.quota_limit_bytes.max(1))
+        .map_err(|_| RegistryError::bad_request("quota_limit_bytes is too large"))?;
+    let (deployment, fragment_hash) = state
+        .broker
+        .ensure_default_fragment(&fragment_name, quota_bytes)
+        .await?;
     state
         .db
         .upsert_fragment_binding(user.uid.clone(), fragment_hash.clone(), deployment, None)

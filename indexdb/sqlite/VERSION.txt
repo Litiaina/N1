@@ -1,0 +1,16 @@
+SQLite version: 3.53.0
+Source package: sqlite-amalgamation-3530000.zip
+Source URL: https://www.sqlite.org/2026/sqlite-amalgamation-3530000.zip
+Date added: 2026-04-28
+
+Compile flags used by indexdb/build.rs:
+- SQLITE_THREADSAFE=1
+- SQLITE_OMIT_LOAD_EXTENSION
+- SQLITE_DEFAULT_MEMSTATUS=0
+- SQLITE_USE_URI=1
+- SQLITE_ENABLE_DBSTAT_VTAB
+
+SQLite is inherited internally as the first-class foundation for N1 indexdb.
+The public N1 identity remains:
+
+    N1 -> indexdb -> .ndxdb

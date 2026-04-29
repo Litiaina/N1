@@ -17,8 +17,9 @@ Use `Registry` when you need:
 
 Current `0.9.1` behavior that matters operationally:
 
-- for fragment-bound object listing and stats, Registry reads logical namespace truth from the bound `N1` engine instead of trusting stale SQLite projection alone
-- Registry object APIs for bound fragments use the engine namespace as the file-tree authority; Registry SQLite is a durable business/policy projection
+- for fragment-bound object listing and stats, Registry reads logical namespace truth from the bound `N1` engine instead of trusting stale Registry projection alone
+- for `N1 3.0`, that engine namespace truth is backed by the fragment's `indexdb/index.ndxdb`, not a separate namespace catalog
+- Registry object APIs for bound fragments use the engine namespace as the file-tree authority; Registry keeps a durable business/policy projection
 - pending quota reservations are stored durably in `object_uploads` and reconciled against committed object usage during finalize/cancel flows
 - shares, audit events, favorites, tags, labels, and comments remain Registry-owned business metadata keyed by logical `object_key`
 - Drive/RAD ARC should treat `/v1/objects` results as the DICOM scan source for N1-bound fragments; direct `.dcm` objects and nested `common_prefixes` are both valid folder contents.
@@ -80,7 +81,7 @@ Bootstrap is separate and uses the `master_key` field in its request body.
 Important distinction:
 
 - `object_key` is the logical user-facing path
-- `storage_object_id` is retained for Registry compatibility and non-engine projections; for `N1` 2.1-bound fragments, Registry addresses N1 by logical `object_key`
+- `storage_object_id` is retained for Registry compatibility and non-engine projections; for `N1` 3.0-bound fragments, Registry addresses N1 by logical `object_key`
 
 ### Audit Event Record
 
@@ -144,7 +145,7 @@ This is the bridge from `Registry` to `N1` or `N2`.
 
 Operational note:
 
-- for standalone `N1 2.0`, `Registry` currently brokers fragment access against the backend engine’s `/n1/auth/fragment` route
+- for standalone `N1 3.0`, `Registry` currently brokers fragment access against the backend engine’s `/n1/auth/fragment` route
 - clients should treat the storage session response as the engine-facing contract and should not re-derive engine auth on their own for normal product flows
 
 ### Share Record
@@ -760,7 +761,7 @@ Response:
 Operational note:
 
 - when `fragment` is provided and bound to an engine, committed object listing is sourced from the live `N1` namespace and then decorated with Registry metadata
-- SQLite remains the Registry policy store, but not the authoritative file-tree source for bound-fragment committed listings
+- Registry policy storage remains a business/policy projection, not the authoritative file-tree source for bound-fragment committed listings
 
 ### `GET /v1/objects/suggest`
 
@@ -1250,7 +1251,8 @@ curl -k https://127.0.0.1:7001/v1/objects/finalize \
 ## Operational Notes
 
 - `Registry` is the correct place for user ownership, quotas, shares, audit/activity, and product metadata overlays.
-- For `N1` 2.1-bound fragments, object listing, stats, suggestions, archive selection, and object existence checks are sourced from N1 namespace truth.
+- For `N1` 3.0-bound fragments, object listing, stats, suggestions, archive selection, and object existence checks are sourced from N1 namespace truth.
+- Registry never opens or imports old N1 `namespace_v2` catalogs or redb-era index files as authority.
 - `Registry` does not own repair, redistribution, GC, or recover-on-read. Those remain backend responsibilities in `N1` or `N2`.
 - `storage_object_id` remains in the Registry schema for compatibility, but N1-bound object operations should use logical `object_key`.
 - Prefix trash, prefix recover, and prefix rename must delegate to the bound engine when the fragment is engine-backed.
