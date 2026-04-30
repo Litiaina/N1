@@ -3082,9 +3082,10 @@ fn bench_namespace_owner_index(fragment: &str, root_count: usize) -> usize {
         return 0;
     }
     let mut hasher = Sha256::new();
-    hasher.update(b"fragment");
-    hasher.update([0u8]);
-    hasher.update(fragment.as_bytes());
+    for part in ["fragment", fragment] {
+        hasher.update(part.as_bytes());
+        hasher.update([0u8]);
+    }
     let hash = hasher.finalize();
     usize::from(u16::from(hash[0]) << 8 | u16::from(hash[1])) % root_count
 }

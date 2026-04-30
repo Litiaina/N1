@@ -1103,12 +1103,13 @@ mod tests {
     use super::{
         AppState, download_filename_for_logical_path, download_selected_archive_scoped,
         get_object_metadata_scoped, get_upload_status_scoped, initiate_object_upload_scoped,
-        list_active_uploads_scoped, list_object_versions_scoped, looks_like_flat_storage_object_id,
-        parse_json_response, upload_object_one_shot_scoped, upload_request_matches_session,
+        list_active_uploads_scoped, list_object_versions_scoped, list_objects_scoped,
+        looks_like_flat_storage_object_id, parse_json_response, upload_object_one_shot_scoped,
+        upload_request_matches_session,
     };
     use crate::core::disk_manager::{
         BLOB_STORE_DISKS, DownloadArchiveRequest, FS_STORAGE_ROOT, INDEX_STORE_DISKS,
-        InitiateUploadResponse, ObjectMetadata,
+        InitiateUploadResponse, ListObjectsResult, ObjectMetadata, ObjectPathManager,
     };
     use crate::core::disk_manager::{InitiateUploadParams, ReservationReceipt, UploadPartQuery};
     use crate::core::fragment_metadata::{
@@ -1124,6 +1125,7 @@ mod tests {
         DATA_SHARDS_ATOMIC, ListUploadsResponse, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC,
         PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
     };
+    use crate::namespace::runtime::global_namespace_runtime;
     use crate::settings::constants::CONFIG_FILE;
     use crate::settings::create_config::create_default_config_ini;
     use crate::structs::auth_structs::Claims;
@@ -1296,6 +1298,18 @@ mod tests {
             delete: true,
             exp: usize::MAX,
         }
+    }
+
+    async fn clean_fragment_test_roots(fragment: &str) {
+        global_namespace_runtime().evict_fragment(fragment);
+        indexdb_store::clear_cached_dbs_for_test();
+        let manager = ObjectPathManager::new();
+        let mut roots = manager.get_all_index_roots();
+        roots.extend(manager.get_blob_roots());
+        for root in roots {
+            let _ = fs::remove_dir_all(root.join(fragment)).await;
+        }
+        indexdb_store::clear_cached_dbs_for_test();
     }
 
     async fn read_response_bytes(response: axum::response::Response) -> Vec<u8> {
@@ -1595,6 +1609,93 @@ mod tests {
             entries.len(),
             1,
             "scoped POSIX folder archive should contain only the selected live namespace subtree"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scoped_bulk_folder_upload_survives_namespace_restart_for_live_fragment_hash() {
+        let _guard = TEST_LOCK.lock().await;
+        ensure_storage_config().await;
+        ensure_upload_runtime_config();
+
+        let fragment = "0d6e4079e36703ebd37c00722f5891d28b0e2811dc114b129215123adcce3605";
+        clean_fragment_test_roots(fragment).await;
+        setup_fragment(fragment).await;
+
+        let state = Arc::new(AppState {
+            ws_manager: WsConnectionManager::new(),
+        });
+
+        let mut expected = Vec::new();
+        for idx in 0..512usize {
+            let logical_path = format!(
+                "web/app/{:02}/nested/{:03}/file-{:04}.txt",
+                idx % 31,
+                idx % 127,
+                idx
+            );
+            let payload = format!("restart-regression-payload-{idx}");
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_LENGTH,
+                axum::http::HeaderValue::from_str(&payload.len().to_string())
+                    .expect("content-length header"),
+            );
+
+            let upload = upload_object_one_shot_scoped(
+                State(Arc::clone(&state)),
+                full_claims(fragment),
+                headers,
+                Path(logical_path.clone()),
+                Query(UploadPartQuery {
+                    checksum: None,
+                    durability: None,
+                    strict_durability: None,
+                    io_gate: None,
+                }),
+                Body::from(payload),
+            )
+            .await
+            .expect("scoped one-shot upload")
+            .into_response();
+            assert_eq!(upload.status(), axum::http::StatusCode::CREATED);
+            expected.push(logical_path);
+        }
+
+        global_namespace_runtime().evict_fragment(fragment);
+        indexdb_store::clear_cached_dbs_for_test();
+
+        let mut actual = Vec::new();
+        let mut continuation_token = None;
+        loop {
+            let mut params = HashMap::new();
+            params.insert("prefix".to_string(), "web/".to_string());
+            params.insert("limit".to_string(), "1000".to_string());
+            if let Some(token) = continuation_token.take() {
+                params.insert("continuation_token".to_string(), token);
+            }
+
+            let response = list_objects_scoped(full_claims(fragment), Query(params))
+                .await
+                .expect("scoped list after restart")
+                .into_response();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let page: ListObjectsResult = parse_json_response(response, "list after restart")
+                .await
+                .expect("decode list page");
+            actual.extend(page.objects.into_iter().map(|object| object.object_key));
+            if let Some(token) = page.continuation_token {
+                continuation_token = Some(token);
+            } else {
+                break;
+            }
+        }
+
+        expected.sort();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "scoped POSIX namespace rows must be durable after cache eviction/restart"
         );
     }
 

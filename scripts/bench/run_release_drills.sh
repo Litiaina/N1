@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-PACKAGE="${PACKAGE:-server}"
+PACKAGE="${PACKAGE:-n1}"
 RUNS="${RUNS:-1}"
 TEST_ARGS="${TEST_ARGS:---nocapture}"
 RUN_CHAOS="${RUN_CHAOS:-1}"
@@ -13,6 +13,7 @@ CHAOS_REQUIRE_ALL_PASS="${CHAOS_REQUIRE_ALL_PASS:-1}"
 CHAOS_MAX_DURATION_SECS="${CHAOS_MAX_DURATION_SECS:-0}"
 RUN_INDEX_OWNER_RESUME_SOAK="${RUN_INDEX_OWNER_RESUME_SOAK:-0}"
 INDEX_OWNER_RESUME_SOAK_ROUNDS="${INDEX_OWNER_RESUME_SOAK_ROUNDS:-5}"
+RUN_REAL_RESTART_PROOF="${RUN_REAL_RESTART_PROOF:-0}"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="${OUT_DIR:-.n1-bench/release-drills-${STAMP}}"
@@ -24,11 +25,15 @@ SUMMARY="$OUT_DIR/summary.txt"
 echo "test,run,exit_code,wall_seconds,passed" > "$CSV"
 
 TESTS=(
-  matrix_active_multipart_resume_survives_replica_index_disk_loss
-  matrix_raw_blob_crud_delete_recover_and_permanent_delete
-  matrix_raw_blob_quota_drift_reconverges_after_redistribution_gc_and_sync
-  matrix_raw_blob_redistribution_repair_recovered_read_and_gc_markers
-  matrix_repair_synchronizes_all_index_disks
+  matrix_multipart_cancel_reclaims_physical_upload_bytes
+  matrix_sync_fragment_metadata_preserves_active_multipart_blob_dirs
+  matrix_gc_keeps_live_data_and_cleans_trash_in_partition_layout
+  matrix_namespace_write_catches_up_stale_owner_after_redistribution_restart
+  matrix_repair_after_empty_index_disk_preserves_live_posix_listing
+  matrix_repair_synchronizes_all_indexdb_replicas
+  matrix_ha_crud_during_redistribution_and_repair
+  matrix_live_listing_rebuilds_partition_namespace_index_when_missing
+  matrix_live_listing_with_delimiter_survives_cache_eviction_after_many_renames
   matrix_ha_repair_reconverges_index_after_index_disk_down
 )
 
@@ -96,6 +101,21 @@ if [[ "$RUN_CHAOS" == "1" ]]; then
   fi
 fi
 
+real_restart_status="skipped"
+if [[ "$RUN_REAL_RESTART_PROOF" == "1" ]]; then
+  echo "[drill] running real HTTP restart proof"
+  set +e
+  OUT_DIR="$OUT_DIR/real-restart-proof" \
+    scripts/bench/run_real_restart_proof.sh >"$OUT_DIR/real-restart-proof.stdout.log" 2>&1
+  real_restart_ec=$?
+  set -e
+  if [[ "$real_restart_ec" -eq 0 ]]; then
+    real_restart_status="pass"
+  else
+    real_restart_status="fail"
+  fi
+fi
+
 read -r pass_count fail_count avg_wall max_wall <<<"$(awk -F, '
   NR==1 { next }
   {
@@ -111,7 +131,7 @@ read -r pass_count fail_count avg_wall max_wall <<<"$(awk -F, '
   }' "$CSV")"
 
 status="PASS"
-if [[ "$fail_count" -gt 0 || "$chaos_status" == "fail" || "$index_resume_soak_status" == "fail" ]]; then
+if [[ "$fail_count" -gt 0 || "$chaos_status" == "fail" || "$index_resume_soak_status" == "fail" || "$real_restart_status" == "fail" ]]; then
   status="FAIL"
 fi
 
@@ -121,6 +141,7 @@ fi
   echo "wall_seconds:avg=$avg_wall max=$max_wall"
   echo "index_owner_resume_soak=$index_resume_soak_status"
   echo "chaos=$chaos_status"
+  echo "real_restart_proof=$real_restart_status"
   echo "csv=$CSV"
 } | tee "$SUMMARY"
 

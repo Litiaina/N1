@@ -81,6 +81,8 @@ Rename, trash, and recover do not move blobs. The N1 metadata database stores me
 
 N1 recommends `XFS` for production blob disks, with project quotas enabled when strict fragment quota enforcement is required.
 
+For release confidence and real restart/listing proof, see `N1_TESTING.md`. The production signal is not only `cargo test`; N1 must also pass the real HTTP restart proof on two real disk roots before a risky deployment.
+
 Fragment quota is a storage limit, not an indexdb reservation ledger. N1 stores the configured fragment quota in `fragment_meta`, while the byte truth is the blob filesystem. Hard delete and empty trash remove namespace reachability first; bytes are returned only after GC physically removes the unreachable blob files.
 
 N1 does not implement a hot upload-path quota ledger in indexdb. That avoids turning a hot fragment into a serialized byte-counter workload. Strict quota enforcement is delegated to the filesystem.

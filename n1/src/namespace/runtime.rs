@@ -2936,9 +2936,10 @@ fn namespace_owner_index(fragment: &str, root_count: usize) -> usize {
         return 0;
     }
     let mut hasher = Sha256::new();
-    hasher.update(b"fragment");
-    hasher.update([0u8]);
-    hasher.update(fragment.as_bytes());
+    for part in ["fragment", fragment] {
+        hasher.update(part.as_bytes());
+        hasher.update([0u8]);
+    }
     let hash = hasher.finalize();
     usize::from(u16::from(hash[0]) << 8 | u16::from(hash[1])) % root_count
 }
@@ -2962,4 +2963,32 @@ pub fn logical_not_found() -> AppError {
 
 pub fn unexpected_response(status: StatusCode, context: &str) -> AppError {
     AppError::InternalServerError(format!("{context} returned unexpected status {status}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::namespace_owner_index;
+    use sha2::{Digest, Sha256};
+
+    fn indexdb_fragment_owner_index(fragment: &str, root_count: usize) -> usize {
+        if root_count <= 1 {
+            return 0;
+        }
+        let mut hasher = Sha256::new();
+        for part in ["fragment", fragment] {
+            hasher.update(part.as_bytes());
+            hasher.update([0u8]);
+        }
+        let hash = hasher.finalize();
+        usize::from(u16::from(hash[0]) << 8 | u16::from(hash[1])) % root_count
+    }
+
+    #[test]
+    fn namespace_owner_hash_matches_indexdb_owner_hash_for_live_fragment() {
+        let fragment = "0d6e4079e36703ebd37c00722f5891d28b0e2811dc114b129215123adcce3605";
+        assert_eq!(
+            namespace_owner_index(fragment, 2),
+            indexdb_fragment_owner_index(fragment, 2)
+        );
+    }
 }
