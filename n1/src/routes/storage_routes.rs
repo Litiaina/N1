@@ -34,12 +34,13 @@ use crate::core::repair_manager::{
     get_repair_status_api, stop_repair_job_api, trigger_repair_job_api,
 };
 use crate::core::retrieve::{
-    get_object as get_object_impl, get_object_metadata as get_object_metadata_impl, list_fragments,
-    list_object_versions as list_object_versions_impl, stream_object as stream_object_impl,
+    get_object as get_object_impl, get_object_metadata_direct, list_fragments,
+    stream_object as stream_object_impl,
 };
 use crate::core::storage_capacity_parser::{
-    get_capacity_usage as get_capacity_usage_impl,
+    ResizeFragmentQuotaRequest, get_capacity_usage as get_capacity_usage_impl,
     get_fragment_quota_usage as get_fragment_quota_usage_impl,
+    resize_fragment_quota as resize_fragment_quota_impl,
 };
 use crate::core::sync::initialize_fragment_storage_api;
 use crate::core::upload::{
@@ -314,6 +315,14 @@ async fn get_fragment_quota_usage_scoped(claims: Claims) -> Result<impl IntoResp
     get_fragment_quota_usage_impl(claims).await
 }
 
+async fn resize_fragment_quota_scoped(
+    claims: Claims,
+    Path(fragment): Path<String>,
+    AxumJson(payload): AxumJson<ResizeFragmentQuotaRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    resize_fragment_quota_impl(claims, axum::extract::Path(fragment), AxumJson(payload)).await
+}
+
 async fn list_objects_scoped(
     claims: Claims,
     Query(params): Query<HashMap<String, String>>,
@@ -349,8 +358,17 @@ async fn list_object_versions_scoped(
     Path(object_key): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
-    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
-    list_object_versions_impl(claims, Path((fragment, physical))).await
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+    let requested_path = object_key;
+    let physical = resolve_logical_read_key(&fragment, &requested_path).await?;
+    let mut versions = index::list_live_object_versions_metadata(&fragment, &physical).await?;
+    for metadata in &mut versions {
+        metadata.object_key = requested_path.clone();
+        metadata.strip_internal_layout();
+    }
+    Ok(AxumJson(versions))
 }
 
 async fn get_object_scoped(
@@ -378,8 +396,16 @@ async fn get_object_metadata_scoped(
     Path(object_key): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
     let fragment = claims.fragment.clone();
-    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
-    get_object_metadata_impl(claims, Path((fragment, physical))).await
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+    let requested_path = object_key;
+    let physical = resolve_logical_read_key(&fragment, &requested_path).await?;
+    let mut metadata = get_object_metadata_direct(&fragment, &physical)
+        .await?
+        .without_internal_layout();
+    metadata.object_key = requested_path;
+    Ok(AxumJson(metadata))
 }
 
 async fn download_object_scoped(
@@ -647,11 +673,14 @@ async fn upload_object_one_shot_scoped(
     if response.status() != StatusCode::CREATED {
         return Ok(response);
     }
-    let mut parsed: crate::core::disk_manager::ObjectMetadata =
+    let public_meta: crate::core::disk_manager::ObjectMetadata =
         parse_json_response(response, "one-shot upload").await?;
+    let mut parsed =
+        index::read_object_version(&fragment, &physical, &public_meta.version_id).await?;
     commit_logical_upload_from_meta(&fragment, &object_key, &physical, &parsed).await?;
     parsed.object_key = object_key;
     emit_logical_file_uploaded(&state, &fragment, &parsed, &parsed.object_key);
+    parsed.strip_internal_layout();
     Ok((StatusCode::CREATED, AxumJson(parsed)).into_response())
 }
 
@@ -732,17 +761,18 @@ async fn finalize_object_upload_scoped(
     if response.status() != StatusCode::OK {
         return Ok(response);
     }
-    let mut parsed = index::read_object_version(&fragment, &physical, &version_id).await?;
     let logical_path = binding
         .as_ref()
         .map(|value| value.logical_path.clone())
         .unwrap_or(key_query.object_key);
+    let mut parsed = index::read_object_version(&fragment, &physical, &version_id).await?;
     commit_logical_upload_from_meta(&parsed.fragment, &logical_path, &physical, &parsed).await?;
     global_namespace_runtime()
         .clear_pending_upload(&parsed.fragment, &parsed.version_id)
         .await?;
     parsed.object_key = logical_path;
     emit_logical_file_uploaded(&state, &fragment, &parsed, &parsed.object_key);
+    parsed.strip_internal_layout();
     Ok((StatusCode::OK, AxumJson(parsed)).into_response())
 }
 
@@ -903,6 +933,10 @@ pub fn build_storage_routes_unbound_with_options(
         let write_ops = Router::new()
             .route("/n1/fragments/{:fragment}", delete(delete_fragment))
             .route("/n1/fragments/{:fragment}", patch(update_fragment))
+            .route(
+                "/n1/fragments/{:fragment}/quota",
+                patch(resize_fragment_quota_scoped),
+            )
             .route("/n1/trash/empty", delete(empty_trash_scoped))
             .route("/n1/objects/rename", post(rename_object_scoped))
             .route("/n1/objects/bulk-delete", post(delete_objects_bulk_impl))
@@ -1066,13 +1100,13 @@ async fn ping() -> &'static str {
 mod tests {
     use super::{
         AppState, download_filename_for_logical_path, download_selected_archive_scoped,
-        get_upload_status_scoped, initiate_object_upload_scoped, list_active_uploads_scoped,
-        looks_like_flat_storage_object_id, parse_json_response, upload_object_one_shot_scoped,
-        upload_request_matches_session,
+        get_object_metadata_scoped, get_upload_status_scoped, initiate_object_upload_scoped,
+        list_active_uploads_scoped, list_object_versions_scoped, looks_like_flat_storage_object_id,
+        parse_json_response, upload_object_one_shot_scoped, upload_request_matches_session,
     };
     use crate::core::disk_manager::{
         BLOB_STORE_DISKS, DownloadArchiveRequest, FS_STORAGE_ROOT, INDEX_STORE_DISKS,
-        InitiateUploadResponse,
+        InitiateUploadResponse, ObjectMetadata,
     };
     use crate::core::disk_manager::{InitiateUploadParams, ReservationReceipt, UploadPartQuery};
     use crate::core::fragment_metadata::{
@@ -1559,6 +1593,87 @@ mod tests {
             entries.len(),
             1,
             "scoped POSIX folder archive should contain only the selected live namespace subtree"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scoped_metadata_and_versions_hide_internal_layout() {
+        let _guard = TEST_LOCK.lock().await;
+        ensure_storage_config().await;
+        ensure_upload_runtime_config();
+
+        let fragment = {
+            let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+            hex::encode(digest)
+        };
+        setup_fragment(&fragment).await;
+
+        let state = Arc::new(AppState {
+            ws_manager: WsConnectionManager::new(),
+        });
+
+        let payload = "layout-redaction-payload";
+        let logical_path = "videos/redacted.mp4".to_string();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from_str(&payload.len().to_string())
+                .expect("content-length header"),
+        );
+
+        let upload = upload_object_one_shot_scoped(
+            State(state),
+            full_claims(&fragment),
+            headers,
+            Path(logical_path.clone()),
+            Query(UploadPartQuery {
+                checksum: None,
+                durability: None,
+                strict_durability: None,
+                io_gate: None,
+            }),
+            Body::from(payload),
+        )
+        .await
+        .expect("scoped one-shot upload")
+        .into_response();
+        assert_eq!(upload.status(), axum::http::StatusCode::CREATED);
+        let upload_meta: ObjectMetadata = parse_json_response(upload, "upload metadata")
+            .await
+            .expect("decode upload metadata");
+        assert_eq!(upload_meta.object_key, logical_path);
+        assert!(
+            upload_meta.parts.is_empty(),
+            "upload response must not expose shard layout"
+        );
+
+        let metadata =
+            get_object_metadata_scoped(full_claims(&fragment), Path(logical_path.clone()))
+                .await
+                .expect("scoped metadata")
+                .into_response();
+        let metadata: ObjectMetadata = parse_json_response(metadata, "object metadata")
+            .await
+            .expect("decode object metadata");
+        assert_eq!(metadata.object_key, logical_path);
+        assert!(
+            metadata.parts.is_empty(),
+            "metadata endpoint must not expose shard layout"
+        );
+
+        let versions =
+            list_object_versions_scoped(full_claims(&fragment), Path(logical_path.clone()))
+                .await
+                .expect("scoped versions")
+                .into_response();
+        let versions: Vec<ObjectMetadata> = parse_json_response(versions, "object versions")
+            .await
+            .expect("decode object versions");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].object_key, logical_path);
+        assert!(
+            versions[0].parts.is_empty(),
+            "versions endpoint must not expose shard layout"
         );
     }
 

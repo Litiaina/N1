@@ -16,7 +16,11 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata, ObjectPathManager};
-use crate::core::indexdb_store::{open_n1_indexdb, with_partition_commit_lock};
+use crate::core::indexdb_store::{
+    PartitionMeta, next_indexdb_metadata_generation, open_n1_indexdb,
+    replay_indexdb_metadata_generation, seed_fragment_owner_indexdb_from_authoritative_copy,
+    with_partition_commit_lock,
+};
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::{
     LifecycleState, NamespaceEntry, NamespaceEntryKind, NamespaceError, NamespaceMutationSummary,
@@ -75,6 +79,7 @@ struct NamespaceReplicaFileInfo {
 
 #[derive(Debug, Clone, Default)]
 struct NamespaceReplicaMutation {
+    partition_meta: Option<PartitionMeta>,
     upsert_nodes: Vec<n1_indexdb::NamespaceNode>,
     move_nodes: Vec<NamespaceNodeMoveReplay>,
     upsert_trash_roots: Vec<n1_indexdb::NamespaceTrashRoot>,
@@ -138,6 +143,20 @@ impl NamespaceReplicaMutation {
             && self.delete_pending_uploads.is_empty()
             && self.upsert_object_metadata.is_empty()
     }
+}
+
+fn seal_namespace_mutation(
+    write_txn: &indexdb::WriteTransaction,
+    mutation: &mut NamespaceReplicaMutation,
+    changed_at_unix: i64,
+) -> Result<(), AppError> {
+    if !mutation.is_empty() {
+        mutation.partition_meta = Some(next_indexdb_metadata_generation(
+            write_txn,
+            changed_at_unix,
+        )?);
+    }
+    Ok(())
 }
 
 static GLOBAL_NAMESPACE_RUNTIME: LazyLock<NamespaceRuntime> = LazyLock::new(NamespaceRuntime::new);
@@ -449,29 +468,27 @@ impl NamespaceRuntime {
         let fragment_owned = fragment.to_string();
         let owner_path = namespace_db_path(fragment)?;
         let changed_at = Utc::now().timestamp();
-        let created_entries = run_namespace_blocking(move || {
+        let mutation = run_namespace_blocking(move || {
             with_partition_commit_lock(&owner_path, || {
                 let write_txn = db
                     .begin_write()
                     .map_err(|e| map_indexdb_error("namespace mkdir begin_write", e))?;
                 let created = ensure_directory_path_nodes(&write_txn, &normalized, changed_at)?;
+                let mut mutation = NamespaceReplicaMutation {
+                    upsert_nodes: created,
+                    ..Default::default()
+                };
+                seal_namespace_mutation(&write_txn, &mut mutation, changed_at)?;
                 write_txn
                     .commit()
                     .map_err(|e| map_indexdb_error("namespace mkdir commit", e))?;
-                Ok(created)
+                Ok(mutation)
             })
         })
         .await?;
-        let created = !created_entries.is_empty();
+        let created = !mutation.is_empty();
         if created {
-            replicate_namespace_mutation_for_fragment(
-                self,
-                &fragment_owned,
-                &NamespaceReplicaMutation {
-                    upsert_nodes: created_entries,
-                    ..Default::default()
-                },
-            )?;
+            replicate_namespace_mutation_for_fragment(self, &fragment_owned, &mutation)?;
         }
         Ok(created)
     }
@@ -547,9 +564,6 @@ impl NamespaceRuntime {
                         changed_at,
                     )
                     .map_err(|e| map_indexdb_error("namespace rename node move", e))?;
-                write_txn
-                    .commit()
-                    .map_err(|e| map_indexdb_error("namespace rename commit", e))?;
                 let summary = NamespaceMutationSummary {
                     operation: "rename".to_string(),
                     kind: namespace_kind_from_indexdb(source_node.kind),
@@ -560,18 +574,20 @@ impl NamespaceRuntime {
                     trash_entry_id: None,
                     deleted_at_unix: None,
                 };
-                Ok((
-                    summary,
-                    NamespaceReplicaMutation {
-                        move_nodes: vec![NamespaceNodeMoveReplay {
-                            node_id: source_node.node_id,
-                            parent_node_id: destination_parent_node.node_id,
-                            name: destination_name,
-                            changed_at_unix: changed_at,
-                        }],
-                        ..Default::default()
-                    },
-                ))
+                let mut mutation = NamespaceReplicaMutation {
+                    move_nodes: vec![NamespaceNodeMoveReplay {
+                        node_id: source_node.node_id,
+                        parent_node_id: destination_parent_node.node_id,
+                        name: destination_name,
+                        changed_at_unix: changed_at,
+                    }],
+                    ..Default::default()
+                };
+                seal_namespace_mutation(&write_txn, &mut mutation, changed_at)?;
+                write_txn
+                    .commit()
+                    .map_err(|e| map_indexdb_error("namespace rename commit", e))?;
+                Ok((summary, mutation))
             })
         })
         .await?;
@@ -719,7 +735,69 @@ impl NamespaceRuntime {
                     }
                 }
             }
+            for binding in db
+                .n1_list_pending_uploads()
+                .map_err(|e| map_indexdb_error("namespace reachability pending uploads", e))?
+            {
+                saw_namespace_rows = true;
+                snapshot
+                    .referenced_object_ids
+                    .insert(binding.physical_object_id);
+                snapshot.referenced_version_ids.insert(binding.version_id);
+            }
             Ok(saw_namespace_rows.then_some(snapshot))
+        })
+        .await
+    }
+
+    pub async fn purged_object_ids_for_gc(
+        &self,
+        fragment: &str,
+    ) -> Result<BTreeSet<String>, AppError> {
+        let Some(db) = self.open_existing_db(fragment)? else {
+            return Ok(BTreeSet::new());
+        };
+        run_namespace_blocking(move || {
+            let mut object_ids = BTreeSet::new();
+            let mut roots_after = None;
+            loop {
+                let roots = db
+                    .n1_list_namespace_trash_roots_all(roots_after.as_deref(), 1000)
+                    .map_err(|e| map_indexdb_error("namespace gc purged roots", e))?;
+                if roots.is_empty() {
+                    break;
+                }
+                roots_after = roots.last().map(|root| root.trash_entry_id.clone());
+                for root in roots
+                    .into_iter()
+                    .filter(|root| root.state == n1_indexdb::TrashEntryState::Purged)
+                {
+                    if let Some(object_id) = root.object_id {
+                        object_ids.insert(object_id);
+                    }
+                    let mut after = None;
+                    loop {
+                        let rows = db
+                            .n1_list_namespace_subtree_nodes(
+                                &root.root_node_id,
+                                &root.original_path,
+                                after.as_deref(),
+                                1000,
+                            )
+                            .map_err(|e| map_indexdb_error("namespace gc purged subtree", e))?;
+                        if rows.is_empty() {
+                            break;
+                        }
+                        after = rows.last().map(|(path, _)| path.clone());
+                        for (_, node) in rows {
+                            if let Some(object_id) = node.object_id {
+                                object_ids.insert(object_id);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(object_ids)
         })
         .await
     }
@@ -852,14 +930,16 @@ impl NamespaceRuntime {
                     .n1_upsert_namespace_node(&node)
                     .map_err(|e| map_indexdb_error("namespace finalize node upsert", e))?;
                 upsert_nodes.push(node);
-                write_txn
-                    .commit()
-                    .map_err(|e| map_indexdb_error("namespace finalize commit", e))?;
-                Ok(NamespaceReplicaMutation {
+                let mut mutation = NamespaceReplicaMutation {
                     upsert_nodes,
                     upsert_object_metadata: vec![(object_id, metadata, changed_at)],
                     ..Default::default()
-                })
+                };
+                seal_namespace_mutation(&write_txn, &mut mutation, changed_at)?;
+                write_txn
+                    .commit()
+                    .map_err(|e| map_indexdb_error("namespace finalize commit", e))?;
+                Ok(mutation)
             })
         })
         .await?;
@@ -893,13 +973,15 @@ impl NamespaceRuntime {
                 write_txn
                     .n1_upsert_pending_upload(&binding)
                     .map_err(|e| map_indexdb_error("namespace pending upsert", e))?;
+                let mut mutation = NamespaceReplicaMutation {
+                    upsert_pending_uploads: vec![binding],
+                    ..Default::default()
+                };
+                seal_namespace_mutation(&write_txn, &mut mutation, Utc::now().timestamp())?;
                 write_txn
                     .commit()
                     .map_err(|e| map_indexdb_error("namespace pending commit", e))?;
-                Ok(NamespaceReplicaMutation {
-                    upsert_pending_uploads: vec![binding],
-                    ..Default::default()
-                })
+                Ok(mutation)
             })
         })
         .await?;
@@ -976,13 +1058,15 @@ impl NamespaceRuntime {
                 write_txn
                     .n1_delete_pending_upload(&version_id)
                     .map_err(|e| map_indexdb_error("namespace pending clear", e))?;
+                let mut mutation = NamespaceReplicaMutation {
+                    delete_pending_uploads: vec![version_id],
+                    ..Default::default()
+                };
+                seal_namespace_mutation(&write_txn, &mut mutation, Utc::now().timestamp())?;
                 write_txn
                     .commit()
                     .map_err(|e| map_indexdb_error("namespace pending clear commit", e))?;
-                Ok(NamespaceReplicaMutation {
-                    delete_pending_uploads: vec![version_id],
-                    ..Default::default()
-                })
+                Ok(mutation)
             })
         })
         .await?;
@@ -1114,9 +1198,14 @@ impl NamespaceRuntime {
     }
 
     fn open_db(&self, fragment: &str) -> Result<Arc<Database>, AppError> {
+        let owner_path = namespace_db_path(fragment)?;
+        if let Some(existing) = self.dbs.get(&owner_path) {
+            self.touch_db_cache(&owner_path);
+            return Ok(existing.clone());
+        }
         let path = self
             .ensure_owner_namespace_db(fragment)?
-            .unwrap_or(namespace_db_path(fragment)?);
+            .unwrap_or(owner_path);
         if let Some(existing) = self.dbs.get(&path) {
             self.touch_db_cache(&path);
             return Ok(existing.clone());
@@ -1133,6 +1222,11 @@ impl NamespaceRuntime {
     }
 
     fn open_existing_db(&self, fragment: &str) -> Result<Option<Arc<Database>>, AppError> {
+        let owner_path = namespace_db_path(fragment)?;
+        if let Some(existing) = self.dbs.get(&owner_path) {
+            self.touch_db_cache(&owner_path);
+            return Ok(Some(existing.clone()));
+        }
         let Some(path) = self.ensure_owner_namespace_db(fragment)? else {
             return Ok(None);
         };
@@ -1168,6 +1262,12 @@ impl NamespaceRuntime {
 
     fn ensure_owner_namespace_db(&self, fragment: &str) -> Result<Option<PathBuf>, AppError> {
         let owner_path = namespace_db_path(fragment)?;
+        let copied_authoritative = seed_fragment_owner_indexdb_from_authoritative_copy(fragment)?;
+        if copied_authoritative {
+            self.dbs.remove(&owner_path);
+            self.db_touch_ticks.remove(&owner_path);
+        }
+
         if owner_path.exists() {
             return Ok(Some(owner_path));
         }
@@ -1242,31 +1342,34 @@ impl NamespaceRuntime {
                             changed_at,
                         )
                         .map_err(|e| map_indexdb_error("namespace trash node detach", e))?;
+                    let source_kind = namespace_kind_from_indexdb(source_node.kind);
+                    let affected_objects = usize::from(source_node.object_id.is_some());
+                    let mut mutation = NamespaceReplicaMutation {
+                        upsert_trash_roots: vec![trash_root],
+                        move_nodes: vec![NamespaceNodeMoveReplay {
+                            node_id: source_node.node_id.clone(),
+                            parent_node_id: trash_parent,
+                            name: source_node.name.clone(),
+                            changed_at_unix: changed_at,
+                        }],
+                        ..Default::default()
+                    };
+                    seal_namespace_mutation(&write_txn, &mut mutation, changed_at)?;
                     write_txn
                         .commit()
                         .map_err(|e| map_indexdb_error("namespace lifecycle commit", e))?;
-                    let source_kind = namespace_kind_from_indexdb(source_node.kind);
                     return Ok((
                         NamespaceMutationSummary {
                             operation: "trash".to_string(),
                             kind: source_kind,
                             affected_paths: 1,
-                            affected_objects: usize::from(source_node.object_id.is_some()),
+                            affected_objects,
                             source_path: Some(source_path),
                             destination_path: None,
                             trash_entry_id: Some(trash_entry_id.clone()),
                             deleted_at_unix: Some(changed_at),
                         },
-                        NamespaceReplicaMutation {
-                            upsert_trash_roots: vec![trash_root],
-                            move_nodes: vec![NamespaceNodeMoveReplay {
-                                node_id: source_node.node_id,
-                                parent_node_id: trash_parent,
-                                name: source_node.name,
-                                changed_at_unix: changed_at,
-                            }],
-                            ..Default::default()
-                        },
+                        mutation,
                     ));
                 }
 
@@ -1326,35 +1429,38 @@ impl NamespaceRuntime {
                             changed_at,
                         )
                         .map_err(|e| map_indexdb_error("namespace trash root retire", e))?;
+                    let source_kind = namespace_kind_from_indexdb(root.kind);
+                    let affected_objects = usize::from(root.object_id.is_some());
+                    let mut mutation = NamespaceReplicaMutation {
+                        move_nodes: vec![NamespaceNodeMoveReplay {
+                            node_id: root.root_node_id.clone(),
+                            parent_node_id: root.original_parent_node_id.clone(),
+                            name: root.original_name.clone(),
+                            changed_at_unix: changed_at,
+                        }],
+                        set_trash_root_states: vec![(
+                            root.trash_entry_id.clone(),
+                            n1_indexdb::TrashEntryState::Retired,
+                            changed_at,
+                        )],
+                        ..Default::default()
+                    };
+                    seal_namespace_mutation(&write_txn, &mut mutation, changed_at)?;
                     write_txn
                         .commit()
                         .map_err(|e| map_indexdb_error("namespace lifecycle commit", e))?;
-                    let source_kind = namespace_kind_from_indexdb(root.kind);
                     return Ok((
                         NamespaceMutationSummary {
                             operation: "recover".to_string(),
                             kind: source_kind,
                             affected_paths: 1,
-                            affected_objects: usize::from(root.object_id.is_some()),
-                            source_path: Some(root.original_path),
+                            affected_objects,
+                            source_path: Some(root.original_path.clone()),
                             destination_path: None,
                             trash_entry_id: Some(root.trash_entry_id.clone()),
                             deleted_at_unix: None,
                         },
-                        NamespaceReplicaMutation {
-                            move_nodes: vec![NamespaceNodeMoveReplay {
-                                node_id: root.root_node_id,
-                                parent_node_id: root.original_parent_node_id,
-                                name: root.original_name,
-                                changed_at_unix: changed_at,
-                            }],
-                            set_trash_root_states: vec![(
-                                root.trash_entry_id,
-                                n1_indexdb::TrashEntryState::Retired,
-                                changed_at,
-                            )],
-                            ..Default::default()
-                        },
+                        mutation,
                     ));
                 }
 
@@ -1423,6 +1529,21 @@ impl NamespaceRuntime {
                         changed_at,
                     )
                     .map_err(|e| map_indexdb_error("namespace recover id root retire", e))?;
+                let mut mutation = NamespaceReplicaMutation {
+                    move_nodes: vec![NamespaceNodeMoveReplay {
+                        node_id: root.root_node_id.clone(),
+                        parent_node_id: root.original_parent_node_id.clone(),
+                        name: root.original_name.clone(),
+                        changed_at_unix: changed_at,
+                    }],
+                    set_trash_root_states: vec![(
+                        root.trash_entry_id.clone(),
+                        n1_indexdb::TrashEntryState::Retired,
+                        changed_at,
+                    )],
+                    ..Default::default()
+                };
+                seal_namespace_mutation(&write_txn, &mut mutation, changed_at)?;
                 write_txn
                     .commit()
                     .map_err(|e| map_indexdb_error("namespace recover id commit", e))?;
@@ -1432,25 +1553,12 @@ impl NamespaceRuntime {
                         kind: namespace_kind_from_indexdb(root.kind),
                         affected_paths: 1,
                         affected_objects: usize::from(root.object_id.is_some()),
-                        source_path: Some(root.original_path),
+                        source_path: Some(root.original_path.clone()),
                         destination_path: None,
                         trash_entry_id: Some(root.trash_entry_id.clone()),
                         deleted_at_unix: None,
                     },
-                    NamespaceReplicaMutation {
-                        move_nodes: vec![NamespaceNodeMoveReplay {
-                            node_id: root.root_node_id,
-                            parent_node_id: root.original_parent_node_id,
-                            name: root.original_name,
-                            changed_at_unix: changed_at,
-                        }],
-                        set_trash_root_states: vec![(
-                            root.trash_entry_id,
-                            n1_indexdb::TrashEntryState::Retired,
-                            changed_at,
-                        )],
-                        ..Default::default()
-                    },
+                    mutation,
                 ))
             })
         })
@@ -1535,6 +1643,7 @@ impl NamespaceRuntime {
                     ));
                 }
                 let affected_paths = mutation.move_nodes.len();
+                seal_namespace_mutation(&write_txn, &mut mutation, changed_at)?;
                 write_txn
                     .commit()
                     .map_err(|e| map_indexdb_error("namespace lifecycle commit", e))?;
@@ -1605,6 +1714,15 @@ impl NamespaceRuntime {
                         changed_at,
                     )
                     .map_err(|e| map_indexdb_error("namespace trash root purge", e))?;
+                let mut mutation = NamespaceReplicaMutation {
+                    set_trash_root_states: vec![(
+                        root.trash_entry_id.clone(),
+                        n1_indexdb::TrashEntryState::Purged,
+                        changed_at,
+                    )],
+                    ..Default::default()
+                };
+                seal_namespace_mutation(&write_txn, &mut mutation, changed_at)?;
                 write_txn
                     .commit()
                     .map_err(|e| map_indexdb_error("namespace purge commit", e))?;
@@ -1614,19 +1732,12 @@ impl NamespaceRuntime {
                         kind: namespace_kind_from_indexdb(root.kind),
                         affected_paths: 1,
                         affected_objects: usize::from(root.object_id.is_some()),
-                        source_path: Some(root.original_path),
+                        source_path: Some(root.original_path.clone()),
                         destination_path: None,
                         trash_entry_id: Some(root.trash_entry_id.clone()),
                         deleted_at_unix: None,
                     },
-                    NamespaceReplicaMutation {
-                        set_trash_root_states: vec![(
-                            root.trash_entry_id,
-                            n1_indexdb::TrashEntryState::Purged,
-                            changed_at,
-                        )],
-                        ..Default::default()
-                    },
+                    mutation,
                 ))
             })
         })
@@ -1681,6 +1792,7 @@ impl NamespaceRuntime {
                     ));
                 }
                 let affected_paths = mutation.set_trash_root_states.len();
+                seal_namespace_mutation(&write_txn, &mut mutation, changed_at)?;
                 write_txn
                     .commit()
                     .map_err(|e| map_indexdb_error("namespace empty trash commit", e))?;
@@ -2555,6 +2667,9 @@ fn replicate_namespace_mutation_for_fragment(
                     .n1_delete_pending_upload(version_id)
                     .map_err(|err| map_indexdb_error("namespace replica pending delete", err))?;
             }
+            if let Some(partition_meta) = &mutation.partition_meta {
+                replay_indexdb_metadata_generation(&write_txn, partition_meta)?;
+            }
             write_txn
                 .commit()
                 .map_err(|err| map_indexdb_error("namespace replica commit", err))
@@ -2566,6 +2681,8 @@ fn replicate_namespace_mutation_for_fragment(
                 replica_path.display(),
                 err
             );
+            runtime.dbs.remove(&replica_path);
+            runtime.db_touch_ticks.remove(&replica_path);
             if let Err(copy_err) = copy_namespace_db_file(&owner_path, &replica_path) {
                 warn!(
                     "namespace replica catch-up failed for {} -> {}: {}",
@@ -2574,6 +2691,8 @@ fn replicate_namespace_mutation_for_fragment(
                     copy_err
                 );
             }
+            runtime.dbs.remove(&replica_path);
+            runtime.db_touch_ticks.remove(&replica_path);
         }
     }
 

@@ -104,27 +104,6 @@ pub async fn open_session(
     run_indexdb_blocking(move || indexdb_store::open_session(&manifest, reservation)).await
 }
 
-pub async fn reserve_upload_quota(
-    fragment: &str,
-    object_key: &str,
-    version_id: &str,
-    reserved_bytes: u64,
-) -> Result<(), AppError> {
-    let fragment = fragment.to_string();
-    let object_key = object_key.to_string();
-    let version_id = version_id.to_string();
-    run_indexdb_blocking(move || {
-        indexdb_store::reserve_upload_quota(&fragment, &object_key, &version_id, reserved_bytes)
-    })
-    .await
-}
-
-pub async fn release_upload_quota(fragment: &str, version_id: &str) -> Result<(), AppError> {
-    let fragment = fragment.to_string();
-    let version_id = version_id.to_string();
-    run_indexdb_blocking(move || indexdb_store::release_upload_quota(&fragment, &version_id)).await
-}
-
 pub async fn commit_session_part(
     fragment: &str,
     version_id: &str,

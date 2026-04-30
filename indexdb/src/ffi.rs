@@ -311,6 +311,7 @@ impl Connection {
                 fragment_id TEXT PRIMARY KEY NOT NULL,
                 state TEXT NOT NULL,
                 quota_bytes INTEGER NOT NULL,
+                quota_project_id INTEGER,
                 committed_bytes INTEGER NOT NULL DEFAULT 0,
                 reserved_bytes INTEGER NOT NULL DEFAULT 0,
                 trash_bytes INTEGER NOT NULL DEFAULT 0,
@@ -523,6 +524,10 @@ impl Connection {
             ",
         )?;
 
+        if !self.column_exists("fragment_meta", "quota_project_id")? {
+            self.exec("ALTER TABLE fragment_meta ADD COLUMN quota_project_id INTEGER")?;
+        }
+
         self.upsert_meta("engine", "indexdb")?;
         self.upsert_meta("format", "ndxdb")?;
         self.upsert_meta("layout", "per_fragment")?;
@@ -533,6 +538,21 @@ impl Connection {
         self.upsert_meta("last_commit_id", "0")?;
         self.upsert_meta("replica_generation", "0")?;
         Ok(())
+    }
+
+    fn column_exists(&mut self, table: &str, column: &str) -> Result<bool, StorageError> {
+        let sql = format!("PRAGMA table_info({table})");
+        let mut stmt = self.prepare(&sql)?;
+        loop {
+            match stmt.step()? {
+                StepResult::Row => {
+                    if stmt.column_text(1).as_deref() == Some(column) {
+                        return Ok(true);
+                    }
+                }
+                StepResult::Done => return Ok(false),
+            }
+        }
     }
 
     fn upsert_meta(&mut self, key: &str, value: &str) -> Result<(), StorageError> {
@@ -703,6 +723,17 @@ impl Statement {
     pub(crate) fn column_i64(&self, idx: i32) -> i64 {
         // SAFETY: stmt is currently on a row.
         unsafe { sqlite3_column_int64(self.stmt, idx) }
+    }
+
+    pub(crate) fn column_i64_optional(&self, idx: i32) -> Option<i64> {
+        // SAFETY: stmt is currently on a row.
+        unsafe {
+            if sqlite3_column_type(self.stmt, idx) == SQLITE_NULL {
+                None
+            } else {
+                Some(sqlite3_column_int64(self.stmt, idx))
+            }
+        }
     }
 
     pub(crate) fn column_i32(&self, idx: i32) -> i32 {

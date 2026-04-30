@@ -268,6 +268,7 @@ pub struct FragmentMeta {
     pub fragment_id: String,
     pub state: String,
     pub quota_bytes: u64,
+    pub quota_project_id: Option<u32>,
     pub committed_bytes: u64,
     pub reserved_bytes: u64,
     pub trash_bytes: u64,

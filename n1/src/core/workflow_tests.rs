@@ -28,7 +28,7 @@ use super::object_parser::{
     STREAM_READAHEAD_BYTES_ATOMIC,
 };
 use super::operation_gate::MaintenanceAccessMode;
-use super::quota_manager::{get_storage_usage, init_quota_file};
+use super::quota_manager::{get_fragment_blob_usage, get_storage_usage, init_quota_file};
 use super::recovery::verify_shard_integrity;
 use super::redistribution::{
     RedistributionDurabilityMode, RedistributionExecutionMode, RedistributionRunOptions,
@@ -41,7 +41,9 @@ use super::repair_manager::{
 use super::retrieve::{
     get_object, get_object_metadata, list_objects, list_trash_objects, stream_object,
 };
-use super::storage_capacity_parser::get_capacity_usage;
+use super::storage_capacity_parser::{
+    ResizeFragmentQuotaRequest, get_capacity_usage, get_fragment_quota_usage, resize_fragment_quota,
+};
 use super::sync::ensure_fragment_blob_directories;
 use super::upload::{
     DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC,
@@ -994,6 +996,9 @@ async fn run_manual_gc_with_target_and_wait(
         .expect("gc status baseline")
         .0;
     let baseline_start = baseline.start_timestamp;
+    while baseline_start > 0 && Utc::now().timestamp() <= baseline_start {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 
     let mut params = HashMap::new();
     if let Some(fragment) = target_fragment {
@@ -1161,6 +1166,13 @@ async fn create_fragment_with_quota(quota_bytes: u64) -> String {
     .expect("create quota fragment")
     .into_response();
     assert_eq!(response.status(), StatusCode::CREATED);
+    let meta = indexdb_store::fragment_quota_meta(&fragment)
+        .expect("fragment quota meta after create")
+        .expect("fragment quota meta");
+    assert!(
+        meta.quota_project_id.is_some(),
+        "fragment creation must assign a stable filesystem quota project id"
+    );
     fragment
 }
 
@@ -1587,6 +1599,10 @@ async fn matrix_upload_part_batched_durability_finalize_ok() {
     let base = TEST_BASE.clone();
     ensure_global_storage_config(&base).await;
     ensure_upload_runtime_config();
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(262_144, Ordering::Relaxed);
 
     let fragment = {
         let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
@@ -1636,6 +1652,10 @@ async fn matrix_upload_one_shot_publishes_without_active_session() {
     let base = TEST_BASE.clone();
     ensure_global_storage_config(&base).await;
     ensure_upload_runtime_config();
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(262_144, Ordering::Relaxed);
 
     let fragment = {
         let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
@@ -1673,13 +1693,83 @@ async fn matrix_upload_one_shot_publishes_without_active_session() {
         .await
         .expect("read version");
     assert_eq!(meta.total_size_bytes, content.len() as u64);
+    assert_eq!(meta.stripe_size_bytes, 16 * 1024);
     assert_eq!(meta.parts.len(), 1);
     assert_eq!(meta.parts[0].part_index, 0);
+    assert_eq!(meta.parts[0].shards[0].size_bytes, 5 * 16 * 1024);
 
     let sessions = index::list_active_sessions(&fragment)
         .await
         .expect("list active sessions");
     assert!(sessions.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_multipart_upload_persists_dynamic_stripe_in_manifest_and_metadata() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(262_144, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+    let key = "multipart/dynamic-stripe.bin";
+    let part0 = vec![0x11; 16 * 1024];
+    let part1 = vec![0x22; 16 * 1024];
+    let total = (part0.len() + part1.len()) as u64;
+
+    let (version_id, session_id) =
+        init_upload_with_part_size(&fragment, key, total, 2, Some(16 * 1024)).await;
+    let session = index::load_session(&fragment, &version_id)
+        .await
+        .expect("load dynamic stripe session")
+        .expect("dynamic stripe session");
+    assert_eq!(session.manifest.stripe_size_bytes, 4096);
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(2, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+
+    let put0 = upload_part(&fragment, &version_id, 0, part0.clone()).await;
+    assert_eq!(put0.status(), StatusCode::OK);
+    let put1 = upload_part(&fragment, &version_id, 1, part1.clone()).await;
+    assert_eq!(put1.status(), StatusCode::OK);
+
+    let finalize_resp =
+        finalize_upload(state, &fragment, &version_id, &session_id, key, total, 2).await;
+    assert_eq!(finalize_resp.status(), StatusCode::OK);
+
+    let meta = index::read_object_version(&fragment, key, &version_id)
+        .await
+        .expect("read finalized dynamic stripe object");
+    assert_eq!(meta.stripe_size_bytes, 4096);
+    assert_eq!(meta.parts.len(), 2);
+    assert!(meta.parts.iter().all(|part| {
+        part.shards.len() == 1 && part.shards.iter().all(|shard| !shard.is_parity)
+    }));
+    assert!(meta.parts.iter().all(|part| {
+        part.shards
+            .iter()
+            .all(|shard| shard.size_bytes == 16 * 1024)
+    }));
+
+    let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.to_string()).await;
+    assert_eq!(got, [part0, part1].concat());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2040,13 +2130,122 @@ async fn matrix_fragment_create_requires_nonzero_quota() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_multipart_upload_reserves_and_releases_fragment_quota() {
+async fn matrix_fragment_quota_resize_is_admin_validated() {
+    let _guard = TEST_LOCK.lock().await;
+    ensure_master_key_for_tests();
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = create_fragment_with_quota(2 * 1024 * 1024).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+    let upload_resp =
+        upload_one_shot(state, &fragment, "quota/resize-used.bin", vec![0x42; 4]).await;
+    assert_eq!(upload_resp.status(), StatusCode::CREATED);
+    let uploaded_meta = index::read_latest_object(&fragment, "quota/resize-used.bin")
+        .await
+        .expect("read quota resize upload metadata");
+    let physical_bytes: u64 = uploaded_meta
+        .parts
+        .iter()
+        .flat_map(|part| part.shards.iter())
+        .map(|shard| shard.size_bytes)
+        .sum();
+    assert!(physical_bytes > 0);
+    global_namespace_runtime()
+        .finalize_logical_upload(
+            &fragment,
+            "quota/resize-used.bin",
+            "quota/resize-used.bin",
+            &uploaded_meta,
+        )
+        .await
+        .expect("bind quota resize object to namespace");
+
+    let grow_resp = resize_fragment_quota(
+        full_claims(&fragment),
+        AxumPath(fragment.clone()),
+        Json(ResizeFragmentQuotaRequest {
+            quota_bytes: 3 * 1024 * 1024,
+            secret: (*MASTER_KEY).clone(),
+        }),
+    )
+    .await
+    .expect("grow quota")
+    .into_response();
+    assert_eq!(grow_resp.status(), StatusCode::OK);
+    let meta = indexdb_store::fragment_quota_meta(&fragment)
+        .expect("quota meta after grow")
+        .expect("fragment quota meta");
+    assert_eq!(meta.quota_bytes, 3 * 1024 * 1024);
+    assert_eq!(meta.committed_bytes, 0);
+
+    let too_small = resize_fragment_quota(
+        full_claims(&fragment),
+        AxumPath(fragment.clone()),
+        Json(ResizeFragmentQuotaRequest {
+            quota_bytes: physical_bytes.saturating_sub(1),
+            secret: (*MASTER_KEY).clone(),
+        }),
+    )
+    .await;
+    match too_small {
+        Err(AppError::Conflict(msg)) => {
+            assert!(msg.contains("below current blob filesystem used_bytes"))
+        }
+        Err(err) => panic!("expected Conflict for shrink below used bytes, got {err:?}"),
+        Ok(_) => panic!("expected shrink below used bytes to fail"),
+    }
+    let meta = indexdb_store::fragment_quota_meta(&fragment)
+        .expect("quota meta after rejected shrink")
+        .expect("fragment quota meta");
+    assert_eq!(meta.quota_bytes, 3 * 1024 * 1024);
+
+    let shrink_resp = resize_fragment_quota(
+        full_claims(&fragment),
+        AxumPath(fragment.clone()),
+        Json(ResizeFragmentQuotaRequest {
+            quota_bytes: physical_bytes,
+            secret: (*MASTER_KEY).clone(),
+        }),
+    )
+    .await
+    .expect("shrink quota to used bytes")
+    .into_response();
+    assert_eq!(shrink_resp.status(), StatusCode::OK);
+    let meta = indexdb_store::fragment_quota_meta(&fragment)
+        .expect("quota meta after valid shrink")
+        .expect("fragment quota meta");
+    assert_eq!(meta.quota_bytes, physical_bytes);
+    assert_eq!(meta.committed_bytes, 0);
+
+    let usage = get_storage_usage().await.expect("physical capacity");
+    let impossible = resize_fragment_quota(
+        full_claims(&fragment),
+        AxumPath(fragment.clone()),
+        Json(ResizeFragmentQuotaRequest {
+            quota_bytes: usage.capacity_allocated.saturating_add(1),
+            secret: (*MASTER_KEY).clone(),
+        }),
+    )
+    .await;
+    match impossible {
+        Err(AppError::InsufficientStorage) => {}
+        Err(err) => panic!("expected InsufficientStorage for impossible grow, got {err:?}"),
+        Ok(_) => panic!("expected impossible quota grow to fail"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_multipart_upload_initiate_does_not_reserve_fragment_quota() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
     ensure_global_storage_config(&base).await;
     ensure_upload_runtime_config();
 
-    let fragment = create_fragment_with_quota(10).await;
+    let fragment = create_fragment_with_quota(2 * 1024 * 1024).await;
     let init_resp = initiate_object_upload(
         full_claims(&fragment),
         AxumPath((fragment.clone(), "quota/session-a.bin".to_string())),
@@ -2058,7 +2257,7 @@ async fn matrix_multipart_upload_reserves_and_releases_fragment_quota() {
         }),
     )
     .await
-    .expect("initiate first quota-bound upload")
+    .expect("initiate first upload")
     .into_response();
     assert_eq!(init_resp.status(), StatusCode::CREATED);
     let init_json = read_response_json(init_resp).await;
@@ -2068,14 +2267,14 @@ async fn matrix_multipart_upload_reserves_and_releases_fragment_quota() {
         .to_string();
 
     let meta = indexdb_store::fragment_quota_meta(&fragment)
-        .expect("quota meta after reservation")
+        .expect("quota meta after initiate")
         .expect("fragment quota meta");
-    assert_eq!(meta.quota_bytes, 10);
+    assert_eq!(meta.quota_bytes, 2 * 1024 * 1024);
     assert_eq!(meta.committed_bytes, 0);
-    assert_eq!(meta.reserved_bytes, 8);
+    assert_eq!(meta.reserved_bytes, 0);
     assert_eq!(meta.trash_bytes, 0);
 
-    let over_quota = initiate_object_upload(
+    let second_resp = initiate_object_upload(
         full_claims(&fragment),
         AxumPath((fragment.clone(), "quota/session-b.bin".to_string())),
         AxumJson(InitiateUploadParams {
@@ -2085,18 +2284,16 @@ async fn matrix_multipart_upload_reserves_and_releases_fragment_quota() {
             part_size_bytes: Some(3),
         }),
     )
-    .await;
-    match over_quota {
-        Err(AppError::InsufficientStorage) => {}
-        Err(err) => panic!("expected InsufficientStorage for reserved quota, got {err:?}"),
-        Ok(_) => panic!("expected reserved quota to reject the second upload"),
-    }
+    .await
+    .expect("initiate second upload without quota reservation")
+    .into_response();
+    assert_eq!(second_resp.status(), StatusCode::CREATED);
 
     index::remove_session(&fragment, &version_id, "quota-test-cancel")
         .await
         .expect("remove quota-bound session");
     let meta = indexdb_store::fragment_quota_meta(&fragment)
-        .expect("quota meta after reservation release")
+        .expect("quota meta after session cancel")
         .expect("fragment quota meta");
     assert_eq!(meta.committed_bytes, 0);
     assert_eq!(meta.reserved_bytes, 0);
@@ -2104,13 +2301,54 @@ async fn matrix_multipart_upload_reserves_and_releases_fragment_quota() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn matrix_one_shot_upload_commits_and_moves_fragment_quota() {
+async fn matrix_fragment_quota_usage_reads_blob_filesystem() {
     let _guard = TEST_LOCK.lock().await;
     let base = TEST_BASE.clone();
     ensure_global_storage_config(&base).await;
     ensure_upload_runtime_config();
 
-    let fragment = create_fragment_with_quota(10).await;
+    let fragment = create_fragment_with_quota(2 * 1024 * 1024).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+    let object_key = "quota/blob-usage.bin";
+
+    let upload_resp = upload_one_shot(state, &fragment, object_key, vec![0x31; 4]).await;
+    assert_eq!(upload_resp.status(), StatusCode::CREATED);
+    let metadata = index::read_latest_object(&fragment, object_key)
+        .await
+        .expect("read uploaded metadata");
+    let physical_bytes: u64 = metadata
+        .parts
+        .iter()
+        .flat_map(|part| part.shards.iter())
+        .map(|shard| shard.size_bytes)
+        .sum();
+    assert!(physical_bytes > 0);
+
+    let blob_usage = get_fragment_blob_usage(&fragment)
+        .await
+        .expect("blob filesystem usage");
+    assert_eq!(blob_usage.used_bytes(), physical_bytes);
+
+    let quota_resp = get_fragment_quota_usage(full_claims(&fragment))
+        .await
+        .expect("quota usage response")
+        .into_response();
+    assert_eq!(quota_resp.status(), StatusCode::OK);
+    let quota_json = read_response_json(quota_resp).await;
+    assert_eq!(quota_json["used_bytes"].as_u64(), Some(physical_bytes));
+    assert_eq!(quota_json["reserved_bytes"].as_u64(), Some(0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_hard_delete_keeps_blob_quota_usage_until_gc() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = create_fragment_with_quota(2 * 1024 * 1024).await;
     let state = Arc::new(AppState {
         ws_manager: WsConnectionManager::new(),
     });
@@ -2118,31 +2356,11 @@ async fn matrix_one_shot_upload_commits_and_moves_fragment_quota() {
 
     let upload_resp = upload_one_shot(state.clone(), &fragment, object_key, vec![0x31; 4]).await;
     assert_eq!(upload_resp.status(), StatusCode::CREATED);
-    let meta = indexdb_store::fragment_quota_meta(&fragment)
-        .expect("quota meta after one-shot")
-        .expect("fragment quota meta");
-    assert_eq!(meta.committed_bytes, 4);
-    assert_eq!(meta.reserved_bytes, 0);
-    assert_eq!(meta.trash_bytes, 0);
-
-    let over_quota = try_upload_one_shot(
-        state.clone(),
-        &fragment,
-        "quota/too-large.bin",
-        vec![0x32; 7],
-    )
-    .await;
-    match over_quota {
-        Err(AppError::InsufficientStorage) => {}
-        Err(err) => panic!("expected InsufficientStorage for committed quota, got {err:?}"),
-        Ok(_) => panic!("expected committed quota to reject the second one-shot upload"),
-    }
-    let meta = indexdb_store::fragment_quota_meta(&fragment)
-        .expect("quota meta after rejected one-shot")
-        .expect("fragment quota meta");
-    assert_eq!(meta.committed_bytes, 4);
-    assert_eq!(meta.reserved_bytes, 0);
-    assert_eq!(meta.trash_bytes, 0);
+    let before_delete = get_fragment_blob_usage(&fragment)
+        .await
+        .expect("blob usage before delete")
+        .used_bytes();
+    assert!(before_delete > 0);
 
     let delete_resp = delete_object(
         State(state.clone()),
@@ -2153,12 +2371,11 @@ async fn matrix_one_shot_upload_commits_and_moves_fragment_quota() {
     .expect("soft delete quota object")
     .into_response();
     assert_eq!(delete_resp.status(), StatusCode::OK);
-    let meta = indexdb_store::fragment_quota_meta(&fragment)
-        .expect("quota meta after soft delete")
-        .expect("fragment quota meta");
-    assert_eq!(meta.committed_bytes, 0);
-    assert_eq!(meta.reserved_bytes, 0);
-    assert_eq!(meta.trash_bytes, 4);
+    let after_soft_delete = get_fragment_blob_usage(&fragment)
+        .await
+        .expect("blob usage after soft delete")
+        .used_bytes();
+    assert_eq!(after_soft_delete, before_delete);
 
     let recover_resp = recover_object(
         State(state.clone()),
@@ -2169,12 +2386,11 @@ async fn matrix_one_shot_upload_commits_and_moves_fragment_quota() {
     .expect("recover quota object")
     .into_response();
     assert_eq!(recover_resp.status(), StatusCode::OK);
-    let meta = indexdb_store::fragment_quota_meta(&fragment)
-        .expect("quota meta after recover")
-        .expect("fragment quota meta");
-    assert_eq!(meta.committed_bytes, 4);
-    assert_eq!(meta.reserved_bytes, 0);
-    assert_eq!(meta.trash_bytes, 0);
+    let after_recover = get_fragment_blob_usage(&fragment)
+        .await
+        .expect("blob usage after recover")
+        .used_bytes();
+    assert_eq!(after_recover, before_delete);
 
     let purge_resp = delete_object_permanently(
         State(state),
@@ -2185,12 +2401,11 @@ async fn matrix_one_shot_upload_commits_and_moves_fragment_quota() {
     .expect("permanently delete quota object")
     .into_response();
     assert_eq!(purge_resp.status(), StatusCode::NO_CONTENT);
-    let meta = indexdb_store::fragment_quota_meta(&fragment)
-        .expect("quota meta after permanent delete")
-        .expect("fragment quota meta");
-    assert_eq!(meta.committed_bytes, 0);
-    assert_eq!(meta.reserved_bytes, 0);
-    assert_eq!(meta.trash_bytes, 0);
+    let after_hard_delete = get_fragment_blob_usage(&fragment)
+        .await
+        .expect("blob usage after hard delete")
+        .used_bytes();
+    assert_eq!(after_hard_delete, before_delete);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2433,7 +2648,7 @@ async fn matrix_manual_gc_preserves_active_multipart_sessions() {
     let put_resp = upload_part(&fragment, &version_id, 0, vec![0x33; 4096]).await;
     assert_eq!(put_resp.status(), StatusCode::OK);
 
-    run_manual_gc_and_wait(state).await;
+    run_manual_gc_for_fragment_and_wait(state, &fragment).await;
 
     let sessions = index::list_active_sessions(&fragment)
         .await
@@ -2501,7 +2716,7 @@ async fn matrix_manual_gc_reclaims_orphaned_multipart_upload_blob_dirs() {
         .await
         .expect("remove multipart session metadata");
     sleep(Duration::from_secs(2)).await;
-    run_manual_gc_and_wait(state).await;
+    run_manual_gc_for_fragment_and_wait(state, &fragment).await;
 
     for path in &version_dirs {
         assert!(
@@ -2732,6 +2947,15 @@ async fn bind_logical_path_to_physical_object(
 }
 
 async fn seed_live_object_metadata(fragment: &str, object_key: &str, size_bytes: u64) -> String {
+    seed_live_object_metadata_at(fragment, object_key, size_bytes, Utc::now().timestamp()).await
+}
+
+async fn seed_live_object_metadata_at(
+    fragment: &str,
+    object_key: &str,
+    size_bytes: u64,
+    created_at: i64,
+) -> String {
     let version_id = Ulid::new().to_string();
     let upload_session_id = Ulid::new().to_string();
     let metadata = ObjectMetadata {
@@ -2742,7 +2966,7 @@ async fn seed_live_object_metadata(fragment: &str, object_key: &str, size_bytes:
         owner_uid: fragment.to_string(),
         content_type: "application/octet-stream".to_string(),
         total_size_bytes: size_bytes,
-        created_at: Utc::now().timestamp(),
+        created_at,
         parts: Vec::new(),
         is_delete_marker: false,
         stripe_size_bytes: 262_144,
@@ -3017,6 +3241,10 @@ async fn workflow_upload_read_modify_delete_redistribute_repair() {
     let base = TEST_BASE.clone();
     ensure_global_storage_config(&base).await;
     ensure_upload_runtime_config();
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(262_144, Ordering::Relaxed);
 
     let fragment = {
         let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
@@ -3059,6 +3287,10 @@ async fn workflow_upload_read_modify_delete_redistribute_repair() {
     let fetched_source =
         read_object_bytes(full_claims(&fragment), fragment.clone(), source_key.clone()).await;
     assert_eq!(fetched_source, content);
+    let source_meta = get_metadata(&fragment, &source_key, &fragment)
+        .await
+        .expect("metadata before redistribution");
+    assert_eq!(source_meta.stripe_size_bytes, 16 * 1024);
 
     let rename_resp = rename_object(
         State(state.clone()),
@@ -3118,6 +3350,7 @@ async fn workflow_upload_read_modify_delete_redistribute_repair() {
     let redistributed_meta = get_metadata(&fragment, &renamed_key, &fragment)
         .await
         .expect("metadata after redistribution");
+    assert_eq!(redistributed_meta.stripe_size_bytes, 16 * 1024);
     assert_eq!(redistributed_meta.parts.len(), 1);
     let shards = &redistributed_meta.parts[0].shards;
     assert_eq!(shards.len(), 3);
@@ -5045,6 +5278,219 @@ async fn matrix_gc_keeps_live_data_and_cleans_trash_in_partition_layout() {
         "manual GC should clear trashed object in this test: {:?}",
         trashed_keys
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_gc_preserves_recent_unbound_physical_live_object() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let physical_key = format!("physical-{}", Ulid::new());
+    let physical_payload = vec![0x77; 4096];
+    let physical_version = put_object(
+        state.clone(),
+        &fragment,
+        &physical_key,
+        physical_payload.clone(),
+    )
+    .await;
+
+    let referenced_physical_key = format!("physical-{}", Ulid::new());
+    put_object(
+        state.clone(),
+        &fragment,
+        &referenced_physical_key,
+        vec![0x42; 4096],
+    )
+    .await;
+    bind_logical_path_to_physical_object(&fragment, "gc/referenced.bin", &referenced_physical_key)
+        .await;
+
+    run_manual_gc_for_fragment_and_wait(state, &fragment).await;
+
+    let bytes = read_object_bytes(full_claims(&fragment), fragment.clone(), physical_key).await;
+    assert_eq!(
+        bytes, physical_payload,
+        "manual GC must not reclaim a recently committed physical object while namespace binding may still be catching up"
+    );
+    for root in ObjectPathManager::new().get_blob_roots() {
+        assert!(
+            root.join(&fragment)
+                .join("blob")
+                .join(&physical_version)
+                .exists(),
+            "GC removed a protected live blob directory from {}",
+            root.display()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_gc_reclaims_stale_unbound_completed_object_when_namespace_is_available() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(0, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    init_quota_file(&fragment, 64 * 1024 * 1024)
+        .await
+        .expect("init quota");
+    ensure_fragment_blob_directories(&fragment).await;
+    init_fragment_metadata(&fragment, "key")
+        .await
+        .expect("init metadata");
+
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let stale_physical_key = format!("physical-{}", Ulid::new());
+    let stale_version = seed_live_object_metadata_at(
+        &fragment,
+        &stale_physical_key,
+        4096,
+        Utc::now().timestamp() - 7200,
+    )
+    .await;
+
+    let referenced_physical_key = format!("physical-{}", Ulid::new());
+    put_object(
+        state.clone(),
+        &fragment,
+        &referenced_physical_key,
+        vec![0x42; 4096],
+    )
+    .await;
+    bind_logical_path_to_physical_object(&fragment, "gc/referenced.bin", &referenced_physical_key)
+        .await;
+
+    run_manual_gc_for_fragment_and_wait(state, &fragment).await;
+
+    assert!(
+        index::read_object_version(&fragment, &stale_physical_key, &stale_version)
+            .await
+            .is_err(),
+        "manual GC should reclaim stale completed object metadata when namespace reachability is available and no binding references it"
+    );
+    let referenced = read_object_bytes(
+        full_claims(&fragment),
+        fragment.clone(),
+        referenced_physical_key,
+    )
+    .await;
+    assert_eq!(referenced, vec![0x42; 4096]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_namespace_write_catches_up_stale_owner_after_redistribution_restart() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+
+    global_namespace_runtime()
+        .mkdir(&fragment, "redistribution")
+        .await
+        .expect("seed namespace root dir");
+
+    let paths = object_partition_db_paths_owner_first(&fragment, "redistribution/probe.bin");
+    assert!(
+        paths.len() >= 2,
+        "test requires at least two indexdb replicas"
+    );
+    let owner_path = paths[0].clone();
+    let stale_owner = owner_path.with_file_name(format!("stale-owner-{}.ndxdb", Ulid::new()));
+    {
+        indexdb_store::evict_cached_db_for_test(&owner_path);
+        let owner_db =
+            indexdb_store::open_n1_indexdb(&owner_path).expect("open owner for stale backup");
+        owner_db
+            .backup_to_path(&stale_owner)
+            .expect("backup stale owner indexdb");
+    }
+
+    global_namespace_runtime()
+        .mkdir(&fragment, "redistribution/newer-on-follower")
+        .await
+        .expect("create newer namespace state");
+    assert_all_indexdb_replicas_synchronized(&fragment).await;
+
+    global_namespace_runtime().evict_fragment(&fragment);
+    indexdb_store::evict_cached_db_for_test(&owner_path);
+    let owner_file_name = owner_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("index.ndxdb")
+        .to_string();
+    for candidate in [
+        owner_path.clone(),
+        owner_path.with_file_name(format!("{owner_file_name}-wal")),
+        owner_path.with_file_name(format!("{owner_file_name}-shm")),
+    ] {
+        let _ = std::fs::remove_file(candidate);
+    }
+    std::fs::rename(&stale_owner, &owner_path).expect("restore stale owner copy");
+
+    global_namespace_runtime()
+        .mkdir(&fragment, "redistribution/after-restart")
+        .await
+        .expect("namespace write must catch up owner from newer follower first");
+
+    let entries = global_namespace_runtime()
+        .list_dir(&fragment, "redistribution", false)
+        .await
+        .expect("list redistribution dir");
+    let names = entries
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"newer-on-follower".to_string()));
+    assert!(names.contains(&"after-restart".to_string()));
+    assert_all_indexdb_replicas_synchronized(&fragment).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

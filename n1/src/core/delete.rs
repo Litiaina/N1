@@ -463,41 +463,6 @@ async fn purge_delete_markers_for_key(fragment: &str, object_key: &str) {
     }
 }
 
-async fn remove_blob_versions(
-    path_manager: &ObjectPathManager,
-    blob_roots: &[std::path::PathBuf],
-    fragment: &str,
-    version_ids: &[String],
-) {
-    let mut removals = Vec::with_capacity(version_ids.len().saturating_mul(blob_roots.len()));
-    for version_id in version_ids {
-        for disk in blob_roots {
-            removals.push((
-                path_manager.get_shard_dir_on_disk(disk, fragment, version_id),
-                get_trash_root(disk, fragment).join("blob").join(version_id),
-            ));
-        }
-    }
-
-    stream::iter(
-        removals
-            .into_iter()
-            .map(|(live_shard, trash_shard)| async move {
-                let _ = fs::remove_dir_all(&live_shard).await;
-                let _ = fs::remove_dir_all(&trash_shard).await;
-            }),
-    )
-    .buffer_unordered(bulk_partition_concurrency_limit())
-    .collect::<Vec<_>>()
-    .await;
-}
-
-async fn remove_blob_versions_for_fragment(fragment: &str, version_ids: &[String]) {
-    let path_manager = ObjectPathManager::new();
-    let blob_roots = path_manager.get_blob_roots();
-    remove_blob_versions(&path_manager, &blob_roots, fragment, version_ids).await;
-}
-
 async fn acquire_bulk_object_operation_locks(
     fragment: &str,
     object_keys: &[String],
@@ -516,12 +481,6 @@ fn flatten_version_ids(version_ids_by_key: &HashMap<String, Vec<String>>) -> Vec
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
-}
-
-fn bulk_partition_concurrency_limit() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| (n.get() * 4).clamp(8, 64))
-        .unwrap_or(16)
 }
 
 #[derive(Debug, Deserialize)]
@@ -577,7 +536,6 @@ async fn delete_object_permanently_core(
             return Err(AppError::NotFound);
         };
 
-    remove_blob_versions_for_fragment(fragment, &versions_to_delete).await;
     for version_id in &versions_to_delete {
         let _ = index::remove_session(fragment, version_id, "permanent-delete").await;
     }
@@ -605,7 +563,6 @@ pub async fn delete_object_version(
         Err(err) => return Err(err),
     }
 
-    remove_blob_versions_for_fragment(&fragment, std::slice::from_ref(&version_id)).await;
     let _ = index::remove_session(&fragment, &version_id, "permanent-delete-version").await;
 
     info!(
@@ -760,7 +717,6 @@ async fn run_empty_trash_job(state: Arc<AppState>, fragment: String) -> Result<(
     let _maintenance_guard = acquire_maintenance_mode(MaintenanceAccessMode::ReadOnly);
     let path_manager = ObjectPathManager::new();
     let index_roots = path_manager.get_all_index_roots();
-    let blob_roots = path_manager.get_blob_roots();
 
     mutate_trash_job_status(&EMPTY_TRASH_STATUS, |status| {
         status.phase = "Loading trash control plane".to_string();
@@ -769,15 +725,8 @@ async fn run_empty_trash_job(state: Arc<AppState>, fragment: String) -> Result<(
 
     let trash_keys = index::list_fragment_object_keys_with_trash_versions(&fragment).await?;
     let total_objects = trash_keys.len() as u64;
-    let trashed_version_ids = flatten_version_ids(
-        &index::list_trashed_object_version_ids_batch(&fragment, &trash_keys).await?,
-    );
-
     let mut trash_targets = BTreeSet::new();
     for root in &index_roots {
-        trash_targets.insert(get_trash_root(root, &fragment));
-    }
-    for root in &blob_roots {
         trash_targets.insert(get_trash_root(root, &fragment));
     }
 
@@ -793,11 +742,9 @@ async fn run_empty_trash_job(state: Arc<AppState>, fragment: String) -> Result<(
     mutate_trash_job_status(&EMPTY_TRASH_STATUS, |status| {
         status.processed_objects = total_objects;
         status.successful_objects = total_objects;
-        status.phase = "Removing trashed blobs".to_string();
+        status.phase = "Trash metadata cleared; blob bytes will be reclaimed by GC".to_string();
     })
     .await;
-
-    remove_blob_versions(&path_manager, &blob_roots, &fragment, &trashed_version_ids).await;
 
     mutate_trash_job_status(&EMPTY_TRASH_STATUS, |status| {
         status.phase = "Retiring trash roots".to_string();

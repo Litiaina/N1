@@ -22,9 +22,12 @@ use crate::{
         },
         indexdb_store::{
             active_fragment_quota_bytes, ensure_fragment_owner_partition_available_strict,
-            evict_fragment_cached_dbs, has_any_fragment_partition_db, set_fragment_quota,
+            ensure_fragment_quota_project_id, evict_fragment_cached_dbs,
+            has_any_fragment_partition_db, set_fragment_quota,
         },
-        quota_manager::get_storage_usage,
+        quota_manager::{
+            apply_fragment_project_quota, fragment_quota_enforcement_enabled, get_storage_usage,
+        },
         sync::{
             CreateFragmentRequest, CreateFragmentResponse, ensure_fragment_blob_directories_strict,
         },
@@ -174,6 +177,8 @@ pub async fn create_fragment(
     prepare_fragment_index_roots_strict(&hash).await?;
     ensure_fragment_blob_directories_strict(&hash).await?;
     ensure_fragment_owner_partition_available_strict(&hash)?;
+    let quota_project_id = ensure_fragment_quota_project_id(&hash)?;
+    apply_fragment_project_quota(&hash, requested_quota, quota_project_id).await?;
     set_fragment_quota(&hash, requested_quota)?;
     if !metadata_exists {
         let _ = init_fragment_metadata_strict(&hash, &payload.key).await?;
@@ -188,6 +193,12 @@ pub async fn create_fragment(
         info!(
             "Created new fragment '{}' with hash: {}",
             payload.name, hash
+        );
+    }
+    if fragment_quota_enforcement_enabled() {
+        info!(
+            "Applied filesystem project quota for fragment {} with project_id={} quota_bytes={}",
+            hash, quota_project_id, requested_quota
         );
     }
 

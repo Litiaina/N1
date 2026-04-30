@@ -15,7 +15,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use chrono::Utc;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -517,8 +517,7 @@ async fn process_fragment_gc(
     let mut live_versions = HashSet::<String>::new();
     let mut trash_versions = HashSet::<String>::new();
     let mut expired_versions: HashMap<String, ObjectMetadata> = HashMap::new();
-    let mut namespace_unreferenced_object_ids = std::collections::BTreeSet::<String>::new();
-    let mut namespace_unreferenced_version_ids = HashSet::<String>::new();
+    let mut purged_namespace_version_ids = HashSet::<String>::new();
 
     let now = SystemTime::now();
     let now_unix = Utc::now().timestamp();
@@ -547,54 +546,84 @@ async fn process_fragment_gc(
         }
     };
 
-    if let Some(snapshot) = &namespace_snapshot {
-        live_versions.extend(snapshot.referenced_version_ids.iter().cloned());
-        for meta in &physical_live_objects {
-            if snapshot.referenced_object_ids.contains(&meta.object_key) {
-                continue;
+    let mut protected_live_object_ids = BTreeSet::<String>::new();
+    for meta in &physical_live_objects {
+        protected_live_object_ids.insert(meta.object_key.clone());
+        match index::list_live_object_versions_metadata(fragment, &meta.object_key).await {
+            Ok(version_metas) => {
+                if version_metas.is_empty() {
+                    live_versions.insert(meta.version_id.clone());
+                } else {
+                    live_versions
+                        .extend(version_metas.into_iter().map(|version| version.version_id));
+                }
             }
-            let age = now_unix.saturating_sub(meta.created_at.max(0)).max(0) as u64;
-            if !is_manual_run && age <= file_ttl.as_secs() {
-                continue;
-            }
-
-            let version_metas = match index::list_live_object_versions_metadata(
-                fragment,
-                &meta.object_key,
-            )
-            .await
-            {
-                Ok(versions) => versions,
-                Err(err) => {
-                    warn!(
-                        "GC: failed to load live version history for orphaned namespace object {}/{}: {}",
-                        fragment, meta.object_key, err
-                    );
-                    continue;
-                }
-            };
-            let refund_bytes = version_metas
-                .iter()
-                .map(|version| version.total_size_bytes)
-                .sum::<u64>();
-            match index::delete_object_fast(fragment, &meta.object_key).await {
-                Ok(Some(version_ids)) => {
-                    namespace_unreferenced_object_ids.insert(meta.object_key.clone());
-                    namespace_unreferenced_version_ids.extend(version_ids);
-                    stats.refund_bytes = stats.refund_bytes.saturating_add(refund_bytes);
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    warn!(
-                        "GC: failed to delete orphaned namespace object {}/{}: {}",
-                        fragment, meta.object_key, err
-                    );
-                }
+            Err(err) => {
+                warn!(
+                    "GC: failed to load live version history for protected object {}/{}: {}; preserving head and skipping destructive namespace purge for this fragment",
+                    fragment, meta.object_key, err
+                );
+                live_versions.insert(meta.version_id.clone());
+                stats.live_versions_seen = live_versions.len() as u64;
+                return stats;
             }
         }
-    } else {
+    }
+
+    let mut purged_object_ids = match global_namespace_runtime()
+        .purged_object_ids_for_gc(fragment)
+        .await
+    {
+        Ok(object_ids) => object_ids,
+        Err(err) => {
+            warn!(
+                "GC: failed to load purged namespace object ids for fragment {}: {}",
+                fragment, err
+            );
+            BTreeSet::new()
+        }
+    };
+    if namespace_snapshot.is_none() && !purged_object_ids.is_empty() {
+        warn!(
+            "GC: preserving {} purged namespace object(s) for fragment {} because namespace reachability was unavailable",
+            purged_object_ids.len(),
+            fragment
+        );
+        purged_object_ids.clear();
+    }
+
+    let mut namespace_absent_gc_candidates = BTreeSet::<String>::new();
+    if let Some(snapshot) = &namespace_snapshot {
+        live_versions.extend(snapshot.referenced_version_ids.iter().cloned());
+        let namespace_absence_grace =
+            Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds.max(300));
+        let namespace_absence_grace_secs = namespace_absence_grace.as_secs() as i64;
+        let mut recent_namespace_absent = 0usize;
         for meta in &physical_live_objects {
-            live_versions.insert(meta.version_id.clone());
+            if snapshot.referenced_object_ids.contains(&meta.object_key)
+                || purged_object_ids.contains(&meta.object_key)
+            {
+                continue;
+            }
+            let age_secs = now_unix.saturating_sub(meta.created_at.max(0));
+            if age_secs <= namespace_absence_grace_secs {
+                recent_namespace_absent += 1;
+            } else {
+                namespace_absent_gc_candidates.insert(meta.object_key.clone());
+            }
+        }
+        if recent_namespace_absent > 0 {
+            info!(
+                "GC: preserving {} recently committed live object(s) for fragment {} while namespace binding catches up",
+                recent_namespace_absent, fragment
+            );
+        }
+        if !namespace_absent_gc_candidates.is_empty() {
+            info!(
+                "GC: reclaiming {} older unbound completed object(s) for fragment {} because namespace reachability is available and no live/trash/pending binding references them",
+                namespace_absent_gc_candidates.len(),
+                fragment
+            );
         }
     }
 
@@ -638,6 +667,129 @@ async fn process_fragment_gc(
             return stats;
         }
     }
+
+    for object_id in purged_object_ids {
+        if should_stop_gc() {
+            return stats;
+        }
+        if namespace_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.referenced_object_ids.contains(&object_id))
+        {
+            warn!(
+                "GC: preserving purged namespace object {}/{} because it is still referenced by live/trash namespace rows",
+                fragment, object_id
+            );
+            continue;
+        }
+        if !protected_live_object_ids.contains(&object_id) {
+            continue;
+        }
+
+        let mut version_metas = match index::list_live_object_versions_metadata(
+            fragment, &object_id,
+        )
+        .await
+        {
+            Ok(versions) => versions,
+            Err(err) => {
+                warn!(
+                    "GC: failed to load live version history for purged namespace object {}/{}: {}",
+                    fragment, object_id, err
+                );
+                continue;
+            }
+        };
+        match index::list_trashed_object_versions_metadata(fragment, &object_id).await {
+            Ok(versions) => version_metas.extend(versions),
+            Err(err) => warn!(
+                "GC: failed to load trash version history for purged namespace object {}/{}: {}",
+                fragment, object_id, err
+            ),
+        }
+        let refund_bytes = version_metas
+            .iter()
+            .map(|version| version.total_size_bytes)
+            .sum::<u64>();
+        match index::delete_object_fast(fragment, &object_id).await {
+            Ok(Some(version_ids)) => {
+                purged_namespace_version_ids.extend(version_ids);
+                stats.refund_bytes = stats.refund_bytes.saturating_add(refund_bytes);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(
+                    "GC: failed to delete purged namespace object {}/{}: {}",
+                    fragment, object_id, err
+                );
+            }
+        }
+    }
+
+    for object_id in namespace_absent_gc_candidates {
+        if should_stop_gc() {
+            return stats;
+        }
+        if namespace_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.referenced_object_ids.contains(&object_id))
+        {
+            continue;
+        }
+
+        let mut version_metas =
+            match index::list_live_object_versions_metadata(fragment, &object_id).await {
+                Ok(versions) => versions,
+                Err(err) => {
+                    warn!(
+                        "GC: failed to load unbound live version history for {}/{}: {}",
+                        fragment, object_id, err
+                    );
+                    continue;
+                }
+            };
+        match index::list_trashed_object_versions_metadata(fragment, &object_id).await {
+            Ok(versions) => version_metas.extend(versions),
+            Err(err) => warn!(
+                "GC: failed to load unbound trash version history for {}/{}: {}",
+                fragment, object_id, err
+            ),
+        }
+        let refund_bytes = version_metas
+            .iter()
+            .map(|version| version.total_size_bytes)
+            .sum::<u64>();
+        for version in &version_metas {
+            live_versions.remove(&version.version_id);
+            trash_versions.remove(&version.version_id);
+        }
+
+        match index::delete_object_fast(fragment, &object_id).await {
+            Ok(Some(version_ids)) => {
+                purged_namespace_version_ids.extend(version_ids);
+                stats.refund_bytes = stats.refund_bytes.saturating_add(refund_bytes);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(
+                    "GC: failed to delete unbound completed object {}/{}: {}",
+                    fragment, object_id, err
+                );
+            }
+        }
+    }
+
+    expired_versions.retain(|version_id, meta| {
+        if live_versions.contains(version_id) {
+            warn!(
+                "GC: preserving expired trash version {}/{}@{} because it is still protected as live",
+                fragment, meta.object_key, version_id
+            );
+            false
+        } else {
+            true
+        }
+    });
     stats.live_versions_seen = live_versions.len() as u64;
 
     let expired_trash_refund: u64 = expired_versions
@@ -670,7 +822,7 @@ async fn process_fragment_gc(
                 let _ = std::fs::remove_dir_all(&trash_path);
             }
         }
-        for ver in &namespace_unreferenced_version_ids {
+        for ver in &purged_namespace_version_ids {
             if should_stop_gc() {
                 return stats;
             }
@@ -682,18 +834,6 @@ async fn process_fragment_gc(
             if trash_path.exists() {
                 let _ = std::fs::remove_dir_all(&trash_path);
             }
-        }
-    }
-
-    if !namespace_unreferenced_object_ids.is_empty() {
-        if let Err(err) = global_namespace_runtime()
-            .purge_unreferenced_object_ids(fragment, &namespace_unreferenced_object_ids)
-            .await
-        {
-            warn!(
-                "GC: failed to purge stale namespace object records for fragment {}: {}",
-                fragment, err
-            );
         }
     }
 
@@ -768,6 +908,7 @@ async fn process_fragment_gc(
     if stats.trash_versions_expired > 0
         || stats.sessions_deleted > 0
         || stats.orphan_blob_dirs_deleted > 0
+        || !purged_namespace_version_ids.is_empty()
     {
         state.emit(fragment, StorageEventPayload::StateInvalidated);
     }

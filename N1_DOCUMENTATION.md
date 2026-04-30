@@ -77,6 +77,145 @@ The blob layout is unchanged:
 
 Rename, trash, and recover do not move blobs. The N1 metadata database stores metadata and references only; GC later removes unreachable blob files.
 
+## Storage Filesystem Recommendation
+
+N1 recommends `XFS` for production blob disks, with project quotas enabled when strict fragment quota enforcement is required.
+
+Fragment quota is a storage limit, not an indexdb reservation ledger. N1 stores the configured fragment quota in `fragment_meta`, while the byte truth is the blob filesystem. Hard delete and empty trash remove namespace reachability first; bytes are returned only after GC physically removes the unreachable blob files.
+
+N1 does not implement a hot upload-path quota ledger in indexdb. That avoids turning a hot fragment into a serialized byte-counter workload. Strict quota enforcement is delegated to the filesystem.
+
+Production quota configuration:
+
+```ini
+[quota_config]
+fragment_quota_backend=xfs_project
+```
+
+With `xfs_project`, N1 requires every configured blob root to exist on XFS with project quota enabled. If a blob root is mounted with `noquota`, is not XFS, or the `xfs_quota` tool cannot apply project quotas, N1 refuses startup or fragment create/resize. This is intentional: quota enforcement is either real or disabled, never silently fake.
+
+Disk preparation is one-time per disk/server, not per fragment:
+
+```bash
+# New/empty disk example only. Do not run mkfs on a disk with data.
+mkfs.xfs /dev/<disk>
+mkdir -p /mnt/disk-00
+mount -o prjquota /dev/<disk> /mnt/disk-00
+```
+
+Persist the mount option in `/etc/fstab`:
+
+```text
+/dev/<disk> /mnt/disk-00 xfs defaults,prjquota 0 0
+```
+
+For an existing XFS disk, do not reformat just to enable quota. Enable `prjquota` in the mount configuration and remount/reboot according to your operating procedure. N1 should then be restarted and will validate the root before serving.
+
+Validate each blob mount before starting N1:
+
+```bash
+findmnt -no TARGET,FSTYPE,OPTIONS /mnt/disk-00
+xfs_quota -x -c 'state -p' /mnt/disk-00
+```
+
+The N1 process must be allowed to run `xfs_quota` in expert mode and set project quota limits. `xfs_quota -x -c 'state -p'` only proves that project quota accounting exists; it does not prove that the N1 service can change limits. In strict mode, N1 performs a small startup permission probe and fails closed if `limit -p ...` returns `Operation not permitted`.
+
+For a locked-down service deployment, run N1 with the needed filesystem quota privileges or set `N1_XFS_QUOTA_BIN` to a root-owned helper that only permits the required `xfs_quota -x -c ... <mount>` operations. A systemd service running as an unprivileged `User=` without the required capability will not be able to create quota-enforced fragments.
+
+Fragment creation remains dynamic. When `POST /n1/fragments` receives `quota_bytes`, N1 creates the fragment directories, assigns a stable XFS project ID to the fragment root under each blob root, and applies the quota automatically.
+
+Use simple blob mount paths such as `/mnt/disk-00` and `/mnt/disk-01`. In strict quota mode, N1 rejects blob paths containing whitespace or quoting characters because `xfs_quota -c` does not reliably parse quoted project paths.
+
+Important multi-disk detail: XFS project quotas are enforced per filesystem. N1 splits a fragment quota across the unique configured blob filesystems so the total enforced footprint remains bounded without a database byte ledger. This preserves upload performance, but operators should keep blob roots balanced and run redistribution after changing disk count/layout.
+
+N1 owns project ID `9999` for startup permission probing and owns high-numbered project IDs for fragments on its blob filesystems. Do not manually reuse N1-assigned project IDs for other directories on the same XFS mounts, because XFS enforces quota per project ID per filesystem.
+
+Development/report-only mode:
+
+```ini
+[quota_config]
+fragment_quota_backend=disabled
+```
+
+In disabled mode, N1 reports usage from blob files and rejects quota shrink below current blob usage, but there is no hard per-fragment byte enforcement. Use this only for development or deliberately unmanaged deployments.
+
+## Production Systemd Installation
+
+N1 Standard should be installed as a systemd service in production. This is the supported operator path because strict fragment quota requires stable startup ordering, journal logs, high file-descriptor limits, and permission to set XFS project quota limits.
+
+The repo provides:
+
+```text
+deploy/systemd/litiaina-n1-standard.service.in
+deploy/systemd/n1.env.example
+scripts/install-n1-systemd.sh
+```
+
+Prepare a server directory that contains:
+
+```text
+<install-dir>/litiaina-n1
+<install-dir>/n1.env
+<install-dir>/n1_config.ini
+<install-dir>/cert.pem
+<install-dir>/key.pem
+```
+
+Copy `deploy/systemd/n1.env.example` to `<install-dir>/n1.env` and replace every secret before installing. The service working directory is the install directory, so `n1.env` and `n1_config.ini` must live there unless explicit paths are passed to the installer.
+
+Production install with strict XFS project quota:
+
+```bash
+sudo scripts/install-n1-systemd.sh \
+  --install-dir /home/administrator/SERVERS/N1-SERVER \
+  --enable \
+  --start
+```
+
+The default installer mode is:
+
+```text
+--service-name litiaina-n1-standard
+--user root
+--group root
+--privilege root
+```
+
+That is intentional. A service running as an ordinary user can read/write normal files, but it cannot apply XFS project quota limits. If `fragment_quota_backend=xfs_project`, N1 must be able to run `xfs_quota -x -c 'limit -p ...' <mount>`.
+
+Advanced non-root install:
+
+```bash
+sudo scripts/install-n1-systemd.sh \
+  --install-dir /home/administrator/SERVERS/N1-SERVER \
+  --privilege cap-sys-admin \
+  --user administrator \
+  --group administrator \
+  --enable \
+  --start
+```
+
+This grants ambient `CAP_SYS_ADMIN` to the N1 process. It is still a broad filesystem administration capability, so root mode is simpler to operate and debug. Use non-root capability mode only after validating that the service can create a fragment with strict quota enabled.
+
+The installer preflights strict quota by checking each blob root for:
+
+- mounted filesystem exists
+- filesystem type is XFS
+- `prjquota` or `pquota` is enabled
+- `noquota` is absent
+- `xfs_quota -x -c 'state -p' <mount>` succeeds
+- `xfs_quota -x -c 'limit -p bhard=1k 9999' <mount>` succeeds
+
+If this preflight fails, fix the mount or service privilege before starting N1. Do not bypass this in production. `--skip-quota-preflight` exists only for controlled packaging or image-build flows where the final runtime host performs the validation.
+
+Useful commands:
+
+```bash
+sudo systemctl status litiaina-n1-standard
+sudo journalctl -u litiaina-n1-standard -f
+sudo systemctl restart litiaina-n1-standard
+```
+
 ## Namespace And Object Metadata Model
 
 Namespace is the POSIX/object-key front tier inside `indexdb`. The namespace module remains an API facade, but it does not own persistence and does not open a separate catalog file. Namespace persistence is `indexdb.namespace_entries`.
@@ -192,6 +331,7 @@ Response:
 Current CLI scope:
 
 - fragment create
+- fragment quota resize
 - health snapshots and watch mode
 - active multipart upload list/status
 - GC start/status/stop/watch
@@ -205,6 +345,12 @@ cargo run -p n1_cli -- \
   --url <url> \
   --secret <secret> \
   fragment create --name <fragment_name> --key <fragment_key> --quota-bytes <bytes>
+
+cargo run -p n1_cli -- \
+  --url <url> \
+  --secret <fragment_key> \
+  --fragment <fragment_name_or_hash> \
+  fragment resize-quota --quota-bytes <bytes> --master-secret <MASTER_KEY>
 
 cargo run -p n1_cli -- \
   --url <url> \
@@ -520,6 +666,8 @@ Fields:
 
 The standalone Storage console uses this same contract and requires a quota amount before submitting fragment creation.
 
+When `fragment_quota_backend=xfs_project`, fragment creation also applies the filesystem project quota. If the blob roots are not mounted with XFS project quota support, creation fails with `503 Service Unavailable`.
+
 Response:
 
 ```json
@@ -564,6 +712,49 @@ Notes:
 - `new_name` requires the master secret because it changes the fragment hash.
 - `new_key` rotates the fragment secret used by `POST /n1/auth/fragment`.
 
+### `PATCH /n1/fragments/{fragment}/quota`
+
+Resize a fragment quota as an explicit operator/admin action.
+
+Request body:
+
+```json
+{
+  "quota_bytes": 1073741824000,
+  "secret": "<MASTER_KEY>"
+}
+```
+
+Rules:
+
+- Requires a valid fragment session plus the N1 master secret.
+- `quota_bytes` must be greater than zero.
+- Increasing quota is accepted only when the new active fragment quota total fits configured physical capacity.
+- Decreasing quota is accepted only when current blob filesystem usage fits inside the new `quota_bytes`.
+- Shrinking below current used bytes returns `409 Conflict`; growing beyond physical capacity returns `507 Insufficient Storage`.
+
+Response:
+
+```json
+{
+  "fragment": "fragment-hash",
+  "previous_quota_bytes": 536870912000,
+  "quota_bytes": 1073741824000,
+  "committed_bytes": 4294967296,
+  "reserved_bytes": 0,
+  "trash_bytes": 0,
+  "used_bytes": 4294967296,
+  "available_bytes": 1069446856704,
+  "usage_percent": 0.4,
+  "active_quota_bytes": 1073741824000,
+  "capacity_allocated": 4000787030016,
+  "quota_enforced": true,
+  "quota_backend": "xfs_project",
+  "changed": true,
+  "direction": "increase"
+}
+```
+
 ### `DELETE /n1/fragments/{fragment}`
 
 Delete the fragment control plane and storage directories for that fragment.
@@ -598,6 +789,8 @@ Response:
 
 Return quota usage for the authenticated fragment.
 
+Usage is reported from the fragment blob files. `reserved_bytes` is `0` in the N1 3.0 active upload path because multipart resumability uses compact persistent receipts, not a durable quota reservation ledger.
+
 Response:
 
 ```json
@@ -605,18 +798,20 @@ Response:
   "fragment": "fragment-hash",
   "state": "active",
   "quota_bytes": 536870912000,
-  "committed_bytes": 3221225472,
+  "committed_bytes": 4294967296,
   "reserved_bytes": 0,
-  "trash_bytes": 1073741824,
+  "trash_bytes": 0,
   "used_bytes": 4294967296,
   "available_bytes": 532575944704,
   "usage_percent": 0.8,
+  "quota_enforced": true,
+  "quota_backend": "xfs_project",
   "created_at_unix": 1777440000,
   "updated_at_unix": 1777443600
 }
 ```
 
-`used_bytes` is `committed_bytes + reserved_bytes + trash_bytes`.
+`used_bytes` is the blob filesystem footprint currently present for the fragment. Because trash and recover do not move blobs, hard-deleted data may remain included until GC reclaims the unreachable blob files.
 
 ## Object Listing And Read API
 
@@ -781,6 +976,20 @@ Fields:
 - `total_size_bytes` required
 - `expected_parts` required
 - `part_size_bytes` optional but strongly recommended for consistent resume behavior
+
+### Upload Stripe Selection
+
+N1 stores the stripe block size with each committed object version. The configured stripe size remains the default ceiling for large objects, while small uploads may use a smaller per-object stripe to avoid excessive physical padding on blob disks.
+
+Current N1 3.0 selection:
+
+- uploads up to `64 KiB`: `4 KiB` stripe block
+- uploads above `64 KiB` and up to `1 MiB`: `16 KiB` stripe block
+- larger uploads: configured stripe block
+
+One-shot upload chooses the stripe from the object size. Multipart upload chooses the stripe once from the planned part sizes during session creation and persists it in the upload manifest. Every retry, finalize, read, archive, repair, and redistribution operation must honor that persisted object stripe.
+
+This keeps multipart resumability durable across server restarts while reducing the quota/usage amplification of deeply nested folder uploads with many small files. Multipart remains strict to the session manifest after creation; changing server EC settings does not rewrite an active session.
 
 ### `POST /n1/upload/one-shot/{*object_key}`
 

@@ -937,75 +937,13 @@ impl WriteTransaction {
         n1_set_fragment_quota_on_conn(&mut conn, &fragment_id, quota_bytes).map_err(Into::into)
     }
 
-    pub fn n1_reserve_quota(
-        &self,
-        reservation_id: &str,
-        version_id: &str,
-        object_key: &str,
-        reserved_bytes: u64,
-    ) -> Result<(), TableError> {
+    pub fn n1_set_fragment_quota_project_id(&self, project_id: u32) -> Result<(), TableError> {
         let Some(fragment_id) = infer_fragment_id(&self.inner.path) else {
             return Ok(());
         };
         let mut conn = self.inner.conn.lock()?;
-        n1_reserve_quota_on_conn(
-            &mut conn,
-            &fragment_id,
-            reservation_id,
-            version_id,
-            object_key,
-            reserved_bytes,
-        )
-        .map_err(Into::into)
-    }
-
-    pub fn n1_commit_quota_reservation(
-        &self,
-        reservation_id: &str,
-        committed_bytes: u64,
-    ) -> Result<bool, TableError> {
-        let Some(fragment_id) = infer_fragment_id(&self.inner.path) else {
-            return Ok(false);
-        };
-        let mut conn = self.inner.conn.lock()?;
-        n1_commit_quota_reservation_on_conn(
-            &mut conn,
-            &fragment_id,
-            reservation_id,
-            committed_bytes,
-        )
-        .map_err(Into::into)
-    }
-
-    pub fn n1_release_quota_reservation(&self, reservation_id: &str) -> Result<bool, TableError> {
-        let Some(fragment_id) = infer_fragment_id(&self.inner.path) else {
-            return Ok(false);
-        };
-        let mut conn = self.inner.conn.lock()?;
-        n1_release_quota_reservation_on_conn(&mut conn, &fragment_id, reservation_id)
+        n1_set_fragment_quota_project_id_on_conn(&mut conn, &fragment_id, project_id)
             .map_err(Into::into)
-    }
-
-    pub fn n1_adjust_fragment_usage(
-        &self,
-        committed_delta: i64,
-        reserved_delta: i64,
-        trash_delta: i64,
-    ) -> Result<(), TableError> {
-        let Some(fragment_id) = infer_fragment_id(&self.inner.path) else {
-            return Ok(());
-        };
-        let mut conn = self.inner.conn.lock()?;
-        n1_adjust_fragment_usage_on_conn(
-            &mut conn,
-            &fragment_id,
-            committed_delta,
-            reserved_delta,
-            trash_delta,
-            true,
-        )
-        .map(|_| ())
-        .map_err(Into::into)
     }
 
     pub fn commit(mut self) -> Result<(), CommitError> {
@@ -3329,7 +3267,7 @@ fn n1_get_fragment_meta_on_conn(
     fragment_id: &str,
 ) -> Result<Option<crate::n1::FragmentMeta>, StorageError> {
     let mut stmt = conn.prepare(
-        "SELECT fragment_id, state, quota_bytes, committed_bytes, reserved_bytes,
+        "SELECT fragment_id, state, quota_bytes, quota_project_id, committed_bytes, reserved_bytes,
                 trash_bytes, created_at_unix, updated_at_unix
          FROM fragment_meta
          WHERE fragment_id = ?1",
@@ -3340,11 +3278,12 @@ fn n1_get_fragment_meta_on_conn(
             fragment_id: stmt.column_text(0).unwrap_or_default(),
             state: stmt.column_text(1).unwrap_or_default(),
             quota_bytes: i64_to_u64(stmt.column_i64(2))?,
-            committed_bytes: i64_to_u64(stmt.column_i64(3))?,
-            reserved_bytes: i64_to_u64(stmt.column_i64(4))?,
-            trash_bytes: i64_to_u64(stmt.column_i64(5))?,
-            created_at_unix: stmt.column_i64(6),
-            updated_at_unix: stmt.column_i64(7),
+            quota_project_id: stmt.column_i64_optional(3).map(i64_to_u32).transpose()?,
+            committed_bytes: i64_to_u64(stmt.column_i64(4))?,
+            reserved_bytes: i64_to_u64(stmt.column_i64(5))?,
+            trash_bytes: i64_to_u64(stmt.column_i64(6))?,
+            created_at_unix: stmt.column_i64(7),
+            updated_at_unix: stmt.column_i64(8),
         })),
         StepResult::Done => Ok(None),
     }
@@ -3367,203 +3306,21 @@ fn n1_set_fragment_quota_on_conn(
     stmt.step_done()
 }
 
-fn n1_ensure_fragment_meta_on_conn(
+fn n1_set_fragment_quota_project_id_on_conn(
     conn: &mut Connection,
     fragment_id: &str,
-) -> Result<crate::n1::FragmentMeta, StorageError> {
-    if let Some(meta) = n1_get_fragment_meta_on_conn(conn, fragment_id)? {
-        return Ok(meta);
-    }
-    let now = unix_now();
-    let mut stmt = conn.prepare(
-        "INSERT INTO fragment_meta(
-            fragment_id, state, quota_bytes, committed_bytes, reserved_bytes,
-            trash_bytes, created_at_unix, updated_at_unix
-         )
-         VALUES(?1, 'active', 0, 0, 0, 0, ?2, ?2)",
-    )?;
-    stmt.bind_text(1, fragment_id)?;
-    stmt.bind_i64(2, now)?;
-    stmt.step_done()?;
-    n1_get_fragment_meta_on_conn(conn, fragment_id)?
-        .ok_or_else(|| StorageError::InvalidInput("fragment_meta row was not created".to_string()))
-}
-
-fn apply_quota_delta(value: u64, delta: i64, label: &str) -> Result<u64, StorageError> {
-    let next = value as i128 + delta as i128;
-    if next < 0 {
-        return Err(StorageError::InvalidInput(format!(
-            "fragment quota counter {label} underflow"
-        )));
-    }
-    u64::try_from(next)
-        .map_err(|_| StorageError::InvalidInput(format!("fragment quota counter {label} overflow")))
-}
-
-fn n1_adjust_fragment_usage_on_conn(
-    conn: &mut Connection,
-    fragment_id: &str,
-    committed_delta: i64,
-    reserved_delta: i64,
-    trash_delta: i64,
-    enforce_quota: bool,
-) -> Result<crate::n1::FragmentMeta, StorageError> {
-    let current = n1_ensure_fragment_meta_on_conn(conn, fragment_id)?;
-    let committed_bytes =
-        apply_quota_delta(current.committed_bytes, committed_delta, "committed_bytes")?;
-    let reserved_bytes =
-        apply_quota_delta(current.reserved_bytes, reserved_delta, "reserved_bytes")?;
-    let trash_bytes = apply_quota_delta(current.trash_bytes, trash_delta, "trash_bytes")?;
-    let used = committed_bytes
-        .saturating_add(reserved_bytes)
-        .saturating_add(trash_bytes);
-    if enforce_quota && current.quota_bytes > 0 && used > current.quota_bytes {
-        return Err(StorageError::InvalidInput(format!(
-            "fragment quota exceeded: quota_bytes={} used_bytes={}",
-            current.quota_bytes, used
-        )));
-    }
+    project_id: u32,
+) -> Result<(), StorageError> {
     let now = unix_now();
     let mut stmt = conn.prepare(
         "UPDATE fragment_meta
-         SET committed_bytes = ?2,
-             reserved_bytes = ?3,
-             trash_bytes = ?4,
-             updated_at_unix = ?5
+         SET quota_project_id = ?2, updated_at_unix = ?3
          WHERE fragment_id = ?1",
     )?;
     stmt.bind_text(1, fragment_id)?;
-    stmt.bind_i64(2, u64_to_i64(committed_bytes)?)?;
-    stmt.bind_i64(3, u64_to_i64(reserved_bytes)?)?;
-    stmt.bind_i64(4, u64_to_i64(trash_bytes)?)?;
-    stmt.bind_i64(5, now)?;
-    stmt.step_done()?;
-    Ok(crate::n1::FragmentMeta {
-        committed_bytes,
-        reserved_bytes,
-        trash_bytes,
-        updated_at_unix: now,
-        ..current
-    })
-}
-
-fn n1_get_quota_reservation_on_conn(
-    conn: &mut Connection,
-    reservation_id: &str,
-) -> Result<Option<(u64, String)>, StorageError> {
-    let mut stmt = conn.prepare(
-        "SELECT reserved_bytes, state
-         FROM quota_reservations
-         WHERE reservation_id = ?1",
-    )?;
-    stmt.bind_text(1, reservation_id)?;
-    match stmt.step()? {
-        StepResult::Row => Ok(Some((
-            i64_to_u64(stmt.column_i64(0))?,
-            stmt.column_text(1).unwrap_or_default(),
-        ))),
-        StepResult::Done => Ok(None),
-    }
-}
-
-fn n1_reserve_quota_on_conn(
-    conn: &mut Connection,
-    fragment_id: &str,
-    reservation_id: &str,
-    version_id: &str,
-    object_key: &str,
-    reserved_bytes: u64,
-) -> Result<(), StorageError> {
-    if reserved_bytes == 0 {
-        return Ok(());
-    }
-    if let Some((existing_bytes, state)) = n1_get_quota_reservation_on_conn(conn, reservation_id)? {
-        if state == "active" && existing_bytes == reserved_bytes {
-            return Ok(());
-        }
-        if state == "committed" {
-            return Ok(());
-        }
-        return Err(StorageError::InvalidInput(format!(
-            "quota reservation {reservation_id} already exists with state {state}"
-        )));
-    }
-    n1_adjust_fragment_usage_on_conn(conn, fragment_id, 0, u64_to_i64(reserved_bytes)?, 0, true)?;
-    let now = unix_now();
-    let mut stmt = conn.prepare(
-        "INSERT INTO quota_reservations(
-            reservation_id, version_id, object_key, reserved_bytes, state,
-            created_at_unix, updated_at_unix
-         )
-         VALUES(?1, ?2, ?3, ?4, 'active', ?5, ?5)",
-    )?;
-    stmt.bind_text(1, reservation_id)?;
-    stmt.bind_text(2, version_id)?;
-    stmt.bind_text(3, object_key)?;
-    stmt.bind_i64(4, u64_to_i64(reserved_bytes)?)?;
-    stmt.bind_i64(5, now)?;
+    stmt.bind_i64(2, project_id as i64)?;
+    stmt.bind_i64(3, now)?;
     stmt.step_done()
-}
-
-fn n1_commit_quota_reservation_on_conn(
-    conn: &mut Connection,
-    fragment_id: &str,
-    reservation_id: &str,
-    committed_bytes: u64,
-) -> Result<bool, StorageError> {
-    let Some((reserved_bytes, state)) = n1_get_quota_reservation_on_conn(conn, reservation_id)?
-    else {
-        return Ok(false);
-    };
-    if state == "committed" {
-        return Ok(false);
-    }
-    if state != "active" {
-        return Ok(false);
-    }
-    n1_adjust_fragment_usage_on_conn(
-        conn,
-        fragment_id,
-        u64_to_i64(committed_bytes)?,
-        -u64_to_i64(reserved_bytes)?,
-        0,
-        true,
-    )?;
-    let now = unix_now();
-    let mut stmt = conn.prepare(
-        "UPDATE quota_reservations
-         SET state = 'committed', updated_at_unix = ?2
-         WHERE reservation_id = ?1",
-    )?;
-    stmt.bind_text(1, reservation_id)?;
-    stmt.bind_i64(2, now)?;
-    stmt.step_done()?;
-    Ok(true)
-}
-
-fn n1_release_quota_reservation_on_conn(
-    conn: &mut Connection,
-    fragment_id: &str,
-    reservation_id: &str,
-) -> Result<bool, StorageError> {
-    let Some((reserved_bytes, state)) = n1_get_quota_reservation_on_conn(conn, reservation_id)?
-    else {
-        return Ok(false);
-    };
-    if state != "active" {
-        return Ok(false);
-    }
-    n1_adjust_fragment_usage_on_conn(conn, fragment_id, 0, -u64_to_i64(reserved_bytes)?, 0, false)?;
-    let now = unix_now();
-    let mut stmt = conn.prepare(
-        "UPDATE quota_reservations
-         SET state = 'released', updated_at_unix = ?2
-         WHERE reservation_id = ?1",
-    )?;
-    stmt.bind_text(1, reservation_id)?;
-    stmt.bind_i64(2, now)?;
-    stmt.step_done()?;
-    Ok(true)
 }
 
 fn bind_optional_text(
@@ -3606,6 +3363,11 @@ fn u64_to_i64(value: u64) -> Result<i64, StorageError> {
 fn i64_to_u64(value: i64) -> Result<u64, StorageError> {
     u64::try_from(value)
         .map_err(|_| StorageError::InvalidInput(format!("negative unsigned integer: {value}")))
+}
+
+fn i64_to_u32(value: i64) -> Result<u32, StorageError> {
+    u32::try_from(value)
+        .map_err(|_| StorageError::InvalidInput(format!("invalid project id: {value}")))
 }
 
 fn i64_to_usize(value: i64) -> Result<usize, StorageError> {
@@ -3857,10 +3619,10 @@ fn initialize_path_metadata(db: &Database) -> Result<(), StorageError> {
 
     let mut fragment = conn.prepare(
         "INSERT INTO fragment_meta(
-            fragment_id, state, quota_bytes, committed_bytes, reserved_bytes,
+            fragment_id, state, quota_bytes, quota_project_id, committed_bytes, reserved_bytes,
             trash_bytes, created_at_unix, updated_at_unix
          )
-         VALUES(?1, 'active', 0, 0, 0, 0, ?2, ?2)
+         VALUES(?1, 'active', 0, NULL, 0, 0, 0, ?2, ?2)
          ON CONFLICT(fragment_id) DO NOTHING",
     )?;
     fragment.bind_text(1, &fragment_id)?;

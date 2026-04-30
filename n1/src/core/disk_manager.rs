@@ -174,6 +174,17 @@ pub struct ObjectMetadata {
     pub stripe_size_bytes: usize,
 }
 
+impl ObjectMetadata {
+    pub fn strip_internal_layout(&mut self) {
+        self.parts.clear();
+    }
+
+    pub fn without_internal_layout(mut self) -> Self {
+        self.strip_internal_layout();
+        self
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ObjectSummary {
     pub object_key: String,

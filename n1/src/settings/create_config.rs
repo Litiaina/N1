@@ -15,6 +15,9 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("blob_store_disks", "")
         .set("fs_storage_path", "");
 
+    conf.with_section(Some("quota_config"))
+        .set("fragment_quota_backend", "xfs_project");
+
     conf.with_section(Some("index_config"))
         .set("partition_count", "64")
         .set("per_db_cache_bytes", "auto")

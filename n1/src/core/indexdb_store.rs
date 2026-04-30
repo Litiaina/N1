@@ -46,6 +46,7 @@ static DB_CACHE: LazyLock<Mutex<HashMap<PathBuf, CachedDatabaseEntry>>> =
 static DB_CACHE_TOUCH_TICK: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(1));
 static PARTITION_OP_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static FRAGMENT_PROJECT_ID_ALLOC_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static INDEXDB_PER_DB_CACHE_BYTES: LazyLock<AtomicUsize> =
     LazyLock::new(|| AtomicUsize::new(DEFAULT_INDEXDB_PER_DB_CACHE_BYTES));
 static INDEXDB_MAX_CACHED_DBS: LazyLock<AtomicUsize> =
@@ -53,6 +54,15 @@ static INDEXDB_MAX_CACHED_DBS: LazyLock<AtomicUsize> =
 
 pub const DEFAULT_INDEXDB_PER_DB_CACHE_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_INDEXDB_MAX_CACHED_DBS: usize = 32;
+const QUOTA_PROJECT_ID_FLOOR: u32 = 10_000;
+const QUOTA_PROJECT_ID_CEILING: u32 = 2_000_000_000;
+
+#[derive(Debug, Clone)]
+pub struct FragmentQuotaSpec {
+    pub fragment: String,
+    pub quota_bytes: u64,
+    pub quota_project_id: u32,
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -90,9 +100,9 @@ struct TrashCatalogRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct PartitionMeta {
-    committed_generation: u64,
-    updated_at: i64,
+pub(crate) struct PartitionMeta {
+    pub(crate) committed_generation: u64,
+    pub(crate) updated_at: i64,
 }
 
 struct CachedDatabaseEntry {
@@ -620,60 +630,12 @@ fn map_indexdb_error(context: &str, err: impl std::fmt::Display) -> AppError {
     }
 }
 
-fn quota_i64(bytes: u64) -> Result<i64, AppError> {
-    i64::try_from(bytes).map_err(|_| {
-        AppError::InternalServerError(format!(
-            "quota byte value {} exceeds supported counter range",
-            bytes
-        ))
-    })
-}
-
-fn add_quota_state_delta(
-    committed_delta: &mut i64,
-    trash_delta: &mut i64,
-    state: ObjectState,
-    bytes: u64,
-    sign: i64,
-) -> Result<(), AppError> {
-    let delta = quota_i64(bytes)?
-        .checked_mul(sign)
-        .ok_or_else(|| AppError::InternalServerError("quota counter delta overflow".to_string()))?;
-    match state {
-        ObjectState::Live => {
-            *committed_delta = committed_delta.checked_add(delta).ok_or_else(|| {
-                AppError::InternalServerError("committed quota delta overflow".to_string())
-            })?;
-        }
-        ObjectState::Trash => {
-            *trash_delta = trash_delta.checked_add(delta).ok_or_else(|| {
-                AppError::InternalServerError("trash quota delta overflow".to_string())
-            })?;
-        }
-        ObjectState::Deleted => {}
-    }
-    Ok(())
-}
-
 fn apply_quota_rewrite(
-    write_txn: &indexdb::WriteTransaction,
-    old_state: Option<(ObjectState, u64)>,
-    new_state: Option<(ObjectState, u64)>,
+    _write_txn: &indexdb::WriteTransaction,
+    _old_state: Option<(ObjectState, u64)>,
+    _new_state: Option<(ObjectState, u64)>,
 ) -> Result<(), AppError> {
-    let mut committed_delta = 0i64;
-    let mut trash_delta = 0i64;
-    if let Some((state, bytes)) = old_state {
-        add_quota_state_delta(&mut committed_delta, &mut trash_delta, state, bytes, -1)?;
-    }
-    if let Some((state, bytes)) = new_state {
-        add_quota_state_delta(&mut committed_delta, &mut trash_delta, state, bytes, 1)?;
-    }
-    if committed_delta == 0 && trash_delta == 0 {
-        return Ok(());
-    }
-    write_txn
-        .n1_adjust_fragment_usage(committed_delta, 0, trash_delta)
-        .map_err(|e| map_indexdb_error("fragment quota usage update", e))
+    Ok(())
 }
 
 fn evict_cached_db(path: &Path) {
@@ -975,11 +937,23 @@ fn open_route_db_for_read(
     match (owner_with_meta, best_follower) {
         (Some((owner_generation, owner_db)), Some((follower_generation, follower_db))) => {
             if follower_generation > owner_generation {
-                warn!(
-                    "indexdb read fallback: follower copy for fragment {} partition {:04x} is newer than owner copy (owner_gen={}, follower_gen={}); using follower copy",
-                    fragment, route.partition_id, owner_generation, follower_generation
-                );
-                return Ok(Some(follower_db));
+                match with_partition_commit_lock(&owner_path, || {
+                    seed_owner_partition_db_from_authoritative_copy(route, fragment)?;
+                    get_or_open_db(&owner_path)
+                }) {
+                    Ok(caught_up_owner) => return Ok(Some(caught_up_owner)),
+                    Err(err) => {
+                        warn!(
+                            "indexdb read fallback: follower copy for fragment {} partition {:04x} is newer than owner copy (owner_gen={}, follower_gen={}) and owner catch-up failed: {}; using follower copy",
+                            fragment,
+                            route.partition_id,
+                            owner_generation,
+                            follower_generation,
+                            err
+                        );
+                        return Ok(Some(follower_db));
+                    }
+                }
             }
             return Ok(Some(owner_db));
         }
@@ -1068,6 +1042,24 @@ fn seed_owner_partition_db_from_authoritative_copy(
     evict_cached_db(&owner_path);
     atomic_copy_db_file(&source_path, &owner_path)?;
     Ok(())
+}
+
+pub(crate) fn seed_fragment_owner_indexdb_from_authoritative_copy(
+    fragment: &str,
+) -> Result<bool, AppError> {
+    let route = fragment_route(fragment)?;
+    let owner_path = owner_db_path(&route, fragment);
+    let Some((source_path, _)) = select_authoritative_partition_db_path(&route, fragment)? else {
+        return Ok(false);
+    };
+
+    if source_path == owner_path {
+        return Ok(false);
+    }
+
+    evict_cached_db(&owner_path);
+    atomic_copy_db_file(&source_path, &owner_path)?;
+    Ok(true)
 }
 
 fn open_owner_db_for_write(route: &IndexRoute, fragment: &str) -> Result<Arc<Database>, AppError> {
@@ -1400,6 +1392,169 @@ pub fn set_fragment_quota(fragment: &str, quota_bytes: u64) -> Result<(), AppErr
     })
 }
 
+fn initial_quota_project_id_candidate(fragment: &str) -> u32 {
+    let digest = Sha256::digest(fragment.as_bytes());
+    let raw = u64::from_be_bytes([
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+    ]);
+    let span = (QUOTA_PROJECT_ID_CEILING - QUOTA_PROJECT_ID_FLOOR) as u64;
+    QUOTA_PROJECT_ID_FLOOR + (raw % span) as u32
+}
+
+fn next_quota_project_id(candidate: u32) -> u32 {
+    if candidate >= QUOTA_PROJECT_ID_CEILING - 1 {
+        QUOTA_PROJECT_ID_FLOOR
+    } else {
+        candidate + 1
+    }
+}
+
+fn used_quota_project_ids_excluding(fragment: &str) -> Result<HashSet<u32>, AppError> {
+    let roots = ObjectPathManager::new().get_all_index_roots();
+    let mut seen_fragments = HashSet::new();
+    let mut used = HashSet::new();
+    for root in roots {
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| AppError::Io(e, format!("read_dir {}", root.display())))?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(candidate_fragment) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if candidate_fragment == fragment {
+                continue;
+            }
+            if !seen_fragments.insert(candidate_fragment.to_string()) {
+                continue;
+            }
+            let db_path = path.join(INDEXDB_DIR).join(INDEXDB_FILE);
+            if !db_path.exists() {
+                continue;
+            }
+            let Ok(db) = get_or_open_db(&db_path) else {
+                continue;
+            };
+            let Some(meta) = db
+                .n1_get_fragment_meta()
+                .map_err(|e| map_indexdb_error("fragment quota project read", e))?
+            else {
+                continue;
+            };
+            if meta.state == "active" {
+                if let Some(project_id) = meta.quota_project_id {
+                    used.insert(project_id);
+                }
+            }
+        }
+    }
+    Ok(used)
+}
+
+fn allocate_quota_project_id(fragment: &str) -> Result<u32, AppError> {
+    let used = used_quota_project_ids_excluding(fragment)?;
+    let start = initial_quota_project_id_candidate(fragment);
+    let mut candidate = start;
+    loop {
+        if !used.contains(&candidate) {
+            return Ok(candidate);
+        }
+        candidate = next_quota_project_id(candidate);
+        if candidate == start {
+            return Err(AppError::ServiceUnavailable(
+                "no free XFS project quota IDs are available".into(),
+            ));
+        }
+    }
+}
+
+pub fn ensure_fragment_quota_project_id(fragment: &str) -> Result<u32, AppError> {
+    let _guard = FRAGMENT_PROJECT_ID_ALLOC_LOCK
+        .lock()
+        .map_err(|_| AppError::InternalServerError("quota project ID lock poisoned".into()))?;
+    let route = fragment_route(fragment)?;
+    let owner_path = owner_db_path(&route, fragment);
+    with_partition_commit_lock(&owner_path, || {
+        let owner_db = open_owner_db_for_write(&route, fragment)?;
+        if let Some(meta) = owner_db
+            .n1_get_fragment_meta()
+            .map_err(|e| map_indexdb_error("fragment quota project meta read", e))?
+        {
+            if let Some(project_id) = meta.quota_project_id {
+                return Ok(project_id);
+            }
+        }
+
+        let project_id = allocate_quota_project_id(fragment)?;
+        let write_txn = owner_db
+            .begin_write()
+            .map_err(|e| map_indexdb_error("begin_write", e))?;
+        write_txn
+            .n1_set_fragment_quota_project_id(project_id)
+            .map_err(|e| map_indexdb_error("fragment quota project update", e))?;
+        write_txn
+            .commit()
+            .map_err(|e| map_indexdb_error("commit fragment quota project", e))?;
+        replicate_owner_partition_db(fragment, &route)?;
+        Ok(project_id)
+    })
+}
+
+pub fn active_fragment_quota_specs() -> Result<Vec<FragmentQuotaSpec>, AppError> {
+    let roots = ObjectPathManager::new().get_all_index_roots();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for root in roots {
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| AppError::Io(e, format!("read_dir {}", root.display())))?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(fragment) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if !seen.insert(fragment.to_string()) {
+                continue;
+            }
+            let db_path = path.join(INDEXDB_DIR).join(INDEXDB_FILE);
+            if !db_path.exists() {
+                continue;
+            }
+            let db = match get_or_open_db(&db_path) {
+                Ok(db) => db,
+                Err(_) => continue,
+            };
+            let Some(meta) = db
+                .n1_get_fragment_meta()
+                .map_err(|e| map_indexdb_error("fragment quota spec read", e))?
+            else {
+                continue;
+            };
+            if meta.state == "active" {
+                let quota_project_id = meta
+                    .quota_project_id
+                    .unwrap_or_else(|| initial_quota_project_id_candidate(fragment));
+                out.push(FragmentQuotaSpec {
+                    fragment: fragment.to_string(),
+                    quota_bytes: meta.quota_bytes,
+                    quota_project_id,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn active_fragment_quota_bytes() -> Result<u64, AppError> {
     let roots = ObjectPathManager::new().get_all_index_roots();
     let mut seen = HashSet::new();
@@ -1452,88 +1607,6 @@ pub fn fragment_quota_meta(fragment: &str) -> Result<Option<n1_indexdb::Fragment
     let db = get_or_open_db(&owner_path)?;
     db.n1_get_fragment_meta()
         .map_err(|e| map_indexdb_error("fragment quota meta read", e))
-}
-
-fn reserve_upload_quota_on_db(
-    db: &Database,
-    reservation_id: &str,
-    version_id: &str,
-    object_key: &str,
-    reserved_bytes: u64,
-) -> Result<(), AppError> {
-    let write_txn = db
-        .begin_write()
-        .map_err(|e| map_indexdb_error("begin_write", e))?;
-    write_txn
-        .n1_reserve_quota(reservation_id, version_id, object_key, reserved_bytes)
-        .map_err(|e| map_indexdb_error("fragment quota reserve", e))?;
-    write_txn
-        .commit()
-        .map_err(|e| map_indexdb_error("commit fragment quota reserve", e))
-}
-
-fn release_upload_quota_on_db(db: &Database, reservation_id: &str) -> Result<(), AppError> {
-    let write_txn = db
-        .begin_write()
-        .map_err(|e| map_indexdb_error("begin_write", e))?;
-    write_txn
-        .n1_release_quota_reservation(reservation_id)
-        .map_err(|e| map_indexdb_error("fragment quota release", e))?;
-    write_txn
-        .commit()
-        .map_err(|e| map_indexdb_error("commit fragment quota release", e))
-}
-
-pub fn reserve_upload_quota(
-    fragment: &str,
-    object_key: &str,
-    version_id: &str,
-    reserved_bytes: u64,
-) -> Result<(), AppError> {
-    if reserved_bytes == 0 {
-        return Ok(());
-    }
-    let route = fragment_route(fragment)?;
-    let owner_path = owner_db_path(&route, fragment);
-    with_partition_commit_lock(&owner_path, || {
-        let owner_db = open_owner_db_for_write(&route, fragment)?;
-        reserve_upload_quota_on_db(
-            &owner_db,
-            version_id,
-            version_id,
-            object_key,
-            reserved_bytes,
-        )?;
-        replicate_object_mutation(fragment, &route, "quota reservation", |replica_db| {
-            reserve_upload_quota_on_db(
-                replica_db,
-                version_id,
-                version_id,
-                object_key,
-                reserved_bytes,
-            )
-        })?;
-        Ok(())
-    })
-}
-
-pub fn release_upload_quota(fragment: &str, version_id: &str) -> Result<(), AppError> {
-    let route = fragment_route(fragment)?;
-    let owner_path = owner_db_path(&route, fragment);
-    with_partition_commit_lock(&owner_path, || {
-        if !owner_path.exists() {
-            return Ok(());
-        }
-        let owner_db = open_owner_db_for_write(&route, fragment)?;
-        release_upload_quota_on_db(&owner_db, version_id)?;
-        replicate_object_mutation(
-            fragment,
-            &route,
-            "quota reservation release",
-            |replica_db| release_upload_quota_on_db(replica_db, version_id),
-        )?;
-        Ok(())
-    })
 }
 
 pub fn has_session_partition_db(fragment: &str, version_id: &str) -> Result<bool, AppError> {
@@ -2066,28 +2139,19 @@ fn write_version_on_db(
         write_txn
             .n1_set_object_version_state(&relational_state)
             .map_err(|e| map_indexdb_error("relational object_version_state upsert", e))?;
-        let reservation_committed = if state == ObjectState::Live && existing_state.is_none() {
-            write_txn
-                .n1_commit_quota_reservation(&metadata.version_id, metadata.total_size_bytes)
-                .map_err(|e| map_indexdb_error("fragment quota reservation commit", e))?
-        } else {
-            false
-        };
-        if !reservation_committed {
-            apply_quota_rewrite(
-                &write_txn,
-                existing_state.as_ref().map(|state| {
-                    (
-                        state.state,
-                        existing_record
-                            .as_ref()
-                            .map(|record| record.metadata.total_size_bytes)
-                            .unwrap_or(metadata.total_size_bytes),
-                    )
-                }),
-                Some((state, metadata.total_size_bytes)),
-            )?;
-        }
+        apply_quota_rewrite(
+            &write_txn,
+            existing_state.as_ref().map(|state| {
+                (
+                    state.state,
+                    existing_record
+                        .as_ref()
+                        .map(|record| record.metadata.total_size_bytes)
+                        .unwrap_or(metadata.total_size_bytes),
+                )
+            }),
+            Some((state, metadata.total_size_bytes)),
+        )?;
         let current_head = heads
             .get(head_row_key(&metadata.fragment, &metadata.object_key)?.as_str())
             .map_err(|e| map_indexdb_error("head get", e))?
@@ -2940,11 +3004,22 @@ fn delete_all_versions_for_key_on_db(
             let _ = states
                 .remove(row_key.as_str())
                 .map_err(|e| map_indexdb_error("version_state remove", e))?;
+            if let Some((_, version_id)) = parse_version_key(row_key) {
+                write_txn
+                    .n1_delete_object_version(&relational_object_id(object_key), version_id)
+                    .map_err(|e| map_indexdb_error("relational object_version delete", e))?;
+                write_txn
+                    .n1_delete_object_version_state(&relational_object_id(object_key), version_id)
+                    .map_err(|e| map_indexdb_error("relational object_version_state delete", e))?;
+            }
         }
         for (state, size_bytes) in quota_rows {
             apply_quota_rewrite(&write_txn, Some((state, size_bytes)), None)?;
         }
         remove_head_with_namespace_exact(&mut heads, &mut live_namespace, fragment, object_key)?;
+        write_txn
+            .n1_delete_object_head(&relational_object_id(object_key))
+            .map_err(|e| map_indexdb_error("relational object_head delete", e))?;
         let _ = trash_objects
             .remove(canonical_key(object_key).as_str())
             .map_err(|e| map_indexdb_error("trash_objects remove", e))?;
@@ -3138,6 +3213,30 @@ fn write_partition_meta_exact(
     Ok(())
 }
 
+pub(crate) fn next_indexdb_metadata_generation(
+    write_txn: &indexdb::WriteTransaction,
+    updated_at: i64,
+) -> Result<PartitionMeta, AppError> {
+    let mut meta = write_txn
+        .open_table(PARTITION_META_TABLE)
+        .map_err(|e| map_indexdb_error("open partition_meta", e))?;
+    let committed_generation = next_partition_generation(&mut meta, updated_at)?;
+    Ok(PartitionMeta {
+        committed_generation,
+        updated_at,
+    })
+}
+
+pub(crate) fn replay_indexdb_metadata_generation(
+    write_txn: &indexdb::WriteTransaction,
+    partition_meta: &PartitionMeta,
+) -> Result<(), AppError> {
+    let mut meta = write_txn
+        .open_table(PARTITION_META_TABLE)
+        .map_err(|e| map_indexdb_error("open partition_meta", e))?;
+    write_partition_meta_exact(&mut meta, partition_meta)
+}
+
 fn write_session_mutation_exact(
     db: &Database,
     version_id: &str,
@@ -3163,26 +3262,10 @@ fn write_session_mutation_exact(
         let mut receipts = write_txn
             .open_table(SESSION_PART_RECEIPTS_TABLE)
             .map_err(|e| map_indexdb_error("open session_part_receipts", e))?;
-        let is_new_session = sessions
-            .get(version_id)
-            .map_err(|e| map_indexdb_error("session get", e))?
-            .is_none();
         let row_bytes = serialize(row)?;
         sessions
             .insert(version_id, row_bytes.as_slice())
             .map_err(|e| map_indexdb_error("session insert", e))?;
-        if is_new_session {
-            if let Some(reservation) = row.reservation.as_ref() {
-                write_txn
-                    .n1_reserve_quota(
-                        version_id,
-                        version_id,
-                        &row.manifest.object_key,
-                        reservation.amount,
-                    )
-                    .map_err(|e| map_indexdb_error("fragment quota reserve", e))?;
-            }
-        }
         if let Some(part) = part {
             let part_bytes = serialize(part)?;
             let part_key = session_part_row_key(version_id, part.part_index);
@@ -3233,26 +3316,10 @@ fn apply_session_mutation_replica_exact(
             .open_table(SESSION_PART_RECEIPTS_TABLE)
             .map_err(|e| map_indexdb_error("open session_part_receipts", e))?;
         write_partition_meta_exact(&mut meta, partition_meta)?;
-        let is_new_session = sessions
-            .get(version_id)
-            .map_err(|e| map_indexdb_error("session get", e))?
-            .is_none();
         let row_bytes = serialize(row)?;
         sessions
             .insert(version_id, row_bytes.as_slice())
             .map_err(|e| map_indexdb_error("session insert", e))?;
-        if is_new_session {
-            if let Some(reservation) = row.reservation.as_ref() {
-                write_txn
-                    .n1_reserve_quota(
-                        version_id,
-                        version_id,
-                        &row.manifest.object_key,
-                        reservation.amount,
-                    )
-                    .map_err(|e| map_indexdb_error("fragment quota replica reserve", e))?;
-            }
-        }
         if let Some(part) = part {
             let part_bytes = serialize(part)?;
             let part_key = session_part_row_key(version_id, part.part_index);
@@ -3365,18 +3432,6 @@ fn apply_session_receipt_replica_exact(
             sessions
                 .insert(version_id, row_bytes.as_slice())
                 .map_err(|e| map_indexdb_error("session insert", e))?;
-            if !session_exists {
-                if let Some(reservation) = row.reservation.as_ref() {
-                    write_txn
-                        .n1_reserve_quota(
-                            version_id,
-                            version_id,
-                            &row.manifest.object_key,
-                            reservation.amount,
-                        )
-                        .map_err(|e| map_indexdb_error("fragment quota replica reserve", e))?;
-                }
-            }
         }
     }
     write_txn
@@ -3535,15 +3590,6 @@ fn remove_session_exact(
                     .map_err(|e| map_indexdb_error("session_part_receipt remove", e))?;
             }
         }
-        if row
-            .as_ref()
-            .and_then(|row| row.reservation.as_ref())
-            .is_some()
-        {
-            write_txn
-                .n1_release_quota_reservation(version_id)
-                .map_err(|e| map_indexdb_error("fragment quota reservation release", e))?;
-        }
         SessionRemoveMutation {
             partition_meta: PartitionMeta {
                 committed_generation,
@@ -3614,9 +3660,6 @@ fn apply_session_remove_replica_exact(
                     .map_err(|e| map_indexdb_error("session_part_receipt remove", e))?;
             }
         }
-        write_txn
-            .n1_release_quota_reservation(version_id)
-            .map_err(|e| map_indexdb_error("fragment quota replica reservation release", e))?;
     }
     write_txn
         .commit()
@@ -3745,36 +3788,22 @@ fn apply_write_version_replica_exact(
         write_txn
             .n1_set_object_version_state(&mutation.relational_state)
             .map_err(|e| map_indexdb_error("relational object_version_state replica upsert", e))?;
-        let reservation_committed = if incoming_state.state == ObjectState::Live
-            && existing_state.is_none()
-        {
-            write_txn
-                .n1_commit_quota_reservation(
-                    &incoming_record.metadata.version_id,
-                    incoming_record.metadata.total_size_bytes,
+        apply_quota_rewrite(
+            &write_txn,
+            existing_state.as_ref().map(|state| {
+                (
+                    state.state,
+                    existing_record
+                        .as_ref()
+                        .map(|record| record.metadata.total_size_bytes)
+                        .unwrap_or(incoming_record.metadata.total_size_bytes),
                 )
-                .map_err(|e| map_indexdb_error("fragment quota replica reservation commit", e))?
-        } else {
-            false
-        };
-        if !reservation_committed {
-            apply_quota_rewrite(
-                &write_txn,
-                existing_state.as_ref().map(|state| {
-                    (
-                        state.state,
-                        existing_record
-                            .as_ref()
-                            .map(|record| record.metadata.total_size_bytes)
-                            .unwrap_or(incoming_record.metadata.total_size_bytes),
-                    )
-                }),
-                Some((
-                    incoming_state.state,
-                    incoming_record.metadata.total_size_bytes,
-                )),
-            )?;
-        }
+            }),
+            Some((
+                incoming_state.state,
+                incoming_record.metadata.total_size_bytes,
+            )),
+        )?;
         if let Some(head_bytes) = mutation.head_bytes.as_ref() {
             let head: HeadRecord = deserialize(head_bytes)?;
             heads
@@ -4225,6 +4254,9 @@ fn apply_delete_all_versions_for_key_replica_exact(
             apply_quota_rewrite(&write_txn, Some((state, size_bytes)), None)?;
         }
         remove_head_with_namespace_exact(&mut heads, &mut live_namespace, fragment, object_key)?;
+        write_txn
+            .n1_delete_object_head(&relational_object_id(object_key))
+            .map_err(|e| map_indexdb_error("relational object_head delete", e))?;
     }
     write_txn
         .commit()

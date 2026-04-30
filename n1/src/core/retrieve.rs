@@ -142,9 +142,13 @@ pub async fn list_object_versions(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    Ok(AxumJson(
-        index::list_live_object_versions_metadata(&fragment, &object_key).await?,
-    ))
+    let versions = index::list_live_object_versions_metadata(&fragment, &object_key)
+        .await?
+        .into_iter()
+        .map(ObjectMetadata::without_internal_layout)
+        .collect::<Vec<_>>();
+
+    Ok(AxumJson(versions))
 }
 
 #[derive(Serialize)]
@@ -221,7 +225,9 @@ pub async fn get_object_metadata(
     }
 
     Ok(AxumJson(
-        get_object_metadata_direct(&fragment, &object_key).await?,
+        get_object_metadata_direct(&fragment, &object_key)
+            .await?
+            .without_internal_layout(),
     ))
 }
 

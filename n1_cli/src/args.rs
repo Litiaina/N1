@@ -168,6 +168,9 @@ pub enum Commands {
 pub enum FragmentCommands {
     #[command(about = "Create a fragment with a caller-provided name and key.")]
     Create(FragmentCreateArgs),
+
+    #[command(about = "Resize a fragment quota as an explicit admin operation.")]
+    ResizeQuota(FragmentResizeQuotaArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -180,6 +183,18 @@ pub struct FragmentCreateArgs {
 
     #[arg(long, help = "Fragment quota in bytes.")]
     pub quota_bytes: u64,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct FragmentResizeQuotaArgs {
+    #[arg(long, help = "New fragment quota in bytes.")]
+    pub quota_bytes: u64,
+
+    #[arg(
+        long,
+        help = "N1 master secret authorizing the virtual partition resize."
+    )]
+    pub master_secret: String,
 }
 
 #[derive(Subcommand, Debug, Clone)]

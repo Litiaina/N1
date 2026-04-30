@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use cli_core::client::{
     AuthSession, CreateFragmentRequest, DynError, N1_AUTH_ROUTES, api_url,
     authenticate_with_routes, build_client, fetch_json, fetch_json_query, get_base_url, get_secret,
-    print_output, print_response_message, send_query_only, send_without_body, watch_rendered,
+    print_output, print_response_message, send_query_only, send_with_session, send_without_body,
+    watch_rendered,
 };
 use cli_core::models::{
     GcJobStatus, HealthResponse, ListUploadsResponse, RedistributionJobStatus, RepairJobStatus,
@@ -30,6 +31,12 @@ struct FragmentHashLookupResponse {
 #[derive(Serialize)]
 struct FragmentHashLookupRequest {
     fragment: String,
+}
+
+#[derive(Serialize)]
+struct ResizeFragmentQuotaRequest {
+    quota_bytes: u64,
+    secret: String,
 }
 
 fn looks_like_fragment_hash(value: &str) -> bool {
@@ -96,7 +103,9 @@ pub async fn run(cli: Cli) -> Result<(), DynError> {
     let client = build_client(cli.insecure)?;
 
     match &cli.command {
-        Commands::Fragment { command } => {
+        Commands::Fragment {
+            command: command @ FragmentCommands::Create(_),
+        } => {
             let secret = get_secret(cli.secret.clone())?;
             handle_fragment_command(&client, &base_url, secret, command).await
         }
@@ -115,6 +124,20 @@ pub async fn run(cli: Cli) -> Result<(), DynError> {
             handle_authenticated_command(&client, &base_url, &mut session, &cli).await
         }
     }
+}
+
+async fn resolve_target_fragment(
+    client: &Client,
+    base_url: &str,
+    cli: &Cli,
+) -> Result<String, DynError> {
+    let target = cli
+        .fragment
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| io::Error::other("Pass --fragment <name-or-hash> for this command."))?;
+    resolve_n1_auth_fragment(client, base_url, target).await
 }
 
 async fn handle_fragment_command(
@@ -137,6 +160,9 @@ async fn handle_fragment_command(
                 .await?;
 
             print_response_message(response).await
+        }
+        FragmentCommands::ResizeQuota(_) => {
+            unreachable!("fragment quota resize is handled after fragment authentication")
         }
     }
 }
@@ -390,7 +416,39 @@ async fn handle_authenticated_command(
                 .await
             }
         },
-        Commands::Fragment { .. } => unreachable!("fragment commands are handled without auth"),
+        Commands::Fragment { command } => {
+            handle_authenticated_fragment_command(client, base_url, session, cli, command).await
+        }
+    }
+}
+
+async fn handle_authenticated_fragment_command(
+    client: &Client,
+    base_url: &str,
+    session: &mut AuthSession,
+    cli: &Cli,
+    command: &FragmentCommands,
+) -> Result<(), DynError> {
+    match command {
+        FragmentCommands::Create(_) => unreachable!("fragment create is handled without auth"),
+        FragmentCommands::ResizeQuota(args) => {
+            let target_fragment = resolve_target_fragment(client, base_url, cli).await?;
+            let url = api_url(
+                base_url,
+                &format!("/n1/fragments/{}/quota", target_fragment),
+            );
+            let response = send_with_session(client, base_url, session, |token| {
+                client
+                    .patch(&url)
+                    .bearer_auth(token)
+                    .json(&ResizeFragmentQuotaRequest {
+                        quota_bytes: args.quota_bytes,
+                        secret: args.master_secret.clone(),
+                    })
+            })
+            .await?;
+            print_response_message(response).await
+        }
     }
 }
 

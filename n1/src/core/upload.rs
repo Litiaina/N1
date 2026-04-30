@@ -39,8 +39,8 @@ use std::os::windows::fs::OpenOptionsExt;
 use crate::core::constants::{PARITY_SUFFIX, SHARD_SUFFIX};
 use crate::core::disk_manager::{
     FinalizeIncompleteResponse, InitiateUploadParams, InitiateUploadResponse, ObjectKeyQuery,
-    ObjectMetadata, ObjectPathManager, PartMetadata, ReservationReceipt, ShardInfo,
-    UploadPartQuery, UploadStatusResponse, default_stripe_size,
+    ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo, UploadPartQuery,
+    UploadStatusResponse, default_stripe_size,
 };
 use crate::core::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::core::index;
@@ -65,6 +65,9 @@ static IO_SEMAPHORE: Lazy<Semaphore> =
     Lazy::new(|| Semaphore::new(*MAX_IO_SEMAPHORE.get().unwrap()));
 static ACTIVE_IO_INFLIGHT: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
 const UPLOAD_IO_GATE_TIMEOUT_SECS: u64 = 2;
+const MIN_DYNAMIC_STRIPE_SIZE: usize = 4 * 1024;
+const TINY_OBJECT_STRIPE_4K_LIMIT: u64 = 64 * 1024;
+const SMALL_OBJECT_STRIPE_16K_LIMIT: u64 = 1024 * 1024;
 
 #[cfg(target_os = "linux")]
 static IO_URING_ENABLED: Lazy<bool> = Lazy::new(|| {
@@ -205,7 +208,8 @@ fn parse_upload_durability_mode(query: &UploadPartQuery) -> UploadDurabilityMode
 #[cfg(test)]
 mod tests {
     use super::{
-        UploadDurabilityMode, acquire_upload_io_guard_with_timeout, parse_upload_durability_mode,
+        UploadDurabilityMode, acquire_upload_io_guard_with_timeout,
+        choose_upload_stripe_size_for_len_with_ceiling, parse_upload_durability_mode,
     };
     use crate::core::disk_manager::UploadPartQuery;
 
@@ -254,6 +258,34 @@ mod tests {
             .await
             .expect("gate bypass succeeds");
         assert!(guard.is_none());
+    }
+
+    #[test]
+    fn dynamic_stripe_uses_small_blocks_for_small_objects_and_configured_ceiling_for_large() {
+        assert_eq!(
+            choose_upload_stripe_size_for_len_with_ceiling(1, 262_144),
+            4096
+        );
+        assert_eq!(
+            choose_upload_stripe_size_for_len_with_ceiling(64 * 1024, 262_144),
+            4096
+        );
+        assert_eq!(
+            choose_upload_stripe_size_for_len_with_ceiling(64 * 1024 + 1, 262_144),
+            16 * 1024
+        );
+        assert_eq!(
+            choose_upload_stripe_size_for_len_with_ceiling(1024 * 1024 + 1, 262_144),
+            262_144
+        );
+        assert_eq!(
+            choose_upload_stripe_size_for_len_with_ceiling(1, 16 * 1024),
+            4096
+        );
+        assert_eq!(
+            choose_upload_stripe_size_for_len_with_ceiling(10 * 1024 * 1024, 16 * 1024),
+            16 * 1024
+        );
     }
 }
 
@@ -690,12 +722,7 @@ fn manifest_data_shards(manifest: &UploadSessionManifest) -> usize {
 }
 
 fn manifest_parity_shards(manifest: &UploadSessionManifest) -> usize {
-    let configured = usize::from(manifest.parity_shards);
-    if configured == 0 {
-        configured_parity_shards()
-    } else {
-        configured
-    }
+    usize::from(manifest.parity_shards)
 }
 
 fn manifest_total_shards(manifest: &UploadSessionManifest) -> usize {
@@ -707,6 +734,31 @@ fn configured_block_size() -> usize {
         .get()
         .map(|v| v.load(Ordering::Relaxed))
         .unwrap_or_else(default_stripe_size)
+}
+
+fn choose_upload_stripe_size_for_len_with_ceiling(content_length: u64, configured: usize) -> usize {
+    if configured <= MIN_DYNAMIC_STRIPE_SIZE {
+        return configured;
+    }
+
+    let candidate = if content_length <= TINY_OBJECT_STRIPE_4K_LIMIT {
+        MIN_DYNAMIC_STRIPE_SIZE
+    } else if content_length <= SMALL_OBJECT_STRIPE_16K_LIMIT {
+        16 * 1024
+    } else {
+        configured
+    };
+
+    candidate.min(configured)
+}
+
+fn choose_upload_stripe_size_for_len(content_length: u64) -> usize {
+    choose_upload_stripe_size_for_len_with_ceiling(content_length, configured_block_size())
+}
+
+fn choose_upload_stripe_size_for_parts(part_sizes: &[u64]) -> usize {
+    let largest_part = part_sizes.iter().copied().max().unwrap_or(0);
+    choose_upload_stripe_size_for_len(largest_part)
 }
 
 fn stable_shard_name(part_index: u64, shard_index: usize, data_shards: usize) -> String {
@@ -816,7 +868,7 @@ async fn part_exists_on_disk(
     };
 
     let data_shards = manifest_data_shards(manifest);
-    let block_size = configured_block_size();
+    let block_size = manifest.stripe_size_bytes;
     let expected_shard_len = final_shard_len_for_part(part_size, data_shards, block_size);
 
     for (_, _, stable_path, _) in shard_specs_for_part(path_manager, manifest, part_index)? {
@@ -910,7 +962,7 @@ async fn reconstruct_part_meta_from_disk(
     };
 
     let data_shards = manifest_data_shards(manifest);
-    let block_size = configured_block_size();
+    let block_size = manifest.stripe_size_bytes;
     let expected_shard_len = final_shard_len_for_part(part_size, data_shards, block_size);
 
     let mut shards = Vec::with_capacity(manifest_total_shards(manifest));
@@ -966,7 +1018,7 @@ async fn reconstruct_part_meta_from_receipt(
         return Ok(None);
     }
 
-    let block_size = configured_block_size();
+    let block_size = manifest.stripe_size_bytes;
     let expected_shard_len = final_shard_len_for_part(part_size, data_shards, block_size);
     let shard_size_bytes = if receipt.shard_size_bytes == 0 {
         expected_shard_len
@@ -1034,22 +1086,24 @@ async fn write_part_blob_to_disk(
     version_id: &str,
     part_index: u64,
     content_length: u64,
+    data_shards: usize,
+    parity_shards: usize,
+    block_size: usize,
     body: Body,
     expected_checksum: Option<&str>,
     strict_durability: bool,
 ) -> Result<PartMetadata, AppError> {
-    let data_shards = DATA_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
-    let parity_shards = PARITY_SHARDS_ATOMIC.get().unwrap().load(Ordering::Relaxed) as usize;
     let total_shards = data_shards + parity_shards;
 
-    let block_size = STRIPE_SIZE_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or_else(default_stripe_size);
+    if data_shards == 0 || total_shards == 0 {
+        return Err(AppError::InternalServerError(
+            "invalid erasure coding layout".into(),
+        ));
+    }
 
-    if block_size % 4096 != 0 {
+    if block_size == 0 || block_size % 4096 != 0 {
         return Err(AppError::InternalServerError(format!(
-            "stripe_size_bytes must be multiple of 4096 for O_DIRECT (got {})",
+            "stripe_size_bytes must be a non-zero multiple of 4096 for O_DIRECT (got {})",
             block_size
         )));
     }
@@ -1437,14 +1491,12 @@ pub async fn initiate_object_upload(
     let version_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
 
-    let receipt = ReservationReceipt {
-        amount: params.total_size_bytes,
-    };
-
-    let stripe_size = STRIPE_SIZE_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or_else(default_stripe_size);
+    let planned_sizes = planned_part_sizes(
+        params.total_size_bytes,
+        params.expected_parts.max(1),
+        part_size_bytes,
+    );
+    let stripe_size = choose_upload_stripe_size_for_parts(&planned_sizes);
 
     let manifest = UploadSessionManifest {
         fragment: fragment.clone(),
@@ -1466,11 +1518,7 @@ pub async fn initiate_object_upload(
 
     ensure_blob_placement_capacity_available_for_parts(
         0,
-        &planned_part_sizes(
-            manifest.total_size_bytes,
-            manifest.expected_parts,
-            manifest.part_size_bytes,
-        ),
+        &planned_sizes,
         manifest_data_shards(&manifest),
         manifest_parity_shards(&manifest),
         manifest.stripe_size_bytes,
@@ -1480,7 +1528,7 @@ pub async fn initiate_object_upload(
     let path_manager = ObjectPathManager::new();
     ensure_version_shard_dirs(&path_manager, &manifest).await?;
 
-    index::open_session(&manifest, Some(receipt)).await?;
+    index::open_session(&manifest, None).await?;
 
     info!(
         "Initiated upload: {}/{} (v: {}, s: {})",
@@ -1699,6 +1747,9 @@ pub async fn object_upload_part(
         &version_id,
         part_index,
         content_length,
+        manifest_data_shards(&manifest),
+        manifest_parity_shards(&manifest),
+        manifest.stripe_size_bytes,
         body,
         expected_checksum,
         strict_durability,
@@ -1754,6 +1805,7 @@ pub async fn upload_object_one_shot(
     }
 
     ensure_capacity_available(content_length).await?;
+    let stripe_size = choose_upload_stripe_size_for_len(content_length);
 
     let version_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
@@ -1766,31 +1818,20 @@ pub async fn upload_object_one_shot(
         request_content_type(&headers).unwrap_or_else(|| "application/octet-stream".to_string());
 
     let path_manager = ObjectPathManager::new();
-    index::reserve_upload_quota(&fragment, &object_key, &version_id, content_length).await?;
-
-    let part_meta = match write_part_blob_to_disk(
+    let part_meta = write_part_blob_to_disk(
         &path_manager,
         &fragment,
         &version_id,
         0,
         content_length,
+        configured_data_shards(),
+        configured_parity_shards(),
+        stripe_size,
         body,
         expected_checksum,
         strict_durability,
     )
-    .await
-    {
-        Ok(part_meta) => part_meta,
-        Err(err) => {
-            let _ = index::release_upload_quota(&fragment, &version_id).await;
-            return Err(err);
-        }
-    };
-
-    let stripe_size = STRIPE_SIZE_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or_else(default_stripe_size);
+    .await?;
 
     let object_meta = ObjectMetadata {
         object_key: object_key.clone(),
@@ -1806,21 +1847,13 @@ pub async fn upload_object_one_shot(
         stripe_size_bytes: stripe_size,
     };
 
-    let _object_lock = match index::acquire_object_operation_lock(&fragment, &object_key).await {
-        Ok(lock) => lock,
-        Err(err) => {
-            let _ = index::release_upload_quota(&fragment, &version_id).await;
-            return Err(err);
-        }
-    };
-    if let Err(err) = index::publish_object(&object_meta).await {
-        let _ = index::release_upload_quota(&fragment, &version_id).await;
-        return Err(err);
-    }
+    let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
+    index::publish_object(&object_meta).await?;
 
-    let response_body = serde_json::to_value(&object_meta).map_err(|e| {
-        AppError::InternalServerError(format!("serialize one-shot upload response: {}", e))
-    })?;
+    let response_body = serde_json::to_value(object_meta.clone().without_internal_layout())
+        .map_err(|e| {
+            AppError::InternalServerError(format!("serialize one-shot upload response: {}", e))
+        })?;
     Ok((StatusCode::CREATED, AxumJson(response_body)).into_response())
 }
 
@@ -1957,10 +1990,10 @@ pub async fn finalize_object_upload(
         total_size_calculated += part.size_bytes;
     }
 
-    let stripe_size = STRIPE_SIZE_ATOMIC
-        .get()
-        .map(|v| v.load(Ordering::Relaxed))
-        .unwrap_or_else(default_stripe_size);
+    let stripe_size = manifest
+        .as_ref()
+        .map(|m| m.stripe_size_bytes)
+        .unwrap_or_else(configured_block_size);
 
     let content_type = manifest
         .as_ref()
@@ -1989,9 +2022,10 @@ pub async fn finalize_object_upload(
 
     let _ = index::remove_session(&fragment, &version_id, "finalized").await;
 
-    let response_body = serde_json::to_value(&object_meta).map_err(|e| {
-        AppError::InternalServerError(format!("serialize finalized upload response: {}", e))
-    })?;
+    let response_body = serde_json::to_value(object_meta.clone().without_internal_layout())
+        .map_err(|e| {
+            AppError::InternalServerError(format!("serialize finalized upload response: {}", e))
+        })?;
     Ok((StatusCode::OK, AxumJson(response_body)).into_response())
 }
 

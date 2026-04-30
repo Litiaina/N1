@@ -2094,7 +2094,7 @@ pub(crate) async fn check_needs_redistribution(
     scope: RedistributionScope,
     target_data: usize,
     target_parity: usize,
-    target_stripe_size: usize,
+    _target_stripe_size: usize,
     target_num_disks: usize,
     target_blob_roots: &[PathBuf],
     target_index_roots: &[PathBuf],
@@ -2107,10 +2107,6 @@ pub(crate) async fn check_needs_redistribution(
     if check_blob {
         if meta.parts.is_empty() {
             return needs;
-        }
-
-        if meta.stripe_size_bytes != target_stripe_size {
-            needs.blob = true;
         }
 
         let part0 = &meta.parts[0];
@@ -2295,7 +2291,7 @@ async fn redistribute_object_streaming(
     meta: &mut ObjectMetadata,
     target_data_shards: usize,
     target_parity_shards: usize,
-    target_stripe_size: usize,
+    _target_stripe_size: usize,
     target_blob_roots: &[PathBuf],
     _target_index_roots: &[PathBuf],
     is_trash: bool,
@@ -2330,7 +2326,7 @@ async fn redistribute_object_streaming(
     }
 
     let old_block_size = meta.stripe_size_bytes;
-    let new_block_size = target_stripe_size;
+    let new_block_size = old_block_size;
     let verify_tmp_crc = strict_durability;
 
     let mut file_cache: HashMap<String, tokio::fs::File> = HashMap::new();

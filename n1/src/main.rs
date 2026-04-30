@@ -13,6 +13,9 @@ use crate::core::object_parser::{
     ADAPTIVE_STREAM_TARGET_ATOMIC, STREAM_CHUNK_SIZE_ATOMIC, STREAM_LOCALITY_BIAS_ENABLED_ATOMIC,
     STREAM_MAX_CONCURRENCY, STREAM_READAHEAD_BYTES_ATOMIC,
 };
+use crate::core::quota_manager::{
+    FragmentQuotaBackend, apply_all_fragment_project_quotas, configure_fragment_quota_backend,
+};
 use crate::core::upload::{
     ADAPTIVE_IO_TARGET_ATOMIC, DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC,
     PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC,
@@ -708,6 +711,20 @@ pub async fn run_server() {
     tracing::info!(
         "Storage mode: standard variant is filesystem-backed (directory-only index/blob roots)"
     );
+
+    let quota_section = config.section(Some("quota_config"));
+    let fragment_quota_backend =
+        FragmentQuotaBackend::parse(quota_section.and_then(|s| s.get("fragment_quota_backend")))
+            .unwrap_or_else(|err| panic!("Invalid quota_config.fragment_quota_backend: {}", err));
+    configure_fragment_quota_backend(fragment_quota_backend)
+        .expect("Double initialization of fragment quota backend");
+    tracing::info!(
+        "Fragment quota enforcement: backend={}",
+        fragment_quota_backend.as_str()
+    );
+    if let Err(err) = apply_all_fragment_project_quotas().await {
+        panic!("N1 startup quota validation failed: {}", err);
+    }
 
     let cpu_cores = detect_cpu_cores();
     let detected_ram_bytes = detect_total_ram_bytes();

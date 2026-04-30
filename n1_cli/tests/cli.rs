@@ -10,7 +10,7 @@ use axum::{
     extract::{Path, Query},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -49,6 +49,12 @@ struct FragmentCreatePayload {
 #[derive(serde::Deserialize)]
 struct FragmentHashPayload {
     fragment: String,
+}
+
+#[derive(serde::Deserialize)]
+struct FragmentQuotaResizePayload {
+    quota_bytes: u64,
+    secret: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -146,6 +152,32 @@ async fn fragment_hash_handler(Json(payload): Json<FragmentHashPayload>) -> impl
         Json(json!({
             "fragment": payload.fragment,
             "fragment_hash": AUTH_FRAGMENT_HASH
+        })),
+    )
+        .into_response()
+}
+
+async fn resize_quota_handler(
+    Path(fragment): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<FragmentQuotaResizePayload>,
+) -> impl IntoResponse {
+    if fragment != AUTH_FRAGMENT_HASH || !authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if payload.quota_bytes != 2_097_152 || payload.secret != "master-secret" {
+        return (StatusCode::BAD_REQUEST, "bad quota resize payload").into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "fragment": fragment,
+            "previous_quota_bytes": 1_048_576_u64,
+            "quota_bytes": payload.quota_bytes,
+            "used_bytes": 524_288_u64,
+            "available_bytes": 1_572_864_u64,
+            "changed": true,
+            "direction": "increase"
         })),
     )
         .into_response()
@@ -387,6 +419,44 @@ async fn fragment_create_uses_direct_route() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("\"fragment_hash\":\"clinic-hash\""));
     assert!(stdout.contains("\"name\":\"clinic\""));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fragment_resize_quota_uses_authenticated_admin_route() {
+    let router = Router::new()
+        .route("/n1/auth/fragment", post(auth_handler))
+        .route("/n1/fragments/hash", get(fragment_hash_handler))
+        .route(
+            "/n1/fragments/{fragment}/quota",
+            patch(resize_quota_handler),
+        );
+    let (base_url, handle) = spawn_server(router).await;
+
+    let output = Command::cargo_bin("litiaina-n1-cli")
+        .unwrap()
+        .args([
+            "--url",
+            &base_url,
+            "--secret",
+            SECRET,
+            "--fragment",
+            AUTH_FRAGMENT_NAME,
+            "fragment",
+            "resize-quota",
+            "--quota-bytes",
+            "2097152",
+            "--master-secret",
+            "master-secret",
+        ])
+        .output()
+        .unwrap();
+
+    handle.abort();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"quota_bytes\":2097152"));
+    assert!(stdout.contains("\"direction\":\"increase\""));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
