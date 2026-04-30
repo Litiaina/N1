@@ -60,6 +60,13 @@ impl FragmentQuotaBackend {
             Self::XfsProject => "xfs_project",
         }
     }
+
+    pub fn public_name(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::XfsProject => "filesystem_project",
+        }
+    }
 }
 
 static FRAGMENT_QUOTA_BACKEND: OnceLock<FragmentQuotaBackend> = OnceLock::new();
@@ -179,13 +186,13 @@ fn run_xfs_quota_command(mount_point: &Path, command: &str) -> Result<String, Ap
             || detail.contains("Permission denied")
         {
             format!(
-                "{detail}; strict fragment quota requires the N1 service to set XFS project quota limits. Run N1 with the required filesystem quota privileges, or set N1_XFS_QUOTA_BIN to a root-owned helper that can run xfs_quota for N1."
+                "{detail}; strict fragment quota requires the N1 service to set filesystem project quota limits. Run N1 with the required filesystem quota privileges, or set N1_XFS_QUOTA_BIN to a root-owned quota helper for N1."
             )
         } else {
             detail
         };
         return Err(AppError::ServiceUnavailable(format!(
-            "XFS project quota command failed on {}: {} ({})",
+            "N1 filesystem quota command failed on {}: {} ({})",
             mount_point.display(),
             command,
             detail
@@ -247,14 +254,14 @@ fn validate_xfs_project_quota_root(
         })?;
     if mount.fs_type != "xfs" {
         return Err(AppError::ServiceUnavailable(format!(
-            "blob root {} is on filesystem type '{}' but strict N1 fragment quota requires XFS project quotas",
+            "blob root {} is on filesystem type '{}' but strict N1 fragment quota requires a project-quota-capable filesystem",
             root.display(),
             mount.fs_type
         )));
     }
     if !mount_has_project_quota(&mount) {
         return Err(AppError::ServiceUnavailable(format!(
-            "blob root {} is on XFS mount {} but project quota is not enabled; mount it with prjquota/pquota",
+            "blob root {} is on mount {} but filesystem project quota is not enabled; enable project quotas for this mount",
             root.display(),
             mount.mount_point.display()
         )));
@@ -393,7 +400,7 @@ fn apply_xfs_project_quota_sync(
         )?;
         if xfs_project_check_has_mismatch(&check) {
             return Err(AppError::ServiceUnavailable(format!(
-                "XFS project quota verification failed for {}: {}",
+                "N1 filesystem quota verification failed for {}: {}",
                 fragment_root.display(),
                 check.trim()
             )));

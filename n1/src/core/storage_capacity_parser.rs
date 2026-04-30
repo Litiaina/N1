@@ -84,7 +84,7 @@ fn quota_usage_from_meta(
         available_bytes,
         usage_percent,
         quota_enforced: fragment_quota_enforcement_enabled(),
-        quota_backend: fragment_quota_backend().as_str(),
+        quota_backend: fragment_quota_backend().public_name(),
         created_at_unix: meta.created_at_unix,
         updated_at_unix: meta.updated_at_unix,
     }
@@ -258,7 +258,7 @@ pub async fn resize_fragment_quota(
         active_quota_bytes: next_active_quota_bytes,
         capacity_allocated: usage.capacity_allocated,
         quota_enforced: fragment_quota_enforcement_enabled(),
-        quota_backend: fragment_quota_backend().as_str(),
+        quota_backend: fragment_quota_backend().public_name(),
         changed,
         direction,
     }))

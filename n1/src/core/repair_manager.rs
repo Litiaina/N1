@@ -3,6 +3,7 @@ use crate::core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata,
 };
 use crate::core::index;
+use crate::core::indexdb_store;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::{repair_entire_shard, verify_shard_integrity};
 use crate::core::redistribution::replay_pending_intents_for_fragment_now;
@@ -239,33 +240,91 @@ fn repair_defaults_for_runtime(
         }
     };
 
-    match ram_gib {
-        0..=2 => {
-            meta = meta.min(2);
-            shard = shard.min(1);
-            batch = batch.min(64);
-        }
-        3..=4 => {
-            meta = meta.min(4);
-            shard = shard.min(1);
-            batch = batch.min(128);
-        }
-        5..=8 => {
-            meta = meta.min(6);
-            shard = shard.min(2);
-            batch = batch.min(192);
-        }
-        9..=16 => {
-            meta = meta.min(8);
-            shard = shard.min(3);
-            batch = batch.min(256);
-        }
-        17..=32 => {
-            meta = meta.min(12);
-            shard = shard.min(4);
-            batch = batch.min(384);
-        }
-        _ => {}
+    match check_mode {
+        RepairCheckMode::Availability => match ram_gib {
+            0..=2 => {
+                meta = meta.min(2);
+                shard = shard.min(1);
+                batch = batch.min(64);
+            }
+            3..=4 => {
+                meta = meta.min(4);
+                shard = shard.min(1);
+                batch = batch.min(128);
+            }
+            5..=8 => {
+                meta = meta.min(6);
+                shard = shard.min(2);
+                batch = batch.min(192);
+            }
+            9..=16 => {
+                meta = meta.min(8);
+                shard = shard.min(3);
+                batch = batch.min(256);
+            }
+            17..=32 => {
+                meta = meta.min(12);
+                shard = shard.min(4);
+                batch = batch.min(384);
+            }
+            _ => {}
+        },
+        RepairCheckMode::Checksum | RepairCheckMode::Strict => match ram_gib {
+            0..=2 => {
+                meta = meta.min(4);
+                shard = shard.min(1);
+                batch = batch.min(128);
+            }
+            3..=4 => {
+                meta = meta.min(8);
+                shard = shard.min(2);
+                batch = batch.min(256);
+            }
+            5..=8 => {
+                meta = meta.min(12);
+                shard = shard.min(4);
+                batch = batch.min(512);
+            }
+            9..=16 => {
+                meta = meta.min(16);
+                shard = shard.min(6);
+                batch = batch.min(768);
+            }
+            17..=32 => {
+                meta = meta.min(24);
+                shard = shard.min(8);
+                batch = batch.min(1024);
+            }
+            _ => {}
+        },
+        RepairCheckMode::Scrub => match ram_gib {
+            0..=2 => {
+                meta = meta.min(4);
+                shard = shard.min(1);
+                batch = batch.min(128);
+            }
+            3..=4 => {
+                meta = meta.min(8);
+                shard = shard.min(2);
+                batch = batch.min(256);
+            }
+            5..=8 => {
+                meta = meta.min(16);
+                shard = shard.min(4);
+                batch = batch.min(768);
+            }
+            9..=16 => {
+                meta = meta.min(24);
+                shard = shard.min(8);
+                batch = batch.min(1024);
+            }
+            17..=32 => {
+                meta = meta.min(32);
+                shard = shard.min(12);
+                batch = batch.min(2048);
+            }
+            _ => {}
+        },
     }
 
     let (max_meta, max_shard, max_batch) = repair_limits_for_ram_gib(ram_gib);
@@ -288,12 +347,12 @@ fn normalize_repair_cfg_for_layout(
     let (meta_cap, shard_cap) = match cfg.check_mode {
         RepairCheckMode::Availability => (io_width.clamp(1, 4), blob_width.clamp(1, 2)),
         RepairCheckMode::Checksum | RepairCheckMode::Strict => (
-            io_width.saturating_mul(2).clamp(2, 16),
-            blob_width.saturating_mul(2).clamp(1, 8),
+            io_width.saturating_mul(4).clamp(4, 32),
+            blob_width.saturating_mul(4).clamp(2, 16),
         ),
         RepairCheckMode::Scrub => (
-            io_width.saturating_mul(4).clamp(4, 24),
-            blob_width.saturating_mul(4).clamp(1, 12),
+            io_width.saturating_mul(8).clamp(8, 64),
+            blob_width.saturating_mul(8).clamp(4, 32),
         ),
     };
 
@@ -758,14 +817,10 @@ async fn repair_fragment_metadata_replicas(
 
 async fn repair_fragment_index_db(
     _index_roots: &[PathBuf],
-    _fragment: &str,
-    _dry_run: bool,
+    fragment: &str,
+    dry_run: bool,
 ) -> Result<(u64, u64, u64), AppError> {
-    // N1 3.0 stores fragment metadata in a WAL-backed index.ndxdb.
-    // Raw byte-copy repair can miss live WAL frames and corrupt an active DB.
-    // The namespace/indexdb replica pass below uses engine backup semantics for
-    // the same file, so this legacy partition repair lane is intentionally inert.
-    Ok((0, 0, 0))
+    indexdb_store::repair_fragment_partition_replicas(fragment, dry_run)
 }
 
 async fn process_object_repair(

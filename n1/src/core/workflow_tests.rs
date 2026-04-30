@@ -48,8 +48,8 @@ use super::sync::ensure_fragment_blob_directories;
 use super::upload::{
     DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC,
     STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC, UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC,
-    WRITER_BUFFER_SIZE_ATOMIC, finalize_object_upload, get_upload_status, initiate_object_upload,
-    object_upload_part, upload_object_one_shot,
+    WRITER_BUFFER_SIZE_ATOMIC, cancel_upload_session, finalize_object_upload, get_upload_status,
+    initiate_object_upload, object_upload_part, upload_object_one_shot,
 };
 use crate::core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
 use crate::enums::app_error_enum::AppError;
@@ -2298,6 +2298,106 @@ async fn matrix_multipart_upload_initiate_does_not_reserve_fragment_quota() {
     assert_eq!(meta.committed_bytes, 0);
     assert_eq!(meta.reserved_bytes, 0);
     assert_eq!(meta.trash_bytes, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_multipart_cancel_reclaims_physical_upload_bytes() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = create_fragment_with_quota(2 * 1024 * 1024).await;
+    let (version_id, _session_id) =
+        init_upload_with_part_size(&fragment, "quota/cancel.bin", 8192, 2, Some(4096)).await;
+    let put_resp = upload_part(&fragment, &version_id, 0, vec![0x42; 4096]).await;
+    assert_eq!(put_resp.status(), StatusCode::OK);
+
+    let usage_before = get_fragment_blob_usage(&fragment)
+        .await
+        .expect("usage before cancel")
+        .used_bytes();
+    assert!(
+        usage_before > 0,
+        "uploaded multipart part should consume physical blob bytes"
+    );
+
+    let cancel_resp = cancel_upload_session(
+        full_claims(&fragment),
+        AxumPath((fragment.clone(), version_id.clone())),
+        Query(ObjectKeyQuery {
+            object_key: "quota/cancel.bin".to_string(),
+            version_id: None,
+            filename: None,
+        }),
+    )
+    .await
+    .expect("cancel multipart upload")
+    .into_response();
+    assert_eq!(cancel_resp.status(), StatusCode::NO_CONTENT);
+
+    let usage_after = get_fragment_blob_usage(&fragment)
+        .await
+        .expect("usage after cancel")
+        .used_bytes();
+    assert_eq!(
+        usage_after, 0,
+        "cancel must reclaim physical multipart upload bytes immediately"
+    );
+    let sessions = index::list_active_sessions(&fragment)
+        .await
+        .expect("active sessions after cancel");
+    assert!(
+        sessions
+            .iter()
+            .all(|session| session.manifest.version_id != version_id),
+        "cancelled session must not remain active"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_failed_multipart_part_cleans_partial_attempt_bytes() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    let fragment = create_fragment_with_quota(2 * 1024 * 1024).await;
+    let (version_id, _session_id) =
+        init_upload_with_part_size(&fragment, "quota/failed-part.bin", 8192, 1, Some(8192)).await;
+
+    let mut headers = HeaderMap::new();
+    headers.insert("content-length", HeaderValue::from_static("8192"));
+    let err = match object_upload_part(
+        full_claims(&fragment),
+        headers,
+        AxumPath((fragment.clone(), version_id.clone(), 0)),
+        Query(UploadPartQuery {
+            checksum: None,
+            durability: Some("batched".to_string()),
+            strict_durability: None,
+            io_gate: None,
+        }),
+        Body::from(vec![0x99; 4096]),
+    )
+    .await
+    {
+        Ok(_) => panic!("short body should fail the part upload"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, AppError::BadRequest(_)),
+        "expected BadRequest for short body, got {err:?}"
+    );
+
+    let usage_after = get_fragment_blob_usage(&fragment)
+        .await
+        .expect("usage after failed part")
+        .used_bytes();
+    assert_eq!(
+        usage_after, 0,
+        "failed part writes must not leave quota-counted temp or stable shard bytes"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6747,6 +6847,110 @@ async fn matrix_ha_repair_reconverges_index_after_index_disk_down() {
     let got_b = read_object_bytes(full_claims(&fragment), fragment.clone(), seed_key_b).await;
     assert_eq!(got_a, seed_bytes_a);
     assert_eq!(got_b, seed_bytes_b);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_repair_after_empty_index_disk_preserves_live_posix_listing() {
+    let _guard = TEST_LOCK.lock().await;
+    let base = TEST_BASE.clone();
+    ensure_global_storage_config(&base).await;
+    ensure_upload_runtime_config();
+
+    DATA_SHARDS_ATOMIC
+        .get()
+        .expect("DATA_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    PARITY_SHARDS_ATOMIC
+        .get()
+        .expect("PARITY_SHARDS_ATOMIC")
+        .store(1, Ordering::Relaxed);
+    STRIPE_SIZE_ATOMIC
+        .get()
+        .expect("STRIPE_SIZE_ATOMIC")
+        .store(64 * 1024, Ordering::Relaxed);
+
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
+    setup_fragment(&fragment).await;
+    let state = Arc::new(AppState {
+        ws_manager: WsConnectionManager::new(),
+    });
+
+    let videos = vec![
+        (
+            "repair-empty/live-a.mp4".to_string(),
+            (0..(384 * 1024 + 17))
+                .map(|i| (i % 251) as u8)
+                .collect::<Vec<u8>>(),
+        ),
+        (
+            "repair-empty/live-b.mp4".to_string(),
+            (0..(512 * 1024 + 31))
+                .map(|i| ((i * 7) % 251) as u8)
+                .collect::<Vec<u8>>(),
+        ),
+    ];
+
+    for (key, bytes) in &videos {
+        put_object(state.clone(), &fragment, key, bytes.clone()).await;
+    }
+
+    let path_manager = ObjectPathManager::new();
+    let index_roots = path_manager.get_all_index_roots();
+    assert!(
+        index_roots.len() >= 2,
+        "repair empty-index-disk regression requires two index roots"
+    );
+
+    for lost_root in index_roots {
+        indexdb_store::clear_cached_dbs_for_test();
+        let lost_fragment = lost_root.join(&fragment);
+        if fs::try_exists(&lost_fragment).await.unwrap_or(false) {
+            fs::remove_dir_all(&lost_fragment)
+                .await
+                .expect("empty one index disk fragment directory");
+        }
+
+        run_repair_job(
+            RepairRunConfig {
+                dry_run: false,
+                target_fragment: Some(fragment.clone()),
+                check_mode: RepairCheckMode::Scrub,
+                meta_concurrency: 8,
+                shard_repair_concurrency: 2,
+                meta_batch_size: 512,
+            },
+            Arc::new(WsConnectionManager::new()),
+        )
+        .await
+        .expect("repair after emptying one index disk");
+        indexdb_store::clear_cached_dbs_for_test();
+        assert_all_indexdb_replicas_synchronized(&fragment).await;
+
+        let listed = list_objects_json(&fragment, Some("repair-empty"), Some("/")).await;
+        let objects = listed["objects"].as_array().expect("objects array");
+        let mut listed_keys = objects
+            .iter()
+            .filter_map(|object| object["object_key"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        listed_keys.sort();
+        assert_eq!(
+            listed_keys,
+            vec![
+                "repair-empty/live-a.mp4".to_string(),
+                "repair-empty/live-b.mp4".to_string(),
+            ],
+            "repair must not lose live POSIX entries after a physical index disk loss"
+        );
+
+        for (key, expected) in &videos {
+            let got =
+                read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
+            assert_eq!(got, *expected, "repaired live object mismatch for {}", key);
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

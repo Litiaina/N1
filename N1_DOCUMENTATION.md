@@ -749,7 +749,7 @@ Response:
   "active_quota_bytes": 1073741824000,
   "capacity_allocated": 4000787030016,
   "quota_enforced": true,
-  "quota_backend": "xfs_project",
+  "quota_backend": "filesystem_project",
   "changed": true,
   "direction": "increase"
 }
@@ -805,7 +805,7 @@ Response:
   "available_bytes": 532575944704,
   "usage_percent": 0.8,
   "quota_enforced": true,
-  "quota_backend": "xfs_project",
+  "quota_backend": "filesystem_project",
   "created_at_unix": 1777440000,
   "updated_at_unix": 1777443600
 }
@@ -1380,6 +1380,13 @@ Routes:
 - `repair_concurrency` optional
 - `batch` optional
 
+Maintenance mode controls how much the operation protects foreground CRUD:
+
+- `availability` keeps the node writable and uses conservative pacing/concurrency.
+- `strict` enters read-only maintenance while repair runs and allows wider metadata/blob concurrency.
+- `scrub` enters quiesced maintenance for the strongest offline-style repair/scrub pass.
+- `checksum` behaves like strict integrity checking without requiring every operator workflow to use the word scrub.
+
 Status shape:
 
 ```json
@@ -1409,6 +1416,18 @@ Routes:
 - `POST /n1/maintenance/gc/start`
 - `POST /n1/maintenance/gc/stop`
 - `GET /n1/maintenance/gc/status`
+
+`gc/start` query parameters:
+
+- `mode` optional: `availability`, `strict`, `scrub`
+- `fast_mode` optional boolean
+- `fragment` optional fragment filter
+
+GC mode controls reclaim aggressiveness:
+
+- `availability` keeps CRUD available and preserves a longer grace window for newly committed namespace/object bindings.
+- `strict` enters read-only maintenance and shortens GC grace windows for intentional operator reclaim.
+- `scrub` enters quiesced maintenance and performs the most aggressive reachability cleanup.
 
 The GC status route returns:
 
@@ -1451,6 +1470,12 @@ Routes:
 - `durability_mode` optional
 - `object_concurrency` optional
 - `status_batch` optional
+
+Redistribution mode controls the placement mover:
+
+- `availability` keeps foreground CRUD available and favors lower concurrency.
+- `strict` enters read-only maintenance and widens object move concurrency for faster convergence.
+- `scrub` enters quiesced maintenance and uses the widest maintenance lane.
 
 Status shape:
 

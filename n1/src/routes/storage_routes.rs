@@ -799,9 +799,11 @@ async fn cancel_upload_session_scoped(
         }),
     )
     .await;
-    let _ = global_namespace_runtime()
-        .clear_pending_upload(&fragment, &version_id)
-        .await;
+    if response.is_ok() {
+        let _ = global_namespace_runtime()
+            .clear_pending_upload(&fragment, &version_id)
+            .await;
+    }
     response
 }
 

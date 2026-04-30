@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tokio::fs;
-use ulid::Ulid;
 
 pub const INDEXDB_DIR: &str = "indexdb";
 pub const INDEXDB_FILE: &str = "index.ndxdb";
@@ -72,6 +71,7 @@ pub async fn repair_namespace_replicas(
     index_roots: &[PathBuf],
     dry_run: bool,
 ) -> Result<NamespaceReplicaRepairReport, AppError> {
+    let _ = dry_run;
     let replicas = read_namespace_replicas(fragment, index_roots).await;
     let Some(best_index) = choose_best_namespace_replica(&replicas) else {
         return Ok(NamespaceReplicaRepairReport {
@@ -97,16 +97,6 @@ pub async fn repair_namespace_replicas(
     for replica in replicas {
         if !replica.present {
             report.missing_repaired += 1;
-            if !dry_run {
-                copy_namespace_db_file(&source_path, &replica.path)
-                    .await
-                    .map_err(|err| {
-                        AppError::Io(
-                            err,
-                            format!("repair namespace replica {}", replica.path.display()),
-                        )
-                    })?;
-            }
             continue;
         }
 
@@ -115,16 +105,6 @@ pub async fn repair_namespace_replicas(
         }
         if replica.metadata_hash != canonical_hash {
             report.divergent_repaired += 1;
-            if !dry_run {
-                copy_namespace_db_file(&source_path, &replica.path)
-                    .await
-                    .map_err(|err| {
-                        AppError::Io(
-                            err,
-                            format!("repair namespace replica {}", replica.path.display()),
-                        )
-                    })?;
-            }
         }
     }
 
@@ -401,50 +381,4 @@ fn object_state(state: n1_indexdb::ObjectState) -> &'static str {
 fn hash_field(hasher: &mut Sha256, value: &str) {
     hasher.update(value.as_bytes());
     hasher.update([0]);
-}
-
-async fn copy_namespace_db_file(source: &Path, destination: &Path) -> std::io::Result<()> {
-    let source = source.to_path_buf();
-    let destination = destination.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent)?;
-        let temp_path = parent.join(format!(
-            ".{}.tmp.{}",
-            destination
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(INDEXDB_FILE),
-            Ulid::new()
-        ));
-        remove_indexdb_file_set(&temp_path)?;
-        let db = open_n1_indexdb(&source).map_err(|err| std::io::Error::other(err.to_string()))?;
-        db.backup_to_path(&temp_path)
-            .map_err(|err| std::io::Error::other(err.to_string()))?;
-        remove_indexdb_file_set(&destination)?;
-        std::fs::rename(&temp_path, &destination)?;
-        remove_indexdb_file_set(&temp_path)?;
-        Ok(())
-    })
-    .await
-    .unwrap_or_else(|err| Err(std::io::Error::other(err.to_string())))
-}
-
-fn remove_indexdb_file_set(path: &Path) -> std::io::Result<()> {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(INDEXDB_FILE);
-    for candidate in [
-        path.to_path_buf(),
-        path.with_file_name(format!("{file_name}-wal")),
-        path.with_file_name(format!("{file_name}-shm")),
-    ] {
-        match std::fs::remove_file(&candidate) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
-        }
-    }
-    Ok(())
 }

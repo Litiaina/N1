@@ -1467,7 +1467,7 @@ fn allocate_quota_project_id(fragment: &str) -> Result<u32, AppError> {
         candidate = next_quota_project_id(candidate);
         if candidate == start {
             return Err(AppError::ServiceUnavailable(
-                "no free XFS project quota IDs are available".into(),
+                "no free N1 filesystem quota project IDs are available".into(),
             ));
         }
     }
@@ -1630,14 +1630,71 @@ pub fn sync_fragment_partition_replicas(fragment: &str) -> Result<(), AppError> 
     if route.roots.len() <= 1 {
         return Ok(());
     }
+    ensure_fragment_owner_partition_available_strict(fragment)
+}
+
+pub fn repair_fragment_partition_replicas(
+    fragment: &str,
+    dry_run: bool,
+) -> Result<(u64, u64, u64), AppError> {
+    let route = fragment_route(fragment)?;
+    if route.roots.len() <= 1 {
+        return Ok((0, 0, 0));
+    }
+
     let owner_path = owner_db_path(&route, fragment);
     with_partition_commit_lock(&owner_path, || {
-        if owner_path.exists() {
-            replicate_owner_partition_db(fragment, &route)?;
+        let Some((source_path, source_generation)) =
+            select_authoritative_partition_db_path(&route, fragment)?
+        else {
+            return Ok((0, 0, 0));
+        };
+
+        let mut missing = 0u64;
+        let mut divergent = 0u64;
+        let mut corrupt = 0u64;
+
+        for root in &route.roots {
+            let replica_path = db_path(root, fragment, route.partition_id);
+            if !replica_path.exists() {
+                missing = missing.saturating_add(1);
+                if !dry_run {
+                    evict_cached_db(&replica_path);
+                    atomic_copy_db_file(&source_path, &replica_path)?;
+                }
+                continue;
+            }
+
+            let replica_generation =
+                match get_or_open_db(&replica_path).and_then(|db| read_partition_meta_exact(&db)) {
+                    Ok(Some(meta)) => meta.committed_generation,
+                    Ok(None) => 0,
+                    Err(err) => {
+                        corrupt = corrupt.saturating_add(1);
+                        warn!(
+                            "indexdb repair: treating {} as corrupt/unreadable: {}",
+                            replica_path.display(),
+                            err
+                        );
+                        if !dry_run {
+                            evict_cached_db(&replica_path);
+                            atomic_copy_db_file(&source_path, &replica_path)?;
+                        }
+                        continue;
+                    }
+                };
+
+            if replica_path != source_path && replica_generation != source_generation {
+                divergent = divergent.saturating_add(1);
+                if !dry_run {
+                    evict_cached_db(&replica_path);
+                    atomic_copy_db_file(&source_path, &replica_path)?;
+                }
+            }
         }
-        Ok(())
-    })?;
-    Ok(())
+
+        Ok((missing, divergent, corrupt))
+    })
 }
 
 fn read_head_exact(

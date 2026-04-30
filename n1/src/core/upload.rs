@@ -208,23 +208,31 @@ fn parse_upload_durability_mode(query: &UploadPartQuery) -> UploadDurabilityMode
 #[cfg(test)]
 mod tests {
     use super::{
-        UploadDurabilityMode, acquire_upload_io_guard_with_timeout,
-        choose_upload_stripe_size_for_len_with_ceiling, parse_upload_durability_mode,
+        UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC, UploadDurabilityMode,
+        acquire_upload_io_guard_with_timeout, choose_upload_stripe_size_for_len_with_ceiling,
+        parse_upload_durability_mode,
     };
     use crate::core::disk_manager::UploadPartQuery;
+    use std::sync::atomic::Ordering;
 
     #[test]
-    fn upload_durability_defaults_to_batched() {
+    fn upload_durability_default_follows_runtime_config_or_batched_when_unset() {
         let q = UploadPartQuery {
             checksum: None,
             durability: None,
             strict_durability: None,
             io_gate: None,
         };
-        assert!(matches!(
-            parse_upload_durability_mode(&q),
+        let expected = if UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC
+            .get()
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(false)
+        {
+            UploadDurabilityMode::Strict
+        } else {
             UploadDurabilityMode::Batched
-        ));
+        };
+        assert_eq!(parse_upload_durability_mode(&q), expected);
     }
 
     #[test]
@@ -1190,135 +1198,157 @@ async fn write_part_blob_to_disk(
         )));
     }
 
-    let calc_total_checksum = expected_checksum.is_some();
-    let mut stream_writer = ErasureStreamWriter::new(
-        writers,
-        data_shards,
-        parity_shards,
-        final_shard_len as usize,
-        calc_total_checksum,
-        block_size,
-    )?;
+    let write_result = async {
+        let calc_total_checksum = expected_checksum.is_some();
+        let mut stream_writer = ErasureStreamWriter::new(
+            writers,
+            data_shards,
+            parity_shards,
+            final_shard_len as usize,
+            calc_total_checksum,
+            block_size,
+        )?;
 
-    let mut body_stream = body.into_data_stream();
-    let mut total_bytes_read = 0u64;
+        let mut body_stream = body.into_data_stream();
+        let mut total_bytes_read = 0u64;
 
-    while let Some(chunk_result) = body_stream.next().await {
-        let chunk = chunk_result.map_err(|e| {
-            AppError::Io(
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-                "stream read".into(),
-            )
-        })?;
+        while let Some(chunk_result) = body_stream.next().await {
+            let chunk = chunk_result.map_err(|e| {
+                AppError::Io(
+                    std::io::Error::new(std::io::ErrorKind::Other, e),
+                    "stream read".into(),
+                )
+            })?;
 
-        if chunk.is_empty() {
-            continue;
-        }
-
-        total_bytes_read += chunk.len() as u64;
-        if total_bytes_read > content_length {
-            cleanup_files_best_effort(&tmp_paths).await;
-            return Err(AppError::BadRequest("Body exceeds Content-Length".into()));
-        }
-
-        stream_writer.write(&chunk).await?;
-    }
-
-    if total_bytes_read != content_length {
-        cleanup_files_best_effort(&tmp_paths).await;
-        return Err(AppError::BadRequest(format!(
-            "Incomplete body: got {} bytes, expected {}",
-            total_bytes_read, content_length
-        )));
-    }
-
-    stream_writer.finalize().await?;
-
-    if let Some(expected) = expected_checksum {
-        let calculated = stream_writer.get_total_checksum();
-        if let Some(calc_str) = calculated.as_ref() {
-            if !expected.eq_ignore_ascii_case(calc_str) {
-                cleanup_files_best_effort(&tmp_paths).await;
-                return Err(AppError::BadRequest("Checksum mismatch".into()));
+            if chunk.is_empty() {
+                continue;
             }
+
+            total_bytes_read += chunk.len() as u64;
+            if total_bytes_read > content_length {
+                return Err(AppError::BadRequest("Body exceeds Content-Length".into()));
+            }
+
+            stream_writer.write(&chunk).await?;
         }
-    }
 
-    let shard_checksums = stream_writer.get_shard_checksums();
-    let total_checksum = stream_writer.get_total_checksum();
-    let writers = stream_writer.into_writers();
+        if total_bytes_read != content_length {
+            return Err(AppError::BadRequest(format!(
+                "Incomplete body: got {} bytes, expected {}",
+                total_bytes_read, content_length
+            )));
+        }
 
-    if strict_durability {
-        let sync_futs = writers.into_iter().filter_map(|w_opt| {
-            w_opt.map(|w| async move {
-                if let Err(e) = w.sync_data().await {
-                    warn!("Failed to fsync shard: {}", e);
-                    return Err(AppError::Io(e, "fsync shard".into()));
+        stream_writer.finalize().await?;
+
+        if let Some(expected) = expected_checksum {
+            let calculated = stream_writer.get_total_checksum();
+            if let Some(calc_str) = calculated.as_ref() {
+                if !expected.eq_ignore_ascii_case(calc_str) {
+                    return Err(AppError::BadRequest("Checksum mismatch".into()));
                 }
-                Ok(())
-            })
-        });
-
-        let sync_results = join_all(sync_futs).await;
-        for r in sync_results {
-            if let Err(e) = r {
-                cleanup_files_best_effort(&tmp_paths).await;
-                return Err(e);
             }
         }
-    }
 
-    let mut dirs_to_sync: Vec<PathBuf> = Vec::new();
-    for i in 0..total_shards {
-        let expected_crc = shard_checksums.get(i).map(|s| s.as_str());
-        publish_one_shard(
-            tmp_paths[i].as_path(),
-            stable_paths[i].as_path(),
-            final_shard_len,
-            expected_crc,
-        )
-        .await?;
+        let shard_checksums = stream_writer.get_shard_checksums();
+        let total_checksum = stream_writer.get_total_checksum();
+        let writers = stream_writer.into_writers();
 
-        if let Some(parent) = stable_paths[i].parent() {
-            dirs_to_sync.push(parent.to_path_buf());
+        if strict_durability {
+            let sync_futs = writers.into_iter().filter_map(|w_opt| {
+                w_opt.map(|w| async move {
+                    if let Err(e) = w.sync_data().await {
+                        warn!("Failed to fsync shard: {}", e);
+                        return Err(AppError::Io(e, "fsync shard".into()));
+                    }
+                    Ok(())
+                })
+            });
+
+            let sync_results = join_all(sync_futs).await;
+            for r in sync_results {
+                r?;
+            }
         }
+
+        let mut dirs_to_sync: Vec<PathBuf> = Vec::new();
+        for i in 0..total_shards {
+            let expected_crc = shard_checksums.get(i).map(|s| s.as_str());
+            publish_one_shard(
+                tmp_paths[i].as_path(),
+                stable_paths[i].as_path(),
+                final_shard_len,
+                expected_crc,
+            )
+            .await?;
+
+            if let Some(parent) = stable_paths[i].parent() {
+                dirs_to_sync.push(parent.to_path_buf());
+            }
+        }
+
+        dirs_to_sync.sort();
+        dirs_to_sync.dedup();
+
+        if strict_durability {
+            let _ = join_all(dirs_to_sync.iter().map(|d| sync_dir(d.as_path()))).await;
+        }
+
+        let mut shards_info = Vec::with_capacity(total_shards);
+        for i in 0..total_shards {
+            shards_info.push(ShardInfo {
+                shard_index: i,
+                file_name: stable_names[i].clone(),
+                absolute_path: stable_paths[i].to_string_lossy().to_string(),
+                size_bytes: final_shard_len,
+                checksum: shard_checksums.get(i).cloned().unwrap_or_default(),
+                is_parity: i >= data_shards,
+            });
+        }
+
+        Ok(PartMetadata {
+            part_index,
+            size_bytes: total_bytes_read,
+            created_at: Utc::now().timestamp(),
+            checksum: if calc_total_checksum {
+                total_checksum
+            } else {
+                None
+            },
+            shards: shards_info,
+        })
+    }
+    .await;
+
+    if write_result.is_err() {
+        cleanup_files_best_effort(&tmp_paths).await;
+        cleanup_files_best_effort(&stable_paths).await;
     }
 
-    dirs_to_sync.sort();
-    dirs_to_sync.dedup();
-
-    if strict_durability {
-        let _ = join_all(dirs_to_sync.iter().map(|d| sync_dir(d.as_path()))).await;
-    }
-
-    let mut shards_info = Vec::with_capacity(total_shards);
-    for i in 0..total_shards {
-        shards_info.push(ShardInfo {
-            shard_index: i,
-            file_name: stable_names[i].clone(),
-            absolute_path: stable_paths[i].to_string_lossy().to_string(),
-            size_bytes: final_shard_len,
-            checksum: shard_checksums.get(i).cloned().unwrap_or_default(),
-            is_parity: i >= data_shards,
-        });
-    }
-
-    Ok(PartMetadata {
-        part_index,
-        size_bytes: total_bytes_read,
-        created_at: Utc::now().timestamp(),
-        checksum: if calc_total_checksum {
-            total_checksum
-        } else {
-            None
-        },
-        shards: shards_info,
-    })
+    write_result
 }
 
 async fn cleanup_files_best_effort(paths: &[PathBuf]) {
     let futs = paths.iter().cloned().map(|p| async move {
         let _ = tokio_fs::remove_file(&p).await;
+    });
+    let _ = join_all(futs).await;
+}
+
+async fn cleanup_blob_version_dirs_for_version(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    version_id: &str,
+) {
+    let futs = path_manager.get_blob_roots().into_iter().map(|root| {
+        let dir = path_manager.get_shard_dir_on_disk(&root, fragment, version_id);
+        async move {
+            let parent = dir.parent().map(Path::to_path_buf);
+            let _ = tokio_fs::remove_dir_all(&dir).await;
+            if let Some(parent) = parent {
+                let _ = sync_dir(&parent).await;
+            }
+        }
     });
     let _ = join_all(futs).await;
 }
@@ -1756,6 +1786,11 @@ pub async fn object_upload_part(
     )
     .await?;
 
+    if index::load_session(&fragment, &version_id).await?.is_none() {
+        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+        return Ok((StatusCode::CONFLICT, "Upload session was cancelled").into_response());
+    }
+
     if let Err(err) =
         index::commit_session_part_receipt(&fragment, &version_id, &manifest, &part_meta).await
     {
@@ -1763,6 +1798,11 @@ pub async fn object_upload_part(
             "Failed to persist compact multipart receipt for {}/{} part {}: {}",
             fragment, version_id, part_index, err
         );
+    }
+
+    if index::load_session(&fragment, &version_id).await?.is_none() {
+        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+        return Ok((StatusCode::CONFLICT, "Upload session was cancelled").into_response());
     }
 
     Ok((StatusCode::OK, "Part uploaded").into_response())
@@ -1818,7 +1858,24 @@ pub async fn upload_object_one_shot(
         request_content_type(&headers).unwrap_or_else(|| "application/octet-stream".to_string());
 
     let path_manager = ObjectPathManager::new();
-    let part_meta = write_part_blob_to_disk(
+    let created_at = Utc::now().timestamp();
+    let manifest = UploadSessionManifest {
+        fragment: fragment.clone(),
+        object_key: object_key.clone(),
+        version_id: version_id.clone(),
+        session_id: session_id.clone(),
+        total_size_bytes: content_length,
+        expected_parts: 1,
+        part_size_bytes: content_length,
+        content_type: content_type.clone(),
+        created_at,
+        stripe_size_bytes: stripe_size,
+        data_shards: configured_data_shards() as u16,
+        parity_shards: configured_parity_shards() as u16,
+    };
+    index::open_session(&manifest, None).await?;
+
+    let part_meta = match write_part_blob_to_disk(
         &path_manager,
         &fragment,
         &version_id,
@@ -1831,7 +1888,15 @@ pub async fn upload_object_one_shot(
         expected_checksum,
         strict_durability,
     )
-    .await?;
+    .await
+    {
+        Ok(part_meta) => part_meta,
+        Err(err) => {
+            let _ = index::remove_session(&fragment, &version_id, "one-shot-failed").await;
+            cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+            return Err(err);
+        }
+    };
 
     let object_meta = ObjectMetadata {
         object_key: object_key.clone(),
@@ -1841,14 +1906,19 @@ pub async fn upload_object_one_shot(
         owner_uid: fragment.clone(),
         content_type,
         total_size_bytes: content_length,
-        created_at: Utc::now().timestamp(),
+        created_at,
         parts: vec![part_meta],
         is_delete_marker: false,
         stripe_size_bytes: stripe_size,
     };
 
     let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
-    index::publish_object(&object_meta).await?;
+    if let Err(err) = index::publish_object(&object_meta).await {
+        let _ = index::remove_session(&fragment, &version_id, "one-shot-publish-failed").await;
+        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+        return Err(err);
+    }
+    let _ = index::remove_session(&fragment, &version_id, "one-shot-finalized").await;
 
     let response_body = serde_json::to_value(object_meta.clone().without_internal_layout())
         .map_err(|e| {
@@ -2042,10 +2112,21 @@ pub async fn cancel_upload_session(
     }
 
     let path_manager = ObjectPathManager::new();
-    let _object_lock =
-        index::acquire_object_operation_lock(&fragment, &key_query.object_key).await?;
+    let session = index::load_session(&fragment, &version_id).await?;
+    let object_key = session
+        .as_ref()
+        .map(|state| state.manifest.object_key.clone())
+        .filter(|key| !key.is_empty())
+        .unwrap_or_else(|| {
+            if key_query.object_key.is_empty() {
+                version_id.clone()
+            } else {
+                key_query.object_key.clone()
+            }
+        });
+    let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
 
-    if index::read_object_version(&fragment, &key_query.object_key, &version_id)
+    if index::read_object_version(&fragment, &object_key, &version_id)
         .await
         .is_ok()
     {
@@ -2056,6 +2137,7 @@ pub async fn cancel_upload_session(
 
     cleanup_blob_tmp_attempt_files_for_version(&path_manager, &fragment, &version_id).await;
     let _ = index::remove_session(&fragment, &version_id, "cancelled").await;
+    cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
 
     Ok(StatusCode::NO_CONTENT)
 }

@@ -1,6 +1,7 @@
 use crate::core::constants::{FRAGMENT_METADATA_FILE, GC_SUFFIX};
 use crate::core::disk_manager::{FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManager};
 use crate::core::index;
+use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::enums::app_error_enum::AppError;
 use crate::fs::cleanup_manager::start_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
@@ -54,6 +55,94 @@ struct FragmentGcStats {
     refund_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GcExecutionMode {
+    Availability,
+    Strict,
+    Scrub,
+}
+
+impl GcExecutionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Availability => "availability",
+            Self::Strict => "strict",
+            Self::Scrub => "scrub",
+        }
+    }
+
+    fn maintenance_access_mode(self) -> MaintenanceAccessMode {
+        match self {
+            Self::Availability => MaintenanceAccessMode::Availability,
+            Self::Strict => MaintenanceAccessMode::ReadOnly,
+            Self::Scrub => MaintenanceAccessMode::Quiesced,
+        }
+    }
+
+    fn namespace_absence_grace(self) -> Duration {
+        match self {
+            Self::Availability => {
+                Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds.max(300))
+            }
+            Self::Strict => Duration::from_secs(30),
+            Self::Scrub => Duration::ZERO,
+        }
+    }
+
+    fn file_ttl(self, is_manual_run: bool) -> Duration {
+        if !is_manual_run {
+            return Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds);
+        }
+        match self {
+            Self::Availability => Duration::from_secs(1),
+            Self::Strict => Duration::from_secs(1),
+            Self::Scrub => Duration::ZERO,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GcRunOptions {
+    execution_mode: GcExecutionMode,
+    fast_mode: bool,
+}
+
+impl Default for GcRunOptions {
+    fn default() -> Self {
+        Self {
+            execution_mode: GcExecutionMode::Availability,
+            fast_mode: false,
+        }
+    }
+}
+
+impl GcRunOptions {
+    fn namespace_absence_grace(self) -> Duration {
+        if !self.fast_mode {
+            return self.execution_mode.namespace_absence_grace();
+        }
+        match self.execution_mode {
+            GcExecutionMode::Availability => Duration::from_secs(60),
+            GcExecutionMode::Strict => Duration::from_secs(5),
+            GcExecutionMode::Scrub => Duration::ZERO,
+        }
+    }
+
+    fn file_ttl(self, is_manual_run: bool) -> Duration {
+        if !self.fast_mode {
+            return self.execution_mode.file_ttl(is_manual_run);
+        }
+        if !is_manual_run {
+            return Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds);
+        }
+        match self.execution_mode {
+            GcExecutionMode::Availability => Duration::from_secs(5),
+            GcExecutionMode::Strict => Duration::from_secs(1),
+            GcExecutionMode::Scrub => Duration::ZERO,
+        }
+    }
+}
+
 static GC_STATUS: std::sync::LazyLock<Arc<RwLock<GcJobStatus>>> =
     std::sync::LazyLock::new(|| Arc::new(RwLock::new(GcJobStatus::default())));
 static GC_RUNNING: std::sync::LazyLock<AtomicBool> =
@@ -91,10 +180,16 @@ async fn run_gc_scan_offthread(
     state: Arc<AppState>,
     is_manual_run: bool,
     target_fragment: Option<String>,
+    options: GcRunOptions,
 ) -> Result<(), AppError> {
     let handle = Handle::current();
     let join = tokio::task::spawn_blocking(move || {
-        handle.block_on(perform_gc_scan(state, is_manual_run, target_fragment))
+        handle.block_on(perform_gc_scan(
+            state,
+            is_manual_run,
+            target_fragment,
+            options,
+        ))
     })
     .await;
 
@@ -122,7 +217,9 @@ pub async fn run_lifecycle_manager(state: Arc<AppState>) {
         }
         GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
 
-        if let Err(err) = run_gc_scan_offthread(state.clone(), false, None).await {
+        if let Err(err) =
+            run_gc_scan_offthread(state.clone(), false, None, GcRunOptions::default()).await
+        {
             error!("Lifecycle Manager Scan failed: {}", err);
             with_gc_status_write(|st| {
                 st.total_errors += 1;
@@ -161,11 +258,42 @@ fn parse_gc_target_fragment(params: &HashMap<String, String>) -> Option<String> 
         .map(str::to_string)
 }
 
+fn parse_bool_param(params: &HashMap<String, String>, key: &str, default: bool) -> bool {
+    params
+        .get(key)
+        .map(|v| v.trim().to_ascii_lowercase())
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on" | "fast"))
+        .unwrap_or(default)
+}
+
+fn parse_gc_execution_mode(params: &HashMap<String, String>) -> GcExecutionMode {
+    let mode = params
+        .get("mode")
+        .or_else(|| params.get("execution_mode"))
+        .or_else(|| params.get("access_mode"))
+        .map(|value| value.trim().to_ascii_lowercase());
+    match mode.as_deref() {
+        Some("strict") | Some("readonly") | Some("read_only") => GcExecutionMode::Strict,
+        Some("scrub") | Some("quiesced") | Some("offline") => GcExecutionMode::Scrub,
+        _ => GcExecutionMode::Availability,
+    }
+}
+
 pub async fn run_garbage_collector(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let target_fragment = parse_gc_target_fragment(&params);
+    let execution_mode = parse_gc_execution_mode(&params);
+    let fast_mode = parse_bool_param(
+        &params,
+        "fast_mode",
+        execution_mode != GcExecutionMode::Availability,
+    );
+    let options = GcRunOptions {
+        execution_mode,
+        fast_mode,
+    };
     if let Some(fragment) = target_fragment.as_ref() {
         let path_manager = ObjectPathManager::new();
         if !collect_gc_fragments(&path_manager.get_all_index_roots()).contains(fragment) {
@@ -198,7 +326,8 @@ pub async fn run_garbage_collector(
             });
         }
 
-        if let Err(err) = run_gc_scan_offthread(state.clone(), true, target_fragment).await {
+        if let Err(err) = run_gc_scan_offthread(state.clone(), true, target_fragment, options).await
+        {
             error!("Manual GC Scan failed: {}", err);
             with_gc_status_write(|st| {
                 st.total_errors += 1;
@@ -394,7 +523,10 @@ async fn perform_gc_scan(
     state: Arc<AppState>,
     is_manual_run: bool,
     target_fragment: Option<String>,
+    options: GcRunOptions,
 ) -> Result<(), AppError> {
+    let _maintenance_gate =
+        acquire_maintenance_mode(options.execution_mode.maintenance_access_mode());
     let path_manager = ObjectPathManager::new();
     let index_roots = path_manager.get_all_index_roots();
     let blob_roots = path_manager.get_blob_roots();
@@ -410,12 +542,21 @@ async fn perform_gc_scan(
         fragments.retain(|fragment| fragment == &target);
     }
 
-    info!("GC: Starting scan for {} fragments...", fragments.len());
+    info!(
+        "GC: Starting scan for {} fragments (mode={}, fast_mode={})...",
+        fragments.len(),
+        options.execution_mode.as_str(),
+        options.fast_mode
+    );
     let fragment_count = fragments.len() as u64;
     let start = std::time::Instant::now();
     with_gc_status_write(|st| {
         st.is_running = true;
-        st.phase = "Scanning fragments".to_string();
+        st.phase = format!(
+            "Scanning fragments (mode={}, fast_mode={})",
+            options.execution_mode.as_str(),
+            options.fast_mode
+        );
         st.is_manual_run = is_manual_run;
         st.total_fragments = fragment_count;
         st.total_fragments_scanned = 0;
@@ -431,11 +572,7 @@ async fn perform_gc_scan(
 
     let retention_duration = Duration::from_secs(CONFIG.garbage_collector.retention_seconds);
 
-    let file_ttl = if is_manual_run {
-        Duration::from_secs(1)
-    } else {
-        Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds)
-    };
+    let file_ttl = options.file_ttl(is_manual_run);
 
     for fragment in fragments {
         if should_stop_gc() {
@@ -452,6 +589,7 @@ async fn perform_gc_scan(
             retention_duration,
             file_ttl,
             is_manual_run,
+            options,
             &state,
         )
         .await;
@@ -511,6 +649,7 @@ async fn process_fragment_gc(
     retention: Duration,
     file_ttl: Duration,
     is_manual_run: bool,
+    options: GcRunOptions,
     state: &Arc<AppState>,
 ) -> FragmentGcStats {
     let mut stats = FragmentGcStats::default();
@@ -595,8 +734,7 @@ async fn process_fragment_gc(
     let mut namespace_absent_gc_candidates = BTreeSet::<String>::new();
     if let Some(snapshot) = &namespace_snapshot {
         live_versions.extend(snapshot.referenced_version_ids.iter().cloned());
-        let namespace_absence_grace =
-            Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds.max(300));
+        let namespace_absence_grace = options.namespace_absence_grace();
         let namespace_absence_grace_secs = namespace_absence_grace.as_secs() as i64;
         let mut recent_namespace_absent = 0usize;
         for meta in &physical_live_objects {
@@ -918,10 +1056,48 @@ async fn process_fragment_gc(
 
 #[cfg(test)]
 mod tests {
-    use super::collect_gc_fragments;
+    use super::{GcExecutionMode, GcRunOptions, collect_gc_fragments, parse_gc_execution_mode};
     use crate::core::constants::FRAGMENT_METADATA_FILE;
     use std::fs;
+    use std::time::Duration;
     use ulid::Ulid;
+
+    #[test]
+    fn gc_execution_mode_parsing_and_fast_options_are_aggressive_only_when_requested() {
+        let mut params = std::collections::HashMap::new();
+        assert_eq!(
+            parse_gc_execution_mode(&params),
+            GcExecutionMode::Availability
+        );
+
+        params.insert("mode".to_string(), "strict".to_string());
+        assert_eq!(parse_gc_execution_mode(&params), GcExecutionMode::Strict);
+
+        params.insert("mode".to_string(), "quiesced".to_string());
+        assert_eq!(parse_gc_execution_mode(&params), GcExecutionMode::Scrub);
+
+        let availability = GcRunOptions {
+            execution_mode: GcExecutionMode::Availability,
+            fast_mode: false,
+        };
+        let strict_fast = GcRunOptions {
+            execution_mode: GcExecutionMode::Strict,
+            fast_mode: true,
+        };
+        let scrub_fast = GcRunOptions {
+            execution_mode: GcExecutionMode::Scrub,
+            fast_mode: true,
+        };
+
+        assert!(availability.namespace_absence_grace() >= Duration::from_secs(300));
+        assert_eq!(
+            strict_fast.namespace_absence_grace(),
+            Duration::from_secs(5)
+        );
+        assert_eq!(scrub_fast.namespace_absence_grace(), Duration::ZERO);
+        assert_eq!(strict_fast.file_ttl(true), Duration::from_secs(1));
+        assert_eq!(scrub_fast.file_ttl(true), Duration::ZERO);
+    }
 
     #[test]
     fn gc_fragment_scan_ignores_filesystem_trash_directories() {

@@ -400,8 +400,8 @@ fn normalize_redistribution_opts_for_layout(
 
     let object_cap = match opts.execution_mode {
         RedistributionExecutionMode::Availability => io_width.clamp(1, 4),
-        RedistributionExecutionMode::Strict => io_width.saturating_mul(2).clamp(2, 16),
-        RedistributionExecutionMode::Scrub => io_width.saturating_mul(4).clamp(4, 32),
+        RedistributionExecutionMode::Strict => io_width.saturating_mul(4).clamp(4, 32),
+        RedistributionExecutionMode::Scrub => io_width.saturating_mul(8).clamp(8, 64),
     };
 
     opts.object_concurrency = opts.object_concurrency.min(object_cap).max(1);
