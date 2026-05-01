@@ -7,7 +7,7 @@ Current version: `3.0.0`
 - fragment provisioning
 - fragment-scoped authentication
 - object upload, read, list, version, trash, recover, and archive flows
-- a POSIX/object-key namespace facade backed by the per-fragment `index.ndxdb`
+- a POSIX/object-key namespace facade backed by the per-fragment sharded `indexdb`
 - lifecycle, garbage collection, repair, redistribution, and health endpoints
 - POSIX-style namespace access on top of the same storage truth
 
@@ -32,13 +32,18 @@ https://127.0.0.1:50001
 
 `N1 3.0` is not runtime-compatible with the `N1 2.x` active metadata layout.
 
-The only active metadata authority for a fragment is:
+The only active metadata authority for a fragment is its per-fragment sharded `indexdb`:
 
 ```text
-<index_root>/<fragment_hash>/indexdb/index.ndxdb
+<index_root>/<fragment_hash>/indexdb/shard_0000.ndxdb
+<index_root>/<fragment_hash>/indexdb/shard_0001.ndxdb
+...
+<index_root>/<fragment_hash>/indexdb/shard_XXXX.ndxdb
 ```
 
-Inside that single per-fragment indexdb, `N1` owns:
+All shard files together form the fragment metadata authority. The shard count is recorded in fragment metadata at creation from `index_config.partition_count` and must match the running server configuration before the fragment is opened.
+
+Inside the per-fragment indexdb shard set, `N1` owns:
 
 - `indexdb_meta`
 - `fragment_meta`
@@ -67,7 +72,7 @@ The following files are not active runtime authorities in `N1 3.0`:
 - any redb-derived active index database
 - any serialized `ObjectMetadata` blob as the main persisted object record
 
-Old files may be read only by explicit one-time migration/import tooling. After import, runtime must use only `indexdb/index.ndxdb`; old files should be ignored or renamed aside.
+Old files may be read only by explicit one-time migration/import tooling. After import, runtime must use only `indexdb/shard_*.ndxdb`; old files should be ignored or renamed aside.
 
 The blob layout is unchanged:
 
@@ -228,7 +233,7 @@ Listing APIs use summary rows and must not load `object_parts`, `part_shards`, o
 
 ## Memory Tuning
 
-`N1 3.0` is designed to be IO-bound and bounded-memory. Metadata calls are routed through blocking work, listing uses cursor queries, and cold DB handles are evicted LRU instead of keeping a full namespace catalog resident in memory.
+`N1 3.0` is designed to be IO-bound and bounded-memory. Metadata calls are routed through blocking work, listing uses cursor queries, and cold DB handles are evicted LRU instead of keeping a full namespace catalog resident in memory. Metadata writes are partitioned across per-fragment indexdb shards so a hot fragment is not forced through one metadata file.
 
 ```ini
 [index_config]
@@ -242,6 +247,8 @@ max_loaded_dbs=auto
 ```
 
 Defaults are adaptive but intentionally lean. `auto` favors bounded RSS over maximum cache residency even on larger hosts: indexdb DB handles, namespace facades, upload buffers, and stream buffers are capped conservatively so N1 remains closer to an IO-bound storage kernel.
+
+`partition_count` controls how many `shard_XXXX.ndxdb` files each new fragment uses. Supported values are `32`, `64`, and `256`. Fragment creation does not accept a shard count in the API; it records the server's configured value. Existing fragments must match the running server's configured `partition_count` until an explicit index rebalance/migration exists.
 
 Increase these only when deliberately running a high-performance profile on machines with enough RAM and heavy namespace/index scan workloads.
 
@@ -259,10 +266,10 @@ Stable `N1 3.0` API routes and operator routes live under `/n1/...`.
 
 Operational note:
 
-- per-fragment `index.ndxdb` is replicated across configured index roots
-- if the owner index disk is lost but another `index.ndxdb` replica survives, `N1` reseeds the owner copy from the surviving replica before serving metadata reads
+- per-fragment indexdb shard files are replicated across configured index roots
+- if the owner index disk is lost but another shard replica survives, `N1` reseeds the owner shard from the surviving replica before serving metadata reads
 - health reports per-fragment index replica debt
-- repair reconciles missing, divergent, or corrupt `index.ndxdb` replicas across reachable index roots
+- repair reconciles missing, divergent, or corrupt shard replicas across reachable index roots
 
 ### Permission Bits
 
@@ -1037,6 +1044,8 @@ Response:
 If an interrupted multipart session already exists for the same logical path and compatible upload manifest, `N1 3.0` reuses it instead of creating a new one.
 
 Multipart resumability is persistent. Each uploaded part writes raw part bytes to the blob plane, then records a compact receipt in the fragment indexdb. The full session row is not rewritten for every part; activity is flushed periodically while each part receipt remains durable. If a retry finds the part bytes already present, N1 treats the part as uploaded and refreshes the missing receipt when needed.
+
+The pending-upload lookup is part of namespace/indexdb state, not blob state. It lets resumability survive process restart while preserving logical POSIX paths separately from immutable object metadata.
 
 ### `GET /n1/upload/multipart`
 

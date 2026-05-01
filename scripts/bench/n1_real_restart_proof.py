@@ -66,6 +66,7 @@ class N1Proof:
         self.index_roots = []
         self.blob_roots = []
         self.server_log = None
+        self.max_server_rss_kib = 0
         self.summary = {
             "base_url": self.base_url,
             "source_dir": str(self.source_dir),
@@ -238,6 +239,7 @@ stripe_block_size=262144
                 status, body = self.http("GET", f"{self.base_url}/n1/ping")
                 if status == 200 and body == b"pong":
                     self.summary[f"server_{suffix}_pid"] = self.server.pid
+                    self.sample_server_rss()
                     return
             except Exception:
                 pass
@@ -245,6 +247,7 @@ stripe_block_size=262144
         raise ProofFailure(f"N1 server did not become ready; see {log_path}")
 
     def stop_server(self):
+        self.sample_server_rss()
         if self.server and self.server.poll() is None:
             self.server.send_signal(signal.SIGINT)
             try:
@@ -256,6 +259,21 @@ stripe_block_size=262144
             self.server_log.close()
         self.server = None
         self.server_log = None
+
+    def sample_server_rss(self):
+        if not self.server or self.server.poll() is not None:
+            return None
+        status_path = Path(f"/proc/{self.server.pid}/status")
+        try:
+            for line in status_path.read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    rss_kib = int(line.split()[1])
+                    self.max_server_rss_kib = max(self.max_server_rss_kib, rss_kib)
+                    self.summary["max_server_rss_kib"] = self.max_server_rss_kib
+                    return rss_kib
+        except Exception:
+            return None
+        return None
 
     def http(self, method, url, body=None, headers=None, timeout=240):
         headers = dict(headers or {})
@@ -381,12 +399,14 @@ stripe_block_size=262144
                 progress["bytes"] += size
                 every = max(1, self.args.progress_every)
                 if progress["count"] % every == 0 or progress["count"] == len(upload_items):
+                    rss_kib = self.sample_server_rss()
                     print(
                         "REAL_N1_PROOF upload_progress "
                         f"{progress['count']}/{len(upload_items)} bytes={progress['bytes']} "
-                        f"elapsed_s={time.monotonic() - start:.2f}",
+                        f"elapsed_s={time.monotonic() - start:.2f} rss_kib={rss_kib}",
                         flush=True,
                     )
+        self.sample_server_rss()
         self.summary["upload_elapsed_s"] = round(time.monotonic() - start, 3)
         self.summary["uploaded_bytes"] = progress["bytes"]
 
@@ -462,27 +482,56 @@ stripe_block_size=262144
     def inspect_indexdb(self, expected_count):
         inspections = []
         for index_root, blob_root in zip(self.index_roots, self.blob_roots):
-            db_path = index_root / self.fragment / "indexdb" / "index.ndxdb"
+            indexdb_dir = index_root / self.fragment / "indexdb"
+            shard_paths = sorted(indexdb_dir.glob("shard_*.ndxdb"))
+            if not shard_paths:
+                raise ProofFailure(f"no sharded indexdb files under {indexdb_dir}")
             blob_path = blob_root / self.fragment / "blob"
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            cur = conn.cursor()
-            checks = {}
-            for label, sql in [
-                ("integrity_check", "PRAGMA integrity_check"),
-                ("namespace_nodes", "SELECT COUNT(*) FROM namespace_nodes"),
-                ("namespace_file_nodes", "SELECT COUNT(*) FROM namespace_nodes WHERE kind='file'"),
-                ("namespace_dir_nodes", "SELECT COUNT(*) FROM namespace_nodes WHERE kind='directory'"),
-                ("object_heads", "SELECT COUNT(*) FROM object_heads"),
-                ("object_versions", "SELECT COUNT(*) FROM object_versions"),
-                ("object_parts", "SELECT COUNT(*) FROM object_parts"),
-                ("part_shards", "SELECT COUNT(*) FROM part_shards"),
-                ("pending_upload_bindings", "SELECT COUNT(*) FROM pending_upload_bindings"),
-                ("upload_sessions", "SELECT COUNT(*) FROM upload_sessions"),
-                ("trash_entries", "SELECT COUNT(*) FROM trash_entries"),
-            ]:
-                cur.execute(sql)
-                checks[label] = cur.fetchone()[0]
-            conn.close()
+            checks = {
+                "shard_files": len(shard_paths),
+                "integrity_check": "ok",
+                "namespace_nodes": 0,
+                "namespace_file_nodes": 0,
+                "namespace_dir_nodes": 0,
+                "object_heads": 0,
+                "object_versions": 0,
+                "object_parts": 0,
+                "part_shards": 0,
+                "pending_upload_bindings": 0,
+                "upload_sessions": 0,
+                "trash_entries": 0,
+            }
+
+            def count_or_zero(cur, sql):
+                try:
+                    cur.execute(sql)
+                    return cur.fetchone()[0]
+                except sqlite3.OperationalError as err:
+                    if "no such table" in str(err).lower():
+                        return 0
+                    raise
+
+            for shard_path in shard_paths:
+                conn = sqlite3.connect(f"file:{shard_path}?mode=ro", uri=True)
+                cur = conn.cursor()
+                cur.execute("PRAGMA integrity_check")
+                integrity = cur.fetchone()[0]
+                if integrity != "ok":
+                    checks["integrity_check"] = integrity
+                for label, sql in [
+                    ("namespace_nodes", "SELECT COUNT(*) FROM namespace_nodes"),
+                    ("namespace_file_nodes", "SELECT COUNT(*) FROM namespace_nodes WHERE kind='file'"),
+                    ("namespace_dir_nodes", "SELECT COUNT(*) FROM namespace_nodes WHERE kind='directory'"),
+                    ("object_heads", "SELECT COUNT(*) FROM object_heads"),
+                    ("object_versions", "SELECT COUNT(*) FROM object_versions"),
+                    ("object_parts", "SELECT COUNT(*) FROM object_parts"),
+                    ("part_shards", "SELECT COUNT(*) FROM part_shards"),
+                    ("pending_upload_bindings", "SELECT COUNT(*) FROM pending_upload_bindings"),
+                    ("upload_sessions", "SELECT COUNT(*) FROM upload_sessions"),
+                    ("trash_entries", "SELECT COUNT(*) FROM trash_entries"),
+                ]:
+                    checks[label] += count_or_zero(cur, sql)
+                conn.close()
             blob_version_dirs = (
                 sum(1 for path in blob_path.iterdir() if path.is_dir())
                 if blob_path.exists()
@@ -492,6 +541,7 @@ stripe_block_size=262144
             print(
                 "REAL_N1_PROOF indexdb_inspect "
                 f"root={index_root} integrity={checks['integrity_check']} "
+                f"shard_files={checks['shard_files']} "
                 f"namespace_file_nodes={checks['namespace_file_nodes']} "
                 f"object_heads={checks['object_heads']} "
                 f"object_versions={checks['object_versions']} "
@@ -500,13 +550,15 @@ stripe_block_size=262144
                 flush=True,
             )
             if checks["integrity_check"] != "ok":
-                raise ProofFailure(f"indexdb integrity failed for {db_path}")
+                raise ProofFailure(f"indexdb integrity failed under {indexdb_dir}")
             for label in ["namespace_file_nodes", "object_heads", "object_versions", "object_parts"]:
                 if checks[label] != expected_count:
-                    raise ProofFailure(f"{label}={checks[label]} expected={expected_count} on {db_path}")
+                    raise ProofFailure(
+                        f"{label}={checks[label]} expected={expected_count} under {indexdb_dir}"
+                    )
             if checks["part_shards"] != expected_count * 2:
                 raise ProofFailure(
-                    f"part_shards={checks['part_shards']} expected={expected_count * 2} on {db_path}"
+                    f"part_shards={checks['part_shards']} expected={expected_count * 2} under {indexdb_dir}"
                 )
             if blob_version_dirs != expected_count:
                 raise ProofFailure(
@@ -516,7 +568,7 @@ stripe_block_size=262144
                 {
                     "index_root": str(index_root),
                     "blob_root": str(blob_root),
-                    "db_path": str(db_path),
+                    "indexdb_dir": str(indexdb_dir),
                     **checks,
                 }
             )

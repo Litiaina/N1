@@ -207,6 +207,11 @@ impl Database {
         })
     }
 
+    pub fn checkpoint(&self) -> Result<(), DatabaseError> {
+        let mut conn = self.inner.conn.lock()?;
+        conn.checkpoint().map_err(Into::into)
+    }
+
     pub fn check_integrity(&mut self) -> Result<bool, DatabaseError> {
         let mut conn = self.inner.conn.lock()?;
         pragma_check(&mut conn, "PRAGMA quick_check")?;
@@ -371,6 +376,23 @@ impl Database {
     ) -> Result<Option<crate::n1::NamespaceNode>, DatabaseError> {
         let mut conn = self.inner.conn.lock()?;
         n1_get_namespace_child_on_conn(&mut conn, parent_node_id, name).map_err(Into::into)
+    }
+
+    pub fn n1_get_namespace_file_head(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<crate::n1::NamespaceFileHead>, DatabaseError> {
+        let mut conn = self.inner.conn.lock()?;
+        n1_get_namespace_file_head_on_conn(&mut conn, node_id).map_err(Into::into)
+    }
+
+    pub fn n1_list_namespace_file_heads(
+        &self,
+        after_node_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::n1::NamespaceFileHead>, DatabaseError> {
+        let mut conn = self.inner.conn.lock()?;
+        n1_list_namespace_file_heads_on_conn(&mut conn, after_node_id, limit).map_err(Into::into)
     }
 
     pub fn n1_list_namespace_node_children(
@@ -791,6 +813,11 @@ impl WriteTransaction {
         n1_delete_namespace_entry_on_conn(&mut conn, path).map_err(Into::into)
     }
 
+    pub fn n1_delete_namespace_node(&self, node_id: &str) -> Result<(), TableError> {
+        let mut conn = self.inner.conn.lock()?;
+        n1_delete_namespace_node_on_conn(&mut conn, node_id).map_err(Into::into)
+    }
+
     pub fn n1_upsert_namespace_node(
         &self,
         node: &crate::n1::NamespaceNode,
@@ -816,6 +843,27 @@ impl WriteTransaction {
         n1_get_namespace_child_on_conn(&mut conn, parent_node_id, name).map_err(Into::into)
     }
 
+    pub fn n1_get_namespace_file_head(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<crate::n1::NamespaceFileHead>, TableError> {
+        let mut conn = self.inner.conn.lock()?;
+        n1_get_namespace_file_head_on_conn(&mut conn, node_id).map_err(Into::into)
+    }
+
+    pub fn n1_upsert_namespace_file_head(
+        &self,
+        head: &crate::n1::NamespaceFileHead,
+    ) -> Result<(), TableError> {
+        let mut conn = self.inner.conn.lock()?;
+        n1_upsert_namespace_file_head_on_conn(&mut conn, head).map_err(Into::into)
+    }
+
+    pub fn n1_delete_namespace_file_head(&self, node_id: &str) -> Result<(), TableError> {
+        let mut conn = self.inner.conn.lock()?;
+        n1_delete_namespace_file_head_on_conn(&mut conn, node_id).map_err(Into::into)
+    }
+
     pub fn n1_move_namespace_node(
         &self,
         node_id: &str,
@@ -834,6 +882,14 @@ impl WriteTransaction {
     ) -> Result<(), TableError> {
         let mut conn = self.inner.conn.lock()?;
         n1_upsert_namespace_trash_root_on_conn(&mut conn, root).map_err(Into::into)
+    }
+
+    pub fn n1_get_namespace_trash_root(
+        &self,
+        trash_entry_id: &str,
+    ) -> Result<Option<crate::n1::NamespaceTrashRoot>, TableError> {
+        let mut conn = self.inner.conn.lock()?;
+        n1_get_namespace_trash_root_on_conn(&mut conn, trash_entry_id).map_err(Into::into)
     }
 
     pub fn n1_set_namespace_trash_root_state(
@@ -2217,6 +2273,118 @@ fn n1_upsert_namespace_node_on_conn(
     stmt.step_done()
 }
 
+fn n1_delete_namespace_node_on_conn(
+    conn: &mut Connection,
+    node_id: &str,
+) -> Result<(), StorageError> {
+    let mut delete_head = conn.prepare("DELETE FROM namespace_file_heads WHERE node_id = ?1")?;
+    delete_head.bind_text(1, node_id)?;
+    delete_head.step_done()?;
+
+    let mut delete_node = conn.prepare("DELETE FROM namespace_nodes WHERE node_id = ?1")?;
+    delete_node.bind_text(1, node_id)?;
+    delete_node.step_done()
+}
+
+fn n1_upsert_namespace_file_head_on_conn(
+    conn: &mut Connection,
+    head: &crate::n1::NamespaceFileHead,
+) -> Result<(), StorageError> {
+    let mut stmt = conn.prepare(
+        "INSERT INTO namespace_file_heads(
+            node_id, object_id, version_id, upload_session_id, owner_uid,
+            content_type, total_size_bytes, created_at_unix, is_delete_marker,
+            stripe_size_bytes, updated_at_unix
+         )
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(node_id) DO UPDATE SET
+            object_id = excluded.object_id,
+            version_id = excluded.version_id,
+            upload_session_id = excluded.upload_session_id,
+            owner_uid = excluded.owner_uid,
+            content_type = excluded.content_type,
+            total_size_bytes = excluded.total_size_bytes,
+            created_at_unix = excluded.created_at_unix,
+            is_delete_marker = excluded.is_delete_marker,
+            stripe_size_bytes = excluded.stripe_size_bytes,
+            updated_at_unix = excluded.updated_at_unix",
+    )?;
+    stmt.bind_text(1, &head.node_id)?;
+    stmt.bind_text(2, &head.object_id)?;
+    stmt.bind_text(3, &head.version_id)?;
+    bind_optional_text(&mut stmt, 4, non_empty(&head.upload_session_id))?;
+    bind_optional_text(&mut stmt, 5, non_empty(&head.owner_uid))?;
+    bind_optional_text(&mut stmt, 6, non_empty(&head.content_type))?;
+    stmt.bind_i64(7, u64_to_i64(head.total_size_bytes)?)?;
+    stmt.bind_i64(8, head.created_at_unix)?;
+    stmt.bind_i32(9, i32::from(head.is_delete_marker))?;
+    stmt.bind_i64(10, u64_to_i64(head.stripe_size_bytes)?)?;
+    stmt.bind_i64(11, head.updated_at_unix)?;
+    stmt.step_done()
+}
+
+fn n1_get_namespace_file_head_on_conn(
+    conn: &mut Connection,
+    node_id: &str,
+) -> Result<Option<crate::n1::NamespaceFileHead>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT node_id, object_id, version_id, upload_session_id, owner_uid,
+                content_type, total_size_bytes, created_at_unix, is_delete_marker,
+                stripe_size_bytes, updated_at_unix
+         FROM namespace_file_heads
+         WHERE node_id = ?1",
+    )?;
+    stmt.bind_text(1, node_id)?;
+    match stmt.step()? {
+        StepResult::Row => n1_namespace_file_head_from_stmt(&stmt).map(Some),
+        StepResult::Done => Ok(None),
+    }
+}
+
+fn n1_list_namespace_file_heads_on_conn(
+    conn: &mut Connection,
+    after_node_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<crate::n1::NamespaceFileHead>, StorageError> {
+    let sql = if after_node_id.is_some() {
+        "SELECT node_id, object_id, version_id, upload_session_id, owner_uid,
+                content_type, total_size_bytes, created_at_unix, is_delete_marker,
+                stripe_size_bytes, updated_at_unix
+         FROM namespace_file_heads
+         WHERE node_id > ?1
+         ORDER BY node_id ASC
+         LIMIT ?2"
+    } else {
+        "SELECT node_id, object_id, version_id, upload_session_id, owner_uid,
+                content_type, total_size_bytes, created_at_unix, is_delete_marker,
+                stripe_size_bytes, updated_at_unix
+         FROM namespace_file_heads
+         ORDER BY node_id ASC
+         LIMIT ?1"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    if let Some(after_node_id) = after_node_id {
+        stmt.bind_text(1, after_node_id)?;
+        stmt.bind_i64(2, u64_to_i64(limit.max(1) as u64)?)?;
+    } else {
+        stmt.bind_i64(1, u64_to_i64(limit.max(1) as u64)?)?;
+    }
+    let mut heads = Vec::new();
+    while matches!(stmt.step()?, StepResult::Row) {
+        heads.push(n1_namespace_file_head_from_stmt(&stmt)?);
+    }
+    Ok(heads)
+}
+
+fn n1_delete_namespace_file_head_on_conn(
+    conn: &mut Connection,
+    node_id: &str,
+) -> Result<(), StorageError> {
+    let mut stmt = conn.prepare("DELETE FROM namespace_file_heads WHERE node_id = ?1")?;
+    stmt.bind_text(1, node_id)?;
+    stmt.step_done()
+}
+
 fn n1_move_namespace_node_on_conn(
     conn: &mut Connection,
     node_id: &str,
@@ -2415,23 +2583,23 @@ fn n1_list_namespace_node_object_summaries_on_conn(
             JOIN subtree ON child.parent_node_id = subtree.node_id
          )
          SELECT subtree.path,
-                COALESCE(v.version_id, h.head_version_id, ''),
-                COALESCE(v.upload_session_id, ''),
-                COALESCE(v.owner_uid, h.owner_uid, ''),
-                COALESCE(v.content_type, h.content_type, ''),
-                COALESCE(v.total_size_bytes, h.total_size_bytes, 0),
-                COALESCE(v.created_at_unix, h.created_at_unix, 0),
-                COALESCE(v.is_delete_marker, 0),
-                COALESCE(v.stripe_size_bytes, 0)
+                fh.version_id,
+                COALESCE(fh.upload_session_id, ''),
+                COALESCE(fh.owner_uid, ''),
+                COALESCE(fh.content_type, ''),
+                fh.total_size_bytes,
+                fh.created_at_unix,
+                fh.is_delete_marker,
+                fh.stripe_size_bytes
          FROM subtree
          JOIN namespace_nodes n ON n.node_id = subtree.node_id
-         LEFT JOIN object_versions v
-            ON v.object_id = n.object_id
-           AND v.version_id = n.head_version_id
-         LEFT JOIN object_heads h
-            ON h.object_id = n.object_id
+         JOIN namespace_file_heads fh
+            ON fh.node_id = n.node_id
+           AND fh.object_id = n.object_id
+           AND fh.version_id = n.head_version_id
          WHERE n.kind = 'file'
-           AND (v.version_id IS NOT NULL OR h.head_version_id IS NOT NULL)",
+           AND n.object_id IS NOT NULL
+           AND n.head_version_id IS NOT NULL",
     );
     let mut next_idx = 3;
     let prefix = prefix.filter(|value| !value.is_empty());
@@ -2683,6 +2851,24 @@ fn n1_namespace_node_from_stmt(
     })
 }
 
+fn n1_namespace_file_head_from_stmt(
+    stmt: &crate::ffi::Statement,
+) -> Result<crate::n1::NamespaceFileHead, StorageError> {
+    Ok(crate::n1::NamespaceFileHead {
+        node_id: stmt.column_text(0).unwrap_or_default(),
+        object_id: stmt.column_text(1).unwrap_or_default(),
+        version_id: stmt.column_text(2).unwrap_or_default(),
+        upload_session_id: stmt.column_text(3).unwrap_or_default(),
+        owner_uid: stmt.column_text(4).unwrap_or_default(),
+        content_type: stmt.column_text(5).unwrap_or_default(),
+        total_size_bytes: i64_to_u64(stmt.column_i64(6))?,
+        created_at_unix: stmt.column_i64(7),
+        is_delete_marker: stmt.column_i32(8) != 0,
+        stripe_size_bytes: i64_to_u64(stmt.column_i64(9))?,
+        updated_at_unix: stmt.column_i64(10),
+    })
+}
+
 fn n1_namespace_trash_root_from_stmt(
     stmt: &crate::ffi::Statement,
 ) -> Result<crate::n1::NamespaceTrashRoot, StorageError> {
@@ -2852,23 +3038,26 @@ fn n1_list_namespace_object_summaries_on_conn(
 ) -> Result<Vec<crate::n1::NamespaceObjectSummary>, StorageError> {
     let mut sql = String::from(
         "SELECT e.path,
-                COALESCE(v.version_id, h.head_version_id, ''),
-                COALESCE(v.upload_session_id, ''),
-                COALESCE(v.owner_uid, h.owner_uid, ''),
-                COALESCE(v.content_type, h.content_type, ''),
-                COALESCE(v.total_size_bytes, h.total_size_bytes, 0),
-                COALESCE(v.created_at_unix, h.created_at_unix, 0),
-                COALESCE(v.is_delete_marker, 0),
-                COALESCE(v.stripe_size_bytes, 0)
+                fh.version_id,
+                COALESCE(fh.upload_session_id, ''),
+                COALESCE(fh.owner_uid, ''),
+                COALESCE(fh.content_type, ''),
+                fh.total_size_bytes,
+                fh.created_at_unix,
+                fh.is_delete_marker,
+                fh.stripe_size_bytes
          FROM namespace_entries e
-         LEFT JOIN object_versions v
-            ON v.object_id = e.object_id
-           AND v.version_id = e.head_version_id
-         LEFT JOIN object_heads h
-            ON h.object_id = e.object_id
+         JOIN namespace_nodes n
+            ON n.object_id = e.object_id
+           AND n.head_version_id = e.head_version_id
+         JOIN namespace_file_heads fh
+            ON fh.node_id = n.node_id
+           AND fh.object_id = e.object_id
+           AND fh.version_id = e.head_version_id
          WHERE e.kind = 'file'
            AND e.lifecycle = ?1
-           AND (v.version_id IS NOT NULL OR h.head_version_id IS NOT NULL)",
+           AND e.object_id IS NOT NULL
+           AND e.head_version_id IS NOT NULL",
     );
     let mut next_idx = 2;
     let prefix = prefix.filter(|value| !value.is_empty());

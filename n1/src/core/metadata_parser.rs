@@ -1,6 +1,7 @@
 use crate::core::disk_manager::ObjectMetadata;
 use crate::core::index;
 use crate::enums::app_error_enum::AppError;
+use crate::namespace::runtime::global_namespace_runtime;
 use tracing::warn;
 
 pub async fn find_latest_metadata_on_disk(
@@ -30,11 +31,17 @@ pub async fn get_metadata(
     object_key: &str,
     _requesting_fragment_context: &str,
 ) -> Result<ObjectMetadata, AppError> {
-    let mut metadata = find_latest_metadata_on_disk(fragment, object_key).await?;
+    let requested_key = object_key.trim_start_matches('/').to_string();
+    let physical_object_id = global_namespace_runtime()
+        .resolve_live_object_id(fragment, &requested_key)
+        .await?
+        .unwrap_or_else(|| requested_key.clone());
+    let mut metadata = find_latest_metadata_on_disk(fragment, &physical_object_id).await?;
 
     if metadata.fragment != fragment {
         metadata.fragment = fragment.to_string();
     }
+    metadata.object_key = requested_key;
 
     Ok(metadata)
 }
@@ -45,11 +52,17 @@ pub async fn get_version_metadata(
     version_id: &str,
     _requesting_fragment_context: &str,
 ) -> Result<ObjectMetadata, AppError> {
-    match index::read_object_version(fragment, object_key, version_id).await {
+    let requested_key = object_key.trim_start_matches('/').to_string();
+    let physical_object_id = global_namespace_runtime()
+        .resolve_any_object_id(fragment, &requested_key)
+        .await?
+        .unwrap_or_else(|| requested_key.clone());
+    match index::read_object_version(fragment, &physical_object_id, version_id).await {
         Ok(mut metadata) => {
             if metadata.fragment != fragment {
                 metadata.fragment = fragment.to_string();
             }
+            metadata.object_key = requested_key;
             Ok(metadata)
         }
         Err(AppError::NotFound) => Err(AppError::NotFound),

@@ -297,7 +297,7 @@ mod tests {
     };
     use crate::core::fragment_metadata::{
         DEFAULT_INDEX_PARTITION_COUNT, clear_fragment_partition_count_cache_for_test,
-        set_configured_index_partition_count,
+        init_fragment_metadata, set_configured_index_partition_count,
     };
     use crate::core::indexdb_store;
     use crate::core::quota_manager::init_quota_file;
@@ -392,6 +392,9 @@ mod tests {
             .await
             .expect("init quota");
         ensure_fragment_blob_directories(fragment).await;
+        init_fragment_metadata(fragment, "test-key")
+            .await
+            .expect("init fragment metadata");
     }
 
     fn full_claims(fragment: &str) -> Claims {

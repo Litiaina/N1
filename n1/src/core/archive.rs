@@ -18,7 +18,7 @@ use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use tokio_util::io::{ReaderStream, StreamReader};
 
 use async_zip::{Compression, ZipEntryBuilder, tokio::write::ZipFileWriter};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_tar::{Builder as TarBuilder, Header as TarHeader};
@@ -37,7 +37,9 @@ use crate::{
     },
     enums::app_error_enum::AppError,
     namespace::{
-        models::NamespaceEntryKind, paths::normalize_path, runtime::global_namespace_runtime,
+        models::NamespaceEntryKind,
+        paths::normalize_path,
+        runtime::{NamespaceObjectRef, global_namespace_runtime},
     },
     structs::auth_structs::Claims,
 };
@@ -458,6 +460,9 @@ async fn load_archive_metadata_for_key(
     key: &str,
 ) -> Result<Option<(String, ObjectMetadata)>, AppError> {
     let clean_key = key.trim_start_matches('/').to_string();
+    if let Some(found) = load_archive_metadata_for_logical_path(fragment, &clean_key, true).await? {
+        return Ok(Some(found));
+    }
     let metadata = match get_metadata(fragment, &clean_key, fragment).await {
         Ok(m) if !m.is_delete_marker => m,
         _ => return Ok(None),
@@ -475,20 +480,106 @@ async fn load_archive_metadata_for_manifest_entry(
         return Ok(None);
     }
 
+    let physical_key = global_namespace_runtime()
+        .resolve_any_object_id(fragment, &clean_key)
+        .await?
+        .unwrap_or_else(|| clean_key.clone());
+
     let metadata = match version_id.map(str::trim).filter(|value| !value.is_empty()) {
         Some(version_id) => {
-            match get_version_metadata(fragment, &clean_key, version_id, fragment).await {
+            match get_version_metadata(fragment, &physical_key, version_id, fragment).await {
                 Ok(m) if !m.is_delete_marker => m,
                 _ => return Ok(None),
             }
         }
-        None => match get_metadata(fragment, &clean_key, fragment).await {
-            Ok(m) if !m.is_delete_marker => m,
-            _ => return Ok(None),
+        None => match load_archive_metadata_for_logical_path(fragment, &clean_key, true).await? {
+            Some((_, metadata)) => metadata,
+            None => match get_metadata(fragment, &clean_key, fragment).await {
+                Ok(m) if !m.is_delete_marker => m,
+                _ => return Ok(None),
+            },
         },
     };
 
     Ok(Some((clean_key, metadata)))
+}
+
+async fn write_physical_tar_entries(
+    fragment: &str,
+    keys: Vec<String>,
+    prefixes: Vec<String>,
+    include_internal: bool,
+    tar: &mut TarBuilder<DuplexStream>,
+) -> Result<(), AppError> {
+    let mut emitted_paths = HashSet::new();
+    for key in keys {
+        let Some((archive_path, metadata)) = load_archive_metadata_for_key(fragment, &key).await?
+        else {
+            continue;
+        };
+        if !include_internal && is_internal_namespace_path(&archive_path) {
+            continue;
+        }
+        if !emitted_paths.insert(archive_path.clone()) {
+            continue;
+        }
+        append_tar_metadata(tar, archive_path, &metadata).await?;
+    }
+
+    for prefix in prefixes {
+        let mut continuation_token = None;
+        loop {
+            let mut params = HashMap::from([
+                ("prefix".to_string(), prefix.clone()),
+                ("limit".to_string(), ARCHIVE_SCAN_PAGE_LIMIT.to_string()),
+                ("include_internal".to_string(), include_internal.to_string()),
+            ]);
+            if let Some(token) = continuation_token.take() {
+                params.insert("continuation_token".to_string(), token);
+            }
+            let page = global_namespace_runtime()
+                .list_objects_page(fragment, &params, false)
+                .await?;
+
+            for metadata in page.objects {
+                let archive_path = canonical_key(&metadata.object_key);
+                if !include_internal && is_internal_namespace_path(&archive_path) {
+                    continue;
+                }
+                let Some((_, full_metadata)) =
+                    load_archive_metadata_for_key(fragment, &archive_path).await?
+                else {
+                    continue;
+                };
+                if !emitted_paths.insert(archive_path.clone()) {
+                    continue;
+                }
+                append_tar_metadata(tar, archive_path, &full_metadata).await?;
+            }
+
+            if page.continuation_token.is_none() {
+                break;
+            }
+            continuation_token = page.continuation_token;
+        }
+    }
+
+    Ok(())
+}
+
+async fn write_fragment_namespace_tar_entries(
+    fragment: &str,
+    include_internal: bool,
+    tar: &mut TarBuilder<DuplexStream>,
+) -> Result<(), AppError> {
+    write_logical_namespace_tar_entries(
+        fragment,
+        Vec::new(),
+        vec![String::new()],
+        include_internal,
+        tar,
+    )
+    .await
 }
 
 async fn load_archive_metadata_for_logical_path(
@@ -526,6 +617,20 @@ async fn load_archive_metadata_for_logical_path(
     };
 
     Ok(Some((normalized, metadata)))
+}
+
+async fn load_archive_metadata_for_object_ref(
+    fragment: &str,
+    entry: &NamespaceObjectRef,
+) -> Result<Option<(String, ObjectMetadata)>, AppError> {
+    let mut metadata =
+        match index::read_object_version(fragment, &entry.object_id, &entry.version_id).await {
+            Ok(metadata) if !metadata.is_delete_marker => metadata,
+            Ok(_) | Err(AppError::NotFound) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+    metadata.object_key = entry.path.clone();
+    Ok(Some((entry.path.clone(), metadata)))
 }
 
 fn include_logical_archive_path(path: &str, include_internal: bool) -> bool {
@@ -680,70 +785,57 @@ async fn write_logical_namespace_tar_entries(
     include_internal: bool,
     tar: &mut TarBuilder<DuplexStream>,
 ) -> Result<(), AppError> {
-    let mut emitted_explicit_paths = HashSet::new();
+    let mut emitted_paths = HashSet::new();
     for key in keys {
         let Some((archive_path, metadata)) =
             load_archive_metadata_for_logical_path(fragment, &key, include_internal).await?
         else {
             continue;
         };
-        if !emitted_explicit_paths.insert(archive_path.clone()) {
+        if !emitted_paths.insert(archive_path.clone()) {
             continue;
         }
         append_tar_metadata(tar, archive_path, &metadata).await?;
     }
 
-    let mut pending_dirs: VecDeque<String> = prefixes.into();
-    let mut seen_dirs = HashSet::new();
-    while let Some(dir) = pending_dirs.pop_front() {
-        if !seen_dirs.insert(dir.clone()) {
-            continue;
-        }
-
+    for prefix in prefixes {
         let mut continuation_token: Option<String> = None;
         loop {
-            let (entries, next_token) = global_namespace_runtime()
-                .list_dir_page(
+            let prefix_query = if prefix.is_empty() {
+                String::new()
+            } else {
+                canonical_archive_prefix(&prefix)
+            };
+            let page = global_namespace_runtime()
+                .list_live_object_refs_page(
                     fragment,
-                    &dir,
-                    false,
-                    ARCHIVE_SCAN_PAGE_LIMIT,
+                    if prefix_query.is_empty() {
+                        None
+                    } else {
+                        Some(prefix_query.as_str())
+                    },
                     continuation_token.as_deref(),
+                    ARCHIVE_SCAN_PAGE_LIMIT,
                 )
                 .await?;
 
-            for entry in entries {
-                if !include_logical_archive_path(&entry.path, include_internal) {
+            for entry in page.entries {
+                let archive_path = canonical_key(&entry.path);
+                if !include_logical_archive_path(&archive_path, include_internal) {
                     continue;
                 }
-
-                match entry.kind {
-                    NamespaceEntryKind::Directory if entry.lifecycle.is_live() => {
-                        pending_dirs.push_back(entry.path);
-                    }
-                    NamespaceEntryKind::File if entry.lifecycle.is_live() => {
-                        if emitted_explicit_paths.contains(&entry.path) {
-                            continue;
-                        }
-                        let Some(object_id) = entry.object_id else {
-                            return Err(AppError::InternalServerError(format!(
-                                "logical file '{}' is missing physical object id",
-                                entry.path
-                            )));
-                        };
-                        let metadata = match get_object_metadata_direct(fragment, &object_id).await
-                        {
-                            Ok(metadata) => metadata,
-                            Err(AppError::NotFound) => continue,
-                            Err(err) => return Err(err),
-                        };
-                        append_tar_metadata(tar, entry.path, &metadata).await?;
-                    }
-                    _ => {}
+                if !emitted_paths.insert(archive_path.clone()) {
+                    continue;
                 }
+                let Some((_, metadata)) =
+                    load_archive_metadata_for_object_ref(fragment, &entry).await?
+                else {
+                    continue;
+                };
+                append_tar_metadata(tar, archive_path, &metadata).await?;
             }
 
-            let Some(next) = next_token else {
+            let Some(next) = page.continuation_token else {
                 break;
             };
             continuation_token = Some(next);
@@ -766,105 +858,11 @@ async fn write_tar_archive(
             prefixes,
             include_internal,
         } => {
-            let mut emitted_paths = HashSet::new();
-            for key in keys {
-                let Some((archive_path, metadata)) =
-                    load_archive_metadata_for_key(fragment, &key).await?
-                else {
-                    continue;
-                };
-                if !emitted_paths.insert(archive_path.clone()) {
-                    continue;
-                }
-
-                let mut header = TarHeader::new_gnu();
-                header.set_size(metadata.total_size_bytes);
-                header.set_mode(0o644);
-
-                let reader = create_multipart_reader(&metadata);
-
-                tar.append_data(&mut header, archive_path, reader)
-                    .await
-                    .map_err(|e| AppError::Io(e, "tar append".into()))?;
-            }
-
-            for prefix in prefixes {
-                let mut continuation_token = None;
-                loop {
-                    let page = index::scan_fragment_live_metadata_page(
-                        fragment,
-                        Some(prefix.clone()),
-                        None,
-                        ARCHIVE_SCAN_PAGE_LIMIT,
-                        continuation_token.clone(),
-                        include_internal,
-                    )
-                    .await?;
-
-                    for metadata in page.objects {
-                        if metadata.is_delete_marker {
-                            continue;
-                        }
-
-                        let archive_path = canonical_key(&metadata.object_key);
-                        if !emitted_paths.insert(archive_path.clone()) {
-                            continue;
-                        }
-
-                        let mut header = TarHeader::new_gnu();
-                        header.set_size(metadata.total_size_bytes);
-                        header.set_mode(0o644);
-
-                        let reader = create_multipart_reader(&metadata);
-
-                        tar.append_data(&mut header, archive_path, reader)
-                            .await
-                            .map_err(|e| AppError::Io(e, "tar append".into()))?;
-                    }
-
-                    if page.continuation_token.is_none() {
-                        break;
-                    }
-                    continuation_token = page.continuation_token;
-                }
-            }
+            write_physical_tar_entries(fragment, keys, prefixes, include_internal, &mut tar)
+                .await?;
         }
         ArchiveSelection::FragmentAll { include_internal } => {
-            let mut continuation_token = None;
-
-            loop {
-                let page = index::scan_fragment_live_metadata_page(
-                    fragment,
-                    None,
-                    None,
-                    ARCHIVE_SCAN_PAGE_LIMIT,
-                    continuation_token.clone(),
-                    include_internal,
-                )
-                .await?;
-
-                for metadata in page.objects {
-                    if metadata.is_delete_marker {
-                        continue;
-                    }
-
-                    let mut header = TarHeader::new_gnu();
-                    header.set_size(metadata.total_size_bytes);
-                    header.set_mode(0o644);
-
-                    let archive_path = canonical_key(&metadata.object_key);
-                    let reader = create_multipart_reader(&metadata);
-
-                    tar.append_data(&mut header, archive_path, reader)
-                        .await
-                        .map_err(|e| AppError::Io(e, "tar append".into()))?;
-                }
-
-                if page.continuation_token.is_none() {
-                    break;
-                }
-                continuation_token = page.continuation_token;
-            }
+            write_fragment_namespace_tar_entries(fragment, include_internal, &mut tar).await?;
         }
         ArchiveSelection::ManifestFile(path) => {
             let result: Result<(), AppError> = async {

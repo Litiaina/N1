@@ -163,13 +163,14 @@ fn adaptive_upload_memory_budget_bytes(
     budget.clamp(32usize * 1024 * 1024, 128usize * 1024 * 1024)
 }
 
-fn adaptive_indexdb_max_cached_dbs(ram_bytes: Option<u64>) -> usize {
-    match ram_gib(ram_bytes) {
+fn adaptive_indexdb_max_cached_dbs(ram_bytes: Option<u64>, partition_count: usize) -> usize {
+    let ram_floor = match ram_gib(ram_bytes) {
         0..=4 => 12,
         5..=8 => 16,
         9..=16 => 24,
         _ => 32,
-    }
+    };
+    partition_count.saturating_mul(2).max(ram_floor)
 }
 
 fn adaptive_indexdb_cache_budget_bytes(ram_bytes: Option<u64>) -> usize {
@@ -181,10 +182,10 @@ fn adaptive_indexdb_cache_budget_bytes(ram_bytes: Option<u64>) -> usize {
     }
 }
 
-fn adaptive_indexdb_per_db_cache_bytes(ram_bytes: Option<u64>) -> usize {
-    let max_cached_dbs = adaptive_indexdb_max_cached_dbs(ram_bytes).max(1);
+fn adaptive_indexdb_per_db_cache_bytes(ram_bytes: Option<u64>, max_cached_dbs: usize) -> usize {
+    let max_cached_dbs = max_cached_dbs.max(1);
     let budget = adaptive_indexdb_cache_budget_bytes(ram_bytes);
-    (budget / max_cached_dbs).clamp(1024 * 1024, 8 * 1024 * 1024)
+    (budget / max_cached_dbs).clamp(256 * 1024, 8 * 1024 * 1024)
 }
 
 fn adaptive_namespace_max_loaded_facades(ram_bytes: Option<u64>) -> usize {
@@ -196,8 +197,10 @@ fn adaptive_namespace_max_loaded_facades(ram_bytes: Option<u64>) -> usize {
     }
 }
 
-fn adaptive_namespace_max_loaded_dbs(ram_bytes: Option<u64>) -> usize {
-    adaptive_namespace_max_loaded_facades(ram_bytes).saturating_mul(2)
+fn adaptive_namespace_max_loaded_dbs(ram_bytes: Option<u64>, partition_count: usize) -> usize {
+    adaptive_namespace_max_loaded_facades(ram_bytes)
+        .saturating_mul(2)
+        .max(partition_count.saturating_mul(2))
 }
 
 fn normalize_indexdb_per_db_cache_bytes(value: usize) -> usize {
@@ -739,13 +742,16 @@ pub async fn run_server() {
     let indexdb_max_cached_dbs = parse_usize_or_auto(
         index_section.and_then(|s| s.get("max_cached_dbs")),
         "index_config.max_cached_dbs",
-        adaptive_indexdb_max_cached_dbs(detected_ram_bytes),
+        adaptive_indexdb_max_cached_dbs(
+            detected_ram_bytes,
+            usize::from(configured_index_partition_count),
+        ),
     )
     .clamp(1, 256);
     let indexdb_per_db_cache_bytes = normalize_indexdb_per_db_cache_bytes(parse_usize_or_auto(
         index_section.and_then(|s| s.get("per_db_cache_bytes")),
         "index_config.per_db_cache_bytes",
-        adaptive_indexdb_per_db_cache_bytes(detected_ram_bytes),
+        adaptive_indexdb_per_db_cache_bytes(detected_ram_bytes, indexdb_max_cached_dbs),
     ));
     configure_indexdb_cache(indexdb_per_db_cache_bytes, indexdb_max_cached_dbs);
 
@@ -767,7 +773,10 @@ pub async fn run_server() {
     let namespace_max_loaded_dbs = parse_usize_or_auto(
         namespace_section.and_then(|s| s.get("max_loaded_dbs")),
         "namespace_config.max_loaded_dbs",
-        adaptive_namespace_max_loaded_dbs(detected_ram_bytes),
+        adaptive_namespace_max_loaded_dbs(
+            detected_ram_bytes,
+            usize::from(configured_index_partition_count),
+        ),
     )
     .clamp(1, 1024);
     configure_namespace_cache(namespace_max_loaded_facades, namespace_max_loaded_dbs);

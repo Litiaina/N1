@@ -18,6 +18,7 @@ use crate::core::disk_manager::ObjectPathManager;
 use crate::core::index;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::enums::app_error_enum::AppError;
+use crate::namespace::runtime::global_namespace_runtime;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
@@ -453,34 +454,27 @@ fn spawn_background_trash_purge(retired_roots: Vec<std::path::PathBuf>) {
 }
 
 async fn purge_delete_markers_for_key(fragment: &str, object_key: &str) {
-    if let Ok(metas) = index::list_live_object_versions_metadata(fragment, object_key).await {
+    let physical_key = resolve_namespace_object_id_or_self(fragment, object_key)
+        .await
+        .unwrap_or_else(|_| object_key.to_string());
+    if let Ok(metas) = index::list_live_object_versions_metadata(fragment, &physical_key).await {
         for meta in metas {
             if !meta.is_delete_marker {
                 continue;
             }
-            let _ = index::delete_object_version(fragment, object_key, &meta.version_id).await;
+            let _ = index::delete_object_version(fragment, &physical_key, &meta.version_id).await;
         }
     }
 }
 
-async fn acquire_bulk_object_operation_locks(
+async fn resolve_namespace_object_id_or_self(
     fragment: &str,
-    object_keys: &[String],
-) -> Result<Vec<index::ObjectOperationGuard>, AppError> {
-    let mut guards = Vec::with_capacity(object_keys.len());
-    for object_key in object_keys {
-        guards.push(index::acquire_object_operation_lock(fragment, object_key).await?);
-    }
-    Ok(guards)
-}
-
-fn flatten_version_ids(version_ids_by_key: &HashMap<String, Vec<String>>) -> Vec<String> {
-    version_ids_by_key
-        .values()
-        .flat_map(|version_ids| version_ids.iter().cloned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+    object_key: &str,
+) -> Result<String, AppError> {
+    Ok(global_namespace_runtime()
+        .resolve_any_object_id(fragment, object_key)
+        .await?
+        .unwrap_or_else(|| object_key.to_string()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -505,19 +499,18 @@ pub struct BulkObjectOperationResponse {
 
 async fn delete_object_core(fragment: &str, object_key: &str) -> Result<usize, AppError> {
     let _object_lock = index::acquire_object_operation_lock(fragment, object_key).await?;
-    match index::move_object_to_trash_fast(fragment, object_key).await? {
-        Some(version_ids) => Ok(version_ids.len()),
-        None => Err(AppError::NotFound),
-    }
+    let summary = global_namespace_runtime()
+        .trash(fragment, object_key)
+        .await?;
+    Ok(summary.affected_objects.max(summary.affected_paths))
 }
 
 async fn recover_object_core(fragment: &str, object_key: &str) -> Result<usize, AppError> {
     let _object_lock = index::acquire_object_operation_lock(fragment, object_key).await?;
-    purge_delete_markers_for_key(fragment, object_key).await;
-    match index::restore_object_from_trash_fast(fragment, object_key).await? {
-        Some(version_ids) => Ok(version_ids.len()),
-        None => Err(AppError::NotFound),
-    }
+    let summary = global_namespace_runtime()
+        .recover(fragment, object_key)
+        .await?;
+    Ok(summary.affected_objects.max(summary.affected_paths))
 }
 
 async fn delete_object_permanently_core(
@@ -525,21 +518,22 @@ async fn delete_object_permanently_core(
     object_key: &str,
 ) -> Result<Vec<String>, AppError> {
     let _object_lock = index::acquire_object_operation_lock(fragment, object_key).await?;
-    let versions_to_delete =
-        if let Some(version_ids) = index::delete_object_fast(fragment, object_key).await? {
-            version_ids
-        } else if let Some(version_ids) =
-            index::delete_all_trash_versions_for_key(fragment, object_key).await?
-        {
-            version_ids
-        } else {
-            return Err(AppError::NotFound);
-        };
-
-    for version_id in &versions_to_delete {
-        let _ = index::remove_session(fragment, version_id, "permanent-delete").await;
-    }
-    Ok(versions_to_delete)
+    let summary = match global_namespace_runtime()
+        .purge_trash_path(fragment, object_key)
+        .await
+    {
+        Ok(summary) => summary,
+        Err(AppError::NotFound) => {
+            global_namespace_runtime()
+                .trash(fragment, object_key)
+                .await?;
+            global_namespace_runtime()
+                .purge_trash_path(fragment, object_key)
+                .await?
+        }
+        Err(err) => return Err(err),
+    };
+    Ok(summary.trash_entry_id.into_iter().collect::<Vec<String>>())
 }
 
 pub async fn delete_object_version(
@@ -554,11 +548,12 @@ pub async fn delete_object_version(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
-    match index::delete_trashed_object_version(&fragment, &object_key, &version_id).await {
+    let physical_key = resolve_namespace_object_id_or_self(&fragment, &object_key).await?;
+    let _object_lock = index::acquire_object_operation_lock(&fragment, &physical_key).await?;
+    match index::delete_trashed_object_version(&fragment, &physical_key, &version_id).await {
         Ok(()) => {}
         Err(AppError::NotFound) => {
-            index::delete_object_version(&fragment, &object_key, &version_id).await?;
+            index::delete_object_version(&fragment, &physical_key, &version_id).await?;
         }
         Err(err) => return Err(err),
     }
@@ -636,32 +631,24 @@ pub async fn delete_objects_bulk(
         return Err(AppError::BadRequest("object_keys must not be empty".into()));
     }
 
-    let _guards = acquire_bulk_object_operation_locks(&fragment, &unique_keys).await?;
     let mut failed = Vec::new();
-    let moved_by_key = match index::move_objects_to_trash_batch(&fragment, &unique_keys).await {
-        Ok(changed) => changed,
-        Err(err) => {
-            for object_key in &unique_keys {
-                failed.push(BulkObjectFailure {
-                    object_key: object_key.clone(),
-                    error: err.to_string(),
-                });
-            }
-            HashMap::new()
+    let mut succeeded = 0usize;
+    let mut not_found = 0usize;
+    for object_key in &unique_keys {
+        match delete_object_core(&fragment, object_key).await {
+            Ok(_) => succeeded = succeeded.saturating_add(1),
+            Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
+            Err(err) => failed.push(BulkObjectFailure {
+                object_key: object_key.clone(),
+                error: err.to_string(),
+            }),
         }
-    };
-
-    let succeeded = moved_by_key.len();
-    let not_found = unique_keys
-        .len()
-        .saturating_sub(succeeded.saturating_add(failed.len()));
+    }
 
     if succeeded > 0 {
         info!(
-            "Soft deleted {} object(s) and {} version(s) for fragment {} via bulk manifest",
-            succeeded,
-            flatten_version_ids(&moved_by_key).len(),
-            fragment
+            "Soft deleted {} namespace object(s) for fragment {} via bulk manifest",
+            succeeded, fragment
         );
     }
 
@@ -723,8 +710,15 @@ async fn run_empty_trash_job(state: Arc<AppState>, fragment: String) -> Result<(
     })
     .await;
 
-    let trash_keys = index::list_fragment_object_keys_with_trash_versions(&fragment).await?;
-    let total_objects = trash_keys.len() as u64;
+    let total_objects = global_namespace_runtime()
+        .list_objects_page(
+            &fragment,
+            &HashMap::from([("limit".to_string(), "1000".to_string())]),
+            true,
+        )
+        .await?
+        .objects
+        .len() as u64;
     let mut trash_targets = BTreeSet::new();
     for root in &index_roots {
         trash_targets.insert(get_trash_root(root, &fragment));
@@ -738,10 +732,24 @@ async fn run_empty_trash_job(state: Arc<AppState>, fragment: String) -> Result<(
     })
     .await;
 
-    index::clear_fragment_trash_in_partitions(&fragment, None).await?;
+    let summary = match global_namespace_runtime().empty_trash(&fragment).await {
+        Ok(summary) => summary,
+        Err(AppError::NotFound) => {
+            mutate_trash_job_status(&EMPTY_TRASH_STATUS, |status| {
+                status.is_running = false;
+                status.phase = "Completed".to_string();
+                status.current_object = None;
+            })
+            .await;
+            clear_persistent_trash_job_record(&fragment).await;
+            state.emit(&fragment, StorageEventPayload::StateInvalidated);
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
     mutate_trash_job_status(&EMPTY_TRASH_STATUS, |status| {
-        status.processed_objects = total_objects;
-        status.successful_objects = total_objects;
+        status.processed_objects = summary.affected_paths as u64;
+        status.successful_objects = summary.affected_paths as u64;
         status.phase = "Trash metadata cleared; blob bytes will be reclaimed by GC".to_string();
     })
     .await;
@@ -884,17 +892,22 @@ pub async fn recover_object_version(
     }
 
     purge_delete_markers_for_key(&fragment, &object_key).await;
-    let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
-    let _restored_meta =
-        index::restore_object_version_from_trash_with_metadata(&fragment, &object_key, &version_id)
-            .await?;
+    let physical_key = resolve_namespace_object_id_or_self(&fragment, &object_key).await?;
+    let _object_lock = index::acquire_object_operation_lock(&fragment, &physical_key).await?;
+    let _restored_meta = index::restore_object_version_from_trash_with_metadata(
+        &fragment,
+        &physical_key,
+        &version_id,
+    )
+    .await?;
 
     info!(
         "Recovered object version: {}/{} (v: {})",
         fragment, object_key, version_id
     );
 
-    if let Ok(meta) = index::read_object_version(&fragment, &object_key, &version_id).await {
+    if let Ok(mut meta) = index::read_object_version(&fragment, &physical_key, &version_id).await {
+        meta.object_key = object_key.clone();
         state.emit(&fragment, StorageEventPayload::FileUploaded(meta));
     }
 
@@ -952,44 +965,27 @@ pub async fn recover_objects_bulk(
         return Err(AppError::BadRequest("object_keys must not be empty".into()));
     }
 
-    let _guards = acquire_bulk_object_operation_locks(&fragment, &unique_keys).await?;
     let mut failed = Vec::new();
-    for object_key in &unique_keys {
-        purge_delete_markers_for_key(&fragment, object_key).await;
-    }
-
-    let recoverable_versions =
-        match index::list_trashed_object_version_ids_batch(&fragment, &unique_keys).await {
-            Ok(found) => found,
-            Err(err) => {
-                return Err(err);
-            }
-        };
-
-    let mut restored_by_key = HashMap::<String, Vec<String>>::new();
-    match index::restore_objects_from_trash_manifest_batch(&fragment, &recoverable_versions).await {
-        Ok(changed) => restored_by_key.extend(changed),
-        Err(err) => {
-            for object_key in recoverable_versions.keys() {
-                failed.push(BulkObjectFailure {
-                    object_key: object_key.clone(),
-                    error: err.to_string(),
-                });
-            }
+    let mut succeeded = 0usize;
+    let mut not_found = 0usize;
+    for (object_key, result) in global_namespace_runtime()
+        .recover_paths_bulk(&fragment, unique_keys.clone())
+        .await?
+    {
+        match result {
+            Ok(_) => succeeded = succeeded.saturating_add(1),
+            Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
+            Err(err) => failed.push(BulkObjectFailure {
+                object_key,
+                error: err.to_string(),
+            }),
         }
     }
 
-    let succeeded = restored_by_key.len();
-    let not_found = unique_keys
-        .len()
-        .saturating_sub(succeeded.saturating_add(failed.len()));
-
     if succeeded > 0 {
         info!(
-            "Recovered {} object(s) and {} version(s) for fragment {} via bulk manifest",
-            succeeded,
-            flatten_version_ids(&restored_by_key).len(),
-            fragment
+            "Recovered {} namespace object(s) for fragment {} via bulk manifest",
+            succeeded, fragment
         );
     }
 
@@ -1050,12 +1046,22 @@ async fn run_recover_all_trash_job(state: Arc<AppState>, fragment: String) -> Re
     })
     .await;
 
-    let trash_keys = index::list_fragment_object_keys_with_trash_versions(&fragment).await?;
-    let recoverable_versions =
-        index::list_trashed_object_version_ids_batch(&fragment, &trash_keys).await?;
-    let total_objects = recoverable_versions.len() as u64;
+    let summary = match global_namespace_runtime().recover_all(&fragment).await {
+        Ok(summary) => summary,
+        Err(AppError::NotFound) => {
+            mutate_trash_job_status(&RECOVER_ALL_TRASH_STATUS, |status| {
+                status.is_running = false;
+                status.phase = "Completed".to_string();
+            })
+            .await;
+            clear_persistent_trash_job_record(&fragment).await;
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
+    let total_objects = summary.affected_paths as u64;
 
-    if recoverable_versions.is_empty() {
+    if total_objects == 0 {
         mutate_trash_job_status(&RECOVER_ALL_TRASH_STATUS, |status| {
             status.is_running = false;
             status.phase = "Completed".to_string();
@@ -1071,42 +1077,16 @@ async fn run_recover_all_trash_job(state: Arc<AppState>, fragment: String) -> Re
     })
     .await;
 
-    for object_key in &trash_keys {
-        purge_delete_markers_for_key(&fragment, object_key).await;
-    }
-    let version_ids = flatten_version_ids(&recoverable_versions);
-
-    let mut recovered_count = 0usize;
-    match index::restore_objects_from_trash_manifest_batch(&fragment, &recoverable_versions).await {
-        Ok(restored) => {
-            recovered_count = version_ids.len();
-            mutate_trash_job_status(&RECOVER_ALL_TRASH_STATUS, |status| {
-                status.processed_objects = total_objects;
-                status.successful_objects = restored.len() as u64;
-                status.current_object = trash_keys.last().cloned();
-            })
-            .await;
-        }
-        Err(err) => {
-            warn!(
-                "Recover-all restore failed for fragment {} keys={} error={}",
-                fragment,
-                trash_keys.len(),
-                err
-            );
-            mutate_trash_job_status(&RECOVER_ALL_TRASH_STATUS, |status| {
-                status.processed_objects = total_objects;
-                status.failed_objects = total_objects;
-                status.current_object = trash_keys.last().cloned();
-                status.last_error = Some(err.to_string());
-            })
-            .await;
-        }
-    }
+    mutate_trash_job_status(&RECOVER_ALL_TRASH_STATUS, |status| {
+        status.processed_objects = total_objects;
+        status.successful_objects = total_objects;
+        status.current_object = None;
+    })
+    .await;
 
     info!(
         "Recovered {} trashed item(s) for fragment {}",
-        recovered_count, fragment
+        total_objects, fragment
     );
 
     mutate_trash_job_status(&RECOVER_ALL_TRASH_STATUS, |status| {

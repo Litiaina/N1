@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
@@ -12,14 +12,14 @@ use indexdb::Database;
 use indexdb::n1 as n1_indexdb;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::warn;
+use tracing::{debug, warn};
 use ulid::Ulid;
 
 use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata, ObjectPathManager};
+use crate::core::fragment_metadata::fragment_index_partition_count;
 use crate::core::indexdb_store::{
-    PartitionMeta, next_indexdb_metadata_generation, open_n1_indexdb,
-    replay_indexdb_metadata_generation, seed_fragment_owner_indexdb_from_authoritative_copy,
-    with_partition_commit_lock,
+    PartitionMeta, next_indexdb_metadata_generation, open_n1_indexdb, read_live_version,
+    read_partition_meta_exact, replay_indexdb_metadata_generation, with_partition_commit_lock,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::{
@@ -30,7 +30,10 @@ use crate::namespace::paths::{base_name, is_same_or_descendant, normalize_path, 
 
 const INDEXDB_DIR: &str = "indexdb";
 const INDEXDB_FILE: &str = "index.ndxdb";
+const INDEXDB_SHARD_FILE_PREFIX: &str = "shard_";
 const NAMESPACE_ROOT_NODE_ID: &str = "root";
+const DIR_MARKER_NAME: &str = ".n1fsd_dir";
+const TRASH_VIRTUAL_NAME: &str = ".n1-trash";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingUploadBinding {
@@ -45,6 +48,20 @@ pub struct PendingUploadBinding {
 pub struct NamespaceRuntime {
     dbs: DashMap<PathBuf, Arc<Database>>,
     db_touch_ticks: DashMap<PathBuf, u64>,
+    verified_owner_shards: DashMap<PathBuf, ()>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NamespaceObjectRef {
+    pub path: String,
+    pub object_id: String,
+    pub version_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NamespaceObjectRefPage {
+    pub entries: Vec<NamespaceObjectRef>,
+    pub continuation_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -74,6 +91,7 @@ struct NamespaceReplicaFileInfo {
     path: PathBuf,
     modified_at: std::time::SystemTime,
     len: u64,
+    generation: u64,
     metadata_hash: [u8; 32],
 }
 
@@ -81,41 +99,11 @@ struct NamespaceReplicaFileInfo {
 struct NamespaceReplicaMutation {
     partition_meta: Option<PartitionMeta>,
     upsert_nodes: Vec<n1_indexdb::NamespaceNode>,
+    delete_nodes: Vec<String>,
     move_nodes: Vec<NamespaceNodeMoveReplay>,
     upsert_trash_roots: Vec<n1_indexdb::NamespaceTrashRoot>,
     set_trash_root_states: Vec<(String, n1_indexdb::TrashEntryState, i64)>,
-    upsert_entries: Vec<n1_indexdb::NamespaceEntry>,
-    delete_paths: Vec<String>,
-    rename_subtrees: Vec<NamespaceRenameReplay>,
-    lifecycle_subtrees: Vec<NamespaceLifecycleReplay>,
-    purge_subtrees: Vec<NamespacePurgeReplay>,
-    upsert_trash_entries: Vec<n1_indexdb::TrashEntry>,
-    set_trash_states: Vec<(String, n1_indexdb::TrashEntryState, i64)>,
-    upsert_pending_uploads: Vec<n1_indexdb::PendingUploadBinding>,
-    delete_pending_uploads: Vec<String>,
-    upsert_object_metadata: Vec<(String, ObjectMetadata, i64)>,
-}
-
-#[derive(Debug, Clone)]
-struct NamespaceRenameReplay {
-    source_path: String,
-    destination_path: String,
-    changed_at_unix: i64,
-}
-
-#[derive(Debug, Clone)]
-struct NamespaceLifecycleReplay {
-    root_path: String,
-    from: n1_indexdb::NamespaceLifecycle,
-    target: n1_indexdb::NamespaceLifecycle,
-    changed_at_unix: i64,
-    trash_entry_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct NamespacePurgeReplay {
-    root_path: Option<String>,
-    trash_entry_id: Option<String>,
+    upsert_file_heads: Vec<n1_indexdb::NamespaceFileHead>,
 }
 
 #[derive(Debug, Clone)]
@@ -126,37 +114,32 @@ struct NamespaceNodeMoveReplay {
     changed_at_unix: i64,
 }
 
+#[derive(Debug, Clone)]
+struct ShardedNamespaceMove {
+    moved_node: n1_indexdb::NamespaceNode,
+    old_shard: u16,
+    new_shard: u16,
+    old_partition_meta: PartitionMeta,
+    new_partition_meta: Option<PartitionMeta>,
+    file_head: Option<n1_indexdb::NamespaceFileHead>,
+}
+
 impl NamespaceReplicaMutation {
     fn is_empty(&self) -> bool {
         self.upsert_nodes.is_empty()
+            && self.delete_nodes.is_empty()
             && self.move_nodes.is_empty()
             && self.upsert_trash_roots.is_empty()
             && self.set_trash_root_states.is_empty()
-            && self.upsert_entries.is_empty()
-            && self.delete_paths.is_empty()
-            && self.rename_subtrees.is_empty()
-            && self.lifecycle_subtrees.is_empty()
-            && self.purge_subtrees.is_empty()
-            && self.upsert_trash_entries.is_empty()
-            && self.set_trash_states.is_empty()
-            && self.upsert_pending_uploads.is_empty()
-            && self.delete_pending_uploads.is_empty()
-            && self.upsert_object_metadata.is_empty()
+            && self.upsert_file_heads.is_empty()
     }
 }
 
-fn seal_namespace_mutation(
+fn bump_namespace_shard_generation(
     write_txn: &indexdb::WriteTransaction,
-    mutation: &mut NamespaceReplicaMutation,
     changed_at_unix: i64,
-) -> Result<(), AppError> {
-    if !mutation.is_empty() {
-        mutation.partition_meta = Some(next_indexdb_metadata_generation(
-            write_txn,
-            changed_at_unix,
-        )?);
-    }
-    Ok(())
+) -> Result<PartitionMeta, AppError> {
+    next_indexdb_metadata_generation(write_txn, changed_at_unix)
 }
 
 static GLOBAL_NAMESPACE_RUNTIME: LazyLock<NamespaceRuntime> = LazyLock::new(NamespaceRuntime::new);
@@ -209,14 +192,29 @@ impl NamespaceRuntime {
         Self {
             dbs: DashMap::new(),
             db_touch_ticks: DashMap::new(),
+            verified_owner_shards: DashMap::new(),
         }
     }
 
     pub fn evict_fragment(&self, fragment: &str) {
-        if let Ok(paths) = namespace_db_paths(fragment) {
-            for path in paths {
-                self.dbs.remove(&path);
-                self.db_touch_ticks.remove(&path);
+        let manager = ObjectPathManager;
+        for root in manager.get_all_index_roots() {
+            let dir = root.join(fragment).join(INDEXDB_DIR);
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("");
+                if name.starts_with(INDEXDB_SHARD_FILE_PREFIX) && name.ends_with(".ndxdb") {
+                    self.checkpoint_cached_db(&path);
+                    self.dbs.remove(&path);
+                    self.db_touch_ticks.remove(&path);
+                    self.verified_owner_shards.remove(&path);
+                }
             }
         }
     }
@@ -265,8 +263,33 @@ impl NamespaceRuntime {
             if self.dbs.len() <= max_loaded_dbs {
                 break;
             }
+            self.checkpoint_cached_db(&path);
             self.dbs.remove(&path);
             self.db_touch_ticks.remove(&path);
+        }
+    }
+
+    fn checkpoint_cached_db(&self, path: &Path) {
+        let Some(db) = self.dbs.get(path).map(|entry| entry.value().clone()) else {
+            return;
+        };
+        if let Err(err) = db.checkpoint() {
+            let message = err.to_string();
+            if message.contains("database table is locked")
+                || message.contains("database is locked")
+            {
+                debug!(
+                    "namespace shard checkpoint skipped for {} before cache eviction: {}",
+                    path.display(),
+                    err
+                );
+            } else {
+                warn!(
+                    "namespace shard checkpoint failed for {} before cache eviction: {}",
+                    path.display(),
+                    err
+                );
+            }
         }
     }
 
@@ -277,15 +300,15 @@ impl NamespaceRuntime {
         include_trashed: bool,
     ) -> Result<Vec<NamespaceEntry>, AppError> {
         let parent = normalize_path(path).map_err(namespace_error_to_app)?;
-        let db = self.open_db(fragment)?;
         let fragment = fragment.to_string();
         run_namespace_blocking(move || {
             if include_trashed {
                 let (entries, _) =
-                    list_trash_dir_page_on_db(&db, &fragment, &parent, usize::MAX / 2, None, 1000)?;
+                    sharded_list_trash_dir_page(&fragment, &parent, usize::MAX / 2, None, 1000)?;
                 return Ok(entries);
             }
-            let Some((resolved_path, parent_node)) = resolve_live_node_on_db(&db, &parent)? else {
+            let Some((resolved_path, parent_node)) = sharded_resolve_live_node(&fragment, &parent)?
+            else {
                 return Ok(Vec::new());
             };
             if parent_node.kind != n1_indexdb::NamespaceEntryKind::Directory {
@@ -294,9 +317,12 @@ impl NamespaceRuntime {
             let mut out = Vec::new();
             let mut after = None;
             loop {
-                let nodes = db
-                    .n1_list_namespace_node_children(&parent_node.node_id, after.as_deref(), 1000)
-                    .map_err(|e| map_indexdb_error("namespace node child list", e))?;
+                let nodes = sharded_list_namespace_children(
+                    &fragment,
+                    &parent_node.node_id,
+                    after.as_deref(),
+                    1000,
+                )?;
                 if nodes.is_empty() {
                     break;
                 }
@@ -328,13 +354,11 @@ impl NamespaceRuntime {
     ) -> Result<(Vec<NamespaceEntry>, Option<String>), AppError> {
         let parent = normalize_path(path).map_err(namespace_error_to_app)?;
         let after_name = continuation_token.map(ToOwned::to_owned);
-        let db = self.open_db(fragment)?;
         let fragment = fragment.to_string();
         let fetch_limit = limit.clamp(1, 1000).saturating_add(1);
         run_namespace_blocking(move || {
             if include_trashed {
-                return list_trash_dir_page_on_db(
-                    &db,
+                return sharded_list_trash_dir_page(
                     &fragment,
                     &parent,
                     limit,
@@ -342,19 +366,19 @@ impl NamespaceRuntime {
                     fetch_limit,
                 );
             }
-            let Some((resolved_path, parent_node)) = resolve_live_node_on_db(&db, &parent)? else {
+            let Some((resolved_path, parent_node)) = sharded_resolve_live_node(&fragment, &parent)?
+            else {
                 return Ok((Vec::new(), None));
             };
             if parent_node.kind != n1_indexdb::NamespaceEntryKind::Directory {
                 return Ok((Vec::new(), None));
             }
-            let rows = db
-                .n1_list_namespace_node_children(
-                    &parent_node.node_id,
-                    after_name.as_deref(),
-                    fetch_limit,
-                )
-                .map_err(|e| map_indexdb_error("namespace node child page", e))?;
+            let rows = sharded_list_namespace_children(
+                &fragment,
+                &parent_node.node_id,
+                after_name.as_deref(),
+                fetch_limit,
+            )?;
             let mut entries = rows
                 .into_iter()
                 .map(|node| {
@@ -382,11 +406,10 @@ impl NamespaceRuntime {
         if normalized.is_empty() {
             return Ok(Some(root_namespace_entry(fragment)));
         }
-        let db = self.open_db(fragment)?;
         let fragment = fragment.to_string();
         run_namespace_blocking(move || {
             Ok(
-                resolve_live_node_on_db(&db, &normalized)?.map(|(path, node)| {
+                sharded_resolve_live_node(&fragment, &normalized)?.map(|(path, node)| {
                     node_entry_from_indexdb(&fragment, path, node, LifecycleState::Live, None, None)
                 }),
             )
@@ -400,9 +423,8 @@ impl NamespaceRuntime {
         path: &str,
     ) -> Result<Option<NamespaceEntry>, AppError> {
         let normalized = normalize_path(path).map_err(namespace_error_to_app)?;
-        let db = self.open_db(fragment)?;
         let fragment = fragment.to_string();
-        run_namespace_blocking(move || trashed_entry_on_db(&db, &fragment, &normalized)).await
+        run_namespace_blocking(move || sharded_trashed_entry(&fragment, &normalized)).await
     }
 
     pub async fn head_for_path(
@@ -411,21 +433,20 @@ impl NamespaceRuntime {
         path: &str,
     ) -> Result<Option<ObjectHead>, AppError> {
         let normalized = normalize_path(path).map_err(namespace_error_to_app)?;
-        let db = self.open_db(fragment)?;
         let fragment = fragment.to_string();
         run_namespace_blocking(move || {
-            let Some((path, node)) = resolve_live_node_on_db(&db, &normalized)? else {
+            let Some((path, node)) = sharded_resolve_live_node(&fragment, &normalized)? else {
                 return Ok(None);
             };
             let Some(object_id) = node.object_id.as_deref() else {
                 return Ok(None);
             };
-            let Some(head) = db
-                .n1_get_object_head(object_id)
-                .map_err(|e| map_indexdb_error("namespace object head get", e))?
-            else {
+            let Some(head) = sharded_file_head_for_node(&fragment, &node)? else {
                 return Ok(None);
             };
+            if head.object_id != object_id {
+                return Ok(None);
+            }
             let entry =
                 node_entry_from_indexdb(&fragment, path, node, LifecycleState::Live, None, None);
             object_head_from_entry(&fragment, &entry, head).map(Some)
@@ -442,16 +463,43 @@ impl NamespaceRuntime {
             return Ok(HashMap::new());
         }
         let ids = object_ids.iter().cloned().collect::<BTreeSet<_>>();
-        let db = self.open_db(fragment)?;
         let fragment = fragment.to_string();
         run_namespace_blocking(move || {
             let mut out = HashMap::new();
-            for object_id in ids {
-                if let Some(head) = db
-                    .n1_get_object_head(&object_id)
-                    .map_err(|e| map_indexdb_error("namespace object head get", e))?
-                {
-                    out.insert(object_id, object_head_from_head_row(&fragment, head));
+            let shard_count = namespace_shard_count(&fragment)?;
+            for shard_id in 0..shard_count {
+                let Some(db) = open_existing_namespace_shard_db(&fragment, shard_id)? else {
+                    continue;
+                };
+                let mut after = None;
+                loop {
+                    let nodes = db
+                        .n1_list_namespace_nodes(after.as_deref(), 1000)
+                        .map_err(|e| map_indexdb_error("namespace head node scan", e))?;
+                    if nodes.is_empty() {
+                        break;
+                    }
+                    after = nodes.last().map(|node| node.node_id.clone());
+                    for node in nodes {
+                        let Some(object_id) = node.object_id.clone() else {
+                            continue;
+                        };
+                        if !ids.contains(&object_id) || out.contains_key(&object_id) {
+                            continue;
+                        }
+                        let Some(head) = sharded_file_head_for_node(&fragment, &node)? else {
+                            continue;
+                        };
+                        let entry = node_entry_from_indexdb(
+                            &fragment,
+                            node.name.clone(),
+                            node,
+                            LifecycleState::Live,
+                            None,
+                            None,
+                        );
+                        out.insert(object_id, object_head_from_entry(&fragment, &entry, head)?);
+                    }
                 }
             }
             Ok(out)
@@ -464,31 +512,31 @@ impl NamespaceRuntime {
         if normalized.is_empty() {
             return Ok(false);
         }
-        let db = self.open_db(fragment)?;
         let fragment_owned = fragment.to_string();
-        let owner_path = namespace_db_path(fragment)?;
+        let fragment_for_write = fragment.to_string();
         let changed_at = Utc::now().timestamp();
-        let mutation = run_namespace_blocking(move || {
-            with_partition_commit_lock(&owner_path, || {
-                let write_txn = db
-                    .begin_write()
-                    .map_err(|e| map_indexdb_error("namespace mkdir begin_write", e))?;
-                let created = ensure_directory_path_nodes(&write_txn, &normalized, changed_at)?;
-                let mut mutation = NamespaceReplicaMutation {
-                    upsert_nodes: created,
-                    ..Default::default()
-                };
-                seal_namespace_mutation(&write_txn, &mut mutation, changed_at)?;
-                write_txn
-                    .commit()
-                    .map_err(|e| map_indexdb_error("namespace mkdir commit", e))?;
-                Ok(mutation)
-            })
+        let (created_count, touched_shards) = run_namespace_blocking(move || {
+            let mut touched_shards = BTreeSet::new();
+            let created = sharded_ensure_directory_path_nodes(
+                &fragment_for_write,
+                &normalized,
+                changed_at,
+                &mut touched_shards,
+            )?;
+            let mut mutations = BTreeMap::new();
+            add_created_namespace_nodes_to_mutations(&fragment_for_write, created, &mut mutations)?;
+            Ok((
+                mutations
+                    .values()
+                    .map(|m| m.upsert_nodes.len())
+                    .sum::<usize>(),
+                touched_shards,
+            ))
         })
         .await?;
-        let created = !mutation.is_empty();
+        let created = created_count > 0;
         if created {
-            replicate_namespace_mutation_for_fragment(self, &fragment_owned, &mutation)?;
+            replicate_namespace_shards_by_copy(&fragment_owned, &touched_shards);
         }
         Ok(created)
     }
@@ -509,89 +557,81 @@ impl NamespaceRuntime {
                 "destination cannot be inside the source subtree".to_string(),
             ));
         }
-        let db = self.open_db(fragment)?;
         let fragment_owned = fragment.to_string();
-        let owner_path = namespace_db_path(fragment)?;
+        let fragment_for_write = fragment.to_string();
         let changed_at = Utc::now().timestamp();
-        let (summary, mutation) = run_namespace_blocking(move || {
-            with_partition_commit_lock(&owner_path, || {
-                let write_txn = db
-                    .begin_write()
-                    .map_err(|e| map_indexdb_error("namespace rename begin_write", e))?;
-                ensure_namespace_root(&write_txn, changed_at)?;
-                let Some((_, source_node)) = resolve_live_node_on_txn(&write_txn, &source)? else {
-                    return Err(AppError::NotFound);
-                };
-                let destination_parent_path = parent_path(&destination);
-                let destination_name = base_name(&destination);
-                let Some((_, destination_parent_node)) =
-                    resolve_live_node_on_txn(&write_txn, &destination_parent_path)?
-                else {
-                    return Err(AppError::NotFound);
-                };
-                if destination_parent_node.kind != n1_indexdb::NamespaceEntryKind::Directory {
-                    return Err(AppError::Conflict(format!(
-                        "destination parent '{}' is not a directory",
-                        destination_parent_path
-                    )));
+        let (summary, mutations) = run_namespace_blocking(move || {
+            let mut touched_shards = BTreeSet::new();
+            let mut mutations = BTreeMap::new();
+            let Some((_, source_node)) =
+                sharded_resolve_live_node_home_or_fallback(&fragment_for_write, &source)?
+            else {
+                return Err(AppError::NotFound);
+            };
+            let destination_parent_path = parent_path(&destination);
+            let destination_name = base_name(&destination);
+            let Some((_, destination_parent_node)) = sharded_resolve_live_node_home_or_fallback(
+                &fragment_for_write,
+                &destination_parent_path,
+            )?
+            else {
+                return Err(AppError::NotFound);
+            };
+            if destination_parent_node.kind != n1_indexdb::NamespaceEntryKind::Directory {
+                return Err(AppError::Conflict(format!(
+                    "destination parent '{}' is not a directory",
+                    destination_parent_path
+                )));
+            }
+            if sharded_get_namespace_child_home_or_fallback(
+                &fragment_for_write,
+                &destination_parent_node.node_id,
+                &destination_name,
+            )?
+            .is_some()
+            {
+                return Err(AppError::Conflict(format!(
+                    "destination path '{}' already exists",
+                    destination
+                )));
+            }
+            if source_node.kind == n1_indexdb::NamespaceEntryKind::Directory {
+                let mut cursor = Some(destination_parent_node.node_id.clone());
+                while let Some(current_id) = cursor {
+                    if current_id == source_node.node_id {
+                        return Err(AppError::Conflict(
+                            "destination cannot be inside the source subtree".to_string(),
+                        ));
+                    }
+                    cursor = sharded_get_namespace_node(&fragment_for_write, &current_id)?
+                        .and_then(|node| node.parent_node_id);
                 }
-                if write_txn
-                    .n1_get_namespace_child(&destination_parent_node.node_id, &destination_name)
-                    .map_err(|e| map_indexdb_error("namespace rename destination child get", e))?
-                    .is_some()
-                {
-                    return Err(AppError::Conflict(format!(
-                        "destination path '{}' already exists",
-                        destination
-                    )));
-                }
-                if source_node.kind == n1_indexdb::NamespaceEntryKind::Directory
-                    && is_descendant_node(
-                        &write_txn,
-                        &source_node.node_id,
-                        &destination_parent_node.node_id,
-                    )?
-                {
-                    return Err(AppError::Conflict(
-                        "destination cannot be inside the source subtree".to_string(),
-                    ));
-                }
-                write_txn
-                    .n1_move_namespace_node(
-                        &source_node.node_id,
-                        &destination_parent_node.node_id,
-                        &destination_name,
-                        changed_at,
-                    )
-                    .map_err(|e| map_indexdb_error("namespace rename node move", e))?;
-                let summary = NamespaceMutationSummary {
-                    operation: "rename".to_string(),
-                    kind: namespace_kind_from_indexdb(source_node.kind),
-                    affected_paths: 1,
-                    affected_objects: usize::from(source_node.object_id.is_some()),
-                    source_path: Some(source.clone()),
-                    destination_path: Some(destination.clone()),
-                    trash_entry_id: None,
-                    deleted_at_unix: None,
-                };
-                let mut mutation = NamespaceReplicaMutation {
-                    move_nodes: vec![NamespaceNodeMoveReplay {
-                        node_id: source_node.node_id,
-                        parent_node_id: destination_parent_node.node_id,
-                        name: destination_name,
-                        changed_at_unix: changed_at,
-                    }],
-                    ..Default::default()
-                };
-                seal_namespace_mutation(&write_txn, &mut mutation, changed_at)?;
-                write_txn
-                    .commit()
-                    .map_err(|e| map_indexdb_error("namespace rename commit", e))?;
-                Ok((summary, mutation))
-            })
+            }
+            let effective_changed_at =
+                changed_at.max(source_node.updated_at_unix.saturating_add(1));
+            let move_result = sharded_move_namespace_node(
+                &fragment_for_write,
+                &source_node,
+                &destination_parent_node.node_id,
+                &destination_name,
+                effective_changed_at,
+                &mut touched_shards,
+            )?;
+            add_namespace_move_to_mutations(move_result, &mut mutations);
+            let summary = NamespaceMutationSummary {
+                operation: "rename".to_string(),
+                kind: namespace_kind_from_indexdb(source_node.kind),
+                affected_paths: 1,
+                affected_objects: usize::from(source_node.object_id.is_some()),
+                source_path: Some(source.clone()),
+                destination_path: Some(destination.clone()),
+                trash_entry_id: None,
+                deleted_at_unix: None,
+            };
+            Ok((summary, mutations))
         })
         .await?;
-        replicate_namespace_mutation_for_fragment(self, &fragment_owned, &mutation)?;
+        replicate_namespace_shard_mutations(&fragment_owned, &mutations);
         Ok(summary)
     }
 
@@ -611,6 +651,83 @@ impl NamespaceRuntime {
     ) -> Result<NamespaceMutationSummary, AppError> {
         self.set_lifecycle_for_path(fragment, path, n1_indexdb::NamespaceLifecycle::Live)
             .await
+    }
+
+    pub async fn recover_paths_bulk(
+        &self,
+        fragment: &str,
+        paths: Vec<String>,
+    ) -> Result<Vec<(String, Result<usize, AppError>)>, AppError> {
+        let mut normalized_paths = Vec::with_capacity(paths.len());
+        for path in paths {
+            match normalize_path(&path).map_err(namespace_error_to_app) {
+                Ok(normalized) if !normalized.is_empty() => {
+                    normalized_paths.push((normalized, Ok(())));
+                }
+                Ok(_) => normalized_paths.push((path, Err(AppError::NotFound))),
+                Err(err) => normalized_paths.push((path, Err(err))),
+            }
+        }
+
+        let fragment_owned = fragment.to_string();
+        let fragment_for_write = fragment.to_string();
+        let changed_at = Utc::now().timestamp();
+        let (results, mutations) = run_namespace_blocking(move || {
+            let roots = sharded_list_trash_roots(
+                &fragment_for_write,
+                Some(n1_indexdb::TrashEntryState::Trashed),
+            )?;
+            let mut roots_by_path: HashMap<String, Vec<n1_indexdb::NamespaceTrashRoot>> =
+                HashMap::new();
+            for root in roots {
+                roots_by_path
+                    .entry(root.original_path.clone())
+                    .or_default()
+                    .push(root);
+            }
+
+            let mut touched_shards = BTreeSet::new();
+            let mut mutations = BTreeMap::new();
+            let mut results = Vec::with_capacity(normalized_paths.len());
+            for (path, normalized_result) in normalized_paths {
+                if let Err(err) = normalized_result {
+                    results.push((path, Err(err)));
+                    continue;
+                }
+                let roots = roots_by_path.remove(&path).unwrap_or_default();
+                if roots.is_empty() {
+                    results.push((path, Err(AppError::NotFound)));
+                    continue;
+                }
+                if roots.len() > 1 {
+                    results.push((
+                        path.clone(),
+                        Err(AppError::Conflict(format!(
+                            "trash path '{}' is ambiguous; use trash_entry_id",
+                            path
+                        ))),
+                    ));
+                    continue;
+                }
+                match sharded_recover_trash_root(
+                    &fragment_for_write,
+                    roots.into_iter().next().expect("checked non-empty"),
+                    changed_at,
+                    &mut touched_shards,
+                    &mut mutations,
+                ) {
+                    Ok(summary) => results.push((
+                        path,
+                        Ok(summary.affected_objects.max(summary.affected_paths)),
+                    )),
+                    Err(err) => results.push((path, Err(err))),
+                }
+            }
+            Ok((results, mutations))
+        })
+        .await?;
+        replicate_namespace_shard_mutations(&fragment_owned, &mutations);
+        Ok(results)
     }
 
     pub async fn recover_trash_entry_id(
@@ -656,31 +773,45 @@ impl NamespaceRuntime {
         &self,
         fragment: &str,
     ) -> Result<Option<NamespaceReachabilitySnapshot>, AppError> {
-        let Some(db) = self.open_existing_db(fragment)? else {
-            return Ok(None);
-        };
+        let fragment = fragment.to_string();
         run_namespace_blocking(move || {
             let mut snapshot = NamespaceReachabilitySnapshot::default();
             let mut saw_namespace_rows = false;
-            let mut after = None;
-            loop {
-                let rows = db
-                    .n1_list_namespace_subtree_nodes(
-                        NAMESPACE_ROOT_NODE_ID,
-                        "",
-                        after.as_deref(),
-                        1000,
-                    )
-                    .map_err(|e| map_indexdb_error("namespace reachability live scan", e))?;
-                if rows.is_empty() {
-                    break;
-                }
+            let live_rows = sharded_list_subtree_nodes(
+                &fragment,
+                NAMESPACE_ROOT_NODE_ID,
+                "",
+                None,
+                usize::MAX / 2,
+            )?;
+            if !live_rows.is_empty() {
                 saw_namespace_rows = true;
-                let last_path = rows
-                    .last()
-                    .map(|(path, _)| path.clone())
-                    .unwrap_or_default();
-                for (_, node) in rows {
+            }
+            for (_, node) in live_rows {
+                if let Some(object_id) = node.object_id {
+                    snapshot.referenced_object_ids.insert(object_id);
+                }
+                if let Some(version_id) = node.head_version_id {
+                    snapshot.referenced_version_ids.insert(version_id);
+                }
+            }
+            for root in
+                sharded_list_trash_roots(&fragment, Some(n1_indexdb::TrashEntryState::Trashed))?
+            {
+                saw_namespace_rows = true;
+                if let Some(object_id) = root.object_id.clone() {
+                    snapshot.referenced_object_ids.insert(object_id);
+                }
+                if let Some(version_id) = root.head_version_id.clone() {
+                    snapshot.referenced_version_ids.insert(version_id);
+                }
+                for (_, node) in sharded_list_subtree_nodes(
+                    &fragment,
+                    &root.root_node_id,
+                    &root.original_path,
+                    None,
+                    usize::MAX / 2,
+                )? {
                     if let Some(object_id) = node.object_id {
                         snapshot.referenced_object_ids.insert(object_id);
                     }
@@ -688,57 +819,8 @@ impl NamespaceRuntime {
                         snapshot.referenced_version_ids.insert(version_id);
                     }
                 }
-                if last_path.is_empty() {
-                    break;
-                }
-                after = Some(last_path);
             }
-            let mut roots_after = None;
-            loop {
-                let roots = db
-                    .n1_list_namespace_trash_roots_all(roots_after.as_deref(), 1000)
-                    .map_err(|e| map_indexdb_error("namespace reachability trash roots", e))?;
-                if roots.is_empty() {
-                    break;
-                }
-                saw_namespace_rows = true;
-                roots_after = roots.last().map(|root| root.trash_entry_id.clone());
-                for root in roots
-                    .into_iter()
-                    .filter(|root| root.state == n1_indexdb::TrashEntryState::Trashed)
-                {
-                    let mut after = None;
-                    loop {
-                        let rows = db
-                            .n1_list_namespace_subtree_nodes(
-                                &root.root_node_id,
-                                &root.original_path,
-                                after.as_deref(),
-                                1000,
-                            )
-                            .map_err(|e| {
-                                map_indexdb_error("namespace reachability trash scan", e)
-                            })?;
-                        if rows.is_empty() {
-                            break;
-                        }
-                        saw_namespace_rows = true;
-                        after = rows.last().map(|(path, _)| path.clone());
-                        for (_, node) in rows {
-                            if let Some(object_id) = node.object_id {
-                                snapshot.referenced_object_ids.insert(object_id);
-                            }
-                            if let Some(version_id) = node.head_version_id {
-                                snapshot.referenced_version_ids.insert(version_id);
-                            }
-                        }
-                    }
-                }
-            }
-            for binding in db
-                .n1_list_pending_uploads()
-                .map_err(|e| map_indexdb_error("namespace reachability pending uploads", e))?
-            {
+            for binding in sharded_list_pending_uploads_raw(&fragment)? {
                 saw_namespace_rows = true;
                 snapshot
                     .referenced_object_ids
@@ -754,46 +836,24 @@ impl NamespaceRuntime {
         &self,
         fragment: &str,
     ) -> Result<BTreeSet<String>, AppError> {
-        let Some(db) = self.open_existing_db(fragment)? else {
-            return Ok(BTreeSet::new());
-        };
+        let fragment = fragment.to_string();
         run_namespace_blocking(move || {
             let mut object_ids = BTreeSet::new();
-            let mut roots_after = None;
-            loop {
-                let roots = db
-                    .n1_list_namespace_trash_roots_all(roots_after.as_deref(), 1000)
-                    .map_err(|e| map_indexdb_error("namespace gc purged roots", e))?;
-                if roots.is_empty() {
-                    break;
+            for root in
+                sharded_list_trash_roots(&fragment, Some(n1_indexdb::TrashEntryState::Purged))?
+            {
+                if let Some(object_id) = root.object_id {
+                    object_ids.insert(object_id);
                 }
-                roots_after = roots.last().map(|root| root.trash_entry_id.clone());
-                for root in roots
-                    .into_iter()
-                    .filter(|root| root.state == n1_indexdb::TrashEntryState::Purged)
-                {
-                    if let Some(object_id) = root.object_id {
+                for (_, node) in sharded_list_subtree_nodes(
+                    &fragment,
+                    &root.root_node_id,
+                    &root.original_path,
+                    None,
+                    usize::MAX / 2,
+                )? {
+                    if let Some(object_id) = node.object_id {
                         object_ids.insert(object_id);
-                    }
-                    let mut after = None;
-                    loop {
-                        let rows = db
-                            .n1_list_namespace_subtree_nodes(
-                                &root.root_node_id,
-                                &root.original_path,
-                                after.as_deref(),
-                                1000,
-                            )
-                            .map_err(|e| map_indexdb_error("namespace gc purged subtree", e))?;
-                        if rows.is_empty() {
-                            break;
-                        }
-                        after = rows.last().map(|(path, _)| path.clone());
-                        for (_, node) in rows {
-                            if let Some(object_id) = node.object_id {
-                                object_ids.insert(object_id);
-                            }
-                        }
                     }
                 }
             }
@@ -816,9 +876,10 @@ impl NamespaceRuntime {
         logical_path: &str,
     ) -> Result<Option<String>, AppError> {
         let normalized = normalize_path(logical_path).map_err(namespace_error_to_app)?;
-        let db = self.open_db(fragment)?;
+        let fragment = fragment.to_string();
         run_namespace_blocking(move || {
-            Ok(resolve_live_node_on_db(&db, &normalized)?.and_then(|(_, node)| node.object_id))
+            Ok(sharded_resolve_live_node(&fragment, &normalized)?
+                .and_then(|(_, node)| node.object_id))
         })
         .await
     }
@@ -829,12 +890,12 @@ impl NamespaceRuntime {
         logical_path: &str,
     ) -> Result<Option<String>, AppError> {
         let normalized = normalize_path(logical_path).map_err(namespace_error_to_app)?;
-        let db = self.open_db(fragment)?;
+        let fragment = fragment.to_string();
         run_namespace_blocking(move || {
-            if let Some((_, node)) = resolve_live_node_on_db(&db, &normalized)? {
+            if let Some((_, node)) = sharded_resolve_live_node(&fragment, &normalized)? {
                 return Ok(node.object_id);
             }
-            Ok(trashed_entry_on_db(&db, "", &normalized)?.and_then(|entry| entry.object_id))
+            Ok(sharded_trashed_entry(&fragment, &normalized)?.and_then(|entry| entry.object_id))
         })
         .await
     }
@@ -845,9 +906,20 @@ impl NamespaceRuntime {
         logical_path: &str,
     ) -> Result<String, AppError> {
         let normalized = normalize_path(logical_path).map_err(namespace_error_to_app)?;
-        let db = self.open_db(fragment)?;
+        let fragment = fragment.to_string();
         run_namespace_blocking(move || {
-            if let Some((_, existing)) = resolve_live_node_on_db(&db, &normalized)? {
+            let parent = parent_path(&normalized);
+            let name = base_name(&normalized);
+            let existing = if normalized.is_empty() {
+                sharded_resolve_live_node(&fragment, &normalized)?.map(|(_, node)| node)
+            } else if let Some((_, parent_node)) =
+                sharded_resolve_live_node_home(&fragment, &parent)?
+            {
+                sharded_get_namespace_child_home(&fragment, &parent_node.node_id, &name)?
+            } else {
+                None
+            };
+            if let Some(existing) = existing {
                 if existing.kind == n1_indexdb::NamespaceEntryKind::Directory {
                     return Err(AppError::Conflict(format!(
                         "logical path '{}' already exists as a directory",
@@ -876,29 +948,46 @@ impl NamespaceRuntime {
                 "root cannot be written as a file".to_string(),
             ));
         }
-        let db = self.open_db(fragment)?;
         let fragment_owned = fragment.to_string();
-        let owner_path = namespace_db_path(fragment)?;
+        let fragment_for_write = fragment.to_string();
         let object_id = physical_object_id.to_string();
         let version_id = metadata.version_id.clone();
         let metadata = metadata.clone();
         let changed_at = metadata.created_at.max(Utc::now().timestamp());
-        let mutation = run_namespace_blocking(move || {
-            with_partition_commit_lock(&owner_path, || {
-                let write_txn = db
-                    .begin_write()
-                    .map_err(|e| map_indexdb_error("namespace finalize begin_write", e))?;
-                let mut upsert_nodes =
-                    ensure_directory_path_nodes(&write_txn, &parent_path(&path), changed_at)?;
-                let parent_path = parent_path(&path);
-                let Some((_, parent_node)) = resolve_live_node_on_txn(&write_txn, &parent_path)?
-                else {
-                    return Err(AppError::NotFound);
-                };
-                let name = base_name(&path);
-                let existing = write_txn
+        let mutations = run_namespace_blocking(move || {
+            let mut touched_shards = BTreeSet::new();
+            let created = sharded_ensure_directory_path_nodes(
+                &fragment_for_write,
+                &parent_path(&path),
+                changed_at,
+                &mut touched_shards,
+            )?;
+            let mut mutations = BTreeMap::new();
+            add_created_namespace_nodes_to_mutations(&fragment_for_write, created, &mut mutations)?;
+            let parent_path = parent_path(&path);
+            let Some((_, parent_node)) =
+                sharded_resolve_live_node_home(&fragment_for_write, &parent_path)?
+            else {
+                return Err(AppError::NotFound);
+            };
+            let name = base_name(&path);
+            let stripe_size_bytes = u64::try_from(metadata.stripe_size_bytes).map_err(|_| {
+                AppError::InternalServerError(format!(
+                    "stripe size {} does not fit in u64",
+                    metadata.stripe_size_bytes
+                ))
+            })?;
+            let shard_id =
+                namespace_node_shard_id(&fragment_for_write, Some(&parent_node.node_id), &name)?;
+            let db = open_namespace_owner_shard_db(&fragment_for_write, shard_id)?;
+            let shard_path = namespace_shard_paths(&fragment_for_write, shard_id)?[0].clone();
+            let mut replica_node = None;
+            let mut replica_head = None;
+            let mut replica_partition_meta = None;
+            with_partition_commit_lock(&shard_path, || {
+                let existing = db
                     .n1_get_namespace_child(&parent_node.node_id, &name)
-                    .map_err(|e| map_indexdb_error("namespace finalize existing node get", e))?;
+                    .map_err(|e| map_indexdb_error("namespace finalize child get", e))?;
                 if existing
                     .as_ref()
                     .is_some_and(|entry| entry.kind == n1_indexdb::NamespaceEntryKind::Directory)
@@ -908,7 +997,22 @@ impl NamespaceRuntime {
                         path
                     )));
                 }
-                upsert_namespace_object_metadata(&write_txn, &object_id, &metadata, changed_at)?;
+                if let Some(existing_file) = existing.as_ref() {
+                    if let Some(current_head) = db
+                        .n1_get_namespace_file_head(&existing_file.node_id)
+                        .map_err(|e| map_indexdb_error("namespace finalize current head get", e))?
+                    {
+                        let current_is_newer = current_head.created_at_unix > metadata.created_at
+                            || (current_head.created_at_unix == metadata.created_at
+                                && current_head.version_id > version_id);
+                        if current_is_newer {
+                            return Ok(());
+                        }
+                    }
+                }
+                let write_txn = db
+                    .begin_write()
+                    .map_err(|e| map_indexdb_error("namespace finalize begin_write", e))?;
                 let created_at = existing
                     .as_ref()
                     .map(|node| node.created_at_unix)
@@ -918,32 +1022,54 @@ impl NamespaceRuntime {
                         .as_ref()
                         .map(|node| node.node_id.clone())
                         .unwrap_or_else(new_namespace_node_id),
-                    parent_node_id: Some(parent_node.node_id),
-                    name,
+                    parent_node_id: Some(parent_node.node_id.clone()),
+                    name: name.clone(),
                     kind: n1_indexdb::NamespaceEntryKind::File,
                     object_id: Some(object_id.clone()),
-                    head_version_id: Some(version_id),
+                    head_version_id: Some(version_id.clone()),
                     created_at_unix: created_at,
+                    updated_at_unix: changed_at,
+                };
+                let file_head = n1_indexdb::NamespaceFileHead {
+                    node_id: node.node_id.clone(),
+                    object_id: object_id.clone(),
+                    version_id: version_id.clone(),
+                    upload_session_id: metadata.upload_session_id.clone(),
+                    owner_uid: metadata.owner_uid.clone(),
+                    content_type: metadata.content_type.clone(),
+                    total_size_bytes: metadata.total_size_bytes,
+                    created_at_unix: metadata.created_at,
+                    is_delete_marker: metadata.is_delete_marker,
+                    stripe_size_bytes,
                     updated_at_unix: changed_at,
                 };
                 write_txn
                     .n1_upsert_namespace_node(&node)
                     .map_err(|e| map_indexdb_error("namespace finalize node upsert", e))?;
-                upsert_nodes.push(node);
-                let mut mutation = NamespaceReplicaMutation {
-                    upsert_nodes,
-                    upsert_object_metadata: vec![(object_id, metadata, changed_at)],
-                    ..Default::default()
-                };
-                seal_namespace_mutation(&write_txn, &mut mutation, changed_at)?;
+                write_txn
+                    .n1_upsert_namespace_file_head(&file_head)
+                    .map_err(|e| map_indexdb_error("namespace file head upsert", e))?;
+                replica_partition_meta =
+                    Some(bump_namespace_shard_generation(&write_txn, changed_at)?);
                 write_txn
                     .commit()
                     .map_err(|e| map_indexdb_error("namespace finalize commit", e))?;
-                Ok(mutation)
-            })
+                replica_node = Some(node);
+                replica_head = Some(file_head);
+                Ok(())
+            })?;
+            let mutation = mutations.entry(shard_id).or_default();
+            mutation.partition_meta = replica_partition_meta;
+            if let Some(node) = replica_node {
+                mutation.upsert_nodes.push(node);
+            }
+            if let Some(file_head) = replica_head {
+                mutation.upsert_file_heads.push(file_head);
+            }
+            Ok(mutations)
         })
         .await?;
-        replicate_namespace_mutation_for_fragment(self, &fragment_owned, &mutation)?;
+        replicate_namespace_shard_mutations(&fragment_owned, &mutations);
         Ok(())
     }
 
@@ -962,10 +1088,12 @@ impl NamespaceRuntime {
             session_id: session_id.to_string(),
             created_at_unix: Utc::now().timestamp(),
         };
-        let db = self.open_db(fragment)?;
         let fragment_owned = fragment.to_string();
-        let owner_path = namespace_db_path(fragment)?;
-        let mutation = run_namespace_blocking(move || {
+        let fragment_for_write = fragment.to_string();
+        let shard_id = namespace_pending_shard_id(fragment, version_id)?;
+        let touched_shards = run_namespace_blocking(move || {
+            let db = open_namespace_owner_shard_db(&fragment_for_write, shard_id)?;
+            let owner_path = namespace_shard_paths(&fragment_for_write, shard_id)?[0].clone();
             with_partition_commit_lock(&owner_path, || {
                 let write_txn = db
                     .begin_write()
@@ -973,19 +1101,17 @@ impl NamespaceRuntime {
                 write_txn
                     .n1_upsert_pending_upload(&binding)
                     .map_err(|e| map_indexdb_error("namespace pending upsert", e))?;
-                let mut mutation = NamespaceReplicaMutation {
-                    upsert_pending_uploads: vec![binding],
-                    ..Default::default()
-                };
-                seal_namespace_mutation(&write_txn, &mut mutation, Utc::now().timestamp())?;
+                bump_namespace_shard_generation(&write_txn, binding.created_at_unix)?;
                 write_txn
                     .commit()
                     .map_err(|e| map_indexdb_error("namespace pending commit", e))?;
-                Ok(mutation)
+                let mut touched = BTreeSet::new();
+                touched.insert(shard_id);
+                Ok(touched)
             })
         })
         .await?;
-        replicate_namespace_mutation_for_fragment(self, &fragment_owned, &mutation)?;
+        replicate_namespace_shards_by_copy(&fragment_owned, &touched_shards);
         Ok(())
     }
 
@@ -994,10 +1120,13 @@ impl NamespaceRuntime {
         fragment: &str,
         version_id: &str,
     ) -> Result<Option<PendingUploadBinding>, AppError> {
-        let db = self.open_db(fragment)?;
         let fragment = fragment.to_string();
         let version_id = version_id.to_string();
         run_namespace_blocking(move || {
+            let shard_id = namespace_pending_shard_id(&fragment, &version_id)?;
+            let Some(db) = open_existing_namespace_shard_db(&fragment, shard_id)? else {
+                return Ok(None);
+            };
             Ok(db
                 .n1_get_pending_upload(&version_id)
                 .map_err(|e| map_indexdb_error("namespace pending get", e))?
@@ -1010,12 +1139,19 @@ impl NamespaceRuntime {
         &self,
         fragment: &str,
     ) -> Result<Vec<PendingUploadBinding>, AppError> {
-        let db = self.open_db(fragment)?;
         let fragment = fragment.to_string();
         run_namespace_blocking(move || {
-            let rows = db
-                .n1_list_pending_uploads()
-                .map_err(|e| map_indexdb_error("namespace pending list", e))?;
+            let mut rows = Vec::new();
+            let shard_count = namespace_shard_count(&fragment)?;
+            for shard_id in 0..shard_count {
+                let Some(db) = open_existing_namespace_shard_db(&fragment, shard_id)? else {
+                    continue;
+                };
+                rows.extend(
+                    db.n1_list_pending_uploads()
+                        .map_err(|e| map_indexdb_error("namespace pending list", e))?,
+                );
+            }
             Ok(rows
                 .into_iter()
                 .map(|binding| pending_upload_from_indexdb(&fragment, binding))
@@ -1030,13 +1166,21 @@ impl NamespaceRuntime {
         logical_path: &str,
     ) -> Result<Option<PendingUploadBinding>, AppError> {
         let normalized = normalize_path(logical_path).map_err(namespace_error_to_app)?;
-        let db = self.open_db(fragment)?;
         let fragment = fragment.to_string();
         run_namespace_blocking(move || {
-            Ok(db
-                .n1_find_pending_upload_by_logical_path(&normalized)
-                .map_err(|e| map_indexdb_error("namespace pending path get", e))?
-                .map(|binding| pending_upload_from_indexdb(&fragment, binding)))
+            let shard_count = namespace_shard_count(&fragment)?;
+            for shard_id in 0..shard_count {
+                let Some(db) = open_existing_namespace_shard_db(&fragment, shard_id)? else {
+                    continue;
+                };
+                if let Some(binding) = db
+                    .n1_find_pending_upload_by_logical_path(&normalized)
+                    .map_err(|e| map_indexdb_error("namespace pending path get", e))?
+                {
+                    return Ok(Some(pending_upload_from_indexdb(&fragment, binding)));
+                }
+            }
+            Ok(None)
         })
         .await
     }
@@ -1046,11 +1190,13 @@ impl NamespaceRuntime {
         fragment: &str,
         version_id: &str,
     ) -> Result<(), AppError> {
-        let db = self.open_db(fragment)?;
         let fragment_owned = fragment.to_string();
+        let fragment_for_write = fragment.to_string();
         let version_id = version_id.to_string();
-        let owner_path = namespace_db_path(fragment)?;
-        let mutation = run_namespace_blocking(move || {
+        let shard_id = namespace_pending_shard_id(fragment, &version_id)?;
+        let touched_shards = run_namespace_blocking(move || {
+            let db = open_namespace_owner_shard_db(&fragment_for_write, shard_id)?;
+            let owner_path = namespace_shard_paths(&fragment_for_write, shard_id)?[0].clone();
             with_partition_commit_lock(&owner_path, || {
                 let write_txn = db
                     .begin_write()
@@ -1058,19 +1204,17 @@ impl NamespaceRuntime {
                 write_txn
                     .n1_delete_pending_upload(&version_id)
                     .map_err(|e| map_indexdb_error("namespace pending clear", e))?;
-                let mut mutation = NamespaceReplicaMutation {
-                    delete_pending_uploads: vec![version_id],
-                    ..Default::default()
-                };
-                seal_namespace_mutation(&write_txn, &mut mutation, Utc::now().timestamp())?;
+                bump_namespace_shard_generation(&write_txn, Utc::now().timestamp())?;
                 write_txn
                     .commit()
                     .map_err(|e| map_indexdb_error("namespace pending clear commit", e))?;
-                Ok(mutation)
+                let mut touched = BTreeSet::new();
+                touched.insert(shard_id);
+                Ok(touched)
             })
         })
         .await?;
-        replicate_namespace_mutation_for_fragment(self, &fragment_owned, &mutation)?;
+        replicate_namespace_shards_by_copy(&fragment_owned, &touched_shards);
         Ok(())
     }
 
@@ -1098,31 +1242,43 @@ impl NamespaceRuntime {
                 "only '/' delimiter is supported".to_string(),
             ));
         }
+        let include_internal = params
+            .get("include_internal")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
         let after = params.get("continuation_token").cloned();
-        let db = self.open_db(fragment)?;
         let fragment = fragment.to_string();
         run_namespace_blocking(move || {
             if !delimiter_is_slash {
-                let rows = if scan_trash {
-                    list_trash_object_summaries_on_db(
-                        &db,
+                let fetch_limit = limit.saturating_add(1);
+                let mut rows = if scan_trash {
+                    sharded_list_trash_object_summaries(
+                        &fragment,
                         prefix.as_deref(),
                         after.as_deref(),
-                        limit,
+                        fetch_limit,
+                        include_internal,
                     )?
                 } else {
-                    db.n1_list_namespace_node_object_summaries(
-                        NAMESPACE_ROOT_NODE_ID,
-                        "",
+                    sharded_list_live_object_summaries(
+                        &fragment,
                         prefix.as_deref(),
                         after.as_deref(),
-                        limit,
-                    )
-                    .map_err(|e| map_indexdb_error("namespace node object summary list", e))?
+                        fetch_limit,
+                        include_internal,
+                    )?
                 };
-                let next_cursor = (rows.len() >= limit)
-                    .then(|| rows.last().map(|row| row.path.clone()))
-                    .flatten();
+                let next_cursor = if rows.len() > limit {
+                    rows.pop();
+                    rows.last().map(|row| row.path.clone())
+                } else {
+                    None
+                };
                 let objects = rows
                     .into_iter()
                     .map(|row| object_metadata_from_namespace_summary(&fragment, row))
@@ -1142,21 +1298,21 @@ impl NamespaceRuntime {
 
             while objects.len() + common_prefixes.len() < limit {
                 let rows = if scan_trash {
-                    list_trash_object_summaries_on_db(
-                        &db,
+                    sharded_list_trash_object_summaries(
+                        &fragment,
                         prefix.as_deref(),
                         cursor.as_deref(),
                         256,
+                        include_internal,
                     )?
                 } else {
-                    db.n1_list_namespace_node_object_summaries(
-                        NAMESPACE_ROOT_NODE_ID,
-                        "",
+                    sharded_list_live_object_summaries(
+                        &fragment,
                         prefix.as_deref(),
                         cursor.as_deref(),
                         256,
-                    )
-                    .map_err(|e| map_indexdb_error("namespace node object list", e))?
+                        include_internal,
+                    )?
                 };
                 if rows.is_empty() {
                     break;
@@ -1197,51 +1353,37 @@ impl NamespaceRuntime {
         .await
     }
 
-    fn open_db(&self, fragment: &str) -> Result<Arc<Database>, AppError> {
-        let owner_path = namespace_db_path(fragment)?;
-        if let Some(existing) = self.dbs.get(&owner_path) {
-            self.touch_db_cache(&owner_path);
-            return Ok(existing.clone());
-        }
-        let path = self
-            .ensure_owner_namespace_db(fragment)?
-            .unwrap_or(owner_path);
-        if let Some(existing) = self.dbs.get(&path) {
-            self.touch_db_cache(&path);
-            return Ok(existing.clone());
-        }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| AppError::Io(e, format!("mkdir {}", parent.display())))?;
-        }
-        let db = Arc::new(open_n1_indexdb(&path)?);
-        self.dbs.insert(path.clone(), db.clone());
-        self.touch_db_cache(&path);
-        self.prune_db_cache();
-        Ok(db)
-    }
-
-    fn open_existing_db(&self, fragment: &str) -> Result<Option<Arc<Database>>, AppError> {
-        let owner_path = namespace_db_path(fragment)?;
-        if let Some(existing) = self.dbs.get(&owner_path) {
-            self.touch_db_cache(&owner_path);
-            return Ok(Some(existing.clone()));
-        }
-        let Some(path) = self.ensure_owner_namespace_db(fragment)? else {
-            return Ok(None);
-        };
-        if let Some(existing) = self.dbs.get(&path) {
-            self.touch_db_cache(&path);
-            return Ok(Some(existing.clone()));
-        }
-        if !path.exists() {
-            return Ok(None);
-        }
-        let db = Arc::new(open_n1_indexdb(&path)?);
-        self.dbs.insert(path.clone(), db.clone());
-        self.touch_db_cache(&path);
-        self.prune_db_cache();
-        Ok(Some(db))
+    pub async fn list_live_object_refs_page(
+        &self,
+        fragment: &str,
+        prefix: Option<&str>,
+        continuation_token: Option<&str>,
+        limit: usize,
+    ) -> Result<NamespaceObjectRefPage, AppError> {
+        let prefix = prefix.map(str::to_string);
+        let continuation_token = continuation_token.map(str::to_string);
+        let fragment = fragment.to_string();
+        let limit = limit.clamp(1, 1000);
+        run_namespace_blocking(move || {
+            let fetch_limit = limit.saturating_add(1);
+            let mut rows = sharded_list_live_object_refs(
+                &fragment,
+                prefix.as_deref(),
+                continuation_token.as_deref(),
+                fetch_limit,
+            )?;
+            let next_cursor = if rows.len() > limit {
+                rows.pop();
+                rows.last().map(|row| row.path.clone())
+            } else {
+                None
+            };
+            Ok(NamespaceObjectRefPage {
+                entries: rows,
+                continuation_token: next_cursor,
+            })
+        })
+        .await
     }
 
     fn open_db_path(&self, path: PathBuf) -> Result<Arc<Database>, AppError> {
@@ -1260,28 +1402,6 @@ impl NamespaceRuntime {
         Ok(db)
     }
 
-    fn ensure_owner_namespace_db(&self, fragment: &str) -> Result<Option<PathBuf>, AppError> {
-        let owner_path = namespace_db_path(fragment)?;
-        let copied_authoritative = seed_fragment_owner_indexdb_from_authoritative_copy(fragment)?;
-        if copied_authoritative {
-            self.dbs.remove(&owner_path);
-            self.db_touch_ticks.remove(&owner_path);
-        }
-
-        if owner_path.exists() {
-            return Ok(Some(owner_path));
-        }
-
-        let Some(replica_path) = best_existing_namespace_db_path(fragment)? else {
-            return Ok(None);
-        };
-        if replica_path == owner_path {
-            return Ok(Some(owner_path));
-        }
-        copy_namespace_db_file(&replica_path, &owner_path)?;
-        Ok(Some(owner_path))
-    }
-
     async fn set_lifecycle_for_path(
         &self,
         fragment: &str,
@@ -1294,183 +1414,107 @@ impl NamespaceRuntime {
                 "root lifecycle cannot be changed".to_string(),
             ));
         }
-        let db = self.open_db(fragment)?;
         let fragment_owned = fragment.to_string();
-        let owner_path = namespace_db_path(fragment)?;
+        let fragment_for_write = fragment.to_string();
         let changed_at = Utc::now().timestamp();
-        let (summary, mutation) = run_namespace_blocking(move || {
-            with_partition_commit_lock(&owner_path, || {
-                let write_txn = db
-                    .begin_write()
-                    .map_err(|e| map_indexdb_error("namespace lifecycle begin_write", e))?;
-                ensure_namespace_root(&write_txn, changed_at)?;
-                if matches!(target, n1_indexdb::NamespaceLifecycle::Trashed) {
-                    let Some((source_path, source_node)) =
-                        resolve_live_node_on_txn(&write_txn, &normalized)?
-                    else {
-                        return Err(AppError::NotFound);
-                    };
-                    let Some(original_parent_node_id) = source_node.parent_node_id.clone() else {
-                        return Err(AppError::BadRequest(
-                            "root lifecycle cannot be changed".to_string(),
-                        ));
-                    };
-                    let trash_entry_id = Ulid::new().to_string();
-                    let trash_root = n1_indexdb::NamespaceTrashRoot {
-                        trash_entry_id: trash_entry_id.clone(),
-                        root_node_id: source_node.node_id.clone(),
-                        original_parent_node_id,
-                        original_name: source_node.name.clone(),
-                        original_path: source_path.clone(),
-                        kind: source_node.kind,
-                        object_id: source_node.object_id.clone(),
-                        head_version_id: source_node.head_version_id.clone(),
-                        deleted_at_unix: changed_at,
-                        retired_at_unix: None,
-                        purged_at_unix: None,
-                        state: n1_indexdb::TrashEntryState::Trashed,
-                    };
-                    write_txn
-                        .n1_upsert_namespace_trash_root(&trash_root)
-                        .map_err(|e| map_indexdb_error("namespace trash root upsert", e))?;
-                    let trash_parent = trash_parent_node_id(&trash_entry_id);
-                    write_txn
-                        .n1_move_namespace_node(
-                            &source_node.node_id,
-                            &trash_parent,
-                            &source_node.name,
-                            changed_at,
-                        )
-                        .map_err(|e| map_indexdb_error("namespace trash node detach", e))?;
-                    let source_kind = namespace_kind_from_indexdb(source_node.kind);
-                    let affected_objects = usize::from(source_node.object_id.is_some());
-                    let mut mutation = NamespaceReplicaMutation {
-                        upsert_trash_roots: vec![trash_root],
-                        move_nodes: vec![NamespaceNodeMoveReplay {
-                            node_id: source_node.node_id.clone(),
-                            parent_node_id: trash_parent,
-                            name: source_node.name.clone(),
-                            changed_at_unix: changed_at,
-                        }],
-                        ..Default::default()
-                    };
-                    seal_namespace_mutation(&write_txn, &mut mutation, changed_at)?;
-                    write_txn
-                        .commit()
-                        .map_err(|e| map_indexdb_error("namespace lifecycle commit", e))?;
-                    return Ok((
-                        NamespaceMutationSummary {
-                            operation: "trash".to_string(),
-                            kind: source_kind,
-                            affected_paths: 1,
-                            affected_objects,
-                            source_path: Some(source_path),
-                            destination_path: None,
-                            trash_entry_id: Some(trash_entry_id.clone()),
-                            deleted_at_unix: Some(changed_at),
-                        },
-                        mutation,
+        let (summary, mutations) = run_namespace_blocking(move || {
+            let mut touched_shards = BTreeSet::new();
+            let mut mutations = BTreeMap::new();
+            if matches!(target, n1_indexdb::NamespaceLifecycle::Trashed) {
+                let Some((source_path, source_node)) =
+                    sharded_resolve_live_node_home_or_fallback(&fragment_for_write, &normalized)?
+                else {
+                    return Err(AppError::NotFound);
+                };
+                let Some(original_parent_node_id) = source_node.parent_node_id.clone() else {
+                    return Err(AppError::BadRequest(
+                        "root lifecycle cannot be changed".to_string(),
                     ));
-                }
+                };
+                let effective_changed_at =
+                    changed_at.max(source_node.updated_at_unix.saturating_add(1));
+                let trash_entry_id = Ulid::new().to_string();
+                let trash_root = n1_indexdb::NamespaceTrashRoot {
+                    trash_entry_id: trash_entry_id.clone(),
+                    root_node_id: source_node.node_id.clone(),
+                    original_parent_node_id,
+                    original_name: source_node.name.clone(),
+                    original_path: source_path.clone(),
+                    kind: source_node.kind,
+                    object_id: source_node.object_id.clone(),
+                    head_version_id: source_node.head_version_id.clone(),
+                    deleted_at_unix: effective_changed_at,
+                    retired_at_unix: None,
+                    purged_at_unix: None,
+                    state: n1_indexdb::TrashEntryState::Trashed,
+                };
+                let trash_partition_meta = sharded_upsert_trash_root(
+                    &fragment_for_write,
+                    &trash_root,
+                    &mut touched_shards,
+                )?;
+                let trash_shard = namespace_trash_shard_id(&fragment_for_write, &trash_entry_id)?;
+                let trash_mutation = mutations.entry(trash_shard).or_default();
+                set_namespace_mutation_partition_meta(trash_mutation, trash_partition_meta);
+                trash_mutation.upsert_trash_roots.push(trash_root);
+                let trash_parent = trash_parent_node_id(&trash_entry_id);
+                let move_result = sharded_move_namespace_node(
+                    &fragment_for_write,
+                    &source_node,
+                    &trash_parent,
+                    &source_node.name,
+                    effective_changed_at,
+                    &mut touched_shards,
+                )?;
+                add_namespace_move_to_mutations(move_result, &mut mutations);
+                return Ok((
+                    NamespaceMutationSummary {
+                        operation: "trash".to_string(),
+                        kind: namespace_kind_from_indexdb(source_node.kind),
+                        affected_paths: 1,
+                        affected_objects: usize::from(source_node.object_id.is_some()),
+                        source_path: Some(source_path),
+                        destination_path: None,
+                        trash_entry_id: Some(trash_entry_id),
+                        deleted_at_unix: Some(effective_changed_at),
+                    },
+                    mutations,
+                ));
+            }
 
-                if matches!(target, n1_indexdb::NamespaceLifecycle::Live) {
-                    let roots = db
-                        .n1_list_namespace_trash_roots_by_path(
-                            &normalized,
-                            n1_indexdb::TrashEntryState::Trashed,
-                        )
-                        .map_err(|e| map_indexdb_error("namespace trash root path get", e))?;
-                    if roots.len() > 1 {
-                        return Err(AppError::Conflict(format!(
-                            "trash path '{}' is ambiguous; use trash_entry_id",
-                            normalized
-                        )));
-                    }
-                    let Some(root) = roots.into_iter().next() else {
-                        return Err(AppError::NotFound);
-                    };
-                    let Some(parent_node) = write_txn
-                        .n1_get_namespace_node(&root.original_parent_node_id)
-                        .map_err(|e| map_indexdb_error("namespace recover parent get", e))?
-                    else {
-                        return Err(AppError::Conflict(format!(
-                            "original parent for '{}' no longer exists",
-                            root.original_path
-                        )));
-                    };
-                    if parent_node.kind != n1_indexdb::NamespaceEntryKind::Directory {
-                        return Err(AppError::Conflict(format!(
-                            "original parent for '{}' is not a directory",
-                            root.original_path
-                        )));
-                    }
-                    if write_txn
-                        .n1_get_namespace_child(&root.original_parent_node_id, &root.original_name)
-                        .map_err(|e| map_indexdb_error("namespace recover conflict get", e))?
-                        .is_some()
-                    {
-                        return Err(AppError::Conflict(format!(
-                            "destination path '{}' already exists",
-                            root.original_path
-                        )));
-                    }
-                    write_txn
-                        .n1_move_namespace_node(
-                            &root.root_node_id,
-                            &root.original_parent_node_id,
-                            &root.original_name,
-                            changed_at,
-                        )
-                        .map_err(|e| map_indexdb_error("namespace recover node attach", e))?;
-                    write_txn
-                        .n1_set_namespace_trash_root_state(
-                            &root.trash_entry_id,
-                            n1_indexdb::TrashEntryState::Retired,
-                            changed_at,
-                        )
-                        .map_err(|e| map_indexdb_error("namespace trash root retire", e))?;
-                    let source_kind = namespace_kind_from_indexdb(root.kind);
-                    let affected_objects = usize::from(root.object_id.is_some());
-                    let mut mutation = NamespaceReplicaMutation {
-                        move_nodes: vec![NamespaceNodeMoveReplay {
-                            node_id: root.root_node_id.clone(),
-                            parent_node_id: root.original_parent_node_id.clone(),
-                            name: root.original_name.clone(),
-                            changed_at_unix: changed_at,
-                        }],
-                        set_trash_root_states: vec![(
-                            root.trash_entry_id.clone(),
-                            n1_indexdb::TrashEntryState::Retired,
-                            changed_at,
-                        )],
-                        ..Default::default()
-                    };
-                    seal_namespace_mutation(&write_txn, &mut mutation, changed_at)?;
-                    write_txn
-                        .commit()
-                        .map_err(|e| map_indexdb_error("namespace lifecycle commit", e))?;
-                    return Ok((
-                        NamespaceMutationSummary {
-                            operation: "recover".to_string(),
-                            kind: source_kind,
-                            affected_paths: 1,
-                            affected_objects,
-                            source_path: Some(root.original_path.clone()),
-                            destination_path: None,
-                            trash_entry_id: Some(root.trash_entry_id.clone()),
-                            deleted_at_unix: None,
-                        },
-                        mutation,
-                    ));
+            if matches!(target, n1_indexdb::NamespaceLifecycle::Live) {
+                let roots = sharded_list_trash_roots(
+                    &fragment_for_write,
+                    Some(n1_indexdb::TrashEntryState::Trashed),
+                )?
+                .into_iter()
+                .filter(|root| root.original_path == normalized)
+                .collect::<Vec<_>>();
+                if roots.len() > 1 {
+                    return Err(AppError::Conflict(format!(
+                        "trash path '{}' is ambiguous; use trash_entry_id",
+                        normalized
+                    )));
                 }
+                let Some(root) = roots.into_iter().next() else {
+                    return Err(AppError::NotFound);
+                };
+                let summary = sharded_recover_trash_root(
+                    &fragment_for_write,
+                    root,
+                    changed_at,
+                    &mut touched_shards,
+                    &mut mutations,
+                )?;
+                return Ok((summary, mutations));
+            }
 
-                Err(AppError::BadRequest(
-                    "unsupported namespace lifecycle transition".to_string(),
-                ))
-            })
+            Err(AppError::BadRequest(
+                "unsupported namespace lifecycle transition".to_string(),
+            ))
         })
         .await?;
-        replicate_namespace_mutation_for_fragment(self, &fragment_owned, &mutation)?;
+        replicate_namespace_shard_mutations(&fragment_owned, &mutations);
         Ok(summary)
     }
 
@@ -1480,90 +1524,35 @@ impl NamespaceRuntime {
         trash_entry_id: &str,
         target: n1_indexdb::NamespaceLifecycle,
     ) -> Result<NamespaceMutationSummary, AppError> {
-        let db = self.open_db(fragment)?;
         let fragment_owned = fragment.to_string();
+        let fragment_for_write = fragment.to_string();
         let trash_entry_id = trash_entry_id.to_string();
-        let owner_path = namespace_db_path(fragment)?;
         let changed_at = Utc::now().timestamp();
-        let (summary, mutation) = run_namespace_blocking(move || {
-            with_partition_commit_lock(&owner_path, || {
-                let write_txn = db
-                    .begin_write()
-                    .map_err(|e| map_indexdb_error("namespace recover id begin_write", e))?;
-                let Some(root) = db
-                    .n1_get_namespace_trash_root(&trash_entry_id)
-                    .map_err(|e| map_indexdb_error("namespace trash root id get", e))?
-                else {
-                    return Err(AppError::NotFound);
-                };
-                if root.state != n1_indexdb::TrashEntryState::Trashed {
-                    return Err(AppError::NotFound);
-                }
-                if !matches!(target, n1_indexdb::NamespaceLifecycle::Live) {
-                    return Err(AppError::BadRequest(
-                        "trash_entry_id lifecycle supports recover only".to_string(),
-                    ));
-                }
-                if write_txn
-                    .n1_get_namespace_child(&root.original_parent_node_id, &root.original_name)
-                    .map_err(|e| map_indexdb_error("namespace recover id conflict get", e))?
-                    .is_some()
-                {
-                    return Err(AppError::Conflict(format!(
-                        "destination path '{}' already exists",
-                        root.original_path
-                    )));
-                }
-                write_txn
-                    .n1_move_namespace_node(
-                        &root.root_node_id,
-                        &root.original_parent_node_id,
-                        &root.original_name,
-                        changed_at,
-                    )
-                    .map_err(|e| map_indexdb_error("namespace recover id node attach", e))?;
-                write_txn
-                    .n1_set_namespace_trash_root_state(
-                        &root.trash_entry_id,
-                        n1_indexdb::TrashEntryState::Retired,
-                        changed_at,
-                    )
-                    .map_err(|e| map_indexdb_error("namespace recover id root retire", e))?;
-                let mut mutation = NamespaceReplicaMutation {
-                    move_nodes: vec![NamespaceNodeMoveReplay {
-                        node_id: root.root_node_id.clone(),
-                        parent_node_id: root.original_parent_node_id.clone(),
-                        name: root.original_name.clone(),
-                        changed_at_unix: changed_at,
-                    }],
-                    set_trash_root_states: vec![(
-                        root.trash_entry_id.clone(),
-                        n1_indexdb::TrashEntryState::Retired,
-                        changed_at,
-                    )],
-                    ..Default::default()
-                };
-                seal_namespace_mutation(&write_txn, &mut mutation, changed_at)?;
-                write_txn
-                    .commit()
-                    .map_err(|e| map_indexdb_error("namespace recover id commit", e))?;
-                Ok((
-                    NamespaceMutationSummary {
-                        operation: "recover".to_string(),
-                        kind: namespace_kind_from_indexdb(root.kind),
-                        affected_paths: 1,
-                        affected_objects: usize::from(root.object_id.is_some()),
-                        source_path: Some(root.original_path.clone()),
-                        destination_path: None,
-                        trash_entry_id: Some(root.trash_entry_id.clone()),
-                        deleted_at_unix: None,
-                    },
-                    mutation,
-                ))
-            })
+        let (summary, mutations) = run_namespace_blocking(move || {
+            if !matches!(target, n1_indexdb::NamespaceLifecycle::Live) {
+                return Err(AppError::BadRequest(
+                    "trash_entry_id lifecycle supports recover only".to_string(),
+                ));
+            }
+            let Some(root) = sharded_get_trash_root(&fragment_for_write, &trash_entry_id)? else {
+                return Err(AppError::NotFound);
+            };
+            if root.state != n1_indexdb::TrashEntryState::Trashed {
+                return Err(AppError::NotFound);
+            }
+            let mut touched_shards = BTreeSet::new();
+            let mut mutations = BTreeMap::new();
+            let summary = sharded_recover_trash_root(
+                &fragment_for_write,
+                root,
+                changed_at,
+                &mut touched_shards,
+                &mut mutations,
+            )?;
+            Ok((summary, mutations))
         })
         .await?;
-        replicate_namespace_mutation_for_fragment(self, &fragment_owned, &mutation)?;
+        replicate_namespace_shard_mutations(&fragment_owned, &mutations);
         Ok(summary)
     }
 
@@ -1572,98 +1561,50 @@ impl NamespaceRuntime {
         fragment: &str,
         target: n1_indexdb::NamespaceLifecycle,
     ) -> Result<NamespaceMutationSummary, AppError> {
-        let db = self.open_db(fragment)?;
         let fragment_owned = fragment.to_string();
-        let owner_path = namespace_db_path(fragment)?;
+        let fragment_for_write = fragment.to_string();
         let changed_at = Utc::now().timestamp();
-        let (summary, mutation) = run_namespace_blocking(move || {
-            with_partition_commit_lock(&owner_path, || {
-                let write_txn = db
-                    .begin_write()
-                    .map_err(|e| map_indexdb_error("namespace lifecycle begin_write", e))?;
-                if !matches!(target, n1_indexdb::NamespaceLifecycle::Live) {
-                    return Err(AppError::BadRequest(
-                        "recover_all supports live target only".to_string(),
-                    ));
-                }
-                let mut roots = Vec::new();
-                let mut after = None;
-                loop {
-                    let page = db
-                        .n1_list_namespace_trash_roots_all(after.as_deref(), 1000)
-                        .map_err(|e| map_indexdb_error("namespace recover all roots list", e))?;
-                    if page.is_empty() {
-                        break;
-                    }
-                    after = page.last().map(|root| root.trash_entry_id.clone());
-                    roots.extend(
-                        page.into_iter()
-                            .filter(|root| root.state == n1_indexdb::TrashEntryState::Trashed),
-                    );
-                }
-                let mut mutation = NamespaceReplicaMutation::default();
-                let mut affected_objects = 0usize;
-                for root in roots.iter().cloned() {
-                    if write_txn
-                        .n1_get_namespace_child(&root.original_parent_node_id, &root.original_name)
-                        .map_err(|e| map_indexdb_error("namespace recover all conflict get", e))?
-                        .is_some()
-                    {
-                        return Err(AppError::Conflict(format!(
-                            "destination path '{}' already exists",
-                            root.original_path
-                        )));
-                    }
-                    write_txn
-                        .n1_move_namespace_node(
-                            &root.root_node_id,
-                            &root.original_parent_node_id,
-                            &root.original_name,
-                            changed_at,
-                        )
-                        .map_err(|e| map_indexdb_error("namespace recover all node attach", e))?;
-                    write_txn
-                        .n1_set_namespace_trash_root_state(
-                            &root.trash_entry_id,
-                            n1_indexdb::TrashEntryState::Retired,
-                            changed_at,
-                        )
-                        .map_err(|e| map_indexdb_error("namespace recover all root retire", e))?;
-                    affected_objects += usize::from(root.object_id.is_some());
-                    mutation.move_nodes.push(NamespaceNodeMoveReplay {
-                        node_id: root.root_node_id,
-                        parent_node_id: root.original_parent_node_id,
-                        name: root.original_name,
-                        changed_at_unix: changed_at,
-                    });
-                    mutation.set_trash_root_states.push((
-                        root.trash_entry_id,
-                        n1_indexdb::TrashEntryState::Retired,
-                        changed_at,
-                    ));
-                }
-                let affected_paths = mutation.move_nodes.len();
-                seal_namespace_mutation(&write_txn, &mut mutation, changed_at)?;
-                write_txn
-                    .commit()
-                    .map_err(|e| map_indexdb_error("namespace lifecycle commit", e))?;
-                Ok((
-                    NamespaceMutationSummary {
-                        operation: "recover".to_string(),
-                        kind: NamespaceEntryKind::Directory,
-                        affected_paths,
-                        affected_objects,
-                        source_path: None,
-                        destination_path: None,
-                        trash_entry_id: None,
-                        deleted_at_unix: None,
-                    },
-                    mutation,
-                ))
-            })
+        let (summary, mutations) = run_namespace_blocking(move || {
+            if !matches!(target, n1_indexdb::NamespaceLifecycle::Live) {
+                return Err(AppError::BadRequest(
+                    "recover_all supports live target only".to_string(),
+                ));
+            }
+            let roots = sharded_list_trash_roots(
+                &fragment_for_write,
+                Some(n1_indexdb::TrashEntryState::Trashed),
+            )?;
+            let mut touched_shards = BTreeSet::new();
+            let mut mutations = BTreeMap::new();
+            let mut affected_objects = 0usize;
+            let mut affected_paths = 0usize;
+            for root in roots {
+                let summary = sharded_recover_trash_root(
+                    &fragment_for_write,
+                    root,
+                    changed_at,
+                    &mut touched_shards,
+                    &mut mutations,
+                )?;
+                affected_paths += summary.affected_paths;
+                affected_objects += summary.affected_objects;
+            }
+            Ok((
+                NamespaceMutationSummary {
+                    operation: "recover".to_string(),
+                    kind: NamespaceEntryKind::Directory,
+                    affected_paths,
+                    affected_objects,
+                    source_path: None,
+                    destination_path: None,
+                    trash_entry_id: None,
+                    deleted_at_unix: None,
+                },
+                mutations,
+            ))
         })
         .await?;
-        replicate_namespace_mutation_for_fragment(self, &fragment_owned, &mutation)?;
+        replicate_namespace_shard_mutations(&fragment_owned, &mutations);
         Ok(summary)
     }
 
@@ -1674,145 +1615,120 @@ impl NamespaceRuntime {
         trash_entry_id: Option<String>,
     ) -> Result<NamespaceMutationSummary, AppError> {
         let normalized = normalize_path(path).map_err(namespace_error_to_app)?;
-        let db = self.open_db(fragment)?;
         let fragment_owned = fragment.to_string();
-        let owner_path = namespace_db_path(fragment)?;
-        let (summary, mutation) = run_namespace_blocking(move || {
-            with_partition_commit_lock(&owner_path, || {
-                let write_txn = db
-                    .begin_write()
-                    .map_err(|e| map_indexdb_error("namespace purge begin_write", e))?;
-                let root = if let Some(trash_entry_id) = trash_entry_id.as_deref() {
-                    db.n1_get_namespace_trash_root(trash_entry_id)
-                        .map_err(|e| map_indexdb_error("namespace purge root id get", e))?
-                } else {
-                    let roots = db
-                        .n1_list_namespace_trash_roots_by_path(
-                            &normalized,
-                            n1_indexdb::TrashEntryState::Trashed,
-                        )
-                        .map_err(|e| map_indexdb_error("namespace purge root path get", e))?;
-                    if roots.len() > 1 {
-                        return Err(AppError::Conflict(format!(
-                            "trash path '{}' is ambiguous; use trash_entry_id",
-                            normalized
-                        )));
-                    }
-                    roots.into_iter().next()
-                };
-                let Some(root) = root else {
-                    return Err(AppError::NotFound);
-                };
-                if root.state != n1_indexdb::TrashEntryState::Trashed {
-                    return Err(AppError::NotFound);
+        let fragment_for_write = fragment.to_string();
+        let (summary, mutations) = run_namespace_blocking(move || {
+            let root = if let Some(trash_entry_id) = trash_entry_id.as_deref() {
+                sharded_get_trash_root(&fragment_for_write, trash_entry_id)?
+            } else {
+                let roots = sharded_list_trash_roots(
+                    &fragment_for_write,
+                    Some(n1_indexdb::TrashEntryState::Trashed),
+                )?
+                .into_iter()
+                .filter(|root| root.original_path == normalized)
+                .collect::<Vec<_>>();
+                if roots.len() > 1 {
+                    return Err(AppError::Conflict(format!(
+                        "trash path '{}' is ambiguous; use trash_entry_id",
+                        normalized
+                    )));
                 }
-                let changed_at = Utc::now().timestamp();
-                write_txn
-                    .n1_set_namespace_trash_root_state(
-                        &root.trash_entry_id,
-                        n1_indexdb::TrashEntryState::Purged,
-                        changed_at,
-                    )
-                    .map_err(|e| map_indexdb_error("namespace trash root purge", e))?;
-                let mut mutation = NamespaceReplicaMutation {
-                    set_trash_root_states: vec![(
-                        root.trash_entry_id.clone(),
-                        n1_indexdb::TrashEntryState::Purged,
-                        changed_at,
-                    )],
-                    ..Default::default()
-                };
-                seal_namespace_mutation(&write_txn, &mut mutation, changed_at)?;
-                write_txn
-                    .commit()
-                    .map_err(|e| map_indexdb_error("namespace purge commit", e))?;
-                Ok((
-                    NamespaceMutationSummary {
-                        operation: "purge_trash".to_string(),
-                        kind: namespace_kind_from_indexdb(root.kind),
-                        affected_paths: 1,
-                        affected_objects: usize::from(root.object_id.is_some()),
-                        source_path: Some(root.original_path.clone()),
-                        destination_path: None,
-                        trash_entry_id: Some(root.trash_entry_id.clone()),
-                        deleted_at_unix: None,
-                    },
-                    mutation,
-                ))
-            })
+                roots.into_iter().next()
+            };
+            let Some(root) = root else {
+                return Err(AppError::NotFound);
+            };
+            if root.state != n1_indexdb::TrashEntryState::Trashed {
+                return Err(AppError::NotFound);
+            }
+            let changed_at = Utc::now().timestamp();
+            let mut touched_shards = BTreeSet::new();
+            let partition_meta = sharded_set_trash_root_state(
+                &fragment_for_write,
+                &root.trash_entry_id,
+                n1_indexdb::TrashEntryState::Purged,
+                changed_at,
+                &mut touched_shards,
+            )?;
+            let mut mutations = BTreeMap::new();
+            let trash_shard = namespace_trash_shard_id(&fragment_for_write, &root.trash_entry_id)?;
+            let mutation = mutations.entry(trash_shard).or_default();
+            set_namespace_mutation_partition_meta(mutation, partition_meta);
+            mutation.set_trash_root_states.push((
+                root.trash_entry_id.clone(),
+                n1_indexdb::TrashEntryState::Purged,
+                changed_at,
+            ));
+            Ok((
+                NamespaceMutationSummary {
+                    operation: "purge_trash".to_string(),
+                    kind: namespace_kind_from_indexdb(root.kind),
+                    affected_paths: 1,
+                    affected_objects: usize::from(root.object_id.is_some()),
+                    source_path: Some(root.original_path.clone()),
+                    destination_path: None,
+                    trash_entry_id: Some(root.trash_entry_id.clone()),
+                    deleted_at_unix: None,
+                },
+                mutations,
+            ))
         })
         .await?;
-        replicate_namespace_mutation_for_fragment(self, &fragment_owned, &mutation)?;
+        replicate_namespace_shard_mutations(&fragment_owned, &mutations);
         Ok(summary)
     }
 
     async fn purge_all_trash(&self, fragment: &str) -> Result<NamespaceMutationSummary, AppError> {
-        let db = self.open_db(fragment)?;
         let fragment_owned = fragment.to_string();
-        let owner_path = namespace_db_path(fragment)?;
-        let (summary, mutation) = run_namespace_blocking(move || {
-            with_partition_commit_lock(&owner_path, || {
-                let write_txn = db
-                    .begin_write()
-                    .map_err(|e| map_indexdb_error("namespace empty trash begin_write", e))?;
-                let mut roots = Vec::new();
-                let mut after = None;
-                loop {
-                    let page = db
-                        .n1_list_namespace_trash_roots_all(after.as_deref(), 1000)
-                        .map_err(|e| map_indexdb_error("namespace empty trash roots list", e))?;
-                    if page.is_empty() {
-                        break;
-                    }
-                    after = page.last().map(|root| root.trash_entry_id.clone());
-                    roots.extend(
-                        page.into_iter()
-                            .filter(|root| root.state == n1_indexdb::TrashEntryState::Trashed),
-                    );
-                }
-                if roots.is_empty() {
-                    return Err(AppError::NotFound);
-                }
-                let changed_at = Utc::now().timestamp();
-                let mut mutation = NamespaceReplicaMutation::default();
-                let mut affected_objects = 0usize;
-                for root in roots {
-                    write_txn
-                        .n1_set_namespace_trash_root_state(
-                            &root.trash_entry_id,
-                            n1_indexdb::TrashEntryState::Purged,
-                            changed_at,
-                        )
-                        .map_err(|e| map_indexdb_error("namespace trash root purge", e))?;
-                    affected_objects += usize::from(root.object_id.is_some());
-                    mutation.set_trash_root_states.push((
-                        root.trash_entry_id,
-                        n1_indexdb::TrashEntryState::Purged,
-                        changed_at,
-                    ));
-                }
-                let affected_paths = mutation.set_trash_root_states.len();
-                seal_namespace_mutation(&write_txn, &mut mutation, changed_at)?;
-                write_txn
-                    .commit()
-                    .map_err(|e| map_indexdb_error("namespace empty trash commit", e))?;
-                Ok((
-                    NamespaceMutationSummary {
-                        operation: "purge_trash".to_string(),
-                        kind: NamespaceEntryKind::Directory,
-                        affected_paths,
-                        affected_objects,
-                        source_path: None,
-                        destination_path: None,
-                        trash_entry_id: None,
-                        deleted_at_unix: None,
-                    },
-                    mutation,
-                ))
-            })
+        let fragment_for_write = fragment.to_string();
+        let (summary, mutations) = run_namespace_blocking(move || {
+            let roots = sharded_list_trash_roots(
+                &fragment_for_write,
+                Some(n1_indexdb::TrashEntryState::Trashed),
+            )?;
+            if roots.is_empty() {
+                return Err(AppError::NotFound);
+            }
+            let changed_at = Utc::now().timestamp();
+            let mut touched_shards = BTreeSet::new();
+            let mut mutations = BTreeMap::new();
+            let mut affected_objects = 0usize;
+            for root in &roots {
+                let partition_meta = sharded_set_trash_root_state(
+                    &fragment_for_write,
+                    &root.trash_entry_id,
+                    n1_indexdb::TrashEntryState::Purged,
+                    changed_at,
+                    &mut touched_shards,
+                )?;
+                let trash_shard =
+                    namespace_trash_shard_id(&fragment_for_write, &root.trash_entry_id)?;
+                let mutation = mutations.entry(trash_shard).or_default();
+                set_namespace_mutation_partition_meta(mutation, partition_meta);
+                mutation.set_trash_root_states.push((
+                    root.trash_entry_id.clone(),
+                    n1_indexdb::TrashEntryState::Purged,
+                    changed_at,
+                ));
+                affected_objects += usize::from(root.object_id.is_some());
+            }
+            Ok((
+                NamespaceMutationSummary {
+                    operation: "purge_trash".to_string(),
+                    kind: NamespaceEntryKind::Directory,
+                    affected_paths: roots.len(),
+                    affected_objects,
+                    source_path: None,
+                    destination_path: None,
+                    trash_entry_id: None,
+                    deleted_at_unix: None,
+                },
+                mutations,
+            ))
         })
         .await?;
-        replicate_namespace_mutation_for_fragment(self, &fragment_owned, &mutation)?;
+        replicate_namespace_shard_mutations(&fragment_owned, &mutations);
         Ok(summary)
     }
 }
@@ -1858,141 +1774,374 @@ fn root_namespace_node(changed_at: i64) -> n1_indexdb::NamespaceNode {
     }
 }
 
-fn ensure_namespace_root(
-    write_txn: &indexdb::WriteTransaction,
-    changed_at: i64,
+fn sharded_get_namespace_child(
+    fragment: &str,
+    parent_node_id: &str,
+    name: &str,
 ) -> Result<Option<n1_indexdb::NamespaceNode>, AppError> {
-    if write_txn
-        .n1_get_namespace_node(NAMESPACE_ROOT_NODE_ID)
-        .map_err(|e| map_indexdb_error("namespace root get", e))?
-        .is_some()
-    {
+    let home_shard_id = namespace_node_shard_id(fragment, Some(parent_node_id), name)?;
+    if let Some(db) = open_existing_namespace_shard_db(fragment, home_shard_id)? {
+        if let Some(node) = db
+            .n1_get_namespace_child(parent_node_id, name)
+            .map_err(|e| map_indexdb_error("sharded namespace child home get", e))?
+        {
+            return Ok(Some(node));
+        }
+    }
+
+    let shard_count = namespace_shard_count(fragment)?;
+    let mut best: Option<(n1_indexdb::NamespaceNode, bool)> = None;
+    for shard_id in 0..shard_count {
+        if shard_id == home_shard_id {
+            continue;
+        }
+        for (db, is_owner_copy) in open_all_existing_namespace_shard_dbs(fragment, shard_id)? {
+            let Some(node) = db
+                .n1_get_namespace_child(parent_node_id, name)
+                .map_err(|e| map_indexdb_error("sharded namespace child fallback get", e))?
+            else {
+                continue;
+            };
+            let preferred_copy = is_owner_copy;
+            match best.as_mut() {
+                Some((existing, existing_preferred)) => {
+                    if node.updated_at_unix > existing.updated_at_unix
+                        || (node.updated_at_unix == existing.updated_at_unix
+                            && preferred_copy
+                            && !*existing_preferred)
+                    {
+                        *existing = node;
+                        *existing_preferred = preferred_copy;
+                    }
+                }
+                None => best = Some((node, preferred_copy)),
+            }
+        }
+    }
+    Ok(best.map(|(node, _)| node))
+}
+
+fn sharded_get_namespace_child_home(
+    fragment: &str,
+    parent_node_id: &str,
+    name: &str,
+) -> Result<Option<n1_indexdb::NamespaceNode>, AppError> {
+    let home_shard_id = namespace_node_shard_id(fragment, Some(parent_node_id), name)?;
+    if let Some(db) = open_existing_namespace_shard_db(fragment, home_shard_id)? {
+        if let Some(node) = db
+            .n1_get_namespace_child(parent_node_id, name)
+            .map_err(|e| map_indexdb_error("sharded namespace child get", e))?
+        {
+            return Ok(Some(node));
+        }
+    }
+    Ok(None)
+}
+
+fn sharded_get_namespace_node(
+    fragment: &str,
+    node_id: &str,
+) -> Result<Option<n1_indexdb::NamespaceNode>, AppError> {
+    if node_id == NAMESPACE_ROOT_NODE_ID {
+        return Ok(Some(root_namespace_node(0)));
+    }
+    let shard_count = namespace_shard_count(fragment)?;
+    let mut best: Option<n1_indexdb::NamespaceNode> = None;
+    for shard_id in 0..shard_count {
+        for (db, _) in open_all_existing_namespace_shard_dbs(fragment, shard_id)? {
+            if let Some(node) = db
+                .n1_get_namespace_node(node_id)
+                .map_err(|e| map_indexdb_error("sharded namespace node get", e))?
+            {
+                if best
+                    .as_ref()
+                    .map(|existing| node.updated_at_unix > existing.updated_at_unix)
+                    .unwrap_or(true)
+                {
+                    best = Some(node);
+                }
+            }
+        }
+    }
+    Ok(best)
+}
+
+fn sharded_resolve_live_node(
+    fragment: &str,
+    path: &str,
+) -> Result<Option<(String, n1_indexdb::NamespaceNode)>, AppError> {
+    if path.is_empty() {
+        return Ok(Some((String::new(), root_namespace_node(0))));
+    }
+    let mut current = root_namespace_node(0);
+    let mut current_path = String::new();
+    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+        let Some(child) = sharded_get_namespace_child(fragment, &current.node_id, segment)? else {
+            return Ok(None);
+        };
+        current_path = join_path(&current_path, segment);
+        current = child;
+    }
+    Ok(Some((current_path, current)))
+}
+
+fn sharded_resolve_live_node_home(
+    fragment: &str,
+    path: &str,
+) -> Result<Option<(String, n1_indexdb::NamespaceNode)>, AppError> {
+    if path.is_empty() {
+        return Ok(Some((String::new(), root_namespace_node(0))));
+    }
+    let mut current = root_namespace_node(0);
+    let mut current_path = String::new();
+    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+        let Some(child) = sharded_get_namespace_child_home(fragment, &current.node_id, segment)?
+        else {
+            return Ok(None);
+        };
+        current_path = join_path(&current_path, segment);
+        current = child;
+    }
+    Ok(Some((current_path, current)))
+}
+
+fn sharded_resolve_live_node_home_or_fallback(
+    fragment: &str,
+    path: &str,
+) -> Result<Option<(String, n1_indexdb::NamespaceNode)>, AppError> {
+    match sharded_resolve_live_node_home(fragment, path)? {
+        Some(node) => Ok(Some(node)),
+        None => sharded_resolve_live_node(fragment, path),
+    }
+}
+
+fn sharded_get_namespace_child_home_or_fallback(
+    fragment: &str,
+    parent_node_id: &str,
+    name: &str,
+) -> Result<Option<n1_indexdb::NamespaceNode>, AppError> {
+    match sharded_get_namespace_child_home(fragment, parent_node_id, name)? {
+        Some(node) => Ok(Some(node)),
+        None => sharded_get_namespace_child(fragment, parent_node_id, name),
+    }
+}
+
+fn sharded_get_current_namespace_child_home(
+    fragment: &str,
+    parent_node_id: &str,
+    name: &str,
+) -> Result<Option<n1_indexdb::NamespaceNode>, AppError> {
+    let Some(node) = sharded_get_namespace_child_home(fragment, parent_node_id, name)? else {
         return Ok(None);
+    };
+    let Some(current) = sharded_get_namespace_node(fragment, &node.node_id)? else {
+        return Ok(None);
+    };
+    if current.parent_node_id.as_deref() == Some(parent_node_id) && current.name == name {
+        Ok(Some(current))
+    } else {
+        Ok(None)
     }
-    let root = root_namespace_node(changed_at);
-    write_txn
-        .n1_upsert_namespace_node(&root)
-        .map_err(|e| map_indexdb_error("namespace root upsert", e))?;
-    Ok(Some(root))
 }
 
-fn resolve_live_node_on_db(
-    db: &Database,
-    path: &str,
-) -> Result<Option<(String, n1_indexdb::NamespaceNode)>, AppError> {
-    if path.is_empty() {
-        let root = db
-            .n1_get_namespace_node(NAMESPACE_ROOT_NODE_ID)
-            .map_err(|e| map_indexdb_error("namespace root get", e))?
-            .unwrap_or_else(|| root_namespace_node(0));
-        return Ok(Some((String::new(), root)));
-    }
-
-    let mut current = db
-        .n1_get_namespace_node(NAMESPACE_ROOT_NODE_ID)
-        .map_err(|e| map_indexdb_error("namespace root get", e))?
-        .unwrap_or_else(|| root_namespace_node(0));
-    let mut current_path = String::new();
-    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
-        let Some(child) = db
-            .n1_get_namespace_child(&current.node_id, segment)
-            .map_err(|e| map_indexdb_error("namespace child get", e))?
-        else {
-            return Ok(None);
-        };
-        current_path = join_path(&current_path, segment);
-        current = child;
-    }
-    Ok(Some((current_path, current)))
-}
-
-fn resolve_live_node_on_txn(
-    write_txn: &indexdb::WriteTransaction,
-    path: &str,
-) -> Result<Option<(String, n1_indexdb::NamespaceNode)>, AppError> {
-    if path.is_empty() {
-        let root = write_txn
-            .n1_get_namespace_node(NAMESPACE_ROOT_NODE_ID)
-            .map_err(|e| map_indexdb_error("namespace root get", e))?
-            .unwrap_or_else(|| root_namespace_node(0));
-        return Ok(Some((String::new(), root)));
-    }
-
-    let mut current = write_txn
-        .n1_get_namespace_node(NAMESPACE_ROOT_NODE_ID)
-        .map_err(|e| map_indexdb_error("namespace root get", e))?
-        .unwrap_or_else(|| root_namespace_node(0));
-    let mut current_path = String::new();
-    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
-        let Some(child) = write_txn
-            .n1_get_namespace_child(&current.node_id, segment)
-            .map_err(|e| map_indexdb_error("namespace child get", e))?
-        else {
-            return Ok(None);
-        };
-        current_path = join_path(&current_path, segment);
-        current = child;
-    }
-    Ok(Some((current_path, current)))
-}
-
-fn resolve_relative_node_on_db(
-    db: &Database,
-    root_node_id: &str,
-    relative_path: &str,
-) -> Result<Option<n1_indexdb::NamespaceNode>, AppError> {
-    let mut current = db
-        .n1_get_namespace_node(root_node_id)
-        .map_err(|e| map_indexdb_error("namespace relative root get", e))?;
-    for segment in relative_path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-    {
-        let Some(node) = current else {
-            return Ok(None);
-        };
-        current = db
-            .n1_get_namespace_child(&node.node_id, segment)
-            .map_err(|e| map_indexdb_error("namespace relative child get", e))?;
-    }
-    Ok(current)
-}
-
-fn ensure_directory_path_nodes(
-    write_txn: &indexdb::WriteTransaction,
-    path: &str,
-    changed_at: i64,
+fn sharded_list_namespace_children(
+    fragment: &str,
+    parent_node_id: &str,
+    after_name: Option<&str>,
+    limit: usize,
 ) -> Result<Vec<n1_indexdb::NamespaceNode>, AppError> {
-    let mut created = Vec::new();
-    if let Some(root) = ensure_namespace_root(write_txn, changed_at)? {
-        created.push(root);
+    let shard_count = namespace_shard_count(fragment)?;
+    let mut nodes_by_id: HashMap<String, (n1_indexdb::NamespaceNode, bool)> = HashMap::new();
+    for shard_id in 0..shard_count {
+        for (db, is_owner_copy) in open_all_existing_namespace_shard_dbs(fragment, shard_id)? {
+            for node in db
+                .n1_list_namespace_node_children(parent_node_id, after_name, limit)
+                .map_err(|e| map_indexdb_error("sharded namespace child list", e))?
+            {
+                let preferred_copy =
+                    namespace_node_shard_id(fragment, node.parent_node_id.as_deref(), &node.name)
+                        .map(|expected| expected == shard_id && is_owner_copy)
+                        .unwrap_or(false);
+                match nodes_by_id.get_mut(&node.node_id) {
+                    Some((existing, existing_preferred)) => {
+                        if node.updated_at_unix > existing.updated_at_unix
+                            || (node.updated_at_unix == existing.updated_at_unix
+                                && preferred_copy
+                                && !*existing_preferred)
+                        {
+                            *existing = node;
+                            *existing_preferred = preferred_copy;
+                        }
+                    }
+                    None => {
+                        nodes_by_id.insert(node.node_id.clone(), (node, preferred_copy));
+                    }
+                }
+            }
+        }
     }
-    if path.is_empty() {
-        return Ok(created);
+    let mut nodes = nodes_by_id
+        .into_values()
+        .map(|(node, _)| node)
+        .collect::<Vec<_>>();
+    nodes.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then(left.node_id.cmp(&right.node_id))
+    });
+    nodes.truncate(limit);
+    Ok(nodes)
+}
+
+struct NamespaceListingSnapshot {
+    children_by_parent: HashMap<String, Vec<n1_indexdb::NamespaceNode>>,
+    file_heads_by_node: HashMap<String, n1_indexdb::NamespaceFileHead>,
+}
+
+fn sharded_namespace_listing_snapshot(
+    fragment: &str,
+) -> Result<NamespaceListingSnapshot, AppError> {
+    let shard_count = namespace_shard_count(fragment)?;
+    let mut nodes_by_id: HashMap<String, (n1_indexdb::NamespaceNode, bool)> = HashMap::new();
+    let mut file_heads_by_node: HashMap<String, n1_indexdb::NamespaceFileHead> = HashMap::new();
+
+    for shard_id in 0..shard_count {
+        for (db, is_owner_copy) in open_all_existing_namespace_shard_dbs(fragment, shard_id)? {
+            let mut after_node_id = None;
+            loop {
+                let page = db
+                    .n1_list_namespace_nodes(after_node_id.as_deref(), 1000)
+                    .map_err(|e| map_indexdb_error("sharded namespace node snapshot", e))?;
+                if page.is_empty() {
+                    break;
+                }
+                after_node_id = page.last().map(|node| node.node_id.clone());
+                for node in page {
+                    let preferred_copy = namespace_node_shard_id(
+                        fragment,
+                        node.parent_node_id.as_deref(),
+                        &node.name,
+                    )
+                    .map(|expected| expected == shard_id && is_owner_copy)
+                    .unwrap_or(false);
+                    match nodes_by_id.get_mut(&node.node_id) {
+                        Some((existing, existing_preferred)) => {
+                            if node.updated_at_unix > existing.updated_at_unix
+                                || (node.updated_at_unix == existing.updated_at_unix
+                                    && preferred_copy
+                                    && !*existing_preferred)
+                            {
+                                *existing = node;
+                                *existing_preferred = preferred_copy;
+                            }
+                        }
+                        None => {
+                            nodes_by_id.insert(node.node_id.clone(), (node, preferred_copy));
+                        }
+                    }
+                }
+            }
+
+            let mut after_head_node_id = None;
+            loop {
+                let page = db
+                    .n1_list_namespace_file_heads(after_head_node_id.as_deref(), 1000)
+                    .map_err(|e| map_indexdb_error("sharded namespace head snapshot", e))?;
+                if page.is_empty() {
+                    break;
+                }
+                after_head_node_id = page.last().map(|head| head.node_id.clone());
+                for head in page {
+                    match file_heads_by_node.get_mut(&head.node_id) {
+                        Some(existing) => {
+                            if head.updated_at_unix > existing.updated_at_unix
+                                || (head.updated_at_unix == existing.updated_at_unix
+                                    && head.version_id > existing.version_id)
+                            {
+                                *existing = head;
+                            }
+                        }
+                        None => {
+                            file_heads_by_node.insert(head.node_id.clone(), head);
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    let mut current = write_txn
-        .n1_get_namespace_node(NAMESPACE_ROOT_NODE_ID)
-        .map_err(|e| map_indexdb_error("namespace root get", e))?
-        .unwrap_or_else(|| root_namespace_node(changed_at));
-    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
-        if let Some(existing) = write_txn
-            .n1_get_namespace_child(&current.node_id, segment)
-            .map_err(|e| map_indexdb_error("namespace mkdir child get", e))?
+    let mut children_by_parent: HashMap<String, Vec<n1_indexdb::NamespaceNode>> = HashMap::new();
+    for (node, _) in nodes_by_id.into_values() {
+        let Some(parent) = node.parent_node_id.clone() else {
+            continue;
+        };
+        children_by_parent.entry(parent).or_default().push(node);
+    }
+    for children in children_by_parent.values_mut() {
+        children.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(left.node_id.cmp(&right.node_id))
+        });
+    }
+
+    Ok(NamespaceListingSnapshot {
+        children_by_parent,
+        file_heads_by_node,
+    })
+}
+
+fn sharded_get_or_create_directory_child(
+    fragment: &str,
+    parent_node: &n1_indexdb::NamespaceNode,
+    name: &str,
+    changed_at: i64,
+    touched_shards: &mut BTreeSet<u16>,
+) -> Result<(n1_indexdb::NamespaceNode, bool, Option<PartitionMeta>), AppError> {
+    let shard_id = namespace_node_shard_id(fragment, Some(&parent_node.node_id), name)?;
+    if let Some(db) = open_existing_namespace_shard_db(fragment, shard_id)? {
+        if let Some(existing) = db
+            .n1_get_namespace_child(&parent_node.node_id, name)
+            .map_err(|e| map_indexdb_error("sharded namespace mkdir child read", e))?
         {
             if existing.kind == n1_indexdb::NamespaceEntryKind::File {
                 return Err(AppError::Conflict(format!(
                     "path '{}' already exists as a file",
-                    segment
+                    name
                 )));
             }
-            current = existing;
-            continue;
+            return Ok((existing, false, None));
         }
+    }
+
+    let db = open_namespace_owner_shard_db(fragment, shard_id)?;
+    let path = namespace_shard_paths(fragment, shard_id)?[0].clone();
+    let mut created = false;
+    let mut partition_meta = None;
+    let node = with_partition_commit_lock(&path, || {
+        let write_txn = db
+            .begin_write()
+            .map_err(|e| map_indexdb_error("sharded namespace mkdir begin_write", e))?;
+        if let Some(existing) = write_txn
+            .n1_get_namespace_child(&parent_node.node_id, name)
+            .map_err(|e| map_indexdb_error("sharded namespace mkdir child get", e))?
+        {
+            if existing.kind == n1_indexdb::NamespaceEntryKind::File {
+                return Err(AppError::Conflict(format!(
+                    "path '{}' already exists as a file",
+                    name
+                )));
+            }
+            write_txn
+                .commit()
+                .map_err(|e| map_indexdb_error("sharded namespace mkdir existing commit", e))?;
+            return Ok(existing);
+        }
+
         let node = n1_indexdb::NamespaceNode {
             node_id: new_namespace_node_id(),
-            parent_node_id: Some(current.node_id.clone()),
-            name: segment.to_string(),
+            parent_node_id: Some(parent_node.node_id.clone()),
+            name: name.to_string(),
             kind: n1_indexdb::NamespaceEntryKind::Directory,
             object_id: None,
             head_version_id: None,
@@ -2001,11 +2150,880 @@ fn ensure_directory_path_nodes(
         };
         write_txn
             .n1_upsert_namespace_node(&node)
-            .map_err(|e| map_indexdb_error("namespace mkdir node upsert", e))?;
-        current = node.clone();
-        created.push(node);
+            .map_err(|e| map_indexdb_error("sharded namespace mkdir node upsert", e))?;
+        partition_meta = Some(bump_namespace_shard_generation(&write_txn, changed_at)?);
+        write_txn
+            .commit()
+            .map_err(|e| map_indexdb_error("sharded namespace mkdir commit", e))?;
+        created = true;
+        Ok(node)
+    })?;
+    if created {
+        touched_shards.insert(shard_id);
+    }
+    Ok((node, created, partition_meta))
+}
+
+fn sharded_move_namespace_node(
+    fragment: &str,
+    node: &n1_indexdb::NamespaceNode,
+    parent_node_id: &str,
+    name: &str,
+    changed_at: i64,
+    touched_shards: &mut BTreeSet<u16>,
+) -> Result<ShardedNamespaceMove, AppError> {
+    let old_shard = namespace_node_shard_id(fragment, node.parent_node_id.as_deref(), &node.name)?;
+    let new_shard = namespace_node_shard_id(fragment, Some(parent_node_id), name)?;
+    let mut moved = node.clone();
+    moved.parent_node_id = Some(parent_node_id.to_string());
+    moved.name = name.to_string();
+    moved.updated_at_unix = changed_at;
+    if old_shard == new_shard {
+        let db = open_namespace_owner_shard_db(fragment, old_shard)?;
+        let path = namespace_shard_paths(fragment, old_shard)?[0].clone();
+        let old_partition_meta = with_partition_commit_lock(&path, || {
+            let write_txn = db
+                .begin_write()
+                .map_err(|e| map_indexdb_error("sharded namespace move begin_write", e))?;
+            write_txn
+                .n1_move_namespace_node(&node.node_id, parent_node_id, name, changed_at)
+                .map_err(|e| map_indexdb_error("sharded namespace move", e))?;
+            let partition_meta = bump_namespace_shard_generation(&write_txn, changed_at)?;
+            write_txn
+                .commit()
+                .map_err(|e| map_indexdb_error("sharded namespace move commit", e))?;
+            Ok(partition_meta)
+        })?;
+        touched_shards.insert(old_shard);
+        return Ok(ShardedNamespaceMove {
+            moved_node: moved,
+            old_shard,
+            new_shard,
+            old_partition_meta,
+            new_partition_meta: None,
+            file_head: None,
+        });
+    } else {
+        let file_head = sharded_file_head_for_node(fragment, node)?;
+        let old_db = open_namespace_owner_shard_db(fragment, old_shard)?;
+        let old_path = namespace_shard_paths(fragment, old_shard)?[0].clone();
+        let old_partition_meta = with_partition_commit_lock(&old_path, || {
+            let write_txn = old_db
+                .begin_write()
+                .map_err(|e| map_indexdb_error("sharded namespace delete begin_write", e))?;
+            write_txn
+                .n1_delete_namespace_node(&node.node_id)
+                .map_err(|e| map_indexdb_error("sharded namespace old node delete", e))?;
+            let partition_meta = bump_namespace_shard_generation(&write_txn, changed_at)?;
+            write_txn
+                .commit()
+                .map_err(|e| map_indexdb_error("sharded namespace delete commit", e))?;
+            Ok(partition_meta)
+        })?;
+        let new_db = open_namespace_owner_shard_db(fragment, new_shard)?;
+        let new_path = namespace_shard_paths(fragment, new_shard)?[0].clone();
+        let new_partition_meta = with_partition_commit_lock(&new_path, || {
+            let write_txn = new_db
+                .begin_write()
+                .map_err(|e| map_indexdb_error("sharded namespace reinsert begin_write", e))?;
+            write_txn
+                .n1_upsert_namespace_node(&moved)
+                .map_err(|e| map_indexdb_error("sharded namespace reinsert node", e))?;
+            if let Some(head) = &file_head {
+                write_txn
+                    .n1_upsert_namespace_file_head(head)
+                    .map_err(|e| map_indexdb_error("sharded namespace reinsert file head", e))?;
+            }
+            let partition_meta = bump_namespace_shard_generation(&write_txn, changed_at)?;
+            write_txn
+                .commit()
+                .map_err(|e| map_indexdb_error("sharded namespace reinsert commit", e))?;
+            Ok(partition_meta)
+        })?;
+        touched_shards.insert(old_shard);
+        touched_shards.insert(new_shard);
+        return Ok(ShardedNamespaceMove {
+            moved_node: moved,
+            old_shard,
+            new_shard,
+            old_partition_meta,
+            new_partition_meta: Some(new_partition_meta),
+            file_head,
+        });
+    }
+}
+
+fn sharded_ensure_directory_path_nodes(
+    fragment: &str,
+    path: &str,
+    changed_at: i64,
+    touched_shards: &mut BTreeSet<u16>,
+) -> Result<Vec<(n1_indexdb::NamespaceNode, PartitionMeta)>, AppError> {
+    let mut created = Vec::new();
+    if path.is_empty() {
+        return Ok(created);
+    }
+    let mut current = root_namespace_node(changed_at);
+    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+        let (node, was_created, partition_meta) = sharded_get_or_create_directory_child(
+            fragment,
+            &current,
+            segment,
+            changed_at,
+            touched_shards,
+        )?;
+        if was_created && let Some(partition_meta) = partition_meta {
+            created.push((node.clone(), partition_meta));
+        }
+        current = node;
     }
     Ok(created)
+}
+
+fn sharded_file_head_for_node(
+    fragment: &str,
+    node: &n1_indexdb::NamespaceNode,
+) -> Result<Option<n1_indexdb::NamespaceFileHead>, AppError> {
+    let shard_id = namespace_node_shard_id(fragment, node.parent_node_id.as_deref(), &node.name)?;
+    let Some(db) = open_existing_namespace_shard_db(fragment, shard_id)? else {
+        return Ok(None);
+    };
+    db.n1_get_namespace_file_head(&node.node_id)
+        .map_err(|e| map_indexdb_error("sharded namespace file head get", e))
+}
+
+fn namespace_summary_from_node_head(
+    path: String,
+    head: n1_indexdb::NamespaceFileHead,
+) -> n1_indexdb::NamespaceObjectSummary {
+    n1_indexdb::NamespaceObjectSummary {
+        path,
+        version_id: head.version_id,
+        upload_session_id: head.upload_session_id,
+        owner_uid: head.owner_uid,
+        content_type: head.content_type,
+        total_size_bytes: head.total_size_bytes,
+        created_at_unix: head.created_at_unix,
+        is_delete_marker: head.is_delete_marker,
+        stripe_size_bytes: head.stripe_size_bytes,
+    }
+}
+
+fn namespace_summary_from_metadata(
+    path: String,
+    metadata: ObjectMetadata,
+) -> Result<n1_indexdb::NamespaceObjectSummary, AppError> {
+    let stripe_size_bytes = u64::try_from(metadata.stripe_size_bytes).map_err(|_| {
+        AppError::InternalServerError(format!(
+            "stripe size {} does not fit in u64",
+            metadata.stripe_size_bytes
+        ))
+    })?;
+    Ok(n1_indexdb::NamespaceObjectSummary {
+        path,
+        version_id: metadata.version_id,
+        upload_session_id: metadata.upload_session_id,
+        owner_uid: metadata.owner_uid,
+        content_type: metadata.content_type,
+        total_size_bytes: metadata.total_size_bytes,
+        created_at_unix: metadata.created_at,
+        is_delete_marker: metadata.is_delete_marker,
+        stripe_size_bytes,
+    })
+}
+
+fn sharded_list_live_object_summaries(
+    fragment: &str,
+    prefix: Option<&str>,
+    after_path: Option<&str>,
+    limit: usize,
+    include_internal: bool,
+) -> Result<Vec<n1_indexdb::NamespaceObjectSummary>, AppError> {
+    let snapshot = sharded_namespace_listing_snapshot(fragment)?;
+    let mut rows = BTreeMap::new();
+    let mut stack = vec![(String::new(), root_namespace_node(0))];
+    while let Some((base_path, node)) = stack.pop() {
+        if node.kind == n1_indexdb::NamespaceEntryKind::File {
+            let path = base_path;
+            if let Some(prefix) = prefix {
+                if !path.starts_with(prefix) {
+                    continue;
+                }
+            }
+            if !include_internal && is_internal_namespace_path(&path) {
+                continue;
+            }
+            if let Some(after) = after_path {
+                if path.as_str() <= after {
+                    continue;
+                }
+            }
+            let node_object_id = node.object_id.as_deref().unwrap_or_default();
+            let node_version_id = node.head_version_id.as_deref().unwrap_or_default();
+            let summary = match snapshot.file_heads_by_node.get(&node.node_id) {
+                Some(head)
+                    if head.object_id == node_object_id && head.version_id == node_version_id =>
+                {
+                    Some(namespace_summary_from_node_head(path.clone(), head.clone()))
+                }
+                _ if !node_object_id.is_empty() && !node_version_id.is_empty() => {
+                    read_live_version(fragment, node_object_id, node_version_id)?
+                        .map(|metadata| namespace_summary_from_metadata(path.clone(), metadata))
+                        .transpose()?
+                }
+                _ => None,
+            };
+            if let Some(summary) = summary {
+                rows.entry(path)
+                    .and_modify(|existing: &mut n1_indexdb::NamespaceObjectSummary| {
+                        if summary.created_at_unix > existing.created_at_unix
+                            || (summary.created_at_unix == existing.created_at_unix
+                                && summary.version_id > existing.version_id)
+                        {
+                            *existing = summary.clone();
+                        }
+                    })
+                    .or_insert(summary);
+            }
+            continue;
+        }
+        if let Some(prefix) = prefix {
+            let is_possible_prefix_parent = base_path.is_empty()
+                || prefix.starts_with(&format!("{}/", base_path))
+                || base_path.starts_with(prefix);
+            if !is_possible_prefix_parent {
+                continue;
+            }
+        }
+        let Some(children) = snapshot.children_by_parent.get(&node.node_id) else {
+            continue;
+        };
+        let mut children = children.clone();
+        children.sort_by(|left, right| right.name.cmp(&left.name));
+        for child in children {
+            let child_path = join_path(&base_path, &child.name);
+            stack.push((child_path, child));
+        }
+    }
+    Ok(rows.into_values().take(limit).collect())
+}
+
+fn sharded_list_live_object_refs(
+    fragment: &str,
+    prefix: Option<&str>,
+    after_path: Option<&str>,
+    limit: usize,
+) -> Result<Vec<NamespaceObjectRef>, AppError> {
+    let snapshot = sharded_namespace_listing_snapshot(fragment)?;
+    let mut rows = BTreeMap::new();
+    let mut stack = vec![(String::new(), root_namespace_node(0))];
+    while let Some((base_path, node)) = stack.pop() {
+        if node.kind == n1_indexdb::NamespaceEntryKind::File {
+            let path = base_path;
+            if let Some(prefix) = prefix {
+                if !path.starts_with(prefix) {
+                    continue;
+                }
+            }
+            if let Some(after) = after_path {
+                if path.as_str() <= after {
+                    continue;
+                }
+            }
+            if let (Some(object_id), Some(version_id)) =
+                (node.object_id.clone(), node.head_version_id.clone())
+            {
+                rows.entry(path.clone())
+                    .and_modify(|existing: &mut NamespaceObjectRef| {
+                        if version_id > existing.version_id {
+                            existing.object_id = object_id.clone();
+                            existing.version_id = version_id.clone();
+                        }
+                    })
+                    .or_insert(NamespaceObjectRef {
+                        path,
+                        object_id,
+                        version_id,
+                    });
+            }
+            continue;
+        }
+        if let Some(prefix) = prefix {
+            let is_possible_prefix_parent = base_path.is_empty()
+                || prefix.starts_with(&format!("{}/", base_path))
+                || base_path.starts_with(prefix);
+            if !is_possible_prefix_parent {
+                continue;
+            }
+        }
+        let Some(children) = snapshot.children_by_parent.get(&node.node_id) else {
+            continue;
+        };
+        let mut children = children.clone();
+        children.sort_by(|left, right| right.name.cmp(&left.name));
+        for child in children {
+            let child_path = join_path(&base_path, &child.name);
+            stack.push((child_path, child));
+        }
+    }
+    Ok(rows.into_values().take(limit).collect())
+}
+
+fn sharded_list_all_namespace_children(
+    fragment: &str,
+    parent_node_id: &str,
+) -> Result<Vec<n1_indexdb::NamespaceNode>, AppError> {
+    let mut out = Vec::new();
+    let mut after = None;
+    loop {
+        let page =
+            sharded_list_namespace_children(fragment, parent_node_id, after.as_deref(), 1000)?;
+        if page.is_empty() {
+            break;
+        }
+        after = page.last().map(|node| node.name.clone());
+        out.extend(page);
+    }
+    Ok(out)
+}
+
+fn sharded_list_trash_roots(
+    fragment: &str,
+    state: Option<n1_indexdb::TrashEntryState>,
+) -> Result<Vec<n1_indexdb::NamespaceTrashRoot>, AppError> {
+    let shard_count = namespace_shard_count(fragment)?;
+    let mut roots_by_id: BTreeMap<String, (n1_indexdb::NamespaceTrashRoot, bool)> = BTreeMap::new();
+    for shard_id in 0..shard_count {
+        for (db, is_owner_copy) in open_all_existing_namespace_shard_dbs(fragment, shard_id)? {
+            let mut after = None;
+            loop {
+                let page = db
+                    .n1_list_namespace_trash_roots_all(after.as_deref(), 1000)
+                    .map_err(|e| map_indexdb_error("sharded namespace trash roots", e))?;
+                if page.is_empty() {
+                    break;
+                }
+                after = page.last().map(|root| root.trash_entry_id.clone());
+                for root in page {
+                    let replace = match roots_by_id.get(&root.trash_entry_id) {
+                        Some((existing, existing_is_owner)) => {
+                            trash_root_updated_at(&root) > trash_root_updated_at(existing)
+                                || (trash_root_updated_at(&root) == trash_root_updated_at(existing)
+                                    && is_owner_copy
+                                    && !*existing_is_owner)
+                        }
+                        None => true,
+                    };
+                    if replace {
+                        roots_by_id.insert(root.trash_entry_id.clone(), (root, is_owner_copy));
+                    }
+                }
+            }
+        }
+    }
+    let mut roots = roots_by_id
+        .into_values()
+        .map(|(root, _)| root)
+        .filter(|root| state.map(|expected| root.state == expected).unwrap_or(true))
+        .collect::<Vec<_>>();
+    roots.sort_by(|left, right| {
+        left.original_path
+            .cmp(&right.original_path)
+            .then(left.trash_entry_id.cmp(&right.trash_entry_id))
+    });
+    Ok(roots)
+}
+
+fn trash_root_updated_at(root: &n1_indexdb::NamespaceTrashRoot) -> i64 {
+    root.purged_at_unix
+        .or(root.retired_at_unix)
+        .unwrap_or(root.deleted_at_unix)
+}
+
+fn sharded_get_trash_root(
+    fragment: &str,
+    trash_entry_id: &str,
+) -> Result<Option<n1_indexdb::NamespaceTrashRoot>, AppError> {
+    let shard_id = namespace_trash_shard_id(fragment, trash_entry_id)?;
+    let Some(db) = open_existing_namespace_shard_db(fragment, shard_id)? else {
+        return Ok(None);
+    };
+    db.n1_get_namespace_trash_root(trash_entry_id)
+        .map_err(|e| map_indexdb_error("sharded namespace trash root get", e))
+}
+
+fn sharded_upsert_trash_root(
+    fragment: &str,
+    root: &n1_indexdb::NamespaceTrashRoot,
+    touched_shards: &mut BTreeSet<u16>,
+) -> Result<PartitionMeta, AppError> {
+    let shard_id = namespace_trash_shard_id(fragment, &root.trash_entry_id)?;
+    let db = open_namespace_owner_shard_db(fragment, shard_id)?;
+    let path = namespace_shard_paths(fragment, shard_id)?[0].clone();
+    let partition_meta = with_partition_commit_lock(&path, || {
+        let write_txn = db
+            .begin_write()
+            .map_err(|e| map_indexdb_error("sharded trash root begin_write", e))?;
+        write_txn
+            .n1_upsert_namespace_trash_root(root)
+            .map_err(|e| map_indexdb_error("sharded trash root upsert", e))?;
+        let partition_meta = bump_namespace_shard_generation(&write_txn, root.deleted_at_unix)?;
+        write_txn
+            .commit()
+            .map_err(|e| map_indexdb_error("sharded trash root commit", e))?;
+        Ok(partition_meta)
+    })?;
+    touched_shards.insert(shard_id);
+    Ok(partition_meta)
+}
+
+fn sharded_set_trash_root_state(
+    fragment: &str,
+    trash_entry_id: &str,
+    state: n1_indexdb::TrashEntryState,
+    changed_at: i64,
+    touched_shards: &mut BTreeSet<u16>,
+) -> Result<PartitionMeta, AppError> {
+    let shard_id = namespace_trash_shard_id(fragment, trash_entry_id)?;
+    let db = open_namespace_owner_shard_db(fragment, shard_id)?;
+    let path = namespace_shard_paths(fragment, shard_id)?[0].clone();
+    let partition_meta = with_partition_commit_lock(&path, || {
+        let write_txn = db
+            .begin_write()
+            .map_err(|e| map_indexdb_error("sharded trash state begin_write", e))?;
+        write_txn
+            .n1_set_namespace_trash_root_state(trash_entry_id, state, changed_at)
+            .map_err(|e| map_indexdb_error("sharded trash state set", e))?;
+        let partition_meta = bump_namespace_shard_generation(&write_txn, changed_at)?;
+        write_txn
+            .commit()
+            .map_err(|e| map_indexdb_error("sharded trash state commit", e))?;
+        Ok(partition_meta)
+    })?;
+    touched_shards.insert(shard_id);
+    Ok(partition_meta)
+}
+
+fn sharded_recover_trash_root(
+    fragment: &str,
+    root: n1_indexdb::NamespaceTrashRoot,
+    changed_at: i64,
+    touched_shards: &mut BTreeSet<u16>,
+    mutations: &mut BTreeMap<u16, NamespaceReplicaMutation>,
+) -> Result<NamespaceMutationSummary, AppError> {
+    let original_parent_path = parent_path(&root.original_path);
+    let Some((_, parent_node)) =
+        sharded_resolve_live_node_home_or_fallback(fragment, &original_parent_path)?
+    else {
+        return Err(AppError::Conflict(format!(
+            "original parent for '{}' no longer exists",
+            root.original_path
+        )));
+    };
+    if parent_node.node_id != root.original_parent_node_id {
+        return Err(AppError::Conflict(format!(
+            "original parent for '{}' changed",
+            root.original_path
+        )));
+    }
+    if parent_node.kind != n1_indexdb::NamespaceEntryKind::Directory {
+        return Err(AppError::Conflict(format!(
+            "original parent for '{}' is not a directory",
+            root.original_path
+        )));
+    }
+    if sharded_get_current_namespace_child_home(
+        fragment,
+        &root.original_parent_node_id,
+        &root.original_name,
+    )?
+    .is_some()
+    {
+        return Err(AppError::Conflict(format!(
+            "destination path '{}' already exists",
+            root.original_path
+        )));
+    }
+    let trash_parent = trash_parent_node_id(&root.trash_entry_id);
+    let root_node =
+        match sharded_get_namespace_child_home(fragment, &trash_parent, &root.original_name)? {
+            Some(node) => node,
+            None => {
+                let Some(node) = sharded_get_namespace_node(fragment, &root.root_node_id)? else {
+                    return Err(AppError::Conflict(format!(
+                        "trash root '{}' is missing namespace node '{}'",
+                        root.trash_entry_id, root.root_node_id
+                    )));
+                };
+                node
+            }
+        };
+    if root_node.node_id != root.root_node_id {
+        return Err(AppError::Conflict(format!(
+            "trash root '{}' points to namespace node '{}' but found '{}'",
+            root.trash_entry_id, root.root_node_id, root_node.node_id
+        )));
+    }
+    let effective_changed_at = changed_at.max(root_node.updated_at_unix.saturating_add(1));
+    let move_result = sharded_move_namespace_node(
+        fragment,
+        &root_node,
+        &root.original_parent_node_id,
+        &root.original_name,
+        effective_changed_at,
+        touched_shards,
+    )?;
+    add_namespace_move_to_mutations(move_result, mutations);
+    let partition_meta = sharded_set_trash_root_state(
+        fragment,
+        &root.trash_entry_id,
+        n1_indexdb::TrashEntryState::Retired,
+        effective_changed_at,
+        touched_shards,
+    )?;
+    let trash_shard = namespace_trash_shard_id(fragment, &root.trash_entry_id)?;
+    let mutation = mutations.entry(trash_shard).or_default();
+    set_namespace_mutation_partition_meta(mutation, partition_meta);
+    mutation.set_trash_root_states.push((
+        root.trash_entry_id.clone(),
+        n1_indexdb::TrashEntryState::Retired,
+        effective_changed_at,
+    ));
+    Ok(NamespaceMutationSummary {
+        operation: "recover".to_string(),
+        kind: namespace_kind_from_indexdb(root.kind),
+        affected_paths: 1,
+        affected_objects: usize::from(root.object_id.is_some()),
+        source_path: Some(root.original_path.clone()),
+        destination_path: None,
+        trash_entry_id: Some(root.trash_entry_id.clone()),
+        deleted_at_unix: None,
+    })
+}
+
+fn sharded_list_pending_uploads_raw(
+    fragment: &str,
+) -> Result<Vec<n1_indexdb::PendingUploadBinding>, AppError> {
+    let mut rows = Vec::new();
+    let shard_count = namespace_shard_count(fragment)?;
+    for shard_id in 0..shard_count {
+        let Some(db) = open_existing_namespace_shard_db(fragment, shard_id)? else {
+            continue;
+        };
+        rows.extend(
+            db.n1_list_pending_uploads()
+                .map_err(|e| map_indexdb_error("sharded pending upload scan", e))?,
+        );
+    }
+    Ok(rows)
+}
+
+fn sharded_resolve_relative_node(
+    fragment: &str,
+    root_node_id: &str,
+    relative_path: &str,
+) -> Result<Option<n1_indexdb::NamespaceNode>, AppError> {
+    let mut current = sharded_get_namespace_node(fragment, root_node_id)?;
+    for segment in relative_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+    {
+        let Some(node) = current else {
+            return Ok(None);
+        };
+        current = sharded_get_namespace_child(fragment, &node.node_id, segment)?;
+    }
+    Ok(current)
+}
+
+fn sharded_visit_subtree_nodes(
+    fragment: &str,
+    root_node_id: &str,
+    root_path: &str,
+    after_path: Option<&str>,
+    mut limit: usize,
+    mut visit: impl FnMut(String, n1_indexdb::NamespaceNode) -> Result<(), AppError>,
+) -> Result<usize, AppError> {
+    if limit == 0 {
+        return Ok(0);
+    }
+    let Some(root) = sharded_get_namespace_node(fragment, root_node_id)? else {
+        return Ok(0);
+    };
+    let mut visited = 0usize;
+    let mut stack = vec![(root_path.to_string(), root)];
+    while let Some((path, node)) = stack.pop() {
+        if after_path
+            .map(|after| path.as_str() <= after)
+            .unwrap_or(false)
+        {
+            if node.kind == n1_indexdb::NamespaceEntryKind::Directory {
+                let mut children = sharded_list_all_namespace_children(fragment, &node.node_id)?;
+                children.sort_by(|left, right| right.name.cmp(&left.name));
+                for child in children {
+                    let child_path = join_path(&path, &child.name);
+                    stack.push((child_path, child));
+                }
+            }
+            continue;
+        }
+        visit(path.clone(), node.clone())?;
+        visited += 1;
+        limit = limit.saturating_sub(1);
+        if limit == 0 {
+            break;
+        }
+        if node.kind != n1_indexdb::NamespaceEntryKind::Directory {
+            continue;
+        }
+        let mut children = sharded_list_all_namespace_children(fragment, &node.node_id)?;
+        children.sort_by(|left, right| right.name.cmp(&left.name));
+        for child in children {
+            let child_path = join_path(&path, &child.name);
+            stack.push((child_path, child));
+        }
+    }
+    Ok(visited)
+}
+
+fn sharded_list_subtree_nodes(
+    fragment: &str,
+    root_node_id: &str,
+    root_path: &str,
+    after_path: Option<&str>,
+    limit: usize,
+) -> Result<Vec<(String, n1_indexdb::NamespaceNode)>, AppError> {
+    let mut rows = Vec::new();
+    sharded_visit_subtree_nodes(
+        fragment,
+        root_node_id,
+        root_path,
+        after_path,
+        limit,
+        |path, node| {
+            rows.push((path, node));
+            Ok(())
+        },
+    )?;
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(rows)
+}
+
+fn sharded_list_trash_dir_page(
+    fragment: &str,
+    parent: &str,
+    limit: usize,
+    continuation_token: Option<&str>,
+    fetch_limit: usize,
+) -> Result<(Vec<NamespaceEntry>, Option<String>), AppError> {
+    if parent.is_empty() {
+        let mut entries =
+            sharded_list_trash_roots(fragment, Some(n1_indexdb::TrashEntryState::Trashed))?
+                .into_iter()
+                .map(|root| trash_root_to_namespace_entry(fragment, &root))
+                .filter(|entry| {
+                    continuation_token
+                        .map(|after| entry.path.as_str() > after)
+                        .unwrap_or(true)
+                })
+                .take(fetch_limit)
+                .collect::<Vec<_>>();
+        let next = if entries.len() > limit {
+            entries.pop();
+            entries.last().map(|entry| entry.path.clone())
+        } else {
+            None
+        };
+        return Ok((entries, next));
+    }
+
+    let mut entries = Vec::new();
+    let mut seen = BTreeSet::new();
+    for root in sharded_list_trash_roots(fragment, Some(n1_indexdb::TrashEntryState::Trashed))? {
+        if parent_path(&root.original_path) == parent {
+            let entry = trash_root_to_namespace_entry(fragment, &root);
+            let key = format!("{}\0{}", entry.path, root.trash_entry_id);
+            if seen.insert(key) {
+                entries.push(entry);
+            }
+            continue;
+        }
+
+        if let Some(relative_to_parent) = root.original_path.strip_prefix(&format!("{parent}/")) {
+            if let Some((next_segment, _)) = relative_to_parent.split_once('/') {
+                let path = join_path(parent, next_segment);
+                if seen.insert(path.clone()) {
+                    entries.push(synthetic_trash_directory_entry(
+                        fragment,
+                        path,
+                        root.deleted_at_unix,
+                    ));
+                }
+                continue;
+            }
+        }
+
+        let Some(relative_parent) = parent
+            .strip_prefix(&format!("{}/", root.original_path))
+            .or_else(|| (parent == root.original_path).then_some(""))
+        else {
+            continue;
+        };
+        let Some(parent_node) =
+            sharded_resolve_relative_node(fragment, &root.root_node_id, relative_parent)?
+        else {
+            continue;
+        };
+        if parent_node.kind != n1_indexdb::NamespaceEntryKind::Directory {
+            continue;
+        }
+        let children =
+            sharded_list_namespace_children(fragment, &parent_node.node_id, None, fetch_limit)?;
+        for child in children {
+            let path = join_path(parent, &child.name);
+            let key = format!("{}\0{}", path, root.trash_entry_id);
+            if seen.insert(key) {
+                entries.push(node_entry_from_indexdb(
+                    fragment,
+                    path,
+                    child,
+                    LifecycleState::trashed(root.deleted_at_unix),
+                    Some(root.trash_entry_id.clone()),
+                    Some(root.deleted_at_unix),
+                ));
+            }
+        }
+    }
+
+    entries.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.trash_entry_id.cmp(&right.trash_entry_id))
+    });
+    if let Some(after) = continuation_token {
+        entries.retain(|entry| entry.path.as_str() > after);
+    }
+    let mut entries = entries.into_iter().take(fetch_limit).collect::<Vec<_>>();
+    let next = if entries.len() > limit {
+        entries.pop();
+        entries.last().map(|entry| entry.path.clone())
+    } else {
+        None
+    };
+    Ok((entries, next))
+}
+
+fn sharded_trashed_entry(fragment: &str, path: &str) -> Result<Option<NamespaceEntry>, AppError> {
+    for root in sharded_list_trash_roots(fragment, Some(n1_indexdb::TrashEntryState::Trashed))? {
+        if root.original_path == path {
+            return Ok(Some(trash_root_to_namespace_entry(fragment, &root)));
+        }
+        let Some(relative) = path.strip_prefix(&format!("{}/", root.original_path)) else {
+            continue;
+        };
+        if let Some(node) = sharded_resolve_relative_node(fragment, &root.root_node_id, relative)? {
+            return Ok(Some(node_entry_from_indexdb(
+                fragment,
+                path.to_string(),
+                node,
+                LifecycleState::trashed(root.deleted_at_unix),
+                Some(root.trash_entry_id),
+                Some(root.deleted_at_unix),
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn sharded_list_trash_object_summaries(
+    fragment: &str,
+    prefix: Option<&str>,
+    after_path: Option<&str>,
+    limit: usize,
+    include_internal: bool,
+) -> Result<Vec<n1_indexdb::NamespaceObjectSummary>, AppError> {
+    let mut summaries = Vec::new();
+    for root in sharded_list_trash_roots(fragment, Some(n1_indexdb::TrashEntryState::Trashed))? {
+        if summaries.len() >= limit {
+            break;
+        }
+        if root.kind == n1_indexdb::NamespaceEntryKind::File {
+            if prefix
+                .map(|prefix| !root.original_path.starts_with(prefix))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if !include_internal && is_internal_namespace_path(&root.original_path) {
+                continue;
+            }
+            if after_path
+                .map(|after| root.original_path.as_str() <= after)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let trash_parent = trash_parent_node_id(&root.trash_entry_id);
+            let summary = match sharded_get_namespace_child_home_or_fallback(
+                fragment,
+                &trash_parent,
+                &root.original_name,
+            )? {
+                Some(node) => sharded_file_head_for_node(fragment, &node)?
+                    .map(|head| namespace_summary_from_node_head(root.original_path.clone(), head)),
+                None => None,
+            }
+            .or_else(|| {
+                root.object_id
+                    .as_ref()
+                    .zip(root.head_version_id.as_ref())
+                    .and_then(|(object_id, version_id)| {
+                        read_live_version(fragment, object_id, version_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|metadata| {
+                                namespace_summary_from_metadata(
+                                    root.original_path.clone(),
+                                    metadata,
+                                )
+                                .ok()
+                            })
+                    })
+            });
+            if let Some(summary) = summary {
+                summaries.push(summary);
+            }
+            continue;
+        }
+        sharded_visit_subtree_nodes(
+            fragment,
+            &root.root_node_id,
+            &root.original_path,
+            after_path,
+            limit.saturating_sub(summaries.len()),
+            |path, node| {
+                if node.kind != n1_indexdb::NamespaceEntryKind::File {
+                    return Ok(());
+                }
+                if prefix
+                    .map(|prefix| !path.starts_with(prefix))
+                    .unwrap_or(false)
+                {
+                    return Ok(());
+                }
+                if !include_internal && is_internal_namespace_path(&path) {
+                    return Ok(());
+                }
+                if let Some(head) = sharded_file_head_for_node(fragment, &node)? {
+                    summaries.push(namespace_summary_from_node_head(path, head));
+                }
+                Ok(())
+            },
+        )?;
+    }
+    summaries.sort_by(|left, right| left.path.cmp(&right.path));
+    summaries.truncate(limit);
+    Ok(summaries)
 }
 
 fn node_entry_from_indexdb(
@@ -2050,144 +3068,6 @@ fn trash_root_to_namespace_entry(
     }
 }
 
-fn is_descendant_node(
-    write_txn: &indexdb::WriteTransaction,
-    ancestor_node_id: &str,
-    node_id: &str,
-) -> Result<bool, AppError> {
-    let mut cursor = Some(node_id.to_string());
-    while let Some(current_id) = cursor {
-        if current_id == ancestor_node_id {
-            return Ok(true);
-        }
-        cursor = write_txn
-            .n1_get_namespace_node(&current_id)
-            .map_err(|e| map_indexdb_error("namespace ancestor get", e))?
-            .and_then(|node| node.parent_node_id);
-    }
-    Ok(false)
-}
-
-fn list_trash_dir_page_on_db(
-    db: &Database,
-    fragment: &str,
-    parent: &str,
-    limit: usize,
-    continuation_token: Option<&str>,
-    fetch_limit: usize,
-) -> Result<(Vec<NamespaceEntry>, Option<String>), AppError> {
-    if parent.is_empty() {
-        let roots = db
-            .n1_list_namespace_trash_roots(
-                n1_indexdb::TrashEntryState::Trashed,
-                continuation_token,
-                fetch_limit,
-            )
-            .map_err(|e| map_indexdb_error("namespace trash roots list", e))?;
-        let mut entries = roots
-            .into_iter()
-            .map(|root| trash_root_to_namespace_entry(fragment, &root))
-            .collect::<Vec<_>>();
-        let next = if entries.len() > limit {
-            entries.pop();
-            entries.last().map(|entry| entry.path.clone())
-        } else {
-            None
-        };
-        return Ok((entries, next));
-    }
-
-    let mut entries = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut roots_after = None;
-    loop {
-        let roots = db
-            .n1_list_namespace_trash_roots_all(roots_after.as_deref(), 1000)
-            .map_err(|e| map_indexdb_error("namespace trash roots scan", e))?;
-        if roots.is_empty() {
-            break;
-        }
-        roots_after = roots.last().map(|root| root.trash_entry_id.clone());
-        for root in roots
-            .into_iter()
-            .filter(|root| root.state == n1_indexdb::TrashEntryState::Trashed)
-        {
-            if parent_path(&root.original_path) == parent {
-                let entry = trash_root_to_namespace_entry(fragment, &root);
-                let key = format!("{}\0{}", entry.path, root.trash_entry_id);
-                if seen.insert(key) {
-                    entries.push(entry);
-                }
-                continue;
-            }
-
-            if let Some(relative_to_parent) = root.original_path.strip_prefix(&format!("{parent}/"))
-            {
-                if let Some((next_segment, _)) = relative_to_parent.split_once('/') {
-                    let path = join_path(parent, next_segment);
-                    if seen.insert(path.clone()) {
-                        entries.push(synthetic_trash_directory_entry(
-                            fragment,
-                            path,
-                            root.deleted_at_unix,
-                        ));
-                    }
-                    continue;
-                }
-            }
-
-            let Some(relative_parent) = parent
-                .strip_prefix(&format!("{}/", root.original_path))
-                .or_else(|| (parent == root.original_path).then_some(""))
-            else {
-                continue;
-            };
-            let Some(parent_node) =
-                resolve_relative_node_on_db(db, &root.root_node_id, relative_parent)?
-            else {
-                continue;
-            };
-            if parent_node.kind != n1_indexdb::NamespaceEntryKind::Directory {
-                continue;
-            }
-            let children = db
-                .n1_list_namespace_node_children(&parent_node.node_id, None, fetch_limit)
-                .map_err(|e| map_indexdb_error("namespace trash child list", e))?;
-            for child in children {
-                let path = join_path(parent, &child.name);
-                let key = format!("{}\0{}", path, root.trash_entry_id);
-                if seen.insert(key) {
-                    entries.push(node_entry_from_indexdb(
-                        fragment,
-                        path,
-                        child,
-                        LifecycleState::trashed(root.deleted_at_unix),
-                        Some(root.trash_entry_id.clone()),
-                        Some(root.deleted_at_unix),
-                    ));
-                }
-            }
-        }
-    }
-
-    entries.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.trash_entry_id.cmp(&right.trash_entry_id))
-    });
-    if let Some(after) = continuation_token {
-        entries.retain(|entry| entry.path.as_str() > after);
-    }
-    let mut entries = entries.into_iter().take(fetch_limit).collect::<Vec<_>>();
-    let next = if entries.len() > limit {
-        entries.pop();
-        entries.last().map(|entry| entry.path.clone())
-    } else {
-        None
-    };
-    Ok((entries, next))
-}
-
 fn synthetic_trash_directory_entry(
     fragment: &str,
     path: String,
@@ -2207,180 +3087,6 @@ fn synthetic_trash_directory_entry(
         created_at_unix: deleted_at_unix,
         updated_at_unix: deleted_at_unix,
     }
-}
-
-fn trashed_entry_on_db(
-    db: &Database,
-    fragment: &str,
-    path: &str,
-) -> Result<Option<NamespaceEntry>, AppError> {
-    let direct_roots = db
-        .n1_list_namespace_trash_roots_by_path(path, n1_indexdb::TrashEntryState::Trashed)
-        .map_err(|e| map_indexdb_error("namespace trash entry direct get", e))?;
-    if let Some(root) = direct_roots.into_iter().next() {
-        return Ok(Some(trash_root_to_namespace_entry(fragment, &root)));
-    }
-
-    let mut after = None;
-    loop {
-        let roots = db
-            .n1_list_namespace_trash_roots_all(after.as_deref(), 1000)
-            .map_err(|e| map_indexdb_error("namespace trash entry roots scan", e))?;
-        if roots.is_empty() {
-            break;
-        }
-        after = roots.last().map(|root| root.trash_entry_id.clone());
-        for root in roots
-            .into_iter()
-            .filter(|root| root.state == n1_indexdb::TrashEntryState::Trashed)
-        {
-            let Some(relative) = path.strip_prefix(&format!("{}/", root.original_path)) else {
-                continue;
-            };
-            if let Some(node) = resolve_relative_node_on_db(db, &root.root_node_id, relative)? {
-                return Ok(Some(node_entry_from_indexdb(
-                    fragment,
-                    path.to_string(),
-                    node,
-                    LifecycleState::trashed(root.deleted_at_unix),
-                    Some(root.trash_entry_id),
-                    Some(root.deleted_at_unix),
-                )));
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn list_trash_object_summaries_on_db(
-    db: &Database,
-    prefix: Option<&str>,
-    after_path: Option<&str>,
-    limit: usize,
-) -> Result<Vec<n1_indexdb::NamespaceObjectSummary>, AppError> {
-    let mut summaries = Vec::new();
-    let mut roots_after = None;
-    loop {
-        let roots = db
-            .n1_list_namespace_trash_roots_all(roots_after.as_deref(), 1000)
-            .map_err(|e| map_indexdb_error("namespace trash summary roots list", e))?;
-        if roots.is_empty() {
-            break;
-        }
-        roots_after = roots.last().map(|root| root.trash_entry_id.clone());
-        for root in roots
-            .into_iter()
-            .filter(|root| root.state == n1_indexdb::TrashEntryState::Trashed)
-        {
-            let rows = db
-                .n1_list_namespace_node_object_summaries(
-                    &root.root_node_id,
-                    &root.original_path,
-                    prefix,
-                    after_path,
-                    limit,
-                )
-                .map_err(|e| map_indexdb_error("namespace trash summary subtree", e))?;
-            summaries.extend(rows);
-        }
-    }
-    summaries.sort_by(|left, right| left.path.cmp(&right.path));
-    summaries.truncate(limit);
-    Ok(summaries)
-}
-
-fn upsert_namespace_object_metadata(
-    write_txn: &indexdb::WriteTransaction,
-    object_id: &str,
-    metadata: &ObjectMetadata,
-    changed_at: i64,
-) -> Result<(), AppError> {
-    let mut parts = Vec::with_capacity(metadata.parts.len());
-    for part in &metadata.parts {
-        let mut shards = Vec::with_capacity(part.shards.len());
-        for shard in &part.shards {
-            shards.push(n1_indexdb::PartShard {
-                shard_index: u64::try_from(shard.shard_index).map_err(|_| {
-                    AppError::InternalServerError(format!(
-                        "shard index {} does not fit in u64",
-                        shard.shard_index
-                    ))
-                })?,
-                file_name: shard.file_name.clone(),
-                absolute_path: shard.absolute_path.clone(),
-                relative_path: None,
-                blob_root_id: None,
-                size_bytes: shard.size_bytes,
-                checksum: shard.checksum.clone(),
-                is_parity: shard.is_parity,
-                created_at_unix: part.created_at,
-            });
-        }
-        parts.push(n1_indexdb::ObjectPart {
-            part_index: part.part_index,
-            size_bytes: part.size_bytes,
-            created_at_unix: part.created_at,
-            checksum: part.checksum.clone(),
-            shards,
-        });
-    }
-
-    let stripe_size_bytes = u64::try_from(metadata.stripe_size_bytes).map_err(|_| {
-        AppError::InternalServerError(format!(
-            "stripe size {} does not fit in u64",
-            metadata.stripe_size_bytes
-        ))
-    })?;
-    let version = n1_indexdb::ObjectVersion {
-        object_id: object_id.to_string(),
-        object_key: object_id.to_string(),
-        version_id: metadata.version_id.clone(),
-        upload_session_id: metadata.upload_session_id.clone(),
-        owner_uid: metadata.owner_uid.clone(),
-        content_type: metadata.content_type.clone(),
-        total_size_bytes: metadata.total_size_bytes,
-        created_at_unix: metadata.created_at,
-        committed_at_unix: Some(changed_at),
-        is_delete_marker: metadata.is_delete_marker,
-        stripe_size_bytes,
-        checksum: None,
-        metadata_json: None,
-        parts,
-    };
-    write_txn
-        .n1_upsert_object_version(&version)
-        .map_err(|e| map_indexdb_error("namespace object_version upsert", e))?;
-
-    let state = if metadata.is_delete_marker {
-        n1_indexdb::ObjectState::Deleted
-    } else {
-        n1_indexdb::ObjectState::Live
-    };
-    let generation = 1;
-    write_txn
-        .n1_set_object_version_state(&n1_indexdb::ObjectVersionState {
-            object_id: object_id.to_string(),
-            version_id: metadata.version_id.clone(),
-            state,
-            generation,
-            updated_at_unix: changed_at,
-        })
-        .map_err(|e| map_indexdb_error("namespace object_version_state upsert", e))?;
-    write_txn
-        .n1_upsert_object_head(&n1_indexdb::ObjectHead {
-            object_id: object_id.to_string(),
-            object_key: object_id.to_string(),
-            head_version_id: metadata.version_id.clone(),
-            owner_uid: metadata.owner_uid.clone(),
-            content_type: metadata.content_type.clone(),
-            total_size_bytes: metadata.total_size_bytes,
-            state,
-            generation,
-            created_at_unix: metadata.created_at,
-            updated_at_unix: changed_at,
-        })
-        .map_err(|e| map_indexdb_error("namespace object_head upsert", e))?;
-    Ok(())
 }
 
 fn root_namespace_entry(fragment: &str) -> NamespaceEntry {
@@ -2406,6 +3112,11 @@ fn namespace_kind_from_indexdb(kind: n1_indexdb::NamespaceEntryKind) -> Namespac
     }
 }
 
+fn is_internal_namespace_path(path: &str) -> bool {
+    path.split('/')
+        .any(|segment| segment == DIR_MARKER_NAME || segment == TRASH_VIRTUAL_NAME)
+}
+
 fn pending_upload_from_indexdb(
     fragment: &str,
     binding: n1_indexdb::PendingUploadBinding,
@@ -2423,7 +3134,7 @@ fn pending_upload_from_indexdb(
 fn object_head_from_entry(
     fragment: &str,
     entry: &NamespaceEntry,
-    head: n1_indexdb::ObjectHead,
+    head: n1_indexdb::NamespaceFileHead,
 ) -> Result<ObjectHead, AppError> {
     Ok(ObjectHead {
         fragment: fragment.to_string(),
@@ -2431,7 +3142,7 @@ fn object_head_from_entry(
             .object_id
             .clone()
             .unwrap_or_else(|| head.object_id.clone()),
-        current_version_id: head.head_version_id.clone(),
+        current_version_id: head.version_id.clone(),
         storage_object_id: head.object_id,
         content_type: head.content_type,
         total_size_bytes: head.total_size_bytes,
@@ -2439,29 +3150,6 @@ fn object_head_from_entry(
         created_at_unix: head.created_at_unix,
         updated_at_unix: head.updated_at_unix,
     })
-}
-
-fn object_head_from_head_row(fragment: &str, head: n1_indexdb::ObjectHead) -> ObjectHead {
-    ObjectHead {
-        fragment: fragment.to_string(),
-        object_id: head.object_id.clone(),
-        current_version_id: head.head_version_id.clone(),
-        storage_object_id: head.object_id,
-        content_type: head.content_type,
-        total_size_bytes: head.total_size_bytes,
-        lifecycle: lifecycle_from_object_state(head.state),
-        created_at_unix: head.created_at_unix,
-        updated_at_unix: head.updated_at_unix,
-    }
-}
-
-fn lifecycle_from_object_state(state: n1_indexdb::ObjectState) -> LifecycleState {
-    match state {
-        n1_indexdb::ObjectState::Live => LifecycleState::Live,
-        n1_indexdb::ObjectState::Trash | n1_indexdb::ObjectState::Deleted => {
-            LifecycleState::Trashed { changed_at_unix: 0 }
-        }
-    }
 }
 
 fn object_metadata_from_namespace_summary(
@@ -2517,22 +3205,22 @@ fn common_prefix_for_entry(prefix: Option<&str>, path: &str) -> Option<String> {
     })
 }
 
-fn namespace_db_path(fragment: &str) -> Result<PathBuf, AppError> {
-    let manager = ObjectPathManager;
-    let roots = manager.get_all_index_roots();
-    if roots.is_empty() {
-        return Err(AppError::InternalServerError(
-            "no index roots configured for namespace indexdb".to_string(),
-        ));
-    }
-    let owner_idx = namespace_owner_index(fragment, roots.len());
-    Ok(roots[owner_idx]
-        .join(fragment)
-        .join(INDEXDB_DIR)
-        .join(INDEXDB_FILE))
+fn namespace_shard_count(fragment: &str) -> Result<u16, AppError> {
+    fragment_index_partition_count(fragment)
 }
 
-fn namespace_db_paths(fragment: &str) -> Result<Vec<PathBuf>, AppError> {
+fn namespace_shard_file(shard_id: u16) -> String {
+    format!("{}{:04x}.ndxdb", INDEXDB_SHARD_FILE_PREFIX, shard_id)
+}
+
+fn namespace_shard_owner_index(fragment: &str, shard_id: u16, root_count: usize) -> usize {
+    if root_count <= 1 {
+        return 0;
+    }
+    (namespace_owner_index(fragment, root_count) + usize::from(shard_id)) % root_count
+}
+
+fn namespace_shard_paths(fragment: &str, shard_id: u16) -> Result<Vec<PathBuf>, AppError> {
     let manager = ObjectPathManager;
     let roots = manager.get_all_index_roots();
     if roots.is_empty() {
@@ -2540,32 +3228,265 @@ fn namespace_db_paths(fragment: &str) -> Result<Vec<PathBuf>, AppError> {
             "no index roots configured for namespace indexdb".to_string(),
         ));
     }
-    let owner_idx = namespace_owner_index(fragment, roots.len());
+    let owner_idx = namespace_shard_owner_index(fragment, shard_id, roots.len());
+    let shard_file = namespace_shard_file(shard_id);
     let mut ordered = Vec::with_capacity(roots.len());
     ordered.push(
         roots[owner_idx]
             .join(fragment)
             .join(INDEXDB_DIR)
-            .join(INDEXDB_FILE),
+            .join(&shard_file),
     );
     for (idx, root) in roots.into_iter().enumerate() {
         if idx == owner_idx {
             continue;
         }
-        ordered.push(root.join(fragment).join(INDEXDB_DIR).join(INDEXDB_FILE));
+        ordered.push(root.join(fragment).join(INDEXDB_DIR).join(&shard_file));
     }
     Ok(ordered)
 }
 
-fn replicate_namespace_mutation_for_fragment(
-    runtime: &NamespaceRuntime,
+fn hash_parts(parts: &[&str]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update([0u8]);
+    }
+    hasher.finalize().into()
+}
+
+fn shard_id_from_hash(fragment: &str, hash: [u8; 32]) -> Result<u16, AppError> {
+    let shard_count = namespace_shard_count(fragment)?;
+    Ok((u16::from(hash[0]) << 8 | u16::from(hash[1])) % shard_count)
+}
+
+fn namespace_node_shard_id(
     fragment: &str,
+    parent_node_id: Option<&str>,
+    name: &str,
+) -> Result<u16, AppError> {
+    let Some(parent_node_id) = parent_node_id else {
+        return Ok(0);
+    };
+    shard_id_from_hash(
+        fragment,
+        hash_parts(&["namespace-node", fragment, parent_node_id, name]),
+    )
+}
+
+fn namespace_trash_shard_id(fragment: &str, trash_entry_id: &str) -> Result<u16, AppError> {
+    shard_id_from_hash(
+        fragment,
+        hash_parts(&["namespace-trash", fragment, trash_entry_id]),
+    )
+}
+
+fn namespace_pending_shard_id(fragment: &str, version_id: &str) -> Result<u16, AppError> {
+    shard_id_from_hash(
+        fragment,
+        hash_parts(&["namespace-pending-upload", fragment, version_id]),
+    )
+}
+
+fn open_namespace_owner_shard_db(fragment: &str, shard_id: u16) -> Result<Arc<Database>, AppError> {
+    let paths = namespace_shard_paths(fragment, shard_id)?;
+    let owner_path = paths[0].clone();
+    let owner_cached = global_namespace_runtime().dbs.contains_key(&owner_path);
+    if !owner_cached {
+        ensure_namespace_owner_shard_recent(fragment, shard_id, &owner_path)?;
+    }
+    if let Some(parent) = owner_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| AppError::Io(err, format!("mkdir {}", parent.display())))?;
+    }
+    global_namespace_runtime().open_db_path(owner_path)
+}
+
+fn ensure_namespace_owner_shard_recent(
+    fragment: &str,
+    shard_id: u16,
+    owner_path: &Path,
+) -> Result<(), AppError> {
+    let runtime = global_namespace_runtime();
+    if runtime.verified_owner_shards.contains_key(owner_path) {
+        return Ok(());
+    }
+    if let Some(best_path) =
+        best_existing_namespace_shard_db_path_by_generation(fragment, shard_id)?
+        && best_path != owner_path
+    {
+        runtime.dbs.remove(owner_path);
+        runtime.db_touch_ticks.remove(owner_path);
+        runtime.verified_owner_shards.remove(owner_path);
+        with_partition_commit_lock(owner_path, || {
+            copy_namespace_db_file(&best_path, owner_path)
+        })?;
+        runtime.dbs.remove(owner_path);
+        runtime.db_touch_ticks.remove(owner_path);
+    }
+    runtime
+        .verified_owner_shards
+        .insert(owner_path.to_path_buf(), ());
+    Ok(())
+}
+
+fn open_existing_namespace_shard_db(
+    fragment: &str,
+    shard_id: u16,
+) -> Result<Option<Arc<Database>>, AppError> {
+    let paths = namespace_shard_paths(fragment, shard_id)?;
+    let owner_path = paths[0].clone();
+    if owner_path.exists() {
+        match global_namespace_runtime().open_db_path(owner_path.clone()) {
+            Ok(db) => return Ok(Some(db)),
+            Err(err) => {
+                global_namespace_runtime().dbs.remove(&owner_path);
+                global_namespace_runtime()
+                    .db_touch_ticks
+                    .remove(&owner_path);
+                warn!(
+                    "namespace shard read fallback: owner copy {} is unreadable: {}; trying a follower copy",
+                    owner_path.display(),
+                    err
+                );
+            }
+        }
+    }
+    let Some(path) = best_existing_namespace_shard_db_path(fragment, shard_id)? else {
+        return Ok(None);
+    };
+    match global_namespace_runtime().open_db_path(path.clone()) {
+        Ok(db) => Ok(Some(db)),
+        Err(err) => {
+            global_namespace_runtime().dbs.remove(&path);
+            global_namespace_runtime().db_touch_ticks.remove(&path);
+            warn!(
+                "namespace shard read fallback: selected copy {} is unreadable: {}",
+                path.display(),
+                err
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn open_all_existing_namespace_shard_dbs(
+    fragment: &str,
+    shard_id: u16,
+) -> Result<Vec<(Arc<Database>, bool)>, AppError> {
+    let paths = namespace_shard_paths(fragment, shard_id)?;
+    let mut out = Vec::new();
+    for (idx, path) in paths.into_iter().enumerate() {
+        if !path.exists() {
+            continue;
+        }
+        match global_namespace_runtime().open_db_path(path.clone()) {
+            Ok(db) => out.push((db, idx == 0)),
+            Err(err) => {
+                global_namespace_runtime().dbs.remove(&path);
+                global_namespace_runtime().db_touch_ticks.remove(&path);
+                warn!(
+                    "namespace shard read fallback: skipping unreadable copy {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn add_created_namespace_nodes_to_mutations(
+    fragment: &str,
+    created: Vec<(n1_indexdb::NamespaceNode, PartitionMeta)>,
+    mutations: &mut BTreeMap<u16, NamespaceReplicaMutation>,
+) -> Result<(), AppError> {
+    for (node, partition_meta) in created {
+        let shard_id =
+            namespace_node_shard_id(fragment, node.parent_node_id.as_deref(), &node.name)?;
+        let mutation = mutations.entry(shard_id).or_default();
+        mutation.partition_meta = Some(partition_meta);
+        mutation.upsert_nodes.push(node);
+    }
+    Ok(())
+}
+
+fn set_namespace_mutation_partition_meta(
+    mutation: &mut NamespaceReplicaMutation,
+    partition_meta: PartitionMeta,
+) {
+    let replace = mutation
+        .partition_meta
+        .as_ref()
+        .map(|existing| {
+            partition_meta.committed_generation > existing.committed_generation
+                || (partition_meta.committed_generation == existing.committed_generation
+                    && partition_meta.updated_at > existing.updated_at)
+        })
+        .unwrap_or(true);
+    if replace {
+        mutation.partition_meta = Some(partition_meta);
+    }
+}
+
+fn add_namespace_move_to_mutations(
+    move_result: ShardedNamespaceMove,
+    mutations: &mut BTreeMap<u16, NamespaceReplicaMutation>,
+) {
+    if move_result.old_shard == move_result.new_shard {
+        let mutation = mutations.entry(move_result.old_shard).or_default();
+        set_namespace_mutation_partition_meta(mutation, move_result.old_partition_meta);
+        mutation.move_nodes.push(NamespaceNodeMoveReplay {
+            node_id: move_result.moved_node.node_id,
+            parent_node_id: move_result
+                .moved_node
+                .parent_node_id
+                .unwrap_or_else(|| NAMESPACE_ROOT_NODE_ID.to_string()),
+            name: move_result.moved_node.name,
+            changed_at_unix: move_result.moved_node.updated_at_unix,
+        });
+        return;
+    }
+
+    let old_mutation = mutations.entry(move_result.old_shard).or_default();
+    set_namespace_mutation_partition_meta(old_mutation, move_result.old_partition_meta);
+    old_mutation
+        .delete_nodes
+        .push(move_result.moved_node.node_id.clone());
+
+    let new_mutation = mutations.entry(move_result.new_shard).or_default();
+    if let Some(partition_meta) = move_result.new_partition_meta {
+        set_namespace_mutation_partition_meta(new_mutation, partition_meta);
+    }
+    new_mutation.upsert_nodes.push(move_result.moved_node);
+    if let Some(file_head) = move_result.file_head {
+        new_mutation.upsert_file_heads.push(file_head);
+    }
+}
+
+fn replicate_namespace_shard_mutations(
+    fragment: &str,
+    mutations: &BTreeMap<u16, NamespaceReplicaMutation>,
+) {
+    for (shard_id, mutation) in mutations {
+        if let Err(err) = replicate_namespace_shard_mutation(fragment, *shard_id, mutation) {
+            warn!(
+                "namespace shard replica logical apply failed for fragment {} shard {:04}: {}",
+                fragment, shard_id, err
+            );
+        }
+    }
+}
+
+fn replicate_namespace_shard_mutation(
+    fragment: &str,
+    shard_id: u16,
     mutation: &NamespaceReplicaMutation,
 ) -> Result<(), AppError> {
     if mutation.is_empty() {
         return Ok(());
     }
-    let paths = namespace_db_paths(fragment)?;
+    let paths = namespace_shard_paths(fragment, shard_id)?;
     if paths.len() <= 1 {
         return Ok(());
     }
@@ -2577,14 +3498,20 @@ fn replicate_namespace_mutation_for_fragment(
                 fs::create_dir_all(parent)
                     .map_err(|err| AppError::Io(err, format!("mkdir {}", parent.display())))?;
             }
+            let runtime = global_namespace_runtime();
             let db = runtime.open_db_path(replica_path.clone())?;
             let write_txn = db
                 .begin_write()
-                .map_err(|err| map_indexdb_error("namespace replica begin_write", err))?;
+                .map_err(|err| map_indexdb_error("namespace shard replica begin_write", err))?;
+            for node_id in &mutation.delete_nodes {
+                write_txn
+                    .n1_delete_namespace_node(node_id)
+                    .map_err(|err| map_indexdb_error("namespace shard replica node delete", err))?;
+            }
             for node in &mutation.upsert_nodes {
                 write_txn
                     .n1_upsert_namespace_node(node)
-                    .map_err(|err| map_indexdb_error("namespace replica node upsert", err))?;
+                    .map_err(|err| map_indexdb_error("namespace shard replica node upsert", err))?;
             }
             for move_node in &mutation.move_nodes {
                 write_txn
@@ -2594,98 +3521,152 @@ fn replicate_namespace_mutation_for_fragment(
                         &move_node.name,
                         move_node.changed_at_unix,
                     )
-                    .map_err(|err| map_indexdb_error("namespace replica node move", err))?;
+                    .map_err(|err| map_indexdb_error("namespace shard replica node move", err))?;
+            }
+            for head in &mutation.upsert_file_heads {
+                write_txn
+                    .n1_upsert_namespace_file_head(head)
+                    .map_err(|err| {
+                        map_indexdb_error("namespace shard replica file head upsert", err)
+                    })?;
             }
             for root in &mutation.upsert_trash_roots {
                 write_txn
                     .n1_upsert_namespace_trash_root(root)
-                    .map_err(|err| map_indexdb_error("namespace replica trash root upsert", err))?;
+                    .map_err(|err| {
+                        map_indexdb_error("namespace shard replica trash root upsert", err)
+                    })?;
             }
             for (trash_entry_id, state, changed_at_unix) in &mutation.set_trash_root_states {
                 write_txn
                     .n1_set_namespace_trash_root_state(trash_entry_id, *state, *changed_at_unix)
-                    .map_err(|err| map_indexdb_error("namespace replica trash root state", err))?;
+                    .map_err(|err| {
+                        map_indexdb_error("namespace shard replica trash root state", err)
+                    })?;
             }
-            for path in &mutation.delete_paths {
-                write_txn
-                    .n1_delete_namespace_entry(path)
-                    .map_err(|err| map_indexdb_error("namespace replica delete", err))?;
+            for node in &mutation.upsert_nodes {
+                let applied = write_txn
+                    .n1_get_namespace_node(&node.node_id)
+                    .map_err(|err| map_indexdb_error("namespace shard replica node verify", err))?
+                    .ok_or_else(|| {
+                        AppError::InternalServerError(format!(
+                            "namespace shard replica missing upserted node {}",
+                            node.node_id
+                        ))
+                    })?;
+                if applied.parent_node_id != node.parent_node_id
+                    || applied.name != node.name
+                    || applied.kind != node.kind
+                    || applied.object_id != node.object_id
+                    || applied.head_version_id != node.head_version_id
+                {
+                    return Err(AppError::InternalServerError(format!(
+                        "namespace shard replica node {} did not match owner mutation",
+                        node.node_id
+                    )));
+                }
             }
-            for rename in &mutation.rename_subtrees {
-                write_txn
-                    .n1_rename_namespace_subtree(
-                        &rename.source_path,
-                        &rename.destination_path,
-                        rename.changed_at_unix,
-                    )
-                    .map_err(|err| map_indexdb_error("namespace replica rename", err))?;
+            for move_node in &mutation.move_nodes {
+                let applied = write_txn
+                    .n1_get_namespace_node(&move_node.node_id)
+                    .map_err(|err| map_indexdb_error("namespace shard replica move verify", err))?
+                    .ok_or_else(|| {
+                        AppError::InternalServerError(format!(
+                            "namespace shard replica missing moved node {}",
+                            move_node.node_id
+                        ))
+                    })?;
+                if applied.parent_node_id.as_deref() != Some(move_node.parent_node_id.as_str())
+                    || applied.name != move_node.name
+                {
+                    return Err(AppError::InternalServerError(format!(
+                        "namespace shard replica moved node {} did not reach target edge",
+                        move_node.node_id
+                    )));
+                }
             }
-            for lifecycle in &mutation.lifecycle_subtrees {
-                write_txn
-                    .n1_set_namespace_lifecycle_subtree(
-                        &lifecycle.root_path,
-                        lifecycle.from,
-                        lifecycle.target,
-                        lifecycle.changed_at_unix,
-                        lifecycle.trash_entry_id.as_deref(),
-                    )
-                    .map_err(|err| map_indexdb_error("namespace replica lifecycle", err))?;
+            for head in &mutation.upsert_file_heads {
+                let applied = write_txn
+                    .n1_get_namespace_file_head(&head.node_id)
+                    .map_err(|err| {
+                        map_indexdb_error("namespace shard replica file head verify", err)
+                    })?
+                    .ok_or_else(|| {
+                        AppError::InternalServerError(format!(
+                            "namespace shard replica missing file head {}",
+                            head.node_id
+                        ))
+                    })?;
+                if applied.object_id != head.object_id || applied.version_id != head.version_id {
+                    return Err(AppError::InternalServerError(format!(
+                        "namespace shard replica file head {} did not match owner mutation",
+                        head.node_id
+                    )));
+                }
             }
-            for purge in &mutation.purge_subtrees {
-                write_txn
-                    .n1_purge_namespace_subtree(
-                        purge.root_path.as_deref(),
-                        purge.trash_entry_id.as_deref(),
-                    )
-                    .map_err(|err| map_indexdb_error("namespace replica purge", err))?;
+            for root in &mutation.upsert_trash_roots {
+                let applied = write_txn
+                    .n1_get_namespace_trash_root(&root.trash_entry_id)
+                    .map_err(|err| {
+                        map_indexdb_error("namespace shard replica trash root verify", err)
+                    })?
+                    .ok_or_else(|| {
+                        AppError::InternalServerError(format!(
+                            "namespace shard replica missing trash root {}",
+                            root.trash_entry_id
+                        ))
+                    })?;
+                if applied.root_node_id != root.root_node_id
+                    || applied.original_path != root.original_path
+                    || applied.state != root.state
+                {
+                    return Err(AppError::InternalServerError(format!(
+                        "namespace shard replica trash root {} did not match owner mutation",
+                        root.trash_entry_id
+                    )));
+                }
             }
-            for (object_id, metadata, changed_at) in &mutation.upsert_object_metadata {
-                upsert_namespace_object_metadata(&write_txn, object_id, metadata, *changed_at)?;
-            }
-            for entry in &mutation.upsert_entries {
-                write_txn
-                    .n1_upsert_namespace_entry(entry)
-                    .map_err(|err| map_indexdb_error("namespace replica upsert", err))?;
-            }
-            for entry in &mutation.upsert_trash_entries {
-                write_txn
-                    .n1_upsert_trash_entry(entry)
-                    .map_err(|err| map_indexdb_error("namespace replica trash upsert", err))?;
-            }
-            for (trash_entry_id, state, changed_at_unix) in &mutation.set_trash_states {
-                write_txn
-                    .n1_set_trash_entry_state(trash_entry_id, *state, *changed_at_unix)
-                    .map_err(|err| map_indexdb_error("namespace replica trash state", err))?;
-            }
-            for binding in &mutation.upsert_pending_uploads {
-                write_txn
-                    .n1_upsert_pending_upload(binding)
-                    .map_err(|err| map_indexdb_error("namespace replica pending upsert", err))?;
-            }
-            for version_id in &mutation.delete_pending_uploads {
-                write_txn
-                    .n1_delete_pending_upload(version_id)
-                    .map_err(|err| map_indexdb_error("namespace replica pending delete", err))?;
+            for (trash_entry_id, state, _) in &mutation.set_trash_root_states {
+                let applied = write_txn
+                    .n1_get_namespace_trash_root(trash_entry_id)
+                    .map_err(|err| {
+                        map_indexdb_error("namespace shard replica trash state verify", err)
+                    })?
+                    .ok_or_else(|| {
+                        AppError::InternalServerError(format!(
+                            "namespace shard replica missing trash root {} for state update",
+                            trash_entry_id
+                        ))
+                    })?;
+                if applied.state != *state {
+                    return Err(AppError::InternalServerError(format!(
+                        "namespace shard replica trash root {} did not reach state {:?}",
+                        trash_entry_id, state
+                    )));
+                }
             }
             if let Some(partition_meta) = &mutation.partition_meta {
                 replay_indexdb_metadata_generation(&write_txn, partition_meta)?;
             }
             write_txn
                 .commit()
-                .map_err(|err| map_indexdb_error("namespace replica commit", err))
+                .map_err(|err| map_indexdb_error("namespace shard replica commit", err))
         });
 
         if let Err(err) = apply_result {
             warn!(
-                "namespace replica logical apply failed for {}: {}; falling back to owner copy",
+                "namespace shard replica logical apply failed for {}: {}; falling back to owner copy",
                 replica_path.display(),
                 err
             );
+            let runtime = global_namespace_runtime();
             runtime.dbs.remove(&replica_path);
             runtime.db_touch_ticks.remove(&replica_path);
-            if let Err(copy_err) = copy_namespace_db_file(&owner_path, &replica_path) {
+            if let Err(copy_err) = with_partition_commit_lock(&replica_path, || {
+                copy_namespace_db_file(&owner_path, &replica_path)
+            }) {
                 warn!(
-                    "namespace replica catch-up failed for {} -> {}: {}",
+                    "namespace shard replica catch-up failed for {} -> {}: {}",
                     owner_path.display(),
                     replica_path.display(),
                     copy_err
@@ -2699,33 +3680,82 @@ fn replicate_namespace_mutation_for_fragment(
     Ok(())
 }
 
-fn best_existing_namespace_db_path(fragment: &str) -> Result<Option<PathBuf>, AppError> {
-    let infos = namespace_db_paths(fragment)?
+fn replicate_namespace_shards_by_copy(fragment: &str, shard_ids: &BTreeSet<u16>) {
+    for shard_id in shard_ids {
+        let Ok(paths) = namespace_shard_paths(fragment, *shard_id) else {
+            continue;
+        };
+        if paths.len() <= 1 {
+            continue;
+        }
+        let owner_path = paths[0].clone();
+        if !owner_path.exists() {
+            continue;
+        }
+        for replica_path in paths.into_iter().skip(1) {
+            global_namespace_runtime().dbs.remove(&replica_path);
+            global_namespace_runtime()
+                .db_touch_ticks
+                .remove(&replica_path);
+            if let Err(err) = with_partition_commit_lock(&replica_path, || {
+                copy_namespace_db_file(&owner_path, &replica_path)
+            }) {
+                warn!(
+                    "namespace shard replica catch-up failed for {} -> {}: {}",
+                    owner_path.display(),
+                    replica_path.display(),
+                    err
+                );
+            }
+            global_namespace_runtime().dbs.remove(&replica_path);
+            global_namespace_runtime()
+                .db_touch_ticks
+                .remove(&replica_path);
+        }
+    }
+}
+
+fn best_existing_namespace_shard_db_path(
+    fragment: &str,
+    shard_id: u16,
+) -> Result<Option<PathBuf>, AppError> {
+    let infos = namespace_shard_paths(fragment, shard_id)?
         .into_iter()
         .filter_map(|path| match inspect_namespace_db_file(&path) {
-            Ok(Some(info)) => Some(Ok(info)),
+            Ok(Some(info)) => Some(info),
             Ok(None) => None,
-            Err(err) => Some(Err(err)),
+            Err(err) => {
+                warn!(
+                    "namespace shard read fallback: ignoring unreadable copy {}: {}",
+                    path.display(),
+                    err
+                );
+                global_namespace_runtime().dbs.remove(&path);
+                global_namespace_runtime().db_touch_ticks.remove(&path);
+                None
+            }
         })
-        .collect::<Result<Vec<_>, AppError>>()?;
+        .collect::<Vec<_>>();
+    if infos.is_empty() {
+        return Ok(None);
+    }
+
     let mut hash_counts: HashMap<[u8; 32], usize> = HashMap::new();
     for info in &infos {
         *hash_counts.entry(info.metadata_hash).or_default() += 1;
     }
-    let Some(canonical_hash) = choose_canonical_metadata_hash(&hash_counts) else {
-        if infos.is_empty() {
-            return Ok(None);
-        }
-        return Err(AppError::InternalServerError(
-            "ambiguous namespace indexdb replicas; no semantic majority exists".to_string(),
-        ));
-    };
 
-    let mut best: Option<&NamespaceReplicaFileInfo> = None;
-    for info in infos
+    let canonical_hash = choose_canonical_metadata_hash(&hash_counts);
+    let candidates = infos
         .iter()
-        .filter(|info| info.metadata_hash == canonical_hash)
-    {
+        .filter(|info| {
+            canonical_hash
+                .map(|hash| info.metadata_hash == hash)
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    let mut best: Option<&NamespaceReplicaFileInfo> = None;
+    for info in candidates {
         let replace = match best.as_ref() {
             Some(current) => compare_namespace_replica_info(info, current) == Ordering::Greater,
             None => true,
@@ -2735,6 +3765,52 @@ fn best_existing_namespace_db_path(fragment: &str) -> Result<Option<PathBuf>, Ap
         }
     }
     Ok(best.map(|info| info.path.clone()))
+}
+
+fn best_existing_namespace_shard_db_path_by_generation(
+    fragment: &str,
+    shard_id: u16,
+) -> Result<Option<PathBuf>, AppError> {
+    let mut best: Option<(PathBuf, u64, u64)> = None;
+    for path in namespace_shard_paths(fragment, shard_id)? {
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
+            Err(err) => return Err(AppError::Io(err, format!("stat {}", path.display()))),
+        };
+        let len = metadata.len();
+        let generation = match open_n1_indexdb(&path).and_then(|db| read_partition_meta_exact(&db))
+        {
+            Ok(Some(meta)) => meta.committed_generation,
+            Ok(None) => 0,
+            Err(err) => {
+                warn!(
+                    "namespace shard owner catch-up: ignoring unreadable copy {}: {}",
+                    path.display(),
+                    err
+                );
+                global_namespace_runtime().dbs.remove(&path);
+                global_namespace_runtime().db_touch_ticks.remove(&path);
+                continue;
+            }
+        };
+
+        match &best {
+            Some((_, best_generation, best_len))
+                if *best_generation > generation
+                    || (*best_generation == generation
+                        && (*best_generation > 0 || *best_len >= len)) => {}
+            _ => best = Some((path, generation, len)),
+        }
+    }
+    Ok(best.map(|(path, _, _)| path))
 }
 
 fn choose_canonical_metadata_hash(hash_counts: &HashMap<[u8; 32], usize>) -> Option<[u8; 32]> {
@@ -2759,18 +3835,29 @@ fn choose_canonical_metadata_hash(hash_counts: &HashMap<[u8; 32], usize>) -> Opt
 fn inspect_namespace_db_file(path: &Path) -> Result<Option<NamespaceReplicaFileInfo>, AppError> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
         Err(err) => return Err(AppError::Io(err, format!("stat {}", path.display()))),
     };
     let modified_at = metadata
         .modified()
         .map_err(|err| AppError::Io(err, format!("mtime {}", path.display())))?;
     let db = open_n1_indexdb(path)?;
+    let generation = read_partition_meta_exact(&db)?
+        .map(|meta| meta.committed_generation)
+        .unwrap_or(0);
     let metadata_hash = namespace_indexdb_semantic_hash(&db)?;
     Ok(Some(NamespaceReplicaFileInfo {
         path: path.to_path_buf(),
         modified_at,
         len: metadata.len(),
+        generation,
         metadata_hash,
     }))
 }
@@ -2796,6 +3883,23 @@ fn namespace_indexdb_semantic_hash(db: &Database) -> Result<[u8; 32], AppError> 
             hash_field(&mut hasher, node.head_version_id.as_deref().unwrap_or(""));
             hash_field(&mut hasher, &node.created_at_unix.to_string());
             hash_field(&mut hasher, &node.updated_at_unix.to_string());
+            if let Some(head) = db
+                .n1_get_namespace_file_head(&node.node_id)
+                .map_err(|e| map_indexdb_error("namespace file head semantic hash get", e))?
+            {
+                hash_field(&mut hasher, "namespace-file-head");
+                hash_field(&mut hasher, &head.node_id);
+                hash_field(&mut hasher, &head.object_id);
+                hash_field(&mut hasher, &head.version_id);
+                hash_field(&mut hasher, &head.upload_session_id);
+                hash_field(&mut hasher, &head.owner_uid);
+                hash_field(&mut hasher, &head.content_type);
+                hash_field(&mut hasher, &head.total_size_bytes.to_string());
+                hash_field(&mut hasher, &head.created_at_unix.to_string());
+                hash_field(&mut hasher, if head.is_delete_marker { "1" } else { "0" });
+                hash_field(&mut hasher, &head.stripe_size_bytes.to_string());
+                hash_field(&mut hasher, &head.updated_at_unix.to_string());
+            }
         }
     }
 
@@ -2864,9 +3968,10 @@ fn compare_namespace_replica_info(
     current: &NamespaceReplicaFileInfo,
 ) -> Ordering {
     candidate
-        .modified_at
-        .cmp(&current.modified_at)
+        .generation
+        .cmp(&current.generation)
         .then_with(|| candidate.len.cmp(&current.len))
+        .then_with(|| candidate.modified_at.cmp(&current.modified_at))
         .then_with(|| candidate.metadata_hash.cmp(&current.metadata_hash))
         .then_with(|| candidate.path.cmp(&current.path))
 }
@@ -2892,6 +3997,9 @@ fn copy_namespace_db_file(source: &Path, destination: &Path) -> Result<(), AppEr
         Ulid::new()
     ));
     let source_db = open_n1_indexdb(source)?;
+    source_db
+        .checkpoint()
+        .map_err(|err| map_indexdb_error("namespace replica source checkpoint", err))?;
     remove_indexdb_file_set(&temp_path)?;
     source_db
         .backup_to_path(&temp_path)

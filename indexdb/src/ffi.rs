@@ -356,6 +356,22 @@ impl Connection {
             CREATE INDEX IF NOT EXISTS idx_namespace_nodes_object
                 ON namespace_nodes(object_id);
 
+            CREATE TABLE IF NOT EXISTS namespace_file_heads (
+                node_id TEXT PRIMARY KEY NOT NULL,
+                object_id TEXT NOT NULL,
+                version_id TEXT NOT NULL,
+                upload_session_id TEXT,
+                owner_uid TEXT,
+                content_type TEXT,
+                total_size_bytes INTEGER NOT NULL,
+                created_at_unix INTEGER NOT NULL,
+                is_delete_marker INTEGER NOT NULL DEFAULT 0,
+                stripe_size_bytes INTEGER NOT NULL,
+                updated_at_unix INTEGER NOT NULL
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_namespace_file_heads_object
+                ON namespace_file_heads(object_id, version_id);
+
             CREATE TABLE IF NOT EXISTS namespace_trash_roots (
                 trash_entry_id TEXT PRIMARY KEY NOT NULL,
                 root_node_id TEXT NOT NULL,

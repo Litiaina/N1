@@ -18,7 +18,7 @@ Use `Registry` when you need:
 Current `0.9.1` behavior that matters operationally:
 
 - for fragment-bound object listing and stats, Registry reads logical namespace truth from the bound `N1` engine instead of trusting stale Registry projection alone
-- for `N1 3.0`, that engine namespace truth is backed by the fragment's `indexdb/index.ndxdb`, not a separate namespace catalog
+- for `N1 3.0`, that engine namespace truth is backed by the fragment's sharded `indexdb`, not a separate namespace catalog
 - Registry object APIs for bound fragments use the engine namespace as the file-tree authority; Registry keeps a durable business/policy projection
 - pending quota reservations are stored durably in `object_uploads` and reconciled against committed object usage during finalize/cancel flows
 - shares, audit events, favorites, tags, labels, and comments remain Registry-owned business metadata keyed by logical `object_key`

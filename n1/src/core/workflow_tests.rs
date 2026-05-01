@@ -253,6 +253,15 @@ async fn ensure_global_storage_config(base: &std::path::Path) {
         .expect("reset configured index partition count");
     clear_fragment_partition_count_cache_for_test();
     indexdb_store::clear_cached_dbs_for_test();
+    if let (Some(index_roots), Some(blob_roots)) = (INDEX_STORE_DISKS.get(), BLOB_STORE_DISKS.get())
+    {
+        for root in index_roots.iter().chain(blob_roots.iter()) {
+            let path = std::path::PathBuf::from(root);
+            let _ = fs::remove_dir_all(&path).await;
+            let _ = fs::create_dir_all(&path).await;
+        }
+        return;
+    }
     let (fs_root, index_roots, blob_roots) =
         resolve_test_storage_roots(base, Some(2), Some(3)).await;
 
@@ -293,6 +302,15 @@ async fn ensure_global_storage_config_with_root_counts(
         .expect("reset configured index partition count");
     clear_fragment_partition_count_cache_for_test();
     indexdb_store::clear_cached_dbs_for_test();
+    if let (Some(index_roots), Some(blob_roots)) = (INDEX_STORE_DISKS.get(), BLOB_STORE_DISKS.get())
+    {
+        for root in index_roots.iter().chain(blob_roots.iter()) {
+            let path = std::path::PathBuf::from(root);
+            let _ = fs::remove_dir_all(&path).await;
+            let _ = fs::create_dir_all(&path).await;
+        }
+        return;
+    }
     let (fs_root, index_roots, blob_roots) =
         resolve_test_storage_roots(base, Some(index_root_count), Some(blob_root_count)).await;
 
@@ -396,19 +414,32 @@ async fn restore_simulated_disk(
     parked_dst: &std::path::Path,
     label: &str,
 ) {
-    if fs::try_exists(live_src).await.unwrap_or(false) {
-        match fs::metadata(live_src).await {
-            Ok(meta) if meta.is_dir() => {
-                let _ = fs::remove_dir_all(live_src).await;
-            }
-            Ok(_) => {
-                let _ = fs::remove_file(live_src).await;
-            }
-            Err(_) => {}
+    remove_path_if_exists(live_src).await;
+
+    match fs::rename(parked_dst, live_src).await {
+        Ok(()) => {}
+        Err(first_err) => {
+            remove_path_if_exists(live_src).await;
+            fs::rename(parked_dst, live_src)
+                .await
+                .unwrap_or_else(|retry_err| panic!("{label}: {first_err}; retry: {retry_err}"));
         }
     }
+}
 
-    fs::rename(parked_dst, live_src).await.expect(label);
+async fn remove_path_if_exists(path: &std::path::Path) {
+    if !fs::try_exists(path).await.unwrap_or(false) {
+        return;
+    }
+    match fs::metadata(path).await {
+        Ok(meta) if meta.is_dir() => {
+            let _ = fs::remove_dir_all(path).await;
+        }
+        Ok(_) => {
+            let _ = fs::remove_file(path).await;
+        }
+        Err(_) => {}
+    }
 }
 
 fn ensure_upload_runtime_config() {
@@ -1102,24 +1133,32 @@ async fn read_object_bytes_eventually_labeled(
     attempts: usize,
     label: &str,
 ) -> Vec<u8> {
+    let mut last_status: Option<StatusCode> = None;
+    let mut last_body_error: Option<String> = None;
+    let mut last_route_error: Option<String> = None;
     for _ in 0..attempts {
         let req = Request::builder()
             .uri("/n1/objects/get")
             .body(Body::empty())
             .expect("build request");
 
-        if let Ok(resp) = get_object(
+        match get_object(
             full_claims(&fragment),
             AxumPath((fragment.clone(), object_key.clone())),
             req,
         )
         .await
         {
-            if resp.status() == StatusCode::OK {
-                if let Ok(body) = to_bytes(resp.into_body(), usize::MAX).await {
-                    return body.to_vec();
+            Ok(resp) => {
+                last_status = Some(resp.status());
+                if resp.status() == StatusCode::OK {
+                    match to_bytes(resp.into_body(), usize::MAX).await {
+                        Ok(body) => return body.to_vec(),
+                        Err(err) => last_body_error = Some(err.to_string()),
+                    }
                 }
             }
+            Err(err) => last_route_error = Some(err.to_string()),
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -1131,11 +1170,14 @@ async fn read_object_bytes_eventually_labeled(
     let trash_versions_after =
         index::list_trashed_object_versions_metadata(&fragment, &object_key).await;
     panic!(
-        "{}: object {} in fragment {} was not readable after {} attempts; metadata={:?}; live_versions={:?}; trash_versions={:?}",
+        "{}: object {} in fragment {} was not readable after {} attempts; last_status={:?}; last_body_error={:?}; last_route_error={:?}; metadata={:?}; live_versions={:?}; trash_versions={:?}",
         label,
         object_key,
         fragment,
         attempts,
+        last_status,
+        last_body_error,
+        last_route_error,
         metadata_after,
         live_versions_after,
         trash_versions_after
@@ -1204,7 +1246,7 @@ async fn collect_fragment_indexdb_files(fragment: &str) -> Vec<String> {
 
 fn object_partition_db_paths_owner_first(
     fragment: &str,
-    _object_key: &str,
+    object_key: &str,
 ) -> Vec<std::path::PathBuf> {
     let path_manager = ObjectPathManager::new();
     let roots = path_manager.get_all_index_roots();
@@ -1212,14 +1254,27 @@ fn object_partition_db_paths_owner_first(
         return Vec::new();
     }
 
-    let mut hasher = Sha256::new();
-    for part in ["fragment", fragment] {
-        hasher.update(part.as_bytes());
-        hasher.update([0u8]);
+    let partition_count =
+        fragment_index_partition_count(fragment).unwrap_or(DEFAULT_INDEX_PARTITION_COUNT);
+    let canonical_key = ObjectPathManager::canonical_object_key(object_key);
+    let mut object_hasher = Sha256::new();
+    for part in ["object", fragment, canonical_key.as_str()] {
+        object_hasher.update(part.as_bytes());
+        object_hasher.update([0u8]);
     }
-    let route_hash: [u8; 32] = hasher.finalize().into();
-    let owner_idx =
-        usize::from(u16::from(route_hash[0]) << 8 | u16::from(route_hash[1])) % roots.len();
+    let object_hash: [u8; 32] = object_hasher.finalize().into();
+    let partition_id =
+        (u16::from(object_hash[0]) << 8 | u16::from(object_hash[1])) % partition_count;
+
+    let mut fragment_hasher = Sha256::new();
+    for part in ["fragment", fragment] {
+        fragment_hasher.update(part.as_bytes());
+        fragment_hasher.update([0u8]);
+    }
+    let fragment_hash: [u8; 32] = fragment_hasher.finalize().into();
+    let fragment_owner =
+        usize::from(u16::from(fragment_hash[0]) << 8 | u16::from(fragment_hash[1])) % roots.len();
+    let owner_idx = (fragment_owner + usize::from(partition_id)) % roots.len();
     let mut selected = vec![roots[owner_idx].clone()];
     for (idx, root) in roots.into_iter().enumerate() {
         if idx != owner_idx {
@@ -1229,14 +1284,22 @@ fn object_partition_db_paths_owner_first(
 
     selected
         .into_iter()
-        .map(|root| root.join(fragment).join("indexdb").join("index.ndxdb"))
+        .map(|root| {
+            root.join(fragment)
+                .join("indexdb")
+                .join(format!("shard_{partition_id:04x}.ndxdb"))
+        })
         .collect()
 }
 
-fn fragment_owned_by_index_root(owner_root: &std::path::Path, prefix: &str) -> String {
+fn fragment_owned_by_index_root(
+    owner_root: &std::path::Path,
+    prefix: &str,
+    object_key: &str,
+) -> String {
     for candidate in 0..4096usize {
         let fragment = hex::encode(Sha256::digest(format!("{prefix}-{candidate}").as_bytes()));
-        let owner_paths = object_partition_db_paths_owner_first(&fragment, "probe.bin");
+        let owner_paths = object_partition_db_paths_owner_first(&fragment, object_key);
         if owner_paths
             .first()
             .map(|path| path.starts_with(owner_root))
@@ -1346,6 +1409,77 @@ fn hash_indexdb_logical_contents(path: &std::path::Path) -> Option<String> {
     .flatten()
 }
 
+fn indexdb_file_has_semantic_rows(path: &std::path::Path) -> Option<bool> {
+    std::panic::catch_unwind(|| {
+        indexdb_store::evict_cached_db_for_test(path);
+        let db = Database::builder().open(path).ok()?;
+
+        for state in [
+            n1_indexdb::ObjectState::Live,
+            n1_indexdb::ObjectState::Trash,
+            n1_indexdb::ObjectState::Deleted,
+        ] {
+            if db
+                .n1_list_object_heads(state, None, None, 1)
+                .ok()
+                .is_some_and(|rows| !rows.is_empty())
+            {
+                return Some(true);
+            }
+        }
+
+        if db
+            .n1_list_namespace_nodes(None, 1)
+            .ok()
+            .is_some_and(|rows| !rows.is_empty())
+            || db
+                .n1_list_namespace_file_heads(None, 1)
+                .ok()
+                .is_some_and(|rows| !rows.is_empty())
+            || db
+                .n1_list_pending_uploads()
+                .ok()
+                .is_some_and(|rows| !rows.is_empty())
+        {
+            return Some(true);
+        }
+
+        for state in [
+            n1_indexdb::TrashEntryState::Trashed,
+            n1_indexdb::TrashEntryState::Retired,
+            n1_indexdb::TrashEntryState::Purged,
+        ] {
+            if db
+                .n1_list_trash_entries(state, None, 1)
+                .ok()
+                .is_some_and(|rows| !rows.is_empty())
+            {
+                return Some(true);
+            }
+        }
+
+        let read_txn = db.begin_read().ok()?;
+        for table_handle in read_txn.list_tables().ok()? {
+            let table_name = table_handle.name();
+            if matches!(table_name, "indexdb_meta" | "partition_meta") {
+                continue;
+            }
+            let definition: TableDefinition<&str, &[u8]> = TableDefinition::new(table_name);
+            if let Ok(table) = read_txn.open_table(definition) {
+                if let Ok(mut iter) = table.iter() {
+                    if iter.next().is_some() {
+                        return Some(true);
+                    }
+                }
+            }
+        }
+
+        Some(false)
+    })
+    .ok()
+    .flatten()
+}
+
 async fn collect_indexdb_replica_semantic_hashes(
     fragment: &str,
 ) -> Vec<(String, BTreeMap<String, String>)> {
@@ -1368,11 +1502,40 @@ async fn collect_indexdb_replica_semantic_hashes(
             map.insert("fragment.metadata.msgpack".to_string(), hex::encode(digest));
         }
 
-        let index_db_path = frag_root.join("indexdb").join("index.ndxdb");
-        if let Some(digest) = hash_indexdb_logical_contents(&index_db_path) {
-            map.insert("indexdb/index.ndxdb".to_string(), digest);
-        } else if fs::try_exists(&index_db_path).await.unwrap_or(false) {
-            map.insert("indexdb/index.ndxdb".to_string(), "unreadable".to_string());
+        let indexdb_dir = frag_root.join("indexdb");
+        if fs::try_exists(&indexdb_dir).await.unwrap_or(false) {
+            for entry in walkdir::WalkDir::new(&indexdb_dir)
+                .max_depth(1)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if !name.starts_with("shard_") || !name.ends_with(".ndxdb") {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&frag_root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if matches!(indexdb_file_has_semantic_rows(path), Some(false)) {
+                    continue;
+                }
+                if let Some(digest) = hash_indexdb_logical_contents(path) {
+                    if digest != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    {
+                        map.insert(rel, digest);
+                    }
+                } else {
+                    map.insert(rel, "unreadable".to_string());
+                }
+            }
         }
 
         out.push((root.to_string_lossy().to_string(), map));
@@ -1425,6 +1588,9 @@ async fn try_upload_one_shot(
     object_key: &str,
     bytes: Vec<u8>,
 ) -> Result<axum::response::Response, AppError> {
+    let physical_object_id = global_namespace_runtime()
+        .select_object_id_for_write(fragment, object_key)
+        .await?;
     let mut headers = HeaderMap::new();
     headers.insert(
         "content-length",
@@ -1435,11 +1601,11 @@ async fn try_upload_one_shot(
         HeaderValue::from_static("application/octet-stream"),
     );
 
-    upload_object_one_shot(
+    let response = upload_object_one_shot(
         State(state),
         full_claims(fragment),
         headers,
-        AxumPath((fragment.to_string(), object_key.to_string())),
+        AxumPath((fragment.to_string(), physical_object_id.clone())),
         Query(UploadPartQuery {
             checksum: None,
             durability: Some("batched".to_string()),
@@ -1449,7 +1615,14 @@ async fn try_upload_one_shot(
         Body::from(bytes),
     )
     .await
-    .map(IntoResponse::into_response)
+    .map(IntoResponse::into_response)?;
+    if response.status() == StatusCode::CREATED {
+        let metadata = index::read_latest_object(fragment, &physical_object_id).await?;
+        global_namespace_runtime()
+            .finalize_logical_upload(fragment, object_key, &physical_object_id, &metadata)
+            .await?;
+    }
+    Ok(response)
 }
 
 fn generated_streaming_body(object_bytes: usize, chunk_bytes: usize, seed: usize) -> Body {
@@ -1477,6 +1650,10 @@ async fn upload_one_shot_generated_chunked_with_options(
     durability: Option<&str>,
     io_gate: Option<bool>,
 ) -> axum::response::Response {
+    let physical_object_id = global_namespace_runtime()
+        .select_object_id_for_write(fragment, object_key)
+        .await
+        .expect("select physical object id");
     let mut headers = HeaderMap::new();
     headers.insert(
         "content-length",
@@ -1487,11 +1664,11 @@ async fn upload_one_shot_generated_chunked_with_options(
         HeaderValue::from_static("application/octet-stream"),
     );
 
-    upload_object_one_shot(
+    let response = upload_object_one_shot(
         State(state),
         full_claims(fragment),
         headers,
-        AxumPath((fragment.to_string(), object_key.to_string())),
+        AxumPath((fragment.to_string(), physical_object_id.clone())),
         Query(UploadPartQuery {
             checksum: None,
             durability: durability.map(str::to_string),
@@ -1502,7 +1679,17 @@ async fn upload_one_shot_generated_chunked_with_options(
     )
     .await
     .expect("upload one-shot generated chunks")
-    .into_response()
+    .into_response();
+    if response.status() == StatusCode::CREATED {
+        let metadata = index::read_latest_object(fragment, &physical_object_id)
+            .await
+            .expect("read generated physical metadata");
+        global_namespace_runtime()
+            .finalize_logical_upload(fragment, object_key, &physical_object_id, &metadata)
+            .await
+            .expect("bind generated logical namespace entry");
+    }
+    response
 }
 
 async fn upload_part_with_durability(
@@ -1556,7 +1743,8 @@ async fn matrix_fragment_partition_count_is_setup_driven_and_mismatch_is_rejecte
     clear_fragment_partition_count_cache_for_test();
 
     let owner_root = base.join("index_1");
-    let fragment = fragment_owned_by_index_root(&owner_root, "fragment-two-disk-cycle");
+    let fragment =
+        fragment_owned_by_index_root(&owner_root, "fragment-two-disk-cycle", "probe.bin");
 
     init_fragment_metadata(&fragment, "partition-key")
         .await
@@ -1689,7 +1877,12 @@ async fn matrix_upload_one_shot_publishes_without_active_session() {
     let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.to_string()).await;
     assert_eq!(got, content);
 
-    let meta = index::read_object_version(&fragment, key, &version_id)
+    let object_id = global_namespace_runtime()
+        .resolve_live_object_id(&fragment, key)
+        .await
+        .expect("resolve one-shot object id")
+        .expect("one-shot object id");
+    let meta = index::read_object_version(&fragment, &object_id, &version_id)
         .await
         .expect("read version");
     assert_eq!(meta.total_size_bytes, content.len() as u64);
@@ -1754,7 +1947,12 @@ async fn matrix_multipart_upload_persists_dynamic_stripe_in_manifest_and_metadat
         finalize_upload(state, &fragment, &version_id, &session_id, key, total, 2).await;
     assert_eq!(finalize_resp.status(), StatusCode::OK);
 
-    let meta = index::read_object_version(&fragment, key, &version_id)
+    let physical_object_id = global_namespace_runtime()
+        .resolve_live_object_id(&fragment, key)
+        .await
+        .expect("resolve finalized dynamic stripe object id")
+        .expect("finalized dynamic stripe object id");
+    let meta = index::read_object_version(&fragment, &physical_object_id, &version_id)
         .await
         .expect("read finalized dynamic stripe object");
     assert_eq!(meta.stripe_size_bytes, 4096);
@@ -2144,7 +2342,7 @@ async fn matrix_fragment_quota_resize_is_admin_validated() {
     let upload_resp =
         upload_one_shot(state, &fragment, "quota/resize-used.bin", vec![0x42; 4]).await;
     assert_eq!(upload_resp.status(), StatusCode::CREATED);
-    let uploaded_meta = index::read_latest_object(&fragment, "quota/resize-used.bin")
+    let uploaded_meta = read_latest_logical_or_physical_object(&fragment, "quota/resize-used.bin")
         .await
         .expect("read quota resize upload metadata");
     let physical_bytes: u64 = uploaded_meta
@@ -2415,7 +2613,7 @@ async fn matrix_fragment_quota_usage_reads_blob_filesystem() {
 
     let upload_resp = upload_one_shot(state, &fragment, object_key, vec![0x31; 4]).await;
     assert_eq!(upload_resp.status(), StatusCode::CREATED);
-    let metadata = index::read_latest_object(&fragment, object_key)
+    let metadata = read_latest_logical_or_physical_object(&fragment, object_key)
         .await
         .expect("read uploaded metadata");
     let physical_bytes: u64 = metadata
@@ -2913,9 +3111,13 @@ async fn init_upload_with_part_size(
     expected_parts: u64,
     part_size_bytes: Option<u64>,
 ) -> (String, String) {
+    let physical_object_id = global_namespace_runtime()
+        .select_object_id_for_write(fragment, object_key)
+        .await
+        .expect("select physical object id");
     let init_resp = initiate_object_upload(
         full_claims(fragment),
-        AxumPath((fragment.to_string(), object_key.to_string())),
+        AxumPath((fragment.to_string(), physical_object_id.clone())),
         AxumJson(InitiateUploadParams {
             content_type: Some("application/octet-stream".into()),
             total_size_bytes: total_size,
@@ -2942,6 +3144,16 @@ async fn init_upload_with_part_size(
         .as_str()
         .expect("session_id")
         .to_string();
+    global_namespace_runtime()
+        .bind_pending_upload(
+            fragment,
+            object_key,
+            &physical_object_id,
+            &version_id,
+            &session_id,
+        )
+        .await
+        .expect("bind pending logical upload");
     (version_id, session_id)
 }
 
@@ -2977,7 +3189,15 @@ async fn finalize_upload_with_part_size(
     expected_parts: u64,
     part_size_bytes: Option<u64>,
 ) -> axum::response::Response {
-    finalize_object_upload(
+    let binding = global_namespace_runtime()
+        .pending_upload(fragment, version_id)
+        .await
+        .expect("pending upload lookup");
+    let physical_object_id = binding
+        .as_ref()
+        .map(|binding| binding.physical_object_id.clone())
+        .unwrap_or_else(|| object_key.to_string());
+    let response = finalize_object_upload(
         State(state),
         full_claims(fragment),
         AxumPath((
@@ -2986,7 +3206,7 @@ async fn finalize_upload_with_part_size(
             session_id.to_string(),
         )),
         Query(ObjectKeyQuery {
-            object_key: object_key.to_string(),
+            object_key: physical_object_id.clone(),
             version_id: None,
             filename: None,
         }),
@@ -3005,7 +3225,21 @@ async fn finalize_upload_with_part_size(
     )
     .await
     .expect("finalize upload")
-    .into_response()
+    .into_response();
+    if response.status() == StatusCode::OK {
+        let metadata = index::read_object_version(fragment, &physical_object_id, version_id)
+            .await
+            .expect("read finalized physical metadata");
+        global_namespace_runtime()
+            .finalize_logical_upload(fragment, object_key, &physical_object_id, &metadata)
+            .await
+            .expect("finalize logical namespace upload");
+        global_namespace_runtime()
+            .clear_pending_upload(fragment, version_id)
+            .await
+            .expect("clear pending logical upload");
+    }
+    response
 }
 
 async fn put_object(
@@ -3036,14 +3270,68 @@ async fn bind_logical_path_to_physical_object(
     logical_path: &str,
     physical_object_id: &str,
 ) -> ObjectMetadata {
-    let metadata = index::read_latest_object(fragment, physical_object_id)
+    let resolved_physical_object_id =
+        match index::read_latest_object(fragment, physical_object_id).await {
+            Ok(metadata) => {
+                global_namespace_runtime()
+                    .finalize_logical_upload(fragment, logical_path, physical_object_id, &metadata)
+                    .await
+                    .expect("bind logical namespace entry");
+                return metadata;
+            }
+            Err(AppError::NotFound) => global_namespace_runtime()
+                .resolve_live_object_id(fragment, physical_object_id)
+                .await
+                .expect("resolve logical physical object id")
+                .unwrap_or_else(|| physical_object_id.to_string()),
+            Err(err) => panic!("read latest physical object metadata: {err:?}"),
+        };
+    let metadata = index::read_latest_object(fragment, &resolved_physical_object_id)
         .await
-        .expect("read latest physical object metadata");
+        .expect("read latest resolved physical object metadata");
     global_namespace_runtime()
-        .finalize_logical_upload(fragment, logical_path, physical_object_id, &metadata)
+        .finalize_logical_upload(
+            fragment,
+            logical_path,
+            &resolved_physical_object_id,
+            &metadata,
+        )
         .await
         .expect("bind logical namespace entry");
     metadata
+}
+
+async fn read_latest_logical_or_physical_object(
+    fragment: &str,
+    object_key: &str,
+) -> Result<ObjectMetadata, AppError> {
+    let physical_object_id = global_namespace_runtime()
+        .resolve_live_object_id(fragment, object_key)
+        .await?
+        .unwrap_or_else(|| object_key.to_string());
+    let mut metadata = index::read_latest_object(fragment, &physical_object_id).await?;
+    if physical_object_id != object_key {
+        metadata.object_key = object_key.to_string();
+    }
+    Ok(metadata)
+}
+
+async fn list_live_logical_or_physical_versions(
+    fragment: &str,
+    object_key: &str,
+) -> Result<Vec<ObjectMetadata>, AppError> {
+    let physical_object_id = global_namespace_runtime()
+        .resolve_live_object_id(fragment, object_key)
+        .await?
+        .unwrap_or_else(|| object_key.to_string());
+    let mut versions =
+        index::list_live_object_versions_metadata(fragment, &physical_object_id).await?;
+    if physical_object_id != object_key {
+        for version in &mut versions {
+            version.object_key = object_key.to_string();
+        }
+    }
+    Ok(versions)
 }
 
 async fn seed_live_object_metadata(fragment: &str, object_key: &str, size_bytes: u64) -> String {
@@ -5361,6 +5649,10 @@ async fn matrix_gc_keeps_live_data_and_cleans_trash_in_partition_layout() {
     .expect("soft delete for gc")
     .into_response();
     assert_eq!(del_resp.status(), StatusCode::OK);
+    global_namespace_runtime()
+        .empty_trash(&fragment)
+        .await
+        .expect("empty namespace trash before manual GC");
 
     run_manual_gc_and_wait(state).await;
 
@@ -5633,7 +5925,8 @@ async fn matrix_namespace_indexdb_manual_gc_preserves_trashed_objects_until_empt
         vec![0x5a; 4096],
     )
     .await;
-    bind_logical_path_to_physical_object(&fragment, "docs/keep.bin", &physical_object_id).await;
+    let physical_meta =
+        bind_logical_path_to_physical_object(&fragment, "docs/keep.bin", &physical_object_id).await;
 
     global_namespace_runtime()
         .trash(&fragment, "docs/keep.bin")
@@ -5651,7 +5944,7 @@ async fn matrix_namespace_indexdb_manual_gc_preserves_trashed_objects_until_empt
         "trashed namespace entry must remain recoverable after manual GC"
     );
     assert!(
-        index::read_latest_object(&fragment, &physical_object_id)
+        index::read_latest_object(&fragment, &physical_meta.object_key)
             .await
             .is_ok(),
         "manual GC must not reclaim namespace-trashed object before empty trash"
@@ -5689,15 +5982,22 @@ async fn matrix_namespace_indexdb_empty_trash_makes_manual_gc_reclaim_physical_o
         ws_manager: WsConnectionManager::new(),
     });
 
-    let physical_object_id = Ulid::new().to_string();
-    let version_id = put_object(
+    put_object(
         state.clone(),
         &fragment,
-        &physical_object_id,
+        "docs/reclaim.bin",
         vec![0x33; 4096],
     )
     .await;
-    bind_logical_path_to_physical_object(&fragment, "docs/reclaim.bin", &physical_object_id).await;
+    let physical_object_id = global_namespace_runtime()
+        .resolve_live_object_id(&fragment, "docs/reclaim.bin")
+        .await
+        .expect("resolve logical object id")
+        .expect("logical object id");
+    let physical_meta = index::read_latest_object(&fragment, &physical_object_id)
+        .await
+        .expect("read physical metadata");
+    let version_id = physical_meta.version_id.clone();
 
     global_namespace_runtime()
         .trash(&fragment, "docs/reclaim.bin")
@@ -5727,7 +6027,7 @@ async fn matrix_namespace_indexdb_empty_trash_makes_manual_gc_reclaim_physical_o
         "empty trash must remove trash namespace entry"
     );
     assert!(
-        index::read_latest_object(&fragment, &physical_object_id)
+        index::read_latest_object(&fragment, &physical_meta.object_key)
             .await
             .is_err(),
         "manual GC must reclaim physical object once namespace no longer references it"
@@ -5790,15 +6090,22 @@ async fn matrix_namespace_indexdb_individual_purge_targeted_gc_reclaims_physical
         ws_manager: WsConnectionManager::new(),
     });
 
-    let physical_object_id = Ulid::new().to_string();
-    let version_id = put_object(
+    put_object(
         state.clone(),
         &fragment,
-        &physical_object_id,
+        "purge-target.bin",
         vec![0x44; 4096],
     )
     .await;
-    bind_logical_path_to_physical_object(&fragment, "purge-target.bin", &physical_object_id).await;
+    let physical_object_id = global_namespace_runtime()
+        .resolve_live_object_id(&fragment, "purge-target.bin")
+        .await
+        .expect("resolve logical object id")
+        .expect("logical object id");
+    let physical_meta = index::read_latest_object(&fragment, &physical_object_id)
+        .await
+        .expect("read physical metadata");
+    let version_id = physical_meta.version_id.clone();
 
     global_namespace_runtime()
         .trash(&fragment, "purge-target.bin")
@@ -5836,7 +6143,7 @@ async fn matrix_namespace_indexdb_individual_purge_targeted_gc_reclaims_physical
         "purged namespace entry must leave trash listing"
     );
     assert!(
-        index::read_latest_object(&fragment, &physical_object_id)
+        index::read_latest_object(&fragment, &physical_meta.object_key)
             .await
             .is_err(),
         "targeted manual GC must reclaim an individually purged object"
@@ -6705,17 +7012,22 @@ async fn matrix_repair_tolerates_missing_trashed_partition_db_replica() {
     .into_response();
     assert_eq!(del_resp.status(), StatusCode::OK);
 
-    let marker_meta = index::read_latest_trashed_object(&fragment, &key)
+    let physical_object_id = global_namespace_runtime()
+        .resolve_any_object_id(&fragment, &key)
         .await
-        .expect("latest trashed metadata after delete");
+        .expect("resolve trashed physical object id")
+        .expect("trashed physical object id");
+    let marker_meta = index::read_latest_object(&fragment, &physical_object_id)
+        .await
+        .expect("latest physical metadata after namespace trash");
     assert!(
         !marker_meta.is_delete_marker,
-        "trashed metadata should remain a real object record"
+        "namespace trash must not rewrite immutable object metadata into a delete marker"
     );
 
     let pm = ObjectPathManager::new();
     let marker_paths = pm
-        .get_all_object_partition_db_paths(&fragment, &key)
+        .get_all_object_partition_db_paths(&fragment, &physical_object_id)
         .expect("object partition db paths");
     assert!(
         marker_paths.len() >= 2,
@@ -6744,10 +7056,10 @@ async fn matrix_repair_tolerates_missing_trashed_partition_db_replica() {
     .await
     .expect("repair should tolerate missing trash partition db replica");
 
-    let trashed_meta_after = index::read_latest_trashed_object(&fragment, &key)
+    let trashed_meta_after = index::read_latest_object(&fragment, &physical_object_id)
         .await
-        .expect("latest trashed metadata should still be readable");
-    assert_eq!(trashed_meta_after.object_key, key);
+        .expect("latest physical metadata should still be readable");
+    assert_eq!(trashed_meta_after.object_key, physical_object_id);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6930,11 +7242,14 @@ async fn matrix_repair_after_empty_index_disk_preserves_live_posix_listing() {
         indexdb_store::clear_cached_dbs_for_test();
         assert_all_indexdb_replicas_synchronized(&fragment).await;
 
-        let listed = list_objects_json(&fragment, Some("repair-empty"), Some("/")).await;
-        let objects = listed["objects"].as_array().expect("objects array");
-        let mut listed_keys = objects
-            .iter()
-            .filter_map(|object| object["object_key"].as_str().map(str::to_string))
+        let (entries, _) = global_namespace_runtime()
+            .list_dir_page(&fragment, "repair-empty", false, 200, None)
+            .await
+            .expect("list repaired POSIX namespace");
+        let mut listed_keys = entries
+            .into_iter()
+            .filter(|entry| entry.kind == crate::namespace::models::NamespaceEntryKind::File)
+            .map(|entry| entry.path)
             .collect::<Vec<_>>();
         listed_keys.sort();
         assert_eq!(
@@ -7352,13 +7667,13 @@ async fn matrix_redistribution_fails_when_target_layout_needs_more_live_blob_dis
         .store(4096, Ordering::Relaxed);
 
     let owner_root = base.join("index_1");
-    let fragment = fragment_owned_by_index_root(&owner_root, "fragment-redist-missing-blob");
+    let key = "ha-redist/missing-live-blob.bin".to_string();
+    let fragment = fragment_owned_by_index_root(&owner_root, "fragment-redist-missing-blob", &key);
     setup_fragment(&fragment).await;
     let state = Arc::new(AppState {
         ws_manager: WsConnectionManager::new(),
     });
 
-    let key = "ha-redist/missing-live-blob.bin".to_string();
     let content = (0..(22 * 1024 + 13))
         .map(|i| ((i * 17 + 5) % 251) as u8)
         .collect::<Vec<u8>>();
@@ -7473,20 +7788,45 @@ async fn matrix_redistribution_read_falls_back_when_primary_indexdb_copy_is_corr
         .expect("STRIPE_SIZE_ATOMIC")
         .store(4096, Ordering::Relaxed);
 
-    let down_src = base.join("index_1");
-    let down_dst = base.join("index_1.down");
-    let owner_root = base.join("index_2");
-    let fragment = fragment_owned_by_index_root(&owner_root, "fragment-ha-index-fallback");
+    let key = "ha-index/fallback-after-redist.bin".to_string();
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
     setup_fragment(&fragment).await;
     let state = Arc::new(AppState {
         ws_manager: WsConnectionManager::new(),
     });
 
-    let key = "ha-index/fallback-after-redist.bin".to_string();
     let content = (0..(40 * 1024 + 73))
         .map(|i| ((i * 13) % 251) as u8)
         .collect::<Vec<u8>>();
     let _version_id = put_object(state, &fragment, &key, content.clone()).await;
+
+    let physical_object_id_before = global_namespace_runtime()
+        .resolve_live_object_id(&fragment, &key)
+        .await
+        .expect("resolve physical object id before follower-down redistribution")
+        .expect("physical object id before follower-down redistribution");
+    let path_manager = ObjectPathManager::new();
+    let partition_paths_before = path_manager
+        .get_all_object_partition_db_paths(&fragment, &physical_object_id_before)
+        .expect("object partition db paths before follower-down redistribution");
+    let follower_partition_path = partition_paths_before
+        .get(1)
+        .expect("follower partition path before follower-down redistribution");
+    let down_src = path_manager
+        .get_all_index_roots()
+        .into_iter()
+        .find(|root| follower_partition_path.starts_with(root))
+        .expect("follower index root before follower-down redistribution");
+    let down_dst = down_src.with_file_name(format!(
+        "{}.down",
+        down_src
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("index")
+    ));
 
     if fs::try_exists(&down_dst).await.unwrap_or(false) {
         let _ = fs::remove_dir_all(&down_dst).await;
@@ -7523,9 +7863,13 @@ async fn matrix_redistribution_read_falls_back_when_primary_indexdb_copy_is_corr
         .await
         .expect("resync restored follower indexdb replica");
 
-    let path_manager = ObjectPathManager::new();
+    let physical_object_id = global_namespace_runtime()
+        .resolve_live_object_id(&fragment, &key)
+        .await
+        .expect("resolve physical object id after redistribution")
+        .expect("physical object id after redistribution");
     let partition_db_paths = path_manager
-        .get_all_object_partition_db_paths(&fragment, &key)
+        .get_all_object_partition_db_paths(&fragment, &physical_object_id)
         .expect("object partition db paths");
     assert!(
         partition_db_paths.len() >= 2,
@@ -7578,15 +7922,16 @@ async fn matrix_redistribution_defers_cutover_until_owner_index_restored() {
         .expect("STRIPE_SIZE_ATOMIC")
         .store(4096, Ordering::Relaxed);
 
-    let down_src = base.join("index_2");
-    let down_dst = base.join("index_2.down");
-    let fragment = fragment_owned_by_index_root(&down_src, "fragment-ha-redist-owner-down");
+    let key = "ha-redist-owner-down.bin".to_string();
+    let fragment = {
+        let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
+        hex::encode(digest)
+    };
     setup_fragment(&fragment).await;
     let state = Arc::new(AppState {
         ws_manager: WsConnectionManager::new(),
     });
 
-    let key = "ha-redist-owner-down.bin".to_string();
     let content = (0..(48 * 1024 + 19))
         .map(|i| ((i * 7 + 11) % 251) as u8)
         .collect::<Vec<u8>>();
@@ -7611,6 +7956,31 @@ async fn matrix_redistribution_defers_cutover_until_owner_index_restored() {
             .count(),
         0
     );
+
+    let physical_object_id = global_namespace_runtime()
+        .resolve_live_object_id(&fragment, &key)
+        .await
+        .expect("resolve physical object id before owner-down redistribution")
+        .expect("physical object id before owner-down redistribution");
+    let path_manager = ObjectPathManager::new();
+    let partition_paths = path_manager
+        .get_all_object_partition_db_paths(&fragment, &physical_object_id)
+        .expect("object partition db paths before owner-down redistribution");
+    let owner_partition_path = partition_paths
+        .first()
+        .expect("owner partition path before owner-down redistribution");
+    let down_src = path_manager
+        .get_all_index_roots()
+        .into_iter()
+        .find(|root| owner_partition_path.starts_with(root))
+        .expect("owner index root before owner-down redistribution");
+    let down_dst = down_src.with_file_name(format!(
+        "{}.down",
+        down_src
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("index")
+    ));
 
     if fs::try_exists(&down_dst).await.unwrap_or(false) {
         let _ = fs::remove_dir_all(&down_dst).await;
@@ -7769,7 +8139,12 @@ async fn matrix_reads_prefer_owner_partition_db_over_divergent_replica() {
         .collect::<Vec<u8>>();
     put_object(state, &fragment, &key, content.clone()).await;
 
-    let partition_db_paths = object_partition_db_paths_owner_first(&fragment, &key);
+    let physical_object_id = global_namespace_runtime()
+        .resolve_live_object_id(&fragment, &key)
+        .await
+        .expect("resolve physical object id")
+        .expect("logical path should point to a physical object id");
+    let partition_db_paths = object_partition_db_paths_owner_first(&fragment, &physical_object_id);
     assert!(
         partition_db_paths.len() >= 2,
         "expected owner + replica partition db paths"
@@ -7828,7 +8203,12 @@ async fn matrix_owner_partition_db_missing_meta_self_heals_on_read() {
         .collect::<Vec<u8>>();
     put_object(state, &fragment, &key, content.clone()).await;
 
-    let partition_db_paths = object_partition_db_paths_owner_first(&fragment, &key);
+    let physical_object_id = global_namespace_runtime()
+        .resolve_live_object_id(&fragment, &key)
+        .await
+        .expect("resolve physical object id")
+        .expect("logical path should point to a physical object id");
+    let partition_db_paths = object_partition_db_paths_owner_first(&fragment, &physical_object_id);
     assert!(
         !partition_db_paths.is_empty(),
         "expected owner partition db path"
@@ -7860,7 +8240,7 @@ async fn matrix_owner_partition_db_missing_meta_self_heals_on_read() {
             .expect("remove replica partition db to force owner read");
     }
 
-    let latest = index::read_latest_object(&fragment, &key)
+    let latest = read_latest_logical_or_physical_object(&fragment, &key)
         .await
         .expect("owner read should self-heal missing partition metadata");
     assert_eq!(latest.object_key, key);
@@ -10067,8 +10447,16 @@ async fn matrix_bulk_delete_and_recover_round_trip() {
         .expect("bulk delete body");
     let bulk_delete_json: serde_json::Value =
         serde_json::from_slice(&bulk_delete_body).expect("bulk delete json");
-    assert_eq!(bulk_delete_json["succeeded"].as_u64(), Some(64));
-    assert_eq!(bulk_delete_json["not_found"].as_u64(), Some(0));
+    assert_eq!(
+        bulk_delete_json["succeeded"].as_u64(),
+        Some(64),
+        "bulk delete response: {bulk_delete_json}"
+    );
+    assert_eq!(
+        bulk_delete_json["not_found"].as_u64(),
+        Some(0),
+        "bulk delete response: {bulk_delete_json}"
+    );
 
     let live_after_delete_resp = list_objects(
         full_claims(&fragment),
@@ -10119,8 +10507,16 @@ async fn matrix_bulk_delete_and_recover_round_trip() {
         .expect("bulk recover body");
     let bulk_recover_json: serde_json::Value =
         serde_json::from_slice(&bulk_recover_body).expect("bulk recover json");
-    assert_eq!(bulk_recover_json["succeeded"].as_u64(), Some(64));
-    assert_eq!(bulk_recover_json["not_found"].as_u64(), Some(0));
+    assert_eq!(
+        bulk_recover_json["succeeded"].as_u64(),
+        Some(64),
+        "bulk recover response: {bulk_recover_json}"
+    );
+    assert_eq!(
+        bulk_recover_json["not_found"].as_u64(),
+        Some(0),
+        "bulk recover response: {bulk_recover_json}"
+    );
 
     let live_after_recover_resp = list_objects(
         full_claims(&fragment),
@@ -10335,7 +10731,7 @@ async fn matrix_version_delete_is_direct_and_skips_trash_plane() {
             .is_empty()
     );
     assert_eq!(
-        index::list_live_object_versions_metadata(&fragment, &key)
+        list_live_logical_or_physical_versions(&fragment, &key)
             .await
             .expect("live versions before recover")
             .len(),
@@ -10370,7 +10766,7 @@ async fn matrix_version_delete_is_direct_and_skips_trash_plane() {
             .expect("trashed versions after empty")
             .is_empty()
     );
-    let live_after_empty = index::list_live_object_versions_metadata(&fragment, &key)
+    let live_after_empty = list_live_logical_or_physical_versions(&fragment, &key)
         .await
         .expect("live versions after empty");
     assert_eq!(live_after_empty.len(), 1);
@@ -10414,6 +10810,16 @@ async fn matrix_rename_allows_destination_with_only_trashed_history() {
         destination_bytes,
     )
     .await;
+    let source_object_id = global_namespace_runtime()
+        .resolve_live_object_id(&fragment, &source_key)
+        .await
+        .expect("resolve source physical object id")
+        .expect("source should resolve before rename");
+    let destination_object_id = global_namespace_runtime()
+        .resolve_live_object_id(&fragment, &destination_key)
+        .await
+        .expect("resolve destination physical object id")
+        .expect("destination should resolve before delete");
 
     let delete_resp = delete_object(
         State(state.clone()),
@@ -10426,19 +10832,34 @@ async fn matrix_rename_allows_destination_with_only_trashed_history() {
     assert_eq!(delete_resp.status(), StatusCode::OK);
 
     assert!(
-        index::list_live_object_versions_metadata(&fragment, &destination_key)
+        global_namespace_runtime()
+            .resolve_live_object_id(&fragment, &destination_key)
             .await
-            .expect("live destination versions after soft delete")
-            .is_empty(),
+            .expect("resolve destination after soft delete")
+            .is_none(),
         "destination should have no live versions after soft delete"
     );
-    assert_eq!(
-        index::list_trashed_object_versions_metadata(&fragment, &destination_key)
-            .await
-            .expect("trashed destination versions after soft delete")
-            .len(),
-        1,
-        "destination should retain one trashed version"
+    let trash_after_delete = list_trash_json_page(&fragment, Some("rename"), None, 100, None).await;
+    let trashed_after_delete = trash_after_delete["objects"]
+        .as_array()
+        .expect("trash objects after delete");
+    assert!(
+        trashed_after_delete.iter().any(|entry| {
+            entry["object_key"].as_str() == Some(destination_key.as_str())
+                && entry["version_id"].as_str() == Some(trashed_destination_version.as_str())
+        }),
+        "destination should retain one namespace trash entry after soft delete: {:?}",
+        trash_after_delete
+    );
+    assert!(
+        index::read_object_version(
+            &fragment,
+            &destination_object_id,
+            &trashed_destination_version,
+        )
+        .await
+        .is_ok(),
+        "soft delete must not mutate or remove immutable destination object metadata"
     );
 
     let rename_resp = rename_object(
@@ -10463,8 +10884,14 @@ async fn matrix_rename_allows_destination_with_only_trashed_history() {
         "source key should disappear after rename"
     );
 
+    let moved_object_id = global_namespace_runtime()
+        .resolve_live_object_id(&fragment, &destination_key)
+        .await
+        .expect("resolve destination after rename")
+        .expect("destination should resolve after rename");
+    assert_eq!(moved_object_id, source_object_id);
     let live_destination_versions =
-        index::list_live_object_versions_metadata(&fragment, &destination_key)
+        list_live_logical_or_physical_versions(&fragment, &destination_key)
             .await
             .expect("live destination versions after rename");
     assert_eq!(live_destination_versions.len(), 1);
@@ -10481,16 +10908,7 @@ async fn matrix_rename_allows_destination_with_only_trashed_history() {
                 meta.is_delete_marker
             ))
             .collect::<Vec<_>>(),
-        index::list_trashed_object_versions_metadata(&fragment, &destination_key)
-            .await
-            .expect("trashed destination versions for debug")
-            .iter()
-            .map(|meta| (
-                meta.object_key.clone(),
-                meta.version_id.clone(),
-                meta.is_delete_marker
-            ))
-            .collect::<Vec<_>>()
+        list_trash_json_page(&fragment, Some("rename"), None, 100, None).await
     );
     let moved = read_object_bytes(
         full_claims(&fragment),
@@ -10500,14 +10918,17 @@ async fn matrix_rename_allows_destination_with_only_trashed_history() {
     .await;
     assert_eq!(moved, source_bytes);
 
-    let trashed_destination_versions =
-        index::list_trashed_object_versions_metadata(&fragment, &destination_key)
-            .await
-            .expect("trashed destination versions after rename");
-    assert_eq!(trashed_destination_versions.len(), 1);
-    assert_eq!(
-        trashed_destination_versions[0].version_id,
-        trashed_destination_version
+    let trash_after_rename = list_trash_json_page(&fragment, Some("rename"), None, 100, None).await;
+    let trashed_after_rename = trash_after_rename["objects"]
+        .as_array()
+        .expect("trash objects after rename");
+    assert!(
+        trashed_after_rename.iter().any(|entry| {
+            entry["object_key"].as_str() == Some(destination_key.as_str())
+                && entry["version_id"].as_str() == Some(trashed_destination_version.as_str())
+        }),
+        "rename must not erase destination namespace trash history: {:?}",
+        trash_after_rename
     );
 }
 
@@ -10541,11 +10962,13 @@ async fn matrix_recover_all_trash_resumes_from_persistent_journal() {
     .expect("soft delete for recover resume")
     .into_response();
     assert_eq!(delete_resp.status(), StatusCode::OK);
+    let trash_before_resume = list_trash_json_page(&fragment, None, None, 100, None).await;
     assert!(
-        !index::list_fragment_object_keys_with_trash_versions(&fragment)
-            .await
-            .expect("trash keys before resume")
-            .is_empty()
+        !trash_before_resume["objects"]
+            .as_array()
+            .expect("trash objects before resume")
+            .is_empty(),
+        "namespace trash should hold the recover candidate before resume"
     );
 
     seed_persistent_trash_job(&fragment, "recover_all_trash").await;
@@ -10556,11 +10979,13 @@ async fn matrix_recover_all_trash_resumes_from_persistent_journal() {
 
     let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
     assert_eq!(got, bytes);
+    let trash_after_resume = list_trash_json_page(&fragment, None, None, 100, None).await;
     assert!(
-        index::list_fragment_object_keys_with_trash_versions(&fragment)
-            .await
-            .expect("trash keys after resume")
-            .is_empty()
+        trash_after_resume["objects"]
+            .as_array()
+            .expect("trash objects after resume")
+            .is_empty(),
+        "namespace trash should be empty after recover resume"
     );
     for path in persistent_trash_job_paths(&fragment) {
         assert!(
@@ -10623,11 +11048,13 @@ async fn matrix_empty_trash_resumes_from_persistent_journal() {
         .is_err(),
         "emptied key should not be readable after journal resume"
     );
+    let trash_after_empty_resume = list_trash_json_page(&fragment, None, None, 100, None).await;
     assert!(
-        index::list_fragment_object_keys_with_trash_versions(&fragment)
-            .await
-            .expect("trash keys after empty resume")
-            .is_empty()
+        trash_after_empty_resume["objects"]
+            .as_array()
+            .expect("trash objects after empty resume")
+            .is_empty(),
+        "namespace trash should be empty after empty-trash resume"
     );
     for path in persistent_trash_job_paths(&fragment) {
         assert!(
@@ -10706,11 +11133,13 @@ async fn matrix_recover_object_remains_correct_if_blob_move_happened_before_meta
 
     let got = read_object_bytes(full_claims(&fragment), fragment.clone(), key.clone()).await;
     assert_eq!(got, bytes);
+    let trash_after_recover = list_trash_json_page(&fragment, None, None, 100, None).await;
     assert!(
-        index::list_fragment_object_keys_with_trash_versions(&fragment)
-            .await
-            .expect("trash keys after interrupted recover")
-            .is_empty()
+        trash_after_recover["objects"]
+            .as_array()
+            .expect("trash objects after interrupted recover")
+            .is_empty(),
+        "namespace trash should be empty after interrupted recover"
     );
 }
 
@@ -11205,7 +11634,6 @@ async fn matrix_live_listing_supports_prefix_and_delimiter_pagination() {
     });
 
     for (key, fill) in [
-        ("page", 1u8),
         ("page/a.bin", 2u8),
         ("page/b.bin", 3u8),
         ("page/sub-a/x.bin", 4u8),
@@ -11251,7 +11679,6 @@ async fn matrix_live_listing_supports_prefix_and_delimiter_pagination() {
     assert_eq!(
         rows,
         vec![
-            "object:page".to_string(),
             "object:page/a.bin".to_string(),
             "object:page/b.bin".to_string(),
             "prefix:page/sub-a/".to_string(),
@@ -11285,7 +11712,6 @@ async fn matrix_live_listing_rebuilds_partition_namespace_index_when_missing() {
     });
 
     for (key, fill) in [
-        ("rebuild", 1u8),
         ("rebuild/a.bin", 2u8),
         ("rebuild/b.bin", 3u8),
         ("rebuild/sub-a/x.bin", 4u8),
@@ -11339,18 +11765,17 @@ async fn matrix_live_listing_rebuilds_partition_namespace_index_when_missing() {
     assert_eq!(
         rows,
         vec![
-            "object:rebuild".to_string(),
             "object:rebuild/a.bin".to_string(),
             "object:rebuild/b.bin".to_string(),
             "prefix:rebuild/sub-a/".to_string(),
             "prefix:rebuild/sub-b/".to_string(),
         ]
     );
-    assert!(
+    assert_eq!(
         indexdb_store::count_live_namespace_rows_for_test(&fragment)
-            .expect("count rebuilt namespace rows")
-            > 0,
-        "listing should lazily rebuild partition-local live namespace rows"
+            .expect("count legacy namespace rows after listing"),
+        0,
+        "listing should use the 3.0 namespace authority, not rebuild legacy live rows"
     );
 }
 
@@ -11389,6 +11814,16 @@ async fn matrix_live_listing_with_delimiter_survives_cache_eviction_after_many_r
         )
         .await;
 
+        let destination_key = format!("sample/{source_key}");
+        let destination_parent = destination_key
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .expect("destination parent");
+        global_namespace_runtime()
+            .mkdir(&fragment, destination_parent)
+            .await
+            .expect("mkdir destination parent");
+
         let response = rename_object(
             State(state.clone()),
             full_claims(&fragment),
@@ -11396,7 +11831,7 @@ async fn matrix_live_listing_with_delimiter_survives_cache_eviction_after_many_r
                 source_fragment: fragment.clone(),
                 source_key: source_key.clone(),
                 destination_fragment: fragment.clone(),
-                destination_key: format!("sample/{source_key}"),
+                destination_key,
             }),
         )
         .await
@@ -11718,9 +12153,14 @@ async fn matrix_permanent_delete_removes_object_and_allows_recreate_without_tomb
     let key = "tombstone/stale-writer.bin".to_string();
     put_object(state.clone(), &fragment, &key, vec![7u8; 4096]).await;
 
-    let old_meta = get_metadata(&fragment, &key, &fragment)
+    let physical_object_id = global_namespace_runtime()
+        .resolve_live_object_id(&fragment, &key)
         .await
-        .expect("metadata before delete");
+        .expect("resolve physical object id before delete")
+        .expect("logical path should point to a physical object id");
+    let old_meta = index::read_latest_object(&fragment, &physical_object_id)
+        .await
+        .expect("physical metadata before delete");
 
     let resp = delete_object_permanently(
         State(state),
@@ -11741,12 +12181,25 @@ async fn matrix_permanent_delete_removes_object_and_allows_recreate_without_tomb
         .await
         .expect("reinsert historical version after permanent delete");
 
+    assert!(
+        matches!(
+            get_metadata(&fragment, &key, &fragment).await,
+            Err(AppError::NotFound)
+        ),
+        "object metadata alone must not resurrect a purged namespace path"
+    );
+
+    global_namespace_runtime()
+        .finalize_logical_upload(&fragment, &key, &physical_object_id, &old_meta)
+        .await
+        .expect("rebind namespace path after explicit recreate");
+
     let recreated = get_metadata(&fragment, &key, &fragment)
         .await
         .expect("recreated metadata after permanent delete");
     assert_eq!(recreated.version_id, old_meta.version_id);
     assert_eq!(
-        index::list_live_object_versions_metadata(&fragment, &key)
+        list_live_logical_or_physical_versions(&fragment, &key)
             .await
             .expect("list live versions after recreate")
             .len(),
@@ -11761,8 +12214,12 @@ async fn matrix_permanent_delete_removes_object_and_allows_recreate_without_tomb
     index::upsert_object_version(&newer_meta)
         .await
         .expect("insert newer version after recreate");
+    global_namespace_runtime()
+        .finalize_logical_upload(&fragment, &key, &physical_object_id, &newer_meta)
+        .await
+        .expect("advance namespace head after explicit newer recreate");
 
-    let latest = index::read_latest_object(&fragment, &key)
+    let latest = read_latest_logical_or_physical_object(&fragment, &key)
         .await
         .expect("newer version should replace recreated historical version");
     assert_eq!(latest.version_id, newer_meta.version_id);
@@ -11795,7 +12252,7 @@ async fn matrix_direct_deleting_current_version_rolls_back_to_previous_live_vers
     put_object(state.clone(), &fragment, &key, v1.clone()).await;
     put_object(state.clone(), &fragment, &key, v2.clone()).await;
 
-    let live_versions = index::list_live_object_versions_metadata(&fragment, &key)
+    let live_versions = list_live_logical_or_physical_versions(&fragment, &key)
         .await
         .expect("list versions before delete");
     assert_eq!(live_versions.len(), 2);
@@ -11811,7 +12268,7 @@ async fn matrix_direct_deleting_current_version_rolls_back_to_previous_live_vers
     .into_response();
     assert_eq!(del_resp.status(), StatusCode::NO_CONTENT);
 
-    let latest = index::read_latest_object(&fragment, &key)
+    let latest = read_latest_logical_or_physical_object(&fragment, &key)
         .await
         .expect("latest object after deleting current version");
     assert_eq!(latest.object_key, key);
@@ -11824,7 +12281,7 @@ async fn matrix_direct_deleting_current_version_rolls_back_to_previous_live_vers
         Err(AppError::NotFound)
     ));
     assert_eq!(
-        index::list_live_object_versions_metadata(&fragment, &key)
+        list_live_logical_or_physical_versions(&fragment, &key)
             .await
             .expect("list versions after direct delete")
             .len(),

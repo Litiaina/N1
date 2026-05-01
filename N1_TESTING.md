@@ -35,7 +35,7 @@ scripts/bench/run_release_drills.sh
 
 This is the confidence test for the bug class where listing is correct before restart but wrong after restart.
 
-It starts a real N1 server binary, creates a real fragment, uploads a real nested folder through the public HTTP one-shot route, lists through the public API, restarts the process, lists again from disk-only state, downloads sample files, and directly inspects each on-disk `index.ndxdb`.
+It starts a real N1 server binary, creates a real fragment, uploads a real nested folder through the public HTTP one-shot route, lists through the public API, restarts the process, lists again from disk-only state, downloads sample files, and directly inspects the on-disk sharded `indexdb` files.
 
 ```bash
 sudo -E \
@@ -81,4 +81,4 @@ scripts/bench/run_release_drills.sh
 sudo -E SOURCE_DIR=<real-folder> DISK_ROOTS=<disk-a>,<disk-b> scripts/bench/run_real_restart_proof.sh
 ```
 
-Do not treat synthetic tests alone as release confidence. N1 must prove the public API, process restart, real filesystem quota, real disk layout, and durable `index.ndxdb` state together.
+Do not treat synthetic tests alone as release confidence. N1 must prove the public API, process restart, real filesystem quota, real disk layout, and durable sharded `indexdb` state together.

@@ -6,6 +6,7 @@ use crate::core::metadata_parser::get_metadata;
 use crate::core::object_parser::{get_object_logic, stream_object_logic};
 use crate::core::quota_manager::get_storage_usage;
 use crate::enums::app_error_enum::AppError;
+use crate::namespace::runtime::global_namespace_runtime;
 use crate::structs::auth_structs::Claims;
 use axum::{
     Json as AxumJson,
@@ -21,33 +22,29 @@ use walkdir::WalkDir;
 async fn list_objects_flat_page(
     fragment: &str,
     scan_trash: bool,
-    prefix: Option<String>,
-    delimiter: Option<String>,
+    _prefix: Option<String>,
+    _delimiter: Option<String>,
     limit: usize,
-    continuation_token: Option<String>,
-    include_internal: bool,
+    _continuation_token: Option<String>,
+    _include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
-    if scan_trash {
-        index::scan_fragment_trash_objects_page(
-            fragment,
-            prefix,
-            delimiter,
-            limit,
-            continuation_token,
-            include_internal,
-        )
-        .await
-    } else {
-        index::scan_fragment_live_objects_page(
-            fragment,
-            prefix,
-            delimiter,
-            limit,
-            continuation_token,
-            include_internal,
-        )
-        .await
+    let mut params = HashMap::new();
+    params.insert("limit".to_string(), limit.to_string());
+    if let Some(prefix) = _prefix {
+        params.insert("prefix".to_string(), prefix);
     }
+    if let Some(delimiter) = _delimiter {
+        params.insert("delimiter".to_string(), delimiter);
+    }
+    if let Some(token) = _continuation_token {
+        params.insert("continuation_token".to_string(), token);
+    }
+    if _include_internal {
+        params.insert("include_internal".to_string(), "true".to_string());
+    }
+    global_namespace_runtime()
+        .list_objects_page(fragment, &params, scan_trash)
+        .await
 }
 
 pub async fn list_objects(
@@ -142,10 +139,14 @@ pub async fn list_object_versions(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let versions = index::list_live_object_versions_metadata(&fragment, &object_key)
+    let physical_object_id = resolve_read_object_id(&fragment, &object_key, false).await?;
+    let versions = index::list_live_object_versions_metadata(&fragment, &physical_object_id)
         .await?
         .into_iter()
-        .map(ObjectMetadata::without_internal_layout)
+        .map(|mut metadata| {
+            metadata.object_key = object_key.clone();
+            metadata.without_internal_layout()
+        })
         .collect::<Vec<_>>();
 
     Ok(AxumJson(versions))
@@ -235,10 +236,12 @@ pub async fn get_object_metadata_direct(
     fragment: &str,
     object_key: &str,
 ) -> Result<ObjectMetadata, AppError> {
-    let metadata = get_metadata(fragment, object_key, fragment).await?;
+    let physical_object_id = resolve_read_object_id(fragment, object_key, false).await?;
+    let mut metadata = get_metadata(fragment, &physical_object_id, fragment).await?;
     if metadata.is_delete_marker {
         return Err(AppError::NotFound);
     }
+    metadata.object_key = object_key.trim_start_matches('/').to_string();
     Ok(metadata)
 }
 
@@ -255,7 +258,7 @@ pub async fn get_object(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let metadata = get_metadata(&fragment, &object_key, &fragment).await?;
+    let metadata = get_object_metadata_direct(&fragment, &object_key).await?;
 
     if metadata.is_delete_marker {
         return Err(AppError::NotFound);
@@ -287,11 +290,29 @@ pub async fn stream_object(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let metadata = get_metadata(&fragment, &object_key, &fragment).await?;
+    let metadata = get_object_metadata_direct(&fragment, &object_key).await?;
 
     if metadata.is_delete_marker {
         return Err(AppError::NotFound);
     }
 
     stream_object_logic(headers, metadata, "inline", None).await
+}
+
+async fn resolve_read_object_id(
+    fragment: &str,
+    object_key: &str,
+    include_trash: bool,
+) -> Result<String, AppError> {
+    let normalized = object_key.trim_start_matches('/').to_string();
+    let resolved = if include_trash {
+        global_namespace_runtime()
+            .resolve_any_object_id(fragment, &normalized)
+            .await?
+    } else {
+        global_namespace_runtime()
+            .resolve_live_object_id(fragment, &normalized)
+            .await?
+    };
+    Ok(resolved.unwrap_or(normalized))
 }

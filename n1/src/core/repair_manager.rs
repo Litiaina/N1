@@ -820,7 +820,7 @@ async fn repair_fragment_index_db(
     fragment: &str,
     dry_run: bool,
 ) -> Result<(u64, u64, u64), AppError> {
-    indexdb_store::repair_fragment_partition_replicas(fragment, dry_run)
+    indexdb_store::repair_fragment_all_partition_replicas(fragment, dry_run)
 }
 
 async fn process_object_repair(
@@ -1080,6 +1080,10 @@ pub async fn run_repair_job_with_options(
             status.divergent_meta_repaired += pdiv;
             status.corrupt_found += pcorrupt;
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
+        }
+
+        if !cfg.dry_run && (pmiss > 0 || pdiv > 0 || pcorrupt > 0) {
+            global_namespace_runtime().evict_fragment(&fragment_hash);
         }
 
         {

@@ -1859,22 +1859,6 @@ pub async fn upload_object_one_shot(
 
     let path_manager = ObjectPathManager::new();
     let created_at = Utc::now().timestamp();
-    let manifest = UploadSessionManifest {
-        fragment: fragment.clone(),
-        object_key: object_key.clone(),
-        version_id: version_id.clone(),
-        session_id: session_id.clone(),
-        total_size_bytes: content_length,
-        expected_parts: 1,
-        part_size_bytes: content_length,
-        content_type: content_type.clone(),
-        created_at,
-        stripe_size_bytes: stripe_size,
-        data_shards: configured_data_shards() as u16,
-        parity_shards: configured_parity_shards() as u16,
-    };
-    index::open_session(&manifest, None).await?;
-
     let part_meta = match write_part_blob_to_disk(
         &path_manager,
         &fragment,
@@ -1892,7 +1876,6 @@ pub async fn upload_object_one_shot(
     {
         Ok(part_meta) => part_meta,
         Err(err) => {
-            let _ = index::remove_session(&fragment, &version_id, "one-shot-failed").await;
             cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
             return Err(err);
         }
@@ -1914,11 +1897,9 @@ pub async fn upload_object_one_shot(
 
     let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
     if let Err(err) = index::publish_object(&object_meta).await {
-        let _ = index::remove_session(&fragment, &version_id, "one-shot-publish-failed").await;
         cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
         return Err(err);
     }
-    let _ = index::remove_session(&fragment, &version_id, "one-shot-finalized").await;
 
     let response_body = serde_json::to_value(object_meta.clone().without_internal_layout())
         .map_err(|e| {

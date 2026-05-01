@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-const INDEXDB_FILE: &str = "index.ndxdb";
+const INDEXDB_SHARD_FILE_PREFIX: &str = "shard_";
 
 pub fn default_format() -> String {
     "zip".to_string()
@@ -60,13 +60,22 @@ impl ObjectPathManager {
         usize::from(u16::from(hash[0]) << 8 | u16::from(hash[1])) % root_count
     }
 
-    fn select_fragment_roots(&self, fragment_hash: &str) -> Vec<PathBuf> {
+    fn partition_id(fragment_hash: &str, namespace: &str, key: &str) -> Result<u16, AppError> {
+        let partition_count =
+            crate::core::fragment_metadata::fragment_index_partition_count(fragment_hash)?;
+        let hash = Self::route_hash(&[namespace, fragment_hash, key]);
+        Ok((u16::from(hash[0]) << 8 | u16::from(hash[1])) % partition_count)
+    }
+
+    fn select_partition_roots(&self, fragment_hash: &str, partition_id: u16) -> Vec<PathBuf> {
         let roots = self.get_all_index_roots();
         if roots.is_empty() {
             return Vec::new();
         }
 
-        let owner_idx = Self::fragment_owner_index(fragment_hash, roots.len());
+        let owner_idx = (Self::fragment_owner_index(fragment_hash, roots.len())
+            + usize::from(partition_id))
+            % roots.len();
         let mut selected = vec![roots[owner_idx].clone()];
         for (idx, root) in roots.into_iter().enumerate() {
             if idx != owner_idx {
@@ -76,19 +85,23 @@ impl ObjectPathManager {
         selected
     }
 
-    fn index_db_path(root: &PathBuf, fragment_hash: &str) -> PathBuf {
-        root.join(fragment_hash).join("indexdb").join(INDEXDB_FILE)
+    fn index_db_path(root: &PathBuf, fragment_hash: &str, partition_id: u16) -> PathBuf {
+        root.join(fragment_hash).join("indexdb").join(format!(
+            "{}{:04x}.ndxdb",
+            INDEXDB_SHARD_FILE_PREFIX, partition_id
+        ))
     }
 
     pub fn get_all_session_partition_db_paths(
         &self,
         fragment_hash: &str,
-        _version_id: &str,
+        version_id: &str,
     ) -> Result<Vec<PathBuf>, AppError> {
+        let partition_id = Self::partition_id(fragment_hash, "session", version_id)?;
         Ok(self
-            .select_fragment_roots(fragment_hash)
+            .select_partition_roots(fragment_hash, partition_id)
             .iter()
-            .map(|root| Self::index_db_path(root, fragment_hash))
+            .map(|root| Self::index_db_path(root, fragment_hash, partition_id))
             .collect())
     }
 
@@ -105,12 +118,14 @@ impl ObjectPathManager {
     pub fn get_all_object_partition_db_paths(
         &self,
         fragment_hash: &str,
-        _object_key: &str,
+        object_key: &str,
     ) -> Result<Vec<PathBuf>, AppError> {
+        let object_key = Self::canonical_object_key(object_key);
+        let partition_id = Self::partition_id(fragment_hash, "object", &object_key)?;
         Ok(self
-            .select_fragment_roots(fragment_hash)
+            .select_partition_roots(fragment_hash, partition_id)
             .iter()
-            .map(|root| Self::index_db_path(root, fragment_hash))
+            .map(|root| Self::index_db_path(root, fragment_hash, partition_id))
             .collect())
     }
 

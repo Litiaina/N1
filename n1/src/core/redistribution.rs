@@ -6,7 +6,9 @@ use crate::core::disk_manager::{
     default_stripe_size,
 };
 use crate::core::ec::ErasureStreamWriter;
-use crate::core::fragment_metadata::{read_fragment_metadata, write_fragment_metadata};
+use crate::core::fragment_metadata::{
+    fragment_index_partition_count, read_fragment_metadata, write_fragment_metadata,
+};
 use crate::core::index;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::read_or_recover_chunk;
@@ -731,7 +733,7 @@ fn get_shard_dir_custom(
 fn get_partition_db_paths_custom(
     index_roots: &[PathBuf],
     fragment_hash: &str,
-    _object_key: &str,
+    object_key: &str,
 ) -> Vec<PathBuf> {
     use sha2::{Digest, Sha256};
 
@@ -739,14 +741,26 @@ fn get_partition_db_paths_custom(
         return Vec::new();
     }
 
+    let partition_count = fragment_index_partition_count(fragment_hash).unwrap_or(1);
+    let canonical_key = ObjectPathManager::canonical_object_key(object_key);
+    let mut object_hasher = Sha256::new();
+    for part in ["object", fragment_hash, canonical_key.as_str()] {
+        object_hasher.update(part.as_bytes());
+        object_hasher.update([0u8]);
+    }
+    let object_hash: [u8; 32] = object_hasher.finalize().into();
+    let partition_id =
+        (u16::from(object_hash[0]) << 8 | u16::from(object_hash[1])) % partition_count;
+
     let mut route_hasher = Sha256::new();
     for part in ["fragment", fragment_hash] {
         route_hasher.update(part.as_bytes());
         route_hasher.update([0u8]);
     }
     let route_hash: [u8; 32] = route_hasher.finalize().into();
-    let owner_idx =
+    let fragment_owner =
         usize::from(u16::from(route_hash[0]) << 8 | u16::from(route_hash[1])) % index_roots.len();
+    let owner_idx = (fragment_owner + usize::from(partition_id)) % index_roots.len();
     let mut selected: Vec<&PathBuf> = vec![&index_roots[owner_idx]];
     for (idx, root) in index_roots.iter().enumerate() {
         if idx != owner_idx {
@@ -756,7 +770,11 @@ fn get_partition_db_paths_custom(
 
     selected
         .into_iter()
-        .map(|root| root.join(fragment_hash).join("indexdb").join("index.ndxdb"))
+        .map(|root| {
+            root.join(fragment_hash)
+                .join("indexdb")
+                .join(format!("shard_{partition_id:04x}.ndxdb"))
+        })
         .collect()
 }
 

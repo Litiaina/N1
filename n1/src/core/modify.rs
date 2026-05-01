@@ -10,6 +10,7 @@ use tracing::{info, warn};
 use crate::core::disk_manager::{ObjectPathManager, RenameObjectRequest};
 use crate::core::index;
 use crate::enums::app_error_enum::AppError;
+use crate::namespace::runtime::global_namespace_runtime;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
 use crate::websocket::ws_structs::StorageEventPayload;
@@ -173,6 +174,36 @@ pub async fn rename_object(
         &payload.destination_key,
     )
     .await?;
+
+    if payload.source_fragment == payload.destination_fragment {
+        global_namespace_runtime()
+            .rename(
+                &payload.source_fragment,
+                &payload.source_key,
+                &payload.destination_key,
+            )
+            .await?;
+
+        info!(
+            "Renamed namespace path from {}/{} to {}/{}",
+            payload.source_fragment,
+            payload.source_key,
+            payload.destination_fragment,
+            payload.destination_key
+        );
+
+        state.emit(
+            &payload.source_fragment,
+            StorageEventPayload::FileRenamed {
+                source_fragment: payload.source_fragment.clone(),
+                source_key: payload.source_key.clone(),
+                destination_fragment: payload.destination_fragment.clone(),
+                destination_key: payload.destination_key.clone(),
+            },
+        );
+
+        return Ok(StatusCode::OK);
+    }
 
     let destination_versions = index::list_live_object_versions_metadata(
         &payload.destination_fragment,

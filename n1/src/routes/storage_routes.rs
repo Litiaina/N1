@@ -5,12 +5,10 @@ use crate::core::archive::{
     download_selected_archive as download_selected_archive_impl,
 };
 use crate::core::delete::{
-    delete_object_version as delete_object_version_impl,
-    delete_objects_bulk as delete_objects_bulk_impl,
-    delete_objects_bulk_permanently as delete_objects_bulk_permanently_impl,
-    get_empty_trash_status_api, get_recover_all_trash_status_api,
-    recover_object_version as recover_object_version_impl,
-    recover_objects_bulk as recover_objects_bulk_impl, resume_persistent_trash_jobs,
+    BulkObjectFailure, BulkObjectKeysRequest, BulkObjectOperationResponse,
+    delete_object_version as delete_object_version_impl, get_empty_trash_status_api,
+    get_recover_all_trash_status_api, recover_object_version as recover_object_version_impl,
+    resume_persistent_trash_jobs,
 };
 use crate::core::download::{
     download_object as download_object_impl, download_object_chunk as download_object_chunk_impl,
@@ -76,7 +74,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
 };
 use serde::de::DeserializeOwned;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
@@ -522,12 +520,22 @@ async fn delete_object_permanently_scoped(
     claims: Claims,
     Path(object_key): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    let _ = state;
-    let _ = claims;
-    let _ = object_key;
-    Err::<axum::response::Response, AppError>(AppError::BadRequest(
-        "Immediate permanent delete is not part of N1 3.0; use lifecycle trash and garbage collection"
-            .to_string(),
+    let fragment = claims.fragment.clone();
+    if !claims.delete {
+        return Err(AppError::Forbidden("Delete permission required".into()));
+    }
+    let summary = global_namespace_runtime()
+        .purge_trash_path(&fragment, &object_key)
+        .await?;
+    state.emit(&fragment, StorageEventPayload::StateInvalidated);
+    Ok((
+        StatusCode::OK,
+        AxumJson(serde_json::json!({
+            "operation": summary.operation,
+            "affected_paths": summary.affected_paths,
+            "affected_objects": summary.affected_objects,
+            "trash_entry_id": summary.trash_entry_id,
+        })),
     ))
 }
 
@@ -558,6 +566,164 @@ async fn recover_object_scoped(
             "affected_paths": summary.affected_paths,
             "affected_objects": summary.affected_objects,
         })),
+    ))
+}
+
+async fn bulk_delete_objects_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    AxumJson(payload): AxumJson<BulkObjectKeysRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    let fragment = claims.fragment.clone();
+    let requested = payload.object_keys.len();
+    let unique_keys = payload
+        .object_keys
+        .into_iter()
+        .filter(|key| !key.trim().is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if unique_keys.is_empty() {
+        return Err(AppError::BadRequest("object_keys must not be empty".into()));
+    }
+
+    let mut succeeded = 0usize;
+    let mut not_found = 0usize;
+    let mut failed = Vec::new();
+    for object_key in &unique_keys {
+        match global_namespace_runtime()
+            .trash(&fragment, object_key)
+            .await
+        {
+            Ok(_) => succeeded = succeeded.saturating_add(1),
+            Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
+            Err(err) => failed.push(BulkObjectFailure {
+                object_key: object_key.clone(),
+                error: err.to_string(),
+            }),
+        }
+    }
+    if succeeded > 0 {
+        state.emit(&fragment, StorageEventPayload::StateInvalidated);
+    }
+    Ok((
+        StatusCode::OK,
+        AxumJson(BulkObjectOperationResponse {
+            requested,
+            unique: unique_keys.len(),
+            succeeded,
+            not_found,
+            failed,
+        }),
+    ))
+}
+
+async fn bulk_recover_objects_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    AxumJson(payload): AxumJson<BulkObjectKeysRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.write {
+        return Err(AppError::Forbidden(
+            "Write permission required to recover".into(),
+        ));
+    }
+    let fragment = claims.fragment.clone();
+    let requested = payload.object_keys.len();
+    let unique_keys = payload
+        .object_keys
+        .into_iter()
+        .filter(|key| !key.trim().is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if unique_keys.is_empty() {
+        return Err(AppError::BadRequest("object_keys must not be empty".into()));
+    }
+
+    let mut succeeded = 0usize;
+    let mut not_found = 0usize;
+    let mut failed = Vec::new();
+    for object_key in &unique_keys {
+        match global_namespace_runtime()
+            .recover(&fragment, object_key)
+            .await
+        {
+            Ok(_) => succeeded = succeeded.saturating_add(1),
+            Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
+            Err(err) => failed.push(BulkObjectFailure {
+                object_key: object_key.clone(),
+                error: err.to_string(),
+            }),
+        }
+    }
+    if succeeded > 0 {
+        state.emit(&fragment, StorageEventPayload::StateInvalidated);
+    }
+    Ok((
+        StatusCode::OK,
+        AxumJson(BulkObjectOperationResponse {
+            requested,
+            unique: unique_keys.len(),
+            succeeded,
+            not_found,
+            failed,
+        }),
+    ))
+}
+
+async fn bulk_permanent_delete_objects_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    AxumJson(payload): AxumJson<BulkObjectKeysRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.delete {
+        return Err(AppError::Forbidden("Delete permission required".into()));
+    }
+    let fragment = claims.fragment.clone();
+    let requested = payload.object_keys.len();
+    let unique_keys = payload
+        .object_keys
+        .into_iter()
+        .filter(|key| !key.trim().is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if unique_keys.is_empty() {
+        return Err(AppError::BadRequest("object_keys must not be empty".into()));
+    }
+
+    let mut succeeded = 0usize;
+    let mut not_found = 0usize;
+    let mut failed = Vec::new();
+    for object_key in &unique_keys {
+        match global_namespace_runtime()
+            .purge_trash_path(&fragment, object_key)
+            .await
+        {
+            Ok(_) => succeeded = succeeded.saturating_add(1),
+            Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
+            Err(err) => failed.push(BulkObjectFailure {
+                object_key: object_key.clone(),
+                error: err.to_string(),
+            }),
+        }
+    }
+    if succeeded > 0 {
+        state.emit(&fragment, StorageEventPayload::StateInvalidated);
+    }
+    Ok((
+        StatusCode::OK,
+        AxumJson(BulkObjectOperationResponse {
+            requested,
+            unique: unique_keys.len(),
+            succeeded,
+            not_found,
+            failed,
+        }),
     ))
 }
 
@@ -941,10 +1107,10 @@ pub fn build_storage_routes_unbound_with_options(
             )
             .route("/n1/trash/empty", delete(empty_trash_scoped))
             .route("/n1/objects/rename", post(rename_object_scoped))
-            .route("/n1/objects/bulk-delete", post(delete_objects_bulk_impl))
+            .route("/n1/objects/bulk-delete", post(bulk_delete_objects_scoped))
             .route(
                 "/n1/objects/permanent/bulk-delete",
-                post(delete_objects_bulk_permanently_impl),
+                post(bulk_permanent_delete_objects_scoped),
             )
             .route("/n1/objects/{*object_key}", delete(delete_object_scoped))
             .route(
@@ -959,7 +1125,10 @@ pub fn build_storage_routes_unbound_with_options(
                 "/n1/objects/recover/version/{:version_id}/{*object_key}",
                 post(recover_object_version_scoped),
             )
-            .route("/n1/objects/bulk-recover", post(recover_objects_bulk_impl))
+            .route(
+                "/n1/objects/bulk-recover",
+                post(bulk_recover_objects_scoped),
+            )
             .route(
                 "/n1/objects/recover/{*object_key}",
                 post(recover_object_scoped),
@@ -1137,8 +1306,7 @@ mod tests {
     use axum::extract::{Path, Query, State};
     use axum::response::IntoResponse;
     use sha2::{Digest, Sha256};
-    use std::collections::BTreeMap;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -1659,6 +1827,18 @@ mod tests {
             .expect("scoped one-shot upload")
             .into_response();
             assert_eq!(upload.status(), axum::http::StatusCode::CREATED);
+            let entry = global_namespace_runtime()
+                .entry(fragment, &logical_path)
+                .await
+                .expect("post-upload namespace entry check")
+                .unwrap_or_else(|| {
+                    panic!("namespace entry missing immediately after upload: {logical_path}")
+                });
+            assert_eq!(
+                entry.kind,
+                crate::namespace::models::NamespaceEntryKind::File,
+                "post-upload namespace entry should be a file: {logical_path}"
+            );
             expected.push(logical_path);
         }
 
@@ -1691,11 +1871,27 @@ mod tests {
             }
         }
 
-        expected.sort();
-        actual.sort();
-        assert_eq!(
-            actual, expected,
-            "scoped POSIX namespace rows must be durable after cache eviction/restart"
+        let expected_set = expected.iter().cloned().collect::<BTreeSet<_>>();
+        let actual_set = actual.iter().cloned().collect::<BTreeSet<_>>();
+        let missing = expected_set
+            .difference(&actual_set)
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>();
+        let extra = actual_set
+            .difference(&expected_set)
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty() && extra.is_empty() && actual.len() == actual_set.len(),
+            "scoped POSIX namespace rows must be durable after cache eviction/restart: expected={} actual={} unique_actual={} duplicate_actual={} missing_sample={:?} extra_sample={:?}",
+            expected.len(),
+            actual.len(),
+            actual_set.len(),
+            actual.len().saturating_sub(actual_set.len()),
+            missing,
+            extra
         );
     }
 

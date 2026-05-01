@@ -38,7 +38,7 @@ This repository now keeps the platform docs split into:
 ## Contract Boundary
 
 - `N1`
-  Physical storage truth, per-fragment `index.ndxdb` namespace/metadata authority, upload, read, lifecycle, maintenance.
+  Physical storage truth, per-fragment sharded `indexdb` namespace/metadata authority, upload, read, lifecycle, maintenance.
   Stable route namespace: `/n1/...`
 
 - `NS`

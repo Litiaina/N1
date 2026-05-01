@@ -1,4 +1,6 @@
+use crate::core::fragment_metadata::fragment_index_partition_count;
 use crate::core::indexdb_store::open_n1_indexdb;
+use crate::core::indexdb_store::read_partition_meta_exact;
 use crate::enums::app_error_enum::AppError;
 
 use indexdb::Database;
@@ -12,6 +14,7 @@ use tokio::fs;
 
 pub const INDEXDB_DIR: &str = "indexdb";
 pub const INDEXDB_FILE: &str = "index.ndxdb";
+const INDEXDB_SHARD_FILE_PREFIX: &str = "shard_";
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct NamespaceReplicaInspection {
@@ -42,12 +45,23 @@ struct RawNamespaceReplica {
     present: bool,
     mtime: SystemTime,
     len: u64,
+    generation: u64,
     metadata_hash: Option<[u8; 32]>,
     valid: bool,
 }
 
 pub fn namespace_db_path_for_root(root: &Path, fragment: &str) -> PathBuf {
-    root.join(fragment).join(INDEXDB_DIR).join(INDEXDB_FILE)
+    namespace_shard_db_path_for_root(root, fragment, 0)
+}
+
+fn namespace_shard_file(shard_id: u16) -> String {
+    format!("{}{:04x}.ndxdb", INDEXDB_SHARD_FILE_PREFIX, shard_id)
+}
+
+fn namespace_shard_db_path_for_root(root: &Path, fragment: &str, shard_id: u16) -> PathBuf {
+    root.join(fragment)
+        .join(INDEXDB_DIR)
+        .join(namespace_shard_file(shard_id))
 }
 
 pub fn namespace_db_paths_for_roots(fragment: &str, roots: &[PathBuf]) -> Vec<PathBuf> {
@@ -61,9 +75,31 @@ pub async fn inspect_namespace_replicas(
     fragment: &str,
     index_roots: &[PathBuf],
 ) -> Result<NamespaceReplicaInspection, AppError> {
-    let replicas = read_namespace_replicas(fragment, index_roots).await;
-    let best = choose_best_namespace_replica(&replicas);
-    Ok(build_inspection(fragment, &replicas, best))
+    let shard_count = fragment_index_partition_count(fragment)?;
+    let mut inspection = NamespaceReplicaInspection {
+        fragment: fragment.to_string(),
+        healthy: true,
+        ..NamespaceReplicaInspection::default()
+    };
+    for shard_id in 0..shard_count {
+        let replicas = read_namespace_shard_replicas(fragment, shard_id, index_roots).await;
+        if replicas.iter().all(|replica| !replica.present) {
+            continue;
+        }
+        let best = choose_best_namespace_replica(&replicas);
+        let shard = build_inspection(fragment, &replicas, best);
+        inspection.expected_replicas += shard.expected_replicas;
+        inspection.present_replicas += shard.present_replicas;
+        inspection.valid_replicas += shard.valid_replicas;
+        inspection.missing_replicas += shard.missing_replicas;
+        inspection.divergent_replicas += shard.divergent_replicas;
+        inspection.corrupt_replicas += shard.corrupt_replicas;
+        inspection.healthy &= shard.healthy;
+        if inspection.canonical_path.is_none() {
+            inspection.canonical_path = shard.canonical_path;
+        }
+    }
+    Ok(inspection)
 }
 
 pub async fn repair_namespace_replicas(
@@ -71,53 +107,72 @@ pub async fn repair_namespace_replicas(
     index_roots: &[PathBuf],
     dry_run: bool,
 ) -> Result<NamespaceReplicaRepairReport, AppError> {
-    let _ = dry_run;
-    let replicas = read_namespace_replicas(fragment, index_roots).await;
-    let Some(best_index) = choose_best_namespace_replica(&replicas) else {
-        return Ok(NamespaceReplicaRepairReport {
-            fragment: fragment.to_string(),
-            expected_replicas: replicas.len() as u64,
-            corrupt_found: replicas
-                .iter()
-                .filter(|replica| replica.present && !replica.valid)
-                .count() as u64,
-            ..NamespaceReplicaRepairReport::default()
-        });
-    };
-
-    let canonical_hash = replicas[best_index].metadata_hash;
-    let source_path = replicas[best_index].path.clone();
     let mut report = NamespaceReplicaRepairReport {
         fragment: fragment.to_string(),
-        expected_replicas: replicas.len() as u64,
-        selected_source: Some(source_path.to_string_lossy().to_string()),
         ..NamespaceReplicaRepairReport::default()
     };
-
-    for replica in replicas {
-        if !replica.present {
-            report.missing_repaired += 1;
+    let shard_count = fragment_index_partition_count(fragment)?;
+    for shard_id in 0..shard_count {
+        let replicas = read_namespace_shard_replicas(fragment, shard_id, index_roots).await;
+        if replicas.iter().all(|replica| !replica.present) {
             continue;
         }
+        report.expected_replicas += replicas.len() as u64;
+        let Some(best_index) = choose_best_namespace_replica(&replicas) else {
+            report.corrupt_found += replicas
+                .iter()
+                .filter(|replica| replica.present && !replica.valid)
+                .count() as u64;
+            continue;
+        };
 
-        if !replica.valid {
-            report.corrupt_found += 1;
+        let canonical_hash = replicas[best_index].metadata_hash;
+        let canonical_generation = replicas[best_index].generation;
+        let source_path = replicas[best_index].path.clone();
+        if report.selected_source.is_none() {
+            report.selected_source = Some(source_path.to_string_lossy().to_string());
         }
-        if replica.metadata_hash != canonical_hash {
-            report.divergent_repaired += 1;
+
+        for replica in replicas {
+            if !replica.present {
+                report.missing_repaired += 1;
+                if !dry_run {
+                    copy_namespace_replica_file(&source_path, &replica.path)?;
+                }
+                continue;
+            }
+
+            if !replica.valid {
+                report.corrupt_found += 1;
+                if !dry_run {
+                    copy_namespace_replica_file(&source_path, &replica.path)?;
+                }
+                continue;
+            }
+            if replica.metadata_hash != canonical_hash || replica.generation != canonical_generation
+            {
+                report.divergent_repaired += 1;
+                if !dry_run {
+                    copy_namespace_replica_file(&source_path, &replica.path)?;
+                }
+            }
         }
     }
 
     Ok(report)
 }
 
-async fn read_namespace_replicas(
+async fn read_namespace_shard_replicas(
     fragment: &str,
+    shard_id: u16,
     index_roots: &[PathBuf],
 ) -> Vec<RawNamespaceReplica> {
     let mut replicas = Vec::with_capacity(index_roots.len());
-    for path in namespace_db_paths_for_roots(fragment, index_roots) {
-        replicas.push(read_namespace_replica(path).await);
+    for root in index_roots {
+        replicas.push(
+            read_namespace_replica(namespace_shard_db_path_for_root(root, fragment, shard_id))
+                .await,
+        );
     }
     replicas
 }
@@ -127,14 +182,18 @@ async fn read_namespace_replica(path: PathBuf) -> RawNamespaceReplica {
         Ok(meta) => {
             let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             let len = meta.len();
-            let hash = namespace_indexdb_semantic_hash(path.clone()).await;
+            let inspection = namespace_indexdb_semantic_hash(path.clone()).await;
             RawNamespaceReplica {
                 path,
                 present: true,
                 mtime,
                 len,
-                metadata_hash: hash,
-                valid: hash.is_some(),
+                generation: inspection
+                    .as_ref()
+                    .map(|(_, generation)| *generation)
+                    .unwrap_or(0),
+                metadata_hash: inspection.map(|(hash, _)| hash),
+                valid: inspection.is_some(),
             }
         }
         Err(_) => RawNamespaceReplica {
@@ -142,6 +201,7 @@ async fn read_namespace_replica(path: PathBuf) -> RawNamespaceReplica {
             present: false,
             mtime: SystemTime::UNIX_EPOCH,
             len: 0,
+            generation: 0,
             metadata_hash: None,
             valid: false,
         },
@@ -167,10 +227,14 @@ fn choose_best_namespace_replica(replicas: &[RawNamespaceReplica]) -> Option<usi
             None => true,
             Some(current_idx) => {
                 let current = &replicas[current_idx];
-                replica.mtime > current.mtime
-                    || (replica.mtime == current.mtime && replica.len > current.len)
+                replica.generation > current.generation
+                    || (replica.generation == current.generation && replica.len > current.len)
+                    || (replica.generation == current.generation
+                        && replica.len == current.len
+                        && replica.mtime > current.mtime)
                     || (replica.mtime == current.mtime
                         && replica.len == current.len
+                        && replica.generation == current.generation
                         && replica.path > current.path)
             }
         };
@@ -247,10 +311,17 @@ fn build_inspection(
     inspection
 }
 
-async fn namespace_indexdb_semantic_hash(path: PathBuf) -> Option<[u8; 32]> {
+async fn namespace_indexdb_semantic_hash(path: PathBuf) -> Option<([u8; 32], u64)> {
     tokio::task::spawn_blocking(move || {
         let db = open_n1_indexdb(&path).ok()?;
-        namespace_indexdb_semantic_hash_blocking(&db).ok()
+        let generation = read_partition_meta_exact(&db)
+            .ok()
+            .flatten()
+            .map(|meta| meta.committed_generation)
+            .unwrap_or(0);
+        namespace_indexdb_semantic_hash_blocking(&db)
+            .ok()
+            .map(|hash| (hash, generation))
     })
     .await
     .unwrap_or(None)
@@ -277,6 +348,25 @@ fn namespace_indexdb_semantic_hash_blocking(db: &Database) -> Result<[u8; 32], A
             hash_field(&mut hasher, node.head_version_id.as_deref().unwrap_or(""));
             hash_field(&mut hasher, &node.created_at_unix.to_string());
             hash_field(&mut hasher, &node.updated_at_unix.to_string());
+            if let Some(head) = db
+                .n1_get_namespace_file_head(&node.node_id)
+                .map_err(|err| {
+                    AppError::InternalServerError(format!("namespace file head hash scan: {err}"))
+                })?
+            {
+                hash_field(&mut hasher, "namespace-file-head");
+                hash_field(&mut hasher, &head.node_id);
+                hash_field(&mut hasher, &head.object_id);
+                hash_field(&mut hasher, &head.version_id);
+                hash_field(&mut hasher, &head.upload_session_id);
+                hash_field(&mut hasher, &head.owner_uid);
+                hash_field(&mut hasher, &head.content_type);
+                hash_field(&mut hasher, &head.total_size_bytes.to_string());
+                hash_field(&mut hasher, &head.created_at_unix.to_string());
+                hash_field(&mut hasher, if head.is_delete_marker { "1" } else { "0" });
+                hash_field(&mut hasher, &head.stripe_size_bytes.to_string());
+                hash_field(&mut hasher, &head.updated_at_unix.to_string());
+            }
         }
     }
 
@@ -320,38 +410,6 @@ fn namespace_indexdb_semantic_hash_blocking(db: &Database) -> Result<[u8; 32], A
         }
     }
 
-    for state in [
-        n1_indexdb::ObjectState::Live,
-        n1_indexdb::ObjectState::Trash,
-        n1_indexdb::ObjectState::Deleted,
-    ] {
-        let mut after = None;
-        loop {
-            let rows = db
-                .n1_list_object_heads(state, None, after.as_deref(), 1000)
-                .map_err(|err| {
-                    AppError::InternalServerError(format!("object head hash scan: {err}"))
-                })?;
-            if rows.is_empty() {
-                break;
-            }
-            after = rows.last().map(|head| head.object_key.clone());
-            for head in rows {
-                hash_field(&mut hasher, "head");
-                hash_field(&mut hasher, &head.object_id);
-                hash_field(&mut hasher, &head.object_key);
-                hash_field(&mut hasher, &head.head_version_id);
-                hash_field(&mut hasher, &head.owner_uid);
-                hash_field(&mut hasher, &head.content_type);
-                hash_field(&mut hasher, &head.total_size_bytes.to_string());
-                hash_field(&mut hasher, object_state(head.state));
-                hash_field(&mut hasher, &head.generation.to_string());
-                hash_field(&mut hasher, &head.created_at_unix.to_string());
-                hash_field(&mut hasher, &head.updated_at_unix.to_string());
-            }
-        }
-    }
-
     Ok(hasher.finalize().into())
 }
 
@@ -370,15 +428,63 @@ fn trash_state(state: n1_indexdb::TrashEntryState) -> &'static str {
     }
 }
 
-fn object_state(state: n1_indexdb::ObjectState) -> &'static str {
-    match state {
-        n1_indexdb::ObjectState::Live => "live",
-        n1_indexdb::ObjectState::Trash => "trash",
-        n1_indexdb::ObjectState::Deleted => "deleted",
-    }
-}
-
 fn hash_field(hasher: &mut Sha256, value: &str) {
     hasher.update(value.as_bytes());
     hasher.update([0]);
+}
+
+fn copy_namespace_replica_file(source: &Path, destination: &Path) -> Result<(), AppError> {
+    if source == destination {
+        return Ok(());
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        AppError::InternalServerError(format!(
+            "namespace destination '{}' has no parent",
+            destination.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent)
+        .map_err(|err| AppError::Io(err, format!("mkdir {}", parent.display())))?;
+    let file_name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("shard.ndxdb");
+    let temp_path = parent.join(format!(".{}.tmp-{}", file_name, ulid::Ulid::new()));
+    remove_indexdb_file_set(destination)?;
+    remove_indexdb_file_set(&temp_path)?;
+    let source_db = open_n1_indexdb(source)?;
+    source_db
+        .backup_to_path(&temp_path)
+        .map_err(|err| AppError::InternalServerError(format!("namespace replica backup: {err}")))?;
+    std::fs::rename(&temp_path, destination).map_err(|err| {
+        AppError::Io(
+            err,
+            format!(
+                "rename {} -> {}",
+                temp_path.display(),
+                destination.display()
+            ),
+        )
+    })?;
+    remove_indexdb_file_set(&temp_path)?;
+    Ok(())
+}
+
+fn remove_indexdb_file_set(path: &Path) -> Result<(), AppError> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("shard.ndxdb");
+    for candidate in [
+        path.to_path_buf(),
+        path.with_file_name(format!("{}-wal", file_name)),
+        path.with_file_name(format!("{}-shm", file_name)),
+    ] {
+        match std::fs::remove_file(&candidate) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(AppError::Io(err, format!("remove {}", candidate.display()))),
+        }
+    }
+    Ok(())
 }

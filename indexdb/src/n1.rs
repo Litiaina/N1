@@ -201,6 +201,21 @@ pub struct NamespaceNode {
 }
 
 #[derive(Debug, Clone)]
+pub struct NamespaceFileHead {
+    pub node_id: String,
+    pub object_id: String,
+    pub version_id: String,
+    pub upload_session_id: String,
+    pub owner_uid: String,
+    pub content_type: String,
+    pub total_size_bytes: u64,
+    pub created_at_unix: i64,
+    pub is_delete_marker: bool,
+    pub stripe_size_bytes: u64,
+    pub updated_at_unix: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct NamespaceTrashRoot {
     pub trash_entry_id: String,
     pub root_node_id: String,

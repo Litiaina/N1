@@ -20,7 +20,7 @@
 This repository contains the storage platform stack built around four runtime components:
 
 > - `N1` (`3.0.0`)
-  Single-node storage kernel with an object-storage core, per-fragment `index.ndxdb` metadata authority, lifecycle, repair, redistribution, GC, recover-on-read, and POSIX-style routes.
+  Single-node storage kernel with an object-storage core, per-fragment sharded `indexdb` metadata authority, lifecycle, repair, redistribution, GC, recover-on-read, and POSIX-style routes.
 > - `N2` (`0.2.0`)
   Multi-node clustering and placement layer built on top of the shared `N1` storage core.
 > - `NS` (`1.0.0`)
@@ -48,10 +48,10 @@ Current route namespaces are intentionally split:
 
 The major `3.0` change in `N1` is a breaking metadata rewrite:
 
-- each fragment has one active metadata authority at `<index_root>/<fragment_hash>/indexdb/index.ndxdb`
-- namespace state lives inside `index.ndxdb` as `namespace_entries`; there is no active `namespace_v2/catalog.ndxdb`
+- each fragment has one active metadata authority: its sharded `indexdb` at `<index_root>/<fragment_hash>/indexdb/shard_XXXX.ndxdb`
+- namespace state lives inside the sharded `indexdb`; there is no active `namespace_v2/catalog.ndxdb`
 - object metadata is persisted as summary/version/part/shard rows instead of one serialized `ObjectMetadata` blob
-- upload sessions, pending namespace bindings, trash state, quota state, repair state, and replica metadata live in the same per-fragment `index.ndxdb`
+- upload sessions, pending namespace bindings, trash state, quota state, repair state, and replica metadata live in the same per-fragment sharded `indexdb`
 - object/version metadata is immutable after commit except lifecycle state
 - blob payloads are immutable
 
@@ -59,13 +59,13 @@ That means file and folder semantics such as `mkdir`, rename, move, trash, recov
 
 Current release notes for the validated `N1 3.0.0`, `NS 1.0.0`, and `Registry 0.9.1` line:
 
-- `N1 3.0.0` removes the old redb-derived active index and the active `namespace_v2/catalog.ndxdb` authority. The only active per-fragment metadata file is `indexdb/index.ndxdb`.
+- `N1 3.0.0` removes the old redb-derived active index and the active `namespace_v2/catalog.ndxdb` authority. The only active per-fragment metadata authority is the sharded `indexdb` under `indexdb/shard_XXXX.ndxdb`.
 - `N1 3.0.0` is not runtime-compatible with `N1 2.x` metadata directories. Old files may be imported by explicit migration tooling, then ignored or renamed aside.
 - `N1 3.0.0` keeps the blob layout unchanged: `<blob_root>/<fragment_hash>/blob/<version_id>/<shard-or-parity-file>`.
 - `N1 3.0.0` is designed to be IO-bound and bounded-memory: listing uses cursor queries and summary rows, cold DB handles are evicted LRU, and full part/shard metadata is loaded only for download, repair, verify, GC, explicit full metadata reads, or recovery.
 - SMB/NAS serving has moved out of `N1` into standalone `NS`, keeping `N1` focused on storage-kernel responsibilities.
 - `NS 1.0.0` keeps the live SMB path local to disk, uses dynamic fragment authentication, supports recursive folder deletion semantics expected by Windows clients, and cold-syncs large files to `N1` through multipart upload.
-- Per-fragment `index.ndxdb` replicas are copied across configured index roots, monitored by health, and repaired when a rebuilt index disk is missing or stale.
+- Per-fragment indexdb shard replicas are copied across configured index roots, monitored by health, and repaired when a rebuilt index disk is missing or stale.
 - Trash entries are generation-addressed with `trash_entry_id`, so repeated deletes of the same visible path remain individually recoverable or purgeable without path ambiguity.
 - fragment-bound Registry listing and stats now prefer `N1` namespace truth instead of stale Registry projection.
 - Registry folder trash/recover delegates to N1 POSIX namespace lifecycle, including empty folders, instead of emulating directory delete with object-key prefix loops.
@@ -85,7 +85,7 @@ It is responsible for:
 - fragment quota state
 - immutable object/version metadata
 - immutable blob payload placement
-- per-fragment `index.ndxdb` metadata authority
+- per-fragment sharded `indexdb` metadata authority
 - one-shot and multipart upload
 - logical reads and downloads
 - lifecycle-first delete, trash, and recover
@@ -164,9 +164,12 @@ Clients / UI / CLI
 For standalone `N1 3.0`, the internal model is:
 
 ```text
-index_root/<fragment_hash>/indexdb/index.ndxdb
+index_root/<fragment_hash>/indexdb/shard_0000.ndxdb
+index_root/<fragment_hash>/indexdb/shard_0001.ndxdb
+...
+index_root/<fragment_hash>/indexdb/shard_XXXX.ndxdb
   - indexdb_meta / fragment_meta
-  - namespace_entries
+  - namespace rows
   - object_heads / object_versions / object_version_states
   - object_parts / part_shards
   - upload_sessions / upload_parts / pending_upload_bindings
@@ -611,10 +614,10 @@ Fragment names hash deterministically. Reusing the same name recreates the same 
 
 ### Active Metadata Files
 
-For `N1 3.0`, the only active per-fragment metadata authority is:
+For `N1 3.0`, the only active per-fragment metadata authority is the sharded indexdb set:
 
 ```text
-<index_root>/<fragment_hash>/indexdb/index.ndxdb
+<index_root>/<fragment_hash>/indexdb/shard_XXXX.ndxdb
 ```
 
 Do not restore or point runtime code at old `namespace_v2/catalog.ndxdb`, `catalog.ndxdb`, `namespace.ndxdb`, `namespace.sqlite`, redb index files, or serialized `ObjectMetadata` blobs as authority. Those belong only to one-time migration/import tooling.

@@ -18,21 +18,21 @@ use crate::core::fragment_metadata::{
     DEFAULT_INDEX_PARTITION_COUNT, clear_fragment_partition_count_cache_for_test,
     init_fragment_metadata, set_configured_index_partition_count,
 };
+use crate::core::index;
 use crate::core::indexdb_store;
 use crate::core::object_parser::{
     STREAM_CHUNK_SIZE_ATOMIC, STREAM_LOCALITY_BIAS_ENABLED_ATOMIC, STREAM_MAX_CONCURRENCY,
     STREAM_READAHEAD_BYTES_ATOMIC,
 };
 use crate::core::quota_manager::init_quota_file;
-use crate::core::retrieve::{get_object_metadata_direct, list_objects_direct};
 use crate::core::sync::ensure_fragment_blob_directories;
 use crate::core::upload::{
     DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC, PARITY_SHARDS_ATOMIC,
     STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC, UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC,
     WRITER_BUFFER_SIZE_ATOMIC, upload_object_one_shot,
 };
+use crate::namespace::runtime::global_namespace_runtime;
 use crate::posix::models::PosixNodeKind;
-use crate::posix::paths::marker_key;
 use crate::posix::service;
 use crate::routes::storage_routes::AppState;
 use crate::settings::constants::CONFIG_FILE;
@@ -66,6 +66,15 @@ async fn ensure_global_storage_config(base: &Path) {
         .expect("reset configured index partition count");
     clear_fragment_partition_count_cache_for_test();
     indexdb_store::clear_cached_dbs_for_test();
+    if let (Some(index_roots), Some(blob_roots)) = (INDEX_STORE_DISKS.get(), BLOB_STORE_DISKS.get())
+    {
+        for root in index_roots.iter().chain(blob_roots.iter()) {
+            let path = PathBuf::from(root);
+            let _ = fs::remove_dir_all(&path).await;
+            let _ = fs::create_dir_all(&path).await;
+        }
+        return;
+    }
     let _ = fs::remove_dir_all(base).await;
     let _ = fs::create_dir_all(base).await;
 
@@ -265,6 +274,13 @@ async fn put_object(state: Arc<AppState>, fragment: &str, object_key: &str, payl
     .expect("upload object")
     .into_response();
     assert_eq!(response.status(), StatusCode::CREATED);
+    let metadata = index::read_latest_object(fragment, object_key)
+        .await
+        .expect("uploaded object metadata");
+    global_namespace_runtime()
+        .finalize_logical_upload(fragment, object_key, object_key, &metadata)
+        .await
+        .expect("bind POSIX namespace entry");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -306,31 +322,7 @@ async fn posix_mkdir_creates_hidden_marker_and_lists_directory() {
     assert_eq!(stat.kind, PosixNodeKind::Directory);
     assert!(
         !stat.is_virtual,
-        "mkdir should create an explicit marker-backed directory"
-    );
-
-    let marker = marker_key("reports").expect("marker key");
-    let marker_meta = get_object_metadata_direct(&fragment, &marker)
-        .await
-        .expect("marker metadata");
-    assert_eq!(marker_meta.total_size_bytes, 0);
-
-    let direct = list_objects_direct(
-        &fragment,
-        [
-            ("prefix".to_string(), "reports/".to_string()),
-            ("limit".to_string(), "100".to_string()),
-            ("include_internal".to_string(), "true".to_string()),
-        ]
-        .into_iter()
-        .collect(),
-        false,
-    )
-    .await
-    .expect("direct internal listing");
-    assert!(
-        direct.objects.iter().any(|item| item.object_key == marker),
-        "expected internal marker in include_internal listing"
+        "mkdir should create an explicit namespace directory"
     );
 }
 
@@ -377,7 +369,7 @@ async fn posix_rename_moves_directory_tree_without_touching_core_identity() {
     .await
     .expect("rename path");
     assert_eq!(rename.kind, PosixNodeKind::Directory);
-    assert_eq!(rename.affected, 3);
+    assert_eq!(rename.affected, 1);
 
     assert!(
         service::stat_path(full_claims(&fragment), "reports".to_string(), false)
@@ -412,10 +404,12 @@ async fn posix_rename_moves_directory_tree_without_touching_core_identity() {
         archive.entries
     );
 
-    let file_meta = get_object_metadata_direct(&fragment, "archive/a.txt")
-        .await
-        .expect("renamed file metadata");
-    assert_eq!(file_meta.total_size_bytes, 5);
+    let renamed_file =
+        service::stat_path(full_claims(&fragment), "archive/a.txt".to_string(), false)
+            .await
+            .expect("renamed file stat");
+    assert_eq!(renamed_file.kind, PosixNodeKind::File);
+    assert_eq!(renamed_file.size_bytes, Some(5));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -453,7 +447,7 @@ async fn posix_trash_and_recover_round_trip_for_directory_tree() {
     .await
     .expect("trash directory");
     assert_eq!(trash.kind, PosixNodeKind::Directory);
-    assert_eq!(trash.affected, 2);
+    assert_eq!(trash.affected, 1);
 
     let live_root = service::list_dir(full_claims(&fragment), String::new(), 100, None, false)
         .await
@@ -484,7 +478,7 @@ async fn posix_trash_and_recover_round_trip_for_directory_tree() {
     .await
     .expect("recover directory");
     assert_eq!(recover.kind, PosixNodeKind::Directory);
-    assert_eq!(recover.affected, 2);
+    assert_eq!(recover.affected, 1);
 
     let recovered = service::list_dir(
         full_claims(&fragment),
