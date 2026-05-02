@@ -133,8 +133,29 @@ pub(crate) struct Connection {
 
 unsafe impl Send for Connection {}
 
+const DEFAULT_CACHE_SIZE_BYTES: usize = 2 * 1024 * 1024;
+const MIN_CACHE_SIZE_BYTES: usize = 64 * 1024;
+const MAX_CACHE_SIZE_BYTES: usize = 64 * 1024 * 1024;
+
+fn cache_size_kib(cache_size_bytes: usize) -> usize {
+    let bounded = if cache_size_bytes == 0 {
+        MIN_CACHE_SIZE_BYTES
+    } else {
+        cache_size_bytes.clamp(MIN_CACHE_SIZE_BYTES, MAX_CACHE_SIZE_BYTES)
+    };
+    bounded.div_ceil(1024)
+}
+
 impl Connection {
     pub(crate) fn open(path: &Path, mode: OpenMode) -> Result<Self, StorageError> {
+        Self::open_with_cache(path, mode, DEFAULT_CACHE_SIZE_BYTES)
+    }
+
+    pub(crate) fn open_with_cache(
+        path: &Path,
+        mode: OpenMode,
+        cache_size_bytes: usize,
+    ) -> Result<Self, StorageError> {
         let path = path.to_string_lossy();
         let c_path = CString::new(path.as_bytes()).map_err(|err| {
             StorageError::InvalidInput(format!("indexdb path contains NUL byte: {err}"))
@@ -168,8 +189,10 @@ impl Connection {
         conn.extended_result_codes(true)?;
         conn.busy_timeout(30_000)?;
         if matches!(mode, OpenMode::ReadWriteCreate) {
-            conn.apply_pragmas()?;
+            conn.apply_pragmas(cache_size_bytes)?;
             conn.initialize_schema()?;
+        } else {
+            conn.apply_cache_pragma(cache_size_bytes)?;
         }
         Ok(conn)
     }
@@ -243,7 +266,6 @@ impl Connection {
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent).map_err(StorageError::Io)?;
         }
-        remove_sqlite_file_set(destination)?;
         let mut dest = Self::open(destination, OpenMode::ReadWriteCreate)?;
         let main = c"main";
         // SAFETY: both sqlite handles are live and the schema names are static C strings.
@@ -270,19 +292,27 @@ impl Connection {
         self.check(rc)
     }
 
-    fn apply_pragmas(&mut self) -> Result<(), StorageError> {
-        self.exec(
+    fn apply_cache_pragma(&mut self, cache_size_bytes: usize) -> Result<(), StorageError> {
+        self.exec(&format!(
+            "PRAGMA cache_size = -{};",
+            cache_size_kib(cache_size_bytes)
+        ))
+    }
+
+    fn apply_pragmas(&mut self, cache_size_bytes: usize) -> Result<(), StorageError> {
+        self.exec(&format!(
             "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;
             PRAGMA temp_store = FILE;
-            PRAGMA cache_size = -2048;
+            PRAGMA cache_size = -{};
             PRAGMA mmap_size = 0;
             PRAGMA busy_timeout = 30000;
-            PRAGMA wal_autocheckpoint = 1000;
+            PRAGMA wal_autocheckpoint = 4096;
             ",
-        )
+            cache_size_kib(cache_size_bytes)
+        ))
     }
 
     fn initialize_schema(&mut self) -> Result<(), StorageError> {
@@ -870,31 +900,6 @@ fn check_stmt(rc: c_int) -> Result<(), StorageError> {
             message: format!("indexdb engine bind/reset/finalize returned {rc}"),
         })
     }
-}
-
-fn remove_sqlite_file_set(path: &Path) -> Result<(), StorageError> {
-    for candidate in [
-        path.to_path_buf(),
-        path.with_file_name(format!(
-            "{}-wal",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("index.ndxdb")
-        )),
-        path.with_file_name(format!(
-            "{}-shm",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("index.ndxdb")
-        )),
-    ] {
-        match std::fs::remove_file(&candidate) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(StorageError::Io(err)),
-        }
-    }
-    Ok(())
 }
 
 fn unix_now() -> i64 {

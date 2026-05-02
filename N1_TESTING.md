@@ -71,6 +71,44 @@ OUT_DIR=/tmp/n1-real-restart-proof
 
 Use `MAX_FILES=128` for a smoke run. Use `MAX_FILES=0` for the full source tree.
 
+To prove the repaired-disk case that matters for production, run the same proof with a simulated formatted disk:
+
+```bash
+sudo -E \
+SOURCE_DIR=/home/administrator/Development/litiaina-cloud-web \
+DISK_ROOTS=/mnt/disk-00,/mnt/disk-01 \
+QUOTA_BACKEND=disabled \
+SIMULATE_DISK_FORMAT_REPAIR=1 \
+scripts/bench/run_real_restart_proof.sh
+```
+
+That mode uploads the source tree, verifies restart listing, removes one proof disk's fragment subtree for both index and blob roots, restarts N1, verifies that the remaining disk still lists all objects, runs strict repair, then verifies listing, sample downloads, every shard DB, and every blob version directory on both roots.
+
+## Gate 4: Parallel Small-Object Storm
+
+This is the hardening test for the minimum two-disk profile. It creates four real fragments, authenticates as four independent users, and uploads 3,000 nested one-shot objects per user through the public HTTP API.
+
+```bash
+scripts/bench/n1_live_parallel_storm.py \
+  --base-url https://127.0.0.1:50001 \
+  --master-key <MASTER_KEY> \
+  --users 4 \
+  --objects-per-user 3000 \
+  --per-user-concurrency 4 \
+  --quota-bytes 21474836480 \
+  --pid <N1_PID>
+```
+
+Expected pass evidence includes:
+
+- total uploaded objects equals 12,000
+- every fragment lists exactly 3,000 objects after upload
+- restart listing still returns exactly 3,000 objects per fragment
+- N1 does not hit the process open-file ceiling
+- no deleted indexdb handles are retained
+- RSS remains bounded under the storm instead of growing with object count
+- logs contain no write-quorum, indexdb replica, namespace replica, locked database, or blob shard open failures
+
 ## Release Rule
 
 For production confidence, require:
@@ -79,6 +117,7 @@ For production confidence, require:
 cargo test -p n1
 scripts/bench/run_release_drills.sh
 sudo -E SOURCE_DIR=<real-folder> DISK_ROOTS=<disk-a>,<disk-b> scripts/bench/run_real_restart_proof.sh
+scripts/bench/n1_live_parallel_storm.py --base-url <live-url> --master-key <MASTER_KEY> --users 4 --objects-per-user 3000 --per-user-concurrency 4 --pid <N1_PID>
 ```
 
 Do not treat synthetic tests alone as release confidence. N1 must prove the public API, process restart, real filesystem quota, real disk layout, and durable sharded `indexdb` state together.

@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, LazyLock};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::thread;
 
 use axum::http::StatusCode;
 use chrono::Utc;
@@ -18,8 +20,9 @@ use ulid::Ulid;
 use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata, ObjectPathManager};
 use crate::core::fragment_metadata::fragment_index_partition_count;
 use crate::core::indexdb_store::{
-    PartitionMeta, next_indexdb_metadata_generation, open_n1_indexdb, read_live_version,
-    read_partition_meta_exact, replay_indexdb_metadata_generation, with_partition_commit_lock,
+    PartitionMeta, next_indexdb_metadata_generation, open_cached_n1_indexdb, open_n1_indexdb,
+    read_live_version, read_partition_meta_exact, replay_indexdb_metadata_generation,
+    with_partition_commit_lock,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::models::{
@@ -29,7 +32,6 @@ use crate::namespace::models::{
 use crate::namespace::paths::{base_name, is_same_or_descendant, normalize_path, parent_path};
 
 const INDEXDB_DIR: &str = "indexdb";
-const INDEXDB_FILE: &str = "index.ndxdb";
 const INDEXDB_SHARD_FILE_PREFIX: &str = "shard_";
 const NAMESPACE_ROOT_NODE_ID: &str = "root";
 const DIR_MARKER_NAME: &str = ".n1fsd_dir";
@@ -106,6 +108,13 @@ struct NamespaceReplicaMutation {
     upsert_file_heads: Vec<n1_indexdb::NamespaceFileHead>,
 }
 
+#[derive(Clone)]
+struct NamespaceReplicaJob {
+    fragment: String,
+    shard_id: u16,
+    mutation: NamespaceReplicaMutation,
+}
+
 #[derive(Debug, Clone)]
 struct NamespaceNodeMoveReplay {
     node_id: String,
@@ -148,6 +157,18 @@ static NAMESPACE_MAX_LOADED_FACADES: LazyLock<AtomicUsize> =
     LazyLock::new(|| AtomicUsize::new(DEFAULT_NAMESPACE_MAX_LOADED_FACADES));
 static NAMESPACE_MAX_LOADED_DBS: LazyLock<AtomicUsize> =
     LazyLock::new(|| AtomicUsize::new(DEFAULT_NAMESPACE_MAX_LOADED_DBS));
+static NAMESPACE_REPLICA_QUEUE: LazyLock<SyncSender<NamespaceReplicaJob>> = LazyLock::new(|| {
+    let (tx, rx) = sync_channel::<NamespaceReplicaJob>(2048);
+    let rx = Arc::new(Mutex::new(rx));
+    for worker_id in 0..4 {
+        let worker_rx = rx.clone();
+        thread::Builder::new()
+            .name(format!("n1-namespace-replica-{worker_id}"))
+            .spawn(move || namespace_replica_worker(worker_rx))
+            .expect("spawn namespace replica worker");
+    }
+    tx
+});
 
 pub const DEFAULT_NAMESPACE_MAX_LOADED_FACADES: usize = 1;
 pub const DEFAULT_NAMESPACE_MAX_LOADED_DBS: usize = 16;
@@ -233,40 +254,6 @@ impl NamespaceRuntime {
     fn touch_db_cache(&self, path: &Path) {
         self.db_touch_ticks
             .insert(path.to_path_buf(), next_namespace_cache_tick());
-    }
-
-    fn prune_db_cache(&self) {
-        let max_loaded_dbs = namespace_cache_config().1;
-        if self.dbs.len() <= max_loaded_dbs {
-            return;
-        }
-
-        let mut evictable = self
-            .dbs
-            .iter()
-            .filter_map(|entry| {
-                if Arc::strong_count(entry.value()) > 1 {
-                    return None;
-                }
-                let path = entry.key().clone();
-                let touch = self
-                    .db_touch_ticks
-                    .get(&path)
-                    .map(|value| *value)
-                    .unwrap_or(0);
-                Some((path, touch))
-            })
-            .collect::<Vec<_>>();
-        evictable.sort_by_key(|(_, touch)| *touch);
-
-        for (path, _) in evictable {
-            if self.dbs.len() <= max_loaded_dbs {
-                break;
-            }
-            self.checkpoint_cached_db(&path);
-            self.dbs.remove(&path);
-            self.db_touch_ticks.remove(&path);
-        }
     }
 
     fn checkpoint_cached_db(&self, path: &Path) {
@@ -1387,18 +1374,12 @@ impl NamespaceRuntime {
     }
 
     fn open_db_path(&self, path: PathBuf) -> Result<Arc<Database>, AppError> {
-        if let Some(existing) = self.dbs.get(&path) {
-            self.touch_db_cache(&path);
-            return Ok(existing.clone());
-        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| AppError::Io(e, format!("mkdir {}", parent.display())))?;
         }
-        let db = Arc::new(open_n1_indexdb(&path)?);
-        self.dbs.insert(path.clone(), db.clone());
+        let db = open_cached_n1_indexdb(&path)?;
         self.touch_db_cache(&path);
-        self.prune_db_cache();
         Ok(db)
     }
 
@@ -3469,11 +3450,46 @@ fn replicate_namespace_shard_mutations(
     mutations: &BTreeMap<u16, NamespaceReplicaMutation>,
 ) {
     for (shard_id, mutation) in mutations {
-        if let Err(err) = replicate_namespace_shard_mutation(fragment, *shard_id, mutation) {
+        if let Err(err) = enqueue_or_apply_namespace_replica_job(NamespaceReplicaJob {
+            fragment: fragment.to_string(),
+            shard_id: *shard_id,
+            mutation: mutation.clone(),
+        }) {
             warn!(
                 "namespace shard replica logical apply failed for fragment {} shard {:04}: {}",
                 fragment, shard_id, err
             );
+        }
+    }
+}
+
+fn namespace_replica_worker(rx: Arc<Mutex<Receiver<NamespaceReplicaJob>>>) {
+    loop {
+        let job = {
+            let recv = rx.lock();
+            match recv {
+                Ok(recv) => recv.recv(),
+                Err(_) => return,
+            }
+        };
+        match job {
+            Ok(job) => {
+                if let Err(err) =
+                    replicate_namespace_shard_mutation(&job.fragment, job.shard_id, &job.mutation)
+                {
+                    warn!("namespace shard replica background apply failed: {}", err);
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+fn enqueue_or_apply_namespace_replica_job(job: NamespaceReplicaJob) -> Result<(), AppError> {
+    match NAMESPACE_REPLICA_QUEUE.try_send(job) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(job)) | Err(TrySendError::Disconnected(job)) => {
+            replicate_namespace_shard_mutation(&job.fragment, job.shard_id, &job.mutation)
         }
     }
 }
@@ -3988,54 +4004,13 @@ fn copy_namespace_db_file(source: &Path, destination: &Path) -> Result<(), AppEr
     };
     fs::create_dir_all(parent)
         .map_err(|err| AppError::Io(err, format!("mkdir {}", parent.display())))?;
-    let temp_path = destination.with_extension(format!(
-        "{}.tmp-{}",
-        destination
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("ndxdb"),
-        Ulid::new()
-    ));
     let source_db = open_n1_indexdb(source)?;
     source_db
         .checkpoint()
         .map_err(|err| map_indexdb_error("namespace replica source checkpoint", err))?;
-    remove_indexdb_file_set(&temp_path)?;
     source_db
-        .backup_to_path(&temp_path)
+        .backup_to_path(destination)
         .map_err(|err| map_indexdb_error("namespace replica indexdb backup", err))?;
-    remove_indexdb_file_set(destination)?;
-    fs::rename(&temp_path, destination).map_err(|err| {
-        let _ = remove_indexdb_file_set(&temp_path);
-        AppError::Io(
-            err,
-            format!(
-                "rename namespace replica {} -> {}",
-                temp_path.display(),
-                destination.display()
-            ),
-        )
-    })?;
-    remove_indexdb_file_set(&temp_path)?;
-    Ok(())
-}
-
-fn remove_indexdb_file_set(path: &Path) -> Result<(), AppError> {
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(INDEXDB_FILE);
-    for candidate in [
-        path.to_path_buf(),
-        path.with_file_name(format!("{file_name}-wal")),
-        path.with_file_name(format!("{file_name}-shm")),
-    ] {
-        match fs::remove_file(&candidate) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(AppError::Io(err, format!("remove {}", candidate.display()))),
-        }
-    }
     Ok(())
 }
 

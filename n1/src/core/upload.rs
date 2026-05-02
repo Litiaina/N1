@@ -11,7 +11,7 @@ use axum::Json as AxumJson;
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 
 use chrono::Utc;
 use crc32fast::Hasher;
@@ -46,6 +46,7 @@ use crate::core::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::core::index;
 use crate::core::quota_manager::{
     ensure_blob_placement_capacity_available_for_parts, ensure_capacity_available,
+    fragment_quota_enforcement_enabled,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::routes::storage_routes::AppState;
@@ -64,10 +65,11 @@ pub static UPLOAD_IO_GATE_ENABLED_ATOMIC: OnceCell<AtomicBool> = OnceCell::new()
 static IO_SEMAPHORE: Lazy<Semaphore> =
     Lazy::new(|| Semaphore::new(*MAX_IO_SEMAPHORE.get().unwrap()));
 static ACTIVE_IO_INFLIGHT: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
-const UPLOAD_IO_GATE_TIMEOUT_SECS: u64 = 2;
+const UPLOAD_IO_GATE_TIMEOUT_SECS: u64 = 120;
 const MIN_DYNAMIC_STRIPE_SIZE: usize = 4 * 1024;
 const TINY_OBJECT_STRIPE_4K_LIMIT: u64 = 64 * 1024;
 const SMALL_OBJECT_STRIPE_16K_LIMIT: u64 = 1024 * 1024;
+const SMALL_BUFFERED_WRITE_LIMIT: u64 = 1024 * 1024;
 
 #[cfg(target_os = "linux")]
 static IO_URING_ENABLED: Lazy<bool> = Lazy::new(|| {
@@ -99,7 +101,7 @@ static IO_URING_ENABLED: Lazy<bool> = Lazy::new(|| {
     }
 });
 
-struct AdaptiveIoGuard<'a> {
+pub(crate) struct AdaptiveIoGuard<'a> {
     _permit: tokio::sync::SemaphorePermit<'a>,
 }
 
@@ -166,6 +168,29 @@ async fn acquire_upload_io_guard_with_timeout(
             ))
         }
     }
+}
+
+pub(crate) async fn acquire_upload_io_guard_for_query(
+    io_gate_override: Option<bool>,
+    context: &str,
+) -> Result<Option<AdaptiveIoGuard<'static>>, AppError> {
+    let global_io_gate_enabled = UPLOAD_IO_GATE_ENABLED_ATOMIC
+        .get()
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or(true);
+    let io_gate_enabled = global_io_gate_enabled || io_gate_override.unwrap_or(false);
+    acquire_upload_io_guard_with_timeout(io_gate_enabled, context).await
+}
+
+async fn acquire_upload_io_guard_for_size(
+    io_gate_override: Option<bool>,
+    context: &str,
+    content_length: u64,
+) -> Result<Option<AdaptiveIoGuard<'static>>, AppError> {
+    if content_length <= SMALL_BUFFERED_WRITE_LIMIT && !io_gate_override.unwrap_or(false) {
+        return Ok(None);
+    }
+    acquire_upload_io_guard_for_query(io_gate_override, context).await
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -358,6 +383,53 @@ pub struct DirectWriter {
     write_buffer: AlignedBuffer,
     next_offset: u64,
     write_task: Option<tokio::task::JoinHandle<Result<AlignedBuffer, std::io::Error>>>,
+}
+
+enum UploadShardWriter {
+    Direct(DirectWriter),
+    Buffered(tokio_fs::File),
+}
+
+impl UploadShardWriter {
+    async fn sync_data(&self) -> Result<(), std::io::Error> {
+        match self {
+            Self::Direct(writer) => writer.sync_data().await,
+            Self::Buffered(file) => file.sync_data().await,
+        }
+    }
+}
+
+impl AsyncWrite for UploadShardWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        match &mut *self {
+            Self::Direct(writer) => Pin::new(writer).poll_write(cx, buf),
+            Self::Buffered(file) => Pin::new(file).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        match &mut *self {
+            Self::Direct(writer) => Pin::new(writer).poll_flush(cx),
+            Self::Buffered(file) => Pin::new(file).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        match &mut *self {
+            Self::Direct(writer) => Pin::new(writer).poll_shutdown(cx),
+            Self::Buffered(file) => Pin::new(file).poll_shutdown(cx),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -613,6 +685,22 @@ pub async fn create_direct_file(path: &PathBuf) -> Result<fs::File, AppError> {
     .map_err(|e| AppError::InternalServerError(format!("Spawn blocking failed: {}", e)))?
 }
 
+async fn create_buffered_file(path: &PathBuf) -> Result<tokio_fs::File, AppError> {
+    if let Some(parent) = path.parent() {
+        tokio_fs::create_dir_all(parent)
+            .await
+            .map_err(|e| AppError::Io(e, format!("create {}", parent.display())))?;
+    }
+
+    tokio_fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .await
+        .map_err(|e| AppError::Io(e, format!("create {}", path.display())))
+}
+
 #[cfg(unix)]
 pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
     let dir = tokio_fs::OpenOptions::new()
@@ -767,6 +855,33 @@ fn choose_upload_stripe_size_for_len(content_length: u64) -> usize {
 fn choose_upload_stripe_size_for_parts(part_sizes: &[u64]) -> usize {
     let largest_part = part_sizes.iter().copied().max().unwrap_or(0);
     choose_upload_stripe_size_for_len(largest_part)
+}
+
+async fn preflight_upload_capacity(required_bytes: u64) -> Result<(), AppError> {
+    if fragment_quota_enforcement_enabled() {
+        return Ok(());
+    }
+    ensure_capacity_available(required_bytes).await
+}
+
+async fn preflight_blob_placement_capacity_for_parts(
+    start_part_index: u64,
+    part_sizes: &[u64],
+    data_shards: usize,
+    parity_shards: usize,
+    block_size: usize,
+) -> Result<(), AppError> {
+    if fragment_quota_enforcement_enabled() {
+        return Ok(());
+    }
+    ensure_blob_placement_capacity_available_for_parts(
+        start_part_index,
+        part_sizes,
+        data_shards,
+        parity_shards,
+        block_size,
+    )
+    .await
 }
 
 fn stable_shard_name(part_index: u64, shard_index: usize, data_shards: usize) -> String {
@@ -1121,7 +1236,7 @@ async fn write_part_blob_to_disk(
     let stripe_count = (content_length + stripe_data_width - 1) / stripe_data_width;
     let final_shard_len = stripe_count * block_size as u64;
 
-    ensure_blob_placement_capacity_available_for_parts(
+    preflight_blob_placement_capacity_for_parts(
         part_index,
         &[content_length],
         data_shards,
@@ -1138,7 +1253,9 @@ async fn write_part_blob_to_disk(
         ));
     }
 
-    let mut writers: Vec<Option<DirectWriter>> = Vec::with_capacity(total_shards);
+    let use_buffered_small_write =
+        !strict_durability && content_length <= SMALL_BUFFERED_WRITE_LIMIT;
+    let mut writers: Vec<Option<UploadShardWriter>> = Vec::with_capacity(total_shards);
     let mut tmp_paths: Vec<PathBuf> = Vec::with_capacity(total_shards);
     let mut stable_paths: Vec<PathBuf> = Vec::with_capacity(total_shards);
     let mut stable_names: Vec<String> = Vec::with_capacity(total_shards);
@@ -1161,28 +1278,60 @@ async fn write_part_blob_to_disk(
         let tmp_path = shard_dir.join(&tmp_name);
         let stable_path = shard_dir.join(&stable_name);
 
-        match create_direct_file(&tmp_path).await {
-            Ok(file) => {
-                if strict_durability {
-                    let file_clone = file
-                        .try_clone()
-                        .map_err(|e| AppError::Io(e, "clone file handle".into()))?;
-                    let prealloc_result =
-                        tokio::task::spawn_blocking(move || file_clone.set_len(final_shard_len))
-                            .await;
-
-                    if let Ok(Ok(_)) = prealloc_result {
-                        writers.push(Some(DirectWriter::new(file)));
-                        successful_opens += 1;
-                    } else {
-                        writers.push(None);
-                    }
-                } else {
-                    writers.push(Some(DirectWriter::new(file)));
+        if use_buffered_small_write {
+            match create_buffered_file(&tmp_path).await {
+                Ok(file) => {
+                    writers.push(Some(UploadShardWriter::Buffered(file)));
                     successful_opens += 1;
                 }
+                Err(err) => {
+                    warn!(
+                        "blob shard open failed for {} on {}: {}",
+                        stable_name,
+                        target_disk.display(),
+                        err
+                    );
+                    writers.push(None);
+                }
             }
-            Err(_) => writers.push(None),
+        } else {
+            match create_direct_file(&tmp_path).await {
+                Ok(file) => {
+                    if strict_durability {
+                        let file_clone = file
+                            .try_clone()
+                            .map_err(|e| AppError::Io(e, "clone file handle".into()))?;
+                        let prealloc_result = tokio::task::spawn_blocking(move || {
+                            file_clone.set_len(final_shard_len)
+                        })
+                        .await;
+
+                        if let Ok(Ok(_)) = prealloc_result {
+                            writers.push(Some(UploadShardWriter::Direct(DirectWriter::new(file))));
+                            successful_opens += 1;
+                        } else {
+                            warn!(
+                                "blob shard preallocation failed for {} on {}",
+                                stable_name,
+                                target_disk.display()
+                            );
+                            writers.push(None);
+                        }
+                    } else {
+                        writers.push(Some(UploadShardWriter::Direct(DirectWriter::new(file))));
+                        successful_opens += 1;
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "blob shard open failed for {} on {}: {}",
+                        stable_name,
+                        target_disk.display(),
+                        err
+                    );
+                    writers.push(None);
+                }
+            }
         }
 
         tmp_paths.push(tmp_path);
@@ -1516,7 +1665,7 @@ pub async fn initiate_object_upload(
         ));
     }
 
-    ensure_capacity_available(params.total_size_bytes).await?;
+    preflight_upload_capacity(params.total_size_bytes).await?;
 
     let version_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
@@ -1546,7 +1695,7 @@ pub async fn initiate_object_upload(
         parity_shards: configured_parity_shards() as u16,
     };
 
-    ensure_blob_placement_capacity_available_for_parts(
+    preflight_blob_placement_capacity_for_parts(
         0,
         &planned_sizes,
         manifest_data_shards(&manifest),
@@ -1694,22 +1843,17 @@ pub async fn object_upload_part(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let io_gate_enabled = query.io_gate.unwrap_or_else(|| {
-        UPLOAD_IO_GATE_ENABLED_ATOMIC
-            .get()
-            .map(|v| v.load(Ordering::Relaxed))
-            .unwrap_or(true)
-    });
-    let gate_context = format!(
-        "fragment={}, version={}, part={}",
-        fragment, version_id, part_index
-    );
-    let _io_guard = acquire_upload_io_guard_with_timeout(io_gate_enabled, &gate_context).await?;
     let durability_mode = parse_upload_durability_mode(&query);
     let strict_durability = durability_mode.strict();
 
     let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
     let content_length = request_content_length(&headers)?;
+    let gate_context = format!(
+        "fragment={}, version={}, part={}",
+        fragment, version_id, part_index
+    );
+    let _io_guard =
+        acquire_upload_io_guard_for_size(query.io_gate, &gate_context, content_length).await?;
 
     if content_length > max_part_size {
         return Ok((StatusCode::PAYLOAD_TOO_LARGE, "Part too large").into_response());
@@ -1808,14 +1952,15 @@ pub async fn object_upload_part(
     Ok((StatusCode::OK, "Part uploaded").into_response())
 }
 
-pub async fn upload_object_one_shot(
+async fn upload_object_one_shot_inner(
     State(_state): State<Arc<AppState>>,
     claims: Claims,
     headers: HeaderMap,
     AxumPath((fragment, object_key)): AxumPath<(String, String)>,
     Query(query): Query<UploadPartQuery>,
     body: Body,
-) -> Result<impl IntoResponse, AppError> {
+    acquire_io_gate: bool,
+) -> Result<Response, AppError> {
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
     }
@@ -1823,18 +1968,15 @@ pub async fn upload_object_one_shot(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let io_gate_enabled = query.io_gate.unwrap_or_else(|| {
-        UPLOAD_IO_GATE_ENABLED_ATOMIC
-            .get()
-            .map(|v| v.load(Ordering::Relaxed))
-            .unwrap_or(true)
-    });
-    let gate_context = format!("fragment={}, object_key={}", fragment, object_key);
-    let _io_guard = acquire_upload_io_guard_with_timeout(io_gate_enabled, &gate_context).await?;
-
     let durability_mode = parse_upload_durability_mode(&query);
     let strict_durability = durability_mode.strict();
     let content_length = request_content_length(&headers)?;
+    let gate_context = format!("fragment={}, object_key={}", fragment, object_key);
+    let _io_guard = if acquire_io_gate {
+        acquire_upload_io_guard_for_size(query.io_gate, &gate_context, content_length).await?
+    } else {
+        None
+    };
     let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
     if content_length > max_part_size {
         return Ok((
@@ -1844,7 +1986,7 @@ pub async fn upload_object_one_shot(
             .into_response());
     }
 
-    ensure_capacity_available(content_length).await?;
+    preflight_upload_capacity(content_length).await?;
     let stripe_size = choose_upload_stripe_size_for_len(content_length);
 
     let version_id = Ulid::new().to_string();
@@ -1896,7 +2038,14 @@ pub async fn upload_object_one_shot(
     };
 
     let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
-    if let Err(err) = index::publish_object(&object_meta).await {
+    let replica_write_mode = if strict_durability {
+        index::IndexReplicaWriteMode::SyncBestEffort
+    } else {
+        index::IndexReplicaWriteMode::BackgroundBestEffort
+    };
+    if let Err(err) =
+        index::publish_object_with_replica_mode(&object_meta, replica_write_mode).await
+    {
         cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
         return Err(err);
     }
@@ -1906,6 +2055,17 @@ pub async fn upload_object_one_shot(
             AppError::InternalServerError(format!("serialize one-shot upload response: {}", e))
         })?;
     Ok((StatusCode::CREATED, AxumJson(response_body)).into_response())
+}
+
+pub async fn upload_object_one_shot(
+    state: State<Arc<AppState>>,
+    claims: Claims,
+    headers: HeaderMap,
+    path: AxumPath<(String, String)>,
+    query: Query<UploadPartQuery>,
+    body: Body,
+) -> Result<impl IntoResponse, AppError> {
+    upload_object_one_shot_inner(state, claims, headers, path, query, body, true).await
 }
 
 pub async fn finalize_object_upload(

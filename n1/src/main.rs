@@ -53,6 +53,37 @@ fn detect_cpu_cores() -> usize {
         .unwrap_or(1)
 }
 
+#[derive(Clone, Copy)]
+struct RuntimeThreadConfig {
+    worker_threads: usize,
+    max_blocking_threads: usize,
+    thread_stack_bytes: usize,
+}
+
+fn parse_env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
+fn runtime_thread_config(cpu_cores: usize) -> RuntimeThreadConfig {
+    let worker_threads = parse_env_usize("N1_RUNTIME_WORKER_THREADS")
+        .unwrap_or_else(|| cpu_cores.clamp(2, 16))
+        .clamp(1, 64);
+    let max_blocking_threads = parse_env_usize("N1_RUNTIME_MAX_BLOCKING_THREADS")
+        .unwrap_or_else(|| cpu_cores.saturating_mul(4).clamp(16, 32))
+        .clamp(8, 128);
+    let thread_stack_bytes = parse_env_usize("N1_RUNTIME_THREAD_STACK_BYTES")
+        .unwrap_or(1024 * 1024)
+        .clamp(512 * 1024, 8 * 1024 * 1024);
+
+    RuntimeThreadConfig {
+        worker_threads,
+        max_blocking_threads,
+        thread_stack_bytes,
+    }
+}
+
 fn align_up_4k(v: usize) -> usize {
     ((v.max(4096) + 4095) / 4096) * 4096
 }
@@ -69,16 +100,22 @@ fn adaptive_max_concurrent_io(
     blob_disks: usize,
     ram_bytes: Option<u64>,
 ) -> usize {
-    let core_cap = (cpu_cores.saturating_mul(4)).clamp(4, 64);
-    let disk_cap = (blob_disks.max(1).saturating_mul(8)).clamp(4, 64);
+    let core_cap = (cpu_cores.saturating_mul(2)).clamp(2, 64);
+    let disk_cap = match blob_disks {
+        0 | 1 => 2,
+        2 => 8,
+        3 | 4 => blob_disks.saturating_mul(3),
+        _ => blob_disks.saturating_mul(4),
+    }
+    .clamp(2, 64);
     let ram_cap = match ram_gib(ram_bytes) {
-        0..=4 => 8,
-        5..=8 => 12,
-        9..=16 => 16,
+        0..=4 => 4,
+        5..=8 => 6,
+        9..=16 => 8,
         17..=32 => 20,
         _ => 24,
     };
-    core_cap.min(disk_cap).min(ram_cap).clamp(4, 64)
+    core_cap.min(disk_cap).min(ram_cap).clamp(2, 64)
 }
 
 fn adaptive_writer_buffer_size(
@@ -164,50 +201,116 @@ fn adaptive_upload_memory_budget_bytes(
 }
 
 fn adaptive_indexdb_max_cached_dbs(ram_bytes: Option<u64>, partition_count: usize) -> usize {
-    let ram_floor = match ram_gib(ram_bytes) {
-        0..=4 => 12,
-        5..=8 => 16,
-        9..=16 => 24,
-        _ => 32,
+    let partition_count = partition_count.max(1);
+    let shard_sets = match ram_gib(ram_bytes) {
+        0..=4 => 2,
+        5..=8 => 4,
+        9..=16 => 8,
+        _ => 12,
     };
-    partition_count.saturating_mul(2).max(ram_floor)
+    partition_count.saturating_mul(shard_sets)
+}
+
+fn soft_open_file_limit() -> Option<usize> {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let limit = unsafe { limit.assume_init() };
+    if limit.rlim_cur == libc::RLIM_INFINITY {
+        return None;
+    }
+    usize::try_from(limit.rlim_cur).ok()
+}
+
+fn raise_open_file_limit_for_storage() {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
+    if rc != 0 {
+        tracing::warn!("Open-file limit: unable to inspect process limit");
+        return;
+    }
+
+    let mut limit = unsafe { limit.assume_init() };
+    if limit.rlim_cur == libc::RLIM_INFINITY {
+        return;
+    }
+
+    let desired = if limit.rlim_max == libc::RLIM_INFINITY {
+        1_048_576 as libc::rlim_t
+    } else {
+        limit.rlim_max
+    };
+    if desired <= limit.rlim_cur {
+        return;
+    }
+
+    let previous = limit.rlim_cur;
+    limit.rlim_cur = desired;
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+    if rc == 0 {
+        tracing::info!(
+            "Open-file limit: raised soft limit from {} to {} for sharded indexdb",
+            previous,
+            desired
+        );
+    } else {
+        tracing::warn!(
+            "Open-file limit: unable to raise soft limit from {} to {}; indexdb cache will be capped",
+            previous,
+            desired
+        );
+    }
+}
+
+fn fd_safe_indexdb_max_cached_dbs(requested: usize) -> usize {
+    let Some(open_file_limit) = soft_open_file_limit() else {
+        return requested;
+    };
+
+    // Each live indexdb handle may consume the main file plus WAL/SHM handles.
+    // Keep enough descriptors free for sockets, blob shard files, directories,
+    // repair workers, and short-lived import/export handles.
+    let reserved_fds = open_file_limit.clamp(128, 2048) / 4;
+    let usable_fds = open_file_limit.saturating_sub(reserved_fds).max(64);
+    let fd_safe = usable_fds / 4;
+    requested.min(fd_safe.max(1))
 }
 
 fn adaptive_indexdb_cache_budget_bytes(ram_bytes: Option<u64>) -> usize {
     match ram_gib(ram_bytes) {
-        0..=4 => 48 * 1024 * 1024,
-        5..=8 => 64 * 1024 * 1024,
-        9..=16 => 96 * 1024 * 1024,
-        _ => 128 * 1024 * 1024,
+        0..=4 => 16 * 1024 * 1024,
+        5..=8 => 24 * 1024 * 1024,
+        9..=16 => 32 * 1024 * 1024,
+        _ => 64 * 1024 * 1024,
     }
 }
 
 fn adaptive_indexdb_per_db_cache_bytes(ram_bytes: Option<u64>, max_cached_dbs: usize) -> usize {
     let max_cached_dbs = max_cached_dbs.max(1);
     let budget = adaptive_indexdb_cache_budget_bytes(ram_bytes);
-    (budget / max_cached_dbs).clamp(256 * 1024, 8 * 1024 * 1024)
+    (budget / max_cached_dbs).clamp(64 * 1024, 8 * 1024 * 1024)
 }
 
 fn adaptive_namespace_max_loaded_facades(ram_bytes: Option<u64>) -> usize {
     match ram_gib(ram_bytes) {
-        0..=4 => 8,
-        5..=8 => 12,
-        9..=16 => 16,
+        0..=4 => 4,
+        5..=8 => 6,
+        9..=16 => 8,
         _ => 24,
     }
 }
 
 fn adaptive_namespace_max_loaded_dbs(ram_bytes: Option<u64>, partition_count: usize) -> usize {
-    adaptive_namespace_max_loaded_facades(ram_bytes)
-        .saturating_mul(2)
-        .max(partition_count.saturating_mul(2))
+    adaptive_indexdb_max_cached_dbs(ram_bytes, partition_count)
 }
 
 fn normalize_indexdb_per_db_cache_bytes(value: usize) -> usize {
     if value == 0 {
         0
     } else {
-        align_up_4k(value).clamp(256 * 1024, 64 * 1024 * 1024)
+        align_up_4k(value).clamp(64 * 1024, 64 * 1024 * 1024)
     }
 }
 
@@ -570,8 +673,21 @@ fn validate_runtime_paths(config: &Ini) -> Result<(), String> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let runtime_config = runtime_thread_config(detect_cpu_cores());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(runtime_config.worker_threads)
+        .max_blocking_threads(runtime_config.max_blocking_threads)
+        .thread_stack_size(runtime_config.thread_stack_bytes)
+        .thread_name("n1-runtime")
+        .build()
+        .expect("Failed to build N1 runtime");
+
+    runtime.block_on(async_main(runtime_config));
+}
+
+async fn async_main(runtime_config: RuntimeThreadConfig) {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install 'ring' as the default TLS provider.");
@@ -597,6 +713,7 @@ async fn main() {
     }
 
     let _guard = init_tracing().expect("Failed to initialize tracing subscriber");
+    raise_open_file_limit_for_storage();
 
     if std::env::args_os().nth(1).is_some() {
         eprintln!(
@@ -620,6 +737,12 @@ async fn main() {
     tracing::info!(
         "│ Working Dir    : {}",
         std::env::current_dir().unwrap_or_default().display()
+    );
+    tracing::info!(
+        "│ Runtime        : worker_threads={} blocking_threads={} stack={}KiB",
+        runtime_config.worker_threads,
+        runtime_config.max_blocking_threads,
+        runtime_config.thread_stack_bytes / 1024
     );
     tracing::info!("╞═════════ ACTIVE CONNECTIONS ═════════╡");
 
@@ -739,7 +862,7 @@ pub async fn run_server() {
     set_configured_index_partition_count(configured_index_partition_count)
         .expect("index_config.partition_count must be one of: 32, 64, 256");
 
-    let indexdb_max_cached_dbs = parse_usize_or_auto(
+    let requested_indexdb_max_cached_dbs = parse_usize_or_auto(
         index_section.and_then(|s| s.get("max_cached_dbs")),
         "index_config.max_cached_dbs",
         adaptive_indexdb_max_cached_dbs(
@@ -747,7 +870,8 @@ pub async fn run_server() {
             usize::from(configured_index_partition_count),
         ),
     )
-    .clamp(1, 256);
+    .clamp(1, 1024);
+    let indexdb_max_cached_dbs = fd_safe_indexdb_max_cached_dbs(requested_indexdb_max_cached_dbs);
     let indexdb_per_db_cache_bytes = normalize_indexdb_per_db_cache_bytes(parse_usize_or_auto(
         index_section.and_then(|s| s.get("per_db_cache_bytes")),
         "index_config.per_db_cache_bytes",
@@ -756,12 +880,22 @@ pub async fn run_server() {
     configure_indexdb_cache(indexdb_per_db_cache_bytes, indexdb_max_cached_dbs);
 
     tracing::info!(
-        "Index layout: configured partition_count={}, indexdb_per_db_cache={}MiB, indexdb_max_cached_dbs={}, indexdb_cache_worst_case={}MiB",
+        "Index layout: configured partition_count={}, indexdb_per_db_cache={}KiB, indexdb_max_cached_dbs={}, indexdb_cache_worst_case={}MiB",
         configured_index_partition_count,
-        indexdb_per_db_cache_bytes / (1024 * 1024),
+        indexdb_per_db_cache_bytes / 1024,
         indexdb_max_cached_dbs,
         indexdb_per_db_cache_bytes.saturating_mul(indexdb_max_cached_dbs) / (1024 * 1024)
     );
+    if indexdb_max_cached_dbs < requested_indexdb_max_cached_dbs {
+        tracing::warn!(
+            "Index layout: capped indexdb_max_cached_dbs from {} to {} because process open-file limit is {}",
+            requested_indexdb_max_cached_dbs,
+            indexdb_max_cached_dbs,
+            soft_open_file_limit()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+    }
 
     let namespace_section = config.section(Some("namespace_config"));
     let namespace_max_loaded_facades = parse_usize_or_auto(
@@ -770,7 +904,7 @@ pub async fn run_server() {
         adaptive_namespace_max_loaded_facades(detected_ram_bytes),
     )
     .clamp(1, 512);
-    let namespace_max_loaded_dbs = parse_usize_or_auto(
+    let requested_namespace_max_loaded_dbs = parse_usize_or_auto(
         namespace_section.and_then(|s| s.get("max_loaded_dbs")),
         "namespace_config.max_loaded_dbs",
         adaptive_namespace_max_loaded_dbs(
@@ -778,7 +912,10 @@ pub async fn run_server() {
             usize::from(configured_index_partition_count),
         ),
     )
-    .clamp(1, 1024);
+    .clamp(1, 2048);
+    let namespace_max_loaded_dbs = requested_namespace_max_loaded_dbs
+        .min(indexdb_max_cached_dbs)
+        .max(1);
     configure_namespace_cache(namespace_max_loaded_facades, namespace_max_loaded_dbs);
 
     tracing::info!(
@@ -786,6 +923,13 @@ pub async fn run_server() {
         namespace_max_loaded_facades,
         namespace_max_loaded_dbs
     );
+    if namespace_max_loaded_dbs < requested_namespace_max_loaded_dbs {
+        tracing::warn!(
+            "Namespace cache: capped max_loaded_dbs from {} to {} to match the process indexdb handle budget",
+            requested_namespace_max_loaded_dbs,
+            namespace_max_loaded_dbs
+        );
+    }
 
     let upload_section = config.section(Some("upload_config"));
 
@@ -891,10 +1035,17 @@ pub async fn run_server() {
         upload_section.and_then(|s| s.get("upload_part_strict_durability_default")),
         false,
     );
-    let upload_io_gate_enabled = parse_bool_or_default(
+    let configured_upload_io_gate_enabled = parse_bool_or_default(
         upload_section.and_then(|s| s.get("upload_io_gate_enabled")),
         true,
     );
+    let upload_io_gate_enabled =
+        configured_upload_io_gate_enabled || effective_blob_disks_for_auto <= 2;
+    if !configured_upload_io_gate_enabled && upload_io_gate_enabled {
+        tracing::warn!(
+            "Upload IO gate forced on for two-disk minimum profile to preserve bounded IO and memory"
+        );
+    }
 
     tracing::info!(
         "Upload tuning: cpu_cores={}, ram_gib={}, blob_paths={}, blob_devices={}, auto_effective_disks={}, ec={}D+{}P, max_concurrent_io={} (configured={} budget_cap={} per_upload_est={}KiB budget={}MiB effective_budget={}MiB), writer_buffer_size={}, part_durability_strict_default={}, io_gate_enabled={}",

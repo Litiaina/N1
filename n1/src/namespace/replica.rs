@@ -13,7 +13,6 @@ use std::time::SystemTime;
 use tokio::fs;
 
 pub const INDEXDB_DIR: &str = "indexdb";
-pub const INDEXDB_FILE: &str = "index.ndxdb";
 const INDEXDB_SHARD_FILE_PREFIX: &str = "shard_";
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -445,46 +444,9 @@ fn copy_namespace_replica_file(source: &Path, destination: &Path) -> Result<(), 
     })?;
     std::fs::create_dir_all(parent)
         .map_err(|err| AppError::Io(err, format!("mkdir {}", parent.display())))?;
-    let file_name = destination
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("shard.ndxdb");
-    let temp_path = parent.join(format!(".{}.tmp-{}", file_name, ulid::Ulid::new()));
-    remove_indexdb_file_set(destination)?;
-    remove_indexdb_file_set(&temp_path)?;
     let source_db = open_n1_indexdb(source)?;
     source_db
-        .backup_to_path(&temp_path)
+        .backup_to_path(destination)
         .map_err(|err| AppError::InternalServerError(format!("namespace replica backup: {err}")))?;
-    std::fs::rename(&temp_path, destination).map_err(|err| {
-        AppError::Io(
-            err,
-            format!(
-                "rename {} -> {}",
-                temp_path.display(),
-                destination.display()
-            ),
-        )
-    })?;
-    remove_indexdb_file_set(&temp_path)?;
-    Ok(())
-}
-
-fn remove_indexdb_file_set(path: &Path) -> Result<(), AppError> {
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("shard.ndxdb");
-    for candidate in [
-        path.to_path_buf(),
-        path.with_file_name(format!("{}-wal", file_name)),
-        path.with_file_name(format!("{}-shm", file_name)),
-    ] {
-        match std::fs::remove_file(&candidate) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(AppError::Io(err, format!("remove {}", candidate.display()))),
-        }
-    }
     Ok(())
 }

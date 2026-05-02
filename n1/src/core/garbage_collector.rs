@@ -211,8 +211,9 @@ pub async fn run_lifecycle_manager(state: Arc<AppState>) {
     let cleanup_interval = Duration::from_secs(interval_secs);
 
     loop {
+        sleep(cleanup_interval).await;
+
         if GC_RUNNING.swap(true, Ordering::SeqCst) {
-            sleep(cleanup_interval).await;
             continue;
         }
         GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
@@ -236,8 +237,6 @@ pub async fn run_lifecycle_manager(state: Arc<AppState>) {
         });
         GC_STOP_SIGNAL.store(false, Ordering::Relaxed);
         GC_RUNNING.store(false, Ordering::SeqCst);
-
-        sleep(cleanup_interval).await;
     }
 }
 

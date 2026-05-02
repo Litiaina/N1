@@ -2,7 +2,9 @@ use super::disk_manager::{
     ListObjectsResult, ObjectMetadata, ObjectPathManager, PartMetadata, ReservationReceipt,
 };
 use super::fragment_metadata::fragment_index_partition_count;
-use super::index::{IndexSessionState, SessionPartReceipt, TrashCatalogEntry};
+use super::index::{
+    IndexReplicaWriteMode, IndexSessionState, SessionPartReceipt, TrashCatalogEntry,
+};
 use super::upload::UploadSessionManifest;
 use crate::enums::app_error_enum::AppError;
 use base64::Engine;
@@ -18,7 +20,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::thread;
 use std::time::Duration;
 use tracing::warn;
 use ulid::Ulid;
@@ -52,6 +56,18 @@ static INDEXDB_PER_DB_CACHE_BYTES: LazyLock<AtomicUsize> =
     LazyLock::new(|| AtomicUsize::new(DEFAULT_INDEXDB_PER_DB_CACHE_BYTES));
 static INDEXDB_MAX_CACHED_DBS: LazyLock<AtomicUsize> =
     LazyLock::new(|| AtomicUsize::new(DEFAULT_INDEXDB_MAX_CACHED_DBS));
+static INDEX_REPLICA_QUEUE: LazyLock<SyncSender<IndexReplicaJob>> = LazyLock::new(|| {
+    let (tx, rx) = sync_channel::<IndexReplicaJob>(2048);
+    let rx = Arc::new(Mutex::new(rx));
+    for worker_id in 0..4 {
+        let worker_rx = rx.clone();
+        thread::Builder::new()
+            .name(format!("n1-index-replica-{worker_id}"))
+            .spawn(move || index_replica_worker(worker_rx))
+            .expect("spawn index replica worker");
+    }
+    tx
+});
 
 pub const DEFAULT_INDEXDB_PER_DB_CACHE_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_INDEXDB_MAX_CACHED_DBS: usize = 32;
@@ -159,6 +175,7 @@ fn is_indexdb_lock_error(err: &AppError) -> bool {
         || message.contains("engine error 6")
 }
 
+#[derive(Clone)]
 struct VersionUpsertMutation {
     partition_meta: PartitionMeta,
     row_key: String,
@@ -168,6 +185,15 @@ struct VersionUpsertMutation {
     relational_state: n1_indexdb::ObjectVersionState,
     head: Option<HeadRecord>,
     trash_record: Option<(String, TrashObjectRecord)>,
+}
+
+#[derive(Clone)]
+enum IndexReplicaJob {
+    ObjectVersion {
+        fragment: String,
+        route: IndexRoute,
+        mutation: VersionUpsertMutation,
+    },
 }
 
 struct SessionRemoveMutation {
@@ -776,41 +802,11 @@ fn atomic_copy_db_file(src: &Path, dst: &Path) -> Result<(), AppError> {
     })?;
     fs::create_dir_all(parent)
         .map_err(|e| AppError::Io(e, format!("mkdir {}", parent.display())))?;
-    let file_name = dst
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("partition");
-    let tmp = parent.join(format!(".{}.tmp.{}", file_name, Ulid::new()));
 
     let source_db = get_or_open_db(src)?;
     source_db
-        .backup_to_path(&tmp)
+        .backup_to_path(dst)
         .map_err(|e| map_indexdb_error(&format!("backup {}", src.display()), e))?;
-
-    evict_cached_db(dst);
-    remove_indexdb_file_set(dst)?;
-    fs::rename(&tmp, dst)
-        .map_err(|e| AppError::Io(e, format!("rename {} -> {}", tmp.display(), dst.display())))?;
-    remove_indexdb_file_set(&tmp)?;
-    Ok(())
-}
-
-fn remove_indexdb_file_set(path: &Path) -> Result<(), AppError> {
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("index.ndxdb");
-    for candidate in [
-        path.to_path_buf(),
-        path.with_file_name(format!("{}-wal", file_name)),
-        path.with_file_name(format!("{}-shm", file_name)),
-    ] {
-        match fs::remove_file(&candidate) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(AppError::Io(err, format!("remove {}", candidate.display()))),
-        }
-    }
     Ok(())
 }
 
@@ -859,6 +855,10 @@ fn get_or_open_db(path: &Path) -> Result<Arc<Database>, AppError> {
     }
 
     Ok(db)
+}
+
+pub(crate) fn open_cached_n1_indexdb(path: &Path) -> Result<Arc<Database>, AppError> {
+    get_or_open_db(path)
 }
 
 fn open_route_db_for_read(
@@ -3759,6 +3759,47 @@ fn apply_session_remove_replica_exact(
     Ok(())
 }
 
+fn apply_index_replica_job(job: IndexReplicaJob) -> Result<(), AppError> {
+    match job {
+        IndexReplicaJob::ObjectVersion {
+            fragment,
+            route,
+            mutation,
+        } => replicate_object_mutation(&fragment, &route, "version upsert", |replica_db| {
+            apply_write_version_replica_exact(replica_db, &mutation)
+        }),
+    }
+}
+
+fn index_replica_worker(rx: Arc<Mutex<Receiver<IndexReplicaJob>>>) {
+    loop {
+        let job = {
+            let recv = rx.lock();
+            match recv {
+                Ok(recv) => recv.recv(),
+                Err(_) => return,
+            }
+        };
+        match job {
+            Ok(job) => {
+                if let Err(err) = apply_index_replica_job(job) {
+                    warn!("object replica background apply failed: {}", err);
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+fn enqueue_or_apply_index_replica_job(job: IndexReplicaJob) -> Result<(), AppError> {
+    match INDEX_REPLICA_QUEUE.try_send(job) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(job)) | Err(TrySendError::Disconnected(job)) => {
+            apply_index_replica_job(job)
+        }
+    }
+}
+
 fn replicate_object_mutation<F>(
     fragment: &str,
     route: &IndexRoute,
@@ -5108,21 +5149,50 @@ pub fn list_active_sessions(fragment: &str) -> Result<Vec<IndexSessionState>, Ap
     Ok(out)
 }
 
-fn write_version_on_owner(metadata: &ObjectMetadata, state: ObjectState) -> Result<(), AppError> {
+fn write_version_on_owner(
+    metadata: &ObjectMetadata,
+    state: ObjectState,
+    replica_write_mode: IndexReplicaWriteMode,
+) -> Result<(), AppError> {
     let route = object_route(&metadata.fragment, &metadata.object_key)?;
     let owner_path = owner_db_path(&route, &metadata.fragment);
     with_partition_commit_lock(&owner_path, || {
         let owner_db = open_owner_db_for_write(&route, &metadata.fragment)?;
         let mutation = write_version_on_db(&owner_db, metadata, state)?;
-        replicate_object_mutation(&metadata.fragment, &route, "version upsert", |replica_db| {
-            apply_write_version_replica_exact(replica_db, &mutation)
-        })?;
+        match replica_write_mode {
+            IndexReplicaWriteMode::SyncBestEffort => {
+                replicate_object_mutation(
+                    &metadata.fragment,
+                    &route,
+                    "version upsert",
+                    |replica_db| apply_write_version_replica_exact(replica_db, &mutation),
+                )?;
+            }
+            IndexReplicaWriteMode::BackgroundBestEffort => {
+                enqueue_or_apply_index_replica_job(IndexReplicaJob::ObjectVersion {
+                    fragment: metadata.fragment.clone(),
+                    route: route.clone(),
+                    mutation,
+                })?;
+            }
+        }
         Ok(())
     })
 }
 
 pub fn upsert_live_version(metadata: &ObjectMetadata) -> Result<(), AppError> {
-    write_version_on_owner(metadata, ObjectState::Live)
+    write_version_on_owner(
+        metadata,
+        ObjectState::Live,
+        IndexReplicaWriteMode::SyncBestEffort,
+    )
+}
+
+pub fn upsert_live_version_with_replica_mode(
+    metadata: &ObjectMetadata,
+    replica_write_mode: IndexReplicaWriteMode,
+) -> Result<(), AppError> {
+    write_version_on_owner(metadata, ObjectState::Live, replica_write_mode)
 }
 
 pub fn read_live_version(
@@ -5348,7 +5418,11 @@ fn scan_trash_catalog_page(
 }
 
 pub fn upsert_trash_version(metadata: &ObjectMetadata) -> Result<(), AppError> {
-    write_version_on_owner(metadata, ObjectState::Trash)
+    write_version_on_owner(
+        metadata,
+        ObjectState::Trash,
+        IndexReplicaWriteMode::SyncBestEffort,
+    )
 }
 
 pub fn read_trash_version(

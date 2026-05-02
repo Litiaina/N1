@@ -1293,6 +1293,7 @@ fn analyze_blob_placement_risk(disk_statuses: &[DiskStatus]) -> BlobPlacementRis
 
 pub async fn run_system_monitor(state: Arc<AppState>) {
     let mut ticker = tokio::time::interval(monitor_interval());
+    ticker.tick().await;
 
     loop {
         ticker.tick().await;

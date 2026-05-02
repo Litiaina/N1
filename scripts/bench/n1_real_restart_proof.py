@@ -39,6 +39,12 @@ def parse_args():
     parser.add_argument("--fragment-key", default="real-proof-fragment-key")
     parser.add_argument("--fragment-name", default="")
     parser.add_argument("--cleanup-roots", action="store_true")
+    parser.add_argument(
+        "--simulate-disk-format-repair",
+        action="store_true",
+        help="After restart proof, remove one proof disk's fragment subtree, restart, run repair, and verify listing/downloads.",
+    )
+    parser.add_argument("--repair-timeout-seconds", type=int, default=1800)
     return parser.parse_args()
 
 
@@ -449,6 +455,31 @@ stripe_block_size=262144
         self.summary[f"{phase}_paths_sha256"] = actual_hash
         return actual
 
+    def posix_list(self, path=""):
+        params = {"path": path, "limit": "1000"}
+        status, page = self.http(
+            "GET",
+            f"{self.base_url}/n1/posix/list?{urllib.parse.urlencode(params)}",
+            headers=self.bearer(),
+        )
+        if status != 200:
+            raise ProofFailure(f"posix list returned {status} for {path!r}")
+        return page
+
+    def assert_posix_visible(self, phase):
+        root_page = self.posix_list("")
+        root_names = sorted(entry["name"] for entry in root_page.get("entries", []))
+        prefix_root = self.args.prefix.strip("/").split("/", 1)[0]
+        if prefix_root and prefix_root not in root_names:
+            raise ProofFailure(
+                f"{phase} POSIX root listing missing {prefix_root!r}; root entries={root_names[:20]}"
+            )
+        prefix_page = self.posix_list(prefix_root)
+        if not prefix_page.get("entries"):
+            raise ProofFailure(f"{phase} POSIX listing under {prefix_root!r} is empty")
+        self.summary[f"{phase}_posix_root_entries"] = len(root_names)
+        self.summary[f"{phase}_posix_prefix_entries"] = len(prefix_page.get("entries", []))
+
     def download_samples(self, actual):
         samples = [actual[0], actual[len(actual) // 2], actual[-1]]
         results = []
@@ -478,6 +509,80 @@ stripe_block_size=262144
                 raise ProofFailure(f"download hash mismatch for {logical}")
             results.append({"path": logical, "bytes": len(payload), "sha256": actual_hash})
         self.summary["download_checks"] = results
+
+    def run_repair_and_wait(self):
+        params = {
+            "fragment": self.fragment,
+            "mode": "strict",
+            "fast_mode": "true",
+            "meta_concurrency": "8",
+            "repair_concurrency": "8",
+            "batch": "512",
+        }
+        status, _ = self.http(
+            "POST",
+            f"{self.base_url}/n1/maintenance/repair/start?{urllib.parse.urlencode(params)}",
+            headers=self.bearer(),
+        )
+        if status != 202:
+            raise ProofFailure(f"repair start returned {status}")
+        deadline = time.monotonic() + self.args.repair_timeout_seconds
+        last = None
+        last_print = 0.0
+        while time.monotonic() < deadline:
+            status, body = self.http(
+                "GET",
+                f"{self.base_url}/n1/maintenance/repair/status",
+                headers=self.bearer(),
+            )
+            if status != 200:
+                raise ProofFailure(f"repair status returned {status}")
+            last = body
+            now = time.monotonic()
+            if now - last_print >= 5:
+                print(
+                    "REAL_N1_PROOF repair_status "
+                    f"phase={body.get('phase')} running={body.get('is_running')} "
+                    f"scanned={body.get('total_fragments_scanned')} "
+                    f"repaired={body.get('total_repaired')} "
+                    f"errors={body.get('total_errors')} "
+                    f"last_error={body.get('last_error')}",
+                    flush=True,
+                )
+                last_print = now
+            if not body.get("is_running"):
+                phase = str(body.get("phase", ""))
+                if phase.lower() == "failed" or body.get("last_error"):
+                    raise ProofFailure(f"repair failed: {body}")
+                self.summary["repair_after_disk_format"] = body
+                return body
+            time.sleep(1)
+        raise ProofFailure(f"repair timed out; last status={last}")
+
+    def simulate_disk_format_and_repair(self, expected_sorted):
+        if len(self.index_roots) < 2 or len(self.blob_roots) < 2:
+            raise ProofFailure("disk-format repair proof requires at least two index/blob roots")
+        self.stop_server()
+        wiped = []
+        for root in (self.index_roots[1], self.blob_roots[1]):
+            target = root / self.fragment
+            if target.exists():
+                subprocess.run(["rm", "-rf", str(target)], check=True)
+            wiped.append(str(target))
+        self.summary["simulated_formatted_fragment_roots"] = wiped
+        print(
+            "REAL_N1_PROOF simulated_disk_format "
+            f"removed={json.dumps(wiped)}",
+            flush=True,
+        )
+        self.start_server("after-disk-format")
+        self.auth()
+        self.assert_listing("after_disk_format_before_repair", expected_sorted)
+        self.assert_posix_visible("after_disk_format_before_repair")
+        self.run_repair_and_wait()
+        actual = self.assert_listing("after_disk_format_repair", expected_sorted)
+        self.assert_posix_visible("after_disk_format_repair")
+        self.download_samples(actual)
 
     def inspect_indexdb(self, expected_count):
         inspections = []
@@ -620,7 +725,10 @@ stripe_block_size=262144
             self.start_server("after")
             self.auth()
             actual = self.assert_listing("after_restart", expected_sorted)
+            self.assert_posix_visible("after_restart")
             self.download_samples(actual)
+            if self.args.simulate_disk_format_repair:
+                self.simulate_disk_format_and_repair(expected_sorted)
             self.inspect_indexdb(len(expected_sorted))
             self.write_summary("PASS")
             if self.args.cleanup_roots:

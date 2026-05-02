@@ -575,11 +575,13 @@ pub struct Builder {
     repair_callback: Box<dyn Fn(&mut RepairSession) + Send + Sync>,
 }
 
+const DEFAULT_BUILDER_CACHE_SIZE_BYTES: usize = 2 * 1024 * 1024;
+
 impl Builder {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
-            cache_size: 1024 * 1024 * 1024,
+            cache_size: DEFAULT_BUILDER_CACHE_SIZE_BYTES,
             repair_callback: Box::new(|_| {}),
         }
     }
@@ -602,7 +604,7 @@ impl Builder {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path, OpenMode::ReadWriteCreate)?;
+        let conn = Connection::open_with_cache(path, OpenMode::ReadWriteCreate, self.cache_size)?;
         let db = Database {
             inner: Arc::new(DatabaseInner {
                 path: path.to_path_buf(),
@@ -611,7 +613,6 @@ impl Builder {
             }),
         };
         initialize_path_metadata(&db)?;
-        let _ = self.cache_size;
         Ok(db)
     }
 
@@ -623,7 +624,7 @@ impl Builder {
                 format!("database file {} does not exist", path.display()),
             )));
         }
-        let conn = Connection::open(path, OpenMode::ReadWriteCreate)?;
+        let conn = Connection::open_with_cache(path, OpenMode::ReadWriteCreate, self.cache_size)?;
         let db = Database {
             inner: Arc::new(DatabaseInner {
                 path: path.to_path_buf(),
@@ -632,7 +633,6 @@ impl Builder {
             }),
         };
         initialize_path_metadata(&db)?;
-        let _ = self.cache_size;
         Ok(db)
     }
 
@@ -640,8 +640,15 @@ impl Builder {
         &self,
         path: impl AsRef<Path>,
     ) -> Result<ReadOnlyDatabase, DatabaseError> {
-        let _ = self.cache_size;
-        ReadOnlyDatabase::open(path)
+        let path = path.as_ref();
+        let conn = Connection::open_with_cache(path, OpenMode::ReadOnly, self.cache_size)?;
+        Ok(ReadOnlyDatabase {
+            inner: Arc::new(DatabaseInner {
+                path: path.to_path_buf(),
+                conn: Mutex::new(conn),
+                write_gate: Arc::new(WriteGate::default()),
+            }),
+        })
     }
 }
 
@@ -3858,6 +3865,7 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{Database, ReadableDatabase, TableDefinition};
+    use crate::ffi::StepResult;
     use crate::n1::{ObjectPart, ObjectState, ObjectVersion, ObjectVersionState, PartShard};
 
     #[test]
@@ -3883,6 +3891,22 @@ mod tests {
             .expect("collect rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0.value(), "listing/summary-only.bin");
+    }
+
+    #[test]
+    fn builder_cache_size_is_applied_to_connection() {
+        let file = crate::create_temp_db_file();
+        let mut builder = Database::builder();
+        builder.set_cache_size(512 * 1024);
+        let db = builder.create(file.path()).expect("create db");
+
+        let mut conn = db.inner.conn.lock().expect("connection lock");
+        let mut stmt = conn.prepare("PRAGMA cache_size").expect("cache pragma");
+        assert!(matches!(
+            stmt.step().expect("step cache pragma"),
+            StepResult::Row
+        ));
+        assert_eq!(stmt.column_i64(0), -512);
     }
 
     #[test]

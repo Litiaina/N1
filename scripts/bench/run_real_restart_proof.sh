@@ -19,6 +19,9 @@ QUOTA_BYTES="${QUOTA_BYTES:-10737418240}"
 QUOTA_BACKEND="${QUOTA_BACKEND:-xfs_project}"
 MASTER_KEY="${MASTER_KEY:-real-proof-master-key}"
 FRAGMENT_KEY="${FRAGMENT_KEY:-real-proof-fragment-key}"
+FRAGMENT_NAME="${FRAGMENT_NAME:-}"
+SIMULATE_DISK_FORMAT_REPAIR="${SIMULATE_DISK_FORMAT_REPAIR:-0}"
+REPAIR_TIMEOUT_SECONDS="${REPAIR_TIMEOUT_SECONDS:-1800}"
 BUILD="${BUILD:-1}"
 BINARY="${BINARY:-$ROOT_DIR/target/debug/litiaina-n1}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -54,6 +57,16 @@ if [[ "$CLEANUP_ROOTS" == "1" ]]; then
   cleanup_flag=(--cleanup-roots)
 fi
 
+disk_format_repair_flag=()
+if [[ "$SIMULATE_DISK_FORMAT_REPAIR" == "1" ]]; then
+  disk_format_repair_flag=(--simulate-disk-format-repair)
+fi
+
+fragment_name_arg=()
+if [[ -n "$FRAGMENT_NAME" ]]; then
+  fragment_name_arg=(--fragment-name "$FRAGMENT_NAME")
+fi
+
 python3 "$ROOT_DIR/scripts/bench/n1_real_restart_proof.py" \
   --binary "$BINARY" \
   --source-dir "$SOURCE_DIR" \
@@ -68,4 +81,7 @@ python3 "$ROOT_DIR/scripts/bench/n1_real_restart_proof.py" \
   --quota-backend "$QUOTA_BACKEND" \
   --master-key "$MASTER_KEY" \
   --fragment-key "$FRAGMENT_KEY" \
+  --repair-timeout-seconds "$REPAIR_TIMEOUT_SECONDS" \
+  "${fragment_name_arg[@]}" \
+  "${disk_format_repair_flag[@]}" \
   "${cleanup_flag[@]}"

@@ -221,6 +221,17 @@ pub async fn publish_object(metadata: &ObjectMetadata) -> Result<(), AppError> {
     run_indexdb_blocking(move || indexdb_store::upsert_live_version(&metadata)).await
 }
 
+pub async fn publish_object_with_replica_mode(
+    metadata: &ObjectMetadata,
+    replica_write_mode: IndexReplicaWriteMode,
+) -> Result<(), AppError> {
+    let metadata = metadata.clone();
+    run_indexdb_blocking(move || {
+        indexdb_store::upsert_live_version_with_replica_mode(&metadata, replica_write_mode)
+    })
+    .await
+}
+
 pub async fn upsert_object_version(metadata: &ObjectMetadata) -> Result<(), AppError> {
     let metadata = metadata.clone();
     run_indexdb_blocking(move || indexdb_store::upsert_live_version(&metadata)).await
