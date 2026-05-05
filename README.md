@@ -21,6 +21,8 @@ This repository contains the storage platform stack built around four runtime co
 
 > - `N1` (`3.0.0`)
   Single-node storage kernel with an object-storage core, per-fragment sharded `indexdb` metadata authority, lifecycle, repair, redistribution, GC, recover-on-read, and POSIX-style routes.
+> - `N1 Edge` (`3.0.0`)
+  Filesystem-native N1 engine face with immutable `.ndx` version records, zero-decode listing, directory-native POSIX movement, and the same N1 blob/shard/parity plane. See `N1_EDGE_DOCUMENTATION.md`.
 > - `N2` (`0.2.0`)
   Multi-node clustering and placement layer built on top of the shared `N1` storage core.
 > - `NS` (`1.0.0`)
@@ -77,7 +79,7 @@ Current release notes for the validated `N1 3.0.0`, `NS 1.0.0`, and `Registry 0.
 
 ### N1
 
-`N1` is the storage kernel.
+`N1 Standard` is the storage kernel backed by per-fragment sharded `indexdb`.
 
 It is responsible for:
 
@@ -102,6 +104,21 @@ It is responsible for:
 It is not the user/account control plane and it is not the business metadata layer.
 
 SMB/NAS access is no longer embedded in `N1`. Use standalone `NS` when Windows/macOS/Linux file-manager SMB workflows are needed.
+
+### N1 Edge
+
+`N1 Edge` is the filesystem-native N1 engine face.
+
+It keeps the N1 object/blob plane, repair model, redistribution model, GC model, and public route shape, but replaces the active index authority with filesystem records:
+
+```text
+index_root/<fragment_hash>/<prefix>/@o_<object-key-hash>/
+  <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
+```
+
+Folders are real directories. Object records are `@o_<hash>` directories. Each committed version is an immutable `.ndx` file. Normal listing parses directory entries and filenames only; it does not decode `.ndx` bodies.
+
+Use `N1 Edge` when the goal is the pure filesystem-native, Linux-first, IO-bound N1 engine. Use `N1 Standard` when the deployment target is the validated sharded `indexdb` engine line.
 
 ### N2
 

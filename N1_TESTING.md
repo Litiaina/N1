@@ -2,6 +2,8 @@
 
 N1 tests are split into three gates. A green unit/workflow suite is useful, but it is not a production release signal by itself.
 
+N1 Standard and N1 Edge have different metadata engines. Standard release proof inspects sharded `indexdb`; Edge release proof must inspect filesystem-native `.ndx` records. Do not use Standard indexdb inspection as final Edge evidence.
+
 ## Gate 1: In-Process Regression Suite
 
 Run this on every code change:
@@ -121,3 +123,53 @@ scripts/bench/n1_live_parallel_storm.py --base-url <live-url> --master-key <MAST
 ```
 
 Do not treat synthetic tests alone as release confidence. N1 must prove the public API, process restart, real filesystem quota, real disk layout, and durable sharded `indexdb` state together.
+
+## N1 Edge Release Gate
+
+N1 Edge has its own documentation and release proof requirements in `N1_EDGE_DOCUMENTATION.md`.
+
+Minimum preflight:
+
+```bash
+cargo build -p n1-edge --bin litiaina-n1-edge
+RUSTFLAGS='-D warnings' cargo test -p n1-edge --all-targets
+RUSTFLAGS='-D warnings' cargo check --workspace --all-targets
+```
+
+Real hardware Edge proof must run on the minimum two-disk profile:
+
+```text
+/mnt/disk-00
+/mnt/disk-01
+```
+
+Both disks should house index and blob roots.
+
+Edge proof must cover:
+
+- CRUD through public HTTP routes
+- latest GET and exact version GET
+- POSIX list, mkdir, rename, folder rename, move, trash, recover, purge
+- restart listing proof
+- multipart resume after restart
+- recover-on-read after a missing shard/parity side
+- repair after one disk is wiped or reformatted
+- redistribution 2 disk -> 1 disk -> 2 disk
+- GC after hard delete and empty trash
+- archive download for selected folders/files
+- four-user parallel upload storm with bounded RSS and file descriptors
+
+API-level storm testing can be reused against a live Edge server:
+
+```bash
+scripts/bench/n1_live_parallel_storm.py \
+  --base-url https://127.0.0.1:50001 \
+  --master-key <MASTER_KEY> \
+  --users 4 \
+  --objects-per-user 3000 \
+  --per-user-concurrency 4 \
+  --quota-bytes 21474836480 \
+  --pid <N1_EDGE_PID>
+```
+
+The current Standard restart proof script includes indexdb table inspection. Before treating it as Edge release evidence, its final inspection phase must be Edge-aware and verify committed `.ndx` records, live/trash reachability, and blob version directories instead of indexdb tables.
