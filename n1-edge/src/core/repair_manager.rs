@@ -1067,7 +1067,7 @@ pub async fn run_repair_job_with_options(
 
         {
             let mut status = REPAIR_STATUS.write().await;
-            status.phase = format!("Repairing partition db replicas {}", fragment_hash);
+            status.phase = format!("Repairing Edge index replicas {}", fragment_hash);
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 

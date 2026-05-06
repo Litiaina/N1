@@ -145,6 +145,22 @@ Real hardware Edge proof must run on the minimum two-disk profile:
 
 Both disks should house index and blob roots.
 
+Run the Edge real proof harness:
+
+```bash
+python3 scripts/bench/n1_edge_real_proof.py \
+  --binary target/debug/litiaina-n1-edge \
+  --source-dir /home/administrator/Development/litiaina-cloud-web \
+  --disk-roots /mnt/disk-00,/mnt/disk-01 \
+  --out-dir /home/administrator/Development/N2/.n1-bench/edge-real-full-$(date +%Y%m%d-%H%M%S) \
+  --port 50561 \
+  --concurrency 16 \
+  --quota-backend disabled \
+  --quota-bytes 10737418240 \
+  --prefix edge-full/ \
+  --simulate-disk-format-repair
+```
+
 Edge proof must cover:
 
 - CRUD through public HTTP routes
@@ -169,7 +185,19 @@ scripts/bench/n1_live_parallel_storm.py \
   --objects-per-user 3000 \
   --per-user-concurrency 4 \
   --quota-bytes 21474836480 \
+  --edge-posix-list \
+  --multipart-size-mib 16 \
+  --multipart-part-mib 4 \
   --pid <N1_EDGE_PID>
 ```
 
-The current Standard restart proof script includes indexdb table inspection. Before treating it as Edge release evidence, its final inspection phase must be Edge-aware and verify committed `.ndx` records, live/trash reachability, and blob version directories instead of indexdb tables.
+The Standard restart proof script includes indexdb table inspection. Do not use it as Edge release evidence. Edge release evidence must verify committed `.ndx` records, live/trash reachability, and blob version directories instead of indexdb tables.
+
+Latest Edge proof evidence from 2026-05-06:
+
+- Warning-gated `cargo test -p n1-edge --all-targets` passed.
+- Warning-gated `cargo check --workspace --all-targets` passed.
+- Real two-disk Edge proof on `/mnt/disk-00` and `/mnt/disk-01` passed CRUD, POSIX, archive, multipart, recover-on-read, simulated disk-format repair, and redistribution `2 disk -> 1 disk -> 2 disk`.
+- The proof verified both roots with `live_ndx=12`, `namespace_symlinks=12`, and `blob_version_dirs=12`.
+- Four concurrent users/fragments uploaded `3,000` small objects each, plus one `16 MiB` multipart object per user. Edge POSIX listing returned `12,004` objects exactly.
+- Storm max RSS was about `258 MiB` with `42` threads. The bad-disk tiny-object workload measured `14.343 objects/s` and `0.203 MiB/s`.

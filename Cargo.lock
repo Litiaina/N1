@@ -2220,7 +2220,7 @@ dependencies = [
 
 [[package]]
 name = "n1-edge"
-version = "3.0.0"
+version = "1.0.0"
 dependencies = [
  "argon2",
  "async_zip",

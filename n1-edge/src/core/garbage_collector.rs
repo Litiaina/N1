@@ -79,16 +79,6 @@ impl GcExecutionMode {
         }
     }
 
-    fn namespace_absence_grace(self) -> Duration {
-        match self {
-            Self::Availability => {
-                Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds.max(300))
-            }
-            Self::Strict => Duration::from_secs(30),
-            Self::Scrub => Duration::ZERO,
-        }
-    }
-
     fn file_ttl(self, is_manual_run: bool) -> Duration {
         if !is_manual_run {
             return Duration::from_secs(CONFIG.garbage_collector.file_ttl_seconds);
@@ -117,17 +107,6 @@ impl Default for GcRunOptions {
 }
 
 impl GcRunOptions {
-    fn namespace_absence_grace(self) -> Duration {
-        if !self.fast_mode {
-            return self.execution_mode.namespace_absence_grace();
-        }
-        match self.execution_mode {
-            GcExecutionMode::Availability => Duration::from_secs(60),
-            GcExecutionMode::Strict => Duration::from_secs(5),
-            GcExecutionMode::Scrub => Duration::ZERO,
-        }
-    }
-
     fn file_ttl(self, is_manual_run: bool) -> Duration {
         if !self.fast_mode {
             return self.execution_mode.file_ttl(is_manual_run);
@@ -518,6 +497,11 @@ fn gc_cleanup_version_dir_unix(
 ) {
 }
 
+#[inline]
+fn orphan_blob_age_expired(age: Duration, ttl: Duration) -> bool {
+    ttl.is_zero() || age >= ttl
+}
+
 async fn perform_gc_scan(
     state: Arc<AppState>,
     is_manual_run: bool,
@@ -648,7 +632,7 @@ async fn process_fragment_gc(
     retention: Duration,
     file_ttl: Duration,
     is_manual_run: bool,
-    options: GcRunOptions,
+    _options: GcRunOptions,
     state: &Arc<AppState>,
 ) -> FragmentGcStats {
     let mut stats = FragmentGcStats::default();
@@ -685,25 +669,30 @@ async fn process_fragment_gc(
     };
 
     let mut protected_live_object_ids = BTreeSet::<String>::new();
-    for meta in &physical_live_objects {
-        protected_live_object_ids.insert(meta.object_key.clone());
-        match index::list_live_object_versions_metadata(fragment, &meta.object_key).await {
-            Ok(version_metas) => {
-                if version_metas.is_empty() {
-                    live_versions.insert(meta.version_id.clone());
-                } else {
-                    live_versions
-                        .extend(version_metas.into_iter().map(|version| version.version_id));
+    if let Some(snapshot) = &namespace_snapshot {
+        protected_live_object_ids.extend(snapshot.referenced_object_ids.iter().cloned());
+        live_versions.extend(snapshot.referenced_version_ids.iter().cloned());
+    } else {
+        for meta in &physical_live_objects {
+            protected_live_object_ids.insert(meta.object_key.clone());
+            match index::list_live_object_versions_metadata(fragment, &meta.object_key).await {
+                Ok(version_metas) => {
+                    if version_metas.is_empty() {
+                        live_versions.insert(meta.version_id.clone());
+                    } else {
+                        live_versions
+                            .extend(version_metas.into_iter().map(|version| version.version_id));
+                    }
                 }
-            }
-            Err(err) => {
-                warn!(
-                    "GC: failed to load live version history for protected object {}/{}: {}; preserving head and skipping destructive namespace purge for this fragment",
-                    fragment, meta.object_key, err
-                );
-                live_versions.insert(meta.version_id.clone());
-                stats.live_versions_seen = live_versions.len() as u64;
-                return stats;
+                Err(err) => {
+                    warn!(
+                        "GC: failed to load live version history for protected object {}/{}: {}; preserving head and skipping destructive namespace purge for this fragment",
+                        fragment, meta.object_key, err
+                    );
+                    live_versions.insert(meta.version_id.clone());
+                    stats.live_versions_seen = live_versions.len() as u64;
+                    return stats;
+                }
             }
         }
     }
@@ -731,37 +720,8 @@ async fn process_fragment_gc(
     }
 
     let mut namespace_absent_gc_candidates = BTreeSet::<String>::new();
-    if let Some(snapshot) = &namespace_snapshot {
-        live_versions.extend(snapshot.referenced_version_ids.iter().cloned());
-        let namespace_absence_grace = options.namespace_absence_grace();
-        let namespace_absence_grace_secs = namespace_absence_grace.as_secs() as i64;
-        let mut recent_namespace_absent = 0usize;
-        for meta in &physical_live_objects {
-            if snapshot.referenced_object_ids.contains(&meta.object_key)
-                || purged_object_ids.contains(&meta.object_key)
-            {
-                continue;
-            }
-            let age_secs = now_unix.saturating_sub(meta.created_at.max(0));
-            if age_secs <= namespace_absence_grace_secs {
-                recent_namespace_absent += 1;
-            } else {
-                namespace_absent_gc_candidates.insert(meta.object_key.clone());
-            }
-        }
-        if recent_namespace_absent > 0 {
-            info!(
-                "GC: preserving {} recently committed live object(s) for fragment {} while namespace binding catches up",
-                recent_namespace_absent, fragment
-            );
-        }
-        if !namespace_absent_gc_candidates.is_empty() {
-            info!(
-                "GC: reclaiming {} older unbound completed object(s) for fragment {} because namespace reachability is available and no live/trash/pending binding references them",
-                namespace_absent_gc_candidates.len(),
-                fragment
-            );
-        }
+    if namespace_snapshot.is_none() {
+        namespace_absent_gc_candidates.extend(purged_object_ids.iter().cloned());
     }
 
     match index::list_fragment_trash_catalog(fragment).await {
@@ -1032,7 +992,8 @@ async fn process_fragment_gc(
                     let modified = fs::metadata(&path)
                         .and_then(|m| m.modified())
                         .unwrap_or(now);
-                    if now.duration_since(modified).unwrap_or(Duration::ZERO) > file_ttl {
+                    let orphan_age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+                    if orphan_blob_age_expired(orphan_age, file_ttl) {
                         if std::fs::remove_dir_all(path).is_ok() {
                             stats.orphan_blob_dirs_deleted += 1;
                         }
@@ -1088,14 +1049,25 @@ mod tests {
             fast_mode: true,
         };
 
-        assert!(availability.namespace_absence_grace() >= Duration::from_secs(300));
-        assert_eq!(
-            strict_fast.namespace_absence_grace(),
-            Duration::from_secs(5)
-        );
-        assert_eq!(scrub_fast.namespace_absence_grace(), Duration::ZERO);
+        assert_eq!(availability.file_ttl(true), Duration::from_secs(1));
         assert_eq!(strict_fast.file_ttl(true), Duration::from_secs(1));
         assert_eq!(scrub_fast.file_ttl(true), Duration::ZERO);
+    }
+
+    #[test]
+    fn scrub_zero_ttl_reclaims_fresh_orphan_blob_dirs() {
+        assert!(super::orphan_blob_age_expired(
+            Duration::ZERO,
+            Duration::ZERO
+        ));
+        assert!(!super::orphan_blob_age_expired(
+            Duration::from_millis(999),
+            Duration::from_secs(1)
+        ));
+        assert!(super::orphan_blob_age_expired(
+            Duration::from_secs(1),
+            Duration::from_secs(1)
+        ));
     }
 
     #[test]

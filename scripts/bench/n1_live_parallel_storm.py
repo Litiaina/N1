@@ -27,6 +27,18 @@ def parse_args():
     parser.add_argument("--prefix", default="")
     parser.add_argument("--pid", type=int, default=0)
     parser.add_argument("--progress-every", type=int, default=250)
+    parser.add_argument(
+        "--edge-posix-list",
+        action="store_true",
+        help="Count uploaded objects through recursive /n1/posix/list for N1 Edge.",
+    )
+    parser.add_argument(
+        "--multipart-size-mib",
+        type=int,
+        default=0,
+        help="Upload one multipart object per user after the small-object storm.",
+    )
+    parser.add_argument("--multipart-part-mib", type=int, default=4)
     return parser.parse_args()
 
 
@@ -58,18 +70,41 @@ class Client:
                     return res.status, {}
                 try:
                     return res.status, json.loads(raw.decode())
-                except json.JSONDecodeError:
-                    return res.status, {"raw": raw.decode(errors="replace")}
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    return res.status, raw
         except urllib.error.HTTPError as err:
             raw = err.read().decode(errors="replace")
             raise StormFailure(f"{method} {path} -> HTTP {err.code}: {raw}") from None
 
 
+def deterministic_payload_bytes(size, seed):
+    digest = hashlib.sha256(seed).digest()
+    repeats = (size + len(digest) - 1) // len(digest)
+    return (digest * repeats)[:size]
+
+
 def deterministic_payload(user_index, object_index):
     size = 1024 + ((user_index * 7919 + object_index * 3571) % (16 * 1024))
-    seed = hashlib.sha256(f"{user_index}:{object_index}".encode()).digest()
-    repeats = (size + len(seed) - 1) // len(seed)
-    return (seed * repeats)[:size]
+    return deterministic_payload_bytes(size, f"{user_index}:{object_index}".encode())
+
+
+def deterministic_multipart_part(user_index, part_index, size):
+    return deterministic_payload_bytes(
+        size,
+        f"multipart:{user_index}:{part_index}".encode(),
+    )
+
+
+def deterministic_multipart_hash(user_index, size, part_size):
+    digest = hashlib.sha256()
+    offset = 0
+    part_index = 0
+    while offset < size:
+        current = min(part_size, size - offset)
+        digest.update(deterministic_multipart_part(user_index, part_index, current))
+        offset += current
+        part_index += 1
+    return digest.hexdigest()
 
 
 def bearer(token):
@@ -111,7 +146,47 @@ def auth_fragment(client, fragment, fragment_key):
     return body["access_token"]
 
 
-def list_count(client, token, prefix):
+def posix_page(client, token, path, cursor=None):
+    params = {"path": path.strip("/"), "limit": "1000"}
+    if cursor:
+        params["continuation_token"] = cursor
+    status, page = client.http(
+        "GET",
+        f"/n1/posix/list?{urllib.parse.urlencode(params)}",
+        headers=bearer(token),
+    )
+    if status != 200:
+        raise StormFailure(f"posix list returned {status}")
+    return page
+
+
+def posix_entries(client, token, path):
+    out = []
+    cursor = None
+    while True:
+        page = posix_page(client, token, path, cursor)
+        out.extend(page.get("entries", []))
+        cursor = page.get("continuation_token")
+        if not cursor:
+            return out
+
+
+def edge_posix_list_count(client, token, prefix):
+    count = 0
+    dirs = [prefix.strip("/")]
+    while dirs:
+        current = dirs.pop(0)
+        for entry in posix_entries(client, token, current):
+            if entry.get("kind") == "directory":
+                dirs.append(entry["path"])
+            elif entry.get("kind") == "file":
+                count += 1
+    return count
+
+
+def list_count(client, token, prefix, edge_posix=False):
+    if edge_posix:
+        return edge_posix_list_count(client, token, prefix)
     count = 0
     cursor = None
     while True:
@@ -149,6 +224,92 @@ def sample_process(pid):
         "mem_percent": float(parts[2]),
         "rss_kib": int(parts[3]),
         "threads": int(parts[4]),
+    }
+
+
+def record_sample(progress, sample):
+    if not sample:
+        return
+    progress["max_rss_kib"] = max(progress.get("max_rss_kib", 0), sample.get("rss_kib", 0))
+    progress["max_threads"] = max(progress.get("max_threads", 0), sample.get("threads", 0))
+
+
+def upload_multipart_user(args, user_index, token, user_prefix):
+    if args.multipart_size_mib <= 0:
+        return None
+    ctx = ssl._create_unverified_context()
+    client = Client(args.base_url, ctx)
+    total_size = args.multipart_size_mib * 1024 * 1024
+    part_size = args.multipart_part_mib * 1024 * 1024
+    expected_parts = (total_size + part_size - 1) // part_size
+    logical = f"{user_prefix}multipart-user-{user_index:02d}.bin"
+    params = {
+        "content_type": "application/octet-stream",
+        "total_size_bytes": total_size,
+        "expected_parts": expected_parts,
+        "part_size_bytes": part_size,
+    }
+    headers = bearer(token)
+    headers["Content-Type"] = "application/json"
+    start = time.monotonic()
+    status, init = client.http(
+        "POST",
+        "/n1/upload/multipart/init/" + urllib.parse.quote(logical, safe="/"),
+        payload=params,
+        headers=headers,
+        timeout=300,
+    )
+    if status != 201:
+        raise StormFailure(f"multipart init returned {status} for {logical}")
+    version_id = init["version_id"]
+    session_id = init["session_id"]
+    offset = 0
+    for part_index in range(expected_parts):
+        current = min(part_size, total_size - offset)
+        part = deterministic_multipart_part(user_index, part_index, current)
+        status, _ = client.http(
+            "PUT",
+            f"/n1/upload/multipart/{version_id}/{part_index}?durability=batched",
+            payload=part,
+            headers={**bearer(token), "Content-Type": "application/octet-stream"},
+            timeout=600,
+        )
+        if status not in (200, 201):
+            raise StormFailure(f"multipart part {part_index} returned {status} for {logical}")
+        offset += current
+    status, _ = client.http(
+        "POST",
+        f"/n1/upload/multipart/{version_id}/{session_id}/finalize?"
+        + urllib.parse.urlencode({"object_key": logical}),
+        payload=params,
+        headers=headers,
+        timeout=600,
+    )
+    if status != 200:
+        raise StormFailure(f"multipart finalize returned {status} for {logical}")
+    status, payload = client.http(
+        "GET",
+        "/n1/objects/download?" + urllib.parse.urlencode({"object_key": logical}),
+        headers=bearer(token),
+        timeout=600,
+    )
+    if status != 200:
+        raise StormFailure(f"multipart download returned {status} for {logical}")
+    if not isinstance(payload, (bytes, bytearray)):
+        raise StormFailure("multipart download did not return raw bytes")
+    actual = hashlib.sha256(payload).hexdigest()
+    expected = deterministic_multipart_hash(user_index, total_size, part_size)
+    if actual != expected:
+        raise StormFailure(f"multipart hash mismatch for {logical}")
+    elapsed = time.monotonic() - start
+    return {
+        "logical": logical,
+        "bytes": total_size,
+        "parts": expected_parts,
+        "elapsed_s": round(elapsed, 3),
+        "mib_s": round((total_size / 1024 / 1024) / max(elapsed, 0.001), 3),
+        "expected_sha256": expected,
+        "actual_sha256": actual,
     }
 
 
@@ -194,18 +355,21 @@ def upload_user(args, user_index, fragment, token, progress, lock):
                 done = progress["objects"]
                 if done % args.progress_every == 0:
                     sample = sample_process(args.pid)
+                    record_sample(progress, sample)
                     print(
                         "N1_STORM progress "
                         f"objects={done}/{args.users * args.objects_per_user} "
                         f"bytes={progress['bytes']} sample={sample}",
                         flush=True,
                     )
+    multipart = upload_multipart_user(args, user_index, token, user_prefix)
     return {
         "user": user_index,
         "fragment": fragment,
         "prefix": user_prefix,
         "objects": args.objects_per_user,
         "bytes": total_bytes,
+        "multipart": multipart,
         "elapsed_s": round(time.monotonic() - start, 3),
     }
 
@@ -230,7 +394,8 @@ def main():
         fragments.append((user_index, fragment, key, token))
         print(f"N1_STORM fragment user={user_index} fragment={fragment}", flush=True)
 
-    progress = {"objects": 0, "bytes": 0}
+    progress = {"objects": 0, "bytes": 0, "max_rss_kib": 0, "max_threads": 0}
+    record_sample(progress, sample_process(args.pid))
     lock = threading.Lock()
     start = time.monotonic()
     with futures.ThreadPoolExecutor(max_workers=args.users) as pool:
@@ -241,18 +406,38 @@ def main():
         results = [future.result() for future in futures.as_completed(running)]
 
     for result in sorted(results, key=lambda item: item["user"]):
-        count = list_count(client, fragments[result["user"]][3], result["prefix"])
+        count = list_count(
+            client,
+            fragments[result["user"]][3],
+            result["prefix"],
+            edge_posix=args.edge_posix_list,
+        )
         result["listed_objects"] = count
-        if count != result["objects"]:
+        expected_count = result["objects"] + (1 if result.get("multipart") else 0)
+        if count != expected_count:
             raise StormFailure(
-                f"user {result['user']} list mismatch: {count} != {result['objects']}"
+                f"user {result['user']} list mismatch: {count} != {expected_count}"
             )
 
+    elapsed = time.monotonic() - start
+    multipart_bytes = sum(
+        item["multipart"]["bytes"] for item in results if item.get("multipart")
+    )
+    total_bytes = progress["bytes"] + multipart_bytes
+    sample = sample_process(args.pid)
+    record_sample(progress, sample)
     summary = {
-        "elapsed_s": round(time.monotonic() - start, 3),
+        "elapsed_s": round(elapsed, 3),
         "total_objects": progress["objects"],
-        "total_bytes": progress["bytes"],
-        "process_sample": sample_process(args.pid),
+        "total_listed_objects": sum(item["listed_objects"] for item in results),
+        "small_object_bytes": progress["bytes"],
+        "multipart_bytes": multipart_bytes,
+        "total_bytes": total_bytes,
+        "objects_per_second": round(progress["objects"] / max(elapsed, 0.001), 3),
+        "mib_per_second": round((total_bytes / 1024 / 1024) / max(elapsed, 0.001), 3),
+        "max_rss_kib": progress["max_rss_kib"],
+        "max_threads": progress["max_threads"],
+        "process_sample": sample,
         "results": sorted(results, key=lambda item: item["user"]),
     }
     print("N1_STORM summary " + json.dumps(summary, sort_keys=True), flush=True)

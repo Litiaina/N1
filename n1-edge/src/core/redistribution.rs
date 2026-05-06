@@ -805,20 +805,16 @@ fn edge_object_dir_for_root(
     root: &Path,
     fragment_hash: &str,
     object_key: &str,
-    is_trash: bool,
+    _is_trash: bool,
 ) -> PathBuf {
-    let canonical_key = ObjectPathManager::canonical_object_key(object_key);
-    let object_hash = ObjectPathManager::object_key_hash(&canonical_key);
-    let mut path = root.join(fragment_hash);
-    if is_trash {
-        path = path.join(".trash");
-    }
-    if let Some((parent, _name)) = canonical_key.rsplit_once('/') {
-        if !parent.is_empty() {
-            path = path.join(parent);
-        }
-    }
-    path.join(format!("@o_{object_hash}"))
+    let object_id = object_key
+        .trim()
+        .trim_start_matches('/')
+        .strip_prefix("@o_")
+        .unwrap_or_else(|| object_key.trim().trim_start_matches('/'));
+    root.join(fragment_hash)
+        .join(".objects")
+        .join(format!("@o_{object_id}"))
 }
 
 async fn edge_object_dir_has_ndx(path: &Path) -> bool {
@@ -2113,7 +2109,7 @@ pub async fn run_redistribution_job_with_options(
         for fragment in &touched_fragments {
             if let Err(err) = index::sync_fragment_partition_replicas(fragment).await {
                 warn!(
-                    "Failed to resynchronize partition db replicas for fragment {}: {}",
+                    "Failed to resynchronize Edge index replicas for fragment {}: {}",
                     fragment, err
                 );
             }

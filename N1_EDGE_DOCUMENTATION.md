@@ -1,455 +1,388 @@
 # N1 Edge Documentation
 
-N1 Edge is a separate N1 engine face.
+N1 Edge 1.0.0 is the primary filesystem-native N1 engine face.
 
-N1 Standard remains the sharded `indexdb` engine. N1 Edge replaces that metadata authority with a filesystem-native index plane. Do not treat Edge as an indexdb compatibility mode, a database wrapper, or a migration layer around Standard.
-
-N1 Edge is intended to be Linux-first, filesystem-native, IO-bound, and close to the kernel:
-
-- the filesystem is the namespace/index authority
-- normal listing is zero-decode
-- committed object versions are immutable `.ndx` files
-- folders are real directories
-- trash and recover are directory movement
-- blob/shard/parity layout remains the existing N1 blob plane
-- repair, redistribution, GC, and health are fragment-scoped by default, with global admin routes retained
-
-N1 Edge is not considered release-proven until the real hardware test matrix in this document passes.
+N1 Standard remains the sharded indexdb engine. N1 Edge is not an indexdb compatibility mode and does not use a database as the active metadata authority. Edge keeps the N1 blob/shard/parity plane, repair model, redistribution model, GC model, and public route shape, but replaces the active index authority with filesystem records.
 
 ## Identity
 
-Runtime crate:
+N1 Edge is:
 
-```text
-n1-edge
-```
+- filesystem-native
+- Linux-first
+- IO-bound by design
+- zero-decode for normal listing
+- immutable for committed object version metadata
+- POSIX-like for folders, rename, move, trash, recover, and listing
+- backed by the existing N1 blob/shard/parity data plane
 
-Binary:
-
-```text
-litiaina-n1-edge
-```
-
-N1 Edge public/operator language should describe the index as:
+Public/operator wording should say:
 
 - N1 Edge index
 - filesystem-native index
-- `.ndx` metadata records
+- `.ndx` metadata record
 - per-fragment Edge index
 - N1 Edge storage kernel
 
-Do not describe N1 Edge as:
+Do not describe Edge as sqlite-backed, indexdb-backed, database-backed, or a sharded database. Those describe N1 Standard, not N1 Edge.
 
-- indexdb-backed
-- sqlite-backed
-- database-backed
-- sharded database
-- namespace database
+## Final Disk Layout
 
-Those terms belong to N1 Standard, not Edge.
-
-## Disk Layout
-
-N1 Edge keeps N1's index/blob separation, but the index root is no longer an indexdb directory.
-
-Live Edge index layout:
+Each configured index root contains one Edge index tree per fragment:
 
 ```text
 <index_root>/<fragment_hash>/
+  .fragment.ndx
+  .objects/
+    @o_<object-id>/
+      <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
+      <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
+  .uploads/
+    <version_id>/
+      manifest.ndx
+      binding.ndx
+      part_p00000000000000000000.<crc32>.receipt
+      shard_p00000000000000000000_s0000.<crc32>.receipt
+  .trash/
+    docs/
+      video.mp4 -> @o_<object-id>
   docs/
-    reports/
-      @o_<object-key-hash>/
-        <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
+    video.mp4 -> @o_<object-id>
 ```
 
-Blob layout remains the N1 blob plane:
+Blob layout is unchanged:
 
 ```text
 <blob_root>/<fragment_hash>/blob/<version_id>/<shard-or-parity-file>
 ```
 
-Edge does not move blobs for rename, trash, recover, or folder movement. GC reclaims blob bytes only after metadata reachability says the blob is headless.
+Both disks may house both index and blob roots. The minimum N1 Edge profile remains two configured roots, for example `/mnt/disk-00` and `/mnt/disk-01`.
 
-## Namespace Model
+## What `.fragment.ndx` Is
 
-Folders are real directories.
+`.fragment.ndx` is the per-fragment Edge control record. It stores fragment-level operational state such as quota/project identity, state, and timestamps.
 
-Object records are directories:
+It is not object metadata truth. It is not a namespace catalog. It is not a database. Object truth is in `.objects/@o_<object-id>/*.ndx`, namespace truth is in real directories and symlink pointers, and payload truth remains in the blob plane.
 
-```text
-@o_<object-key-hash>/
-```
+## Namespace And Object Truth
 
-The object key hash is:
+N1 Edge has three clear planes:
 
-```text
-sha256(canonical_object_key)
-```
+- Namespace: real directories and file symlinks.
+- Object index: flat `.objects/@o_<object-id>/` directories with immutable `.ndx` versions.
+- Blob plane: immutable shard/parity files under `<blob_root>/<fragment>/blob/<version_id>/`.
 
-Example:
+The namespace symlink is the mutable POSIX face:
 
 ```text
-object key: docs/video.mp4
-index path: <index_root>/<fragment>/docs/@o_<sha256("docs/video.mp4")>/
+docs/video.mp4 -> @o_01KQ...
 ```
 
-Reserved user path segments are rejected:
+The symlink payload is a stable object id. N1 reads it with `readlink` and resolves it to:
 
 ```text
-@o_
-.trash
-.uploads
-.tmp
-.locks
-.gc
-.repair
+<index_root>/<fragment>/.objects/@o_01KQ.../
 ```
 
-This keeps user namespace separate from Edge's internal filesystem records.
+The symlink target is intentionally not a depth-relative filesystem path. That makes folder rename and folder move safe: moving `docs/` to `archive/docs/` does not require rewriting child symlinks.
 
-## Version Records
+## Object Versions
 
-Each committed object version is one immutable `.ndx` file:
+Each committed version is one immutable `.ndx` file:
 
 ```text
 <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
 ```
 
-The `.ndx` filename is the zero-decode list summary.
+The filename is the list summary. Normal listing parses this filename only.
 
-The `.ndx` body contains the full immutable object metadata needed by download, repair, verify, recover-on-read, redistribution, and GC.
+The `.ndx` body contains full immutable object metadata for download, verify, repair, redistribution, recover-on-read, archive generation, and GC.
 
 Head/latest is:
 
 ```text
-max ULID among valid .ndx filenames under @o_<object-key-hash>/
+max ULID among valid .ndx filenames under .objects/@o_<object-id>/
 ```
 
-There is no:
+There is no `.head`, mutable head pointer, object head table, version counter, sidecar summary file, or correctness cache.
 
-- `.head`
-- mutable head pointer
-- object head table
-- version counter
-- database state for latest
-- cache required for correctness
+## Packed Extension
 
-## Listing
+The packed extension field is a zero-allocation u64:
 
-Normal LIST is zero-decode.
+- byte 0 stores extension length
+- bytes 1 through 7 store lowercase ASCII extension bytes
+- extensions longer than 7 bytes store `0`
 
-For a prefix such as:
+This keeps normal listing from decoding `.ndx` bodies just to know basic file type.
+
+## Normal Listing
+
+Normal listing is direct directory scanning:
 
 ```text
-docs/
+prefix=docs/
+open <index_root>/<fragment>/docs/
+read direct children only
 ```
 
-Edge opens exactly:
-
-```text
-<index_root>/<fragment>/docs/
-```
-
-Then it reads direct children:
+For each direct child:
 
 - normal directory -> directory entry
-- `@o_...` directory -> inspect `.ndx` filenames only, choose greatest ULID, parse size/time/extension from the filename
+- symlink whose payload is `@o_<object-id>` -> file entry
+- reserved internal entry -> hidden
 
-LIST must not decode `.ndx` bodies.
+For a file symlink, Edge:
 
-LIST must not recursively scan the whole fragment and filter afterward.
+1. reads the symlink payload
+2. opens `.objects/@o_<object-id>/`
+3. chooses the greatest valid ULID `.ndx` filename
+4. parses size, timestamp, extension, and version id from the filename
+5. returns the entry
 
-LIST must not synthesize folders from key prefixes as the core model. Folders are directories.
+Normal listing does not decode `.ndx` bodies.
+
+Reserved internal names are hidden from user listing:
+
+```text
+.objects
+.uploads
+.trash
+.tmp
+.locks
+.gc
+.repair
+.intents
+.trash-jobs
+blob
+@o_*
+```
+
+User paths containing reserved segments are rejected.
+
+## POSIX Semantics
+
+File rename:
+
+```text
+rename docs/video.mp4 -> docs/new-video.mp4
+```
+
+This renames the symlink only. The object id stays the same, so version lineage is preserved.
+
+Folder rename:
+
+```text
+rename docs -> archive/docs
+```
+
+This renames the directory tree only. Child symlinks keep pointing to the same stable object ids.
+
+Soft delete:
+
+```text
+mv docs/video.mp4 .trash/docs/video.mp4
+```
+
+Recover:
+
+```text
+mv .trash/docs/video.mp4 docs/video.mp4
+```
+
+Hard delete removes the trash symlink or trash directory. After no live or trash symlink references an object id, Edge removes the unreferenced `.objects/@o_<object-id>/` index record so GC can reclaim headless blobs.
+
+Rename, trash, and recover never move blobs.
 
 ## Read And Download
 
-GET/download is where `.ndx` body decoding is correct.
+Read paths decode `.ndx`; listing does not.
 
-Latest open:
+Latest read:
 
-```text
-canonicalize object key
-hash object key
-open @o_<hash>/
-choose max ULID .ndx filename
-decode selected .ndx body
-read through the existing N1 blob/shard/parity plane
-```
+1. resolve logical path through namespace symlink
+2. open `.objects/@o_<object-id>/`
+3. choose greatest ULID `.ndx`
+4. decode `.ndx`
+5. read through the existing N1 blob/shard/parity plane
 
-Exact version open:
-
-```text
-canonicalize object key
-hash object key
-open @o_<hash>/
-find .ndx whose filename begins with requested ULID
-decode selected .ndx body
-read through the existing N1 blob/shard/parity plane
-```
+Exact version read selects the requested ULID `.ndx` before decoding.
 
 ## Upload
 
-One-shot upload keeps the existing N1 blob write path.
-
-Commit point:
+One-shot upload keeps the existing N1 data plane:
 
 ```text
-final .ndx exists under live @o_<hash>/
-```
-
-Finalize discipline:
-
-```text
+stream bytes -> erasure-coded blob/shard/parity files
+build immutable object metadata with stable object id
 write temp .ndx
 fsync temp file
 rename temp -> final .ndx
 fsync parent directory
+publish or reuse namespace symlink
 ```
 
-The final committed `.ndx` record makes the object visible in listing.
+If the logical path already points to an object id, the new version appends under the same `.objects/@o_<object-id>/` directory. Rename does not break version history.
 
 ## Multipart Upload
 
 Incomplete multipart state stays outside the live namespace:
 
 ```text
-<index_root>/<fragment>/.uploads/<upload_id>/
+<index_root>/<fragment>/.uploads/<version_id>/
 ```
 
-Receipts are upload-session state only. Receipts are not committed object truth.
-
-N1 Edge receipt records are intentionally tiny and filename-authoritative:
+Receipts are filename-authoritative and intentionally tiny:
 
 ```text
-shard_p<part-number>_s<shard-index>.<crc32>.receipt
 part_p<part-number>.<crc32>.receipt
+shard_p<part-number>_s<shard-index>.<crc32>.receipt
 ```
 
-Finalize reads the upload manifest/receipts, rebuilds final object metadata, writes the final `.ndx`, and atomically publishes into live `@o_<hash>/`.
-
-Live listing never sees incomplete multipart state.
-
-## Trash, Recover, And Purge
-
-Trash is filesystem movement.
-
-Soft delete object:
-
-```text
-mv <index_root>/<fragment>/docs/@o_<hash> \
-   <index_root>/<fragment>/.trash/docs/@o_<hash>
-```
-
-Recover object:
-
-```text
-mv <index_root>/<fragment>/.trash/docs/@o_<hash> \
-   <index_root>/<fragment>/docs/@o_<hash>
-```
-
-Soft delete folder:
-
-```text
-mv <index_root>/<fragment>/docs \
-   <index_root>/<fragment>/.trash/docs
-```
-
-Recover folder:
-
-```text
-mv <index_root>/<fragment>/.trash/docs \
-   <index_root>/<fragment>/docs
-```
-
-Hard delete removes the selected trash subtree. It does not move blobs.
-
-GC later reclaims headless blobs after no committed `.ndx` under live or trash references them.
+Receipt bodies are not authoritative. Finalize reads the upload manifest and receipt filenames, rebuilds full object metadata, writes the final `.ndx`, and publishes the namespace symlink. Live listing never sees incomplete multipart state.
 
 ## GC
 
 GC is reachability-driven.
 
-GC may decode `.ndx` bodies because it needs full blob references.
+GC may decode `.ndx` bodies because it needs full blob references. It protects blobs referenced by committed object records whose object id is referenced by live namespace symlinks or trash symlinks.
 
-GC protects blobs referenced by committed `.ndx` records under:
+When trash is emptied, bytes are not promised back immediately. Blob bytes return after GC removes headless blob versions.
 
-```text
-<index_root>/<fragment>/
-<index_root>/<fragment>/.trash/
-```
-
-GC may reclaim blobs that no longer have committed metadata reachability.
-
-GC must support:
-
-- one fragment
-- all fragments for admin/CLI
-
-Fragment route:
+Fragment-scoped and global routes are supported:
 
 ```http
 POST /n1/maintenance/fragments/{fragment}/gc/start
-```
-
-Global/admin route:
-
-```http
 POST /n1/maintenance/gc/start
+GET  /n1/maintenance/gc/status
 ```
 
-## Repair
+## Repair And Redistribution
 
-Repair is fragment-scoped by default because the fragment is the virtual partition and durability boundary.
+Repair and redistribution remain N1 operations over the existing blob/shard/parity system. Edge only changes how metadata reachability is found.
 
 Repair must restore:
 
 - missing Edge index records on rebuilt index roots
+- missing namespace symlinks from mirrored index roots when available
 - missing blob shards/parity where recoverable
 - listing after disk loss/reformat
 - download after repair
 
-Fragment route:
+Redistribution may move blob placement when disk topology changes. It must preserve stable object ids, namespace symlinks, immutable `.ndx` records, and blob references.
+
+Both operations can run per fragment or globally.
+
+## Public API Shape
+
+Common fragment routes:
 
 ```http
-POST /n1/maintenance/fragments/{fragment}/repair/start
+POST /n1/fragments
+GET  /n1/fragments
+GET  /n1/fragments/{fragment}/quota
+PATCH /n1/fragments/{fragment}/quota
 ```
 
-Global/admin route:
+Object routes:
 
 ```http
-POST /n1/maintenance/repair/start
+GET    /n1/objects?prefix=docs/&limit=200
+PUT    /n1/object/{*object_key}
+GET    /n1/object/{*object_key}
+DELETE /n1/object/{*object_key}
+GET    /n1/objects/versions/{*object_key}
+DELETE /n1/objects/version/{version_id}/{*object_key}
 ```
 
-## Redistribution
-
-Redistribution is also fragment-scoped by default.
-
-It may move blob placement when the physical disk set changes, but it must preserve immutable logical metadata identity.
-
-Fragment route:
+POSIX routes:
 
 ```http
-POST /n1/maintenance/fragments/{fragment}/redistribution/start
+GET  /n1/posix/list?path=docs&limit=200
+POST /n1/posix/mkdir
+POST /n1/posix/rename
+POST /n1/posix/trash
+POST /n1/posix/recover
+POST /n1/posix/trash/empty
 ```
 
-Global/admin route:
+Multipart routes:
 
 ```http
-POST /n1/maintenance/redistribution/start
+POST /n1/upload/multipart/initiate
+PUT  /n1/upload/multipart/{version_id}/{part_index}
+POST /n1/upload/multipart/{version_id}/{session_id}/finalize
+GET  /n1/upload/multipart/{version_id}
+DELETE /n1/upload/multipart/{version_id}
 ```
 
-Required real-hardware redistribution proof:
+Archive download routes use namespace truth and then decode selected `.ndx` records for payload reads.
 
-```text
-2 disks, 1+1 EC -> 1 disk, 1+0 EC -> 2 disks, 1+1 EC
-```
+## Operational Tradeoff
 
-After each stage:
+N1 Edge is optimized for durable object storage, large byte flow, POSIX movement, and bounded memory. It can store many small objects, but tiny-object storms pay filesystem commit and EC flush overhead per object. For very high counts of tiny files, archiving or batching before upload is usually more efficient.
 
-- live listing matches expected object count
-- sample downloads match source hashes
-- repair status is clean
-- health does not report missing index or blob replicas
+This is an intentional storage-kernel tradeoff: Edge stays close to the filesystem and kernel instead of hiding the workload in RAM-heavy caches.
 
-## Health Monitoring
+## Verification
 
-Health monitoring should be fragment-bound for normal UI/operator flows.
-
-Fragment route:
-
-```http
-GET /n1/maintenance/fragments/{fragment}/health
-```
-
-Global/admin route:
-
-```http
-GET /n1/maintenance/health
-```
-
-Fragment health must avoid whole-server deep scans unless the caller explicitly requests global/admin health.
-
-## Real Hardware Test Matrix
-
-Run this before treating N1 Edge as release-ready.
-
-Minimum hardware profile:
-
-```text
-index roots: /mnt/disk-00, /mnt/disk-01
-blob roots:  /mnt/disk-00, /mnt/disk-01
-```
-
-The two disks intentionally house both index and blob roots. This is the minimum N1 Edge profile.
-
-Required proof cases:
-
-1. Fragment creation with quota.
-2. One-shot upload of a real nested folder.
-3. Multipart upload resume after restart.
-4. LIST before restart.
-5. LIST after restart.
-6. Download sampled files and compare SHA-256.
-7. POSIX mkdir, rename, folder rename, move folder to folder.
-8. Soft delete file and folder, verify hidden from live listing.
-9. Trash listing.
-10. Recover by path and by trash entry ID where ambiguous.
-11. Hard delete selected trash entries.
-12. Empty trash.
-13. GC after hard delete, verify only headless blobs are reclaimed.
-14. Recover-on-read after wiping one shard/parity side.
-15. Repair after real disk loss/reformat.
-16. Redistribution 2 disk -> 1 disk -> 2 disk.
-17. Bitrot detection and repair where recoverable.
-18. Archive download of selected files/folders as TAR.
-19. Parallel four-user small-object storm.
-20. RAM, open file descriptors, and CPU remain bounded by configured runtime caps.
-
-Expected pass evidence:
-
-- live listing count is exact
-- restart listing count is exact
-- POSIX listing is exact
-- trash listing is exact
-- sample downloads hash-match source files
-- no warning storm from repair/replica/GC paths
-- GC never deletes a blob referenced by live or trash `.ndx`
-- disk loss followed by repair restores both listing and reads
-- health reports fragment-specific debt accurately
-- global health is only used for admin/CLI aggregate views
-- RSS does not grow with object count under parallel upload
-
-## Testing Notes
-
-Standard N1 proof scripts that inspect sharded `indexdb` files are not sufficient final evidence for Edge. Edge proof must inspect filesystem-native `.ndx` records instead of indexdb tables.
-
-API-level storm tests can still be used against Edge because the public routes are compatible:
+Source-level verification currently includes:
 
 ```bash
-scripts/bench/n1_live_parallel_storm.py \
-  --base-url https://127.0.0.1:50001 \
-  --master-key <MASTER_KEY> \
-  --users 4 \
-  --objects-per-user 3000 \
-  --per-user-concurrency 4 \
-  --quota-bytes 21474836480 \
-  --pid <N1_EDGE_PID>
-```
-
-Before tomorrow's rigorous test pass, build and run:
-
-```bash
-cargo build -p n1-edge --bin litiaina-n1-edge
 RUSTFLAGS='-D warnings' cargo test -p n1-edge --all-targets
 RUSTFLAGS='-D warnings' cargo check --workspace --all-targets
 ```
 
-Then run real hardware tests against:
+The non-destructive HTTP smoke proof can be run on two temporary roots:
 
-```text
-/mnt/disk-00
-/mnt/disk-01
+```bash
+mkdir -p /tmp/n1-edge-proof-disk-00 /tmp/n1-edge-proof-disk-01
+python3 scripts/bench/n1_edge_real_proof.py \
+  --binary target/debug/litiaina-n1-edge \
+  --source-dir /home/administrator/Development/N2/n1-edge/src \
+  --disk-roots /tmp/n1-edge-proof-disk-00,/tmp/n1-edge-proof-disk-01 \
+  --out-dir /tmp/n1-edge-proof-run \
+  --port 50661 \
+  --concurrency 4 \
+  --quota-backend disabled \
+  --quota-bytes 1073741824 \
+  --prefix edge-smoke/ \
+  --max-files 8 \
+  --skip-redistribution \
+  --cleanup-roots
 ```
 
-Do not mark Edge stable from synthetic tests alone.
+The Edge unit suite covers:
 
+- reserved path rejection
+- correct packed extension encoding
+- zero-decode live listing with invalid `.ndx` bodies
+- friendly POSIX pagination from symlink names
+- file rename preserving object id and version lineage
+- folder move preserving symlink object pointers
+- soft delete moving namespace symlinks to trash
+- hard delete removing unreferenced object index records
+- multipart receipt filenames as zero-decode state
+
+Real hardware qualification should still be performed before release promotion:
+
+- CRUD
+- POSIX list/rename/move/trash/recover
+- one-shot upload
+- multipart upload/resume/finalize
+- archive download
+- recover-on-read
+- GC after hard delete
+- repair after simulated disk loss/reformat
+- redistribution 2 roots -> 1 root -> 2 roots
+- concurrent multi-user upload on `/mnt/disk-00` and `/mnt/disk-01`
+
+Latest local proof run on 2026-05-06:
+
+- `cargo test -p n1-edge --all-targets` passed with `RUSTFLAGS=-D warnings`.
+- `cargo check --workspace --all-targets` passed with `RUSTFLAGS=-D warnings`.
+- Edge real proof on `/mnt/disk-00` and `/mnt/disk-01` passed CRUD, POSIX, archive, multipart, recover-on-read, simulated disk-format repair, and redistribution `2 disk -> 1 disk -> 2 disk`.
+- The real proof ended with `live_ndx=12`, `namespace_symlinks=12`, and `blob_version_dirs=12` on both roots.
+- Four-user storm passed on the same two disks: `12,000` one-shot objects plus `4` multipart objects of `16 MiB` each; Edge POSIX listing returned `12,004` objects exactly.
+- Storm memory remained bounded: max server RSS was about `258 MiB` with `42` threads.
+- Storm throughput on the bad-disk tiny-object workload was `14.343 objects/s` and `0.203 MiB/s`, confirming the expected IO/fsync-heavy small-object tradeoff rather than a RAM runaway.
