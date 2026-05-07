@@ -28,7 +28,8 @@ use crate::core::redistribution::{
     get_redist_status_api, stop_redistribution_job_api, trigger_redistribution_job_api,
 };
 use crate::core::repair_manager::{
-    get_repair_status_api, stop_repair_job_api, trigger_repair_job_api,
+    get_repair_status_api, inspect_object_status, parse_check_mode, repair_object,
+    stop_repair_job_api, trigger_repair_job_api,
 };
 use crate::core::retrieve::{
     get_object as get_object_impl, get_object_metadata_direct, list_fragments,
@@ -609,6 +610,42 @@ async fn recover_object_scoped(
     ))
 }
 
+async fn get_object_repair_status_scoped(
+    claims: Claims,
+    Path(object_key): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+    let fragment = claims.fragment.clone();
+    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
+    let mut metadata = get_object_metadata_direct(&fragment, &physical).await?;
+    metadata.object_key = object_key.trim_start_matches('/').to_string();
+    Ok(AxumJson(
+        inspect_object_status(&metadata, parse_check_mode(&params)).await?,
+    ))
+}
+
+async fn repair_object_scoped(
+    claims: Claims,
+    Path(object_key): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.write || !claims.modify {
+        return Err(AppError::Forbidden(
+            "Write and Modify permission required".into(),
+        ));
+    }
+    let fragment = claims.fragment.clone();
+    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
+    let mut metadata = get_object_metadata_direct(&fragment, &physical).await?;
+    metadata.object_key = object_key.trim_start_matches('/').to_string();
+    Ok(AxumJson(
+        repair_object(&metadata, parse_check_mode(&params)).await?,
+    ))
+}
+
 async fn bulk_delete_objects_scoped(
     State(state): State<Arc<AppState>>,
     claims: Claims,
@@ -1119,6 +1156,10 @@ pub fn build_storage_routes_unbound_with_options(
                 "/n1/objects/meta/{*object_key}",
                 get(get_object_metadata_scoped),
             )
+            .route(
+                "/n1/objects/status/{*object_key}",
+                get(get_object_repair_status_scoped),
+            )
             .route("/n1/objects/download", get(download_object_scoped))
             .route(
                 "/n1/objects/download/chunk",
@@ -1163,6 +1204,10 @@ pub fn build_storage_routes_unbound_with_options(
             .route(
                 "/n1/objects/permanent/{*object_key}",
                 delete(delete_object_permanently_scoped),
+            )
+            .route(
+                "/n1/objects/repair/{*object_key}",
+                post(repair_object_scoped),
             )
             .route(
                 "/n1/objects/recover/version/{:version_id}/{*object_key}",

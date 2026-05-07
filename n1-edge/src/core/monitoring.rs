@@ -232,7 +232,7 @@ struct BlobPlacementRisk {
 
 #[derive(Default)]
 struct FragmentRedundancyDebt {
-    orphaned_blob_fragments: Vec<String>,
+    pending_gc_blob_fragments: Vec<String>,
     sampled_degraded_fragments: Vec<String>,
 }
 
@@ -608,7 +608,7 @@ async fn detect_fragment_redundancy_debt(
             fragment_has_indexed_payload(&fragment, active_index_roots).await?;
         if !has_indexed_payload {
             if fragment_has_blob_payload(&fragment, active_blob_roots).await {
-                debt.orphaned_blob_fragments.push(fragment);
+                debt.pending_gc_blob_fragments.push(fragment);
             }
             continue;
         }
@@ -932,14 +932,6 @@ async fn collect_system_health(
                 online_blob_count, total_blob
             ),
         )
-    } else if !fragment_redundancy_debt.orphaned_blob_fragments.is_empty() {
-        (
-            "critical",
-            format!(
-                "Fragments with blob payload but no indexed metadata: {}.",
-                fragment_redundancy_debt.orphaned_blob_fragments.join(", ")
-            ),
-        )
     } else if !fragment_redundancy_debt
         .sampled_degraded_fragments
         .is_empty()
@@ -983,6 +975,17 @@ async fn collect_system_health(
     };
 
     if status == "healthy" {
+        if !fragment_redundancy_debt
+            .pending_gc_blob_fragments
+            .is_empty()
+        {
+            summary.push_str(&format!(
+                " Headless blob payload is pending GC for fragment(s): {}.",
+                fragment_redundancy_debt
+                    .pending_gc_blob_fragments
+                    .join(", ")
+            ));
+        }
         if storage.heterogeneous_blob_capacity {
             if let Some(ratio) = storage.blob_capacity_imbalance_ratio {
                 let note = if let Some(limit) = placement_limiter_summary.as_ref() {

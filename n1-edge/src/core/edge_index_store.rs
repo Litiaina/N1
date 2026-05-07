@@ -1,6 +1,6 @@
 use super::disk_manager::{
-    EdgeListEntry, ListObjectsResult, ObjectMetadata, ObjectPathManager, PartMetadata,
-    ReservationReceipt,
+    BLOB_STORE_DISKS, EdgeListEntry, ListObjectsResult, ObjectMetadata, ObjectPathManager,
+    PartMetadata, ReservationReceipt,
 };
 use super::index::{
     IndexReplicaWriteMode, IndexSessionState, SessionPartReceipt, TrashCatalogEntry,
@@ -20,7 +20,7 @@ use std::io::Write;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
-use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use ulid::Ulid;
 
 pub(crate) const OBJECTS_DIR: &str = ".objects";
@@ -797,6 +797,12 @@ fn remove_file_if_exists(path: &Path) -> Result<bool, AppError> {
     }
 }
 
+fn create_empty_marker(path: &Path) -> Result<(), AppError> {
+    File::create(path)
+        .map(|_| ())
+        .map_err(|e| io_err(e, "create edge marker"))
+}
+
 fn path_exists_no_follow(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
@@ -1174,10 +1180,7 @@ pub(crate) fn write_trash_record(fragment: &str, record: &EdgeTrashRecord) -> Re
     Ok(())
 }
 
-pub(crate) fn remove_trash_record(
-    fragment: &str,
-    trash_entry_id: &str,
-) -> Result<bool, AppError> {
+pub(crate) fn remove_trash_record(fragment: &str, trash_entry_id: &str) -> Result<bool, AppError> {
     let file_name = trash_entry_marker_name(trash_entry_id);
     let mut removed = false;
     for root in index_roots() {
@@ -1187,9 +1190,9 @@ pub(crate) fn remove_trash_record(
 }
 
 fn trash_anchor_exists(fragment: &str, source_relative_path: &str) -> bool {
-    existing_fragment_roots(fragment).into_iter().any(|root| {
-        path_exists_no_follow(&root.join(TRASH_DIR).join(source_relative_path))
-    })
+    existing_fragment_roots(fragment)
+        .into_iter()
+        .any(|root| path_exists_no_follow(&root.join(TRASH_DIR).join(source_relative_path)))
 }
 
 fn scan_trash_record_markers(fragment: &str) -> Result<Vec<EdgeTrashRecord>, AppError> {
@@ -1204,9 +1207,9 @@ fn scan_trash_record_markers(fragment: &str) -> Result<Vec<EdgeTrashRecord>, App
             if !name.ends_with(TRASH_ENTRY_SUFFIX) {
                 continue;
             }
-            let record: EdgeTrashRecord = decode(&fs::read(dir.join(name)).map_err(|e| {
-                io_err(e, "read edge trash entry marker")
-            })?)?;
+            let record: EdgeTrashRecord = decode(
+                &fs::read(dir.join(name)).map_err(|e| io_err(e, "read edge trash entry marker"))?,
+            )?;
             if !trash_anchor_exists(fragment, &record.source_relative_path) {
                 continue;
             }
@@ -1377,11 +1380,14 @@ pub fn list_trash_catalog(fragment: &str) -> Result<Vec<TrashCatalogEntry>, AppE
     Ok(scan_trash_records(fragment)?
         .into_iter()
         .flat_map(|record| {
-            record.object_keys.into_iter().map(move |object_id| TrashCatalogEntry {
-                object_key: object_id,
-                version_ids: record.version_ids.clone(),
-                deleted_at: record.deleted_at_unix,
-            })
+            record
+                .object_keys
+                .into_iter()
+                .map(move |object_id| TrashCatalogEntry {
+                    object_key: object_id,
+                    version_ids: record.version_ids.clone(),
+                    deleted_at: record.deleted_at_unix,
+                })
         })
         .collect())
 }
@@ -2060,22 +2066,63 @@ fn edge_replica_score(root: &Path, fragment: &str) -> EdgeReplicaScore {
     }
 }
 
+fn edge_replica_index_records(score: &EdgeReplicaScore) -> u64 {
+    score
+        .object_records
+        .saturating_add(score.namespace_links)
+        .saturating_add(score.trash_markers)
+        .saturating_add(score.upload_records)
+}
+
+fn mtime_nanos(path: &Path) -> u128 {
+    fs::symlink_metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+}
+
+fn latest_index_plane_mtime_nanos(fragment_root: &Path) -> u128 {
+    let mut latest = mtime_nanos(fragment_root);
+    let Ok(entries) = fs::read_dir(fragment_root) else {
+        return latest;
+    };
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        if entry.file_name().to_str() == Some(BLOB_DIR) {
+            continue;
+        }
+        let path = entry.path();
+        latest = latest.max(mtime_nanos(&path));
+        if path.is_dir() {
+            latest = latest.max(latest_index_plane_mtime_nanos(&path));
+        }
+    }
+    latest
+}
+
 fn choose_edge_replica_source(fragment: &str) -> Option<(PathBuf, EdgeReplicaScore)> {
-    let mut best: Option<(PathBuf, EdgeReplicaScore, SystemTime)> = None;
+    let mut best: Option<(PathBuf, EdgeReplicaScore, u128)> = None;
     for root in index_roots() {
         let fragment_root = root.join(fragment);
         if !fragment_root.exists() {
             continue;
         }
         let score = edge_replica_score(&root, fragment);
-        let modified = fs::metadata(&fragment_root)
-            .and_then(|meta| meta.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let modified = latest_index_plane_mtime_nanos(&fragment_root);
         let take = match best.as_ref() {
             None => true,
             Some((_, current_score, current_modified)) => {
-                score > *current_score
-                    || (score == *current_score && modified > *current_modified)
+                let records = edge_replica_index_records(&score);
+                let current_records = edge_replica_index_records(current_score);
+                if records == 0 && current_records > 0 {
+                    false
+                } else if records > 0 && current_records == 0 {
+                    true
+                } else {
+                    modified > *current_modified
+                        || (modified == *current_modified && score > *current_score)
+                }
             }
         };
         if take {
@@ -2260,6 +2307,7 @@ pub fn sync_fragment_partition_replicas(fragment: &str) -> Result<(), AppError> 
         clear_edge_index_plane(&dst)?;
         copy_dir_contents(&source, &dst)?;
     }
+    let _ = cleanup_stale_index_plane_on_blob_only_roots(fragment)?;
     Ok(())
 }
 
@@ -2302,7 +2350,51 @@ pub fn repair_fragment_all_partition_replicas(
             copy_dir_contents(&source, &dst)?;
         }
     }
+    if !dry_run {
+        let _ = cleanup_stale_index_plane_on_blob_only_roots(fragment)?;
+    }
     Ok((missing, divergent, 0))
+}
+
+fn same_root(left: &Path, right: &Path) -> bool {
+    let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    left == right
+}
+
+pub fn cleanup_stale_index_plane_on_blob_only_roots(fragment: &str) -> Result<usize, AppError> {
+    let active_index_roots = index_roots();
+    let Some((_source, source_score)) = choose_edge_replica_source(fragment) else {
+        return Ok(0);
+    };
+    if source_score.meta_present == 0 && edge_replica_index_records(&source_score) == 0 {
+        return Ok(0);
+    }
+
+    let blob_roots = BLOB_STORE_DISKS
+        .get()
+        .map(|roots| roots.iter().map(PathBuf::from).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut cleaned = 0usize;
+    for blob_root in blob_roots {
+        if active_index_roots
+            .iter()
+            .any(|index_root| same_root(index_root, &blob_root))
+        {
+            continue;
+        }
+        let fragment_root = blob_root.join(fragment);
+        if !fragment_root.exists() {
+            continue;
+        }
+        let score = edge_replica_score(&blob_root, fragment);
+        if score.meta_present == 0 && edge_replica_index_records(&score) == 0 {
+            continue;
+        }
+        clear_edge_index_plane(&fragment_root)?;
+        cleaned += 1;
+    }
+    Ok(cleaned)
 }
 
 fn clear_edge_index_plane(fragment_root: &Path) -> Result<(), AppError> {
@@ -2314,8 +2406,8 @@ fn clear_edge_index_plane(fragment_root: &Path) -> Result<(), AppError> {
             continue;
         }
         let path = entry.path();
-        let meta = fs::symlink_metadata(&path)
-            .map_err(|e| io_err(e, "inspect edge replica target"))?;
+        let meta =
+            fs::symlink_metadata(&path).map_err(|e| io_err(e, "inspect edge replica target"))?;
         if meta.file_type().is_symlink() || meta.is_file() {
             fs::remove_file(&path).map_err(|e| io_err(e, "clear edge replica file"))?;
         } else if meta.is_dir() {
@@ -2432,21 +2524,16 @@ pub fn commit_session_part_receipt(
         fs::create_dir_all(&dir).map_err(|e| io_err(e, "create upload receipt dir"))?;
         remove_receipts_for_part(&dir, receipt.part_index)?;
         if let Some(checksum) = receipt.checksum {
-            write_atomic(
-                &dir.join(part_receipt_name(receipt.part_index, checksum)),
-                b"",
-            )?;
+            create_empty_marker(&dir.join(part_receipt_name(receipt.part_index, checksum)))?;
         }
         for (shard_index, checksum) in receipt.shard_checksums.iter().copied().enumerate() {
-            write_atomic(
-                &dir.join(shard_receipt_name(
-                    receipt.part_index,
-                    shard_index,
-                    checksum,
-                )),
-                b"",
-            )?;
+            create_empty_marker(&dir.join(shard_receipt_name(
+                receipt.part_index,
+                shard_index,
+                checksum,
+            )))?;
         }
+        sync_dir(&dir);
     }
     Ok(())
 }
@@ -2588,10 +2675,34 @@ pub(crate) fn clear_pending_binding(fragment: &str, version_id: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::disk_manager::{INDEX_STORE_DISKS, ObjectMetadata};
+    use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS, ObjectMetadata};
     use ulid::Ulid;
 
+    fn ensure_test_blob_roots() -> Vec<PathBuf> {
+        if let Some(existing) = BLOB_STORE_DISKS.get() {
+            let roots = existing.iter().map(PathBuf::from).collect::<Vec<_>>();
+            for root in &roots {
+                let _ = fs::create_dir_all(root);
+            }
+            return roots;
+        }
+
+        let base = std::env::temp_dir().join(format!("n1-edge-blob-{}", std::process::id()));
+        let roots = vec![base.join("blob-0"), base.join("blob-1")];
+        for root in &roots {
+            fs::create_dir_all(root).expect("create test blob root");
+        }
+        let _ = BLOB_STORE_DISKS.set(
+            roots
+                .iter()
+                .map(|root| root.to_string_lossy().to_string())
+                .collect(),
+        );
+        roots
+    }
+
     fn ensure_test_index_roots() -> Vec<PathBuf> {
+        let _ = ensure_test_blob_roots();
         if let Some(existing) = INDEX_STORE_DISKS.get() {
             let roots = existing.iter().map(PathBuf::from).collect::<Vec<_>>();
             for root in &roots {
@@ -2672,7 +2783,10 @@ mod tests {
         assert_eq!(corrupt, 0);
 
         let repaired = inspect_fragment_partition_replicas(&fragment, &roots);
-        assert!(repaired.healthy, "repair should restore mirrored Edge index");
+        assert!(
+            repaired.healthy,
+            "repair should restore mirrored Edge index"
+        );
         assert!(
             bad_root
                 .join(OBJECTS_DIR)
@@ -2689,6 +2803,60 @@ mod tests {
         assert!(
             blob_marker.is_file(),
             "index repair must not delete or overwrite the blob plane"
+        );
+    }
+
+    #[test]
+    fn stale_edge_index_on_blob_only_root_is_cleaned_without_touching_blobs() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let roots = ensure_test_index_roots();
+        let blob_roots = ensure_test_blob_roots();
+        let Some(blob_only_root) = blob_roots
+            .iter()
+            .find(|blob_root| {
+                !roots
+                    .iter()
+                    .any(|index_root| same_root(blob_root, index_root))
+            })
+            .cloned()
+        else {
+            return;
+        };
+        let fragment = format!("edge-stale-cleanup-{}", Ulid::new());
+        let object_id = publish_logical_object(&roots, &fragment, "docs/video.mp4", 123);
+
+        let stale_fragment_root = blob_only_root.join(&fragment);
+        let stale_object_dir = stale_fragment_root
+            .join(OBJECTS_DIR)
+            .join(format!("@o_{object_id}"));
+        fs::create_dir_all(&stale_object_dir).expect("create stale object dir");
+        fs::write(
+            stale_fragment_root.join(FRAGMENT_META_FILE),
+            b"stale-fragment-meta",
+        )
+        .expect("write stale fragment meta");
+        fs::create_dir_all(stale_fragment_root.join("docs")).expect("create stale namespace dir");
+        fs::write(
+            stale_fragment_root.join("docs/old-name.txt"),
+            b"stale-link-placeholder",
+        )
+        .expect("write stale namespace placeholder");
+        let blob_marker = stale_fragment_root
+            .join(BLOB_DIR)
+            .join("version")
+            .join("part_0_shard_0.shard");
+        fs::create_dir_all(blob_marker.parent().expect("blob parent")).expect("create blob dir");
+        fs::write(&blob_marker, b"payload").expect("write blob marker");
+
+        let cleaned =
+            cleanup_stale_index_plane_on_blob_only_roots(&fragment).expect("cleanup stale index");
+        assert_eq!(cleaned, 1);
+        assert!(!stale_fragment_root.join(OBJECTS_DIR).exists());
+        assert!(!stale_fragment_root.join(FRAGMENT_META_FILE).exists());
+        assert!(!stale_fragment_root.join("docs").exists());
+        assert!(
+            blob_marker.is_file(),
+            "cleanup must preserve the blob plane"
         );
     }
 

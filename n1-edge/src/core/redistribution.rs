@@ -6,8 +6,8 @@ use crate::core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo,
     default_stripe_size,
 };
-use crate::core::edge_index_store;
 use crate::core::ec::ErasureStreamWriter;
+use crate::core::edge_index_store;
 use crate::core::fragment_metadata::{
     fragment_index_partition_count, read_fragment_metadata, write_fragment_metadata,
 };
@@ -1724,6 +1724,7 @@ pub async fn run_redistribution_job_with_options(
     );
 
     let mut touched_fragments: HashSet<String> = HashSet::new();
+    let mut scanned_fragments: HashSet<String> = HashSet::new();
     let mut total_task_errors: u64 = 0;
     let mut last_task_error: Option<String> = None;
     let fragments = match opts.target_fragment.as_ref() {
@@ -1786,23 +1787,16 @@ pub async fn run_redistribution_job_with_options(
             st.phase = format!("Scanning Fragment {}", fragment_hash);
             ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
         }
+        scanned_fragments.insert(fragment_hash.clone());
 
         let has_blob_payload = fragment_has_blob_payload(&fragment_hash, live_blob.as_ref()).await;
         let has_indexed_payload =
             fragment_has_indexed_payload(&fragment_hash, live_index.as_ref()).await?;
         if has_blob_payload && !has_indexed_payload {
-            let err = format!(
-                "Fragment {} has blob payload on disk but no indexed live/trash metadata. Redistribution cannot re-encode orphaned blob data.",
+            info!(
+                "Fragment {} has headless blob payload with no live/trash index; leaving it for GC",
                 fragment_hash
             );
-            warn!("{}", err);
-            total_task_errors = total_task_errors.saturating_add(1);
-            last_task_error = Some(err.clone());
-            let mut st = REDIST_STATUS.write().await;
-            st.total_errors = st.total_errors.saturating_add(1);
-            st.last_error = Some(err);
-            st.phase = format!("Blocked by orphaned blob payload in {}", fragment_hash);
-            ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
             continue;
         }
 
@@ -2130,6 +2124,16 @@ pub async fn run_redistribution_job_with_options(
             if let Err(err) = index::sync_fragment_partition_replicas(fragment).await {
                 warn!(
                     "Failed to resynchronize Edge index replicas for fragment {}: {}",
+                    fragment, err
+                );
+            }
+        }
+        for fragment in &scanned_fragments {
+            if let Err(err) =
+                edge_index_store::cleanup_stale_index_plane_on_blob_only_roots(fragment)
+            {
+                warn!(
+                    "Failed to clean stale Edge index plane from blob-only roots for fragment {}: {}",
                     fragment, err
                 );
             }
