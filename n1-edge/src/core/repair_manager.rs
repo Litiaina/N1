@@ -1062,6 +1062,7 @@ pub async fn run_repair_job_with_options(
             status.missing_meta_repaired += fmiss;
             status.divergent_meta_repaired += fdiv;
             status.corrupt_found += fcorrupt;
+            status.total_repaired += fmiss + fdiv;
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 
@@ -1079,6 +1080,7 @@ pub async fn run_repair_job_with_options(
             status.missing_meta_repaired += pmiss;
             status.divergent_meta_repaired += pdiv;
             status.corrupt_found += pcorrupt;
+            status.total_repaired += pmiss + pdiv;
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 
@@ -1100,6 +1102,8 @@ pub async fn run_repair_job_with_options(
             status.missing_meta_repaired += namespace_report.missing_repaired;
             status.divergent_meta_repaired += namespace_report.divergent_repaired;
             status.corrupt_found += namespace_report.corrupt_found;
+            status.total_repaired +=
+                namespace_report.missing_repaired + namespace_report.divergent_repaired;
             if namespace_report.missing_repaired > 0
                 || namespace_report.divergent_repaired > 0
                 || namespace_report.corrupt_found > 0

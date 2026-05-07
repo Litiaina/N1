@@ -323,12 +323,20 @@ impl NamespaceRuntime {
     }
 
     pub async fn empty_trash(&self, fragment: &str) -> Result<NamespaceMutationSummary, AppError> {
+        let records = scan_trash_records(fragment)?;
+        let object_ids = records
+            .iter()
+            .flat_map(|record| record.object_keys.iter().cloned())
+            .collect::<BTreeSet<_>>();
         edge_index_store::drop_fragment_trash_namespace(fragment)?;
+        for object_id in &object_ids {
+            let _ = edge_index_store::delete_unreferenced_object_index(fragment, object_id)?;
+        }
         Ok(NamespaceMutationSummary {
             operation: "empty_trash".to_string(),
             kind: NamespaceEntryKind::Directory,
             affected_paths: 0,
-            affected_objects: 0,
+            affected_objects: object_ids.len(),
             source_path: None,
             destination_path: None,
             trash_entry_id: None,
@@ -1035,6 +1043,7 @@ fn trash_live_path(fragment: &str, path: &str) -> Result<NamespaceMutationSummar
         version_ids,
         deleted_at_unix: deleted_at,
     };
+    edge_index_store::write_trash_record(fragment, &record)?;
     Ok(NamespaceMutationSummary {
         operation: "trash".to_string(),
         kind: entry.kind,
@@ -1100,6 +1109,7 @@ fn recover_trash_path(
             .map_err(|e| AppError::InternalServerError(format!("edge namespace recover: {e}")))?;
         prune_empty_trash_parents(&fragment_root.join(TRASH_DIR), &record.source_relative_path);
     }
+    let _ = edge_index_store::remove_trash_record(fragment, &record.trash_entry_id)?;
     Ok(NamespaceMutationSummary {
         operation: "recover".to_string(),
         kind: if record.kind == EdgeTrashKind::File {
@@ -1140,6 +1150,7 @@ fn purge_trash(
             );
         }
     }
+    let _ = edge_index_store::remove_trash_record(fragment, &record.trash_entry_id)?;
     for object_id in &record.object_keys {
         let _ = edge_index_store::delete_unreferenced_object_index(fragment, object_id)?;
     }
@@ -1422,5 +1433,50 @@ mod tests {
             .await
             .expect("page with empty object dir");
         assert!(!entries.iter().any(|entry| entry.name == "empty.svg"));
+    }
+
+    #[tokio::test]
+    async fn edge_trash_list_shows_only_explicit_file_delete_anchor() {
+        let _guard = crate::test_support::global_test_lock().lock().await;
+        let roots = ensure_test_index_roots();
+        let fragment = format!("edge-trash-file-anchor-{}", Ulid::new());
+        publish_logical_object(&roots, &fragment, "videos/clip.mp4", 123);
+
+        global_namespace_runtime()
+            .trash(&fragment, "videos/clip.mp4")
+            .await
+            .expect("trash file");
+
+        let (entries, token) = global_namespace_runtime()
+            .list_dir_page(&fragment, "", true, 10, None)
+            .await
+            .expect("list trash");
+        assert!(token.is_none());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "videos/clip.mp4");
+        assert_eq!(entries[0].kind, NamespaceEntryKind::File);
+    }
+
+    #[tokio::test]
+    async fn edge_trash_list_shows_only_explicit_folder_delete_anchor() {
+        let _guard = crate::test_support::global_test_lock().lock().await;
+        let roots = ensure_test_index_roots();
+        let fragment = format!("edge-trash-folder-anchor-{}", Ulid::new());
+        publish_logical_object(&roots, &fragment, "videos/clip.mp4", 123);
+        publish_logical_object(&roots, &fragment, "videos/deep/other.mp4", 456);
+
+        global_namespace_runtime()
+            .trash(&fragment, "videos")
+            .await
+            .expect("trash folder");
+
+        let (entries, token) = global_namespace_runtime()
+            .list_dir_page(&fragment, "", true, 10, None)
+            .await
+            .expect("list trash");
+        assert!(token.is_none());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "videos");
+        assert_eq!(entries[0].kind, NamespaceEntryKind::Directory);
     }
 }

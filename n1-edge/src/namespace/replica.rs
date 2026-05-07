@@ -41,24 +41,17 @@ pub async fn inspect_namespace_replicas(
     fragment: &str,
     index_roots: &[PathBuf],
 ) -> Result<NamespaceReplicaInspection, AppError> {
-    let present = index_roots
-        .iter()
-        .filter(|root| root.join(fragment).exists())
-        .count() as u64;
-    let expected = index_roots.len() as u64;
+    let inspection = edge_index_store::inspect_fragment_partition_replicas(fragment, index_roots);
     Ok(NamespaceReplicaInspection {
         fragment: fragment.to_string(),
-        expected_replicas: expected,
-        present_replicas: present,
-        valid_replicas: present,
-        missing_replicas: expected.saturating_sub(present),
-        divergent_replicas: 0,
-        corrupt_replicas: 0,
-        healthy: present == expected,
-        canonical_path: index_roots
-            .iter()
-            .find(|root| root.join(fragment).exists())
-            .map(|root| root.join(fragment).display().to_string()),
+        expected_replicas: inspection.expected_replicas,
+        present_replicas: inspection.present_replicas,
+        valid_replicas: inspection.valid_replicas,
+        missing_replicas: inspection.missing_replicas,
+        divergent_replicas: inspection.divergent_replicas,
+        corrupt_replicas: inspection.corrupt_replicas,
+        healthy: inspection.healthy,
+        canonical_path: inspection.canonical_path,
     })
 }
 
