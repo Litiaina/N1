@@ -1,3 +1,4 @@
+use crate::core::constants::EDGE_BLOB_DIR;
 use crate::core::disk_manager::ObjectPathManager;
 use crate::core::edge_index_store;
 use crate::enums::app_error_enum::AppError;
@@ -547,11 +548,11 @@ async fn compute_fragment_blob_usage(fragment: &str) -> Result<FragmentBlobUsage
             if !seen_roots.insert(root.clone()) {
                 continue;
             }
-            usage.live_bytes = usage
-                .live_bytes
-                .saturating_add(sum_file_tree_bytes(&root.join(&fragment).join("blob"))?);
+            usage.live_bytes = usage.live_bytes.saturating_add(sum_file_tree_bytes(
+                &root.join(&fragment).join(EDGE_BLOB_DIR),
+            )?);
             usage.trash_bytes = usage.trash_bytes.saturating_add(sum_file_tree_bytes(
-                &root.join(&fragment).join(".trash").join("blob"),
+                &root.join(&fragment).join(".trash").join(EDGE_BLOB_DIR),
             )?);
         }
         Ok::<FragmentBlobUsage, AppError>(usage)

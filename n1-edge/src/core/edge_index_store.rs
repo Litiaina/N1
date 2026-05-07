@@ -6,6 +6,7 @@ use super::index::{
     IndexReplicaWriteMode, IndexSessionState, SessionPartReceipt, TrashCatalogEntry,
 };
 use super::upload::UploadSessionManifest;
+use crate::core::constants::EDGE_BLOB_DIR;
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::paths::{base_name, normalize_path};
 use chrono::Utc;
@@ -38,7 +39,7 @@ const PART_META_PREFIX: &str = "part_";
 pub(crate) const OBJECT_DIR_PREFIX: &str = "@o_";
 const INTENTS_DIR: &str = ".intents";
 const TRASH_JOBS_DIR: &str = ".trash-jobs";
-pub(crate) const BLOB_DIR: &str = "blob";
+pub(crate) const BLOB_DIR: &str = EDGE_BLOB_DIR;
 
 static EDGE_FS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 const QUOTA_PROJECT_ID_FLOOR: u32 = 10_000;
@@ -62,6 +63,12 @@ pub struct FragmentMeta {
     pub trash_bytes: u64,
     pub created_at_unix: i64,
     pub updated_at_unix: i64,
+    #[serde(default)]
+    pub key_phc: Option<String>,
+    #[serde(default)]
+    pub nt_hash_hex: Option<String>,
+    #[serde(default)]
+    pub index_partition_count: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,7 +232,7 @@ pub(crate) fn object_key_hash(object_key: &str) -> Result<String, AppError> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn normalize_object_id(object_id: &str) -> Result<String, AppError> {
+pub(crate) fn normalize_object_id(object_id: &str) -> Result<String, AppError> {
     let value = object_id
         .trim()
         .trim_start_matches('/')
@@ -811,6 +818,7 @@ fn object_dirs_for_all_live(fragment: &str) -> Result<Vec<(PathBuf, String, Stri
             }
         }
     }
+    out.sort_by(|a, b| a.1.cmp(&b.1));
     Ok(out)
 }
 
@@ -1007,6 +1015,8 @@ pub fn scan_live_full_metadata_page(
 ) -> Result<ListObjectsResult, AppError> {
     let prefix = prefix.unwrap_or_default();
     let delimiter = delimiter.unwrap_or_default();
+    let limit = limit.max(1);
+    let mut candidates = Vec::new();
     let mut objects = Vec::new();
     let mut common_prefixes = BTreeSet::new();
     for (dir, rel, object_id) in object_dirs_for_all_live(fragment)? {
@@ -1036,6 +1046,16 @@ pub fn scan_live_full_metadata_page(
                 continue;
             }
         }
+        candidates.push((rel, object_id, dir));
+    }
+
+    let mut continuation = None;
+    if candidates.len() > limit {
+        candidates.truncate(limit);
+        continuation = candidates.last().map(|(rel, _, _)| rel.clone());
+    }
+
+    for (_rel, object_id, dir) in candidates {
         let Some(summary) = latest_summary_in_object_dir(&dir)? else {
             continue;
         };
@@ -1043,12 +1063,6 @@ pub fn scan_live_full_metadata_page(
             &dir.join(summary.file_name),
             &object_id,
         )?);
-    }
-    objects.sort_by(|a, b| a.object_key.cmp(&b.object_key));
-    let mut continuation = None;
-    if objects.len() > limit {
-        objects.truncate(limit);
-        continuation = objects.last().map(|meta| meta.object_key.clone());
     }
     Ok(ListObjectsResult {
         prefix: Some(prefix),
@@ -1275,30 +1289,67 @@ fn scan_trash_page(
     continuation_token: Option<String>,
     full_metadata: bool,
 ) -> Result<ListObjectsResult, AppError> {
-    let prefix = prefix.unwrap_or_default();
-    let mut objects = Vec::new();
+    let prefix = prefix
+        .map(|prefix| normalize_edge_key(&prefix))
+        .transpose()?
+        .unwrap_or_default();
+    let limit = limit.max(1);
+    let mut by_record = BTreeMap::<String, (EdgeListEntry, Option<ObjectMetadata>)>::new();
+
     for record in scan_trash_records(fragment)? {
-        if !prefix.is_empty() && !record.original_path.starts_with(&prefix) {
+        let relative = if prefix.is_empty() {
+            record.original_path.as_str()
+        } else if record.original_path == prefix {
+            if record.kind == EdgeTrashKind::Directory {
+                continue;
+            }
+            record.original_path.as_str()
+        } else if let Some(rest) = record
+            .original_path
+            .strip_prefix(prefix.as_str())
+            .and_then(|rest| rest.strip_prefix('/'))
+        {
+            rest
+        } else {
+            continue;
+        };
+
+        if relative.is_empty() {
             continue;
         }
+
+        let (name, is_nested) = relative
+            .split_once('/')
+            .map(|(head, _)| (head.to_string(), true))
+            .unwrap_or_else(|| (relative.to_string(), false));
+
         if continuation_token
             .as_ref()
-            .is_some_and(|after| record.original_path <= *after)
+            .is_some_and(|after| name.as_str() <= after.as_str())
         {
             continue;
         }
-        if full_metadata {
-            if let Some(object_id) = record.object_keys.first() {
-                let Some(mut meta) = read_latest_trash(fragment, object_id)? else {
-                    continue;
-                };
-                meta.object_key = record.original_path.clone();
-                objects.push(meta);
-            }
+
+        if is_nested || record.kind == EdgeTrashKind::Directory {
+            by_record
+                .entry(name.clone())
+                .or_insert((directory_entry(name), None));
+            continue;
+        }
+
+        let version_id = record.version_ids.last().cloned().unwrap_or_default();
+        let mut metadata = if full_metadata {
+            let Some(object_id) = record.object_keys.first() else {
+                continue;
+            };
+            let Some(mut meta) = read_latest_trash(fragment, object_id)? else {
+                continue;
+            };
+            meta.object_key = record.original_path.clone();
+            meta
         } else {
-            let version_id = record.version_ids.last().cloned().unwrap_or_default();
-            objects.push(ObjectMetadata {
-                object_key: record.original_path,
+            ObjectMetadata {
+                object_key: record.original_path.clone(),
                 fragment: fragment.to_string(),
                 version_id,
                 upload_session_id: String::new(),
@@ -1309,30 +1360,41 @@ fn scan_trash_page(
                 parts: Vec::new(),
                 is_delete_marker: false,
                 stripe_size_bytes: super::disk_manager::default_stripe_size(),
-            });
-        }
+            }
+        };
+        metadata.object_key = record.original_path.clone();
+        let entry = EdgeListEntry {
+            record: name.clone(),
+            kind: "file".to_string(),
+            size_bytes: metadata.total_size_bytes,
+            created_at_unix_nanos: metadata.created_at.saturating_mul(1_000_000_000),
+            packed_ext_u64: Some(packed_extension_key(&metadata.object_key)),
+            version_ulid: Some(metadata.version_id.clone()),
+        };
+        by_record.entry(name).or_insert((entry, Some(metadata)));
     }
-    objects.sort_by(|a, b| a.object_key.cmp(&b.object_key));
-    let continuation = if objects.len() > limit {
-        objects.truncate(limit);
-        objects.last().map(|m| m.object_key.clone())
+
+    let mut page = by_record.into_iter().collect::<Vec<_>>();
+    page.sort_by(|a, b| a.0.cmp(&b.0));
+    let continuation = if page.len() > limit {
+        page.truncate(limit);
+        page.last().map(|(record, _)| record.clone())
     } else {
         None
     };
+    let entries = page
+        .iter()
+        .map(|(_, (entry, _))| entry.clone())
+        .collect::<Vec<_>>();
+    let mut objects = page
+        .into_iter()
+        .filter_map(|(_, (_, meta))| meta)
+        .collect::<Vec<_>>();
+    objects.sort_by(|a, b| a.object_key.cmp(&b.object_key));
     Ok(ListObjectsResult {
         prefix: Some(prefix),
         limit: Some(limit),
-        entries: objects
-            .iter()
-            .map(|meta| EdgeListEntry {
-                record: meta.object_key.clone(),
-                kind: "file".to_string(),
-                size_bytes: meta.total_size_bytes,
-                created_at_unix_nanos: meta.created_at.saturating_mul(1_000_000_000),
-                packed_ext_u64: Some(packed_extension_key(&meta.object_key)),
-                version_ulid: Some(meta.version_id.clone()),
-            })
-            .collect(),
+        entries,
         objects,
         common_prefixes: Vec::new(),
         continuation_token: continuation.clone(),
@@ -1692,6 +1754,19 @@ pub fn clear_fragment_trash(fragment: &str, object_key: Option<&str>) -> Result<
     Ok(())
 }
 
+pub fn drop_fragment_trash_namespace(fragment: &str) -> Result<(), AppError> {
+    for root in index_roots() {
+        let fragment_root = root.join(fragment);
+        let path = fragment_root.join(TRASH_DIR);
+        if path.exists() {
+            fs::remove_dir_all(&path).map_err(|e| io_err(e, "drop edge trash namespace"))?;
+        }
+        fs::create_dir_all(&path).map_err(|e| io_err(e, "recreate edge trash namespace"))?;
+        sync_dir(&fragment_root);
+    }
+    Ok(())
+}
+
 pub fn clear_fragment_trash_for_partitions(
     fragment: &str,
     _touched_partitions: &BTreeSet<u16>,
@@ -1755,6 +1830,42 @@ pub fn has_any_fragment_edge_index(fragment: &str) -> Result<bool, AppError> {
     }))
 }
 
+pub fn fragment_has_object_index_records(fragment: &str, roots: &[PathBuf]) -> bool {
+    for root in roots {
+        let objects_root = root.join(fragment).join(OBJECTS_DIR);
+        let Ok(object_dirs) = fs::read_dir(&objects_root) else {
+            continue;
+        };
+        for object_dir in object_dirs.filter_map(|entry| entry.ok()) {
+            let Ok(file_type) = object_dir.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let file_name = object_dir.file_name();
+            if !file_name
+                .to_str()
+                .is_some_and(|name| name.starts_with(OBJECT_DIR_PREFIX))
+            {
+                continue;
+            }
+            let Ok(records) = fs::read_dir(object_dir.path()) else {
+                continue;
+            };
+            for record in records.filter_map(|entry| entry.ok()) {
+                let Some(name) = record.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if parse_ndx_file_name(&name).is_some() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn default_project_id(fragment: &str) -> u32 {
     let mut hasher = Sha256::new();
     hasher.update(fragment.as_bytes());
@@ -1802,6 +1913,9 @@ pub fn set_fragment_quota(fragment: &str, quota_bytes: u64) -> Result<(), AppErr
         trash_bytes: 0,
         created_at_unix: now,
         updated_at_unix: now,
+        key_phc: None,
+        nt_hash_hex: None,
+        index_partition_count: None,
     });
     meta.quota_bytes = quota_bytes;
     meta.updated_at_unix = now;
@@ -2232,11 +2346,23 @@ mod tests {
     fn reserved_user_path_segments_are_rejected() {
         assert!(normalize_edge_key("docs/@o_bad/file.txt").is_err());
         assert!(normalize_edge_key(".trash/video.mp4").is_err());
+        assert!(normalize_edge_key(".blobs/video.mp4").is_err());
         assert!(normalize_edge_key("docs/.repair/file.txt").is_err());
         assert_eq!(
             normalize_edge_key("docs/video.mp4").unwrap(),
             "docs/video.mp4"
         );
+        assert_eq!(
+            normalize_edge_key("blob/video.mp4").unwrap(),
+            "blob/video.mp4"
+        );
+    }
+
+    #[test]
+    fn edge_object_id_validation_rejects_posix_file_names() {
+        assert!(normalize_object_id("INCDT 122225.mp4").is_err());
+        assert!(normalize_object_id("videos/clip.mp4").is_err());
+        assert!(normalize_object_id("@o_01KQXRVALIDEDGEID0000000").is_ok());
     }
 
     #[test]
@@ -2337,6 +2463,52 @@ mod tests {
                 .expect("full metadata page");
         assert_eq!(page.objects.len(), 1);
         assert_eq!(page.objects[0].object_key, object_id);
+    }
+
+    #[test]
+    fn full_metadata_pagination_advances_by_namespace_path() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let roots = ensure_test_index_roots();
+        let fragment = format!("edge-full-page-{}", Ulid::new());
+        let first_id = publish_logical_object(&roots, &fragment, "docs/a.txt", 10);
+        let second_id = publish_logical_object(&roots, &fragment, "docs/b.txt", 20);
+        let third_id = publish_logical_object(&roots, &fragment, "docs/c.txt", 30);
+
+        let first =
+            scan_live_full_metadata_page(&fragment, Some("docs".to_string()), None, 2, None, true)
+                .expect("first full metadata page");
+        assert_eq!(
+            first
+                .objects
+                .iter()
+                .map(|meta| meta.object_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![first_id.as_str(), second_id.as_str()]
+        );
+        let token = first
+            .continuation_token
+            .clone()
+            .expect("first page continuation");
+        assert_eq!(token, "docs/b.txt");
+
+        let second = scan_live_full_metadata_page(
+            &fragment,
+            Some("docs".to_string()),
+            None,
+            2,
+            first.continuation_token,
+            true,
+        )
+        .expect("second full metadata page");
+        assert_eq!(
+            second
+                .objects
+                .iter()
+                .map(|meta| meta.object_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![third_id.as_str()]
+        );
+        assert!(second.continuation_token.is_none());
     }
 
     #[test]

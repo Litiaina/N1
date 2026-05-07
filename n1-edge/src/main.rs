@@ -330,14 +330,14 @@ fn normalize_fs_backed_disk_paths(role: &str, paths: Vec<String>) -> Vec<String>
             let ft = meta.file_type();
             if ft.is_block_device() || ft.is_char_device() {
                 panic!(
-                    "{} entry '{}' is a device. The standard variant is filesystem-backed and requires directory paths.",
+                    "{} entry '{}' is a device. N1 Edge is filesystem-native and requires mounted directory paths.",
                     role, trimmed
                 );
             }
         }
         if !meta.is_dir() {
             panic!(
-                "{} entry '{}' is not a directory. The standard variant is filesystem-backed and requires directory paths.",
+                "{} entry '{}' is not a directory. N1 Edge is filesystem-native and requires directory paths.",
                 role, trimmed
             );
         }
@@ -616,7 +616,7 @@ async fn async_main(runtime_config: RuntimeThreadConfig) {
         .install_default()
         .expect("Failed to install 'ring' as the default TLS provider.");
 
-    warn_if_running_as_root("litiaina-n1-standard");
+    warn_if_running_as_root("litiaina-n1-edge");
 
     if let Err(e) = validate_bootstrap_targets() {
         eprintln!("N1 startup failed: {}", e);
@@ -641,7 +641,7 @@ async fn async_main(runtime_config: RuntimeThreadConfig) {
 
     if std::env::args_os().nth(1).is_some() {
         eprintln!(
-            "litiaina-n1-standard runs the server only. Use `litiaina-n1-cli` for admin commands."
+            "litiaina-n1-edge runs the server only. Use `litiaina-n1-cli` for admin commands."
         );
         std::process::exit(2);
     }
@@ -759,7 +759,7 @@ pub async fn run_server() {
         .set(blob_disks)
         .expect("Double initialization of BLOB_STORE_DISKS!");
     tracing::info!(
-        "Storage mode: standard variant is filesystem-backed (directory-only index/blob roots)"
+        "Storage mode: N1 Edge filesystem-native index with explicit .blobs payload roots"
     );
 
     let quota_section = config.section(Some("quota_config"));
@@ -899,13 +899,7 @@ pub async fn run_server() {
         upload_section.and_then(|s| s.get("upload_io_gate_enabled")),
         true,
     );
-    let upload_io_gate_enabled =
-        configured_upload_io_gate_enabled || effective_blob_disks_for_auto <= 2;
-    if !configured_upload_io_gate_enabled && upload_io_gate_enabled {
-        tracing::warn!(
-            "Upload IO gate forced on for two-disk minimum profile to preserve bounded IO and memory"
-        );
-    }
+    let upload_io_gate_enabled = configured_upload_io_gate_enabled;
 
     tracing::info!(
         "Upload tuning: cpu_cores={}, ram_gib={}, blob_paths={}, blob_devices={}, auto_effective_disks={}, ec={}D+{}P, max_concurrent_io={} (configured={} budget_cap={} per_upload_est={}KiB budget={}MiB effective_budget={}MiB), writer_buffer_size={}, part_durability_strict_default={}, io_gate_enabled={}",

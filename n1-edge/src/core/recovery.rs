@@ -1,4 +1,4 @@
-use crate::core::constants::GC_SUFFIX;
+use crate::core::constants::{EDGE_BLOB_DIR, GC_SUFFIX};
 use crate::core::disk_manager::{ObjectPathManager, PartMetadata, ShardInfo};
 use crate::core::upload::{DirectWriter, sync_dir};
 use crate::enums::app_error_enum::AppError;
@@ -122,7 +122,7 @@ fn extract_fragment_version_from_abs(abs: &str) -> Option<(String, String, bool)
     }
     let norm = abs.replace('\\', "/");
     let parts: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
-    let blob_pos = parts.iter().position(|p| *p == "blob")?;
+    let blob_pos = parts.iter().position(|p| *p == EDGE_BLOB_DIR)?;
     if blob_pos == 0 || blob_pos + 1 >= parts.len() {
         return None;
     }
@@ -144,7 +144,7 @@ fn extract_fragment_version_from_abs(abs: &str) -> Option<(String, String, bool)
 fn parse_version_dir_hint(version_dir: &Path) -> Option<(String, String, bool)> {
     let version_id = version_dir.file_name()?.to_string_lossy().to_string();
     let blob_dir = version_dir.parent()?;
-    if blob_dir.file_name()?.to_string_lossy() != "blob" {
+    if blob_dir.file_name()?.to_string_lossy() != EDGE_BLOB_DIR {
         return None;
     }
 
@@ -166,7 +166,10 @@ fn shard_dir_on_root(
     is_trash: bool,
 ) -> PathBuf {
     let _ = is_trash;
-    disk_root.join(fragment).join("blob").join(version_id)
+    disk_root
+        .join(fragment)
+        .join(EDGE_BLOB_DIR)
+        .join(version_id)
 }
 
 fn owning_blob_root_for_path(path: &Path) -> Option<&'static PathBuf> {
@@ -804,7 +807,7 @@ mod tests {
     #[tokio::test]
     async fn read_or_recover_chunk_restores_single_data_shard_for_nine_byte_object() {
         let root = std::env::temp_dir().join(format!("n1-recovery-nine-byte-{}", Ulid::new()));
-        let parity_dir = root.join("frag").join("blob").join("ver");
+        let parity_dir = root.join("frag").join(EDGE_BLOB_DIR).join("ver");
         fs::create_dir_all(&parity_dir)
             .await
             .expect("create parity dir");
@@ -859,7 +862,7 @@ mod tests {
                     absolute_path: root
                         .join("missing")
                         .join("frag")
-                        .join("blob")
+                        .join(EDGE_BLOB_DIR)
                         .join("ver")
                         .join("part_0_shard_0.shard")
                         .to_string_lossy()
@@ -881,7 +884,11 @@ mod tests {
 
         let bytes = read_or_recover_chunk(
             &mut HashMap::new(),
-            &root.join("missing").join("frag").join("blob").join("ver"),
+            &root
+                .join("missing")
+                .join("frag")
+                .join(EDGE_BLOB_DIR)
+                .join("ver"),
             part,
             0,
             0,

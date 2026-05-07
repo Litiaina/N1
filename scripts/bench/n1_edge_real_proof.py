@@ -431,7 +431,7 @@ stripe_block_size=262144
         raise ProofFailure(f"{label} timed out; last={last}")
 
     def blob_version_exists(self, version_id):
-        return any((root / self.fragment / "blob" / version_id).exists() for root in self.blob_roots)
+        return any((root / self.fragment / ".blobs" / version_id).exists() for root in self.blob_roots)
 
     def edge_archive_proof(self, expected):
         status, raw = self.http(
@@ -459,7 +459,7 @@ stripe_block_size=262144
         if versions_status != 200 or not versions:
             raise ProofFailure(f"versions unavailable for recover-on-read {logical}")
         version_id = versions[-1]["version_id"]
-        version_dir = self.blob_roots[0] / self.fragment / "blob" / version_id
+        version_dir = self.blob_roots[0] / self.fragment / ".blobs" / version_id
         shard_files = sorted(path for path in version_dir.iterdir() if path.is_file())
         if not shard_files:
             raise ProofFailure(f"no shard files for recover-on-read {version_id}")
@@ -532,7 +532,7 @@ stripe_block_size=262144
                     trash_ndx.append(path)
                 elif path.parent.name.startswith("@o_"):
                     live_ndx.append(path)
-            blob_path = blob_root / self.fragment / "blob"
+            blob_path = blob_root / self.fragment / ".blobs"
             blob_version_dirs = (
                 sum(1 for path in blob_path.iterdir() if path.is_dir())
                 if blob_path.exists()

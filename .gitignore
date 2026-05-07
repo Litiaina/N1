@@ -21,6 +21,7 @@ Desktop.ini
 
 # Temporary & backup files
 *.log
+*.pid
 *.tmp
 *.swp
 *.swo

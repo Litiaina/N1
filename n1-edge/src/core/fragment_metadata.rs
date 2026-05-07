@@ -1,4 +1,5 @@
 use crate::core::disk_manager::ObjectPathManager;
+use crate::core::edge_index_store::FragmentMeta as EdgeFragmentMeta;
 use crate::{core::constants::FRAGMENT_METADATA_FILE, enums::app_error_enum::AppError};
 
 use argon2::{
@@ -20,6 +21,7 @@ use std::sync::{LazyLock, Mutex};
 
 pub const DEFAULT_INDEX_PARTITION_COUNT: u16 = 64;
 pub const SUPPORTED_INDEX_PARTITION_COUNTS: [u16; 3] = [32, 64, 256];
+const LEGACY_FRAGMENT_METADATA_FILE: &str = "fragment.metadata.msgpack";
 
 static CONFIGURED_INDEX_PARTITION_COUNT: LazyLock<AtomicU16> =
     LazyLock::new(|| AtomicU16::new(DEFAULT_INDEX_PARTITION_COUNT));
@@ -77,13 +79,40 @@ fn enforce_fragment_index_partition_count(
     Ok(partition_count)
 }
 
+fn unix_to_rfc3339(seconds: i64) -> String {
+    chrono::DateTime::<Utc>::from_timestamp(seconds, 0)
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn decode_edge_fragment_meta(raw: &[u8]) -> Result<EdgeFragmentMeta, AppError> {
+    rmp_serde::from_slice::<EdgeFragmentMeta>(raw)
+        .map_err(|e| AppError::InternalServerError(format!("decode edge fragment metadata: {}", e)))
+}
+
+fn fragment_metadata_from_edge(meta: EdgeFragmentMeta) -> FragmentMetadata {
+    FragmentMetadata {
+        fragment: meta.fragment_id,
+        key_phc: meta.key_phc.unwrap_or_default(),
+        nt_hash_hex: meta.nt_hash_hex,
+        index_partition_count: meta
+            .index_partition_count
+            .unwrap_or_else(configured_index_partition_count),
+        created: unix_to_rfc3339(meta.created_at_unix),
+        updated: Some(unix_to_rfc3339(meta.updated_at_unix)),
+    }
+}
+
 fn decode_fragment_metadata(raw: &[u8]) -> Result<FragmentMetadata, AppError> {
-    rmp_serde::from_slice::<FragmentMetadata>(raw)
-        .map_err(|e| AppError::InternalServerError(format!("decode msgpack: {}", e)))
+    decode_edge_fragment_meta(raw).map(fragment_metadata_from_edge)
 }
 
 fn fragment_meta_path(root: &Path, fragment_hash: &str) -> PathBuf {
     root.join(fragment_hash).join(FRAGMENT_METADATA_FILE)
+}
+
+fn legacy_fragment_meta_path(root: &Path, fragment_hash: &str) -> PathBuf {
+    root.join(fragment_hash).join(LEGACY_FRAGMENT_METADATA_FILE)
 }
 
 async fn sync_dir(dir: &Path) -> Result<(), AppError> {
@@ -132,6 +161,18 @@ async fn durable_atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AppError>
 
     sync_dir(parent).await?;
     Ok(())
+}
+
+async fn read_edge_fragment_meta_if_exists(
+    path: &Path,
+) -> Result<Option<EdgeFragmentMeta>, AppError> {
+    if !tokio_fs::try_exists(path).await.unwrap_or(false) {
+        return Ok(None);
+    }
+    let raw = tokio_fs::read(path)
+        .await
+        .map_err(|e| AppError::Io(e, format!("read {}", path.display())))?;
+    decode_edge_fragment_meta(&raw).map(Some)
 }
 
 fn hash_key_to_phc(key: &str) -> Result<String, AppError> {
@@ -219,7 +260,7 @@ pub async fn read_fragment_metadata(fragment_hash: &str) -> Result<FragmentMetad
 
         let meta = decode_fragment_metadata(&raw)?;
 
-        if meta.fragment == fragment_hash {
+        if meta.fragment == fragment_hash && !meta.key_phc.trim().is_empty() {
             return Ok(meta);
         }
     }
@@ -240,7 +281,7 @@ pub fn read_fragment_metadata_sync(fragment_hash: &str) -> Result<FragmentMetada
         let raw =
             std::fs::read(&p).map_err(|e| AppError::Io(e, format!("read {}", p.display())))?;
         let meta = decode_fragment_metadata(&raw)?;
-        if meta.fragment == fragment_hash {
+        if meta.fragment == fragment_hash && !meta.key_phc.trim().is_empty() {
             return Ok(meta);
         }
     }
@@ -279,16 +320,54 @@ async fn write_fragment_metadata_with_policy(
     let pm = ObjectPathManager::new();
     let roots = pm.get_all_index_roots();
 
-    let bytes = rmp_serde::to_vec(meta)
-        .map_err(|e| AppError::InternalServerError(format!("encode msgpack: {}", e)))?;
-
     let mut any_ok = false;
     let mut failed_paths = Vec::new();
 
     for root in roots {
         let p = fragment_meta_path(&root, &meta.fragment);
+        let now = Utc::now().timestamp();
+        let mut edge = match read_edge_fragment_meta_if_exists(&p).await {
+            Ok(Some(existing)) => existing,
+            Ok(None) => EdgeFragmentMeta {
+                fragment_id: meta.fragment.clone(),
+                state: "active".to_string(),
+                quota_bytes: 0,
+                quota_project_id: None,
+                committed_bytes: 0,
+                reserved_bytes: 0,
+                trash_bytes: 0,
+                created_at_unix: now,
+                updated_at_unix: now,
+                key_phc: None,
+                nt_hash_hex: None,
+                index_partition_count: None,
+            },
+            Err(err) => {
+                failed_paths.push(format!("{} ({})", p.display(), err));
+                continue;
+            }
+        };
+        edge.fragment_id = meta.fragment.clone();
+        edge.key_phc = Some(meta.key_phc.clone());
+        edge.nt_hash_hex = meta.nt_hash_hex.clone();
+        edge.index_partition_count = Some(meta.index_partition_count);
+        edge.updated_at_unix = now;
+        let bytes = match rmp_serde::to_vec(&edge) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                failed_paths.push(format!(
+                    "{} (encode edge fragment metadata: {})",
+                    p.display(),
+                    e
+                ));
+                continue;
+            }
+        };
+
         match durable_atomic_write(&p, &bytes).await {
             Ok(()) => {
+                let _ =
+                    tokio_fs::remove_file(legacy_fragment_meta_path(&root, &meta.fragment)).await;
                 any_ok = true;
             }
             Err(err) => {
@@ -388,20 +467,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decode_fragment_metadata_accepts_current_shape() {
-        let current = FragmentMetadata {
-            fragment: "abc".to_string(),
-            key_phc: "phc".to_string(),
+    fn decode_fragment_metadata_accepts_edge_fragment_ndx_shape() {
+        let current = EdgeFragmentMeta {
+            fragment_id: "abc".to_string(),
+            state: "active".to_string(),
+            quota_bytes: 1024,
+            quota_project_id: Some(12_345),
+            committed_bytes: 0,
+            reserved_bytes: 0,
+            trash_bytes: 0,
+            created_at_unix: 1_777_905_000,
+            updated_at_unix: 1_777_905_001,
+            key_phc: Some("phc".to_string()),
             nt_hash_hex: Some("00112233445566778899aabbccddeeff".to_string()),
-            index_partition_count: 64,
-            created: "2026-01-01T00:00:00Z".to_string(),
-            updated: None,
+            index_partition_count: Some(64),
         };
-        let raw = rmp_serde::to_vec(&current).expect("encode current");
+        let raw = rmp_serde::to_vec(&current).expect("encode current edge fragment ndx");
         let decoded = decode_fragment_metadata(&raw).expect("decode current");
-        assert_eq!(decoded.fragment, current.fragment);
-        assert_eq!(decoded.key_phc, current.key_phc);
+        assert_eq!(decoded.fragment, current.fragment_id);
+        assert_eq!(decoded.key_phc, current.key_phc.unwrap());
         assert_eq!(decoded.nt_hash_hex, current.nt_hash_hex);
+        assert_eq!(decoded.index_partition_count, 64);
     }
 
     #[test]

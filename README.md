@@ -113,12 +113,14 @@ It keeps the N1 object/blob plane, repair model, redistribution model, GC model,
 
 ```text
 index_root/<fragment_hash>/
+  .blobs/<version-id>/
+    <shard-or-parity-file>
   .objects/@o_<object-id>/
     <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
   docs/video.mp4 -> @o_<object-id>
 ```
 
-Folders are real directories. File names are namespace symlinks whose payload is a stable object id. Object records live in flat `.objects/@o_<object-id>/` directories, each committed version is an immutable `.ndx` file, and normal listing reads direct directory children plus `.ndx` filenames only. It does not decode `.ndx` bodies.
+Folders are real directories. File names are namespace symlinks whose payload is a stable object id. Object records live in flat `.objects/@o_<object-id>/` directories, each committed version is an immutable `.ndx` file, and normal listing reads direct directory children plus `.ndx` filenames only. Payload shards live under the explicit internal `.blobs/` directory so user namespace names such as `blob/` remain valid. Normal listing does not decode `.ndx` bodies.
 
 Use `N1 Edge` when the goal is the pure filesystem-native, Linux-first, IO-bound N1 engine. Use `N1 Standard` when the deployment target is the validated sharded `indexdb` engine line.
 

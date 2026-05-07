@@ -7,6 +7,7 @@ use chrono::Utc;
 use tokio::fs;
 use tracing::{info, warn};
 
+use crate::core::constants::EDGE_BLOB_DIR;
 use crate::core::disk_manager::{ObjectPathManager, RenameObjectRequest};
 use crate::core::index;
 use crate::enums::app_error_enum::AppError;
@@ -96,14 +97,20 @@ fn remap_shard_absolute_path_for_fragment_move(
         }
     }
 
-    let unix_from = format!("/{}/blob/{}/", source_fragment, version_id);
-    let unix_to = format!("/{}/blob/{}/", destination_fragment, version_id);
+    let unix_from = format!("/{}/{}/{}/", source_fragment, EDGE_BLOB_DIR, version_id);
+    let unix_to = format!(
+        "/{}/{}/{}/",
+        destination_fragment, EDGE_BLOB_DIR, version_id
+    );
     if current_path.contains(&unix_from) {
         return current_path.replacen(&unix_from, &unix_to, 1);
     }
 
-    let win_from = format!("\\{}\\blob\\{}\\", source_fragment, version_id);
-    let win_to = format!("\\{}\\blob\\{}\\", destination_fragment, version_id);
+    let win_from = format!("\\{}\\{}\\{}\\", source_fragment, EDGE_BLOB_DIR, version_id);
+    let win_to = format!(
+        "\\{}\\{}\\{}\\",
+        destination_fragment, EDGE_BLOB_DIR, version_id
+    );
     if current_path.contains(&win_from) {
         return current_path.replacen(&win_from, &win_to, 1);
     }

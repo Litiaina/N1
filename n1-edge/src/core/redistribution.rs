@@ -1,10 +1,12 @@
 use crate::core::constants::{
-    FRAGMENT_METADATA_FILE, GC_SUFFIX, PARITY_SUFFIX, REDIST_TMP_SUFFIX, SHARD_SUFFIX,
+    EDGE_BLOB_DIR, FRAGMENT_METADATA_FILE, GC_SUFFIX, PARITY_SUFFIX, REDIST_TMP_SUFFIX,
+    SHARD_SUFFIX,
 };
 use crate::core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo,
     default_stripe_size,
 };
+use crate::core::edge_index_store;
 use crate::core::ec::ErasureStreamWriter;
 use crate::core::fragment_metadata::{
     fragment_index_partition_count, read_fragment_metadata, write_fragment_metadata,
@@ -727,7 +729,10 @@ fn get_shard_dir_custom(
     is_trash: bool,
 ) -> PathBuf {
     let _ = is_trash;
-    disk_root.join(fragment_hash).join("blob").join(version_id)
+    disk_root
+        .join(fragment_hash)
+        .join(EDGE_BLOB_DIR)
+        .join(version_id)
 }
 
 fn get_partition_intent_paths_custom(
@@ -1421,7 +1426,7 @@ async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bo
     let now = SystemTime::now();
     tokio::task::spawn_blocking(move || {
         for root in roots {
-            let blob_dir = root.join(&fragment).join("blob");
+            let blob_dir = root.join(&fragment).join(EDGE_BLOB_DIR);
             let Ok(entries) = std::fs::read_dir(&blob_dir) else {
                 continue;
             };
@@ -1455,7 +1460,21 @@ async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bo
     .unwrap_or(false)
 }
 
-async fn fragment_has_indexed_payload(fragment: &str) -> Result<bool, AppError> {
+async fn fragment_has_indexed_payload(
+    fragment: &str,
+    active_index_roots: &[PathBuf],
+) -> Result<bool, AppError> {
+    let fragment_owned = fragment.to_string();
+    let roots = active_index_roots.to_vec();
+    let has_object_index = tokio::task::spawn_blocking(move || {
+        edge_index_store::fragment_has_object_index_records(&fragment_owned, &roots)
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("edge object index scan join: {e}")))?;
+    if has_object_index {
+        return Ok(true);
+    }
+
     let live = index::scan_fragment_live_metadata_page(fragment, None, None, 1, None, true).await?;
     if !live.objects.is_empty() {
         return Ok(true);
@@ -1769,7 +1788,8 @@ pub async fn run_redistribution_job_with_options(
         }
 
         let has_blob_payload = fragment_has_blob_payload(&fragment_hash, live_blob.as_ref()).await;
-        let has_indexed_payload = fragment_has_indexed_payload(&fragment_hash).await?;
+        let has_indexed_payload =
+            fragment_has_indexed_payload(&fragment_hash, live_index.as_ref()).await?;
         if has_blob_payload && !has_indexed_payload {
             let err = format!(
                 "Fragment {} has blob payload on disk but no indexed live/trash metadata. Redistribution cannot re-encode orphaned blob data.",

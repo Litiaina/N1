@@ -1,5 +1,7 @@
+use crate::core::constants::EDGE_BLOB_DIR;
 use crate::core::delete::{get_empty_trash_status, get_recover_all_trash_status};
 use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
+use crate::core::edge_index_store;
 use crate::core::fragment_manager::is_fragment_hash;
 use crate::core::garbage_collector::get_gc_status;
 use crate::core::index;
@@ -441,7 +443,7 @@ async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bo
     let now = SystemTime::now();
     tokio::task::spawn_blocking(move || {
         for root in roots {
-            let blob_dir = root.join(&fragment).join("blob");
+            let blob_dir = root.join(&fragment).join(EDGE_BLOB_DIR);
             let Ok(entries) = std::fs::read_dir(&blob_dir) else {
                 continue;
             };
@@ -475,7 +477,21 @@ async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bo
     .unwrap_or(false)
 }
 
-async fn fragment_has_indexed_payload(fragment: &str) -> Result<bool, AppError> {
+async fn fragment_has_indexed_payload(
+    fragment: &str,
+    active_index_roots: &[PathBuf],
+) -> Result<bool, AppError> {
+    let fragment_owned = fragment.to_string();
+    let roots = active_index_roots.to_vec();
+    let has_object_index = tokio::task::spawn_blocking(move || {
+        edge_index_store::fragment_has_object_index_records(&fragment_owned, &roots)
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("edge object index scan join: {e}")))?;
+    if has_object_index {
+        return Ok(true);
+    }
+
     let live = index::scan_fragment_live_metadata_page(fragment, None, None, 1, None, true).await?;
     if !live.objects.is_empty() {
         return Ok(true);
@@ -588,7 +604,8 @@ async fn detect_fragment_redundancy_debt(
 
     let mut debt = FragmentRedundancyDebt::default();
     for fragment in fragments {
-        let has_indexed_payload = fragment_has_indexed_payload(&fragment).await?;
+        let has_indexed_payload =
+            fragment_has_indexed_payload(&fragment, active_index_roots).await?;
         if !has_indexed_payload {
             if fragment_has_blob_payload(&fragment, active_blob_roots).await {
                 debt.orphaned_blob_fragments.push(fragment);
@@ -635,7 +652,7 @@ async fn detect_edge_index_replica_debt(
         let has_indexed_payload = if has_namespace_materialized {
             true
         } else if deep_scan {
-            fragment_has_indexed_payload(&fragment).await?
+            fragment_has_indexed_payload(&fragment, active_index_roots).await?
         } else {
             false
         };

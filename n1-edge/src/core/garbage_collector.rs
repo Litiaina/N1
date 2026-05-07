@@ -1,4 +1,4 @@
-use crate::core::constants::{FRAGMENT_METADATA_FILE, GC_SUFFIX};
+use crate::core::constants::{EDGE_BLOB_DIR, FRAGMENT_METADATA_FILE, GC_SUFFIX};
 use crate::core::disk_manager::{FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManager};
 use crate::core::index;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
@@ -910,8 +910,8 @@ async fn process_fragment_gc(
             if should_stop_gc() {
                 return stats;
             }
-            let live_path = root.join(fragment).join("blob").join(ver);
-            let trash_path = get_trash_root(root, fragment).join("blob").join(ver);
+            let live_path = root.join(fragment).join(EDGE_BLOB_DIR).join(ver);
+            let trash_path = get_trash_root(root, fragment).join(EDGE_BLOB_DIR).join(ver);
             if live_path.exists() {
                 let _ = std::fs::remove_dir_all(&live_path);
             }
@@ -923,8 +923,8 @@ async fn process_fragment_gc(
             if should_stop_gc() {
                 return stats;
             }
-            let live_path = root.join(fragment).join("blob").join(ver);
-            let trash_path = get_trash_root(root, fragment).join("blob").join(ver);
+            let live_path = root.join(fragment).join(EDGE_BLOB_DIR).join(ver);
+            let trash_path = get_trash_root(root, fragment).join(EDGE_BLOB_DIR).join(ver);
             if live_path.exists() {
                 let _ = std::fs::remove_dir_all(&live_path);
             }
@@ -965,7 +965,7 @@ async fn process_fragment_gc(
         if should_stop_gc() {
             return stats;
         }
-        let blob_root = root.join(fragment).join("blob");
+        let blob_root = root.join(fragment).join(EDGE_BLOB_DIR);
         if !blob_root.exists() {
             continue;
         }

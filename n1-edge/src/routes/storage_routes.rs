@@ -19,7 +19,6 @@ use crate::core::fragment_manager::{
 use crate::core::garbage_collector::{
     get_gc_status_api, run_garbage_collector, run_lifecycle_manager, stop_garbage_collector,
 };
-use crate::core::index;
 use crate::core::maintenance::sync_fragment_metadata;
 use crate::core::monitoring::{get_system_health, run_system_monitor};
 use crate::core::operation_gate::{
@@ -49,6 +48,7 @@ use crate::core::upload::{
     list_active_uploads as list_active_uploads_impl, object_upload_part as object_upload_part_impl,
     upload_object_one_shot as upload_object_one_shot_impl,
 };
+use crate::core::{edge_index_store, index};
 use crate::enums::app_error_enum::AppError;
 use crate::fs::fs_constants::MAX_FILE_SIZE;
 use crate::middleware::auth_middleware::{
@@ -104,8 +104,9 @@ async fn resolve_logical_read_key(
     fragment: &str,
     requested_path: &str,
 ) -> Result<String, AppError> {
+    let requested = requested_path.trim_start_matches('/').trim();
     if let Some(entry) = global_namespace_runtime()
-        .entry(fragment, requested_path)
+        .entry(fragment, requested)
         .await?
     {
         if entry.kind != crate::namespace::models::NamespaceEntryKind::File
@@ -117,7 +118,7 @@ async fn resolve_logical_read_key(
             AppError::InternalServerError("logical file is missing physical object id".to_string())
         });
     }
-    Ok(requested_path.to_string())
+    edge_index_store::normalize_object_id(requested).map_err(|_| logical_not_found())
 }
 
 fn download_filename_for_logical_path(requested_path: &str, resolved_key: &str) -> Option<String> {
@@ -1144,7 +1145,10 @@ pub fn build_storage_routes_unbound_with_options(
                 "/n1/fragments/{:fragment}/quota",
                 patch(resize_fragment_quota_scoped),
             )
-            .route("/n1/trash/empty", delete(empty_trash_scoped))
+            .route(
+                "/n1/trash/empty",
+                delete(empty_trash_scoped).post(empty_trash_scoped),
+            )
             .route("/n1/objects/rename", post(rename_object_scoped))
             .route("/n1/objects/bulk-delete", post(bulk_delete_objects_scoped))
             .route(

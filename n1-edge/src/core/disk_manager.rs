@@ -1,3 +1,4 @@
+use crate::core::constants::EDGE_BLOB_DIR;
 use crate::enums::app_error_enum::AppError;
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
@@ -139,7 +140,10 @@ impl ObjectPathManager {
         fragment_hash: &str,
         version_id: &str,
     ) -> PathBuf {
-        disk_root.join(fragment_hash).join("blob").join(version_id)
+        disk_root
+            .join(fragment_hash)
+            .join(EDGE_BLOB_DIR)
+            .join(version_id)
     }
 }
 

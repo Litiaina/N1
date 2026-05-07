@@ -50,10 +50,10 @@ Each configured index root contains one Edge index tree per fragment:
     video.mp4 -> @o_<object-id>
 ```
 
-Blob layout is unchanged:
+Edge blob payload layout is explicit-internal:
 
 ```text
-<blob_root>/<fragment_hash>/blob/<version_id>/<shard-or-parity-file>
+<blob_root>/<fragment_hash>/.blobs/<version_id>/<shard-or-parity-file>
 ```
 
 Both disks may house both index and blob roots. The minimum N1 Edge profile remains two configured roots, for example `/mnt/disk-00` and `/mnt/disk-01`.
@@ -70,7 +70,7 @@ N1 Edge has three clear planes:
 
 - Namespace: real directories and file symlinks.
 - Object index: flat `.objects/@o_<object-id>/` directories with immutable `.ndx` versions.
-- Blob plane: immutable shard/parity files under `<blob_root>/<fragment>/blob/<version_id>/`.
+- Blob plane: immutable shard/parity files under `<blob_root>/<fragment>/.blobs/<version_id>/`.
 
 The namespace symlink is the mutable POSIX face:
 

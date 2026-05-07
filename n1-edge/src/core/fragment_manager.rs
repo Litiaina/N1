@@ -253,6 +253,8 @@ pub async fn update_fragment(
         let new_hash = hex::encode(hasher.finalize());
 
         if new_hash != current_hash {
+            let existing_meta = read_fragment_metadata(&current_hash).await.ok();
+
             for root in &index_roots {
                 if root.join(&new_hash).exists() {
                     return Err(AppError::Conflict(format!(
@@ -285,25 +287,19 @@ pub async fn update_fragment(
                 }
             }
 
-            let mut meta = match read_fragment_metadata(&new_hash).await {
-                Ok(m) => m,
-                Err(_) => {
-                    let old_meta = read_fragment_metadata(&current_hash).await.ok();
-                    old_meta.unwrap_or_else(|| crate::core::fragment_metadata::FragmentMetadata {
-                        fragment: new_hash.clone(),
-                        key_phc: String::new(),
-                        nt_hash_hex: None,
-                        index_partition_count:
-                            crate::core::fragment_metadata::configured_index_partition_count(),
-                        created: chrono::Utc::now()
-                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                        updated: None,
-                    })
-                }
-            };
+            let mut meta =
+                existing_meta.unwrap_or_else(|| crate::core::fragment_metadata::FragmentMetadata {
+                    fragment: new_hash.clone(),
+                    key_phc: String::new(),
+                    nt_hash_hex: None,
+                    index_partition_count:
+                        crate::core::fragment_metadata::configured_index_partition_count(),
+                    created: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    updated: None,
+                });
 
             meta.fragment = new_hash.clone();
-            write_fragment_metadata(&meta).await.ok();
+            write_fragment_metadata(&meta).await?;
 
             info!(
                 "Renamed fragment {} -> {} ({})",

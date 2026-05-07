@@ -323,19 +323,12 @@ impl NamespaceRuntime {
     }
 
     pub async fn empty_trash(&self, fragment: &str) -> Result<NamespaceMutationSummary, AppError> {
-        let records = scan_trash_records(fragment)?;
-        let mut affected = 0usize;
-        for record in records {
-            affected += self
-                .purge_trash_entry_id(fragment, &record.trash_entry_id)
-                .await?
-                .affected_objects;
-        }
+        edge_index_store::drop_fragment_trash_namespace(fragment)?;
         Ok(NamespaceMutationSummary {
             operation: "empty_trash".to_string(),
             kind: NamespaceEntryKind::Directory,
-            affected_paths: affected,
-            affected_objects: affected,
+            affected_paths: 0,
+            affected_objects: 0,
             source_path: None,
             destination_path: None,
             trash_entry_id: None,

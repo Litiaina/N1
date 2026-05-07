@@ -525,7 +525,7 @@ mod tests {
             checksum: None,
             shards: vec![ShardInfo {
                 file_name: "a.shard".into(),
-                absolute_path: "/d1/frag/blob/ver/a.shard".into(),
+                absolute_path: "/d1/frag/.blobs/ver/a.shard".into(),
                 checksum: "x".into(),
                 size_bytes: 1,
                 shard_index: 0,
