@@ -16,11 +16,15 @@ use crate::distribution_core::data_plane::{
 };
 use crate::middleware::auth_middleware::validate_access;
 use crate::middleware::rate_limiter_middleware::RateLimitLayers;
+use crate::s3::{
+    s3_delete_object, s3_get_object, s3_head_bucket, s3_head_object, s3_list_buckets,
+    s3_list_objects_v2, s3_put_object,
+};
 use axum::Router;
 use axum::middleware::from_fn;
-use axum::routing::{delete, get, post, put};
-pub use n1::routes::storage_routes::AppState;
-use n1::routes::storage_routes::{
+use axum::routing::{delete, get, head, post, put};
+pub use n1_edge::routes::storage_routes::AppState;
+use n1_edge::routes::storage_routes::{
     StorageRouteOptions, apply_runtime_http_layers, build_storage_routes_unbound_with_options,
 };
 use std::sync::Arc;
@@ -71,6 +75,37 @@ fn protected_n2_routes(layers: &RateLimitLayers) -> Router<Arc<AppState>> {
         )
         .route("/v4/n2/object/rename", post(rename_n2_object))
         .route("/v4/n2/reconcile/{:fragment}", post(reconcile_n2_fragment));
+
+    let write_ops = layers
+        .layer_upload(write_ops)
+        .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
+
+    Router::<Arc<AppState>>::new()
+        .merge(read_ops)
+        .merge(write_ops)
+        .layer(from_fn(validate_access))
+}
+
+fn protected_s3_routes(layers: &RateLimitLayers) -> Router<Arc<AppState>> {
+    let read_ops = Router::<Arc<AppState>>::new()
+        .route("/s3", get(s3_list_buckets))
+        .route(
+            "/s3/{:bucket}",
+            head(s3_head_bucket).get(s3_list_objects_v2),
+        )
+        .route(
+            "/s3/{:bucket}/{*key}",
+            get(s3_get_object).head(s3_head_object),
+        );
+
+    let read_ops = layers
+        .layer_view(read_ops)
+        .layer(from_fn(enforce_quiesced_mode_on_reads));
+
+    let write_ops = Router::<Arc<AppState>>::new().route(
+        "/s3/{:bucket}/{*key}",
+        put(s3_put_object).delete(s3_delete_object),
+    );
 
     let write_ops = layers
         .layer_upload(write_ops)
@@ -144,6 +179,7 @@ pub async fn serve_storage_routes() -> Router {
         base_router
             .merge(public_n2_routes(&layers))
             .merge(protected_n2_routes(&layers))
+            .merge(protected_s3_routes(&layers))
             .merge(internal_n2_routes(&layers)),
     )
     .with_state(app_state)

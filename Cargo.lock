@@ -2288,7 +2288,7 @@ dependencies = [
 
 [[package]]
 name = "n2"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "async_zip",
@@ -2315,7 +2315,7 @@ dependencies = [
  "md4",
  "mime_guess",
  "moka",
- "n1",
+ "n1-edge",
  "once_cell",
  "percent-encoding",
  "rand 0.8.5",
@@ -2344,7 +2344,7 @@ dependencies = [
 
 [[package]]
 name = "n2_cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "assert_cmd",
  "axum",

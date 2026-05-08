@@ -310,6 +310,10 @@ fn validate_membership(membership: &ClusterMembership) -> Result<(), AppError> {
 
 static MEMBERSHIP: OnceLock<RwLock<ClusterMembership>> = OnceLock::new();
 
+#[cfg(test)]
+pub(crate) static N2_TEST_CLUSTER_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 async fn initialize_membership() -> ClusterMembership {
     let cfg = n2_runtime_config();
     match read_membership_file(cfg.membership_file.as_path()).await {

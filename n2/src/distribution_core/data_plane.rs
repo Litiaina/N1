@@ -24,7 +24,7 @@ use axum::body::Body;
 use axum::extract::{Path, Query};
 use axum::http::{
     HeaderMap, HeaderValue, StatusCode,
-    header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE},
+    header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, RANGE},
 };
 use axum::response::{IntoResponse, Response};
 use bytes::{Bytes, BytesMut};
@@ -46,10 +46,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-const N2_OBJECT_MAP_EXT: &str = ".n2map";
-const N2_OBJECT_LATEST_EXT: &str = ".n2latest";
-const N2_LOCAL_CSHARD_META_FILE: &str = "cshard.meta";
+const N2_OBJECT_METADATA_FILE: &str = ".nmtd";
+const N2_OBJECT_LATEST_FILE: &str = ".nlatest";
+const N2_LOCAL_CSHARD_METADATA_FILE: &str = ".nmtd";
 const N2_INTERNAL_TOKEN_HEADER: &str = "x-n2-internal-token";
+const X_AMZ_VERSION_ID_HEADER: &str = "x-amz-version-id";
 const N2_REMOTE_CHUNK_FLUSH_MIN_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
@@ -279,20 +280,22 @@ fn object_key_hash(object_key: &str) -> String {
 fn map_dir_for_root(root: &StdPath, fragment: &str, key_hash: &str) -> PathBuf {
     root.join(fragment)
         .join("n2")
-        .join("index")
+        .join("objects")
         .join(&key_hash[0..2])
         .join(&key_hash[2..4])
         .join(&key_hash[4..6])
         .join(&key_hash[6..8])
+        .join(key_hash)
 }
 
 fn map_path_for_root(root: &StdPath, fragment: &str, key_hash: &str, version_id: &str) -> PathBuf {
     map_dir_for_root(root, fragment, key_hash)
-        .join(format!("{}#{}{}", key_hash, version_id, N2_OBJECT_MAP_EXT))
+        .join(version_id)
+        .join(N2_OBJECT_METADATA_FILE)
 }
 
 fn latest_path_for_root(root: &StdPath, fragment: &str, key_hash: &str) -> PathBuf {
-    map_dir_for_root(root, fragment, key_hash).join(format!("{}{}", key_hash, N2_OBJECT_LATEST_EXT))
+    map_dir_for_root(root, fragment, key_hash).join(N2_OBJECT_LATEST_FILE)
 }
 
 async fn write_atomic(path: &StdPath, data: &[u8]) -> Result<(), AppError> {
@@ -387,17 +390,18 @@ async fn list_n2_map_versions_local(
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with(N2_OBJECT_MAP_EXT) {
+            if name.starts_with('.') || name.is_empty() {
                 continue;
             }
-            let Some(rest) = name.strip_prefix(format!("{}#", key_hash).as_str()) else {
+            let Ok(file_type) = entry.file_type().await else {
                 continue;
             };
-            let Some(version) = rest.strip_suffix(N2_OBJECT_MAP_EXT) else {
+            if !file_type.is_dir() {
                 continue;
-            };
-            if !version.is_empty() {
-                versions.insert(version.to_string());
+            }
+            let metadata_path = entry.path().join(N2_OBJECT_METADATA_FILE);
+            if fs::try_exists(&metadata_path).await.unwrap_or(false) {
+                versions.insert(name);
             }
         }
     }
@@ -471,6 +475,7 @@ async fn delete_n2_object_map_local(
         deleted = deleted.saturating_add(1);
         if let Some(parent) = map_path.parent() {
             let _ = sync_dir(parent).await;
+            let _ = fs::remove_dir(parent).await;
         }
     }
 
@@ -671,17 +676,18 @@ async fn discover_latest_n2_version(fragment: &str, object_key: &str) -> Result<
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with(N2_OBJECT_MAP_EXT) {
+            if name.starts_with('.') || name.is_empty() {
                 continue;
             }
-            let Some(rest) = name.strip_prefix(format!("{}#", key_hash).as_str()) else {
+            let Ok(file_type) = entry.file_type().await else {
                 continue;
             };
-            let Some(version) = rest.strip_suffix(N2_OBJECT_MAP_EXT) else {
+            if !file_type.is_dir() {
                 continue;
-            };
-            if !version.is_empty() {
-                discovered.push(version.to_string());
+            }
+            let metadata_path = entry.path().join(N2_OBJECT_METADATA_FILE);
+            if fs::try_exists(&metadata_path).await.unwrap_or(false) {
+                discovered.push(name);
             }
         }
     }
@@ -744,7 +750,7 @@ async fn load_n2_object_map_remote(
         .map_err(|e| AppError::InternalServerError(format!("decode remote n2 map failed: {}", e)))
 }
 
-async fn load_n2_object_map(
+pub(crate) async fn load_n2_object_map(
     fragment: &str,
     object_key: &str,
     version_id: Option<&str>,
@@ -832,7 +838,7 @@ async fn collect_n2_map_paths(root: &StdPath, max_paths: usize) -> Result<Vec<Pa
             let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
                 continue;
             };
-            if !name.ends_with(N2_OBJECT_MAP_EXT) {
+            if name != N2_OBJECT_METADATA_FILE {
                 continue;
             }
             out.push(path);
@@ -857,7 +863,7 @@ async fn list_fragment_n2_maps(
     let mut seen_map_ids = HashSet::new();
     let mut out = Vec::new();
     for root in roots {
-        let index_root = root.join(fragment).join("n2").join("index");
+        let index_root = root.join(fragment).join("n2").join("objects");
         let exists = fs::try_exists(&index_root)
             .await
             .map_err(|e| AppError::Io(e, format!("check {:?}", index_root)))?;
@@ -870,10 +876,11 @@ async fn list_fragment_n2_maps(
             collect_n2_map_paths(&index_root, max_objects.saturating_mul(8)).await?;
         map_paths.sort();
         for path in map_paths {
-            let Some(file_name) = path.file_name().and_then(|v| v.to_str()) else {
-                continue;
-            };
-            if !seen_map_ids.insert(file_name.to_string()) {
+            let map_id = path
+                .strip_prefix(&index_root)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| path.to_string_lossy().to_string());
+            if !seen_map_ids.insert(map_id) {
                 continue;
             }
             let bytes = match fs::read(&path).await {
@@ -935,7 +942,7 @@ async fn collect_n2_latest_marker_paths(
             let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
                 continue;
             };
-            if !name.ends_with(N2_OBJECT_LATEST_EXT) {
+            if name != N2_OBJECT_LATEST_FILE {
                 continue;
             }
             out.push(path);
@@ -960,7 +967,7 @@ async fn list_fragment_n2_latest_maps(
     let mut seen_key_hashes = HashSet::new();
     let mut out = Vec::new();
     for root in roots.clone() {
-        let index_root = root.join(fragment).join("n2").join("index");
+        let index_root = root.join(fragment).join("n2").join("objects");
         let exists = fs::try_exists(&index_root)
             .await
             .map_err(|e| AppError::Io(e, format!("check {:?}", index_root)))?;
@@ -972,10 +979,11 @@ async fn list_fragment_n2_latest_maps(
             collect_n2_latest_marker_paths(&index_root, max_objects.saturating_mul(8)).await?;
         latest_paths.sort();
         for latest_path in latest_paths {
-            let Some(file_name) = latest_path.file_name().and_then(|v| v.to_str()) else {
-                continue;
-            };
-            let Some(key_hash) = file_name.strip_suffix(N2_OBJECT_LATEST_EXT) else {
+            let Some(key_hash) = latest_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|v| v.to_str())
+            else {
                 continue;
             };
             if !seen_key_hashes.insert(key_hash.to_string()) {
@@ -1042,7 +1050,7 @@ async fn list_n2_fragments(max_fragments: usize) -> Result<Vec<String>, AppError
             let Some(fragment) = path.file_name().and_then(|v| v.to_str()) else {
                 continue;
             };
-            let n2_index = path.join("n2").join("index");
+            let n2_index = path.join("n2").join("objects");
             let exists = fs::try_exists(&n2_index)
                 .await
                 .map_err(|e| AppError::Io(e, format!("check {:?}", n2_index)))?;
@@ -1222,8 +1230,8 @@ async fn store_local_cluster_shard_from_file(
         let disk_idx = (cluster_shard_index + disk_shard_index) % blob_roots.len();
         let cshard_dir = blob_roots[disk_idx]
             .join(object.fragment.as_str())
-            .join("n2_data")
-            .join("blobs")
+            .join("n2")
+            .join("shards")
             .join(object.version_id.as_str())
             .join(format!("cshard_{}", cluster_shard_index));
         fs::create_dir_all(&cshard_dir)
@@ -1355,7 +1363,7 @@ async fn store_local_cluster_shard_from_file(
             continue;
         }
         seen_dirs.insert(parent_key, true);
-        let meta_path = parent.join(N2_LOCAL_CSHARD_META_FILE);
+        let meta_path = parent.join(N2_LOCAL_CSHARD_METADATA_FILE);
         write_atomic(&meta_path, &local_meta_bytes).await?;
     }
 
@@ -1692,11 +1700,11 @@ async fn load_local_cluster_shard_meta(
     for root in roots {
         let meta_path = root
             .join(fragment)
-            .join("n2_data")
-            .join("blobs")
+            .join("n2")
+            .join("shards")
             .join(version_id)
             .join(format!("cshard_{}", cluster_shard_index))
-            .join(N2_LOCAL_CSHARD_META_FILE);
+            .join(N2_LOCAL_CSHARD_METADATA_FILE);
         let exists = fs::try_exists(&meta_path)
             .await
             .map_err(|e| AppError::Io(e, format!("check {:?}", meta_path)))?;
@@ -1839,8 +1847,8 @@ async fn delete_local_cluster_shard(
     for root in blob_roots {
         let cshard_dir = root
             .join(fragment)
-            .join("n2_data")
-            .join("blobs")
+            .join("n2")
+            .join("shards")
             .join(version_id)
             .join(format!("cshard_{}", cluster_shard_index));
         let exists = fs::try_exists(&cshard_dir)
@@ -3170,6 +3178,14 @@ pub async fn get_n2_object(
     response
         .headers_mut()
         .insert(CONTENT_TYPE, content_type_header);
+    if let Ok(v) = HeaderValue::from_str(format!("\"{}\"", map.object.version_id).as_str()) {
+        response.headers_mut().insert(ETAG, v);
+    }
+    if let Ok(name) = axum::http::HeaderName::from_bytes(X_AMZ_VERSION_ID_HEADER.as_bytes()) {
+        if let Ok(v) = HeaderValue::from_str(map.object.version_id.as_str()) {
+            response.headers_mut().insert(name, v);
+        }
+    }
     response
         .headers_mut()
         .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
@@ -4319,7 +4335,9 @@ mod tests {
         DeleteN2ObjectQuery, GetObjectQuery, ListN2ObjectsQuery, ListN2VersionsQuery,
         PutObjectQuery, ReconcileFragmentQuery, RenameN2ObjectRequest, UpsertMembershipRequest,
     };
-    use crate::distribution_core::state::{get_membership, upsert_membership};
+    use crate::distribution_core::state::{
+        N2_TEST_CLUSTER_LOCK as STORAGE_TEST_LOCK, get_membership, upsert_membership,
+    };
     use crate::structs::auth_structs::Claims;
     use axum::Router;
     use axum::body::to_bytes;
@@ -4327,11 +4345,8 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
     use axum::response::IntoResponse;
     use axum::routing::{get, post, put};
-    use std::sync::{Arc, LazyLock};
+    use std::sync::Arc;
     use tokio::net::TcpListener;
-    use tokio::sync::Mutex;
-
-    static STORAGE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn full_claims(fragment: &str) -> Claims {
         Claims {
@@ -4982,6 +4997,54 @@ mod tests {
         assert_eq!(put_result.0.required_quorum, 2);
         assert_eq!(put_result.0.required_commit_shards, 2);
         assert_eq!(put_result.0.committed_shards, 2);
+
+        let key_hash = object_key_hash(object_key.as_str());
+        let index_roots = INDEX_STORE_DISKS.get().expect("index roots initialized");
+        let mut nmtd_mirrors = 0usize;
+        for root in index_roots {
+            let root = StdPath::new(root);
+            let nmtd_path = map_path_for_root(
+                root,
+                fragment.as_str(),
+                key_hash.as_str(),
+                put_result.0.version_id.as_str(),
+            );
+            if fs::try_exists(&nmtd_path).await.expect("check .nmtd") {
+                nmtd_mirrors = nmtd_mirrors.saturating_add(1);
+            }
+            assert!(
+                !fs::try_exists(nmtd_path.with_extension("n2map"))
+                    .await
+                    .unwrap_or(false),
+                "N2 0.3 metadata must not create legacy .n2map files"
+            );
+        }
+        assert!(
+            nmtd_mirrors > 0,
+            "N2 object metadata must be written as .nmtd"
+        );
+
+        let blob_roots = BLOB_STORE_DISKS.get().expect("blob roots initialized");
+        let mut local_shard_nmtd = 0usize;
+        for root in blob_roots {
+            let version_dir = StdPath::new(root)
+                .join(fragment.as_str())
+                .join("n2")
+                .join("shards")
+                .join(put_result.0.version_id.as_str());
+            if let Ok(mut entries) = fs::read_dir(&version_dir).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let marker = entry.path().join(N2_LOCAL_CSHARD_METADATA_FILE);
+                    if fs::try_exists(&marker).await.unwrap_or(false) {
+                        local_shard_nmtd = local_shard_nmtd.saturating_add(1);
+                    }
+                }
+            }
+        }
+        assert!(
+            local_shard_nmtd > 0,
+            "N2 local cluster shard metadata must be written as .nmtd"
+        );
 
         let get_resp = get_n2_object(
             full_claims(fragment.as_str()),

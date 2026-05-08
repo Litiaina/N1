@@ -947,18 +947,17 @@ mod tests {
         GovernanceAppendRequest, GovernanceMembershipEntry, NodeDescriptor, UpsertMembershipRequest,
     };
     use crate::distribution_core::state::{
-        get_membership, stage_rollback_membership, stage_upsert_membership, upsert_membership,
+        N2_TEST_CLUSTER_LOCK as GOVERNANCE_TEST_LOCK, get_membership, stage_rollback_membership,
+        stage_upsert_membership, upsert_membership,
     };
     use axum::Json as AxumJson;
     use axum::Router;
     use axum::extract::State as AxumState;
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::routing::post;
-    use std::sync::{Arc, LazyLock};
+    use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio::sync::Mutex as AsyncMutex;
-
-    static GOVERNANCE_TEST_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
     #[derive(Clone, Default)]
     struct MockGovernancePeer {

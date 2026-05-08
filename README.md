@@ -23,8 +23,8 @@ This repository contains the storage platform stack built around five runtime co
   Primary N1 storage kernel with an Edge namespace, flat immutable `.objects/@o_<object-id>` records, zero-decode listing, and the N1 blob/shard/parity plane. This is the true N1 face for new deployments. See `N1_EDGE_DOCUMENTATION.md`.
 > - `N1 Standard` (`3.0.0`)
   Secondary N1 engine line with the same object-storage core and lifecycle model, backed by per-fragment sharded `indexdb`. Keep it for deployments that explicitly want the validated indexdb path.
-> - `N2` (`0.2.0`)
-  Multi-node clustering and placement layer built on top of the shared `N1` storage core.
+> - `N2` (`0.3.0`)
+  Multi-node clustering and placement layer built on top of the `N1 Edge` storage kernel, with filesystem `.nmtd` cluster metadata and an S3-compatible path-style object surface.
 > - `NS` (`1.0.0`)
   Standalone NAS Lite / SMB service with fragment-backed auth, configurable share roots, backing-filesystem capacity, and optional cold-sync backup to `N1`.
 > - `Registry` (`0.9.1`)
@@ -126,17 +126,19 @@ SMB/NAS access is no longer embedded in `N1`. Use standalone `NS` when Windows/m
 
 ### N2
 
-`N2` is the multi-node layer.
+`N2 0.3.0` is the multi-node layer for the Edge line.
 
-It extends the shared storage core with:
+It extends `N1 Edge` with:
 
 - cluster membership
 - governance state
 - shard placement
 - peer transport
 - reconcile behavior
+- filesystem `.nmtd` cluster object metadata
+- S3-compatible path-style object operations under `/s3/...`
 
-Use `N2` when storage needs to span multiple nodes with cluster-managed placement and reconcile behavior. Use standalone `N1` when you want a single-node engine.
+Use `N2` when storage needs to span multiple nodes with cluster-managed placement and reconcile behavior. Use standalone `N1 Edge` when you want a single-node engine.
 
 ### NS
 
@@ -473,13 +475,15 @@ cargo run -p registry
 
 ### N2 Cluster
 
-Use `N2` when you need cluster-managed placement instead of a single storage node. `N2` reuses the shared storage core and auth model, but adds cluster membership, governance, placement, and reconcile flows. Multi-node `N2` must not be configured as loopback-only.
+Use `N2` when you need cluster-managed placement instead of a single storage node. `N2 0.3.0` uses the `N1 Edge` storage kernel locally, stores distributed object maps as `.nmtd`, and adds cluster membership, governance, placement, peer transport, S3-compatible path-style object routes, and reconcile flows. Multi-node `N2` must not be configured as loopback-only.
 
 ## Configuration Overview
 
-### N1 Config
+### N1 / N2 Config
 
-The main runtime file is `n1_config.ini`.
+Standalone `N1 Edge` uses `n1_config.ini`.
+
+`N2` uses `n2_config.ini` and `n2.env`. At runtime it also materializes Edge-kernel aliases for the embedded `N1 Edge` storage kernel.
 
 Important settings:
 
@@ -489,8 +493,9 @@ Important settings:
 - `disk_config.blob_store_disks`
 - `garbage_collector.retention_seconds`
 - `upload_config.data_shards`, `upload_config.parity_shards`
-- `index_config.partition_count`, `index_config.per_db_cache_bytes`, `index_config.max_cached_dbs`
-- `namespace_config.max_loaded_facades`, `namespace_config.max_loaded_dbs`
+- `[n2].node_id`, `[n2].node_endpoint`, `[n2].cluster_membership_file`
+- `[n2].kc`, `[n2].mc`, `[n2].kd`, `[n2].md`
+- `[n2].cluster_commit_mode`
 
 Notes:
 
@@ -683,5 +688,13 @@ High-signal release tests used for `N1 3.0` include:
 - redistribution with disk loss
 - POSIX pagination, mkdir, rename, trash, recover
 - NS SMB read/write/mkdir/rename/delete flows
+
+High-signal proof used for `N2 0.3.0` includes:
+
+- native `/v4/n2` upload/download over two real nodes
+- `.nmtd` object-map replication on local and remote index roots
+- S3 path-style put/head/get/list/delete under `/s3`
+- remote-node-loss read from the surviving node
+- verification that legacy `.n2map` and `cshard.meta` files are not created
 
 If you are touching a subsystem boundary, prefer adding a focused regression test in that subsystem plus a workflow test when the behavior spans storage, namespace, and maintenance.

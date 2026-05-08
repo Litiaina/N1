@@ -1,10 +1,11 @@
-# N2 API Documentation
+# N2 0.3 API Documentation
 
-`N2` is the multi-node clustering and placement layer that sits on top of the shared `N1` storage kernel. Use it when you want object storage across multiple nodes with cluster-managed placement, cluster shard maps, and reconcile behavior.
+`N2` is the multi-node clustering and placement layer for the `N1 Edge` storage kernel. It is a rewrite of the active N2 storage path: N2 owns distributed placement, peer transport, reconcile, and cluster object metadata while each node uses `N1 Edge` as its local storage kernel.
 
 This document focuses on:
 
 - the public and operator-facing `N2` APIs
+- the S3-compatible path-style object surface
 - the request and response fields that matter to integrators
 - the difference between public routes and node-to-node internal routes
 
@@ -16,10 +17,38 @@ This document focuses on:
 - cluster view and governance state
 - rendezvous placement of cluster shards
 - multi-node object ingest and read
-- shard-map persistence and reconcile
+- filesystem `.nmtd` object-map persistence and reconcile
 - internal peer transport between `N2` nodes
 
-`N2` does not replace `N1`'s storage kernel responsibilities. It reuses that core underneath.
+`N2` does not redesign the local blob/shard/parity kernel. Local physical durability remains `N1 Edge`; distributed object placement and `.nmtd` cluster metadata are N2 responsibilities.
+
+## N2 0.3 Storage Layout
+
+N2 uses filesystem metadata, not an external database.
+
+Object maps are stored as `.nmtd` files under each configured index root:
+
+```text
+<index_root>/<fragment_hash>/n2/objects/<hh>/<hh>/<hh>/<hh>/<object_key_hash>/<version_id>/.nmtd
+<index_root>/<fragment_hash>/n2/objects/<hh>/<hh>/<hh>/<hh>/<object_key_hash>/.nlatest
+```
+
+Local cluster shards are stored under each configured blob root:
+
+```text
+<blob_root>/<fragment_hash>/n2/shards/<version_id>/cshard_<cluster_shard_index>/
+  disk_shard_*.bin
+  .nmtd
+```
+
+Forbidden legacy active metadata for N2 0.3:
+
+- `.n2map`
+- `.n2latest`
+- `cshard.meta`
+- any N1 Standard/indexdb metadata as the active N2 map authority
+
+The local `N1 Edge` kernel may still own its own Edge runtime files and fragment metadata. N2's distributed object truth is `.nmtd`.
 
 ## Base URL
 
@@ -29,9 +58,11 @@ Typical base URL:
 https://127.0.0.1:50001
 ```
 
-`N2` routes live under `/v4/n2/...`.
+`N2` native routes live under `/v4/n2/...`.
 
-That route namespace is intentional. `N1` moved its stable standalone surface to `/n1/...`, but the current `N2` cluster API still lives under `/v4/n2/...`.
+S3-compatible path-style routes live under `/s3/...`.
+
+The `/n1/...` routes remain available for fragment creation/auth and local Edge-kernel operations. New clustered object traffic should use `/v4/n2/...` or `/s3/...`.
 
 ## Authentication Model
 
@@ -65,6 +96,47 @@ Example auth request:
   "delete": true
 }
 ```
+
+## S3-Compatible Path-Style Object Surface
+
+N2 exposes a path-style object surface for S3-oriented clients and gateways. The route prefix is `/s3`, and the bucket name is the fragment hash.
+
+Authentication currently uses the same N2 bearer token as the native API:
+
+```text
+Authorization: Bearer <access_token>
+```
+
+Implemented object operations:
+
+- `GET /s3` list accessible buckets for the current token
+- `HEAD /s3/{bucket}` check bucket access
+- `GET /s3/{bucket}?list-type=2&prefix=...&delimiter=...&max-keys=...&continuation-token=...`
+- `PUT /s3/{bucket}/{*key}` upload an object
+- `HEAD /s3/{bucket}/{*key}` object metadata
+- `GET /s3/{bucket}/{*key}` read an object
+- `DELETE /s3/{bucket}/{*key}` delete an object
+
+Examples:
+
+```bash
+curl -k -X PUT \
+  "https://127.0.0.1:50001/s3/<fragment_hash>/videos/demo.mp4" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: video/mp4" \
+  --data-binary @demo.mp4
+
+curl -k \
+  "https://127.0.0.1:50001/s3/<fragment_hash>?list-type=2&prefix=videos/" \
+  -H "Authorization: Bearer <token>"
+
+curl -k \
+  "https://127.0.0.1:50001/s3/<fragment_hash>/videos/demo.mp4" \
+  -H "Authorization: Bearer <token>" \
+  -o demo.mp4
+```
+
+Responses use S3-style XML for bucket/list operations and S3 object headers such as `ETag` and `x-amz-version-id`.
 
 ## Core Data Shapes
 
@@ -579,6 +651,8 @@ Body:
 
 - `N2ObjectMap`
 
+The replicated body is persisted as `.nmtd` on receiving peers.
+
 #### `GET /v4/n2/internal/map/{fragment}`
 
 Read fragment-local map state.
@@ -680,4 +754,5 @@ curl -k -X POST \
 - Membership changes are operator workflows. Treat them like control-plane operations, not end-user object operations.
 - Internal peer routes are intentionally low-level and should not be used as an application integration surface.
 - `Registry` remains the right layer for user-facing logical namespace, quota, share, and account behavior above `N2`.
-- `N2` reuses the `N1 3.0` storage core. Per-fragment metadata authority is still the sharded `indexdb` at `<index_root>/<fragment_hash>/indexdb/shard_XXXX.ndxdb`; old N1 namespace catalog or redb index files are not active runtime inputs.
+- `N2 0.3` uses `N1 Edge` locally and persists distributed object truth as `.nmtd`. N1 Standard/indexdb files are not active N2 metadata inputs.
+- A two-node proof run on real disks validated native N2 upload/download, S3 path-style put/head/get/list/delete, remote-node-loss read, `.nmtd` mirror presence, and absence of legacy `.n2map`/`cshard.meta` files. The proof summary is stored under `.n1-bench/n2-0.3.0-edge-rewrite-proof-20260508-150617/summary.json`.

@@ -1,6 +1,6 @@
 [package]
 name = "n2"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [[bin]]
@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Internal dependencies
-n1 = { path = "../n1" }
+n1-edge = { path = "../n1-edge" }
 
 # External workspace dependencies
 axum.workspace = true

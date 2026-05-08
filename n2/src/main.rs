@@ -1,4 +1,4 @@
-pub use n1::{core, enums, fs, handlers, middleware, statics, structs, utils, websocket};
+pub use n1_edge::{core, enums, fs, handlers, middleware, statics, structs, utils, websocket};
 
 use crate::core::adaptive_concurrency::{
     ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC, ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC,
@@ -10,6 +10,9 @@ use crate::core::monitoring::{
 use crate::core::object_parser::{
     ADAPTIVE_STREAM_TARGET_ATOMIC, STREAM_CHUNK_SIZE_ATOMIC, STREAM_LOCALITY_BIAS_ENABLED_ATOMIC,
     STREAM_MAX_CONCURRENCY, STREAM_READAHEAD_BYTES_ATOMIC,
+};
+use crate::core::quota_manager::{
+    FragmentQuotaBackend, apply_all_fragment_project_quotas, configure_fragment_quota_backend,
 };
 use crate::core::upload::{
     ADAPTIVE_IO_TARGET_ATOMIC, DATA_SHARDS_ATOMIC, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC,
@@ -31,7 +34,7 @@ use axum::Router;
 use axum_server::tls_rustls::RustlsConfig;
 use chrono::Local;
 use ini::Ini;
-use n1::settings::constants::{CONFIG_FILE as STANDARD_CONFIG_FILE, ENV_FILE as STANDARD_ENV_FILE};
+use n1_edge::settings::constants::{CONFIG_FILE as EDGE_CONFIG_FILE, ENV_FILE as EDGE_ENV_FILE};
 use std::collections::HashSet;
 use std::fs as stdfs;
 use std::fs::OpenOptions;
@@ -48,6 +51,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 mod distribution_core;
 mod routes;
+mod s3;
 mod settings;
 mod validation;
 fn detect_cpu_cores() -> usize {
@@ -261,14 +265,14 @@ fn normalize_fs_backed_disk_paths(role: &str, paths: Vec<String>) -> Vec<String>
             let ft = meta.file_type();
             if ft.is_block_device() || ft.is_char_device() {
                 panic!(
-                    "{} entry '{}' is a device. The standard variant is filesystem-backed and requires directory paths.",
+                    "{} entry '{}' is a device. N2 0.3 uses the N1 Edge storage kernel and requires directory paths.",
                     role, trimmed
                 );
             }
         }
         if !meta.is_dir() {
             panic!(
-                "{} entry '{}' is not a directory. The standard variant is filesystem-backed and requires directory paths.",
+                "{} entry '{}' is not a directory. N2 0.3 uses the N1 Edge storage kernel and requires directory paths.",
                 role, trimmed
             );
         }
@@ -391,7 +395,7 @@ pub fn init_tracing() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
         .with(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,litiaina_n1=trace,axum=info,hyper=info".into()),
+                .unwrap_or_else(|_| "info,n2=trace,litiaina_n2=trace,axum=info,hyper=info".into()),
         )
         .with(
             fmt::layer()
@@ -436,7 +440,11 @@ fn parse_https_url(raw: &str, label: &str) -> Result<reqwest::Url, String> {
     Ok(parsed)
 }
 
-fn ensure_standard_compat_alias(source: &Path, alias: &Path, label: &str) -> Result<(), String> {
+fn ensure_edge_kernel_runtime_alias(
+    source: &Path,
+    alias: &Path,
+    label: &str,
+) -> Result<(), String> {
     if alias.exists() {
         return Ok(());
     }
@@ -461,7 +469,7 @@ fn ensure_standard_compat_alias(source: &Path, alias: &Path, label: &str) -> Res
             Ok(_) => return Ok(()),
             Err(err) => {
                 tracing::warn!(
-                    "N2 compatibility guard could not create symlink '{}' -> '{}': {}. Falling back to a copy.",
+                    "N2 Edge-kernel runtime guard could not create symlink '{}' -> '{}': {}. Falling back to a copy.",
                     alias.display(),
                     source.display(),
                     err
@@ -481,16 +489,16 @@ fn ensure_standard_compat_alias(source: &Path, alias: &Path, label: &str) -> Res
     Ok(())
 }
 
-fn ensure_standard_compat_files() -> Result<(), String> {
-    ensure_standard_compat_alias(
+fn ensure_edge_kernel_runtime_files() -> Result<(), String> {
+    ensure_edge_kernel_runtime_alias(
         Path::new(ENV_FILE),
-        Path::new(STANDARD_ENV_FILE),
-        "N2 env compatibility file",
+        Path::new(EDGE_ENV_FILE),
+        "N2 Edge-kernel env runtime file",
     )?;
-    ensure_standard_compat_alias(
+    ensure_edge_kernel_runtime_alias(
         Path::new(CONFIG_FILE),
-        Path::new(STANDARD_CONFIG_FILE),
-        "N2 config compatibility file",
+        Path::new(EDGE_CONFIG_FILE),
+        "N2 Edge-kernel config runtime file",
     )?;
     Ok(())
 }
@@ -820,7 +828,7 @@ async fn main() {
         return;
     }
 
-    if let Err(e) = ensure_standard_compat_files() {
+    if let Err(e) = ensure_edge_kernel_runtime_files() {
         eprintln!("N2 startup failed: {}", e);
         return;
     }
@@ -834,7 +842,7 @@ async fn main() {
 
     let current_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     tracing::info!("╔══════════════════════════════════════╗");
-    tracing::info!("║         L I T I A I N A  N 1         ║");
+    tracing::info!("║         L I T I A I N A  N 2         ║");
     tracing::info!("╚══════════════════════════════════════╝");
     tracing::info!("│ Version        : {}", env!("CARGO_PKG_VERSION"));
     tracing::info!("│ Status         : ONLINE");
@@ -939,6 +947,20 @@ pub async fn run_server() {
         .set(blob_disks)
         .expect("Double initialization of BLOB_STORE_DISKS!");
 
+    let quota_section = config.section(Some("quota_config"));
+    let fragment_quota_backend =
+        FragmentQuotaBackend::parse(quota_section.and_then(|s| s.get("fragment_quota_backend")))
+            .unwrap_or_else(|err| panic!("Invalid quota_config.fragment_quota_backend: {}", err));
+    configure_fragment_quota_backend(fragment_quota_backend)
+        .expect("Double initialization of fragment quota backend");
+    tracing::info!(
+        "Fragment quota enforcement: backend={}",
+        fragment_quota_backend.as_str()
+    );
+    if let Err(err) = apply_all_fragment_project_quotas().await {
+        panic!("N2 startup quota validation failed: {}", err);
+    }
+
     validate_n2_startup_layout(&config, blob_disk_count).await;
     let startup_membership = get_membership().await.unwrap_or_else(|e| {
         panic!(
@@ -961,9 +983,7 @@ pub async fn run_server() {
         governance_state.last_applied_membership_epoch
     );
 
-    tracing::info!(
-        "Storage mode: standard variant is filesystem-backed (directory-only index/blob roots)"
-    );
+    tracing::info!("Storage mode: N2 .nmtd metadata plane over the N1 Edge storage kernel");
 
     let upload_section = config.section(Some("upload_config"));
     let cpu_cores = detect_cpu_cores();
