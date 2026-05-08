@@ -17,12 +17,12 @@
 
 ---
 
-This repository contains the storage platform stack built around four runtime components:
+This repository contains the storage platform stack built around five runtime components:
 
-> - `N1 Standard` (`3.0.0`)
-  Single-node storage kernel with an object-storage core, per-fragment sharded `indexdb` metadata authority, lifecycle, repair, redistribution, GC, recover-on-read, and POSIX-style routes.
 > - `N1 Edge` (`1.0.0`)
-  Primary filesystem-native N1 engine face with symlink-owned POSIX namespace, flat immutable `.objects/@o_<object-id>` records, zero-decode listing, and the same N1 blob/shard/parity plane. See `N1_EDGE_DOCUMENTATION.md`.
+  Primary N1 storage kernel with an Edge namespace, flat immutable `.objects/@o_<object-id>` records, zero-decode listing, and the N1 blob/shard/parity plane. This is the true N1 face for new deployments. See `N1_EDGE_DOCUMENTATION.md`.
+> - `N1 Standard` (`3.0.0`)
+  Secondary N1 engine line with the same object-storage core and lifecycle model, backed by per-fragment sharded `indexdb`. Keep it for deployments that explicitly want the validated indexdb path.
 > - `N2` (`0.2.0`)
   Multi-node clustering and placement layer built on top of the shared `N1` storage core.
 > - `NS` (`1.0.0`)
@@ -77,9 +77,28 @@ Current release notes for the validated `N1 3.0.0`, `NS 1.0.0`, and `Registry 0.
 
 ## Core Concepts
 
-### N1
+### N1 Edge
 
-`N1 Standard` is the storage kernel backed by per-fragment sharded `indexdb`.
+`N1 Edge 1.0.0` is the primary N1 storage kernel and the default N1 face for new deployments.
+
+It keeps the N1 object/blob plane, repair model, redistribution model, GC model, and public route shape, but moves the active storage authority into explicit Edge planes:
+
+```text
+index_root/<fragment_hash>/
+  .blobs/<version-id>/
+    <shard-or-parity-file>
+  .objects/@o_<object-id>/
+    <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
+  docs/video.mp4 -> @o_<object-id>
+```
+
+Folders are real directories. File names are namespace symlinks whose payload is a stable object id. Object records live in flat `.objects/@o_<object-id>/` directories, each committed version is an immutable `.ndx` file, and normal listing reads direct directory children plus `.ndx` filenames only. Payload shards live under the explicit internal `.blobs/` directory so user namespace names such as `blob/` remain valid. Normal listing does not decode `.ndx` bodies.
+
+Use `N1 Edge` when the goal is the Linux-first, IO-bound N1 storage kernel.
+
+### N1 Standard
+
+`N1 Standard` is the secondary N1 engine line backed by per-fragment sharded `indexdb`.
 
 It is responsible for:
 
@@ -97,32 +116,13 @@ It is responsible for:
 - standalone namespace routes
 - POSIX-style namespace access
 
-`N1 3.0` is best thought of as:
+`N1 Standard 3.0` is best thought of as:
 
 `object storage core + POSIX namespace front tier inside per-fragment indexdb`
 
-It is not the user/account control plane and it is not the business metadata layer.
+It is not the user/account control plane and it is not the business metadata layer. Use Standard when a deployment explicitly wants the sharded `indexdb` engine path instead of Edge.
 
 SMB/NAS access is no longer embedded in `N1`. Use standalone `NS` when Windows/macOS/Linux file-manager SMB workflows are needed.
-
-### N1 Edge
-
-`N1 Edge 1.0.0` is the primary filesystem-native N1 engine face.
-
-It keeps the N1 object/blob plane, repair model, redistribution model, GC model, and public route shape, but replaces the active index authority with filesystem records:
-
-```text
-index_root/<fragment_hash>/
-  .blobs/<version-id>/
-    <shard-or-parity-file>
-  .objects/@o_<object-id>/
-    <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
-  docs/video.mp4 -> @o_<object-id>
-```
-
-Folders are real directories. File names are namespace symlinks whose payload is a stable object id. Object records live in flat `.objects/@o_<object-id>/` directories, each committed version is an immutable `.ndx` file, and normal listing reads direct directory children plus `.ndx` filenames only. Payload shards live under the explicit internal `.blobs/` directory so user namespace names such as `blob/` remain valid. Normal listing does not decode `.ndx` bodies.
-
-Use `N1 Edge` when the goal is the pure filesystem-native, Linux-first, IO-bound N1 engine. Use `N1 Standard` when the deployment target is the validated sharded `indexdb` engine line.
 
 ### N2
 

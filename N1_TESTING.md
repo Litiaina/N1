@@ -2,7 +2,7 @@
 
 N1 tests are split into three gates. A green unit/workflow suite is useful, but it is not a production release signal by itself.
 
-N1 Standard and N1 Edge have different metadata engines. Standard release proof inspects sharded `indexdb`; Edge release proof must inspect filesystem-native `.ndx` records. Do not use Standard indexdb inspection as final Edge evidence.
+N1 Standard and N1 Edge have different metadata engines. Standard release proof inspects sharded `indexdb`; Edge release proof must inspect Edge namespace, Edge object-index `.ndx` records, and Edge blob-plane reachability. Do not use Standard indexdb inspection as final Edge evidence.
 
 ## Gate 1: In-Process Regression Suite
 

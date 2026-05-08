@@ -2084,17 +2084,25 @@ fn mtime_nanos(path: &Path) -> u128 {
 }
 
 fn latest_index_plane_mtime_nanos(fragment_root: &Path) -> u128 {
-    let mut latest = mtime_nanos(fragment_root);
+    let mut latest = 0;
     let Ok(entries) = fs::read_dir(fragment_root) else {
         return latest;
     };
     for entry in entries.filter_map(|entry| entry.ok()) {
-        if entry.file_name().to_str() == Some(BLOB_DIR) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if matches!(
+            name.as_ref(),
+            BLOB_DIR | FRAGMENT_META_FILE | TMP_DIR | LOCKS_DIR | GC_DIR | REPAIR_DIR
+        ) {
             continue;
         }
         let path = entry.path();
         latest = latest.max(mtime_nanos(&path));
-        if path.is_dir() {
+        if fs::symlink_metadata(&path)
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false)
+        {
             latest = latest.max(latest_index_plane_mtime_nanos(&path));
         }
     }
@@ -2804,6 +2812,66 @@ mod tests {
             blob_marker.is_file(),
             "index repair must not delete or overwrite the blob plane"
         );
+    }
+
+    #[test]
+    fn repair_fragment_replicas_ignores_newer_fragment_meta_on_stale_replica() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let roots = ensure_test_index_roots();
+        assert!(roots.len() >= 2);
+        let fragment = format!("edge-repair-stale-meta-{}", Ulid::new());
+        publish_logical_object(&roots, &fragment, "docs/original.txt", 123);
+
+        let one_disk_object_id = new_object_id();
+        let one_disk_meta = test_metadata(&fragment, &one_disk_object_id, 34);
+        let one_disk_object_dir =
+            object_index_dir(&roots[0], &fragment, &one_disk_object_id).expect("object dir");
+        fs::create_dir_all(&one_disk_object_dir).expect("create one-disk object dir");
+        write_atomic(
+            &one_disk_object_dir.join(ndx_file_name(&one_disk_meta)),
+            &encode(&one_disk_meta).expect("encode one-disk metadata"),
+        )
+        .expect("write one-disk metadata");
+        publish_namespace_link(
+            &roots[0],
+            &fragment,
+            "edge-redistribution/one-disk.txt",
+            &one_disk_object_id,
+        )
+        .expect("publish one-disk namespace link");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let stale_meta = roots[1].join(&fragment).join(FRAGMENT_META_FILE);
+        fs::write(&stale_meta, b"newer stale fragment metadata").expect("touch stale meta");
+
+        let (source, _score) = choose_edge_replica_source(&fragment).expect("source replica");
+        assert_eq!(
+            source,
+            roots[0].join(&fragment),
+            "newer .fragment.ndx on a stale replica must not outrank the richer index plane"
+        );
+
+        repair_fragment_all_partition_replicas(&fragment, false).expect("repair edge replicas");
+
+        for root in &roots {
+            assert!(
+                fs::symlink_metadata(
+                    root.join(&fragment)
+                        .join("edge-redistribution/one-disk.txt")
+                )
+                .expect("one-disk namespace link")
+                .file_type()
+                .is_symlink(),
+                "repair must preserve the namespace link created while one replica was active"
+            );
+            assert!(
+                root.join(&fragment)
+                    .join(OBJECTS_DIR)
+                    .join(format!("@o_{one_disk_object_id}"))
+                    .is_dir(),
+                "repair must replicate the one-disk object index"
+            );
+        }
     }
 
     #[test]

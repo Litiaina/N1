@@ -11,6 +11,8 @@ Current version: `3.0.0`
 - lifecycle, garbage collection, repair, redistribution, and health endpoints
 - POSIX-style namespace access on top of the same storage truth
 
+This document describes **N1 Standard**, the secondary sharded `indexdb` engine line. For the primary N1 face for new deployments, use **N1 Edge** and see `N1_EDGE_DOCUMENTATION.md`.
+
 SMB/NAS serving has moved to standalone `Litiaina NS`. `N1` no longer embeds the SMB server; keep `N1` focused on storage-kernel durability, namespace truth, repair, redistribution, and lifecycle.
 
 This document is written as an operator and integrator reference. It is meant to answer:
@@ -148,7 +150,7 @@ In disabled mode, N1 reports usage from blob files and rejects quota shrink belo
 
 ## Production Systemd Installation
 
-N1 Standard should be installed as a systemd service in production. This is the supported operator path because strict fragment quota requires stable startup ordering, journal logs, high file-descriptor limits, and permission to set XFS project quota limits.
+N1 Standard should be installed as a systemd service when operating the Standard engine line in production. N1 Edge is the primary N1 face for new deployments, but Standard still requires stable startup ordering, journal logs, high file-descriptor limits, and permission to set XFS project quota limits when it is used.
 
 The repo provides:
 

@@ -1,15 +1,13 @@
 # N1 Edge Documentation
 
-N1 Edge 1.0.0 is the primary filesystem-native N1 engine face.
+N1 Edge 1.0.0 is the primary N1 storage kernel.
 
-N1 Standard remains the sharded indexdb engine. N1 Edge is not an indexdb compatibility mode and does not use a database as the active metadata authority. Edge keeps the N1 blob/shard/parity plane, repair model, redistribution model, GC model, and public route shape, but replaces the active index authority with filesystem records.
+N1 Edge is the true N1 face for new deployments. N1 Standard remains available as the secondary sharded indexdb engine line. N1 Edge is not an indexdb compatibility mode and does not use a database as the active metadata authority. Edge keeps the N1 blob/shard/parity plane, repair model, redistribution model, GC model, and public route shape, but moves N1's active storage authority into the Edge namespace, Edge object index, and Edge blob plane.
 
 ## Identity
 
-N1 Edge is:
+N1 Edge is the Linux-first N1 storage kernel:
 
-- filesystem-native
-- Linux-first
 - IO-bound by design
 - zero-decode for normal listing
 - immutable for committed object version metadata
@@ -18,17 +16,22 @@ N1 Edge is:
 
 Public/operator wording should say:
 
+- N1 Edge
+- N1 Edge storage kernel
+- Edge namespace
+- Edge object index
+- Edge blob plane
 - N1 Edge index
-- filesystem-native index
 - `.ndx` metadata record
 - per-fragment Edge index
-- N1 Edge storage kernel
 
-Do not describe Edge as sqlite-backed, indexdb-backed, database-backed, or a sharded database. Those describe N1 Standard, not N1 Edge.
+Do not describe Edge publicly as just a filesystem index, a filesystem database, sqlite-backed, indexdb-backed, database-backed, or a sharded database. Those either reduce Edge to an implementation detail or describe N1 Standard, not N1 Edge.
+
+Internally, Edge deliberately uses Linux filesystem and kernel semantics for namespace movement, atomic publish, directory scanning, symlink identity, and durability. That is the execution substrate, not the product identity. The public identity is N1 Edge.
 
 ## Final Disk Layout
 
-Each configured index root contains one Edge index tree per fragment:
+Each configured index root contains one Edge storage-kernel tree per fragment:
 
 ```text
 <index_root>/<fragment_hash>/
@@ -50,7 +53,7 @@ Each configured index root contains one Edge index tree per fragment:
     video.mp4 -> @o_<object-id>
 ```
 
-Edge blob payload layout is explicit-internal:
+Edge blob payload layout is explicit and internal:
 
 ```text
 <blob_root>/<fragment_hash>/.blobs/<version_id>/<shard-or-parity-file>
@@ -66,7 +69,7 @@ It is not object metadata truth. It is not a namespace catalog. It is not a data
 
 ## Namespace And Object Truth
 
-N1 Edge has three clear planes:
+N1 Edge has three clear storage planes:
 
 - Namespace: real directories and file symlinks.
 - Object index: flat `.objects/@o_<object-id>/` directories with immutable `.ndx` versions.
@@ -320,9 +323,9 @@ Archive download routes use namespace truth and then decode selected `.ndx` reco
 
 ## Operational Tradeoff
 
-N1 Edge is optimized for durable object storage, large byte flow, POSIX movement, and bounded memory. It can store many small objects, but tiny-object storms pay filesystem commit and EC flush overhead per object. For very high counts of tiny files, archiving or batching before upload is usually more efficient.
+N1 Edge is optimized for durable object storage, large byte flow, POSIX movement, and bounded memory. It can store many small objects, but tiny-object storms pay kernel namespace commit and EC flush overhead per object. For very high counts of tiny files, archiving or batching before upload is usually more efficient.
 
-This is an intentional storage-kernel tradeoff: Edge stays close to the filesystem and kernel instead of hiding the workload in RAM-heavy caches.
+This is an intentional storage-kernel tradeoff: Edge keeps storage truth in explicit Edge planes and leans on the kernel for durable movement and publish semantics instead of hiding the workload in RAM-heavy caches.
 
 ## Verification
 
