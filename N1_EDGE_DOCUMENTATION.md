@@ -1,6 +1,6 @@
 # N1 Edge Documentation
 
-N1 Edge 1.0.0 is the primary N1 storage kernel.
+N1 Edge 1.0.1 is the primary N1 storage kernel.
 
 N1 Edge is the true N1 face for new deployments. N1 Standard remains available as the secondary sharded indexdb engine line. N1 Edge is not an indexdb compatibility mode and does not use a database as the active metadata authority. Edge keeps the N1 blob/shard/parity plane, repair model, redistribution model, GC model, and public route shape, but moves N1's active storage authority into the Edge namespace, Edge object index, and Edge blob plane.
 

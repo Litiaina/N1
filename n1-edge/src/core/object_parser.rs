@@ -1,6 +1,6 @@
 use crate::core::disk_manager::{ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo};
 use crate::core::header_parser::parse_range_header;
-use crate::core::recovery::read_or_recover_chunk;
+use crate::core::recovery::read_or_recover_chunk_streaming;
 use crate::enums::app_error_enum::AppError;
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -166,6 +166,7 @@ fn shard_dir_with_locality_hint<'a>(
 
 async fn read_chunk_with_retries(
     file_cache: &mut HashMap<String, File>,
+    recovery_file_cache: &mut HashMap<String, File>,
     shard_dir: &PathBuf,
     part: Arc<PartMetadata>,
     shard_index: usize,
@@ -175,8 +176,9 @@ async fn read_chunk_with_retries(
 ) -> Result<Vec<u8>, AppError> {
     let mut last_err: Option<AppError> = None;
     for attempt in 0..3usize {
-        match read_or_recover_chunk(
+        match read_or_recover_chunk_streaming(
             file_cache,
+            recovery_file_cache,
             shard_dir,
             Arc::clone(&part),
             shard_index,
@@ -190,6 +192,7 @@ async fn read_chunk_with_retries(
             Err(e) => {
                 last_err = Some(e);
                 file_cache.clear();
+                recovery_file_cache.clear();
                 if attempt < 2 {
                     tokio::time::sleep(Duration::from_millis(4)).await;
                 }
@@ -276,6 +279,7 @@ pub async fn stream_object_logic(
         parts: Vec<Arc<PartMetadata>>,
         shard_dirs: Vec<PathBuf>,
         file_cache: HashMap<String, File>,
+        recovery_file_cache: HashMap<String, File>,
         current_part_idx: usize,
         current_part_offset: u64,
         stripe_size: usize,
@@ -313,6 +317,7 @@ pub async fn stream_object_logic(
         parts,
         shard_dirs,
         file_cache: HashMap::new(),
+        recovery_file_cache: HashMap::new(),
         current_part_idx: start_part_index,
         current_part_offset: start_part_offset,
         stripe_size: stripe_size_bytes,
@@ -332,6 +337,7 @@ pub async fn stream_object_logic(
                 state.current_part_idx += 1;
                 state.current_part_offset = part_end_global;
                 state.file_cache.clear();
+                state.recovery_file_cache.clear();
                 continue;
             }
 
@@ -421,6 +427,7 @@ pub async fn stream_object_logic(
 
                 let data_result = read_chunk_with_retries(
                     &mut state.file_cache,
+                    &mut state.recovery_file_cache,
                     shard_dir,
                     Arc::clone(part),
                     shard_index,

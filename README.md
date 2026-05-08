@@ -19,7 +19,7 @@
 
 This repository contains the storage platform stack built around five runtime components:
 
-> - `N1 Edge` (`1.0.0`)
+> - `N1 Edge` (`1.0.1`)
   Primary N1 storage kernel with an Edge namespace, flat immutable `.objects/@o_<object-id>` records, zero-decode listing, and the N1 blob/shard/parity plane. This is the true N1 face for new deployments. See `N1_EDGE_DOCUMENTATION.md`.
 > - `N1 Standard` (`3.0.0`)
   Secondary N1 engine line with the same object-storage core and lifecycle model, backed by per-fragment sharded `indexdb`. Keep it for deployments that explicitly want the validated indexdb path.
@@ -79,7 +79,7 @@ Current release notes for the validated `N1 3.0.0`, `NS 1.0.0`, and `Registry 0.
 
 ### N1 Edge
 
-`N1 Edge 1.0.0` is the primary N1 storage kernel and the default N1 face for new deployments.
+`N1 Edge 1.0.1` is the primary N1 storage kernel and the default N1 face for new deployments.
 
 It keeps the N1 object/blob plane, repair model, redistribution model, GC model, and public route shape, but moves the active storage authority into explicit Edge planes:
 
