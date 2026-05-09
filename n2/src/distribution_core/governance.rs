@@ -4,6 +4,9 @@ use crate::distribution_core::model::{
     GovernanceAppendResponse, GovernanceMembershipEntry, GovernanceVoteRequest,
     GovernanceVoteResponse, N2GovernanceStateResponse,
 };
+use crate::distribution_core::peer::{
+    INTERNAL_TOKEN_HEADER, normalize_endpoint, validate_internal_token,
+};
 use crate::distribution_core::state::{
     apply_membership_snapshot, ensure_membership_artifacts, get_membership,
 };
@@ -17,7 +20,6 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
-const N2_INTERNAL_TOKEN_HEADER: &str = "x-n2-internal-token";
 const GOVERNANCE_LEADER_LEASE_MS: u64 = 10_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -84,20 +86,6 @@ fn governance_journal_path() -> PathBuf {
         n2_runtime_config().membership_file.as_path(),
         "governance-log.jsonl",
     )
-}
-
-async fn validate_internal_token(headers: &HeaderMap) -> Result<(), AppError> {
-    let cfg = n2_runtime_config();
-    let Some(token) = headers
-        .get(N2_INTERNAL_TOKEN_HEADER)
-        .and_then(|v| v.to_str().ok())
-    else {
-        return Err(AppError::Forbidden("missing internal n2 token".to_string()));
-    };
-    if token != cfg.internal_token {
-        return Err(AppError::Forbidden("invalid internal n2 token".to_string()));
-    }
-    Ok(())
 }
 
 async fn write_atomic_json<T: Serialize>(
@@ -315,10 +303,6 @@ fn active_peers(
         .collect()
 }
 
-fn normalize_endpoint(endpoint: &str) -> String {
-    endpoint.trim().trim_end_matches('/').to_ascii_lowercase()
-}
-
 fn commit_notification_endpoints(
     current: &ClusterMembership,
     next: &ClusterMembership,
@@ -364,7 +348,7 @@ async fn request_vote_from_peer(
     let response = client
         .post(url)
         .header(
-            N2_INTERNAL_TOKEN_HEADER,
+            INTERNAL_TOKEN_HEADER,
             n2_runtime_config().internal_token.as_str(),
         )
         .json(request)
@@ -404,7 +388,7 @@ async fn append_to_peer(
     let response = client
         .post(url)
         .header(
-            N2_INTERNAL_TOKEN_HEADER,
+            INTERNAL_TOKEN_HEADER,
             n2_runtime_config().internal_token.as_str(),
         )
         .json(request)
@@ -447,7 +431,7 @@ async fn abort_peer_pending(
     let _ = client
         .post(url)
         .header(
-            N2_INTERNAL_TOKEN_HEADER,
+            INTERNAL_TOKEN_HEADER,
             n2_runtime_config().internal_token.as_str(),
         )
         .json(request)
@@ -738,7 +722,7 @@ pub async fn handle_governance_vote(
     headers: &HeaderMap,
     request: GovernanceVoteRequest,
 ) -> Result<GovernanceVoteResponse, AppError> {
-    validate_internal_token(headers).await?;
+    validate_internal_token(headers)?;
     let lock = runtime_lock().await?;
     let mut runtime = lock.lock().await;
 
@@ -796,7 +780,7 @@ pub async fn handle_governance_append(
     headers: &HeaderMap,
     request: GovernanceAppendRequest,
 ) -> Result<GovernanceAppendResponse, AppError> {
-    validate_internal_token(headers).await?;
+    validate_internal_token(headers)?;
     let lock = runtime_lock().await?;
 
     {
@@ -865,7 +849,7 @@ pub async fn handle_governance_abort(
     headers: &HeaderMap,
     request: GovernanceAbortRequest,
 ) -> Result<GovernanceAbortResponse, AppError> {
-    validate_internal_token(headers).await?;
+    validate_internal_token(headers)?;
     let lock = runtime_lock().await?;
     let mut runtime = lock.lock().await;
 
@@ -970,7 +954,7 @@ mod tests {
     fn internal_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
-            N2_INTERNAL_TOKEN_HEADER,
+            INTERNAL_TOKEN_HEADER,
             HeaderValue::from_str(n2_runtime_config().internal_token.as_str())
                 .expect("internal token"),
         );
@@ -1001,7 +985,7 @@ mod tests {
                      AxumState(state): AxumState<Arc<AsyncMutex<MockGovernancePeer>>>,
                      AxumJson(payload): AxumJson<GovernanceVoteRequest>| async move {
                         let token_ok = headers
-                            .get(N2_INTERNAL_TOKEN_HEADER)
+                            .get(INTERNAL_TOKEN_HEADER)
                             .and_then(|v| v.to_str().ok())
                             .map(|v| v == n2_runtime_config().internal_token.as_str())
                             .unwrap_or(false);
@@ -1031,7 +1015,7 @@ mod tests {
                      AxumState(state): AxumState<Arc<AsyncMutex<MockGovernancePeer>>>,
                      AxumJson(payload): AxumJson<GovernanceAppendRequest>| async move {
                         let token_ok = headers
-                            .get(N2_INTERNAL_TOKEN_HEADER)
+                            .get(INTERNAL_TOKEN_HEADER)
                             .and_then(|v| v.to_str().ok())
                             .map(|v| v == n2_runtime_config().internal_token.as_str())
                             .unwrap_or(false);
@@ -1070,7 +1054,7 @@ mod tests {
                      AxumState(state): AxumState<Arc<AsyncMutex<MockGovernancePeer>>>,
                      AxumJson(payload): AxumJson<GovernanceAbortRequest>| async move {
                         let token_ok = headers
-                            .get(N2_INTERNAL_TOKEN_HEADER)
+                            .get(INTERNAL_TOKEN_HEADER)
                             .and_then(|v| v.to_str().ok())
                             .map(|v| v == n2_runtime_config().internal_token.as_str())
                             .unwrap_or(false);

@@ -1,7 +1,16 @@
 pub mod api;
+pub mod cluster_shards;
+pub mod cluster_topology;
+pub mod codec;
 pub mod config;
 pub mod cross;
 pub mod data_plane;
 pub mod governance;
+pub mod map_store;
 pub mod model;
+pub mod nmtd;
+pub mod object_request;
+pub mod peer;
+pub mod peer_api;
+pub mod shard_session;
 pub mod state;

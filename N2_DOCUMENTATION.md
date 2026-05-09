@@ -22,6 +22,20 @@ This document focuses on:
 
 `N2` does not redesign the local blob/shard/parity kernel. Local physical durability remains `N1 Edge`; distributed object placement and `.nmtd` cluster metadata are N2 responsibilities.
 
+## N2 0.3 Rewrite Structure
+
+N2 0.3 is being shaped as a clean Litiaina cluster layer over the Edge kernel, not as a carry-over of the old pre-Edge N2 runtime.
+
+The active code boundaries are:
+
+- native N2 routes for cluster/object APIs under `/v4/n2/...`
+- peer routes for node-to-node shard, map, and governance traffic under `/v4/n2/internal/...`
+- S3 route face under `/s3/...`
+- `.nmtd` metadata primitives for filesystem object-map paths and names
+- N1 Edge as the local storage kernel dependency
+
+This keeps S3 compatibility as a product face, peer transport as a private cluster face, and `.nmtd` as the N2 metadata identity.
+
 ## N2 0.3 Storage Layout
 
 N2 uses filesystem metadata, not an external database.
@@ -116,6 +130,13 @@ Implemented object operations:
 - `HEAD /s3/{bucket}/{*key}` object metadata
 - `GET /s3/{bucket}/{*key}` read an object
 - `DELETE /s3/{bucket}/{*key}` delete an object
+- `POST /s3/{bucket}/{*key}?uploads` initiate a multipart upload
+- `PUT /s3/{bucket}/{*key}?partNumber=<n>&uploadId=<id>` upload a multipart part
+- `GET /s3/{bucket}/{*key}?uploadId=<id>` list uploaded parts
+- `POST /s3/{bucket}/{*key}?uploadId=<id>` complete multipart upload
+- `DELETE /s3/{bucket}/{*key}?uploadId=<id>` abort multipart upload
+
+S3 multipart upload state is staged outside committed object truth under the local N2 runtime storage area. Parts are not visible as objects. Completion streams the ordered parts into the N2 object plane and commits one `.nmtd` object map. Aborting removes the staging directory. This preserves the N2 rule that committed distributed object truth is `.nmtd`.
 
 Examples:
 
@@ -134,6 +155,25 @@ curl -k \
   "https://127.0.0.1:50001/s3/<fragment_hash>/videos/demo.mp4" \
   -H "Authorization: Bearer <token>" \
   -o demo.mp4
+```
+
+Multipart example:
+
+```bash
+UPLOAD_ID=$(curl -ks -X POST \
+  "https://127.0.0.1:50001/s3/<fragment_hash>/videos/big.bin?uploads" \
+  -H "Authorization: Bearer <token>" | sed -n 's:.*<UploadId>\\(.*\\)</UploadId>.*:\\1:p')
+
+curl -k -X PUT \
+  "https://127.0.0.1:50001/s3/<fragment_hash>/videos/big.bin?partNumber=1&uploadId=${UPLOAD_ID}" \
+  -H "Authorization: Bearer <token>" \
+  --data-binary @part-001.bin
+
+curl -k -X POST \
+  "https://127.0.0.1:50001/s3/<fragment_hash>/videos/big.bin?uploadId=${UPLOAD_ID}" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/xml" \
+  --data '<CompleteMultipartUpload><Part><PartNumber>1</PartNumber></Part></CompleteMultipartUpload>'
 ```
 
 Responses use S3-style XML for bucket/list operations and S3 object headers such as `ETag` and `x-amz-version-id`.
@@ -756,3 +796,4 @@ curl -k -X POST \
 - `Registry` remains the right layer for user-facing logical namespace, quota, share, and account behavior above `N2`.
 - `N2 0.3` uses `N1 Edge` locally and persists distributed object truth as `.nmtd`. N1 Standard/indexdb files are not active N2 metadata inputs.
 - A two-node proof run on real disks validated native N2 upload/download, S3 path-style put/head/get/list/delete, remote-node-loss read, `.nmtd` mirror presence, and absence of legacy `.n2map`/`cshard.meta` files. The proof summary is stored under `.n1-bench/n2-0.3.0-edge-rewrite-proof-20260508-150617/summary.json`.
+- The source tree now keeps N2 faces separate: native API routes, private peer API routes, and S3 routes are separate modules. S3 multipart staging is also isolated under the S3 face instead of being mixed into the core data plane.
