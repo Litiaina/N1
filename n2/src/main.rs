@@ -265,14 +265,14 @@ fn normalize_fs_backed_disk_paths(role: &str, paths: Vec<String>) -> Vec<String>
             let ft = meta.file_type();
             if ft.is_block_device() || ft.is_char_device() {
                 panic!(
-                    "{} entry '{}' is a device. N2 0.3 uses the N1 Edge storage kernel and requires directory paths.",
+                    "{} entry '{}' is a device. N2 0.4 uses the N1 Edge storage kernel and requires directory paths.",
                     role, trimmed
                 );
             }
         }
         if !meta.is_dir() {
             panic!(
-                "{} entry '{}' is not a directory. N2 0.3 uses the N1 Edge storage kernel and requires directory paths.",
+                "{} entry '{}' is not a directory. N2 0.4 uses the N1 Edge storage kernel and requires directory paths.",
                 role, trimmed
             );
         }
@@ -670,12 +670,10 @@ async fn validate_n2_startup_layout(config: &Ini, local_blob_roots: usize) {
             cluster_view.active_nodes
         );
     }
-    if source == "configured" && local_blob_roots > 1 && resolved.md == 0 {
-        tracing::warn!(
-            "N2 local shard storage is running with md=0 across {} blob root(s); one local disk loss can make a cluster shard unavailable",
-            local_blob_roots
-        );
-    }
+    tracing::info!(
+        "N2 local shard storage: one cluster EC layer, local N1 Edge shard objects use kd=1 md=0 across {} blob root(s)",
+        local_blob_roots
+    );
 }
 
 fn warn_if_running_as_root(binary: &str) {

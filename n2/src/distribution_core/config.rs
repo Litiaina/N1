@@ -257,11 +257,8 @@ fn auto_cluster_cross_params(active_nodes: usize) -> (u8, u8) {
 }
 
 fn auto_local_cross_params(blob_roots: usize) -> (u8, u8) {
-    match blob_roots {
-        0 | 1 => (1, 0),
-        2 => (1, 1),
-        n => ((n.saturating_sub(1)).min(u8::MAX as usize) as u8, 1),
-    }
+    let _ = blob_roots;
+    (1, 0)
 }
 
 pub fn validate_cross_params(
@@ -272,8 +269,11 @@ pub fn validate_cross_params(
     if params.kc == 0 {
         return Err("kc must be at least 1".to_string());
     }
-    if params.kd == 0 {
-        return Err("kd must be at least 1".to_string());
+    if params.kd != 1 || params.md != 0 {
+        return Err(format!(
+            "N2 0.4 uses one cluster-level EC layer; local N1 Edge shard storage must be kd=1 md=0, got kd={} md={}",
+            params.kd, params.md
+        ));
     }
 
     let cluster_width = usize::from(params.kc).saturating_add(usize::from(params.mc));
@@ -290,15 +290,8 @@ pub fn validate_cross_params(
         ));
     }
 
-    let data_width = usize::from(params.kd);
     if blob_roots == 0 {
         return Err("blob_store_disks has zero usable roots".to_string());
-    }
-    if data_width > blob_roots {
-        return Err(format!(
-            "kd={} exceeds local blob root count {}",
-            params.kd, blob_roots
-        ));
     }
 
     Ok(())
@@ -370,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_cross_params_rejects_too_wide_local_data_layout() {
+    fn validate_cross_params_rejects_second_local_ec_layer() {
         let err = validate_cross_params(
             CrossParams {
                 kc: 1,
@@ -381,8 +374,8 @@ mod tests {
             3,
             2,
         )
-        .expect_err("local data width should fail");
-        assert!(err.contains("kd=3 exceeds local blob root count 2"));
+        .expect_err("second local EC layer should fail");
+        assert!(err.contains("kd=1 md=0"));
     }
 
     #[test]
@@ -390,7 +383,7 @@ mod tests {
         let (kc, mc) = auto_cluster_cross_params(3);
         let (kd, md) = auto_local_cross_params(4);
         assert_eq!((kc, mc), (2, 1));
-        assert_eq!((kd, md), (3, 1));
+        assert_eq!((kd, md), (1, 0));
     }
 
     #[test]

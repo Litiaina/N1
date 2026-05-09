@@ -46,36 +46,26 @@ pub async fn s3_list_objects_v2(
         claims,
         Path(bucket.clone()),
         Query(ListN2ObjectsQuery {
-            limit: Some(limit.saturating_mul(8).clamp(limit, 10_000)),
+            limit: Some(limit),
             continuation: query.continuation_token.clone(),
+            prefix: if prefix.is_empty() {
+                None
+            } else {
+                Some(prefix.clone())
+            },
+            delimiter: if delimiter.is_empty() {
+                None
+            } else {
+                Some(delimiter.clone())
+            },
         }),
     )
     .await?
     .0;
 
     let mut contents = String::new();
-    let mut common_prefixes = Vec::<String>::new();
     let mut emitted = 0usize;
     for object in listed.objects {
-        if !prefix.is_empty() && !object.object_key.starts_with(prefix.as_str()) {
-            continue;
-        }
-        if !delimiter.is_empty() {
-            let rest = object
-                .object_key
-                .strip_prefix(prefix.as_str())
-                .unwrap_or(object.object_key.as_str());
-            if let Some(pos) = rest.find(delimiter.as_str()) {
-                let common = format!("{}{}", prefix, &rest[..pos + delimiter.len()]);
-                if !common_prefixes.iter().any(|v| v == &common) {
-                    common_prefixes.push(common);
-                }
-                continue;
-            }
-        }
-        if emitted >= limit {
-            break;
-        }
         emitted = emitted.saturating_add(1);
         let key = xml_escape(object.object_key.as_str());
         let last_modified = unix_to_rfc3339(object.committed_at);
@@ -89,7 +79,8 @@ pub async fn s3_list_objects_v2(
         );
     }
 
-    let common_xml = common_prefixes
+    let common_xml = listed
+        .common_prefixes
         .into_iter()
         .map(|p| {
             format!(

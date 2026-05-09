@@ -18,9 +18,9 @@ use crate::distribution_core::config::{
     N2AutoMaintenanceMode, effective_cross_params, n2_runtime_config,
 };
 use crate::distribution_core::map_store::{
-    delete_n2_object_map_local, delete_n2_object_map_remote, list_fragment_n2_latest_maps,
-    list_fragment_n2_maps, list_n2_fragments, list_n2_maps_for_object, load_n2_object_map,
-    persist_n2_object_map,
+    delete_n2_object_map_local, delete_n2_object_map_remote, list_fragment_n2_maps,
+    list_fragment_n2_namespace_page, list_n2_fragments, list_n2_maps_for_object,
+    load_n2_object_map, persist_n2_object_map,
 };
 use crate::distribution_core::model::{
     CrossParams, DeleteN2ObjectQuery, GetObjectQuery, ListN2ObjectsQuery, ListN2VersionsQuery,
@@ -695,10 +695,27 @@ pub async fn list_n2_objects(
         .as_ref()
         .map(|v| v.trim().trim_matches('/').to_string())
         .filter(|v| !v.is_empty());
-    let scan_limit = limit.saturating_mul(1024).clamp(limit, 1_000_000);
-    let maps = list_fragment_n2_latest_maps(fragment.as_str(), scan_limit).await?;
+    let prefix = query
+        .prefix
+        .as_ref()
+        .map(|v| v.trim().trim_start_matches('/').to_string())
+        .filter(|v| !v.is_empty());
+    let delimiter = query
+        .delimiter
+        .as_ref()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let page = list_fragment_n2_namespace_page(
+        fragment.as_str(),
+        prefix.as_deref(),
+        delimiter.as_deref(),
+        limit,
+        continuation.as_deref(),
+    )
+    .await?;
 
-    let mut objects = maps
+    let objects = page
+        .maps
         .into_iter()
         .map(|map| N2ObjectSummary {
             object_key: map.object.object_key,
@@ -710,27 +727,15 @@ pub async fn list_n2_objects(
             shard_count: map.shards.len(),
         })
         .collect::<Vec<_>>();
-    objects.sort_by(|a, b| a.object_key.cmp(&b.object_key));
-
-    if let Some(cursor) = continuation.as_ref() {
-        objects.retain(|object| object.object_key.as_str() > cursor.as_str());
-    }
-
-    let has_more = objects.len() > limit;
-    let next_continuation = if has_more {
-        objects
-            .get(limit - 1)
-            .map(|object| object.object_key.clone())
-    } else {
-        None
-    };
-    objects.truncate(limit);
 
     Ok(AxumJson(N2ListObjectsResponse {
         fragment,
+        prefix,
+        delimiter,
         limit,
-        continuation: next_continuation,
-        has_more,
+        continuation: page.next_continuation,
+        has_more: page.has_more,
+        common_prefixes: page.common_prefixes,
         objects,
     }))
 }
@@ -2238,7 +2243,7 @@ mod tests {
                 !fs::try_exists(nmtd_path.with_extension("n2map"))
                     .await
                     .unwrap_or(false),
-                "N2 0.3 metadata must not create legacy .n2map files"
+                "N2 0.4 metadata must not create legacy .n2map files"
             );
         }
         assert!(
@@ -2732,6 +2737,8 @@ mod tests {
             AxumQuery(ListN2ObjectsQuery {
                 limit: Some(100),
                 continuation: None,
+                prefix: None,
+                delimiter: None,
             }),
         )
         .await
@@ -2743,6 +2750,42 @@ mod tests {
                 .iter()
                 .any(|row| row.object_key == destination_key)
         );
+
+        let root_delimited = list_n2_objects(
+            full_claims(fragment.as_str()),
+            AxumPath(fragment.clone()),
+            AxumQuery(ListN2ObjectsQuery {
+                limit: Some(100),
+                continuation: None,
+                prefix: None,
+                delimiter: Some("/".to_string()),
+            }),
+        )
+        .await
+        .expect("list n2 root common prefixes")
+        .0;
+        assert!(
+            root_delimited
+                .common_prefixes
+                .iter()
+                .any(|row| row == "archive/")
+        );
+
+        let archive_delimited = list_n2_objects(
+            full_claims(fragment.as_str()),
+            AxumPath(fragment.clone()),
+            AxumQuery(ListN2ObjectsQuery {
+                limit: Some(100),
+                continuation: None,
+                prefix: Some("archive/".to_string()),
+                delimiter: Some("/".to_string()),
+            }),
+        )
+        .await
+        .expect("list n2 archive prefix")
+        .0;
+        assert_eq!(archive_delimited.objects.len(), 1);
+        assert_eq!(archive_delimited.objects[0].object_key, destination_key);
 
         let delete_one = delete_n2_object(
             full_claims(fragment.as_str()),
@@ -2785,6 +2828,8 @@ mod tests {
             AxumQuery(ListN2ObjectsQuery {
                 limit: Some(100),
                 continuation: None,
+                prefix: None,
+                delimiter: None,
             }),
         )
         .await

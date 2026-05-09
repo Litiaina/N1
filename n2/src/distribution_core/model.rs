@@ -102,6 +102,8 @@ pub struct GetObjectQuery {
 pub struct ListN2ObjectsQuery {
     pub limit: Option<usize>,
     pub continuation: Option<String>,
+    pub prefix: Option<String>,
+    pub delimiter: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -294,9 +296,12 @@ pub struct N2ObjectSummary {
 #[derive(Clone, Debug, Serialize)]
 pub struct N2ListObjectsResponse {
     pub fragment: String,
+    pub prefix: Option<String>,
+    pub delimiter: Option<String>,
     pub limit: usize,
     pub continuation: Option<String>,
     pub has_more: bool,
+    pub common_prefixes: Vec<String>,
     pub objects: Vec<N2ObjectSummary>,
 }
 

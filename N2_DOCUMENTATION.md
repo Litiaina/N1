@@ -1,4 +1,4 @@
-# N2 0.3 API Documentation
+# N2 0.4 API Documentation
 
 `N2` is the multi-node clustering and placement layer for the `N1 Edge` storage kernel. It is a rewrite of the active N2 storage path: N2 owns distributed placement, peer transport, reconcile, and cluster object metadata while each node uses `N1 Edge` as its local storage kernel.
 
@@ -17,14 +17,15 @@ This document focuses on:
 - cluster view and governance state
 - rendezvous placement of cluster shards
 - multi-node object ingest and read
-- filesystem `.nmtd` object-map persistence and reconcile
+- real-prefix N2 namespace directories with symlink object entries
+- immutable filesystem `.nmtd` object-map persistence and reconcile
 - internal peer transport between `N2` nodes
 
-`N2` does not redesign the local blob/shard/parity kernel. Local physical durability remains `N1 Edge`; distributed object placement and `.nmtd` cluster metadata are N2 responsibilities.
+`N2` does not use N1 Edge's rich namespace for user object keys. N2 owns the distributed namespace and stores physical shard objects into the local N1 Edge storage kernel using internal shard identity. Distributed EC is performed once at the N2 layer; local N1 Edge shard storage is a single local shard object (`kd=1`, `md=0`) by design.
 
-## N2 0.3 Rewrite Structure
+## N2 0.4 Rewrite Structure
 
-N2 0.3 is being shaped as a clean Litiaina cluster layer over the Edge kernel, not as a carry-over of the old pre-Edge N2 runtime.
+N2 0.4 is being shaped as a clean Litiaina cluster layer over the Edge kernel, not as a carry-over of the old pre-Edge N2 runtime.
 
 The active code boundaries are:
 
@@ -36,30 +37,42 @@ The active code boundaries are:
 
 This keeps S3 compatibility as a product face, peer transport as a private cluster face, and `.nmtd` as the N2 metadata identity.
 
-## N2 0.3 Storage Layout
+## N2 0.4 Storage Layout
 
 N2 uses filesystem metadata, not an external database.
 
-Object maps are stored as `.nmtd` files under each configured index root:
+The mutable N2 namespace is a real directory tree. Object names are symlinks to immutable object-map records:
+
+```text
+<index_root>/<fragment_hash>/n2/namespace/videos/demo.mp4
+  -> <index_root>/<fragment_hash>/n2/objects/<hh>/<hh>/<hh>/<hh>/<object_key_hash>
+```
+
+Object maps are immutable `.nmtd` files under each configured index root:
 
 ```text
 <index_root>/<fragment_hash>/n2/objects/<hh>/<hh>/<hh>/<hh>/<object_key_hash>/<version_id>/.nmtd
 <index_root>/<fragment_hash>/n2/objects/<hh>/<hh>/<hh>/<hh>/<object_key_hash>/.nlatest
 ```
 
+Normal prefix listing reads the real namespace directory first. A delimiter listing such as `prefix=videos/&delimiter=/` opens the `videos/` namespace directory directly and returns direct children/common prefixes without walking the whole cluster map tree.
+
 Local cluster shards are stored under each configured blob root:
 
 ```text
 <blob_root>/<fragment_hash>/n2/shards/<version_id>/cshard_<cluster_shard_index>/
-  disk_shard_*.bin
+  disk_shard_0.bin
   .nmtd
 ```
 
-Forbidden legacy active metadata for N2 0.3:
+`disk_shard_0.bin` is the exact cluster shard payload. N2 0.4 does not run a second local erasure-code pass under each node. Node/disk survivability is handled by the N2 cluster EC plan and by the local N1 Edge storage kernel around the shard object.
+
+Forbidden legacy active metadata for N2 0.4:
 
 - `.n2map`
 - `.n2latest`
 - `cshard.meta`
+- local second-layer `kd>1` or `md>0` EC for N2 shard storage
 - any N1 Standard/indexdb metadata as the active N2 map authority
 
 The local `N1 Edge` kernel may still own its own Edge runtime files and fragment metadata. N2's distributed object truth is `.nmtd`.
@@ -235,8 +248,8 @@ The committed cluster object map contains:
 - `params`:
   - `kc`
   - `mc`
-  - `kd`
-  - `md`
+  - `kd` (`1` in N2 0.4)
+  - `md` (`0` in N2 0.4)
 - `stripe_block_size`
 - `total_size_bytes`
 - `content_type`
@@ -259,8 +272,8 @@ Representative response:
   "params": {
     "kc": 2,
     "mc": 1,
-    "kd": 2,
-    "md": 1
+    "kd": 1,
+    "md": 0
   },
   "stripe_block_size": 1048576,
   "total_size_bytes": 10485760,
@@ -444,8 +457,8 @@ Query parameters:
 - `expected_epoch` optional
 - `kc` optional
 - `mc` optional
-- `kd` optional
-- `md` optional
+- `kd` optional, must be `1` if supplied
+- `md` optional, must be `0` if supplied
 - `stripe_block_size` optional
 - `content_type` optional
 
@@ -647,8 +660,8 @@ Query parameters:
 
 - `uid` optional
 - `object_key` optional
-- `kd` required
-- `md` required
+- `kd` required, must be `1`
+- `md` required, must be `0`
 - `stripe_block_size` required
 
 Response:
@@ -765,7 +778,7 @@ curl -k \
 
 ```bash
 curl -k -X POST \
-  "https://127.0.0.1:50001/v4/n2/object/fragment-a/videos/demo.mp4?kc=2&mc=1&kd=2&md=1&content_type=video/mp4" \
+  "https://127.0.0.1:50001/v4/n2/object/fragment-a/videos/demo.mp4?kc=2&mc=1&content_type=video/mp4" \
   -H "Authorization: Bearer <token>" \
   --data-binary @demo.mp4
 ```
@@ -794,6 +807,8 @@ curl -k -X POST \
 - Membership changes are operator workflows. Treat them like control-plane operations, not end-user object operations.
 - Internal peer routes are intentionally low-level and should not be used as an application integration surface.
 - `Registry` remains the right layer for user-facing logical namespace, quota, share, and account behavior above `N2`.
-- `N2 0.3` uses `N1 Edge` locally and persists distributed object truth as `.nmtd`. N1 Standard/indexdb files are not active N2 metadata inputs.
-- A two-node proof run on real disks validated native N2 upload/download, S3 path-style put/head/get/list/delete, remote-node-loss read, `.nmtd` mirror presence, and absence of legacy `.n2map`/`cshard.meta` files. The proof summary is stored under `.n1-bench/n2-0.3.0-edge-rewrite-proof-20260508-150617/summary.json`.
+- `N2 0.4` uses `N1 Edge` locally and persists distributed object truth as `.nmtd`. N1 Standard/indexdb files are not active N2 metadata inputs.
+- `N2 0.4` performs one cluster EC pass. Local shard storage is `kd=1`, `md=0`, so uploads do not pay a second per-node EC encode.
+- Prefix listing uses the N2 namespace tree first. Delimiter listing is direct-directory IO, not a whole-map scan.
+- The older `N2 0.3` proof remains historical evidence for the Edge rewrite. `N2 0.4` requires a fresh multi-node proof before a 1.0 release decision.
 - The source tree now keeps N2 faces separate: native API routes, private peer API routes, and S3 routes are separate modules. S3 multipart staging is also isolated under the S3 face instead of being mixed into the core data plane.

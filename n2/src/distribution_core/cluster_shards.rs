@@ -17,12 +17,12 @@ use futures_util::StreamExt;
 use reqwest::Body as ReqwestBody;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use simd_erasure_core::{ReedSolomonDecoder, ReedSolomonEncoder};
+use simd_erasure_core::ReedSolomonDecoder;
 use std::collections::{HashMap, HashSet};
 use std::path::Path as StdPath;
 use std::pin::Pin;
 use tokio::fs::{self, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use ulid::Ulid;
@@ -87,20 +87,12 @@ pub(crate) async fn store_local_cluster_shard_from_file(
             "No blob roots configured".to_string(),
         ));
     }
-    let kd_usize = usize::from(kd);
-    let md_usize = usize::from(md);
-    if kd_usize == 0 {
-        return Err(AppError::BadRequest("kd must be >= 1".to_string()));
-    }
-    if blob_roots.len() < kd_usize {
-        return Err(AppError::InternalServerError(format!(
-            "insufficient blob roots for kd={} (have {})",
-            kd_usize,
-            blob_roots.len()
-        )));
+    if kd != 1 || md != 0 {
+        return Err(AppError::BadRequest(
+            "N2 0.4 uses one cluster-level EC layer; local N1 Edge shard storage must use kd=1 md=0".to_string(),
+        ));
     }
 
-    let nd = kd_usize.saturating_add(md_usize);
     let mut source_file = fs::File::open(source_path)
         .await
         .map_err(|e| AppError::Io(e, format!("open source shard {:?}", source_path)))?;
@@ -110,128 +102,49 @@ pub(crate) async fn store_local_cluster_shard_from_file(
         .map_err(|e| AppError::Io(e, format!("stat source shard {:?}", source_path)))?
         .len();
 
-    let stripe_data_width = stripe_block_size as u64 * kd_usize as u64;
-    let stripe_count = if source_size == 0 {
-        0
-    } else {
-        (source_size + stripe_data_width - 1) / stripe_data_width
-    };
-    let disk_shard_size_bytes = stripe_count * stripe_block_size as u64;
-
-    let mut writers = Vec::with_capacity(nd);
-    let mut disk_shards = Vec::with_capacity(nd);
-    for disk_shard_index in 0..nd {
-        let disk_idx = (cluster_shard_index + disk_shard_index) % blob_roots.len();
-        let cshard_dir = blob_roots[disk_idx]
-            .join(object.fragment.as_str())
-            .join("n2")
-            .join("shards")
-            .join(object.version_id.as_str())
-            .join(format!("cshard_{}", cluster_shard_index));
-        fs::create_dir_all(&cshard_dir)
-            .await
-            .map_err(|e| AppError::Io(e, format!("mkdir {:?}", cshard_dir)))?;
-
-        let shard_path = cshard_dir.join(format!("disk_shard_{}.bin", disk_shard_index));
-        let mut file = fs::File::create(&shard_path)
-            .await
-            .map_err(|e| AppError::Io(e, format!("create {:?}", shard_path)))?;
-        if disk_shard_size_bytes > 0 {
-            file.set_len(disk_shard_size_bytes)
-                .await
-                .map_err(|e| AppError::Io(e, format!("prealloc {:?}", shard_path)))?;
-            file.seek(SeekFrom::Start(0))
-                .await
-                .map_err(|e| AppError::Io(e, format!("seek {:?}", shard_path)))?;
-        }
-        writers.push(file);
-
-        disk_shards.push(N2DiskShardRef {
-            disk_shard_index,
-            absolute_path: shard_path.to_string_lossy().to_string(),
-            size_bytes: disk_shard_size_bytes,
-            checksum: String::new(),
-            is_parity: disk_shard_index >= kd_usize,
-        });
-    }
-
+    let disk_idx = cluster_shard_index % blob_roots.len();
+    let cshard_dir = blob_roots[disk_idx]
+        .join(object.fragment.as_str())
+        .join("n2")
+        .join("shards")
+        .join(object.version_id.as_str())
+        .join(format!("cshard_{}", cluster_shard_index));
+    fs::create_dir_all(&cshard_dir)
+        .await
+        .map_err(|e| AppError::Io(e, format!("mkdir {:?}", cshard_dir)))?;
+    let shard_path = cshard_dir.join("disk_shard_0.bin");
+    let mut writer = fs::File::create(&shard_path)
+        .await
+        .map_err(|e| AppError::Io(e, format!("create {:?}", shard_path)))?;
     let mut cluster_hasher = Sha256::new();
-    let mut shard_hashers: Vec<Sha256> = (0..nd).map(|_| Sha256::new()).collect();
-
-    for _ in 0..stripe_count {
-        let mut stripe = vec![0u8; stripe_data_width as usize];
-        let mut read_total = 0usize;
-        while read_total < stripe.len() {
-            let n = source_file
-                .read(&mut stripe[read_total..])
-                .await
-                .map_err(|e| AppError::Io(e, "read source shard".to_string()))?;
-            if n == 0 {
-                break;
-            }
-            read_total += n;
-        }
-        if read_total > 0 {
-            cluster_hasher.update(&stripe[..read_total]);
-        }
-
-        if md_usize > 0 {
-            let mut encoder = ReedSolomonEncoder::new(kd_usize, md_usize, stripe_block_size)
-                .map_err(|e| AppError::InternalServerError(format!("local RS init: {}", e)))?;
-            for i in 0..kd_usize {
-                let start = i * stripe_block_size;
-                let end = start + stripe_block_size;
-                encoder
-                    .add_original_shard(&stripe[start..end])
-                    .map_err(|e| AppError::InternalServerError(format!("local RS add: {}", e)))?;
-            }
-            let encoded = encoder
-                .encode()
-                .map_err(|e| AppError::InternalServerError(format!("local RS encode: {}", e)))?;
-
-            for i in 0..kd_usize {
-                let start = i * stripe_block_size;
-                let end = start + stripe_block_size;
-                let slice = &stripe[start..end];
-                shard_hashers[i].update(slice);
-                writers[i]
-                    .write_all(slice)
-                    .await
-                    .map_err(|e| AppError::Io(e, "write local data disk shard".to_string()))?;
-            }
-            for i in 0..md_usize {
-                let parity = encoded.recovery(i).ok_or_else(|| {
-                    AppError::InternalServerError("local missing parity shard".to_string())
-                })?;
-                shard_hashers[kd_usize + i].update(parity);
-                writers[kd_usize + i]
-                    .write_all(parity)
-                    .await
-                    .map_err(|e| AppError::Io(e, "write local parity disk shard".to_string()))?;
-            }
-        } else {
-            for i in 0..kd_usize {
-                let start = i * stripe_block_size;
-                let end = start + stripe_block_size;
-                let slice = &stripe[start..end];
-                shard_hashers[i].update(slice);
-                writers[i]
-                    .write_all(slice)
-                    .await
-                    .map_err(|e| AppError::Io(e, "write local disk shard".to_string()))?;
-            }
-        }
-    }
-
-    for w in &mut writers {
-        w.flush()
+    let mut buf = vec![0u8; stripe_block_size.max(64 * 1024)];
+    loop {
+        let n = source_file
+            .read(&mut buf)
             .await
-            .map_err(|e| AppError::Io(e, "flush local disk shard".to_string()))?;
+            .map_err(|e| AppError::Io(e, "read source shard".to_string()))?;
+        if n == 0 {
+            break;
+        }
+        cluster_hasher.update(&buf[..n]);
+        writer
+            .write_all(&buf[..n])
+            .await
+            .map_err(|e| AppError::Io(e, "write local cluster shard".to_string()))?;
     }
+    writer
+        .flush()
+        .await
+        .map_err(|e| AppError::Io(e, "flush local cluster shard".to_string()))?;
 
-    for (idx, hash) in shard_hashers.iter_mut().enumerate() {
-        disk_shards[idx].checksum = hex::encode(hash.clone().finalize());
-    }
+    let checksum = hex::encode(cluster_hasher.clone().finalize());
+    let disk_shards = vec![N2DiskShardRef {
+        disk_shard_index: 0,
+        absolute_path: shard_path.to_string_lossy().to_string(),
+        size_bytes: source_size,
+        checksum: checksum.clone(),
+        is_parity: false,
+    }];
 
     let local_meta = LocalClusterShardMeta {
         fragment: object.fragment.clone(),
@@ -241,7 +154,7 @@ pub(crate) async fn store_local_cluster_shard_from_file(
         md,
         stripe_block_size,
         cluster_size_bytes: source_size,
-        disk_shard_size_bytes,
+        disk_shard_size_bytes: source_size,
         disk_shards: disk_shards.clone(),
     };
     let local_meta_bytes = rmp_serde::to_vec(&local_meta).map_err(|e| {
@@ -267,7 +180,7 @@ pub(crate) async fn store_local_cluster_shard_from_file(
         node_id: cfg.node_id.clone(),
         endpoint: cfg.node_endpoint.clone(),
         size_bytes: source_size,
-        checksum: hex::encode(cluster_hasher.finalize()),
+        checksum,
         disk_shards,
     })
 }
@@ -625,107 +538,27 @@ pub(crate) async fn read_local_cluster_shard(
     let meta = load_local_cluster_shard_meta(fragment, version_id, cluster_shard_index).await?;
     let kd = usize::from(meta.kd);
     let md = usize::from(meta.md);
-    if kd == 0 {
+    if kd != 1 || md != 0 {
         return Err(AppError::InternalServerError(
-            "local cshard meta has invalid kd".to_string(),
+            "N2 0.4 local shard metadata must be kd=1 md=0".to_string(),
         ));
     }
     if meta.cluster_size_bytes == 0 {
         return Ok(Vec::new());
     }
-    let stripe_count = if meta.disk_shard_size_bytes == 0 {
-        0
-    } else {
-        (meta.disk_shard_size_bytes / meta.stripe_block_size as u64) as usize
-    };
-
-    let mut files = HashMap::<usize, fs::File>::new();
-    for shard in &meta.disk_shards {
-        if let Ok(file) = fs::File::open(shard.absolute_path.as_str()).await {
-            files.insert(shard.disk_shard_index, file);
-        }
-    }
-
-    let mut out = Vec::with_capacity((stripe_count * kd * meta.stripe_block_size).max(1024));
-    if md == 0 {
-        for stripe_idx in 0..stripe_count {
-            let offset = stripe_idx as u64 * meta.stripe_block_size as u64;
-            for disk_shard_index in 0..kd {
-                let file = files.get_mut(&disk_shard_index).ok_or_else(|| {
-                    AppError::InternalServerError(format!(
-                        "missing required data disk shard {} for cshard read",
-                        disk_shard_index
-                    ))
-                })?;
-                file.seek(SeekFrom::Start(offset))
-                    .await
-                    .map_err(|e| AppError::Io(e, "seek local data disk shard".to_string()))?;
-                let mut block = vec![0u8; meta.stripe_block_size];
-                file.read_exact(&mut block)
-                    .await
-                    .map_err(|e| AppError::Io(e, "read local data disk shard".to_string()))?;
-                out.extend_from_slice(&block);
-            }
-        }
-        out.truncate(meta.cluster_size_bytes as usize);
-        return Ok(out);
-    }
-
-    for stripe_idx in 0..stripe_count {
-        let offset = stripe_idx as u64 * meta.stripe_block_size as u64;
-        let mut decoder = ReedSolomonDecoder::new(kd, md, meta.stripe_block_size)
-            .map_err(|e| AppError::InternalServerError(format!("local RS decode init: {}", e)))?;
-
-        let mut originals: Vec<Option<Vec<u8>>> = vec![None; kd];
-        let mut added = 0usize;
-
-        for shard in &meta.disk_shards {
-            let Some(file) = files.get_mut(&shard.disk_shard_index) else {
-                continue;
-            };
-            if file.seek(SeekFrom::Start(offset)).await.is_err() {
-                continue;
-            }
-            let mut block = vec![0u8; meta.stripe_block_size];
-            if file.read_exact(&mut block).await.is_err() {
-                continue;
-            }
-
-            let add_res = if shard.disk_shard_index < kd {
-                originals[shard.disk_shard_index] = Some(block.clone());
-                decoder.add_original_shard(shard.disk_shard_index, &block)
-            } else {
-                decoder.add_recovery_shard(shard.disk_shard_index - kd, &block)
-            };
-            if add_res.is_ok() {
-                added = added.saturating_add(1);
-            }
-        }
-
-        if added < kd {
-            return Err(AppError::InternalServerError(format!(
-                "insufficient disk shards to rebuild cshard (need {}, have {})",
-                kd, added
-            )));
-        }
-
-        let decoded = decoder
-            .decode()
-            .map_err(|e| AppError::InternalServerError(format!("local RS decode: {}", e)))?;
-        for (idx, data) in decoded.restored_original_iter() {
-            if idx < kd {
-                originals[idx] = Some(data.to_vec());
-            }
-        }
-
-        for maybe in originals {
-            let block = maybe.ok_or_else(|| {
-                AppError::InternalServerError("missing restored original block".to_string())
-            })?;
-            out.extend_from_slice(&block);
-        }
-    }
-
+    let shard = meta
+        .disk_shards
+        .iter()
+        .find(|s| s.disk_shard_index == 0)
+        .ok_or_else(|| {
+            AppError::InternalServerError("local cshard metadata missing disk_shard_0".to_string())
+        })?;
+    let mut out = fs::read(shard.absolute_path.as_str()).await.map_err(|e| {
+        AppError::Io(
+            e,
+            format!("read local cluster shard {}", shard.absolute_path),
+        )
+    })?;
     out.truncate(meta.cluster_size_bytes as usize);
     Ok(out)
 }
