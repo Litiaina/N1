@@ -1,6 +1,6 @@
 # N1 Edge Documentation
 
-N1 Edge 1.0.1 is the primary N1 storage kernel.
+N1 Edge 1.1.0 is the primary N1 storage kernel.
 
 N1 Edge is the true N1 face for new deployments. N1 Standard remains available as the secondary sharded indexdb engine line. N1 Edge is not an indexdb compatibility mode and does not use a database as the active metadata authority. Edge keeps the N1 blob/shard/parity plane, repair model, redistribution model, GC model, and public route shape, but moves N1's active storage authority into the Edge namespace, Edge object index, and Edge blob plane.
 
@@ -37,9 +37,10 @@ Each configured index root contains one Edge storage-kernel tree per fragment:
 <index_root>/<fragment_hash>/
   .fragment.ndx
   .objects/
-    @o_<object-id>/
-      <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
-      <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
+    <hh>/
+      <hh>/
+        @o_<object-id>/
+          <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
   .uploads/
     <version_id>/
       manifest.ndx
@@ -65,14 +66,14 @@ Both disks may house both index and blob roots. The minimum N1 Edge profile rema
 
 `.fragment.ndx` is the per-fragment Edge control record. It stores fragment-level operational state such as quota/project identity, state, and timestamps.
 
-It is not object metadata truth. It is not a namespace catalog. It is not a database. Object truth is in `.objects/@o_<object-id>/*.ndx`, namespace truth is in real directories and symlink pointers, and payload truth remains in the blob plane.
+It is not object metadata truth. It is not a namespace catalog. It is not a database. Object truth is in `.objects/<hh>/<hh>/@o_<object-id>/*.ndx`, namespace truth is in real directories and symlink pointers, and payload truth remains in the blob plane.
 
 ## Namespace And Object Truth
 
 N1 Edge has three clear storage planes:
 
 - Namespace: real directories and file symlinks.
-- Object index: flat `.objects/@o_<object-id>/` directories with immutable `.ndx` versions.
+- Object index: two-level fanned `.objects/<hh>/<hh>/@o_<object-id>/` directories with immutable `.ndx` versions.
 - Blob plane: immutable shard/parity files under `<blob_root>/<fragment>/.blobs/<version_id>/`.
 
 The namespace symlink is the mutable POSIX face:
@@ -84,8 +85,10 @@ docs/video.mp4 -> @o_01KQ...
 The symlink payload is a stable object id. N1 reads it with `readlink` and resolves it to:
 
 ```text
-<index_root>/<fragment>/.objects/@o_01KQ.../
+<index_root>/<fragment>/.objects/<hh>/<hh>/@o_01KQ.../
 ```
+
+The fanout directories are derived from a stable hash of the object id. Namespace symlinks still store only `@o_<object-id>`, so folder rename and folder move never require symlink rewrites.
 
 The symlink target is intentionally not a depth-relative filesystem path. That makes folder rename and folder move safe: moving `docs/` to `archive/docs/` does not require rewriting child symlinks.
 
@@ -104,7 +107,7 @@ The `.ndx` body contains full immutable object metadata for download, verify, re
 Head/latest is:
 
 ```text
-max ULID among valid .ndx filenames under .objects/@o_<object-id>/
+max ULID among valid .ndx filenames under .objects/<hh>/<hh>/@o_<object-id>/
 ```
 
 There is no `.head`, mutable head pointer, object head table, version counter, sidecar summary file, or correctness cache.
@@ -138,7 +141,7 @@ For each direct child:
 For a file symlink, Edge:
 
 1. reads the symlink payload
-2. opens `.objects/@o_<object-id>/`
+2. opens `.objects/<hh>/<hh>/@o_<object-id>/`
 3. chooses the greatest valid ULID `.ndx` filename
 4. parses size, timestamp, extension, and version id from the filename
 5. returns the entry
@@ -193,7 +196,7 @@ Recover:
 mv .trash/docs/video.mp4 docs/video.mp4
 ```
 
-Hard delete removes the trash symlink or trash directory. After no live or trash symlink references an object id, Edge removes the unreferenced `.objects/@o_<object-id>/` index record so GC can reclaim headless blobs.
+Hard delete removes the trash symlink or trash directory. After no live or trash symlink references an object id, Edge removes the unreferenced `.objects/<hh>/<hh>/@o_<object-id>/` index record so GC can reclaim headless blobs.
 
 Rename, trash, and recover never move blobs.
 
@@ -204,7 +207,7 @@ Read paths decode `.ndx`; listing does not.
 Latest read:
 
 1. resolve logical path through namespace symlink
-2. open `.objects/@o_<object-id>/`
+2. open `.objects/<hh>/<hh>/@o_<object-id>/`
 3. choose greatest ULID `.ndx`
 4. decode `.ndx`
 5. read through the existing N1 blob/shard/parity plane
@@ -225,7 +228,7 @@ fsync parent directory
 publish or reuse namespace symlink
 ```
 
-If the logical path already points to an object id, the new version appends under the same `.objects/@o_<object-id>/` directory. Rename does not break version history.
+If the logical path already points to an object id, the new version appends under the same `.objects/<hh>/<hh>/@o_<object-id>/` directory. Rename does not break version history.
 
 ## Multipart Upload
 

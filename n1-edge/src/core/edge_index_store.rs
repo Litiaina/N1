@@ -292,6 +292,14 @@ fn object_dir_name_for_id(object_id: &str) -> Result<String, AppError> {
     ))
 }
 
+fn object_fanout_segments_for_id(object_id: &str) -> Result<(String, String), AppError> {
+    let object_id = normalize_object_id(object_id)?;
+    let mut hasher = Sha256::new();
+    hasher.update(object_id.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+    Ok((hash[0..2].to_string(), hash[2..4].to_string()))
+}
+
 pub(crate) fn object_id_from_dir_name(name: &str) -> Option<String> {
     normalize_object_id(name.strip_prefix(OBJECT_DIR_PREFIX)?).ok()
 }
@@ -301,9 +309,12 @@ pub(crate) fn object_index_dir(
     fragment: &str,
     object_id: &str,
 ) -> Result<PathBuf, AppError> {
+    let (fanout_a, fanout_b) = object_fanout_segments_for_id(object_id)?;
     Ok(root
         .join(fragment)
         .join(OBJECTS_DIR)
+        .join(fanout_a)
+        .join(fanout_b)
         .join(object_dir_name_for_id(object_id)?))
 }
 
@@ -406,6 +417,40 @@ pub(crate) fn object_dir_candidates(
     }
     out.sort();
     out.dedup();
+    Ok(out)
+}
+
+fn object_index_dirs_under_root(
+    root: &Path,
+    fragment: &str,
+) -> Result<Vec<(PathBuf, String)>, AppError> {
+    let objects_root = root.join(fragment).join(OBJECTS_DIR);
+    if !objects_root.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    for fanout_a in read_dir_names(&objects_root)? {
+        let fanout_a_dir = objects_root.join(&fanout_a);
+        if !fanout_a_dir.is_dir() {
+            continue;
+        }
+        for fanout_b in read_dir_names(&fanout_a_dir)? {
+            let fanout_b_dir = fanout_a_dir.join(&fanout_b);
+            if !fanout_b_dir.is_dir() {
+                continue;
+            }
+            for name in read_dir_names(&fanout_b_dir)? {
+                let Some(object_id) = object_id_from_dir_name(&name) else {
+                    continue;
+                };
+                let object_dir = fanout_b_dir.join(&name);
+                if object_dir.is_dir() {
+                    out.push((object_dir, object_id));
+                }
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -1613,14 +1658,8 @@ pub(crate) fn cleanup_unreferenced_object_indexes(fragment: &str) -> Result<usiz
     let mut removed = 0usize;
     let mut seen = HashSet::new();
     for fragment_root in existing_fragment_roots(fragment) {
-        let objects_root = fragment_root.join(OBJECTS_DIR);
-        if !objects_root.is_dir() {
-            continue;
-        }
-        for name in read_dir_names(&objects_root)? {
-            let Some(object_id) = object_id_from_dir_name(&name) else {
-                continue;
-            };
+        let root = fragment_root.parent().unwrap_or(&fragment_root);
+        for (_, object_id) in object_index_dirs_under_root(root, fragment)? {
             if referenced.contains(&object_id) || !seen.insert(object_id.clone()) {
                 continue;
             }
@@ -1929,11 +1968,7 @@ pub fn has_any_fragment_edge_index(fragment: &str) -> Result<bool, AppError> {
     Ok(existing_fragment_roots(fragment).into_iter().any(|root| {
         root.join(FRAGMENT_META_FILE).exists()
             || root.join(UPLOADS_DIR).exists()
-            || root
-                .join(OBJECTS_DIR)
-                .read_dir()
-                .map(|mut entries| entries.next().is_some())
-                .unwrap_or(false)
+            || count_object_index_records(root.parent().unwrap_or(&root), fragment) > 0
             || object_dirs_for_all_live(fragment)
                 .map(|v| !v.is_empty())
                 .unwrap_or(false)
@@ -1942,25 +1977,11 @@ pub fn has_any_fragment_edge_index(fragment: &str) -> Result<bool, AppError> {
 
 pub fn fragment_has_object_index_records(fragment: &str, roots: &[PathBuf]) -> bool {
     for root in roots {
-        let objects_root = root.join(fragment).join(OBJECTS_DIR);
-        let Ok(object_dirs) = fs::read_dir(&objects_root) else {
+        let Ok(object_dirs) = object_index_dirs_under_root(root, fragment) else {
             continue;
         };
-        for object_dir in object_dirs.filter_map(|entry| entry.ok()) {
-            let Ok(file_type) = object_dir.file_type() else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let file_name = object_dir.file_name();
-            if !file_name
-                .to_str()
-                .is_some_and(|name| name.starts_with(OBJECT_DIR_PREFIX))
-            {
-                continue;
-            }
-            let Ok(records) = fs::read_dir(object_dir.path()) else {
+        for (object_dir, _) in object_dirs {
+            let Ok(records) = fs::read_dir(object_dir) else {
                 continue;
             };
             for record in records.filter_map(|entry| entry.ok()) {
@@ -1977,26 +1998,12 @@ pub fn fragment_has_object_index_records(fragment: &str, roots: &[PathBuf]) -> b
 }
 
 fn count_object_index_records(root: &Path, fragment: &str) -> u64 {
-    let objects_root = root.join(fragment).join(OBJECTS_DIR);
-    let Ok(object_dirs) = fs::read_dir(&objects_root) else {
+    let Ok(object_dirs) = object_index_dirs_under_root(root, fragment) else {
         return 0;
     };
     let mut count = 0u64;
-    for object_dir in object_dirs.filter_map(|entry| entry.ok()) {
-        let Ok(file_type) = object_dir.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-        if !object_dir
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name.starts_with(OBJECT_DIR_PREFIX))
-        {
-            continue;
-        }
-        let Ok(records) = fs::read_dir(object_dir.path()) else {
+    for (object_dir, _) in object_dirs {
+        let Ok(records) = fs::read_dir(object_dir) else {
             continue;
         };
         for record in records.filter_map(|entry| entry.ok()) {
@@ -2796,9 +2803,8 @@ mod tests {
             "repair should restore mirrored Edge index"
         );
         assert!(
-            bad_root
-                .join(OBJECTS_DIR)
-                .join(format!("@o_{object_id}"))
+            live_object_dir(&roots[0], &fragment, &object_id)
+                .expect("object dir")
                 .is_dir(),
             "object index restored from the rich replica"
         );
@@ -2865,9 +2871,8 @@ mod tests {
                 "repair must preserve the namespace link created while one replica was active"
             );
             assert!(
-                root.join(&fragment)
-                    .join(OBJECTS_DIR)
-                    .join(format!("@o_{one_disk_object_id}"))
+                live_object_dir(root, &fragment, &one_disk_object_id)
+                    .expect("object dir")
                     .is_dir(),
                 "repair must replicate the one-disk object index"
             );
@@ -2894,9 +2899,8 @@ mod tests {
         let object_id = publish_logical_object(&roots, &fragment, "docs/video.mp4", 123);
 
         let stale_fragment_root = blob_only_root.join(&fragment);
-        let stale_object_dir = stale_fragment_root
-            .join(OBJECTS_DIR)
-            .join(format!("@o_{object_id}"));
+        let stale_object_dir =
+            live_object_dir(&blob_only_root, &fragment, &object_id).expect("stale object dir");
         fs::create_dir_all(&stale_object_dir).expect("create stale object dir");
         fs::write(
             stale_fragment_root.join(FRAGMENT_META_FILE),
@@ -2957,6 +2961,32 @@ mod tests {
         assert!(normalize_object_id("INCDT 122225.mp4").is_err());
         assert!(normalize_object_id("videos/clip.mp4").is_err());
         assert!(normalize_object_id("@o_01KQXRVALIDEDGEID0000000").is_ok());
+    }
+
+    #[test]
+    fn object_index_dir_uses_two_level_hash_fanout() {
+        let root = PathBuf::from("/edge-index");
+        let fragment = "fragment-a";
+        let object_id = "01KQXRVALIDEDGEID0000000";
+        let (fanout_a, fanout_b) =
+            object_fanout_segments_for_id(object_id).expect("fanout segments");
+        let path = object_index_dir(&root, fragment, object_id).expect("object dir");
+
+        assert_eq!(
+            path,
+            root.join(fragment)
+                .join(OBJECTS_DIR)
+                .join(fanout_a)
+                .join(fanout_b)
+                .join(format!("@o_{object_id}"))
+        );
+        assert_ne!(
+            path,
+            root.join(fragment)
+                .join(OBJECTS_DIR)
+                .join(format!("@o_{object_id}")),
+            "N1 Edge 1.1 object records must not use the old flat object directory"
+        );
     }
 
     #[test]

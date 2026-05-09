@@ -817,9 +817,11 @@ fn edge_object_dir_for_root(
         .trim_start_matches('/')
         .strip_prefix("@o_")
         .unwrap_or_else(|| object_key.trim().trim_start_matches('/'));
-    root.join(fragment_hash)
-        .join(".objects")
-        .join(format!("@o_{object_id}"))
+    edge_index_store::live_object_dir(root, fragment_hash, object_id).unwrap_or_else(|_| {
+        root.join(fragment_hash)
+            .join(".objects")
+            .join(".invalid-object-id")
+    })
 }
 
 async fn edge_object_dir_has_ndx(path: &Path) -> bool {

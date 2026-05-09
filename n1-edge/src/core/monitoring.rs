@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn deep_scan_counts_only_live_edge_index_records() {
         assert!(should_count_edge_index_record(Path::new(
-            "frag/docs/@o_abc/01HZ.123.456.7.ndx"
+            "frag/.objects/ab/cd/@o_abc/01HZ.123.456.7.ndx"
         )));
         assert!(!should_count_edge_index_record(Path::new(
             "frag/.intents/0001.pending.redist.intent.msgpack"
@@ -281,7 +281,7 @@ mod tests {
             "frag/.fragment.ndx"
         )));
         assert!(!should_count_edge_index_record(Path::new(
-            "frag/.trash/docs/@o_abc/01HZ.123.456.7.ndx"
+            "frag/.trash/.objects/ab/cd/@o_abc/01HZ.123.456.7.ndx"
         )));
     }
 }

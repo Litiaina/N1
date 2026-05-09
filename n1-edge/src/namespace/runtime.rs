@@ -1197,7 +1197,7 @@ pub fn unexpected_response(status: axum::http::StatusCode, context: &str) -> App
 mod tests {
     use super::*;
     use crate::core::disk_manager::{INDEX_STORE_DISKS, ObjectMetadata};
-    use crate::core::edge_index_store::{self, OBJECTS_DIR};
+    use crate::core::edge_index_store;
     use ulid::Ulid;
 
     fn ensure_test_index_roots() -> Vec<PathBuf> {
@@ -1355,9 +1355,8 @@ mod tests {
                     .join("video/my-video.mp4")
             ));
             assert!(
-                root.join(&fragment)
-                    .join(OBJECTS_DIR)
-                    .join(format!("@o_{object_id}"))
+                live_object_dir(root, &fragment, &object_id)
+                    .expect("object dir")
                     .is_dir(),
                 "soft delete must not move immutable object index"
             );
@@ -1375,10 +1374,8 @@ mod tests {
                     .join("video/my-video.mp4")
             ));
             assert!(
-                !root
-                    .join(&fragment)
-                    .join(OBJECTS_DIR)
-                    .join(format!("@o_{object_id}"))
+                !live_object_dir(root, &fragment, &object_id)
+                    .expect("object dir")
                     .exists(),
                 "hard delete removes unreferenced object index so GC can reclaim blobs"
             );
