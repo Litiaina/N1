@@ -2130,11 +2130,13 @@ fn choose_edge_replica_source(fragment: &str) -> Option<(PathBuf, EdgeReplicaSco
             Some((_, current_score, current_modified)) => {
                 let records = edge_replica_index_records(&score);
                 let current_records = edge_replica_index_records(current_score);
-                if records == 0 && current_records > 0 {
-                    false
-                } else if records > 0 && current_records == 0 {
+                if records > current_records {
                     true
+                } else if records < current_records {
+                    false
                 } else {
+                    // Maintenance and redistribution can touch stale replicas after a
+                    // one-disk write. Use mtime only when the Edge index content matches.
                     modified > *current_modified
                         || (modified == *current_modified && score > *current_score)
                 }
@@ -2855,6 +2857,71 @@ mod tests {
             source,
             roots[0].join(&fragment),
             "newer .fragment.ndx on a stale replica must not outrank the richer index plane"
+        );
+
+        repair_fragment_all_partition_replicas(&fragment, false).expect("repair edge replicas");
+
+        for root in &roots {
+            assert!(
+                fs::symlink_metadata(
+                    root.join(&fragment)
+                        .join("edge-redistribution/one-disk.txt")
+                )
+                .expect("one-disk namespace link")
+                .file_type()
+                .is_symlink(),
+                "repair must preserve the namespace link created while one replica was active"
+            );
+            assert!(
+                live_object_dir(root, &fragment, &one_disk_object_id)
+                    .expect("object dir")
+                    .is_dir(),
+                "repair must replicate the one-disk object index"
+            );
+        }
+    }
+
+    #[test]
+    fn repair_fragment_replicas_prefers_richer_replica_even_when_stale_plane_is_newer() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let roots = ensure_test_index_roots();
+        assert!(roots.len() >= 2);
+        let fragment = format!("edge-repair-stale-plane-{}", Ulid::new());
+        publish_logical_object(&roots, &fragment, "docs/original.txt", 123);
+
+        let one_disk_object_id = new_object_id();
+        let one_disk_meta = test_metadata(&fragment, &one_disk_object_id, 34);
+        let one_disk_object_dir =
+            object_index_dir(&roots[0], &fragment, &one_disk_object_id).expect("object dir");
+        fs::create_dir_all(&one_disk_object_dir).expect("create one-disk object dir");
+        write_atomic(
+            &one_disk_object_dir.join(ndx_file_name(&one_disk_meta)),
+            &encode(&one_disk_meta).expect("encode one-disk metadata"),
+        )
+        .expect("write one-disk metadata");
+        publish_namespace_link(
+            &roots[0],
+            &fragment,
+            "edge-redistribution/one-disk.txt",
+            &one_disk_object_id,
+        )
+        .expect("publish one-disk namespace link");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let stale_user_dir = roots[1].join(&fragment).join("maintenance-touched-stale-tree");
+        fs::create_dir_all(&stale_user_dir).expect("touch stale index plane");
+
+        assert!(
+            latest_index_plane_mtime_nanos(&roots[1].join(&fragment))
+                > latest_index_plane_mtime_nanos(&roots[0].join(&fragment)),
+            "stale replica must be newer to reproduce the redistribution regression"
+        );
+
+        let (source, _score) = choose_edge_replica_source(&fragment).expect("source replica");
+        assert_eq!(
+            source,
+            roots[0].join(&fragment),
+            "a touched stale plane must not outrank the richer one-disk write"
         );
 
         repair_fragment_all_partition_replicas(&fragment, false).expect("repair edge replicas");
