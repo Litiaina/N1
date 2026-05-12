@@ -1,11 +1,13 @@
 use crate::core::constants::{
-    FRAGMENT_METADATA_FILE, GC_SUFFIX, PARITY_SUFFIX, REDIST_TMP_SUFFIX, SHARD_SUFFIX,
+    EDGE_BLOB_DIR, FRAGMENT_METADATA_FILE, GC_SUFFIX, PARITY_SUFFIX, REDIST_TMP_SUFFIX,
+    SHARD_SUFFIX,
 };
 use crate::core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo,
     default_stripe_size,
 };
 use crate::core::ec::ErasureStreamWriter;
+use crate::core::edge_index_store;
 use crate::core::fragment_metadata::{
     fragment_index_partition_count, read_fragment_metadata, write_fragment_metadata,
 };
@@ -727,10 +729,13 @@ fn get_shard_dir_custom(
     is_trash: bool,
 ) -> PathBuf {
     let _ = is_trash;
-    disk_root.join(fragment_hash).join("blob").join(version_id)
+    disk_root
+        .join(fragment_hash)
+        .join(EDGE_BLOB_DIR)
+        .join(version_id)
 }
 
-fn get_partition_db_paths_custom(
+fn get_partition_intent_paths_custom(
     index_roots: &[PathBuf],
     fragment_hash: &str,
     object_key: &str,
@@ -772,8 +777,8 @@ fn get_partition_db_paths_custom(
         .into_iter()
         .map(|root| {
             root.join(fragment_hash)
-                .join("indexdb")
-                .join(format!("shard_{partition_id:04x}.ndxdb"))
+                .join(".intents")
+                .join(format!("partition_{partition_id:04x}.n1"))
         })
         .collect()
 }
@@ -785,7 +790,7 @@ fn get_all_intent_paths_custom(
     version_id: &str,
     is_trash: bool,
 ) -> Vec<PathBuf> {
-    get_partition_db_paths_custom(index_roots, fragment_hash, object_key)
+    get_partition_intent_paths_custom(index_roots, fragment_hash, object_key)
         .into_iter()
         .map(|db_path| {
             let partition_stem = db_path
@@ -799,6 +804,37 @@ fn get_all_intent_paths_custom(
             ))
         })
         .collect()
+}
+
+fn object_index_dir_for_root(
+    root: &Path,
+    fragment_hash: &str,
+    object_key: &str,
+    _is_trash: bool,
+) -> PathBuf {
+    let object_id = object_key
+        .trim()
+        .trim_start_matches('/')
+        .strip_prefix("@o_")
+        .unwrap_or_else(|| object_key.trim().trim_start_matches('/'));
+    edge_index_store::live_object_dir(root, fragment_hash, object_id).unwrap_or_else(|_| {
+        root.join(fragment_hash)
+            .join(".objects")
+            .join(".invalid-object-id")
+    })
+}
+
+async fn object_index_dir_has_ndx(path: &Path) -> bool {
+    let Ok(mut entries) = tokio_fs::read_dir(path).await else {
+        return false;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        if name.to_string_lossy().ends_with(".ndx") {
+            return true;
+        }
+    }
+    false
 }
 
 fn intent_dedupe_key(fragment: &str, object_key: &str, version_id: &str, is_trash: bool) -> String {
@@ -849,6 +885,7 @@ async fn remove_intent_paths_best_effort(intent_paths: &[PathBuf]) {
 
 pub async fn collect_redistribution_intent_debt(
     index_roots: &[PathBuf],
+    target_fragment: Option<String>,
 ) -> RedistributionIntentDebtSnapshot {
     if index_roots.is_empty() {
         return RedistributionIntentDebtSnapshot::default();
@@ -861,10 +898,12 @@ pub async fn collect_redistribution_intent_debt(
         let mut fragments = HashSet::new();
 
         for root in roots {
-            let indexdb_dir = root.join("indexdb");
-            if indexdb_dir.exists() {
-                // Allow callers to point directly at a fragment/indexdb directory if needed.
-                for entry in WalkDir::new(indexdb_dir).into_iter().filter_map(|e| e.ok()) {
+            let direct_intent_dir = root.join(".intents");
+            if target_fragment.is_none() && direct_intent_dir.exists() {
+                for entry in WalkDir::new(direct_intent_dir)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                {
                     if !entry.file_type().is_file() {
                         continue;
                     }
@@ -899,7 +938,16 @@ pub async fn collect_redistribution_intent_debt(
             if !root.exists() {
                 continue;
             }
-            for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+            let scan_root = if let Some(fragment) = target_fragment.as_ref() {
+                let scoped = root.join(fragment).join(".intents");
+                if !scoped.exists() {
+                    continue;
+                }
+                scoped
+            } else {
+                root
+            };
+            for entry in WalkDir::new(scan_root).into_iter().filter_map(|e| e.ok()) {
                 if !entry.file_type().is_file() {
                     continue;
                 }
@@ -913,6 +961,12 @@ pub async fn collect_redistribution_intent_debt(
                 let Ok(intent) = rmp_serde::from_slice::<RedistributionIntent>(&bytes) else {
                     continue;
                 };
+                if target_fragment
+                    .as_ref()
+                    .is_some_and(|target| intent.fragment != *target)
+                {
+                    continue;
+                }
                 let key = intent_dedupe_key(
                     &intent.fragment,
                     &intent.object_key,
@@ -968,11 +1022,11 @@ async fn replay_pending_intents_for_fragment(
 ) -> Result<(), AppError> {
     let mut intent_files = Vec::<PathBuf>::new();
     for root in live_index {
-        let indexdb_dir = root.join(fragment_hash).join("indexdb");
-        if !indexdb_dir.exists() {
+        let intent_dir = root.join(fragment_hash).join(".intents");
+        if !intent_dir.exists() {
             continue;
         }
-        for entry in WalkDir::new(indexdb_dir).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(intent_dir).into_iter().filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -1374,7 +1428,7 @@ async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bo
     let now = SystemTime::now();
     tokio::task::spawn_blocking(move || {
         for root in roots {
-            let blob_dir = root.join(&fragment).join("blob");
+            let blob_dir = root.join(&fragment).join(EDGE_BLOB_DIR);
             let Ok(entries) = std::fs::read_dir(&blob_dir) else {
                 continue;
             };
@@ -1408,7 +1462,21 @@ async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bo
     .unwrap_or(false)
 }
 
-async fn fragment_has_indexed_payload(fragment: &str) -> Result<bool, AppError> {
+async fn fragment_has_indexed_payload(
+    fragment: &str,
+    active_index_roots: &[PathBuf],
+) -> Result<bool, AppError> {
+    let fragment_owned = fragment.to_string();
+    let roots = active_index_roots.to_vec();
+    let has_object_index = tokio::task::spawn_blocking(move || {
+        edge_index_store::fragment_has_object_index_records(&fragment_owned, &roots)
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("N1 object index scan join: {e}")))?;
+    if has_object_index {
+        return Ok(true);
+    }
+
     let live = index::scan_fragment_live_metadata_page(fragment, None, None, 1, None, true).await?;
     if !live.objects.is_empty() {
         return Ok(true);
@@ -1658,6 +1726,7 @@ pub async fn run_redistribution_job_with_options(
     );
 
     let mut touched_fragments: HashSet<String> = HashSet::new();
+    let mut scanned_fragments: HashSet<String> = HashSet::new();
     let mut total_task_errors: u64 = 0;
     let mut last_task_error: Option<String> = None;
     let fragments = match opts.target_fragment.as_ref() {
@@ -1720,22 +1789,16 @@ pub async fn run_redistribution_job_with_options(
             st.phase = format!("Scanning Fragment {}", fragment_hash);
             ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
         }
+        scanned_fragments.insert(fragment_hash.clone());
 
         let has_blob_payload = fragment_has_blob_payload(&fragment_hash, live_blob.as_ref()).await;
-        let has_indexed_payload = fragment_has_indexed_payload(&fragment_hash).await?;
+        let has_indexed_payload =
+            fragment_has_indexed_payload(&fragment_hash, live_index.as_ref()).await?;
         if has_blob_payload && !has_indexed_payload {
-            let err = format!(
-                "Fragment {} has blob payload on disk but no indexed live/trash metadata. Redistribution cannot re-encode orphaned blob data.",
+            info!(
+                "Fragment {} has headless blob payload with no live/trash index; leaving it for GC",
                 fragment_hash
             );
-            warn!("{}", err);
-            total_task_errors = total_task_errors.saturating_add(1);
-            last_task_error = Some(err.clone());
-            let mut st = REDIST_STATUS.write().await;
-            st.total_errors = st.total_errors.saturating_add(1);
-            st.last_error = Some(err);
-            st.phase = format!("Blocked by orphaned blob payload in {}", fragment_hash);
-            ws_manager.broadcast_system_wide(StorageEventPayload::RedistributionUpdate(st.clone()));
             continue;
         }
 
@@ -2062,7 +2125,17 @@ pub async fn run_redistribution_job_with_options(
         for fragment in &touched_fragments {
             if let Err(err) = index::sync_fragment_partition_replicas(fragment).await {
                 warn!(
-                    "Failed to resynchronize partition db replicas for fragment {}: {}",
+                    "Failed to resynchronize N1 index replicas for fragment {}: {}",
+                    fragment, err
+                );
+            }
+        }
+        for fragment in &scanned_fragments {
+            if let Err(err) =
+                edge_index_store::cleanup_stale_index_plane_on_blob_only_roots(fragment)
+            {
+                warn!(
+                    "Failed to clean stale N1 index plane from blob-only roots for fragment {}: {}",
                     fragment, err
                 );
             }
@@ -2177,11 +2250,9 @@ pub(crate) async fn check_needs_redistribution(
     }
 
     if check_index {
-        let expected_partition_db_paths =
-            get_partition_db_paths_custom(target_index_roots, &meta.fragment, &meta.object_key);
-
-        for path in expected_partition_db_paths {
-            if !tokio_fs::try_exists(&path).await.unwrap_or(false) {
+        for root in target_index_roots {
+            let path = object_index_dir_for_root(root, &meta.fragment, &meta.object_key, is_trash);
+            if !object_index_dir_has_ndx(&path).await {
                 needs.index = true;
                 break;
             }
@@ -2204,7 +2275,7 @@ async fn write_redistributed_metadata(
     _strict_durability: bool,
 ) -> Result<(), AppError> {
     if is_trash {
-        index::upsert_trashed_object_version(meta).await
+        index::publish_trashed_object_version_for_maintenance(meta).await
     } else {
         index::upsert_object_version(meta).await
     }
@@ -2675,10 +2746,11 @@ async fn redistribute_object_streaming(
 #[cfg(test)]
 mod tests {
     use super::{
-        RedistributionDurabilityMode, RedistributionExecutionMode, RedistributionRunOptions,
-        RedistributionScope, default_object_concurrency, default_status_batch, list_all_fragments,
-        parse_durability_mode_param, parse_execution_mode_param, parse_scope_param,
-        reachable_roots,
+        REDIST_INTENT_SUFFIX, RedistributionDurabilityMode, RedistributionExecutionMode,
+        RedistributionIntent, RedistributionRunOptions, RedistributionScope,
+        collect_redistribution_intent_debt, default_object_concurrency, default_status_batch,
+        list_all_fragments, parse_durability_mode_param, parse_execution_mode_param,
+        parse_scope_param, reachable_roots,
     };
     use crate::core::constants::FRAGMENT_METADATA_FILE;
     use std::collections::HashMap;
@@ -2857,6 +2929,56 @@ mod tests {
 
         let live = reachable_roots(&[live_root.clone(), blocked_root.clone()]).await;
         assert_eq!(live, vec![live_root]);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn redistribution_intent_debt_can_scope_to_one_fragment() {
+        let base = std::env::temp_dir().join(format!("n1-redist-intents-{}", Ulid::new()));
+        let index_root = base.join("index-root");
+        let fragment_a = "fragment-a";
+        let fragment_b = "fragment-b";
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        let write_intent = |fragment: &str, object_key: &str, phase: &str| {
+            let intent_dir = index_root.join(fragment).join(".intents");
+            fs::create_dir_all(&intent_dir).expect("create intent dir");
+            let intent = RedistributionIntent {
+                tx_id: Ulid::new().to_string(),
+                fragment: fragment.to_string(),
+                object_key: object_key.to_string(),
+                version_id: Ulid::new().to_string(),
+                is_trash: false,
+                scope: "all".to_string(),
+                phase: phase.to_string(),
+                created_at_unix_ms: now_ms.saturating_sub(1000),
+                updated_at_unix_ms: now_ms,
+            };
+            let payload = rmp_serde::to_vec(&intent).expect("serialize intent");
+            fs::write(
+                intent_dir.join(format!("{}{}", intent.tx_id, REDIST_INTENT_SUFFIX)),
+                payload,
+            )
+            .expect("write intent");
+        };
+
+        write_intent(fragment_a, "a.txt", "pending");
+        write_intent(fragment_b, "b.txt", "failed");
+
+        let scoped = collect_redistribution_intent_debt(
+            std::slice::from_ref(&index_root),
+            Some(fragment_a.to_string()),
+        )
+        .await;
+        assert_eq!(scoped.pending_intents, 1);
+        assert_eq!(scoped.failed_intents, 0);
+        assert_eq!(scoped.fragments_with_pending_intents, 1);
+
+        let global = collect_redistribution_intent_debt(&[index_root], None).await;
+        assert_eq!(global.pending_intents, 2);
+        assert_eq!(global.failed_intents, 1);
+        assert_eq!(global.fragments_with_pending_intents, 2);
 
         let _ = fs::remove_dir_all(base);
     }

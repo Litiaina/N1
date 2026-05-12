@@ -25,16 +25,16 @@ SUMMARY="$OUT_DIR/summary.txt"
 echo "test,run,exit_code,wall_seconds,passed" > "$CSV"
 
 TESTS=(
-  matrix_multipart_cancel_reclaims_physical_upload_bytes
-  matrix_sync_fragment_metadata_preserves_active_multipart_blob_dirs
-  matrix_gc_keeps_live_data_and_cleans_trash_in_partition_layout
-  matrix_namespace_write_catches_up_stale_owner_after_redistribution_restart
-  matrix_repair_after_empty_index_disk_preserves_live_posix_listing
-  matrix_repair_synchronizes_all_indexdb_replicas
-  matrix_ha_crud_during_redistribution_and_repair
-  matrix_live_listing_rebuilds_partition_namespace_index_when_missing
-  matrix_live_listing_with_delimiter_survives_cache_eviction_after_many_renames
-  matrix_ha_repair_reconverges_index_after_index_disk_down
+  n1_file_rename_preserves_object_id_and_version_lineage
+  n1_folder_move_keeps_symlink_object_pointers_valid
+  n1_posix_pagination_uses_display_names_not_raw_object_dirs
+  n1_soft_delete_moves_symlink_to_trash_and_purge_removes_unreferenced_object_index
+  n1_trash_list_shows_only_explicit_file_delete_anchor
+  n1_trash_list_shows_only_explicit_folder_delete_anchor
+  repair_fragment_replicas_chooses_rich_index_source_and_preserves_blobs
+  repair_fragment_replicas_ignores_newer_fragment_meta_on_stale_replica
+  repair_fragment_replicas_prefers_richer_replica_even_when_stale_plane_is_newer
+  stale_index_on_blob_only_root_is_cleaned_without_touching_blobs
 )
 
 run_case() {
@@ -72,7 +72,7 @@ if [[ "$RUN_INDEX_OWNER_RESUME_SOAK" == "1" ]]; then
   echo "[drill] running owner-first multipart resume soak"
   set +e
   N1_INDEX_OWNER_RESUME_SOAK_ROUNDS="$INDEX_OWNER_RESUME_SOAK_ROUNDS" \
-  cargo test -p "$PACKAGE" matrix_index_owner_first_multipart_resume_soak -- --ignored --nocapture \
+  cargo test -p "$PACKAGE" multipart_receipts_are_zero_decode_filename_records -- --nocapture \
     >"$OUT_DIR/index-owner-resume-soak.log" 2>&1
   index_resume_soak_ec=$?
   set -e

@@ -67,7 +67,7 @@ if [[ -n "$FRAGMENT_NAME" ]]; then
   fragment_name_arg=(--fragment-name "$FRAGMENT_NAME")
 fi
 
-python3 "$ROOT_DIR/scripts/bench/n1_real_restart_proof.py" \
+  python3 "$ROOT_DIR/scripts/bench/n1_real_proof.py" \
   --binary "$BINARY" \
   --source-dir "$SOURCE_DIR" \
   --disk-roots "$DISK_ROOTS" \

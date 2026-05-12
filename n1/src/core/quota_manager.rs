@@ -1,5 +1,6 @@
+use crate::core::constants::EDGE_BLOB_DIR;
 use crate::core::disk_manager::ObjectPathManager;
-use crate::core::indexdb_store;
+use crate::core::edge_index_store;
 use crate::enums::app_error_enum::AppError;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -430,13 +431,13 @@ pub async fn apply_all_fragment_project_quotas() -> Result<(), AppError> {
         return Ok(());
     }
     validate_fragment_quota_backend().await?;
-    let specs = tokio::task::spawn_blocking(indexdb_store::active_fragment_quota_specs)
+    let specs = tokio::task::spawn_blocking(edge_index_store::active_fragment_quota_specs)
         .await
         .map_err(|err| AppError::InternalServerError(format!("quota spec task: {err}")))??;
     for spec in specs {
         let fragment = spec.fragment.clone();
         let project_id = tokio::task::spawn_blocking(move || {
-            indexdb_store::ensure_fragment_quota_project_id(&fragment)
+            edge_index_store::ensure_fragment_quota_project_id(&fragment)
         })
         .await
         .map_err(|err| AppError::InternalServerError(format!("quota project id task: {err}")))??;
@@ -547,11 +548,11 @@ async fn compute_fragment_blob_usage(fragment: &str) -> Result<FragmentBlobUsage
             if !seen_roots.insert(root.clone()) {
                 continue;
             }
-            usage.live_bytes = usage
-                .live_bytes
-                .saturating_add(sum_file_tree_bytes(&root.join(&fragment).join("blob"))?);
+            usage.live_bytes = usage.live_bytes.saturating_add(sum_file_tree_bytes(
+                &root.join(&fragment).join(EDGE_BLOB_DIR),
+            )?);
             usage.trash_bytes = usage.trash_bytes.saturating_add(sum_file_tree_bytes(
-                &root.join(&fragment).join(".trash").join("blob"),
+                &root.join(&fragment).join(".trash").join(EDGE_BLOB_DIR),
             )?);
         }
         Ok::<FragmentBlobUsage, AppError>(usage)

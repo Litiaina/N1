@@ -1,6 +1,6 @@
 # N2 0.4 API Documentation
 
-`N2` is the multi-node clustering and placement layer for the `N1 Edge` storage kernel. It is a rewrite of the active N2 storage path: N2 owns distributed placement, peer transport, reconcile, and cluster object metadata while each node uses `N1 Edge` as its local storage kernel.
+`N2` is the multi-node clustering and placement layer for the `N1` storage kernel. It is a rewrite of the active N2 storage path: N2 owns distributed placement, peer transport, reconcile, and cluster object metadata while each node uses `N1` as its local storage kernel.
 
 This document focuses on:
 
@@ -21,11 +21,11 @@ This document focuses on:
 - immutable filesystem `.nmtd` object-map persistence and reconcile
 - internal peer transport between `N2` nodes
 
-`N2` does not use N1 Edge's rich namespace for user object keys. N2 owns the distributed namespace and stores physical shard objects into the local N1 Edge storage kernel using internal shard identity. Distributed EC is performed once at the N2 layer; local N1 Edge shard storage is a single local shard object (`kd=1`, `md=0`) by design.
+`N2` does not use N1's rich namespace for user object keys. N2 owns the distributed namespace and stores physical shard objects into the local N1 storage kernel using internal shard identity. Distributed EC is performed once at the N2 layer; local N1 shard storage is a single local shard object (`kd=1`, `md=0`) by design.
 
 ## N2 0.4 Rewrite Structure
 
-N2 0.4 is being shaped as a clean Litiaina cluster layer over the Edge kernel, not as a carry-over of the old pre-Edge N2 runtime.
+N2 0.4 is being shaped as a clean Litiaina cluster layer over the N1 kernel, not as a carry-over of the old pre-N1-kernel N2 runtime.
 
 The active code boundaries are:
 
@@ -33,7 +33,7 @@ The active code boundaries are:
 - peer routes for node-to-node shard, map, and governance traffic under `/v4/n2/internal/...`
 - S3 route face under `/s3/...`
 - `.nmtd` metadata primitives for filesystem object-map paths and names
-- N1 Edge as the local storage kernel dependency
+- N1 as the local storage kernel dependency
 
 This keeps S3 compatibility as a product face, peer transport as a private cluster face, and `.nmtd` as the N2 metadata identity.
 
@@ -65,7 +65,7 @@ Local cluster shards are stored under each configured blob root:
   .nmtd
 ```
 
-`disk_shard_0.bin` is the exact cluster shard payload. N2 0.4 does not run a second local erasure-code pass under each node. Node/disk survivability is handled by the N2 cluster EC plan and by the local N1 Edge storage kernel around the shard object.
+`disk_shard_0.bin` is the exact cluster shard payload. N2 0.4 does not run a second local erasure-code pass under each node. Node/disk survivability is handled by the N2 cluster EC plan and by the local N1 storage kernel around the shard object.
 
 Forbidden legacy active metadata for N2 0.4:
 
@@ -73,9 +73,9 @@ Forbidden legacy active metadata for N2 0.4:
 - `.n2latest`
 - `cshard.meta`
 - local second-layer `kd>1` or `md>0` EC for N2 shard storage
-- any N1 Standard/indexdb metadata as the active N2 map authority
+- any retired N1 indexdb metadata as the active N2 map authority
 
-The local `N1 Edge` kernel may still own its own Edge runtime files and fragment metadata. N2's distributed object truth is `.nmtd`.
+The local `N1` kernel may still own its own runtime files and fragment metadata. N2's distributed object truth is `.nmtd`.
 
 ## Base URL
 
@@ -89,7 +89,7 @@ https://127.0.0.1:50001
 
 S3-compatible path-style routes live under `/s3/...`.
 
-The `/n1/...` routes remain available for fragment creation/auth and local Edge-kernel operations. New clustered object traffic should use `/v4/n2/...` or `/s3/...`.
+The `/n1/...` routes remain available for fragment creation/auth and local N1-kernel operations. New clustered object traffic should use `/v4/n2/...` or `/s3/...`.
 
 ## Authentication Model
 
@@ -807,8 +807,8 @@ curl -k -X POST \
 - Membership changes are operator workflows. Treat them like control-plane operations, not end-user object operations.
 - Internal peer routes are intentionally low-level and should not be used as an application integration surface.
 - `Registry` remains the right layer for user-facing logical namespace, quota, share, and account behavior above `N2`.
-- `N2 0.4` uses `N1 Edge` locally and persists distributed object truth as `.nmtd`. N1 Standard/indexdb files are not active N2 metadata inputs.
+- `N2 0.4` uses `N1` locally and persists distributed object truth as `.nmtd`. Retired N1 indexdb files are not active N2 metadata inputs.
 - `N2 0.4` performs one cluster EC pass. Local shard storage is `kd=1`, `md=0`, so uploads do not pay a second per-node EC encode.
 - Prefix listing uses the N2 namespace tree first. Delimiter listing is direct-directory IO, not a whole-map scan.
-- The older `N2 0.3` proof remains historical evidence for the Edge rewrite. `N2 0.4` requires a fresh multi-node proof before a 1.0 release decision.
+- The older `N2 0.3` proof remains historical evidence for the N1-kernel rewrite. `N2 0.4` requires a fresh multi-node proof before a 1.0 release decision.
 - The source tree now keeps N2 faces separate: native API routes, private peer API routes, and S3 routes are separate modules. S3 multipart staging is also isolated under the S3 face instead of being mixed into the core data plane.

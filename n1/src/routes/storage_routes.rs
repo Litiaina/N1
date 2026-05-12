@@ -19,7 +19,6 @@ use crate::core::fragment_manager::{
 use crate::core::garbage_collector::{
     get_gc_status_api, run_garbage_collector, run_lifecycle_manager, stop_garbage_collector,
 };
-use crate::core::index;
 use crate::core::maintenance::sync_fragment_metadata;
 use crate::core::monitoring::{get_system_health, run_system_monitor};
 use crate::core::operation_gate::{
@@ -29,7 +28,8 @@ use crate::core::redistribution::{
     get_redist_status_api, stop_redistribution_job_api, trigger_redistribution_job_api,
 };
 use crate::core::repair_manager::{
-    get_repair_status_api, stop_repair_job_api, trigger_repair_job_api,
+    get_repair_status_api, inspect_object_status, parse_check_mode, repair_object,
+    stop_repair_job_api, trigger_repair_job_api,
 };
 use crate::core::retrieve::{
     get_object as get_object_impl, get_object_metadata_direct, list_fragments,
@@ -49,6 +49,7 @@ use crate::core::upload::{
     list_active_uploads as list_active_uploads_impl, object_upload_part as object_upload_part_impl,
     upload_object_one_shot as upload_object_one_shot_impl,
 };
+use crate::core::{edge_index_store, index};
 use crate::enums::app_error_enum::AppError;
 use crate::fs::fs_constants::MAX_FILE_SIZE;
 use crate::middleware::auth_middleware::{
@@ -63,7 +64,7 @@ use crate::url::signed_read::{
 };
 use crate::websocket::handler::ws_handler;
 use crate::websocket::manager::{WsConnectionManager, register_global_ws_manager};
-use crate::websocket::ws_structs::StorageEventPayload;
+use crate::websocket::ws_structs::{NamespaceChangeEvent, StorageEventPayload};
 use axum::body::to_bytes;
 use axum::http::{HeaderName, Method, StatusCode};
 use axum::middleware::from_fn;
@@ -104,8 +105,9 @@ async fn resolve_logical_read_key(
     fragment: &str,
     requested_path: &str,
 ) -> Result<String, AppError> {
+    let requested = requested_path.trim_start_matches('/').trim();
     if let Some(entry) = global_namespace_runtime()
-        .entry(fragment, requested_path)
+        .entry(fragment, requested)
         .await?
     {
         if entry.kind != crate::namespace::models::NamespaceEntryKind::File
@@ -117,7 +119,7 @@ async fn resolve_logical_read_key(
             AppError::InternalServerError("logical file is missing physical object id".to_string())
         });
     }
-    Ok(requested_path.to_string())
+    edge_index_store::normalize_object_id(requested).map_err(|_| logical_not_found())
 }
 
 fn download_filename_for_logical_path(requested_path: &str, resolved_key: &str) -> Option<String> {
@@ -282,13 +284,22 @@ async fn commit_logical_upload_from_meta(
 fn emit_logical_file_uploaded(
     state: &Arc<AppState>,
     fragment: &str,
-    metadata: &crate::core::disk_manager::ObjectMetadata,
     logical_path: &str,
+    physical_object_id: &str,
+    metadata: &crate::core::disk_manager::ObjectMetadata,
 ) {
-    let mut event_meta = metadata.clone();
-    event_meta.object_key = logical_path.to_string();
-    event_meta.parts.clear();
-    state.emit(fragment, StorageEventPayload::FileUploaded(event_meta));
+    state.emit(
+        fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::file_upsert(
+            fragment,
+            logical_path,
+            physical_object_id,
+            metadata.total_size_bytes,
+            &metadata.version_id,
+            &metadata.content_type,
+            metadata.created_at,
+        )),
+    );
 }
 
 async fn mint_signed_read_url_scoped(
@@ -311,6 +322,45 @@ async fn get_capacity_usage_scoped(claims: Claims) -> Result<impl IntoResponse, 
 
 async fn get_fragment_quota_usage_scoped(claims: Claims) -> Result<impl IntoResponse, AppError> {
     get_fragment_quota_usage_impl(claims).await
+}
+
+async fn run_fragment_gc(
+    State(state): State<Arc<AppState>>,
+    Path(fragment): Path<String>,
+    Query(mut params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    params.insert("fragment".to_string(), fragment);
+    run_garbage_collector(State(state), Query(params)).await
+}
+
+async fn trigger_fragment_repair_job(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Path(fragment): Path<String>,
+    Query(mut params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    params.insert("fragment".to_string(), fragment);
+    trigger_repair_job_api(claims, State(state), Query(params)).await
+}
+
+async fn trigger_fragment_redistribution_job(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Path(fragment): Path<String>,
+    Query(mut params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    params.insert("fragment".to_string(), fragment);
+    trigger_redistribution_job_api(claims, State(state), Query(params)).await
+}
+
+async fn get_fragment_health(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Path(fragment): Path<String>,
+    Query(mut params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    params.insert("fragment".to_string(), fragment);
+    get_system_health(State(state), claims, Query(params)).await
 }
 
 async fn resize_fragment_quota_scoped(
@@ -470,7 +520,13 @@ async fn empty_trash_scoped(
         return Err(AppError::Forbidden("Delete permission required".into()));
     }
     let summary = global_namespace_runtime().empty_trash(&fragment).await?;
-    state.emit(&fragment, StorageEventPayload::StateInvalidated);
+    state.emit(
+        &fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment,
+            summary.clone(),
+        )),
+    );
     Ok((
         StatusCode::OK,
         AxumJson(serde_json::json!({
@@ -492,7 +548,13 @@ async fn delete_object_scoped(
     let summary = global_namespace_runtime()
         .trash(&fragment, &object_key)
         .await?;
-    state.emit(&fragment, StorageEventPayload::StateInvalidated);
+    state.emit(
+        &fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment,
+            summary.clone(),
+        )),
+    );
     Ok((
         StatusCode::OK,
         AxumJson(serde_json::json!({
@@ -527,7 +589,13 @@ async fn delete_object_permanently_scoped(
     let summary = global_namespace_runtime()
         .purge_trash_path(&fragment, &object_key)
         .await?;
-    state.emit(&fragment, StorageEventPayload::StateInvalidated);
+    state.emit(
+        &fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment,
+            summary.clone(),
+        )),
+    );
     Ok((
         StatusCode::OK,
         AxumJson(serde_json::json!({
@@ -558,7 +626,13 @@ async fn recover_object_scoped(
     let summary = global_namespace_runtime()
         .recover(&fragment, &object_key)
         .await?;
-    state.emit(&fragment, StorageEventPayload::StateInvalidated);
+    state.emit(
+        &fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment,
+            summary.clone(),
+        )),
+    );
     Ok((
         StatusCode::OK,
         AxumJson(serde_json::json!({
@@ -566,6 +640,42 @@ async fn recover_object_scoped(
             "affected_paths": summary.affected_paths,
             "affected_objects": summary.affected_objects,
         })),
+    ))
+}
+
+async fn get_object_repair_status_scoped(
+    claims: Claims,
+    Path(object_key): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+    let fragment = claims.fragment.clone();
+    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
+    let mut metadata = get_object_metadata_direct(&fragment, &physical).await?;
+    metadata.object_key = object_key.trim_start_matches('/').to_string();
+    Ok(AxumJson(
+        inspect_object_status(&metadata, parse_check_mode(&params)).await?,
+    ))
+}
+
+async fn repair_object_scoped(
+    claims: Claims,
+    Path(object_key): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.write || !claims.modify {
+        return Err(AppError::Forbidden(
+            "Write and Modify permission required".into(),
+        ));
+    }
+    let fragment = claims.fragment.clone();
+    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
+    let mut metadata = get_object_metadata_direct(&fragment, &physical).await?;
+    metadata.object_key = object_key.trim_start_matches('/').to_string();
+    Ok(AxumJson(
+        repair_object(&metadata, parse_check_mode(&params)).await?,
     ))
 }
 
@@ -607,7 +717,14 @@ async fn bulk_delete_objects_scoped(
         }
     }
     if succeeded > 0 {
-        state.emit(&fragment, StorageEventPayload::StateInvalidated);
+        state.emit(
+            &fragment,
+            StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::bulk(
+                &fragment,
+                "bulk_delete",
+                succeeded,
+            )),
+        );
     }
     Ok((
         StatusCode::OK,
@@ -661,7 +778,14 @@ async fn bulk_recover_objects_scoped(
         }
     }
     if succeeded > 0 {
-        state.emit(&fragment, StorageEventPayload::StateInvalidated);
+        state.emit(
+            &fragment,
+            StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::bulk(
+                &fragment,
+                "bulk_recover",
+                succeeded,
+            )),
+        );
     }
     Ok((
         StatusCode::OK,
@@ -713,7 +837,14 @@ async fn bulk_permanent_delete_objects_scoped(
         }
     }
     if succeeded > 0 {
-        state.emit(&fragment, StorageEventPayload::StateInvalidated);
+        state.emit(
+            &fragment,
+            StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::bulk(
+                &fragment,
+                "bulk_delete_permanent",
+                succeeded,
+            )),
+        );
     }
     Ok((
         StatusCode::OK,
@@ -738,7 +869,13 @@ async fn recover_all_trash_scoped(
         ));
     }
     let summary = global_namespace_runtime().recover_all(&fragment).await?;
-    state.emit(&fragment, StorageEventPayload::StateInvalidated);
+    state.emit(
+        &fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment,
+            summary.clone(),
+        )),
+    );
     Ok((
         StatusCode::OK,
         AxumJson(serde_json::json!({
@@ -762,7 +899,7 @@ async fn rename_object_scoped(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    global_namespace_runtime()
+    let summary = global_namespace_runtime()
         .rename(
             &claims.fragment,
             &payload.source_key,
@@ -772,12 +909,10 @@ async fn rename_object_scoped(
 
     state.emit(
         &claims.fragment,
-        StorageEventPayload::FileRenamed {
-            source_fragment: claims.fragment.clone(),
-            source_key: payload.source_key,
-            destination_fragment: claims.fragment.clone(),
-            destination_key: payload.destination_key,
-        },
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &claims.fragment,
+            summary,
+        )),
     );
     Ok(StatusCode::OK)
 }
@@ -845,7 +980,7 @@ async fn upload_object_one_shot_scoped(
         index::read_object_version(&fragment, &physical, &public_meta.version_id).await?;
     commit_logical_upload_from_meta(&fragment, &object_key, &physical, &parsed).await?;
     parsed.object_key = object_key;
-    emit_logical_file_uploaded(&state, &fragment, &parsed, &parsed.object_key);
+    emit_logical_file_uploaded(&state, &fragment, &parsed.object_key, &physical, &parsed);
     parsed.strip_internal_layout();
     Ok((StatusCode::CREATED, AxumJson(parsed)).into_response())
 }
@@ -937,7 +1072,7 @@ async fn finalize_object_upload_scoped(
         .clear_pending_upload(&parsed.fragment, &parsed.version_id)
         .await?;
     parsed.object_key = logical_path;
-    emit_logical_file_uploaded(&state, &fragment, &parsed, &parsed.object_key);
+    emit_logical_file_uploaded(&state, &fragment, &parsed.object_key, &physical, &parsed);
     parsed.strip_internal_layout();
     Ok((StatusCode::OK, AxumJson(parsed)).into_response())
 }
@@ -1079,6 +1214,10 @@ pub fn build_storage_routes_unbound_with_options(
                 "/n1/objects/meta/{*object_key}",
                 get(get_object_metadata_scoped),
             )
+            .route(
+                "/n1/objects/status/{*object_key}",
+                get(get_object_repair_status_scoped),
+            )
             .route("/n1/objects/download", get(download_object_scoped))
             .route(
                 "/n1/objects/download/chunk",
@@ -1105,7 +1244,10 @@ pub fn build_storage_routes_unbound_with_options(
                 "/n1/fragments/{:fragment}/quota",
                 patch(resize_fragment_quota_scoped),
             )
-            .route("/n1/trash/empty", delete(empty_trash_scoped))
+            .route(
+                "/n1/trash/empty",
+                delete(empty_trash_scoped).post(empty_trash_scoped),
+            )
             .route("/n1/objects/rename", post(rename_object_scoped))
             .route("/n1/objects/bulk-delete", post(bulk_delete_objects_scoped))
             .route(
@@ -1120,6 +1262,10 @@ pub fn build_storage_routes_unbound_with_options(
             .route(
                 "/n1/objects/permanent/{*object_key}",
                 delete(delete_object_permanently_scoped),
+            )
+            .route(
+                "/n1/objects/repair/{*object_key}",
+                post(repair_object_scoped),
             )
             .route(
                 "/n1/objects/recover/version/{:version_id}/{*object_key}",
@@ -1174,6 +1320,10 @@ pub fn build_storage_routes_unbound_with_options(
             .route("/n1/maintenance/repair/stop", post(stop_repair_job_api))
             .route("/n1/maintenance/repair/status", get(get_repair_status_api))
             .route("/n1/maintenance/gc/start", post(run_garbage_collector))
+            .route(
+                "/n1/maintenance/fragments/{:fragment}/gc/start",
+                post(run_fragment_gc),
+            )
             .route("/n1/maintenance/gc/stop", post(stop_garbage_collector))
             .route("/n1/maintenance/gc/status", get(get_gc_status_api))
             .route(
@@ -1189,12 +1339,24 @@ pub fn build_storage_routes_unbound_with_options(
                 post(trigger_redistribution_job_api),
             )
             .route(
+                "/n1/maintenance/fragments/{:fragment}/redistribution/start",
+                post(trigger_fragment_redistribution_job),
+            )
+            .route(
                 "/n1/maintenance/redistribution/stop",
                 post(stop_redistribution_job_api),
             )
             .route(
                 "/n1/maintenance/redistribution/status",
                 get(get_redist_status_api),
+            )
+            .route(
+                "/n1/maintenance/fragments/{:fragment}/repair/start",
+                post(trigger_fragment_repair_job),
+            )
+            .route(
+                "/n1/maintenance/fragments/{:fragment}/health",
+                get(get_fragment_health),
             )
             .route("/n1/maintenance/health", get(get_system_health));
 
@@ -1265,770 +1427,4 @@ pub async fn serve_storage_routes() -> Router {
 
 async fn ping() -> &'static str {
     "pong"
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        AppState, download_filename_for_logical_path, download_selected_archive_scoped,
-        get_object_metadata_scoped, get_upload_status_scoped, initiate_object_upload_scoped,
-        list_active_uploads_scoped, list_object_versions_scoped, list_objects_scoped,
-        looks_like_flat_storage_object_id, parse_json_response, upload_object_one_shot_scoped,
-        upload_request_matches_session,
-    };
-    use crate::core::disk_manager::{
-        BLOB_STORE_DISKS, DownloadArchiveRequest, FS_STORAGE_ROOT, INDEX_STORE_DISKS,
-        InitiateUploadResponse, ListObjectsResult, ObjectMetadata, ObjectPathManager,
-    };
-    use crate::core::disk_manager::{InitiateUploadParams, ReservationReceipt, UploadPartQuery};
-    use crate::core::fragment_metadata::{
-        DEFAULT_INDEX_PARTITION_COUNT, clear_fragment_partition_count_cache_for_test,
-        init_fragment_metadata, set_configured_index_partition_count,
-    };
-    use crate::core::index::IndexSessionState;
-    use crate::core::indexdb_store;
-    use crate::core::quota_manager::init_quota_file;
-    use crate::core::sync::ensure_fragment_blob_directories;
-    use crate::core::upload::UploadSessionManifest;
-    use crate::core::upload::{
-        DATA_SHARDS_ATOMIC, ListUploadsResponse, MAX_IO_SEMAPHORE, MAX_PART_SIZE_ATOMIC,
-        PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
-    };
-    use crate::namespace::runtime::global_namespace_runtime;
-    use crate::settings::constants::CONFIG_FILE;
-    use crate::settings::create_config::create_default_config_ini;
-    use crate::structs::auth_structs::Claims;
-    use crate::test_support::global_test_lock;
-    use crate::websocket::manager::WsConnectionManager;
-    use crate::websocket::ws_structs::StorageEventPayload;
-    use axum::Json as AxumJson;
-    use axum::body::Body;
-    use axum::extract::{Path, Query, State};
-    use axum::response::IntoResponse;
-    use sha2::{Digest, Sha256};
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use tokio::fs;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio_stream::StreamExt;
-    use tokio_tar::Archive as TarArchive;
-    use ulid::Ulid;
-
-    struct SharedTestLock;
-
-    impl SharedTestLock {
-        async fn lock(&self) -> tokio::sync::MutexGuard<'static, ()> {
-            global_test_lock().lock().await
-        }
-    }
-
-    static TEST_LOCK: SharedTestLock = SharedTestLock;
-
-    fn ensure_test_config_file() {
-        let config_path = PathBuf::from(CONFIG_FILE);
-        if !config_path.exists() {
-            create_default_config_ini(&config_path).expect("create default test config");
-        }
-    }
-
-    async fn ensure_storage_config() {
-        ensure_test_config_file();
-        set_configured_index_partition_count(DEFAULT_INDEX_PARTITION_COUNT)
-            .expect("reset configured index partition count");
-        clear_fragment_partition_count_cache_for_test();
-        indexdb_store::clear_cached_dbs_for_test();
-
-        let base = std::env::temp_dir().join(format!("n1-storage-routes-{}", std::process::id()));
-        let index_roots = if let Some(existing) = INDEX_STORE_DISKS.get() {
-            existing.iter().map(PathBuf::from).collect::<Vec<_>>()
-        } else {
-            vec![base.join("index_1"), base.join("index_2")]
-        };
-        let blob_roots = if let Some(existing) = BLOB_STORE_DISKS.get() {
-            existing.iter().map(PathBuf::from).collect::<Vec<_>>()
-        } else {
-            vec![
-                base.join("blob_1"),
-                base.join("blob_2"),
-                base.join("blob_3"),
-            ]
-        };
-        let fs_root = if let Some(existing) = FS_STORAGE_ROOT.get() {
-            PathBuf::from(existing)
-        } else {
-            base.join("fs")
-        };
-
-        for root in index_roots
-            .iter()
-            .chain(blob_roots.iter())
-            .chain(std::iter::once(&fs_root))
-        {
-            let _ = fs::create_dir_all(root).await;
-        }
-
-        if INDEX_STORE_DISKS.get().is_none() {
-            INDEX_STORE_DISKS
-                .set(
-                    index_roots
-                        .iter()
-                        .map(|path| path.to_string_lossy().to_string())
-                        .collect(),
-                )
-                .expect("set INDEX_STORE_DISKS");
-        }
-        if BLOB_STORE_DISKS.get().is_none() {
-            BLOB_STORE_DISKS
-                .set(
-                    blob_roots
-                        .iter()
-                        .map(|path| path.to_string_lossy().to_string())
-                        .collect(),
-                )
-                .expect("set BLOB_STORE_DISKS");
-        }
-        if FS_STORAGE_ROOT.get().is_none() {
-            FS_STORAGE_ROOT
-                .set(fs_root.to_string_lossy().to_string())
-                .expect("set FS_STORAGE_ROOT");
-        }
-    }
-
-    fn ensure_upload_runtime_config() {
-        if MAX_IO_SEMAPHORE.get().is_none() {
-            MAX_IO_SEMAPHORE.set(128).expect("set MAX_IO_SEMAPHORE");
-        }
-        if MAX_PART_SIZE_ATOMIC.get().is_none() {
-            MAX_PART_SIZE_ATOMIC
-                .set(AtomicU64::new(16 * 1024 * 1024))
-                .expect("set MAX_PART_SIZE_ATOMIC");
-        }
-        if DATA_SHARDS_ATOMIC.get().is_none() {
-            DATA_SHARDS_ATOMIC
-                .set(AtomicUsize::new(1))
-                .expect("set DATA_SHARDS_ATOMIC");
-        } else {
-            DATA_SHARDS_ATOMIC
-                .get()
-                .expect("DATA_SHARDS_ATOMIC")
-                .store(1, Ordering::Relaxed);
-        }
-        if PARITY_SHARDS_ATOMIC.get().is_none() {
-            PARITY_SHARDS_ATOMIC
-                .set(AtomicUsize::new(0))
-                .expect("set PARITY_SHARDS_ATOMIC");
-        } else {
-            PARITY_SHARDS_ATOMIC
-                .get()
-                .expect("PARITY_SHARDS_ATOMIC")
-                .store(0, Ordering::Relaxed);
-        }
-        if WRITER_BUFFER_SIZE_ATOMIC.get().is_none() {
-            WRITER_BUFFER_SIZE_ATOMIC
-                .set(AtomicUsize::new(64 * 1024))
-                .expect("set WRITER_BUFFER_SIZE_ATOMIC");
-        } else {
-            WRITER_BUFFER_SIZE_ATOMIC
-                .get()
-                .expect("WRITER_BUFFER_SIZE_ATOMIC")
-                .store(64 * 1024, Ordering::Relaxed);
-        }
-        if STRIPE_SIZE_ATOMIC.get().is_none() {
-            STRIPE_SIZE_ATOMIC
-                .set(AtomicUsize::new(256 * 1024))
-                .expect("set STRIPE_SIZE_ATOMIC");
-        } else {
-            STRIPE_SIZE_ATOMIC
-                .get()
-                .expect("STRIPE_SIZE_ATOMIC")
-                .store(256 * 1024, Ordering::Relaxed);
-        }
-    }
-
-    async fn setup_fragment(fragment: &str) {
-        init_quota_file(fragment, 64 * 1024 * 1024)
-            .await
-            .expect("init quota");
-        ensure_fragment_blob_directories(fragment).await;
-        init_fragment_metadata(fragment, "key")
-            .await
-            .expect("init metadata");
-    }
-
-    fn full_claims(fragment: &str) -> Claims {
-        Claims {
-            fragment: fragment.to_string(),
-            read: true,
-            write: true,
-            modify: true,
-            delete: true,
-            exp: usize::MAX,
-        }
-    }
-
-    async fn clean_fragment_test_roots(fragment: &str) {
-        global_namespace_runtime().evict_fragment(fragment);
-        indexdb_store::clear_cached_dbs_for_test();
-        let manager = ObjectPathManager::new();
-        let mut roots = manager.get_all_index_roots();
-        roots.extend(manager.get_blob_roots());
-        for root in roots {
-            let _ = fs::remove_dir_all(root.join(fragment)).await;
-        }
-        indexdb_store::clear_cached_dbs_for_test();
-    }
-
-    async fn read_response_bytes(response: axum::response::Response) -> Vec<u8> {
-        axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("read response body")
-            .to_vec()
-    }
-
-    async fn read_tar_entries(bytes: Vec<u8>) -> BTreeMap<String, Vec<u8>> {
-        let (mut writer, reader) = tokio::io::duplex(bytes.len().max(4096));
-        tokio::spawn(async move {
-            writer
-                .write_all(&bytes)
-                .await
-                .expect("write tar bytes into duplex");
-        });
-        let mut archive = TarArchive::new(reader);
-        let mut entries = archive.entries().expect("tar entries");
-        let mut out = BTreeMap::new();
-
-        while let Some(entry) = entries.next().await {
-            let mut entry = entry.expect("tar entry");
-            let path = entry
-                .path()
-                .expect("tar path")
-                .to_string_lossy()
-                .to_string();
-            let mut body = Vec::new();
-            entry
-                .read_to_end(&mut body)
-                .await
-                .expect("read tar entry body");
-            out.insert(path, body);
-        }
-
-        out
-    }
-
-    fn sample_upload_params() -> InitiateUploadParams {
-        InitiateUploadParams {
-            content_type: Some("video/mp4".to_string()),
-            total_size_bytes: 8 * 1024 * 1024,
-            expected_parts: 4,
-            part_size_bytes: Some(2 * 1024 * 1024),
-        }
-    }
-
-    #[test]
-    fn flat_storage_object_id_detection_matches_registry_shape() {
-        assert!(looks_like_flat_storage_object_id(
-            "a309986ad9486b636f2c7ffd3abd63a244a0bf14e32f9a05274c27209da687cb"
-        ));
-        assert!(!looks_like_flat_storage_object_id("images/archive.bin"));
-        assert!(!looks_like_flat_storage_object_id(
-            "01KNSFH1NYRERVTB8XT0SB9DD5"
-        ));
-        assert!(!looks_like_flat_storage_object_id(
-            "a309986ad9486b636f2c7ffd3abd63a244a0bf14e32f9a05274c27209da687cb/child"
-        ));
-    }
-
-    #[test]
-    fn logical_download_filename_uses_requested_basename_only_for_logical_paths() {
-        assert_eq!(
-            download_filename_for_logical_path(
-                "videos/demo.mp4",
-                "a309986ad9486b636f2c7ffd3abd63a244a0bf14e32f9a05274c27209da687cb"
-            )
-            .as_deref(),
-            Some("demo.mp4")
-        );
-        assert_eq!(
-            download_filename_for_logical_path(
-                "IMG_0001.mov",
-                "f32cf9271c2517798966d4970207d463f9a3277ceb5b0e3520f9d5dba8747e7e"
-            )
-            .as_deref(),
-            Some("IMG_0001.mov")
-        );
-        assert!(
-            download_filename_for_logical_path(
-                "a309986ad9486b636f2c7ffd3abd63a244a0bf14e32f9a05274c27209da687cb",
-                "a309986ad9486b636f2c7ffd3abd63a244a0bf14e32f9a05274c27209da687cb"
-            )
-            .is_none()
-        );
-    }
-
-    fn sample_session_state(
-        total_size_bytes: u64,
-        expected_parts: u64,
-        part_size_bytes: u64,
-        content_type: &str,
-    ) -> IndexSessionState {
-        IndexSessionState {
-            manifest: UploadSessionManifest {
-                fragment: "frag".to_string(),
-                object_key: "01TESTOBJECTID".to_string(),
-                version_id: "01TESTVERSION".to_string(),
-                session_id: "01TESTSESSION".to_string(),
-                total_size_bytes,
-                expected_parts,
-                part_size_bytes,
-                content_type: content_type.to_string(),
-                created_at: 0,
-                stripe_size_bytes: 262_144,
-                data_shards: 1,
-                parity_shards: 0,
-            },
-            reservation: Some(ReservationReceipt {
-                amount: total_size_bytes,
-            }),
-            parts: BTreeMap::new(),
-            part_receipts: BTreeMap::new(),
-            last_activity_at: 0,
-            finalized_at: None,
-            aborted_at: None,
-        }
-    }
-
-    #[test]
-    fn upload_request_matching_accepts_same_session_shape() {
-        let params = InitiateUploadParams {
-            content_type: Some("video/mp4".to_string()),
-            total_size_bytes: 8_388_608,
-            expected_parts: 4,
-            part_size_bytes: Some(2_097_152),
-        };
-        let state = sample_session_state(8_388_608, 4, 2_097_152, "video/mp4");
-        assert!(upload_request_matches_session(&params, &state));
-    }
-
-    #[test]
-    fn upload_request_matching_rejects_size_or_type_mismatch() {
-        let params = InitiateUploadParams {
-            content_type: Some("video/mp4".to_string()),
-            total_size_bytes: 8_388_609,
-            expected_parts: 4,
-            part_size_bytes: Some(2_097_152),
-        };
-        let state = sample_session_state(8_388_608, 4, 2_097_152, "application/octet-stream");
-        assert!(!upload_request_matches_session(&params, &state));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scoped_multipart_resume_surfaces_logical_path_and_reuses_pending_session() {
-        let _guard = TEST_LOCK.lock().await;
-        ensure_storage_config().await;
-        ensure_upload_runtime_config();
-
-        let fragment = {
-            let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
-            hex::encode(digest)
-        };
-        setup_fragment(&fragment).await;
-        let logical_path = "videos/video.mp4".to_string();
-
-        let first = initiate_object_upload_scoped(
-            full_claims(&fragment),
-            Path(logical_path.clone()),
-            AxumJson(sample_upload_params()),
-        )
-        .await
-        .expect("first scoped init")
-        .into_response();
-        let first_json: InitiateUploadResponse = parse_json_response(first, "scoped init first")
-            .await
-            .expect("decode first init");
-
-        let second = initiate_object_upload_scoped(
-            full_claims(&fragment),
-            Path(logical_path.clone()),
-            AxumJson(sample_upload_params()),
-        )
-        .await
-        .expect("second scoped init")
-        .into_response();
-        let second_json: InitiateUploadResponse = parse_json_response(second, "scoped init second")
-            .await
-            .expect("decode second init");
-
-        assert_eq!(second_json.version_id, first_json.version_id);
-        assert_eq!(second_json.session_id, first_json.session_id);
-
-        let listed = list_active_uploads_scoped(full_claims(&fragment), Query(HashMap::new()))
-            .await
-            .expect("list active uploads")
-            .into_response();
-        let listed_json: ListUploadsResponse = parse_json_response(listed, "scoped active uploads")
-            .await
-            .expect("decode uploads");
-        let session = listed_json
-            .sessions
-            .iter()
-            .find(|entry| entry.version_id == first_json.version_id)
-            .expect("pending session in scoped listing");
-        assert_eq!(session.object_key.as_deref(), Some(logical_path.as_str()));
-        assert!(
-            session
-                .physical_object_key
-                .as_deref()
-                .is_some_and(|value| !value.is_empty() && value != logical_path)
-        );
-
-        let status =
-            get_upload_status_scoped(full_claims(&fragment), Path(first_json.version_id.clone()))
-                .await
-                .expect("get upload status")
-                .into_response();
-        let status_json: crate::core::disk_manager::UploadStatusResponse =
-            parse_json_response(status, "scoped upload status")
-                .await
-                .expect("decode status");
-        assert_eq!(
-            status_json.object_key.as_deref(),
-            Some(logical_path.as_str())
-        );
-        assert!(
-            status_json
-                .physical_object_key
-                .as_deref()
-                .is_some_and(|value| !value.is_empty() && value != logical_path)
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scoped_folder_archive_download_resolves_logical_prefixes() {
-        let _guard = TEST_LOCK.lock().await;
-        ensure_storage_config().await;
-        ensure_upload_runtime_config();
-
-        let fragment = {
-            let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
-            hex::encode(digest)
-        };
-        setup_fragment(&fragment).await;
-
-        let state = Arc::new(AppState {
-            ws_manager: WsConnectionManager::new(),
-        });
-
-        let payload = "demo-video-payload";
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            axum::http::header::CONTENT_LENGTH,
-            axum::http::HeaderValue::from_str(&payload.len().to_string())
-                .expect("content-length header"),
-        );
-
-        let upload = upload_object_one_shot_scoped(
-            State(state),
-            full_claims(&fragment),
-            headers,
-            Path("videos/demo.mp4".to_string()),
-            Query(UploadPartQuery {
-                checksum: None,
-                durability: None,
-                strict_durability: None,
-                io_gate: None,
-            }),
-            Body::from(payload),
-        )
-        .await
-        .expect("scoped one-shot upload")
-        .into_response();
-        assert_eq!(upload.status(), axum::http::StatusCode::CREATED);
-
-        let request = DownloadArchiveRequest {
-            keys: Vec::new(),
-            prefix: None,
-            prefixes: vec!["videos/".to_string()],
-            format: "tar".to_string(),
-            filename: Some("videos".to_string()),
-            export_all: false,
-            include_internal: false,
-        };
-
-        let response = download_selected_archive_scoped(full_claims(&fragment), AxumJson(request))
-            .await
-            .expect("download folder archive");
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        assert_eq!(
-            response
-                .headers()
-                .get(axum::http::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()),
-            Some("application/x-tar")
-        );
-
-        let entries = read_tar_entries(read_response_bytes(response).await).await;
-        assert_eq!(
-            entries.get("videos/demo.mp4").map(Vec::as_slice),
-            Some(payload.as_bytes())
-        );
-        assert_eq!(
-            entries.len(),
-            1,
-            "scoped POSIX folder archive should contain only the selected live namespace subtree"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn scoped_bulk_folder_upload_survives_namespace_restart_for_live_fragment_hash() {
-        let _guard = TEST_LOCK.lock().await;
-        ensure_storage_config().await;
-        ensure_upload_runtime_config();
-
-        let fragment = "0d6e4079e36703ebd37c00722f5891d28b0e2811dc114b129215123adcce3605";
-        clean_fragment_test_roots(fragment).await;
-        setup_fragment(fragment).await;
-
-        let state = Arc::new(AppState {
-            ws_manager: WsConnectionManager::new(),
-        });
-
-        let mut expected = Vec::new();
-        for idx in 0..512usize {
-            let logical_path = format!(
-                "web/app/{:02}/nested/{:03}/file-{:04}.txt",
-                idx % 31,
-                idx % 127,
-                idx
-            );
-            let payload = format!("restart-regression-payload-{idx}");
-            let mut headers = axum::http::HeaderMap::new();
-            headers.insert(
-                axum::http::header::CONTENT_LENGTH,
-                axum::http::HeaderValue::from_str(&payload.len().to_string())
-                    .expect("content-length header"),
-            );
-
-            let upload = upload_object_one_shot_scoped(
-                State(Arc::clone(&state)),
-                full_claims(fragment),
-                headers,
-                Path(logical_path.clone()),
-                Query(UploadPartQuery {
-                    checksum: None,
-                    durability: None,
-                    strict_durability: None,
-                    io_gate: None,
-                }),
-                Body::from(payload),
-            )
-            .await
-            .expect("scoped one-shot upload")
-            .into_response();
-            assert_eq!(upload.status(), axum::http::StatusCode::CREATED);
-            let entry = global_namespace_runtime()
-                .entry(fragment, &logical_path)
-                .await
-                .expect("post-upload namespace entry check")
-                .unwrap_or_else(|| {
-                    panic!("namespace entry missing immediately after upload: {logical_path}")
-                });
-            assert_eq!(
-                entry.kind,
-                crate::namespace::models::NamespaceEntryKind::File,
-                "post-upload namespace entry should be a file: {logical_path}"
-            );
-            expected.push(logical_path);
-        }
-
-        global_namespace_runtime().evict_fragment(fragment);
-        indexdb_store::clear_cached_dbs_for_test();
-
-        let mut actual = Vec::new();
-        let mut continuation_token = None;
-        loop {
-            let mut params = HashMap::new();
-            params.insert("prefix".to_string(), "web/".to_string());
-            params.insert("limit".to_string(), "1000".to_string());
-            if let Some(token) = continuation_token.take() {
-                params.insert("continuation_token".to_string(), token);
-            }
-
-            let response = list_objects_scoped(full_claims(fragment), Query(params))
-                .await
-                .expect("scoped list after restart")
-                .into_response();
-            assert_eq!(response.status(), axum::http::StatusCode::OK);
-            let page: ListObjectsResult = parse_json_response(response, "list after restart")
-                .await
-                .expect("decode list page");
-            actual.extend(page.objects.into_iter().map(|object| object.object_key));
-            if let Some(token) = page.continuation_token {
-                continuation_token = Some(token);
-            } else {
-                break;
-            }
-        }
-
-        let expected_set = expected.iter().cloned().collect::<BTreeSet<_>>();
-        let actual_set = actual.iter().cloned().collect::<BTreeSet<_>>();
-        let missing = expected_set
-            .difference(&actual_set)
-            .take(20)
-            .cloned()
-            .collect::<Vec<_>>();
-        let extra = actual_set
-            .difference(&expected_set)
-            .take(20)
-            .cloned()
-            .collect::<Vec<_>>();
-        assert!(
-            missing.is_empty() && extra.is_empty() && actual.len() == actual_set.len(),
-            "scoped POSIX namespace rows must be durable after cache eviction/restart: expected={} actual={} unique_actual={} duplicate_actual={} missing_sample={:?} extra_sample={:?}",
-            expected.len(),
-            actual.len(),
-            actual_set.len(),
-            actual.len().saturating_sub(actual_set.len()),
-            missing,
-            extra
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scoped_metadata_and_versions_hide_internal_layout() {
-        let _guard = TEST_LOCK.lock().await;
-        ensure_storage_config().await;
-        ensure_upload_runtime_config();
-
-        let fragment = {
-            let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
-            hex::encode(digest)
-        };
-        setup_fragment(&fragment).await;
-
-        let state = Arc::new(AppState {
-            ws_manager: WsConnectionManager::new(),
-        });
-
-        let payload = "layout-redaction-payload";
-        let logical_path = "videos/redacted.mp4".to_string();
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            axum::http::header::CONTENT_LENGTH,
-            axum::http::HeaderValue::from_str(&payload.len().to_string())
-                .expect("content-length header"),
-        );
-
-        let upload = upload_object_one_shot_scoped(
-            State(state),
-            full_claims(&fragment),
-            headers,
-            Path(logical_path.clone()),
-            Query(UploadPartQuery {
-                checksum: None,
-                durability: None,
-                strict_durability: None,
-                io_gate: None,
-            }),
-            Body::from(payload),
-        )
-        .await
-        .expect("scoped one-shot upload")
-        .into_response();
-        assert_eq!(upload.status(), axum::http::StatusCode::CREATED);
-        let upload_meta: ObjectMetadata = parse_json_response(upload, "upload metadata")
-            .await
-            .expect("decode upload metadata");
-        assert_eq!(upload_meta.object_key, logical_path);
-        assert!(
-            upload_meta.parts.is_empty(),
-            "upload response must not expose shard layout"
-        );
-
-        let metadata =
-            get_object_metadata_scoped(full_claims(&fragment), Path(logical_path.clone()))
-                .await
-                .expect("scoped metadata")
-                .into_response();
-        let metadata: ObjectMetadata = parse_json_response(metadata, "object metadata")
-            .await
-            .expect("decode object metadata");
-        assert_eq!(metadata.object_key, logical_path);
-        assert!(
-            metadata.parts.is_empty(),
-            "metadata endpoint must not expose shard layout"
-        );
-
-        let versions =
-            list_object_versions_scoped(full_claims(&fragment), Path(logical_path.clone()))
-                .await
-                .expect("scoped versions")
-                .into_response();
-        let versions: Vec<ObjectMetadata> = parse_json_response(versions, "object versions")
-            .await
-            .expect("decode object versions");
-        assert_eq!(versions.len(), 1);
-        assert_eq!(versions[0].object_key, logical_path);
-        assert!(
-            versions[0].parts.is_empty(),
-            "versions endpoint must not expose shard layout"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scoped_one_shot_upload_websocket_emits_logical_path() {
-        let _guard = TEST_LOCK.lock().await;
-        ensure_storage_config().await;
-        ensure_upload_runtime_config();
-
-        let fragment = {
-            let digest = Sha256::digest(format!("fragment-{}", Ulid::new()).as_bytes());
-            hex::encode(digest)
-        };
-        setup_fragment(&fragment).await;
-
-        let state = Arc::new(AppState {
-            ws_manager: WsConnectionManager::new(),
-        });
-        let mut events = state.ws_manager.subscribe(&fragment);
-
-        let payload = "logical-ws-demo";
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            axum::http::header::CONTENT_LENGTH,
-            axum::http::HeaderValue::from_str(&payload.len().to_string())
-                .expect("content-length header"),
-        );
-
-        let upload = upload_object_one_shot_scoped(
-            State(Arc::clone(&state)),
-            full_claims(&fragment),
-            headers,
-            Path("videos/demo.mp4".to_string()),
-            Query(UploadPartQuery {
-                checksum: None,
-                durability: None,
-                strict_durability: None,
-                io_gate: None,
-            }),
-            Body::from(payload),
-        )
-        .await
-        .expect("scoped one-shot upload")
-        .into_response();
-        assert_eq!(upload.status(), axum::http::StatusCode::CREATED);
-
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
-            .await
-            .expect("websocket event timeout")
-            .expect("websocket event");
-        match event.payload {
-            StorageEventPayload::FileUploaded(meta) => {
-                assert_eq!(meta.object_key, "videos/demo.mp4");
-                assert!(meta.parts.is_empty());
-            }
-            other => panic!("unexpected websocket payload: {:?}", other),
-        }
-    }
 }

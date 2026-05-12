@@ -1,3 +1,4 @@
+use crate::core::constants::EDGE_BLOB_DIR;
 use crate::enums::app_error_enum::AppError;
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
@@ -5,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-const INDEXDB_SHARD_FILE_PREFIX: &str = "shard_";
+const EDGE_INTENT_PARTITION_PREFIX: &str = "partition_";
 
 pub fn default_format() -> String {
     "zip".to_string()
@@ -85,14 +86,18 @@ impl ObjectPathManager {
         selected
     }
 
-    fn index_db_path(root: &PathBuf, fragment_hash: &str, partition_id: u16) -> PathBuf {
-        root.join(fragment_hash).join("indexdb").join(format!(
-            "{}{:04x}.ndxdb",
-            INDEXDB_SHARD_FILE_PREFIX, partition_id
+    fn edge_intent_partition_path(
+        root: &PathBuf,
+        fragment_hash: &str,
+        partition_id: u16,
+    ) -> PathBuf {
+        root.join(fragment_hash).join(".intents").join(format!(
+            "{}{:04x}.n1",
+            EDGE_INTENT_PARTITION_PREFIX, partition_id
         ))
     }
 
-    pub fn get_all_session_partition_db_paths(
+    pub fn get_all_session_intent_partition_paths(
         &self,
         fragment_hash: &str,
         version_id: &str,
@@ -101,7 +106,7 @@ impl ObjectPathManager {
         Ok(self
             .select_partition_roots(fragment_hash, partition_id)
             .iter()
-            .map(|root| Self::index_db_path(root, fragment_hash, partition_id))
+            .map(|root| Self::edge_intent_partition_path(root, fragment_hash, partition_id))
             .collect())
     }
 
@@ -115,7 +120,7 @@ impl ObjectPathManager {
         object_key.trim_start_matches('/').to_string()
     }
 
-    pub fn get_all_object_partition_db_paths(
+    pub fn get_all_object_intent_partition_paths(
         &self,
         fragment_hash: &str,
         object_key: &str,
@@ -125,7 +130,7 @@ impl ObjectPathManager {
         Ok(self
             .select_partition_roots(fragment_hash, partition_id)
             .iter()
-            .map(|root| Self::index_db_path(root, fragment_hash, partition_id))
+            .map(|root| Self::edge_intent_partition_path(root, fragment_hash, partition_id))
             .collect())
     }
 
@@ -135,16 +140,39 @@ impl ObjectPathManager {
         fragment_hash: &str,
         version_id: &str,
     ) -> PathBuf {
-        disk_root.join(fragment_hash).join("blob").join(version_id)
+        disk_root
+            .join(fragment_hash)
+            .join(EDGE_BLOB_DIR)
+            .join(version_id)
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EdgeListEntry {
+    pub record: String,
+    pub kind: String,
+    pub size_bytes: u64,
+    pub created_at_unix_nanos: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packed_ext_u64: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_ulid: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ListObjectsResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<EdgeListEntry>,
     pub objects: Vec<ObjectMetadata>,
     #[serde(default)]
     pub common_prefixes: Vec<String>,
     pub continuation_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_continuation_token: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

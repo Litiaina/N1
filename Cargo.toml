@@ -2,7 +2,6 @@
 members = [
     "block_manager",
     "n1-arc",
-    "n1-edge",
     "cli_core",
     "registry",
     "n1",

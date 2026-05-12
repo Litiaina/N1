@@ -28,9 +28,10 @@ def parse_args():
     parser.add_argument("--pid", type=int, default=0)
     parser.add_argument("--progress-every", type=int, default=250)
     parser.add_argument(
-        "--edge-posix-list",
+        "--posix-list",
+        dest="posix_list",
         action="store_true",
-        help="Count uploaded objects through recursive /n1/posix/list for N1 Edge.",
+        help="Count uploaded objects through recursive /n1/posix/list for N1.",
     )
     parser.add_argument(
         "--multipart-size-mib",
@@ -171,7 +172,7 @@ def posix_entries(client, token, path):
             return out
 
 
-def edge_posix_list_count(client, token, prefix):
+def posix_list_count(client, token, prefix):
     count = 0
     dirs = [prefix.strip("/")]
     while dirs:
@@ -184,9 +185,9 @@ def edge_posix_list_count(client, token, prefix):
     return count
 
 
-def list_count(client, token, prefix, edge_posix=False):
-    if edge_posix:
-        return edge_posix_list_count(client, token, prefix)
+def list_count(client, token, prefix, posix_list=False):
+    if posix_list:
+        return posix_list_count(client, token, prefix)
     count = 0
     cursor = None
     while True:
@@ -410,7 +411,7 @@ def main():
             client,
             fragments[result["user"]][3],
             result["prefix"],
-            edge_posix=args.edge_posix_list,
+            posix_list=args.posix_list,
         )
         result["listed_objects"] = count
         expected_count = result["objects"] + (1 if result.get("multipart") else 0)

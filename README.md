@@ -17,14 +17,12 @@
 
 ---
 
-This repository contains the storage platform stack built around five runtime components:
+This repository contains the storage platform stack built around four runtime components:
 
-> - `N1 Edge` (`1.1.0`)
-  Primary N1 storage kernel with an Edge namespace, two-level fanned immutable `.objects/<hh>/<hh>/@o_<object-id>` records, zero-decode listing, and the N1 blob/shard/parity plane. This is the true N1 face for new deployments. See `N1_EDGE_DOCUMENTATION.md`.
-> - `N1 Standard` (`3.0.0`)
-  Secondary N1 engine line with the same object-storage core and lifecycle model, backed by per-fragment sharded `indexdb`. Keep it for deployments that explicitly want the validated indexdb path.
+> - `N1` (`1.1.0`)
+  Primary N1 storage kernel with an N1 namespace, two-level fanned immutable `.objects/<hh>/<hh>/@o_<object-id>` records, zero-decode listing, object-level repair/status, and the N1 blob/shard/parity plane. See `N1_DOCUMENTATION.md`.
 > - `N2` (`0.4.0`)
-  Multi-node clustering and placement layer built on top of the `N1 Edge` storage kernel, with real-prefix namespace directories, symlink object entries, immutable filesystem `.nmtd` cluster metadata, one cluster EC pass, and an S3-compatible path-style object surface.
+  Multi-node clustering and placement layer built on top of the `N1` storage kernel, with real-prefix namespace directories, symlink object entries, immutable filesystem `.nmtd` cluster metadata, one cluster EC pass, and an S3-compatible path-style object surface.
 > - `NS` (`1.0.0`)
   Standalone NAS Lite / SMB service with fragment-backed auth, configurable share roots, backing-filesystem capacity, and optional cold-sync backup to `N1`.
 > - `Registry` (`0.9.1`)
@@ -48,26 +46,16 @@ Current route namespaces are intentionally split:
 - `NS` exposes SMB on its configured TCP bind address and port.
 - `Registry` product-facing routes live under `/v1/...`
 
-The major `3.0` change in `N1` is a breaking metadata rewrite:
+The current N1 line retires the old Standard/indexdb engine from the active workspace. Active N1 metadata truth is the N1 namespace, immutable `.ndx` object records, and the `.blobs` payload plane:
 
-- each fragment has one active metadata authority: its sharded `indexdb` at `<index_root>/<fragment_hash>/indexdb/shard_XXXX.ndxdb`
-- namespace state lives inside the sharded `indexdb`; there is no active `namespace_v2/catalog.ndxdb`
-- object metadata is persisted as summary/version/part/shard rows instead of one serialized `ObjectMetadata` blob
-- upload sessions, pending namespace bindings, trash state, quota state, repair state, and replica metadata live in the same per-fragment sharded `indexdb`
-- object/version metadata is immutable after commit except lifecycle state
-- blob payloads are immutable
-
-That means file and folder semantics such as `mkdir`, rename, move, trash, recover, and browse are handled by the namespace facade over `indexdb.namespace_entries`, while repair, redistribution, GC, and recover-on-read operate on storage truth and reachability.
-
-Current release notes for the validated `N1 3.0.0`, `NS 1.0.0`, and `Registry 0.9.1` line:
-
-- `N1 3.0.0` removes the old redb-derived active index and the active `namespace_v2/catalog.ndxdb` authority. The only active per-fragment metadata authority is the sharded `indexdb` under `indexdb/shard_XXXX.ndxdb`.
-- `N1 3.0.0` is not runtime-compatible with `N1 2.x` metadata directories. Old files may be imported by explicit migration tooling, then ignored or renamed aside.
-- `N1 3.0.0` keeps the blob layout unchanged: `<blob_root>/<fragment_hash>/blob/<version_id>/<shard-or-parity-file>`.
-- `N1 3.0.0` is designed to be IO-bound and bounded-memory: listing uses cursor queries and summary rows, cold DB handles are evicted LRU, and full part/shard metadata is loaded only for download, repair, verify, GC, explicit full metadata reads, or recovery.
+- namespace state is real directories and symlink object pointers
+- object metadata is immutable `.ndx` records under `.objects/<hh>/<hh>/@o_<object-id>/`
+- upload sessions and receipts live under `.uploads/`
+- trash is namespace movement under `.trash/`
+- repair, redistribution, GC, and recover-on-read operate on explicit storage truth and reachability
 - SMB/NAS serving has moved out of `N1` into standalone `NS`, keeping `N1` focused on storage-kernel responsibilities.
 - `NS 1.0.0` keeps the live SMB path local to disk, uses dynamic fragment authentication, supports recursive folder deletion semantics expected by Windows clients, and cold-syncs large files to `N1` through multipart upload.
-- Per-fragment indexdb shard replicas are copied across configured index roots, monitored by health, and repaired when a rebuilt index disk is missing or stale.
+- Per-fragment N1 index replicas are copied across configured index roots, monitored by health, and repaired when a rebuilt index disk is missing or stale.
 - Trash entries are generation-addressed with `trash_entry_id`, so repeated deletes of the same visible path remain individually recoverable or purgeable without path ambiguity.
 - fragment-bound Registry listing and stats now prefer `N1` namespace truth instead of stale Registry projection.
 - Registry folder trash/recover delegates to N1 POSIX namespace lifecycle, including empty folders, instead of emulating directory delete with object-key prefix loops.
@@ -77,11 +65,11 @@ Current release notes for the validated `N1 3.0.0`, `NS 1.0.0`, and `Registry 0.
 
 ## Core Concepts
 
-### N1 Edge
+### N1
 
-`N1 Edge 1.1.0` is the primary N1 storage kernel and the default N1 face for new deployments.
+`N1 1.1.0` is the primary N1 storage kernel and the default N1 face for new deployments.
 
-It keeps the N1 object/blob plane, repair model, redistribution model, GC model, and public route shape, but moves the active storage authority into explicit Edge planes:
+It keeps the N1 object/blob plane, repair model, redistribution model, GC model, and public route shape, with active storage authority in explicit N1 planes:
 
 ```text
 index_root/<fragment_hash>/
@@ -94,41 +82,13 @@ index_root/<fragment_hash>/
 
 Folders are real directories. File names are namespace symlinks whose payload is a stable object id. Object records live in two-level fanned `.objects/<hh>/<hh>/@o_<object-id>/` directories, each committed version is an immutable `.ndx` file, and normal listing reads direct directory children plus `.ndx` filenames only. Payload shards live under the explicit internal `.blobs/` directory so user namespace names such as `blob/` remain valid. Normal listing does not decode `.ndx` bodies.
 
-Use `N1 Edge` when the goal is the Linux-first, IO-bound N1 storage kernel.
-
-### N1 Standard
-
-`N1 Standard` is the secondary N1 engine line backed by per-fragment sharded `indexdb`.
-
-It is responsible for:
-
-- fragments and storage tenancy boundaries
-- fragment quota state
-- immutable object/version metadata
-- immutable blob payload placement
-- per-fragment sharded `indexdb` metadata authority
-- one-shot and multipart upload
-- logical reads and downloads
-- lifecycle-first delete, trash, and recover
-- garbage collection
-- redistribution
-- repair and recover-on-read
-- standalone namespace routes
-- POSIX-style namespace access
-
-`N1 Standard 3.0` is best thought of as:
-
-`object storage core + POSIX namespace front tier inside per-fragment indexdb`
-
-It is not the user/account control plane and it is not the business metadata layer. Use Standard when a deployment explicitly wants the sharded `indexdb` engine path instead of Edge.
-
-SMB/NAS access is no longer embedded in `N1`. Use standalone `NS` when Windows/macOS/Linux file-manager SMB workflows are needed.
+Use `N1` when the goal is the Linux-first, IO-bound N1 storage kernel.
 
 ### N2
 
-`N2 0.4.0` is the multi-node layer for the Edge line.
+`N2 0.4.0` is the multi-node layer for N1.
 
-It extends `N1 Edge` with:
+It extends `N1` with:
 
 - cluster membership
 - governance state
@@ -137,10 +97,10 @@ It extends `N1 Edge` with:
 - reconcile behavior
 - real-prefix namespace directories with symlink object entries
 - filesystem `.nmtd` cluster object metadata
-- one cluster-level EC pass; local N1 Edge shard storage is `kd=1`, `md=0`
+- one cluster-level EC pass; local N1 shard storage is `kd=1`, `md=0`
 - S3-compatible path-style object operations under `/s3/...`
 
-Use `N2` when storage needs to span multiple nodes with cluster-managed placement and reconcile behavior. Use standalone `N1 Edge` when you want a single-node engine.
+Use `N2` when storage needs to span multiple nodes with cluster-managed placement and reconcile behavior. Use standalone `N1` when you want a single-node engine.
 
 ### NS
 
@@ -186,34 +146,32 @@ Clients / UI / CLI
                                     optional cold sync to N1
 ```
 
-For standalone `N1 3.0`, the internal model is:
+For standalone `N1 1.1`, the internal model is:
 
 ```text
-index_root/<fragment_hash>/indexdb/shard_0000.ndxdb
-index_root/<fragment_hash>/indexdb/shard_0001.ndxdb
-...
-index_root/<fragment_hash>/indexdb/shard_XXXX.ndxdb
-  - indexdb_meta / fragment_meta
-  - namespace rows
-  - object_heads / object_versions / object_version_states
-  - object_parts / part_shards
-  - upload_sessions / upload_parts / pending_upload_bindings
-  - trash_entries / quota_reservations
-  - maintenance_state / replica_meta
+index_root/<fragment_hash>/
+  .fragment.ndx
+  .objects/<hh>/<hh>/@o_<object-id>/
+    <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
+  .uploads/<version-id>/
+    manifest.ndx
+    part_p<part-number>.<crc32>.receipt
+  .trash/
+  docs/video.mp4 -> @o_<object-id>
 
-blob_root/<fragment_hash>/blob/<version_id>/
+blob_root/<fragment_hash>/.blobs/<version_id>/
   - payload shards / parity
   - placement
 ```
 
-This split is why `N1 3.0` is materially different from the older path-as-identity and redb-backed design:
+This split is why current `N1` is materially different from the older Standard/indexdb design:
 
 - path changes do not rewrite immutable object or blob truth
-- namespace is the POSIX/object-key face, but indexdb owns persistence
+- namespace is the POSIX/object-key face and is expressed as real directories plus symlink object pointers
 - delete becomes lifecycle-first
 - GC is driven by reachability
 - repair and redistribution stay storage-focused
-- object listing does not deserialize part or shard maps
+- object listing parses filenames and decodes `.ndx` only when full metadata is needed
 
 ## Features And Capabilities
 
@@ -268,7 +226,7 @@ Typical deployments:
 - [`registry`](registry)
   Registry service
 - [`n1_cli`](n1_cli)
-  Operator CLI for `N1 3.0` maintenance, health, fragment create, and multipart status
+  Operator CLI for `N1` maintenance, health, fragment create, object status/repair, and multipart status
 - [`n2_cli`](n2_cli)
   CLI helpers for `N2`
 - [`indexdb`](indexdb)
@@ -477,15 +435,15 @@ cargo run -p registry
 
 ### N2 Cluster
 
-Use `N2` when you need cluster-managed placement instead of a single storage node. `N2 0.4.0` uses the `N1 Edge` storage kernel locally, stores distributed object maps as `.nmtd`, uses real-prefix namespace directories for listing, and adds cluster membership, governance, placement, peer transport, S3-compatible path-style object routes, and reconcile flows. Multi-node `N2` must not be configured as loopback-only.
+Use `N2` when you need cluster-managed placement instead of a single storage node. `N2 0.4.0` uses the `N1` storage kernel locally, stores distributed object maps as `.nmtd`, uses real-prefix namespace directories for listing, and adds cluster membership, governance, placement, peer transport, S3-compatible path-style object routes, and reconcile flows. Multi-node `N2` must not be configured as loopback-only.
 
 ## Configuration Overview
 
 ### N1 / N2 Config
 
-Standalone `N1 Edge` uses `n1_config.ini`.
+Standalone `N1` uses `n1_config.ini`.
 
-`N2` uses `n2_config.ini` and `n2.env`. At runtime it also materializes Edge-kernel aliases for the embedded `N1 Edge` storage kernel.
+`N2` uses `n2_config.ini` and `n2.env`. At runtime it also materializes N1-kernel aliases for the embedded `N1` storage kernel.
 
 Important settings:
 
@@ -629,7 +587,7 @@ Quota and end-user policy live in `Registry`, not in standalone `N1`.
 
 That is expected.
 
-`N1 3.0` is lifecycle-first:
+`N1` is lifecycle-first:
 
 - trash hides objects from the live namespace
 - empty trash retires namespace visibility
@@ -639,21 +597,26 @@ If you need immediate space reclamation, empty trash and then run GC.
 
 ### Fragment Already Exists After Reusing The Same Name
 
-Fragment names hash deterministically. Reusing the same name recreates the same fragment hash. If you want a brand-new fragment identity, use a different name. If a fragment was partially initialized, current `3.0` fragment create logic heals partial state on retry instead of false-conflicting.
+Fragment names hash deterministically. Reusing the same name recreates the same fragment hash. If you want a brand-new fragment identity, use a different name. If a fragment was partially initialized, current N1 fragment create logic heals partial state on retry instead of false-conflicting.
 
 ### Active Metadata Files
 
-For `N1 3.0`, the only active per-fragment metadata authority is the sharded indexdb set:
+For current `N1`, the active per-fragment metadata authority is the N1 storage index:
 
 ```text
-<index_root>/<fragment_hash>/indexdb/shard_XXXX.ndxdb
+<index_root>/<fragment_hash>/
+  .fragment.ndx
+  .objects/<hh>/<hh>/@o_<object-id>/*.ndx
+  .uploads/
+  .trash/
+  <namespace directories and symlink object pointers>
 ```
 
-Do not restore or point runtime code at old `namespace_v2/catalog.ndxdb`, `catalog.ndxdb`, `namespace.ndxdb`, `namespace.sqlite`, redb index files, or serialized `ObjectMetadata` blobs as authority. Those belong only to one-time migration/import tooling.
+Do not restore or point runtime code at retired Standard `indexdb`, `namespace_v2/catalog.ndxdb`, `catalog.ndxdb`, `namespace.ndxdb`, `namespace.sqlite`, redb index files, or serialized `ObjectMetadata` blobs as authority. Those belong only to older releases or explicit import tooling.
 
 ### Listing Or Trash Views Look Wrong
 
-The `3.0` namespace routes are the source of truth for standalone namespace behavior:
+The N1 namespace routes are the source of truth for standalone namespace behavior:
 
 - `GET /n1/posix/list`
 - `POST /n1/posix/mkdir`
@@ -682,7 +645,7 @@ cargo test -p ns
 cargo test -p registry -- --test-threads=1
 ```
 
-High-signal release tests used for `N1 3.0` include:
+High-signal release tests used for `N1` include:
 
 - CRUD upload/read/delete/recover flows
 - GC reclaim after empty trash
@@ -692,7 +655,7 @@ High-signal release tests used for `N1 3.0` include:
 - POSIX pagination, mkdir, rename, trash, recover
 - NS SMB read/write/mkdir/rename/delete flows
 
-High-signal proof used for the previous N2 Edge rewrite includes:
+High-signal proof used for the N2 rewrite includes:
 
 - native `/v4/n2` upload/download over two real nodes
 - `.nmtd` object-map replication on local and remote index roots

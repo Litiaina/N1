@@ -1,4 +1,4 @@
-use crate::core::constants::GC_SUFFIX;
+use crate::core::constants::{EDGE_BLOB_DIR, GC_SUFFIX};
 use crate::core::disk_manager::{ObjectPathManager, PartMetadata, ShardInfo};
 use crate::core::upload::{DirectWriter, sync_dir};
 use crate::enums::app_error_enum::AppError;
@@ -122,7 +122,7 @@ fn extract_fragment_version_from_abs(abs: &str) -> Option<(String, String, bool)
     }
     let norm = abs.replace('\\', "/");
     let parts: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
-    let blob_pos = parts.iter().position(|p| *p == "blob")?;
+    let blob_pos = parts.iter().position(|p| *p == EDGE_BLOB_DIR)?;
     if blob_pos == 0 || blob_pos + 1 >= parts.len() {
         return None;
     }
@@ -144,7 +144,7 @@ fn extract_fragment_version_from_abs(abs: &str) -> Option<(String, String, bool)
 fn parse_version_dir_hint(version_dir: &Path) -> Option<(String, String, bool)> {
     let version_id = version_dir.file_name()?.to_string_lossy().to_string();
     let blob_dir = version_dir.parent()?;
-    if blob_dir.file_name()?.to_string_lossy() != "blob" {
+    if blob_dir.file_name()?.to_string_lossy() != EDGE_BLOB_DIR {
         return None;
     }
 
@@ -166,7 +166,10 @@ fn shard_dir_on_root(
     is_trash: bool,
 ) -> PathBuf {
     let _ = is_trash;
-    disk_root.join(fragment).join("blob").join(version_id)
+    disk_root
+        .join(fragment)
+        .join(EDGE_BLOB_DIR)
+        .join(version_id)
 }
 
 fn owning_blob_root_for_path(path: &Path) -> Option<&'static PathBuf> {
@@ -279,6 +282,14 @@ async fn try_open_verified(path: &str, checksum: &str) -> Option<File> {
     None
 }
 
+async fn try_open_unverified(path: &str) -> Option<File> {
+    if path.is_empty() {
+        return None;
+    }
+
+    File::open(path).await.ok()
+}
+
 async fn preexisting_gc_candidates(path: &str) -> Vec<String> {
     let path = Path::new(path);
     let Some(parent) = path.parent() else {
@@ -365,6 +376,78 @@ async fn get_or_open_shard_ha(
                 continue;
             }
             if let Some(f) = try_open_verified(&preexisting, &shard_info.checksum).await {
+                if let Ok(cloned) = f.try_clone().await {
+                    file_cache.insert(shard_info.file_name.clone(), cloned);
+                    return Some(f);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+async fn get_or_open_shard_fast(
+    file_cache: &mut HashMap<String, File>,
+    shard_info: &ShardInfo,
+    version_dir_hint: Option<&Path>,
+) -> Option<File> {
+    if let Some(file) = file_cache.get(&shard_info.file_name) {
+        return file.try_clone().await.ok();
+    }
+
+    let mut candidates: Vec<String> = stable_abs_candidates(&shard_info.absolute_path);
+
+    if let Some(vdir) = version_dir_hint {
+        candidates.push(
+            vdir.join(&shard_info.file_name)
+                .to_string_lossy()
+                .to_string(),
+        );
+
+        if let Some((fragment, version_id, is_trash)) = parse_version_dir_hint(vdir) {
+            for root in BLOB_ROOTS.iter() {
+                let dir = shard_dir_on_root(root.as_path(), &fragment, &version_id, is_trash);
+                candidates.push(
+                    dir.join(&shard_info.file_name)
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    if let Some((fragment, version_id, is_trash)) =
+        extract_fragment_version_from_abs(&shard_info.absolute_path)
+    {
+        for root in BLOB_ROOTS.iter() {
+            let dir = shard_dir_on_root(root.as_path(), &fragment, &version_id, is_trash);
+            candidates.push(
+                dir.join(&shard_info.file_name)
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+    }
+
+    let mut tried = HashSet::<String>::new();
+    for cand in candidates {
+        if cand.is_empty() || !tried.insert(cand.clone()) {
+            continue;
+        }
+
+        if let Some(f) = try_open_unverified(&cand).await {
+            if let Ok(cloned) = f.try_clone().await {
+                file_cache.insert(shard_info.file_name.clone(), cloned);
+                return Some(f);
+            }
+        }
+
+        for preexisting in preexisting_gc_candidates(&cand).await {
+            if !tried.insert(preexisting.clone()) {
+                continue;
+            }
+            if let Some(f) = try_open_unverified(&preexisting).await {
                 if let Ok(cloned) = f.try_clone().await {
                     file_cache.insert(shard_info.file_name.clone(), cloned);
                     return Some(f);
@@ -502,6 +585,51 @@ pub async fn read_or_recover_chunk(
     let mut restored = restored;
     restored.truncate(len);
     Ok(restored)
+}
+
+pub async fn read_or_recover_chunk_streaming(
+    file_cache: &mut HashMap<String, File>,
+    recovery_file_cache: &mut HashMap<String, File>,
+    version_dir: &Path,
+    part: Arc<PartMetadata>,
+    shard_idx: usize,
+    offset: u64,
+    len: usize,
+    block_size: usize,
+) -> Result<Vec<u8>, AppError> {
+    let target_shard = nth_data_shard(&part, shard_idx)
+        .ok_or(AppError::InternalServerError("Bad shard index".into()))?;
+
+    let vdir_hint = if version_dir.as_os_str().is_empty() {
+        None
+    } else {
+        Some(version_dir)
+    };
+
+    if let Some(mut file) = get_or_open_shard_fast(file_cache, target_shard, vdir_hint).await {
+        let mut buf = vec![0u8; len];
+        if file.seek(SeekFrom::Start(offset)).await.is_ok()
+            && file.read_exact(&mut buf).await.is_ok()
+        {
+            return Ok(buf);
+        }
+        file_cache.remove(&target_shard.file_name);
+        warn!(
+            "Fast stream read failed for shard {}; attempting verified recovery.",
+            target_shard.file_name
+        );
+    }
+
+    read_or_recover_chunk(
+        recovery_file_cache,
+        version_dir,
+        part,
+        shard_idx,
+        offset,
+        len,
+        block_size,
+    )
+    .await
 }
 
 pub async fn repair_entire_shard(
@@ -804,7 +932,7 @@ mod tests {
     #[tokio::test]
     async fn read_or_recover_chunk_restores_single_data_shard_for_nine_byte_object() {
         let root = std::env::temp_dir().join(format!("n1-recovery-nine-byte-{}", Ulid::new()));
-        let parity_dir = root.join("frag").join("blob").join("ver");
+        let parity_dir = root.join("frag").join(EDGE_BLOB_DIR).join("ver");
         fs::create_dir_all(&parity_dir)
             .await
             .expect("create parity dir");
@@ -859,7 +987,7 @@ mod tests {
                     absolute_path: root
                         .join("missing")
                         .join("frag")
-                        .join("blob")
+                        .join(EDGE_BLOB_DIR)
                         .join("ver")
                         .join("part_0_shard_0.shard")
                         .to_string_lossy()
@@ -881,7 +1009,11 @@ mod tests {
 
         let bytes = read_or_recover_chunk(
             &mut HashMap::new(),
-            &root.join("missing").join("frag").join("blob").join("ver"),
+            &root
+                .join("missing")
+                .join("frag")
+                .join(EDGE_BLOB_DIR)
+                .join("ver"),
             part,
             0,
             0,
@@ -890,6 +1022,55 @@ mod tests {
         )
         .await
         .expect("recover missing shard");
+
+        assert_eq!(bytes, b"trash-me\n");
+
+        let bytes = read_or_recover_chunk_streaming(
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &root
+                .join("missing")
+                .join("frag")
+                .join(EDGE_BLOB_DIR)
+                .join("ver"),
+            Arc::new(PartMetadata {
+                part_index: 0,
+                size_bytes: 9,
+                created_at: 0,
+                checksum: None,
+                shards: vec![
+                    ShardInfo {
+                        shard_index: 0,
+                        file_name: "part_0_shard_0.shard".to_string(),
+                        absolute_path: root
+                            .join("missing")
+                            .join("frag")
+                            .join(EDGE_BLOB_DIR)
+                            .join("ver")
+                            .join("part_0_shard_0.shard")
+                            .to_string_lossy()
+                            .to_string(),
+                        size_bytes: 262_144,
+                        checksum: crc32_hex(&shard_bytes),
+                        is_parity: false,
+                    },
+                    ShardInfo {
+                        shard_index: 1,
+                        file_name: "part_0_shard_1.parity".to_string(),
+                        absolute_path: parity_path.to_string_lossy().to_string(),
+                        size_bytes: 262_144,
+                        checksum: crc32_hex(&shard_bytes),
+                        is_parity: true,
+                    },
+                ],
+            }),
+            0,
+            0,
+            9,
+            262_144,
+        )
+        .await
+        .expect("streaming fallback recovers missing shard");
 
         assert_eq!(bytes, b"trash-me\n");
 

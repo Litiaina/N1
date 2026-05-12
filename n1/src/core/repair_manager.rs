@@ -2,8 +2,8 @@ use crate::core::constants::{FRAGMENT_METADATA_FILE, PARITY_SUFFIX, SHARD_SUFFIX
 use crate::core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata,
 };
+use crate::core::edge_index_store;
 use crate::core::index;
-use crate::core::indexdb_store;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::{repair_entire_shard, verify_shard_integrity};
 use crate::core::redistribution::replay_pending_intents_for_fragment_now;
@@ -52,6 +52,21 @@ pub struct RepairJobStatus {
     pub start_timestamp: i64,
     pub duration_seconds: u64,
     pub scan_rate_per_sec: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ObjectRepairStatus {
+    pub object_key: String,
+    pub version_id: String,
+    pub status: String,
+    pub total_parts: u64,
+    pub total_shards: u64,
+    pub healthy_shards: u64,
+    pub missing_shards: u64,
+    pub corrupt_shards: u64,
+    pub repairable: bool,
+    pub repaired_shards: u64,
+    pub failed_repairs: u64,
 }
 
 static REPAIR_STATUS: LazyLock<Arc<RwLock<RepairJobStatus>>> =
@@ -127,7 +142,7 @@ fn clamp_usize(v: usize, lo: usize, hi: usize) -> usize {
     v.max(lo).min(hi)
 }
 
-fn parse_check_mode(params: &HashMap<String, String>) -> RepairCheckMode {
+pub(crate) fn parse_check_mode(params: &HashMap<String, String>) -> RepairCheckMode {
     let normalized_mode = params
         .get("mode")
         .or_else(|| params.get("check_mode"))
@@ -482,6 +497,156 @@ async fn normalize_part_paths_for_repair(
     part
 }
 
+async fn inspect_object_parts(
+    meta: &ObjectMetadata,
+    check_mode: RepairCheckMode,
+) -> Result<(ObjectRepairStatus, Vec<PartMetadata>, Vec<Vec<usize>>), AppError> {
+    let path_manager = ObjectPathManager::new();
+    let blob_roots = reachable_dir_roots(path_manager.get_blob_roots()).await;
+    let mut report = ObjectRepairStatus {
+        object_key: meta.object_key.clone(),
+        version_id: meta.version_id.clone(),
+        status: "healthy".to_string(),
+        total_parts: meta.parts.len() as u64,
+        total_shards: 0,
+        healthy_shards: 0,
+        missing_shards: 0,
+        corrupt_shards: 0,
+        repairable: true,
+        repaired_shards: 0,
+        failed_repairs: 0,
+    };
+
+    let mut normalized_parts = Vec::with_capacity(meta.parts.len());
+    let mut repair_targets = Vec::with_capacity(meta.parts.len());
+    let mut any_degraded = false;
+    let mut any_critical = false;
+    let mut any_lost = false;
+
+    for part in &meta.parts {
+        let normalized = normalize_part_paths_for_repair(
+            &path_manager,
+            &blob_roots,
+            &meta.fragment,
+            &meta.version_id,
+            part.clone(),
+        )
+        .await;
+        let data_shards = normalized
+            .shards
+            .iter()
+            .filter(|shard| !shard.is_parity)
+            .count()
+            .max(1);
+        let mut healthy_in_part = 0usize;
+        let mut bad_indexes = Vec::new();
+
+        for shard in &normalized.shards {
+            report.total_shards += 1;
+            let shard_path = PathBuf::from(strip_tmp_attempt_suffix(&shard.absolute_path));
+            match fs::metadata(&shard_path).await {
+                Ok(metadata) => {
+                    if metadata.len() != shard.size_bytes {
+                        report.corrupt_shards += 1;
+                        bad_indexes.push(shard.shard_index);
+                    } else if check_mode.verifies_full_integrity() {
+                        match File::open(&shard_path).await {
+                            Ok(mut file) => {
+                                if verify_shard_integrity(&mut file, &shard.checksum).await {
+                                    report.healthy_shards += 1;
+                                    healthy_in_part += 1;
+                                } else {
+                                    report.corrupt_shards += 1;
+                                    bad_indexes.push(shard.shard_index);
+                                }
+                            }
+                            Err(_) => {
+                                report.missing_shards += 1;
+                                bad_indexes.push(shard.shard_index);
+                            }
+                        }
+                    } else {
+                        report.healthy_shards += 1;
+                        healthy_in_part += 1;
+                    }
+                }
+                Err(_) => {
+                    report.missing_shards += 1;
+                    bad_indexes.push(shard.shard_index);
+                }
+            }
+        }
+
+        if !bad_indexes.is_empty() {
+            any_degraded = true;
+        }
+        if healthy_in_part == 0 {
+            any_lost = true;
+        } else if healthy_in_part < data_shards {
+            any_critical = true;
+        }
+        if healthy_in_part < data_shards {
+            report.repairable = false;
+        }
+
+        normalized_parts.push(normalized);
+        repair_targets.push(bad_indexes);
+    }
+
+    report.status = if any_lost {
+        "lost".to_string()
+    } else if any_critical {
+        "critical".to_string()
+    } else if any_degraded {
+        "degraded".to_string()
+    } else {
+        "healthy".to_string()
+    };
+
+    Ok((report, normalized_parts, repair_targets))
+}
+
+pub async fn inspect_object_status(
+    meta: &ObjectMetadata,
+    check_mode: RepairCheckMode,
+) -> Result<ObjectRepairStatus, AppError> {
+    inspect_object_parts(meta, check_mode)
+        .await
+        .map(|(report, _, _)| report)
+}
+
+pub async fn repair_object(
+    meta: &ObjectMetadata,
+    check_mode: RepairCheckMode,
+) -> Result<ObjectRepairStatus, AppError> {
+    let (mut report, normalized_parts, repair_targets) =
+        inspect_object_parts(meta, check_mode).await?;
+    if report.status == "healthy" || !report.repairable {
+        return Ok(report);
+    }
+
+    for (part, bad_indexes) in normalized_parts.into_iter().zip(repair_targets.into_iter()) {
+        let part = Arc::new(part);
+        for missing_idx in bad_indexes {
+            match repair_entire_shard(part.clone(), missing_idx, meta.stripe_size_bytes).await {
+                Ok(()) => report.repaired_shards += 1,
+                Err(err) => {
+                    report.failed_repairs += 1;
+                    warn!(
+                        "Object-level repair failed for {}/{} shard {}: {}",
+                        meta.fragment, meta.object_key, missing_idx, err
+                    );
+                }
+            }
+        }
+    }
+
+    let (mut after, _, _) = inspect_object_parts(meta, check_mode).await?;
+    after.repaired_shards = report.repaired_shards;
+    after.failed_repairs = report.failed_repairs;
+    Ok(after)
+}
+
 pub async fn get_repair_status() -> RepairJobStatus {
     REPAIR_STATUS.read().await.clone()
 }
@@ -820,7 +985,7 @@ async fn repair_fragment_index_db(
     fragment: &str,
     dry_run: bool,
 ) -> Result<(u64, u64, u64), AppError> {
-    indexdb_store::repair_fragment_all_partition_replicas(fragment, dry_run)
+    edge_index_store::repair_fragment_all_partition_replicas(fragment, dry_run)
 }
 
 async fn process_object_repair(
@@ -1062,12 +1227,13 @@ pub async fn run_repair_job_with_options(
             status.missing_meta_repaired += fmiss;
             status.divergent_meta_repaired += fdiv;
             status.corrupt_found += fcorrupt;
+            status.total_repaired += fmiss + fdiv;
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 
         {
             let mut status = REPAIR_STATUS.write().await;
-            status.phase = format!("Repairing partition db replicas {}", fragment_hash);
+            status.phase = format!("Repairing N1 index replicas {}", fragment_hash);
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 
@@ -1079,6 +1245,7 @@ pub async fn run_repair_job_with_options(
             status.missing_meta_repaired += pmiss;
             status.divergent_meta_repaired += pdiv;
             status.corrupt_found += pcorrupt;
+            status.total_repaired += pmiss + pdiv;
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 
@@ -1088,7 +1255,7 @@ pub async fn run_repair_job_with_options(
 
         {
             let mut status = REPAIR_STATUS.write().await;
-            status.phase = format!("Repairing namespace indexdb replicas {}", fragment_hash);
+            status.phase = format!("Repairing N1 index replicas {}", fragment_hash);
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));
         }
 
@@ -1100,11 +1267,13 @@ pub async fn run_repair_job_with_options(
             status.missing_meta_repaired += namespace_report.missing_repaired;
             status.divergent_meta_repaired += namespace_report.divergent_repaired;
             status.corrupt_found += namespace_report.corrupt_found;
+            status.total_repaired +=
+                namespace_report.missing_repaired + namespace_report.divergent_repaired;
             if namespace_report.missing_repaired > 0
                 || namespace_report.divergent_repaired > 0
                 || namespace_report.corrupt_found > 0
             {
-                status.last_repaired = Some(format!("namespace_indexdb:{}", fragment_hash));
+                status.last_repaired = Some(format!("index:{}", fragment_hash));
                 status.last_disagreement = namespace_report.selected_source.clone();
             }
             ws_manager.broadcast_system_wide(StorageEventPayload::RepairUpdate(status.clone()));

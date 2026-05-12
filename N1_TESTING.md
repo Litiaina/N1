@@ -1,18 +1,18 @@
 # N1 Testing And Release Confidence
 
-N1 tests are split into three gates. A green unit/workflow suite is useful, but it is not a production release signal by itself.
+N1 tests are split into three gates. A green in-process suite is useful, but it is not a production release signal by itself.
 
-N1 Standard and N1 Edge have different metadata engines. Standard release proof inspects sharded `indexdb`; Edge release proof must inspect Edge namespace, Edge object-index `.ndx` records, and Edge blob-plane reachability. Do not use Standard indexdb inspection as final Edge evidence.
+The active N1 architecture uses real namespace directories, symlink object pointers, immutable `.ndx` object records, and explicit `.blobs` payload roots. Release evidence must inspect those N1 planes directly. Do not use retired Standard/indexdb table inspection as current N1 release evidence.
 
 ## Gate 1: In-Process Regression Suite
 
 Run this on every code change:
 
 ```bash
-cargo test -p n1
+RUSTFLAGS='-D warnings' cargo test -p n1 --all-targets
 ```
 
-This catches deterministic invariants, object metadata rules, namespace semantics, GC safety, repair/redistribution contracts, and route-level regressions. It is not enough for production confidence because many tests run in-process and cannot prove process restart, TLS/JWT routing, real filesystem quota, or real disk behavior.
+This catches deterministic invariants, object metadata rules, namespace semantics, GC safety, repair/redistribution contracts, object-level repair/status, and route-level regressions. It is not enough for production confidence because many tests run in-process and cannot prove process restart, TLS/JWT routing, real filesystem quota, or real disk behavior.
 
 ## Gate 2: Release Drills
 
@@ -33,47 +33,9 @@ DISK_ROOTS=/mnt/disk-00,/mnt/disk-01 \
 scripts/bench/run_release_drills.sh
 ```
 
-## Gate 3: Real HTTP Restart Proof
+## Gate 3: Real HTTP Proof
 
-This is the confidence test for the bug class where listing is correct before restart but wrong after restart.
-
-It starts a real N1 server binary, creates a real fragment, uploads a real nested folder through the public HTTP one-shot route, lists through the public API, restarts the process, lists again from disk-only state, downloads sample files, and directly inspects the on-disk sharded `indexdb` files.
-
-```bash
-sudo -E \
-SOURCE_DIR=/home/administrator/Development/litiaina-cloud-web \
-DISK_ROOTS=/mnt/disk-00,/mnt/disk-01 \
-scripts/bench/run_real_restart_proof.sh
-```
-
-The script uses dedicated subdirectories under each disk root, so startup GC does not scan unrelated live fragments. It still uses the real physical disks for both index and blob roots.
-
-Expected pass evidence includes:
-
-- before-restart list count equals uploaded file count
-- after-restart list count equals uploaded file count
-- before/after path set hashes match
-- sample downloads match source SHA-256
-- every index root reports `integrity_check=ok`
-- every index root reports matching `namespace_file_nodes`, `object_heads`, `object_versions`, and `object_parts`
-- `part_shards` equals `file_count * 2` for the default 1+1 EC proof
-- every blob root has one version directory per uploaded object
-
-Useful knobs:
-
-```bash
-PORT=50491
-CONCURRENCY=16
-MAX_FILES=0
-QUOTA_BACKEND=xfs_project
-QUOTA_BYTES=10737418240
-CLEANUP_ROOTS=0
-OUT_DIR=/tmp/n1-real-restart-proof
-```
-
-Use `MAX_FILES=128` for a smoke run. Use `MAX_FILES=0` for the full source tree.
-
-To prove the repaired-disk case that matters for production, run the same proof with a simulated formatted disk:
+This is the confidence test for process restart, real disks, namespace persistence, repair, recover-on-read, archive download, and redistribution.
 
 ```bash
 sudo -E \
@@ -84,7 +46,34 @@ SIMULATE_DISK_FORMAT_REPAIR=1 \
 scripts/bench/run_real_restart_proof.sh
 ```
 
-That mode uploads the source tree, verifies restart listing, removes one proof disk's fragment subtree for both index and blob roots, restarts N1, verifies that the remaining disk still lists all objects, runs strict repair, then verifies listing, sample downloads, every shard DB, and every blob version directory on both roots.
+The proof starts a real `litiaina-n1` server, creates a real fragment, uploads a real nested folder through public HTTP routes, lists through public APIs, restarts the process, downloads sample files, simulates one disk being formatted, repairs, performs `2 disk -> 1 disk -> 2 disk` redistribution, and directly inspects committed `.ndx`, namespace symlink, and blob-version counts on both roots.
+
+Expected pass evidence includes:
+
+- before-restart list count equals uploaded file count
+- after-restart list count equals uploaded file count
+- before/after path set hashes match
+- sample downloads match source SHA-256
+- after simulated disk format, the surviving root still lists all expected objects
+- strict repair restores the missing index and blob planes
+- after `1 disk -> 2 disk` re-expansion, the one-disk write is still listed
+- every index root reports matching `live_ndx` and `namespace_symlinks`
+- every blob root has one version directory per committed object
+- server RSS remains bounded instead of growing with object count
+
+Useful knobs:
+
+```bash
+PORT=50491
+CONCURRENCY=16
+MAX_FILES=0
+QUOTA_BACKEND=disabled
+QUOTA_BYTES=10737418240
+CLEANUP_ROOTS=0
+OUT_DIR=/tmp/n1-real-proof
+```
+
+Use `MAX_FILES=128` for a smoke run. Use `MAX_FILES=0` for the full source tree.
 
 ## Gate 4: Parallel Small-Object Storm
 
@@ -98,6 +87,9 @@ scripts/bench/n1_live_parallel_storm.py \
   --objects-per-user 3000 \
   --per-user-concurrency 4 \
   --quota-bytes 21474836480 \
+  --posix-list \
+  --multipart-size-mib 16 \
+  --multipart-part-mib 4 \
   --pid <N1_PID>
 ```
 
@@ -107,97 +99,27 @@ Expected pass evidence includes:
 - every fragment lists exactly 3,000 objects after upload
 - restart listing still returns exactly 3,000 objects per fragment
 - N1 does not hit the process open-file ceiling
-- no deleted indexdb handles are retained
 - RSS remains bounded under the storm instead of growing with object count
-- logs contain no write-quorum, indexdb replica, namespace replica, locked database, or blob shard open failures
+- logs contain no write-quorum, replica, namespace, object-index, or blob shard open failures
 
 ## Release Rule
 
 For production confidence, require:
 
 ```bash
-cargo test -p n1
+RUSTFLAGS='-D warnings' cargo test -p n1 --all-targets
 scripts/bench/run_release_drills.sh
-sudo -E SOURCE_DIR=<real-folder> DISK_ROOTS=<disk-a>,<disk-b> scripts/bench/run_real_restart_proof.sh
+sudo -E SOURCE_DIR=<real-folder> DISK_ROOTS=<disk-a>,<disk-b> SIMULATE_DISK_FORMAT_REPAIR=1 scripts/bench/run_real_restart_proof.sh
 scripts/bench/n1_live_parallel_storm.py --base-url <live-url> --master-key <MASTER_KEY> --users 4 --objects-per-user 3000 --per-user-concurrency 4 --pid <N1_PID>
 ```
 
-Do not treat synthetic tests alone as release confidence. N1 must prove the public API, process restart, real filesystem quota, real disk layout, and durable sharded `indexdb` state together.
+Do not treat synthetic tests alone as release confidence. N1 must prove the public API, process restart, real filesystem quota behavior, real disk layout, object-level repair/status, and durable `.ndx`/namespace/blob state together.
 
-## N1 Edge Release Gate
+## Latest Focused Evidence
 
-N1 Edge has its own documentation and release proof requirements in `N1_EDGE_DOCUMENTATION.md`.
+Latest focused proof evidence from 2026-05-12:
 
-Minimum preflight:
-
-```bash
-cargo build -p n1-edge --bin litiaina-n1-edge
-RUSTFLAGS='-D warnings' cargo test -p n1-edge --all-targets
-RUSTFLAGS='-D warnings' cargo check --workspace --all-targets
-```
-
-Real hardware Edge proof must run on the minimum two-disk profile:
-
-```text
-/mnt/disk-00
-/mnt/disk-01
-```
-
-Both disks should house index and blob roots.
-
-Run the Edge real proof harness:
-
-```bash
-python3 scripts/bench/n1_edge_real_proof.py \
-  --binary target/debug/litiaina-n1-edge \
-  --source-dir /home/administrator/Development/litiaina-cloud-web \
-  --disk-roots /mnt/disk-00,/mnt/disk-01 \
-  --out-dir /home/administrator/Development/N2/.n1-bench/edge-real-full-$(date +%Y%m%d-%H%M%S) \
-  --port 50561 \
-  --concurrency 16 \
-  --quota-backend disabled \
-  --quota-bytes 10737418240 \
-  --prefix edge-full/ \
-  --simulate-disk-format-repair
-```
-
-Edge proof must cover:
-
-- CRUD through public HTTP routes
-- latest GET and exact version GET
-- POSIX list, mkdir, rename, folder rename, move, trash, recover, purge
-- restart listing proof
-- multipart resume after restart
-- recover-on-read after a missing shard/parity side
-- repair after one disk is wiped or reformatted
-- redistribution 2 disk -> 1 disk -> 2 disk
-- GC after hard delete and empty trash
-- archive download for selected folders/files
-- four-user parallel upload storm with bounded RSS and file descriptors
-
-API-level storm testing can be reused against a live Edge server:
-
-```bash
-scripts/bench/n1_live_parallel_storm.py \
-  --base-url https://127.0.0.1:50001 \
-  --master-key <MASTER_KEY> \
-  --users 4 \
-  --objects-per-user 3000 \
-  --per-user-concurrency 4 \
-  --quota-bytes 21474836480 \
-  --edge-posix-list \
-  --multipart-size-mib 16 \
-  --multipart-part-mib 4 \
-  --pid <N1_EDGE_PID>
-```
-
-The Standard restart proof script includes indexdb table inspection. Do not use it as Edge release evidence. Edge release evidence must verify committed `.ndx` records, live/trash reachability, and blob version directories instead of indexdb tables.
-
-Latest Edge proof evidence from 2026-05-06:
-
-- Warning-gated `cargo test -p n1-edge --all-targets` passed.
-- Warning-gated `cargo check --workspace --all-targets` passed.
-- Real two-disk Edge proof on `/mnt/disk-00` and `/mnt/disk-01` passed CRUD, POSIX, archive, multipart, recover-on-read, simulated disk-format repair, and redistribution `2 disk -> 1 disk -> 2 disk`.
-- The proof verified both roots with `live_ndx=12`, `namespace_symlinks=12`, and `blob_version_dirs=12`.
-- Four concurrent users/fragments uploaded `3,000` small objects each, plus one `16 MiB` multipart object per user. Edge POSIX listing returned `12,004` objects exactly.
-- Storm max RSS was about `258 MiB` with `42` threads. The bad-disk tiny-object workload measured `14.343 objects/s` and `0.203 MiB/s`.
+- `cargo test -p n1 --all-targets` passed after the N1 promotion and repair-source regression fix.
+- Real two-disk proof on `/mnt/disk-00` and `/mnt/disk-01` passed CRUD, POSIX, archive, multipart, recover-on-read, simulated disk-format repair, and redistribution `2 disk -> 1 disk -> 2 disk`.
+- The proof verified both roots with `live_ndx=904`, `namespace_symlinks=904`, and `blob_version_dirs=904` after re-expansion.
+- Server RSS stayed bounded at about `52 MiB` during that focused proof.

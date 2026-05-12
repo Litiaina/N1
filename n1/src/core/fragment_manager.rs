@@ -16,14 +16,13 @@ use tracing::{error, info, warn};
 use crate::{
     core::{
         disk_manager::ObjectPathManager,
+        edge_index_store::{
+            active_fragment_quota_bytes, ensure_fragment_owner_partition_available_strict,
+            ensure_fragment_quota_project_id, has_any_fragment_edge_index, set_fragment_quota,
+        },
         fragment_metadata::{
             init_fragment_metadata_strict, read_fragment_metadata, rotate_fragment_key,
             write_fragment_metadata,
-        },
-        indexdb_store::{
-            active_fragment_quota_bytes, ensure_fragment_owner_partition_available_strict,
-            ensure_fragment_quota_project_id, evict_fragment_cached_dbs,
-            has_any_fragment_partition_db, set_fragment_quota,
         },
         quota_manager::{
             apply_fragment_project_quota, fragment_quota_enforcement_enabled, get_storage_usage,
@@ -77,7 +76,7 @@ async fn prepare_fragment_index_roots_strict(fragment: &str) -> Result<(), AppEr
     }
 
     for root in index_roots {
-        let index_dir = root.join(fragment).join("indexdb");
+        let index_dir = root.join(fragment);
         timeout(FRAGMENT_CREATE_IO_TIMEOUT, fs::create_dir_all(&index_dir))
             .await
             .map_err(|_| {
@@ -153,8 +152,8 @@ pub async fn create_fragment(
     global_namespace_runtime().evict_fragment(&hash);
 
     let metadata_exists = read_fragment_metadata(&hash).await.is_ok();
-    let owner_partition_exists = has_any_fragment_partition_db(&hash)?;
-    if metadata_exists && owner_partition_exists {
+    let edge_index_exists = has_any_fragment_edge_index(&hash)?;
+    if metadata_exists && edge_index_exists {
         return Err(AppError::Conflict(format!(
             "Fragment already exists: {}",
             hash
@@ -184,7 +183,7 @@ pub async fn create_fragment(
         let _ = init_fragment_metadata_strict(&hash, &payload.key).await?;
     }
 
-    if metadata_exists || owner_partition_exists {
+    if metadata_exists || edge_index_exists {
         info!(
             "Recovered partial fragment '{}' with hash: {}",
             payload.name, hash
@@ -254,6 +253,8 @@ pub async fn update_fragment(
         let new_hash = hex::encode(hasher.finalize());
 
         if new_hash != current_hash {
+            let existing_meta = read_fragment_metadata(&current_hash).await.ok();
+
             for root in &index_roots {
                 if root.join(&new_hash).exists() {
                     return Err(AppError::Conflict(format!(
@@ -286,25 +287,19 @@ pub async fn update_fragment(
                 }
             }
 
-            let mut meta = match read_fragment_metadata(&new_hash).await {
-                Ok(m) => m,
-                Err(_) => {
-                    let old_meta = read_fragment_metadata(&current_hash).await.ok();
-                    old_meta.unwrap_or_else(|| crate::core::fragment_metadata::FragmentMetadata {
-                        fragment: new_hash.clone(),
-                        key_phc: String::new(),
-                        nt_hash_hex: None,
-                        index_partition_count:
-                            crate::core::fragment_metadata::configured_index_partition_count(),
-                        created: chrono::Utc::now()
-                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                        updated: None,
-                    })
-                }
-            };
+            let mut meta =
+                existing_meta.unwrap_or_else(|| crate::core::fragment_metadata::FragmentMetadata {
+                    fragment: new_hash.clone(),
+                    key_phc: String::new(),
+                    nt_hash_hex: None,
+                    index_partition_count:
+                        crate::core::fragment_metadata::configured_index_partition_count(),
+                    created: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    updated: None,
+                });
 
             meta.fragment = new_hash.clone();
-            write_fragment_metadata(&meta).await.ok();
+            write_fragment_metadata(&meta).await?;
 
             info!(
                 "Renamed fragment {} -> {} ({})",
@@ -325,7 +320,6 @@ pub async fn update_fragment(
 
     if let Some(new_key) = payload.new_key {
         rotate_fragment_key(&current_hash, &new_key).await?;
-        state.emit(&current_hash, StorageEventPayload::StateInvalidated);
     }
 
     Ok((
@@ -358,7 +352,6 @@ pub async fn delete_fragment(
     let fragment_owned = fragment.clone();
 
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-        evict_fragment_cached_dbs(&fragment_owned);
         global_namespace_runtime().evict_fragment(&fragment_owned);
 
         for root in index_roots.iter() {

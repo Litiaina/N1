@@ -65,7 +65,7 @@ pub static UPLOAD_IO_GATE_ENABLED_ATOMIC: OnceCell<AtomicBool> = OnceCell::new()
 static IO_SEMAPHORE: Lazy<Semaphore> =
     Lazy::new(|| Semaphore::new(*MAX_IO_SEMAPHORE.get().unwrap()));
 static ACTIVE_IO_INFLIGHT: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
-const UPLOAD_IO_GATE_TIMEOUT_SECS: u64 = 120;
+const UPLOAD_IO_GATE_WAIT_LOG_SECS: u64 = 30;
 const MIN_DYNAMIC_STRIPE_SIZE: usize = 4 * 1024;
 const TINY_OBJECT_STRIPE_4K_LIMIT: u64 = 64 * 1024;
 const SMALL_OBJECT_STRIPE_16K_LIMIT: u64 = 1024 * 1024;
@@ -93,7 +93,7 @@ static IO_URING_ENABLED: Lazy<bool> = Lazy::new(|| {
         Ok(_) => true,
         Err(err) => {
             warn!(
-                "io_uring unavailable for Standard direct writer, falling back to O_DIRECT blocking writes: {}",
+                "io_uring unavailable for N1 direct writer, falling back to O_DIRECT blocking writes: {}",
                 err
             );
             false
@@ -150,22 +150,23 @@ async fn acquire_upload_io_guard_with_timeout(
         return Ok(None);
     }
 
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(UPLOAD_IO_GATE_TIMEOUT_SECS),
-        acquire_adaptive_io_guard(),
-    )
-    .await
-    {
-        Ok(Ok(guard)) => Ok(Some(guard)),
-        Ok(Err(e)) => Err(e),
-        Err(_) => {
-            warn!(
-                "Upload IO gate wait timed out ({}); rejecting request to preserve backpressure",
-                context
-            );
-            Err(AppError::ServiceUnavailable(
-                "Upload path is saturated; retry shortly.".into(),
-            ))
+    let started = std::time::Instant::now();
+    loop {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(UPLOAD_IO_GATE_WAIT_LOG_SECS),
+            acquire_adaptive_io_guard(),
+        )
+        .await
+        {
+            Ok(Ok(guard)) => return Ok(Some(guard)),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                warn!(
+                    "Upload IO gate still waiting after {}s ({}); preserving request instead of rejecting multipart progress",
+                    started.elapsed().as_secs(),
+                    context
+                );
+            }
         }
     }
 }
@@ -178,7 +179,7 @@ pub(crate) async fn acquire_upload_io_guard_for_query(
         .get()
         .map(|v| v.load(Ordering::Relaxed))
         .unwrap_or(true);
-    let io_gate_enabled = global_io_gate_enabled || io_gate_override.unwrap_or(false);
+    let io_gate_enabled = io_gate_override.unwrap_or(global_io_gate_enabled);
     acquire_upload_io_guard_with_timeout(io_gate_enabled, context).await
 }
 

@@ -5,12 +5,12 @@ pub mod delete;
 pub mod disk_manager;
 pub mod download;
 pub mod ec;
+pub mod edge_index_store;
 pub mod fragment_manager;
 pub mod fragment_metadata;
 pub mod garbage_collector;
 pub mod header_parser;
 pub mod index;
-pub mod indexdb_store;
 pub mod maintenance;
 pub mod metadata_parser;
 pub mod modify;
@@ -26,6 +26,3 @@ pub mod storage_capacity_parser;
 pub mod sync;
 pub mod system;
 pub mod upload;
-
-#[cfg(test)]
-mod workflow_tests;

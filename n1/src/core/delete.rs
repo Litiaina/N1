@@ -18,10 +18,11 @@ use crate::core::disk_manager::ObjectPathManager;
 use crate::core::index;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::enums::app_error_enum::AppError;
+use crate::namespace::models::NamespaceMutationSummary;
 use crate::namespace::runtime::global_namespace_runtime;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
-use crate::websocket::ws_structs::StorageEventPayload;
+use crate::websocket::ws_structs::{NamespaceChangeEvent, StorageEventPayload};
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct TrashLifecycleJobStatus {
@@ -208,7 +209,7 @@ pub(crate) fn persistent_trash_job_paths(fragment: &str) -> Vec<std::path::PathB
         .into_iter()
         .map(|root| {
             root.join(fragment)
-                .join("indexdb")
+                .join(".trash-jobs")
                 .join(PERSISTENT_TRASH_JOB_FILE)
         })
         .collect()
@@ -290,7 +291,10 @@ async fn discover_persistent_trash_jobs() -> Result<Vec<PersistentTrashJobRecord
                 continue;
             }
 
-            let job_path = entry.path().join("indexdb").join(PERSISTENT_TRASH_JOB_FILE);
+            let job_path = entry
+                .path()
+                .join(".trash-jobs")
+                .join(PERSISTENT_TRASH_JOB_FILE);
             let raw = match fs::read(&job_path).await {
                 Ok(raw) => raw,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -497,43 +501,44 @@ pub struct BulkObjectOperationResponse {
     pub failed: Vec<BulkObjectFailure>,
 }
 
-async fn delete_object_core(fragment: &str, object_key: &str) -> Result<usize, AppError> {
+async fn delete_object_core(
+    fragment: &str,
+    object_key: &str,
+) -> Result<NamespaceMutationSummary, AppError> {
     let _object_lock = index::acquire_object_operation_lock(fragment, object_key).await?;
-    let summary = global_namespace_runtime()
-        .trash(fragment, object_key)
-        .await?;
-    Ok(summary.affected_objects.max(summary.affected_paths))
+    global_namespace_runtime().trash(fragment, object_key).await
 }
 
-async fn recover_object_core(fragment: &str, object_key: &str) -> Result<usize, AppError> {
+async fn recover_object_core(
+    fragment: &str,
+    object_key: &str,
+) -> Result<NamespaceMutationSummary, AppError> {
     let _object_lock = index::acquire_object_operation_lock(fragment, object_key).await?;
-    let summary = global_namespace_runtime()
+    global_namespace_runtime()
         .recover(fragment, object_key)
-        .await?;
-    Ok(summary.affected_objects.max(summary.affected_paths))
+        .await
 }
 
 async fn delete_object_permanently_core(
     fragment: &str,
     object_key: &str,
-) -> Result<Vec<String>, AppError> {
+) -> Result<NamespaceMutationSummary, AppError> {
     let _object_lock = index::acquire_object_operation_lock(fragment, object_key).await?;
-    let summary = match global_namespace_runtime()
+    match global_namespace_runtime()
         .purge_trash_path(fragment, object_key)
         .await
     {
-        Ok(summary) => summary,
+        Ok(summary) => Ok(summary),
         Err(AppError::NotFound) => {
             global_namespace_runtime()
                 .trash(fragment, object_key)
                 .await?;
-            global_namespace_runtime()
+            Ok(global_namespace_runtime()
                 .purge_trash_path(fragment, object_key)
-                .await?
+                .await?)
         }
-        Err(err) => return Err(err),
-    };
-    Ok(summary.trash_entry_id.into_iter().collect::<Vec<String>>())
+        Err(err) => Err(err),
+    }
 }
 
 pub async fn delete_object_version(
@@ -565,14 +570,12 @@ pub async fn delete_object_version(
         fragment, object_key, version_id
     );
 
-    state.emit(
-        &fragment,
-        StorageEventPayload::FileDeleted {
-            fragment: fragment.clone(),
-            object_key,
-            version_id: Some(version_id),
-        },
-    );
+    let event = StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::version_removed(
+        fragment.clone(),
+        object_key,
+        version_id,
+    ));
+    state.emit(&fragment, event);
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -589,7 +592,8 @@ pub async fn delete_object(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let moved_count = delete_object_core(&fragment, &object_key).await?;
+    let summary = delete_object_core(&fragment, &object_key).await?;
+    let moved_count = summary.affected_objects.max(summary.affected_paths);
 
     info!(
         "Soft deleted {} versions for object {}/{}",
@@ -598,11 +602,9 @@ pub async fn delete_object(
 
     state.emit(
         &fragment,
-        StorageEventPayload::FileDeleted {
-            fragment: fragment.clone(),
-            object_key,
-            version_id: None,
-        },
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment, summary,
+        )),
     );
 
     Ok(StatusCode::OK)
@@ -634,9 +636,13 @@ pub async fn delete_objects_bulk(
     let mut failed = Vec::new();
     let mut succeeded = 0usize;
     let mut not_found = 0usize;
+    let mut summaries = Vec::new();
     for object_key in &unique_keys {
         match delete_object_core(&fragment, object_key).await {
-            Ok(_) => succeeded = succeeded.saturating_add(1),
+            Ok(summary) => {
+                succeeded = succeeded.saturating_add(1);
+                summaries.push(summary);
+            }
             Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
             Err(err) => failed.push(BulkObjectFailure {
                 object_key: object_key.clone(),
@@ -652,8 +658,13 @@ pub async fn delete_objects_bulk(
         );
     }
 
-    if succeeded > 0 {
-        state.emit(&fragment, StorageEventPayload::StateInvalidated);
+    for summary in summaries {
+        state.emit(
+            &fragment,
+            StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+                &fragment, summary,
+            )),
+        );
     }
 
     Ok((
@@ -742,7 +753,6 @@ async fn run_empty_trash_job(state: Arc<AppState>, fragment: String) -> Result<(
             })
             .await;
             clear_persistent_trash_job_record(&fragment).await;
-            state.emit(&fragment, StorageEventPayload::StateInvalidated);
             return Ok(());
         }
         Err(err) => return Err(err),
@@ -786,7 +796,12 @@ async fn run_empty_trash_job(state: Arc<AppState>, fragment: String) -> Result<(
     .await;
     clear_persistent_trash_job_record(&fragment).await;
 
-    state.emit(&fragment, StorageEventPayload::StateInvalidated);
+    state.emit(
+        &fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment, summary,
+        )),
+    );
     Ok(())
 }
 
@@ -802,22 +817,20 @@ pub async fn delete_object_permanently(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let versions_to_delete = delete_object_permanently_core(&fragment, &object_key).await?;
+    let summary = delete_object_permanently_core(&fragment, &object_key).await?;
 
     info!(
         "Permanently deleted {} versions for {}/{}",
-        versions_to_delete.len(),
+        summary.affected_objects.max(summary.affected_paths),
         fragment,
         object_key
     );
 
     state.emit(
         &fragment,
-        StorageEventPayload::FileDeleted {
-            fragment: fragment.clone(),
-            object_key,
-            version_id: None,
-        },
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment, summary,
+        )),
     );
 
     Ok(StatusCode::NO_CONTENT)
@@ -850,9 +863,13 @@ pub async fn delete_objects_bulk_permanently(
     let mut not_found = 0usize;
     let mut failed = Vec::new();
 
+    let mut summaries = Vec::new();
     for object_key in &unique_keys {
         match delete_object_permanently_core(&fragment, object_key).await {
-            Ok(_) => succeeded = succeeded.saturating_add(1),
+            Ok(summary) => {
+                succeeded = succeeded.saturating_add(1);
+                summaries.push(summary);
+            }
             Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
             Err(err) => failed.push(BulkObjectFailure {
                 object_key: object_key.clone(),
@@ -861,8 +878,13 @@ pub async fn delete_objects_bulk_permanently(
         }
     }
 
-    if succeeded > 0 {
-        state.emit(&fragment, StorageEventPayload::StateInvalidated);
+    for summary in summaries {
+        state.emit(
+            &fragment,
+            StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+                &fragment, summary,
+            )),
+        );
     }
 
     Ok((
@@ -908,7 +930,18 @@ pub async fn recover_object_version(
 
     if let Ok(mut meta) = index::read_object_version(&fragment, &physical_key, &version_id).await {
         meta.object_key = object_key.clone();
-        state.emit(&fragment, StorageEventPayload::FileUploaded(meta));
+        state.emit(
+            &fragment,
+            StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::file_upsert(
+                &fragment,
+                &object_key,
+                &physical_key,
+                meta.total_size_bytes,
+                &meta.version_id,
+                &meta.content_type,
+                meta.created_at,
+            )),
+        );
     }
 
     Ok(StatusCode::OK)
@@ -928,14 +961,20 @@ pub async fn recover_object(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let restored_count = recover_object_core(&fragment, &object_key).await?;
+    let summary = recover_object_core(&fragment, &object_key).await?;
+    let restored_count = summary.affected_objects.max(summary.affected_paths);
 
     info!(
         "Recovered {} versions for object {}/{}",
         restored_count, fragment, object_key
     );
 
-    state.emit(&fragment, StorageEventPayload::StateInvalidated);
+    state.emit(
+        &fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment, summary,
+        )),
+    );
 
     Ok(StatusCode::OK)
 }
@@ -968,12 +1007,16 @@ pub async fn recover_objects_bulk(
     let mut failed = Vec::new();
     let mut succeeded = 0usize;
     let mut not_found = 0usize;
+    let mut summaries = Vec::new();
     for (object_key, result) in global_namespace_runtime()
         .recover_paths_bulk(&fragment, unique_keys.clone())
         .await?
     {
         match result {
-            Ok(_) => succeeded = succeeded.saturating_add(1),
+            Ok(summary) => {
+                succeeded = succeeded.saturating_add(1);
+                summaries.push(summary);
+            }
             Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
             Err(err) => failed.push(BulkObjectFailure {
                 object_key,
@@ -989,8 +1032,13 @@ pub async fn recover_objects_bulk(
         );
     }
 
-    if succeeded > 0 {
-        state.emit(&fragment, StorageEventPayload::StateInvalidated);
+    for summary in summaries {
+        state.emit(
+            &fragment,
+            StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+                &fragment, summary,
+            )),
+        );
     }
 
     Ok((
@@ -1097,7 +1145,12 @@ async fn run_recover_all_trash_job(state: Arc<AppState>, fragment: String) -> Re
     .await;
     clear_persistent_trash_job_record(&fragment).await;
 
-    state.emit(&fragment, StorageEventPayload::StateInvalidated);
+    state.emit(
+        &fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment, summary,
+        )),
+    );
 
     Ok(())
 }

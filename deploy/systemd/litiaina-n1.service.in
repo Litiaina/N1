@@ -1,5 +1,5 @@
 [Unit]
-Description=Litiaina N1 Standard
+Description=Litiaina N1
 Wants=network-online.target
 After=network-online.target local-fs.target
 StartLimitIntervalSec=300

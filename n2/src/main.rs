@@ -1,4 +1,4 @@
-pub use n1_edge::{core, enums, fs, handlers, middleware, statics, structs, utils, websocket};
+pub use n1::{core, enums, fs, handlers, middleware, statics, structs, utils, websocket};
 
 use crate::core::adaptive_concurrency::{
     ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC, ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC,
@@ -34,7 +34,7 @@ use axum::Router;
 use axum_server::tls_rustls::RustlsConfig;
 use chrono::Local;
 use ini::Ini;
-use n1_edge::settings::constants::{CONFIG_FILE as EDGE_CONFIG_FILE, ENV_FILE as EDGE_ENV_FILE};
+use n1::settings::constants::{CONFIG_FILE as EDGE_CONFIG_FILE, ENV_FILE as EDGE_ENV_FILE};
 use std::collections::HashSet;
 use std::fs as stdfs;
 use std::fs::OpenOptions;
@@ -265,14 +265,14 @@ fn normalize_fs_backed_disk_paths(role: &str, paths: Vec<String>) -> Vec<String>
             let ft = meta.file_type();
             if ft.is_block_device() || ft.is_char_device() {
                 panic!(
-                    "{} entry '{}' is a device. N2 0.4 uses the N1 Edge storage kernel and requires directory paths.",
+                    "{} entry '{}' is a device. N2 0.4 uses the N1 storage kernel and requires directory paths.",
                     role, trimmed
                 );
             }
         }
         if !meta.is_dir() {
             panic!(
-                "{} entry '{}' is not a directory. N2 0.4 uses the N1 Edge storage kernel and requires directory paths.",
+                "{} entry '{}' is not a directory. N2 0.4 uses the N1 storage kernel and requires directory paths.",
                 role, trimmed
             );
         }
@@ -469,7 +469,7 @@ fn ensure_edge_kernel_runtime_alias(
             Ok(_) => return Ok(()),
             Err(err) => {
                 tracing::warn!(
-                    "N2 Edge-kernel runtime guard could not create symlink '{}' -> '{}': {}. Falling back to a copy.",
+                    "N2 N1-kernel runtime guard could not create symlink '{}' -> '{}': {}. Falling back to a copy.",
                     alias.display(),
                     source.display(),
                     err
@@ -493,12 +493,12 @@ fn ensure_edge_kernel_runtime_files() -> Result<(), String> {
     ensure_edge_kernel_runtime_alias(
         Path::new(ENV_FILE),
         Path::new(EDGE_ENV_FILE),
-        "N2 Edge-kernel env runtime file",
+        "N2 N1-kernel env runtime file",
     )?;
     ensure_edge_kernel_runtime_alias(
         Path::new(CONFIG_FILE),
         Path::new(EDGE_CONFIG_FILE),
-        "N2 Edge-kernel config runtime file",
+        "N2 N1-kernel config runtime file",
     )?;
     Ok(())
 }
@@ -671,7 +671,7 @@ async fn validate_n2_startup_layout(config: &Ini, local_blob_roots: usize) {
         );
     }
     tracing::info!(
-        "N2 local shard storage: one cluster EC layer, local N1 Edge shard objects use kd=1 md=0 across {} blob root(s)",
+        "N2 local shard storage: one cluster EC layer, local N1 shard objects use kd=1 md=0 across {} blob root(s)",
         local_blob_roots
     );
 }
@@ -981,7 +981,7 @@ pub async fn run_server() {
         governance_state.last_applied_membership_epoch
     );
 
-    tracing::info!("Storage mode: N2 .nmtd metadata plane over the N1 Edge storage kernel");
+    tracing::info!("Storage mode: N2 .nmtd metadata plane over the N1 storage kernel");
 
     let upload_section = config.section(Some("upload_config"));
     let cpu_cores = detect_cpu_cores();

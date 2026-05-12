@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 use crate::{
     core::{
         disk_manager::CapacityUsageResponse,
-        indexdb_store,
+        edge_index_store,
         quota_manager::{
             FragmentBlobUsage, apply_fragment_project_quota, fragment_quota_backend,
             fragment_quota_enforcement_enabled, get_fragment_blob_usage, get_storage_usage,
@@ -62,7 +62,7 @@ pub struct ResizeFragmentQuotaResponse {
 
 fn quota_usage_from_meta(
     fragment: String,
-    meta: indexdb::n1::FragmentMeta,
+    meta: edge_index_store::FragmentMeta,
     blob_usage: FragmentBlobUsage,
 ) -> FragmentQuotaUsageResponse {
     let used_bytes = blob_usage.used_bytes();
@@ -119,10 +119,11 @@ pub async fn get_fragment_quota_usage(claims: Claims) -> Result<impl IntoRespons
 
     let fragment = claims.fragment.clone();
     let lookup_fragment = fragment.clone();
-    let meta =
-        tokio::task::spawn_blocking(move || indexdb_store::fragment_quota_meta(&lookup_fragment))
-            .await
-            .map_err(|err| AppError::InternalServerError(format!("quota usage worker: {err}")))??;
+    let meta = tokio::task::spawn_blocking(move || {
+        edge_index_store::fragment_quota_meta(&lookup_fragment)
+    })
+    .await
+    .map_err(|err| AppError::InternalServerError(format!("quota usage worker: {err}")))??;
 
     let Some(meta) = meta else {
         return Err(AppError::NotFound);
@@ -158,12 +159,11 @@ pub async fn resize_fragment_quota(
 
     let _guard = FRAGMENT_QUOTA_RESIZE_LOCK.lock().await;
     let lookup_fragment = fragment.clone();
-    let meta =
-        tokio::task::spawn_blocking(move || indexdb_store::fragment_quota_meta(&lookup_fragment))
-            .await
-            .map_err(|err| {
-                AppError::InternalServerError(format!("quota resize worker: {err}"))
-            })??;
+    let meta = tokio::task::spawn_blocking(move || {
+        edge_index_store::fragment_quota_meta(&lookup_fragment)
+    })
+    .await
+    .map_err(|err| AppError::InternalServerError(format!("quota resize worker: {err}")))??;
 
     let Some(meta) = meta else {
         return Err(AppError::NotFound);
@@ -189,7 +189,7 @@ pub async fn resize_fragment_quota(
 
     let usage = get_storage_usage().await?;
     let active_quota_bytes =
-        tokio::task::spawn_blocking(indexdb_store::active_fragment_quota_bytes)
+        tokio::task::spawn_blocking(edge_index_store::active_fragment_quota_bytes)
             .await
             .map_err(|err| AppError::InternalServerError(format!("quota total worker: {err}")))??;
 
@@ -207,7 +207,7 @@ pub async fn resize_fragment_quota(
     if changed {
         let project_fragment = fragment.clone();
         let project_id = tokio::task::spawn_blocking(move || {
-            indexdb_store::ensure_fragment_quota_project_id(&project_fragment)
+            edge_index_store::ensure_fragment_quota_project_id(&project_fragment)
         })
         .await
         .map_err(|err| AppError::InternalServerError(format!("quota project worker: {err}")))??;
@@ -217,7 +217,7 @@ pub async fn resize_fragment_quota(
         let fragment_for_update = fragment.clone();
         let quota_bytes = payload.quota_bytes;
         if let Err(err) = tokio::task::spawn_blocking(move || {
-            indexdb_store::set_fragment_quota(&fragment_for_update, quota_bytes)
+            edge_index_store::set_fragment_quota(&fragment_for_update, quota_bytes)
         })
         .await
         .map_err(|err| AppError::InternalServerError(format!("quota update worker: {err}")))?

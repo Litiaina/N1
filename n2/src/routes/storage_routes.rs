@@ -3,7 +3,7 @@ use crate::routes::native::{protected_n2_routes, public_n2_routes};
 use crate::routes::peer::internal_n2_routes;
 use crate::s3::routes::protected_s3_routes;
 use axum::Router;
-use n1_edge::routes::storage_routes::{
+use n1::routes::storage_routes::{
     StorageRouteOptions, apply_runtime_http_layers, build_storage_routes_unbound_with_options,
 };
 

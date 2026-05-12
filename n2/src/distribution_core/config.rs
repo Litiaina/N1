@@ -271,7 +271,7 @@ pub fn validate_cross_params(
     }
     if params.kd != 1 || params.md != 0 {
         return Err(format!(
-            "N2 0.4 uses one cluster-level EC layer; local N1 Edge shard storage must be kd=1 md=0, got kd={} md={}",
+            "N2 0.4 uses one cluster-level EC layer; local N1 shard storage must be kd=1 md=0, got kd={} md={}",
             params.kd, params.md
         ));
     }

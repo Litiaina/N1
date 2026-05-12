@@ -1,4 +1,4 @@
-pub use n1_edge::routes::storage_routes::AppState;
+pub use n1::routes::storage_routes::AppState;
 
 pub mod native;
 pub mod peer;

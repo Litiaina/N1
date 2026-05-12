@@ -19,13 +19,7 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("fragment_quota_backend", "xfs_project");
 
     conf.with_section(Some("index_config"))
-        .set("partition_count", "64")
-        .set("per_db_cache_bytes", "auto")
-        .set("max_cached_dbs", "auto");
-
-    conf.with_section(Some("namespace_config"))
-        .set("max_loaded_facades", "auto")
-        .set("max_loaded_dbs", "auto");
+        .set("partition_count", "64");
 
     conf.with_section(Some("garbage_collector"))
         .set("cleanup_interval_seconds", "3600")
@@ -100,8 +94,6 @@ mod tests {
             .section(Some("index_config"))
             .expect("index_config section");
         assert_eq!(index.get("partition_count"), Some("64"));
-        assert_eq!(index.get("per_db_cache_bytes"), Some("auto"));
-        assert_eq!(index.get("max_cached_dbs"), Some("auto"));
 
         let _ = fs::remove_file(path);
     }

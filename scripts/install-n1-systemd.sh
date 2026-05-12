@@ -2,9 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TEMPLATE_FILE="${ROOT_DIR}/deploy/systemd/litiaina-n1-standard.service.in"
+TEMPLATE_FILE="${ROOT_DIR}/deploy/systemd/litiaina-n1.service.in"
 
-SERVICE_NAME="litiaina-n1-standard"
+SERVICE_NAME="litiaina-n1"
 INSTALL_DIR=""
 BINARY_PATH=""
 ENV_FILE=""
@@ -22,7 +22,7 @@ DRY_RUN=0
 
 usage() {
   cat <<'USAGE'
-Install the production systemd unit for Litiaina N1 Standard.
+Install the production systemd unit for Litiaina N1.
 
 Usage:
   sudo scripts/install-n1-systemd.sh --install-dir /path/to/n1-server [options]
@@ -34,7 +34,7 @@ Common options:
   --binary PATH             N1 binary path. Default: <install-dir>/litiaina-n1
   --env-file PATH           Environment file. Default: <install-dir>/n1.env
   --config-file PATH        Config file. Default: <install-dir>/n1_config.ini
-  --service-name NAME       systemd unit name without .service. Default: litiaina-n1-standard
+  --service-name NAME       systemd unit name without .service. Default: litiaina-n1
   --rust-log VALUE          RUST_LOG value. Default: info
   --xfs-quota-bin PATH      xfs_quota path. Default: /usr/sbin/xfs_quota
   --enable                  Run systemctl enable after installing.

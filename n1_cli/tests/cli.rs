@@ -490,7 +490,7 @@ async fn health_renders_disk_usage_and_health() {
         "stdout={stdout}\nstderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("N1 3.0 Health"));
+    assert!(stdout.contains("N1 Health"));
     assert!(stdout.contains("/mnt/DISK0"));
     assert!(stdout.contains("75.00%"));
     assert!(stdout.contains("healthy"));
@@ -574,12 +574,12 @@ async fn health_auto_refreshes_expiring_access_token() {
         "stdout={stdout}\nstderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("N1 3.0 Health"));
+    assert!(stdout.contains("N1 Health"));
     assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn maintenance_status_commands_use_n1_3_routes() {
+async fn maintenance_status_commands_use_n1_routes() {
     let router = Router::new()
         .route("/n1/fragments/hash", get(fragment_hash_handler))
         .route("/n1/auth/fragment", post(auth_handler))

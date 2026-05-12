@@ -89,7 +89,8 @@ pub(crate) async fn store_local_cluster_shard_from_file(
     }
     if kd != 1 || md != 0 {
         return Err(AppError::BadRequest(
-            "N2 0.4 uses one cluster-level EC layer; local N1 Edge shard storage must use kd=1 md=0".to_string(),
+            "N2 0.4 uses one cluster-level EC layer; local N1 shard storage must use kd=1 md=0"
+                .to_string(),
         ));
     }
 

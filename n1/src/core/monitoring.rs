@@ -1,5 +1,7 @@
+use crate::core::constants::EDGE_BLOB_DIR;
 use crate::core::delete::{get_empty_trash_status, get_recover_all_trash_status};
 use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
+use crate::core::edge_index_store;
 use crate::core::fragment_manager::is_fragment_hash;
 use crate::core::garbage_collector::get_gc_status;
 use crate::core::index;
@@ -110,15 +112,15 @@ pub struct DiskStatus {
 
 #[derive(Serialize, Clone)]
 pub struct ConsistencyStats {
-    pub total_partition_dbs_scanned: u64,
-    pub index_partition_health: String,
-    pub namespace_indexdb: NamespaceIndexDbHealthStats,
+    pub total_index_records_scanned: u64,
+    pub index_health: String,
+    pub index_replicas: IndexReplicaHealthStats,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub partition_db_counts: Option<HashMap<String, u64>>,
+    pub index_record_counts: Option<HashMap<String, u64>>,
 }
 
 #[derive(Serialize, Clone, Default)]
-pub struct NamespaceIndexDbHealthStats {
+pub struct IndexReplicaHealthStats {
     pub fragments_checked: u64,
     pub fragments_degraded: u64,
     pub fragments_critical: u64,
@@ -146,8 +148,8 @@ pub struct UploadRuntimeStats {
 
 #[derive(Serialize, Clone, Default)]
 pub struct IndexRuntimeStats {
-    pub loaded_partition_runtimes: u64,
-    pub wal_appenders: u64,
+    pub loaded_index_records: u64,
+    pub index_roots_online: u64,
     pub prefix_projection_fragments_pending: u64,
 }
 
@@ -230,51 +232,56 @@ struct BlobPlacementRisk {
 
 #[derive(Default)]
 struct FragmentRedundancyDebt {
-    orphaned_blob_fragments: Vec<String>,
+    pending_gc_blob_fragments: Vec<String>,
     sampled_degraded_fragments: Vec<String>,
 }
 
-fn should_count_index_db_file(path: &std::path::Path) -> bool {
+fn should_count_edge_index_record(path: &std::path::Path) -> bool {
     let name = match path.file_name().and_then(|n| n.to_str()) {
         Some(s) => s,
         None => return false,
     };
 
-    if !name.ends_with(".ndxdb") {
+    if !name.ends_with(".ndx") {
         return false;
     }
 
-    if path
-        .components()
-        .any(|component| component.as_os_str() == std::ffi::OsStr::new(".trash"))
-    {
+    if path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some(".trash" | ".uploads" | ".intents")
+        )
+    }) {
         return false;
     }
 
     let Some(parent) = path.parent() else {
         return false;
     };
-    parent.file_name().and_then(|n| n.to_str()) == Some("indexdb") && name == "index.ndxdb"
+    parent
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|parent_name| parent_name.starts_with("@o_"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::should_count_index_db_file;
+    use super::should_count_edge_index_record;
     use std::path::Path;
 
     #[test]
-    fn deep_scan_counts_only_index_db_files() {
-        assert!(should_count_index_db_file(Path::new(
-            "frag/indexdb/index.ndxdb"
+    fn deep_scan_counts_only_live_index_records() {
+        assert!(should_count_edge_index_record(Path::new(
+            "frag/.objects/ab/cd/@o_abc/01HZ.123.456.7.ndx"
         )));
-        assert!(!should_count_index_db_file(Path::new(
-            "frag/indexdb/intents/0001.pending.redist.intent.msgpack"
+        assert!(!should_count_edge_index_record(Path::new(
+            "frag/.intents/0001.pending.redist.intent.msgpack"
         )));
-        assert!(!should_count_index_db_file(Path::new(
-            "frag/indexdb/index.ndxdb.gc"
+        assert!(!should_count_edge_index_record(Path::new(
+            "frag/.fragment.ndx"
         )));
-        assert!(!should_count_index_db_file(Path::new(
-            "frag/.trash/indexdb/index.ndxdb"
+        assert!(!should_count_edge_index_record(Path::new(
+            "frag/.trash/.objects/ab/cd/@o_abc/01HZ.123.456.7.ndx"
         )));
     }
 }
@@ -436,7 +443,7 @@ async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bo
     let now = SystemTime::now();
     tokio::task::spawn_blocking(move || {
         for root in roots {
-            let blob_dir = root.join(&fragment).join("blob");
+            let blob_dir = root.join(&fragment).join(EDGE_BLOB_DIR);
             let Ok(entries) = std::fs::read_dir(&blob_dir) else {
                 continue;
             };
@@ -470,7 +477,21 @@ async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bo
     .unwrap_or(false)
 }
 
-async fn fragment_has_indexed_payload(fragment: &str) -> Result<bool, AppError> {
+async fn fragment_has_indexed_payload(
+    fragment: &str,
+    active_index_roots: &[PathBuf],
+) -> Result<bool, AppError> {
+    let fragment_owned = fragment.to_string();
+    let roots = active_index_roots.to_vec();
+    let has_object_index = tokio::task::spawn_blocking(move || {
+        edge_index_store::fragment_has_object_index_records(&fragment_owned, &roots)
+    })
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("N1 object index scan join: {e}")))?;
+    if has_object_index {
+        return Ok(true);
+    }
+
     let live = index::scan_fragment_live_metadata_page(fragment, None, None, 1, None, true).await?;
     if !live.objects.is_empty() {
         return Ok(true);
@@ -552,6 +573,7 @@ async fn detect_fragment_redundancy_debt(
     active_index_roots: &[PathBuf],
     active_blob_roots: &[PathBuf],
     deep_scan: bool,
+    target_fragment: Option<&str>,
 ) -> Result<FragmentRedundancyDebt, AppError> {
     if active_index_roots.is_empty() && active_blob_roots.is_empty() {
         return Ok(FragmentRedundancyDebt::default());
@@ -559,7 +581,10 @@ async fn detect_fragment_redundancy_debt(
 
     let mut roots = active_index_roots.to_vec();
     roots.extend_from_slice(active_blob_roots);
-    let fragments = list_known_fragments(&roots).await;
+    let mut fragments = list_known_fragments(&roots).await;
+    if let Some(target) = target_fragment {
+        fragments.retain(|fragment| fragment == target);
+    }
     if fragments.is_empty() {
         return Ok(FragmentRedundancyDebt::default());
     }
@@ -579,10 +604,11 @@ async fn detect_fragment_redundancy_debt(
 
     let mut debt = FragmentRedundancyDebt::default();
     for fragment in fragments {
-        let has_indexed_payload = fragment_has_indexed_payload(&fragment).await?;
+        let has_indexed_payload =
+            fragment_has_indexed_payload(&fragment, active_index_roots).await?;
         if !has_indexed_payload {
             if fragment_has_blob_payload(&fragment, active_blob_roots).await {
-                debt.orphaned_blob_fragments.push(fragment);
+                debt.pending_gc_blob_fragments.push(fragment);
             }
             continue;
         }
@@ -605,16 +631,20 @@ async fn detect_fragment_redundancy_debt(
     Ok(debt)
 }
 
-async fn detect_namespace_indexdb_debt(
+async fn detect_edge_index_replica_debt(
     active_index_roots: &[PathBuf],
     deep_scan: bool,
-) -> Result<NamespaceIndexDbHealthStats, AppError> {
+    target_fragment: Option<&str>,
+) -> Result<IndexReplicaHealthStats, AppError> {
     if active_index_roots.is_empty() {
-        return Ok(NamespaceIndexDbHealthStats::default());
+        return Ok(IndexReplicaHealthStats::default());
     }
 
-    let fragments = list_known_fragments(active_index_roots).await;
-    let mut stats = NamespaceIndexDbHealthStats::default();
+    let mut fragments = list_known_fragments(active_index_roots).await;
+    if let Some(target) = target_fragment {
+        fragments.retain(|fragment| fragment == target);
+    }
+    let mut stats = IndexReplicaHealthStats::default();
 
     for fragment in fragments {
         let inspection = inspect_namespace_replicas(&fragment, active_index_roots).await?;
@@ -622,7 +652,7 @@ async fn detect_namespace_indexdb_debt(
         let has_indexed_payload = if has_namespace_materialized {
             true
         } else if deep_scan {
-            fragment_has_indexed_payload(&fragment).await?
+            fragment_has_indexed_payload(&fragment, active_index_roots).await?
         } else {
             false
         };
@@ -707,6 +737,10 @@ async fn collect_system_health(
     state: &Arc<AppState>,
     params: &HashMap<String, String>,
 ) -> Result<SystemHealthResponse, AppError> {
+    let target_fragment = params
+        .get("fragment")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let system_metrics = get_system_metrics().await;
     let redist_status = get_redist_status().await;
     let repair_status = get_repair_status().await;
@@ -757,7 +791,7 @@ async fn collect_system_health(
         .map(|v| v == "true")
         .unwrap_or(false);
     let force_refresh = params.get("refresh").map(|v| v == "true").unwrap_or(false);
-    let mut partition_db_counts = Vec::new();
+    let mut edge_index_record_counts = Vec::new();
     let mut partition_map = HashMap::new();
     let mut scan_performed = false;
     let mut scan_busy = false;
@@ -766,6 +800,7 @@ async fn collect_system_health(
         if let Ok(_permit) = DEEP_SCAN_SEMAPHORE.try_acquire() {
             scan_performed = true;
             let roots_clone = active_index_roots.clone();
+            let target_fragment_for_scan = target_fragment.clone();
             let (tx, rx) = oneshot::channel();
 
             std::thread::spawn(move || {
@@ -778,11 +813,15 @@ async fn collect_system_health(
                 let mut counts = Vec::new();
                 for root in roots_clone {
                     let mut current_disk_count = 0u64;
-                    let walker = WalkDir::new(&root).into_iter();
+                    let scan_root = target_fragment_for_scan
+                        .as_ref()
+                        .map(|fragment| root.join(fragment))
+                        .unwrap_or_else(|| root.clone());
+                    let walker = WalkDir::new(&scan_root).into_iter();
 
                     for entry in walker.filter_map(|e| e.ok()) {
                         let path = entry.path();
-                        if entry.file_type().is_file() && should_count_index_db_file(path) {
+                        if entry.file_type().is_file() && should_count_edge_index_record(path) {
                             current_disk_count += 1;
                         }
 
@@ -797,12 +836,12 @@ async fn collect_system_health(
                 let _ = tx.send(counts);
             });
 
-            partition_db_counts = rx.await.map_err(|e| {
+            edge_index_record_counts = rx.await.map_err(|e| {
                 AppError::InternalServerError(format!("Consistency check thread failed: {}", e))
             })?;
 
             for (i, root) in active_index_roots.iter().enumerate() {
-                if let Some(count) = partition_db_counts.get(i) {
+                if let Some(count) = edge_index_record_counts.get(i) {
                     partition_map.insert(root.to_string_lossy().to_string(), *count);
                 }
             }
@@ -811,28 +850,39 @@ async fn collect_system_health(
         }
     }
 
-    let total_partition_dbs = partition_db_counts.iter().copied().sum::<u64>();
+    let total_edge_index_records = edge_index_record_counts.iter().copied().sum::<u64>();
 
     let index_health = if scan_busy {
         "skipped (scan in progress)".to_string()
     } else if !scan_performed {
         "skipped (use ?deep_scan=true)".to_string()
-    } else if partition_db_counts.is_empty() {
+    } else if edge_index_record_counts.is_empty() {
         "empty".to_string()
     } else {
-        "partitioned".to_string()
+        "records-scanned".to_string()
     };
 
     let total_index = index_disks_config.len();
     let total_blob = blob_disks_config.len();
-    let uploads = collect_upload_runtime_stats(&active_index_roots).await?;
+    let uploads =
+        collect_upload_runtime_stats(&active_index_roots, target_fragment.as_deref()).await?;
     let namespace_runtime = global_namespace_runtime().runtime_stats();
-    let redistribution_debt =
-        load_redistribution_intent_debt(&active_index_roots, force_refresh || deep_scan).await;
-    let fragment_redundancy_debt =
-        detect_fragment_redundancy_debt(&active_index_roots, &active_blob_roots, deep_scan).await?;
-    let namespace_indexdb_debt =
-        detect_namespace_indexdb_debt(&active_index_roots, deep_scan).await?;
+    let redistribution_debt = load_redistribution_intent_debt(
+        &active_index_roots,
+        force_refresh || deep_scan,
+        target_fragment.clone(),
+    )
+    .await;
+    let fragment_redundancy_debt = detect_fragment_redundancy_debt(
+        &active_index_roots,
+        &active_blob_roots,
+        deep_scan,
+        target_fragment.as_deref(),
+    )
+    .await?;
+    let edge_index_replica_debt =
+        detect_edge_index_replica_debt(&active_index_roots, deep_scan, target_fragment.as_deref())
+            .await?;
     let storage = collect_storage_plane_stats(
         &disk_statuses,
         total_index as u64,
@@ -882,14 +932,6 @@ async fn collect_system_health(
                 online_blob_count, total_blob
             ),
         )
-    } else if !fragment_redundancy_debt.orphaned_blob_fragments.is_empty() {
-        (
-            "critical",
-            format!(
-                "Fragments with blob payload but no indexed metadata: {}.",
-                fragment_redundancy_debt.orphaned_blob_fragments.join(", ")
-            ),
-        )
     } else if !fragment_redundancy_debt
         .sampled_degraded_fragments
         .is_empty()
@@ -903,22 +945,22 @@ async fn collect_system_health(
                     .join(", ")
             ),
         )
-    } else if namespace_indexdb_debt.fragments_critical > 0 {
+    } else if edge_index_replica_debt.fragments_critical > 0 {
         (
             "critical",
             format!(
-                "Namespace indexdb has no valid replica for {} fragment(s): {}.",
-                namespace_indexdb_debt.fragments_critical,
-                namespace_indexdb_debt.degraded_fragments.join(", ")
+                "N1 index has no valid replica for {} fragment(s): {}.",
+                edge_index_replica_debt.fragments_critical,
+                edge_index_replica_debt.degraded_fragments.join(", ")
             ),
         )
-    } else if namespace_indexdb_debt.fragments_degraded > 0 {
+    } else if edge_index_replica_debt.fragments_degraded > 0 {
         (
             "degraded",
             format!(
-                "Namespace indexdb replicas need repair for {} fragment(s): {}.",
-                namespace_indexdb_debt.fragments_degraded,
-                namespace_indexdb_debt.degraded_fragments.join(", ")
+                "N1 index replicas need repair for {} fragment(s): {}.",
+                edge_index_replica_debt.fragments_degraded,
+                edge_index_replica_debt.degraded_fragments.join(", ")
             ),
         )
     } else if placement_limiter_low {
@@ -933,6 +975,17 @@ async fn collect_system_health(
     };
 
     if status == "healthy" {
+        if !fragment_redundancy_debt
+            .pending_gc_blob_fragments
+            .is_empty()
+        {
+            summary.push_str(&format!(
+                " Headless blob payload is pending GC for fragment(s): {}.",
+                fragment_redundancy_debt
+                    .pending_gc_blob_fragments
+                    .join(", ")
+            ));
+        }
         if storage.heterogeneous_blob_capacity {
             if let Some(ratio) = storage.blob_capacity_imbalance_ratio {
                 let note = if let Some(limit) = placement_limiter_summary.as_ref() {
@@ -982,8 +1035,8 @@ async fn collect_system_health(
         .ok(),
         repair_job: serde_json::to_value(&repair_status).ok(),
         redist_job: serde_json::to_value(&redist_status).ok(),
-        shadow_index_status: index_health.clone(),
-        shadow_index_healthy: online_index_count == total_index,
+        index_status: index_health.clone(),
+        index_healthy: online_index_count == total_index,
         sampled_at: Some(Utc::now().timestamp()),
         summary: Some(summary.clone()),
     };
@@ -994,10 +1047,10 @@ async fn collect_system_health(
         status: status.to_string(),
         disks: disk_statuses,
         consistency: ConsistencyStats {
-            total_partition_dbs_scanned: total_partition_dbs,
-            index_partition_health: index_health,
-            namespace_indexdb: namespace_indexdb_debt,
-            partition_db_counts: if !partition_map.is_empty() {
+            total_index_records_scanned: total_edge_index_records,
+            index_health,
+            index_replicas: edge_index_replica_debt,
+            index_record_counts: if !partition_map.is_empty() {
                 Some(partition_map)
             } else {
                 None
@@ -1006,8 +1059,8 @@ async fn collect_system_health(
         system: system_metrics,
         uploads,
         index_runtime: IndexRuntimeStats {
-            loaded_partition_runtimes: total_partition_dbs,
-            wal_appenders: online_index_count as u64,
+            loaded_index_records: total_edge_index_records,
+            index_roots_online: online_index_count as u64,
             prefix_projection_fragments_pending: 0,
         },
         namespace_runtime,
@@ -1046,12 +1099,13 @@ async fn collect_system_health(
 async fn load_redistribution_intent_debt(
     active_index_roots: &[PathBuf],
     force_refresh: bool,
+    target_fragment: Option<String>,
 ) -> RedistributionIntentDebtSnapshot {
     if active_index_roots.is_empty() {
         return RedistributionIntentDebtSnapshot::default();
     }
 
-    if !force_refresh {
+    if target_fragment.is_none() && !force_refresh {
         let cached = REDIST_INTENT_DEBT_CACHE.read().await.clone();
         if let Some(cached) = cached {
             if cached.collected_at.elapsed() < REDIST_INTENT_DEBT_REFRESH_INTERVAL {
@@ -1060,24 +1114,35 @@ async fn load_redistribution_intent_debt(
         }
     }
 
-    let snapshot = collect_redistribution_intent_debt(active_index_roots).await;
-    *REDIST_INTENT_DEBT_CACHE.write().await = Some(CachedRedistributionIntentDebt {
-        collected_at: Instant::now(),
-        snapshot: snapshot.clone(),
-    });
+    let snapshot =
+        collect_redistribution_intent_debt(active_index_roots, target_fragment.clone()).await;
+    if target_fragment.is_none() {
+        *REDIST_INTENT_DEBT_CACHE.write().await = Some(CachedRedistributionIntentDebt {
+            collected_at: Instant::now(),
+            snapshot: snapshot.clone(),
+        });
+    }
     snapshot
 }
 
 async fn collect_upload_runtime_stats(
     active_index_roots: &[PathBuf],
+    target_fragment: Option<&str>,
 ) -> Result<UploadRuntimeStats, AppError> {
     if active_index_roots.is_empty() {
         return Ok(UploadRuntimeStats::default());
     }
 
     let roots = active_index_roots.to_vec();
+    let target_fragment_owned = target_fragment.map(str::to_string);
     let fragments = tokio::task::spawn_blocking(move || -> Vec<String> {
         let mut seen = HashSet::new();
+        if let Some(fragment) = target_fragment_owned {
+            if roots.iter().any(|root| root.join(&fragment).is_dir()) {
+                seen.insert(fragment);
+            }
+            return seen.into_iter().collect();
+        }
         for root in roots {
             if !root.exists() {
                 continue;

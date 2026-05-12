@@ -7,13 +7,15 @@ use chrono::Utc;
 use tokio::fs;
 use tracing::{info, warn};
 
+use crate::core::constants::EDGE_BLOB_DIR;
 use crate::core::disk_manager::{ObjectPathManager, RenameObjectRequest};
 use crate::core::index;
 use crate::enums::app_error_enum::AppError;
+use crate::namespace::models::NamespaceEntryKind;
 use crate::namespace::runtime::global_namespace_runtime;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
-use crate::websocket::ws_structs::StorageEventPayload;
+use crate::websocket::ws_structs::{NamespaceChangeEvent, StorageEventPayload};
 
 #[cfg(unix)]
 pub async fn sync_dir(path: &std::path::Path) -> Result<(), AppError> {
@@ -96,14 +98,20 @@ fn remap_shard_absolute_path_for_fragment_move(
         }
     }
 
-    let unix_from = format!("/{}/blob/{}/", source_fragment, version_id);
-    let unix_to = format!("/{}/blob/{}/", destination_fragment, version_id);
+    let unix_from = format!("/{}/{}/{}/", source_fragment, EDGE_BLOB_DIR, version_id);
+    let unix_to = format!(
+        "/{}/{}/{}/",
+        destination_fragment, EDGE_BLOB_DIR, version_id
+    );
     if current_path.contains(&unix_from) {
         return current_path.replacen(&unix_from, &unix_to, 1);
     }
 
-    let win_from = format!("\\{}\\blob\\{}\\", source_fragment, version_id);
-    let win_to = format!("\\{}\\blob\\{}\\", destination_fragment, version_id);
+    let win_from = format!("\\{}\\{}\\{}\\", source_fragment, EDGE_BLOB_DIR, version_id);
+    let win_to = format!(
+        "\\{}\\{}\\{}\\",
+        destination_fragment, EDGE_BLOB_DIR, version_id
+    );
     if current_path.contains(&win_from) {
         return current_path.replacen(&win_from, &win_to, 1);
     }
@@ -176,7 +184,7 @@ pub async fn rename_object(
     .await?;
 
     if payload.source_fragment == payload.destination_fragment {
-        global_namespace_runtime()
+        let summary = global_namespace_runtime()
             .rename(
                 &payload.source_fragment,
                 &payload.source_key,
@@ -194,12 +202,10 @@ pub async fn rename_object(
 
         state.emit(
             &payload.source_fragment,
-            StorageEventPayload::FileRenamed {
-                source_fragment: payload.source_fragment.clone(),
-                source_key: payload.source_key.clone(),
-                destination_fragment: payload.destination_fragment.clone(),
-                destination_key: payload.destination_key.clone(),
-            },
+            StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+                &payload.source_fragment,
+                summary,
+            )),
         );
 
         return Ok(StatusCode::OK);
@@ -340,13 +346,28 @@ pub async fn rename_object(
 
     state.emit(
         &payload.source_fragment,
-        StorageEventPayload::FileRenamed {
-            source_fragment: payload.source_fragment.clone(),
-            source_key: payload.source_key.clone(),
-            destination_fragment: payload.destination_fragment.clone(),
-            destination_key: payload.destination_key.clone(),
-        },
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::renamed(
+            &payload.source_fragment,
+            &payload.source_key,
+            &payload.destination_key,
+            NamespaceEntryKind::File,
+            1,
+            affected_versions.len(),
+        )),
     );
+    if payload.source_fragment != payload.destination_fragment {
+        state.emit(
+            &payload.destination_fragment,
+            StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::renamed(
+                &payload.destination_fragment,
+                &payload.source_key,
+                &payload.destination_key,
+                NamespaceEntryKind::File,
+                1,
+                affected_versions.len(),
+            )),
+        );
+    }
 
     Ok(StatusCode::OK)
 }

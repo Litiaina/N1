@@ -13,15 +13,15 @@ This repository now keeps the platform docs split into:
 ## Runtime API References
 
 - [N1_DOCUMENTATION.md](N1_DOCUMENTATION.md)
-  Detailed `N1 3.0.0` storage-kernel reference:
-  breaking metadata rewrite, fragment provisioning, auth, upload, read, lifecycle, POSIX, maintenance, request parameters, and example payloads.
+  Detailed `N1 1.1.0` storage-kernel reference:
+  fragment provisioning, auth, upload, read, lifecycle, POSIX, object status/repair, maintenance, request parameters, and example payloads.
 
 - [NS_DOCUMENTATION.md](NS_DOCUMENTATION.md)
   Detailed `NS 1.0.0` NAS Lite deployment reference:
   SMB listener setup, dynamic N1 fragment auth, share roots, staging, capacity behavior, and optional cold sync to `N1`.
 
 - [N2_DOCUMENTATION.md](N2_DOCUMENTATION.md)
-  Detailed `N2 0.2.0` cluster-layer reference:
+  Detailed `N2 0.4.0` cluster-layer reference:
   membership, governance, placement, object APIs, reconcile, and internal peer routes.
 
 - [REGISTRY_DOCUMENTATION.md](REGISTRY_DOCUMENTATION.md)
@@ -38,7 +38,7 @@ This repository now keeps the platform docs split into:
 ## Contract Boundary
 
 - `N1`
-  Physical storage truth, per-fragment sharded `indexdb` namespace/metadata authority, upload, read, lifecycle, maintenance.
+  Physical storage truth, N1 namespace/object index/blob planes, upload, read, lifecycle, object status/repair, maintenance.
   Stable route namespace: `/n1/...`
 
 - `NS`

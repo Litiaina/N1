@@ -18,11 +18,11 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::middleware::auth_middleware::JWT_KEYS;
-use crate::websocket::ws_structs::{BroadcastReq, StorageEvent};
+use crate::websocket::ws_structs::BroadcastReq;
 use crate::{
     routes::storage_routes::AppState,
     structs::auth_structs::Claims,
-    websocket::ws_structs::{ClientMessage, ServerMessage, StorageEventPayload, WsAuthParams},
+    websocket::ws_structs::{ClientMessage, ServerMessage, WsAuthParams},
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -101,10 +101,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                             let _ = tx_logic.try_send(ServerMessage::Event(StorageEvent {
-                                timestamp_ms: chrono::Utc::now().timestamp_millis() as u64,
-                                payload: StorageEventPayload::StateInvalidated
-                            }));
+                            warn!("Websocket client {} lagged behind namespace events. Disconnecting.", fragment);
+                            break;
                         }
                         Err(_) => break,
                     }

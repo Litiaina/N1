@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Internal dependencies
-n1-edge = { path = "../n1-edge" }
+n1 = { path = "../n1" }
 
 # External workspace dependencies
 axum.workspace = true

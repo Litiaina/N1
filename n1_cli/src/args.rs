@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 const CLI_LONG_ABOUT: &str = "\
-Operator-first CLI for N1 3.0.
+Operator-first CLI for N1.
 
 Use this CLI to inspect health, track upload pressure, and run maintenance jobs
 without guessing the HTTP routes behind them. Global flags apply to every
@@ -24,7 +24,7 @@ Examples:
 #[command(
     name = "litiaina-n1-cli",
     version,
-    about = "Operator CLI for N1 3.0",
+    about = "Operator CLI for N1",
     long_about = CLI_LONG_ABOUT,
     subcommand_required = true,
     arg_required_else_help = true,

@@ -9,6 +9,7 @@ use crate::posix::models::{
 use crate::posix::paths::normalize_posix_path;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
+use crate::websocket::ws_structs::{NamespaceChangeEvent, StorageEventPayload};
 
 fn posix_kind_from_namespace(kind: NamespaceEntryKind) -> PosixNodeKind {
     match kind {
@@ -53,26 +54,16 @@ pub async fn list_dir(
             continuation_token.as_deref(),
         )
         .await?;
-    let object_ids = namespace_entries
-        .iter()
-        .filter_map(|entry| entry.object_id.clone())
-        .collect::<Vec<_>>();
-    let heads = global_namespace_runtime()
-        .object_heads(&fragment, &object_ids)
-        .await?;
     let entries = namespace_entries
         .into_iter()
         .map(|entry| PosixEntry {
             name: entry.name,
             path: entry.path,
             kind: posix_kind_from_namespace(entry.kind),
-            size_bytes: entry
-                .object_id
-                .as_ref()
-                .and_then(|object_id| heads.get(object_id).map(|head| head.total_size_bytes)),
+            size_bytes: entry.size_bytes,
             modified_at_unix: Some(entry.updated_at_unix),
             content_type: None,
-            version_id: None,
+            version_id: entry.version_id,
             trash_entry_id: entry.trash_entry_id,
             deleted_at_unix: entry.deleted_at_unix,
         })
@@ -147,7 +138,7 @@ pub async fn stat_path(
 }
 
 pub async fn mkdir_path(
-    _state: Arc<AppState>,
+    state: Arc<AppState>,
     claims: Claims,
     path: String,
 ) -> Result<PosixMutationResponse, AppError> {
@@ -163,6 +154,14 @@ pub async fn mkdir_path(
     }
 
     let created = global_namespace_runtime().mkdir(&fragment, &path).await?;
+    if created {
+        state.emit(
+            &fragment,
+            StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::directory_created(
+                &fragment, &path,
+            )),
+        );
+    }
 
     Ok(PosixMutationResponse {
         operation: "mkdir".to_string(),
@@ -218,7 +217,10 @@ pub async fn rename_path(
         .await?;
     state.emit(
         &fragment,
-        crate::websocket::ws_structs::StorageEventPayload::StateInvalidated,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment,
+            summary.clone(),
+        )),
     );
     Ok(PosixMutationResponse {
         operation: summary.operation,
@@ -248,7 +250,10 @@ pub async fn trash_path(
     let summary = global_namespace_runtime().trash(&fragment, &path).await?;
     state.emit(
         &fragment,
-        crate::websocket::ws_structs::StorageEventPayload::StateInvalidated,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment,
+            summary.clone(),
+        )),
     );
     Ok(PosixMutationResponse {
         operation: summary.operation,
@@ -278,7 +283,10 @@ pub async fn recover_path(
     let summary = global_namespace_runtime().recover(&fragment, &path).await?;
     state.emit(
         &fragment,
-        crate::websocket::ws_structs::StorageEventPayload::StateInvalidated,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment,
+            summary.clone(),
+        )),
     );
     Ok(PosixMutationResponse {
         operation: summary.operation,
@@ -310,7 +318,10 @@ pub async fn permanently_delete_path(
         .await?;
     state.emit(
         &fragment,
-        crate::websocket::ws_structs::StorageEventPayload::StateInvalidated,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment,
+            summary.clone(),
+        )),
     );
     Ok(PosixMutationResponse {
         operation: summary.operation,

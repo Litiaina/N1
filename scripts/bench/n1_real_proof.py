@@ -16,9 +16,9 @@ from n1_real_restart_proof import N1Proof, ProofFailure
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run a real N1 Edge HTTP/filesystem proof on real disk roots."
+        description="Run a real N1 HTTP/storage proof on real disk roots."
     )
-    parser.add_argument("--binary", required=True, help="Path to litiaina-n1-edge binary")
+    parser.add_argument("--binary", required=True, help="Path to litiaina-n1 binary")
     parser.add_argument("--source-dir", required=True, help="Directory to upload")
     parser.add_argument("--disk-roots", required=True)
     parser.add_argument("--out-dir", required=True)
@@ -26,11 +26,11 @@ def parse_args():
     parser.add_argument("--concurrency", type=int, default=16)
     parser.add_argument("--progress-every", type=int, default=500)
     parser.add_argument("--max-files", type=int, default=0)
-    parser.add_argument("--prefix", default="edge-proof/")
+    parser.add_argument("--prefix", default="n1-proof/")
     parser.add_argument("--quota-bytes", type=int, default=10 * 1024 * 1024 * 1024)
     parser.add_argument("--quota-backend", default="disabled")
-    parser.add_argument("--master-key", default="edge-proof-master-key")
-    parser.add_argument("--fragment-key", default="edge-proof-fragment-key")
+    parser.add_argument("--master-key", default="n1-proof-master-key")
+    parser.add_argument("--fragment-key", default="n1-proof-fragment-key")
     parser.add_argument("--fragment-name", default="")
     parser.add_argument("--cleanup-roots", action="store_true")
     parser.add_argument("--simulate-disk-format-repair", action="store_true")
@@ -39,7 +39,7 @@ def parse_args():
     return parser.parse_args()
 
 
-class N1EdgeProof(N1Proof):
+class N1StorageProof(N1Proof):
     def __init__(self, args):
         super().__init__(args)
         self.active_disk_count = 0
@@ -83,7 +83,7 @@ class N1EdgeProof(N1Proof):
         (self.out_dir / "n1.env").write_text(
             "\n".join(
                 [
-                    "JWT_SECRET=edge-proof-jwt-secret",
+                    "JWT_SECRET=n1-proof-jwt-secret",
                     f"MASTER_KEY={self.args.master_key}",
                     f"AUTH_KEY={self.args.master_key}",
                     f"ADMIN_KEY={self.args.master_key}",
@@ -280,13 +280,13 @@ stripe_block_size=262144
             raise ProofFailure(f"{route} returned {status}: {body}")
         return body
 
-    def edge_posix_crud(self, expected):
+    def n1_posix_crud(self, expected):
         start = time.monotonic()
-        base = f"{self.args.prefix}edge-crud"
+        base = f"{self.args.prefix}n1-crud"
         self.posix_json("/n1/posix/mkdir", {"path": f"{base}/folder"})
         old_file = f"{base}/rename-me.txt"
         new_file = f"{base}/renamed.txt"
-        payload = b"edge rename payload\n"
+        payload = b"n1 rename payload\n"
         self.upload_bytes(old_file, payload, "text/plain")
         self.posix_json(
             "/n1/posix/rename",
@@ -297,7 +297,7 @@ stripe_block_size=262144
 
         child = f"{base}/folder/child.txt"
         moved_child = f"{base}/folder-renamed/child.txt"
-        child_payload = b"edge folder rename payload\n"
+        child_payload = b"n1 folder rename payload\n"
         self.upload_bytes(child, child_payload, "text/plain")
         self.posix_json(
             "/n1/posix/rename",
@@ -320,7 +320,7 @@ stripe_block_size=262144
         expected.append(moved_child)
 
         delete_me = f"{base}/delete-me.bin"
-        delete_payload = b"edge gc purge payload\n" * 1024
+        delete_payload = b"n1 gc purge payload\n" * 1024
         meta = self.upload_bytes(delete_me, delete_payload)
         version_id = meta["version_id"]
         trash = self.posix_json("/n1/posix/trash", {"path": delete_me})
@@ -333,11 +333,11 @@ stripe_block_size=262144
             raise ProofFailure(f"GC did not reclaim purged version {version_id}")
         self.summary["posix_crud_elapsed_s"] = round(time.monotonic() - start, 3)
 
-    def edge_multipart_proof(self, expected):
-        logical = f"{self.args.prefix}edge-multipart/video-parted.bin"
+    def n1_multipart_proof(self, expected):
+        logical = f"{self.args.prefix}n1-multipart/video-parted.bin"
         part_size = 2 * 1024 * 1024
         expected_parts = 4
-        payload = deterministic_payload_bytes(8 * 1024 * 1024, b"edge-multipart-proof")
+        payload = deterministic_payload_bytes(8 * 1024 * 1024, b"n1-multipart-proof")
         params = {
             "content_type": "application/octet-stream",
             "total_size_bytes": len(payload),
@@ -433,11 +433,11 @@ stripe_block_size=262144
     def blob_version_exists(self, version_id):
         return any((root / self.fragment / ".blobs" / version_id).exists() for root in self.blob_roots)
 
-    def edge_archive_proof(self, expected):
+    def n1_archive_proof(self, expected):
         status, raw = self.http(
             "POST",
             f"{self.base_url}/n1/objects/archive",
-            body={"prefixes": [self.args.prefix], "format": "tar", "filename": "edge-proof.tar"},
+            body={"prefixes": [self.args.prefix], "format": "tar", "filename": "n1-proof.tar"},
             headers=self.bearer_json(),
             timeout=900,
         )
@@ -478,7 +478,7 @@ stripe_block_size=262144
             raise ProofFailure(f"recover-on-read did not restore {removed}")
         self.summary["recover_on_read"] = {"version_id": version_id, "restored": str(removed)}
 
-    def edge_redistribution_proof(self, expected):
+    def n1_redistribution_proof(self, expected):
         if len(self.index_roots) < 2:
             return
         self.stop_server()
@@ -489,8 +489,8 @@ stripe_block_size=262144
         self.auth()
         self.assert_listing("one_disk_before_redistribution", sorted(expected))
         self.run_redist_and_wait()
-        one_disk_key = f"{self.args.prefix}edge-redistribution/one-disk.txt"
-        one_disk_payload = b"edge one disk redistribution payload\n"
+        one_disk_key = f"{self.args.prefix}n1-redistribution/one-disk.txt"
+        one_disk_payload = b"n1 one disk redistribution payload\n"
         self.upload_bytes(one_disk_key, one_disk_payload, "text/plain")
         expected.append(one_disk_key)
         self.assert_download_hash(one_disk_key, one_disk_payload)
@@ -506,12 +506,12 @@ stripe_block_size=262144
         self.assert_listing("two_disk_after_redistribution", sorted(expected))
         self.assert_download_hash(one_disk_key, one_disk_payload)
 
-    def inspect_edge_index(self, expected_count):
+    def inspect_n1_index(self, expected_count):
         inspections = []
         for index_root, blob_root in zip(self.index_roots, self.blob_roots):
             fragment_root = index_root / self.fragment
             if (fragment_root / "indexdb").exists():
-                raise ProofFailure(f"Edge fragment must not contain indexdb: {fragment_root}")
+                raise ProofFailure(f"N1 fragment must not contain indexdb: {fragment_root}")
             live_ndx = []
             trash_ndx = []
             upload_receipts = []
@@ -539,7 +539,7 @@ stripe_block_size=262144
                 else 0
             )
             print(
-                "REAL_N1_EDGE_PROOF inspect "
+                "REAL_N1_PROOF inspect "
                 f"index_root={index_root} live_ndx={len(live_ndx)} "
                 f"trash_ndx={len(trash_ndx)} namespace_symlinks={len(namespace_symlinks)} "
                 f"receipts={len(upload_receipts)} "
@@ -561,7 +561,7 @@ stripe_block_size=262144
                     "blob_version_dirs": blob_version_dirs,
                 }
             )
-        self.summary["edge_index_inspection"] = inspections
+        self.summary["n1_index_inspection"] = inspections
 
     def run(self):
         self.validate()
@@ -572,7 +572,7 @@ stripe_block_size=262144
         expected_sorted = sorted(expected)
         self.summary.update(
             {
-                "engine": "n1-edge",
+                "engine": "n1",
                 "file_count": len(files),
                 "source_bytes": sum(path.stat().st_size for path in files),
                 "expected_paths_sha256": hashlib.sha256(
@@ -596,17 +596,17 @@ stripe_block_size=262144
             self.download_samples(actual)
 
             live_expected = list(expected_sorted)
-            self.edge_posix_crud(live_expected)
-            self.edge_multipart_proof(live_expected)
+            self.n1_posix_crud(live_expected)
+            self.n1_multipart_proof(live_expected)
             live_expected = sorted(live_expected)
-            self.edge_archive_proof(live_expected)
+            self.n1_archive_proof(live_expected)
             self.simulate_recover_on_read(live_expected[0])
             if self.args.simulate_disk_format_repair:
                 self.simulate_disk_format_and_repair(live_expected)
             if not self.args.skip_redistribution:
-                self.edge_redistribution_proof(live_expected)
+                self.n1_redistribution_proof(live_expected)
                 live_expected = sorted(live_expected)
-            self.inspect_edge_index(len(live_expected))
+            self.inspect_n1_index(len(live_expected))
             self.write_summary("PASS")
             if self.args.cleanup_roots:
                 self.cleanup_roots()
@@ -624,13 +624,13 @@ def deterministic_payload_bytes(size, seed):
 
 
 def main():
-    proof = N1EdgeProof(parse_args())
+    proof = N1StorageProof(parse_args())
     try:
         proof.run()
     except Exception as err:
-        print(f"REAL_N1_EDGE_PROOF FAIL {err}", file=sys.stderr, flush=True)
+        print(f"REAL_N1_PROOF FAIL {err}", file=sys.stderr, flush=True)
         return 1
-    print("REAL_N1_EDGE_PROOF PASS", flush=True)
+    print("REAL_N1_PROOF PASS", flush=True)
     return 0
 
 

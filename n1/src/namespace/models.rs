@@ -77,6 +77,12 @@ pub struct NamespaceEntry {
     pub name: String,
     pub kind: NamespaceEntryKind,
     pub object_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packed_ext_u64: Option<u64>,
     pub lifecycle: LifecycleState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trash_entry_id: Option<String>,

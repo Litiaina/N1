@@ -192,7 +192,7 @@ fn first_fragment_root(fragment: &str) -> Result<PathBuf, AppError> {
     let roots = fragment_roots(fragment);
     let Some(root) = roots.first() else {
         return Err(AppError::ServiceUnavailable(
-            "no index roots configured for N1 Edge".to_string(),
+            "no index roots configured for N1".to_string(),
         ));
     };
     Ok(root.clone())
@@ -237,7 +237,7 @@ pub(crate) fn reject_reserved_user_path(path: &str) -> Result<(), AppError> {
     for segment in path.split('/').filter(|segment| !segment.is_empty()) {
         if reserved_user_segment(segment) {
             return Err(AppError::BadRequest(format!(
-                "path segment '{}' is reserved by N1 Edge",
+                "path segment '{}' is reserved by N1",
                 segment
             )));
         }
@@ -273,9 +273,7 @@ pub(crate) fn normalize_object_id(object_id: &str) -> Result<String, AppError> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
     {
-        return Err(AppError::BadRequest(
-            "invalid N1 Edge object id".to_string(),
-        ));
+        return Err(AppError::BadRequest("invalid N1 object id".to_string()));
     }
     Ok(value)
 }
@@ -342,21 +340,21 @@ pub(crate) fn read_namespace_symlink_object_id(
     let meta = match fs::symlink_metadata(link_path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(io_err(err, "inspect edge namespace link")),
+        Err(err) => return Err(io_err(err, "inspect N1 namespace link")),
     };
     if !meta.file_type().is_symlink() {
         return Ok(None);
     }
-    let target = fs::read_link(link_path).map_err(|e| io_err(e, "read edge namespace link"))?;
+    let target = fs::read_link(link_path).map_err(|e| io_err(e, "read N1 namespace link"))?;
     if target.is_absolute() {
         return Err(AppError::InternalServerError(format!(
-            "edge namespace link {} has absolute target",
+            "N1 namespace link {} has absolute target",
             link_path.display()
         )));
     }
     if target.components().count() != 1 {
         return Err(AppError::InternalServerError(format!(
-            "edge namespace link {} target is not a direct object pointer",
+            "N1 namespace link {} target is not a direct object pointer",
             link_path.display()
         )));
     }
@@ -375,11 +373,11 @@ pub(crate) fn publish_namespace_link(
     let logical_path = normalize_edge_key(logical_path)?;
     let link = namespace_path(root, fragment, &logical_path);
     let parent = link.parent().ok_or_else(|| {
-        AppError::InternalServerError("edge namespace link has no parent".to_string())
+        AppError::InternalServerError("N1 namespace link has no parent".to_string())
     })?;
-    fs::create_dir_all(parent).map_err(|e| io_err(e, "create edge namespace parent"))?;
+    fs::create_dir_all(parent).map_err(|e| io_err(e, "create N1 namespace parent"))?;
     fs::create_dir_all(object_index_dir(root, fragment, object_id)?)
-        .map_err(|e| io_err(e, "create edge object index dir"))?;
+        .map_err(|e| io_err(e, "create N1 object index dir"))?;
 
     if let Some(existing) = read_namespace_symlink_object_id(root, fragment, &link)? {
         if existing == normalize_object_id(object_id)? {
@@ -397,7 +395,7 @@ pub(crate) fn publish_namespace_link(
         )));
     }
     let target = object_symlink_target(object_id)?;
-    unix_fs::symlink(target, &link).map_err(|e| io_err(e, "publish edge namespace link"))?;
+    unix_fs::symlink(target, &link).map_err(|e| io_err(e, "publish N1 namespace link"))?;
     sync_dir(parent);
     Ok(())
 }
@@ -542,15 +540,15 @@ pub(crate) fn read_dir_names(path: &Path) -> Result<Vec<String>, AppError> {
         Mode::empty(),
     )
     .map_err(|e| {
-        AppError::InternalServerError(format!("open edge directory {}: {e}", path.display()))
+        AppError::InternalServerError(format!("open N1 directory {}: {e}", path.display()))
     })?;
     let mut dir = Dir::new(fd).map_err(|e| {
-        AppError::InternalServerError(format!("scan edge directory {}: {e}", path.display()))
+        AppError::InternalServerError(format!("scan N1 directory {}: {e}", path.display()))
     })?;
     let mut names = Vec::new();
     for entry in &mut dir {
         let entry = entry.map_err(|e| {
-            AppError::InternalServerError(format!("read edge directory {}: {e}", path.display()))
+            AppError::InternalServerError(format!("read N1 directory {}: {e}", path.display()))
         })?;
         let name = entry.file_name().to_string_lossy();
         if name != "." && name != ".." {
@@ -740,7 +738,7 @@ fn push_receipts_from_filename(
 }
 
 fn decode_metadata_file(path: &Path) -> Result<ObjectMetadata, AppError> {
-    let bytes = fs::read(path).map_err(|e| io_err(e, "read edge object metadata"))?;
+    let bytes = fs::read(path).map_err(|e| io_err(e, "read N1 object metadata"))?;
     decode(&bytes)
 }
 
@@ -812,23 +810,23 @@ fn sync_dir(path: &Path) {
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
     let parent = path.parent().ok_or_else(|| {
-        AppError::InternalServerError(format!("edge path {} has no parent", path.display()))
+        AppError::InternalServerError(format!("N1 path {} has no parent", path.display()))
     })?;
-    fs::create_dir_all(parent).map_err(|e| io_err(e, "create edge parent dir"))?;
+    fs::create_dir_all(parent).map_err(|e| io_err(e, "create N1 parent dir"))?;
     let tmp = parent.join(format!(
         ".{}.{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("edge"),
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("n1"),
         Ulid::new()
     ));
     {
-        let mut file = File::create(&tmp).map_err(|e| io_err(e, "create edge temp file"))?;
+        let mut file = File::create(&tmp).map_err(|e| io_err(e, "create N1 temp file"))?;
         file.write_all(bytes)
-            .map_err(|e| io_err(e, "write edge temp file"))?;
+            .map_err(|e| io_err(e, "write N1 temp file"))?;
         file.sync_all()
-            .map_err(|e| io_err(e, "sync edge temp file"))?;
+            .map_err(|e| io_err(e, "sync N1 temp file"))?;
     }
     renameat(CWD, &tmp, CWD, path).map_err(|e| {
-        AppError::InternalServerError(format!("publish edge file {}: {e}", path.display()))
+        AppError::InternalServerError(format!("publish N1 file {}: {e}", path.display()))
     })?;
     sync_dir(parent);
     Ok(())
@@ -838,14 +836,14 @@ fn remove_file_if_exists(path: &Path) -> Result<bool, AppError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(io_err(err, "remove edge file")),
+        Err(err) => Err(io_err(err, "remove N1 file")),
     }
 }
 
 fn create_empty_marker(path: &Path) -> Result<(), AppError> {
     File::create(path)
         .map(|_| ())
-        .map_err(|e| io_err(e, "create edge marker"))
+        .map_err(|e| io_err(e, "create N1 marker"))
 }
 
 fn path_exists_no_follow(path: &Path) -> bool {
@@ -1253,7 +1251,7 @@ fn scan_trash_record_markers(fragment: &str) -> Result<Vec<EdgeTrashRecord>, App
                 continue;
             }
             let record: EdgeTrashRecord = decode(
-                &fs::read(dir.join(name)).map_err(|e| io_err(e, "read edge trash entry marker"))?,
+                &fs::read(dir.join(name)).map_err(|e| io_err(e, "read N1 trash entry marker"))?,
             )?;
             if !trash_anchor_exists(fragment, &record.source_relative_path) {
                 continue;
@@ -1643,7 +1641,7 @@ pub(crate) fn delete_unreferenced_object_index(
     let mut removed = false;
     for dir in object_dir_candidates(fragment, &object_id)? {
         if dir.exists() {
-            fs::remove_dir_all(&dir).map_err(|e| io_err(e, "delete edge object index dir"))?;
+            fs::remove_dir_all(&dir).map_err(|e| io_err(e, "delete N1 object index dir"))?;
             removed = true;
             if let Some(parent) = dir.parent() {
                 sync_dir(parent);
@@ -1895,9 +1893,9 @@ pub fn clear_fragment_trash(fragment: &str, object_key: Option<&str>) -> Result<
     for root in index_roots() {
         let path = root.join(fragment).join(TRASH_DIR);
         if path.exists() {
-            fs::remove_dir_all(&path).map_err(|e| io_err(e, "clear edge trash object dir"))?;
+            fs::remove_dir_all(&path).map_err(|e| io_err(e, "clear N1 trash object dir"))?;
         }
-        fs::create_dir_all(&path).map_err(|e| io_err(e, "recreate edge trash object dir"))?;
+        fs::create_dir_all(&path).map_err(|e| io_err(e, "recreate N1 trash object dir"))?;
     }
     let _ = cleanup_unreferenced_object_indexes(fragment)?;
     Ok(())
@@ -1908,9 +1906,9 @@ pub fn drop_fragment_trash_namespace(fragment: &str) -> Result<(), AppError> {
         let fragment_root = root.join(fragment);
         let path = fragment_root.join(TRASH_DIR);
         if path.exists() {
-            fs::remove_dir_all(&path).map_err(|e| io_err(e, "drop edge trash namespace"))?;
+            fs::remove_dir_all(&path).map_err(|e| io_err(e, "drop N1 trash namespace"))?;
         }
-        fs::create_dir_all(&path).map_err(|e| io_err(e, "recreate edge trash namespace"))?;
+        fs::create_dir_all(&path).map_err(|e| io_err(e, "recreate N1 trash namespace"))?;
         sync_dir(&fragment_root);
     }
     Ok(())
@@ -1953,7 +1951,7 @@ pub fn ensure_object_owner_partition_available(
         fragment,
         object_key,
     )?)
-    .map_err(|e| io_err(e, "ensure edge object dir"))
+    .map_err(|e| io_err(e, "ensure N1 object dir"))
 }
 
 pub fn ensure_fragment_owner_partition_available(fragment: &str) -> Result<(), AppError> {
@@ -2136,7 +2134,7 @@ fn choose_edge_replica_source(fragment: &str) -> Option<(PathBuf, EdgeReplicaSco
                     false
                 } else {
                     // Maintenance and redistribution can touch stale replicas after a
-                    // one-disk write. Use mtime only when the Edge index content matches.
+                    // one-disk write. Use mtime only when the N1 index content matches.
                     modified > *current_modified
                         || (modified == *current_modified && score > *current_score)
                 }
@@ -2215,7 +2213,7 @@ fn read_fragment_meta_from(root: &Path, fragment: &str) -> Result<Option<Fragmen
     if !path.exists() {
         return Ok(None);
     }
-    let bytes = fs::read(path).map_err(|e| io_err(e, "read edge fragment metadata"))?;
+    let bytes = fs::read(path).map_err(|e| io_err(e, "read N1 fragment metadata"))?;
     decode(&bytes).map(Some)
 }
 
@@ -2309,7 +2307,7 @@ pub fn active_fragment_quota_bytes() -> Result<u64, AppError> {
 pub fn sync_fragment_partition_replicas(fragment: &str) -> Result<(), AppError> {
     let _guard = EDGE_FS_LOCK
         .lock()
-        .map_err(|_| AppError::InternalServerError("edge index sync lock poisoned".to_string()))?;
+        .map_err(|_| AppError::InternalServerError("N1 index sync lock poisoned".to_string()))?;
     let Some((source, source_score)) = choose_edge_replica_source(fragment) else {
         return Ok(());
     };
@@ -2415,54 +2413,54 @@ pub fn cleanup_stale_index_plane_on_blob_only_roots(fragment: &str) -> Result<us
 }
 
 fn clear_edge_index_plane(fragment_root: &Path) -> Result<(), AppError> {
-    fs::create_dir_all(fragment_root).map_err(|e| io_err(e, "create edge replica root"))?;
-    for entry in fs::read_dir(fragment_root).map_err(|e| io_err(e, "scan edge replica root"))? {
-        let entry = entry.map_err(|e| io_err(e, "scan edge replica root entry"))?;
+    fs::create_dir_all(fragment_root).map_err(|e| io_err(e, "create N1 replica root"))?;
+    for entry in fs::read_dir(fragment_root).map_err(|e| io_err(e, "scan N1 replica root"))? {
+        let entry = entry.map_err(|e| io_err(e, "scan N1 replica root entry"))?;
         let name = entry.file_name();
         if name.to_str() == Some(BLOB_DIR) {
             continue;
         }
         let path = entry.path();
         let meta =
-            fs::symlink_metadata(&path).map_err(|e| io_err(e, "inspect edge replica target"))?;
+            fs::symlink_metadata(&path).map_err(|e| io_err(e, "inspect N1 replica target"))?;
         if meta.file_type().is_symlink() || meta.is_file() {
-            fs::remove_file(&path).map_err(|e| io_err(e, "clear edge replica file"))?;
+            fs::remove_file(&path).map_err(|e| io_err(e, "clear N1 replica file"))?;
         } else if meta.is_dir() {
-            fs::remove_dir_all(&path).map_err(|e| io_err(e, "clear edge replica dir"))?;
+            fs::remove_dir_all(&path).map_err(|e| io_err(e, "clear N1 replica dir"))?;
         }
     }
     Ok(())
 }
 
 fn copy_dir_contents(src: &Path, dst: &Path) -> Result<(), AppError> {
-    fs::create_dir_all(dst).map_err(|e| io_err(e, "create edge replica dir"))?;
-    for entry in fs::read_dir(src).map_err(|e| io_err(e, "scan edge replica source"))? {
-        let entry = entry.map_err(|e| io_err(e, "scan edge replica entry"))?;
+    fs::create_dir_all(dst).map_err(|e| io_err(e, "create N1 replica dir"))?;
+    for entry in fs::read_dir(src).map_err(|e| io_err(e, "scan N1 replica source"))? {
+        let entry = entry.map_err(|e| io_err(e, "scan N1 replica entry"))?;
         if entry.file_name().to_str() == Some(BLOB_DIR) {
             continue;
         }
         let source = entry.path();
         let target = dst.join(entry.file_name());
         let meta =
-            fs::symlink_metadata(&source).map_err(|e| io_err(e, "inspect edge replica source"))?;
+            fs::symlink_metadata(&source).map_err(|e| io_err(e, "inspect N1 replica source"))?;
         if meta.file_type().is_symlink() {
             if fs::symlink_metadata(&target).is_ok() {
                 let _ = fs::remove_file(&target);
             }
             if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|e| io_err(e, "create edge replica parent"))?;
+                fs::create_dir_all(parent).map_err(|e| io_err(e, "create N1 replica parent"))?;
             }
             let link_target =
-                fs::read_link(&source).map_err(|e| io_err(e, "read edge replica symlink"))?;
+                fs::read_link(&source).map_err(|e| io_err(e, "read N1 replica symlink"))?;
             unix_fs::symlink(link_target, &target)
-                .map_err(|e| io_err(e, "copy edge replica symlink"))?;
+                .map_err(|e| io_err(e, "copy N1 replica symlink"))?;
         } else if meta.is_dir() {
             copy_dir_contents(&source, &target)?;
         } else {
             if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|e| io_err(e, "create edge replica parent"))?;
+                fs::create_dir_all(parent).map_err(|e| io_err(e, "create N1 replica parent"))?;
             }
-            fs::copy(&source, &target).map_err(|e| io_err(e, "copy edge replica file"))?;
+            fs::copy(&source, &target).map_err(|e| io_err(e, "copy N1 replica file"))?;
         }
     }
     Ok(())
@@ -2704,7 +2702,7 @@ mod tests {
             return roots;
         }
 
-        let base = std::env::temp_dir().join(format!("n1-edge-blob-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("n1-blob-{}", std::process::id()));
         let roots = vec![base.join("blob-0"), base.join("blob-1")];
         for root in &roots {
             fs::create_dir_all(root).expect("create test blob root");
@@ -2728,7 +2726,7 @@ mod tests {
             return roots;
         }
 
-        let base = std::env::temp_dir().join(format!("n1-edge-index-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("n1-index-{}", std::process::id()));
         let roots = vec![base.join("index-0"), base.join("index-1")];
         for root in &roots {
             fs::create_dir_all(root).expect("create test index root");
@@ -2774,10 +2772,10 @@ mod tests {
     }
 
     #[test]
-    fn repair_fragment_replicas_chooses_rich_edge_index_source_and_preserves_blobs() {
+    fn repair_fragment_replicas_chooses_rich_index_source_and_preserves_blobs() {
         let _guard = crate::test_support::global_test_lock().blocking_lock();
         let roots = ensure_test_index_roots();
-        let fragment = format!("edge-repair-source-{}", Ulid::new());
+        let fragment = format!("n1-repair-source-{}", Ulid::new());
         let object_id = publish_logical_object(&roots, &fragment, "docs/video.mp4", 123);
 
         let bad_root = roots[0].join(&fragment);
@@ -2795,15 +2793,12 @@ mod tests {
         assert!(before.missing_replicas > 0);
 
         let (missing, divergent, corrupt) =
-            repair_fragment_all_partition_replicas(&fragment, false).expect("repair edge index");
+            repair_fragment_all_partition_replicas(&fragment, false).expect("repair N1 index");
         assert!(missing + divergent > 0);
         assert_eq!(corrupt, 0);
 
         let repaired = inspect_fragment_partition_replicas(&fragment, &roots);
-        assert!(
-            repaired.healthy,
-            "repair should restore mirrored Edge index"
-        );
+        assert!(repaired.healthy, "repair should restore mirrored N1 index");
         assert!(
             live_object_dir(&roots[0], &fragment, &object_id)
                 .expect("object dir")
@@ -2827,7 +2822,7 @@ mod tests {
         let _guard = crate::test_support::global_test_lock().blocking_lock();
         let roots = ensure_test_index_roots();
         assert!(roots.len() >= 2);
-        let fragment = format!("edge-repair-stale-meta-{}", Ulid::new());
+        let fragment = format!("n1-repair-stale-meta-{}", Ulid::new());
         publish_logical_object(&roots, &fragment, "docs/original.txt", 123);
 
         let one_disk_object_id = new_object_id();
@@ -2843,7 +2838,7 @@ mod tests {
         publish_namespace_link(
             &roots[0],
             &fragment,
-            "edge-redistribution/one-disk.txt",
+            "n1-redistribution/one-disk.txt",
             &one_disk_object_id,
         )
         .expect("publish one-disk namespace link");
@@ -2859,17 +2854,14 @@ mod tests {
             "newer .fragment.ndx on a stale replica must not outrank the richer index plane"
         );
 
-        repair_fragment_all_partition_replicas(&fragment, false).expect("repair edge replicas");
+        repair_fragment_all_partition_replicas(&fragment, false).expect("repair N1 replicas");
 
         for root in &roots {
             assert!(
-                fs::symlink_metadata(
-                    root.join(&fragment)
-                        .join("edge-redistribution/one-disk.txt")
-                )
-                .expect("one-disk namespace link")
-                .file_type()
-                .is_symlink(),
+                fs::symlink_metadata(root.join(&fragment).join("n1-redistribution/one-disk.txt"))
+                    .expect("one-disk namespace link")
+                    .file_type()
+                    .is_symlink(),
                 "repair must preserve the namespace link created while one replica was active"
             );
             assert!(
@@ -2886,7 +2878,7 @@ mod tests {
         let _guard = crate::test_support::global_test_lock().blocking_lock();
         let roots = ensure_test_index_roots();
         assert!(roots.len() >= 2);
-        let fragment = format!("edge-repair-stale-plane-{}", Ulid::new());
+        let fragment = format!("n1-repair-stale-plane-{}", Ulid::new());
         publish_logical_object(&roots, &fragment, "docs/original.txt", 123);
 
         let one_disk_object_id = new_object_id();
@@ -2902,13 +2894,15 @@ mod tests {
         publish_namespace_link(
             &roots[0],
             &fragment,
-            "edge-redistribution/one-disk.txt",
+            "n1-redistribution/one-disk.txt",
             &one_disk_object_id,
         )
         .expect("publish one-disk namespace link");
 
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let stale_user_dir = roots[1].join(&fragment).join("maintenance-touched-stale-tree");
+        let stale_user_dir = roots[1]
+            .join(&fragment)
+            .join("maintenance-touched-stale-tree");
         fs::create_dir_all(&stale_user_dir).expect("touch stale index plane");
 
         assert!(
@@ -2924,17 +2918,14 @@ mod tests {
             "a touched stale plane must not outrank the richer one-disk write"
         );
 
-        repair_fragment_all_partition_replicas(&fragment, false).expect("repair edge replicas");
+        repair_fragment_all_partition_replicas(&fragment, false).expect("repair N1 replicas");
 
         for root in &roots {
             assert!(
-                fs::symlink_metadata(
-                    root.join(&fragment)
-                        .join("edge-redistribution/one-disk.txt")
-                )
-                .expect("one-disk namespace link")
-                .file_type()
-                .is_symlink(),
+                fs::symlink_metadata(root.join(&fragment).join("n1-redistribution/one-disk.txt"))
+                    .expect("one-disk namespace link")
+                    .file_type()
+                    .is_symlink(),
                 "repair must preserve the namespace link created while one replica was active"
             );
             assert!(
@@ -2947,7 +2938,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_edge_index_on_blob_only_root_is_cleaned_without_touching_blobs() {
+    fn stale_index_on_blob_only_root_is_cleaned_without_touching_blobs() {
         let _guard = crate::test_support::global_test_lock().blocking_lock();
         let roots = ensure_test_index_roots();
         let blob_roots = ensure_test_blob_roots();
@@ -2962,7 +2953,7 @@ mod tests {
         else {
             return;
         };
-        let fragment = format!("edge-stale-cleanup-{}", Ulid::new());
+        let fragment = format!("n1-stale-cleanup-{}", Ulid::new());
         let object_id = publish_logical_object(&roots, &fragment, "docs/video.mp4", 123);
 
         let stale_fragment_root = blob_only_root.join(&fragment);
@@ -3024,7 +3015,7 @@ mod tests {
     }
 
     #[test]
-    fn edge_object_id_validation_rejects_posix_file_names() {
+    fn n1_object_id_validation_rejects_posix_file_names() {
         assert!(normalize_object_id("INCDT 122225.mp4").is_err());
         assert!(normalize_object_id("videos/clip.mp4").is_err());
         assert!(normalize_object_id("@o_01KQXRVALIDEDGEID0000000").is_ok());
@@ -3032,7 +3023,7 @@ mod tests {
 
     #[test]
     fn object_index_dir_uses_two_level_hash_fanout() {
-        let root = PathBuf::from("/edge-index");
+        let root = PathBuf::from("/n1-index");
         let fragment = "fragment-a";
         let object_id = "01KQXRVALIDEDGEID0000000";
         let (fanout_a, fanout_b) =
@@ -3052,7 +3043,7 @@ mod tests {
             root.join(fragment)
                 .join(OBJECTS_DIR)
                 .join(format!("@o_{object_id}")),
-            "N1 Edge 1.1 object records must not use the old flat object directory"
+            "N1 1.1 object records must not use the old flat object directory"
         );
     }
 
@@ -3060,7 +3051,7 @@ mod tests {
     fn live_head_listing_reads_filenames_without_decoding_ndx_body() {
         let _guard = crate::test_support::global_test_lock().blocking_lock();
         let roots = ensure_test_index_roots();
-        let fragment = format!("edge-list-{}", Ulid::new());
+        let fragment = format!("n1-list-{}", Ulid::new());
         let object_id = new_object_id();
         let logical_path = "docs/bad-body.mp4";
         let file_name = format!(
@@ -3092,7 +3083,7 @@ mod tests {
     fn live_head_pagination_uses_display_names_not_raw_object_dirs() {
         let _guard = crate::test_support::global_test_lock().blocking_lock();
         let roots = ensure_test_index_roots();
-        let fragment = format!("edge-page-{}", Ulid::new());
+        let fragment = format!("n1-page-{}", Ulid::new());
         for (name, size) in [
             ("docs/a.svg", 10u64),
             ("docs/b.svg", 20u64),
@@ -3134,14 +3125,14 @@ mod tests {
     fn full_metadata_scan_uses_current_filesystem_path_after_rename() {
         let _guard = crate::test_support::global_test_lock().blocking_lock();
         let roots = ensure_test_index_roots();
-        let fragment = format!("edge-full-meta-{}", Ulid::new());
+        let fragment = format!("n1-full-meta-{}", Ulid::new());
         let old_key = "docs/old-name.txt";
         let new_key = "docs/new-name.txt";
         let object_id = publish_logical_object(&roots, &fragment, old_key, 42);
         for root in &roots {
             let old_link = root.join(&fragment).join(old_key);
             let new_link = root.join(&fragment).join(new_key);
-            fs::rename(&old_link, &new_link).expect("simulate edge namespace rename");
+            fs::rename(&old_link, &new_link).expect("simulate N1 namespace rename");
             assert_eq!(
                 read_namespace_symlink_object_id(root, &fragment, &new_link)
                     .expect("read moved link"),
@@ -3160,7 +3151,7 @@ mod tests {
     fn full_metadata_pagination_advances_by_namespace_path() {
         let _guard = crate::test_support::global_test_lock().blocking_lock();
         let roots = ensure_test_index_roots();
-        let fragment = format!("edge-full-page-{}", Ulid::new());
+        let fragment = format!("n1-full-page-{}", Ulid::new());
         let first_id = publish_logical_object(&roots, &fragment, "docs/a.txt", 10);
         let second_id = publish_logical_object(&roots, &fragment, "docs/b.txt", 20);
         let third_id = publish_logical_object(&roots, &fragment, "docs/c.txt", 30);
@@ -3206,7 +3197,7 @@ mod tests {
     fn multipart_receipts_are_zero_decode_filename_records() {
         let _guard = crate::test_support::global_test_lock().blocking_lock();
         let roots = ensure_test_index_roots();
-        let fragment = format!("edge-upload-{}", Ulid::new());
+        let fragment = format!("n1-upload-{}", Ulid::new());
         let version_id = Ulid::new().to_string();
         let manifest = UploadSessionManifest {
             fragment: fragment.clone(),

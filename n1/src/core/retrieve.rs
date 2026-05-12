@@ -1,12 +1,12 @@
 use crate::core::constants::BROWSER_CACHE_MAX_AGE;
 use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata, ObjectPathManager};
 use crate::core::fragment_manager::is_fragment_hash;
-use crate::core::index;
 use crate::core::metadata_parser::get_metadata;
 use crate::core::object_parser::{get_object_logic, stream_object_logic};
 use crate::core::quota_manager::get_storage_usage;
+use crate::core::{edge_index_store, index};
 use crate::enums::app_error_enum::AppError;
-use crate::namespace::runtime::global_namespace_runtime;
+use crate::namespace::runtime::{global_namespace_runtime, logical_not_found};
 use crate::structs::auth_structs::Claims;
 use axum::{
     Json as AxumJson,
@@ -304,7 +304,7 @@ async fn resolve_read_object_id(
     object_key: &str,
     include_trash: bool,
 ) -> Result<String, AppError> {
-    let normalized = object_key.trim_start_matches('/').to_string();
+    let normalized = object_key.trim_start_matches('/').trim().to_string();
     let resolved = if include_trash {
         global_namespace_runtime()
             .resolve_any_object_id(fragment, &normalized)
@@ -314,5 +314,8 @@ async fn resolve_read_object_id(
             .resolve_live_object_id(fragment, &normalized)
             .await?
     };
-    Ok(resolved.unwrap_or(normalized))
+    match resolved {
+        Some(object_id) => Ok(object_id),
+        None => edge_index_store::normalize_object_id(&normalized).map_err(|_| logical_not_found()),
+    }
 }

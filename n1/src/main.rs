@@ -5,7 +5,6 @@ use crate::core::adaptive_concurrency::{
 };
 use crate::core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
 use crate::core::fragment_metadata::set_configured_index_partition_count;
-use crate::core::indexdb_store::configure_indexdb_cache;
 use crate::core::monitoring::{
     MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC, MONITOR_INTERVAL_SECS_ATOMIC,
 };
@@ -24,7 +23,6 @@ use crate::core::upload::{
 use crate::fs::cleanup_manager::interval_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
-use crate::namespace::runtime::configure_namespace_cache;
 use crate::routes::storage_routes::serve_storage_routes;
 use crate::settings::constants::{CONFIG_FILE, ENV_FILE};
 use crate::utils::date_time_formatter::LocalTimer;
@@ -200,30 +198,6 @@ fn adaptive_upload_memory_budget_bytes(
     budget.clamp(32usize * 1024 * 1024, 128usize * 1024 * 1024)
 }
 
-fn adaptive_indexdb_max_cached_dbs(ram_bytes: Option<u64>, partition_count: usize) -> usize {
-    let partition_count = partition_count.max(1);
-    let shard_sets = match ram_gib(ram_bytes) {
-        0..=4 => 2,
-        5..=8 => 4,
-        9..=16 => 8,
-        _ => 12,
-    };
-    partition_count.saturating_mul(shard_sets)
-}
-
-fn soft_open_file_limit() -> Option<usize> {
-    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
-    if rc != 0 {
-        return None;
-    }
-    let limit = unsafe { limit.assume_init() };
-    if limit.rlim_cur == libc::RLIM_INFINITY {
-        return None;
-    }
-    usize::try_from(limit.rlim_cur).ok()
-}
-
 fn raise_open_file_limit_for_storage() {
     let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
     let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
@@ -251,66 +225,16 @@ fn raise_open_file_limit_for_storage() {
     let rc = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
     if rc == 0 {
         tracing::info!(
-            "Open-file limit: raised soft limit from {} to {} for sharded indexdb",
+            "Open-file limit: raised soft limit from {} to {} for N1 storage index",
             previous,
             desired
         );
     } else {
         tracing::warn!(
-            "Open-file limit: unable to raise soft limit from {} to {}; indexdb cache will be capped",
+            "Open-file limit: unable to raise soft limit from {} to {}; N1 index directory concurrency may be capped",
             previous,
             desired
         );
-    }
-}
-
-fn fd_safe_indexdb_max_cached_dbs(requested: usize) -> usize {
-    let Some(open_file_limit) = soft_open_file_limit() else {
-        return requested;
-    };
-
-    // Each live indexdb handle may consume the main file plus WAL/SHM handles.
-    // Keep enough descriptors free for sockets, blob shard files, directories,
-    // repair workers, and short-lived import/export handles.
-    let reserved_fds = open_file_limit.clamp(128, 2048) / 4;
-    let usable_fds = open_file_limit.saturating_sub(reserved_fds).max(64);
-    let fd_safe = usable_fds / 4;
-    requested.min(fd_safe.max(1))
-}
-
-fn adaptive_indexdb_cache_budget_bytes(ram_bytes: Option<u64>) -> usize {
-    match ram_gib(ram_bytes) {
-        0..=4 => 16 * 1024 * 1024,
-        5..=8 => 24 * 1024 * 1024,
-        9..=16 => 32 * 1024 * 1024,
-        _ => 64 * 1024 * 1024,
-    }
-}
-
-fn adaptive_indexdb_per_db_cache_bytes(ram_bytes: Option<u64>, max_cached_dbs: usize) -> usize {
-    let max_cached_dbs = max_cached_dbs.max(1);
-    let budget = adaptive_indexdb_cache_budget_bytes(ram_bytes);
-    (budget / max_cached_dbs).clamp(64 * 1024, 8 * 1024 * 1024)
-}
-
-fn adaptive_namespace_max_loaded_facades(ram_bytes: Option<u64>) -> usize {
-    match ram_gib(ram_bytes) {
-        0..=4 => 4,
-        5..=8 => 6,
-        9..=16 => 8,
-        _ => 24,
-    }
-}
-
-fn adaptive_namespace_max_loaded_dbs(ram_bytes: Option<u64>, partition_count: usize) -> usize {
-    adaptive_indexdb_max_cached_dbs(ram_bytes, partition_count)
-}
-
-fn normalize_indexdb_per_db_cache_bytes(value: usize) -> usize {
-    if value == 0 {
-        0
-    } else {
-        align_up_4k(value).clamp(64 * 1024, 64 * 1024 * 1024)
     }
 }
 
@@ -406,14 +330,14 @@ fn normalize_fs_backed_disk_paths(role: &str, paths: Vec<String>) -> Vec<String>
             let ft = meta.file_type();
             if ft.is_block_device() || ft.is_char_device() {
                 panic!(
-                    "{} entry '{}' is a device. The standard variant is filesystem-backed and requires directory paths.",
+                    "{} entry '{}' is a device. N1 requires mounted directory paths.",
                     role, trimmed
                 );
             }
         }
         if !meta.is_dir() {
             panic!(
-                "{} entry '{}' is not a directory. The standard variant is filesystem-backed and requires directory paths.",
+                "{} entry '{}' is not a directory. N1 requires directory paths.",
                 role, trimmed
             );
         }
@@ -692,7 +616,7 @@ async fn async_main(runtime_config: RuntimeThreadConfig) {
         .install_default()
         .expect("Failed to install 'ring' as the default TLS provider.");
 
-    warn_if_running_as_root("litiaina-n1-standard");
+    warn_if_running_as_root("litiaina-n1");
 
     if let Err(e) = validate_bootstrap_targets() {
         eprintln!("N1 startup failed: {}", e);
@@ -716,16 +640,14 @@ async fn async_main(runtime_config: RuntimeThreadConfig) {
     raise_open_file_limit_for_storage();
 
     if std::env::args_os().nth(1).is_some() {
-        eprintln!(
-            "litiaina-n1-standard runs the server only. Use `litiaina-n1-cli` for admin commands."
-        );
+        eprintln!("litiaina-n1 runs the server only. Use `litiaina-n1-cli` for admin commands.");
         std::process::exit(2);
     }
 
     let current_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    tracing::info!("╔══════════════════════════════════════╗");
-    tracing::info!("║         L I T I A I N A  N 1         ║");
-    tracing::info!("╚══════════════════════════════════════╝");
+    tracing::info!("╔════════════════════════════════════════════════╗");
+    tracing::info!("║              L I T I A I N A  N 1              ║");
+    tracing::info!("╚════════════════════════════════════════════════╝");
     tracing::info!("│ Version        : {}", env!("CARGO_PKG_VERSION"));
     tracing::info!("│ Status         : ONLINE");
     tracing::info!("│ Start Time     : {}", current_time);
@@ -834,9 +756,7 @@ pub async fn run_server() {
     BLOB_STORE_DISKS
         .set(blob_disks)
         .expect("Double initialization of BLOB_STORE_DISKS!");
-    tracing::info!(
-        "Storage mode: standard variant is filesystem-backed (directory-only index/blob roots)"
-    );
+    tracing::info!("Storage mode: N1 storage kernel with explicit .blobs payload roots");
 
     let quota_section = config.section(Some("quota_config"));
     let fragment_quota_backend =
@@ -862,74 +782,10 @@ pub async fn run_server() {
     set_configured_index_partition_count(configured_index_partition_count)
         .expect("index_config.partition_count must be one of: 32, 64, 256");
 
-    let requested_indexdb_max_cached_dbs = parse_usize_or_auto(
-        index_section.and_then(|s| s.get("max_cached_dbs")),
-        "index_config.max_cached_dbs",
-        adaptive_indexdb_max_cached_dbs(
-            detected_ram_bytes,
-            usize::from(configured_index_partition_count),
-        ),
-    )
-    .clamp(1, 1024);
-    let indexdb_max_cached_dbs = fd_safe_indexdb_max_cached_dbs(requested_indexdb_max_cached_dbs);
-    let indexdb_per_db_cache_bytes = normalize_indexdb_per_db_cache_bytes(parse_usize_or_auto(
-        index_section.and_then(|s| s.get("per_db_cache_bytes")),
-        "index_config.per_db_cache_bytes",
-        adaptive_indexdb_per_db_cache_bytes(detected_ram_bytes, indexdb_max_cached_dbs),
-    ));
-    configure_indexdb_cache(indexdb_per_db_cache_bytes, indexdb_max_cached_dbs);
-
     tracing::info!(
-        "Index layout: configured partition_count={}, indexdb_per_db_cache={}KiB, indexdb_max_cached_dbs={}, indexdb_cache_worst_case={}MiB",
-        configured_index_partition_count,
-        indexdb_per_db_cache_bytes / 1024,
-        indexdb_max_cached_dbs,
-        indexdb_per_db_cache_bytes.saturating_mul(indexdb_max_cached_dbs) / (1024 * 1024)
+        "Index layout: N1 namespace + object index, partition_count={} for intent routing",
+        configured_index_partition_count
     );
-    if indexdb_max_cached_dbs < requested_indexdb_max_cached_dbs {
-        tracing::warn!(
-            "Index layout: capped indexdb_max_cached_dbs from {} to {} because process open-file limit is {}",
-            requested_indexdb_max_cached_dbs,
-            indexdb_max_cached_dbs,
-            soft_open_file_limit()
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_string())
-        );
-    }
-
-    let namespace_section = config.section(Some("namespace_config"));
-    let namespace_max_loaded_facades = parse_usize_or_auto(
-        namespace_section.and_then(|s| s.get("max_loaded_facades")),
-        "namespace_config.max_loaded_facades",
-        adaptive_namespace_max_loaded_facades(detected_ram_bytes),
-    )
-    .clamp(1, 512);
-    let requested_namespace_max_loaded_dbs = parse_usize_or_auto(
-        namespace_section.and_then(|s| s.get("max_loaded_dbs")),
-        "namespace_config.max_loaded_dbs",
-        adaptive_namespace_max_loaded_dbs(
-            detected_ram_bytes,
-            usize::from(configured_index_partition_count),
-        ),
-    )
-    .clamp(1, 2048);
-    let namespace_max_loaded_dbs = requested_namespace_max_loaded_dbs
-        .min(indexdb_max_cached_dbs)
-        .max(1);
-    configure_namespace_cache(namespace_max_loaded_facades, namespace_max_loaded_dbs);
-
-    tracing::info!(
-        "Namespace cache: max_loaded_facades={}, max_loaded_dbs={} (cold DB handles are evicted LRU to keep N1 IO-bound)",
-        namespace_max_loaded_facades,
-        namespace_max_loaded_dbs
-    );
-    if namespace_max_loaded_dbs < requested_namespace_max_loaded_dbs {
-        tracing::warn!(
-            "Namespace cache: capped max_loaded_dbs from {} to {} to match the process indexdb handle budget",
-            requested_namespace_max_loaded_dbs,
-            namespace_max_loaded_dbs
-        );
-    }
 
     let upload_section = config.section(Some("upload_config"));
 
@@ -1039,13 +895,7 @@ pub async fn run_server() {
         upload_section.and_then(|s| s.get("upload_io_gate_enabled")),
         true,
     );
-    let upload_io_gate_enabled =
-        configured_upload_io_gate_enabled || effective_blob_disks_for_auto <= 2;
-    if !configured_upload_io_gate_enabled && upload_io_gate_enabled {
-        tracing::warn!(
-            "Upload IO gate forced on for two-disk minimum profile to preserve bounded IO and memory"
-        );
-    }
+    let upload_io_gate_enabled = configured_upload_io_gate_enabled;
 
     tracing::info!(
         "Upload tuning: cpu_cores={}, ram_gib={}, blob_paths={}, blob_devices={}, auto_effective_disks={}, ec={}D+{}P, max_concurrent_io={} (configured={} budget_cap={} per_upload_est={}KiB budget={}MiB effective_budget={}MiB), writer_buffer_size={}, part_durability_strict_default={}, io_gate_enabled={}",
