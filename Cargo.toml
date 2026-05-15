@@ -8,6 +8,7 @@ members = [
     "n1_cli",
     "n2",
     "n2_cli",
+    "tools/n1-release-proof",
     "simd-erasure-core",
     "indexdb", "ns",
 ]

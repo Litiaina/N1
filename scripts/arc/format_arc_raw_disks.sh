@@ -70,18 +70,10 @@ resolve_arc_bin() {
 
 json_get() {
   local key="$1"
-  python3 - "$key" <<'PY'
-import json
-import sys
-
-key = sys.argv[1]
-payload = json.load(sys.stdin)
-value = payload[key]
-if isinstance(value, bool):
-    print("true" if value else "false")
-else:
-    print(value)
-PY
+  sed -nE \
+    -e 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' \
+    -e 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*([^,}]*).*/\1/p' \
+    | head -n 1
 }
 
 ARC_BIN="${ARC_BIN:-}"
@@ -144,7 +136,6 @@ done
   die "no devices provided"
 }
 
-require_cmd python3
 ARC_BIN="$(resolve_arc_bin)"
 
 declare -A SEEN=()
@@ -159,12 +150,11 @@ for device in "${DEVICES[@]}"; do
   UNIQUE_DEVICES+=("$device")
 done
 
-tmp_json="$(mktemp)"
 cleanup() {
-  rm -f -- "$tmp_json"
+  true
 }
 trap cleanup EXIT
-printf '[]\n' >"$tmp_json"
+declare -a STATUS_ITEMS=()
 
 force_args=()
 if ((FORCE)); then
@@ -179,42 +169,32 @@ for device in "${UNIQUE_DEVICES[@]}"; do
 
   printf 'Formatting %s\n' "$device" >&2
   status_json="$("$ARC_BIN" --json "$FORMAT_COMMAND" --path "$device" "${force_args[@]}" --nonce "$nonce" --fingerprint "$fingerprint")"
-
-  python3 - "$tmp_json" <<'PY' <<<"$status_json"
-import json
-import sys
-
-store_path = sys.argv[1]
-status = json.load(sys.stdin)
-with open(store_path, "r", encoding="utf-8") as fh:
-    items = json.load(fh)
-items.append(status)
-with open(store_path, "w", encoding="utf-8") as fh:
-    json.dump(items, fh, indent=2)
-PY
+  STATUS_ITEMS+=("$status_json")
 done
 
 if ((JSON_OUTPUT)); then
-  cat "$tmp_json"
+  printf '[\n'
+  for idx in "${!STATUS_ITEMS[@]}"; do
+    if ((idx > 0)); then
+      printf ',\n'
+    fi
+    printf '%s' "${STATUS_ITEMS[$idx]}"
+  done
+  printf '\n]\n'
 else
-  python3 - "$tmp_json" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as fh:
-    items = json.load(fh)
-
-print("Formatted devices:")
-for item in items:
-    print(f"  path: {item.get('path')}")
-    print(f"  canonical_path: {item.get('canonical_path')}")
-    print(f"  status: {item.get('status')}")
-    print(f"  device_id: {item.get('device_id') or '<none>'}")
-    print(f"  block_size_bytes: {item.get('block_size_bytes')}")
-    print(f"  total_bytes: {item.get('total_bytes')}")
-    print(f"  available_bytes: {item.get('available_bytes')}")
-    warning = item.get("path_warning")
-    if warning:
-        print(f"  warning: {warning}")
-PY
+  printf 'Formatted devices:\n'
+  for item in "${STATUS_ITEMS[@]}"; do
+    printf '  path: %s\n' "$(printf '%s\n' "$item" | json_get path)"
+    printf '  canonical_path: %s\n' "$(printf '%s\n' "$item" | json_get canonical_path)"
+    printf '  status: %s\n' "$(printf '%s\n' "$item" | json_get status)"
+    device_id="$(printf '%s\n' "$item" | json_get device_id)"
+    printf '  device_id: %s\n' "${device_id:-<none>}"
+    printf '  block_size_bytes: %s\n' "$(printf '%s\n' "$item" | json_get block_size_bytes)"
+    printf '  total_bytes: %s\n' "$(printf '%s\n' "$item" | json_get total_bytes)"
+    printf '  available_bytes: %s\n' "$(printf '%s\n' "$item" | json_get available_bytes)"
+    warning="$(printf '%s\n' "$item" | json_get path_warning)"
+    if [[ -n "$warning" && "$warning" != "null" ]]; then
+      printf '  warning: %s\n' "$warning"
+    fi
+  done
 fi

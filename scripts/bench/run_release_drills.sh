@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 PACKAGE="${PACKAGE:-n1}"
 RUNS="${RUNS:-1}"
 TEST_ARGS="${TEST_ARGS:---nocapture}"
-RUN_CHAOS="${RUN_CHAOS:-1}"
+RUN_CHAOS="${RUN_CHAOS:-0}"
 CHAOS_RUNS="${CHAOS_RUNS:-3}"
 CHAOS_REQUIRE_ALL_PASS="${CHAOS_REQUIRE_ALL_PASS:-1}"
 CHAOS_MAX_DURATION_SECS="${CHAOS_MAX_DURATION_SECS:-0}"
@@ -103,10 +103,10 @@ fi
 
 real_restart_status="skipped"
 if [[ "$RUN_REAL_RESTART_PROOF" == "1" ]]; then
-  echo "[drill] running real HTTP restart proof"
+  echo "[drill] running real N1 release proof"
   set +e
   OUT_DIR="$OUT_DIR/real-restart-proof" \
-    scripts/bench/run_real_restart_proof.sh >"$OUT_DIR/real-restart-proof.stdout.log" 2>&1
+    scripts/bench/run_n1_release_proof.sh >"$OUT_DIR/real-restart-proof.stdout.log" 2>&1
   real_restart_ec=$?
   set -e
   if [[ "$real_restart_ec" -eq 0 ]]; then

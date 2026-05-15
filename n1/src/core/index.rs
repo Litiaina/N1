@@ -1,7 +1,7 @@
 use crate::core::disk_manager::{
     ListObjectsResult, ObjectMetadata, ObjectPathManager, PartMetadata, ReservationReceipt,
 };
-use crate::core::edge_index_store;
+use crate::core::index_store;
 use crate::core::upload::UploadSessionManifest;
 use crate::enums::app_error_enum::AppError;
 use serde::{Deserialize, Serialize};
@@ -85,7 +85,7 @@ fn parse_crc32_hex(value: &str) -> Result<u32, AppError> {
     })
 }
 
-async fn run_edge_index_blocking<T>(
+async fn run_index_blocking<T>(
     op: impl FnOnce() -> Result<T, AppError> + Send + 'static,
 ) -> Result<T, AppError>
 where
@@ -101,7 +101,7 @@ pub async fn open_session(
     reservation: Option<ReservationReceipt>,
 ) -> Result<(), AppError> {
     let manifest = manifest.clone();
-    run_edge_index_blocking(move || edge_index_store::open_session(&manifest, reservation)).await
+    run_index_blocking(move || index_store::open_session(&manifest, reservation)).await
 }
 
 pub async fn commit_session_part(
@@ -113,10 +113,8 @@ pub async fn commit_session_part(
     let fragment = fragment.to_string();
     let version_id = version_id.to_string();
     let part = part.clone();
-    run_edge_index_blocking(move || {
-        edge_index_store::commit_session_part(&fragment, &version_id, &part)
-    })
-    .await
+    run_index_blocking(move || index_store::commit_session_part(&fragment, &version_id, &part))
+        .await
 }
 
 pub async fn commit_session_part_receipt(
@@ -157,8 +155,8 @@ pub async fn commit_session_part_receipt(
     };
     let fragment = fragment.to_string();
     let version_id = version_id.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::commit_session_part_receipt(&fragment, &version_id, &receipt)
+    run_index_blocking(move || {
+        index_store::commit_session_part_receipt(&fragment, &version_id, &receipt)
     })
     .await
 }
@@ -169,7 +167,7 @@ pub async fn load_session(
 ) -> Result<Option<IndexSessionState>, AppError> {
     let fragment = fragment.to_string();
     let version_id = version_id.to_string();
-    run_edge_index_blocking(move || edge_index_store::load_session(&fragment, &version_id)).await
+    run_index_blocking(move || index_store::load_session(&fragment, &version_id)).await
 }
 
 pub async fn read_session_part(
@@ -179,10 +177,8 @@ pub async fn read_session_part(
 ) -> Result<Option<PartMetadata>, AppError> {
     let fragment = fragment.to_string();
     let version_id = version_id.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::read_session_part(&fragment, &version_id, part_index)
-    })
-    .await
+    run_index_blocking(move || index_store::read_session_part(&fragment, &version_id, part_index))
+        .await
 }
 
 pub async fn load_session_part_receipts(
@@ -193,8 +189,8 @@ pub async fn load_session_part_receipts(
     let fragment = fragment.to_string();
     let version_id = version_id.to_string();
     let manifest = manifest.clone();
-    run_edge_index_blocking(move || {
-        edge_index_store::load_session_part_receipts(&fragment, &version_id, &manifest)
+    run_index_blocking(move || {
+        index_store::load_session_part_receipts(&fragment, &version_id, &manifest)
     })
     .await
 }
@@ -206,8 +202,8 @@ pub async fn remove_session(
 ) -> Result<(), AppError> {
     let fragment = fragment.to_string();
     let version_id = version_id.to_string();
-    run_edge_index_blocking(move || {
-        let _ = edge_index_store::remove_session(&fragment, &version_id)?;
+    run_index_blocking(move || {
+        let _ = index_store::remove_session(&fragment, &version_id)?;
         Ok(())
     })
     .await
@@ -215,12 +211,12 @@ pub async fn remove_session(
 
 pub async fn list_active_sessions(fragment: &str) -> Result<Vec<IndexSessionState>, AppError> {
     let fragment = fragment.to_string();
-    run_edge_index_blocking(move || edge_index_store::list_active_sessions(&fragment)).await
+    run_index_blocking(move || index_store::list_active_sessions(&fragment)).await
 }
 
 pub async fn publish_object(metadata: &ObjectMetadata) -> Result<(), AppError> {
     let metadata = metadata.clone();
-    run_edge_index_blocking(move || edge_index_store::upsert_live_version(&metadata)).await
+    run_index_blocking(move || index_store::upsert_live_version(&metadata)).await
 }
 
 pub async fn publish_object_with_replica_mode(
@@ -228,25 +224,22 @@ pub async fn publish_object_with_replica_mode(
     replica_write_mode: IndexReplicaWriteMode,
 ) -> Result<(), AppError> {
     let metadata = metadata.clone();
-    run_edge_index_blocking(move || {
-        edge_index_store::upsert_live_version_with_replica_mode(&metadata, replica_write_mode)
+    run_index_blocking(move || {
+        index_store::upsert_live_version_with_replica_mode(&metadata, replica_write_mode)
     })
     .await
 }
 
 pub async fn upsert_object_version(metadata: &ObjectMetadata) -> Result<(), AppError> {
     let metadata = metadata.clone();
-    run_edge_index_blocking(move || edge_index_store::upsert_live_version(&metadata)).await
+    run_index_blocking(move || index_store::upsert_live_version(&metadata)).await
 }
 
 pub async fn publish_trashed_object_version_for_maintenance(
     metadata: &ObjectMetadata,
 ) -> Result<(), AppError> {
     let metadata = metadata.clone();
-    run_edge_index_blocking(move || {
-        edge_index_store::publish_trash_version_for_maintenance(&metadata)
-    })
-    .await
+    run_index_blocking(move || index_store::publish_trash_version_for_maintenance(&metadata)).await
 }
 
 pub async fn read_object_version(
@@ -257,8 +250,8 @@ pub async fn read_object_version(
     let fragment = fragment.to_string();
     let object_key = object_key.to_string();
     let version_id = version_id.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::read_live_version(&fragment, &object_key, &version_id)?
+    run_index_blocking(move || {
+        index_store::read_live_version(&fragment, &object_key, &version_id)?
             .ok_or(AppError::NotFound)
     })
     .await
@@ -272,8 +265,8 @@ pub async fn read_trashed_object_version(
     let fragment = fragment.to_string();
     let object_key = object_key.to_string();
     let version_id = version_id.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::read_trash_version(&fragment, &object_key, &version_id)?
+    run_index_blocking(move || {
+        index_store::read_trash_version(&fragment, &object_key, &version_id)?
             .ok_or(AppError::NotFound)
     })
     .await
@@ -285,8 +278,7 @@ pub async fn list_live_object_versions_metadata(
 ) -> Result<Vec<ObjectMetadata>, AppError> {
     let fragment = fragment.to_string();
     let object_key = object_key.to_string();
-    run_edge_index_blocking(move || edge_index_store::list_live_versions(&fragment, &object_key))
-        .await
+    run_index_blocking(move || index_store::list_live_versions(&fragment, &object_key)).await
 }
 
 pub async fn list_trashed_object_versions_metadata(
@@ -295,8 +287,7 @@ pub async fn list_trashed_object_versions_metadata(
 ) -> Result<Vec<ObjectMetadata>, AppError> {
     let fragment = fragment.to_string();
     let object_key = object_key.to_string();
-    run_edge_index_blocking(move || edge_index_store::list_trash_versions(&fragment, &object_key))
-        .await
+    run_index_blocking(move || index_store::list_trash_versions(&fragment, &object_key)).await
 }
 
 pub async fn list_live_object_version_ids(
@@ -305,13 +296,11 @@ pub async fn list_live_object_version_ids(
 ) -> Result<Vec<String>, AppError> {
     let fragment = fragment.to_string();
     let object_key = object_key.to_string();
-    run_edge_index_blocking(move || {
-        Ok(
-            edge_index_store::list_live_versions(&fragment, &object_key)?
-                .into_iter()
-                .map(|metadata| metadata.version_id)
-                .collect(),
-        )
+    run_index_blocking(move || {
+        Ok(index_store::list_live_versions(&fragment, &object_key)?
+            .into_iter()
+            .map(|metadata| metadata.version_id)
+            .collect())
     })
     .await
 }
@@ -322,13 +311,11 @@ pub async fn list_trashed_object_version_ids(
 ) -> Result<Vec<String>, AppError> {
     let fragment = fragment.to_string();
     let object_key = object_key.to_string();
-    run_edge_index_blocking(move || {
-        Ok(
-            edge_index_store::list_trash_versions(&fragment, &object_key)?
-                .into_iter()
-                .map(|metadata| metadata.version_id)
-                .collect(),
-        )
+    run_index_blocking(move || {
+        Ok(index_store::list_trash_versions(&fragment, &object_key)?
+            .into_iter()
+            .map(|metadata| metadata.version_id)
+            .collect())
     })
     .await
 }
@@ -339,8 +326,8 @@ pub async fn read_latest_object(
 ) -> Result<ObjectMetadata, AppError> {
     let fragment = fragment.to_string();
     let object_key = object_key.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::read_current_live_head(&fragment, &object_key)?.ok_or(AppError::NotFound)
+    run_index_blocking(move || {
+        index_store::read_current_live_head(&fragment, &object_key)?.ok_or(AppError::NotFound)
     })
     .await
 }
@@ -351,33 +338,29 @@ pub async fn read_latest_trashed_object(
 ) -> Result<ObjectMetadata, AppError> {
     let fragment = fragment.to_string();
     let object_key = object_key.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::read_latest_trash(&fragment, &object_key)?.ok_or(AppError::NotFound)
+    run_index_blocking(move || {
+        index_store::read_latest_trash(&fragment, &object_key)?.ok_or(AppError::NotFound)
     })
     .await
 }
 
 pub async fn list_fragment_trash_objects(fragment: &str) -> Result<Vec<ObjectMetadata>, AppError> {
     let fragment = fragment.to_string();
-    run_edge_index_blocking(move || edge_index_store::list_trash_heads(&fragment)).await
+    run_index_blocking(move || index_store::list_trash_heads(&fragment)).await
 }
 
 pub async fn list_fragment_object_keys_with_trash_versions(
     fragment: &str,
 ) -> Result<Vec<String>, AppError> {
     let fragment = fragment.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::list_object_keys_with_trash_versions(&fragment)
-    })
-    .await
+    run_index_blocking(move || index_store::list_object_keys_with_trash_versions(&fragment)).await
 }
 
 pub async fn list_active_trash_partition_ids(
     fragment: &str,
 ) -> Result<std::collections::BTreeSet<u16>, AppError> {
     let fragment = fragment.to_string();
-    run_edge_index_blocking(move || edge_index_store::list_active_trash_partition_ids(&fragment))
-        .await
+    run_index_blocking(move || index_store::list_active_trash_partition_ids(&fragment)).await
 }
 
 pub async fn list_partition_trash_entries(
@@ -385,17 +368,15 @@ pub async fn list_partition_trash_entries(
     partition_id: u16,
 ) -> Result<std::collections::HashMap<String, Vec<String>>, AppError> {
     let fragment = fragment.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::list_partition_trash_entries(&fragment, partition_id)
-    })
-    .await
+    run_index_blocking(move || index_store::list_partition_trash_entries(&fragment, partition_id))
+        .await
 }
 
 pub async fn list_fragment_trash_catalog(
     fragment: &str,
 ) -> Result<Vec<TrashCatalogEntry>, AppError> {
     let fragment = fragment.to_string();
-    run_edge_index_blocking(move || edge_index_store::list_trash_catalog(&fragment)).await
+    run_index_blocking(move || index_store::list_trash_catalog(&fragment)).await
 }
 
 pub async fn list_trashed_object_version_ids_batch(
@@ -404,8 +385,8 @@ pub async fn list_trashed_object_version_ids_batch(
 ) -> Result<std::collections::HashMap<String, Vec<String>>, AppError> {
     let fragment = fragment.to_string();
     let object_keys = object_keys.to_vec();
-    run_edge_index_blocking(move || {
-        edge_index_store::list_trashed_object_version_ids_batch(&fragment, &object_keys)
+    run_index_blocking(move || {
+        index_store::list_trashed_object_version_ids_batch(&fragment, &object_keys)
     })
     .await
 }
@@ -413,13 +394,12 @@ pub async fn list_trashed_object_version_ids_batch(
 pub async fn object_partition_id(fragment: &str, object_key: &str) -> Result<u16, AppError> {
     let fragment = fragment.to_string();
     let object_key = object_key.to_string();
-    run_edge_index_blocking(move || edge_index_store::object_partition_id(&fragment, &object_key))
-        .await
+    run_index_blocking(move || index_store::object_partition_id(&fragment, &object_key)).await
 }
 
 pub async fn list_fragment_live_objects(fragment: &str) -> Result<Vec<ObjectMetadata>, AppError> {
     let fragment = fragment.to_string();
-    run_edge_index_blocking(move || edge_index_store::list_live_heads(&fragment)).await
+    run_index_blocking(move || index_store::list_live_heads(&fragment)).await
 }
 
 pub async fn scan_fragment_live_objects_page(
@@ -431,8 +411,8 @@ pub async fn scan_fragment_live_objects_page(
     include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
     let fragment = fragment.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::scan_live_heads_page(
+    run_index_blocking(move || {
+        index_store::scan_live_heads_page(
             &fragment,
             prefix,
             delimiter,
@@ -453,8 +433,8 @@ pub async fn scan_fragment_live_metadata_page(
     include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
     let fragment = fragment.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::scan_live_full_metadata_page(
+    run_index_blocking(move || {
+        index_store::scan_live_full_metadata_page(
             &fragment,
             prefix,
             delimiter,
@@ -475,8 +455,8 @@ pub async fn scan_fragment_trash_objects_page(
     include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
     let fragment = fragment.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::scan_trash_heads_page(
+    run_index_blocking(move || {
+        index_store::scan_trash_heads_page(
             &fragment,
             prefix,
             delimiter,
@@ -497,8 +477,8 @@ pub async fn scan_fragment_trash_metadata_page(
     include_internal: bool,
 ) -> Result<ListObjectsResult, AppError> {
     let fragment = fragment.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::scan_trash_full_metadata_page(
+    run_index_blocking(move || {
+        index_store::scan_trash_full_metadata_page(
             &fragment,
             prefix,
             delimiter,
@@ -518,8 +498,8 @@ pub async fn move_object_version_to_trash_with_metadata(
     let fragment = fragment.to_string();
     let object_key = object_key.to_string();
     let version_id = version_id.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::move_object_version_to_trash_with_metadata(
+    run_index_blocking(move || {
+        index_store::move_object_version_to_trash_with_metadata(
             &fragment,
             &object_key,
             &version_id,
@@ -548,8 +528,8 @@ pub async fn restore_object_version_from_trash_with_metadata(
     let fragment = fragment.to_string();
     let object_key = object_key.to_string();
     let version_id = version_id.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::restore_object_version_from_trash_with_metadata(
+    run_index_blocking(move || {
+        index_store::restore_object_version_from_trash_with_metadata(
             &fragment,
             &object_key,
             &version_id,
@@ -565,10 +545,7 @@ pub async fn move_object_to_trash_fast(
 ) -> Result<Option<Vec<String>>, AppError> {
     let fragment = fragment.to_string();
     let object_key = object_key.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::move_object_to_trash_fast(&fragment, &object_key)
-    })
-    .await
+    run_index_blocking(move || index_store::move_object_to_trash_fast(&fragment, &object_key)).await
 }
 
 pub async fn move_objects_to_trash_batch(
@@ -577,10 +554,8 @@ pub async fn move_objects_to_trash_batch(
 ) -> Result<HashMap<String, Vec<String>>, AppError> {
     let fragment = fragment.to_string();
     let object_keys = object_keys.to_vec();
-    run_edge_index_blocking(move || {
-        edge_index_store::move_objects_to_trash_batch(&fragment, &object_keys)
-    })
-    .await
+    run_index_blocking(move || index_store::move_objects_to_trash_batch(&fragment, &object_keys))
+        .await
 }
 
 pub async fn restore_object_from_trash_fast(
@@ -589,10 +564,8 @@ pub async fn restore_object_from_trash_fast(
 ) -> Result<Option<Vec<String>>, AppError> {
     let fragment = fragment.to_string();
     let object_key = object_key.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::restore_object_from_trash_fast(&fragment, &object_key)
-    })
-    .await
+    run_index_blocking(move || index_store::restore_object_from_trash_fast(&fragment, &object_key))
+        .await
 }
 
 pub async fn restore_objects_from_trash_batch(
@@ -601,8 +574,8 @@ pub async fn restore_objects_from_trash_batch(
 ) -> Result<HashMap<String, Vec<String>>, AppError> {
     let fragment = fragment.to_string();
     let object_keys = object_keys.to_vec();
-    run_edge_index_blocking(move || {
-        edge_index_store::restore_objects_from_trash_batch(&fragment, &object_keys)
+    run_index_blocking(move || {
+        index_store::restore_objects_from_trash_batch(&fragment, &object_keys)
     })
     .await
 }
@@ -613,8 +586,8 @@ pub async fn restore_objects_from_trash_manifest_batch(
 ) -> Result<HashMap<String, Vec<String>>, AppError> {
     let fragment = fragment.to_string();
     let object_versions = object_versions.clone();
-    run_edge_index_blocking(move || {
-        edge_index_store::restore_objects_from_trash_manifest_batch(&fragment, &object_versions)
+    run_index_blocking(move || {
+        index_store::restore_objects_from_trash_manifest_batch(&fragment, &object_versions)
     })
     .await
 }
@@ -625,8 +598,8 @@ pub async fn delete_all_trash_versions_for_key(
 ) -> Result<Option<Vec<String>>, AppError> {
     let fragment = fragment.to_string();
     let object_key = object_key.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::delete_all_trash_versions_for_key(&fragment, &object_key)
+    run_index_blocking(move || {
+        index_store::delete_all_trash_versions_for_key(&fragment, &object_key)
     })
     .await
 }
@@ -637,14 +610,12 @@ pub async fn delete_object_fast(
 ) -> Result<Option<Vec<String>>, AppError> {
     let fragment = fragment.to_string();
     let object_key = object_key.to_string();
-    run_edge_index_blocking(move || edge_index_store::delete_object_fast(&fragment, &object_key))
-        .await
+    run_index_blocking(move || index_store::delete_object_fast(&fragment, &object_key)).await
 }
 
 pub async fn sync_fragment_partition_replicas(fragment: &str) -> Result<(), AppError> {
     let fragment = fragment.to_string();
-    run_edge_index_blocking(move || edge_index_store::sync_fragment_partition_replicas(&fragment))
-        .await
+    run_index_blocking(move || index_store::sync_fragment_partition_replicas(&fragment)).await
 }
 
 pub async fn ensure_object_owner_partition_available(
@@ -653,8 +624,8 @@ pub async fn ensure_object_owner_partition_available(
 ) -> Result<(), AppError> {
     let fragment = fragment.to_string();
     let object_key = object_key.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::ensure_object_owner_partition_available(&fragment, &object_key)
+    run_index_blocking(move || {
+        index_store::ensure_object_owner_partition_available(&fragment, &object_key)
     })
     .await
 }
@@ -667,8 +638,8 @@ pub async fn delete_object_version(
     let fragment = fragment.to_string();
     let object_key = object_key.to_string();
     let version_id = version_id.to_string();
-    run_edge_index_blocking(move || {
-        if edge_index_store::delete_live_version(&fragment, &object_key, &version_id)? {
+    run_index_blocking(move || {
+        if index_store::delete_live_version(&fragment, &object_key, &version_id)? {
             Ok(())
         } else {
             Err(AppError::NotFound)
@@ -685,8 +656,8 @@ pub async fn delete_trashed_object_version(
     let fragment = fragment.to_string();
     let object_key = object_key.to_string();
     let version_id = version_id.to_string();
-    run_edge_index_blocking(move || {
-        if edge_index_store::delete_trash_version(&fragment, &object_key, &version_id)? {
+    run_index_blocking(move || {
+        if index_store::delete_trash_version(&fragment, &object_key, &version_id)? {
             Ok(())
         } else {
             Err(AppError::NotFound)
@@ -701,10 +672,8 @@ pub async fn clear_fragment_trash_in_partitions(
 ) -> Result<(), AppError> {
     let fragment = fragment.to_string();
     let object_key = object_key.map(ToOwned::to_owned);
-    run_edge_index_blocking(move || {
-        edge_index_store::clear_fragment_trash(&fragment, object_key.as_deref())
-    })
-    .await
+    run_index_blocking(move || index_store::clear_fragment_trash(&fragment, object_key.as_deref()))
+        .await
 }
 
 pub async fn clear_fragment_trash_for_partitions(
@@ -713,8 +682,8 @@ pub async fn clear_fragment_trash_for_partitions(
 ) -> Result<usize, AppError> {
     let fragment = fragment.to_string();
     let touched_partitions = touched_partitions.clone();
-    run_edge_index_blocking(move || {
-        edge_index_store::clear_fragment_trash_for_partitions(&fragment, &touched_partitions)
+    run_index_blocking(move || {
+        index_store::clear_fragment_trash_for_partitions(&fragment, &touched_partitions)
     })
     .await
 }
@@ -724,8 +693,6 @@ pub async fn clear_fragment_trash_partition(
     partition_id: u16,
 ) -> Result<usize, AppError> {
     let fragment = fragment.to_string();
-    run_edge_index_blocking(move || {
-        edge_index_store::clear_fragment_trash_partition(&fragment, partition_id)
-    })
-    .await
+    run_index_blocking(move || index_store::clear_fragment_trash_partition(&fragment, partition_id))
+        .await
 }

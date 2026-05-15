@@ -1935,7 +1935,7 @@ pub fn object_partition_id(_fragment: &str, object_key: &str) -> Result<u16, App
     Ok(u16::from_str_radix(&hash[..4], 16).unwrap_or(0))
 }
 
-pub fn has_object_edge_index_record(fragment: &str, object_key: &str) -> Result<bool, AppError> {
+pub fn has_object_index_record(fragment: &str, object_key: &str) -> Result<bool, AppError> {
     Ok(object_dir_candidates(fragment, object_key)?
         .into_iter()
         .any(|path| path.is_dir()))
@@ -1962,7 +1962,7 @@ pub fn ensure_fragment_owner_partition_available_strict(fragment: &str) -> Resul
     ensure_fragment_dirs(fragment)
 }
 
-pub fn has_any_fragment_edge_index(fragment: &str) -> Result<bool, AppError> {
+pub fn has_any_fragment_index(fragment: &str) -> Result<bool, AppError> {
     Ok(existing_fragment_roots(fragment).into_iter().any(|root| {
         root.join(FRAGMENT_META_FILE).exists()
             || root.join(UPLOADS_DIR).exists()
@@ -3248,5 +3248,274 @@ mod tests {
             loaded_receipt.shard_checksums,
             vec![0x1111_1111, 0x2222_2222, 0x3333_3333]
         );
+    }
+
+    #[test]
+    fn multipart_manifest_and_binding_are_stable_session_truth() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let roots = ensure_test_index_roots();
+        let fragment = format!("n1-upload-truth-{}", Ulid::new());
+        let version_id = Ulid::new().to_string();
+        let session_id = Ulid::new().to_string();
+        let manifest = UploadSessionManifest {
+            fragment: fragment.clone(),
+            object_key: "@o_01KSESSIONPHYSICALOBJECT000".to_string(),
+            version_id: version_id.clone(),
+            session_id: session_id.clone(),
+            total_size_bytes: 6 * 1024,
+            expected_parts: 3,
+            part_size_bytes: 2 * 1024,
+            content_type: "application/octet-stream".to_string(),
+            created_at: 1_777_905_100,
+            stripe_size_bytes: 512,
+            data_shards: 2,
+            parity_shards: 1,
+        };
+        let binding = PendingUploadBinding {
+            fragment: fragment.clone(),
+            logical_path: "videos/movie.mp4".to_string(),
+            physical_object_id: manifest.object_key.clone(),
+            version_id: version_id.clone(),
+            session_id: session_id.clone(),
+            created_at_unix: 1_777_905_101,
+        };
+
+        open_session(&manifest, None).expect("open multipart session");
+        write_pending_binding(&binding).expect("write pending namespace binding");
+
+        let manifest_bytes_before = roots
+            .iter()
+            .map(|root| {
+                fs::read(
+                    root.join(&fragment)
+                        .join(UPLOADS_DIR)
+                        .join(&version_id)
+                        .join(MANIFEST_FILE),
+                )
+                .expect("read manifest")
+            })
+            .collect::<Vec<_>>();
+        let binding_bytes_before = roots
+            .iter()
+            .map(|root| {
+                fs::read(
+                    root.join(&fragment)
+                        .join(UPLOADS_DIR)
+                        .join(&version_id)
+                        .join(BINDING_FILE),
+                )
+                .expect("read binding")
+            })
+            .collect::<Vec<_>>();
+
+        for part_index in 0..manifest.expected_parts {
+            let receipt = SessionPartReceipt {
+                part_index,
+                size_bytes: manifest.part_size_bytes,
+                shard_size_bytes: 1024,
+                created_at: 1_777_905_200 + part_index as i64,
+                checksum: Some(0xaaaa_0000 + part_index as u32),
+                shard_checksums: vec![
+                    0xbbbb_0000 + part_index as u32,
+                    0xcccc_0000 + part_index as u32,
+                    0xdddd_0000 + part_index as u32,
+                ],
+            };
+            commit_session_part_receipt(&fragment, &version_id, &receipt)
+                .expect("write zero-decode receipt");
+        }
+
+        for (idx, root) in roots.iter().enumerate() {
+            let dir = root.join(&fragment).join(UPLOADS_DIR).join(&version_id);
+            assert_eq!(
+                fs::read(dir.join(MANIFEST_FILE)).expect("manifest after receipts"),
+                manifest_bytes_before[idx],
+                "part receipt commits must not rewrite manifest.ndx"
+            );
+            assert_eq!(
+                fs::read(dir.join(BINDING_FILE)).expect("binding after receipts"),
+                binding_bytes_before[idx],
+                "part receipt commits must not rewrite binding.ndx"
+            );
+            assert!(
+                !read_dir_names(&dir)
+                    .expect("session dir entries")
+                    .iter()
+                    .any(|name| name.starts_with(PART_META_PREFIX) && name.ends_with(".ndx")),
+                "receipt-only hot path must not create heavy part metadata records"
+            );
+        }
+
+        let loaded = load_session(&fragment, &version_id)
+            .expect("load session")
+            .expect("session exists");
+        assert_eq!(loaded.manifest.version_id, manifest.version_id);
+        assert_eq!(loaded.manifest.expected_parts, manifest.expected_parts);
+        assert_eq!(loaded.part_receipts.len(), manifest.expected_parts as usize);
+
+        let loaded_binding = read_pending_binding(&fragment, &version_id)
+            .expect("read binding")
+            .expect("binding exists");
+        assert_eq!(loaded_binding.logical_path, "videos/movie.mp4");
+        assert_eq!(loaded_binding.physical_object_id, manifest.object_key);
+    }
+
+    #[test]
+    fn removing_multipart_session_clears_manifest_binding_and_receipts_on_all_replicas() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let roots = ensure_test_index_roots();
+        let fragment = format!("n1-upload-remove-{}", Ulid::new());
+        let version_id = Ulid::new().to_string();
+        let session_id = Ulid::new().to_string();
+        let manifest = UploadSessionManifest {
+            fragment: fragment.clone(),
+            object_key: "@o_01KSESSIONDELETE000000000".to_string(),
+            version_id: version_id.clone(),
+            session_id: session_id.clone(),
+            total_size_bytes: 1024,
+            expected_parts: 1,
+            part_size_bytes: 1024,
+            content_type: "application/octet-stream".to_string(),
+            created_at: 1_777_905_300,
+            stripe_size_bytes: 512,
+            data_shards: 1,
+            parity_shards: 1,
+        };
+        open_session(&manifest, None).expect("open session");
+        write_pending_binding(&PendingUploadBinding {
+            fragment: fragment.clone(),
+            logical_path: "docs/delete-me.bin".to_string(),
+            physical_object_id: manifest.object_key.clone(),
+            version_id: version_id.clone(),
+            session_id,
+            created_at_unix: 1_777_905_301,
+        })
+        .expect("write binding");
+        commit_session_part_receipt(
+            &fragment,
+            &version_id,
+            &SessionPartReceipt {
+                part_index: 0,
+                size_bytes: 1024,
+                shard_size_bytes: 1024,
+                created_at: 1_777_905_302,
+                checksum: Some(0x0102_0304),
+                shard_checksums: vec![0x1111_1111, 0x2222_2222],
+            },
+        )
+        .expect("write receipt");
+
+        assert!(remove_session(&fragment, &version_id).expect("remove session"));
+        for root in roots {
+            assert!(
+                !root
+                    .join(&fragment)
+                    .join(UPLOADS_DIR)
+                    .join(&version_id)
+                    .exists(),
+                "session removal must clear manifest, binding, and receipts on every index replica"
+            );
+        }
+        assert!(
+            read_pending_binding(&fragment, &version_id)
+                .expect("read binding after remove")
+                .is_none(),
+            "removed upload sessions must not leave pending namespace bindings"
+        );
+    }
+
+    #[test]
+    fn root_listing_hides_internal_planes_and_blob_aliases() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let roots = ensure_test_index_roots();
+        let fragment = format!("n1-root-hidden-{}", Ulid::new());
+        publish_logical_object(&roots, &fragment, "docs/video.mp4", 123);
+
+        for root in &roots {
+            let fragment_root = root.join(&fragment);
+            for internal in [
+                OBJECTS_DIR,
+                UPLOADS_DIR,
+                TRASH_DIR,
+                TMP_DIR,
+                LOCKS_DIR,
+                GC_DIR,
+                REPAIR_DIR,
+                INTENTS_DIR,
+                TRASH_ENTRIES_DIR,
+                TRASH_JOBS_DIR,
+                BLOB_DIR,
+                FRAGMENT_META_FILE,
+            ] {
+                let path = fragment_root.join(internal);
+                if internal == FRAGMENT_META_FILE {
+                    fs::write(path, b"fragment-meta").expect("write internal file");
+                } else {
+                    fs::create_dir_all(path).expect("create internal dir");
+                }
+            }
+            fs::create_dir_all(fragment_root.join("@o_fake_user_visible"))
+                .expect("create raw object-like dir");
+        }
+
+        let page = scan_live_heads_page(&fragment, Some(String::new()), None, 100, None, true)
+            .expect("root list");
+        let records = page
+            .entries
+            .iter()
+            .map(|entry| entry.record.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(records, vec!["docs"]);
+        assert_eq!(page.common_prefixes, vec!["docs"]);
+    }
+
+    #[test]
+    fn latest_head_uses_max_ulid_and_ignores_invalid_ndx_names() {
+        let _guard = crate::test_support::global_test_lock().blocking_lock();
+        let roots = ensure_test_index_roots();
+        let fragment = format!("n1-head-{}", Ulid::new());
+        let object_id = new_object_id();
+        let old_id = "01K00000000000000000000000";
+        let new_id = "01K00000000000000000000001";
+
+        for root in &roots {
+            publish_namespace_link(root, &fragment, "docs/versioned.bin", &object_id)
+                .expect("publish namespace link");
+            let dir = live_object_dir(root, &fragment, &object_id).expect("object dir");
+            fs::create_dir_all(&dir).expect("create object dir");
+
+            let mut old = test_metadata(&fragment, &object_id, 111);
+            old.version_id = old_id.to_string();
+            old.created_at = 1_777_905_400;
+            write_atomic(
+                &dir.join(ndx_file_name(&old)),
+                &encode(&old).expect("encode old metadata"),
+            )
+            .expect("write old version");
+
+            fs::write(dir.join("not-a-valid-version.ndx"), b"garbage")
+                .expect("write invalid ndx name");
+
+            let mut new = test_metadata(&fragment, &object_id, 222);
+            new.version_id = new_id.to_string();
+            new.created_at = 1_777_905_500;
+            write_atomic(
+                &dir.join(ndx_file_name(&new)),
+                &encode(&new).expect("encode new metadata"),
+            )
+            .expect("write new version");
+        }
+
+        let page = scan_live_heads_page(&fragment, Some("docs".to_string()), None, 10, None, true)
+            .expect("list latest head");
+        assert_eq!(page.objects.len(), 1);
+        assert_eq!(page.objects[0].version_id, new_id);
+        assert_eq!(page.objects[0].total_size_bytes, 222);
+
+        let full = read_current_live_head(&fragment, &object_id)
+            .expect("read latest")
+            .expect("head exists");
+        assert_eq!(full.version_id, new_id);
+        assert_eq!(full.total_size_bytes, 222);
     }
 }

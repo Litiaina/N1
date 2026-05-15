@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-PACKAGE="${PACKAGE:-server}"
+PACKAGE="${PACKAGE:-n1-arc}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="${OUT_DIR:-.n1-bench/perf-probes-${STAMP}}"
 mkdir -p "$OUT_DIR"

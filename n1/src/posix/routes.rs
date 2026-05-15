@@ -13,6 +13,7 @@ use crate::posix::models::{
 };
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
+use crate::websocket::ws_structs::{NamespaceChangeEvent, StorageEventPayload};
 
 async fn posix_list(
     claims: Claims,
@@ -115,18 +116,27 @@ async fn posix_mkdir(
     claims: Claims,
     Json(req): Json<PosixPathRequest>,
 ) -> Result<Json<PosixMutationResponse>, AppError> {
-    let _ = state;
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
     }
+    let path = req.path;
     let created = global_namespace_runtime()
-        .mkdir(&claims.fragment, &req.path)
+        .mkdir(&claims.fragment, &path)
         .await?;
+    if created {
+        state.emit(
+            &claims.fragment,
+            StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::directory_created(
+                &claims.fragment,
+                &path,
+            )),
+        );
+    }
     Ok(Json(PosixMutationResponse {
         operation: "mkdir".to_string(),
         kind: PosixNodeKind::Directory,
         affected: usize::from(created),
-        path: Some(req.path),
+        path: Some(path),
         source_path: None,
         destination_path: None,
         created: Some(created),
@@ -140,13 +150,19 @@ async fn posix_rename(
     claims: Claims,
     Json(req): Json<PosixRenameRequest>,
 ) -> Result<Json<PosixMutationResponse>, AppError> {
-    let _ = state;
     if !claims.modify {
         return Err(AppError::Forbidden("Modify permission required".into()));
     }
     let summary = global_namespace_runtime()
         .rename(&claims.fragment, &req.source_path, &req.destination_path)
         .await?;
+    state.emit(
+        &claims.fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &claims.fragment,
+            summary.clone(),
+        )),
+    );
     Ok(Json(PosixMutationResponse {
         operation: summary.operation,
         kind: match summary.kind {
@@ -168,10 +184,16 @@ async fn posix_trash(
     claims: Claims,
     Json(req): Json<PosixPathRequest>,
 ) -> Result<Json<PosixMutationResponse>, AppError> {
-    let _ = state;
     let summary = global_namespace_runtime()
         .trash(&claims.fragment, &req.path)
         .await?;
+    state.emit(
+        &claims.fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &claims.fragment,
+            summary.clone(),
+        )),
+    );
     Ok(Json(PosixMutationResponse {
         operation: summary.operation,
         kind: match summary.kind {
@@ -193,7 +215,6 @@ async fn posix_recover(
     claims: Claims,
     Json(req): Json<PosixPathRequest>,
 ) -> Result<Json<PosixMutationResponse>, AppError> {
-    let _ = state;
     let summary = match req.trash_entry_id.as_deref().map(str::trim) {
         Some(trash_entry_id) if !trash_entry_id.is_empty() => {
             global_namespace_runtime()
@@ -206,6 +227,13 @@ async fn posix_recover(
                 .await?
         }
     };
+    state.emit(
+        &claims.fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &claims.fragment,
+            summary.clone(),
+        )),
+    );
     Ok(Json(PosixMutationResponse {
         operation: summary.operation,
         kind: match summary.kind {
@@ -227,7 +255,6 @@ async fn posix_purge(
     claims: Claims,
     Json(req): Json<PosixPathRequest>,
 ) -> Result<Json<PosixMutationResponse>, AppError> {
-    let _ = state;
     if !claims.delete {
         return Err(AppError::Forbidden("Delete permission required".into()));
     }
@@ -243,6 +270,13 @@ async fn posix_purge(
                 .await?
         }
     };
+    state.emit(
+        &claims.fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &claims.fragment,
+            summary.clone(),
+        )),
+    );
     Ok(Json(PosixMutationResponse {
         operation: summary.operation,
         kind: match summary.kind {

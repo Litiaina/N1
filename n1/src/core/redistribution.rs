@@ -7,11 +7,11 @@ use crate::core::disk_manager::{
     default_stripe_size,
 };
 use crate::core::ec::ErasureStreamWriter;
-use crate::core::edge_index_store;
 use crate::core::fragment_metadata::{
     fragment_index_partition_count, read_fragment_metadata, write_fragment_metadata,
 };
 use crate::core::index;
+use crate::core::index_store;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::read_or_recover_chunk;
 use crate::core::upload::{
@@ -817,7 +817,7 @@ fn object_index_dir_for_root(
         .trim_start_matches('/')
         .strip_prefix("@o_")
         .unwrap_or_else(|| object_key.trim().trim_start_matches('/'));
-    edge_index_store::live_object_dir(root, fragment_hash, object_id).unwrap_or_else(|_| {
+    index_store::live_object_dir(root, fragment_hash, object_id).unwrap_or_else(|_| {
         root.join(fragment_hash)
             .join(".objects")
             .join(".invalid-object-id")
@@ -1469,7 +1469,7 @@ async fn fragment_has_indexed_payload(
     let fragment_owned = fragment.to_string();
     let roots = active_index_roots.to_vec();
     let has_object_index = tokio::task::spawn_blocking(move || {
-        edge_index_store::fragment_has_object_index_records(&fragment_owned, &roots)
+        index_store::fragment_has_object_index_records(&fragment_owned, &roots)
     })
     .await
     .map_err(|e| AppError::InternalServerError(format!("N1 object index scan join: {e}")))?;
@@ -2131,9 +2131,7 @@ pub async fn run_redistribution_job_with_options(
             }
         }
         for fragment in &scanned_fragments {
-            if let Err(err) =
-                edge_index_store::cleanup_stale_index_plane_on_blob_only_roots(fragment)
-            {
+            if let Err(err) = index_store::cleanup_stale_index_plane_on_blob_only_roots(fragment) {
                 warn!(
                     "Failed to clean stale N1 index plane from blob-only roots for fragment {}: {}",
                     fragment, err

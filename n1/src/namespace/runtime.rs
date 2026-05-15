@@ -1,14 +1,14 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use chrono::Utc;
 use rustix::fs::{CWD, renameat};
 use serde::Serialize;
 
 use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata};
-use crate::core::edge_index_store::{
+use crate::core::index_store::{
     self, EdgeTrashKind, EdgeTrashRecord, PendingUploadBinding, TRASH_DIR, fragment_root_on,
     internal_namespace_entry_name, latest_summary_metadata_in_object_dir, live_object_dir,
     namespace_path, new_object_id, publish_namespace_link, read_dir_names,
@@ -23,6 +23,8 @@ use crate::namespace::models::{
 use crate::namespace::paths::{base_name, is_same_or_descendant, normalize_path, parent_path};
 
 static GLOBAL_NAMESPACE_RUNTIME: LazyLock<NamespaceRuntime> = LazyLock::new(NamespaceRuntime::new);
+static FINALIZE_LOCKS: LazyLock<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
 
 pub fn global_namespace_runtime() -> &'static NamespaceRuntime {
     &GLOBAL_NAMESPACE_RUNTIME
@@ -150,7 +152,7 @@ impl NamespaceRuntime {
         let Some(object_id) = self.resolve_live_object_id(fragment, path).await? else {
             return Ok(None);
         };
-        let Some(meta) = edge_index_store::read_current_live_head(fragment, &object_id)? else {
+        let Some(meta) = index_store::read_current_live_head(fragment, &object_id)? else {
             return Ok(None);
         };
         Ok(Some(object_head_from_meta(
@@ -167,7 +169,7 @@ impl NamespaceRuntime {
     ) -> Result<HashMap<String, ObjectHead>, AppError> {
         let mut out = HashMap::new();
         for object_id in object_ids {
-            if let Some(meta) = edge_index_store::read_current_live_head(fragment, object_id)? {
+            if let Some(meta) = index_store::read_current_live_head(fragment, object_id)? {
                 out.insert(
                     object_id.clone(),
                     object_head_from_meta(fragment, LifecycleState::Live, meta),
@@ -325,9 +327,9 @@ impl NamespaceRuntime {
             .iter()
             .flat_map(|record| record.object_keys.iter().cloned())
             .collect::<BTreeSet<_>>();
-        edge_index_store::drop_fragment_trash_namespace(fragment)?;
+        index_store::drop_fragment_trash_namespace(fragment)?;
         for object_id in &object_ids {
-            let _ = edge_index_store::delete_unreferenced_object_index(fragment, object_id)?;
+            let _ = index_store::delete_unreferenced_object_index(fragment, object_id)?;
         }
         Ok(NamespaceMutationSummary {
             operation: "empty_trash".to_string(),
@@ -346,8 +348,8 @@ impl NamespaceRuntime {
         fragment: &str,
     ) -> Result<Option<NamespaceReachabilitySnapshot>, AppError> {
         let mut snapshot = NamespaceReachabilitySnapshot::default();
-        for object_id in edge_index_store::referenced_object_ids(fragment)? {
-            for meta in edge_index_store::list_live_versions(fragment, &object_id)? {
+        for object_id in index_store::referenced_object_ids(fragment)? {
+            for meta in index_store::list_live_versions(fragment, &object_id)? {
                 snapshot.referenced_object_ids.insert(object_id.clone());
                 snapshot.referenced_version_ids.insert(meta.version_id);
             }
@@ -437,19 +439,58 @@ impl NamespaceRuntime {
         fragment: &str,
         logical_path: &str,
         physical_object_id: &str,
-        _metadata: &ObjectMetadata,
-    ) -> Result<(), AppError> {
+        metadata: &ObjectMetadata,
+    ) -> Result<String, AppError> {
         let fragment = fragment.to_string();
         let logical_path = normalize_user_path(logical_path)?;
         let physical_object_id = physical_object_id.to_string();
-        tokio::task::spawn_blocking(move || {
-            for root in index_roots() {
-                publish_namespace_link(&root, &fragment, &logical_path, &physical_object_id)?;
+        let mut metadata = metadata.clone();
+        let lock_key = format!("{fragment}\0{logical_path}");
+        let lock = {
+            let mut locks = FINALIZE_LOCKS.lock().await;
+            locks
+                .entry(lock_key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let guard = lock.lock().await;
+
+        let result = tokio::task::spawn_blocking(move || {
+            let final_object_id = match live_entry(&fragment, &logical_path)? {
+                Some(entry) if entry.kind == NamespaceEntryKind::Directory => {
+                    return Err(AppError::Conflict(format!(
+                        "logical path '{}' already exists as a directory",
+                        logical_path
+                    )));
+                }
+                Some(entry) => entry
+                    .object_id
+                    .unwrap_or_else(|| physical_object_id.clone()),
+                None => physical_object_id.clone(),
+            };
+
+            if final_object_id != physical_object_id {
+                metadata.object_key = final_object_id.clone();
+                index_store::upsert_live_version(&metadata)?;
+                index_store::delete_unreferenced_object_index(&fragment, &physical_object_id)?;
             }
-            Ok(())
+
+            for root in index_roots() {
+                publish_namespace_link(&root, &fragment, &logical_path, &final_object_id)?;
+            }
+            Ok(final_object_id)
         })
         .await
-        .map_err(|err| AppError::InternalServerError(format!("N1 namespace worker: {err}")))?
+        .map_err(|err| AppError::InternalServerError(format!("N1 namespace worker: {err}")))?;
+
+        drop(guard);
+        let mut locks = FINALIZE_LOCKS.lock().await;
+        if locks.get(&lock_key).is_some_and(|existing| {
+            Arc::ptr_eq(existing, &lock) && Arc::strong_count(existing) <= 2
+        }) {
+            locks.remove(&lock_key);
+        }
+        result
     }
 
     pub async fn bind_pending_upload(
@@ -476,14 +517,14 @@ impl NamespaceRuntime {
         fragment: &str,
         version_id: &str,
     ) -> Result<Option<PendingUploadBinding>, AppError> {
-        edge_index_store::read_pending_binding(fragment, version_id)
+        index_store::read_pending_binding(fragment, version_id)
     }
 
     pub async fn list_pending_uploads(
         &self,
         fragment: &str,
     ) -> Result<Vec<PendingUploadBinding>, AppError> {
-        edge_index_store::list_pending_bindings(fragment)
+        index_store::list_pending_bindings(fragment)
     }
 
     pub async fn find_pending_upload_by_logical_path(
@@ -492,7 +533,7 @@ impl NamespaceRuntime {
         logical_path: &str,
     ) -> Result<Option<PendingUploadBinding>, AppError> {
         let normalized = normalize_user_path(logical_path)?;
-        Ok(edge_index_store::list_pending_bindings(fragment)?
+        Ok(index_store::list_pending_bindings(fragment)?
             .into_iter()
             .find(|binding| binding.logical_path == normalized))
     }
@@ -502,7 +543,7 @@ impl NamespaceRuntime {
         fragment: &str,
         version_id: &str,
     ) -> Result<(), AppError> {
-        edge_index_store::clear_pending_binding(fragment, version_id)
+        index_store::clear_pending_binding(fragment, version_id)
     }
 
     pub async fn list_objects_page(
@@ -520,9 +561,9 @@ impl NamespaceRuntime {
         let delimiter = params.get("delimiter").cloned();
         let after = params.get("continuation_token").cloned();
         if scan_trash {
-            edge_index_store::scan_trash_heads_page(fragment, prefix, delimiter, limit, after, true)
+            index_store::scan_trash_heads_page(fragment, prefix, delimiter, limit, after, true)
         } else {
-            edge_index_store::scan_live_heads_page(fragment, prefix, delimiter, limit, after, true)
+            index_store::scan_live_heads_page(fragment, prefix, delimiter, limit, after, true)
         }
     }
 
@@ -963,7 +1004,7 @@ fn collect_object_refs_under(
     if kind == NamespaceEntryKind::File {
         if let Some(object_id) = resolve_live_object_id_sync(fragment, path)? {
             object_keys.insert(object_id.clone());
-            for meta in edge_index_store::list_live_versions(fragment, &object_id)? {
+            for meta in index_store::list_live_versions(fragment, &object_id)? {
                 version_ids.insert(meta.version_id);
             }
         }
@@ -983,8 +1024,7 @@ fn collect_object_refs_under(
                         read_namespace_symlink_object_id(&root, fragment, &child)?
                     {
                         if object_keys.insert(object_id.clone()) {
-                            for meta in edge_index_store::list_live_versions(fragment, &object_id)?
-                            {
+                            for meta in index_store::list_live_versions(fragment, &object_id)? {
                                 version_ids.insert(meta.version_id);
                             }
                         }
@@ -1040,7 +1080,7 @@ fn trash_live_path(fragment: &str, path: &str) -> Result<NamespaceMutationSummar
         version_ids,
         deleted_at_unix: deleted_at,
     };
-    edge_index_store::write_trash_record(fragment, &record)?;
+    index_store::write_trash_record(fragment, &record)?;
     Ok(NamespaceMutationSummary {
         operation: "trash".to_string(),
         kind: entry.kind,
@@ -1106,7 +1146,7 @@ fn recover_trash_path(
             .map_err(|e| AppError::InternalServerError(format!("N1 namespace recover: {e}")))?;
         prune_empty_trash_parents(&fragment_root.join(TRASH_DIR), &record.source_relative_path);
     }
-    let _ = edge_index_store::remove_trash_record(fragment, &record.trash_entry_id)?;
+    let _ = index_store::remove_trash_record(fragment, &record.trash_entry_id)?;
     Ok(NamespaceMutationSummary {
         operation: "recover".to_string(),
         kind: if record.kind == EdgeTrashKind::File {
@@ -1147,9 +1187,9 @@ fn purge_trash(
             );
         }
     }
-    let _ = edge_index_store::remove_trash_record(fragment, &record.trash_entry_id)?;
+    let _ = index_store::remove_trash_record(fragment, &record.trash_entry_id)?;
     for object_id in &record.object_keys {
-        let _ = edge_index_store::delete_unreferenced_object_index(fragment, object_id)?;
+        let _ = index_store::delete_unreferenced_object_index(fragment, object_id)?;
     }
     Ok(NamespaceMutationSummary {
         operation: "purge_trash".to_string(),
@@ -1194,7 +1234,7 @@ pub fn unexpected_response(status: axum::http::StatusCode, context: &str) -> App
 mod tests {
     use super::*;
     use crate::core::disk_manager::{INDEX_STORE_DISKS, ObjectMetadata};
-    use crate::core::edge_index_store;
+    use crate::core::index_store;
     use ulid::Ulid;
 
     fn ensure_test_index_roots() -> Vec<PathBuf> {
@@ -1240,7 +1280,7 @@ mod tests {
         size: u64,
     ) -> String {
         let object_id = new_object_id();
-        edge_index_store::upsert_live_version(&test_metadata(fragment, &object_id, size))
+        index_store::upsert_live_version(&test_metadata(fragment, &object_id, size))
             .expect("publish N1 ndx");
         for root in roots {
             publish_namespace_link(root, fragment, logical_path, &object_id)
@@ -1283,13 +1323,60 @@ mod tests {
             .expect("select object id for overwrite");
         assert_eq!(selected, object_id);
 
-        edge_index_store::upsert_live_version(&test_metadata(&fragment, &selected, 456))
+        index_store::upsert_live_version(&test_metadata(&fragment, &selected, 456))
             .expect("publish second version");
         assert_eq!(
-            edge_index_store::list_live_versions(&fragment, &selected)
+            index_store::list_live_versions(&fragment, &selected)
                 .expect("live versions")
                 .len(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn n1_concurrent_finalize_keeps_same_path_version_lineage() {
+        let _guard = crate::test_support::global_test_lock().lock().await;
+        let _roots = ensure_test_index_roots();
+        let fragment = format!("n1-finalize-race-{}", Ulid::new());
+        let logical_path = "docs/shared.bin";
+        let first_object_id = new_object_id();
+        let second_object_id = new_object_id();
+        let first = test_metadata(&fragment, &first_object_id, 111);
+        let second = test_metadata(&fragment, &second_object_id, 222);
+        index_store::upsert_live_version(&first).expect("publish first provisional version");
+        index_store::upsert_live_version(&second).expect("publish second provisional version");
+
+        let committed_first = global_namespace_runtime()
+            .finalize_logical_upload(&fragment, logical_path, &first_object_id, &first)
+            .await
+            .expect("finalize first writer");
+        assert_eq!(committed_first, first_object_id);
+
+        let committed_second = global_namespace_runtime()
+            .finalize_logical_upload(&fragment, logical_path, &second_object_id, &second)
+            .await
+            .expect("finalize second writer under existing path");
+        assert_eq!(committed_second, first_object_id);
+
+        assert_eq!(
+            global_namespace_runtime()
+                .resolve_live_object_id(&fragment, logical_path)
+                .await
+                .expect("resolve shared path"),
+            Some(first_object_id.clone())
+        );
+        let versions =
+            index_store::list_live_versions(&fragment, &first_object_id).expect("live versions");
+        assert_eq!(versions.len(), 2);
+        assert!(
+            versions
+                .iter()
+                .all(|meta| meta.object_key == first_object_id)
+        );
+        assert!(
+            index_store::read_current_live_head(&fragment, &second_object_id)
+                .expect("read stale provisional object")
+                .is_none()
         );
     }
 
@@ -1418,7 +1505,7 @@ mod tests {
 
         for root in &roots {
             let empty_object_dir =
-                crate::core::edge_index_store::live_object_dir(root, &fragment, &new_object_id())
+                crate::core::index_store::live_object_dir(root, &fragment, &new_object_id())
                     .expect("empty object dir");
             std::fs::create_dir_all(empty_object_dir).expect("empty object dir");
         }

@@ -2,8 +2,8 @@ use crate::core::constants::{FRAGMENT_METADATA_FILE, PARITY_SUFFIX, SHARD_SUFFIX
 use crate::core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata,
 };
-use crate::core::edge_index_store;
 use crate::core::index;
+use crate::core::index_store;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::{repair_entire_shard, verify_shard_integrity};
 use crate::core::redistribution::replay_pending_intents_for_fragment_now;
@@ -985,7 +985,7 @@ async fn repair_fragment_index_db(
     fragment: &str,
     dry_run: bool,
 ) -> Result<(u64, u64, u64), AppError> {
-    edge_index_store::repair_fragment_all_partition_replicas(fragment, dry_run)
+    index_store::repair_fragment_all_partition_replicas(fragment, dry_run)
 }
 
 async fn process_object_repair(

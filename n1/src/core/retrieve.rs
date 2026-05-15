@@ -4,7 +4,7 @@ use crate::core::fragment_manager::is_fragment_hash;
 use crate::core::metadata_parser::get_metadata;
 use crate::core::object_parser::{get_object_logic, stream_object_logic};
 use crate::core::quota_manager::get_storage_usage;
-use crate::core::{edge_index_store, index};
+use crate::core::{index, index_store};
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::runtime::{global_namespace_runtime, logical_not_found};
 use crate::structs::auth_structs::Claims;
@@ -316,6 +316,6 @@ async fn resolve_read_object_id(
     };
     match resolved {
         Some(object_id) => Ok(object_id),
-        None => edge_index_store::normalize_object_id(&normalized).map_err(|_| logical_not_found()),
+        None => index_store::normalize_object_id(&normalized).map_err(|_| logical_not_found()),
     }
 }

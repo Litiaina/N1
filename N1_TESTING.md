@@ -24,29 +24,35 @@ scripts/bench/run_release_drills.sh
 
 The drill runs high-value workflow cases repeatedly and can include the HA chaos harness. It writes logs under `.n1-bench/release-drills-*`.
 
-For a real HTTP restart proof as part of the release drill:
+For a real large-file multipart restart proof as part of the release drill:
 
 ```bash
 RUN_REAL_RESTART_PROOF=1 \
-SOURCE_DIR=/home/administrator/Development/litiaina-cloud-web \
+SOURCE_FILE=/home/administrator/Downloads/INCDT\ 122225.mp4 \
 DISK_ROOTS=/mnt/disk-00,/mnt/disk-01 \
 scripts/bench/run_release_drills.sh
 ```
 
 ## Gate 3: Real HTTP Proof
 
-This is the confidence test for process restart, real disks, namespace persistence, repair, recover-on-read, archive download, and redistribution.
+This focused gate covers process restart, real disks, multipart receipt
+persistence, streamed download hashing, range reads, health, and committed
+index/blob state. It is not the complete LTS matrix by itself; repair,
+redistribution, GC, UI, and long chaos still need their Rust-owned gates.
 
 ```bash
-sudo -E \
-SOURCE_DIR=/home/administrator/Development/litiaina-cloud-web \
+SOURCE_FILE=/home/administrator/Downloads/INCDT\ 122225.mp4 \
 DISK_ROOTS=/mnt/disk-00,/mnt/disk-01 \
 QUOTA_BACKEND=disabled \
-SIMULATE_DISK_FORMAT_REPAIR=1 \
-scripts/bench/run_real_restart_proof.sh
+scripts/bench/run_n1_release_proof.sh
 ```
 
-The proof starts a real `litiaina-n1` server, creates a real fragment, uploads a real nested folder through public HTTP routes, lists through public APIs, restarts the process, downloads sample files, simulates one disk being formatted, repairs, performs `2 disk -> 1 disk -> 2 disk` redistribution, and directly inspects committed `.ndx`, namespace symlink, and blob-version counts on both roots.
+The proof starts a real `litiaina-n1` server, creates a real fragment, rejects
+one-shot for files under the multipart threshold, uploads a real video through
+multipart, restarts the process midway, resumes from persisted receipts,
+finalizes, lists through public APIs, streams the download hash, checks range
+reads, health-checks, and directly inspects committed `.ndx` state on both
+roots.
 
 Expected pass evidence includes:
 
@@ -77,21 +83,8 @@ Use `MAX_FILES=128` for a smoke run. Use `MAX_FILES=0` for the full source tree.
 
 ## Gate 4: Parallel Small-Object Storm
 
-This is the hardening test for the minimum two-disk profile. It creates four real fragments, authenticates as four independent users, and uploads 3,000 nested one-shot objects per user through the public HTTP API.
-
-```bash
-scripts/bench/n1_live_parallel_storm.py \
-  --base-url https://127.0.0.1:50001 \
-  --master-key <MASTER_KEY> \
-  --users 4 \
-  --objects-per-user 3000 \
-  --per-user-concurrency 4 \
-  --quota-bytes 21474836480 \
-  --posix-list \
-  --multipart-size-mib 16 \
-  --multipart-part-mib 4 \
-  --pid <N1_PID>
-```
+This hardening gate must be owned by a Rust runner. Python is not part of the
+N1 release verification path.
 
 Expected pass evidence includes:
 
@@ -109,8 +102,7 @@ For production confidence, require:
 ```bash
 RUSTFLAGS='-D warnings' cargo test -p n1 --all-targets
 scripts/bench/run_release_drills.sh
-sudo -E SOURCE_DIR=<real-folder> DISK_ROOTS=<disk-a>,<disk-b> SIMULATE_DISK_FORMAT_REPAIR=1 scripts/bench/run_real_restart_proof.sh
-scripts/bench/n1_live_parallel_storm.py --base-url <live-url> --master-key <MASTER_KEY> --users 4 --objects-per-user 3000 --per-user-concurrency 4 --pid <N1_PID>
+SOURCE_FILE=<large-video> DISK_ROOTS=<disk-a>,<disk-b> scripts/bench/run_n1_release_proof.sh
 ```
 
 Do not treat synthetic tests alone as release confidence. N1 must prove the public API, process restart, real filesystem quota behavior, real disk layout, object-level repair/status, and durable `.ndx`/namespace/blob state together.

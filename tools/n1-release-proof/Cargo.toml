@@ -1,0 +1,21 @@
+[package]
+name = "n1-release-proof"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "n1-release-proof"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+futures-util.workspace = true
+percent-encoding.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+native-tls = "0.2"
+tokio-tungstenite = { version = "0.28.0", features = ["native-tls"] }

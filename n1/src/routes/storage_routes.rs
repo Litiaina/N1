@@ -49,7 +49,7 @@ use crate::core::upload::{
     list_active_uploads as list_active_uploads_impl, object_upload_part as object_upload_part_impl,
     upload_object_one_shot as upload_object_one_shot_impl,
 };
-use crate::core::{edge_index_store, index};
+use crate::core::{index, index_store};
 use crate::enums::app_error_enum::AppError;
 use crate::fs::fs_constants::MAX_FILE_SIZE;
 use crate::middleware::auth_middleware::{
@@ -119,7 +119,7 @@ async fn resolve_logical_read_key(
             AppError::InternalServerError("logical file is missing physical object id".to_string())
         });
     }
-    edge_index_store::normalize_object_id(requested).map_err(|_| logical_not_found())
+    index_store::normalize_object_id(requested).map_err(|_| logical_not_found())
 }
 
 fn download_filename_for_logical_path(requested_path: &str, resolved_key: &str) -> Option<String> {
@@ -275,7 +275,7 @@ async fn commit_logical_upload_from_meta(
     logical_path: &str,
     physical_object_id: &str,
     metadata: &crate::core::disk_manager::ObjectMetadata,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
     global_namespace_runtime()
         .finalize_logical_upload(fragment, logical_path, physical_object_id, metadata)
         .await
@@ -978,9 +978,16 @@ async fn upload_object_one_shot_scoped(
         parse_json_response(response, "one-shot upload").await?;
     let mut parsed =
         index::read_object_version(&fragment, &physical, &public_meta.version_id).await?;
-    commit_logical_upload_from_meta(&fragment, &object_key, &physical, &parsed).await?;
+    let committed_physical =
+        commit_logical_upload_from_meta(&fragment, &object_key, &physical, &parsed).await?;
     parsed.object_key = object_key;
-    emit_logical_file_uploaded(&state, &fragment, &parsed.object_key, &physical, &parsed);
+    emit_logical_file_uploaded(
+        &state,
+        &fragment,
+        &parsed.object_key,
+        &committed_physical,
+        &parsed,
+    );
     parsed.strip_internal_layout();
     Ok((StatusCode::CREATED, AxumJson(parsed)).into_response())
 }
@@ -1067,12 +1074,20 @@ async fn finalize_object_upload_scoped(
         .map(|value| value.logical_path.clone())
         .unwrap_or(key_query.object_key);
     let mut parsed = index::read_object_version(&fragment, &physical, &version_id).await?;
-    commit_logical_upload_from_meta(&parsed.fragment, &logical_path, &physical, &parsed).await?;
+    let committed_physical =
+        commit_logical_upload_from_meta(&parsed.fragment, &logical_path, &physical, &parsed)
+            .await?;
     global_namespace_runtime()
         .clear_pending_upload(&parsed.fragment, &parsed.version_id)
         .await?;
     parsed.object_key = logical_path;
-    emit_logical_file_uploaded(&state, &fragment, &parsed.object_key, &physical, &parsed);
+    emit_logical_file_uploaded(
+        &state,
+        &fragment,
+        &parsed.object_key,
+        &committed_physical,
+        &parsed,
+    );
     parsed.strip_internal_layout();
     Ok((StatusCode::OK, AxumJson(parsed)).into_response())
 }

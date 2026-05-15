@@ -1,10 +1,10 @@
 use crate::core::constants::EDGE_BLOB_DIR;
 use crate::core::delete::{get_empty_trash_status, get_recover_all_trash_status};
 use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
-use crate::core::edge_index_store;
 use crate::core::fragment_manager::is_fragment_hash;
 use crate::core::garbage_collector::get_gc_status;
 use crate::core::index;
+use crate::core::index_store;
 use crate::core::operation_gate::{MaintenanceAccessMode, current_maintenance_access_mode};
 use crate::core::redistribution::{
     RedistributionIntentDebtSnapshot, collect_redistribution_intent_debt, get_redist_status,
@@ -484,7 +484,7 @@ async fn fragment_has_indexed_payload(
     let fragment_owned = fragment.to_string();
     let roots = active_index_roots.to_vec();
     let has_object_index = tokio::task::spawn_blocking(move || {
-        edge_index_store::fragment_has_object_index_records(&fragment_owned, &roots)
+        index_store::fragment_has_object_index_records(&fragment_owned, &roots)
     })
     .await
     .map_err(|e| AppError::InternalServerError(format!("N1 object index scan join: {e}")))?;

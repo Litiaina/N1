@@ -1,6 +1,6 @@
 use crate::core::constants::EDGE_BLOB_DIR;
 use crate::core::disk_manager::ObjectPathManager;
-use crate::core::edge_index_store;
+use crate::core::index_store;
 use crate::enums::app_error_enum::AppError;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -431,13 +431,13 @@ pub async fn apply_all_fragment_project_quotas() -> Result<(), AppError> {
         return Ok(());
     }
     validate_fragment_quota_backend().await?;
-    let specs = tokio::task::spawn_blocking(edge_index_store::active_fragment_quota_specs)
+    let specs = tokio::task::spawn_blocking(index_store::active_fragment_quota_specs)
         .await
         .map_err(|err| AppError::InternalServerError(format!("quota spec task: {err}")))??;
     for spec in specs {
         let fragment = spec.fragment.clone();
         let project_id = tokio::task::spawn_blocking(move || {
-            edge_index_store::ensure_fragment_quota_project_id(&fragment)
+            index_store::ensure_fragment_quota_project_id(&fragment)
         })
         .await
         .map_err(|err| AppError::InternalServerError(format!("quota project id task: {err}")))??;

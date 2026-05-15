@@ -1,5 +1,5 @@
 use crate::core::disk_manager::ObjectPathManager;
-use crate::core::edge_index_store::FragmentMeta as EdgeFragmentMeta;
+use crate::core::index_store::FragmentMeta as IndexFragmentMeta;
 use crate::{core::constants::FRAGMENT_METADATA_FILE, enums::app_error_enum::AppError};
 
 use argon2::{
@@ -85,12 +85,12 @@ fn unix_to_rfc3339(seconds: i64) -> String {
         .to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-fn decode_edge_fragment_meta(raw: &[u8]) -> Result<EdgeFragmentMeta, AppError> {
-    rmp_serde::from_slice::<EdgeFragmentMeta>(raw)
+fn decode_index_fragment_meta(raw: &[u8]) -> Result<IndexFragmentMeta, AppError> {
+    rmp_serde::from_slice::<IndexFragmentMeta>(raw)
         .map_err(|e| AppError::InternalServerError(format!("decode N1 fragment metadata: {}", e)))
 }
 
-fn fragment_metadata_from_edge(meta: EdgeFragmentMeta) -> FragmentMetadata {
+fn fragment_metadata_from_index(meta: IndexFragmentMeta) -> FragmentMetadata {
     FragmentMetadata {
         fragment: meta.fragment_id,
         key_phc: meta.key_phc.unwrap_or_default(),
@@ -104,7 +104,7 @@ fn fragment_metadata_from_edge(meta: EdgeFragmentMeta) -> FragmentMetadata {
 }
 
 fn decode_fragment_metadata(raw: &[u8]) -> Result<FragmentMetadata, AppError> {
-    decode_edge_fragment_meta(raw).map(fragment_metadata_from_edge)
+    decode_index_fragment_meta(raw).map(fragment_metadata_from_index)
 }
 
 fn fragment_meta_path(root: &Path, fragment_hash: &str) -> PathBuf {
@@ -163,16 +163,16 @@ async fn durable_atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AppError>
     Ok(())
 }
 
-async fn read_edge_fragment_meta_if_exists(
+async fn read_index_fragment_meta_if_exists(
     path: &Path,
-) -> Result<Option<EdgeFragmentMeta>, AppError> {
+) -> Result<Option<IndexFragmentMeta>, AppError> {
     if !tokio_fs::try_exists(path).await.unwrap_or(false) {
         return Ok(None);
     }
     let raw = tokio_fs::read(path)
         .await
         .map_err(|e| AppError::Io(e, format!("read {}", path.display())))?;
-    decode_edge_fragment_meta(&raw).map(Some)
+    decode_index_fragment_meta(&raw).map(Some)
 }
 
 fn hash_key_to_phc(key: &str) -> Result<String, AppError> {
@@ -326,9 +326,9 @@ async fn write_fragment_metadata_with_policy(
     for root in roots {
         let p = fragment_meta_path(&root, &meta.fragment);
         let now = Utc::now().timestamp();
-        let mut edge = match read_edge_fragment_meta_if_exists(&p).await {
+        let mut edge = match read_index_fragment_meta_if_exists(&p).await {
             Ok(Some(existing)) => existing,
-            Ok(None) => EdgeFragmentMeta {
+            Ok(None) => IndexFragmentMeta {
                 fragment_id: meta.fragment.clone(),
                 state: "active".to_string(),
                 quota_bytes: 0,
@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn decode_fragment_metadata_accepts_n1_fragment_ndx_shape() {
-        let current = EdgeFragmentMeta {
+        let current = IndexFragmentMeta {
             fragment_id: "abc".to_string(),
             state: "active".to_string(),
             quota_bytes: 1024,

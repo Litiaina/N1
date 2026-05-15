@@ -1,4 +1,4 @@
-use crate::core::edge_index_store;
+use crate::core::index_store;
 use crate::enums::app_error_enum::AppError;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -41,7 +41,7 @@ pub async fn inspect_namespace_replicas(
     fragment: &str,
     index_roots: &[PathBuf],
 ) -> Result<NamespaceReplicaInspection, AppError> {
-    let inspection = edge_index_store::inspect_fragment_partition_replicas(fragment, index_roots);
+    let inspection = index_store::inspect_fragment_partition_replicas(fragment, index_roots);
     Ok(NamespaceReplicaInspection {
         fragment: fragment.to_string(),
         expected_replicas: inspection.expected_replicas,
@@ -61,7 +61,7 @@ pub async fn repair_namespace_replicas(
     dry_run: bool,
 ) -> Result<NamespaceReplicaRepairReport, AppError> {
     let (missing, divergent, corrupt) =
-        edge_index_store::repair_fragment_all_partition_replicas(fragment, dry_run)?;
+        index_store::repair_fragment_all_partition_replicas(fragment, dry_run)?;
     Ok(NamespaceReplicaRepairReport {
         fragment: fragment.to_string(),
         expected_replicas: 0,

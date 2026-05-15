@@ -435,23 +435,21 @@ RUSTFLAGS='-D warnings' cargo test -p n1 --all-targets
 RUSTFLAGS='-D warnings' cargo check --workspace --all-targets
 ```
 
-The non-destructive HTTP smoke proof can be run on two temporary roots:
+Release proof runners must be Rust-first. Shell scripts may prepare the
+environment and launch Rust binaries, but Python is not part of the N1 release
+verification path.
+
+The focused large-file multipart proof uses the Rust `n1-release-proof` tool
+under `tools/`. It rejects a source file that fits in the one-shot limit,
+uploads larger files through multipart, restarts N1 midway, resumes the upload
+from persisted receipts, finalizes, streams the download hash, checks range
+reads, and verifies health. This proof is one release gate; it is not the full
+LTS chaos matrix by itself:
 
 ```bash
-mkdir -p /tmp/n1-proof-disk-00 /tmp/n1-proof-disk-01
-python3 scripts/bench/n1_real_proof.py \
-  --binary target/debug/litiaina-n1 \
-  --source-dir /home/administrator/Development/N2/n1/src \
-  --disk-roots /tmp/n1-proof-disk-00,/tmp/n1-proof-disk-01 \
-  --out-dir /tmp/n1-proof-run \
-  --port 50661 \
-  --concurrency 4 \
-  --quota-backend disabled \
-  --quota-bytes 1073741824 \
-  --prefix n1-smoke/ \
-  --max-files 8 \
-  --skip-redistribution \
-  --cleanup-roots
+SOURCE_FILE="/home/administrator/Downloads/INCDT 122225.mp4" \
+DISK_ROOTS="/mnt/disk-00,/mnt/disk-01" \
+scripts/bench/run_n1_release_proof.sh
 ```
 
 The N1 unit suite covers:
