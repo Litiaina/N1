@@ -1,4 +1,4 @@
-use crate::core::constants::EDGE_BLOB_DIR;
+use crate::core::constants::N1_BLOB_DIR;
 use crate::core::delete::{get_empty_trash_status, get_recover_all_trash_status};
 use crate::core::disk_manager::{BLOB_STORE_DISKS, INDEX_STORE_DISKS};
 use crate::core::fragment_manager::is_fragment_hash;
@@ -236,7 +236,7 @@ struct FragmentRedundancyDebt {
     sampled_degraded_fragments: Vec<String>,
 }
 
-fn should_count_edge_index_record(path: &std::path::Path) -> bool {
+fn should_count_index_record(path: &std::path::Path) -> bool {
     let name = match path.file_name().and_then(|n| n.to_str()) {
         Some(s) => s,
         None => return false,
@@ -266,21 +266,19 @@ fn should_count_edge_index_record(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::should_count_edge_index_record;
+    use super::should_count_index_record;
     use std::path::Path;
 
     #[test]
     fn deep_scan_counts_only_live_index_records() {
-        assert!(should_count_edge_index_record(Path::new(
+        assert!(should_count_index_record(Path::new(
             "frag/.objects/ab/cd/@o_abc/01HZ.123.456.7.ndx"
         )));
-        assert!(!should_count_edge_index_record(Path::new(
+        assert!(!should_count_index_record(Path::new(
             "frag/.intents/0001.pending.redist.intent.msgpack"
         )));
-        assert!(!should_count_edge_index_record(Path::new(
-            "frag/.fragment.ndx"
-        )));
-        assert!(!should_count_edge_index_record(Path::new(
+        assert!(!should_count_index_record(Path::new("frag/.fragment.ndx")));
+        assert!(!should_count_index_record(Path::new(
             "frag/.trash/.objects/ab/cd/@o_abc/01HZ.123.456.7.ndx"
         )));
     }
@@ -443,7 +441,7 @@ async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bo
     let now = SystemTime::now();
     tokio::task::spawn_blocking(move || {
         for root in roots {
-            let blob_dir = root.join(&fragment).join(EDGE_BLOB_DIR);
+            let blob_dir = root.join(&fragment).join(N1_BLOB_DIR);
             let Ok(entries) = std::fs::read_dir(&blob_dir) else {
                 continue;
             };
@@ -631,7 +629,7 @@ async fn detect_fragment_redundancy_debt(
     Ok(debt)
 }
 
-async fn detect_edge_index_replica_debt(
+async fn detect_index_replica_debt(
     active_index_roots: &[PathBuf],
     deep_scan: bool,
     target_fragment: Option<&str>,
@@ -791,7 +789,7 @@ async fn collect_system_health(
         .map(|v| v == "true")
         .unwrap_or(false);
     let force_refresh = params.get("refresh").map(|v| v == "true").unwrap_or(false);
-    let mut edge_index_record_counts = Vec::new();
+    let mut index_record_counts = Vec::new();
     let mut partition_map = HashMap::new();
     let mut scan_performed = false;
     let mut scan_busy = false;
@@ -821,7 +819,7 @@ async fn collect_system_health(
 
                     for entry in walker.filter_map(|e| e.ok()) {
                         let path = entry.path();
-                        if entry.file_type().is_file() && should_count_edge_index_record(path) {
+                        if entry.file_type().is_file() && should_count_index_record(path) {
                             current_disk_count += 1;
                         }
 
@@ -836,12 +834,12 @@ async fn collect_system_health(
                 let _ = tx.send(counts);
             });
 
-            edge_index_record_counts = rx.await.map_err(|e| {
+            index_record_counts = rx.await.map_err(|e| {
                 AppError::InternalServerError(format!("Consistency check thread failed: {}", e))
             })?;
 
             for (i, root) in active_index_roots.iter().enumerate() {
-                if let Some(count) = edge_index_record_counts.get(i) {
+                if let Some(count) = index_record_counts.get(i) {
                     partition_map.insert(root.to_string_lossy().to_string(), *count);
                 }
             }
@@ -850,13 +848,13 @@ async fn collect_system_health(
         }
     }
 
-    let total_edge_index_records = edge_index_record_counts.iter().copied().sum::<u64>();
+    let total_index_records = index_record_counts.iter().copied().sum::<u64>();
 
     let index_health = if scan_busy {
         "skipped (scan in progress)".to_string()
     } else if !scan_performed {
         "skipped (use ?deep_scan=true)".to_string()
-    } else if edge_index_record_counts.is_empty() {
+    } else if index_record_counts.is_empty() {
         "empty".to_string()
     } else {
         "records-scanned".to_string()
@@ -880,8 +878,8 @@ async fn collect_system_health(
         target_fragment.as_deref(),
     )
     .await?;
-    let edge_index_replica_debt =
-        detect_edge_index_replica_debt(&active_index_roots, deep_scan, target_fragment.as_deref())
+    let index_replica_debt =
+        detect_index_replica_debt(&active_index_roots, deep_scan, target_fragment.as_deref())
             .await?;
     let storage = collect_storage_plane_stats(
         &disk_statuses,
@@ -945,22 +943,22 @@ async fn collect_system_health(
                     .join(", ")
             ),
         )
-    } else if edge_index_replica_debt.fragments_critical > 0 {
+    } else if index_replica_debt.fragments_critical > 0 {
         (
             "critical",
             format!(
                 "N1 index has no valid replica for {} fragment(s): {}.",
-                edge_index_replica_debt.fragments_critical,
-                edge_index_replica_debt.degraded_fragments.join(", ")
+                index_replica_debt.fragments_critical,
+                index_replica_debt.degraded_fragments.join(", ")
             ),
         )
-    } else if edge_index_replica_debt.fragments_degraded > 0 {
+    } else if index_replica_debt.fragments_degraded > 0 {
         (
             "degraded",
             format!(
                 "N1 index replicas need repair for {} fragment(s): {}.",
-                edge_index_replica_debt.fragments_degraded,
-                edge_index_replica_debt.degraded_fragments.join(", ")
+                index_replica_debt.fragments_degraded,
+                index_replica_debt.degraded_fragments.join(", ")
             ),
         )
     } else if placement_limiter_low {
@@ -1047,9 +1045,9 @@ async fn collect_system_health(
         status: status.to_string(),
         disks: disk_statuses,
         consistency: ConsistencyStats {
-            total_index_records_scanned: total_edge_index_records,
+            total_index_records_scanned: total_index_records,
             index_health,
-            index_replicas: edge_index_replica_debt,
+            index_replicas: index_replica_debt,
             index_record_counts: if !partition_map.is_empty() {
                 Some(partition_map)
             } else {
@@ -1059,7 +1057,7 @@ async fn collect_system_health(
         system: system_metrics,
         uploads,
         index_runtime: IndexRuntimeStats {
-            loaded_index_records: total_edge_index_records,
+            loaded_index_records: total_index_records,
             index_roots_online: online_index_count as u64,
             prefix_projection_fragments_pending: 0,
         },

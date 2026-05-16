@@ -1,267 +1,904 @@
 # N1 Documentation
 
-N1 1.1.0 is the N1 storage kernel.
+N1 is a single-node storage kernel for durable object storage with a POSIX-like namespace. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, garbage collection, trash/recover, archive download, and realtime namespace events.
 
-N1 is no longer the old Standard/indexdb engine. The active N1 architecture is the storage-kernel design: real namespace directories, symlink object identity, immutable `.ndx` object-version records, and explicit `.blobs` payload roots. The old Standard engine has been retired from the active workspace; if an operator needs that historical engine, they should use an older tagged release.
+N1 exposes a file-explorer-friendly namespace while storing payloads through its shard/parity blob plane. Folders are real namespace directories. Files are stable object identities with immutable version records. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
-## Identity
+For implementation details, see [N1_ARCHITECTURE.md](N1_ARCHITECTURE.md). For release validation notes, see [N1_VERIFICATION.md](N1_VERIFICATION.md).
 
-N1 is the Linux-first N1 storage kernel:
+## Core Concepts
 
-- IO-bound by design
-- zero-decode for normal listing
-- immutable for committed object version metadata
-- POSIX-like for folders, rename, move, trash, recover, and listing
-- backed by the existing N1 blob/shard/parity data plane
+- **Fragment:** A quota-bound virtual storage partition. Clients mount/authenticate a fragment before using the API.
+- **Namespace:** The user-facing tree of folders and files. This is what `/n1/posix/*` and the UI show.
+- **Object:** The stable identity behind a file. Renaming a file changes the namespace name, not the object identity.
+- **Version:** One committed immutable object version. Uploading to an existing file path creates a new version under the same object identity.
+- **Trash:** Soft delete moves namespace entries to trash. Hard delete removes trash entries. GC later reclaims blob bytes that no remaining metadata references.
+- **Repair:** Rebuilds missing or corrupt shard/parity/index replicas when enough data remains.
+- **Redistribution:** Rebalances index/blob placement after disk topology changes.
 
-Public/operator wording should say:
+## Installation
 
-- N1
-- N1 storage kernel
-- N1 namespace
-- N1 object index
-- N1 blob plane
-- N1 index
-- `.ndx` metadata record
-- per-fragment N1 index
+Build N1:
 
-Do not describe N1 publicly as just a filesystem index, a filesystem database, sqlite-backed, indexdb-backed, database-backed, or a sharded database. Those either reduce N1 to an implementation detail or describe the retired Standard engine, not the active N1 architecture.
-
-Internally, N1 deliberately uses Linux filesystem and kernel semantics for namespace movement, atomic publish, directory scanning, symlink identity, and durability. That is the execution substrate, not the product identity. The public identity is N1.
-
-## Final Disk Layout
-
-Each configured index root contains one N1 storage-kernel tree per fragment:
-
-```text
-<index_root>/<fragment_hash>/
-  .fragment.ndx
-  .objects/
-    <hh>/
-      <hh>/
-        @o_<object-id>/
-          <ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
-  .uploads/
-    <version_id>/
-      manifest.ndx
-      binding.ndx
-      part_p00000000000000000000.<crc32>.receipt
-      shard_p00000000000000000000_s0000.<crc32>.receipt
-  .trash/
-    docs/
-      video.mp4 -> @o_<object-id>
-  docs/
-    video.mp4 -> @o_<object-id>
+```bash
+cargo build -p n1 --release
 ```
 
-N1 blob payload layout is explicit and internal:
+Run directly for development:
 
-```text
-<blob_root>/<fragment_hash>/.blobs/<version_id>/<shard-or-parity-file>
+```bash
+sudo ./target/release/litiaina-n1
 ```
 
-Both disks may house both index and blob roots. The minimum N1 profile remains two configured roots, for example `/mnt/disk-00` and `/mnt/disk-01`.
+For production, install N1 as a systemd service:
 
-## What `.fragment.ndx` Is
-
-`.fragment.ndx` is the per-fragment N1 control record. It stores fragment-level operational state such as quota/project identity, state, and timestamps.
-
-It is not object metadata truth. It is not a namespace catalog. It is not a database. Object truth is in `.objects/<hh>/<hh>/@o_<object-id>/*.ndx`, namespace truth is in real directories and symlink pointers, and payload truth remains in the blob plane.
-
-## Namespace And Object Truth
-
-N1 has three clear storage planes:
-
-- Namespace: real directories and file symlinks.
-- Object index: two-level fanned `.objects/<hh>/<hh>/@o_<object-id>/` directories with immutable `.ndx` versions.
-- Blob plane: immutable shard/parity files under `<blob_root>/<fragment>/.blobs/<version_id>/`.
-
-The namespace symlink is the mutable POSIX face:
-
-```text
-docs/video.mp4 -> @o_01KQ...
+```bash
+sudo scripts/install-n1-systemd.sh \
+  --install-dir /home/administrator/SERVERS/N1-SERVER \
+  --binary ./target/release/litiaina-n1 \
+  --user administrator \
+  --group administrator
 ```
 
-The symlink payload is a stable object id. N1 reads it with `readlink` and resolves it to:
+Then:
 
-```text
-<index_root>/<fragment>/.objects/<hh>/<hh>/@o_01KQ.../
+```bash
+sudo systemctl enable --now litiaina-n1.service
+sudo journalctl -u litiaina-n1.service -f
 ```
 
-The fanout directories are derived from a stable hash of the object id. Namespace symlinks still store only `@o_<object-id>`, so folder rename and folder move never require symlink rewrites.
+## Configuration
 
-The symlink target is intentionally not a depth-relative filesystem path. That makes folder rename and folder move safe: moving `docs/` to `archive/docs/` does not require rewriting child symlinks.
+N1 reads `n1_config.ini` and `n1.env` from the server working directory.
 
-## Object Versions
+Minimal two-disk configuration where both disks house index and blob data:
 
-Each committed version is one immutable `.ndx` file:
+```ini
+[server]
+host=127.0.0.1
+https_port=50001
+cert_path=cert.pem
+key_path=key.pem
 
-```text
-<ulid>.<size-bytes>.<unix-nanos>.<packed-ext-u64>.ndx
+[disk_config]
+index_store_disks=/mnt/disk-00,/mnt/disk-01
+blob_store_disks=/mnt/disk-00,/mnt/disk-01
+fs_storage_path=/home/administrator/Server Deploy Test/fs-disk
+
+[quota_config]
+fragment_quota_backend=xfs_project
+
+[upload_config]
+data_shards=1
+parity_shards=1
+max_part_size=52428800
+stripe_block_size=262144
+max_concurrent_io=auto
+upload_memory_budget_bytes=auto
+adaptive_concurrency_enabled=true
+upload_io_gate_enabled=true
 ```
 
-The filename is the list summary. Normal listing parses this filename only.
+`n1.env` must provide the secrets used by N1:
 
-The `.ndx` body contains full immutable object metadata for download, verify, repair, redistribution, recover-on-read, archive generation, and GC.
-
-Head/latest is:
-
-```text
-max ULID among valid .ndx filenames under .objects/<hh>/<hh>/@o_<object-id>/
+```bash
+JWT_SECRET=change-this
+MASTER_KEY=change-this-master-key
+SIGNED_READ_URL_SECRET=change-this-signed-url-secret
 ```
 
-There is no `.head`, mutable head pointer, object head table, version counter, sidecar summary file, or correctness cache.
+### Disk And Quota Notes
 
-## Packed Extension
+N1 recommends XFS with project quota enabled for production fragment quotas:
 
-The packed extension field is a zero-allocation u64:
-
-- byte 0 stores extension length
-- bytes 1 through 7 store lowercase ASCII extension bytes
-- extensions longer than 7 bytes store `0`
-
-This keeps normal listing from decoding `.ndx` bodies just to know basic file type.
-
-## Normal Listing
-
-Normal listing is direct directory scanning:
-
-```text
-prefix=docs/
-open <index_root>/<fragment>/docs/
-read direct children only
+```bash
+sudo mount -o prjquota /dev/<device> /mnt/disk-00
 ```
 
-For each direct child:
+Fragment quota is a storage partition limit. Creating a fragment requires `quota_bytes`. N1 refuses fragment creation when the requested quota exceeds available allocatable capacity.
 
-- normal directory -> directory entry
-- symlink whose payload is `@o_<object-id>` -> file entry
-- reserved internal entry -> hidden
+## Quick Start
 
-For a file symlink, N1:
+Set a base URL:
 
-1. reads the symlink payload
-2. opens `.objects/<hh>/<hh>/@o_<object-id>/`
-3. chooses the greatest valid ULID `.ndx` filename
-4. parses size, timestamp, extension, and version id from the filename
-5. returns the entry
-
-Normal listing does not decode `.ndx` bodies.
-
-Reserved internal names are hidden from user listing:
-
-```text
-.objects
-.uploads
-.trash
-.tmp
-.locks
-.gc
-.repair
-.intents
-.trash-jobs
-blob
-@o_*
+```bash
+BASE='https://127.0.0.1:50001'
+MASTER='<MASTER_KEY>'
 ```
 
-User paths containing reserved segments are rejected.
+Check server health:
 
-## POSIX Semantics
-
-File rename:
-
-```text
-rename docs/video.mp4 -> docs/new-video.mp4
+```bash
+curl -k "$BASE/n1/ping"
 ```
 
-This renames the symlink only. The object id stays the same, so version lineage is preserved.
+Create a fragment:
 
-Folder rename:
-
-```text
-rename docs -> archive/docs
+```bash
+curl -k "$BASE/n1/fragments" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "mainframe",
+    "secret": "'"$MASTER"'",
+    "key": "fragment-local-secret",
+    "quota_bytes": 322122547200
+  }'
 ```
 
-This renames the directory tree only. Child symlinks keep pointing to the same stable object ids.
+Authenticate the fragment:
 
-Soft delete:
-
-```text
-mv docs/video.mp4 .trash/docs/video.mp4
+```bash
+curl -k "$BASE/n1/auth/fragment" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "fragment": "<FRAGMENT_HASH>",
+    "secret": "fragment-local-secret",
+    "read": true,
+    "write": true,
+    "modify": true,
+    "delete": true
+  }'
 ```
 
-Recover:
+Use the returned token:
 
-```text
-mv .trash/docs/video.mp4 docs/video.mp4
+```bash
+TOKEN='<ACCESS_TOKEN>'
+AUTH=(-H "Authorization: Bearer $TOKEN")
 ```
 
-Hard delete removes the trash symlink or trash directory. After no live or trash symlink references an object id, N1 removes the unreferenced `.objects/<hh>/<hh>/@o_<object-id>/` index record so GC can reclaim headless blobs.
+Create a folder:
 
-Rename, trash, and recover never move blobs.
-
-## Realtime Namespace Websocket
-
-Authenticated clients can subscribe to fragment-local namespace changes:
-
-```text
-wss://<host>/ws?token=<fragment-token>
+```bash
+curl -k "$BASE/n1/posix/mkdir" "${AUTH[@]}" \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"videos"}'
 ```
 
-The websocket is a realtime namespace stream for the authenticated fragment. It is not an object-metadata stream and it does not ask clients to reload the whole tree for every mutation.
+Upload a small file with one-shot upload:
 
-All CRUD and POSIX namespace mutations emit `NAMESPACE_CHANGED` deltas. Common operations include:
-
-```text
-upsert_file
-mkdir
-rename
-trash
-recover
-purge_trash
-empty_trash
-recover_all
-delete_version
-bulk_delete
-bulk_recover
-bulk_delete_permanent
+```bash
+curl -k "$BASE/n1/upload/one-shot/videos/clip.mp4" "${AUTH[@]}" \
+  -H 'Content-Type: video/mp4' \
+  --data-binary @clip.mp4
 ```
 
-Example file publish event:
+List files:
+
+```bash
+curl -k "$BASE/n1/posix/list?path=videos&limit=200" "${AUTH[@]}"
+```
+
+Download a file:
+
+```bash
+curl -k "$BASE/n1/objects/download?object_key=videos/clip.mp4" \
+  "${AUTH[@]}" \
+  -o clip.mp4
+```
+
+Soft delete and recover:
+
+```bash
+curl -k "$BASE/n1/posix/trash" "${AUTH[@]}" \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"videos/clip.mp4"}'
+
+curl -k "$BASE/n1/posix/recover" "${AUTH[@]}" \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"videos/clip.mp4"}'
+```
+
+## Authentication
+
+Protected routes require:
+
+```http
+Authorization: Bearer <access_token>
+```
+
+Fragment tokens carry independent permissions:
+
+- `read`
+- `write`
+- `modify`
+- `delete`
+
+### `POST /n1/auth/fragment`
+
+Body:
 
 ```json
 {
-  "op": "EVENT",
-  "d": {
-    "timestamp_ms": 1778000000000,
-    "type": "NAMESPACE_CHANGED",
-    "data": {
-      "fragment": "<fragment_hash>",
-      "operation": "upsert_file",
-      "kind": "File",
-      "path": "docs/video.mp4",
-      "entry": {
-        "fragment": "<fragment_hash>",
-        "path": "docs/video.mp4",
-        "parent_path": "docs",
-        "name": "video.mp4",
-        "kind": "File",
-        "lifecycle": "Live",
-        "object_id": "@o_...",
-        "size_bytes": 536870912,
-        "version_id": "01K...",
-        "content_type": "video/mp4",
-        "modified_at_unix": 1778000000
-      },
-      "affected_paths": 1,
-      "affected_objects": 1,
-      "version_id": "01K..."
-    }
-  }
+  "fragment": "<fragment_hash>",
+  "secret": "fragment-local-secret",
+  "read": true,
+  "write": true,
+  "modify": true,
+  "delete": true,
+  "expires_in": 3600
 }
 ```
 
-Example rename event:
+Response:
+
+```json
+{
+  "access_token": "<jwt>",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "refresh_token": "<refresh-token>",
+  "refresh_expires_in": 2592000
+}
+```
+
+### `POST /n1/auth/refresh`
+
+Body:
+
+```json
+{ "refresh_token": "<refresh-token>" }
+```
+
+### `POST /n1/auth/logout`
+
+Body:
+
+```json
+{ "refresh_token": "<refresh-token>" }
+```
+
+## Fragment API
+
+### `POST /n1/fragments`
+
+Creates a quota-bound fragment. This route uses the master secret and does not use a fragment token.
+
+Body:
+
+```json
+{
+  "name": "mainframe",
+  "secret": "<MASTER_KEY>",
+  "key": "fragment-local-secret",
+  "quota_bytes": 322122547200
+}
+```
+
+Response:
+
+```json
+{
+  "fragment_hash": "<fragment_hash>",
+  "name": "mainframe"
+}
+```
+
+### `GET /n1/fragments`
+
+Lists fragments visible to the authenticated caller.
+
+### `GET /n1/fragments/check`
+
+Checks whether a fragment hash exists.
+
+Body:
+
+```json
+{ "fragment": "<fragment_hash>" }
+```
+
+### `GET /n1/fragments/hash`
+
+Returns the fragment hash for a fragment name when that fragment exists.
+
+Body:
+
+```json
+{ "fragment": "mainframe" }
+```
+
+### `PATCH /n1/fragments/{fragment}`
+
+Updates fragment name or fragment key.
+
+Body:
+
+```json
+{
+  "new_name": "mainframe-renamed",
+  "new_key": "new-fragment-secret",
+  "secret": "<MASTER_KEY>"
+}
+```
+
+### `DELETE /n1/fragments/{fragment}`
+
+Deletes a fragment. Requires a token with delete permission and an implementation state that allows deletion.
+
+### `GET /n1/capacity/usage`
+
+Returns system-level configured storage capacity and availability.
+
+### `GET /n1/capacity/quota`
+
+Returns quota usage for the authenticated fragment:
+
+```json
+{
+  "fragment": "<fragment_hash>",
+  "quota_bytes": 322122547200,
+  "used_bytes": 104857600,
+  "available_bytes": 322017689600,
+  "usage_percent": 0.0325,
+  "quota_enforced": true,
+  "quota_backend": "xfs_project"
+}
+```
+
+### `PATCH /n1/fragments/{fragment}/quota`
+
+Admin-driven quota resize.
+
+Body:
+
+```json
+{
+  "quota_bytes": 536870912000,
+  "secret": "<MASTER_KEY>"
+}
+```
+
+### `POST /n1/maintenance/fragment/init`
+
+Initializes the storage structure for the authenticated fragment. This is normally handled during fragment creation, but the route is useful after manual disk preparation.
+
+### `POST /n1/maintenance/fragment/cleanup`
+
+Cleans stale fragment metadata and old orphaned blob directories for the authenticated fragment.
+
+Response:
+
+```json
+{
+  "fragment": "<fragment_hash>",
+  "usage_bytes": 104857600,
+  "orphan_blob_dirs_removed": 2,
+  "message": "Fragment metadata cleanup complete."
+}
+```
+
+## POSIX Namespace API
+
+These routes operate on the user-facing namespace.
+
+### `GET /n1/posix/list`
+
+Query parameters:
+
+- `path`: directory path, default `""`
+- `limit`: page size, default `200`, max `1000`
+- `continuation_token`: optional cursor
+- `trash`: `true` to list trash
+
+Example:
+
+```bash
+curl -k "$BASE/n1/posix/list?path=videos&limit=200" "${AUTH[@]}"
+```
+
+Response:
+
+```json
+{
+  "path": "videos",
+  "scan_trash": false,
+  "entries": [
+    {
+      "name": "clip.mp4",
+      "path": "videos/clip.mp4",
+      "kind": "file",
+      "size_bytes": 157230177,
+      "modified_at_unix": 1778045325,
+      "version_id": "01KQXW54GPFX8STY6NGC8J11PA"
+    }
+  ],
+  "continuation_token": null
+}
+```
+
+### `GET /n1/posix/stat`
+
+Query parameters:
+
+- `path`
+- `trash=true` for trash lookup
+
+### `POST /n1/posix/mkdir`
+
+Body:
+
+```json
+{ "path": "videos/2026" }
+```
+
+### `POST /n1/posix/rename`
+
+Also available as `POST /n1/posix/move`.
+
+Body:
+
+```json
+{
+  "source_path": "videos/clip.mp4",
+  "destination_path": "archive/clip.mp4"
+}
+```
+
+### `POST /n1/posix/trash`
+
+Soft deletes a file or folder.
+
+Body:
+
+```json
+{ "path": "archive/clip.mp4" }
+```
+
+### `POST /n1/posix/recover`
+
+Recovers a trash entry. Use `trash_entry_id` when a trash path is ambiguous.
+
+Body:
+
+```json
+{
+  "path": "archive/clip.mp4",
+  "trash_entry_id": "<optional-trash-entry-id>"
+}
+```
+
+### `POST /n1/posix/purge`
+
+Hard deletes a trash entry. GC reclaims blob bytes later.
+
+Body:
+
+```json
+{
+  "path": "archive/clip.mp4",
+  "trash_entry_id": "<optional-trash-entry-id>"
+}
+```
+
+## Object API
+
+These routes accept namespace paths. N1 resolves them to stable object identities internally.
+
+### `GET /n1/objects`
+
+Lists live objects. Query parameters:
+
+- `prefix`
+- `limit`
+- `continuation_token`
+- `delimiter`
+
+Example:
+
+```bash
+curl -k "$BASE/n1/objects?prefix=videos/&limit=200" "${AUTH[@]}"
+```
+
+### `GET /n1/trash`
+
+Lists trash entries. Supports the same paging style as object listing.
+
+### `GET /n1/objects/meta/{object_key}`
+
+Returns public object metadata for the latest version.
+
+### `GET /n1/objects/versions/{object_key}`
+
+Returns committed versions for a file path. Internal shard layout is stripped from the public response.
+
+### `GET /n1/objects/get/{object_key}`
+
+Returns the object payload response.
+
+### `GET /n1/objects/stream/{object_key}`
+
+Streams an object. Supports HTTP `Range`.
+
+### `GET /n1/objects/download`
+
+Query parameters:
+
+- `object_key`
+- `version_id` optional
+- `filename` optional
+
+Example:
+
+```bash
+curl -k "$BASE/n1/objects/download?object_key=videos/clip.mp4" \
+  "${AUTH[@]}" \
+  -o clip.mp4
+```
+
+### `GET /n1/objects/download/chunk`
+
+Query parameters:
+
+- `object_key`
+- `offset`
+- `chunk_size`
+
+### `POST /n1/objects/signed-url`
+
+Creates a temporary signed read URL.
+
+Body:
+
+```json
+{
+  "object_key": "videos/clip.mp4",
+  "disposition": "download",
+  "expires_in": 3600,
+  "version_id": null,
+  "filename": "clip.mp4"
+}
+```
+
+### `GET /n1/objects/signed-read`
+
+Public signed read endpoint. The signed URL generator returns the full URL.
+
+### `DELETE /n1/objects/{object_key}`
+
+Soft deletes a file or folder.
+
+### `DELETE /n1/objects/permanent/{object_key}`
+
+Hard deletes a trash path.
+
+### `POST /n1/objects/recover/{object_key}`
+
+Recovers a trash path.
+
+### `DELETE /n1/objects/version/{version_id}/{object_key}`
+
+Deletes one object version.
+
+### `POST /n1/objects/recover/version/{version_id}/{object_key}`
+
+Recovers one object version when available.
+
+### `POST /n1/objects/rename`
+
+Body:
+
+```json
+{
+  "source_fragment": "<fragment_hash>",
+  "source_key": "videos/clip.mp4",
+  "destination_fragment": "<fragment_hash>",
+  "destination_key": "archive/clip.mp4"
+}
+```
+
+### `POST /n1/objects/bulk-delete`
+
+Body:
+
+```json
+{ "object_keys": ["a.txt", "b.txt"] }
+```
+
+### `POST /n1/objects/bulk-recover`
+
+Body:
+
+```json
+{ "object_keys": ["a.txt", "b.txt"] }
+```
+
+### `POST /n1/objects/permanent/bulk-delete`
+
+Body:
+
+```json
+{ "object_keys": ["a.txt", "b.txt"] }
+```
+
+## Upload API
+
+Use one-shot upload for small files. Use multipart for large files and resumability.
+
+### One-shot Upload
+
+```http
+POST /n1/upload/one-shot/{object_key}
+```
+
+Query parameters:
+
+- `checksum` optional
+- `durability` optional
+- `strict_durability` optional boolean
+- `io_gate` optional boolean
+
+Request body is raw bytes.
+
+Example:
+
+```bash
+curl -k "$BASE/n1/upload/one-shot/docs/readme.txt" \
+  "${AUTH[@]}" \
+  -H 'Content-Type: text/plain' \
+  --data-binary @readme.txt
+```
+
+### Multipart Initiate
+
+```http
+POST /n1/upload/multipart/init/{object_key}
+```
+
+Body:
+
+```json
+{
+  "content_type": "video/mp4",
+  "total_size_bytes": 21474836480,
+  "expected_parts": 410,
+  "part_size_bytes": 52428800
+}
+```
+
+Response:
+
+```json
+{
+  "session_id": "<session_id>",
+  "version_id": "01KR..."
+}
+```
+
+### Multipart Upload Part
+
+```http
+PUT /n1/upload/multipart/{version_id}/{part_index}
+```
+
+Query parameters:
+
+- `checksum` optional
+- `durability` optional
+- `strict_durability` optional boolean
+- `io_gate` optional boolean
+
+Request body is the raw bytes for that part. Parts may be retried. Uploaded part receipts are persistent and survive server restart.
+
+Example:
+
+```bash
+curl -k "$BASE/n1/upload/multipart/$VERSION_ID/0?io_gate=true" \
+  "${AUTH[@]}" \
+  -H 'Content-Type: application/octet-stream' \
+  --data-binary @part-000
+```
+
+### Multipart Status
+
+```http
+GET /n1/upload/multipart/{version_id}
+```
+
+Response:
+
+```json
+{
+  "uploaded_parts": [0, 1, 2],
+  "committed_parts": 3,
+  "committed_bytes": 157286400,
+  "expected_parts": 410,
+  "total_size_bytes": 21474836480,
+  "session_id": "<session_id>",
+  "version_id": "01KR...",
+  "object_key": "videos/large.mp4"
+}
+```
+
+### List Active Multipart Uploads
+
+```http
+GET /n1/upload/multipart?limit=100&offset=0
+```
+
+### Multipart Finalize
+
+```http
+POST /n1/upload/multipart/{version_id}/{session_id}/finalize?object_key=videos/large.mp4
+```
+
+Body should match the initiate sizing:
+
+```json
+{
+  "content_type": "video/mp4",
+  "total_size_bytes": 21474836480,
+  "expected_parts": 410,
+  "part_size_bytes": 52428800
+}
+```
+
+If any part is missing, N1 returns the uploaded and missing part indexes.
+
+### Multipart Cancel
+
+```http
+DELETE /n1/upload/multipart/{version_id}?object_key=videos/large.mp4
+```
+
+Cancel removes the pending upload session. GC can later reclaim orphaned partial payloads.
+
+## Archive Download
+
+### `POST /n1/objects/archive`
+
+Downloads selected files or folders as an archive.
+
+Body:
+
+```json
+{
+  "keys": ["videos/clip.mp4"],
+  "prefix": "docs/",
+  "prefixes": ["photos/", "reports/"],
+  "format": "tar",
+  "filename": "export.tar",
+  "export_all": false,
+  "include_internal": false
+}
+```
+
+Use `tar` for very large folder downloads. `zip` is available but is not ideal for very large archives.
+
+### `POST /n1/objects/archive/manifest`
+
+Streams an archive from a request manifest.
+
+Query parameters:
+
+- `format`: `tar` or `zip`, default `tar`
+- `filename`: optional response filename
+
+## Trash And Recovery
+
+Soft delete moves a file or folder into trash. Live listing no longer shows it. Trash listing shows only the entry that was deleted, not every nested child as a separate top-level decision item.
+
+Hard delete removes trash namespace entries. Bytes are returned after GC determines no live or trash metadata references the blob versions.
+
+Empty trash:
+
+```bash
+curl -k -X DELETE "$BASE/n1/trash/empty" "${AUTH[@]}"
+```
+
+Recover all trash:
+
+```bash
+curl -k -X POST "$BASE/n1/trash/recover-all" "${AUTH[@]}"
+```
+
+Status routes:
+
+```http
+GET /n1/maintenance/trash/empty/status
+GET /n1/maintenance/trash/recover/status
+```
+
+## Health, Repair, GC, And Redistribution
+
+### Health
+
+System health:
+
+```http
+GET /n1/maintenance/health?deep_scan=true&refresh=true
+```
+
+Fragment health:
+
+```http
+GET /n1/maintenance/fragments/{fragment}/health?deep_scan=true&refresh=true
+```
+
+### Object Status And Repair
+
+Object status:
+
+```http
+GET /n1/objects/status/{object_key}?mode=availability
+```
+
+Object repair:
+
+```http
+POST /n1/objects/repair/{object_key}?mode=strict
+```
+
+Modes:
+
+- `availability`: fast placement/existence check
+- `checksum`: verify checksum where needed
+- `strict`: read-only full integrity check
+- `scrub`: quiesced/offline full integrity check
+
+### Fragment Or Global Repair
+
+```http
+POST /n1/maintenance/fragments/{fragment}/repair/start?mode=strict
+POST /n1/maintenance/repair/start?fragment={fragment}&mode=strict
+POST /n1/maintenance/repair/stop
+GET  /n1/maintenance/repair/status
+```
+
+Useful query parameters:
+
+- `mode`: `availability`, `checksum`, `strict`, `scrub`
+- `dry_run`: boolean
+- `fast_mode`: boolean
+- `read_only_fast`: boolean
+- `meta_concurrency`
+- `repair_concurrency`
+- `batch`
+
+### Garbage Collection
+
+```http
+POST /n1/maintenance/fragments/{fragment}/gc/start?mode=availability
+POST /n1/maintenance/gc/start?fragment={fragment}&mode=availability
+POST /n1/maintenance/gc/stop
+GET  /n1/maintenance/gc/status
+```
+
+Modes:
+
+- `availability`: conservative online GC
+- `strict`: read-only stronger check
+- `scrub`: quiesced strongest check
+
+### Redistribution
+
+```http
+POST /n1/maintenance/fragments/{fragment}/redistribution/start?mode=strict
+POST /n1/maintenance/redistribution/start?fragment={fragment}&mode=strict
+POST /n1/maintenance/redistribution/stop
+GET  /n1/maintenance/redistribution/status
+```
+
+Useful query parameters:
+
+- `mode`: `availability`, `strict`, `scrub`
+- `scope`: `all`, `index`, or `blob`
+- `durability`: `auto`, `strict`, or `batched`
+- `fast_mode`: boolean
+- `object_concurrency`
+- `status_batch`
+
+## Realtime Namespace Websocket
+
+Connect with a fragment token:
+
+```text
+wss://127.0.0.1:50001/ws?token=<access_token>
+```
+
+The websocket emits namespace deltas for CRUD and POSIX changes. It does not ask clients to reload the whole tree after each operation.
+
+Example event:
 
 ```json
 {
@@ -273,7 +910,6 @@ Example rename event:
       "fragment": "<fragment_hash>",
       "operation": "rename",
       "kind": "Directory",
-      "path": "archive/videos",
       "source_path": "videos",
       "destination_path": "archive/videos",
       "affected_paths": 1,
@@ -283,206 +919,78 @@ Example rename event:
 }
 ```
 
-Clients should update the affected path, source path, destination path, or entry directly. If a websocket client falls behind the namespace event stream, N1 disconnects that client so it can reconnect and explicitly list the current directory it cares about.
+Common operations:
 
-## Read And Download
+- `upsert_file`
+- `mkdir`
+- `rename`
+- `trash`
+- `recover`
+- `purge_trash`
+- `empty_trash`
+- `recover_all`
+- `delete_version`
+- `bulk_delete`
+- `bulk_recover`
+- `bulk_delete_permanent`
 
-Read paths decode `.ndx`; listing does not.
+## Error Handling
 
-Latest read:
+N1 returns HTTP status codes with plain error text for most failures.
 
-1. resolve logical path through namespace symlink
-2. open `.objects/<hh>/<hh>/@o_<object-id>/`
-3. choose greatest ULID `.ndx`
-4. decode `.ndx`
-5. read through the existing N1 blob/shard/parity plane
+Common mappings:
 
-Exact version read selects the requested ULID `.ndx` before decoding.
+- `400 Bad Request`: invalid path, invalid body, missing required field
+- `401 Unauthorized`: missing or invalid token/secret
+- `403 Forbidden`: token lacks required permission
+- `404 Not Found`: object, fragment, or path not found
+- `409 Conflict`: existing fragment or running maintenance job
+- `413 Payload Too Large`: request exceeds configured size
+- `416 Range Not Satisfiable`: invalid range request
+- `503 Service Unavailable`: maintenance mode, saturated upload path, disk/quota provisioning issue
+- `507 Insufficient Storage`: quota/capacity limit reached
 
-## Upload
+## Troubleshooting
 
-One-shot upload keeps the existing N1 data plane:
+### Fragment creation fails with quota errors
 
-```text
-stream bytes -> erasure-coded blob/shard/parity files
-build immutable object metadata with stable object id
-write temp .ndx
-fsync temp file
-rename temp -> final .ndx
-fsync parent directory
-publish or reuse namespace symlink
-```
-
-If the logical path already points to an object id, the new version appends under the same `.objects/<hh>/<hh>/@o_<object-id>/` directory. Rename does not break version history.
-
-## Multipart Upload
-
-Incomplete multipart state stays outside the live namespace:
-
-```text
-<index_root>/<fragment>/.uploads/<version_id>/
-```
-
-Receipts are filename-authoritative and intentionally tiny:
-
-```text
-part_p<part-number>.<crc32>.receipt
-shard_p<part-number>_s<shard-index>.<crc32>.receipt
-```
-
-Receipt bodies are not authoritative. Finalize reads the upload manifest and receipt filenames, rebuilds full object metadata, writes the final `.ndx`, and publishes the namespace symlink. Live listing never sees incomplete multipart state.
-
-## GC
-
-GC is reachability-driven.
-
-GC may decode `.ndx` bodies because it needs full blob references. It protects blobs referenced by committed object records whose object id is referenced by live namespace symlinks or trash symlinks.
-
-When trash is emptied, bytes are not promised back immediately. Blob bytes return after GC removes headless blob versions.
-
-Fragment-scoped and global routes are supported:
-
-```http
-POST /n1/maintenance/fragments/{fragment}/gc/start
-POST /n1/maintenance/gc/start
-GET  /n1/maintenance/gc/status
-```
-
-## Repair And Redistribution
-
-Repair and redistribution remain N1 operations over the existing blob/shard/parity system. The active N1 index changes how metadata reachability is found: object identity comes from namespace symlinks, immutable `.ndx` records, and blob references rather than a database catalog.
-
-Repair must restore:
-
-- missing N1 index records on rebuilt index roots
-- missing namespace symlinks from mirrored index roots when available
-- missing blob shards/parity where recoverable
-- listing after disk loss/reformat
-- download after repair
-
-Redistribution may move blob placement when disk topology changes. It must preserve stable object ids, namespace symlinks, immutable `.ndx` records, and blob references.
-
-Both operations can run per fragment or globally.
-
-Object-level inspection and repair are available for user-facing recovery:
-
-```http
-GET  /n1/objects/status/{*object_key}
-POST /n1/objects/repair/{*object_key}
-```
-
-Object status reports whether the selected object is healthy, degraded, critical, or lost at the object level. Object repair targets that object only and is intended for user-visible recovery without running a full-fragment disaster repair.
-
-## Public API Shape
-
-Common fragment routes:
-
-```http
-POST /n1/fragments
-GET  /n1/fragments
-GET  /n1/fragments/{fragment}/quota
-PATCH /n1/fragments/{fragment}/quota
-```
-
-Object routes:
-
-```http
-GET    /n1/objects?prefix=docs/&limit=200
-PUT    /n1/object/{*object_key}
-GET    /n1/object/{*object_key}
-DELETE /n1/object/{*object_key}
-GET    /n1/objects/versions/{*object_key}
-DELETE /n1/objects/version/{version_id}/{*object_key}
-GET    /n1/objects/status/{*object_key}
-POST   /n1/objects/repair/{*object_key}
-```
-
-POSIX routes:
-
-```http
-GET  /n1/posix/list?path=docs&limit=200
-POST /n1/posix/mkdir
-POST /n1/posix/rename
-POST /n1/posix/trash
-POST /n1/posix/recover
-POST /n1/posix/trash/empty
-```
-
-Multipart routes:
-
-```http
-POST /n1/upload/multipart/initiate
-PUT  /n1/upload/multipart/{version_id}/{part_index}
-POST /n1/upload/multipart/{version_id}/{session_id}/finalize
-GET  /n1/upload/multipart/{version_id}
-DELETE /n1/upload/multipart/{version_id}
-```
-
-Archive download routes use namespace truth and then decode selected `.ndx` records for payload reads.
-
-## Operational Tradeoff
-
-N1 is optimized for durable object storage, large byte flow, POSIX movement, and bounded memory. It can store many small objects, but tiny-object storms pay kernel namespace commit and EC flush overhead per object. For very high counts of tiny files, archiving or batching before upload is usually more efficient.
-
-This is an intentional storage-kernel tradeoff: N1 keeps storage truth in explicit N1 planes and leans on the kernel for durable movement and publish semantics instead of hiding the workload in RAM-heavy caches.
-
-## Verification
-
-Source-level verification currently includes:
+Check that every fragment disk is mounted with project quota support and that N1 has permission to apply project quotas.
 
 ```bash
-RUSTFLAGS='-D warnings' cargo test -p n1 --all-targets
-RUSTFLAGS='-D warnings' cargo check --workspace --all-targets
+findmnt -no OPTIONS /mnt/disk-00
+sudo xfs_quota -x -c 'state' /mnt/disk-00
 ```
 
-Release proof runners must be Rust-first. Shell scripts may prepare the
-environment and launch Rust binaries, but Python is not part of the N1 release
-verification path.
+### Upload returns `Upload path is saturated`
 
-The focused large-file multipart proof uses the Rust `n1-release-proof` tool
-under `tools/`. It rejects a source file that fits in the one-shot limit,
-uploads larger files through multipart, restarts N1 midway, resumes the upload
-from persisted receipts, finalizes, streams the download hash, checks range
-reads, and verifies health. This proof is one release gate; it is not the full
-LTS chaos matrix by itself:
+The upload IO gate is protecting the server. Retry with backoff or lower client concurrency. On slow mixed disks, this is a backpressure signal, not a data-loss event.
+
+### Empty trash does not immediately free bytes
+
+This is expected. Empty trash removes namespace references. GC later reclaims unreferenced blob payloads.
+
+### Health shows degraded after disk loss
+
+Run fragment repair first, then refresh health:
 
 ```bash
-SOURCE_FILE="/home/administrator/Downloads/INCDT 122225.mp4" \
-DISK_ROOTS="/mnt/disk-00,/mnt/disk-01" \
-scripts/bench/run_n1_release_proof.sh
+curl -k -X POST "$BASE/n1/maintenance/fragments/$FRAGMENT/repair/start?mode=strict" "${AUTH[@]}"
+curl -k "$BASE/n1/maintenance/fragments/$FRAGMENT/health?deep_scan=true&refresh=true" "${AUTH[@]}"
 ```
 
-The N1 unit suite covers:
+### Ambiguous trash recover
 
-- reserved path rejection
-- correct packed extension encoding
-- zero-decode live listing with invalid `.ndx` bodies
-- friendly POSIX pagination from symlink names
-- file rename preserving object id and version lineage
-- folder move preserving symlink object pointers
-- soft delete moving namespace symlinks to trash
-- hard delete removing unreferenced object index records
-- multipart receipt filenames as zero-decode state
+Use `trash_entry_id` from trash listing:
 
-Real hardware qualification should still be performed before release promotion:
+```json
+{
+  "path": "videos",
+  "trash_entry_id": "<trash-entry-id>"
+}
+```
 
-- CRUD
-- POSIX list/rename/move/trash/recover
-- one-shot upload
-- multipart upload/resume/finalize
-- archive download
-- recover-on-read
-- GC after hard delete
-- repair after simulated disk loss/reformat
-- redistribution 2 roots -> 1 root -> 2 roots
-- concurrent multi-user upload on `/mnt/disk-00` and `/mnt/disk-01`
+## Operational Tradeoffs
 
-Latest local proof run on 2026-05-12:
+N1 is optimized for durable large-object storage, POSIX movement, repairability, and bounded memory. It can store many small objects, but tiny-object storms pay per-object namespace commit, receipt, and shard/parity overhead. For very high counts of tiny files, archiving or batching before upload is usually more efficient.
 
-- `cargo test -p n1 --all-targets` passed with `RUSTFLAGS=-D warnings`.
-- N1 real proof on `/mnt/disk-00` and `/mnt/disk-01` passed CRUD, POSIX, archive, multipart, recover-on-read, simulated disk-format repair, and redistribution `2 disk -> 1 disk -> 2 disk`.
-- The real proof ended with `live_ndx=904`, `namespace_symlinks=904`, and `blob_version_dirs=904` on both roots after re-expansion.
-- Server RSS stayed bounded at about `52 MiB` during that focused proof.
-- Four-user storm passed on the same two disks: `12,000` one-shot objects plus `4` multipart objects of `16 MiB` each; N1 POSIX listing returned `12,004` objects exactly.
-- Storm memory remained bounded: max server RSS was about `258 MiB` with `42` threads.
-- Storm throughput on the bad-disk tiny-object workload was `14.343 objects/s` and `0.203 MiB/s`, confirming the expected IO/fsync-heavy small-object tradeoff rather than a RAM runaway.
+N1 is strongest when it can stream bytes, use the kernel for namespace movement, and keep durable resumability on disk rather than depending on RAM-only state.

@@ -1,12 +1,12 @@
 use super::disk_manager::{
-    BLOB_STORE_DISKS, EdgeListEntry, ListObjectsResult, ObjectMetadata, ObjectPathManager,
+    BLOB_STORE_DISKS, IndexListEntry, ListObjectsResult, ObjectMetadata, ObjectPathManager,
     PartMetadata, ReservationReceipt,
 };
 use super::index::{
     IndexReplicaWriteMode, IndexSessionState, SessionPartReceipt, TrashCatalogEntry,
 };
 use super::upload::UploadSessionManifest;
-use crate::core::constants::EDGE_BLOB_DIR;
+use crate::core::constants::N1_BLOB_DIR;
 use crate::enums::app_error_enum::AppError;
 use crate::namespace::paths::{base_name, normalize_path};
 use chrono::Utc;
@@ -42,9 +42,9 @@ const INTENTS_DIR: &str = ".intents";
 const TRASH_ENTRIES_DIR: &str = ".trash-entries";
 const TRASH_ENTRY_SUFFIX: &str = ".trash.ndx";
 const TRASH_JOBS_DIR: &str = ".trash-jobs";
-pub(crate) const BLOB_DIR: &str = EDGE_BLOB_DIR;
+pub(crate) const BLOB_DIR: &str = N1_BLOB_DIR;
 
-static EDGE_FS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static N1_FS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 const QUOTA_PROJECT_ID_FLOOR: u32 = 10_000;
 const QUOTA_PROJECT_ID_CEILING: u32 = 2_000_000_000;
 
@@ -85,17 +85,17 @@ pub struct PendingUploadBinding {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum EdgeTrashKind {
+pub(crate) enum TrashKind {
     File,
     Directory,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct EdgeTrashRecord {
+pub(crate) struct TrashRecord {
     pub trash_entry_id: String,
     pub original_path: String,
     pub source_relative_path: String,
-    pub kind: EdgeTrashKind,
+    pub kind: TrashKind,
     pub object_keys: Vec<String>,
     pub version_ids: Vec<String>,
     pub deleted_at_unix: i64,
@@ -111,7 +111,7 @@ struct NdxSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
-struct EdgeReplicaScore {
+struct ReplicaScore {
     meta_present: u64,
     object_records: u64,
     namespace_links: u64,
@@ -120,7 +120,7 @@ struct EdgeReplicaScore {
 }
 
 #[derive(Debug, Clone)]
-pub struct EdgeReplicaInspection {
+pub struct ReplicaInspection {
     pub expected_replicas: u64,
     pub present_replicas: u64,
     pub valid_replicas: u64,
@@ -245,14 +245,14 @@ pub(crate) fn reject_reserved_user_path(path: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-pub(crate) fn normalize_edge_key(object_key: &str) -> Result<String, AppError> {
+pub(crate) fn normalize_object_key(object_key: &str) -> Result<String, AppError> {
     let key = normalize_path(object_key).map_err(|err| AppError::BadRequest(err.to_string()))?;
     reject_reserved_user_path(&key)?;
     Ok(key)
 }
 
 pub(crate) fn object_key_hash(object_key: &str) -> Result<String, AppError> {
-    let key = normalize_edge_key(object_key)?;
+    let key = normalize_object_key(object_key)?;
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
     Ok(hex::encode(hasher.finalize()))
@@ -370,7 +370,7 @@ pub(crate) fn publish_namespace_link(
     logical_path: &str,
     object_id: &str,
 ) -> Result<(), AppError> {
-    let logical_path = normalize_edge_key(logical_path)?;
+    let logical_path = normalize_object_key(logical_path)?;
     let link = namespace_path(root, fragment, &logical_path);
     let parent = link.parent().ok_or_else(|| {
         AppError::InternalServerError("N1 namespace link has no parent".to_string())
@@ -780,8 +780,8 @@ fn summary_metadata(fragment: &str, object_key: String, summary: NdxSummary) -> 
     }
 }
 
-fn summary_entry(record: String, summary: &NdxSummary) -> EdgeListEntry {
-    EdgeListEntry {
+fn summary_entry(record: String, summary: &NdxSummary) -> IndexListEntry {
+    IndexListEntry {
         record,
         kind: "file".to_string(),
         size_bytes: summary.size_bytes,
@@ -791,8 +791,8 @@ fn summary_entry(record: String, summary: &NdxSummary) -> EdgeListEntry {
     }
 }
 
-fn directory_entry(record: String) -> EdgeListEntry {
-    EdgeListEntry {
+fn directory_entry(record: String) -> IndexListEntry {
+    IndexListEntry {
         record,
         kind: "directory".to_string(),
         size_bytes: 0,
@@ -934,7 +934,7 @@ pub fn read_live_version(
     object_key: &str,
     version_id: &str,
 ) -> Result<Option<ObjectMetadata>, AppError> {
-    let object_key = normalize_edge_key(object_key)?;
+    let object_key = normalize_object_key(object_key)?;
     for dir in object_dir_candidates(fragment, &object_key)? {
         if let Some(path) = ndx_path_for_version(&dir, version_id)? {
             return decode_metadata_file_as(&path, &object_key).map(Some);
@@ -947,7 +947,7 @@ pub fn read_current_live_head(
     fragment: &str,
     object_key: &str,
 ) -> Result<Option<ObjectMetadata>, AppError> {
-    let object_key = normalize_edge_key(object_key)?;
+    let object_key = normalize_object_key(object_key)?;
     for dir in object_dir_candidates(fragment, &object_key)? {
         let Some(summary) = latest_summary_in_object_dir(&dir)? else {
             continue;
@@ -961,7 +961,7 @@ pub fn list_live_versions(
     fragment: &str,
     object_key: &str,
 ) -> Result<Vec<ObjectMetadata>, AppError> {
-    let object_key = normalize_edge_key(object_key)?;
+    let object_key = normalize_object_key(object_key)?;
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for path in all_live_version_paths(fragment, &object_key)? {
@@ -992,11 +992,11 @@ fn scan_live_heads_direct_page(
     continuation_token: Option<String>,
 ) -> Result<ListObjectsResult, AppError> {
     let prefix = prefix
-        .map(|prefix| normalize_edge_key(&prefix))
+        .map(|prefix| normalize_object_key(&prefix))
         .transpose()?
         .unwrap_or_default();
     let limit = limit.max(1);
-    let mut by_record = BTreeMap::<String, (EdgeListEntry, Option<ObjectMetadata>)>::new();
+    let mut by_record = BTreeMap::<String, (IndexListEntry, Option<ObjectMetadata>)>::new();
     for fragment_root in existing_fragment_roots(fragment) {
         let index_root = fragment_root
             .parent()
@@ -1050,7 +1050,7 @@ fn scan_live_heads_direct_page(
         if idx >= limit {
             next = entries
                 .last()
-                .map(|entry: &EdgeListEntry| entry.record.clone());
+                .map(|entry: &IndexListEntry| entry.record.clone());
             break;
         }
         if entry.kind == "directory" {
@@ -1214,7 +1214,7 @@ fn trash_entries_dir(root: &Path, fragment: &str) -> PathBuf {
     root.join(fragment).join(TRASH_DIR).join(TRASH_ENTRIES_DIR)
 }
 
-pub(crate) fn write_trash_record(fragment: &str, record: &EdgeTrashRecord) -> Result<(), AppError> {
+pub(crate) fn write_trash_record(fragment: &str, record: &TrashRecord) -> Result<(), AppError> {
     let bytes = encode(record)?;
     let file_name = trash_entry_marker_name(&record.trash_entry_id);
     for root in index_roots() {
@@ -1238,7 +1238,7 @@ fn trash_anchor_exists(fragment: &str, source_relative_path: &str) -> bool {
         .any(|root| path_exists_no_follow(&root.join(TRASH_DIR).join(source_relative_path)))
 }
 
-fn scan_trash_record_markers(fragment: &str) -> Result<Vec<EdgeTrashRecord>, AppError> {
+fn scan_trash_record_markers(fragment: &str) -> Result<Vec<TrashRecord>, AppError> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for root in index_roots() {
@@ -1250,7 +1250,7 @@ fn scan_trash_record_markers(fragment: &str) -> Result<Vec<EdgeTrashRecord>, App
             if !name.ends_with(TRASH_ENTRY_SUFFIX) {
                 continue;
             }
-            let record: EdgeTrashRecord = decode(
+            let record: TrashRecord = decode(
                 &fs::read(dir.join(name)).map_err(|e| io_err(e, "read N1 trash entry marker"))?,
             )?;
             if !trash_anchor_exists(fragment, &record.source_relative_path) {
@@ -1265,7 +1265,7 @@ fn scan_trash_record_markers(fragment: &str) -> Result<Vec<EdgeTrashRecord>, App
     Ok(out)
 }
 
-pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<EdgeTrashRecord>, AppError> {
+pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, AppError> {
     let marker_records = scan_trash_record_markers(fragment)?;
     if !marker_records.is_empty() {
         return Ok(marker_records);
@@ -1314,11 +1314,11 @@ pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<EdgeTrashRecord>,
                         version_ids.insert(meta.version_id);
                     }
                     if seen.insert(child_rel.clone()) {
-                        out.push(EdgeTrashRecord {
+                        out.push(TrashRecord {
                             trash_entry_id: child_rel.clone(),
                             original_path: child_rel.clone(),
                             source_relative_path: child_rel,
-                            kind: EdgeTrashKind::File,
+                            kind: TrashKind::File,
                             object_keys: object_keys.into_iter().collect(),
                             version_ids: version_ids.into_iter().collect(),
                             deleted_at_unix: deleted_at,
@@ -1327,11 +1327,11 @@ pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<EdgeTrashRecord>,
                 } else if child.is_dir() {
                     let (object_keys, version_ids, deleted_at) = collect_trash_refs_under(&child)?;
                     if !object_keys.is_empty() && seen.insert(child_rel.clone()) {
-                        out.push(EdgeTrashRecord {
+                        out.push(TrashRecord {
                             trash_entry_id: child_rel.clone(),
                             original_path: child_rel.clone(),
                             source_relative_path: child_rel.clone(),
-                            kind: EdgeTrashKind::Directory,
+                            kind: TrashKind::Directory,
                             object_keys,
                             version_ids,
                             deleted_at_unix: deleted_at,
@@ -1443,17 +1443,17 @@ fn scan_trash_page(
     full_metadata: bool,
 ) -> Result<ListObjectsResult, AppError> {
     let prefix = prefix
-        .map(|prefix| normalize_edge_key(&prefix))
+        .map(|prefix| normalize_object_key(&prefix))
         .transpose()?
         .unwrap_or_default();
     let limit = limit.max(1);
-    let mut by_record = BTreeMap::<String, (EdgeListEntry, Option<ObjectMetadata>)>::new();
+    let mut by_record = BTreeMap::<String, (IndexListEntry, Option<ObjectMetadata>)>::new();
 
     for record in scan_trash_records(fragment)? {
         let relative = if prefix.is_empty() {
             record.original_path.as_str()
         } else if record.original_path == prefix {
-            if record.kind == EdgeTrashKind::Directory {
+            if record.kind == TrashKind::Directory {
                 continue;
             }
             record.original_path.as_str()
@@ -1483,7 +1483,7 @@ fn scan_trash_page(
             continue;
         }
 
-        if is_nested || record.kind == EdgeTrashKind::Directory {
+        if is_nested || record.kind == TrashKind::Directory {
             by_record
                 .entry(name.clone())
                 .or_insert((directory_entry(name), None));
@@ -1516,7 +1516,7 @@ fn scan_trash_page(
             }
         };
         metadata.object_key = record.original_path.clone();
-        let entry = EdgeListEntry {
+        let entry = IndexListEntry {
             record: name.clone(),
             kind: "file".to_string(),
             size_bytes: metadata.total_size_bytes,
@@ -2061,8 +2061,8 @@ fn count_namespace_links(root: &Path, fragment: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn edge_replica_score(root: &Path, fragment: &str) -> EdgeReplicaScore {
-    EdgeReplicaScore {
+fn replica_score(root: &Path, fragment: &str) -> ReplicaScore {
+    ReplicaScore {
         meta_present: u64::from(root.join(fragment).join(FRAGMENT_META_FILE).is_file()),
         object_records: count_object_index_records(root, fragment),
         namespace_links: count_namespace_links(root, fragment),
@@ -2071,7 +2071,7 @@ fn edge_replica_score(root: &Path, fragment: &str) -> EdgeReplicaScore {
     }
 }
 
-fn edge_replica_index_records(score: &EdgeReplicaScore) -> u64 {
+fn replica_index_records(score: &ReplicaScore) -> u64 {
     score
         .object_records
         .saturating_add(score.namespace_links)
@@ -2114,20 +2114,20 @@ fn latest_index_plane_mtime_nanos(fragment_root: &Path) -> u128 {
     latest
 }
 
-fn choose_edge_replica_source(fragment: &str) -> Option<(PathBuf, EdgeReplicaScore)> {
-    let mut best: Option<(PathBuf, EdgeReplicaScore, u128)> = None;
+fn choose_replica_source(fragment: &str) -> Option<(PathBuf, ReplicaScore)> {
+    let mut best: Option<(PathBuf, ReplicaScore, u128)> = None;
     for root in index_roots() {
         let fragment_root = root.join(fragment);
         if !fragment_root.exists() {
             continue;
         }
-        let score = edge_replica_score(&root, fragment);
+        let score = replica_score(&root, fragment);
         let modified = latest_index_plane_mtime_nanos(&fragment_root);
         let take = match best.as_ref() {
             None => true,
             Some((_, current_score, current_modified)) => {
-                let records = edge_replica_index_records(&score);
-                let current_records = edge_replica_index_records(current_score);
+                let records = replica_index_records(&score);
+                let current_records = replica_index_records(current_score);
                 if records > current_records {
                     true
                 } else if records < current_records {
@@ -2147,16 +2147,13 @@ fn choose_edge_replica_source(fragment: &str) -> Option<(PathBuf, EdgeReplicaSco
     best.map(|(root, score, _)| (root.join(fragment), score))
 }
 
-pub fn inspect_fragment_partition_replicas(
-    fragment: &str,
-    roots: &[PathBuf],
-) -> EdgeReplicaInspection {
+pub fn inspect_fragment_partition_replicas(fragment: &str, roots: &[PathBuf]) -> ReplicaInspection {
     let expected_replicas = roots.len() as u64;
     let mut present_replicas = 0u64;
     let mut missing_replicas = 0u64;
     let mut divergent_replicas = 0u64;
-    let Some((source_fragment_root, canonical_score)) = choose_edge_replica_source(fragment) else {
-        return EdgeReplicaInspection {
+    let Some((source_fragment_root, canonical_score)) = choose_replica_source(fragment) else {
+        return ReplicaInspection {
             expected_replicas,
             present_replicas: 0,
             valid_replicas: 0,
@@ -2176,7 +2173,7 @@ pub fn inspect_fragment_partition_replicas(
             continue;
         }
         present_replicas += 1;
-        let score = edge_replica_score(root, fragment);
+        let score = replica_score(root, fragment);
         if score == canonical_score {
             valid_replicas += 1;
             continue;
@@ -2188,7 +2185,7 @@ pub fn inspect_fragment_partition_replicas(
         }
     }
 
-    EdgeReplicaInspection {
+    ReplicaInspection {
         expected_replicas,
         present_replicas,
         valid_replicas,
@@ -2305,10 +2302,10 @@ pub fn active_fragment_quota_bytes() -> Result<u64, AppError> {
 }
 
 pub fn sync_fragment_partition_replicas(fragment: &str) -> Result<(), AppError> {
-    let _guard = EDGE_FS_LOCK
+    let _guard = N1_FS_LOCK
         .lock()
         .map_err(|_| AppError::InternalServerError("N1 index sync lock poisoned".to_string()))?;
-    let Some((source, source_score)) = choose_edge_replica_source(fragment) else {
+    let Some((source, source_score)) = choose_replica_source(fragment) else {
         return Ok(());
     };
     for dst in fragment_roots(fragment) {
@@ -2316,10 +2313,10 @@ pub fn sync_fragment_partition_replicas(fragment: &str) -> Result<(), AppError> 
             continue;
         }
         let dst_root = dst.parent().unwrap_or(&dst).to_path_buf();
-        if dst.exists() && edge_replica_score(&dst_root, fragment) == source_score {
+        if dst.exists() && replica_score(&dst_root, fragment) == source_score {
             continue;
         }
-        clear_edge_index_plane(&dst)?;
+        clear_index_plane(&dst)?;
         copy_dir_contents(&source, &dst)?;
     }
     let _ = cleanup_stale_index_plane_on_blob_only_roots(fragment)?;
@@ -2337,7 +2334,7 @@ pub fn repair_fragment_all_partition_replicas(
     fragment: &str,
     dry_run: bool,
 ) -> Result<(u64, u64, u64), AppError> {
-    let Some((source, source_score)) = choose_edge_replica_source(fragment) else {
+    let Some((source, source_score)) = choose_replica_source(fragment) else {
         return Ok((0, 0, 0));
     };
     let mut missing = 0;
@@ -2350,7 +2347,7 @@ pub fn repair_fragment_all_partition_replicas(
             missing += 1;
         } else {
             let dst_root = dst.parent().unwrap_or(&dst).to_path_buf();
-            let dst_score = edge_replica_score(&dst_root, fragment);
+            let dst_score = replica_score(&dst_root, fragment);
             if dst_score == source_score {
                 continue;
             }
@@ -2361,7 +2358,7 @@ pub fn repair_fragment_all_partition_replicas(
             }
         }
         if !dry_run {
-            clear_edge_index_plane(&dst)?;
+            clear_index_plane(&dst)?;
             copy_dir_contents(&source, &dst)?;
         }
     }
@@ -2379,10 +2376,10 @@ fn same_root(left: &Path, right: &Path) -> bool {
 
 pub fn cleanup_stale_index_plane_on_blob_only_roots(fragment: &str) -> Result<usize, AppError> {
     let active_index_roots = index_roots();
-    let Some((_source, source_score)) = choose_edge_replica_source(fragment) else {
+    let Some((_source, source_score)) = choose_replica_source(fragment) else {
         return Ok(0);
     };
-    if source_score.meta_present == 0 && edge_replica_index_records(&source_score) == 0 {
+    if source_score.meta_present == 0 && replica_index_records(&source_score) == 0 {
         return Ok(0);
     }
 
@@ -2402,17 +2399,17 @@ pub fn cleanup_stale_index_plane_on_blob_only_roots(fragment: &str) -> Result<us
         if !fragment_root.exists() {
             continue;
         }
-        let score = edge_replica_score(&blob_root, fragment);
-        if score.meta_present == 0 && edge_replica_index_records(&score) == 0 {
+        let score = replica_score(&blob_root, fragment);
+        if score.meta_present == 0 && replica_index_records(&score) == 0 {
             continue;
         }
-        clear_edge_index_plane(&fragment_root)?;
+        clear_index_plane(&fragment_root)?;
         cleaned += 1;
     }
     Ok(cleaned)
 }
 
-fn clear_edge_index_plane(fragment_root: &Path) -> Result<(), AppError> {
+fn clear_index_plane(fragment_root: &Path) -> Result<(), AppError> {
     fs::create_dir_all(fragment_root).map_err(|e| io_err(e, "create N1 replica root"))?;
     for entry in fs::read_dir(fragment_root).map_err(|e| io_err(e, "scan N1 replica root"))? {
         let entry = entry.map_err(|e| io_err(e, "scan N1 replica root entry"))?;
@@ -2847,7 +2844,7 @@ mod tests {
         let stale_meta = roots[1].join(&fragment).join(FRAGMENT_META_FILE);
         fs::write(&stale_meta, b"newer stale fragment metadata").expect("touch stale meta");
 
-        let (source, _score) = choose_edge_replica_source(&fragment).expect("source replica");
+        let (source, _score) = choose_replica_source(&fragment).expect("source replica");
         assert_eq!(
             source,
             roots[0].join(&fragment),
@@ -2911,7 +2908,7 @@ mod tests {
             "stale replica must be newer to reproduce the redistribution regression"
         );
 
-        let (source, _score) = choose_edge_replica_source(&fragment).expect("source replica");
+        let (source, _score) = choose_replica_source(&fragment).expect("source replica");
         assert_eq!(
             source,
             roots[0].join(&fragment),
@@ -3000,16 +2997,16 @@ mod tests {
 
     #[test]
     fn reserved_user_path_segments_are_rejected() {
-        assert!(normalize_edge_key("docs/@o_bad/file.txt").is_err());
-        assert!(normalize_edge_key(".trash/video.mp4").is_err());
-        assert!(normalize_edge_key(".blobs/video.mp4").is_err());
-        assert!(normalize_edge_key("docs/.repair/file.txt").is_err());
+        assert!(normalize_object_key("docs/@o_bad/file.txt").is_err());
+        assert!(normalize_object_key(".trash/video.mp4").is_err());
+        assert!(normalize_object_key(".blobs/video.mp4").is_err());
+        assert!(normalize_object_key("docs/.repair/file.txt").is_err());
         assert_eq!(
-            normalize_edge_key("docs/video.mp4").unwrap(),
+            normalize_object_key("docs/video.mp4").unwrap(),
             "docs/video.mp4"
         );
         assert_eq!(
-            normalize_edge_key("blob/video.mp4").unwrap(),
+            normalize_object_key("blob/video.mp4").unwrap(),
             "blob/video.mp4"
         );
     }

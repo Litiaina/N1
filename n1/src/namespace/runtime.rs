@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::core::disk_manager::{ListObjectsResult, ObjectMetadata};
 use crate::core::index_store::{
-    self, EdgeTrashKind, EdgeTrashRecord, PendingUploadBinding, TRASH_DIR, fragment_root_on,
+    self, PendingUploadBinding, TRASH_DIR, TrashKind, TrashRecord, fragment_root_on,
     internal_namespace_entry_name, latest_summary_metadata_in_object_dir, live_object_dir,
     namespace_path, new_object_id, publish_namespace_link, read_dir_names,
     read_namespace_symlink_object_id, reject_reserved_user_path, scan_trash_records,
@@ -906,13 +906,13 @@ fn list_trash_dir_page(
     Ok((entries, next))
 }
 
-fn trash_record_entry(fragment: &str, record: &EdgeTrashRecord) -> NamespaceEntry {
+fn trash_record_entry(fragment: &str, record: &TrashRecord) -> NamespaceEntry {
     namespace_entry(
         fragment,
         record.original_path.clone(),
         match record.kind {
-            EdgeTrashKind::File => NamespaceEntryKind::File,
-            EdgeTrashKind::Directory => NamespaceEntryKind::Directory,
+            TrashKind::File => NamespaceEntryKind::File,
+            TrashKind::Directory => NamespaceEntryKind::Directory,
         },
         record.object_keys.first().cloned(),
         LifecycleState::trashed(record.deleted_at_unix),
@@ -1067,14 +1067,14 @@ fn trash_live_path(fragment: &str, path: &str) -> Result<NamespaceMutationSummar
         renameat(CWD, &src, CWD, &dst)
             .map_err(|e| AppError::InternalServerError(format!("N1 namespace trash: {e}")))?;
     }
-    let record = EdgeTrashRecord {
+    let record = TrashRecord {
         trash_entry_id: source_relative.clone(),
         original_path: path.to_string(),
         source_relative_path: source_relative,
         kind: if entry.kind == NamespaceEntryKind::File {
-            EdgeTrashKind::File
+            TrashKind::File
         } else {
-            EdgeTrashKind::Directory
+            TrashKind::Directory
         },
         object_keys,
         version_ids,
@@ -1097,7 +1097,7 @@ fn select_trash_record(
     fragment: &str,
     path: &str,
     trash_entry_id: Option<&str>,
-) -> Result<EdgeTrashRecord, AppError> {
+) -> Result<TrashRecord, AppError> {
     let mut records = scan_trash_records(fragment)?
         .into_iter()
         .filter(|record| {
@@ -1149,7 +1149,7 @@ fn recover_trash_path(
     let _ = index_store::remove_trash_record(fragment, &record.trash_entry_id)?;
     Ok(NamespaceMutationSummary {
         operation: "recover".to_string(),
-        kind: if record.kind == EdgeTrashKind::File {
+        kind: if record.kind == TrashKind::File {
             NamespaceEntryKind::File
         } else {
             NamespaceEntryKind::Directory
@@ -1193,7 +1193,7 @@ fn purge_trash(
     }
     Ok(NamespaceMutationSummary {
         operation: "purge_trash".to_string(),
-        kind: if record.kind == EdgeTrashKind::File {
+        kind: if record.kind == TrashKind::File {
             NamespaceEntryKind::File
         } else {
             NamespaceEntryKind::Directory

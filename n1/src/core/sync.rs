@@ -6,7 +6,7 @@ use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
 use crate::{
-    core::{constants::EDGE_BLOB_DIR, disk_manager::ObjectPathManager},
+    core::{constants::N1_BLOB_DIR, disk_manager::ObjectPathManager},
     enums::app_error_enum::AppError,
     structs::auth_structs::Claims,
 };
@@ -33,7 +33,7 @@ pub async fn ensure_fragment_blob_directories(fragment_hash: &str) {
     let blob_roots = path_manager.get_blob_roots();
 
     for root in blob_roots {
-        let blob_dir = root.join(fragment_hash).join(EDGE_BLOB_DIR);
+        let blob_dir = root.join(fragment_hash).join(N1_BLOB_DIR);
 
         let exists_check = timeout(DISK_OP_TIMEOUT, tokio::fs::try_exists(&blob_dir)).await;
 
@@ -75,7 +75,7 @@ pub async fn ensure_fragment_blob_directories_strict(fragment_hash: &str) -> Res
     }
 
     for root in blob_roots {
-        let blob_dir = root.join(fragment_hash).join(EDGE_BLOB_DIR);
+        let blob_dir = root.join(fragment_hash).join(N1_BLOB_DIR);
 
         match timeout(DISK_OP_TIMEOUT, tokio::fs::try_exists(&blob_dir)).await {
             Ok(Ok(false)) => {

@@ -1,6 +1,5 @@
 use crate::core::constants::{
-    EDGE_BLOB_DIR, FRAGMENT_METADATA_FILE, GC_SUFFIX, PARITY_SUFFIX, REDIST_TMP_SUFFIX,
-    SHARD_SUFFIX,
+    FRAGMENT_METADATA_FILE, GC_SUFFIX, N1_BLOB_DIR, PARITY_SUFFIX, REDIST_TMP_SUFFIX, SHARD_SUFFIX,
 };
 use crate::core::disk_manager::{
     INDEX_STORE_DISKS, ObjectMetadata, ObjectPathManager, PartMetadata, ShardInfo,
@@ -731,7 +730,7 @@ fn get_shard_dir_custom(
     let _ = is_trash;
     disk_root
         .join(fragment_hash)
-        .join(EDGE_BLOB_DIR)
+        .join(N1_BLOB_DIR)
         .join(version_id)
 }
 
@@ -1428,7 +1427,7 @@ async fn fragment_has_blob_payload(fragment: &str, blob_roots: &[PathBuf]) -> bo
     let now = SystemTime::now();
     tokio::task::spawn_blocking(move || {
         for root in roots {
-            let blob_dir = root.join(&fragment).join(EDGE_BLOB_DIR);
+            let blob_dir = root.join(&fragment).join(N1_BLOB_DIR);
             let Ok(entries) = std::fs::read_dir(&blob_dir) else {
                 continue;
             };

@@ -1,4 +1,4 @@
-use crate::core::constants::EDGE_BLOB_DIR;
+use crate::core::constants::N1_BLOB_DIR;
 use crate::enums::app_error_enum::AppError;
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-const EDGE_INTENT_PARTITION_PREFIX: &str = "partition_";
+const INTENT_PARTITION_PREFIX: &str = "partition_";
 
 pub fn default_format() -> String {
     "zip".to_string()
@@ -86,14 +86,10 @@ impl ObjectPathManager {
         selected
     }
 
-    fn edge_intent_partition_path(
-        root: &PathBuf,
-        fragment_hash: &str,
-        partition_id: u16,
-    ) -> PathBuf {
+    fn intent_partition_path(root: &PathBuf, fragment_hash: &str, partition_id: u16) -> PathBuf {
         root.join(fragment_hash).join(".intents").join(format!(
             "{}{:04x}.n1",
-            EDGE_INTENT_PARTITION_PREFIX, partition_id
+            INTENT_PARTITION_PREFIX, partition_id
         ))
     }
 
@@ -106,7 +102,7 @@ impl ObjectPathManager {
         Ok(self
             .select_partition_roots(fragment_hash, partition_id)
             .iter()
-            .map(|root| Self::edge_intent_partition_path(root, fragment_hash, partition_id))
+            .map(|root| Self::intent_partition_path(root, fragment_hash, partition_id))
             .collect())
     }
 
@@ -130,7 +126,7 @@ impl ObjectPathManager {
         Ok(self
             .select_partition_roots(fragment_hash, partition_id)
             .iter()
-            .map(|root| Self::edge_intent_partition_path(root, fragment_hash, partition_id))
+            .map(|root| Self::intent_partition_path(root, fragment_hash, partition_id))
             .collect())
     }
 
@@ -142,13 +138,13 @@ impl ObjectPathManager {
     ) -> PathBuf {
         disk_root
             .join(fragment_hash)
-            .join(EDGE_BLOB_DIR)
+            .join(N1_BLOB_DIR)
             .join(version_id)
     }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct EdgeListEntry {
+pub struct IndexListEntry {
     pub record: String,
     pub kind: String,
     pub size_bytes: u64,
@@ -166,7 +162,7 @@ pub struct ListObjectsResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub entries: Vec<EdgeListEntry>,
+    pub entries: Vec<IndexListEntry>,
     pub objects: Vec<ObjectMetadata>,
     #[serde(default)]
     pub common_prefixes: Vec<String>,
