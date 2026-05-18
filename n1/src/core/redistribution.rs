@@ -12,6 +12,7 @@ use crate::core::fragment_metadata::{
 use crate::core::index;
 use crate::core::index_store;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
+use crate::core::quota_manager::validate_fragment_project_headroom_for_redistribution;
 use crate::core::recovery::read_or_recover_chunk;
 use crate::core::upload::{
     DATA_SHARDS_ATOMIC, DirectWriter, PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, create_direct_file,
@@ -1762,6 +1763,13 @@ pub async fn run_redistribution_job_with_options(
         }
 
         replicate_fragment_metadata_best_effort(&fragment_hash).await;
+        if !dry_run && opts.scope != RedistributionScope::Index {
+            validate_fragment_project_headroom_for_redistribution(
+                &fragment_hash,
+                live_blob.as_ref(),
+            )
+            .await?;
+        }
         if !dry_run {
             if let Err(err) = replay_pending_intents_for_fragment(
                 &fragment_hash,

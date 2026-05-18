@@ -204,6 +204,16 @@ Fragment tokens carry independent permissions:
 - `modify`
 - `delete`
 
+## API Conventions
+
+- `object_key`, `path`, `source_path`, and `destination_path` are namespace paths such as `videos/clip.mp4`. URL-encode spaces and special characters when they appear in a path or query string.
+- Request bodies are JSON unless the route says the body is raw bytes.
+- Large files should use multipart upload. One-shot upload is intended for smaller objects.
+- `version_id` is the persistent upload/object-version id. Multipart part upload and status use `version_id`; finalize also requires the `session_id` returned by init.
+- Empty trash and hard delete remove namespace references first. Blob bytes are reclaimed after GC proves no live or trash metadata references them.
+- Object status/repair is object-scoped. A repair or scrub for one object does not lock the whole fragment.
+- When an operation returns `503 Service Unavailable`, retry later. This can mean maintenance is running, object maintenance gates are saturated, or quota/disk provisioning prevents safe progress.
+
 ### `POST /n1/auth/fragment`
 
 Body:
@@ -534,6 +544,19 @@ Query parameters:
 - `offset`
 - `chunk_size`
 
+Server-side limits:
+
+- `chunk_size` must be greater than `0`.
+- `chunk_size` must be `<= 8388608` bytes (`8 MiB`).
+- Use `/n1/objects/download` or `/n1/objects/stream/{object_key}` for normal large downloads. The chunk route exists for bounded browser save flows and must not be used with huge per-request buffers.
+
+Responses:
+
+- `200 OK`: body contains the requested bytes.
+- `204 No Content`: `offset` is at or beyond object size.
+- `400 Bad Request`: invalid or overflowing range.
+- `413 Payload Too Large`: requested chunk exceeds the server maximum.
+
 ### `POST /n1/objects/signed-url`
 
 Creates a temporary signed read URL.
@@ -823,6 +846,24 @@ Object status:
 GET /n1/objects/status/{object_key}?mode=availability
 ```
 
+Response:
+
+```json
+{
+  "object_key": "videos/clip.mp4",
+  "version_id": "01KR...",
+  "status": "healthy",
+  "total_parts": 1,
+  "total_shards": 2,
+  "healthy_shards": 2,
+  "missing_shards": 0,
+  "corrupt_shards": 0,
+  "repairable": true,
+  "repaired_shards": 0,
+  "failed_repairs": 0
+}
+```
+
 Object repair:
 
 ```http
@@ -835,6 +876,8 @@ Modes:
 - `checksum`: verify checksum where needed
 - `strict`: read-only full integrity check
 - `scrub`: quiesced/offline full integrity check
+
+Object status and repair are bounded by global and per-fragment gates. If too many checks or repairs are already running, N1 returns `503 Service Unavailable` with a retry-shortly message. Repair and scrub also take an object-scoped lock so two repair/scrub tasks cannot mutate the same object at the same time.
 
 ### Fragment Or Global Repair
 
@@ -887,6 +930,14 @@ Useful query parameters:
 - `fast_mode`: boolean
 - `object_concurrency`
 - `status_batch`
+
+When filesystem project quota is enabled, redistribution preflights per-root fragment quota headroom before moving blob payloads. If a fragment is too close to its quota share, N1 fails fast with:
+
+```text
+fragment quota headroom insufficient for redistribution
+```
+
+That error means the operator should increase fragment quota, run GC if trash/orphans are expected, or disable strict quota only for controlled stress tests. N1 does this before migration to avoid repeated low-level `No space left on device` shard-write failures.
 
 ## Realtime Namespace Websocket
 
@@ -968,6 +1019,10 @@ The upload IO gate is protecting the server. Retry with backoff or lower client 
 ### Empty trash does not immediately free bytes
 
 This is expected. Empty trash removes namespace references. GC later reclaims unreferenced blob payloads.
+
+### Redistribution fails with quota headroom insufficient
+
+Redistribution can need temporary write headroom while it rebuilds shard placement. With filesystem project quota enabled, N1 checks that headroom before starting blob movement. Increase the fragment quota, run GC, or use a quota-disabled test profile when the goal is stress testing disk behavior instead of quota enforcement.
 
 ### Health shows degraded after disk loss
 

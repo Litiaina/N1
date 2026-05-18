@@ -24,10 +24,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::fs::{self, File};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
@@ -73,6 +73,140 @@ static REPAIR_STATUS: LazyLock<Arc<RwLock<RepairJobStatus>>> =
     LazyLock::new(|| Arc::new(RwLock::new(RepairJobStatus::default())));
 
 static STOP_SIGNAL: LazyLock<AtomicBool> = LazyLock::new(|| AtomicBool::new(false));
+static OBJECT_STATUS_GATE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(64)));
+static OBJECT_REPAIR_GATE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8)));
+static OBJECT_STATUS_FRAGMENT_GATES: LazyLock<StdMutex<HashMap<String, Arc<Semaphore>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+static OBJECT_REPAIR_FRAGMENT_GATES: LazyLock<StdMutex<HashMap<String, Arc<Semaphore>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+static OBJECT_MAINTENANCE_LOCKS: LazyLock<StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+const OBJECT_STATUS_PER_FRAGMENT_LIMIT: usize = 16;
+const OBJECT_REPAIR_PER_FRAGMENT_LIMIT: usize = 2;
+
+struct ObjectMaintenancePermit {
+    _global: OwnedSemaphorePermit,
+    _fragment: OwnedSemaphorePermit,
+    object_lock_key: Option<String>,
+    object_guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for ObjectMaintenancePermit {
+    fn drop(&mut self) {
+        drop(self.object_guard.take());
+        let Some(key) = self.object_lock_key.as_ref() else {
+            return;
+        };
+        let Ok(mut locks) = OBJECT_MAINTENANCE_LOCKS.lock() else {
+            return;
+        };
+        if let Some(lock) = locks.get(key) {
+            if Arc::strong_count(lock) <= 1 {
+                locks.remove(key);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ObjectMaintenanceKind {
+    Status,
+    Repair,
+}
+
+impl ObjectMaintenanceKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Status => "object status",
+            Self::Repair => "object repair",
+        }
+    }
+
+    fn global_gate(self) -> Arc<Semaphore> {
+        match self {
+            Self::Status => OBJECT_STATUS_GATE.clone(),
+            Self::Repair => OBJECT_REPAIR_GATE.clone(),
+        }
+    }
+
+    fn fragment_gate(self, fragment: &str) -> Result<Arc<Semaphore>, AppError> {
+        let (map, limit) = match self {
+            Self::Status => (
+                &*OBJECT_STATUS_FRAGMENT_GATES,
+                OBJECT_STATUS_PER_FRAGMENT_LIMIT,
+            ),
+            Self::Repair => (
+                &*OBJECT_REPAIR_FRAGMENT_GATES,
+                OBJECT_REPAIR_PER_FRAGMENT_LIMIT,
+            ),
+        };
+        let mut gates = map.lock().map_err(|_| {
+            AppError::InternalServerError("object maintenance gate lock poisoned".into())
+        })?;
+        Ok(gates
+            .entry(fragment.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(limit)))
+            .clone())
+    }
+}
+
+fn object_maintenance_lock(
+    fragment: &str,
+    object_id: &str,
+) -> Result<Arc<AsyncMutex<()>>, AppError> {
+    let key = format!("{fragment}\0{object_id}");
+    let mut locks = OBJECT_MAINTENANCE_LOCKS.lock().map_err(|_| {
+        AppError::InternalServerError("object maintenance lock map poisoned".into())
+    })?;
+    Ok(locks
+        .entry(key)
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone())
+}
+
+async fn acquire_object_maintenance_permit(
+    meta: &ObjectMetadata,
+    kind: ObjectMaintenanceKind,
+    lock_object: bool,
+) -> Result<ObjectMaintenancePermit, AppError> {
+    let global = kind.global_gate().try_acquire_owned().map_err(|_| {
+        AppError::ServiceUnavailable(format!(
+            "{} path is saturated globally; retry shortly",
+            kind.label()
+        ))
+    })?;
+    let fragment_gate = kind.fragment_gate(&meta.fragment)?;
+    let fragment = fragment_gate.try_acquire_owned().map_err(|_| {
+        AppError::ServiceUnavailable(format!(
+            "{} path is saturated for fragment {}; retry shortly",
+            kind.label(),
+            meta.fragment
+        ))
+    })?;
+
+    let (object_lock_key, object) = if lock_object {
+        let key = format!("{}\0{}", meta.fragment, meta.object_key);
+        let lock = object_maintenance_lock(&meta.fragment, &meta.object_key)?;
+        let guard = lock.try_lock_owned().map_err(|_| {
+            AppError::ServiceUnavailable(format!(
+                "{} is already running for this object; retry shortly",
+                kind.label()
+            ))
+        })?;
+        (Some(key), Some(guard))
+    } else {
+        (None, None)
+    };
+
+    Ok(ObjectMaintenancePermit {
+        _global: global,
+        _fragment: fragment,
+        object_lock_key,
+        object_guard: object,
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepairCheckMode {
@@ -610,6 +744,12 @@ pub async fn inspect_object_status(
     meta: &ObjectMetadata,
     check_mode: RepairCheckMode,
 ) -> Result<ObjectRepairStatus, AppError> {
+    let _permit = acquire_object_maintenance_permit(
+        meta,
+        ObjectMaintenanceKind::Status,
+        matches!(check_mode, RepairCheckMode::Scrub),
+    )
+    .await?;
     inspect_object_parts(meta, check_mode)
         .await
         .map(|(report, _, _)| report)
@@ -619,6 +759,8 @@ pub async fn repair_object(
     meta: &ObjectMetadata,
     check_mode: RepairCheckMode,
 ) -> Result<ObjectRepairStatus, AppError> {
+    let _permit =
+        acquire_object_maintenance_permit(meta, ObjectMaintenanceKind::Repair, true).await?;
     let (mut report, normalized_parts, repair_targets) =
         inspect_object_parts(meta, check_mode).await?;
     if report.status == "healthy" || !report.repairable {

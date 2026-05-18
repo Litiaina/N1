@@ -45,7 +45,38 @@ fi
 SOURCE_BYTES="$(stat -c '%s' "$SOURCE_FILE")"
 if [[ -z "${QUOTA_BYTES:-}" ]]; then
   MIXED_BYTES="$(( (MIXED_USERS * MIXED_FILES_PER_USER * 64 * 1024) + (MIXED_BACKGROUND_UPLOADS * STORM_OBJECT_SIZE) + (MULTI_FRAGMENT_USERS * MULTI_FRAGMENT_FILES_PER_USER * 64 * 1024) ))"
-  QUOTA_BYTES="$(( ((SOURCE_BYTES * (LARGE_COPIES + 3)) + (STORM_OBJECTS * STORM_OBJECT_SIZE * 2) + (MIXED_BYTES * 2) + (10 * 1024 * 1024 * 1024)) * 2 ))"
+  ESTIMATED_QUOTA_BYTES="$(( ((SOURCE_BYTES * (LARGE_COPIES + 3)) + (STORM_OBJECTS * STORM_OBJECT_SIZE * 2) + (MIXED_BYTES * 2) + (10 * 1024 * 1024 * 1024)) * 2 ))"
+  case "${QUOTA_BACKEND,,}" in
+    disabled|disable|none|off|false|0|"")
+      QUOTA_BYTES="$ESTIMATED_QUOTA_BYTES"
+      ;;
+    *)
+      IFS=',' read -r -a ROOT_ARRAY <<< "$DISK_ROOTS"
+      MIN_ROOT_SIZE=0
+      for root in "${ROOT_ARRAY[@]}"; do
+        root_size="$(df -B1 --output=size "$root" | tail -n 1 | tr -d ' ')"
+        if [[ -z "$root_size" || "$root_size" == "0" ]]; then
+          continue
+        fi
+        if [[ "$MIN_ROOT_SIZE" == "0" || "$root_size" -lt "$MIN_ROOT_SIZE" ]]; then
+          MIN_ROOT_SIZE="$root_size"
+        fi
+      done
+      if [[ "$MIN_ROOT_SIZE" == "0" ]]; then
+        QUOTA_BYTES="$ESTIMATED_QUOTA_BYTES"
+      else
+        # XFS project quota is applied per blob root. Give redistribution real temp headroom
+        # by sizing the fragment quota near the smallest participating disk, not near payload.
+        DISK_COUNT="${#ROOT_ARRAY[@]}"
+        MAX_TEST_QUOTA_BYTES="$(( MIN_ROOT_SIZE * DISK_COUNT * 90 / 100 ))"
+        if [[ "$MAX_TEST_QUOTA_BYTES" -gt "$ESTIMATED_QUOTA_BYTES" ]]; then
+          QUOTA_BYTES="$MAX_TEST_QUOTA_BYTES"
+        else
+          QUOTA_BYTES="$ESTIMATED_QUOTA_BYTES"
+        fi
+      fi
+      ;;
+  esac
 fi
 
 if [[ "$PROFILE" == "release" ]]; then

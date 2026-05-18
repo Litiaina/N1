@@ -149,6 +149,13 @@ impl Proof {
         })
     }
 
+    fn quota_backend_enforced(&self) -> bool {
+        !matches!(
+            self.args.quota_backend.trim().to_ascii_lowercase().as_str(),
+            "" | "disabled" | "disable" | "none" | "off" | "false" | "0"
+        )
+    }
+
     async fn run(&mut self) -> ProofResult<()> {
         self.validate()?;
         self.prepare_dirs()?;
@@ -200,8 +207,20 @@ impl Proof {
         let permissions = self.permission_boundary_proof(&mut live_expected).await?;
         evidence.push(json!({"gate": "auth_permission_boundaries", "status": "PASS"}));
 
-        let quota = self.quota_api_proof().await?;
-        evidence.push(json!({"gate": "quota_api_and_usage", "status": "PASS"}));
+        let quota = if self.quota_backend_enforced() {
+            let quota = self.quota_api_proof().await?;
+            evidence.push(json!({"gate": "quota_api_and_usage", "status": "PASS"}));
+            quota
+        } else {
+            let quota = json!({
+                "status": "SKIP",
+                "reason": "quota backend disabled for release proof stress run",
+                "quota_backend": self.args.quota_backend,
+                "quota_bytes": self.args.quota_bytes,
+            });
+            evidence.push(json!({"gate": "quota_api_and_usage", "status": "SKIP"}));
+            quota
+        };
 
         let rename_lineage = self
             .rename_version_lineage_proof(&mut live_expected)

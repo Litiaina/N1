@@ -19,7 +19,7 @@
 
 This repository contains the storage platform stack built around four runtime components:
 
-> - `N1` (`1.1.0`)
+> - `N1` (`1.1.1`)
   Primary N1 storage kernel with an N1 namespace, two-level fanned immutable `.objects/<hh>/<hh>/@o_<object-id>` records, zero-decode listing, object-level repair/status, and the N1 blob/shard/parity plane. See `N1_DOCUMENTATION.md`.
 > - `N2` (`0.4.0`)
   Multi-node clustering and placement layer built on top of the `N1` storage kernel, with real-prefix namespace directories, symlink object entries, immutable filesystem `.nmtd` cluster metadata, one cluster EC pass, and an S3-compatible path-style object surface.
@@ -67,7 +67,7 @@ The current N1 line retires the old Standard/indexdb engine from the active work
 
 ### N1
 
-`N1 1.1.0` is the primary N1 storage kernel and the default N1 face for new deployments.
+`N1 1.1.1` is the primary N1 storage kernel and the default N1 face for new deployments.
 
 It keeps the N1 object/blob plane, repair model, redistribution model, GC model, and public route shape, with active storage authority in explicit N1 planes:
 

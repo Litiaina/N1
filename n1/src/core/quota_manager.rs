@@ -452,6 +452,104 @@ impl FragmentBlobUsage {
     }
 }
 
+const REDISTRIBUTION_MIN_PROJECT_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
+const REDISTRIBUTION_MAX_PROJECT_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn redistribution_required_project_headroom(per_mount_quota_bytes: u64) -> u64 {
+    (per_mount_quota_bytes / 20)
+        .max(REDISTRIBUTION_MIN_PROJECT_HEADROOM_BYTES)
+        .min(REDISTRIBUTION_MAX_PROJECT_HEADROOM_BYTES)
+}
+
+fn sum_project_tree_bytes_no_follow(path: &Path) -> Result<u64, AppError> {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(AppError::Io(err, format!("read_dir {}", current.display()))),
+        };
+        for entry in entries {
+            let entry = entry
+                .map_err(|err| AppError::Io(err, format!("read_dir {}", current.display())))?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|err| AppError::Io(err, format!("metadata {}", path.display())))?;
+            total = total.saturating_add(file_storage_bytes(&metadata));
+            if metadata.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn validate_fragment_project_headroom_sync(
+    fragment: &str,
+    live_blob_roots: &[PathBuf],
+) -> Result<(), AppError> {
+    if !fragment_quota_enforcement_enabled() {
+        return Ok(());
+    }
+
+    let Some(meta) = index_store::fragment_quota_meta(fragment)? else {
+        return Ok(());
+    };
+    if meta.quota_bytes == 0 {
+        return Err(AppError::ServiceUnavailable(format!(
+            "fragment quota headroom insufficient for redistribution: fragment {fragment} has zero quota"
+        )));
+    }
+
+    let configured_roots = ObjectPathManager::new().get_blob_roots();
+    let mounts = read_mountinfo()?;
+    let unique_mount_count = unique_blob_quota_mounts(&configured_roots, &mounts)?
+        .len()
+        .max(1);
+    let per_mount_quota_bytes = meta.quota_bytes.div_ceil(unique_mount_count as u64).max(1);
+    let required_headroom = redistribution_required_project_headroom(per_mount_quota_bytes);
+
+    let mut seen_roots = HashSet::<PathBuf>::new();
+    for root in live_blob_roots {
+        if !seen_roots.insert(root.clone()) {
+            continue;
+        }
+        let fragment_root = root.join(fragment);
+        let used_bytes = sum_project_tree_bytes_no_follow(&fragment_root)?;
+        let available_bytes = per_mount_quota_bytes.saturating_sub(used_bytes);
+        if available_bytes < required_headroom {
+            return Err(AppError::ServiceUnavailable(format!(
+                "fragment quota headroom insufficient for redistribution on {}: project quota share={}, used={}, available={}, required_headroom={}. Increase fragment quota, run GC, or disable strict quota for stress tests.",
+                fragment_root.display(),
+                human_bytes_for_error(per_mount_quota_bytes),
+                human_bytes_for_error(used_bytes),
+                human_bytes_for_error(available_bytes),
+                human_bytes_for_error(required_headroom)
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn validate_fragment_project_headroom_for_redistribution(
+    fragment: &str,
+    live_blob_roots: &[PathBuf],
+) -> Result<(), AppError> {
+    if !fragment_quota_enforcement_enabled() {
+        return Ok(());
+    }
+
+    let fragment = fragment.to_string();
+    let live_blob_roots = live_blob_roots.to_vec();
+    tokio::task::spawn_blocking(move || {
+        validate_fragment_project_headroom_sync(&fragment, &live_blob_roots)
+    })
+    .await
+    .map_err(|err| AppError::InternalServerError(format!("quota headroom task: {err}")))?
+}
+
 #[cfg(unix)]
 fn statvfs_totals_sync(path: &Path) -> Result<(u64, u64, u64), AppError> {
     use std::ffi::CString;
@@ -766,7 +864,8 @@ pub async fn ensure_blob_placement_capacity_available_for_parts(
 mod tests {
     use super::{
         FragmentQuotaBackend, find_mount_for_path, mount_has_project_quota, parse_mountinfo_line,
-        placement_required_bytes_by_root, quota_limit_kib, xfs_project_check_has_mismatch,
+        placement_required_bytes_by_root, quota_limit_kib,
+        redistribution_required_project_headroom, xfs_project_check_has_mismatch,
         xfs_quota_path_arg,
     };
     use std::path::Path;
@@ -822,6 +921,18 @@ mod tests {
         assert_eq!(quota_limit_kib(1), 1);
         assert_eq!(quota_limit_kib(1024), 1);
         assert_eq!(quota_limit_kib(1025), 2);
+    }
+
+    #[test]
+    fn redistribution_quota_headroom_is_bounded() {
+        assert_eq!(
+            redistribution_required_project_headroom(1024),
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            redistribution_required_project_headroom(100 * 1024 * 1024 * 1024),
+            1024 * 1024 * 1024
+        );
     }
 
     #[test]

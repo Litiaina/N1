@@ -653,11 +653,10 @@ async fn get_object_repair_status_scoped(
     }
     let fragment = claims.fragment.clone();
     let physical = resolve_logical_read_key(&fragment, &object_key).await?;
-    let mut metadata = get_object_metadata_direct(&fragment, &physical).await?;
-    metadata.object_key = object_key.trim_start_matches('/').to_string();
-    Ok(AxumJson(
-        inspect_object_status(&metadata, parse_check_mode(&params)).await?,
-    ))
+    let metadata = get_object_metadata_direct(&fragment, &physical).await?;
+    let mut status = inspect_object_status(&metadata, parse_check_mode(&params)).await?;
+    status.object_key = object_key.trim_start_matches('/').to_string();
+    Ok(AxumJson(status))
 }
 
 async fn repair_object_scoped(
@@ -672,11 +671,10 @@ async fn repair_object_scoped(
     }
     let fragment = claims.fragment.clone();
     let physical = resolve_logical_read_key(&fragment, &object_key).await?;
-    let mut metadata = get_object_metadata_direct(&fragment, &physical).await?;
-    metadata.object_key = object_key.trim_start_matches('/').to_string();
-    Ok(AxumJson(
-        repair_object(&metadata, parse_check_mode(&params)).await?,
-    ))
+    let metadata = get_object_metadata_direct(&fragment, &physical).await?;
+    let mut status = repair_object(&metadata, parse_check_mode(&params)).await?;
+    status.object_key = object_key.trim_start_matches('/').to_string();
+    Ok(AxumJson(status))
 }
 
 async fn bulk_delete_objects_scoped(

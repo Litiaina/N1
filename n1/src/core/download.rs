@@ -14,6 +14,27 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::fs::File;
 
+const MAX_DOWNLOAD_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+fn validate_chunk_query(params: &ChunkQuery) -> Result<(), AppError> {
+    if params.chunk_size == 0 {
+        return Err(AppError::BadRequest(
+            "chunk_size must be greater than 0".into(),
+        ));
+    }
+    if params.chunk_size > MAX_DOWNLOAD_CHUNK_SIZE {
+        return Err(AppError::PayloadTooLarge(format!(
+            "chunk_size exceeds server maximum of {} bytes; use streaming download or smaller chunks",
+            MAX_DOWNLOAD_CHUNK_SIZE
+        )));
+    }
+    params
+        .offset
+        .checked_add(params.chunk_size as u64)
+        .ok_or_else(|| AppError::BadRequest("download chunk range overflows u64".into()))?;
+    Ok(())
+}
+
 pub async fn download_object(
     claims: Claims,
     Path(fragment): Path<String>,
@@ -46,6 +67,7 @@ pub async fn download_object_chunk(
     Path(fragment): Path<String>,
     Query(params): Query<ChunkQuery>,
 ) -> Result<impl IntoResponse, AppError> {
+    validate_chunk_query(&params)?;
     if !claims.read {
         return Err(AppError::Forbidden("Read permission required".into()));
     }
@@ -83,6 +105,7 @@ pub async fn download_object_chunk_direct(
     fragment: &str,
     params: &ChunkQuery,
 ) -> Result<Vec<u8>, AppError> {
+    validate_chunk_query(params)?;
     let metadata = get_metadata(fragment, &params.object_key, fragment).await?;
     if metadata.is_delete_marker {
         return Err(AppError::NotFound);
@@ -99,6 +122,7 @@ async fn download_object_chunk_from_metadata(
     metadata: ObjectMetadata,
     params: &ChunkQuery,
 ) -> Result<(Vec<u8>, Option<String>), AppError> {
+    validate_chunk_query(params)?;
     let stripe_block_size = metadata.stripe_size_bytes;
     let mut result_buffer = Vec::with_capacity(params.chunk_size);
     let mut current_global_pos = 0u64;
@@ -119,7 +143,10 @@ async fn download_object_chunk_from_metadata(
         let part_end = current_global_pos + part_len;
 
         let req_start = params.offset;
-        let req_end = params.offset + params.chunk_size as u64;
+        let req_end = params
+            .offset
+            .checked_add(params.chunk_size as u64)
+            .ok_or_else(|| AppError::BadRequest("download chunk range overflows u64".into()))?;
 
         if req_start == current_global_pos && params.chunk_size as u64 == part_len {
             checksum_header = part.checksum.clone();
@@ -194,4 +221,48 @@ async fn download_object_chunk_from_metadata(
     }
 
     Ok((result_buffer, checksum_header))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_DOWNLOAD_CHUNK_SIZE, validate_chunk_query};
+    use crate::core::disk_manager::ChunkQuery;
+    use crate::enums::app_error_enum::AppError;
+
+    fn chunk(chunk_size: usize) -> ChunkQuery {
+        ChunkQuery {
+            object_key: "video.mp4".to_string(),
+            offset: 0,
+            chunk_size,
+        }
+    }
+
+    #[test]
+    fn chunk_query_rejects_zero_size() {
+        assert!(matches!(
+            validate_chunk_query(&chunk(0)),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn chunk_query_rejects_oversized_browser_buffers() {
+        assert!(matches!(
+            validate_chunk_query(&chunk(MAX_DOWNLOAD_CHUNK_SIZE + 1)),
+            Err(AppError::PayloadTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn chunk_query_rejects_overflowing_ranges() {
+        let query = ChunkQuery {
+            object_key: "video.mp4".to_string(),
+            offset: u64::MAX,
+            chunk_size: 1,
+        };
+        assert!(matches!(
+            validate_chunk_query(&query),
+            Err(AppError::BadRequest(_))
+        ));
+    }
 }
