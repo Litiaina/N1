@@ -82,6 +82,8 @@ struct Args {
     chaos_cycles: usize,
     #[arg(long, default_value_t = 1_000)]
     chaos_storm_objects: usize,
+    #[arg(long, default_value_t = false)]
+    maintenance_interrupt_proof: bool,
 }
 
 #[derive(Debug)]
@@ -347,6 +349,99 @@ impl Proof {
             "redistribution": redistribution,
             "chaos": chaos,
             "live_object_count": live_expected.len(),
+            "evidence": evidence,
+            "rss_samples": rss_samples,
+            "log_scan": logs,
+            "index_inspection": inspection,
+            "fragment_hash": self.fragment,
+            "index_roots": self.index_roots,
+            "blob_roots": self.blob_roots,
+        });
+        self.write_summary()?;
+        if self.args.cleanup_roots {
+            self.cleanup_roots()?;
+        }
+        Ok(())
+    }
+
+    async fn run_maintenance_interrupt_proof(&mut self) -> ProofResult<()> {
+        self.validate()?;
+        self.prepare_dirs()?;
+        self.write_config()?;
+        self.start_server("maintenance-before").await?;
+        self.create_fragment().await?;
+        self.auth().await?;
+
+        let object_key = self.object_key();
+        let source_len = self.args.source_file.metadata()?.len();
+        if source_len <= self.args.max_part_size {
+            return Err(format!(
+                "source file is too small for large multipart proof: {} <= max_part_size {}",
+                source_len, self.args.max_part_size
+            )
+            .into());
+        }
+
+        let mut expected = BTreeSet::new();
+        let mut evidence = Vec::new();
+        let mut rss_samples = Vec::new();
+        let source_sha = self.sha256_file(&self.args.source_file).await?;
+        rss_samples.push(self.rss_sample("maintenance_started"));
+
+        let upload = self.multipart_restart_resume(&object_key).await?;
+        expected.insert(object_key.clone());
+        self.assert_download_sha256(&object_key, &source_sha)
+            .await?;
+        self.assert_object_status_clean(&object_key, "maintenance_large_multipart")
+            .await?;
+        evidence.push(json!({"gate": "large_multipart_restart_resume", "status": "PASS"}));
+        rss_samples.push(self.rss_sample("after_large_multipart"));
+
+        let storm = self
+            .concurrent_object_storm(&mut expected, "maintenance-1000", self.args.storm_objects)
+            .await?;
+        evidence.push(json!({"gate": "thousand_object_concurrency", "status": "PASS"}));
+        rss_samples.push(self.rss_sample("after_thousand_object_concurrency"));
+
+        self.assert_expected_visible(&expected).await?;
+        self.assert_health_clean("before_maintenance_interrupt")
+            .await?;
+
+        let disk_repair = self
+            .simulate_disk_format_and_repair(&expected, &object_key, &source_sha)
+            .await?;
+        evidence.push(json!({"gate": "disk_format_repair_on_large_plus_1000", "status": "PASS"}));
+        rss_samples.push(self.rss_sample("after_disk_format_repair"));
+
+        let redistribution = self
+            .redistribution_interrupt_resume_proof(&mut expected, &object_key, &source_sha)
+            .await?;
+        evidence.push(json!({"gate": "redistribution_interrupt_resume_2_1_2", "status": "PASS"}));
+        rss_samples.push(self.rss_sample("after_redistribution_interrupt_resume"));
+
+        self.assert_expected_visible(&expected).await?;
+        self.assert_download_sha256(&object_key, &source_sha)
+            .await?;
+        self.assert_health_clean("maintenance_interrupt_final")
+            .await?;
+        let inspection = self.inspect_index(expected.len())?;
+        self.stop_server()?;
+        let logs = self.scan_logs()?;
+
+        self.summary = json!({
+            "status": "PASS",
+            "engine": "n1",
+            "proof": "n1_maintenance_interrupt_resume",
+            "source_file": self.args.source_file,
+            "source_bytes": source_len,
+            "source_sha256": source_sha,
+            "large_object_key": object_key,
+            "max_part_size": self.args.max_part_size,
+            "large_upload": upload,
+            "object_storm": storm,
+            "disk_format_repair": disk_repair,
+            "redistribution_interrupt_resume": redistribution,
+            "live_object_count": expected.len(),
             "evidence": evidence,
             "rss_samples": rss_samples,
             "log_scan": logs,
@@ -2509,6 +2604,106 @@ stripe_block_size=262144
         Ok(json!({"one_disk_object": one_disk_key, "active_disk_count": self.active_disk_count}))
     }
 
+    async fn redistribution_interrupt_resume_proof(
+        &mut self,
+        expected: &mut BTreeSet<String>,
+        sample_key: &str,
+        sample_sha: &str,
+    ) -> ProofResult<Value> {
+        self.stop_server()?;
+        self.active_disk_count = 1;
+        self.parity_shards = 0;
+        self.write_config()?;
+        self.start_server("redistribution-interrupt-one-disk")
+            .await?;
+        self.auth().await?;
+        self.assert_expected_visible(expected).await?;
+
+        let one_disk_interrupt = self
+            .start_redistribution_then_interrupt("redistribution-interrupt-one-disk", 8)
+            .await?;
+
+        self.start_server("redistribution-resume-one-disk").await?;
+        self.auth().await?;
+        let one_disk_resume = self.run_redistribution_and_wait().await?;
+        self.assert_expected_visible(expected).await?;
+        self.assert_download_sha256(sample_key, sample_sha).await?;
+
+        let one_disk_key = format!(
+            "{}n1-redistribution/one-disk-after-resume.txt",
+            self.args.prefix
+        );
+        let payload = b"n1 one disk write after interrupted redistribution resume\n".to_vec();
+        let one_disk_sha = sha256_bytes(&payload);
+        self.upload_bytes(&one_disk_key, payload, "text/plain")
+            .await?;
+        self.assert_download_sha256(&one_disk_key, &one_disk_sha)
+            .await?;
+        expected.insert(one_disk_key.clone());
+
+        self.stop_server()?;
+        self.active_disk_count = self.index_roots.len();
+        self.parity_shards = 1;
+        self.write_config()?;
+        self.start_server("redistribution-interrupt-two-disk")
+            .await?;
+        self.auth().await?;
+        self.assert_expected_visible(expected).await?;
+
+        let two_disk_interrupt = self
+            .start_redistribution_then_interrupt("redistribution-interrupt-two-disk", 8)
+            .await?;
+
+        self.start_server("redistribution-resume-two-disk").await?;
+        self.auth().await?;
+        let two_disk_resume = self.run_redistribution_and_wait().await?;
+        let repair_after_resume = self.run_repair_and_wait().await?;
+        self.assert_expected_visible(expected).await?;
+        self.assert_download_sha256(sample_key, sample_sha).await?;
+        self.assert_download_sha256(&one_disk_key, &one_disk_sha)
+            .await?;
+        self.assert_health_clean("after_redistribution_interrupt_resume")
+            .await?;
+
+        Ok(json!({
+            "one_disk_interrupt": one_disk_interrupt,
+            "one_disk_resume": one_disk_resume,
+            "one_disk_object": one_disk_key,
+            "two_disk_interrupt": two_disk_interrupt,
+            "two_disk_resume": two_disk_resume,
+            "repair_after_resume": repair_after_resume,
+            "active_disk_count": self.active_disk_count,
+        }))
+    }
+
+    async fn start_redistribution_then_interrupt(
+        &mut self,
+        log_label: &str,
+        min_redistributed_lines: usize,
+    ) -> ProofResult<Value> {
+        let start = Instant::now();
+        let started = self.start_redistribution_job().await?;
+        self.wait_for_log_count(
+            log_label,
+            "Redistributed ",
+            min_redistributed_lines,
+            Duration::from_secs(180),
+        )
+        .await?;
+        let status_before_stop = self
+            .redistribution_status()
+            .await
+            .unwrap_or_else(|err| json!({"status_read_error": err.to_string()}));
+        self.stop_server()?;
+        let log_count = self.count_log_matches(log_label, "Redistributed ")?;
+        Ok(json!({
+            "started": started,
+            "interrupted_after_redistributed_log_lines": log_count,
+            "status_before_stop": status_before_stop,
+            "elapsed_before_stop_s": round3(start.elapsed().as_secs_f64()),
+        }))
+    }
+
     async fn chaos_proof(
         &mut self,
         expected: &mut BTreeSet<String>,
@@ -2742,6 +2937,12 @@ stripe_block_size=262144
     }
 
     async fn run_redistribution_and_wait(&self) -> ProofResult<Value> {
+        self.start_redistribution_job().await?;
+        self.wait_job("/n1/maintenance/redistribution/status", "redistribution")
+            .await
+    }
+
+    async fn start_redistribution_job(&self) -> ProofResult<Value> {
         let response = self
             .client
             .post(format!(
@@ -2759,8 +2960,31 @@ stripe_block_size=262144
             )
             .into());
         }
-        self.wait_job("/n1/maintenance/redistribution/status", "redistribution")
+        Ok(response
+            .json()
             .await
+            .unwrap_or_else(|_| json!({"accepted": true})))
+    }
+
+    async fn redistribution_status(&self) -> ProofResult<Value> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/n1/maintenance/redistribution/status",
+                self.base_url
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await?;
+        if response.status() != StatusCode::OK {
+            return Err(format!(
+                "redistribution status failed: {} {}",
+                response.status(),
+                response.text().await?
+            )
+            .into());
+        }
+        Ok(response.json().await?)
     }
 
     async fn wait_job(&self, path: &str, label: &str) -> ProofResult<Value> {
@@ -3051,6 +3275,43 @@ stripe_block_size=262144
         }))
     }
 
+    fn count_log_matches(&self, label: &str, needle: &str) -> ProofResult<usize> {
+        let path = self.args.out_dir.join(format!("server-{label}.log"));
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        Ok(text.lines().filter(|line| line.contains(needle)).count())
+    }
+
+    async fn wait_for_log_count(
+        &self,
+        label: &str,
+        needle: &str,
+        min_count: usize,
+        timeout: Duration,
+    ) -> ProofResult<()> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let count = self.count_log_matches(label, needle)?;
+            if count >= min_count {
+                return Ok(());
+            }
+            if let Some(child) = self.server.as_ref() {
+                let pid = child.id();
+                if !Path::new(&format!("/proc/{pid}")).exists() {
+                    return Err(format!(
+                        "server exited while waiting for {min_count} log matches of {needle:?} in {label}; observed {count}"
+                    )
+                    .into());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let count = self.count_log_matches(label, needle)?;
+        Err(format!(
+            "timed out waiting for {min_count} log matches of {needle:?} in {label}; observed {count}"
+        )
+        .into())
+    }
+
     fn write_summary(&self) -> ProofResult<()> {
         fs::write(
             self.args.out_dir.join("summary.json"),
@@ -3332,7 +3593,12 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    match proof.run().await {
+    let result = if proof.args.maintenance_interrupt_proof {
+        proof.run_maintenance_interrupt_proof().await
+    } else {
+        proof.run().await
+    };
+    match result {
         Ok(()) => {
             println!("N1_RELEASE_PROOF PASS");
         }
