@@ -84,6 +84,8 @@ struct Args {
     chaos_storm_objects: usize,
     #[arg(long, default_value_t = false)]
     maintenance_interrupt_proof: bool,
+    #[arg(long, default_value_t = false)]
+    object_maintenance_gate_proof: bool,
 }
 
 #[derive(Debug)]
@@ -441,6 +443,102 @@ impl Proof {
             "object_storm": storm,
             "disk_format_repair": disk_repair,
             "redistribution_interrupt_resume": redistribution,
+            "live_object_count": expected.len(),
+            "evidence": evidence,
+            "rss_samples": rss_samples,
+            "log_scan": logs,
+            "index_inspection": inspection,
+            "fragment_hash": self.fragment,
+            "index_roots": self.index_roots,
+            "blob_roots": self.blob_roots,
+        });
+        self.write_summary()?;
+        if self.args.cleanup_roots {
+            self.cleanup_roots()?;
+        }
+        Ok(())
+    }
+
+    async fn run_object_maintenance_gate_proof(&mut self) -> ProofResult<()> {
+        self.validate()?;
+        self.prepare_dirs()?;
+        self.write_config()?;
+        self.start_server("object-maintenance-before").await?;
+        self.create_fragment().await?;
+        self.auth().await?;
+
+        let object_key = self.object_key();
+        let source_len = self.args.source_file.metadata()?.len();
+        if source_len <= self.args.max_part_size {
+            return Err(format!(
+                "source file is too small for object maintenance gate proof: {} <= max_part_size {}",
+                source_len, self.args.max_part_size
+            )
+            .into());
+        }
+
+        let mut expected = BTreeSet::new();
+        let mut evidence = Vec::new();
+        let mut rss_samples = Vec::new();
+        let source_sha = self.sha256_file(&self.args.source_file).await?;
+        rss_samples.push(self.rss_sample("object_maintenance_started"));
+
+        let upload = self.multipart_restart_resume(&object_key).await?;
+        expected.insert(object_key.clone());
+        self.assert_download_sha256(&object_key, &source_sha)
+            .await?;
+        self.assert_object_status_clean(&object_key, "object_maintenance_baseline")
+            .await?;
+        evidence.push(json!({"gate": "baseline_large_multipart", "status": "PASS"}));
+
+        let same_object_contention = self
+            .same_object_repair_contention_proof(&object_key)
+            .await?;
+        rss_samples.push(self.rss_sample("after_same_object_repair_contention"));
+        evidence.push(json!({"gate": "same_object_repair_contention", "status": "PASS"}));
+
+        let object_then_fragment_repair = self
+            .object_repair_then_fragment_repair_overlap_proof(&object_key)
+            .await?;
+        rss_samples.push(self.rss_sample("after_object_then_fragment_repair_overlap"));
+        evidence
+            .push(json!({"gate": "object_repair_then_fragment_repair_overlap", "status": "PASS"}));
+
+        let storm_count = self.args.storm_objects.clamp(256, 1_000);
+        let storm = self
+            .concurrent_object_storm(&mut expected, "object-maint-gate", storm_count)
+            .await?;
+        rss_samples.push(self.rss_sample("after_object_maintenance_storm"));
+        evidence.push(json!({"gate": "fragment_repair_seed_objects", "status": "PASS"}));
+
+        let fragment_scrub_blocking = self
+            .fragment_scrub_blocks_object_maintenance_proof(&expected, &object_key, &source_sha)
+            .await?;
+        rss_samples.push(self.rss_sample("after_fragment_scrub_blocking"));
+        evidence
+            .push(json!({"gate": "fragment_scrub_blocks_object_maintenance", "status": "PASS"}));
+
+        self.assert_expected_visible(&expected).await?;
+        self.assert_download_sha256(&object_key, &source_sha)
+            .await?;
+        self.assert_health_clean("object_maintenance_final").await?;
+        let inspection = self.inspect_index(expected.len())?;
+        self.stop_server()?;
+        let logs = self.scan_logs()?;
+
+        self.summary = json!({
+            "status": "PASS",
+            "engine": "n1",
+            "proof": "n1_object_maintenance_gate",
+            "source_file": self.args.source_file,
+            "source_bytes": source_len,
+            "source_sha256": source_sha,
+            "large_object_key": object_key,
+            "large_upload": upload,
+            "same_object_repair_contention": same_object_contention,
+            "object_repair_then_fragment_repair_overlap": object_then_fragment_repair,
+            "fragment_repair_seed_storm": storm,
+            "fragment_scrub_blocking": fragment_scrub_blocking,
             "live_object_count": expected.len(),
             "evidence": evidence,
             "rss_samples": rss_samples,
@@ -2549,6 +2647,195 @@ stripe_block_size=262144
         )
     }
 
+    async fn same_object_repair_contention_proof(&self, object_key: &str) -> ProofResult<Value> {
+        let version_id = self.latest_version_id(object_key).await?;
+        let removed = self.remove_one_shard(&version_id)?;
+        let degraded = self.object_status(object_key, "strict").await?;
+        let status = degraded
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if status == "healthy" {
+            return Err(format!(
+                "object status stayed healthy before contention repair: {degraded}"
+            )
+            .into());
+        }
+
+        let attempts = 8usize;
+        let responses =
+            join_all((0..attempts).map(|_| self.object_repair_raw(object_key, "strict"))).await;
+        let mut ok = 0usize;
+        let mut busy = 0usize;
+        let mut details = Vec::new();
+        for response in responses {
+            let (status, body) = response?;
+            if status == StatusCode::OK {
+                ok += 1;
+            } else if status == StatusCode::SERVICE_UNAVAILABLE {
+                busy += 1;
+            }
+            details.push(json!({
+                "status": status.as_u16(),
+                "body": body,
+            }));
+        }
+        if ok == 0 {
+            return Err(format!(
+                "same-object repair contention had no successful repair: {details:?}"
+            )
+            .into());
+        }
+        if busy == 0 {
+            return Err(format!(
+                "same-object repair contention did not reject any concurrent repair: {details:?}"
+            )
+            .into());
+        }
+
+        self.wait_for_path(&removed, true, Duration::from_secs(60))
+            .await?;
+        self.assert_object_status_clean(object_key, "after_same_object_repair_contention")
+            .await?;
+        Ok(json!({
+            "object_key": object_key,
+            "version_id": version_id,
+            "removed": removed,
+            "pre_repair_status": degraded,
+            "attempts": attempts,
+            "ok": ok,
+            "service_unavailable": busy,
+            "responses": details,
+        }))
+    }
+
+    async fn object_repair_then_fragment_repair_overlap_proof(
+        &self,
+        object_key: &str,
+    ) -> ProofResult<Value> {
+        let version_id = self.latest_version_id(object_key).await?;
+        let removed = self.remove_one_shard(&version_id)?;
+        let degraded = self.object_status(object_key, "strict").await?;
+        let status = degraded
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if status == "healthy" {
+            return Err(
+                format!("object status stayed healthy before overlap repair: {degraded}").into(),
+            );
+        }
+
+        let client = self.client.clone();
+        let token = self.token.clone();
+        let url = format!(
+            "{}/n1/objects/repair/{}?mode=strict",
+            self.base_url,
+            encode_path(object_key)
+        );
+        let object_repair = tokio::spawn(async move {
+            let response = client.post(url).bearer_auth(token).send().await?;
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            Ok::<_, reqwest::Error>((status, body))
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let fragment_start = self.start_repair_job().await?;
+        let (object_repair_code, object_repair_body) = object_repair.await??;
+        if object_repair_code != StatusCode::OK {
+            return Err(format!(
+                "object repair did not complete successfully before/with fragment repair: status={} body={}",
+                object_repair_code, object_repair_body
+            )
+            .into());
+        }
+        let fragment_repair = self
+            .wait_job("/n1/maintenance/repair/status", "repair")
+            .await?;
+        self.wait_for_path(&removed, true, Duration::from_secs(60))
+            .await?;
+        self.assert_object_status_clean(object_key, "after_object_fragment_repair_overlap")
+            .await?;
+
+        Ok(json!({
+            "object_key": object_key,
+            "version_id": version_id,
+            "removed": removed,
+            "pre_repair_status": degraded,
+            "object_repair": {
+                "status": object_repair_code.as_u16(),
+                "body": object_repair_body,
+            },
+            "fragment_repair_start": fragment_start,
+            "fragment_repair": fragment_repair,
+        }))
+    }
+
+    async fn fragment_scrub_blocks_object_maintenance_proof(
+        &mut self,
+        expected: &BTreeSet<String>,
+        sample_key: &str,
+        sample_sha: &str,
+    ) -> ProofResult<Value> {
+        self.stop_server()?;
+        let removed_index = self.index_roots[0].join(&self.fragment);
+        let removed_blob = self.blob_roots[0].join(&self.fragment);
+        let _ = fs::remove_dir_all(&removed_index);
+        let _ = fs::remove_dir_all(&removed_blob);
+        self.start_server("fragment-scrub-blocking").await?;
+        self.auth().await?;
+
+        let start = self.start_repair_job().await?;
+        let running = self.wait_repair_running(Duration::from_secs(30)).await?;
+
+        let (status_code, status_body) = self.object_status_raw(sample_key, "strict").await?;
+        if status_code != StatusCode::SERVICE_UNAVAILABLE {
+            return Err(format!(
+                "object status was not blocked during fragment scrub repair: status={} body={}",
+                status_code, status_body
+            )
+            .into());
+        }
+
+        let (repair_code, repair_body) = self.object_repair_raw(sample_key, "strict").await?;
+        if repair_code != StatusCode::SERVICE_UNAVAILABLE {
+            return Err(format!(
+                "object repair was not blocked during fragment scrub repair: status={} body={}",
+                repair_code, repair_body
+            )
+            .into());
+        }
+
+        let repair = self
+            .wait_job("/n1/maintenance/repair/status", "repair")
+            .await?;
+        self.assert_expected_visible(expected).await?;
+        self.assert_download_sha256(sample_key, sample_sha).await?;
+        self.assert_object_status_clean(sample_key, "after_fragment_scrub_blocking")
+            .await?;
+        self.assert_health_clean("after_fragment_scrub_blocking")
+            .await?;
+
+        Ok(json!({
+            "removed_index": removed_index,
+            "removed_blob": removed_blob,
+            "start": start,
+            "running": running,
+            "blocked_object_status": {
+                "status": status_code.as_u16(),
+                "body": status_body,
+            },
+            "blocked_object_repair": {
+                "status": repair_code.as_u16(),
+                "body": repair_body,
+            },
+            "repair": repair,
+        }))
+    }
+
     async fn simulate_disk_format_and_repair(
         &mut self,
         expected: &BTreeSet<String>,
@@ -2853,6 +3140,48 @@ stripe_block_size=262144
         Ok(response.json().await?)
     }
 
+    async fn object_status_raw(
+        &self,
+        object_key: &str,
+        mode: &str,
+    ) -> ProofResult<(StatusCode, String)> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/n1/objects/status/{}?mode={}",
+                self.base_url,
+                encode_path(object_key),
+                mode
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Ok((status, body))
+    }
+
+    async fn object_repair_raw(
+        &self,
+        object_key: &str,
+        mode: &str,
+    ) -> ProofResult<(StatusCode, String)> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/n1/objects/repair/{}?mode={}",
+                self.base_url,
+                encode_path(object_key),
+                mode
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Ok((status, body))
+    }
+
     async fn assert_object_status_clean(&self, object_key: &str, phase: &str) -> ProofResult<()> {
         let body = self.object_status(object_key, "strict").await?;
         let status = body
@@ -2915,6 +3244,12 @@ stripe_block_size=262144
     }
 
     async fn run_repair_and_wait(&self) -> ProofResult<Value> {
+        self.start_repair_job().await?;
+        self.wait_job("/n1/maintenance/repair/status", "repair")
+            .await
+    }
+
+    async fn start_repair_job(&self) -> ProofResult<Value> {
         let response = self
             .client
             .post(format!(
@@ -2932,8 +3267,41 @@ stripe_block_size=262144
             )
             .into());
         }
-        self.wait_job("/n1/maintenance/repair/status", "repair")
+        Ok(response
+            .json()
             .await
+            .unwrap_or_else(|_| json!({"accepted": true})))
+    }
+
+    async fn wait_repair_running(&self, timeout: Duration) -> ProofResult<Value> {
+        let deadline = Instant::now() + timeout;
+        let mut last = json!(null);
+        while Instant::now() < deadline {
+            let response = self
+                .client
+                .get(format!("{}/n1/maintenance/repair/status", self.base_url))
+                .bearer_auth(&self.token)
+                .send()
+                .await?;
+            if response.status() != StatusCode::OK {
+                return Err(format!(
+                    "repair running status failed: {} {}",
+                    response.status(),
+                    response.text().await?
+                )
+                .into());
+            }
+            last = response.json().await?;
+            if last
+                .get("is_running")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return Ok(last);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(format!("repair did not enter running state; last={last}").into())
     }
 
     async fn run_redistribution_and_wait(&self) -> ProofResult<Value> {
@@ -3593,7 +3961,9 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let result = if proof.args.maintenance_interrupt_proof {
+    let result = if proof.args.object_maintenance_gate_proof {
+        proof.run_object_maintenance_gate_proof().await
+    } else if proof.args.maintenance_interrupt_proof {
         proof.run_maintenance_interrupt_proof().await
     } else {
         proof.run().await
