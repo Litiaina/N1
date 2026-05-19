@@ -4,11 +4,47 @@ This document describes how N1 stores metadata and payloads on disk. Operators s
 
 ## Storage Planes
 
-N1 has three storage planes:
+N1 has three storage planes and two transport faces:
 
 - **Namespace plane:** real directories and file symlinks.
 - **Object index plane:** fanned `.objects/<hh>/<hh>/@o_<object-id>/` directories with immutable `.ndx` version records.
 - **Blob plane:** shard/parity payload files under `.blobs/<version_id>/`.
+- **HTTPS/LOA face:** the universal `/n1/...` API.
+- **Native `n1://` face:** a MessagePack-framed protocol for N1 Console, CLI, NS, N2, and trusted internal native clients.
+
+The transport faces call the same N1 service graph. `n1://` is not a separate metadata path and does not own storage truth.
+
+## Native Protocol Plane
+
+N1 1.2.0 adds `n1://` as an internal protocol plane beside HTTPS. The protocol exists so N1-owned tools can talk to the storage kernel without paying HTTP/TLS overhead on small control-plane calls. The native listener is required at startup; if its port cannot bind, N1 should fail startup instead of silently running without the low-level face.
+
+The native plane is intentionally thin:
+
+```text
+TCP connection
+  u32_be frame length
+  MessagePack NativeRequest
+    id
+    op
+    payload: JSON text
+    body: optional binary bytes
+  MessagePack NativeResponse
+```
+
+The server stores auth state per native connection. `auth.fragment` enters through the same fragment auth route used by HTTPS, then the returned JWT is attached to later native-dispatched API calls. `api.request` is the parity path: it maps method/path/headers/json/body into the same Axum route graph used by HTTPS. Typed operations such as `namespace.stat` and `maintenance.health` are convenience mappings over that same graph.
+
+Native protocol performance depends on avoiding small-frame TCP latency. N1 sets `TCP_NODELAY` on accepted native sockets. The Rust release proof includes a native benchmark so delayed-ACK/Nagle regressions are caught.
+
+The native plane must not:
+
+- own namespace truth
+- bypass fragment auth
+- bypass object maintenance gates
+- bypass upload accounting
+- bypass repair, GC, redistribution, or validation logic
+- implement a separate object metadata path
+
+Native is a lower-latency face for the same storage kernel, not a fourth storage plane.
 
 Each configured root can house both index and blob data:
 

@@ -1,6 +1,6 @@
 # N1 Documentation
 
-N1 is a single-node storage kernel for durable object storage with a POSIX-like namespace. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, garbage collection, trash/recover, archive download, and realtime namespace events.
+N1 1.2.0 is a single-node storage kernel for durable object storage with a POSIX-like namespace and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, garbage collection, trash/recover, archive download, and realtime namespace events.
 
 N1 exposes a file-explorer-friendly namespace while storing payloads through its shard/parity blob plane. Folders are real namespace directories. Files are stable object identities with immutable version records. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
@@ -57,6 +57,7 @@ Minimal two-disk configuration where both disks house index and blob data:
 [server]
 host=127.0.0.1
 https_port=50001
+native_port=50002
 cert_path=cert.pem
 key_path=key.pem
 
@@ -208,11 +209,259 @@ Fragment tokens carry independent permissions:
 
 - `object_key`, `path`, `source_path`, and `destination_path` are namespace paths such as `videos/clip.mp4`. URL-encode spaces and special characters when they appear in a path or query string.
 - Request bodies are JSON unless the route says the body is raw bytes.
+- HTTPS is the universal API face for consumers and broad compatibility. `n1://` is the native N1 protocol face for N1 Console, N1 CLI, NS, N2, and heavy internal clients.
 - Large files should use multipart upload. One-shot upload is intended for smaller objects.
 - `version_id` is the persistent upload/object-version id. Multipart part upload and status use `version_id`; finalize also requires the `session_id` returned by init.
 - Empty trash and hard delete remove namespace references first. Blob bytes are reclaimed after GC proves no live or trash metadata references them.
 - Object status/repair is object-scoped. A repair or scrub for one object does not lock the whole fragment.
 - When an operation returns `503 Service Unavailable`, retry later. This can mean maintenance is running, object maintenance gates are saturated, or quota/disk provisioning prevents safe progress.
+
+## Native N1 Protocol
+
+N1 1.2.0 includes the native N1 protocol:
+
+```text
+n1://127.0.0.1:50002
+```
+
+HTTPS remains the universal consumer API. The native protocol is the low-level N1 transport for N1 Console, N1 CLI, NS, N2, and trusted services that need lower latency than HTTPS for control-plane and namespace calls.
+
+The native protocol is only a transport face. It does not create another storage engine, another namespace, another metadata authority, or another code path for object truth. Native requests dispatch into the same N1 service graph used by HTTPS.
+
+### Configuration
+
+```ini
+[server]
+host=127.0.0.1
+https_port=50001
+native_port=50002
+```
+
+The native listener is part of N1, not an optional sidecar. Configure `native_port` to choose where the low-level protocol binds. N1 fails startup if this required listener cannot bind. Bind `host` carefully. `n1://` should be treated as an internal/trusted-network protocol unless a deployment adds an external secure tunnel or equivalent network protection.
+
+### Frame Format
+
+Every frame uses a fixed length prefix followed by a MessagePack payload:
+
+```text
+u32_be frame_length
+MessagePack payload
+```
+
+The maximum frame size is currently `128 MiB`. This keeps native control frames bounded and prevents one client from forcing unbounded server buffers. Large object transfer should still prefer streaming/range/multipart semantics instead of attempting to place huge files in one native frame.
+
+Client request:
+
+```json
+{
+  "id": "request-id",
+  "op": "api.request",
+  "payload": "{\"method\":\"GET\",\"path\":\"/n1/ping\"}",
+  "body": null
+}
+```
+
+Response:
+
+```json
+{
+  "id": "request-id",
+  "ok": true,
+  "status": 200,
+  "payload": "{\"status\":200,\"headers\":{\"content-type\":\"text/plain\"},\"json\":null,\"body_len\":4}",
+  "body": "raw MessagePack binary bytes when the response has a body",
+  "error": null
+}
+```
+
+Important details:
+
+- `id` is echoed by the server so clients can correlate requests.
+- `op` selects the native operation.
+- `payload` is UTF-8 JSON text stored inside the MessagePack frame.
+- `body` is MessagePack binary for raw request/response bytes.
+- `ok=false` means the native transport or mapped API request failed.
+- `status` is present for requests mapped into the HTTP-compatible N1 route graph.
+- `error.code` and `error.message` are present for native-layer failures.
+
+Native sockets use `TCP_NODELAY` to avoid delayed-ACK/Nagle latency on small framed request/response workloads.
+
+### Authentication
+
+Native connections hold session state. Authenticate once, then reuse the connection:
+
+```json
+{
+  "id": "auth-1",
+  "op": "auth.fragment",
+  "payload": "{\"fragment\":\"<fragment_hash>\",\"secret\":\"fragment-local-secret\",\"read\":true,\"write\":true,\"modify\":true,\"delete\":true,\"expires_in\":3600}",
+  "body": null
+}
+```
+
+The server calls the same `/n1/auth/fragment` route internally and stores the returned bearer token in that native connection session. Future native operations on the same connection automatically use that bearer unless the caller overrides authorization through `api.request` headers.
+
+Other auth/session operations:
+
+- `auth.bearer`: install an existing JWT bearer token into the connection session.
+- `auth.clear` or `logout`: clear native session state.
+- `session.info`: inspect the current native session permissions.
+
+### API Bridge
+
+`api.request` is the 1:1 parity bridge. It accepts a method, path, optional headers, and optional JSON body, then dispatches through the same N1 route graph as HTTPS without leaving the process:
+
+```json
+{
+  "id": "list-1",
+  "op": "api.request",
+  "payload": "{\"method\":\"GET\",\"path\":\"/n1/posix/list?path=videos&limit=200\"}",
+  "body": null
+}
+```
+
+POST with JSON:
+
+```json
+{
+  "id": "mkdir-1",
+  "op": "api.request",
+  "payload": "{\"method\":\"POST\",\"path\":\"/n1/posix/mkdir\",\"json\":{\"path\":\"videos/2026\"}}",
+  "body": null
+}
+```
+
+Raw bytes:
+
+```json
+{
+  "id": "part-1",
+  "op": "api.request",
+  "payload": "{\"method\":\"PUT\",\"path\":\"/n1/upload/multipart/<version_id>/0?durability=batched\",\"headers\":{\"content-type\":\"application/octet-stream\"}}",
+  "body": "<raw part bytes>"
+}
+```
+
+### Typed Operations
+
+Typed operations are convenience shortcuts for the same routes. They are useful for SDKs and internal tools because callers do not need to manually assemble URLs.
+
+Namespace/POSIX:
+
+- `namespace.list`
+- `namespace.stat`
+- `namespace.mkdir`
+- `namespace.rename`
+- `namespace.trash`
+- `namespace.recover`
+- `namespace.purge`
+
+Object:
+
+- `object.list`
+- `object.status`
+- `object.repair`
+- `object.delete`
+- `object.recover`
+- `object.purge`
+
+Trash:
+
+- `trash.list`
+- `trash.empty`
+- `trash.recover_all`
+
+Multipart:
+
+- `multipart.init`
+- `multipart.status`
+- `multipart.part`
+- `multipart.finalize`
+
+Maintenance:
+
+- `maintenance.health`
+- `maintenance.repair.start`
+- `maintenance.repair.status`
+- `maintenance.gc.start`
+- `maintenance.gc.status`
+- `maintenance.redistribution.start`
+- `maintenance.redistribution.status`
+
+Typed stat example:
+
+```json
+{
+  "id": "stat-1",
+  "op": "namespace.stat",
+  "payload": "{\"path\":\"videos/clip.mp4\"}",
+  "body": null
+}
+```
+
+Typed rename example:
+
+```json
+{
+  "id": "rename-1",
+  "op": "namespace.rename",
+  "payload": "{\"source_path\":\"videos/clip.mp4\",\"destination_path\":\"videos/final.mp4\"}",
+  "body": null
+}
+```
+
+### Performance Profile
+
+Native is designed to remove HTTP/TLS overhead for trusted internal clients. Current release-build loopback proof on 1,000 measured iterations showed:
+
+- `ping`: about `20k ops/sec`, p50 about `47 us`.
+- `posix stat`: about `6.1k-6.8k ops/sec`, p50 about `134-145 us`.
+- HTTPS `posix stat` on the same run: about `3.6k ops/sec`, p50 about `237 us`.
+
+Listing is less transport-bound because namespace scanning and response body size dominate; native remains competitive and is best viewed as a low-latency control-plane/tooling transport rather than a storage-core shortcut.
+
+### Tooling Policy
+
+N1-owned tools should use `n1://` when they are running on trusted infrastructure. HTTPS stays available for browsers, external consumers, curl workflows, and compatibility. `n1_cli` uses native transport by default and only uses HTTPS when the operator explicitly passes `--url <https-url>`.
+
+`n1_cli` is stateful when opened as a console:
+
+```bash
+cargo run -p n1_cli -- --secret <secret> --fragment <fragment> console
+```
+
+The console keeps one native session open and supports read/maintenance operations:
+
+- `health`
+- `quota`
+- `fragments`
+- `list [path]`
+- `stat <path>`
+- `uploads`
+- `upload <version_id>`
+- `gc status|start`
+- `repair status|start`
+- `redistribute status|start`
+- `object status <object_key>`
+- `object repair <object_key>`
+- `session`
+
+The CLI intentionally keeps destructive namespace mutations out of the operator console. Rename, delete, update, upload, and application CRUD still belong to the HTTP or native API surfaces used by clients that explicitly own those workflows.
+
+### Stability Boundary
+
+Native `n1://` does not bypass N1 validation, authorization, repair, GC, redistribution, upload accounting, or namespace rules. It reaches the same service graph as HTTPS. Its stability risks are protocol risks: framing, session handling, socket behavior, and client implementation. The storage kernel stays unchanged.
+
+For LTS release proof, native should remain in the Rust release proof matrix for:
+
+- auth/session
+- list/stat
+- CRUD namespace operations
+- trash/recover/purge
+- object status/repair
+- maintenance status/start
+- multipart control paths
+- benchmark regression detection
 
 ### `POST /n1/auth/fragment`
 

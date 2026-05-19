@@ -21,6 +21,7 @@ Before an LTS release, N1 should pass:
 - concurrent users across multiple fragments
 - memory/RSS observation under sustained load
 - UI-backed smoke against the real N1 API
+- native `n1://` auth/list/stat/CRUD smoke and transport benchmark
 
 ## Rust Release Proof Runner
 
@@ -39,6 +40,26 @@ scripts/bench/run_n1_release_proof.sh
 For a large multipart proof, use a source file that exceeds the configured one-shot size. Large files must exercise multipart, persisted receipts, restart/resume, finalize, and download verification.
 
 ## Focused Proof Evidence
+
+Latest native protocol benchmark for N1 1.2.0:
+
+- Command path: Rust release proof `--native-transport-benchmark`.
+- Build mode: release.
+- Setup: one N1 server, 64 real namespace objects, same fragment for HTTPS and native.
+- Iterations: 1,000 measured requests after 100 warmups per operation.
+- Native listener: `n1://127.0.0.1:<native_port>`.
+- HTTPS listener: `https://127.0.0.1:<https_port>`.
+- Result: `PASS`.
+
+Measured loopback results after enabling `TCP_NODELAY`:
+
+| Operation | HTTPS ops/sec | Native ops/sec | HTTPS p50 | Native p50 |
+| --- | ---: | ---: | ---: | ---: |
+| ping | 7,566 | 20,093 | 111 us | 47 us |
+| posix stat | 3,588 | 6,088 typed / 6,807 api bridge | 237 us | 145 us typed / 134 us api bridge |
+| posix list, 64 entries | 653 | 536 typed / 725 api bridge | 1,347 us | 1,442 us typed / 1,389 us api bridge |
+
+Interpretation: native `n1://` is materially faster for small control-plane and metadata calls. Listing is less transport-bound because direct namespace work and response body size dominate. The benchmark also caught a real protocol weakness before release: without `TCP_NODELAY`, tiny native frames hit delayed-ACK/Nagle latency around 82 ms per operation.
 
 Latest local proof run recorded in the previous documentation set:
 

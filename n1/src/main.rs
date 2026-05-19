@@ -23,7 +23,8 @@ use crate::core::upload::{
 use crate::fs::cleanup_manager::interval_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
-use crate::routes::storage_routes::serve_storage_routes;
+use crate::protocol::{bind_native_protocol, serve_native_protocol};
+use crate::routes::storage_routes::{apply_runtime_http_layers, build_storage_routes_unbound};
 use crate::settings::constants::{CONFIG_FILE, ENV_FILE};
 use crate::utils::date_time_formatter::LocalTimer;
 use crate::validation::enforce_init_settings::{ensure_config_file, ensure_env_file};
@@ -693,7 +694,10 @@ pub async fn run_server() {
         .get("https_port")
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(50001);
-
+    let native_port = server_section
+        .get("native_port")
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(50002);
     let cert_path = server_section
         .get("cert_path")
         .map(|v| v.to_string())
@@ -1050,8 +1054,14 @@ pub async fn run_server() {
         .expect("Failed to load TLS certificates");
 
     let storage_addr = SocketAddr::from((ip, https_port));
-    let storage_router = serve_storage_routes().await;
-    let serve_storage = storage_router.fallback(handler_404);
+    let native_addr = SocketAddr::from((ip, native_port));
+    let native_listener = bind_native_protocol(native_addr)
+        .await
+        .expect("Failed to bind required N1 native protocol listener");
+    let (storage_router, app_state) = build_storage_routes_unbound();
+    let serve_storage = apply_runtime_http_layers(storage_router)
+        .with_state(app_state)
+        .fallback(handler_404);
 
     let fs_root = FS_STORAGE_ROOT
         .get()
@@ -1059,6 +1069,11 @@ pub async fn run_server() {
         .to_string();
     tokio::spawn(async move {
         interval_cleanup(&fs_root).await;
+    });
+
+    let native_router = serve_storage.clone();
+    tokio::spawn(async move {
+        serve_native_protocol(native_listener, native_addr, native_router).await;
     });
 
     serve(storage_addr, serve_storage, cert).await;

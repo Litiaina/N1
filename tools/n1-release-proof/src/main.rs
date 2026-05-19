@@ -26,6 +26,8 @@ include!("proof_scenarios.rs");
 include!("proof_environment.rs");
 include!("proof_workloads.rs");
 include!("proof_client.rs");
+include!("proof_native.rs");
+include!("proof_native_bench.rs");
 include!("proof_maintenance.rs");
 include!("proof_jobs.rs");
 include!("proof_utils.rs");
@@ -42,6 +44,10 @@ async fn main() {
     };
     let result = if proof.args.object_maintenance_gate_proof {
         proof.run_object_maintenance_gate_proof().await
+    } else if proof.args.native_transport_benchmark {
+        proof.run_native_transport_benchmark().await
+    } else if proof.args.native_protocol_proof {
+        proof.run_native_protocol_smoke().await
     } else if proof.args.maintenance_interrupt_proof {
         proof.run_maintenance_interrupt_proof().await
     } else {

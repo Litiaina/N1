@@ -1,6 +1,6 @@
 [package]
 name = "n1"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2024"
 
 [[bin]]
@@ -54,9 +54,9 @@ rmp-serde.workspace = true
 argon2.workspace = true
 rand.workspace = true
 rustix.workspace = true
+tower.workspace = true
 
 [dev-dependencies]
-tower.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"

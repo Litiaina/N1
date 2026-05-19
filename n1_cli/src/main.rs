@@ -1,5 +1,6 @@
 mod args;
 mod client;
+mod native;
 mod output;
 
 use clap::Parser;

@@ -123,6 +123,7 @@ impl Proof {
             r#"[server]
 host=127.0.0.1
 https_port={}
+native_port={}
 cert_path={}
 key_path={}
 
@@ -185,6 +186,7 @@ parity_shards={}
 stripe_block_size=262144
 "#,
             self.args.port,
+            self.native_port(),
             cert.display(),
             key.display(),
             index_roots,

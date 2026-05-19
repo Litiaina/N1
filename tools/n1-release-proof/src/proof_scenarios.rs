@@ -36,6 +36,8 @@ impl Proof {
         self.assert_object_status_clean(&object_key, "after_large_multipart")
             .await?;
         self.assert_health_clean("after_large_multipart").await?;
+        let native_protocol = self.native_protocol_proof(&object_key).await?;
+        evidence.push(json!({"gate": "native_n1_protocol", "status": "PASS"}));
         rss_samples.push(self.rss_sample("after_large_multipart"));
         evidence.push(json!({"gate": "large_multipart_restart_resume", "status": "PASS"}));
 
@@ -170,6 +172,7 @@ impl Proof {
             "source_sha256": local_sha,
             "download_sha256": downloaded_sha,
             "max_part_size": self.args.max_part_size,
+            "native_protocol": native_protocol,
             "upload": upload,
             "additional_large_multipart": additional_large,
             "object_storm": object_storm,

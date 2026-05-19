@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileSystemClaims {
     pub path: String,
     pub read: bool,
@@ -25,7 +25,7 @@ pub struct LoginRequest {
     pub expires_in: Option<u64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub fragment: String,
     pub read: bool,

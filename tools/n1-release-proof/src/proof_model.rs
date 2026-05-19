@@ -15,6 +15,8 @@ struct Args {
     out_dir: PathBuf,
     #[arg(long, default_value_t = 50_671)]
     port: u16,
+    #[arg(long, default_value_t = 0)]
+    native_port: u16,
     #[arg(long, default_value = "release-proof/")]
     prefix: String,
     #[arg(long, default_value_t = 2_147_483_648)]
@@ -63,6 +65,14 @@ struct Args {
     maintenance_interrupt_proof: bool,
     #[arg(long, default_value_t = false)]
     object_maintenance_gate_proof: bool,
+    #[arg(long, default_value_t = false)]
+    native_protocol_proof: bool,
+    #[arg(long, default_value_t = false)]
+    native_transport_benchmark: bool,
+    #[arg(long, default_value_t = 1_000)]
+    benchmark_iterations: usize,
+    #[arg(long, default_value_t = 100)]
+    benchmark_warmup: usize,
 }
 
 #[derive(Debug)]
@@ -135,6 +145,14 @@ impl Proof {
             self.args.quota_backend.trim().to_ascii_lowercase().as_str(),
             "" | "disabled" | "disable" | "none" | "off" | "false" | "0"
         )
+    }
+
+    fn native_port(&self) -> u16 {
+        if self.args.native_port == 0 {
+            self.args.port.saturating_add(1)
+        } else {
+            self.args.native_port
+        }
     }
 
 }

@@ -5,6 +5,7 @@ pub mod handlers;
 pub mod middleware;
 pub mod namespace;
 pub mod posix;
+pub mod protocol;
 pub mod routes;
 pub mod settings;
 pub mod statics;

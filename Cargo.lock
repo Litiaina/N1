@@ -2111,7 +2111,7 @@ dependencies = [
 
 [[package]]
 name = "n1"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "argon2",
  "async_zip",
@@ -2226,6 +2226,7 @@ dependencies = [
  "native-tls",
  "percent-encoding",
  "reqwest",
+ "rmp-serde",
  "serde",
  "serde_json",
  "sha2",
@@ -2236,14 +2237,16 @@ dependencies = [
 
 [[package]]
 name = "n1_cli"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "assert_cmd",
  "axum",
  "chrono",
  "clap",
  "cli_core",
+ "percent-encoding",
  "reqwest",
+ "rmp-serde",
  "serde",
  "serde_json",
  "tokio",

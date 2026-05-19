@@ -1,7 +1,9 @@
 use std::io;
 
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Client, Method, StatusCode};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use cli_core::client::{
     AuthSession, CreateFragmentRequest, DynError, N1_AUTH_ROUTES, api_url,
@@ -15,8 +17,9 @@ use cli_core::models::{
 };
 
 use crate::args::{
-    Cli, Commands, DurabilityArg, ExecutionModeArg, FragmentCommands, JobAction,
-    RedistributeAction, RedistributeScopeArg, RepairAction, RepairModeArg, UploadCommands,
+    Cli, Commands, DurabilityArg, ExecutionModeArg, FragmentCommands, JobAction, NamespaceCommands,
+    ObjectCommands, RedistributeAction, RedistributeScopeArg, RepairAction, RepairModeArg,
+    UploadCommands,
 };
 use crate::output::{
     format_gc_status, format_health, format_health_watch_line, format_redistribution_status,
@@ -24,26 +27,26 @@ use crate::output::{
 };
 
 #[derive(Deserialize)]
-struct FragmentHashLookupResponse {
-    fragment_hash: String,
+pub(crate) struct FragmentHashLookupResponse {
+    pub(crate) fragment_hash: String,
 }
 
 #[derive(Serialize)]
-struct FragmentHashLookupRequest {
-    fragment: String,
+pub(crate) struct FragmentHashLookupRequest {
+    pub(crate) fragment: String,
 }
 
 #[derive(Serialize)]
-struct ResizeFragmentQuotaRequest {
-    quota_bytes: u64,
-    secret: String,
+pub(crate) struct ResizeFragmentQuotaRequest {
+    pub(crate) quota_bytes: u64,
+    pub(crate) secret: String,
 }
 
-fn looks_like_fragment_hash(value: &str) -> bool {
+pub(crate) fn looks_like_fragment_hash(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn resolve_cli_auth_fragment_hint(cli: &Cli) -> Result<String, DynError> {
+pub(crate) fn resolve_cli_auth_fragment_hint(cli: &Cli) -> Result<String, DynError> {
     cli.auth_fragment
         .clone()
         .or_else(|| cli.fragment.clone())
@@ -99,6 +102,10 @@ async fn resolve_n1_auth_fragment(
 }
 
 pub async fn run(cli: Cli) -> Result<(), DynError> {
+    if cli.native_url.is_some() || cli.url.is_none() {
+        return crate::native::run_native(cli).await;
+    }
+
     let base_url = get_base_url(cli.url.clone());
     let client = build_client(cli.insecure)?;
 
@@ -164,6 +171,9 @@ async fn handle_fragment_command(
         FragmentCommands::ResizeQuota(_) => {
             unreachable!("fragment quota resize is handled after fragment authentication")
         }
+        FragmentCommands::List | FragmentCommands::Hash { .. } | FragmentCommands::Quota => {
+            unreachable!("fragment read commands are handled after fragment authentication")
+        }
     }
 }
 
@@ -174,6 +184,10 @@ async fn handle_authenticated_command(
     cli: &Cli,
 ) -> Result<(), DynError> {
     match &cli.command {
+        Commands::Console => Err(io::Error::other(
+            "console requires native n1:// transport; omit --url or pass --native-url.",
+        )
+        .into()),
         Commands::Health { watch, deep_scan } => {
             let url = format!(
                 "{}?deep_scan={}",
@@ -198,6 +212,68 @@ async fn handle_authenticated_command(
                 print_output(cli.json, &health, &format_health(&health))
             }
         }
+        Commands::Namespace { command } => match command {
+            NamespaceCommands::List { path, limit } => {
+                let value: Value = fetch_json(
+                    client,
+                    base_url,
+                    session,
+                    &format!(
+                        "{}?path={}&limit={}",
+                        api_url(base_url, "/n1/posix/list"),
+                        encode_query(path),
+                        (*limit).clamp(1, 1000)
+                    ),
+                )
+                .await?;
+                print_output(cli.json, &value, &serde_json::to_string_pretty(&value)?)
+            }
+            NamespaceCommands::Stat { path } => {
+                let value: Value = fetch_json(
+                    client,
+                    base_url,
+                    session,
+                    &format!(
+                        "{}?path={}",
+                        api_url(base_url, "/n1/posix/stat"),
+                        encode_query(path)
+                    ),
+                )
+                .await?;
+                print_output(cli.json, &value, &serde_json::to_string_pretty(&value)?)
+            }
+        },
+        Commands::Object { command } => match command {
+            ObjectCommands::Status { object_key, mode } => {
+                let value: Value = fetch_json(
+                    client,
+                    base_url,
+                    session,
+                    &format!(
+                        "{}/{}?mode={}",
+                        api_url(base_url, "/n1/objects/status"),
+                        encode_path(object_key),
+                        encode_query(mode)
+                    ),
+                )
+                .await?;
+                print_output(cli.json, &value, &serde_json::to_string_pretty(&value)?)
+            }
+            ObjectCommands::Repair { object_key, mode } => {
+                let response = send_with_session(client, base_url, session, |token| {
+                    client
+                        .post(format!(
+                            "{}/{}?mode={}",
+                            api_url(base_url, "/n1/objects/repair"),
+                            encode_path(object_key),
+                            encode_query(mode)
+                        ))
+                        .bearer_auth(token)
+                })
+                .await?;
+                print_response_message(response).await
+            }
+        },
         Commands::Uploads { command } => match command {
             UploadCommands::List { limit, offset } => {
                 let query = vec![
@@ -431,6 +507,44 @@ async fn handle_authenticated_fragment_command(
 ) -> Result<(), DynError> {
     match command {
         FragmentCommands::Create(_) => unreachable!("fragment create is handled without auth"),
+        FragmentCommands::List => {
+            let value: Value = fetch_json(
+                client,
+                base_url,
+                session,
+                &api_url(base_url, "/n1/fragments"),
+            )
+            .await?;
+            print_output(cli.json, &value, &serde_json::to_string_pretty(&value)?)
+        }
+        FragmentCommands::Hash { fragment } => {
+            let fragment = fragment
+                .as_deref()
+                .or(cli.fragment.as_deref())
+                .ok_or_else(|| {
+                    io::Error::other("pass --fragment or fragment hash --fragment <name>")
+                })?;
+            let response = send_with_session(client, base_url, session, |token| {
+                client
+                    .get(api_url(base_url, "/n1/fragments/hash"))
+                    .bearer_auth(token)
+                    .json(&FragmentHashLookupRequest {
+                        fragment: fragment.to_string(),
+                    })
+            })
+            .await?;
+            print_response_message(response).await
+        }
+        FragmentCommands::Quota => {
+            let value: Value = fetch_json(
+                client,
+                base_url,
+                session,
+                &api_url(base_url, "/n1/capacity/quota"),
+            )
+            .await?;
+            print_output(cli.json, &value, &serde_json::to_string_pretty(&value)?)
+        }
         FragmentCommands::ResizeQuota(args) => {
             let target_fragment = resolve_target_fragment(client, base_url, cli).await?;
             let url = api_url(
@@ -464,7 +578,7 @@ fn push_query_value<T: ToString>(query: &mut Vec<(String, String)>, key: &str, v
     }
 }
 
-fn build_repair_start_query(
+pub(crate) fn build_repair_start_query(
     dry_run: bool,
     fragment: Option<&str>,
     mode: Option<RepairModeArg>,
@@ -494,7 +608,7 @@ fn build_repair_start_query(
     query
 }
 
-fn build_redistribution_start_query(
+pub(crate) fn build_redistribution_start_query(
     dry_run: bool,
     fragment: Option<&str>,
     mode: Option<ExecutionModeArg>,
@@ -532,4 +646,12 @@ fn build_redistribution_start_query(
     push_query_value(&mut query, "object_concurrency", object_concurrency);
     push_query_value(&mut query, "status_batch", status_batch);
     query
+}
+
+fn encode_query(value: &str) -> String {
+    utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
+}
+
+fn encode_path(value: &str) -> String {
+    encode_query(value).replace("%2F", "/")
 }

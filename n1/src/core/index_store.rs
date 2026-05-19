@@ -3040,7 +3040,7 @@ mod tests {
             root.join(fragment)
                 .join(OBJECTS_DIR)
                 .join(format!("@o_{object_id}")),
-            "N1 1.1 object records must not use the old flat object directory"
+            "N1 object records must not use the old flat object directory"
         );
     }
 

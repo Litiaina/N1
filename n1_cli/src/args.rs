@@ -3,22 +3,23 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 const CLI_LONG_ABOUT: &str = "\
 Operator-first CLI for N1.
 
-Use this CLI to inspect health, track upload pressure, and run maintenance jobs
-without guessing the HTTP routes behind them. Global flags apply to every
-subcommand, so set the server URL, fragment, and secret once and keep the rest
-focused on the operation you need.
+Use this CLI to inspect health, track upload pressure, list namespace state,
+and run maintenance jobs without guessing the protocol routes behind them.
+When no HTTPS --url is provided, the CLI prefers the native n1:// transport
+from n1_config.ini or n1://127.0.0.1:50002.
 
 N1 authentication is fragment-scoped. For protected commands, pass either
 --fragment <name-or-hash> or --auth-fragment <name-or-hash>.";
 
 const CLI_AFTER_HELP: &str = "\
 Examples:
-  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> --fragment mainframe health
-  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> --fragment mainframe health --watch
-  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> --fragment mainframe uploads list
-  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> --fragment mainframe repair start --mode availability
-  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> --fragment mainframe redistribute start --mode strict --durability strict
-  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> --fragment mainframe gc watch";
+  litiaina-n1-cli --secret <secret> --fragment mainframe console
+  litiaina-n1-cli --secret <secret> --fragment mainframe health
+  litiaina-n1-cli --secret <secret> --fragment mainframe namespace list --path docs
+  litiaina-n1-cli --secret <secret> --fragment mainframe uploads list
+  litiaina-n1-cli --secret <secret> --fragment mainframe repair start --mode availability
+  litiaina-n1-cli --secret <secret> --fragment mainframe redistribute start --mode strict --durability strict
+  litiaina-n1-cli --url https://n1.local:50001 --secret <secret> --fragment mainframe health";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -65,9 +66,17 @@ pub struct Cli {
         long,
         global = true,
         help_heading = "Connection",
-        help = "Base server URL, for example https://127.0.0.1:50001."
+        help = "Compatibility HTTPS API URL, for example https://127.0.0.1:50001. If omitted, the CLI prefers native n1://."
     )]
     pub url: Option<String>,
+
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Connection",
+        help = "Native N1 URL, for example n1://127.0.0.1:50002. Overrides config/default native endpoint."
+    )]
+    pub native_url: Option<String>,
 
     #[arg(
         long,
@@ -100,6 +109,12 @@ pub struct Cli {
 #[derive(Subcommand, Debug, Clone)]
 pub enum Commands {
     #[command(
+        about = "Open a stateful native N1 operator console.",
+        long_about = "Open a persistent n1:// session for monitoring, listing, object status/repair, GC, repair, redistribution, and quota checks."
+    )]
+    Console,
+
+    #[command(
         about = "Manage engine fragments.",
         long_about = "Create or inspect fragment-level access scopes used by N1."
     )]
@@ -125,6 +140,24 @@ pub enum Commands {
             help = "Ask the engine to perform a deeper partition scan instead of using the lighter cached view."
         )]
         deep_scan: bool,
+    },
+
+    #[command(
+        about = "Read namespace state.",
+        long_about = "Read-only namespace commands for listing and stat. The CLI intentionally does not expose namespace rename/delete/update operations."
+    )]
+    Namespace {
+        #[command(subcommand)]
+        command: NamespaceCommands,
+    },
+
+    #[command(
+        about = "Inspect or repair a single object.",
+        long_about = "Object status and repair commands. Repair is object-scoped and does not lock the whole fragment."
+    )]
+    Object {
+        #[command(subcommand)]
+        command: ObjectCommands,
     },
 
     #[command(
@@ -169,8 +202,64 @@ pub enum FragmentCommands {
     #[command(about = "Create a fragment with a caller-provided name and key.")]
     Create(FragmentCreateArgs),
 
+    #[command(about = "List fragments visible to the server.")]
+    List,
+
+    #[command(about = "Resolve a fragment name to its hash.")]
+    Hash {
+        #[arg(long, help = "Fragment name or hash to resolve.")]
+        fragment: Option<String>,
+    },
+
+    #[command(about = "Show quota/usage for the authenticated fragment.")]
+    Quota,
+
     #[command(about = "Resize a fragment quota as an explicit admin operation.")]
     ResizeQuota(FragmentResizeQuotaArgs),
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum NamespaceCommands {
+    #[command(about = "List one namespace directory.")]
+    List {
+        #[arg(long, default_value = "", help = "Namespace path to list.")]
+        path: String,
+        #[arg(long, default_value_t = 200, help = "Maximum entries to return.")]
+        limit: usize,
+    },
+
+    #[command(about = "Stat one namespace path.")]
+    Stat {
+        #[arg(long, help = "Namespace path to inspect.")]
+        path: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ObjectCommands {
+    #[command(about = "Check one object status.")]
+    Status {
+        #[arg(long, help = "Object key / namespace path.")]
+        object_key: String,
+        #[arg(
+            long,
+            default_value = "availability",
+            help = "availability, checksum, strict, or scrub."
+        )]
+        mode: String,
+    },
+
+    #[command(about = "Repair one object.")]
+    Repair {
+        #[arg(long, help = "Object key / namespace path.")]
+        object_key: String,
+        #[arg(
+            long,
+            default_value = "strict",
+            help = "availability, checksum, strict, or scrub."
+        )]
+        mode: String,
+    },
 }
 
 #[derive(Args, Debug, Clone)]

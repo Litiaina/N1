@@ -19,8 +19,8 @@
 
 This repository contains the storage platform stack built around four runtime components:
 
-> - `N1` (`1.1.1`)
-  Primary N1 storage kernel with an N1 namespace, two-level fanned immutable `.objects/<hh>/<hh>/@o_<object-id>` records, zero-decode listing, object-level repair/status, and the N1 blob/shard/parity plane. See `N1_DOCUMENTATION.md`.
+> - `N1` (`1.2.0`)
+  Primary N1 storage kernel with an N1 namespace, two-level fanned immutable `.objects/<hh>/<hh>/@o_<object-id>` records, zero-decode listing, object-level repair/status, the N1 blob/shard/parity plane, and the native `n1://` protocol for internal tools. See `N1_DOCUMENTATION.md`.
 > - `N2` (`0.4.0`)
   Multi-node clustering and placement layer built on top of the `N1` storage kernel, with real-prefix namespace directories, symlink object entries, immutable filesystem `.nmtd` cluster metadata, one cluster EC pass, and an S3-compatible path-style object surface.
 > - `NS` (`1.0.0`)
@@ -67,7 +67,7 @@ The current N1 line retires the old Standard/indexdb engine from the active work
 
 ### N1
 
-`N1 1.1.1` is the primary N1 storage kernel and the default N1 face for new deployments.
+`N1 1.2.0` is the primary N1 storage kernel and the default N1 face for new deployments.
 
 It keeps the N1 object/blob plane, repair model, redistribution model, GC model, and public route shape, with active storage authority in explicit N1 planes:
 
@@ -83,6 +83,11 @@ index_root/<fragment_hash>/
 Folders are real directories. File names are namespace symlinks whose payload is a stable object id. Object records live in two-level fanned `.objects/<hh>/<hh>/@o_<object-id>/` directories, each committed version is an immutable `.ndx` file, and normal listing reads direct directory children plus `.ndx` filenames only. Payload shards live under the explicit internal `.blobs/` directory so user namespace names such as `blob/` remain valid. Normal listing does not decode `.ndx` bodies.
 
 Use `N1` when the goal is the Linux-first, IO-bound N1 storage kernel.
+
+N1 exposes two supported transport faces:
+
+- HTTPS `/n1/...` for consumer APIs, browser clients, and broad compatibility.
+- Native `n1://` for N1 Console, N1 CLI, NS, N2, and trusted internal tools that need lower control-plane latency.
 
 ### N2
 
@@ -146,7 +151,7 @@ Clients / UI / CLI
                                     optional cold sync to N1
 ```
 
-For standalone `N1 1.1`, the internal model is:
+For standalone `N1 1.2`, the internal model is:
 
 ```text
 index_root/<fragment_hash>/
@@ -306,30 +311,32 @@ curl -k https://127.0.0.1:50001/n1/auth/fragment \
 
 ### N1 Operator CLI
 
-`n1_cli` is aligned with the stable `/n1/...` surface. It is an operator CLI, not a general file-transfer client.
+`n1_cli` is the operator CLI for N1 health, maintenance, fragments, namespace reads, object status/repair, quota operations, and upload inspection. In N1 1.2, the CLI prefers the native `n1://` transport by default. HTTPS remains available only when `--url <https-url>` is provided for compatibility.
 
-Protected CLI commands authenticate through `/n1/auth/fragment`, so pass `--fragment <name-or-hash>` or `--auth-fragment <name-or-hash>` when talking to a real server.
+Protected CLI commands authenticate with fragment-scoped credentials over the selected transport, so pass `--fragment <name-or-hash>` or `--auth-fragment <name-or-hash>` when talking to a real server. The native endpoint is discovered from `--native-url`, then `N1_NATIVE_URL`, then `n1_config.ini`, then `n1://127.0.0.1:50002`.
 
 Examples:
 
 ```bash
 cargo run -p n1_cli -- \
-  --url <url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  console
+
+cargo run -p n1_cli -- \
   --secret <secret> \
   --fragment <fragment> \
   health --deep-scan
 
 cargo run -p n1_cli -- \
-  --url <url> \
   --secret <secret> \
   --fragment <fragment> \
-  uploads status --version-id <version_id>
+  namespace list --path docs
 
 cargo run -p n1_cli -- \
-  --url <url> \
   --secret <secret> \
   --fragment <fragment> \
-  repair status
+  object status --object-key docs/video.mp4
 ```
 
 Common commands:
@@ -337,73 +344,102 @@ Common commands:
 ```bash
 # Create a fragment
 cargo run -p n1_cli -- \
-  --url <url> \
   --secret <secret> \
   fragment create --name <fragment_name> --key <fragment_key> --quota-bytes <bytes>
 
 # Health
 cargo run -p n1_cli -- \
-  --url <url> \
   --secret <secret> \
   --fragment <fragment> \
   health
 
 cargo run -p n1_cli -- \
-  --url <url> \
   --secret <secret> \
   --fragment <fragment> \
   health --watch --deep-scan
 
+# Namespace reads
+cargo run -p n1_cli -- \
+  --secret <secret> \
+  --fragment <fragment> \
+  namespace list --path docs --limit 200
+
+cargo run -p n1_cli -- \
+  --secret <secret> \
+  --fragment <fragment> \
+  namespace stat --path docs/video.mp4
+
+# Object health and repair
+cargo run -p n1_cli -- \
+  --secret <secret> \
+  --fragment <fragment> \
+  object status --object-key docs/video.mp4 --mode strict
+
+cargo run -p n1_cli -- \
+  --secret <secret> \
+  --fragment <fragment> \
+  object repair --object-key docs/video.mp4 --mode strict
+
 # Multipart uploads
 cargo run -p n1_cli -- \
-  --url <url> \
   --secret <secret> \
   --fragment <fragment> \
   uploads list --limit 100 --offset 0
 
 cargo run -p n1_cli -- \
-  --url <url> \
   --secret <secret> \
   --fragment <fragment> \
   uploads status --version-id <version_id>
 
 # GC
 cargo run -p n1_cli -- \
-  --url <url> \
   --secret <secret> \
   --fragment <fragment> \
   gc status
 
 cargo run -p n1_cli -- \
-  --url <url> \
   --secret <secret> \
   --fragment <fragment> \
   gc start
 
 # Repair dry-run
 cargo run -p n1_cli -- \
-  --url <url> \
   --secret <secret> \
   --fragment <fragment> \
   repair start --dry-run --mode availability
 
 # Redistribution dry-run
 cargo run -p n1_cli -- \
-  --url <url> \
   --secret <secret> \
   --fragment <fragment> \
   redistribute start --dry-run --mode availability --durability auto --scope all
 
+# Fragment quota
+cargo run -p n1_cli -- \
+  --secret <secret> \
+  --fragment <fragment> \
+  fragment quota
+
+cargo run -p n1_cli -- \
+  --secret <secret> \
+  --fragment <fragment> \
+  fragment resize-quota --quota-bytes <bytes> --master-secret <master-secret>
+
 # JSON output
 cargo run -p n1_cli -- \
-  --url <url> \
   --secret <secret> \
   --fragment <fragment> \
   --json repair status
 
+# HTTPS compatibility
+cargo run -p n1_cli -- \
+  --url <https-url> \
+  --secret <secret> \
+  --fragment <fragment> \
+  health
+
 # Use a different fragment only for auth
 cargo run -p n1_cli -- \
-  --url <url> \
   --secret <secret> \
   --fragment <target_fragment> \
   --auth-fragment <auth_fragment> \
