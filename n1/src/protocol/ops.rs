@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use axum::body::to_bytes;
+use axum::body::{Body, to_bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -39,7 +39,8 @@ use crate::core::sync::CreateFragmentRequest;
 use crate::core::upload::{
     FinalizeUploadResult, cancel_upload_session_direct, finalize_object_upload_direct,
     get_upload_status, initiate_object_upload_direct, list_active_uploads,
-    object_upload_part_direct, upload_object_one_shot_direct,
+    object_upload_part_body_direct, object_upload_part_direct, upload_object_one_shot_body_direct,
+    upload_object_one_shot_direct,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::middleware::auth_middleware::AuthError;
@@ -70,6 +71,87 @@ pub async fn execute_native_op(
         Ok(value) => Ok(value),
         Err(err) => Err(native_app_error(err)),
     }
+}
+
+pub async fn execute_native_streaming_op(
+    state: Arc<AppState>,
+    session: &NativeSession,
+    op: &str,
+    payload: Value,
+    body: Body,
+    body_len: u64,
+) -> Result<Option<(NativeOpResponse, Vec<u8>)>, NativeExecutionError> {
+    let result =
+        execute_native_streaming_op_inner(state, session, op, payload, body, body_len).await;
+    match result {
+        Ok(value) => Ok(value),
+        Err(err) => Err(native_app_error(err)),
+    }
+}
+
+async fn execute_native_streaming_op_inner(
+    state: Arc<AppState>,
+    session: &NativeSession,
+    op: &str,
+    payload: Value,
+    body: Body,
+    body_len: u64,
+) -> Result<Option<(NativeOpResponse, Vec<u8>)>, AppError> {
+    let claims = require_claims(session)?;
+    let response = match op {
+        "upload.one_shot" | "object.upload.one_shot" => {
+            require_write(&claims)?;
+            let fragment = claims.fragment.clone();
+            let logical = required_string(&payload, "object_key")?;
+            let physical = resolve_logical_write_key(&fragment, &logical).await?;
+            let mut metadata = upload_object_one_shot_body_direct(
+                claims,
+                fragment.clone(),
+                physical.clone(),
+                upload_part_query_from_payload(&payload)?,
+                string_field(&payload, "content_type"),
+                body,
+                body_len,
+                true,
+            )
+            .await?;
+            let committed_physical =
+                commit_logical_upload_from_meta(&fragment, &logical, &physical, &metadata).await?;
+            metadata.object_key = logical;
+            emit_logical_file_uploaded(
+                &state,
+                &fragment,
+                &metadata.object_key,
+                &committed_physical,
+                &metadata,
+            );
+            metadata.strip_internal_layout();
+            Some((op_response(201), native_body_bytes(&metadata)))
+        }
+        "multipart.put_part" | "upload.multipart.put_part" => {
+            require_write(&claims)?;
+            let version_id = required_string(&payload, "version_id")?;
+            let part_index = u64_field(&payload, "part_index")
+                .ok_or_else(|| AppError::BadRequest("part_index is required".into()))?;
+            object_upload_part_body_direct(
+                claims.clone(),
+                claims.fragment.clone(),
+                version_id.clone(),
+                part_index,
+                upload_part_query_from_payload(&payload)?,
+                body,
+                body_len,
+            )
+            .await?;
+            Some(native_body(json!({
+                "version_id": version_id,
+                "part_index": part_index,
+                "uploaded": true,
+            })))
+        }
+        _ => None,
+    };
+    Ok(response)
 }
 
 async fn execute_native_op_inner(

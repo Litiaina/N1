@@ -253,7 +253,7 @@ The native protocol does not create another storage engine, another namespace, a
 - `object.download_chunk`
 - `object.download`
 
-Upload bodies are sent as raw bytes after a small MessagePack control frame. This keeps the native protocol from inflating large upload parts inside the request envelope.
+Upload bodies are sent as raw bytes after a small MessagePack control frame. The server streams those bytes through a bounded internal pipe into the N1 upload core, so large native one-shot uploads and multipart parts do not become whole in-memory protocol frames.
 
 ### Configuration
 

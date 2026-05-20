@@ -37,7 +37,7 @@ TCP connection
 
 The server stores auth state per native connection. `auth.fragment` calls the fragment authorization core directly, then the returned JWT is attached to later typed native operations. Native does not contain an HTTP route bridge and does not dispatch through Axum. Operations such as `namespace.stat`, `maintenance.health`, `object.status`, and `fragment.quota` call the same N1 core/service functions that HTTPS routes use.
 
-Native protocol performance depends on avoiding small-frame TCP latency and avoiding binary payload inflation. N1 sets `TCP_NODELAY` on accepted native sockets. Protocol `n1/0.3` sends upload payloads as raw bytes after a small MessagePack control frame instead of embedding large bodies inside the MessagePack frame. The Rust release proof includes native namespace and upload benchmarks so delayed-ACK/Nagle regressions and native data-plane regressions are caught.
+Native protocol performance depends on avoiding small-frame TCP latency and avoiding binary payload inflation. N1 sets `TCP_NODELAY` on accepted native sockets. Protocol `n1/0.3` sends upload payloads as raw bytes after a small MessagePack control frame instead of embedding large bodies inside the MessagePack frame. Native upload dispatch streams those raw bytes through a bounded internal pipe into the same N1 upload core, so one-shot and multipart parts are not materialized as whole protocol buffers on the server. The Rust release proof includes native namespace and upload benchmarks so delayed-ACK/Nagle regressions and native data-plane regressions are caught.
 
 The native plane must not:
 
