@@ -237,6 +237,20 @@ pub enum NamespaceCommands {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum ObjectCommands {
+    #[command(about = "Read object metadata.")]
+    Meta {
+        #[arg(long, help = "Object key / namespace path.")]
+        object_key: String,
+        #[arg(long, help = "Optional exact version id.")]
+        version_id: Option<String>,
+    },
+
+    #[command(about = "List committed versions for one object.")]
+    Versions {
+        #[arg(long, help = "Object key / namespace path.")]
+        object_key: String,
+    },
+
     #[command(about = "Check one object status.")]
     Status {
         #[arg(long, help = "Object key / namespace path.")]

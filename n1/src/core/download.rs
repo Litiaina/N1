@@ -118,7 +118,7 @@ pub async fn download_object_chunk_direct(
     Ok(result_buffer)
 }
 
-async fn download_object_chunk_from_metadata(
+pub(crate) async fn download_object_chunk_from_metadata(
     metadata: ObjectMetadata,
     params: &ChunkQuery,
 ) -> Result<(Vec<u8>, Option<String>), AppError> {

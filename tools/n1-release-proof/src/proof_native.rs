@@ -17,6 +17,7 @@ struct NativeProofResponse {
     status: Option<u16>,
     payload: Option<String>,
     body: Option<serde_bytes::ByteBuf>,
+    body_len: Option<u64>,
     error: Option<Value>,
 }
 
@@ -115,7 +116,7 @@ impl Proof {
                 "content_type": "application/octet-stream",
                 "durability": "batched",
             }),
-            Some(native_one_shot_payload),
+            Some(native_one_shot_payload.clone()),
         )
         .await?;
         ensure_native_status(&native_upload, 201, "native one-shot upload")?;
@@ -209,6 +210,235 @@ impl Proof {
         if download_chunk.body.as_ref().map(|body| body.len()) != Some(64 * 1024) {
             return Err("native download chunk returned the wrong byte count".into());
         }
+
+        let full_download = native_round_trip(
+            &mut stream,
+            "native-full-download",
+            "object.download",
+            json!({"object_key": native_one_shot_key}),
+            None,
+        )
+        .await?;
+        ensure_native_status(&full_download, 200, "native full download")?;
+        if full_download.body.as_ref().map(|body| body.as_slice())
+            != Some(native_one_shot_payload.as_slice())
+        {
+            return Err("native full download returned different bytes".into());
+        }
+
+        let meta = native_round_trip(
+            &mut stream,
+            "native-object-meta",
+            "object.meta",
+            json!({"object_key": native_multipart_key}),
+            None,
+        )
+        .await?;
+        ensure_native_status(&meta, 200, "native object metadata")?;
+        let meta_body = native_json_body(&meta)?;
+        if meta_body
+            .get("total_size_bytes")
+            .and_then(Value::as_u64)
+            != Some(native_multipart_payload.len() as u64)
+        {
+            return Err(format!("native metadata size mismatch: {meta_body}").into());
+        }
+
+        let versions = native_round_trip(
+            &mut stream,
+            "native-object-versions",
+            "object.versions",
+            json!({"object_key": native_multipart_key}),
+            None,
+        )
+        .await?;
+        ensure_native_status(&versions, 200, "native object versions")?;
+        if native_json_body(&versions)?
+            .as_array()
+            .is_none_or(|versions| versions.is_empty())
+        {
+            return Err("native object versions returned no versions".into());
+        }
+
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-object-status",
+                "object.status",
+                json!({"object_key": native_multipart_key, "mode": "availability"}),
+                None,
+            )
+            .await?,
+            200,
+            "native object status",
+        )?;
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-object-repair",
+                "object.repair",
+                json!({"object_key": native_multipart_key, "mode": "availability"}),
+                None,
+            )
+            .await?,
+            200,
+            "native object repair",
+        )?;
+
+        let rename_source = format!("{}native-protocol/rename-source.bin", self.args.prefix);
+        let rename_dest = format!("{}native-protocol/rename-dest.bin", self.args.prefix);
+        let rename_payload = deterministic_payload(128 * 1024, b"native-rename-object");
+        let rename_sha = sha256_bytes(&rename_payload);
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-rename-upload",
+                "upload.one_shot",
+                json!({
+                    "object_key": rename_source,
+                    "content_type": "application/octet-stream",
+                    "durability": "batched",
+                }),
+                Some(rename_payload),
+            )
+            .await?,
+            201,
+            "native upload before object rename",
+        )?;
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-object-rename",
+                "object.rename",
+                json!({"source_key": rename_source, "destination_key": rename_dest}),
+                None,
+            )
+            .await?,
+            200,
+            "native object rename",
+        )?;
+        self.assert_download_sha256(&rename_dest, &rename_sha).await?;
+
+        let recover_version_key = format!("{}native-protocol/version-recover.bin", self.args.prefix);
+        let recover_payload = deterministic_payload(96 * 1024, b"native-version-recover");
+        let recover_sha = sha256_bytes(&recover_payload);
+        let recover_upload = native_round_trip(
+            &mut stream,
+            "native-version-recover-upload",
+            "upload.one_shot",
+            json!({
+                "object_key": recover_version_key,
+                "content_type": "application/octet-stream",
+                "durability": "batched",
+            }),
+            Some(recover_payload),
+        )
+        .await?;
+        ensure_native_status(&recover_upload, 201, "native version recover upload")?;
+        let recover_version_id = native_json_body(&recover_upload)?
+            .get("version_id")
+            .and_then(Value::as_str)
+            .ok_or("native version recover upload missing version_id")?
+            .to_string();
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-version-recover-trash",
+                "object.delete",
+                json!({"object_key": recover_version_key}),
+                None,
+            )
+            .await?,
+            200,
+            "native version recover soft delete",
+        )?;
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-version-recover",
+                "object.version.recover",
+                json!({
+                    "object_key": recover_version_key,
+                    "version_id": recover_version_id,
+                }),
+                None,
+            )
+            .await?,
+            200,
+            "native version recover",
+        )?;
+        self.assert_download_sha256(&recover_version_key, &recover_sha)
+            .await?;
+
+        let bulk_a = format!("{}native-protocol/bulk-a.bin", self.args.prefix);
+        let bulk_b = format!("{}native-protocol/bulk-b.bin", self.args.prefix);
+        for (idx, key) in [&bulk_a, &bulk_b].into_iter().enumerate() {
+            ensure_native_status(
+                &native_round_trip(
+                    &mut stream,
+                    &format!("native-bulk-upload-{idx}"),
+                    "upload.one_shot",
+                    json!({
+                        "object_key": key,
+                        "content_type": "application/octet-stream",
+                        "durability": "batched",
+                    }),
+                    Some(deterministic_payload(64 * 1024, key.as_bytes())),
+                )
+                .await?,
+                201,
+                "native bulk seed upload",
+            )?;
+        }
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-bulk-delete",
+                "object.bulk_delete",
+                json!({"object_keys": [bulk_a.clone(), bulk_b.clone()]}),
+                None,
+            )
+            .await?,
+            200,
+            "native bulk delete",
+        )?;
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-bulk-recover",
+                "object.bulk_recover",
+                json!({"object_keys": [bulk_a.clone(), bulk_b.clone()]}),
+                None,
+            )
+            .await?,
+            200,
+            "native bulk recover",
+        )?;
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-bulk-delete-again",
+                "object.bulk_delete",
+                json!({"object_keys": [bulk_a.clone(), bulk_b.clone()]}),
+                None,
+            )
+            .await?,
+            200,
+            "native bulk delete before purge",
+        )?;
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-bulk-purge",
+                "object.bulk_purge",
+                json!({"object_keys": [bulk_a, bulk_b]}),
+                None,
+            )
+            .await?,
+            200,
+            "native bulk purge",
+        )?;
+
         let cancel_key = format!("{}native-protocol/cancel-me.bin", self.args.prefix);
         let cancel_init = native_round_trip(
             &mut stream,
@@ -373,7 +603,17 @@ impl Proof {
                 "multipart.put_part",
                 "multipart.finalize",
                 "multipart.cancel",
-                "object.download_chunk"
+                "object.download_chunk",
+                "object.download",
+                "object.meta",
+                "object.versions",
+                "object.status",
+                "object.repair",
+                "object.rename",
+                "object.version.recover",
+                "object.bulk_delete",
+                "object.bulk_recover",
+                "object.bulk_purge"
             ],
             "status": "PASS"
         }))
@@ -411,7 +651,16 @@ async fn native_round_trip(
     let len = u32::from_be_bytes(len) as usize;
     let mut frame = vec![0u8; len];
     stream.read_exact(&mut frame).await?;
-    let response = rmp_serde::from_slice::<NativeProofResponse>(&frame)?;
+    let mut response = rmp_serde::from_slice::<NativeProofResponse>(&frame)?;
+    if response.body.is_none() {
+        if let Some(body_len) = response.body_len {
+            let mut body = vec![0u8; body_len as usize];
+            if !body.is_empty() {
+                stream.read_exact(&mut body).await?;
+            }
+            response.body = Some(serde_bytes::ByteBuf::from(body));
+        }
+    }
     if response.id != id {
         return Err(format!("native response id mismatch: got {} expected {}", response.id, id).into());
     }

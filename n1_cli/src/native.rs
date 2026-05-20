@@ -38,6 +38,7 @@ struct NativeRequest {
     op: String,
     payload: Option<String>,
     body: Option<ByteBuf>,
+    body_len: Option<u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -47,6 +48,7 @@ struct NativeResponse {
     status: Option<u16>,
     payload: Option<String>,
     body: Option<ByteBuf>,
+    body_len: Option<u64>,
     error: Option<NativeError>,
 }
 
@@ -253,6 +255,23 @@ async fn handle_native_authenticated_command(
             }
         },
         Commands::Object { command } => match command {
+            ObjectCommands::Meta {
+                object_key,
+                version_id,
+            } => {
+                let mut payload = json!({"object_key": object_key});
+                if let Some(version_id) = version_id {
+                    payload["version_id"] = Value::String(version_id.clone());
+                }
+                let value: Value = client.operation_json("object.meta", payload, None).await?;
+                print_json_value(cli.json, &value)
+            }
+            ObjectCommands::Versions { object_key } => {
+                let value: Value = client
+                    .operation_json("object.versions", json!({"object_key": object_key}), None)
+                    .await?;
+                print_json_value(cli.json, &value)
+            }
             ObjectCommands::Status { object_key, mode } => {
                 let value: Value = client
                     .mapped_json(
@@ -644,6 +663,18 @@ async fn handle_console_line(
                 .await?;
             print_json_value(cli.json, &value)
         }
+        ["object", "meta", object_key] => {
+            let value: Value = client
+                .operation_json("object.meta", json!({"object_key": object_key}), None)
+                .await?;
+            print_json_value(cli.json, &value)
+        }
+        ["object", "versions", object_key] => {
+            let value: Value = client
+                .operation_json("object.versions", json!({"object_key": object_key}), None)
+                .await?;
+            print_json_value(cli.json, &value)
+        }
         ["object", "repair", object_key] => {
             let value: Value = client
                 .mapped_json(
@@ -667,7 +698,7 @@ async fn handle_console_line(
 
 fn print_console_help() {
     println!(
-        "commands:\n  health\n  quota\n  fragments\n  list [path]\n  stat <path>\n  uploads\n  upload <version_id>\n  gc status|start\n  repair status|start\n  redistribute status|start\n  object status <object_key>\n  object repair <object_key>\n  session\n  exit"
+        "commands:\n  health\n  quota\n  fragments\n  list [path]\n  stat <path>\n  uploads\n  upload <version_id>\n  gc status|start\n  repair status|start\n  redistribute status|start\n  object meta <object_key>\n  object versions <object_key>\n  object status <object_key>\n  object repair <object_key>\n  session\n  exit"
     );
 }
 
@@ -811,6 +842,22 @@ impl NativeN1Client {
         Ok(serde_json::from_str(&payload)?)
     }
 
+    async fn operation_json<T: DeserializeOwned>(
+        &mut self,
+        op: &str,
+        payload: Value,
+        body: Option<Vec<u8>>,
+    ) -> Result<T, DynError> {
+        let response = self.round_trip(op, payload, body).await?;
+        ensure_native_ok(&response)?;
+        let body = response
+            .body
+            .as_ref()
+            .map(|body| body.as_slice())
+            .unwrap_or_default();
+        Ok(rmp_serde::from_slice(body)?)
+    }
+
     async fn round_trip(
         &mut self,
         op: &str,
@@ -823,7 +870,8 @@ impl NativeN1Client {
             id: id.clone(),
             op: op.to_string(),
             payload: Some(serde_json::to_string(&payload)?),
-            body: body.map(ByteBuf::from),
+            body_len: body.as_ref().map(|body| body.len() as u64),
+            body: None,
         };
         let bytes = rmp_serde::to_vec(&request)?;
         if bytes.is_empty() || bytes.len() > MAX_NATIVE_FRAME_BYTES {
@@ -837,6 +885,9 @@ impl NativeN1Client {
             .write_all(&(bytes.len() as u32).to_be_bytes())
             .await?;
         self.stream.write_all(&bytes).await?;
+        if let Some(body) = body {
+            self.stream.write_all(&body).await?;
+        }
         self.stream.flush().await?;
 
         let mut len = [0u8; 4];
@@ -849,7 +900,16 @@ impl NativeN1Client {
         }
         let mut frame = vec![0u8; len];
         self.stream.read_exact(&mut frame).await?;
-        let response = rmp_serde::from_slice::<NativeResponse>(&frame)?;
+        let mut response = rmp_serde::from_slice::<NativeResponse>(&frame)?;
+        if response.body.is_none() {
+            if let Some(body_len) = response.body_len {
+                let mut body = vec![0u8; body_len as usize];
+                if !body.is_empty() {
+                    self.stream.read_exact(&mut body).await?;
+                }
+                response.body = Some(ByteBuf::from(body));
+            }
+        }
         if response.id != id {
             return Err(io::Error::other(format!(
                 "native response id mismatch: got {} expected {id}",

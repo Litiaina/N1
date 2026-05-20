@@ -1973,6 +1973,28 @@ pub async fn object_upload_part_direct(
     query: UploadPartQuery,
     body: Vec<u8>,
 ) -> Result<(), AppError> {
+    let content_length = body.len() as u64;
+    object_upload_part_body_direct(
+        claims,
+        fragment,
+        version_id,
+        part_index,
+        query,
+        Body::from(body),
+        content_length,
+    )
+    .await
+}
+
+pub async fn object_upload_part_body_direct(
+    claims: Claims,
+    fragment: String,
+    version_id: String,
+    part_index: u64,
+    query: UploadPartQuery,
+    body: Body,
+    content_length: u64,
+) -> Result<(), AppError> {
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
     }
@@ -1983,7 +2005,6 @@ pub async fn object_upload_part_direct(
     let durability_mode = parse_upload_durability_mode(&query);
     let strict_durability = durability_mode.strict();
     let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
-    let content_length = body.len() as u64;
     let gate_context = format!(
         "fragment={}, version={}, part={}",
         fragment, version_id, part_index
@@ -2056,7 +2077,7 @@ pub async fn object_upload_part_direct(
         manifest_data_shards(&manifest),
         manifest_parity_shards(&manifest),
         manifest.stripe_size_bytes,
-        Body::from(body),
+        body,
         expected_checksum,
         strict_durability,
     )
@@ -2209,6 +2230,30 @@ pub async fn upload_object_one_shot_direct(
     body: Vec<u8>,
     acquire_io_gate: bool,
 ) -> Result<ObjectMetadata, AppError> {
+    let content_length = body.len() as u64;
+    upload_object_one_shot_body_direct(
+        claims,
+        fragment,
+        object_key,
+        query,
+        content_type,
+        Body::from(body),
+        content_length,
+        acquire_io_gate,
+    )
+    .await
+}
+
+pub async fn upload_object_one_shot_body_direct(
+    claims: Claims,
+    fragment: String,
+    object_key: String,
+    query: UploadPartQuery,
+    content_type: Option<String>,
+    body: Body,
+    content_length: u64,
+    acquire_io_gate: bool,
+) -> Result<ObjectMetadata, AppError> {
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
     }
@@ -2218,7 +2263,6 @@ pub async fn upload_object_one_shot_direct(
 
     let durability_mode = parse_upload_durability_mode(&query);
     let strict_durability = durability_mode.strict();
-    let content_length = body.len() as u64;
     let gate_context = format!("fragment={}, object_key={}", fragment, object_key);
     let _io_guard = if acquire_io_gate {
         acquire_upload_io_guard_for_size(query.io_gate, &gate_context, content_length).await?
@@ -2255,7 +2299,7 @@ pub async fn upload_object_one_shot_direct(
         configured_data_shards(),
         configured_parity_shards(),
         stripe_size,
-        Body::from(body),
+        body,
         expected_checksum,
         strict_durability,
     )

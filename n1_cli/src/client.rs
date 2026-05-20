@@ -244,6 +244,63 @@ async fn handle_authenticated_command(
             }
         },
         Commands::Object { command } => match command {
+            ObjectCommands::Meta {
+                object_key,
+                version_id,
+            } => {
+                let value: Value = if let Some(version_id) = version_id {
+                    let versions: Value = fetch_json(
+                        client,
+                        base_url,
+                        session,
+                        &format!(
+                            "{}/{}",
+                            api_url(base_url, "/n1/objects/versions"),
+                            encode_path(object_key)
+                        ),
+                    )
+                    .await?;
+                    versions
+                        .as_array()
+                        .and_then(|items| {
+                            items.iter().find(|item| {
+                                item.get("version_id").and_then(Value::as_str)
+                                    == Some(version_id.as_str())
+                            })
+                        })
+                        .cloned()
+                        .ok_or_else(|| {
+                            std::io::Error::other(format!("version {version_id} was not found"))
+                        })?
+                } else {
+                    fetch_json(
+                        client,
+                        base_url,
+                        session,
+                        &format!(
+                            "{}/{}",
+                            api_url(base_url, "/n1/objects/meta"),
+                            encode_path(object_key)
+                        ),
+                    )
+                    .await?
+                };
+                print_output(cli.json, &value, &serde_json::to_string_pretty(&value)?)
+            }
+            ObjectCommands::Versions { object_key } => {
+                let value: Value = fetch_json(
+                    client,
+                    base_url,
+                    session,
+                    &format!(
+                        "{}/{}",
+                        api_url(base_url, "/n1/objects/versions"),
+                        encode_path(object_key)
+                    ),
+                )
+                .await?;
+                print_output(cli.json, &value, &serde_json::to_string_pretty(&value)?)
+            }
             ObjectCommands::Status { object_key, mode } => {
                 let value: Value = fetch_json(
                     client,

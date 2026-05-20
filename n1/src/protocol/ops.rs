@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use axum::body::to_bytes;
@@ -11,11 +11,18 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::core::disk_manager::{ChunkQuery, InitiateUploadParams, UploadPartQuery};
-use crate::core::fragment_manager::create_fragment;
+use crate::core::delete::delete_object_version;
+use crate::core::disk_manager::{
+    ChunkQuery, InitiateUploadParams, ObjectMetadata, UploadPartQuery,
+};
+use crate::core::fragment_manager::{
+    UpdateFragmentRequest, create_fragment, delete_fragment, update_fragment,
+};
 use crate::core::garbage_collector::{
     get_gc_status, run_garbage_collector, stop_garbage_collector,
 };
+use crate::core::index;
+use crate::core::metadata_parser::get_version_metadata;
 use crate::core::monitoring::system_health_snapshot;
 use crate::core::redistribution::{
     get_redist_status, stop_redistribution_job_api, trigger_redistribution_job_api,
@@ -26,7 +33,7 @@ use crate::core::repair_manager::{
 };
 use crate::core::retrieve::{get_object_metadata_direct, list_fragments};
 use crate::core::storage_capacity_parser::{
-    ResizeFragmentQuotaRequest, get_fragment_quota_usage, resize_fragment_quota,
+    ResizeFragmentQuotaRequest, get_capacity_usage, get_fragment_quota_usage, resize_fragment_quota,
 };
 use crate::core::sync::CreateFragmentRequest;
 use crate::core::upload::{
@@ -73,7 +80,7 @@ async fn execute_native_op_inner(
     _body: Option<Vec<u8>>,
 ) -> Result<Option<(NativeOpResponse, Vec<u8>)>, AppError> {
     let claims = match op {
-        "fragment.create" | "fragment.hash.public" => None,
+        "fragment.create" | "fragment.hash.public" | "fragment.check" => None,
         _ => Some(require_claims(session)?),
     };
 
@@ -238,6 +245,145 @@ async fn execute_native_op_inner(
             let claims = claims.expect("claims required");
             let path = required_string(&payload, "object_key")?;
             native_body(posix_service::permanently_delete_path(state, claims, path).await?)
+        }
+        "object.rename" => {
+            let claims = claims.expect("claims required");
+            require_write_modify(&claims)?;
+            let source = string_field(&payload, "source_key")
+                .or_else(|| string_field(&payload, "source_path"))
+                .ok_or_else(|| AppError::BadRequest("source_key is required".into()))?;
+            let destination = string_field(&payload, "destination_key")
+                .or_else(|| string_field(&payload, "destination_path"))
+                .ok_or_else(|| AppError::BadRequest("destination_key is required".into()))?;
+            native_body(posix_service::rename_path(state, claims, source, destination).await?)
+        }
+        "object.meta" | "object.get" => {
+            let claims = claims.expect("claims required");
+            require_read(&claims)?;
+            let logical = required_string(&payload, "object_key")?;
+            let fragment = claims.fragment.clone();
+            let physical = resolve_logical_read_key(&fragment, &logical).await?;
+            let mut metadata = if let Some(version_id) = string_field(&payload, "version_id") {
+                get_version_metadata(&fragment, &physical, &version_id, &fragment).await?
+            } else {
+                get_object_metadata_direct(&fragment, &physical).await?
+            };
+            metadata.object_key = logical.trim_start_matches('/').to_string();
+            metadata.strip_internal_layout();
+            native_body(metadata)
+        }
+        "object.versions" => {
+            let claims = claims.expect("claims required");
+            require_read(&claims)?;
+            let logical = required_string(&payload, "object_key")?;
+            let fragment = claims.fragment.clone();
+            let physical = resolve_logical_read_key(&fragment, &logical).await?;
+            let mut versions =
+                index::list_live_object_versions_metadata(&fragment, &physical).await?;
+            for metadata in &mut versions {
+                metadata.object_key = logical.trim_start_matches('/').to_string();
+                metadata.strip_internal_layout();
+            }
+            native_body(versions)
+        }
+        "object.version.delete" => {
+            let claims = claims.expect("claims required");
+            require_write(&claims)?;
+            let fragment = claims.fragment.clone();
+            native_from_response(
+                delete_object_version(
+                    State(state),
+                    claims,
+                    Path((
+                        fragment,
+                        required_string(&payload, "version_id")?,
+                        required_string(&payload, "object_key")?,
+                    )),
+                )
+                .await?,
+            )
+            .await
+        }
+        "object.version.recover" => {
+            let claims = claims.expect("claims required");
+            require_write(&claims)?;
+            let fragment = claims.fragment.clone();
+            let version_id = required_string(&payload, "version_id")?;
+            let logical = required_string(&payload, "object_key")?;
+            let physical = resolve_any_logical_object_id(&fragment, &logical).await?;
+            let version_exists =
+                match index::read_object_version(&fragment, &physical, &version_id).await {
+                    Ok(_) => true,
+                    Err(AppError::NotFound) => {
+                        index::read_trashed_object_version(&fragment, &physical, &version_id)
+                            .await
+                            .is_ok()
+                    }
+                    Err(err) => return Err(err),
+                };
+            if !version_exists {
+                return Err(AppError::NotFound);
+            }
+            let summary = global_namespace_runtime()
+                .recover(&fragment, &logical)
+                .await?;
+            state.emit(
+                &fragment,
+                StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+                    &fragment,
+                    summary.clone(),
+                )),
+            );
+            native_body(json!({
+                "operation": summary.operation,
+                "object_key": logical,
+                "physical_object_id": physical,
+                "version_id": version_id,
+                "affected_paths": summary.affected_paths,
+                "affected_objects": summary.affected_objects,
+            }))
+        }
+        "object.bulk_delete" | "object.bulk.delete" => {
+            let claims = claims.expect("claims required");
+            require_write(&claims)?;
+            native_body(
+                native_bulk_namespace_operation(
+                    &state,
+                    &claims.fragment,
+                    string_array_field(&payload, "object_keys")?,
+                    "bulk_delete",
+                    BulkNamespaceMode::Trash,
+                )
+                .await?,
+            )
+        }
+        "object.bulk_recover" | "object.bulk.recover" => {
+            let claims = claims.expect("claims required");
+            require_write(&claims)?;
+            native_body(
+                native_bulk_namespace_operation(
+                    &state,
+                    &claims.fragment,
+                    string_array_field(&payload, "object_keys")?,
+                    "bulk_recover",
+                    BulkNamespaceMode::Recover,
+                )
+                .await?,
+            )
+        }
+        "object.bulk_purge" | "object.bulk.purge" => {
+            let claims = claims.expect("claims required");
+            require_delete(&claims)?;
+            native_body(
+                native_bulk_namespace_operation(
+                    &state,
+                    &claims.fragment,
+                    string_array_field(&payload, "object_keys")?,
+                    "bulk_delete_permanent",
+                    BulkNamespaceMode::Purge,
+                )
+                .await?,
+            )
         }
         "upload.one_shot" | "object.upload.one_shot" => {
             let claims = claims.expect("claims required");
@@ -405,17 +551,37 @@ async fn execute_native_op_inner(
             let fragment = claims.fragment.clone();
             let logical = required_string(&payload, "object_key")?;
             let physical = resolve_logical_read_key(&fragment, &logical).await?;
-            let bytes = crate::core::download::download_object_chunk_direct(
-                &fragment,
+            let metadata = if let Some(version_id) = string_field(&payload, "version_id") {
+                get_version_metadata(&fragment, &physical, &version_id, &fragment).await?
+            } else {
+                get_object_metadata_direct(&fragment, &physical).await?
+            };
+            let offset = u64_field(&payload, "offset").unwrap_or(0);
+            let chunk_size = usize_field(&payload, "chunk_size").unwrap_or(8 * 1024 * 1024);
+            let (bytes, _) = crate::core::download::download_object_chunk_from_metadata(
+                metadata,
                 &ChunkQuery {
                     object_key: physical,
-                    offset: u64_field(&payload, "offset").unwrap_or(0),
-                    chunk_size: usize_field(&payload, "chunk_size").unwrap_or(8 * 1024 * 1024),
+                    offset,
+                    chunk_size,
                 },
             )
             .await?;
             let status = if bytes.is_empty() { 204 } else { 200 };
             (op_response(status), bytes)
+        }
+        "object.download" | "object.stream" | "object.view" => {
+            let claims = claims.expect("claims required");
+            require_read(&claims)?;
+            let fragment = claims.fragment.clone();
+            let logical = required_string(&payload, "object_key")?;
+            let physical = resolve_logical_read_key(&fragment, &logical).await?;
+            let metadata = if let Some(version_id) = string_field(&payload, "version_id") {
+                get_version_metadata(&fragment, &physical, &version_id, &fragment).await?
+            } else {
+                get_object_metadata_direct(&fragment, &physical).await?
+            };
+            native_download_metadata(metadata, physical).await?
         }
         "maintenance.health" => {
             let claims = claims.expect("claims required");
@@ -474,6 +640,29 @@ async fn execute_native_op_inner(
             let claims = claims.expect("claims required");
             native_from_response(list_fragments(claims).await?).await
         }
+        "fragment.update" => {
+            let claims = claims.expect("claims required");
+            let fragment =
+                string_field(&payload, "fragment").unwrap_or_else(|| claims.fragment.clone());
+            let req: UpdateFragmentRequest = typed_payload(&payload)?;
+            native_from_response(
+                update_fragment(State(state), claims, Path(fragment), axum::Json(req)).await?,
+            )
+            .await
+        }
+        "fragment.delete" => {
+            let claims = claims.expect("claims required");
+            let fragment =
+                string_field(&payload, "fragment").unwrap_or_else(|| claims.fragment.clone());
+            native_from_response(delete_fragment(State(state), claims, Path(fragment)).await?).await
+        }
+        "fragment.check" => {
+            let fragment = required_string(&payload, "fragment")?;
+            native_body(json!({
+                "fragment": fragment,
+                "exists": does_fragment_exist(&fragment).await,
+            }))
+        }
         "fragment.hash" | "fragment.hash.public" => {
             let fragment = required_string(&payload, "fragment")?;
             let hash = fragment_hash(&fragment);
@@ -485,6 +674,11 @@ async fn execute_native_op_inner(
         "fragment.quota" => {
             let claims = claims.expect("claims required");
             native_from_response(get_fragment_quota_usage(claims).await?).await
+        }
+        "capacity.usage" => {
+            let claims = claims.expect("claims required");
+            let fragment = claims.fragment.clone();
+            native_from_response(get_capacity_usage(claims, Path(fragment)).await?).await
         }
         "fragment.resize_quota" => {
             let claims = claims.expect("claims required");
@@ -537,6 +731,115 @@ fn typed_payload<T: DeserializeOwned>(payload: &Value) -> Result<T, AppError> {
 
 fn upload_part_query_from_payload(payload: &Value) -> Result<UploadPartQuery, AppError> {
     typed_payload(payload)
+}
+
+#[derive(Clone, Copy)]
+enum BulkNamespaceMode {
+    Trash,
+    Recover,
+    Purge,
+}
+
+async fn native_bulk_namespace_operation(
+    state: &Arc<AppState>,
+    fragment: &str,
+    object_keys: Vec<String>,
+    event: &str,
+    mode: BulkNamespaceMode,
+) -> Result<Value, AppError> {
+    let requested = object_keys.len();
+    let unique_keys = object_keys
+        .into_iter()
+        .filter(|key| !key.trim().is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if unique_keys.is_empty() {
+        return Err(AppError::BadRequest("object_keys must not be empty".into()));
+    }
+
+    let mut succeeded = 0usize;
+    let mut not_found = 0usize;
+    let mut failed = Vec::new();
+    for object_key in &unique_keys {
+        let result = match mode {
+            BulkNamespaceMode::Trash => {
+                global_namespace_runtime().trash(fragment, object_key).await
+            }
+            BulkNamespaceMode::Recover => {
+                global_namespace_runtime()
+                    .recover(fragment, object_key)
+                    .await
+            }
+            BulkNamespaceMode::Purge => {
+                global_namespace_runtime()
+                    .purge_trash_path(fragment, object_key)
+                    .await
+            }
+        };
+        match result {
+            Ok(_) => succeeded = succeeded.saturating_add(1),
+            Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
+            Err(err) => failed.push(json!({
+                "object_key": object_key,
+                "error": err.to_string(),
+            })),
+        }
+    }
+
+    if succeeded > 0 {
+        state.emit(
+            fragment,
+            StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::bulk(
+                fragment, event, succeeded,
+            )),
+        );
+    }
+
+    Ok(json!({
+        "requested": requested,
+        "unique": unique_keys.len(),
+        "succeeded": succeeded,
+        "not_found": not_found,
+        "failed": failed,
+    }))
+}
+
+async fn native_download_metadata(
+    metadata: ObjectMetadata,
+    physical_object_key: String,
+) -> Result<(NativeOpResponse, Vec<u8>), AppError> {
+    let total_size = usize::try_from(metadata.total_size_bytes).map_err(|_| {
+        AppError::PayloadTooLarge("native download size exceeds platform usize".into())
+    })?;
+    if total_size > crate::protocol::types::MAX_NATIVE_BODY_BYTES {
+        return Err(AppError::PayloadTooLarge(format!(
+            "native full download exceeds {} bytes; use object.download_chunk",
+            crate::protocol::types::MAX_NATIVE_BODY_BYTES
+        )));
+    }
+
+    let mut offset = 0u64;
+    let mut out = Vec::with_capacity(total_size);
+    while offset < metadata.total_size_bytes {
+        let chunk_size = ((metadata.total_size_bytes - offset) as usize).min(8 * 1024 * 1024);
+        let (chunk, _) = crate::core::download::download_object_chunk_from_metadata(
+            metadata.clone(),
+            &ChunkQuery {
+                object_key: physical_object_key.clone(),
+                offset,
+                chunk_size,
+            },
+        )
+        .await?;
+        if chunk.is_empty() {
+            break;
+        }
+        offset = offset.saturating_add(chunk.len() as u64);
+        out.extend_from_slice(&chunk);
+    }
+
+    Ok((op_response(200), out))
 }
 
 async fn native_from_response(response: impl IntoResponse) -> (NativeOpResponse, Vec<u8>) {
@@ -672,6 +975,20 @@ async fn resolve_logical_read_key(
     crate::core::index_store::normalize_object_id(requested).map_err(|_| logical_not_found())
 }
 
+async fn resolve_any_logical_object_id(
+    fragment: &str,
+    requested_path: &str,
+) -> Result<String, AppError> {
+    let requested = requested_path.trim_start_matches('/').trim();
+    if let Some(object_id) = global_namespace_runtime()
+        .resolve_any_object_id(fragment, requested)
+        .await?
+    {
+        return Ok(object_id);
+    }
+    crate::core::index_store::normalize_object_id(requested).map_err(|_| logical_not_found())
+}
+
 fn params_from_payload(payload: &Value) -> HashMap<String, String> {
     payload
         .as_object()
@@ -715,6 +1032,21 @@ fn string_field(payload: &Value, key: &str) -> Option<String> {
 
 fn required_string(payload: &Value, key: &str) -> Result<String, AppError> {
     string_field(payload, key).ok_or_else(|| AppError::BadRequest(format!("{key} is required")))
+}
+
+fn string_array_field(payload: &Value, key: &str) -> Result<Vec<String>, AppError> {
+    payload
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::BadRequest(format!("{key} must be an array")))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| AppError::BadRequest(format!("{key} must contain strings")))
+        })
+        .collect()
 }
 
 fn bool_field(payload: &Value, key: &str) -> Option<bool> {

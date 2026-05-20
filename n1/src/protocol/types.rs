@@ -28,6 +28,8 @@ pub struct NativeResponse {
     #[serde(default)]
     pub body: Option<ByteBuf>,
     #[serde(default)]
+    pub body_len: Option<u64>,
+    #[serde(default)]
     pub error: Option<NativeError>,
 }
 
@@ -72,6 +74,7 @@ impl NativeResponse {
             status: None,
             payload: Some(payload),
             body: None,
+            body_len: None,
             error: None,
         }
     }
@@ -83,6 +86,11 @@ impl NativeResponse {
             ok: status < 400,
             status: Some(status),
             payload: None,
+            body_len: if body.is_empty() {
+                None
+            } else {
+                Some(body.len() as u64)
+            },
             body: if body.is_empty() {
                 None
             } else {
@@ -99,6 +107,7 @@ impl NativeResponse {
             status: None,
             payload: None,
             body: None,
+            body_len: None,
             error: Some(NativeError {
                 code: code.into(),
                 message: message.into(),

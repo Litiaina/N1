@@ -235,9 +235,23 @@ The native protocol does not create another storage engine, another namespace, a
 - `multipart.init`
 - `multipart.put_part`
 - `multipart.finalize`
+- `multipart.cancel`
 - `uploads.list`
 - `uploads.status`
+- `object.meta`
+- `object.versions`
+- `object.status`
+- `object.repair`
+- `object.rename`
+- `object.delete`
+- `object.recover`
+- `object.purge`
+- `object.version.recover`
+- `object.bulk_delete`
+- `object.bulk_recover`
+- `object.bulk_purge`
 - `object.download_chunk`
+- `object.download`
 
 Upload bodies are sent as raw bytes after a small MessagePack control frame. This keeps the native protocol from inflating large upload parts inside the request envelope.
 
