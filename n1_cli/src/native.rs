@@ -1,12 +1,11 @@
-use std::collections::BTreeMap;
-use std::error::Error;
 use std::io::{self, Write};
 use std::time::Duration;
 
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use reqwest::{Method, StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde_bytes::ByteBuf;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -38,7 +37,7 @@ struct NativeRequest {
     id: String,
     op: String,
     payload: Option<String>,
-    body: Option<Vec<u8>>,
+    body: Option<ByteBuf>,
 }
 
 #[derive(serde::Deserialize)]
@@ -47,7 +46,7 @@ struct NativeResponse {
     ok: bool,
     status: Option<u16>,
     payload: Option<String>,
-    body: Option<Vec<u8>>,
+    body: Option<ByteBuf>,
     error: Option<NativeError>,
 }
 
@@ -55,16 +54,6 @@ struct NativeResponse {
 struct NativeError {
     code: String,
     message: String,
-}
-
-#[derive(Serialize)]
-struct NativeApiRequest {
-    method: String,
-    path: String,
-    #[serde(default)]
-    headers: BTreeMap<String, String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    json: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -84,7 +73,7 @@ struct NativeN1Client {
     next_id: u64,
 }
 
-struct NativeApiResult {
+struct NativeOpResult {
     status: StatusCode,
     body: Vec<u8>,
 }
@@ -103,7 +92,7 @@ pub async fn run_native(cli: Cli) -> Result<(), DynError> {
             command: FragmentCommands::Create(args),
         } => {
             let response = client
-                .api_request(
+                .mapped_request(
                     Method::POST,
                     "/n1/fragments",
                     Some(serde_json::to_value(CreateFragmentRequest {
@@ -200,7 +189,7 @@ async fn resolve_n1_auth_fragment_native(
         return Ok(fragment_hint.to_string());
     }
     let response: FragmentHashLookupResponse = client
-        .api_json(
+        .mapped_json(
             Method::GET,
             "/n1/fragments/hash",
             Some(serde_json::to_value(FragmentHashLookupRequest {
@@ -233,14 +222,14 @@ async fn handle_native_authenticated_command(
                 )
                 .await
             } else {
-                let health: HealthResponse = client.api_json(Method::GET, &path, None).await?;
+                let health: HealthResponse = client.mapped_json(Method::GET, &path, None).await?;
                 print_output(cli.json, &health, &format_health(&health))
             }
         }
         Commands::Namespace { command } => match command {
             NamespaceCommands::List { path, limit } => {
                 let value: Value = client
-                    .api_json(
+                    .mapped_json(
                         Method::GET,
                         &format!(
                             "/n1/posix/list?path={}&limit={}",
@@ -254,7 +243,7 @@ async fn handle_native_authenticated_command(
             }
             NamespaceCommands::Stat { path } => {
                 let value: Value = client
-                    .api_json(
+                    .mapped_json(
                         Method::GET,
                         &format!("/n1/posix/stat?path={}", encode_query(path)),
                         None,
@@ -266,7 +255,7 @@ async fn handle_native_authenticated_command(
         Commands::Object { command } => match command {
             ObjectCommands::Status { object_key, mode } => {
                 let value: Value = client
-                    .api_json(
+                    .mapped_json(
                         Method::GET,
                         &format!(
                             "/n1/objects/status/{}?mode={}",
@@ -280,7 +269,7 @@ async fn handle_native_authenticated_command(
             }
             ObjectCommands::Repair { object_key, mode } => {
                 let value: Value = client
-                    .api_json(
+                    .mapped_json(
                         Method::POST,
                         &format!(
                             "/n1/objects/repair/{}?mode={}",
@@ -296,7 +285,7 @@ async fn handle_native_authenticated_command(
         Commands::Uploads { command } => match command {
             UploadCommands::List { limit, offset } => {
                 let uploads: ListUploadsResponse = client
-                    .api_json(
+                    .mapped_json(
                         Method::GET,
                         &format!("/n1/upload/multipart?limit={limit}&offset={offset}"),
                         None,
@@ -306,7 +295,7 @@ async fn handle_native_authenticated_command(
             }
             UploadCommands::Status { version_id } => {
                 let status: UploadStatusResponse = client
-                    .api_json(
+                    .mapped_json(
                         Method::GET,
                         &format!("/n1/upload/multipart/{}", encode_path(version_id)),
                         None,
@@ -318,7 +307,7 @@ async fn handle_native_authenticated_command(
         Commands::Gc { action } => match action {
             JobAction::Start => {
                 let response = client
-                    .api_request(Method::POST, "/n1/maintenance/gc/start", None)
+                    .mapped_request(Method::POST, "/n1/maintenance/gc/start", None)
                     .await?;
                 print_native_response(response)?;
                 native_watch_json::<GcJobStatus, _, _>(
@@ -333,13 +322,13 @@ async fn handle_native_authenticated_command(
             }
             JobAction::Status => {
                 let status: GcJobStatus = client
-                    .api_json(Method::GET, "/n1/maintenance/gc/status", None)
+                    .mapped_json(Method::GET, "/n1/maintenance/gc/status", None)
                     .await?;
                 print_output(cli.json, &status, &format_gc_status(&status))
             }
             JobAction::Stop => print_native_response(
                 client
-                    .api_request(Method::POST, "/n1/maintenance/gc/stop", None)
+                    .mapped_request(Method::POST, "/n1/maintenance/gc/stop", None)
                     .await?,
             ),
             JobAction::Watch => {
@@ -367,7 +356,7 @@ async fn handle_native_authenticated_command(
                     args.batch,
                 );
                 let path = path_with_query("/n1/maintenance/repair/start", &query);
-                print_native_response(client.api_request(Method::POST, &path, None).await?)?;
+                print_native_response(client.mapped_request(Method::POST, &path, None).await?)?;
                 native_watch_json::<RepairJobStatus, _, _>(
                     client,
                     "/n1/maintenance/repair/status",
@@ -380,13 +369,13 @@ async fn handle_native_authenticated_command(
             }
             RepairAction::Status => {
                 let status: RepairJobStatus = client
-                    .api_json(Method::GET, "/n1/maintenance/repair/status", None)
+                    .mapped_json(Method::GET, "/n1/maintenance/repair/status", None)
                     .await?;
                 print_output(cli.json, &status, &format_repair_status(&status))
             }
             RepairAction::Stop => print_native_response(
                 client
-                    .api_request(Method::POST, "/n1/maintenance/repair/stop", None)
+                    .mapped_request(Method::POST, "/n1/maintenance/repair/stop", None)
                     .await?,
             ),
             RepairAction::Watch => {
@@ -415,7 +404,7 @@ async fn handle_native_authenticated_command(
                     args.status_batch,
                 );
                 let path = path_with_query("/n1/maintenance/redistribution/start", &query);
-                print_native_response(client.api_request(Method::POST, &path, None).await?)?;
+                print_native_response(client.mapped_request(Method::POST, &path, None).await?)?;
                 native_watch_json::<RedistributionJobStatus, _, _>(
                     client,
                     "/n1/maintenance/redistribution/status",
@@ -428,13 +417,13 @@ async fn handle_native_authenticated_command(
             }
             RedistributeAction::Status => {
                 let status: RedistributionJobStatus = client
-                    .api_json(Method::GET, "/n1/maintenance/redistribution/status", None)
+                    .mapped_json(Method::GET, "/n1/maintenance/redistribution/status", None)
                     .await?;
                 print_output(cli.json, &status, &format_redistribution_status(&status))
             }
             RedistributeAction::Stop => print_native_response(
                 client
-                    .api_request(Method::POST, "/n1/maintenance/redistribution/stop", None)
+                    .mapped_request(Method::POST, "/n1/maintenance/redistribution/stop", None)
                     .await?,
             ),
             RedistributeAction::Watch => {
@@ -460,7 +449,9 @@ async fn handle_native_fragment_command(
     match command {
         FragmentCommands::Create(_) => unreachable!("fragment create is handled before auth"),
         FragmentCommands::List => {
-            let value: Value = client.api_json(Method::GET, "/n1/fragments", None).await?;
+            let value: Value = client
+                .mapped_json(Method::GET, "/n1/fragments", None)
+                .await?;
             print_json_value(cli.json, &value)
         }
         FragmentCommands::Hash { fragment } => {
@@ -471,7 +462,7 @@ async fn handle_native_fragment_command(
                     io::Error::other("pass --fragment or fragment hash --fragment <name>")
                 })?;
             let value: Value = client
-                .api_json(
+                .mapped_json(
                     Method::GET,
                     "/n1/fragments/hash",
                     Some(serde_json::to_value(FragmentHashLookupRequest {
@@ -483,7 +474,7 @@ async fn handle_native_fragment_command(
         }
         FragmentCommands::Quota => {
             let value: Value = client
-                .api_json(Method::GET, "/n1/capacity/quota", None)
+                .mapped_json(Method::GET, "/n1/capacity/quota", None)
                 .await?;
             print_json_value(cli.json, &value)
         }
@@ -498,7 +489,7 @@ async fn handle_native_fragment_command(
                 })?;
             let fragment = resolve_n1_auth_fragment_native(client, target).await?;
             let response = client
-                .api_request(
+                .mapped_request(
                     Method::PATCH,
                     &format!("/n1/fragments/{}/quota", encode_path(&fragment)),
                     Some(serde_json::to_value(ResizeFragmentQuotaRequest {
@@ -549,29 +540,31 @@ async fn handle_console_line(
     match parts.as_slice() {
         ["health"] => {
             let health: HealthResponse = client
-                .api_json(Method::GET, "/n1/maintenance/health", None)
+                .mapped_json(Method::GET, "/n1/maintenance/health", None)
                 .await?;
             print_output(cli.json, &health, &format_health(&health))
         }
         ["quota"] => {
             let value: Value = client
-                .api_json(Method::GET, "/n1/capacity/quota", None)
+                .mapped_json(Method::GET, "/n1/capacity/quota", None)
                 .await?;
             print_json_value(cli.json, &value)
         }
         ["fragments"] => {
-            let value: Value = client.api_json(Method::GET, "/n1/fragments", None).await?;
+            let value: Value = client
+                .mapped_json(Method::GET, "/n1/fragments", None)
+                .await?;
             print_json_value(cli.json, &value)
         }
         ["list"] => {
             let value: Value = client
-                .api_json(Method::GET, "/n1/posix/list?path=&limit=200", None)
+                .mapped_json(Method::GET, "/n1/posix/list?path=&limit=200", None)
                 .await?;
             print_json_value(cli.json, &value)
         }
         ["list", path] => {
             let value: Value = client
-                .api_json(
+                .mapped_json(
                     Method::GET,
                     &format!("/n1/posix/list?path={}&limit=200", encode_query(path)),
                     None,
@@ -581,7 +574,7 @@ async fn handle_console_line(
         }
         ["stat", path] => {
             let value: Value = client
-                .api_json(
+                .mapped_json(
                     Method::GET,
                     &format!("/n1/posix/stat?path={}", encode_query(path)),
                     None,
@@ -591,13 +584,13 @@ async fn handle_console_line(
         }
         ["uploads"] => {
             let uploads: ListUploadsResponse = client
-                .api_json(Method::GET, "/n1/upload/multipart?limit=50&offset=0", None)
+                .mapped_json(Method::GET, "/n1/upload/multipart?limit=50&offset=0", None)
                 .await?;
             print_output(cli.json, &uploads, &format_upload_list(&uploads))
         }
         ["upload", version_id] => {
             let status: UploadStatusResponse = client
-                .api_json(
+                .mapped_json(
                     Method::GET,
                     &format!("/n1/upload/multipart/{}", encode_path(version_id)),
                     None,
@@ -607,40 +600,40 @@ async fn handle_console_line(
         }
         ["gc"] | ["gc", "status"] => {
             let status: GcJobStatus = client
-                .api_json(Method::GET, "/n1/maintenance/gc/status", None)
+                .mapped_json(Method::GET, "/n1/maintenance/gc/status", None)
                 .await?;
             print_output(cli.json, &status, &format_gc_status(&status))
         }
         ["gc", "start"] => print_native_response(
             client
-                .api_request(Method::POST, "/n1/maintenance/gc/start", None)
+                .mapped_request(Method::POST, "/n1/maintenance/gc/start", None)
                 .await?,
         ),
         ["repair"] | ["repair", "status"] => {
             let status: RepairJobStatus = client
-                .api_json(Method::GET, "/n1/maintenance/repair/status", None)
+                .mapped_json(Method::GET, "/n1/maintenance/repair/status", None)
                 .await?;
             print_output(cli.json, &status, &format_repair_status(&status))
         }
         ["repair", "start"] => print_native_response(
             client
-                .api_request(Method::POST, "/n1/maintenance/repair/start", None)
+                .mapped_request(Method::POST, "/n1/maintenance/repair/start", None)
                 .await?,
         ),
         ["redistribute"] | ["redistribute", "status"] => {
             let status: RedistributionJobStatus = client
-                .api_json(Method::GET, "/n1/maintenance/redistribution/status", None)
+                .mapped_json(Method::GET, "/n1/maintenance/redistribution/status", None)
                 .await?;
             print_output(cli.json, &status, &format_redistribution_status(&status))
         }
         ["redistribute", "start"] => print_native_response(
             client
-                .api_request(Method::POST, "/n1/maintenance/redistribution/start", None)
+                .mapped_request(Method::POST, "/n1/maintenance/redistribution/start", None)
                 .await?,
         ),
         ["object", "status", object_key] => {
             let value: Value = client
-                .api_json(
+                .mapped_json(
                     Method::GET,
                     &format!(
                         "/n1/objects/status/{}?mode=availability",
@@ -653,7 +646,7 @@ async fn handle_console_line(
         }
         ["object", "repair", object_key] => {
             let value: Value = client
-                .api_json(
+                .mapped_json(
                     Method::POST,
                     &format!("/n1/objects/repair/{}?mode=strict", encode_path(object_key)),
                     None,
@@ -692,7 +685,7 @@ where
     D: Fn(&T) -> bool,
 {
     loop {
-        let value: T = client.api_json(Method::GET, path, None).await?;
+        let value: T = client.mapped_json(Method::GET, path, None).await?;
         print_output(json_output, &value, &format(&value))?;
         if done(&value) {
             return Ok(());
@@ -710,8 +703,10 @@ fn print_json_value(json_output: bool, value: &Value) -> Result<(), DynError> {
     Ok(())
 }
 
-fn print_native_response(response: NativeApiResult) -> Result<(), DynError> {
-    if let Ok(value) = serde_json::from_slice::<Value>(&response.body) {
+fn print_native_response(response: NativeOpResult) -> Result<(), DynError> {
+    if let Ok(value) = rmp_serde::from_slice::<Value>(&response.body) {
+        println!("{}", serde_json::to_string(&value)?);
+    } else if let Ok(value) = serde_json::from_slice::<Value>(&response.body) {
         println!("{}", serde_json::to_string(&value)?);
     } else if !response.body.is_empty() {
         println!("{}", String::from_utf8_lossy(&response.body));
@@ -769,47 +764,39 @@ impl NativeN1Client {
         Ok(())
     }
 
-    async fn api_json<T: DeserializeOwned>(
+    async fn mapped_json<T: DeserializeOwned>(
         &mut self,
         method: Method,
         path: &str,
         json_body: Option<Value>,
     ) -> Result<T, DynError> {
-        let response = self.api_request(method, path, json_body).await?;
-        Ok(serde_json::from_slice(&response.body)?)
+        let response = self.mapped_request(method, path, json_body).await?;
+        Ok(rmp_serde::from_slice(&response.body)?)
     }
 
-    async fn api_request(
+    async fn mapped_request(
         &mut self,
         method: Method,
         path: &str,
         json_body: Option<Value>,
-    ) -> Result<NativeApiResult, DynError> {
-        let path = api_path(path)?;
-        let response = self
-            .round_trip(
-                "api.request",
-                json!(NativeApiRequest {
-                    method: method.as_str().to_string(),
-                    path,
-                    headers: BTreeMap::new(),
-                    json: json_body,
-                }),
-                None,
-            )
-            .await?;
+    ) -> Result<NativeOpResult, DynError> {
+        let (op, payload) = native_op_from_mapped_call(method, path, json_body)?;
+        let response = self.round_trip(&op, payload, None).await?;
         ensure_native_ok(&response)?;
         let status = StatusCode::from_u16(response.status.unwrap_or(500))?;
-        let body = response.body.unwrap_or_default();
+        let body = response
+            .body
+            .map(|body| body.into_vec())
+            .unwrap_or_default();
         if status.is_client_error() || status.is_server_error() {
             return Err(io::Error::other(format!(
-                "native API request failed: status={} body={}",
+                "native operation failed: status={} body={}",
                 status,
                 String::from_utf8_lossy(&body)
             ))
             .into());
         }
-        Ok(NativeApiResult { status, body })
+        Ok(NativeOpResult { status, body })
     }
 
     async fn raw_json(
@@ -836,7 +823,7 @@ impl NativeN1Client {
             id: id.clone(),
             op: op.to_string(),
             payload: Some(serde_json::to_string(&payload)?),
-            body,
+            body: body.map(ByteBuf::from),
         };
         let bytes = rmp_serde::to_vec(&request)?;
         if bytes.is_empty() || bytes.len() > MAX_NATIVE_FRAME_BYTES {
@@ -885,19 +872,6 @@ fn parse_native_address(url: &str) -> Result<String, DynError> {
     Ok(address.to_string())
 }
 
-fn api_path(path: &str) -> Result<String, Box<dyn Error>> {
-    if path.starts_with("/n1/") {
-        return Ok(path.to_string());
-    }
-    let url = Url::parse(path)?;
-    let mut out = url.path().to_string();
-    if let Some(query) = url.query() {
-        out.push('?');
-        out.push_str(query);
-    }
-    Ok(out)
-}
-
 fn ensure_native_ok(response: &NativeResponse) -> Result<(), DynError> {
     if response.ok {
         return Ok(());
@@ -908,4 +882,111 @@ fn ensure_native_ok(response: &NativeResponse) -> Result<(), DynError> {
         .map(|err| format!("{}: {}", err.code, err.message))
         .unwrap_or_else(|| "unknown native error".to_string());
     Err(io::Error::other(error).into())
+}
+
+fn native_op_from_mapped_call(
+    method: Method,
+    path: &str,
+    json_body: Option<Value>,
+) -> Result<(String, Value), DynError> {
+    let (path, query) = split_mapped_path(path)?;
+    let mut payload = query;
+
+    let merge_json = |payload: &mut Value| {
+        if let Some(body) = json_body.clone()
+            && let (Some(dst), Some(src)) = (payload.as_object_mut(), body.as_object())
+        {
+            for (key, value) in src {
+                dst.insert(key.clone(), value.clone());
+            }
+        } else if let Some(body) = json_body.clone() {
+            *payload = body;
+        }
+    };
+
+    let method_for_error = method.clone();
+    let op = match (method, path.as_str()) {
+        (Method::POST, "/n1/fragments") => {
+            merge_json(&mut payload);
+            "fragment.create"
+        }
+        (Method::GET, "/n1/fragments") => "fragment.list",
+        (Method::GET, "/n1/fragments/hash") => {
+            merge_json(&mut payload);
+            "fragment.hash.public"
+        }
+        (Method::GET, "/n1/capacity/quota") => "fragment.quota",
+        (Method::GET, "/n1/maintenance/health") => "maintenance.health",
+        (Method::GET, "/n1/posix/list") => "namespace.list",
+        (Method::GET, "/n1/posix/stat") => "namespace.stat",
+        (Method::GET, "/n1/upload/multipart") => "uploads.list",
+        (Method::POST, "/n1/maintenance/gc/start") => "maintenance.gc.start",
+        (Method::GET, "/n1/maintenance/gc/status") => "maintenance.gc.status",
+        (Method::POST, "/n1/maintenance/gc/stop") => "maintenance.gc.stop",
+        (Method::POST, "/n1/maintenance/repair/start") => "maintenance.repair.start",
+        (Method::GET, "/n1/maintenance/repair/status") => "maintenance.repair.status",
+        (Method::POST, "/n1/maintenance/repair/stop") => "maintenance.repair.stop",
+        (Method::POST, "/n1/maintenance/redistribution/start") => {
+            "maintenance.redistribution.start"
+        }
+        (Method::GET, "/n1/maintenance/redistribution/status") => {
+            "maintenance.redistribution.status"
+        }
+        (Method::POST, "/n1/maintenance/redistribution/stop") => "maintenance.redistribution.stop",
+        (Method::PATCH, path) if path.starts_with("/n1/fragments/") && path.ends_with("/quota") => {
+            let fragment = path
+                .trim_start_matches("/n1/fragments/")
+                .trim_end_matches("/quota");
+            payload["fragment"] = Value::String(fragment.to_string());
+            merge_json(&mut payload);
+            "fragment.resize_quota"
+        }
+        (Method::GET, path) if path.starts_with("/n1/upload/multipart/") => {
+            payload["version_id"] =
+                Value::String(path.trim_start_matches("/n1/upload/multipart/").to_string());
+            "uploads.status"
+        }
+        (Method::GET, path) if path.starts_with("/n1/objects/status/") => {
+            payload["object_key"] =
+                Value::String(path.trim_start_matches("/n1/objects/status/").to_string());
+            "object.status"
+        }
+        (Method::POST, path) if path.starts_with("/n1/objects/repair/") => {
+            payload["object_key"] =
+                Value::String(path.trim_start_matches("/n1/objects/repair/").to_string());
+            "object.repair"
+        }
+        _ => {
+            return Err(io::Error::other(format!(
+                "native CLI has no direct n1:// mapping for {} {}",
+                method_for_error, path
+            ))
+            .into());
+        }
+    };
+    Ok((op.to_string(), payload))
+}
+
+fn split_mapped_path(path: &str) -> Result<(String, Value), DynError> {
+    let normalized = if path.starts_with("/n1/") {
+        path.to_string()
+    } else {
+        let url = Url::parse(path)?;
+        let mut out = url.path().to_string();
+        if let Some(query) = url.query() {
+            out.push('?');
+            out.push_str(query);
+        }
+        out
+    };
+    let (path, query) = normalized.split_once('?').unwrap_or((&normalized, ""));
+    let path = percent_decode_str(path).decode_utf8_lossy().to_string();
+    let mut payload = serde_json::Map::new();
+    for pair in query.split('&').filter(|item| !item.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode_str(key).decode_utf8_lossy().to_string();
+        let value = percent_decode_str(value).decode_utf8_lossy().to_string();
+        payload.insert(key, Value::String(value));
+    }
+    Ok((path, Value::Object(payload)))
 }

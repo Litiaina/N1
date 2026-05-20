@@ -1393,6 +1393,14 @@ pub async fn get_system_health(
     claims: Claims,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, AppError> {
+    Ok(Json(system_health_snapshot(state, claims, params).await?))
+}
+
+pub async fn system_health_snapshot(
+    state: Arc<AppState>,
+    claims: Claims,
+    params: HashMap<String, String>,
+) -> Result<SystemHealthResponse, AppError> {
     if !claims.read {
         return Err(AppError::Forbidden("Read permission required".into()));
     }
@@ -1409,14 +1417,14 @@ pub async fn get_system_health(
         if deep_scan {
             *LAST_DEEP_SCAN_AT.write().await = Some(Instant::now());
         }
-        return Ok(Json(snapshot));
+        return Ok(snapshot);
     }
 
     if let Some(cached) = HEALTH_CACHE.read().await.clone() {
-        return Ok(Json(cached));
+        return Ok(cached);
     }
 
     let snapshot = collect_system_health(&state, &params).await?;
     *HEALTH_CACHE.write().await = Some(snapshot.clone());
-    Ok(Json(snapshot))
+    Ok(snapshot)
 }

@@ -1,5 +1,4 @@
 pub mod auth;
-pub mod dispatch;
 pub mod frame;
 pub mod ops;
 pub mod server;

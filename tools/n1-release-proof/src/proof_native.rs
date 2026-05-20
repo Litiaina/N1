@@ -5,7 +5,7 @@ struct NativeProofRequest {
     #[serde(default)]
     payload: String,
     #[serde(default)]
-    body: Option<Vec<u8>>,
+    body: Option<serde_bytes::ByteBuf>,
 }
 
 #[derive(serde::Deserialize)]
@@ -14,7 +14,7 @@ struct NativeProofResponse {
     ok: bool,
     status: Option<u16>,
     payload: Option<String>,
-    body: Option<Vec<u8>>,
+    body: Option<serde_bytes::ByteBuf>,
     error: Option<Value>,
 }
 
@@ -79,7 +79,7 @@ impl Proof {
             .and_then(|value| serde_json::from_str::<Value>(value).ok())
             .and_then(|value| value.get("protocol").and_then(Value::as_str).map(str::to_owned))
             .unwrap_or_default();
-        if protocol != "n1/0.1" {
+        if protocol != "n1/0.2" {
             return Err(format!("native ping returned unexpected protocol '{protocol}'").into());
         }
 
@@ -133,22 +133,6 @@ impl Proof {
         )
         .await?;
         ensure_native_status(&stat, 200, "native namespace stat")?;
-
-        let api_bridge = native_round_trip(
-            &mut stream,
-            "native-api",
-            "api.request",
-            json!({
-                "method": "GET",
-                "path": format!(
-                    "/n1/posix/stat?path={}",
-                    encode_query_value(object_key)
-                ),
-            }),
-            None,
-        )
-        .await?;
-        ensure_native_status(&api_bridge, 200, "native api bridge")?;
 
         let native_dir = format!("{}native-protocol/probe", self.args.prefix);
         let renamed_dir = format!("{}native-protocol/probe-renamed", self.args.prefix);
@@ -232,7 +216,6 @@ impl Proof {
             "checked_ops": [
                 "ping",
                 "auth.fragment",
-                "api.request",
                 "namespace.list",
                 "namespace.stat",
                 "namespace.mkdir",
@@ -259,7 +242,7 @@ async fn native_round_trip(
         id: id.to_string(),
         op: op.to_string(),
         payload: serde_json::to_string(&payload)?,
-        body,
+        body: body.map(serde_bytes::ByteBuf::from),
     };
     let encoded = rmp_serde::to_vec(&request)?;
     stream
@@ -301,7 +284,7 @@ fn ensure_native_status(
             response.status,
             response.ok,
             native_error_string(response),
-            String::from_utf8_lossy(response.body.as_deref().unwrap_or_default())
+            String::from_utf8_lossy(response.body.as_ref().map(|body| body.as_slice()).unwrap_or_default())
         )
         .into())
     }
@@ -310,9 +293,10 @@ fn ensure_native_status(
 fn native_json_body(response: &NativeProofResponse) -> ProofResult<Value> {
     let body = response
         .body
-        .as_deref()
+        .as_ref()
+        .map(|body| body.as_slice())
         .ok_or("native response did not include body")?;
-    Ok(serde_json::from_slice(body)?)
+    Ok(rmp_serde::from_slice(body)?)
 }
 
 fn native_error_string(response: &NativeProofResponse) -> String {

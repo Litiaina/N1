@@ -1,15 +1,15 @@
 use crate::protocol::auth::NativeSession;
-use crate::protocol::dispatch::NativeApiDispatcher;
 use crate::protocol::frame::{read_request, write_response};
-use crate::protocol::ops::typed_api_request;
+use crate::protocol::ops::execute_native_op;
 use crate::protocol::types::{
-    N1_NATIVE_PROTOCOL_VERSION, NativeApiRequest, NativeAuthFragmentRequest, NativeBearerRequest,
-    NativeRequest, NativeResponse,
+    N1_NATIVE_PROTOCOL_VERSION, NativeAuthFragmentRequest, NativeBearerRequest, NativeRequest,
+    NativeResponse,
 };
-use axum::Router;
+use crate::routes::storage_routes::AppState;
 use serde_json::{Value, json};
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
@@ -17,10 +17,9 @@ pub async fn bind_native_protocol(addr: SocketAddr) -> io::Result<TcpListener> {
     TcpListener::bind(addr).await
 }
 
-pub async fn serve_native_protocol(listener: TcpListener, addr: SocketAddr, router: Router) {
+pub async fn serve_native_protocol(listener: TcpListener, addr: SocketAddr, state: Arc<AppState>) {
     info!("Native protocol => n1://{}", addr);
 
-    let dispatcher = NativeApiDispatcher::new(router);
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
@@ -30,9 +29,9 @@ pub async fn serve_native_protocol(listener: TcpListener, addr: SocketAddr, rout
                         peer, err
                     );
                 }
-                let dispatcher = dispatcher.clone();
+                let state = state.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, peer, dispatcher).await {
+                    if let Err(err) = handle_connection(stream, peer, state).await {
                         debug!("N1 native connection {} closed: {}", peer, err);
                     }
                 });
@@ -45,7 +44,7 @@ pub async fn serve_native_protocol(listener: TcpListener, addr: SocketAddr, rout
 async fn handle_connection(
     mut stream: TcpStream,
     peer: SocketAddr,
-    dispatcher: NativeApiDispatcher,
+    state: Arc<AppState>,
 ) -> Result<(), String> {
     let mut session = NativeSession::default();
     loop {
@@ -56,7 +55,7 @@ async fn handle_connection(
             return Ok(());
         };
 
-        let response = handle_request(&dispatcher, &mut session, peer, request).await;
+        let response = handle_request(&state, &mut session, peer, request).await;
         write_response(&mut stream, &response)
             .await
             .map_err(|err| format!("write frame failed: {err}"))?;
@@ -64,9 +63,9 @@ async fn handle_connection(
 }
 
 async fn handle_request(
-    dispatcher: &NativeApiDispatcher,
+    state: &Arc<AppState>,
     session: &mut NativeSession,
-    peer: SocketAddr,
+    _peer: SocketAddr,
     request: NativeRequest,
 ) -> NativeResponse {
     let id = request.id.clone();
@@ -103,7 +102,7 @@ async fn handle_request(
         },
         "auth.fragment" => {
             match payload_as::<NativeAuthFragmentRequest>(request.payload.as_deref()) {
-                Ok(payload) => auth_fragment(dispatcher, session, peer, &id, payload).await,
+                Ok(payload) => auth_fragment(session, &id, payload).await,
                 Err(err) => NativeResponse::err(id, "bad_request", err),
             }
         }
@@ -122,19 +121,24 @@ async fn handle_request(
             };
             NativeResponse::ok(id, payload)
         }
-        "api.request" => match payload_as::<NativeApiRequest>(request.payload.as_deref()) {
-            Ok(api_request) => {
-                dispatch_api(dispatcher, session, peer, id, api_request, request.body).await
+        op => match payload_value(request.payload.as_deref()) {
+            Ok(payload) => {
+                match execute_native_op(
+                    state.clone(),
+                    session,
+                    op,
+                    payload,
+                    request.body.map(|body| body.into_vec()),
+                )
+                .await
+                {
+                    Ok(Some((payload, body))) => NativeResponse::operation(id, payload, body),
+                    Ok(None) => {
+                        NativeResponse::err(id, "unknown_op", format!("unsupported op '{op}'"))
+                    }
+                    Err(err) => NativeResponse::operation(id, err.0, err.1),
+                }
             }
-            Err(err) => NativeResponse::err(id, "bad_request", err),
-        },
-        op => match payload_value(request.payload.as_deref())
-            .and_then(|payload| typed_api_request(op, &payload).map_err(|err| err.to_string()))
-        {
-            Ok(Some(api_request)) => {
-                dispatch_api(dispatcher, session, peer, id, api_request, request.body).await
-            }
-            Ok(None) => NativeResponse::err(id, "unknown_op", format!("unsupported op '{op}'")),
             Err(err) => NativeResponse::err(id, "bad_request", err),
         },
     }
@@ -157,55 +161,41 @@ where
 }
 
 async fn auth_fragment(
-    dispatcher: &NativeApiDispatcher,
     session: &mut NativeSession,
-    peer: SocketAddr,
     id: &str,
     payload: NativeAuthFragmentRequest,
 ) -> NativeResponse {
-    let api_request = NativeApiRequest {
-        method: "POST".to_string(),
-        path: "/n1/auth/fragment".to_string(),
-        headers: Default::default(),
-        json: Some(serde_json::to_value(payload).unwrap_or(Value::Null)),
-    };
-    let empty_session = NativeSession::default();
-    let (api_response, body) = match dispatcher
-        .dispatch(&empty_session, peer, api_request, None)
-        .await
+    let body = match crate::middleware::auth_middleware::authorize_fragment_core(
+        crate::structs::auth_structs::AuthorizationRequest {
+            fragment: payload.fragment,
+            secret: payload.secret,
+            read: payload.read,
+            write: payload.write,
+            modify: payload.modify,
+            delete: payload.delete,
+            expires_in: payload.expires_in,
+        },
+    )
+    .await
     {
-        Ok(response) => response,
-        Err(err) => return NativeResponse::err(id, "dispatch_failed", err),
+        Ok(body) => body,
+        Err(err) => {
+            return NativeResponse::operation(
+                id,
+                crate::protocol::ops::auth_error_response(&err),
+                crate::protocol::ops::native_body_bytes(&json!({
+                    "error": crate::protocol::ops::auth_error_message(&err)
+                })),
+            );
+        }
     };
-    if api_response.status >= 400 {
-        return NativeResponse::api(id, api_response, body);
-    }
-    let Ok(value) = serde_json::from_slice::<Value>(&body) else {
-        return NativeResponse::err(id, "auth.invalid_response", "auth response was not JSON");
-    };
-    let Some(token) = value.get("access_token").and_then(Value::as_str) else {
-        return NativeResponse::err(
-            id,
-            "auth.invalid_response",
-            "auth response did not include access_token",
-        );
-    };
+    let token = body.access_token.clone();
     if let Err(err) = session.set_bearer(token.to_string()) {
         return NativeResponse::err(id, "auth.invalid_token", err);
     }
-    NativeResponse::api(id, api_response, body)
-}
-
-async fn dispatch_api(
-    dispatcher: &NativeApiDispatcher,
-    session: &NativeSession,
-    peer: SocketAddr,
-    id: String,
-    request: NativeApiRequest,
-    body: Option<Vec<u8>>,
-) -> NativeResponse {
-    match dispatcher.dispatch(session, peer, request, body).await {
-        Ok((payload, body)) => NativeResponse::api(id, payload, body),
-        Err(err) => NativeResponse::err(id, "dispatch_failed", err),
-    }
+    NativeResponse::operation(
+        id,
+        crate::protocol::ops::op_response(200),
+        crate::protocol::ops::native_body_bytes(&body),
+    )
 }

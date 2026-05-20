@@ -89,6 +89,10 @@ pub async fn validate_access(req: Request<Body>, next: Next) -> Result<Response,
 pub async fn authorize_fragment(
     Json(payload): Json<AuthorizationRequest>,
 ) -> Result<Json<AuthBody>, AuthError> {
+    Ok(Json(authorize_fragment_core(payload).await?))
+}
+
+pub async fn authorize_fragment_core(payload: AuthorizationRequest) -> Result<AuthBody, AuthError> {
     if payload.secret.is_empty() || payload.fragment.is_empty() {
         return Err(AuthError::MissingCredentials);
     }
@@ -124,7 +128,7 @@ pub async fn authorize_fragment(
         }
     }
 
-    let body = mint_fragment_auth_body(
+    mint_fragment_auth_body(
         payload.fragment,
         payload.read,
         payload.write,
@@ -132,9 +136,7 @@ pub async fn authorize_fragment(
         payload.delete,
         resolve_access_token_ttl(payload.expires_in),
     )
-    .await?;
-
-    Ok(Json(body))
+    .await
 }
 
 pub async fn auth(req: Request<Body>, next: Next) -> Result<Response, AuthError> {

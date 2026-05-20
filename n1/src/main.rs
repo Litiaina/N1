@@ -1059,6 +1059,7 @@ pub async fn run_server() {
         .await
         .expect("Failed to bind required N1 native protocol listener");
     let (storage_router, app_state) = build_storage_routes_unbound();
+    let native_state = app_state.clone();
     let serve_storage = apply_runtime_http_layers(storage_router)
         .with_state(app_state)
         .fallback(handler_404);
@@ -1071,9 +1072,8 @@ pub async fn run_server() {
         interval_cleanup(&fs_root).await;
     });
 
-    let native_router = serve_storage.clone();
     tokio::spawn(async move {
-        serve_native_protocol(native_listener, native_addr, native_router).await;
+        serve_native_protocol(native_listener, native_addr, native_state).await;
     });
 
     serve(storage_addr, serve_storage, cert).await;

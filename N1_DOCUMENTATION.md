@@ -1,6 +1,6 @@
 # N1 Documentation
 
-N1 1.2.0 is a single-node storage kernel for durable object storage with a POSIX-like namespace and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, garbage collection, trash/recover, archive download, and realtime namespace events.
+N1 1.2.1 is a single-node storage kernel for durable object storage with a POSIX-like namespace and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, garbage collection, trash/recover, archive download, and realtime namespace events.
 
 N1 exposes a file-explorer-friendly namespace while storing payloads through its shard/parity blob plane. Folders are real namespace directories. Files are stable object identities with immutable version records. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
@@ -218,15 +218,16 @@ Fragment tokens carry independent permissions:
 
 ## Native N1 Protocol
 
-N1 1.2.0 includes the native N1 protocol:
+N1 1.2.1 includes the native N1 protocol:
 
 ```text
 n1://127.0.0.1:50002
+protocol: n1/0.2
 ```
 
-HTTPS remains the universal consumer API. The native protocol is the low-level N1 transport for N1 Console, N1 CLI, NS, N2, and trusted services that need lower latency than HTTPS for control-plane and namespace calls.
+HTTPS remains the universal consumer API. The native protocol is the low-level N1 execution face for N1 Console, N1 CLI, NS, N2, and trusted services that need lower latency than HTTPS for control-plane and namespace calls.
 
-The native protocol is only a transport face. It does not create another storage engine, another namespace, another metadata authority, or another code path for object truth. Native requests dispatch into the same N1 service graph used by HTTPS.
+The native protocol does not create another storage engine, another namespace, another metadata authority, or another code path for object truth. Native requests use typed `n1://` operations that call N1 core/service functions directly. They do not emulate HTTP requests and they do not dispatch through the Axum route graph.
 
 ### Configuration
 
@@ -255,21 +256,21 @@ Client request:
 ```json
 {
   "id": "request-id",
-  "op": "api.request",
-  "payload": "{\"method\":\"GET\",\"path\":\"/n1/ping\"}",
+  "op": "namespace.stat",
+  "payload": "{\"path\":\"videos/clip.mp4\"}",
   "body": null
 }
 ```
 
-Response:
+Operation response:
 
 ```json
 {
   "id": "request-id",
   "ok": true,
   "status": 200,
-  "payload": "{\"status\":200,\"headers\":{\"content-type\":\"text/plain\"},\"json\":null,\"body_len\":4}",
-  "body": "raw MessagePack binary bytes when the response has a body",
+  "payload": null,
+  "body": "MessagePack-encoded operation result bytes",
   "error": null
 }
 ```
@@ -278,10 +279,10 @@ Important details:
 
 - `id` is echoed by the server so clients can correlate requests.
 - `op` selects the native operation.
-- `payload` is UTF-8 JSON text stored inside the MessagePack frame.
-- `body` is MessagePack binary for raw request/response bytes.
-- `ok=false` means the native transport or mapped API request failed.
-- `status` is present for requests mapped into the HTTP-compatible N1 route graph.
+- request `payload` is UTF-8 JSON text stored inside the MessagePack frame.
+- operation response `body` is MessagePack-encoded typed data. Native does not duplicate the same data as JSON in the envelope.
+- `ok=false` means the native transport or typed operation failed.
+- `status` is present for typed operations that return API-style status bodies.
 - `error.code` and `error.message` are present for native-layer failures.
 
 Native sockets use `TCP_NODELAY` to avoid delayed-ACK/Nagle latency on small framed request/response workloads.
@@ -299,7 +300,7 @@ Native connections hold session state. Authenticate once, then reuse the connect
 }
 ```
 
-The server calls the same `/n1/auth/fragment` route internally and stores the returned bearer token in that native connection session. Future native operations on the same connection automatically use that bearer unless the caller overrides authorization through `api.request` headers.
+The server calls the fragment authorization core directly and stores the returned bearer token in that native connection session. Future native operations on the same connection automatically use that bearer.
 
 Other auth/session operations:
 
@@ -307,44 +308,9 @@ Other auth/session operations:
 - `auth.clear` or `logout`: clear native session state.
 - `session.info`: inspect the current native session permissions.
 
-### API Bridge
+### Core Operations
 
-`api.request` is the 1:1 parity bridge. It accepts a method, path, optional headers, and optional JSON body, then dispatches through the same N1 route graph as HTTPS without leaving the process:
-
-```json
-{
-  "id": "list-1",
-  "op": "api.request",
-  "payload": "{\"method\":\"GET\",\"path\":\"/n1/posix/list?path=videos&limit=200\"}",
-  "body": null
-}
-```
-
-POST with JSON:
-
-```json
-{
-  "id": "mkdir-1",
-  "op": "api.request",
-  "payload": "{\"method\":\"POST\",\"path\":\"/n1/posix/mkdir\",\"json\":{\"path\":\"videos/2026\"}}",
-  "body": null
-}
-```
-
-Raw bytes:
-
-```json
-{
-  "id": "part-1",
-  "op": "api.request",
-  "payload": "{\"method\":\"PUT\",\"path\":\"/n1/upload/multipart/<version_id>/0?durability=batched\",\"headers\":{\"content-type\":\"application/octet-stream\"}}",
-  "body": "<raw part bytes>"
-}
-```
-
-### Typed Operations
-
-Typed operations are convenience shortcuts for the same routes. They are useful for SDKs and internal tools because callers do not need to manually assemble URLs.
+Native operations are typed N1 operations, not HTTP bridge calls. Native has no HTTP bridge operation; clients should use the operation names below.
 
 Namespace/POSIX:
 
@@ -373,20 +339,32 @@ Trash:
 
 Multipart:
 
-- `multipart.init`
+- `uploads.list`
+- `uploads.status`
 - `multipart.status`
-- `multipart.part`
-- `multipart.finalize`
+- `multipart.list`
 
 Maintenance:
 
 - `maintenance.health`
 - `maintenance.repair.start`
 - `maintenance.repair.status`
+- `maintenance.repair.stop`
 - `maintenance.gc.start`
 - `maintenance.gc.status`
+- `maintenance.gc.stop`
 - `maintenance.redistribution.start`
 - `maintenance.redistribution.status`
+- `maintenance.redistribution.stop`
+
+Fragment:
+
+- `fragment.create`
+- `fragment.list`
+- `fragment.hash`
+- `fragment.hash.public`
+- `fragment.quota`
+- `fragment.resize_quota`
 
 Typed stat example:
 
@@ -412,13 +390,16 @@ Typed rename example:
 
 ### Performance Profile
 
-Native is designed to remove HTTP/TLS overhead for trusted internal clients. Current release-build loopback proof on 1,000 measured iterations showed:
+Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 1.2.1 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope.
 
-- `ping`: about `20k ops/sec`, p50 about `47 us`.
-- `posix stat`: about `6.1k-6.8k ops/sec`, p50 about `134-145 us`.
-- HTTPS `posix stat` on the same run: about `3.6k ops/sec`, p50 about `237 us`.
+Current release-build loopback proof on 1,000 measured iterations showed:
 
-Listing is less transport-bound because namespace scanning and response body size dominate; native remains competitive and is best viewed as a low-latency control-plane/tooling transport rather than a storage-core shortcut.
+- HTTPS `posix stat`: about `3.4k ops/sec`, p50 about `262 us`.
+- Native `namespace.stat`: about `11.8k ops/sec`, p50 about `76 us`.
+- HTTPS `posix list`: about `576 ops/sec`, p50 about `1387 us`.
+- Native `namespace.list`: about `804 ops/sec`, p50 about `1189 us`.
+
+Listing is less transport-bound because namespace scanning and response body size dominate, but the native MessagePack body path avoids JSON duplication and now stays ahead of HTTPS on the POSIX list proof.
 
 ### Tooling Policy
 
@@ -450,7 +431,7 @@ The CLI intentionally keeps destructive namespace mutations out of the operator 
 
 ### Stability Boundary
 
-Native `n1://` does not bypass N1 validation, authorization, repair, GC, redistribution, upload accounting, or namespace rules. It reaches the same service graph as HTTPS. Its stability risks are protocol risks: framing, session handling, socket behavior, and client implementation. The storage kernel stays unchanged.
+Native `n1://` does not bypass N1 validation, authorization, repair, GC, redistribution, upload accounting, or namespace rules. It reaches N1 core/service functions directly instead of masking HTTP. Its stability risks are protocol risks: framing, session handling, socket behavior, and client implementation. The storage kernel stays unchanged.
 
 For LTS release proof, native should remain in the Rust release proof matrix for:
 

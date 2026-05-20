@@ -2111,7 +2111,7 @@ dependencies = [
 
 [[package]]
 name = "n1"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "argon2",
  "async_zip",
@@ -2144,6 +2144,7 @@ dependencies = [
  "rustix",
  "rustls",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sha2",
  "simd-erasure-core",
@@ -2228,6 +2229,7 @@ dependencies = [
  "reqwest",
  "rmp-serde",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sha2",
  "tokio",
@@ -2237,7 +2239,7 @@ dependencies = [
 
 [[package]]
 name = "n1_cli"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "assert_cmd",
  "axum",
@@ -2248,6 +2250,7 @@ dependencies = [
  "reqwest",
  "rmp-serde",
  "serde",
+ "serde_bytes",
  "serde_json",
  "tokio",
 ]
@@ -3486,6 +3489,16 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde_bytes"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

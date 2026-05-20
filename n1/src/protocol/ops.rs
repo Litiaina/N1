@@ -1,338 +1,563 @@
-use crate::protocol::dispatch::api_request;
-use crate::protocol::types::NativeApiRequest;
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::sync::Arc;
 
-pub fn typed_api_request(op: &str, payload: &Value) -> Result<Option<NativeApiRequest>, String> {
-    let request = match op {
+use axum::body::to_bytes;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use serde::Serialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+use crate::core::fragment_manager::create_fragment;
+use crate::core::garbage_collector::{
+    get_gc_status, run_garbage_collector, stop_garbage_collector,
+};
+use crate::core::monitoring::system_health_snapshot;
+use crate::core::redistribution::{
+    get_redist_status, stop_redistribution_job_api, trigger_redistribution_job_api,
+};
+use crate::core::repair_manager::{
+    get_repair_status, inspect_object_status, parse_check_mode, repair_object, stop_repair_job_api,
+    trigger_repair_job_api,
+};
+use crate::core::retrieve::{get_object_metadata_direct, list_fragments};
+use crate::core::storage_capacity_parser::{
+    ResizeFragmentQuotaRequest, get_fragment_quota_usage, resize_fragment_quota,
+};
+use crate::core::sync::CreateFragmentRequest;
+use crate::core::upload::{get_upload_status, list_active_uploads};
+use crate::enums::app_error_enum::AppError;
+use crate::middleware::auth_middleware::AuthError;
+use crate::namespace::models::NamespaceEntryKind;
+use crate::namespace::runtime::{global_namespace_runtime, logical_not_found};
+use crate::posix::service as posix_service;
+use crate::protocol::auth::NativeSession;
+use crate::protocol::types::NativeOpResponse;
+use crate::routes::storage_routes::AppState;
+use crate::structs::auth_structs::Claims;
+use crate::validation::fragment_validation::does_fragment_exist;
+use crate::websocket::ws_structs::{NamespaceChangeEvent, StorageEventPayload};
+
+pub struct NativeExecutionError(pub NativeOpResponse, pub Vec<u8>);
+
+pub async fn execute_native_op(
+    state: Arc<AppState>,
+    session: &NativeSession,
+    op: &str,
+    payload: Value,
+    _body: Option<Vec<u8>>,
+) -> Result<Option<(NativeOpResponse, Vec<u8>)>, NativeExecutionError> {
+    let result = execute_native_op_inner(state, session, op, payload, _body).await;
+    match result {
+        Ok(value) => Ok(value),
+        Err(err) => Err(native_app_error(err)),
+    }
+}
+
+async fn execute_native_op_inner(
+    state: Arc<AppState>,
+    session: &NativeSession,
+    op: &str,
+    payload: Value,
+    _body: Option<Vec<u8>>,
+) -> Result<Option<(NativeOpResponse, Vec<u8>)>, AppError> {
+    let claims = match op {
+        "fragment.create" | "fragment.hash.public" => None,
+        _ => Some(require_claims(session)?),
+    };
+
+    let response = match op {
         "namespace.list" | "posix.list" => {
-            let path = string_field(payload, "path").unwrap_or_default();
-            let limit = usize_field(payload, "limit").unwrap_or(200).clamp(1, 1000);
-            let trash = bool_field(payload, "trash").unwrap_or(false);
-            let continuation = string_field(payload, "continuation_token");
-            let mut query = vec![
-                ("path", path),
-                ("limit", limit.to_string()),
-                ("trash", trash.to_string()),
-            ];
-            if let Some(continuation) = continuation {
-                query.push(("continuation_token", continuation));
-            }
-            api_request(
-                "GET",
-                format!("/n1/posix/list?{}", query_string(query)),
-                None,
+            let claims = claims.expect("claims required");
+            native_body(
+                posix_service::list_dir(
+                    claims,
+                    string_field(&payload, "path").unwrap_or_default(),
+                    usize_field(&payload, "limit").unwrap_or(200),
+                    string_field(&payload, "continuation_token"),
+                    bool_field(&payload, "trash").unwrap_or(false),
+                )
+                .await?,
             )
         }
         "namespace.stat" | "posix.stat" => {
-            let path = required_string(payload, "path")?;
-            let trash = bool_field(payload, "trash").unwrap_or(false);
-            api_request(
-                "GET",
-                format!(
-                    "/n1/posix/stat?{}",
-                    query_string(vec![("path", path), ("trash", trash.to_string())])
-                ),
-                None,
+            let claims = claims.expect("claims required");
+            native_body(
+                posix_service::stat_path(
+                    claims,
+                    required_string(&payload, "path")?,
+                    bool_field(&payload, "trash").unwrap_or(false),
+                )
+                .await?,
             )
         }
-        "namespace.mkdir" | "posix.mkdir" => api_request(
-            "POST",
-            "/n1/posix/mkdir",
-            Some(json!({"path": required_string(payload, "path")?})),
-        ),
-        "namespace.rename" | "posix.rename" | "posix.move" => api_request(
-            "POST",
-            "/n1/posix/rename",
-            Some(json!({
-                "source_path": required_string(payload, "source_path")?,
-                "destination_path": required_string(payload, "destination_path")?,
-            })),
-        ),
-        "namespace.trash" | "posix.trash" => api_request(
-            "POST",
-            "/n1/posix/trash",
-            Some(path_payload(payload, true)?),
-        ),
-        "namespace.recover" | "posix.recover" => api_request(
-            "POST",
-            "/n1/posix/recover",
-            Some(path_payload(payload, true)?),
-        ),
-        "namespace.purge" | "posix.purge" => api_request(
-            "POST",
-            "/n1/posix/purge",
-            Some(path_payload(payload, true)?),
-        ),
+        "namespace.mkdir" | "posix.mkdir" => {
+            let claims = claims.expect("claims required");
+            native_body(
+                posix_service::mkdir_path(state, claims, required_string(&payload, "path")?)
+                    .await?,
+            )
+        }
+        "namespace.rename" | "posix.rename" | "posix.move" => {
+            let claims = claims.expect("claims required");
+            native_body(
+                posix_service::rename_path(
+                    state,
+                    claims,
+                    required_string(&payload, "source_path")?,
+                    required_string(&payload, "destination_path")?,
+                )
+                .await?,
+            )
+        }
+        "namespace.trash" | "posix.trash" => {
+            let claims = claims.expect("claims required");
+            native_body(
+                posix_service::trash_path(state, claims, required_string(&payload, "path")?)
+                    .await?,
+            )
+        }
+        "namespace.recover" | "posix.recover" => {
+            let claims = claims.expect("claims required");
+            native_body(
+                posix_service::recover_path(state, claims, required_string(&payload, "path")?)
+                    .await?,
+            )
+        }
+        "namespace.purge" | "posix.purge" => {
+            let claims = claims.expect("claims required");
+            native_body(
+                posix_service::permanently_delete_path(
+                    state,
+                    claims,
+                    required_string(&payload, "path")?,
+                )
+                .await?,
+            )
+        }
         "object.list" => {
-            let prefix = string_field(payload, "prefix");
-            let delimiter = string_field(payload, "delimiter");
-            let limit = usize_field(payload, "limit").unwrap_or(100).clamp(1, 1000);
-            let continuation = string_field(payload, "continuation_token");
-            let mut query = vec![("limit", limit.to_string())];
-            if let Some(prefix) = prefix {
-                query.push(("prefix", prefix));
-            }
-            if let Some(delimiter) = delimiter {
-                query.push(("delimiter", delimiter));
-            }
-            if let Some(continuation) = continuation {
-                query.push(("continuation_token", continuation));
-            }
-            api_request("GET", format!("/n1/objects?{}", query_string(query)), None)
+            let claims = claims.expect("claims required");
+            require_read(&claims)?;
+            native_body(
+                global_namespace_runtime()
+                    .list_objects_page(&claims.fragment, &params_from_payload(&payload), false)
+                    .await?,
+            )
         }
         "trash.list" => {
-            let prefix = string_field(payload, "prefix");
-            let limit = usize_field(payload, "limit").unwrap_or(100).clamp(1, 1000);
-            let continuation = string_field(payload, "continuation_token");
-            let mut query = vec![("limit", limit.to_string())];
-            if let Some(prefix) = prefix {
-                query.push(("prefix", prefix));
-            }
-            if let Some(continuation) = continuation {
-                query.push(("continuation_token", continuation));
-            }
-            api_request("GET", format!("/n1/trash?{}", query_string(query)), None)
-        }
-        "trash.empty" => api_request("DELETE", "/n1/trash/empty", None),
-        "trash.recover_all" => api_request("POST", "/n1/trash/recover-all", None),
-        "object.status" => {
-            let object_key = required_string(payload, "object_key")?;
-            let mode = string_field(payload, "mode").unwrap_or_else(|| "availability".to_string());
-            api_request(
-                "GET",
-                format!(
-                    "/n1/objects/status/{}?{}",
-                    encode_path(&object_key),
-                    query_string(vec![("mode", mode)])
-                ),
-                None,
+            let claims = claims.expect("claims required");
+            require_read(&claims)?;
+            native_body(
+                global_namespace_runtime()
+                    .list_objects_page(&claims.fragment, &params_from_payload(&payload), true)
+                    .await?,
             )
+        }
+        "trash.empty" => {
+            let claims = claims.expect("claims required");
+            require_delete(&claims)?;
+            let summary = global_namespace_runtime()
+                .empty_trash(&claims.fragment)
+                .await?;
+            state.emit(
+                &claims.fragment,
+                StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+                    &claims.fragment,
+                    summary.clone(),
+                )),
+            );
+            native_body(json!({
+                "operation": summary.operation,
+                "affected_paths": summary.affected_paths,
+                "affected_objects": summary.affected_objects,
+                "trash_entry_id": summary.trash_entry_id,
+                "deleted_at_unix": summary.deleted_at_unix,
+            }))
+        }
+        "trash.recover_all" => {
+            let claims = claims.expect("claims required");
+            require_write(&claims)?;
+            let summary = global_namespace_runtime()
+                .recover_all(&claims.fragment)
+                .await?;
+            state.emit(
+                &claims.fragment,
+                StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+                    &claims.fragment,
+                    summary.clone(),
+                )),
+            );
+            native_body(json!({
+                "operation": summary.operation,
+                "affected_paths": summary.affected_paths,
+                "affected_objects": summary.affected_objects,
+            }))
+        }
+        "object.status" => {
+            let claims = claims.expect("claims required");
+            require_read(&claims)?;
+            let object_key = required_string(&payload, "object_key")?;
+            let physical = resolve_logical_read_key(&claims.fragment, &object_key).await?;
+            let metadata = get_object_metadata_direct(&claims.fragment, &physical).await?;
+            let mut status = inspect_object_status(&metadata, check_mode_payload(&payload)).await?;
+            status.object_key = object_key.trim_start_matches('/').to_string();
+            native_body(status)
         }
         "object.repair" => {
-            let object_key = required_string(payload, "object_key")?;
-            let mode = string_field(payload, "mode").unwrap_or_else(|| "strict".to_string());
-            api_request(
-                "POST",
-                format!(
-                    "/n1/objects/repair/{}?{}",
-                    encode_path(&object_key),
-                    query_string(vec![("mode", mode)])
-                ),
-                None,
-            )
+            let claims = claims.expect("claims required");
+            require_write_modify(&claims)?;
+            let object_key = required_string(&payload, "object_key")?;
+            let physical = resolve_logical_read_key(&claims.fragment, &object_key).await?;
+            let metadata = get_object_metadata_direct(&claims.fragment, &physical).await?;
+            let mut status = repair_object(&metadata, check_mode_payload(&payload)).await?;
+            status.object_key = object_key.trim_start_matches('/').to_string();
+            native_body(status)
         }
-        "object.delete" => api_request(
-            "DELETE",
-            format!(
-                "/n1/objects/{}",
-                encode_path(&required_string(payload, "object_key")?)
-            ),
-            None,
-        ),
-        "object.recover" => api_request(
-            "POST",
-            format!(
-                "/n1/objects/recover/{}",
-                encode_path(&required_string(payload, "object_key")?)
-            ),
-            None,
-        ),
-        "object.purge" => api_request(
-            "DELETE",
-            format!(
-                "/n1/objects/permanent/{}",
-                encode_path(&required_string(payload, "object_key")?)
-            ),
-            None,
-        ),
-        "multipart.init" => {
-            let object_key = required_string(payload, "object_key")?;
-            let params = payload
-                .get("params")
-                .cloned()
-                .unwrap_or_else(|| payload_without(payload, &["object_key"]));
-            api_request(
-                "POST",
-                format!("/n1/upload/multipart/init/{}", encode_path(&object_key)),
-                Some(params),
-            )
+        "object.delete" => {
+            let claims = claims.expect("claims required");
+            let path = required_string(&payload, "object_key")?;
+            native_body(posix_service::trash_path(state, claims, path).await?)
         }
-        "multipart.status" => api_request(
-            "GET",
-            format!(
-                "/n1/upload/multipart/{}",
-                encode_path(&required_string(payload, "version_id")?)
-            ),
-            None,
-        ),
-        "multipart.part" => {
-            let version_id = required_string(payload, "version_id")?;
-            let part_index = required_string(payload, "part_index")?;
-            api_request(
-                "PUT",
-                format!(
-                    "/n1/upload/multipart/{}/{}?{}",
-                    encode_path(&version_id),
-                    encode_path(&part_index),
-                    query_string(upload_part_query(payload)?)
-                ),
-                None,
-            )
+        "object.recover" => {
+            let claims = claims.expect("claims required");
+            let path = required_string(&payload, "object_key")?;
+            native_body(posix_service::recover_path(state, claims, path).await?)
         }
-        "multipart.finalize" => {
-            let version_id = required_string(payload, "version_id")?;
-            let session_id = required_string(payload, "session_id")?;
-            let object_key = required_string(payload, "object_key")?;
-            let params = payload.get("params").cloned().unwrap_or_else(|| {
-                payload_without(payload, &["version_id", "session_id", "object_key"])
-            });
-            api_request(
-                "POST",
-                format!(
-                    "/n1/upload/multipart/{}/{}/finalize?{}",
-                    encode_path(&version_id),
-                    encode_path(&session_id),
-                    query_string(vec![("object_key", object_key)])
-                ),
-                Some(params),
-            )
+        "object.purge" => {
+            let claims = claims.expect("claims required");
+            let path = required_string(&payload, "object_key")?;
+            native_body(posix_service::permanently_delete_path(state, claims, path).await?)
         }
-        "maintenance.health" => api_request("GET", "/n1/maintenance/health", None),
-        "maintenance.repair.status" => api_request("GET", "/n1/maintenance/repair/status", None),
-        "maintenance.repair.start" => api_request(
-            "POST",
-            maintenance_fragment_path(payload, "/n1/maintenance/fragments", "/repair/start")?,
-            None,
-        ),
-        "maintenance.gc.status" => api_request("GET", "/n1/maintenance/gc/status", None),
+        "maintenance.health" => {
+            let claims = claims.expect("claims required");
+            native_body(system_health_snapshot(state, claims, params_from_payload(&payload)).await?)
+        }
+        "maintenance.gc.status" => native_body(get_gc_status().await),
+        "maintenance.repair.status" => native_body(get_repair_status().await),
+        "maintenance.redistribution.status" => native_body(get_redist_status().await),
         "maintenance.gc.start" => {
-            if let Some(fragment) = string_field(payload, "fragment") {
-                api_request(
-                    "POST",
-                    format!(
-                        "/n1/maintenance/fragments/{}/gc/start",
-                        encode_path(&fragment)
-                    ),
-                    None,
-                )
-            } else {
-                api_request("POST", "/n1/maintenance/gc/start", None)
+            let claims = claims.expect("claims required");
+            require_write_modify_delete(&claims)?;
+            native_from_response(
+                run_garbage_collector(State(state), Query(params_from_payload(&payload))).await,
+            )
+            .await
+        }
+        "maintenance.gc.stop" => {
+            let claims = claims.expect("claims required");
+            native_from_response(stop_garbage_collector(claims, State(state)).await).await
+        }
+        "maintenance.repair.start" => {
+            let claims = claims.expect("claims required");
+            let params = params_with_claim_fragment(&claims, &payload);
+            native_from_response(trigger_repair_job_api(claims, State(state), Query(params)).await?)
+                .await
+        }
+        "maintenance.repair.stop" => {
+            let claims = claims.expect("claims required");
+            native_from_response(stop_repair_job_api(claims, State(state)).await?).await
+        }
+        "maintenance.redistribution.start" => {
+            let claims = claims.expect("claims required");
+            let params = params_with_claim_fragment(&claims, &payload);
+            native_from_response(
+                trigger_redistribution_job_api(claims, State(state), Query(params)).await?,
+            )
+            .await
+        }
+        "maintenance.redistribution.stop" => {
+            let claims = claims.expect("claims required");
+            native_from_response(stop_redistribution_job_api(claims, State(state)).await?).await
+        }
+        "fragment.create" => {
+            let req = CreateFragmentRequest {
+                name: required_string(&payload, "name")?,
+                key: required_string(&payload, "key")?,
+                secret: required_string(&payload, "secret")?,
+                quota_bytes: Some(
+                    u64_field(&payload, "quota_bytes")
+                        .ok_or_else(|| AppError::BadRequest("quota_bytes is required".into()))?,
+                ),
+            };
+            native_from_response(create_fragment(axum::Json(req)).await?).await
+        }
+        "fragment.list" => {
+            let claims = claims.expect("claims required");
+            native_from_response(list_fragments(claims).await?).await
+        }
+        "fragment.hash" | "fragment.hash.public" => {
+            let fragment = required_string(&payload, "fragment")?;
+            let hash = fragment_hash(&fragment);
+            if !does_fragment_exist(&hash).await {
+                return Err(AppError::NotFound);
             }
+            native_body(json!({"fragment": fragment, "fragment_hash": hash}))
         }
-        "maintenance.redistribution.status" => {
-            api_request("GET", "/n1/maintenance/redistribution/status", None)
+        "fragment.quota" => {
+            let claims = claims.expect("claims required");
+            native_from_response(get_fragment_quota_usage(claims).await?).await
         }
-        "maintenance.redistribution.start" => api_request(
-            "POST",
-            maintenance_fragment_path(
-                payload,
-                "/n1/maintenance/fragments",
-                "/redistribution/start",
-            )?,
-            None,
-        ),
+        "fragment.resize_quota" => {
+            let claims = claims.expect("claims required");
+            let fragment =
+                string_field(&payload, "fragment").unwrap_or_else(|| claims.fragment.clone());
+            let req = ResizeFragmentQuotaRequest {
+                quota_bytes: u64_field(&payload, "quota_bytes")
+                    .ok_or_else(|| AppError::BadRequest("quota_bytes is required".into()))?,
+                secret: required_string(&payload, "secret")?,
+            };
+            native_from_response(
+                resize_fragment_quota(claims, Path(fragment), axum::Json(req)).await?,
+            )
+            .await
+        }
+        "uploads.list" | "multipart.list" => {
+            let claims = claims.expect("claims required");
+            let fragment = claims.fragment.clone();
+            native_from_response(
+                list_active_uploads(claims, Path(fragment), Query(params_from_payload(&payload)))
+                    .await?,
+            )
+            .await
+        }
+        "uploads.status" | "multipart.status" => {
+            let claims = claims.expect("claims required");
+            let fragment = claims.fragment.clone();
+            let version_id = required_string(&payload, "version_id")?;
+            native_from_response(get_upload_status(claims, Path((fragment, version_id))).await?)
+                .await
+        }
         _ => return Ok(None),
     };
-    Ok(Some(request))
+
+    Ok(Some(response))
 }
 
-fn upload_part_query(payload: &Value) -> Result<Vec<(&'static str, String)>, String> {
-    let mut query = Vec::new();
-    for key in [
-        "durability",
-        "expected_checksum",
-        "content_type",
-        "checksum",
-        "size_bytes",
-    ] {
-        if let Some(value) = string_field(payload, key) {
-            query.push((key, value));
-        }
+pub fn op_response(status: u16) -> NativeOpResponse {
+    NativeOpResponse { status }
+}
+
+fn native_body<T: Serialize>(value: T) -> (NativeOpResponse, Vec<u8>) {
+    (op_response(200), native_body_bytes(&value))
+}
+
+async fn native_from_response(response: impl IntoResponse) -> (NativeOpResponse, Vec<u8>) {
+    let response = response.into_response();
+    let status = response.status().as_u16();
+    let raw_body = to_bytes(
+        response.into_body(),
+        crate::protocol::types::MAX_NATIVE_FRAME_BYTES,
+    )
+    .await
+    .map(|bytes| bytes.to_vec())
+    .unwrap_or_default();
+    let body = serde_json::from_slice::<Value>(&raw_body)
+        .ok()
+        .and_then(|value| rmp_serde::to_vec_named(&value).ok())
+        .unwrap_or(raw_body);
+    (op_response(status), body)
+}
+
+fn native_app_error(err: AppError) -> NativeExecutionError {
+    let status = app_error_status(&err).as_u16();
+    let body = native_body_bytes(&json!({"error": err.to_string()}));
+    NativeExecutionError(op_response(status), body)
+}
+
+pub fn auth_error_response(err: &AuthError) -> NativeOpResponse {
+    op_response(auth_error_status(err).as_u16())
+}
+
+pub fn native_body_bytes<T: Serialize>(value: &T) -> Vec<u8> {
+    rmp_serde::to_vec_named(value).unwrap_or_default()
+}
+
+pub fn auth_error_message(err: &AuthError) -> &'static str {
+    match err {
+        AuthError::WrongCredentials => "Wrong credentials",
+        AuthError::MissingCredentials => "Missing credentials",
+        AuthError::InvalidToken => "Invalid token",
+        AuthError::InternalError => "An internal error occurred",
+        AuthError::FragmentNotFound => "Fragment not found",
     }
-    Ok(query)
 }
 
-fn maintenance_fragment_path(
-    payload: &Value,
-    prefix: &str,
-    suffix: &str,
-) -> Result<String, String> {
-    let fragment = required_string(payload, "fragment")?;
-    let mode = string_field(payload, "mode").unwrap_or_else(|| "scrub".to_string());
-    let fast = bool_field(payload, "fast_mode").unwrap_or(true);
-    Ok(format!(
-        "{}/{}/{}?{}",
-        prefix.trim_end_matches('/'),
-        encode_path(&fragment),
-        suffix.trim_start_matches('/'),
-        query_string(vec![("mode", mode), ("fast_mode", fast.to_string())])
-    ))
-}
-
-fn path_payload(payload: &Value, include_trash_id: bool) -> Result<Value, String> {
-    let mut out = json!({"path": required_string(payload, "path")?});
-    if include_trash_id {
-        if let Some(value) = string_field(payload, "trash_entry_id") {
-            out["trash_entry_id"] = Value::String(value);
-        }
+fn auth_error_status(err: &AuthError) -> StatusCode {
+    match err {
+        AuthError::WrongCredentials | AuthError::InvalidToken => StatusCode::UNAUTHORIZED,
+        AuthError::MissingCredentials | AuthError::FragmentNotFound => StatusCode::BAD_REQUEST,
+        AuthError::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
     }
-    Ok(out)
 }
 
-fn payload_without(payload: &Value, keys: &[&str]) -> Value {
-    let Some(map) = payload.as_object() else {
-        return Value::Null;
-    };
-    let mut out = serde_json::Map::new();
-    for (key, value) in map {
-        if !keys.contains(&key.as_str()) {
-            out.insert(key.clone(), value.clone());
-        }
+fn app_error_status(err: &AppError) -> StatusCode {
+    match err {
+        AppError::NotFound => StatusCode::NOT_FOUND,
+        AppError::Timeout(_) => StatusCode::REQUEST_TIMEOUT,
+        AppError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+        AppError::Conflict(_) => StatusCode::CONFLICT,
+        AppError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+        AppError::Unauthorized => StatusCode::UNAUTHORIZED,
+        AppError::Forbidden(_) => StatusCode::FORBIDDEN,
+        AppError::Multipart(_) => StatusCode::BAD_REQUEST,
+        AppError::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
+        AppError::InsufficientStorage => StatusCode::INSUFFICIENT_STORAGE,
+        AppError::Io(_, _) | AppError::InternalServerError(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
-    Value::Object(out)
 }
 
-fn required_string(payload: &Value, field: &str) -> Result<String, String> {
-    string_field(payload, field).ok_or_else(|| format!("missing string field '{field}'"))
+fn require_claims(session: &NativeSession) -> Result<Claims, AppError> {
+    session.claims().cloned().ok_or(AppError::Unauthorized)
 }
 
-fn string_field(payload: &Value, field: &str) -> Option<String> {
-    match payload.get(field)? {
+fn require_read(claims: &Claims) -> Result<(), AppError> {
+    if claims.read {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden("Read permission required".into()))
+    }
+}
+
+fn require_write(claims: &Claims) -> Result<(), AppError> {
+    if claims.write {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden("Write permission required".into()))
+    }
+}
+
+fn require_delete(claims: &Claims) -> Result<(), AppError> {
+    if claims.delete {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden("Delete permission required".into()))
+    }
+}
+
+fn require_write_modify(claims: &Claims) -> Result<(), AppError> {
+    if claims.write && claims.modify {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "Write and Modify permission required".into(),
+        ))
+    }
+}
+
+fn require_write_modify_delete(claims: &Claims) -> Result<(), AppError> {
+    if claims.write && claims.modify && claims.delete {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "Write, Modify and Delete permission required".into(),
+        ))
+    }
+}
+
+async fn resolve_logical_read_key(
+    fragment: &str,
+    requested_path: &str,
+) -> Result<String, AppError> {
+    let requested = requested_path.trim_start_matches('/').trim();
+    if let Some(entry) = global_namespace_runtime()
+        .entry(fragment, requested)
+        .await?
+    {
+        if entry.kind != NamespaceEntryKind::File || !entry.lifecycle.is_live() {
+            return Err(logical_not_found());
+        }
+        return entry.object_id.ok_or_else(|| {
+            AppError::InternalServerError("logical file is missing physical object id".to_string())
+        });
+    }
+    crate::core::index_store::normalize_object_id(requested).map_err(|_| logical_not_found())
+}
+
+fn params_from_payload(payload: &Value) -> HashMap<String, String> {
+    payload
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(key, value)| value_to_string(value).map(|value| (key.clone(), value)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn params_with_claim_fragment(claims: &Claims, payload: &Value) -> HashMap<String, String> {
+    let mut params = params_from_payload(payload);
+    params
+        .entry("fragment".to_string())
+        .or_insert_with(|| claims.fragment.clone());
+    params
+}
+
+fn check_mode_payload(payload: &Value) -> crate::core::repair_manager::RepairCheckMode {
+    parse_check_mode(&params_from_payload(payload))
+}
+
+fn value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
         Value::String(value) => Some(value.clone()),
-        Value::Number(value) => Some(value.to_string()),
         Value::Bool(value) => Some(value.to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => Some(value.to_string()),
+    }
+}
+
+fn string_field(payload: &Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(value_to_string)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn required_string(payload: &Value, key: &str) -> Result<String, AppError> {
+    string_field(payload, key).ok_or_else(|| AppError::BadRequest(format!("{key} is required")))
+}
+
+fn bool_field(payload: &Value, key: &str) -> Option<bool> {
+    match payload.get(key)? {
+        Value::Bool(value) => Some(*value),
+        Value::String(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+        .then_some(true)
+        .or_else(|| Some(false)),
+        Value::Number(value) => value.as_u64().map(|value| value != 0),
         _ => None,
     }
 }
 
-fn usize_field(payload: &Value, field: &str) -> Option<usize> {
-    payload
-        .get(field)
-        .and_then(|value| value.as_u64())
-        .and_then(|value| usize::try_from(value).ok())
+fn usize_field(payload: &Value, key: &str) -> Option<usize> {
+    payload.get(key).and_then(|value| match value {
+        Value::Number(value) => value.as_u64().and_then(|value| usize::try_from(value).ok()),
+        Value::String(value) => value.trim().parse::<usize>().ok(),
+        _ => None,
+    })
 }
 
-fn bool_field(payload: &Value, field: &str) -> Option<bool> {
-    payload.get(field).and_then(Value::as_bool)
+fn u64_field(payload: &Value, key: &str) -> Option<u64> {
+    payload.get(key).and_then(|value| match value {
+        Value::Number(value) => value.as_u64(),
+        Value::String(value) => value.trim().parse::<u64>().ok(),
+        _ => None,
+    })
 }
 
-fn query_string(values: Vec<(&str, String)>) -> String {
-    values
-        .into_iter()
-        .map(|(key, value)| format!("{}={}", encode_query(key), encode_query(&value)))
-        .collect::<Vec<_>>()
-        .join("&")
+fn fragment_hash(fragment: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(fragment.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
+#[allow(dead_code)]
 fn encode_query(value: &str) -> String {
     utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
-}
-
-fn encode_path(value: &str) -> String {
-    value
-        .split('/')
-        .map(|segment| utf8_percent_encode(segment, NON_ALPHANUMERIC).to_string())
-        .collect::<Vec<_>>()
-        .join("/")
 }

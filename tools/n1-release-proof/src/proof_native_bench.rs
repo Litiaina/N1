@@ -80,15 +80,6 @@ impl Proof {
                 warmup,
             )
             .await?;
-        let native_api_stat = self
-            .benchmark_native_api_get(
-                &mut stream,
-                "native_api_posix_stat",
-                &stat_path,
-                iterations,
-                warmup,
-            )
-            .await?;
         let http_list = self
             .benchmark_http_get("http_posix_list", &list_path, iterations, warmup)
             .await?;
@@ -98,15 +89,6 @@ impl Proof {
                 "native_typed_namespace_list",
                 "namespace.list",
                 json!({"path": bench_prefix, "limit": 1000}),
-                iterations,
-                warmup,
-            )
-            .await?;
-        let native_api_list = self
-            .benchmark_native_api_get(
-                &mut stream,
-                "native_api_posix_list",
-                &list_path,
                 iterations,
                 warmup,
             )
@@ -127,10 +109,8 @@ impl Proof {
                 native_ping,
                 http_stat,
                 native_typed_stat,
-                native_api_stat,
                 http_list,
                 native_typed_list,
-                native_api_list,
             ],
             "rss": rss,
         });
@@ -220,7 +200,7 @@ impl Proof {
             samples.push(start.elapsed());
             ensure_native_ok(&response, name)?;
             total_body_bytes =
-                total_body_bytes.saturating_add(response.body.as_ref().map_or(0, Vec::len));
+                total_body_bytes.saturating_add(response.body.as_ref().map_or(0, |body| body.len()));
         }
         let stats = transport_benchmark_stats(
             name,
@@ -233,27 +213,6 @@ impl Proof {
         Ok(stats)
     }
 
-    async fn benchmark_native_api_get(
-        &self,
-        stream: &mut TcpStream,
-        name: &str,
-        path: &str,
-        iterations: usize,
-        warmup: usize,
-    ) -> ProofResult<Value> {
-        self.benchmark_native_op(
-            stream,
-            name,
-            "api.request",
-            json!({
-                "method": "GET",
-                "path": path,
-            }),
-            iterations,
-            warmup,
-        )
-        .await
-    }
 }
 
 fn transport_benchmark_stats(

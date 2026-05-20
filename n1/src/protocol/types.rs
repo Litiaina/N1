@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::BTreeMap;
+use serde_bytes::ByteBuf;
 
-pub const N1_NATIVE_PROTOCOL_VERSION: &str = "n1/0.1";
+pub const N1_NATIVE_PROTOCOL_VERSION: &str = "n1/0.2";
 pub const MAX_NATIVE_FRAME_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,7 +11,7 @@ pub struct NativeRequest {
     #[serde(default)]
     pub payload: Option<String>,
     #[serde(default)]
-    pub body: Option<Vec<u8>>,
+    pub body: Option<ByteBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,7 +23,7 @@ pub struct NativeResponse {
     #[serde(default)]
     pub payload: Option<String>,
     #[serde(default)]
-    pub body: Option<Vec<u8>>,
+    pub body: Option<ByteBuf>,
     #[serde(default)]
     pub error: Option<NativeError>,
 }
@@ -36,23 +35,8 @@ pub struct NativeError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NativeApiRequest {
-    pub method: String,
-    pub path: String,
-    #[serde(default)]
-    pub headers: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub json: Option<Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NativeApiResponse {
+pub struct NativeOpResponse {
     pub status: u16,
-    #[serde(default)]
-    pub headers: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub json: Option<Value>,
-    pub body_len: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,15 +73,18 @@ impl NativeResponse {
         }
     }
 
-    pub fn api(id: impl Into<String>, payload: NativeApiResponse, body: Vec<u8>) -> Self {
+    pub fn operation(id: impl Into<String>, payload: NativeOpResponse, body: Vec<u8>) -> Self {
         let status = payload.status;
-        let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "null".to_string());
         Self {
             id: id.into(),
             ok: status < 400,
             status: Some(status),
-            payload: Some(payload_json),
-            body: if body.is_empty() { None } else { Some(body) },
+            payload: None,
+            body: if body.is_empty() {
+                None
+            } else {
+                Some(ByteBuf::from(body))
+            },
             error: None,
         }
     }
