@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 
-pub const N1_NATIVE_PROTOCOL_VERSION: &str = "n1/0.2";
+pub const N1_NATIVE_PROTOCOL_VERSION: &str = "n1/0.3";
 pub const MAX_NATIVE_FRAME_BYTES: usize = 128 * 1024 * 1024;
+pub const MAX_NATIVE_BODY_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeRequest {
@@ -12,6 +13,8 @@ pub struct NativeRequest {
     pub payload: Option<String>,
     #[serde(default)]
     pub body: Option<ByteBuf>,
+    #[serde(default)]
+    pub body_len: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

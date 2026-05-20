@@ -69,10 +69,20 @@ struct Args {
     native_protocol_proof: bool,
     #[arg(long, default_value_t = false)]
     native_transport_benchmark: bool,
+    #[arg(long, default_value_t = false)]
+    upload_benchmark: bool,
     #[arg(long, default_value_t = 1_000)]
     benchmark_iterations: usize,
     #[arg(long, default_value_t = 100)]
     benchmark_warmup: usize,
+    #[arg(long, default_value_t = 3)]
+    upload_benchmark_repeats: usize,
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    one_shot_benchmark_bytes: usize,
+    #[arg(long, default_value_t = 128 * 1024 * 1024)]
+    multipart_benchmark_bytes: usize,
+    #[arg(long, default_value_t = 32 * 1024 * 1024)]
+    multipart_benchmark_part_bytes: usize,
 }
 
 #[derive(Debug)]

@@ -6,6 +6,8 @@ struct NativeProofRequest {
     payload: String,
     #[serde(default)]
     body: Option<serde_bytes::ByteBuf>,
+    #[serde(default)]
+    body_len: Option<u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -79,7 +81,7 @@ impl Proof {
             .and_then(|value| serde_json::from_str::<Value>(value).ok())
             .and_then(|value| value.get("protocol").and_then(Value::as_str).map(str::to_owned))
             .unwrap_or_default();
-        if protocol != "n1/0.2" {
+        if protocol != "n1/0.3" {
             return Err(format!("native ping returned unexpected protocol '{protocol}'").into());
         }
 
@@ -100,6 +102,149 @@ impl Proof {
         )
         .await?;
         ensure_native_ok(&auth, "native auth")?;
+
+        let native_one_shot_key = format!("{}native-protocol/native-one-shot.bin", self.args.prefix);
+        let native_one_shot_payload = deterministic_payload(512 * 1024, b"native-one-shot");
+        let native_one_shot_sha = sha256_bytes(&native_one_shot_payload);
+        let native_upload = native_round_trip(
+            &mut stream,
+            "native-upload-one-shot",
+            "upload.one_shot",
+            json!({
+                "object_key": native_one_shot_key,
+                "content_type": "application/octet-stream",
+                "durability": "batched",
+            }),
+            Some(native_one_shot_payload),
+        )
+        .await?;
+        ensure_native_status(&native_upload, 201, "native one-shot upload")?;
+        self.assert_download_sha256(&native_one_shot_key, &native_one_shot_sha)
+            .await?;
+
+        let native_multipart_key = format!("{}native-protocol/native-multipart.bin", self.args.prefix);
+        let native_multipart_payload = deterministic_payload(2 * 1024 * 1024, b"native-multipart");
+        let native_multipart_sha = sha256_bytes(&native_multipart_payload);
+        let part_size = 512 * 1024usize;
+        let expected_parts = native_multipart_payload.len().div_ceil(part_size);
+        let init = native_round_trip(
+            &mut stream,
+            "native-multipart-init",
+            "multipart.init",
+            json!({
+                "object_key": native_multipart_key,
+                "content_type": "application/octet-stream",
+                "total_size_bytes": native_multipart_payload.len(),
+                "expected_parts": expected_parts,
+                "part_size_bytes": part_size,
+            }),
+            None,
+        )
+        .await?;
+        ensure_native_status(&init, 201, "native multipart init")?;
+        let init_body = native_json_body(&init)?;
+        let version_id = init_body
+            .get("version_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("native multipart init missing version_id: {init_body}"))?
+            .to_string();
+        let session_id = init_body
+            .get("session_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("native multipart init missing session_id: {init_body}"))?
+            .to_string();
+        for (idx, chunk) in native_multipart_payload.chunks(part_size).enumerate() {
+            ensure_native_status(
+                &native_round_trip(
+                    &mut stream,
+                    &format!("native-multipart-part-{idx}"),
+                    "multipart.put_part",
+                    json!({
+                        "version_id": version_id,
+                        "part_index": idx,
+                        "durability": "batched",
+                    }),
+                    Some(chunk.to_vec()),
+                )
+                .await?,
+                200,
+                "native multipart part",
+            )?;
+        }
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-multipart-finalize",
+                "multipart.finalize",
+                json!({
+                    "object_key": native_multipart_key,
+                    "version_id": version_id,
+                    "session_id": session_id,
+                    "content_type": "application/octet-stream",
+                    "total_size_bytes": native_multipart_payload.len(),
+                    "expected_parts": expected_parts,
+                    "part_size_bytes": part_size,
+                }),
+                None,
+            )
+            .await?,
+            200,
+            "native multipart finalize",
+        )?;
+        self.assert_download_sha256(&native_multipart_key, &native_multipart_sha)
+            .await?;
+        let download_chunk = native_round_trip(
+            &mut stream,
+            "native-download-chunk",
+            "object.download_chunk",
+            json!({
+                "object_key": native_multipart_key,
+                "offset": 0,
+                "chunk_size": 64 * 1024,
+            }),
+            None,
+        )
+        .await?;
+        ensure_native_status(&download_chunk, 200, "native download chunk")?;
+        if download_chunk.body.as_ref().map(|body| body.len()) != Some(64 * 1024) {
+            return Err("native download chunk returned the wrong byte count".into());
+        }
+        let cancel_key = format!("{}native-protocol/cancel-me.bin", self.args.prefix);
+        let cancel_init = native_round_trip(
+            &mut stream,
+            "native-multipart-cancel-init",
+            "multipart.init",
+            json!({
+                "object_key": cancel_key,
+                "content_type": "application/octet-stream",
+                "total_size_bytes": 1024,
+                "expected_parts": 1,
+                "part_size_bytes": 1024,
+            }),
+            None,
+        )
+        .await?;
+        ensure_native_status(&cancel_init, 201, "native multipart cancel init")?;
+        let cancel_body = native_json_body(&cancel_init)?;
+        let cancel_version_id = cancel_body
+            .get("version_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("native cancel init missing version_id: {cancel_body}"))?;
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-multipart-cancel",
+                "multipart.cancel",
+                json!({
+                    "version_id": cancel_version_id,
+                    "object_key": cancel_key,
+                }),
+                None,
+            )
+            .await?,
+            204,
+            "native multipart cancel",
+        )?;
 
         let (parent, name) = split_parent_name(object_key);
         let list = native_round_trip(
@@ -222,7 +367,13 @@ impl Proof {
                 "namespace.rename",
                 "namespace.trash",
                 "namespace.recover",
-                "namespace.purge"
+                "namespace.purge",
+                "upload.one_shot",
+                "multipart.init",
+                "multipart.put_part",
+                "multipart.finalize",
+                "multipart.cancel",
+                "object.download_chunk"
             ],
             "status": "PASS"
         }))
@@ -242,13 +393,17 @@ async fn native_round_trip(
         id: id.to_string(),
         op: op.to_string(),
         payload: serde_json::to_string(&payload)?,
-        body: body.map(serde_bytes::ByteBuf::from),
+        body_len: body.as_ref().map(|body| body.len() as u64),
+        body: None,
     };
     let encoded = rmp_serde::to_vec(&request)?;
     stream
         .write_all(&(encoded.len() as u32).to_be_bytes())
         .await?;
     stream.write_all(&encoded).await?;
+    if let Some(body) = body {
+        stream.write_all(&body).await?;
+    }
     stream.flush().await?;
 
     let mut len = [0u8; 4];

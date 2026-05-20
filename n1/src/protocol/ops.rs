@@ -7,9 +7,11 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::core::disk_manager::{ChunkQuery, InitiateUploadParams, UploadPartQuery};
 use crate::core::fragment_manager::create_fragment;
 use crate::core::garbage_collector::{
     get_gc_status, run_garbage_collector, stop_garbage_collector,
@@ -27,7 +29,11 @@ use crate::core::storage_capacity_parser::{
     ResizeFragmentQuotaRequest, get_fragment_quota_usage, resize_fragment_quota,
 };
 use crate::core::sync::CreateFragmentRequest;
-use crate::core::upload::{get_upload_status, list_active_uploads};
+use crate::core::upload::{
+    FinalizeUploadResult, cancel_upload_session_direct, finalize_object_upload_direct,
+    get_upload_status, initiate_object_upload_direct, list_active_uploads,
+    object_upload_part_direct, upload_object_one_shot_direct,
+};
 use crate::enums::app_error_enum::AppError;
 use crate::middleware::auth_middleware::AuthError;
 use crate::namespace::models::NamespaceEntryKind;
@@ -35,7 +41,10 @@ use crate::namespace::runtime::{global_namespace_runtime, logical_not_found};
 use crate::posix::service as posix_service;
 use crate::protocol::auth::NativeSession;
 use crate::protocol::types::NativeOpResponse;
-use crate::routes::storage_routes::AppState;
+use crate::routes::storage_routes::{
+    AppState, commit_logical_upload_from_meta, emit_logical_file_uploaded,
+    find_reusable_pending_upload, resolve_logical_write_key,
+};
 use crate::structs::auth_structs::Claims;
 use crate::validation::fragment_validation::does_fragment_exist;
 use crate::websocket::ws_structs::{NamespaceChangeEvent, StorageEventPayload};
@@ -230,6 +239,184 @@ async fn execute_native_op_inner(
             let path = required_string(&payload, "object_key")?;
             native_body(posix_service::permanently_delete_path(state, claims, path).await?)
         }
+        "upload.one_shot" | "object.upload.one_shot" => {
+            let claims = claims.expect("claims required");
+            require_write(&claims)?;
+            let body =
+                _body.ok_or_else(|| AppError::BadRequest("upload body is required".into()))?;
+            let fragment = claims.fragment.clone();
+            let logical = required_string(&payload, "object_key")?;
+            let physical = resolve_logical_write_key(&fragment, &logical).await?;
+            let mut metadata = upload_object_one_shot_direct(
+                claims,
+                fragment.clone(),
+                physical.clone(),
+                upload_part_query_from_payload(&payload)?,
+                string_field(&payload, "content_type"),
+                body,
+                true,
+            )
+            .await?;
+            let committed_physical =
+                commit_logical_upload_from_meta(&fragment, &logical, &physical, &metadata).await?;
+            metadata.object_key = logical;
+            emit_logical_file_uploaded(
+                &state,
+                &fragment,
+                &metadata.object_key,
+                &committed_physical,
+                &metadata,
+            );
+            metadata.strip_internal_layout();
+            (op_response(201), native_body_bytes(&metadata))
+        }
+        "multipart.init" | "upload.multipart.init" => {
+            let claims = claims.expect("claims required");
+            require_write(&claims)?;
+            let fragment = claims.fragment.clone();
+            let logical = required_string(&payload, "object_key")?;
+            let params: InitiateUploadParams = typed_payload(&payload)?;
+            if let Some(existing) =
+                find_reusable_pending_upload(&fragment, &logical, &params).await?
+            {
+                (op_response(201), native_body_bytes(&existing))
+            } else {
+                let physical = resolve_logical_write_key(&fragment, &logical).await?;
+                let response = initiate_object_upload_direct(
+                    claims,
+                    fragment.clone(),
+                    physical.clone(),
+                    params,
+                )
+                .await?;
+                global_namespace_runtime()
+                    .bind_pending_upload(
+                        &fragment,
+                        &logical,
+                        &physical,
+                        &response.version_id,
+                        &response.session_id,
+                    )
+                    .await?;
+                (op_response(201), native_body_bytes(&response))
+            }
+        }
+        "multipart.put_part" | "upload.multipart.put_part" => {
+            let claims = claims.expect("claims required");
+            require_write(&claims)?;
+            let body = _body.ok_or_else(|| AppError::BadRequest("part body is required".into()))?;
+            let version_id = required_string(&payload, "version_id")?;
+            let part_index = u64_field(&payload, "part_index")
+                .ok_or_else(|| AppError::BadRequest("part_index is required".into()))?;
+            object_upload_part_direct(
+                claims.clone(),
+                claims.fragment.clone(),
+                version_id.clone(),
+                part_index,
+                upload_part_query_from_payload(&payload)?,
+                body,
+            )
+            .await?;
+            native_body(json!({
+                "version_id": version_id,
+                "part_index": part_index,
+                "uploaded": true,
+            }))
+        }
+        "multipart.finalize" | "upload.multipart.finalize" => {
+            let claims = claims.expect("claims required");
+            require_write(&claims)?;
+            let fragment = claims.fragment.clone();
+            let version_id = required_string(&payload, "version_id")?;
+            let session_id = required_string(&payload, "session_id")?;
+            let logical = required_string(&payload, "object_key")?;
+            let params: InitiateUploadParams = typed_payload(&payload)?;
+            let binding = global_namespace_runtime()
+                .pending_upload(&fragment, &version_id)
+                .await?;
+            let physical = binding
+                .as_ref()
+                .map(|value| value.physical_object_id.clone())
+                .unwrap_or_else(|| logical.clone());
+            match finalize_object_upload_direct(
+                claims,
+                fragment.clone(),
+                version_id,
+                session_id,
+                physical.clone(),
+                params,
+            )
+            .await?
+            {
+                FinalizeUploadResult::Complete(mut metadata) => {
+                    let logical_path = binding
+                        .as_ref()
+                        .map(|value| value.logical_path.clone())
+                        .unwrap_or(logical);
+                    let committed_physical = commit_logical_upload_from_meta(
+                        &fragment,
+                        &logical_path,
+                        &physical,
+                        &metadata,
+                    )
+                    .await?;
+                    global_namespace_runtime()
+                        .clear_pending_upload(&fragment, &metadata.version_id)
+                        .await?;
+                    metadata.object_key = logical_path;
+                    emit_logical_file_uploaded(
+                        &state,
+                        &fragment,
+                        &metadata.object_key,
+                        &committed_physical,
+                        &metadata,
+                    );
+                    metadata.strip_internal_layout();
+                    (op_response(200), native_body_bytes(&metadata))
+                }
+                FinalizeUploadResult::Incomplete(incomplete) => {
+                    (op_response(409), native_body_bytes(&incomplete))
+                }
+            }
+        }
+        "multipart.cancel" | "upload.multipart.cancel" => {
+            let claims = claims.expect("claims required");
+            require_write(&claims)?;
+            let fragment = claims.fragment.clone();
+            let version_id = required_string(&payload, "version_id")?;
+            let binding = global_namespace_runtime()
+                .pending_upload(&fragment, &version_id)
+                .await?;
+            let object_key = binding
+                .as_ref()
+                .map(|value| value.physical_object_id.clone())
+                .or_else(|| string_field(&payload, "object_key"))
+                .unwrap_or_else(|| version_id.clone());
+            cancel_upload_session_direct(claims, fragment.clone(), version_id.clone(), object_key)
+                .await?;
+            let _ = global_namespace_runtime()
+                .clear_pending_upload(&fragment, &version_id)
+                .await;
+            (op_response(204), Vec::new())
+        }
+        "object.download_chunk" | "download.chunk" => {
+            let claims = claims.expect("claims required");
+            require_read(&claims)?;
+            let fragment = claims.fragment.clone();
+            let logical = required_string(&payload, "object_key")?;
+            let physical = resolve_logical_read_key(&fragment, &logical).await?;
+            let bytes = crate::core::download::download_object_chunk_direct(
+                &fragment,
+                &ChunkQuery {
+                    object_key: physical,
+                    offset: u64_field(&payload, "offset").unwrap_or(0),
+                    chunk_size: usize_field(&payload, "chunk_size").unwrap_or(8 * 1024 * 1024),
+                },
+            )
+            .await?;
+            let status = if bytes.is_empty() { 204 } else { 200 };
+            (op_response(status), bytes)
+        }
         "maintenance.health" => {
             let claims = claims.expect("claims required");
             native_body(system_health_snapshot(state, claims, params_from_payload(&payload)).await?)
@@ -341,6 +528,15 @@ pub fn op_response(status: u16) -> NativeOpResponse {
 
 fn native_body<T: Serialize>(value: T) -> (NativeOpResponse, Vec<u8>) {
     (op_response(200), native_body_bytes(&value))
+}
+
+fn typed_payload<T: DeserializeOwned>(payload: &Value) -> Result<T, AppError> {
+    serde_json::from_value(payload.clone())
+        .map_err(|err| AppError::BadRequest(format!("invalid native payload: {err}")))
+}
+
+fn upload_part_query_from_payload(payload: &Value) -> Result<UploadPartQuery, AppError> {
+    typed_payload(payload)
 }
 
 async fn native_from_response(response: impl IntoResponse) -> (NativeOpResponse, Vec<u8>) {

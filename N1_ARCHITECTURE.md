@@ -16,7 +16,7 @@ The transport faces call the same N1 core/service graph. `n1://` is not a separa
 
 ## Native Protocol Plane
 
-N1 1.2.1 uses `n1://` protocol `n1/0.2` as an internal protocol plane beside HTTPS. The protocol exists so N1-owned tools can talk to the storage kernel without paying HTTP/TLS overhead or JSON response duplication on control-plane calls. The native listener is required at startup; if its port cannot bind, N1 should fail startup instead of silently running without the low-level face.
+N1 1.2.2 uses `n1://` protocol `n1/0.3` as the native N1 protocol plane beside HTTPS. The protocol exists so N1-owned tools can talk to the storage kernel without paying HTTP/TLS overhead or JSON response duplication. It covers namespace/control operations and the native data plane: one-shot upload, multipart init/part/finalize, upload status/list, object chunk download, object status/repair, GC, repair, redistribution, quota, and health. The native listener is required at startup; if its port cannot bind, N1 should fail startup instead of silently running without the low-level face.
 
 The native plane is intentionally thin:
 
@@ -37,7 +37,7 @@ TCP connection
 
 The server stores auth state per native connection. `auth.fragment` calls the fragment authorization core directly, then the returned JWT is attached to later typed native operations. Native does not contain an HTTP route bridge and does not dispatch through Axum. Operations such as `namespace.stat`, `maintenance.health`, `object.status`, and `fragment.quota` call the same N1 core/service functions that HTTPS routes use.
 
-Native protocol performance depends on avoiding small-frame TCP latency. N1 sets `TCP_NODELAY` on accepted native sockets. The Rust release proof includes a native benchmark so delayed-ACK/Nagle regressions are caught.
+Native protocol performance depends on avoiding small-frame TCP latency and avoiding binary payload inflation. N1 sets `TCP_NODELAY` on accepted native sockets. Protocol `n1/0.3` sends upload payloads as raw bytes after a small MessagePack control frame instead of embedding large bodies inside the MessagePack frame. The Rust release proof includes native namespace and upload benchmarks so delayed-ACK/Nagle regressions and native data-plane regressions are caught.
 
 The native plane must not:
 

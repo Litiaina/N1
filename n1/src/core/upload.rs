@@ -200,6 +200,11 @@ enum UploadDurabilityMode {
     Batched,
 }
 
+pub enum FinalizeUploadResult {
+    Complete(ObjectMetadata),
+    Incomplete(FinalizeIncompleteResponse),
+}
+
 impl UploadDurabilityMode {
     fn strict(self) -> bool {
         matches!(self, Self::Strict)
@@ -1630,6 +1635,16 @@ pub async fn initiate_object_upload(
     AxumPath((fragment, object_key)): AxumPath<(String, String)>,
     AxumJson(params): AxumJson<InitiateUploadParams>,
 ) -> Result<impl IntoResponse, AppError> {
+    let response = initiate_object_upload_direct(claims, fragment, object_key, params).await?;
+    Ok((StatusCode::CREATED, AxumJson(response)))
+}
+
+pub async fn initiate_object_upload_direct(
+    claims: Claims,
+    fragment: String,
+    object_key: String,
+    params: InitiateUploadParams,
+) -> Result<InitiateUploadResponse, AppError> {
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
     }
@@ -1715,13 +1730,10 @@ pub async fn initiate_object_upload(
         fragment, object_key, version_id, session_id
     );
 
-    Ok((
-        StatusCode::CREATED,
-        AxumJson(InitiateUploadResponse {
-            session_id,
-            version_id,
-        }),
-    ))
+    Ok(InitiateUploadResponse {
+        session_id,
+        version_id,
+    })
 }
 
 pub async fn list_active_uploads(
@@ -1953,6 +1965,125 @@ pub async fn object_upload_part(
     Ok((StatusCode::OK, "Part uploaded").into_response())
 }
 
+pub async fn object_upload_part_direct(
+    claims: Claims,
+    fragment: String,
+    version_id: String,
+    part_index: u64,
+    query: UploadPartQuery,
+    body: Vec<u8>,
+) -> Result<(), AppError> {
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+
+    let durability_mode = parse_upload_durability_mode(&query);
+    let strict_durability = durability_mode.strict();
+    let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
+    let content_length = body.len() as u64;
+    let gate_context = format!(
+        "fragment={}, version={}, part={}",
+        fragment, version_id, part_index
+    );
+    let _io_guard =
+        acquire_upload_io_guard_for_size(query.io_gate, &gate_context, content_length).await?;
+
+    if content_length > max_part_size {
+        return Err(AppError::PayloadTooLarge("Part too large".into()));
+    }
+
+    let path_manager = ObjectPathManager::new();
+    let manifest = read_manifest_any(&fragment, &version_id)
+        .await?
+        .ok_or(AppError::BadRequest("Upload session not found".into()))?;
+    if part_index >= manifest.expected_parts {
+        return Err(AppError::BadRequest("Part index out of range".into()));
+    }
+    let expected_size = expected_part_size_bytes(&manifest, part_index);
+    let expected_checksum = query
+        .checksum
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if part_exists_on_disk(&path_manager, &manifest, part_index).await? {
+        if let Some(expected_size) = expected_size {
+            if content_length != expected_size {
+                return Err(AppError::Conflict(
+                    "Part already uploaded but size differs".into(),
+                ));
+            }
+        }
+        if expected_checksum.is_some() {
+            warn!(
+                "Multipart resume for {}/{} part {} skipped checksum revalidation because session part metadata is not persisted",
+                fragment, version_id, part_index
+            );
+        }
+        if let Err(err) = persist_missing_receipt_from_disk(
+            &path_manager,
+            &fragment,
+            &version_id,
+            &manifest,
+            part_index,
+        )
+        .await
+        {
+            warn!(
+                "Multipart resume for {}/{} part {} could not refresh compact receipt: {}",
+                fragment, version_id, part_index, err
+            );
+        }
+        return Ok(());
+    }
+    if let Some(expected_size) = expected_size {
+        if content_length != expected_size {
+            return Err(AppError::BadRequest(
+                "Part size does not match upload session manifest".into(),
+            ));
+        }
+    }
+
+    let part_meta = write_part_blob_to_disk(
+        &path_manager,
+        &fragment,
+        &version_id,
+        part_index,
+        content_length,
+        manifest_data_shards(&manifest),
+        manifest_parity_shards(&manifest),
+        manifest.stripe_size_bytes,
+        Body::from(body),
+        expected_checksum,
+        strict_durability,
+    )
+    .await?;
+
+    if index::load_session(&fragment, &version_id).await?.is_none() {
+        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+        return Err(AppError::Conflict("Upload session was cancelled".into()));
+    }
+
+    if let Err(err) =
+        index::commit_session_part_receipt(&fragment, &version_id, &manifest, &part_meta).await
+    {
+        warn!(
+            "Failed to persist compact multipart receipt for {}/{} part {}: {}",
+            fragment, version_id, part_index, err
+        );
+    }
+
+    if index::load_session(&fragment, &version_id).await?.is_none() {
+        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+        return Err(AppError::Conflict("Upload session was cancelled".into()));
+    }
+
+    Ok(())
+}
+
 async fn upload_object_one_shot_inner(
     State(_state): State<Arc<AppState>>,
     claims: Claims,
@@ -2069,13 +2200,15 @@ pub async fn upload_object_one_shot(
     upload_object_one_shot_inner(state, claims, headers, path, query, body, true).await
 }
 
-pub async fn finalize_object_upload(
-    State(_state): State<Arc<AppState>>,
+pub async fn upload_object_one_shot_direct(
     claims: Claims,
-    AxumPath((fragment, version_id, session_id)): AxumPath<(String, String, String)>,
-    Query(key_query): Query<ObjectKeyQuery>,
-    AxumJson(params): AxumJson<InitiateUploadParams>,
-) -> Result<impl IntoResponse, AppError> {
+    fragment: String,
+    object_key: String,
+    query: UploadPartQuery,
+    content_type: Option<String>,
+    body: Vec<u8>,
+    acquire_io_gate: bool,
+) -> Result<ObjectMetadata, AppError> {
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
     }
@@ -2083,15 +2216,141 @@ pub async fn finalize_object_upload(
         return Err(AppError::Forbidden("Access denied to this fragment".into()));
     }
 
-    let object_key = key_query.object_key;
+    let durability_mode = parse_upload_durability_mode(&query);
+    let strict_durability = durability_mode.strict();
+    let content_length = body.len() as u64;
+    let gate_context = format!("fragment={}, object_key={}", fragment, object_key);
+    let _io_guard = if acquire_io_gate {
+        acquire_upload_io_guard_for_size(query.io_gate, &gate_context, content_length).await?
+    } else {
+        None
+    };
+    let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
+    if content_length > max_part_size {
+        return Err(AppError::PayloadTooLarge(
+            "Object too large for one-shot upload".into(),
+        ));
+    }
+
+    preflight_upload_capacity(content_length).await?;
+    let stripe_size = choose_upload_stripe_size_for_len(content_length);
+
+    let version_id = Ulid::new().to_string();
+    let session_id = Ulid::new().to_string();
+    let expected_checksum = query
+        .checksum
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let content_type = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+
+    let path_manager = ObjectPathManager::new();
+    let created_at = Utc::now().timestamp();
+    let part_meta = match write_part_blob_to_disk(
+        &path_manager,
+        &fragment,
+        &version_id,
+        0,
+        content_length,
+        configured_data_shards(),
+        configured_parity_shards(),
+        stripe_size,
+        Body::from(body),
+        expected_checksum,
+        strict_durability,
+    )
+    .await
+    {
+        Ok(part_meta) => part_meta,
+        Err(err) => {
+            cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+            return Err(err);
+        }
+    };
+
+    let object_meta = ObjectMetadata {
+        object_key: object_key.clone(),
+        fragment: fragment.clone(),
+        version_id: version_id.clone(),
+        upload_session_id: session_id,
+        owner_uid: fragment.clone(),
+        content_type,
+        total_size_bytes: content_length,
+        created_at,
+        parts: vec![part_meta],
+        is_delete_marker: false,
+        stripe_size_bytes: stripe_size,
+    };
+
+    let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
+    let replica_write_mode = if strict_durability {
+        index::IndexReplicaWriteMode::SyncBestEffort
+    } else {
+        index::IndexReplicaWriteMode::BackgroundBestEffort
+    };
+    if let Err(err) =
+        index::publish_object_with_replica_mode(&object_meta, replica_write_mode).await
+    {
+        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+        return Err(err);
+    }
+
+    Ok(object_meta.without_internal_layout())
+}
+
+pub async fn finalize_object_upload(
+    State(_state): State<Arc<AppState>>,
+    claims: Claims,
+    AxumPath((fragment, version_id, session_id)): AxumPath<(String, String, String)>,
+    Query(key_query): Query<ObjectKeyQuery>,
+    AxumJson(params): AxumJson<InitiateUploadParams>,
+) -> Result<impl IntoResponse, AppError> {
+    match finalize_object_upload_direct(
+        claims,
+        fragment,
+        version_id,
+        session_id,
+        key_query.object_key,
+        params,
+    )
+    .await?
+    {
+        FinalizeUploadResult::Complete(object_meta) => {
+            let response_body = serde_json::to_value(object_meta.without_internal_layout())
+                .map_err(|e| {
+                    AppError::InternalServerError(format!(
+                        "serialize finalized upload response: {}",
+                        e
+                    ))
+                })?;
+            Ok((StatusCode::OK, AxumJson(response_body)).into_response())
+        }
+        FinalizeUploadResult::Incomplete(incomplete) => {
+            Ok((StatusCode::CONFLICT, AxumJson(incomplete)).into_response())
+        }
+    }
+}
+
+pub async fn finalize_object_upload_direct(
+    claims: Claims,
+    fragment: String,
+    version_id: String,
+    session_id: String,
+    object_key: String,
+    params: InitiateUploadParams,
+) -> Result<FinalizeUploadResult, AppError> {
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+
     let path_manager = ObjectPathManager::new();
     let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
 
-    if index::read_object_version(&fragment, &object_key, &version_id)
-        .await
-        .is_ok()
-    {
-        return Ok((StatusCode::OK, "Upload finalized.").into_response());
+    if let Ok(existing) = index::read_object_version(&fragment, &object_key, &version_id).await {
+        return Ok(FinalizeUploadResult::Complete(existing));
     }
 
     let manifest = read_manifest_any(&fragment, &version_id).await?;
@@ -2184,15 +2443,13 @@ pub async fn finalize_object_upload(
     }
 
     if !missing.is_empty() {
-        return Ok((
-            StatusCode::CONFLICT,
-            AxumJson(FinalizeIncompleteResponse {
+        return Ok(FinalizeUploadResult::Incomplete(
+            FinalizeIncompleteResponse {
                 uploaded_parts: present.into_iter().collect(),
                 missing_parts: missing,
                 expected_parts,
-            }),
-        )
-            .into_response());
+            },
+        ));
     }
 
     parts.sort_by_key(|p| p.part_index);
@@ -2234,11 +2491,7 @@ pub async fn finalize_object_upload(
 
     let _ = index::remove_session(&fragment, &version_id, "finalized").await;
 
-    let response_body = serde_json::to_value(object_meta.clone().without_internal_layout())
-        .map_err(|e| {
-            AppError::InternalServerError(format!("serialize finalized upload response: {}", e))
-        })?;
-    Ok((StatusCode::OK, AxumJson(response_body)).into_response())
+    Ok(FinalizeUploadResult::Complete(object_meta))
 }
 
 pub async fn cancel_upload_session(
@@ -2246,6 +2499,16 @@ pub async fn cancel_upload_session(
     AxumPath((fragment, version_id)): AxumPath<(String, String)>,
     Query(key_query): Query<ObjectKeyQuery>,
 ) -> Result<impl IntoResponse, AppError> {
+    cancel_upload_session_direct(claims, fragment, version_id, key_query.object_key).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn cancel_upload_session_direct(
+    claims: Claims,
+    fragment: String,
+    version_id: String,
+    object_key_hint: String,
+) -> Result<(), AppError> {
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
     }
@@ -2260,10 +2523,10 @@ pub async fn cancel_upload_session(
         .map(|state| state.manifest.object_key.clone())
         .filter(|key| !key.is_empty())
         .unwrap_or_else(|| {
-            if key_query.object_key.is_empty() {
+            if object_key_hint.is_empty() {
                 version_id.clone()
             } else {
-                key_query.object_key.clone()
+                object_key_hint
             }
         });
     let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
@@ -2281,5 +2544,5 @@ pub async fn cancel_upload_session(
     let _ = index::remove_session(&fragment, &version_id, "cancelled").await;
     cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
 
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }

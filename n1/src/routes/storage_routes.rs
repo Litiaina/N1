@@ -101,7 +101,7 @@ async fn parse_json_response<T: DeserializeOwned>(
         .map_err(|e| AppError::InternalServerError(format!("{context} json decode failed: {e}")))
 }
 
-async fn resolve_logical_read_key(
+pub(crate) async fn resolve_logical_read_key(
     fragment: &str,
     requested_path: &str,
 ) -> Result<String, AppError> {
@@ -144,7 +144,7 @@ fn looks_like_flat_storage_object_id(requested_path: &str) -> bool {
         && normalized.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-async fn resolve_logical_write_key(
+pub(crate) async fn resolve_logical_write_key(
     fragment: &str,
     requested_path: &str,
 ) -> Result<String, AppError> {
@@ -198,7 +198,7 @@ fn upload_request_matches_session(
         && content_type_matches
 }
 
-async fn find_reusable_pending_upload(
+pub(crate) async fn find_reusable_pending_upload(
     fragment: &str,
     logical_path: &str,
     params: &crate::core::disk_manager::InitiateUploadParams,
@@ -270,7 +270,7 @@ async fn apply_logical_upload_bindings_to_sessions(
     Ok(())
 }
 
-async fn commit_logical_upload_from_meta(
+pub(crate) async fn commit_logical_upload_from_meta(
     fragment: &str,
     logical_path: &str,
     physical_object_id: &str,
@@ -281,7 +281,7 @@ async fn commit_logical_upload_from_meta(
         .await
 }
 
-fn emit_logical_file_uploaded(
+pub(crate) fn emit_logical_file_uploaded(
     state: &Arc<AppState>,
     fragment: &str,
     logical_path: &str,

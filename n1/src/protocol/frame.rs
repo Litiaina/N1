@@ -1,4 +1,6 @@
-use crate::protocol::types::{MAX_NATIVE_FRAME_BYTES, NativeRequest, NativeResponse};
+use crate::protocol::types::{
+    MAX_NATIVE_BODY_BYTES, MAX_NATIVE_FRAME_BYTES, NativeRequest, NativeResponse,
+};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -9,7 +11,23 @@ where
     let Some(bytes) = read_frame(reader).await? else {
         return Ok(None);
     };
-    let request = rmp_serde::from_slice(&bytes).map_err(invalid_data)?;
+    let mut request: NativeRequest = rmp_serde::from_slice(&bytes).map_err(invalid_data)?;
+    if request.body.is_none() {
+        if let Some(body_len) = request.body_len {
+            let body_len = body_len as usize;
+            if body_len > MAX_NATIVE_BODY_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("native body exceeds {} bytes", MAX_NATIVE_BODY_BYTES),
+                ));
+            }
+            if body_len > 0 {
+                let mut body = vec![0u8; body_len];
+                reader.read_exact(&mut body).await?;
+                request.body = Some(serde_bytes::ByteBuf::from(body));
+            }
+        }
+    }
     Ok(Some(request))
 }
 

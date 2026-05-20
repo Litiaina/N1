@@ -1,6 +1,6 @@
 # N1 Documentation
 
-N1 1.2.1 is a single-node storage kernel for durable object storage with a POSIX-like namespace and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, garbage collection, trash/recover, archive download, and realtime namespace events.
+N1 1.2.2 is a single-node storage kernel for durable object storage with a POSIX-like namespace and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, garbage collection, trash/recover, archive download, and realtime namespace events.
 
 N1 exposes a file-explorer-friendly namespace while storing payloads through its shard/parity blob plane. Folders are real namespace directories. Files are stable object identities with immutable version records. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
@@ -218,16 +218,28 @@ Fragment tokens carry independent permissions:
 
 ## Native N1 Protocol
 
-N1 1.2.1 includes the native N1 protocol:
+N1 1.2.2 includes the native N1 protocol:
 
 ```text
 n1://127.0.0.1:50002
-protocol: n1/0.2
+protocol: n1/0.3
 ```
 
-HTTPS remains the universal consumer API. The native protocol is the low-level N1 execution face for N1 Console, N1 CLI, NS, N2, and trusted services that need lower latency than HTTPS for control-plane and namespace calls.
+HTTPS remains the universal consumer API. The native protocol is the low-level N1 execution face for N1 Console, N1 CLI, NS, N2, and trusted services that need lower latency than HTTPS for namespace, control-plane, and data-plane calls.
 
 The native protocol does not create another storage engine, another namespace, another metadata authority, or another code path for object truth. Native requests use typed `n1://` operations that call N1 core/service functions directly. They do not emulate HTTP requests and they do not dispatch through the Axum route graph.
+
+`n1/0.3` supports the native data plane:
+
+- `upload.one_shot`
+- `multipart.init`
+- `multipart.put_part`
+- `multipart.finalize`
+- `uploads.list`
+- `uploads.status`
+- `object.download_chunk`
+
+Upload bodies are sent as raw bytes after a small MessagePack control frame. This keeps the native protocol from inflating large upload parts inside the request envelope.
 
 ### Configuration
 
@@ -390,7 +402,7 @@ Typed rename example:
 
 ### Performance Profile
 
-Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 1.2.1 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope.
+Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 1.2.2 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes.
 
 Current release-build loopback proof on 1,000 measured iterations showed:
 
