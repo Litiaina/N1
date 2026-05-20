@@ -1,6 +1,7 @@
 use crate::core::disk_manager::{
     ChunkQuery, ObjectKeyQuery, ObjectMetadata, ObjectPathManager, ShardInfo,
 };
+use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io};
 use crate::core::metadata_parser::{get_metadata, get_version_metadata};
 use crate::core::object_parser::stream_object_logic;
 use crate::core::recovery::read_or_recover_chunk;
@@ -123,6 +124,12 @@ pub(crate) async fn download_object_chunk_from_metadata(
     params: &ChunkQuery,
 ) -> Result<(Vec<u8>, Option<String>), AppError> {
     validate_chunk_query(params)?;
+    let _io_guard = acquire_disk_io(
+        DiskIoClass::ForegroundRead,
+        Some(&metadata.fragment),
+        "download chunk",
+    )
+    .await?;
     let stripe_block_size = metadata.stripe_size_bytes;
     let mut result_buffer = Vec::with_capacity(params.chunk_size);
     let mut current_global_pos = 0u64;

@@ -11,6 +11,7 @@ use crate::core::fragment_metadata::{
 };
 use crate::core::index;
 use crate::core::index_store;
+use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io};
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::quota_manager::validate_fragment_project_headroom_for_redistribution;
 use crate::core::recovery::read_or_recover_chunk;
@@ -1626,6 +1627,12 @@ pub async fn run_redistribution_job_with_options(
     STOP_SIGNAL.store(false, Ordering::Relaxed);
     let start_time = Instant::now();
     let _write_gate = acquire_maintenance_mode(opts.execution_mode.maintenance_access_mode());
+    let _io_guard = acquire_disk_io(
+        DiskIoClass::BackgroundRedistribution,
+        opts.target_fragment.as_deref(),
+        "redistribution job",
+    )
+    .await?;
     let strict_durability = opts.strict_durability();
     let effective_durability = opts.effective_durability_mode();
     let pacing_delay = redistribution_pacing_delay(opts.execution_mode, opts.fast_mode);

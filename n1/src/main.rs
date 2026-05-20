@@ -5,6 +5,7 @@ use crate::core::adaptive_concurrency::{
 };
 use crate::core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
 use crate::core::fragment_metadata::set_configured_index_partition_count;
+use crate::core::io_scheduler::{DiskIoSchedulerConfig, configure_disk_io_scheduler};
 use crate::core::monitoring::{
     MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC, MONITOR_INTERVAL_SECS_ATOMIC,
 };
@@ -864,6 +865,10 @@ pub async fn run_server() {
     ADAPTIVE_IO_TARGET_ATOMIC
         .set(AtomicUsize::new(max_io_semaphore))
         .expect("Double initialization of ADAPTIVE_IO_TARGET_ATOMIC");
+    let disk_io_scheduler =
+        DiskIoSchedulerConfig::from_runtime(max_io_semaphore, effective_blob_disks_for_auto);
+    configure_disk_io_scheduler(disk_io_scheduler)
+        .expect("Double initialization of N1 disk IO scheduler");
 
     let max_part_size = upload_section
         .and_then(|s| s.get("max_part_size"))
@@ -902,7 +907,7 @@ pub async fn run_server() {
     let upload_io_gate_enabled = configured_upload_io_gate_enabled;
 
     tracing::info!(
-        "Upload tuning: cpu_cores={}, ram_gib={}, blob_paths={}, blob_devices={}, auto_effective_disks={}, ec={}D+{}P, max_concurrent_io={} (configured={} budget_cap={} per_upload_est={}KiB budget={}MiB effective_budget={}MiB), writer_buffer_size={}, part_durability_strict_default={}, io_gate_enabled={}",
+        "Upload tuning: cpu_cores={}, ram_gib={}, blob_paths={}, blob_devices={}, auto_effective_disks={}, ec={}D+{}P, max_concurrent_io={} (configured={} budget_cap={} per_upload_est={}KiB budget={}MiB effective_budget={}MiB), disk_scheduler={{total:{}, foreground:{}, background:{}, fg_fragment:{}, bg_fragment:{}}}, writer_buffer_size={}, part_durability_strict_default={}, io_gate_enabled={}",
         cpu_cores,
         detected_ram_gib,
         blob_disk_count,
@@ -916,6 +921,11 @@ pub async fn run_server() {
         per_upload_bytes / 1024,
         upload_memory_budget_bytes / (1024 * 1024),
         effective_upload_budget_bytes / (1024 * 1024),
+        disk_io_scheduler.total_permits,
+        disk_io_scheduler.foreground_permits,
+        disk_io_scheduler.background_permits,
+        disk_io_scheduler.foreground_per_fragment_permits,
+        disk_io_scheduler.background_per_fragment_permits,
         writer_buffer_size,
         upload_part_strict_durability_default,
         upload_io_gate_enabled

@@ -4,6 +4,7 @@ use crate::core::disk_manager::{
 };
 use crate::core::index;
 use crate::core::index_store;
+use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io, try_acquire_disk_io};
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::core::recovery::{repair_entire_shard, verify_shard_integrity};
 use crate::core::redistribution::replay_pending_intents_for_fragment_now;
@@ -750,6 +751,7 @@ pub async fn inspect_object_status(
         matches!(check_mode, RepairCheckMode::Scrub),
     )
     .await?;
+    let _io = try_acquire_disk_io(DiskIoClass::ForegroundRead, Some(&meta.fragment))?;
     inspect_object_parts(meta, check_mode)
         .await
         .map(|(report, _, _)| report)
@@ -761,6 +763,7 @@ pub async fn repair_object(
 ) -> Result<ObjectRepairStatus, AppError> {
     let _permit =
         acquire_object_maintenance_permit(meta, ObjectMaintenanceKind::Repair, true).await?;
+    let _io = try_acquire_disk_io(DiskIoClass::BackgroundRepair, Some(&meta.fragment))?;
     let (mut report, normalized_parts, repair_targets) =
         inspect_object_parts(meta, check_mode).await?;
     if report.status == "healthy" || !report.repairable {
@@ -1261,6 +1264,12 @@ pub async fn run_repair_job_with_options(
         );
     }
     let _write_gate = acquire_maintenance_mode(effective_access_mode);
+    let _io_guard = acquire_disk_io(
+        DiskIoClass::BackgroundRepair,
+        cfg.target_fragment.as_deref(),
+        "fragment repair job",
+    )
+    .await?;
     let batch_pacing = availability_pacing_delay(cfg.check_mode, opts.fast_mode);
 
     {

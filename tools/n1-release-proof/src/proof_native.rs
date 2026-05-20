@@ -107,6 +107,7 @@ impl Proof {
         let native_one_shot_key = format!("{}native-protocol/native-one-shot.bin", self.args.prefix);
         let native_one_shot_payload = deterministic_payload(512 * 1024, b"native-one-shot");
         let native_one_shot_sha = sha256_bytes(&native_one_shot_payload);
+        let mut live_object_keys = Vec::new();
         let native_upload = native_round_trip(
             &mut stream,
             "native-upload-one-shot",
@@ -122,6 +123,7 @@ impl Proof {
         ensure_native_status(&native_upload, 201, "native one-shot upload")?;
         self.assert_download_sha256(&native_one_shot_key, &native_one_shot_sha)
             .await?;
+        live_object_keys.push(native_one_shot_key.clone());
 
         let native_multipart_key = format!("{}native-protocol/native-multipart.bin", self.args.prefix);
         let native_multipart_payload = deterministic_payload(2 * 1024 * 1024, b"native-multipart");
@@ -194,6 +196,7 @@ impl Proof {
         )?;
         self.assert_download_sha256(&native_multipart_key, &native_multipart_sha)
             .await?;
+        live_object_keys.push(native_multipart_key.clone());
         let download_chunk = native_round_trip(
             &mut stream,
             "native-download-chunk",
@@ -318,6 +321,7 @@ impl Proof {
             "native object rename",
         )?;
         self.assert_download_sha256(&rename_dest, &rename_sha).await?;
+        live_object_keys.push(rename_dest.clone());
 
         let recover_version_key = format!("{}native-protocol/version-recover.bin", self.args.prefix);
         let recover_payload = deterministic_payload(96 * 1024, b"native-version-recover");
@@ -369,6 +373,7 @@ impl Proof {
         )?;
         self.assert_download_sha256(&recover_version_key, &recover_sha)
             .await?;
+        live_object_keys.push(recover_version_key.clone());
 
         let bulk_a = format!("{}native-protocol/bulk-a.bin", self.args.prefix);
         let bulk_b = format!("{}native-protocol/bulk-b.bin", self.args.prefix);
@@ -588,6 +593,7 @@ impl Proof {
         Ok(json!({
             "native_port": self.native_port(),
             "object_key": object_key,
+            "live_object_keys": live_object_keys,
             "checked_ops": [
                 "ping",
                 "auth.fragment",

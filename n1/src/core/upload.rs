@@ -21,7 +21,6 @@ use once_cell::sync::{Lazy, OnceCell};
 use serde::{Deserialize, Serialize};
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
@@ -44,6 +43,7 @@ use crate::core::disk_manager::{
 };
 use crate::core::ec::{AlignedBuffer, ErasureStreamWriter};
 use crate::core::index;
+use crate::core::io_scheduler::{DiskIoClass, DiskIoGuard, acquire_disk_io};
 use crate::core::quota_manager::{
     ensure_blob_placement_capacity_available_for_parts, ensure_capacity_available,
     fragment_quota_enforcement_enabled,
@@ -62,9 +62,6 @@ pub static ADAPTIVE_IO_TARGET_ATOMIC: OnceCell<AtomicUsize> = OnceCell::new();
 pub static UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC: OnceCell<AtomicBool> = OnceCell::new();
 pub static UPLOAD_IO_GATE_ENABLED_ATOMIC: OnceCell<AtomicBool> = OnceCell::new();
 
-static IO_SEMAPHORE: Lazy<Semaphore> =
-    Lazy::new(|| Semaphore::new(*MAX_IO_SEMAPHORE.get().unwrap()));
-static ACTIVE_IO_INFLIGHT: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
 const UPLOAD_IO_GATE_WAIT_LOG_SECS: u64 = 30;
 const MIN_DYNAMIC_STRIPE_SIZE: usize = 4 * 1024;
 const TINY_OBJECT_STRIPE_4K_LIMIT: u64 = 64 * 1024;
@@ -101,51 +98,24 @@ static IO_URING_ENABLED: Lazy<bool> = Lazy::new(|| {
     }
 });
 
-pub(crate) struct AdaptiveIoGuard<'a> {
-    _permit: tokio::sync::SemaphorePermit<'a>,
+pub(crate) struct AdaptiveIoGuard {
+    _guard: DiskIoGuard,
 }
 
-impl Drop for AdaptiveIoGuard<'_> {
-    fn drop(&mut self) {
-        ACTIVE_IO_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-async fn acquire_adaptive_io_guard() -> Result<AdaptiveIoGuard<'static>, AppError> {
-    'outer: loop {
-        let permit = match IO_SEMAPHORE.acquire().await {
-            Ok(permit) => permit,
-            Err(_) => return Err(AppError::InternalServerError("Server busy".into())),
-        };
-
-        loop {
-            let target = ADAPTIVE_IO_TARGET_ATOMIC
-                .get()
-                .map(|v| v.load(Ordering::Relaxed))
-                .unwrap_or_else(|| *MAX_IO_SEMAPHORE.get().unwrap_or(&128usize))
-                .max(1);
-
-            let active = ACTIVE_IO_INFLIGHT.load(Ordering::Relaxed);
-            if active >= target {
-                drop(permit);
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-                continue 'outer;
-            }
-
-            if ACTIVE_IO_INFLIGHT
-                .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Ok(AdaptiveIoGuard { _permit: permit });
-            }
-        }
-    }
+async fn acquire_adaptive_io_guard(
+    fragment: &str,
+    context: &str,
+) -> Result<AdaptiveIoGuard, AppError> {
+    Ok(AdaptiveIoGuard {
+        _guard: acquire_disk_io(DiskIoClass::ForegroundWrite, Some(fragment), context).await?,
+    })
 }
 
 async fn acquire_upload_io_guard_with_timeout(
     io_gate_enabled: bool,
+    fragment: &str,
     context: &str,
-) -> Result<Option<AdaptiveIoGuard<'static>>, AppError> {
+) -> Result<Option<AdaptiveIoGuard>, AppError> {
     if !io_gate_enabled {
         return Ok(None);
     }
@@ -154,7 +124,7 @@ async fn acquire_upload_io_guard_with_timeout(
     loop {
         match tokio::time::timeout(
             std::time::Duration::from_secs(UPLOAD_IO_GATE_WAIT_LOG_SECS),
-            acquire_adaptive_io_guard(),
+            acquire_adaptive_io_guard(fragment, context),
         )
         .await
         {
@@ -173,25 +143,27 @@ async fn acquire_upload_io_guard_with_timeout(
 
 pub(crate) async fn acquire_upload_io_guard_for_query(
     io_gate_override: Option<bool>,
+    fragment: &str,
     context: &str,
-) -> Result<Option<AdaptiveIoGuard<'static>>, AppError> {
+) -> Result<Option<AdaptiveIoGuard>, AppError> {
     let global_io_gate_enabled = UPLOAD_IO_GATE_ENABLED_ATOMIC
         .get()
         .map(|v| v.load(Ordering::Relaxed))
         .unwrap_or(true);
     let io_gate_enabled = io_gate_override.unwrap_or(global_io_gate_enabled);
-    acquire_upload_io_guard_with_timeout(io_gate_enabled, context).await
+    acquire_upload_io_guard_with_timeout(io_gate_enabled, fragment, context).await
 }
 
 async fn acquire_upload_io_guard_for_size(
     io_gate_override: Option<bool>,
+    fragment: &str,
     context: &str,
     content_length: u64,
-) -> Result<Option<AdaptiveIoGuard<'static>>, AppError> {
+) -> Result<Option<AdaptiveIoGuard>, AppError> {
     if content_length <= SMALL_BUFFERED_WRITE_LIMIT && !io_gate_override.unwrap_or(false) {
         return Ok(None);
     }
-    acquire_upload_io_guard_for_query(io_gate_override, context).await
+    acquire_upload_io_guard_for_query(io_gate_override, fragment, context).await
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,7 +265,7 @@ mod tests {
 
     #[tokio::test]
     async fn upload_io_gate_helper_bypasses_when_disabled() {
-        let guard = acquire_upload_io_guard_with_timeout(false, "unit-test")
+        let guard = acquire_upload_io_guard_with_timeout(false, "unit-test-fragment", "unit-test")
             .await
             .expect("gate bypass succeeds");
         assert!(guard.is_none());
@@ -1866,7 +1838,8 @@ pub async fn object_upload_part(
         fragment, version_id, part_index
     );
     let _io_guard =
-        acquire_upload_io_guard_for_size(query.io_gate, &gate_context, content_length).await?;
+        acquire_upload_io_guard_for_size(query.io_gate, &fragment, &gate_context, content_length)
+            .await?;
 
     if content_length > max_part_size {
         return Ok((StatusCode::PAYLOAD_TOO_LARGE, "Part too large").into_response());
@@ -2010,7 +1983,8 @@ pub async fn object_upload_part_body_direct(
         fragment, version_id, part_index
     );
     let _io_guard =
-        acquire_upload_io_guard_for_size(query.io_gate, &gate_context, content_length).await?;
+        acquire_upload_io_guard_for_size(query.io_gate, &fragment, &gate_context, content_length)
+            .await?;
 
     if content_length > max_part_size {
         return Err(AppError::PayloadTooLarge("Part too large".into()));
@@ -2126,7 +2100,8 @@ async fn upload_object_one_shot_inner(
     let content_length = request_content_length(&headers)?;
     let gate_context = format!("fragment={}, object_key={}", fragment, object_key);
     let _io_guard = if acquire_io_gate {
-        acquire_upload_io_guard_for_size(query.io_gate, &gate_context, content_length).await?
+        acquire_upload_io_guard_for_size(query.io_gate, &fragment, &gate_context, content_length)
+            .await?
     } else {
         None
     };
@@ -2265,7 +2240,8 @@ pub async fn upload_object_one_shot_body_direct(
     let strict_durability = durability_mode.strict();
     let gate_context = format!("fragment={}, object_key={}", fragment, object_key);
     let _io_guard = if acquire_io_gate {
-        acquire_upload_io_guard_for_size(query.io_gate, &gate_context, content_length).await?
+        acquire_upload_io_guard_for_size(query.io_gate, &fragment, &gate_context, content_length)
+            .await?
     } else {
         None
     };

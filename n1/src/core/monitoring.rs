@@ -5,6 +5,7 @@ use crate::core::fragment_manager::is_fragment_hash;
 use crate::core::garbage_collector::get_gc_status;
 use crate::core::index;
 use crate::core::index_store;
+use crate::core::io_scheduler::{DiskIoSchedulerSnapshot, disk_io_scheduler_snapshot};
 use crate::core::operation_gate::{MaintenanceAccessMode, current_maintenance_access_mode};
 use crate::core::redistribution::{
     RedistributionIntentDebtSnapshot, collect_redistribution_intent_debt, get_redist_status,
@@ -209,6 +210,7 @@ pub struct SystemHealthResponse {
     pub consistency: ConsistencyStats,
     pub system: SystemMetrics,
     pub uploads: UploadRuntimeStats,
+    pub io_scheduler: DiskIoSchedulerSnapshot,
     pub index_runtime: IndexRuntimeStats,
     pub namespace_runtime: NamespaceRuntimeStats,
     pub storage: StoragePlaneStats,
@@ -1056,6 +1058,7 @@ async fn collect_system_health(
         },
         system: system_metrics,
         uploads,
+        io_scheduler: disk_io_scheduler_snapshot(),
         index_runtime: IndexRuntimeStats {
             loaded_index_records: total_index_records,
             index_roots_online: online_index_count as u64,

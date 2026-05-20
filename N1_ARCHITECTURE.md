@@ -16,7 +16,7 @@ The transport faces call the same N1 core/service graph. `n1://` is not a separa
 
 ## Native Protocol Plane
 
-N1 1.2.2 uses `n1://` protocol `n1/0.3` as the native N1 protocol plane beside HTTPS. The protocol exists so N1-owned tools can talk to the storage kernel without paying HTTP/TLS overhead or JSON response duplication. It covers namespace/control operations and the native data plane: one-shot upload, multipart init/part/finalize, upload status/list, object chunk download, object status/repair, GC, repair, redistribution, quota, and health. The native listener is required at startup; if its port cannot bind, N1 should fail startup instead of silently running without the low-level face.
+N1 1.3.0 uses `n1://` protocol `n1/0.3` as the native N1 protocol plane beside HTTPS. The protocol exists so N1-owned tools can talk to the storage kernel without paying HTTP/TLS overhead or JSON response duplication. It covers namespace/control operations and the native data plane: one-shot upload, multipart init/part/finalize, upload status/list, object chunk download, object status/repair, GC, repair, redistribution, quota, and health. The native listener is required at startup; if its port cannot bind, N1 should fail startup instead of silently running without the low-level face.
 
 The native plane is intentionally thin:
 
@@ -49,6 +49,22 @@ The native plane must not:
 - implement a separate object metadata path
 
 Native is a lower-latency core face for the same storage kernel, not a fourth storage plane and not masked HTTP.
+
+## Disk IO Scheduler
+
+N1 1.3.0 introduces a shared disk IO scheduler above the storage planes. The scheduler is not a metadata authority and does not change the object/index/blob layout. It only controls admission into disk-heavy work.
+
+Scheduler lanes:
+
+- foreground read
+- foreground write
+- background repair
+- background GC
+- background redistribution
+
+Foreground work uses the adaptive upload target so live traffic can contract under CPU/RAM pressure. Background work has its own smaller lane and per-fragment gate, so GC, repair, and redistribution cannot consume the whole disk path while users are uploading or reading. Object status and repair also pass through the scheduler in addition to their object-scoped maintenance gates.
+
+The scheduler is intentionally coarse at 1.3.0: it controls classes and fragment fairness, not individual low-level block requests. That keeps N1 stable while creating the right foundation for later multipart pipelining and read/write priority tuning.
 
 Each configured root can house both index and blob data:
 

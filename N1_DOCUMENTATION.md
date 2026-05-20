@@ -1,6 +1,6 @@
 # N1 Documentation
 
-N1 1.2.2 is a single-node storage kernel for durable object storage with a POSIX-like namespace and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, garbage collection, trash/recover, archive download, and realtime namespace events.
+N1 1.3.0 is a single-node storage kernel for durable object storage with a POSIX-like namespace and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, garbage collection, trash/recover, archive download, and realtime namespace events.
 
 N1 exposes a file-explorer-friendly namespace while storing payloads through its shard/parity blob plane. Folders are real namespace directories. Files are stable object identities with immutable version records. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
@@ -218,7 +218,7 @@ Fragment tokens carry independent permissions:
 
 ## Native N1 Protocol
 
-N1 1.2.2 includes the native N1 protocol:
+N1 1.3.0 includes the native N1 protocol:
 
 ```text
 n1://127.0.0.1:50002
@@ -416,7 +416,7 @@ Typed rename example:
 
 ### Performance Profile
 
-Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 1.2.2 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes.
+Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 1.3.0 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes.
 
 Current release-build loopback proof on 1,000 measured iterations showed:
 
@@ -1079,6 +1079,22 @@ GET /n1/maintenance/trash/recover/status
 ```
 
 ## Health, Repair, GC, And Redistribution
+
+### Disk IO Scheduler
+
+N1 1.3.0 adds a shared disk IO scheduler for kernel-level fairness. Foreground uploads and chunk reads, object status/repair, GC, fragment repair, and redistribution now acquire scheduler lanes before doing disk-heavy work.
+
+The scheduler separates:
+
+- foreground read/write work
+- background repair
+- background GC
+- background redistribution
+- per-fragment pressure
+
+This prevents one hot fragment or one background job from consuming the whole disk path. It does not change object metadata, blob layout, durability semantics, or namespace behavior.
+
+The health response includes an `io_scheduler` object with configured permits, active foreground/background counts, and currently available lanes.
 
 ### Health
 

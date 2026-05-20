@@ -1,6 +1,7 @@
 use crate::core::constants::{FRAGMENT_METADATA_FILE, GC_SUFFIX, N1_BLOB_DIR};
 use crate::core::disk_manager::{FS_STORAGE_ROOT, ObjectMetadata, ObjectPathManager};
 use crate::core::index;
+use crate::core::io_scheduler::{DiskIoClass, acquire_disk_io};
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::enums::app_error_enum::AppError;
 use crate::fs::cleanup_manager::start_cleanup;
@@ -532,6 +533,17 @@ async fn perform_gc_scan(
     );
     let fragment_count = fragments.len() as u64;
     let start = std::time::Instant::now();
+    let scheduler_fragment = if fragments.len() == 1 {
+        fragments.first().map(String::as_str)
+    } else {
+        None
+    };
+    let _io_guard = acquire_disk_io(
+        DiskIoClass::BackgroundGc,
+        scheduler_fragment,
+        "garbage collection",
+    )
+    .await?;
     with_gc_status_write(|st| {
         st.is_running = true;
         st.phase = format!(

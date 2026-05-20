@@ -11,6 +11,7 @@ pub mod garbage_collector;
 pub mod header_parser;
 pub mod index;
 pub mod index_store;
+pub mod io_scheduler;
 pub mod maintenance;
 pub mod metadata_parser;
 pub mod modify;

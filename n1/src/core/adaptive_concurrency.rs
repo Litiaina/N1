@@ -1,3 +1,4 @@
+use crate::core::io_scheduler::DISK_IO_TARGET_ATOMIC;
 use crate::core::object_parser::{
     ADAPTIVE_STREAM_TARGET_ATOMIC, STREAM_CHUNK_SIZE_ATOMIC, STREAM_MAX_CONCURRENCY,
     STREAM_READAHEAD_BYTES_ATOMIC,
@@ -105,6 +106,9 @@ pub async fn run_adaptive_concurrency_loop() {
             let cur = io_target.load(Ordering::Relaxed);
             let next = clamp_next(cur, io_min, io_max, down_pct, up_pct);
             io_target.store(next, Ordering::Relaxed);
+            if let Some(disk_target) = DISK_IO_TARGET_ATOMIC.get() {
+                disk_target.store(next, Ordering::Relaxed);
+            }
         }
 
         if let Some(stream_target) = ADAPTIVE_STREAM_TARGET_ATOMIC.get() {

@@ -37,6 +37,14 @@ impl Proof {
             .await?;
         self.assert_health_clean("after_large_multipart").await?;
         let native_protocol = self.native_protocol_proof(&object_key).await?;
+        if let Some(keys) = native_protocol
+            .get("live_object_keys")
+            .and_then(Value::as_array)
+        {
+            for key in keys.iter().filter_map(Value::as_str) {
+                live_expected.insert(key.to_string());
+            }
+        }
         evidence.push(json!({"gate": "native_n1_protocol", "status": "PASS"}));
         rss_samples.push(self.rss_sample("after_large_multipart"));
         evidence.push(json!({"gate": "large_multipart_restart_resume", "status": "PASS"}));
