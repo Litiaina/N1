@@ -135,8 +135,7 @@ where
     writer
         .write_all(&(bytes.len() as u32).to_be_bytes())
         .await?;
-    writer.write_all(bytes).await?;
-    writer.flush().await
+    writer.write_all(bytes).await
 }
 
 fn invalid_data(err: impl std::fmt::Display) -> io::Error {

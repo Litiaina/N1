@@ -1,12 +1,16 @@
 use crate::enums::app_error_enum::AppError;
 use crc32fast::Hasher;
+use futures_util::future::join_all;
+use futures_util::future::poll_fn;
 use once_cell::sync::Lazy;
 use simd_erasure_core::ReedSolomonEncoder;
 use std::alloc::{Layout, alloc, dealloc};
+use std::mem::MaybeUninit;
+use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tracing::{info, warn};
 
 pub const ALIGNMENT: usize = 4096;
@@ -135,6 +139,27 @@ impl AlignedBuffer {
             self.len = self.layout.size();
         }
     }
+
+    pub async fn read_from<R>(&mut self, reader: &mut R, max_bytes: usize) -> std::io::Result<usize>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let spare = self.layout.size().saturating_sub(self.len).min(max_bytes);
+        if spare == 0 {
+            return Ok(0);
+        }
+
+        let start = self.len;
+        let read = unsafe {
+            let ptr = self.ptr.as_ptr().add(start).cast::<MaybeUninit<u8>>();
+            let uninit = std::slice::from_raw_parts_mut(ptr, spare);
+            let mut read_buf = ReadBuf::uninit(uninit);
+            poll_fn(|cx| Pin::new(&mut *reader).poll_read(cx, &mut read_buf)).await?;
+            read_buf.filled().len()
+        };
+        self.len += read;
+        Ok(read)
+    }
 }
 
 impl Drop for AlignedBuffer {
@@ -257,6 +282,46 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
         Ok(())
     }
 
+    pub async fn write_exact_from_reader<R>(
+        &mut self,
+        reader: &mut R,
+        content_length: u64,
+    ) -> Result<u64, AppError>
+    where
+        R: AsyncRead + Unpin + Send,
+    {
+        let mut total_bytes_read = 0u64;
+        let stripe_capacity = self.buffer.capacity();
+
+        while total_bytes_read < content_length {
+            if self.buffer.len() == stripe_capacity {
+                self.process_stripe().await?;
+            }
+
+            let before = self.buffer.len();
+            let remaining = (content_length - total_bytes_read).min(usize::MAX as u64) as usize;
+            let read = self
+                .buffer
+                .read_from(reader, remaining)
+                .await
+                .map_err(|e| AppError::Io(e, "native upload stream".into()))?;
+            if read == 0 {
+                return Err(AppError::BadRequest(format!(
+                    "Incomplete body: got {} bytes, expected {}",
+                    total_bytes_read, content_length
+                )));
+            }
+
+            EC_BYTES_IN_TOTAL.fetch_add(read as u64, Ordering::Relaxed);
+            if let Some(h) = self.total_hasher.as_mut() {
+                h.update(&self.buffer.as_slice()[before..before + read]);
+            }
+            total_bytes_read += read as u64;
+        }
+
+        Ok(total_bytes_read)
+    }
+
     pub async fn finalize(&mut self) -> Result<(), AppError> {
         if self.buffer.len() > 0 {
             self.buffer.fill_zeros();
@@ -273,18 +338,8 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
                 h.update(padding_buf.as_slice());
             }
 
-            for writer_opt in self.writers.iter_mut() {
-                if let Some(writer) = writer_opt {
-                    let write_start = Instant::now();
-                    if let Err(e) = writer.write_all(padding_buf.as_slice()).await {
-                        EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        warn!("Failed to write padding to shard: {}", e);
-                        *writer_opt = None;
-                    }
-                    EC_WRITE_NS_TOTAL
-                        .fetch_add(write_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                }
-            }
+            let padding_slices = vec![padding_buf.as_slice(); self.writers.len()];
+            write_slices_to_shards(&mut self.writers, &padding_slices, self.data_shards).await?;
         }
 
         if self.writers.iter().filter(|w| w.is_some()).count() < self.data_shards {
@@ -294,25 +349,7 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
             ));
         }
 
-        for w_opt in self.writers.iter_mut() {
-            if let Some(w) = w_opt {
-                let flush_start = Instant::now();
-                if let Err(e) = w.flush().await {
-                    EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    warn!("Failed to flush shard writer: {}", e);
-                    *w_opt = None;
-                }
-                EC_FLUSH_NS_TOTAL
-                    .fetch_add(flush_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            }
-        }
-
-        if self.writers.iter().filter(|w| w.is_some()).count() < self.data_shards {
-            EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return Err(AppError::InternalServerError(
-                "Not enough healthy disks to persist data".into(),
-            ));
-        }
+        flush_shard_writers(&mut self.writers, self.data_shards).await?;
 
         maybe_log_ec_metrics();
         Ok(())
@@ -354,40 +391,26 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
                 })?;
                 self.shard_hashers[self.data_shards + i].update(slice);
             }
-            let mut successful_writes = 0;
-            for (i, writer_opt) in self.writers.iter_mut().enumerate() {
-                if let Some(writer) = writer_opt {
-                    let slice = if i < self.data_shards {
-                        let start = i * block_size;
-                        let end = start + block_size;
-                        &self.buffer.as_full_slice()[start..end]
-                    } else {
-                        let parity_idx = i - self.data_shards;
-                        result.recovery(parity_idx).ok_or_else(|| {
-                            EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                            AppError::InternalServerError("RS parity shard access mismatch".into())
-                        })?
-                    };
-
-                    let write_start = Instant::now();
-                    if let Err(e) = writer.write_all(slice).await {
+            let mut shard_slices = Vec::with_capacity(self.data_shards + self.parity_shards);
+            for (i, writer_opt) in self.writers.iter().enumerate() {
+                let slice = if i < self.data_shards {
+                    let start = i * block_size;
+                    let end = start + block_size;
+                    &self.buffer.as_full_slice()[start..end]
+                } else {
+                    let parity_idx = i - self.data_shards;
+                    result.recovery(parity_idx).ok_or_else(|| {
                         EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        warn!("Failed to write stripe to shard: {}", e);
-                        *writer_opt = None;
-                    } else {
-                        successful_writes += 1;
-                    }
-                    EC_WRITE_NS_TOTAL
-                        .fetch_add(write_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        AppError::InternalServerError("RS parity shard access mismatch".into())
+                    })?
+                };
+                if writer_opt.is_some() {
+                    shard_slices.push(slice);
+                } else {
+                    shard_slices.push(&[]);
                 }
             }
-
-            if successful_writes < self.data_shards {
-                EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                return Err(AppError::InternalServerError(
-                    "Not enough healthy disks to persist data".into(),
-                ));
-            }
+            write_slices_to_shards(&mut self.writers, &shard_slices, self.data_shards).await?;
         } else {
             for i in 0..self.data_shards {
                 let start = i * block_size;
@@ -395,32 +418,17 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
                 self.shard_hashers[i].update(&buffer_slice[start..end]);
             }
 
-            let mut successful_writes = 0;
-            for (i, writer_opt) in self.writers.iter_mut().enumerate() {
-                if let Some(writer) = writer_opt {
-                    let start = i * block_size;
-                    let end = start + block_size;
-                    let slice = &self.buffer.as_full_slice()[start..end];
-
-                    let write_start = Instant::now();
-                    if let Err(e) = writer.write_all(slice).await {
-                        EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        warn!("Failed to write stripe to shard: {}", e);
-                        *writer_opt = None;
-                    } else {
-                        successful_writes += 1;
-                    }
-                    EC_WRITE_NS_TOTAL
-                        .fetch_add(write_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let mut shard_slices = Vec::with_capacity(self.data_shards);
+            for (i, writer_opt) in self.writers.iter().enumerate() {
+                let start = i * block_size;
+                let end = start + block_size;
+                if writer_opt.is_some() {
+                    shard_slices.push(&self.buffer.as_full_slice()[start..end]);
+                } else {
+                    shard_slices.push(&[]);
                 }
             }
-
-            if successful_writes < self.data_shards {
-                EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                return Err(AppError::InternalServerError(
-                    "Not enough healthy disks to persist data".into(),
-                ));
-            }
+            write_slices_to_shards(&mut self.writers, &shard_slices, self.data_shards).await?;
         }
 
         self.buffer.clear();
@@ -448,4 +456,104 @@ impl<W: AsyncWrite + Unpin + Send> ErasureStreamWriter<W> {
     pub fn into_writers(self) -> Vec<Option<W>> {
         self.writers
     }
+}
+
+async fn write_slices_to_shards<W>(
+    writers: &mut [Option<W>],
+    slices: &[&[u8]],
+    data_shards: usize,
+) -> Result<(), AppError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    let write_futs = writers
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(idx, writer_opt)| {
+            let writer = writer_opt.as_mut()?;
+            let slice = *slices.get(idx)?;
+            Some(async move {
+                let write_start = Instant::now();
+                let result = writer.write_all(slice).await;
+                (idx, result, write_start.elapsed().as_nanos() as u64)
+            })
+        });
+
+    let results = join_all(write_futs).await;
+    let mut successful_writes = 0usize;
+    let mut failed = Vec::new();
+
+    for (idx, result, elapsed_ns) in results {
+        EC_WRITE_NS_TOTAL.fetch_add(elapsed_ns, Ordering::Relaxed);
+        match result {
+            Ok(()) => successful_writes += 1,
+            Err(err) => {
+                EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                warn!("Failed to write stripe to shard: {}", err);
+                failed.push(idx);
+            }
+        }
+    }
+
+    for idx in failed {
+        if let Some(slot) = writers.get_mut(idx) {
+            *slot = None;
+        }
+    }
+
+    if successful_writes < data_shards {
+        EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        return Err(AppError::InternalServerError(
+            "Not enough healthy disks to persist data".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+async fn flush_shard_writers<W>(
+    writers: &mut [Option<W>],
+    data_shards: usize,
+) -> Result<(), AppError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    let flush_futs = writers
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(idx, writer_opt)| {
+            let writer = writer_opt.as_mut()?;
+            Some(async move {
+                let flush_start = Instant::now();
+                let result = writer.flush().await;
+                (idx, result, flush_start.elapsed().as_nanos() as u64)
+            })
+        });
+
+    let results = join_all(flush_futs).await;
+    let mut failed = Vec::new();
+
+    for (idx, result, elapsed_ns) in results {
+        EC_FLUSH_NS_TOTAL.fetch_add(elapsed_ns, Ordering::Relaxed);
+        if let Err(err) = result {
+            EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            warn!("Failed to flush shard writer: {}", err);
+            failed.push(idx);
+        }
+    }
+
+    for idx in failed {
+        if let Some(slot) = writers.get_mut(idx) {
+            *slot = None;
+        }
+    }
+
+    if writers.iter().filter(|w| w.is_some()).count() < data_shards {
+        EC_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        return Err(AppError::InternalServerError(
+            "Not enough healthy disks to persist data".into(),
+        ));
+    }
+
+    Ok(())
 }

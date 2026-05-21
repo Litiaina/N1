@@ -894,6 +894,8 @@ Body:
 
 Use one-shot upload for small files. Use multipart for large files and resumability.
 
+Multipart upload is pipelined inside N1's foreground write lane. Different parts can upload concurrently, and each part writes/flushes/publishes its shard set in parallel across the configured disks. N1 intentionally serializes retries for the same `(version_id, part_index)` so a duplicate client retry cannot race the same receipt or stable shard files.
+
 ### One-shot Upload
 
 ```http
@@ -958,6 +960,8 @@ Query parameters:
 - `io_gate` optional boolean
 
 Request body is the raw bytes for that part. Parts may be retried. Uploaded part receipts are persistent and survive server restart.
+
+Clients should use bounded in-flight parts for large files instead of increasing the one-shot size. Start with `2-4` concurrent parts and tune by disk count and disk quality. Very small multipart jobs may not benefit from part concurrency; large files with many parts usually do. N1 will apply upload backpressure when the disk scheduler is saturated.
 
 Example:
 
@@ -1082,7 +1086,7 @@ GET /n1/maintenance/trash/recover/status
 
 ### Disk IO Scheduler
 
-N1 1.3.0 adds a shared disk IO scheduler for kernel-level fairness. Foreground uploads and chunk reads, object status/repair, GC, fragment repair, and redistribution now acquire scheduler lanes before doing disk-heavy work.
+N1 1.3.0 adds a shared disk IO scheduler for kernel-level fairness. Foreground uploads and chunk reads, object status/repair, GC, fragment repair, and redistribution now acquire scheduler lanes before doing disk-heavy work. Multipart upload also pipelines shard writes, shard flushes, and shard publication inside the foreground write lane.
 
 The scheduler separates:
 

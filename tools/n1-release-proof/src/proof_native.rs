@@ -10,6 +10,8 @@ struct NativeProofRequest {
     body_len: Option<u64>,
 }
 
+const NATIVE_UPLOAD_COPY_BUFFER_BYTES: usize = 256 * 1024;
+
 #[derive(serde::Deserialize)]
 struct NativeProofResponse {
     id: String,
@@ -651,7 +653,65 @@ async fn native_round_trip(
         stream.write_all(&body).await?;
     }
     stream.flush().await?;
+    read_native_response(stream, id).await
+}
 
+async fn native_round_trip_file_range(
+    stream: &mut TcpStream,
+    id: &str,
+    op: &str,
+    mut payload: Value,
+    path: &Path,
+    offset: u64,
+    len: usize,
+) -> ProofResult<NativeProofResponse> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    if let Value::Object(ref mut map) = payload {
+        map.insert("expect_continue".to_string(), Value::Bool(true));
+    }
+
+    let request = NativeProofRequest {
+        id: id.to_string(),
+        op: op.to_string(),
+        payload: serde_json::to_string(&payload)?,
+        body_len: Some(len as u64),
+        body: None,
+    };
+    let encoded = rmp_serde::to_vec(&request)?;
+    stream
+        .write_all(&(encoded.len() as u32).to_be_bytes())
+        .await?;
+    stream.write_all(&encoded).await?;
+    stream.flush().await?;
+
+    let continue_response = read_native_response(stream, id).await?;
+    ensure_native_status(&continue_response, 100, "native upload continue")?;
+
+    let mut file = tokio::fs::File::open(path).await?;
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    let mut remaining = len;
+    let mut buffer = vec![0u8; NATIVE_UPLOAD_COPY_BUFFER_BYTES];
+    while remaining > 0 {
+        let wanted = remaining.min(buffer.len());
+        let read = file.read(&mut buffer[..wanted]).await?;
+        if read == 0 {
+            return Err(format!(
+                "native file body ended early for {id}: remaining={remaining}"
+            )
+            .into());
+        }
+        stream.write_all(&buffer[..read]).await?;
+        remaining -= read;
+    }
+    stream.flush().await?;
+    read_native_response(stream, id).await
+}
+
+async fn read_native_response(
+    stream: &mut TcpStream,
+    id: &str,
+) -> ProofResult<NativeProofResponse> {
     let mut len = [0u8; 4];
     stream.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;

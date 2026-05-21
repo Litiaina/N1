@@ -71,6 +71,8 @@ struct Args {
     native_transport_benchmark: bool,
     #[arg(long, default_value_t = false)]
     upload_benchmark: bool,
+    #[arg(long, default_value_t = false)]
+    multipart_resume_proof: bool,
     #[arg(long, default_value_t = 1_000)]
     benchmark_iterations: usize,
     #[arg(long, default_value_t = 100)]
@@ -83,6 +85,14 @@ struct Args {
     multipart_benchmark_bytes: usize,
     #[arg(long, default_value_t = 32 * 1024 * 1024)]
     multipart_benchmark_part_bytes: usize,
+    #[arg(long, default_value_t = 0)]
+    multipart_benchmark_concurrency: usize,
+    #[arg(long, default_value_t = 2 * 1024 * 1024 * 1024)]
+    multipart_resume_bytes: usize,
+    #[arg(long, default_value_t = 32 * 1024 * 1024)]
+    multipart_resume_part_bytes: usize,
+    #[arg(long, default_value_t = 4)]
+    multipart_resume_concurrency: usize,
 }
 
 #[derive(Debug)]

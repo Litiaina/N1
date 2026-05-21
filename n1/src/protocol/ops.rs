@@ -5,11 +5,14 @@ use axum::body::{Body, to_bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncRead;
 
 use crate::core::delete::delete_object_version;
 use crate::core::disk_manager::{
@@ -39,8 +42,9 @@ use crate::core::sync::CreateFragmentRequest;
 use crate::core::upload::{
     FinalizeUploadResult, cancel_upload_session_direct, finalize_object_upload_direct,
     get_upload_status, initiate_object_upload_direct, list_active_uploads,
-    object_upload_part_body_direct, object_upload_part_direct, upload_object_one_shot_body_direct,
-    upload_object_one_shot_direct,
+    object_upload_part_direct, object_upload_part_reader_direct, object_upload_part_stream_direct,
+    upload_object_one_shot_direct, upload_object_one_shot_reader_direct,
+    upload_object_one_shot_stream_direct,
 };
 use crate::enums::app_error_enum::AppError;
 use crate::middleware::auth_middleware::AuthError;
@@ -81,22 +85,66 @@ pub async fn execute_native_streaming_op(
     body: Body,
     body_len: u64,
 ) -> Result<Option<(NativeOpResponse, Vec<u8>)>, NativeExecutionError> {
+    let body_stream = body.into_data_stream().map(|chunk_result| {
+        chunk_result.map_err(|e| {
+            AppError::Io(
+                std::io::Error::new(std::io::ErrorKind::Other, e),
+                "native stream read".into(),
+            )
+        })
+    });
+    execute_native_streaming_source(state, session, op, payload, body_stream, body_len).await
+}
+
+pub async fn execute_native_streaming_source<S>(
+    state: Arc<AppState>,
+    session: &NativeSession,
+    op: &str,
+    payload: Value,
+    body_stream: S,
+    body_len: u64,
+) -> Result<Option<(NativeOpResponse, Vec<u8>)>, NativeExecutionError>
+where
+    S: Stream<Item = Result<Bytes, AppError>> + Unpin,
+{
     let result =
-        execute_native_streaming_op_inner(state, session, op, payload, body, body_len).await;
+        execute_native_streaming_op_inner(state, session, op, payload, body_stream, body_len).await;
     match result {
         Ok(value) => Ok(value),
         Err(err) => Err(native_app_error(err)),
     }
 }
 
-async fn execute_native_streaming_op_inner(
+pub async fn execute_native_streaming_reader<R>(
     state: Arc<AppState>,
     session: &NativeSession,
     op: &str,
     payload: Value,
-    body: Body,
+    reader: &mut R,
     body_len: u64,
-) -> Result<Option<(NativeOpResponse, Vec<u8>)>, AppError> {
+) -> Result<Option<(NativeOpResponse, Vec<u8>)>, NativeExecutionError>
+where
+    R: AsyncRead + Unpin + Send,
+{
+    let result =
+        execute_native_streaming_reader_inner(state, session, op, payload, reader, body_len).await;
+    match result {
+        Ok(value) => Ok(value),
+        Err(err) => Err(native_app_error(err)),
+    }
+}
+
+async fn execute_native_streaming_reader_inner<R>(
+    state: Arc<AppState>,
+    session: &NativeSession,
+    op: &str,
+    payload: Value,
+    reader: &mut R,
+    body_len: u64,
+) -> Result<Option<(NativeOpResponse, Vec<u8>)>, AppError>
+where
+    R: AsyncRead + Unpin + Send,
+{
     let claims = require_claims(session)?;
     let response = match op {
         "upload.one_shot" | "object.upload.one_shot" => {
@@ -104,13 +152,13 @@ async fn execute_native_streaming_op_inner(
             let fragment = claims.fragment.clone();
             let logical = required_string(&payload, "object_key")?;
             let physical = resolve_logical_write_key(&fragment, &logical).await?;
-            let mut metadata = upload_object_one_shot_body_direct(
+            let mut metadata = upload_object_one_shot_reader_direct(
                 claims,
                 fragment.clone(),
                 physical.clone(),
                 upload_part_query_from_payload(&payload)?,
                 string_field(&payload, "content_type"),
-                body,
+                reader,
                 body_len,
                 true,
             )
@@ -133,13 +181,85 @@ async fn execute_native_streaming_op_inner(
             let version_id = required_string(&payload, "version_id")?;
             let part_index = u64_field(&payload, "part_index")
                 .ok_or_else(|| AppError::BadRequest("part_index is required".into()))?;
-            object_upload_part_body_direct(
+            object_upload_part_reader_direct(
                 claims.clone(),
                 claims.fragment.clone(),
                 version_id.clone(),
                 part_index,
                 upload_part_query_from_payload(&payload)?,
-                body,
+                reader,
+                body_len,
+            )
+            .await?;
+            Some(native_body(json!({
+                "version_id": version_id,
+                "part_index": part_index,
+                "uploaded": true,
+            })))
+        }
+        _ => None,
+    };
+
+    if let Some(response) = response {
+        return Ok(Some(response));
+    }
+    execute_native_op_inner(state, session, op, payload, None).await
+}
+
+async fn execute_native_streaming_op_inner<S>(
+    state: Arc<AppState>,
+    session: &NativeSession,
+    op: &str,
+    payload: Value,
+    body_stream: S,
+    body_len: u64,
+) -> Result<Option<(NativeOpResponse, Vec<u8>)>, AppError>
+where
+    S: Stream<Item = Result<Bytes, AppError>> + Unpin,
+{
+    let claims = require_claims(session)?;
+    let response = match op {
+        "upload.one_shot" | "object.upload.one_shot" => {
+            require_write(&claims)?;
+            let fragment = claims.fragment.clone();
+            let logical = required_string(&payload, "object_key")?;
+            let physical = resolve_logical_write_key(&fragment, &logical).await?;
+            let mut metadata = upload_object_one_shot_stream_direct(
+                claims,
+                fragment.clone(),
+                physical.clone(),
+                upload_part_query_from_payload(&payload)?,
+                string_field(&payload, "content_type"),
+                body_stream,
+                body_len,
+                true,
+            )
+            .await?;
+            let committed_physical =
+                commit_logical_upload_from_meta(&fragment, &logical, &physical, &metadata).await?;
+            metadata.object_key = logical;
+            emit_logical_file_uploaded(
+                &state,
+                &fragment,
+                &metadata.object_key,
+                &committed_physical,
+                &metadata,
+            );
+            metadata.strip_internal_layout();
+            Some((op_response(201), native_body_bytes(&metadata)))
+        }
+        "multipart.put_part" | "upload.multipart.put_part" => {
+            require_write(&claims)?;
+            let version_id = required_string(&payload, "version_id")?;
+            let part_index = u64_field(&payload, "part_index")
+                .ok_or_else(|| AppError::BadRequest("part_index is required".into()))?;
+            object_upload_part_stream_direct(
+                claims.clone(),
+                claims.fragment.clone(),
+                version_id.clone(),
+                part_index,
+                upload_part_query_from_payload(&payload)?,
+                body_stream,
                 body_len,
             )
             .await?;
@@ -168,7 +288,7 @@ async fn execute_native_op_inner(
 
     let response = match op {
         "namespace.list" | "posix.list" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             native_body(
                 posix_service::list_dir(
                     claims,
@@ -181,7 +301,7 @@ async fn execute_native_op_inner(
             )
         }
         "namespace.stat" | "posix.stat" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             native_body(
                 posix_service::stat_path(
                     claims,
@@ -192,14 +312,14 @@ async fn execute_native_op_inner(
             )
         }
         "namespace.mkdir" | "posix.mkdir" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             native_body(
                 posix_service::mkdir_path(state, claims, required_string(&payload, "path")?)
                     .await?,
             )
         }
         "namespace.rename" | "posix.rename" | "posix.move" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             native_body(
                 posix_service::rename_path(
                     state,
@@ -211,21 +331,21 @@ async fn execute_native_op_inner(
             )
         }
         "namespace.trash" | "posix.trash" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             native_body(
                 posix_service::trash_path(state, claims, required_string(&payload, "path")?)
                     .await?,
             )
         }
         "namespace.recover" | "posix.recover" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             native_body(
                 posix_service::recover_path(state, claims, required_string(&payload, "path")?)
                     .await?,
             )
         }
         "namespace.purge" | "posix.purge" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             native_body(
                 posix_service::permanently_delete_path(
                     state,
@@ -236,7 +356,7 @@ async fn execute_native_op_inner(
             )
         }
         "object.list" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_read(&claims)?;
             native_body(
                 global_namespace_runtime()
@@ -245,7 +365,7 @@ async fn execute_native_op_inner(
             )
         }
         "trash.list" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_read(&claims)?;
             native_body(
                 global_namespace_runtime()
@@ -254,7 +374,7 @@ async fn execute_native_op_inner(
             )
         }
         "trash.empty" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_delete(&claims)?;
             let summary = global_namespace_runtime()
                 .empty_trash(&claims.fragment)
@@ -275,7 +395,7 @@ async fn execute_native_op_inner(
             }))
         }
         "trash.recover_all" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_write(&claims)?;
             let summary = global_namespace_runtime()
                 .recover_all(&claims.fragment)
@@ -294,7 +414,7 @@ async fn execute_native_op_inner(
             }))
         }
         "object.status" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_read(&claims)?;
             let object_key = required_string(&payload, "object_key")?;
             let physical = resolve_logical_read_key(&claims.fragment, &object_key).await?;
@@ -304,7 +424,7 @@ async fn execute_native_op_inner(
             native_body(status)
         }
         "object.repair" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_write_modify(&claims)?;
             let object_key = required_string(&payload, "object_key")?;
             let physical = resolve_logical_read_key(&claims.fragment, &object_key).await?;
@@ -314,22 +434,22 @@ async fn execute_native_op_inner(
             native_body(status)
         }
         "object.delete" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             let path = required_string(&payload, "object_key")?;
             native_body(posix_service::trash_path(state, claims, path).await?)
         }
         "object.recover" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             let path = required_string(&payload, "object_key")?;
             native_body(posix_service::recover_path(state, claims, path).await?)
         }
         "object.purge" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             let path = required_string(&payload, "object_key")?;
             native_body(posix_service::permanently_delete_path(state, claims, path).await?)
         }
         "object.rename" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_write_modify(&claims)?;
             let source = string_field(&payload, "source_key")
                 .or_else(|| string_field(&payload, "source_path"))
@@ -340,7 +460,7 @@ async fn execute_native_op_inner(
             native_body(posix_service::rename_path(state, claims, source, destination).await?)
         }
         "object.meta" | "object.get" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_read(&claims)?;
             let logical = required_string(&payload, "object_key")?;
             let fragment = claims.fragment.clone();
@@ -355,7 +475,7 @@ async fn execute_native_op_inner(
             native_body(metadata)
         }
         "object.versions" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_read(&claims)?;
             let logical = required_string(&payload, "object_key")?;
             let fragment = claims.fragment.clone();
@@ -369,7 +489,7 @@ async fn execute_native_op_inner(
             native_body(versions)
         }
         "object.version.delete" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_write(&claims)?;
             let fragment = claims.fragment.clone();
             native_from_response(
@@ -387,7 +507,7 @@ async fn execute_native_op_inner(
             .await
         }
         "object.version.recover" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_write(&claims)?;
             let fragment = claims.fragment.clone();
             let version_id = required_string(&payload, "version_id")?;
@@ -426,7 +546,7 @@ async fn execute_native_op_inner(
             }))
         }
         "object.bulk_delete" | "object.bulk.delete" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_write(&claims)?;
             native_body(
                 native_bulk_namespace_operation(
@@ -440,7 +560,7 @@ async fn execute_native_op_inner(
             )
         }
         "object.bulk_recover" | "object.bulk.recover" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_write(&claims)?;
             native_body(
                 native_bulk_namespace_operation(
@@ -454,7 +574,7 @@ async fn execute_native_op_inner(
             )
         }
         "object.bulk_purge" | "object.bulk.purge" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_delete(&claims)?;
             native_body(
                 native_bulk_namespace_operation(
@@ -468,7 +588,7 @@ async fn execute_native_op_inner(
             )
         }
         "upload.one_shot" | "object.upload.one_shot" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_write(&claims)?;
             let body =
                 _body.ok_or_else(|| AppError::BadRequest("upload body is required".into()))?;
@@ -499,7 +619,7 @@ async fn execute_native_op_inner(
             (op_response(201), native_body_bytes(&metadata))
         }
         "multipart.init" | "upload.multipart.init" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_write(&claims)?;
             let fragment = claims.fragment.clone();
             let logical = required_string(&payload, "object_key")?;
@@ -530,7 +650,7 @@ async fn execute_native_op_inner(
             }
         }
         "multipart.put_part" | "upload.multipart.put_part" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_write(&claims)?;
             let body = _body.ok_or_else(|| AppError::BadRequest("part body is required".into()))?;
             let version_id = required_string(&payload, "version_id")?;
@@ -552,7 +672,7 @@ async fn execute_native_op_inner(
             }))
         }
         "multipart.finalize" | "upload.multipart.finalize" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_write(&claims)?;
             let fragment = claims.fragment.clone();
             let version_id = required_string(&payload, "version_id")?;
@@ -608,7 +728,7 @@ async fn execute_native_op_inner(
             }
         }
         "multipart.cancel" | "upload.multipart.cancel" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_write(&claims)?;
             let fragment = claims.fragment.clone();
             let version_id = required_string(&payload, "version_id")?;
@@ -628,7 +748,7 @@ async fn execute_native_op_inner(
             (op_response(204), Vec::new())
         }
         "object.download_chunk" | "download.chunk" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_read(&claims)?;
             let fragment = claims.fragment.clone();
             let logical = required_string(&payload, "object_key")?;
@@ -653,7 +773,7 @@ async fn execute_native_op_inner(
             (op_response(status), bytes)
         }
         "object.download" | "object.stream" | "object.view" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_read(&claims)?;
             let fragment = claims.fragment.clone();
             let logical = required_string(&payload, "object_key")?;
@@ -666,14 +786,14 @@ async fn execute_native_op_inner(
             native_download_metadata(metadata, physical).await?
         }
         "maintenance.health" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             native_body(system_health_snapshot(state, claims, params_from_payload(&payload)).await?)
         }
         "maintenance.gc.status" => native_body(get_gc_status().await),
         "maintenance.repair.status" => native_body(get_repair_status().await),
         "maintenance.redistribution.status" => native_body(get_redist_status().await),
         "maintenance.gc.start" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             require_write_modify_delete(&claims)?;
             native_from_response(
                 run_garbage_collector(State(state), Query(params_from_payload(&payload))).await,
@@ -681,21 +801,21 @@ async fn execute_native_op_inner(
             .await
         }
         "maintenance.gc.stop" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             native_from_response(stop_garbage_collector(claims, State(state)).await).await
         }
         "maintenance.repair.start" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             let params = params_with_claim_fragment(&claims, &payload);
             native_from_response(trigger_repair_job_api(claims, State(state), Query(params)).await?)
                 .await
         }
         "maintenance.repair.stop" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             native_from_response(stop_repair_job_api(claims, State(state)).await?).await
         }
         "maintenance.redistribution.start" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             let params = params_with_claim_fragment(&claims, &payload);
             native_from_response(
                 trigger_redistribution_job_api(claims, State(state), Query(params)).await?,
@@ -703,7 +823,7 @@ async fn execute_native_op_inner(
             .await
         }
         "maintenance.redistribution.stop" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             native_from_response(stop_redistribution_job_api(claims, State(state)).await?).await
         }
         "fragment.create" => {
@@ -719,11 +839,11 @@ async fn execute_native_op_inner(
             native_from_response(create_fragment(axum::Json(req)).await?).await
         }
         "fragment.list" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             native_from_response(list_fragments(claims).await?).await
         }
         "fragment.update" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             let fragment =
                 string_field(&payload, "fragment").unwrap_or_else(|| claims.fragment.clone());
             let req: UpdateFragmentRequest = typed_payload(&payload)?;
@@ -733,7 +853,7 @@ async fn execute_native_op_inner(
             .await
         }
         "fragment.delete" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             let fragment =
                 string_field(&payload, "fragment").unwrap_or_else(|| claims.fragment.clone());
             native_from_response(delete_fragment(State(state), claims, Path(fragment)).await?).await
@@ -754,16 +874,16 @@ async fn execute_native_op_inner(
             native_body(json!({"fragment": fragment, "fragment_hash": hash}))
         }
         "fragment.quota" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             native_from_response(get_fragment_quota_usage(claims).await?).await
         }
         "capacity.usage" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             let fragment = claims.fragment.clone();
             native_from_response(get_capacity_usage(claims, Path(fragment)).await?).await
         }
         "fragment.resize_quota" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             let fragment =
                 string_field(&payload, "fragment").unwrap_or_else(|| claims.fragment.clone());
             let req = ResizeFragmentQuotaRequest {
@@ -777,7 +897,7 @@ async fn execute_native_op_inner(
             .await
         }
         "uploads.list" | "multipart.list" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             let fragment = claims.fragment.clone();
             native_from_response(
                 list_active_uploads(claims, Path(fragment), Query(params_from_payload(&payload)))
@@ -786,7 +906,7 @@ async fn execute_native_op_inner(
             .await
         }
         "uploads.status" | "multipart.status" => {
-            let claims = claims.expect("claims required");
+            let claims = claims_required(claims)?;
             let fragment = claims.fragment.clone();
             let version_id = required_string(&payload, "version_id")?;
             native_from_response(get_upload_status(claims, Path((fragment, version_id))).await?)
@@ -894,10 +1014,10 @@ async fn native_download_metadata(
     let total_size = usize::try_from(metadata.total_size_bytes).map_err(|_| {
         AppError::PayloadTooLarge("native download size exceeds platform usize".into())
     })?;
-    if total_size > crate::protocol::types::MAX_NATIVE_BODY_BYTES {
+    if total_size > crate::protocol::types::MAX_NATIVE_FULL_DOWNLOAD_BYTES {
         return Err(AppError::PayloadTooLarge(format!(
             "native full download exceeds {} bytes; use object.download_chunk",
-            crate::protocol::types::MAX_NATIVE_BODY_BYTES
+            crate::protocol::types::MAX_NATIVE_FULL_DOWNLOAD_BYTES
         )));
     }
 
@@ -992,6 +1112,10 @@ fn app_error_status(err: &AppError) -> StatusCode {
 
 fn require_claims(session: &NativeSession) -> Result<Claims, AppError> {
     session.claims().cloned().ok_or(AppError::Unauthorized)
+}
+
+fn claims_required(claims: Option<Claims>) -> Result<Claims, AppError> {
+    claims.ok_or(AppError::Unauthorized)
 }
 
 fn require_read(claims: &Claims) -> Result<(), AppError> {

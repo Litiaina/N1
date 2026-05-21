@@ -302,7 +302,11 @@ fn derive_scheduler_config(max_concurrent_io: usize, blob_roots: usize) -> DiskI
     let disk_floor = blob_roots.max(1);
     let background = (foreground / 4).max(1).min(disk_floor.max(1)).min(8);
     let total = foreground.saturating_add(background).max(1);
-    let foreground_per_fragment = (foreground / 2).max(1);
+    let foreground_per_fragment = match blob_roots {
+        0..=2 => 1,
+        3 | 4 => (foreground / 2).max(2).min(blob_roots),
+        _ => (foreground / 2).max(2).min(blob_roots.saturating_mul(2)),
+    };
     let background_per_fragment = (background / 2).max(1);
 
     DiskIoSchedulerConfig {
@@ -324,7 +328,7 @@ mod tests {
         assert_eq!(cfg.foreground_permits, 8);
         assert_eq!(cfg.background_permits, 2);
         assert_eq!(cfg.total_permits, 10);
-        assert_eq!(cfg.foreground_per_fragment_permits, 4);
+        assert_eq!(cfg.foreground_per_fragment_permits, 1);
         assert_eq!(cfg.background_per_fragment_permits, 1);
     }
 

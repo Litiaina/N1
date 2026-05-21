@@ -64,7 +64,9 @@ Scheduler lanes:
 
 Foreground work uses the adaptive upload target so live traffic can contract under CPU/RAM pressure. Background work has its own smaller lane and per-fragment gate, so GC, repair, and redistribution cannot consume the whole disk path while users are uploading or reading. Object status and repair also pass through the scheduler in addition to their object-scoped maintenance gates.
 
-The scheduler is intentionally coarse at 1.3.0: it controls classes and fragment fairness, not individual low-level block requests. That keeps N1 stable while creating the right foundation for later multipart pipelining and read/write priority tuning.
+The scheduler is intentionally coarse at 1.3.0: it controls classes and fragment fairness, not individual low-level block requests. Multipart writes then pipeline inside the admitted foreground lane: EC stripe writes are issued across shard writers concurrently, final shard flushes run concurrently, and multipart tmp-to-stable shard publish runs concurrently. That keeps the storage-kernel invariants stable while removing avoidable per-shard serialization from large uploads.
+
+N1 still serializes the same `(fragment, version_id, part_index)` upload part. Different parts can move in parallel, but two clients cannot race the same receipt or stable shard set for the same part. Large-upload clients should keep part concurrency bounded; too much concurrency can overload weak two-disk deployments instead of improving them.
 
 Each configured root can house both index and blob data:
 

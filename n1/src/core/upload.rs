@@ -3,8 +3,9 @@ use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
+use std::sync::{LazyLock, Mutex};
 use std::task::{Context, Poll};
 
 use axum::Json as AxumJson;
@@ -13,14 +14,17 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
+use bytes::Bytes;
 use chrono::Utc;
 use crc32fast::Hasher;
+use futures_util::Stream;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
 use once_cell::sync::{Lazy, OnceCell};
 use serde::{Deserialize, Serialize};
 use tokio::fs as tokio_fs;
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
@@ -67,6 +71,40 @@ const MIN_DYNAMIC_STRIPE_SIZE: usize = 4 * 1024;
 const TINY_OBJECT_STRIPE_4K_LIMIT: u64 = 64 * 1024;
 const SMALL_OBJECT_STRIPE_16K_LIMIT: u64 = 1024 * 1024;
 const SMALL_BUFFERED_WRITE_LIMIT: u64 = 1024 * 1024;
+
+static MULTIPART_PART_LOCKS: LazyLock<
+    Mutex<std::collections::HashMap<String, Weak<AsyncMutex<()>>>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+struct MultipartPartGuard {
+    _guard: OwnedMutexGuard<()>,
+}
+
+async fn acquire_multipart_part_lock(
+    fragment: &str,
+    version_id: &str,
+    part_index: u64,
+) -> Result<MultipartPartGuard, AppError> {
+    let key = format!("{fragment}\u{001f}{version_id}\u{001f}{part_index}");
+    let lock = {
+        let mut locks = MULTIPART_PART_LOCKS.lock().map_err(|_| {
+            AppError::InternalServerError("multipart part lock map poisoned".to_string())
+        })?;
+        if locks.len() > 4096 {
+            locks.retain(|_, lock| lock.strong_count() > 0);
+        }
+        if let Some(existing) = locks.get(&key).and_then(Weak::upgrade) {
+            existing
+        } else {
+            let lock = Arc::new(AsyncMutex::new(()));
+            locks.insert(key, Arc::downgrade(&lock));
+            lock
+        }
+    };
+    Ok(MultipartPartGuard {
+        _guard: lock.lock_owned().await,
+    })
+}
 
 #[cfg(target_os = "linux")]
 static IO_URING_ENABLED: Lazy<bool> = Lazy::new(|| {
@@ -1194,6 +1232,46 @@ async fn write_part_blob_to_disk(
     expected_checksum: Option<&str>,
     strict_durability: bool,
 ) -> Result<PartMetadata, AppError> {
+    let body_stream = body.into_data_stream().map(|chunk_result| {
+        chunk_result.map_err(|e| {
+            AppError::Io(
+                std::io::Error::new(std::io::ErrorKind::Other, e),
+                "stream read".into(),
+            )
+        })
+    });
+    write_part_blob_to_disk_from_stream(
+        path_manager,
+        fragment,
+        version_id,
+        part_index,
+        content_length,
+        data_shards,
+        parity_shards,
+        block_size,
+        body_stream,
+        expected_checksum,
+        strict_durability,
+    )
+    .await
+}
+
+async fn write_part_blob_to_disk_from_stream<S>(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    version_id: &str,
+    part_index: u64,
+    content_length: u64,
+    data_shards: usize,
+    parity_shards: usize,
+    block_size: usize,
+    mut body_stream: S,
+    expected_checksum: Option<&str>,
+    strict_durability: bool,
+) -> Result<PartMetadata, AppError>
+where
+    S: Stream<Item = Result<Bytes, AppError>> + Unpin,
+{
     let total_shards = data_shards + parity_shards;
 
     if data_shards == 0 || total_shards == 0 {
@@ -1336,16 +1414,10 @@ async fn write_part_blob_to_disk(
             block_size,
         )?;
 
-        let mut body_stream = body.into_data_stream();
         let mut total_bytes_read = 0u64;
 
         while let Some(chunk_result) = body_stream.next().await {
-            let chunk = chunk_result.map_err(|e| {
-                AppError::Io(
-                    std::io::Error::new(std::io::ErrorKind::Other, e),
-                    "stream read".into(),
-                )
-            })?;
+            let chunk = chunk_result?;
 
             if chunk.is_empty() {
                 continue;
@@ -1398,19 +1470,286 @@ async fn write_part_blob_to_disk(
             }
         }
 
+        let publish_results = join_all((0..total_shards).map(|i| {
+            let tmp_path = tmp_paths[i].clone();
+            let stable_path = stable_paths[i].clone();
+            let expected_crc = shard_checksums.get(i).cloned();
+            async move {
+                publish_one_shard(
+                    tmp_path.as_path(),
+                    stable_path.as_path(),
+                    final_shard_len,
+                    expected_crc.as_deref(),
+                )
+                .await?;
+                Ok::<Option<PathBuf>, AppError>(stable_path.parent().map(Path::to_path_buf))
+            }
+        }))
+        .await;
+
         let mut dirs_to_sync: Vec<PathBuf> = Vec::new();
+        for result in publish_results {
+            if let Some(dir) = result? {
+                dirs_to_sync.push(dir);
+            }
+        }
+
+        dirs_to_sync.sort();
+        dirs_to_sync.dedup();
+
+        if strict_durability {
+            let _ = join_all(dirs_to_sync.iter().map(|d| sync_dir(d.as_path()))).await;
+        }
+
+        let mut shards_info = Vec::with_capacity(total_shards);
         for i in 0..total_shards {
-            let expected_crc = shard_checksums.get(i).map(|s| s.as_str());
-            publish_one_shard(
-                tmp_paths[i].as_path(),
-                stable_paths[i].as_path(),
-                final_shard_len,
-                expected_crc,
-            )
+            shards_info.push(ShardInfo {
+                shard_index: i,
+                file_name: stable_names[i].clone(),
+                absolute_path: stable_paths[i].to_string_lossy().to_string(),
+                size_bytes: final_shard_len,
+                checksum: shard_checksums.get(i).cloned().unwrap_or_default(),
+                is_parity: i >= data_shards,
+            });
+        }
+
+        Ok(PartMetadata {
+            part_index,
+            size_bytes: total_bytes_read,
+            created_at: Utc::now().timestamp(),
+            checksum: if calc_total_checksum {
+                total_checksum
+            } else {
+                None
+            },
+            shards: shards_info,
+        })
+    }
+    .await;
+
+    if write_result.is_err() {
+        cleanup_files_best_effort(&tmp_paths).await;
+        cleanup_files_best_effort(&stable_paths).await;
+    }
+
+    write_result
+}
+
+async fn write_part_blob_to_disk_from_reader<R>(
+    path_manager: &ObjectPathManager,
+    fragment: &str,
+    version_id: &str,
+    part_index: u64,
+    content_length: u64,
+    data_shards: usize,
+    parity_shards: usize,
+    block_size: usize,
+    reader: &mut R,
+    expected_checksum: Option<&str>,
+    strict_durability: bool,
+) -> Result<PartMetadata, AppError>
+where
+    R: AsyncRead + Unpin + Send,
+{
+    let total_shards = data_shards + parity_shards;
+
+    if data_shards == 0 || total_shards == 0 {
+        return Err(AppError::InternalServerError(
+            "invalid erasure coding layout".into(),
+        ));
+    }
+
+    if block_size == 0 || block_size % 4096 != 0 {
+        return Err(AppError::InternalServerError(format!(
+            "stripe_size_bytes must be a non-zero multiple of 4096 for O_DIRECT (got {})",
+            block_size
+        )));
+    }
+
+    let attempt_id = Ulid::new().to_string();
+    let stripe_data_width = block_size as u64 * data_shards as u64;
+    let stripe_count = (content_length + stripe_data_width - 1) / stripe_data_width;
+    let final_shard_len = stripe_count * block_size as u64;
+
+    preflight_blob_placement_capacity_for_parts(
+        part_index,
+        &[content_length],
+        data_shards,
+        parity_shards,
+        block_size,
+    )
+    .await?;
+
+    let blob_roots = path_manager.get_blob_roots();
+    let num_disks = blob_roots.len();
+    if num_disks == 0 {
+        return Err(AppError::InternalServerError(
+            "No blob storage disks configured".into(),
+        ));
+    }
+
+    let use_buffered_small_write =
+        !strict_durability && content_length <= SMALL_BUFFERED_WRITE_LIMIT;
+    let mut writers: Vec<Option<UploadShardWriter>> = Vec::with_capacity(total_shards);
+    let mut tmp_paths: Vec<PathBuf> = Vec::with_capacity(total_shards);
+    let mut stable_paths: Vec<PathBuf> = Vec::with_capacity(total_shards);
+    let mut stable_names: Vec<String> = Vec::with_capacity(total_shards);
+    let mut successful_opens = 0usize;
+
+    for i in 0..total_shards {
+        let is_parity = i >= data_shards;
+        let ext = if is_parity {
+            PARITY_SUFFIX
+        } else {
+            SHARD_SUFFIX
+        };
+
+        let stable_name = format!("part_{}_shard_{}{}", part_index, i, ext);
+        let tmp_name = format!("{}.tmp.{}", stable_name, attempt_id);
+        let disk_idx = (part_index as usize + i) % num_disks;
+        let target_disk = &blob_roots[disk_idx];
+        let shard_dir = path_manager.get_shard_dir_on_disk(target_disk, fragment, version_id);
+
+        let tmp_path = shard_dir.join(&tmp_name);
+        let stable_path = shard_dir.join(&stable_name);
+
+        if use_buffered_small_write {
+            match create_buffered_file(&tmp_path).await {
+                Ok(file) => {
+                    writers.push(Some(UploadShardWriter::Buffered(file)));
+                    successful_opens += 1;
+                }
+                Err(err) => {
+                    warn!(
+                        "blob shard open failed for {} on {}: {}",
+                        stable_name,
+                        target_disk.display(),
+                        err
+                    );
+                    writers.push(None);
+                }
+            }
+        } else {
+            match create_direct_file(&tmp_path).await {
+                Ok(file) => {
+                    if strict_durability {
+                        let file_clone = file
+                            .try_clone()
+                            .map_err(|e| AppError::Io(e, "clone file handle".into()))?;
+                        let prealloc_result = tokio::task::spawn_blocking(move || {
+                            file_clone.set_len(final_shard_len)
+                        })
+                        .await;
+
+                        if let Ok(Ok(_)) = prealloc_result {
+                            writers.push(Some(UploadShardWriter::Direct(DirectWriter::new(file))));
+                            successful_opens += 1;
+                        } else {
+                            warn!(
+                                "blob shard preallocation failed for {} on {}",
+                                stable_name,
+                                target_disk.display()
+                            );
+                            writers.push(None);
+                        }
+                    } else {
+                        writers.push(Some(UploadShardWriter::Direct(DirectWriter::new(file))));
+                        successful_opens += 1;
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "blob shard open failed for {} on {}: {}",
+                        stable_name,
+                        target_disk.display(),
+                        err
+                    );
+                    writers.push(None);
+                }
+            }
+        }
+
+        tmp_paths.push(tmp_path);
+        stable_paths.push(stable_path);
+        stable_names.push(stable_name);
+    }
+
+    if successful_opens < data_shards {
+        cleanup_files_best_effort(&tmp_paths).await;
+        return Err(AppError::InternalServerError(format!(
+            "Insufficient healthy disks for write quorum. Need {}, got {}.",
+            data_shards, successful_opens
+        )));
+    }
+
+    let write_result = async {
+        let calc_total_checksum = expected_checksum.is_some();
+        let mut stream_writer = ErasureStreamWriter::new(
+            writers,
+            data_shards,
+            parity_shards,
+            final_shard_len as usize,
+            calc_total_checksum,
+            block_size,
+        )?;
+
+        let total_bytes_read = stream_writer
+            .write_exact_from_reader(reader, content_length)
             .await?;
 
-            if let Some(parent) = stable_paths[i].parent() {
-                dirs_to_sync.push(parent.to_path_buf());
+        stream_writer.finalize().await?;
+
+        if let Some(expected) = expected_checksum {
+            let calculated = stream_writer.get_total_checksum();
+            if let Some(calc_str) = calculated.as_ref() {
+                if !expected.eq_ignore_ascii_case(calc_str) {
+                    return Err(AppError::BadRequest("Checksum mismatch".into()));
+                }
+            }
+        }
+
+        let shard_checksums = stream_writer.get_shard_checksums();
+        let total_checksum = stream_writer.get_total_checksum();
+        let writers = stream_writer.into_writers();
+
+        if strict_durability {
+            let sync_futs = writers.into_iter().filter_map(|w_opt| {
+                w_opt.map(|w| async move {
+                    if let Err(e) = w.sync_data().await {
+                        warn!("Failed to fsync shard: {}", e);
+                        return Err(AppError::Io(e, "fsync shard".into()));
+                    }
+                    Ok(())
+                })
+            });
+
+            let sync_results = join_all(sync_futs).await;
+            for r in sync_results {
+                r?;
+            }
+        }
+
+        let publish_results = join_all((0..total_shards).map(|i| {
+            let tmp_path = tmp_paths[i].clone();
+            let stable_path = stable_paths[i].clone();
+            let expected_crc = shard_checksums.get(i).cloned();
+            async move {
+                publish_one_shard(
+                    tmp_path.as_path(),
+                    stable_path.as_path(),
+                    final_shard_len,
+                    expected_crc.as_deref(),
+                )
+                .await?;
+                Ok::<Option<PathBuf>, AppError>(stable_path.parent().map(Path::to_path_buf))
+            }
+        }))
+        .await;
+
+        let mut dirs_to_sync: Vec<PathBuf> = Vec::new();
+        for result in publish_results {
+            if let Some(dir) = result? {
+                dirs_to_sync.push(dir);
             }
         }
 
@@ -1852,6 +2191,7 @@ pub async fn object_upload_part(
     if part_index >= manifest.expected_parts {
         return Ok((StatusCode::BAD_REQUEST, "Part index out of range").into_response());
     }
+    let _part_lock = acquire_multipart_part_lock(&fragment, &version_id, part_index).await?;
     let expected_size = expected_part_size_bytes(&manifest, part_index);
     let expected_checksum = query
         .checksum
@@ -1968,6 +2308,38 @@ pub async fn object_upload_part_body_direct(
     body: Body,
     content_length: u64,
 ) -> Result<(), AppError> {
+    let body_stream = body.into_data_stream().map(|chunk_result| {
+        chunk_result.map_err(|e| {
+            AppError::Io(
+                std::io::Error::new(std::io::ErrorKind::Other, e),
+                "stream read".into(),
+            )
+        })
+    });
+    object_upload_part_stream_direct(
+        claims,
+        fragment,
+        version_id,
+        part_index,
+        query,
+        body_stream,
+        content_length,
+    )
+    .await
+}
+
+pub async fn object_upload_part_stream_direct<S>(
+    claims: Claims,
+    fragment: String,
+    version_id: String,
+    part_index: u64,
+    query: UploadPartQuery,
+    body_stream: S,
+    content_length: u64,
+) -> Result<(), AppError>
+where
+    S: Stream<Item = Result<Bytes, AppError>> + Unpin,
+{
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
     }
@@ -1997,6 +2369,7 @@ pub async fn object_upload_part_body_direct(
     if part_index >= manifest.expected_parts {
         return Err(AppError::BadRequest("Part index out of range".into()));
     }
+    let _part_lock = acquire_multipart_part_lock(&fragment, &version_id, part_index).await?;
     let expected_size = expected_part_size_bytes(&manifest, part_index);
     let expected_checksum = query
         .checksum
@@ -2042,7 +2415,7 @@ pub async fn object_upload_part_body_direct(
         }
     }
 
-    let part_meta = write_part_blob_to_disk(
+    let part_meta = write_part_blob_to_disk_from_stream(
         &path_manager,
         &fragment,
         &version_id,
@@ -2051,7 +2424,131 @@ pub async fn object_upload_part_body_direct(
         manifest_data_shards(&manifest),
         manifest_parity_shards(&manifest),
         manifest.stripe_size_bytes,
-        body,
+        body_stream,
+        expected_checksum,
+        strict_durability,
+    )
+    .await?;
+
+    if index::load_session(&fragment, &version_id).await?.is_none() {
+        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+        return Err(AppError::Conflict("Upload session was cancelled".into()));
+    }
+
+    if let Err(err) =
+        index::commit_session_part_receipt(&fragment, &version_id, &manifest, &part_meta).await
+    {
+        warn!(
+            "Failed to persist compact multipart receipt for {}/{} part {}: {}",
+            fragment, version_id, part_index, err
+        );
+    }
+
+    if index::load_session(&fragment, &version_id).await?.is_none() {
+        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+        return Err(AppError::Conflict("Upload session was cancelled".into()));
+    }
+
+    Ok(())
+}
+
+pub async fn object_upload_part_reader_direct<R>(
+    claims: Claims,
+    fragment: String,
+    version_id: String,
+    part_index: u64,
+    query: UploadPartQuery,
+    reader: &mut R,
+    content_length: u64,
+) -> Result<(), AppError>
+where
+    R: AsyncRead + Unpin + Send,
+{
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+
+    let durability_mode = parse_upload_durability_mode(&query);
+    let strict_durability = durability_mode.strict();
+    let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
+    let gate_context = format!(
+        "fragment={}, version={}, part={}",
+        fragment, version_id, part_index
+    );
+    let _io_guard =
+        acquire_upload_io_guard_for_size(query.io_gate, &fragment, &gate_context, content_length)
+            .await?;
+
+    if content_length > max_part_size {
+        return Err(AppError::PayloadTooLarge("Part too large".into()));
+    }
+
+    let path_manager = ObjectPathManager::new();
+    let manifest = read_manifest_any(&fragment, &version_id)
+        .await?
+        .ok_or(AppError::BadRequest("Upload session not found".into()))?;
+    if part_index >= manifest.expected_parts {
+        return Err(AppError::BadRequest("Part index out of range".into()));
+    }
+    let _part_lock = acquire_multipart_part_lock(&fragment, &version_id, part_index).await?;
+    let expected_size = expected_part_size_bytes(&manifest, part_index);
+    let expected_checksum = query
+        .checksum
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if part_exists_on_disk(&path_manager, &manifest, part_index).await? {
+        if let Some(expected_size) = expected_size {
+            if content_length != expected_size {
+                return Err(AppError::Conflict(
+                    "Part already uploaded but size differs".into(),
+                ));
+            }
+        }
+        if expected_checksum.is_some() {
+            warn!(
+                "Multipart resume for {}/{} part {} skipped checksum revalidation because session part metadata is not persisted",
+                fragment, version_id, part_index
+            );
+        }
+        if let Err(err) = persist_missing_receipt_from_disk(
+            &path_manager,
+            &fragment,
+            &version_id,
+            &manifest,
+            part_index,
+        )
+        .await
+        {
+            warn!(
+                "Multipart resume for {}/{} part {} could not refresh compact receipt: {}",
+                fragment, version_id, part_index, err
+            );
+        }
+        return Ok(());
+    }
+    if let Some(expected_size) = expected_size {
+        if content_length != expected_size {
+            return Err(AppError::BadRequest(
+                "Part size does not match upload session manifest".into(),
+            ));
+        }
+    }
+
+    let part_meta = write_part_blob_to_disk_from_reader(
+        &path_manager,
+        &fragment,
+        &version_id,
+        part_index,
+        content_length,
+        manifest_data_shards(&manifest),
+        manifest_parity_shards(&manifest),
+        manifest.stripe_size_bytes,
+        reader,
         expected_checksum,
         strict_durability,
     )
@@ -2229,6 +2726,40 @@ pub async fn upload_object_one_shot_body_direct(
     content_length: u64,
     acquire_io_gate: bool,
 ) -> Result<ObjectMetadata, AppError> {
+    let body_stream = body.into_data_stream().map(|chunk_result| {
+        chunk_result.map_err(|e| {
+            AppError::Io(
+                std::io::Error::new(std::io::ErrorKind::Other, e),
+                "stream read".into(),
+            )
+        })
+    });
+    upload_object_one_shot_stream_direct(
+        claims,
+        fragment,
+        object_key,
+        query,
+        content_type,
+        body_stream,
+        content_length,
+        acquire_io_gate,
+    )
+    .await
+}
+
+pub async fn upload_object_one_shot_stream_direct<S>(
+    claims: Claims,
+    fragment: String,
+    object_key: String,
+    query: UploadPartQuery,
+    content_type: Option<String>,
+    body_stream: S,
+    content_length: u64,
+    acquire_io_gate: bool,
+) -> Result<ObjectMetadata, AppError>
+where
+    S: Stream<Item = Result<Bytes, AppError>> + Unpin,
+{
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".into()));
     }
@@ -2266,7 +2797,7 @@ pub async fn upload_object_one_shot_body_direct(
 
     let path_manager = ObjectPathManager::new();
     let created_at = Utc::now().timestamp();
-    let part_meta = match write_part_blob_to_disk(
+    let part_meta = match write_part_blob_to_disk_from_stream(
         &path_manager,
         &fragment,
         &version_id,
@@ -2275,7 +2806,109 @@ pub async fn upload_object_one_shot_body_direct(
         configured_data_shards(),
         configured_parity_shards(),
         stripe_size,
-        body,
+        body_stream,
+        expected_checksum,
+        strict_durability,
+    )
+    .await
+    {
+        Ok(part_meta) => part_meta,
+        Err(err) => {
+            cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+            return Err(err);
+        }
+    };
+
+    let object_meta = ObjectMetadata {
+        object_key: object_key.clone(),
+        fragment: fragment.clone(),
+        version_id: version_id.clone(),
+        upload_session_id: session_id,
+        owner_uid: fragment.clone(),
+        content_type,
+        total_size_bytes: content_length,
+        created_at,
+        parts: vec![part_meta],
+        is_delete_marker: false,
+        stripe_size_bytes: stripe_size,
+    };
+
+    let _object_lock = index::acquire_object_operation_lock(&fragment, &object_key).await?;
+    let replica_write_mode = if strict_durability {
+        index::IndexReplicaWriteMode::SyncBestEffort
+    } else {
+        index::IndexReplicaWriteMode::BackgroundBestEffort
+    };
+    if let Err(err) =
+        index::publish_object_with_replica_mode(&object_meta, replica_write_mode).await
+    {
+        cleanup_blob_version_dirs_for_version(&path_manager, &fragment, &version_id).await;
+        return Err(err);
+    }
+
+    Ok(object_meta.without_internal_layout())
+}
+
+pub async fn upload_object_one_shot_reader_direct<R>(
+    claims: Claims,
+    fragment: String,
+    object_key: String,
+    query: UploadPartQuery,
+    content_type: Option<String>,
+    reader: &mut R,
+    content_length: u64,
+    acquire_io_gate: bool,
+) -> Result<ObjectMetadata, AppError>
+where
+    R: AsyncRead + Unpin + Send,
+{
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    if claims.fragment != fragment {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+
+    let durability_mode = parse_upload_durability_mode(&query);
+    let strict_durability = durability_mode.strict();
+    let gate_context = format!("fragment={}, object_key={}", fragment, object_key);
+    let _io_guard = if acquire_io_gate {
+        acquire_upload_io_guard_for_size(query.io_gate, &fragment, &gate_context, content_length)
+            .await?
+    } else {
+        None
+    };
+    let max_part_size = MAX_PART_SIZE_ATOMIC.get().unwrap().load(Ordering::Relaxed);
+    if content_length > max_part_size {
+        return Err(AppError::PayloadTooLarge(
+            "Object too large for one-shot upload".into(),
+        ));
+    }
+
+    preflight_upload_capacity(content_length).await?;
+    let stripe_size = choose_upload_stripe_size_for_len(content_length);
+
+    let version_id = Ulid::new().to_string();
+    let session_id = Ulid::new().to_string();
+    let expected_checksum = query
+        .checksum
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let content_type = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+
+    let path_manager = ObjectPathManager::new();
+    let created_at = Utc::now().timestamp();
+    let part_meta = match write_part_blob_to_disk_from_reader(
+        &path_manager,
+        &fragment,
+        &version_id,
+        0,
+        content_length,
+        configured_data_shards(),
+        configured_parity_shards(),
+        stripe_size,
+        reader,
         expected_checksum,
         strict_durability,
     )

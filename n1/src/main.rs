@@ -100,22 +100,23 @@ fn adaptive_max_concurrent_io(
     blob_disks: usize,
     ram_bytes: Option<u64>,
 ) -> usize {
-    let core_cap = (cpu_cores.saturating_mul(2)).clamp(2, 64);
+    let core_cap = (cpu_cores.saturating_mul(2)).clamp(1, 64);
     let disk_cap = match blob_disks {
-        0 | 1 => 2,
-        2 => 8,
-        3 | 4 => blob_disks.saturating_mul(3),
-        _ => blob_disks.saturating_mul(4),
+        0 | 1 => 1,
+        2 => 2,
+        3 => 4,
+        4 => 6,
+        _ => blob_disks.saturating_mul(2),
     }
-    .clamp(2, 64);
+    .clamp(1, 64);
     let ram_cap = match ram_gib(ram_bytes) {
-        0..=4 => 4,
-        5..=8 => 6,
+        0..=4 => 2,
+        5..=8 => 4,
         9..=16 => 8,
         17..=32 => 20,
         _ => 24,
     };
-    core_cap.min(disk_cap).min(ram_cap).clamp(2, 64)
+    core_cap.min(disk_cap).min(ram_cap).clamp(1, 64)
 }
 
 fn adaptive_writer_buffer_size(
