@@ -1,6 +1,6 @@
 # N1 Documentation
 
-N1 1.3.0 is a single-node storage kernel for durable object storage with a POSIX-like namespace and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, garbage collection, trash/recover, archive download, and realtime namespace events.
+N1 1.3.1 is a single-node storage kernel for durable object storage with a POSIX-like namespace and a native `n1://` protocol for internal tools. It is designed to exploit one Linux server: multiple disks, bounded memory, durable upload resumability, repair, redistribution, garbage collection, trash/recover, archive download, and realtime namespace events.
 
 N1 exposes a file-explorer-friendly namespace while storing payloads through its shard/parity blob plane. Folders are real namespace directories. Files are stable object identities with immutable version records. Large data movement stays in the blob plane; namespace operations stay lightweight.
 
@@ -218,18 +218,20 @@ Fragment tokens carry independent permissions:
 
 ## Native N1 Protocol
 
-N1 1.3.0 includes the native N1 protocol:
+N1 1.3.1 includes the native N1 protocol:
 
 ```text
 n1://127.0.0.1:50002
-protocol: n1/0.3
+protocol: n1/0.4
 ```
 
 HTTPS remains the universal consumer API. The native protocol is the low-level N1 execution face for N1 Console, N1 CLI, NS, N2, and trusted services that need lower latency than HTTPS for namespace, control-plane, and data-plane calls.
 
 The native protocol does not create another storage engine, another namespace, another metadata authority, or another code path for object truth. Native requests use typed `n1://` operations that call N1 core/service functions directly. They do not emulate HTTP requests and they do not dispatch through the Axum route graph.
 
-`n1/0.3` supports the native data plane:
+Rust clients should use the workspace `n1_native_client` crate instead of reimplementing frames. The crate owns native URL parsing, MessagePack frame IO, fragment authentication, typed operation calls, raw upload bodies, and raw streaming response reads.
+
+`n1/0.4` supports the native data plane:
 
 - `upload.one_shot`
 - `multipart.init`
@@ -252,8 +254,10 @@ The native protocol does not create another storage engine, another namespace, a
 - `object.bulk_purge`
 - `object.download_chunk`
 - `object.download`
+- `object.download_stream`
+- `object.view_stream`
 
-Upload bodies are sent as raw bytes after a small MessagePack control frame. The server streams those bytes through a bounded internal pipe into the N1 upload core, so large native one-shot uploads and multipart parts do not become whole in-memory protocol frames.
+Upload bodies are sent as raw bytes after a small MessagePack control frame. The server streams those bytes through a bounded internal pipe into the N1 upload core, so large native one-shot uploads and multipart parts do not become whole in-memory protocol frames. Streaming download/view responses send a small MessagePack response frame with `body_len`, then stream raw object bytes directly on the same socket.
 
 ### Configuration
 
@@ -275,7 +279,7 @@ u32_be frame_length
 MessagePack payload
 ```
 
-The maximum frame size is currently `128 MiB`. This keeps native control frames bounded and prevents one client from forcing unbounded server buffers. Large object transfer should still prefer streaming/range/multipart semantics instead of attempting to place huge files in one native frame.
+The maximum frame size is currently `8 MiB`. This keeps native control frames bounded and prevents one client from forcing unbounded server buffers. Large object transfer should use streaming/range/multipart semantics instead of attempting to place huge files in one native frame.
 
 Client request:
 
@@ -297,6 +301,7 @@ Operation response:
   "status": 200,
   "payload": null,
   "body": "MessagePack-encoded operation result bytes",
+  "body_len": 12345,
   "error": null
 }
 ```
@@ -306,7 +311,8 @@ Important details:
 - `id` is echoed by the server so clients can correlate requests.
 - `op` selects the native operation.
 - request `payload` is UTF-8 JSON text stored inside the MessagePack frame.
-- operation response `body` is MessagePack-encoded typed data. Native does not duplicate the same data as JSON in the envelope.
+- operation response `body` is MessagePack-encoded typed data for normal operations. Native does not duplicate the same data as JSON in the envelope.
+- streaming response operations set `body_len`, omit the large response body from the MessagePack frame, and then write exactly that many raw bytes after the response frame.
 - `ok=false` means the native transport or typed operation failed.
 - `status` is present for typed operations that return API-style status bodies.
 - `error.code` and `error.message` are present for native-layer failures.
@@ -416,7 +422,7 @@ Typed rename example:
 
 ### Performance Profile
 
-Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 1.3.0 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes.
+Native is designed to remove HTTP/TLS overhead and JSON response duplication for trusted internal clients. N1 1.3.1 operation responses send the result once as MessagePack body bytes instead of JSON body plus a second JSON copy in the response envelope. Upload operations send payload bytes outside the MessagePack envelope as raw native body bytes, and streaming download/view responses send raw object bytes after the control response frame.
 
 Current release-build loopback proof on 1,000 measured iterations showed:
 
@@ -430,6 +436,8 @@ Listing is less transport-bound because namespace scanning and response body siz
 ### Tooling Policy
 
 N1-owned tools should use `n1://` when they are running on trusted infrastructure. HTTPS stays available for browsers, external consumers, curl workflows, and compatibility. `n1_cli` uses native transport by default and only uses HTTPS when the operator explicitly passes `--url <https-url>`.
+
+`n1_cli` uses the shared `n1_native_client` crate. It does not keep a private native frame/auth implementation.
 
 `n1_cli` is stateful when opened as a console:
 
@@ -1086,7 +1094,7 @@ GET /n1/maintenance/trash/recover/status
 
 ### Disk IO Scheduler
 
-N1 1.3.0 adds a shared disk IO scheduler for kernel-level fairness. Foreground uploads and chunk reads, object status/repair, GC, fragment repair, and redistribution now acquire scheduler lanes before doing disk-heavy work. Multipart upload also pipelines shard writes, shard flushes, and shard publication inside the foreground write lane.
+N1 1.3 adds a shared disk IO scheduler for kernel-level fairness. Foreground uploads and chunk reads, object status/repair, GC, fragment repair, and redistribution now acquire scheduler lanes before doing disk-heavy work. Multipart upload also pipelines shard writes, shard flushes, and shard publication inside the foreground write lane.
 
 The scheduler separates:
 

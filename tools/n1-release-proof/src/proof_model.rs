@@ -77,6 +77,14 @@ struct Args {
     benchmark_iterations: usize,
     #[arg(long, default_value_t = 100)]
     benchmark_warmup: usize,
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    download_benchmark_bytes: usize,
+    #[arg(long, default_value_t = 32 * 1024 * 1024)]
+    download_benchmark_part_bytes: usize,
+    #[arg(long, default_value_t = 5)]
+    download_benchmark_iterations: usize,
+    #[arg(long, default_value_t = 1)]
+    download_benchmark_warmup: usize,
     #[arg(long, default_value_t = 3)]
     upload_benchmark_repeats: usize,
     #[arg(long, default_value_t = 16 * 1024 * 1024)]

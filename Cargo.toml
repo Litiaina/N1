@@ -5,6 +5,7 @@ members = [
     "cli_core",
     "registry",
     "n1",
+    "n1_native_client",
     "n1_cli",
     "n2",
     "n2_cli",

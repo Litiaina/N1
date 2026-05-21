@@ -4,6 +4,7 @@ use crate::protocol::auth::NativeSession;
 use crate::protocol::frame::{read_request_body, read_request_control, write_response};
 use crate::protocol::ops::{
     NativeExecutionError, execute_native_op, execute_native_streaming_reader,
+    prepare_native_download_stream, stream_native_download_plan,
 };
 use crate::protocol::types::{
     MAX_NATIVE_BODY_BYTES, N1_NATIVE_PROTOCOL_VERSION, NativeAuthFragmentRequest,
@@ -63,11 +64,20 @@ async fn handle_connection(
             return Ok(());
         };
 
-        let response = handle_request(&state, &mut session, peer, request, &mut stream).await;
-        write_response(&mut stream, &response)
-            .await
-            .map_err(|err| format!("write frame failed: {err}"))?;
+        match handle_request(&state, &mut session, peer, request, &mut stream).await {
+            NativeRequestOutcome::Response(response) => {
+                write_response(&mut stream, &response)
+                    .await
+                    .map_err(|err| format!("write frame failed: {err}"))?;
+            }
+            NativeRequestOutcome::Written => {}
+        }
     }
+}
+
+enum NativeRequestOutcome {
+    Response(NativeResponse),
+    Written,
 }
 
 async fn handle_request(
@@ -76,9 +86,9 @@ async fn handle_request(
     _peer: SocketAddr,
     request: NativeRequest,
     stream: &mut TcpStream,
-) -> NativeResponse {
+) -> NativeRequestOutcome {
     let id = request.id.clone();
-    match request.op.as_str() {
+    let response = match request.op.as_str() {
         "ping" => NativeResponse::ok(
             id,
             json!({
@@ -132,6 +142,26 @@ async fn handle_request(
         }
         op => match payload_value(request.payload.as_deref()) {
             Ok(payload) => {
+                if request.body.is_none()
+                    && request.body_len.unwrap_or(0) == 0
+                    && native_op_streams_response_body(op)
+                {
+                    return match execute_native_streaming_response_body(
+                        session.clone(),
+                        op,
+                        payload,
+                        stream,
+                        &id,
+                    )
+                    .await
+                    {
+                        Ok(()) => NativeRequestOutcome::Written,
+                        Err(err) => NativeRequestOutcome::Response(NativeResponse::operation(
+                            id, err.0, err.1,
+                        )),
+                    };
+                }
+
                 let result = if request.body.is_none()
                     && request.body_len.unwrap_or(0) > 0
                     && native_op_accepts_streaming_body(op)
@@ -153,11 +183,11 @@ async fn handle_request(
                         match read_request_body(stream, body_len).await {
                             Ok(body) => Some(body),
                             Err(err) => {
-                                return NativeResponse::err(
+                                return NativeRequestOutcome::Response(NativeResponse::err(
                                     id,
                                     "bad_request",
                                     format!("read native body failed: {err}"),
-                                );
+                                ));
                             }
                         }
                     } else {
@@ -176,7 +206,8 @@ async fn handle_request(
             }
             Err(err) => NativeResponse::err(id, "bad_request", err),
         },
-    }
+    };
+    NativeRequestOutcome::Response(response)
 }
 
 async fn execute_native_streaming_body(
@@ -245,6 +276,42 @@ async fn execute_native_streaming_body(
 
     drop(pre_gate);
     result
+}
+
+async fn execute_native_streaming_response_body(
+    session: NativeSession,
+    op: &str,
+    payload: Value,
+    stream: &mut TcpStream,
+    request_id: &str,
+) -> Result<(), NativeExecutionError> {
+    match op {
+        "object.download_stream" | "download.stream" | "object.view_stream" => {
+            let plan = prepare_native_download_stream(&session, payload)
+                .await
+                .map_err(native_app_error_for_continue)?;
+            let response = NativeResponse {
+                id: request_id.to_string(),
+                ok: true,
+                status: Some(200),
+                payload: Some(serde_json::to_string(&plan.payload).unwrap_or_else(|_| "{}".into())),
+                body: None,
+                body_len: Some(plan.body_len),
+                error: None,
+            };
+            write_response(stream, &response).await.map_err(|err| {
+                native_protocol_error(500, format!("native download control write failed: {err}"))
+            })?;
+            stream_native_download_plan(stream, plan)
+                .await
+                .map_err(native_app_error_for_continue)?;
+            Ok(())
+        }
+        _ => Err(native_protocol_error(
+            400,
+            format!("op '{op}' does not stream a native response body"),
+        )),
+    }
 }
 
 struct NativeSocketReader<'a> {
@@ -317,6 +384,13 @@ fn native_op_accepts_streaming_body(op: &str) -> bool {
             | "object.upload.one_shot"
             | "multipart.put_part"
             | "upload.multipart.put_part"
+    )
+}
+
+fn native_op_streams_response_body(op: &str) -> bool {
+    matches!(
+        op,
+        "object.download_stream" | "download.stream" | "object.view_stream"
     )
 }
 

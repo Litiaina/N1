@@ -1,14 +1,12 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
+use n1_native_client::{N1NativeClient, NativeOperationResponse};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use reqwest::{Method, StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_bytes::ByteBuf;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 use cli_core::client::{CreateFragmentRequest, DynError, get_secret, print_output};
 use cli_core::models::{
@@ -30,60 +28,14 @@ use crate::output::{
     format_repair_status, format_upload_list, format_upload_status,
 };
 
-const MAX_NATIVE_FRAME_BYTES: usize = 128 * 1024 * 1024;
-
-#[derive(Serialize)]
-struct NativeRequest {
-    id: String,
-    op: String,
-    payload: Option<String>,
-    body: Option<ByteBuf>,
-    body_len: Option<u64>,
-}
-
-#[derive(serde::Deserialize)]
-struct NativeResponse {
-    id: String,
-    ok: bool,
-    status: Option<u16>,
-    payload: Option<String>,
-    body: Option<ByteBuf>,
-    body_len: Option<u64>,
-    error: Option<NativeError>,
-}
-
-#[derive(serde::Deserialize)]
-struct NativeError {
-    code: String,
-    message: String,
-}
-
-#[derive(Serialize)]
-struct NativeAuthFragmentRequest {
-    fragment: String,
-    secret: String,
-    read: bool,
-    write: bool,
-    modify: bool,
-    delete: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expires_in: Option<u64>,
-}
-
-struct NativeN1Client {
-    stream: TcpStream,
-    next_id: u64,
-}
-
-struct NativeOpResult {
-    status: StatusCode,
-    body: Vec<u8>,
-}
+type NativeOpResult = NativeOperationResponse;
 
 pub async fn run_native(cli: Cli) -> Result<(), DynError> {
     let native_url = resolve_native_url(&cli)?;
     let secret = get_secret(cli.secret.clone())?;
-    let mut client = NativeN1Client::connect(&native_url).await?;
+    let mut client = N1NativeClient::connect(&native_url)
+        .await?
+        .with_request_prefix("n1-cli");
 
     match &cli.command {
         Commands::Console => {
@@ -174,17 +126,18 @@ fn native_url_from_config(path: &str) -> Option<String> {
 }
 
 async fn authenticate_native_cli(
-    client: &mut NativeN1Client,
+    client: &mut N1NativeClient,
     cli: &Cli,
     secret: &str,
 ) -> Result<(), DynError> {
     let auth_hint = resolve_cli_auth_fragment_hint(cli)?;
     let auth_fragment = resolve_n1_auth_fragment_native(client, &auth_hint).await?;
-    client.auth_fragment(&auth_fragment, secret).await
+    client.auth_fragment(&auth_fragment, secret).await?;
+    Ok(())
 }
 
 async fn resolve_n1_auth_fragment_native(
-    client: &mut NativeN1Client,
+    client: &mut N1NativeClient,
     fragment_hint: &str,
 ) -> Result<String, DynError> {
     if looks_like_fragment_hash(fragment_hint) {
@@ -203,7 +156,7 @@ async fn resolve_n1_auth_fragment_native(
 }
 
 async fn handle_native_authenticated_command(
-    client: &mut NativeN1Client,
+    client: &mut N1NativeClient,
     cli: &Cli,
 ) -> Result<(), DynError> {
     match &cli.command {
@@ -263,12 +216,12 @@ async fn handle_native_authenticated_command(
                 if let Some(version_id) = version_id {
                     payload["version_id"] = Value::String(version_id.clone());
                 }
-                let value: Value = client.operation_json("object.meta", payload, None).await?;
+                let value: Value = client.operation_json("object.meta", &payload, None).await?;
                 print_json_value(cli.json, &value)
             }
             ObjectCommands::Versions { object_key } => {
                 let value: Value = client
-                    .operation_json("object.versions", json!({"object_key": object_key}), None)
+                    .operation_json("object.versions", &json!({"object_key": object_key}), None)
                     .await?;
                 print_json_value(cli.json, &value)
             }
@@ -461,7 +414,7 @@ async fn handle_native_authenticated_command(
 }
 
 async fn handle_native_fragment_command(
-    client: &mut NativeN1Client,
+    client: &mut N1NativeClient,
     cli: &Cli,
     command: &FragmentCommands,
 ) -> Result<(), DynError> {
@@ -522,7 +475,7 @@ async fn handle_native_fragment_command(
     }
 }
 
-async fn native_console(client: &mut NativeN1Client, cli: &Cli) -> Result<(), DynError> {
+async fn native_console(client: &mut N1NativeClient, cli: &Cli) -> Result<(), DynError> {
     println!("N1 native console connected. Type 'help' for commands, 'exit' to quit.");
     let mut line = String::new();
     loop {
@@ -551,7 +504,7 @@ async fn native_console(client: &mut NativeN1Client, cli: &Cli) -> Result<(), Dy
 }
 
 async fn handle_console_line(
-    client: &mut NativeN1Client,
+    client: &mut N1NativeClient,
     cli: &Cli,
     input: &str,
 ) -> Result<(), DynError> {
@@ -665,13 +618,13 @@ async fn handle_console_line(
         }
         ["object", "meta", object_key] => {
             let value: Value = client
-                .operation_json("object.meta", json!({"object_key": object_key}), None)
+                .operation_json("object.meta", &json!({"object_key": object_key}), None)
                 .await?;
             print_json_value(cli.json, &value)
         }
         ["object", "versions", object_key] => {
             let value: Value = client
-                .operation_json("object.versions", json!({"object_key": object_key}), None)
+                .operation_json("object.versions", &json!({"object_key": object_key}), None)
                 .await?;
             print_json_value(cli.json, &value)
         }
@@ -686,7 +639,7 @@ async fn handle_console_line(
             print_json_value(cli.json, &value)
         }
         ["session"] => {
-            let value = client.raw_json("session.info", json!({}), None).await?;
+            let value = client.raw_json("session.info", &json!({}), None).await?;
             print_json_value(cli.json, &value)
         }
         _ => {
@@ -703,7 +656,7 @@ fn print_console_help() {
 }
 
 async fn native_watch_json<T, F, D>(
-    client: &mut NativeN1Client,
+    client: &mut N1NativeClient,
     path: &str,
     poll_ms: u64,
     json_output: bool,
@@ -742,7 +695,7 @@ fn print_native_response(response: NativeOpResult) -> Result<(), DynError> {
     } else if !response.body.is_empty() {
         println!("{}", String::from_utf8_lossy(&response.body));
     } else {
-        println!("{{\"status\":{}}}", response.status.as_u16());
+        println!("{{\"status\":{}}}", response.status);
     }
     Ok(())
 }
@@ -767,34 +720,23 @@ fn encode_path(value: &str) -> String {
     encode_query(value).replace("%2F", "/")
 }
 
-impl NativeN1Client {
-    async fn connect(url: &str) -> Result<Self, DynError> {
-        let address = parse_native_address(url)?;
-        let stream = TcpStream::connect(address).await?;
-        stream.set_nodelay(true)?;
-        Ok(Self { stream, next_id: 0 })
-    }
+trait NativeCliExt {
+    async fn mapped_json<T: DeserializeOwned>(
+        &mut self,
+        method: Method,
+        path: &str,
+        json_body: Option<Value>,
+    ) -> Result<T, DynError>;
 
-    async fn auth_fragment(&mut self, fragment: &str, secret: &str) -> Result<(), DynError> {
-        let response = self
-            .round_trip(
-                "auth.fragment",
-                json!(NativeAuthFragmentRequest {
-                    fragment: fragment.to_string(),
-                    secret: secret.to_string(),
-                    read: true,
-                    write: true,
-                    modify: true,
-                    delete: true,
-                    expires_in: Some(21_600),
-                }),
-                None,
-            )
-            .await?;
-        ensure_native_ok(&response)?;
-        Ok(())
-    }
+    async fn mapped_request(
+        &mut self,
+        method: Method,
+        path: &str,
+        json_body: Option<Value>,
+    ) -> Result<NativeOpResult, DynError>;
+}
 
+impl NativeCliExt for N1NativeClient {
     async fn mapped_json<T: DeserializeOwned>(
         &mut self,
         method: Method,
@@ -812,136 +754,18 @@ impl NativeN1Client {
         json_body: Option<Value>,
     ) -> Result<NativeOpResult, DynError> {
         let (op, payload) = native_op_from_mapped_call(method, path, json_body)?;
-        let response = self.round_trip(&op, payload, None).await?;
-        ensure_native_ok(&response)?;
-        let status = StatusCode::from_u16(response.status.unwrap_or(500))?;
-        let body = response
-            .body
-            .map(|body| body.into_vec())
-            .unwrap_or_default();
+        let response = self.operation(&op, &payload, None).await?;
+        let status = StatusCode::from_u16(response.status)?;
         if status.is_client_error() || status.is_server_error() {
             return Err(io::Error::other(format!(
                 "native operation failed: status={} body={}",
                 status,
-                String::from_utf8_lossy(&body)
-            ))
-            .into());
-        }
-        Ok(NativeOpResult { status, body })
-    }
-
-    async fn raw_json(
-        &mut self,
-        op: &str,
-        payload: Value,
-        body: Option<Vec<u8>>,
-    ) -> Result<Value, DynError> {
-        let response = self.round_trip(op, payload, body).await?;
-        ensure_native_ok(&response)?;
-        let payload = response.payload.unwrap_or_else(|| "null".to_string());
-        Ok(serde_json::from_str(&payload)?)
-    }
-
-    async fn operation_json<T: DeserializeOwned>(
-        &mut self,
-        op: &str,
-        payload: Value,
-        body: Option<Vec<u8>>,
-    ) -> Result<T, DynError> {
-        let response = self.round_trip(op, payload, body).await?;
-        ensure_native_ok(&response)?;
-        let body = response
-            .body
-            .as_ref()
-            .map(|body| body.as_slice())
-            .unwrap_or_default();
-        Ok(rmp_serde::from_slice(body)?)
-    }
-
-    async fn round_trip(
-        &mut self,
-        op: &str,
-        payload: Value,
-        body: Option<Vec<u8>>,
-    ) -> Result<NativeResponse, DynError> {
-        self.next_id = self.next_id.saturating_add(1);
-        let id = format!("n1-cli-{}", self.next_id);
-        let request = NativeRequest {
-            id: id.clone(),
-            op: op.to_string(),
-            payload: Some(serde_json::to_string(&payload)?),
-            body_len: body.as_ref().map(|body| body.len() as u64),
-            body: None,
-        };
-        let bytes = rmp_serde::to_vec(&request)?;
-        if bytes.is_empty() || bytes.len() > MAX_NATIVE_FRAME_BYTES {
-            return Err(io::Error::other(format!(
-                "native request frame size {} is outside the supported bound",
-                bytes.len()
-            ))
-            .into());
-        }
-        self.stream
-            .write_all(&(bytes.len() as u32).to_be_bytes())
-            .await?;
-        self.stream.write_all(&bytes).await?;
-        if let Some(body) = body {
-            self.stream.write_all(&body).await?;
-        }
-        self.stream.flush().await?;
-
-        let mut len = [0u8; 4];
-        self.stream.read_exact(&mut len).await?;
-        let len = u32::from_be_bytes(len) as usize;
-        if len == 0 || len > MAX_NATIVE_FRAME_BYTES {
-            return Err(
-                io::Error::other(format!("native response frame size {len} is invalid")).into(),
-            );
-        }
-        let mut frame = vec![0u8; len];
-        self.stream.read_exact(&mut frame).await?;
-        let mut response = rmp_serde::from_slice::<NativeResponse>(&frame)?;
-        if response.body.is_none() {
-            if let Some(body_len) = response.body_len {
-                let mut body = vec![0u8; body_len as usize];
-                if !body.is_empty() {
-                    self.stream.read_exact(&mut body).await?;
-                }
-                response.body = Some(ByteBuf::from(body));
-            }
-        }
-        if response.id != id {
-            return Err(io::Error::other(format!(
-                "native response id mismatch: got {} expected {id}",
-                response.id
+                String::from_utf8_lossy(&response.body)
             ))
             .into());
         }
         Ok(response)
     }
-}
-
-fn parse_native_address(url: &str) -> Result<String, DynError> {
-    let Some(rest) = url.strip_prefix("n1://") else {
-        return Err(io::Error::other("native URL must start with n1://").into());
-    };
-    let address = rest.trim_end_matches('/');
-    if address.is_empty() {
-        return Err(io::Error::other("native URL did not include host:port").into());
-    }
-    Ok(address.to_string())
-}
-
-fn ensure_native_ok(response: &NativeResponse) -> Result<(), DynError> {
-    if response.ok {
-        return Ok(());
-    }
-    let error = response
-        .error
-        .as_ref()
-        .map(|err| format!("{}: {}", err.code, err.message))
-        .unwrap_or_else(|| "unknown native error".to_string());
-    Err(io::Error::other(error).into())
 }
 
 fn native_op_from_mapped_call(

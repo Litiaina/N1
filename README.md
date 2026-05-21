@@ -19,7 +19,7 @@
 
 This repository contains the storage platform stack built around four runtime components:
 
-> - `N1` (`1.2.0`)
+> - `N1` (`1.3.1`)
   Primary N1 storage kernel with an N1 namespace, two-level fanned immutable `.objects/<hh>/<hh>/@o_<object-id>` records, zero-decode listing, object-level repair/status, the N1 blob/shard/parity plane, and the native `n1://` protocol for internal tools. See `N1_DOCUMENTATION.md`.
 > - `N2` (`0.4.0`)
   Multi-node clustering and placement layer built on top of the `N1` storage kernel, with real-prefix namespace directories, symlink object entries, immutable filesystem `.nmtd` cluster metadata, one cluster EC pass, and an S3-compatible path-style object surface.
@@ -67,7 +67,7 @@ The current N1 line retires the old Standard/indexdb engine from the active work
 
 ### N1
 
-`N1 1.2.0` is the primary N1 storage kernel and the default N1 face for new deployments.
+`N1 1.3.1` is the primary N1 storage kernel and the default N1 face for new deployments.
 
 It keeps the N1 object/blob plane, repair model, redistribution model, GC model, and public route shape, with active storage authority in explicit N1 planes:
 
@@ -151,7 +151,7 @@ Clients / UI / CLI
                                     optional cold sync to N1
 ```
 
-For standalone `N1 1.2`, the internal model is:
+For standalone `N1 1.3`, the internal model is:
 
 ```text
 index_root/<fragment_hash>/
@@ -311,7 +311,9 @@ curl -k https://127.0.0.1:50001/n1/auth/fragment \
 
 ### N1 Operator CLI
 
-`n1_cli` is the operator CLI for N1 health, maintenance, fragments, namespace reads, object status/repair, quota operations, and upload inspection. In N1 1.2, the CLI prefers the native `n1://` transport by default. HTTPS remains available only when `--url <https-url>` is provided for compatibility.
+`n1_cli` is the operator CLI for N1 health, maintenance, fragments, namespace reads, object status/repair, quota operations, and upload inspection. In N1 1.3, the CLI prefers the native `n1://` transport by default. HTTPS remains available only when `--url <https-url>` is provided for compatibility.
+
+The CLI uses the shared `n1_native_client` crate, which is also the intended Rust client foundation for N2, NS, and future N1 desktop/native tools.
 
 Protected CLI commands authenticate with fragment-scoped credentials over the selected transport, so pass `--fragment <name-or-hash>` or `--auth-fragment <name-or-hash>` when talking to a real server. The native endpoint is discovered from `--native-url`, then `N1_NATIVE_URL`, then `n1_config.ini`, then `n1://127.0.0.1:50002`.
 

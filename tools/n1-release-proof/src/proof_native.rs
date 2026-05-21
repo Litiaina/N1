@@ -84,7 +84,7 @@ impl Proof {
             .and_then(|value| serde_json::from_str::<Value>(value).ok())
             .and_then(|value| value.get("protocol").and_then(Value::as_str).map(str::to_owned))
             .unwrap_or_default();
-        if protocol != "n1/0.3" {
+        if protocol != "n1/0.4" {
             return Err(format!("native ping returned unexpected protocol '{protocol}'").into());
         }
 
@@ -231,6 +231,33 @@ impl Proof {
             return Err("native full download returned different bytes".into());
         }
 
+        let stream_download = native_round_trip_stream_hash(
+            &mut stream,
+            "native-stream-download",
+            "object.download_stream",
+            json!({
+                "object_key": native_multipart_key,
+                "chunk_size": 1024 * 1024,
+            }),
+        )
+        .await?;
+        ensure_native_status(&stream_download.response, 200, "native stream download")?;
+        if stream_download.bytes_read != native_multipart_payload.len() {
+            return Err(format!(
+                "native stream download byte count mismatch: got {} expected {}",
+                stream_download.bytes_read,
+                native_multipart_payload.len()
+            )
+            .into());
+        }
+        if stream_download.sha256 != native_multipart_sha {
+            return Err(format!(
+                "native stream download sha mismatch: got {} expected {}",
+                stream_download.sha256, native_multipart_sha
+            )
+            .into());
+        }
+
         let meta = native_round_trip(
             &mut stream,
             "native-object-meta",
@@ -288,6 +315,35 @@ impl Proof {
             .await?,
             200,
             "native object repair",
+        )?;
+
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-fragment-quota",
+                "fragment.quota",
+                json!({}),
+                None,
+            )
+            .await?,
+            200,
+            "native fragment quota",
+        )?;
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-fragment-quota-resize",
+                "fragment.resize_quota",
+                json!({
+                    "fragment": self.fragment,
+                    "quota_bytes": self.args.quota_bytes,
+                    "secret": self.args.master_key,
+                }),
+                None,
+            )
+            .await?,
+            200,
+            "native fragment quota resize",
         )?;
 
         let rename_source = format!("{}native-protocol/rename-source.bin", self.args.prefix);
@@ -470,6 +526,30 @@ impl Proof {
         ensure_native_status(
             &native_round_trip(
                 &mut stream,
+                "native-uploads-list",
+                "uploads.list",
+                json!({"limit": 50, "offset": 0}),
+                None,
+            )
+            .await?,
+            200,
+            "native uploads list",
+        )?;
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-uploads-status",
+                "uploads.status",
+                json!({"version_id": cancel_version_id}),
+                None,
+            )
+            .await?,
+            200,
+            "native uploads status",
+        )?;
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
                 "native-multipart-cancel",
                 "multipart.cancel",
                 json!({
@@ -592,6 +672,129 @@ impl Proof {
             "native purge",
         )?;
 
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-gc-status",
+                "maintenance.gc.status",
+                json!({}),
+                None,
+            )
+            .await?,
+            200,
+            "native gc status",
+        )?;
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-gc-start",
+                "maintenance.gc.start",
+                json!({"dry_run": true}),
+                None,
+            )
+            .await?,
+            202,
+            "native gc start",
+        )?;
+        native_wait_job_not_running(
+            &mut stream,
+            "native-gc-status-wait",
+            "maintenance.gc.status",
+            "native gc wait",
+        )
+        .await?;
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-gc-stop",
+                "maintenance.gc.stop",
+                json!({}),
+                None,
+            )
+            .await?,
+            200,
+            "native gc stop",
+        )?;
+
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-repair-start",
+                "maintenance.repair.start",
+                json!({
+                    "dry_run": true,
+                    "fast_mode": true,
+                    "read_only_fast": true,
+                    "batch": 8,
+                    "mode": "availability",
+                }),
+                None,
+            )
+            .await?,
+            202,
+            "native repair start",
+        )?;
+        native_wait_job_not_running(
+            &mut stream,
+            "native-repair-status-wait",
+            "maintenance.repair.status",
+            "native repair wait",
+        )
+        .await?;
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-repair-stop",
+                "maintenance.repair.stop",
+                json!({}),
+                None,
+            )
+            .await?,
+            200,
+            "native repair stop",
+        )?;
+
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-redistribution-start",
+                "maintenance.redistribution.start",
+                json!({
+                    "dry_run": true,
+                    "fast_mode": true,
+                    "read_only_fast": true,
+                    "mode": "fast",
+                    "durability": "relaxed",
+                    "scope": "all",
+                    "object_concurrency": 1,
+                    "status_batch": 8,
+                }),
+                None,
+            )
+            .await?,
+            202,
+            "native redistribution start",
+        )?;
+        native_wait_job_not_running(
+            &mut stream,
+            "native-redistribution-status-wait",
+            "maintenance.redistribution.status",
+            "native redistribution wait",
+        )
+        .await?;
+        ensure_native_status(
+            &native_round_trip(
+                &mut stream,
+                "native-redistribution-stop",
+                "maintenance.redistribution.stop",
+                json!({}),
+                None,
+            )
+            .await?,
+            200,
+            "native redistribution stop",
+        )?;
+
         Ok(json!({
             "native_port": self.native_port(),
             "object_key": object_key,
@@ -611,8 +814,11 @@ impl Proof {
                 "multipart.put_part",
                 "multipart.finalize",
                 "multipart.cancel",
+                "uploads.list",
+                "uploads.status",
                 "object.download_chunk",
                 "object.download",
+                "object.download_stream",
                 "object.meta",
                 "object.versions",
                 "object.status",
@@ -621,11 +827,87 @@ impl Proof {
                 "object.version.recover",
                 "object.bulk_delete",
                 "object.bulk_recover",
-                "object.bulk_purge"
+                "object.bulk_purge",
+                "fragment.quota",
+                "fragment.resize_quota",
+                "maintenance.gc.status",
+                "maintenance.gc.start",
+                "maintenance.gc.stop",
+                "maintenance.repair.start",
+                "maintenance.repair.status",
+                "maintenance.repair.stop",
+                "maintenance.redistribution.start",
+                "maintenance.redistribution.status",
+                "maintenance.redistribution.stop"
             ],
             "status": "PASS"
         }))
     }
+}
+
+struct NativeStreamBodyProof {
+    response: NativeProofResponse,
+    bytes_read: usize,
+    sha256: String,
+}
+
+async fn native_round_trip_stream_hash(
+    stream: &mut TcpStream,
+    id: &str,
+    op: &str,
+    payload: Value,
+) -> ProofResult<NativeStreamBodyProof> {
+    use tokio::io::AsyncWriteExt;
+
+    let request = NativeProofRequest {
+        id: id.to_string(),
+        op: op.to_string(),
+        payload: serde_json::to_string(&payload)?,
+        body_len: None,
+        body: None,
+    };
+    let encoded = rmp_serde::to_vec(&request)?;
+    stream
+        .write_all(&(encoded.len() as u32).to_be_bytes())
+        .await?;
+    stream.write_all(&encoded).await?;
+    stream.flush().await?;
+
+    let mut len = [0u8; 4];
+    stream.read_exact(&mut len).await?;
+    let len = u32::from_be_bytes(len) as usize;
+    let mut frame = vec![0u8; len];
+    stream.read_exact(&mut frame).await?;
+    let response = rmp_serde::from_slice::<NativeProofResponse>(&frame)?;
+    if response.id != id {
+        return Err(format!(
+            "native response id mismatch: got {} expected {}",
+            response.id, id
+        )
+        .into());
+    }
+
+    let mut hasher = Sha256::new();
+    let mut bytes_read = 0usize;
+    if let Some(body) = response.body.as_ref() {
+        hasher.update(body.as_slice());
+        bytes_read = bytes_read.saturating_add(body.len());
+    } else if let Some(mut body_len) = response.body_len {
+        let mut buffer = vec![0u8; NATIVE_UPLOAD_COPY_BUFFER_BYTES];
+        while body_len > 0 {
+            let wanted = (body_len as usize).min(buffer.len());
+            stream.read_exact(&mut buffer[..wanted]).await?;
+            hasher.update(&buffer[..wanted]);
+            bytes_read = bytes_read.saturating_add(wanted);
+            body_len = body_len.saturating_sub(wanted as u64);
+        }
+    }
+
+    Ok(NativeStreamBodyProof {
+        response,
+        bytes_read,
+        sha256: format!("{:x}", hasher.finalize()),
+    })
 }
 
 async fn native_round_trip(
@@ -767,6 +1049,40 @@ fn native_json_body(response: &NativeProofResponse) -> ProofResult<Value> {
         .map(|body| body.as_slice())
         .ok_or("native response did not include body")?;
     Ok(rmp_serde::from_slice(body)?)
+}
+
+async fn native_wait_job_not_running(
+    stream: &mut TcpStream,
+    id_prefix: &str,
+    status_op: &str,
+    label: &str,
+) -> ProofResult<Value> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut attempt = 0usize;
+    loop {
+        let response = native_round_trip(
+            stream,
+            &format!("{id_prefix}-{attempt}"),
+            status_op,
+            json!({}),
+            None,
+        )
+        .await?;
+        ensure_native_status(&response, 200, label)?;
+        let body = native_json_body(&response)?;
+        if body
+            .get("is_running")
+            .and_then(Value::as_bool)
+            .is_none_or(|running| !running)
+        {
+            return Ok(body);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("{label} did not finish within 30s: {body}").into());
+        }
+        attempt = attempt.saturating_add(1);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 fn native_error_string(response: &NativeProofResponse) -> String {

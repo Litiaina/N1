@@ -14,9 +14,11 @@ N1 has three storage planes and two transport faces:
 
 The transport faces call the same N1 core/service graph. `n1://` is not a separate metadata path and does not own storage truth.
 
+The workspace `n1_native_client` crate is the canonical Rust client implementation for this transport. N1 CLI uses it directly, and N2, NS, desktop tools, and future operators should use the same crate instead of copying frame/auth/streaming code.
+
 ## Native Protocol Plane
 
-N1 1.3.0 uses `n1://` protocol `n1/0.3` as the native N1 protocol plane beside HTTPS. The protocol exists so N1-owned tools can talk to the storage kernel without paying HTTP/TLS overhead or JSON response duplication. It covers namespace/control operations and the native data plane: one-shot upload, multipart init/part/finalize, upload status/list, object chunk download, object status/repair, GC, repair, redistribution, quota, and health. The native listener is required at startup; if its port cannot bind, N1 should fail startup instead of silently running without the low-level face.
+N1 1.3.1 uses `n1://` protocol `n1/0.4` as the native N1 protocol plane beside HTTPS. The protocol exists so N1-owned tools can talk to the storage kernel without paying HTTP/TLS overhead or JSON response duplication. It covers namespace/control operations and the native data plane: one-shot upload, multipart init/part/finalize, upload status/list, object chunk download, object streaming download/view, object status/repair, GC, repair, redistribution, quota, and health. The native listener is required at startup; if its port cannot bind, N1 should fail startup instead of silently running without the low-level face.
 
 The native plane is intentionally thin:
 
@@ -37,7 +39,7 @@ TCP connection
 
 The server stores auth state per native connection. `auth.fragment` calls the fragment authorization core directly, then the returned JWT is attached to later typed native operations. Native does not contain an HTTP route bridge and does not dispatch through Axum. Operations such as `namespace.stat`, `maintenance.health`, `object.status`, and `fragment.quota` call the same N1 core/service functions that HTTPS routes use.
 
-Native protocol performance depends on avoiding small-frame TCP latency and avoiding binary payload inflation. N1 sets `TCP_NODELAY` on accepted native sockets. Protocol `n1/0.3` sends upload payloads as raw bytes after a small MessagePack control frame instead of embedding large bodies inside the MessagePack frame. Native upload dispatch streams those raw bytes through a bounded internal pipe into the same N1 upload core, so one-shot and multipart parts are not materialized as whole protocol buffers on the server. The Rust release proof includes native namespace and upload benchmarks so delayed-ACK/Nagle regressions and native data-plane regressions are caught.
+Native protocol performance depends on avoiding small-frame TCP latency and avoiding binary payload inflation. N1 sets `TCP_NODELAY` on accepted native sockets. Protocol `n1/0.4` sends upload payloads as raw bytes after a small MessagePack control frame instead of embedding large bodies inside the MessagePack frame. Streaming download responses send a small MessagePack response frame with `body_len`, then stream the object bytes directly on the same socket. Native upload dispatch streams raw request bytes through a bounded internal pipe into the same N1 upload core, so one-shot and multipart parts are not materialized as whole protocol buffers on the server. The Rust release proof includes native namespace, upload, resume, and streaming download benchmarks so delayed-ACK/Nagle regressions and native data-plane regressions are caught.
 
 The native plane must not:
 
@@ -52,7 +54,7 @@ Native is a lower-latency core face for the same storage kernel, not a fourth st
 
 ## Disk IO Scheduler
 
-N1 1.3.0 introduces a shared disk IO scheduler above the storage planes. The scheduler is not a metadata authority and does not change the object/index/blob layout. It only controls admission into disk-heavy work.
+N1 1.3 introduces a shared disk IO scheduler above the storage planes. The scheduler is not a metadata authority and does not change the object/index/blob layout. It only controls admission into disk-heavy work.
 
 Scheduler lanes:
 
@@ -64,7 +66,7 @@ Scheduler lanes:
 
 Foreground work uses the adaptive upload target so live traffic can contract under CPU/RAM pressure. Background work has its own smaller lane and per-fragment gate, so GC, repair, and redistribution cannot consume the whole disk path while users are uploading or reading. Object status and repair also pass through the scheduler in addition to their object-scoped maintenance gates.
 
-The scheduler is intentionally coarse at 1.3.0: it controls classes and fragment fairness, not individual low-level block requests. Multipart writes then pipeline inside the admitted foreground lane: EC stripe writes are issued across shard writers concurrently, final shard flushes run concurrently, and multipart tmp-to-stable shard publish runs concurrently. That keeps the storage-kernel invariants stable while removing avoidable per-shard serialization from large uploads.
+The scheduler is intentionally coarse at 1.3: it controls classes and fragment fairness, not individual low-level block requests. Multipart writes then pipeline inside the admitted foreground lane: EC stripe writes are issued across shard writers concurrently, final shard flushes run concurrently, and multipart tmp-to-stable shard publish runs concurrently. That keeps the storage-kernel invariants stable while removing avoidable per-shard serialization from large uploads.
 
 N1 still serializes the same `(fragment, version_id, part_index)` upload part. Different parts can move in parallel, but two clients cannot race the same receipt or stable shard set for the same part. Large-upload clients should keep part concurrency bounded; too much concurrency can overload weak two-disk deployments instead of improving them.
 

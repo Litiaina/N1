@@ -69,8 +69,11 @@ pub struct UploadRuntimeStats {
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct IndexRuntimeStats {
+    #[serde(default)]
     pub loaded_partition_runtimes: u64,
+    #[serde(default)]
     pub wal_appenders: u64,
+    #[serde(default)]
     pub prefix_projection_fragments_pending: u64,
 }
 
