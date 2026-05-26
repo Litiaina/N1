@@ -8,6 +8,7 @@ use crate::distribution_core::model::{
     ClusterViewQuery, GovernanceAbortRequest, GovernanceAppendRequest, GovernanceVoteRequest,
     ObjectIdentity, ResolvePlacementQuery, UpsertMembershipRequest,
 };
+use crate::distribution_core::object_index::resolve_n2_object_id_local;
 use crate::distribution_core::state::{
     get_cluster_view, get_membership, resolve_placement, stage_rollback_membership,
     stage_upsert_membership,
@@ -18,10 +19,22 @@ use crate::structs::auth_structs::Claims;
 use axum::Json as AxumJson;
 use axum::extract::{Path, Query};
 use axum::http::HeaderMap;
+use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 fn is_admin_claim(claims: &Claims) -> bool {
     claims.fragment == *ADMIN_KEY
+}
+
+fn preview_object_id(uid: &str, fragment: &str, object_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"n2-preview-object-id|");
+    hasher.update(uid.as_bytes());
+    hasher.update(b"|");
+    hasher.update(fragment.as_bytes());
+    hasher.update(b"|");
+    hasher.update(object_key.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 pub async fn get_n2_membership(
@@ -137,11 +150,16 @@ pub async fn resolve_n2_placement(
     let mc = query.mc.unwrap_or(cross_params.mc);
     let uid = query.uid.unwrap_or_else(|| claims.fragment.clone());
     let version_id = query.version_id.unwrap_or_else(|| Ulid::new().to_string());
+    let object_key = object_key.trim_start_matches('/').to_string();
+    let object_id = resolve_n2_object_id_local(fragment.as_str(), object_key.as_str())
+        .await?
+        .unwrap_or_else(|| preview_object_id(uid.as_str(), fragment.as_str(), object_key.as_str()));
 
     let identity = ObjectIdentity {
         uid,
         fragment,
-        object_key: object_key.trim_start_matches('/').to_string(),
+        object_id,
+        object_key,
         version_id,
     };
     let response = resolve_placement(identity, kc, mc).await?;

@@ -317,18 +317,24 @@ impl Proof {
             "native object repair",
         )?;
 
-        ensure_native_status(
-            &native_round_trip(
-                &mut stream,
-                "native-fragment-quota",
-                "fragment.quota",
-                json!({}),
-                None,
-            )
-            .await?,
-            200,
-            "native fragment quota",
-        )?;
+        let quota = native_round_trip(
+            &mut stream,
+            "native-fragment-quota",
+            "fragment.quota",
+            json!({}),
+            None,
+        )
+        .await?;
+        ensure_native_status(&quota, 200, "native fragment quota")?;
+        let quota_body = native_json_body(&quota)?;
+        let used_bytes = quota_body
+            .get("used_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let quota_bytes = self
+            .args
+            .quota_bytes
+            .max(used_bytes.saturating_add(1024 * 1024 * 1024));
         ensure_native_status(
             &native_round_trip(
                 &mut stream,
@@ -336,7 +342,7 @@ impl Proof {
                 "fragment.resize_quota",
                 json!({
                     "fragment": self.fragment,
-                    "quota_bytes": self.args.quota_bytes,
+                    "quota_bytes": quota_bytes,
                     "secret": self.args.master_key,
                 }),
                 None,

@@ -1,5 +1,8 @@
 use crate::enums::app_error_enum::AppError;
-use simd_erasure_core::{ReedSolomonDecoder, ReedSolomonEncoder};
+#[cfg(test)]
+use simd_erasure_core::ReedSolomonDecoder;
+use simd_erasure_core::ReedSolomonEncoder;
+#[cfg(test)]
 use std::collections::HashMap;
 
 pub(crate) fn normalize_n2_stripe_block_size(v: usize) -> usize {
@@ -51,6 +54,7 @@ pub(crate) fn encode_cluster_stripe_blocks(
     Ok(out)
 }
 
+#[cfg(test)]
 pub(crate) fn reconstruct_cluster_shard_from_available(
     kc: usize,
     mc: usize,

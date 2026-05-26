@@ -55,6 +55,7 @@ mod tests {
         ObjectIdentity {
             uid: "u1".to_string(),
             fragment: "frag".to_string(),
+            object_id: "object-1".to_string(),
             object_key: "videos/x.mp4".to_string(),
             version_id: "v1".to_string(),
         }
@@ -92,6 +93,7 @@ mod tests {
                 let id = ObjectIdentity {
                     uid: fragment.to_string(),
                     fragment: fragment.to_string(),
+                    object_id: format!("object-{}", i),
                     object_key: format!("videos/object-{}.bin", i),
                     version_id: format!("v{}", i),
                 };

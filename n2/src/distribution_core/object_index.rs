@@ -1,14 +1,15 @@
 use crate::core::disk_manager::ObjectPathManager;
 use crate::core::modify::sync_dir;
 use crate::distribution_core::config::n2_runtime_config;
-use crate::distribution_core::model::N2ObjectMap;
+use crate::distribution_core::model::N2ObjectRecord;
 use crate::distribution_core::nmtd::{
-    N2_OBJECTS_DIR, OBJECT_LATEST_FILE, OBJECT_METADATA_FILE, decode_namespace_relative_path,
-    latest_path_for_root, map_dir_for_root, map_path_for_root, namespace_path_for_root,
-    namespace_root_for_root, normalize_object_key, object_key_hash, write_atomic,
+    N2_OBJECTS_DIR, OBJECT_METADATA_EXT, decode_namespace_relative_path, namespace_path_for_root,
+    namespace_root_for_root, new_object_id, normalize_object_id, normalize_object_key,
+    object_dir_for_root, object_id_from_dir_name, record_path_for_root, write_atomic,
 };
 use crate::distribution_core::peer::{
-    InternalMapDeleteResponse, add_internal_peer_headers, normalize_endpoint,
+    InternalNamespaceRenameRequest, InternalNamespaceRenameResponse,
+    InternalObjectRecordDeleteResponse, add_internal_peer_headers, normalize_endpoint,
 };
 use crate::distribution_core::state::get_membership;
 use crate::enums::app_error_enum::AppError;
@@ -21,10 +22,28 @@ use tracing::warn;
 
 #[derive(Clone, Debug)]
 pub(crate) struct N2NamespaceListPage {
-    pub(crate) maps: Vec<N2ObjectMap>,
+    pub(crate) records: Vec<N2ObjectRecord>,
     pub(crate) common_prefixes: Vec<String>,
     pub(crate) has_more: bool,
     pub(crate) next_continuation: Option<String>,
+}
+
+fn metadata_version_from_name(name: &str) -> Option<String> {
+    name.strip_suffix(&format!(".{}", OBJECT_METADATA_EXT))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+}
+
+fn apply_namespace_key(mut record: N2ObjectRecord, object_key: &str) -> N2ObjectRecord {
+    record.object.object_key = normalize_object_key(object_key);
+    record
+}
+
+fn object_id_from_object_dir(path: &StdPath) -> Option<String> {
+    path.file_name()
+        .and_then(|v| v.to_str())
+        .and_then(object_id_from_dir_name)
 }
 
 async fn remove_namespace_entry_for_root(
@@ -50,7 +69,7 @@ async fn write_namespace_entry_for_root(
     root: &StdPath,
     fragment: &str,
     object_key: &str,
-    key_hash: &str,
+    object_id: &str,
 ) -> Result<(), AppError> {
     let namespace_path = namespace_path_for_root(root, fragment, object_key);
     let Some(parent) = namespace_path.parent() else {
@@ -61,7 +80,7 @@ async fn write_namespace_entry_for_root(
     fs::create_dir_all(parent)
         .await
         .map_err(|e| AppError::Io(e, format!("mkdir N2 namespace {:?}", parent)))?;
-    let target = map_dir_for_root(root, fragment, key_hash);
+    let target = object_dir_for_root(root, fragment, object_id);
     let tmp = namespace_path.with_extension(format!("tmp.{}", ulid::Ulid::new()));
 
     #[cfg(unix)]
@@ -99,12 +118,12 @@ async fn write_namespace_entry_for_root(
 async fn refresh_namespace_entry_local(
     fragment: &str,
     object_key: &str,
-    key_hash: &str,
+    object_id: &str,
 ) -> Result<(), AppError> {
     let path_manager = ObjectPathManager::new();
     let roots = path_manager.get_all_index_roots();
     for root in &roots {
-        write_namespace_entry_for_root(root, fragment, object_key, key_hash).await?;
+        write_namespace_entry_for_root(root, fragment, object_key, object_id).await?;
     }
     Ok(())
 }
@@ -121,7 +140,121 @@ async fn remove_namespace_entry_local(fragment: &str, object_key: &str) -> Resul
     Ok(removed)
 }
 
-pub(crate) async fn persist_n2_object_map_local(map: &N2ObjectMap) -> Result<usize, AppError> {
+async fn read_namespace_target_for_root(
+    root: &StdPath,
+    fragment: &str,
+    object_key: &str,
+) -> Result<Option<PathBuf>, AppError> {
+    let namespace_path = namespace_path_for_root(root, fragment, object_key);
+    if !fs::symlink_metadata(&namespace_path).await.is_ok() {
+        return Ok(None);
+    }
+
+    #[cfg(unix)]
+    {
+        let target = fs::read_link(&namespace_path)
+            .await
+            .map_err(|e| AppError::Io(e, format!("read N2 namespace link {:?}", namespace_path)))?;
+        return Ok(Some(target));
+    }
+
+    #[cfg(not(unix))]
+    {
+        let target = fs::read_to_string(&namespace_path).await.map_err(|e| {
+            AppError::Io(e, format!("read N2 namespace pointer {:?}", namespace_path))
+        })?;
+        return Ok(Some(PathBuf::from(target.trim())));
+    }
+}
+
+pub(crate) async fn resolve_n2_object_id_local(
+    fragment: &str,
+    object_key: &str,
+) -> Result<Option<String>, AppError> {
+    let path_manager = ObjectPathManager::new();
+    for root in path_manager.get_all_index_roots() {
+        let Some(target) = read_namespace_target_for_root(&root, fragment, object_key).await?
+        else {
+            continue;
+        };
+        if let Some(object_id) = object_id_from_object_dir(&target) {
+            return Ok(Some(object_id));
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) async fn resolve_or_create_n2_object_id_local(
+    fragment: &str,
+    object_key: &str,
+) -> Result<String, AppError> {
+    if let Some(object_id) = resolve_n2_object_id_local(fragment, object_key).await? {
+        return Ok(object_id);
+    }
+    Ok(new_object_id())
+}
+
+async fn rename_namespace_entry_for_root(
+    root: &StdPath,
+    fragment: &str,
+    source_object_key: &str,
+    destination_object_key: &str,
+) -> Result<bool, AppError> {
+    let source = namespace_path_for_root(root, fragment, source_object_key);
+    let destination = namespace_path_for_root(root, fragment, destination_object_key);
+    if !fs::symlink_metadata(&source).await.is_ok() {
+        return Ok(false);
+    }
+    if fs::symlink_metadata(&destination).await.is_ok() {
+        return Err(AppError::Conflict(format!(
+            "destination namespace entry already exists: {}",
+            destination_object_key
+        )));
+    }
+    let Some(parent) = destination.parent() else {
+        return Err(AppError::InternalServerError(
+            "N2 destination namespace path missing parent".to_string(),
+        ));
+    };
+    fs::create_dir_all(parent)
+        .await
+        .map_err(|e| AppError::Io(e, format!("mkdir N2 namespace {:?}", parent)))?;
+    fs::rename(&source, &destination)
+        .await
+        .map_err(|e| AppError::Io(e, format!("rename {:?} -> {:?}", source, destination)))?;
+    if let Some(source_parent) = source.parent() {
+        let _ = sync_dir(source_parent).await;
+    }
+    let _ = sync_dir(parent).await;
+    Ok(true)
+}
+
+pub(crate) async fn rename_n2_namespace_entry_local(
+    fragment: &str,
+    source_object_key: &str,
+    destination_object_key: &str,
+) -> Result<usize, AppError> {
+    let path_manager = ObjectPathManager::new();
+    let roots = path_manager.get_all_index_roots();
+    let mut moved = 0usize;
+    for root in &roots {
+        if rename_namespace_entry_for_root(
+            root,
+            fragment,
+            source_object_key,
+            destination_object_key,
+        )
+        .await?
+        {
+            moved = moved.saturating_add(1);
+        }
+    }
+    Ok(moved)
+}
+
+pub(crate) async fn persist_n2_object_record_local(
+    record: &N2ObjectRecord,
+) -> Result<usize, AppError> {
     let path_manager = ObjectPathManager::new();
     let roots = path_manager.get_all_index_roots();
     if roots.is_empty() {
@@ -130,52 +263,53 @@ pub(crate) async fn persist_n2_object_map_local(map: &N2ObjectMap) -> Result<usi
         ));
     }
 
-    let key_hash = object_key_hash(map.object.object_key.as_str());
-    let map_bytes = rmp_serde::to_vec(map).map_err(|e| {
-        AppError::InternalServerError(format!("encode n2 object map failed: {}", e))
+    let object_id = normalize_object_id(record.object.object_id.as_str());
+    if object_id.is_empty() {
+        return Err(AppError::BadRequest(
+            "N2 object record missing object_id".to_string(),
+        ));
+    }
+    let record_bytes = rmp_serde::to_vec(record).map_err(|e| {
+        AppError::InternalServerError(format!("encode n2 object record failed: {}", e))
     })?;
-    let latest_bytes = map.object.version_id.as_bytes().to_vec();
 
     let mut writes_ok = 0usize;
     for root in &roots {
-        let map_path = map_path_for_root(
+        let record_path = record_path_for_root(
             root,
-            map.object.fragment.as_str(),
-            &key_hash,
-            map.object.version_id.as_str(),
+            record.object.fragment.as_str(),
+            &object_id,
+            record.object.version_id.as_str(),
         );
-        let latest_path = latest_path_for_root(root, map.object.fragment.as_str(), &key_hash);
-        if write_atomic(&map_path, &map_bytes).await.is_ok()
-            && write_atomic(&latest_path, &latest_bytes).await.is_ok()
-        {
+        if write_atomic(&record_path, &record_bytes).await.is_ok() {
             writes_ok = writes_ok.saturating_add(1);
         } else {
             warn!(
-                "n2 map mirror write failed root={} key={} version={}",
+                "n2 record mirror write failed root={} key={} version={}",
                 root.display(),
-                map.object.object_key,
-                map.object.version_id
+                record.object.object_key,
+                record.object.version_id
             );
         }
     }
 
     if writes_ok == 0 {
         return Err(AppError::InternalServerError(
-            "failed to persist n2 object map on all mirrors".to_string(),
+            "failed to persist n2 object record on all mirrors".to_string(),
         ));
     }
 
     refresh_namespace_entry_local(
-        map.object.fragment.as_str(),
-        map.object.object_key.as_str(),
-        &key_hash,
+        record.object.fragment.as_str(),
+        record.object.object_key.as_str(),
+        &object_id,
     )
     .await?;
 
     Ok(writes_ok)
 }
 
-pub(crate) async fn list_n2_map_versions_local(
+pub(crate) async fn list_n2_record_versions_local(
     fragment: &str,
     object_key: &str,
 ) -> Result<Vec<String>, AppError> {
@@ -185,10 +319,12 @@ pub(crate) async fn list_n2_map_versions_local(
         return Ok(Vec::new());
     }
 
-    let key_hash = object_key_hash(object_key);
+    let Some(object_id) = resolve_n2_object_id_local(fragment, object_key).await? else {
+        return Ok(Vec::new());
+    };
     let mut versions = HashSet::new();
     for root in &roots {
-        let dir = map_dir_for_root(root, fragment, key_hash.as_str());
+        let dir = object_dir_for_root(root, fragment, object_id.as_str());
         let exists = fs::try_exists(&dir)
             .await
             .map_err(|e| AppError::Io(e, format!("check {:?}", dir)))?;
@@ -201,18 +337,8 @@ pub(crate) async fn list_n2_map_versions_local(
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') || name.is_empty() {
-                continue;
-            }
-            let Ok(file_type) = entry.file_type().await else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let metadata_path = entry.path().join(OBJECT_METADATA_FILE);
-            if fs::try_exists(&metadata_path).await.unwrap_or(false) {
-                versions.insert(name);
+            if let Some(version) = metadata_version_from_name(name.as_str()) {
+                versions.insert(version);
             }
         }
     }
@@ -222,48 +348,20 @@ pub(crate) async fn list_n2_map_versions_local(
     Ok(out)
 }
 
-pub(crate) async fn refresh_n2_latest_marker_local(
+pub(crate) async fn remove_n2_namespace_if_headless_local(
     fragment: &str,
     object_key: &str,
 ) -> Result<(), AppError> {
-    let path_manager = ObjectPathManager::new();
-    let roots = path_manager.get_all_index_roots();
-    if roots.is_empty() {
-        return Ok(());
-    }
-
-    let key_hash = object_key_hash(object_key);
-    let latest_version = list_n2_map_versions_local(fragment, object_key)
+    if list_n2_record_versions_local(fragment, object_key)
         .await?
-        .pop();
-    if let Some(version) = latest_version {
-        let latest_bytes = version.into_bytes();
-        let mut writes_ok = 0usize;
-        for root in &roots {
-            let latest_path = latest_path_for_root(root, fragment, key_hash.as_str());
-            if write_atomic(&latest_path, &latest_bytes).await.is_ok() {
-                writes_ok = writes_ok.saturating_add(1);
-            }
-        }
-        if writes_ok == 0 {
-            return Err(AppError::InternalServerError(
-                "failed to update n2 latest marker on all mirrors".to_string(),
-            ));
-        }
-    } else {
-        for root in &roots {
-            let latest_path = latest_path_for_root(root, fragment, key_hash.as_str());
-            let _ = fs::remove_file(&latest_path).await;
-            if let Some(parent) = latest_path.parent() {
-                let _ = sync_dir(parent).await;
-            }
-        }
+        .is_empty()
+    {
         let _ = remove_namespace_entry_local(fragment, object_key).await?;
     }
     Ok(())
 }
 
-pub(crate) async fn delete_n2_object_map_local(
+pub(crate) async fn delete_n2_object_record_local(
     fragment: &str,
     object_key: &str,
     version_id: &str,
@@ -274,56 +372,59 @@ pub(crate) async fn delete_n2_object_map_local(
         return Ok(0);
     }
 
-    let key_hash = object_key_hash(object_key);
+    let Some(object_id) = resolve_n2_object_id_local(fragment, object_key).await? else {
+        return Ok(0);
+    };
     let mut deleted = 0usize;
     for root in &roots {
-        let map_path = map_path_for_root(root, fragment, key_hash.as_str(), version_id);
-        let exists = fs::try_exists(&map_path)
+        let record_path = record_path_for_root(root, fragment, object_id.as_str(), version_id);
+        let exists = fs::try_exists(&record_path)
             .await
-            .map_err(|e| AppError::Io(e, format!("check {:?}", map_path)))?;
+            .map_err(|e| AppError::Io(e, format!("check {:?}", record_path)))?;
         if !exists {
             continue;
         }
-        fs::remove_file(&map_path)
+        fs::remove_file(&record_path)
             .await
-            .map_err(|e| AppError::Io(e, format!("remove {:?}", map_path)))?;
+            .map_err(|e| AppError::Io(e, format!("remove {:?}", record_path)))?;
         deleted = deleted.saturating_add(1);
-        if let Some(parent) = map_path.parent() {
+        if let Some(parent) = record_path.parent() {
             let _ = sync_dir(parent).await;
-            let _ = fs::remove_dir(parent).await;
         }
     }
 
-    refresh_n2_latest_marker_local(fragment, object_key).await?;
+    remove_n2_namespace_if_headless_local(fragment, object_key).await?;
     Ok(deleted)
 }
 
-pub(crate) async fn replicate_n2_object_map_remote(
+pub(crate) async fn replicate_n2_object_record_remote(
     http_client: &reqwest::Client,
     endpoint: &str,
-    map: &N2ObjectMap,
+    record: &N2ObjectRecord,
 ) -> Result<(), AppError> {
     let url = format!(
-        "{}/v4/n2/internal/map/upsert",
+        "{}/n2/internal/object-record/upsert",
         endpoint.trim_end_matches('/')
     );
-    let response = add_internal_peer_headers(http_client.post(url.as_str()).json(map))
+    let response = add_internal_peer_headers(http_client.post(url.as_str()).json(record))
         .await?
         .send()
         .await
-        .map_err(|e| AppError::InternalServerError(format!("send n2 map upsert failed: {}", e)))?;
+        .map_err(|e| {
+            AppError::InternalServerError(format!("send n2 object record upsert failed: {}", e))
+        })?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         return Err(AppError::InternalServerError(format!(
-            "n2 map upsert failed status={} body={}",
+            "n2 object record upsert failed status={} body={}",
             status, body
         )));
     }
     Ok(())
 }
 
-pub(crate) async fn delete_n2_object_map_remote(
+pub(crate) async fn delete_n2_object_record_remote(
     http_client: &reqwest::Client,
     endpoint: &str,
     fragment: &str,
@@ -331,7 +432,7 @@ pub(crate) async fn delete_n2_object_map_remote(
     version_id: &str,
 ) -> Result<usize, AppError> {
     let url = format!(
-        "{}/v4/n2/internal/map/{}",
+        "{}/n2/internal/object-record/{}",
         endpoint.trim_end_matches('/'),
         fragment
     );
@@ -343,29 +444,131 @@ pub(crate) async fn delete_n2_object_map_remote(
     .await?
     .send()
     .await
-    .map_err(|e| AppError::InternalServerError(format!("send n2 map delete failed: {}", e)))?;
+    .map_err(|e| {
+        AppError::InternalServerError(format!("send n2 object record delete failed: {}", e))
+    })?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         return Err(AppError::InternalServerError(format!(
-            "n2 map delete failed status={} body={}",
+            "n2 object record delete failed status={} body={}",
             status, body
         )));
     }
     let parsed = response
-        .json::<InternalMapDeleteResponse>()
+        .json::<InternalObjectRecordDeleteResponse>()
         .await
         .map_err(|e| {
-            AppError::InternalServerError(format!("decode n2 map delete response failed: {}", e))
+            AppError::InternalServerError(format!(
+                "decode n2 object record delete response failed: {}",
+                e
+            ))
         })?;
-    Ok(parsed.local_map_files_deleted)
+    Ok(parsed.local_metadata_files_deleted)
 }
 
-pub(crate) async fn persist_n2_object_map(map: &N2ObjectMap) -> Result<(), AppError> {
-    let local_writes = persist_n2_object_map_local(map).await?;
+pub(crate) async fn rename_n2_namespace_entry_remote(
+    http_client: &reqwest::Client,
+    endpoint: &str,
+    fragment: &str,
+    source_object_key: &str,
+    destination_object_key: &str,
+) -> Result<usize, AppError> {
+    let url = format!(
+        "{}/n2/internal/namespace/rename",
+        endpoint.trim_end_matches('/')
+    );
+    let request = InternalNamespaceRenameRequest {
+        fragment: fragment.to_string(),
+        source_object_key: source_object_key.to_string(),
+        destination_object_key: destination_object_key.to_string(),
+    };
+    let response = add_internal_peer_headers(http_client.post(url.as_str()).json(&request))
+        .await?
+        .send()
+        .await
+        .map_err(|e| {
+            AppError::InternalServerError(format!("send n2 namespace rename failed: {}", e))
+        })?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(AppError::InternalServerError(format!(
+            "n2 namespace rename failed status={} body={}",
+            status, body
+        )));
+    }
+    let parsed = response
+        .json::<InternalNamespaceRenameResponse>()
+        .await
+        .map_err(|e| {
+            AppError::InternalServerError(format!(
+                "decode n2 namespace rename response failed: {}",
+                e
+            ))
+        })?;
+    Ok(parsed.local_namespace_entries_moved)
+}
+
+pub(crate) async fn rename_n2_namespace_entry(
+    fragment: &str,
+    source_object_key: &str,
+    destination_object_key: &str,
+    remote_endpoints: &[String],
+) -> Result<usize, AppError> {
+    let mut moved = 0usize;
+    if remote_endpoints.is_empty() {
+        return rename_n2_namespace_entry_local(
+            fragment,
+            source_object_key,
+            destination_object_key,
+        )
+        .await;
+    }
+
+    let cfg = n2_runtime_config();
+    let http_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_millis(cfg.remote_request_timeout_ms))
+        .build()
+        .map_err(|e| {
+            AppError::InternalServerError(format!("build n2 http client failed: {}", e))
+        })?;
+    for endpoint in remote_endpoints {
+        match rename_n2_namespace_entry_remote(
+            &http_client,
+            endpoint.as_str(),
+            fragment,
+            source_object_key,
+            destination_object_key,
+        )
+        .await
+        {
+            Ok(count) => moved = moved.saturating_add(count),
+            Err(err) => {
+                warn!(
+                    "n2 remote namespace rename failed fragment={} source={} destination={} endpoint={} err={}",
+                    fragment, source_object_key, destination_object_key, endpoint, err
+                );
+                return Err(AppError::Conflict(format!(
+                    "n2 namespace rename did not reach peer {}: {}",
+                    endpoint, err
+                )));
+            }
+        }
+    }
+    moved = moved.saturating_add(
+        rename_n2_namespace_entry_local(fragment, source_object_key, destination_object_key)
+            .await?,
+    );
+    Ok(moved)
+}
+
+pub(crate) async fn persist_n2_object_record(record: &N2ObjectRecord) -> Result<(), AppError> {
+    let local_writes = persist_n2_object_record_local(record).await?;
     let cfg = n2_runtime_config();
 
-    let mut remote_endpoints = map
+    let mut remote_endpoints = record
         .shards
         .iter()
         .map(|s| s.endpoint.clone())
@@ -388,26 +591,29 @@ pub(crate) async fn persist_n2_object_map(map: &N2ObjectMap) -> Result<(), AppEr
         })?;
     let mut replicated = 0usize;
     for endpoint in &remote_endpoints {
-        if replicate_n2_object_map_remote(&http_client, endpoint.as_str(), map)
+        if replicate_n2_object_record_remote(&http_client, endpoint.as_str(), record)
             .await
             .is_ok()
         {
             replicated = replicated.saturating_add(1);
         } else {
             warn!(
-                "n2 map replication failed fragment={} object_key={} version={} endpoint={}",
-                map.object.fragment, map.object.object_key, map.object.version_id, endpoint
+                "n2 object record replication failed fragment={} object_key={} version={} endpoint={}",
+                record.object.fragment,
+                record.object.object_key,
+                record.object.version_id,
+                endpoint
             );
         }
     }
 
     let required_remote_acks = remote_endpoints
         .len()
-        .min(usize::from(map.write_quorum.saturating_sub(1)));
+        .min(usize::from(record.write_quorum.saturating_sub(1)));
 
     if replicated < required_remote_acks {
         return Err(AppError::Conflict(format!(
-            "object committed locally ({} mirrors) but map replication acknowledged only {} remote targets, need {}",
+            "object committed locally ({} mirrors) but object record replication acknowledged only {} remote targets, need {}",
             local_writes, replicated, required_remote_acks
         )));
     }
@@ -415,38 +621,41 @@ pub(crate) async fn persist_n2_object_map(map: &N2ObjectMap) -> Result<(), AppEr
     Ok(())
 }
 
-pub(crate) async fn read_n2_map_version(
+pub(crate) async fn read_n2_record_version(
     fragment: &str,
     object_key: &str,
     version_id: &str,
-) -> Result<N2ObjectMap, AppError> {
+) -> Result<N2ObjectRecord, AppError> {
     let path_manager = ObjectPathManager::new();
     let roots = path_manager.get_all_index_roots();
-    let key_hash = object_key_hash(object_key);
-
-    read_n2_map_version_by_hash(roots, fragment, &key_hash, version_id).await
+    let Some(object_id) = resolve_n2_object_id_local(fragment, object_key).await? else {
+        return Err(AppError::NotFound);
+    };
+    let record =
+        read_n2_record_version_by_object_id(roots, fragment, &object_id, version_id).await?;
+    Ok(apply_namespace_key(record, object_key))
 }
 
-pub(crate) async fn read_n2_map_version_by_hash(
+pub(crate) async fn read_n2_record_version_by_object_id(
     roots: Vec<PathBuf>,
     fragment: &str,
-    key_hash: &str,
+    object_id: &str,
     version_id: &str,
-) -> Result<N2ObjectMap, AppError> {
+) -> Result<N2ObjectRecord, AppError> {
     for root in roots {
-        let map_path = map_path_for_root(&root, fragment, key_hash, version_id);
-        let exists = fs::try_exists(&map_path)
+        let record_path = record_path_for_root(&root, fragment, object_id, version_id);
+        let exists = fs::try_exists(&record_path)
             .await
-            .map_err(|e| AppError::Io(e, format!("check {:?}", map_path)))?;
+            .map_err(|e| AppError::Io(e, format!("check {:?}", record_path)))?;
         if !exists {
             continue;
         }
 
-        let bytes = fs::read(&map_path)
+        let bytes = fs::read(&record_path)
             .await
-            .map_err(|e| AppError::Io(e, format!("read {:?}", map_path)))?;
-        let parsed = rmp_serde::from_slice::<N2ObjectMap>(&bytes).map_err(|e| {
-            AppError::InternalServerError(format!("decode n2 object map failed: {}", e))
+            .map_err(|e| AppError::Io(e, format!("read {:?}", record_path)))?;
+        let parsed = rmp_serde::from_slice::<N2ObjectRecord>(&bytes).map_err(|e| {
+            AppError::InternalServerError(format!("decode n2 object record failed: {}", e))
         })?;
         return Ok(parsed);
     }
@@ -454,87 +663,60 @@ pub(crate) async fn read_n2_map_version_by_hash(
     Err(AppError::NotFound)
 }
 
-pub(crate) async fn discover_latest_n2_version(
+pub(crate) async fn discover_latest_n2_record_version(
     fragment: &str,
     object_key: &str,
 ) -> Result<String, AppError> {
-    let path_manager = ObjectPathManager::new();
-    let roots = path_manager.get_all_index_roots();
-    let key_hash = object_key_hash(object_key);
+    let versions = list_n2_record_versions_local(fragment, object_key).await?;
+    versions.into_iter().max().ok_or(AppError::NotFound)
+}
 
-    for root in &roots {
-        let latest_path = latest_path_for_root(root, fragment, &key_hash);
-        let exists = fs::try_exists(&latest_path)
-            .await
-            .map_err(|e| AppError::Io(e, format!("check {:?}", latest_path)))?;
-        if !exists {
-            continue;
-        }
-        let bytes = fs::read(&latest_path)
-            .await
-            .map_err(|e| AppError::Io(e, format!("read {:?}", latest_path)))?;
-        let raw = String::from_utf8_lossy(&bytes).trim().to_string();
-        if !raw.is_empty() {
-            return Ok(raw);
-        }
-    }
-
+async fn discover_latest_n2_record_version_by_object_dir(
+    object_dir: &StdPath,
+) -> Result<Option<String>, AppError> {
     let mut discovered = Vec::new();
-    for root in &roots {
-        let dir = map_dir_for_root(root, fragment, &key_hash);
-        let exists = fs::try_exists(&dir)
-            .await
-            .map_err(|e| AppError::Io(e, format!("check {:?}", dir)))?;
-        if !exists {
-            continue;
-        }
-        let mut entries = match fs::read_dir(&dir).await {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') || name.is_empty() {
-                continue;
-            }
-            let Ok(file_type) = entry.file_type().await else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let metadata_path = entry.path().join(OBJECT_METADATA_FILE);
-            if fs::try_exists(&metadata_path).await.unwrap_or(false) {
-                discovered.push(name);
-            }
+    let exists = fs::try_exists(object_dir)
+        .await
+        .map_err(|e| AppError::Io(e, format!("check {:?}", object_dir)))?;
+    if !exists {
+        return Ok(None);
+    }
+    let mut entries = match fs::read_dir(object_dir).await {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(version) = metadata_version_from_name(name.as_str()) {
+            discovered.push(version);
         }
     }
 
     discovered.sort();
-    discovered.pop().ok_or(AppError::NotFound)
+    Ok(discovered.pop())
 }
 
-pub(crate) async fn load_n2_object_map_local(
+pub(crate) async fn load_n2_object_record_local(
     fragment: &str,
     object_key: &str,
     version_id: Option<&str>,
-) -> Result<N2ObjectMap, AppError> {
+) -> Result<N2ObjectRecord, AppError> {
     let version = match version_id {
         Some(v) if !v.trim().is_empty() => v.trim().to_string(),
-        _ => discover_latest_n2_version(fragment, object_key).await?,
+        _ => discover_latest_n2_record_version(fragment, object_key).await?,
     };
-    read_n2_map_version(fragment, object_key, version.as_str()).await
+    read_n2_record_version(fragment, object_key, version.as_str()).await
 }
 
-pub(crate) async fn load_n2_object_map_remote(
+pub(crate) async fn load_n2_object_record_remote(
     http_client: &reqwest::Client,
     endpoint: &str,
     fragment: &str,
     object_key: &str,
     version_id: Option<&str>,
-) -> Result<N2ObjectMap, AppError> {
+) -> Result<N2ObjectRecord, AppError> {
     let url = format!(
-        "{}/v4/n2/internal/map/{}",
+        "{}/n2/internal/object-record/{}",
         endpoint.trim_end_matches('/'),
         fragment
     );
@@ -549,7 +731,7 @@ pub(crate) async fn load_n2_object_map_remote(
         .send()
         .await
         .map_err(|e| {
-            AppError::InternalServerError(format!("request remote n2 map failed: {}", e))
+            AppError::InternalServerError(format!("request remote n2 record failed: {}", e))
         })?;
     if response.status() == StatusCode::NOT_FOUND {
         return Err(AppError::NotFound);
@@ -558,22 +740,21 @@ pub(crate) async fn load_n2_object_map_remote(
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         return Err(AppError::InternalServerError(format!(
-            "remote n2 map read failed status={} body={}",
+            "remote n2 object record read failed status={} body={}",
             status, body
         )));
     }
-    response
-        .json::<N2ObjectMap>()
-        .await
-        .map_err(|e| AppError::InternalServerError(format!("decode remote n2 map failed: {}", e)))
+    response.json::<N2ObjectRecord>().await.map_err(|e| {
+        AppError::InternalServerError(format!("decode remote n2 record failed: {}", e))
+    })
 }
 
-pub(crate) async fn load_n2_object_map(
+pub(crate) async fn load_n2_object_record(
     fragment: &str,
     object_key: &str,
     version_id: Option<&str>,
-) -> Result<N2ObjectMap, AppError> {
-    let local_result = load_n2_object_map_local(fragment, object_key, version_id).await;
+) -> Result<N2ObjectRecord, AppError> {
+    let local_result = load_n2_object_record_local(fragment, object_key, version_id).await;
     if local_result.is_ok() {
         return local_result;
     }
@@ -607,7 +788,7 @@ pub(crate) async fn load_n2_object_map(
         })?;
     let mut last_err = None;
     for endpoint in remote_endpoints {
-        match load_n2_object_map_remote(
+        match load_n2_object_record_remote(
             &http_client,
             endpoint.as_str(),
             fragment,
@@ -616,7 +797,7 @@ pub(crate) async fn load_n2_object_map(
         )
         .await
         {
-            Ok(map) => return Ok(map),
+            Ok(record) => return Ok(record),
             Err(AppError::NotFound) => {}
             Err(e) => last_err = Some(e),
         }
@@ -628,46 +809,44 @@ pub(crate) async fn load_n2_object_map(
     local_result
 }
 
-async fn read_latest_map_from_map_dir(map_dir: &StdPath) -> Result<Option<N2ObjectMap>, AppError> {
-    let latest_path = map_dir.join(OBJECT_LATEST_FILE);
-    if !fs::try_exists(&latest_path)
+async fn read_latest_record_from_object_dir(
+    object_dir: &StdPath,
+) -> Result<Option<N2ObjectRecord>, AppError> {
+    let Some(version_id) = discover_latest_n2_record_version_by_object_dir(object_dir).await?
+    else {
+        return Ok(None);
+    };
+    let Some(object_id) = object_id_from_object_dir(object_dir) else {
+        return Ok(None);
+    };
+    let record_path = object_dir.join(format!("{}.{}", version_id, OBJECT_METADATA_EXT));
+    if !fs::try_exists(&record_path)
         .await
-        .map_err(|e| AppError::Io(e, format!("check {:?}", latest_path)))?
+        .map_err(|e| AppError::Io(e, format!("check {:?}", record_path)))?
     {
         return Ok(None);
     }
-    let latest_bytes = fs::read(&latest_path)
+    let bytes = fs::read(&record_path)
         .await
-        .map_err(|e| AppError::Io(e, format!("read {:?}", latest_path)))?;
-    let version_id = String::from_utf8_lossy(&latest_bytes).trim().to_string();
-    if version_id.is_empty() {
-        return Ok(None);
-    }
-    let map_path = map_dir.join(version_id).join(OBJECT_METADATA_FILE);
-    if !fs::try_exists(&map_path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("check {:?}", map_path)))?
-    {
-        return Ok(None);
-    }
-    let bytes = fs::read(&map_path)
-        .await
-        .map_err(|e| AppError::Io(e, format!("read {:?}", map_path)))?;
-    let parsed = rmp_serde::from_slice::<N2ObjectMap>(&bytes).map_err(|e| {
-        AppError::InternalServerError(format!("decode n2 namespace map failed: {}", e))
+        .map_err(|e| AppError::Io(e, format!("read {:?}", record_path)))?;
+    let parsed = rmp_serde::from_slice::<N2ObjectRecord>(&bytes).map_err(|e| {
+        AppError::InternalServerError(format!("decode n2 namespace record failed: {}", e))
     })?;
+    if normalize_object_id(parsed.object.object_id.as_str()) != object_id {
+        return Ok(None);
+    }
     Ok(Some(parsed))
 }
 
-async fn read_latest_map_from_namespace_entry(
+async fn read_latest_record_from_namespace_entry(
     entry_path: &StdPath,
-) -> Result<Option<N2ObjectMap>, AppError> {
+) -> Result<Option<N2ObjectRecord>, AppError> {
     #[cfg(unix)]
     {
         let target = fs::read_link(entry_path)
             .await
             .map_err(|e| AppError::Io(e, format!("read N2 namespace link {:?}", entry_path)))?;
-        return read_latest_map_from_map_dir(&target).await;
+        return read_latest_record_from_object_dir(&target).await;
     }
 
     #[cfg(not(unix))]
@@ -675,7 +854,7 @@ async fn read_latest_map_from_namespace_entry(
         let target = fs::read_to_string(entry_path)
             .await
             .map_err(|e| AppError::Io(e, format!("read N2 namespace pointer {:?}", entry_path)))?;
-        return read_latest_map_from_map_dir(StdPath::new(target.trim())).await;
+        return read_latest_record_from_object_dir(StdPath::new(target.trim())).await;
     }
 }
 
@@ -705,7 +884,7 @@ async fn collect_namespace_recursive(
     root_dir: &StdPath,
     dir_prefix: &str,
     name_filter: &str,
-    out: &mut Vec<N2ObjectMap>,
+    out: &mut Vec<N2ObjectRecord>,
     max_entries: usize,
 ) -> Result<(), AppError> {
     let mut stack = vec![(root_dir.to_path_buf(), dir_prefix.to_string())];
@@ -740,10 +919,10 @@ async fn collect_namespace_recursive(
                 continue;
             }
             if metadata.file_type().is_symlink() || metadata.file_type().is_file() {
-                if let Some(map) =
-                    read_latest_map_from_namespace_entry(entry.path().as_path()).await?
+                if let Some(record) =
+                    read_latest_record_from_namespace_entry(entry.path().as_path()).await?
                 {
-                    out.push(map);
+                    out.push(apply_namespace_key(record, key.as_str()));
                     if out.len() >= max_entries {
                         return Ok(());
                     }
@@ -765,7 +944,7 @@ pub(crate) async fn list_fragment_n2_namespace_page(
     let roots = path_manager.get_all_index_roots();
     if roots.is_empty() {
         return Ok(N2NamespaceListPage {
-            maps: Vec::new(),
+            records: Vec::new(),
             common_prefixes: Vec::new(),
             has_more: false,
             next_continuation: None,
@@ -773,7 +952,7 @@ pub(crate) async fn list_fragment_n2_namespace_page(
     }
 
     let (dir_prefix, name_filter) = split_namespace_prefix(prefix.unwrap_or_default());
-    let mut maps = Vec::new();
+    let mut records = Vec::new();
     let mut prefixes = HashSet::<String>::new();
     let scan_limit = limit.saturating_mul(8).clamp(limit, 1_000_000);
     let delimiter_is_dir = delimiter == Some("/");
@@ -818,13 +997,13 @@ pub(crate) async fn list_fragment_n2_namespace_page(
                     continue;
                 }
                 if metadata.file_type().is_symlink() || metadata.file_type().is_file() {
-                    if let Some(map) =
-                        read_latest_map_from_namespace_entry(entry.path().as_path()).await?
+                    if let Some(record) =
+                        read_latest_record_from_namespace_entry(entry.path().as_path()).await?
                     {
-                        maps.push(map);
+                        records.push(apply_namespace_key(record, key.as_str()));
                     }
                 }
-                if maps.len().saturating_add(prefixes.len()) >= scan_limit {
+                if records.len().saturating_add(prefixes.len()) >= scan_limit {
                     break;
                 }
             }
@@ -833,27 +1012,27 @@ pub(crate) async fn list_fragment_n2_namespace_page(
                 &dir,
                 dir_prefix.as_str(),
                 name_filter.as_str(),
-                &mut maps,
+                &mut records,
                 scan_limit,
             )
             .await?;
         }
     }
 
-    maps.sort_by(|a, b| a.object.object_key.cmp(&b.object.object_key));
-    maps.dedup_by(|a, b| a.object.object_key == b.object.object_key);
+    records.sort_by(|a, b| a.object.object_key.cmp(&b.object.object_key));
+    records.dedup_by(|a, b| a.object.object_key == b.object.object_key);
     let mut common_prefixes = prefixes.into_iter().collect::<Vec<_>>();
     common_prefixes.sort();
 
     let continuation = continuation.unwrap_or_default();
     if !continuation.is_empty() {
-        maps.retain(|m| m.object.object_key.as_str() > continuation);
+        records.retain(|record| record.object.object_key.as_str() > continuation);
         common_prefixes.retain(|p| p.as_str() > continuation);
     }
 
-    let mut combined = maps
+    let mut combined = records
         .iter()
-        .map(|m| m.object.object_key.clone())
+        .map(|record| record.object.object_key.clone())
         .chain(common_prefixes.iter().cloned())
         .collect::<Vec<_>>();
     combined.sort();
@@ -865,18 +1044,18 @@ pub(crate) async fn list_fragment_n2_namespace_page(
     };
 
     let allowed = combined.into_iter().take(limit).collect::<HashSet<_>>();
-    maps.retain(|m| allowed.contains(m.object.object_key.as_str()));
+    records.retain(|record| allowed.contains(record.object.object_key.as_str()));
     common_prefixes.retain(|p| allowed.contains(p.as_str()));
 
     Ok(N2NamespaceListPage {
-        maps,
+        records,
         common_prefixes,
         has_more,
         next_continuation,
     })
 }
 
-pub(crate) async fn collect_n2_map_paths(
+pub(crate) async fn collect_n2_record_paths(
     root: &StdPath,
     max_paths: usize,
 ) -> Result<Vec<PathBuf>, AppError> {
@@ -907,7 +1086,7 @@ pub(crate) async fn collect_n2_map_paths(
             let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
                 continue;
             };
-            if name != OBJECT_METADATA_FILE {
+            if metadata_version_from_name(name).is_none() {
                 continue;
             }
             out.push(path);
@@ -919,17 +1098,17 @@ pub(crate) async fn collect_n2_map_paths(
     Ok(out)
 }
 
-pub(crate) async fn list_fragment_n2_maps(
+pub(crate) async fn list_fragment_n2_records(
     fragment: &str,
     max_objects: usize,
-) -> Result<Vec<N2ObjectMap>, AppError> {
+) -> Result<Vec<N2ObjectRecord>, AppError> {
     let path_manager = ObjectPathManager::new();
     let roots = path_manager.get_all_index_roots();
     if roots.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut seen_map_ids = HashSet::new();
+    let mut seen_record_ids = HashSet::new();
     let mut out = Vec::new();
     for root in roots {
         let index_root = root.join(fragment).join("n2").join(N2_OBJECTS_DIR);
@@ -941,29 +1120,29 @@ pub(crate) async fn list_fragment_n2_maps(
         }
 
         // Pull a bounded number of files per root; mirrors typically contain the same keys.
-        let mut map_paths =
-            collect_n2_map_paths(&index_root, max_objects.saturating_mul(8)).await?;
-        map_paths.sort();
-        for path in map_paths {
-            let map_id = path
+        let mut record_paths =
+            collect_n2_record_paths(&index_root, max_objects.saturating_mul(8)).await?;
+        record_paths.sort();
+        for path in record_paths {
+            let record_id = path
                 .strip_prefix(&index_root)
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| path.to_string_lossy().to_string());
-            if !seen_map_ids.insert(map_id) {
+            if !seen_record_ids.insert(record_id) {
                 continue;
             }
             let bytes = match fs::read(&path).await {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let map = match rmp_serde::from_slice::<N2ObjectMap>(&bytes) {
+            let record = match rmp_serde::from_slice::<N2ObjectRecord>(&bytes) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if map.object.fragment != fragment {
+            if record.object.fragment != fragment {
                 continue;
             }
-            out.push(map);
+            out.push(record);
             if out.len() >= max_objects {
                 return Ok(out);
             }
@@ -1022,29 +1201,29 @@ pub(crate) async fn list_n2_fragments(max_fragments: usize) -> Result<Vec<String
     Ok(out)
 }
 
-pub(crate) async fn list_n2_maps_for_object(
+pub(crate) async fn list_n2_records_for_object(
     fragment: &str,
     object_key: &str,
     max_versions: usize,
-) -> Result<Vec<N2ObjectMap>, AppError> {
+) -> Result<Vec<N2ObjectRecord>, AppError> {
     let key = normalize_object_key(object_key);
     if key.is_empty() {
         return Ok(Vec::new());
     }
 
-    let versions = list_n2_map_versions_local(fragment, key.as_str()).await?;
-    let mut maps = Vec::with_capacity(versions.len().min(max_versions));
+    let versions = list_n2_record_versions_local(fragment, key.as_str()).await?;
+    let mut records = Vec::with_capacity(versions.len().min(max_versions));
     for version in versions.into_iter().rev().take(max_versions) {
-        match read_n2_map_version(fragment, key.as_str(), version.as_str()).await {
-            Ok(map) => maps.push(map),
+        match read_n2_record_version(fragment, key.as_str(), version.as_str()).await {
+            Ok(record) => records.push(record),
             Err(AppError::NotFound) => {}
             Err(err) => return Err(err),
         }
     }
-    maps.sort_by(|a, b| {
+    records.sort_by(|a, b| {
         b.committed_at
             .cmp(&a.committed_at)
             .then_with(|| b.object.version_id.cmp(&a.object.version_id))
     });
-    Ok(maps)
+    Ok(records)
 }

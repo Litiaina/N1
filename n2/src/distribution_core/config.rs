@@ -29,9 +29,12 @@ pub struct N2RuntimeConfig {
     pub internal_token: String,
     pub cluster_commit_mode: ClusterCommitMode,
     pub auto_maintenance_mode: N2AutoMaintenanceMode,
+    pub auto_maintenance_interval_seconds: u64,
     pub auto_maintenance_max_fragments: usize,
     pub auto_maintenance_max_objects_per_fragment: usize,
     pub auto_maintenance_cleanup_orphans: bool,
+    pub repair_global_concurrency: usize,
+    pub repair_per_fragment_concurrency: usize,
     pub auto_cross_params: bool,
     pub cluster_stripe_block_size: usize,
     pub remote_request_timeout_ms: u64,
@@ -137,9 +140,12 @@ fn load_runtime_config() -> N2RuntimeConfig {
         internal_token: default_internal_token(),
         cluster_commit_mode: default_cluster_commit_mode(),
         auto_maintenance_mode: default_auto_maintenance_mode(),
+        auto_maintenance_interval_seconds: 300,
         auto_maintenance_max_fragments: 64,
         auto_maintenance_max_objects_per_fragment: 256,
         auto_maintenance_cleanup_orphans: true,
+        repair_global_concurrency: 2,
+        repair_per_fragment_concurrency: 1,
         auto_cross_params: default_auto_cross_params(),
         cluster_stripe_block_size: 256 * 1024,
         remote_request_timeout_ms: 60_000,
@@ -180,6 +186,11 @@ fn load_runtime_config() -> N2RuntimeConfig {
         sec.get("auto_maintenance_mode"),
         defaults.auto_maintenance_mode,
     );
+    let auto_maintenance_interval_seconds = parse_u64_or_default(
+        sec.get("auto_maintenance_interval_seconds"),
+        defaults.auto_maintenance_interval_seconds,
+    )
+    .clamp(5, 86_400);
     let auto_maintenance_max_fragments = parse_usize_or_default(
         sec.get("auto_maintenance_max_fragments"),
         defaults.auto_maintenance_max_fragments,
@@ -199,6 +210,16 @@ fn load_runtime_config() -> N2RuntimeConfig {
             )
         })
         .unwrap_or(defaults.auto_maintenance_cleanup_orphans);
+    let repair_global_concurrency = parse_usize_or_default(
+        sec.get("repair_global_concurrency"),
+        defaults.repair_global_concurrency,
+    )
+    .clamp(1, 64);
+    let repair_per_fragment_concurrency = parse_usize_or_default(
+        sec.get("repair_per_fragment_concurrency"),
+        defaults.repair_per_fragment_concurrency,
+    )
+    .clamp(1, 16);
     let auto_cross_params = sec
         .get("auto_cross_params")
         .map(|v| {
@@ -231,9 +252,12 @@ fn load_runtime_config() -> N2RuntimeConfig {
         internal_token,
         cluster_commit_mode,
         auto_maintenance_mode,
+        auto_maintenance_interval_seconds,
         auto_maintenance_max_fragments,
         auto_maintenance_max_objects_per_fragment,
         auto_maintenance_cleanup_orphans,
+        repair_global_concurrency,
+        repair_per_fragment_concurrency,
         auto_cross_params,
         cluster_stripe_block_size,
         remote_request_timeout_ms,
@@ -271,7 +295,7 @@ pub fn validate_cross_params(
     }
     if params.kd != 1 || params.md != 0 {
         return Err(format!(
-            "N2 0.4 uses one cluster-level EC layer; local N1 shard storage must be kd=1 md=0, got kd={} md={}",
+            "N2 uses one cluster-level EC layer; local N1 shard storage must be kd=1 md=0, got kd={} md={}",
             params.kd, params.md
         ));
     }

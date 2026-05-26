@@ -947,9 +947,7 @@ pub async fn prepare_native_download_stream(
     }
 
     let total_size = metadata.total_size_bytes;
-    let offset = u64_field(&payload, "offset")
-        .unwrap_or(0)
-        .min(total_size);
+    let offset = u64_field(&payload, "offset").unwrap_or(0).min(total_size);
     let remaining = total_size.saturating_sub(offset);
     let requested_len = u64_field(&payload, "length").unwrap_or(remaining);
     let body_len = remaining.min(requested_len);
@@ -999,9 +997,10 @@ where
         )));
     }
 
-    writer.flush().await.map_err(|err| {
-        AppError::Io(err, "native download stream flush".to_string())
-    })?;
+    writer
+        .flush()
+        .await
+        .map_err(|err| AppError::Io(err, "native download stream flush".to_string()))?;
     Ok(written)
 }
 

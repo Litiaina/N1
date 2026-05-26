@@ -4,12 +4,13 @@ use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
 
 use cli_core::client::{
-    AuthSession, CreateFragmentRequest, DynError, api_url, authenticate, build_client, fetch_json,
-    fetch_json_query, get_base_url, get_secret, print_output, print_response_message,
-    resolve_auth_fragment, send_query_only, send_with_session, send_without_body, watch_rendered,
+    AuthSession, CreateFragmentRequest, DynError, N1_AUTH_ROUTES, api_url,
+    authenticate_with_routes, build_client, fetch_json, fetch_json_query, get_base_url, get_secret,
+    print_output, print_response_message, resolve_auth_fragment, send_query_only,
+    send_with_session, send_without_body, watch_rendered,
 };
 use cli_core::models::{
-    GcJobStatus, HealthResponse, ListUploadsResponse, RedistributionJobStatus, RepairJobStatus,
+    GcJobStatus, ListUploadsResponse, RedistributionJobStatus, RepairJobStatus,
     UploadStatusResponse,
 };
 
@@ -18,7 +19,7 @@ use crate::args::{
     RedistributeAction, RedistributeScopeArg, RepairAction, RepairModeArg, UploadCommands,
 };
 use crate::output::{
-    format_cluster_view, format_gc_status, format_health, format_health_watch_line,
+    format_cluster_health, format_cluster_health_watch_line, format_cluster_view, format_gc_status,
     format_membership, format_placement, format_redistribution_status, format_repair_status,
     format_upload_list, format_upload_status,
 };
@@ -58,6 +59,19 @@ pub struct N2ClusterViewResponse {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+pub struct N2ClusterHealthResponse {
+    pub level: String,
+    pub view: N2ClusterViewResponse,
+    pub expected_shards: usize,
+    pub required_shards: usize,
+    pub reachable_active_nodes: usize,
+    pub unreachable_active_nodes: usize,
+    pub storage_ready_nodes: usize,
+    pub deep: bool,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ObjectIdentity {
     pub uid: String,
     pub fragment: String,
@@ -91,7 +105,14 @@ pub async fn run(cli: Cli) -> Result<(), DynError> {
         _ => {
             let secret = get_secret(cli.secret.clone())?;
             let auth_fragment = resolve_auth_fragment(cli.auth_fragment.clone());
-            let mut session = authenticate(&client, &base_url, &secret, &auth_fragment).await?;
+            let mut session = authenticate_with_routes(
+                &client,
+                &base_url,
+                &secret,
+                &auth_fragment,
+                N1_AUTH_ROUTES,
+            )
+            .await?;
             handle_authenticated_command(&client, &base_url, &mut session, &cli).await
         }
     }
@@ -106,7 +127,7 @@ async fn handle_fragment_command(
     match command {
         FragmentCommands::Create(args) => {
             let response = client
-                .post(api_url(base_url, "/v4/fragment/create"))
+                .post(api_url(base_url, "/n1/fragments"))
                 .json(&CreateFragmentRequest {
                     name: args.name.clone(),
                     key: args.key.clone(),
@@ -130,7 +151,7 @@ async fn handle_public_cluster_view(
         expected_epoch,
     } = &cli.command
     {
-        let mut request = client.get(api_url(base_url, "/v4/n2/cluster/view/public"));
+        let mut request = client.get(api_url(base_url, "/n2/cluster/view/public"));
         if let Some(expected_epoch) = expected_epoch {
             request = request.query(&[("expected_epoch", expected_epoch)]);
         }
@@ -151,25 +172,26 @@ async fn handle_authenticated_command(
     match &cli.command {
         Commands::Health { watch, deep_scan } => {
             let url = format!(
-                "{}?deep_scan={}",
-                api_url(base_url, "/v4/maintenance/health"),
+                "{}?deep={}",
+                api_url(base_url, "/n2/health/cluster"),
                 if *deep_scan { "true" } else { "false" }
             );
             if *watch {
-                watch_rendered::<HealthResponse, _, _>(
+                watch_rendered::<N2ClusterHealthResponse, _, _>(
                     client,
                     base_url,
                     session,
                     &url,
                     cli.poll_ms,
                     cli.json,
-                    format_health_watch_line,
+                    format_cluster_health_watch_line,
                     |_| false,
                 )
                 .await
             } else {
-                let health: HealthResponse = fetch_json(client, base_url, session, &url).await?;
-                print_output(cli.json, &health, &format_health(&health))
+                let health: N2ClusterHealthResponse =
+                    fetch_json(client, base_url, session, &url).await?;
+                print_output(cli.json, &health, &format_cluster_health(&health))
             }
         }
         Commands::Uploads { command } => match command {
@@ -182,7 +204,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/upload/status/list"),
+                    &api_url(base_url, "/n1/upload/multipart"),
                     &query,
                 )
                 .await?;
@@ -193,7 +215,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, &format!("/v4/upload/status/{version_id}")),
+                    &api_url(base_url, &format!("/n1/upload/multipart/{version_id}")),
                 )
                 .await?;
                 print_output(cli.json, &status, &format_upload_status(&status))
@@ -206,14 +228,14 @@ async fn handle_authenticated_command(
                     base_url,
                     session,
                     Method::POST,
-                    &api_url(base_url, "/v4/maintenance/gc/start"),
+                    &api_url(base_url, "/n1/maintenance/gc/start"),
                 )
                 .await?;
                 watch_rendered::<GcJobStatus, _, _>(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/maintenance/gc/status"),
+                    &api_url(base_url, "/n1/maintenance/gc/status"),
                     cli.poll_ms,
                     cli.json,
                     format_gc_status,
@@ -226,7 +248,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/maintenance/gc/status"),
+                    &api_url(base_url, "/n1/maintenance/gc/status"),
                 )
                 .await?;
                 print_output(cli.json, &status, &format_gc_status(&status))
@@ -237,7 +259,7 @@ async fn handle_authenticated_command(
                     base_url,
                     session,
                     Method::POST,
-                    &api_url(base_url, "/v4/maintenance/gc/stop"),
+                    &api_url(base_url, "/n1/maintenance/gc/stop"),
                 )
                 .await
             }
@@ -246,7 +268,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/maintenance/gc/status"),
+                    &api_url(base_url, "/n1/maintenance/gc/status"),
                     cli.poll_ms,
                     cli.json,
                     format_gc_status,
@@ -272,7 +294,7 @@ async fn handle_authenticated_command(
                     base_url,
                     session,
                     Method::POST,
-                    &api_url(base_url, "/v4/maintenance/repair/start"),
+                    &api_url(base_url, "/n1/maintenance/repair/start"),
                     &query,
                 )
                 .await?;
@@ -280,7 +302,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/maintenance/repair/status"),
+                    &api_url(base_url, "/n1/maintenance/repair/status"),
                     cli.poll_ms,
                     cli.json,
                     format_repair_status,
@@ -293,7 +315,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/maintenance/repair/status"),
+                    &api_url(base_url, "/n1/maintenance/repair/status"),
                 )
                 .await?;
                 print_output(cli.json, &status, &format_repair_status(&status))
@@ -304,7 +326,7 @@ async fn handle_authenticated_command(
                     base_url,
                     session,
                     Method::POST,
-                    &api_url(base_url, "/v4/maintenance/repair/stop"),
+                    &api_url(base_url, "/n1/maintenance/repair/stop"),
                 )
                 .await
             }
@@ -313,7 +335,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/maintenance/repair/status"),
+                    &api_url(base_url, "/n1/maintenance/repair/status"),
                     cli.poll_ms,
                     cli.json,
                     format_repair_status,
@@ -340,7 +362,7 @@ async fn handle_authenticated_command(
                     base_url,
                     session,
                     Method::POST,
-                    &api_url(base_url, "/v4/maintenance/redistribution/start"),
+                    &api_url(base_url, "/n1/maintenance/redistribution/start"),
                     &query,
                 )
                 .await?;
@@ -348,7 +370,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/maintenance/redistribution/monitor"),
+                    &api_url(base_url, "/n1/maintenance/redistribution/monitor"),
                     cli.poll_ms,
                     cli.json,
                     format_redistribution_status,
@@ -361,7 +383,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/maintenance/redistribution/monitor"),
+                    &api_url(base_url, "/n1/maintenance/redistribution/monitor"),
                 )
                 .await?;
                 print_output(cli.json, &status, &format_redistribution_status(&status))
@@ -372,7 +394,7 @@ async fn handle_authenticated_command(
                     base_url,
                     session,
                     Method::PATCH,
-                    &api_url(base_url, "/v4/maintenance/redistribution/stop"),
+                    &api_url(base_url, "/n1/maintenance/redistribution/stop"),
                 )
                 .await
             }
@@ -381,7 +403,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/maintenance/redistribution/monitor"),
+                    &api_url(base_url, "/n1/maintenance/redistribution/monitor"),
                     cli.poll_ms,
                     cli.json,
                     format_redistribution_status,
@@ -397,7 +419,7 @@ async fn handle_authenticated_command(
             let response: N2ClusterViewResponse =
                 send_with_session(client, base_url, session, |token| {
                     let mut request = client
-                        .get(api_url(base_url, "/v4/n2/cluster/view"))
+                        .get(api_url(base_url, "/n2/cluster/view"))
                         .bearer_auth(token);
                     if let Some(expected_epoch) = expected_epoch {
                         request = request.query(&[("expected_epoch", expected_epoch)]);
@@ -415,7 +437,7 @@ async fn handle_authenticated_command(
                     client,
                     base_url,
                     session,
-                    &api_url(base_url, "/v4/n2/membership"),
+                    &api_url(base_url, "/n2/membership"),
                 )
                 .await?;
                 print_output(cli.json, &response, &format_membership(&response))
@@ -424,7 +446,7 @@ async fn handle_authenticated_command(
                 let payload: UpsertMembershipRequest = serde_json::from_slice(&fs::read(file)?)?;
                 let response = send_with_session(client, base_url, session, |token| {
                     client
-                        .put(api_url(base_url, "/v4/n2/membership"))
+                        .put(api_url(base_url, "/n2/membership"))
                         .bearer_auth(token)
                         .json(&payload)
                 })
@@ -436,7 +458,7 @@ async fn handle_authenticated_command(
                     client
                         .post(api_url(
                             base_url,
-                            &format!("/v4/n2/membership/rollback/{epoch}"),
+                            &format!("/n2/membership/rollback/{epoch}"),
                         ))
                         .bearer_auth(token)
                 })
@@ -456,7 +478,7 @@ async fn handle_authenticated_command(
                         .get(api_url(
                             base_url,
                             &format!(
-                                "/v4/n2/placement/{}/{}",
+                                "/n2/placement/{}/{}",
                                 placement.fragment, placement.object_key
                             ),
                         ))

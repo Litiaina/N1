@@ -6,7 +6,7 @@ use crate::distribution_core::model::{
 use crate::distribution_core::nmtd::{LOCAL_CLUSTER_SHARD_METADATA_FILE, write_atomic};
 use crate::distribution_core::peer::{
     InternalShardAbortResponse, InternalShardChunkAck, InternalShardDeleteResponse,
-    InternalShardSessionResponse, add_internal_peer_headers,
+    InternalShardSessionResponse, add_internal_peer_headers, normalize_endpoint,
 };
 use crate::distribution_core::shard_session::{
     CoordinatorShardSession, LocalCoordinatorShardSession,
@@ -19,12 +19,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use simd_erasure_core::ReedSolomonDecoder;
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::path::Path as StdPath;
 use std::pin::Pin;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::io::ReaderStream;
 use ulid::Ulid;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,15 +42,17 @@ pub(crate) struct LocalClusterShardMeta {
     disk_shards: Vec<N2DiskShardRef>,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct MemoryClusterShardSource {
-    pub(crate) cluster_shard_index: usize,
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) cursor: usize,
+pub(crate) struct LocalClusterShardStreamSource {
+    cluster_shard_index: usize,
+    size_bytes: usize,
+    cursor: usize,
+    file: fs::File,
 }
 
 type RemoteShardByteStream =
     Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+pub(crate) type ClusterShardByteStream =
+    Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, io::Error>> + Send>>;
 
 pub(crate) struct RemoteClusterShardStreamSource {
     cluster_shard_index: usize,
@@ -59,13 +63,14 @@ pub(crate) struct RemoteClusterShardStreamSource {
 }
 
 pub(crate) enum ClusterShardReadSource {
-    Memory(MemoryClusterShardSource),
+    Local(LocalClusterShardStreamSource),
     Remote(RemoteClusterShardStreamSource),
 }
 
 #[derive(Clone, Debug, Serialize)]
 struct InternalStoreShardRemoteQuery<'a> {
     uid: &'a str,
+    object_id: &'a str,
     object_key: &'a str,
     kd: u8,
     md: u8,
@@ -89,7 +94,7 @@ pub(crate) async fn store_local_cluster_shard_from_file(
     }
     if kd != 1 || md != 0 {
         return Err(AppError::BadRequest(
-            "N2 0.4 uses one cluster-level EC layer; local N1 shard storage must use kd=1 md=0"
+            "N2 uses one cluster-level EC layer; local N1 shard storage must use kd=1 md=0"
                 .to_string(),
         ));
     }
@@ -186,6 +191,7 @@ pub(crate) async fn store_local_cluster_shard_from_file(
     })
 }
 
+#[cfg(test)]
 pub(crate) async fn store_local_cluster_shard_from_bytes(
     bytes: &[u8],
     object: &ObjectIdentity,
@@ -256,11 +262,12 @@ pub(crate) async fn begin_remote_cluster_shard_session(
 ) -> Result<String, AppError> {
     let base = target.endpoint.trim_end_matches('/');
     let url = format!(
-        "{}/v4/n2/internal/session/begin/{}/{}/{}",
+        "{}/n2/internal/session/begin/{}/{}/{}",
         base, object.fragment, object.version_id, cluster_shard_index
     );
     let query = InternalStoreShardRemoteQuery {
         uid: object.uid.as_str(),
+        object_id: object.object_id.as_str(),
         object_key: object.object_key.as_str(),
         kd,
         md,
@@ -298,7 +305,7 @@ pub(crate) async fn append_remote_cluster_shard_chunk(
         return Ok(());
     }
     let base = target.endpoint.trim_end_matches('/');
-    let url = format!("{}/v4/n2/internal/session/chunk/{}", base, session_id);
+    let url = format!("{}/n2/internal/session/chunk/{}", base, session_id);
     let response = add_internal_peer_headers(client.put(url).body(bytes))
         .await?
         .send()
@@ -327,7 +334,7 @@ pub(crate) async fn commit_remote_cluster_shard_session(
     session_id: &str,
 ) -> Result<N2ClusterShardRef, AppError> {
     let base = target.endpoint.trim_end_matches('/');
-    let url = format!("{}/v4/n2/internal/session/commit/{}", base, session_id);
+    let url = format!("{}/n2/internal/session/commit/{}", base, session_id);
     let response = add_internal_peer_headers(client.post(url))
         .await?
         .send()
@@ -341,9 +348,12 @@ pub(crate) async fn commit_remote_cluster_shard_session(
             status, text
         )));
     }
-    response.json::<N2ClusterShardRef>().await.map_err(|e| {
+    let mut shard = response.json::<N2ClusterShardRef>().await.map_err(|e| {
         AppError::InternalServerError(format!("decode remote shard commit response failed: {}", e))
-    })
+    })?;
+    shard.node_id = target.node_id.clone();
+    shard.endpoint = target.endpoint.clone();
+    Ok(shard)
 }
 
 pub(crate) async fn abort_remote_cluster_shard_session(
@@ -352,7 +362,7 @@ pub(crate) async fn abort_remote_cluster_shard_session(
     session_id: &str,
 ) -> Result<(), AppError> {
     let base = target.endpoint.trim_end_matches('/');
-    let url = format!("{}/v4/n2/internal/session/abort/{}", base, session_id);
+    let url = format!("{}/n2/internal/session/abort/{}", base, session_id);
     let response = add_internal_peer_headers(client.post(url))
         .await?
         .send()
@@ -531,6 +541,7 @@ pub(crate) async fn load_local_cluster_shard_meta(
     Err(AppError::NotFound)
 }
 
+#[cfg(test)]
 pub(crate) async fn read_local_cluster_shard(
     fragment: &str,
     version_id: &str,
@@ -541,7 +552,7 @@ pub(crate) async fn read_local_cluster_shard(
     let md = usize::from(meta.md);
     if kd != 1 || md != 0 {
         return Err(AppError::InternalServerError(
-            "N2 0.4 local shard metadata must be kd=1 md=0".to_string(),
+            "N2 local shard metadata must be kd=1 md=0".to_string(),
         ));
     }
     if meta.cluster_size_bytes == 0 {
@@ -562,6 +573,54 @@ pub(crate) async fn read_local_cluster_shard(
     })?;
     out.truncate(meta.cluster_size_bytes as usize);
     Ok(out)
+}
+
+pub(crate) async fn open_local_cluster_shard_file(
+    fragment: &str,
+    version_id: &str,
+    cluster_shard_index: usize,
+) -> Result<(fs::File, u64), AppError> {
+    let meta = load_local_cluster_shard_meta(fragment, version_id, cluster_shard_index).await?;
+    let kd = usize::from(meta.kd);
+    let md = usize::from(meta.md);
+    if kd != 1 || md != 0 {
+        return Err(AppError::InternalServerError(
+            "N2 local shard metadata must be kd=1 md=0".to_string(),
+        ));
+    }
+    let shard = meta
+        .disk_shards
+        .iter()
+        .find(|s| s.disk_shard_index == 0)
+        .ok_or_else(|| {
+            AppError::InternalServerError("local cshard metadata missing disk_shard_0".to_string())
+        })?;
+    let file = fs::File::open(shard.absolute_path.as_str())
+        .await
+        .map_err(|e| {
+            AppError::Io(
+                e,
+                format!("open local cluster shard {}", shard.absolute_path),
+            )
+        })?;
+    Ok((file, meta.cluster_size_bytes))
+}
+
+pub(crate) async fn open_local_cluster_shard_stream(
+    fragment: &str,
+    version_id: &str,
+    cluster_shard_index: usize,
+) -> Result<ClusterShardReadSource, AppError> {
+    let (file, size_bytes) =
+        open_local_cluster_shard_file(fragment, version_id, cluster_shard_index).await?;
+    Ok(ClusterShardReadSource::Local(
+        LocalClusterShardStreamSource {
+            cluster_shard_index,
+            size_bytes: size_bytes as usize,
+            cursor: 0,
+            file,
+        },
+    ))
 }
 
 pub(crate) async fn delete_local_cluster_shard(
@@ -606,7 +665,7 @@ pub(crate) async fn delete_local_cluster_shard(
     Ok(deleted_paths)
 }
 
-pub(crate) async fn store_remote_cluster_shard_bytes(
+pub(crate) async fn store_remote_cluster_shard_from_file(
     client: &reqwest::Client,
     target: &NodeDescriptor,
     object: &ObjectIdentity,
@@ -614,8 +673,12 @@ pub(crate) async fn store_remote_cluster_shard_bytes(
     kd: u8,
     md: u8,
     stripe_block_size: usize,
-    bytes: Vec<u8>,
+    source_path: &StdPath,
 ) -> Result<N2ClusterShardRef, AppError> {
+    let file = fs::File::open(source_path)
+        .await
+        .map_err(|e| AppError::Io(e, format!("open rebuilt shard {:?}", source_path)))?;
+    let body = ReqwestBody::wrap_stream(ReaderStream::new(file));
     store_remote_cluster_shard_with_body(
         client,
         target,
@@ -624,7 +687,7 @@ pub(crate) async fn store_remote_cluster_shard_bytes(
         kd,
         md,
         stripe_block_size,
-        ReqwestBody::from(bytes),
+        body,
     )
     .await
 }
@@ -641,12 +704,13 @@ pub(crate) async fn store_remote_cluster_shard_with_body(
 ) -> Result<N2ClusterShardRef, AppError> {
     let base = target.endpoint.trim_end_matches('/');
     let url = format!(
-        "{}/v4/n2/internal/store/{}/{}/{}",
+        "{}/n2/internal/store/{}/{}/{}",
         base, object.fragment, object.version_id, cluster_shard_index
     );
 
     let query = InternalStoreShardRemoteQuery {
         uid: object.uid.as_str(),
+        object_id: object.object_id.as_str(),
         object_key: object.object_key.as_str(),
         kd,
         md,
@@ -668,38 +732,12 @@ pub(crate) async fn store_remote_cluster_shard_with_body(
         )));
     }
 
-    response.json::<N2ClusterShardRef>().await.map_err(|e| {
+    let mut shard = response.json::<N2ClusterShardRef>().await.map_err(|e| {
         AppError::InternalServerError(format!("decode remote store shard response failed: {}", e))
-    })
-}
-
-pub(crate) async fn fetch_remote_cluster_shard(
-    client: &reqwest::Client,
-    endpoint: &str,
-    fragment: &str,
-    version_id: &str,
-    cluster_shard_index: usize,
-) -> Result<Vec<u8>, AppError> {
-    let base = endpoint.trim_end_matches('/');
-    let url = format!(
-        "{}/v4/n2/internal/read/{}/{}/{}",
-        base, fragment, version_id, cluster_shard_index
-    );
-    let resp = add_internal_peer_headers(client.get(url))
-        .await?
-        .send()
-        .await
-        .map_err(|e| AppError::Timeout(format!("n2 remote read shard request failed: {}", e)))?;
-    if !resp.status().is_success() {
-        return Err(AppError::InternalServerError(format!(
-            "remote read shard returned status {}",
-            resp.status()
-        )));
-    }
-    resp.bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|e| AppError::InternalServerError(format!("read remote shard body failed: {}", e)))
+    })?;
+    shard.node_id = target.node_id.clone();
+    shard.endpoint = target.endpoint.clone();
+    Ok(shard)
 }
 
 pub(crate) async fn open_remote_cluster_shard_stream(
@@ -712,7 +750,7 @@ pub(crate) async fn open_remote_cluster_shard_stream(
 ) -> Result<ClusterShardReadSource, AppError> {
     let base = endpoint.trim_end_matches('/');
     let url = format!(
-        "{}/v4/n2/internal/read/{}/{}/{}",
+        "{}/n2/internal/read/{}/{}/{}",
         base, fragment, version_id, cluster_shard_index
     );
     let response = add_internal_peer_headers(client.get(url))
@@ -738,6 +776,336 @@ pub(crate) async fn open_remote_cluster_shard_stream(
     ))
 }
 
+async fn open_cluster_shard_source_from_ref(
+    client: &reqwest::Client,
+    fragment: &str,
+    version_id: &str,
+    shard: &N2ClusterShardRef,
+) -> Result<ClusterShardReadSource, AppError> {
+    let cfg = n2_runtime_config();
+    if shard.node_id == cfg.node_id
+        || normalize_endpoint(shard.endpoint.as_str())
+            == normalize_endpoint(cfg.node_endpoint.as_str())
+    {
+        open_local_cluster_shard_stream(fragment, version_id, shard.cluster_shard_index).await
+    } else {
+        open_remote_cluster_shard_stream(
+            client,
+            shard.endpoint.as_str(),
+            fragment,
+            version_id,
+            shard.cluster_shard_index,
+            shard.size_bytes as usize,
+        )
+        .await
+    }
+}
+
+pub(crate) async fn cluster_shard_ref_is_readable(
+    client: &reqwest::Client,
+    fragment: &str,
+    version_id: &str,
+    shard: &N2ClusterShardRef,
+) -> bool {
+    open_cluster_shard_source_from_ref(client, fragment, version_id, shard)
+        .await
+        .is_ok()
+}
+
+pub(crate) async fn collect_readable_cluster_shard_refs(
+    client: &reqwest::Client,
+    fragment: &str,
+    version_id: &str,
+    shards: &[N2ClusterShardRef],
+) -> Vec<N2ClusterShardRef> {
+    let mut readable = Vec::new();
+    let mut seen = HashSet::new();
+    for shard in shards {
+        if !seen.insert(shard.cluster_shard_index) {
+            continue;
+        }
+        if cluster_shard_ref_is_readable(client, fragment, version_id, shard).await {
+            readable.push(shard.clone());
+        }
+    }
+    readable
+}
+
+async fn copy_cluster_source_to_file(
+    source: ClusterShardReadSource,
+    target_path: &StdPath,
+) -> Result<(), AppError> {
+    let size_bytes = source.size_bytes() as u64;
+    let mut stream = source.into_byte_stream(size_bytes);
+    let mut writer = fs::File::create(target_path)
+        .await
+        .map_err(|e| AppError::Io(e, format!("create rebuilt shard {:?}", target_path)))?;
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| AppError::Io(e, "read repair shard stream".to_string()))?;
+        if bytes.is_empty() {
+            continue;
+        }
+        writer
+            .write_all(bytes.as_ref())
+            .await
+            .map_err(|e| AppError::Io(e, "write rebuilt shard stream".to_string()))?;
+    }
+    writer
+        .flush()
+        .await
+        .map_err(|e| AppError::Io(e, "flush rebuilt shard stream".to_string()))?;
+    Ok(())
+}
+
+async fn reconstruct_cluster_shard_to_file(
+    client: &reqwest::Client,
+    object: &ObjectIdentity,
+    target_cluster_shard_index: usize,
+    kc: usize,
+    mc: usize,
+    stripe_block_size: usize,
+    source_refs: &[N2ClusterShardRef],
+    target_path: &StdPath,
+) -> Result<(), AppError> {
+    let mut sources = Vec::new();
+    let mut seen = HashSet::new();
+    for shard in source_refs {
+        if !seen.insert(shard.cluster_shard_index) {
+            continue;
+        }
+        if let Ok(source) = open_cluster_shard_source_from_ref(
+            client,
+            object.fragment.as_str(),
+            object.version_id.as_str(),
+            shard,
+        )
+        .await
+        {
+            sources.push(source);
+        }
+    }
+
+    if sources.len() < kc {
+        return Err(AppError::InternalServerError(format!(
+            "insufficient readable shards for streaming repair: need {}, have {}",
+            kc,
+            sources.len()
+        )));
+    }
+
+    sources.sort_by_key(|source| source.cluster_shard_index());
+    let same_shard_source_pos = {
+        let mut found = None;
+        for idx in 0..sources.len() {
+            if sources[idx].cluster_shard_index() == target_cluster_shard_index {
+                found = Some(idx);
+                break;
+            }
+        }
+        found
+    };
+    if let Some(pos) = same_shard_source_pos {
+        let source = sources.swap_remove(pos);
+        return copy_cluster_source_to_file(source, target_path).await;
+    }
+
+    if kc == 1 {
+        let source = sources.remove(0);
+        return copy_cluster_source_to_file(source, target_path).await;
+    }
+
+    if mc == 0 {
+        return Err(AppError::InternalServerError(format!(
+            "cannot reconstruct missing cluster shard {} without parity",
+            target_cluster_shard_index
+        )));
+    }
+
+    let max_shard_size = sources
+        .iter()
+        .map(ClusterShardReadSource::size_bytes)
+        .max()
+        .unwrap_or(0);
+    let mut writer = fs::File::create(target_path)
+        .await
+        .map_err(|e| AppError::Io(e, format!("create rebuilt shard {:?}", target_path)))?;
+    if max_shard_size == 0 {
+        writer
+            .flush()
+            .await
+            .map_err(|e| AppError::Io(e, "flush empty rebuilt shard".to_string()))?;
+        return Ok(());
+    }
+
+    let stripe_count = max_shard_size.div_ceil(stripe_block_size);
+    for stripe_idx in 0..stripe_count {
+        let mut decoder = ReedSolomonDecoder::new(kc, mc, stripe_block_size).map_err(|e| {
+            AppError::InternalServerError(format!("streaming repair decoder init failed: {}", e))
+        })?;
+        let mut originals: Vec<Option<Vec<u8>>> = vec![None; kc];
+        let mut added = 0usize;
+
+        for source in &mut sources {
+            let cluster_idx = source.cluster_shard_index();
+            let block = source.read_block(stripe_block_size).await?;
+            let add_res = if cluster_idx < kc {
+                originals[cluster_idx] = Some(block.clone());
+                decoder.add_original_shard(cluster_idx, &block)
+            } else {
+                decoder.add_recovery_shard(cluster_idx - kc, &block)
+            };
+            if add_res.is_ok() {
+                added = added.saturating_add(1);
+            }
+        }
+
+        if added < kc {
+            return Err(AppError::InternalServerError(format!(
+                "insufficient cluster blocks for streaming repair stripe {}: need {}, have {}",
+                stripe_idx, kc, added
+            )));
+        }
+
+        let decoded = decoder.decode().map_err(|e| {
+            AppError::InternalServerError(format!("streaming repair decode failed: {}", e))
+        })?;
+        for (idx, data) in decoded.restored_original_iter() {
+            if idx < kc && originals[idx].is_none() {
+                originals[idx] = Some(data.to_vec());
+            }
+        }
+
+        let target_block = if target_cluster_shard_index < kc {
+            originals[target_cluster_shard_index]
+                .as_ref()
+                .ok_or_else(|| {
+                    AppError::InternalServerError(
+                        "missing streaming-repaired original block".to_string(),
+                    )
+                })?
+                .clone()
+        } else {
+            let mut encoder = simd_erasure_core::ReedSolomonEncoder::new(kc, mc, stripe_block_size)
+                .map_err(|e| {
+                    AppError::InternalServerError(format!(
+                        "streaming parity repair init failed: {}",
+                        e
+                    ))
+                })?;
+            for original in &originals {
+                let block = original.as_ref().ok_or_else(|| {
+                    AppError::InternalServerError(
+                        "missing original block for streaming parity repair".to_string(),
+                    )
+                })?;
+                encoder.add_original_shard(block).map_err(|e| {
+                    AppError::InternalServerError(format!(
+                        "streaming parity repair add failed: {}",
+                        e
+                    ))
+                })?;
+            }
+            let encoded = encoder.encode().map_err(|e| {
+                AppError::InternalServerError(format!(
+                    "streaming parity repair encode failed: {}",
+                    e
+                ))
+            })?;
+            encoded
+                .recovery(target_cluster_shard_index - kc)
+                .ok_or_else(|| {
+                    AppError::InternalServerError(
+                        "streaming parity repair target out of bounds".to_string(),
+                    )
+                })?
+                .to_vec()
+        };
+
+        writer
+            .write_all(target_block.as_slice())
+            .await
+            .map_err(|e| AppError::Io(e, "write streaming-repaired shard".to_string()))?;
+    }
+
+    writer
+        .set_len(max_shard_size as u64)
+        .await
+        .map_err(|e| AppError::Io(e, "truncate streaming-repaired shard".to_string()))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| AppError::Io(e, "flush streaming-repaired shard".to_string()))?;
+    Ok(())
+}
+
+pub(crate) async fn store_cluster_shard_from_available_sources(
+    client: &reqwest::Client,
+    target: &NodeDescriptor,
+    object: &ObjectIdentity,
+    cluster_shard_index: usize,
+    kd: u8,
+    md: u8,
+    stripe_block_size: usize,
+    kc: usize,
+    mc: usize,
+    source_refs: &[N2ClusterShardRef],
+) -> Result<N2ClusterShardRef, AppError> {
+    let temp_root = std::env::temp_dir().join(format!(
+        "n2-repair-cshard-{}-{}",
+        cluster_shard_index,
+        Ulid::new()
+    ));
+    fs::create_dir_all(&temp_root)
+        .await
+        .map_err(|e| AppError::Io(e, format!("mkdir {:?}", temp_root)))?;
+    let temp_path = temp_root.join("cluster_shard.bin");
+    let rebuilt = reconstruct_cluster_shard_to_file(
+        client,
+        object,
+        cluster_shard_index,
+        kc,
+        mc,
+        stripe_block_size,
+        source_refs,
+        temp_path.as_path(),
+    )
+    .await;
+    let stored = match rebuilt {
+        Ok(()) => {
+            let cfg = n2_runtime_config();
+            if target.node_id == cfg.node_id
+                || normalize_endpoint(target.endpoint.as_str())
+                    == normalize_endpoint(cfg.node_endpoint.as_str())
+            {
+                store_local_cluster_shard_from_file(
+                    temp_path.as_path(),
+                    object,
+                    cluster_shard_index,
+                    kd,
+                    md,
+                    stripe_block_size,
+                )
+                .await
+            } else {
+                store_remote_cluster_shard_from_file(
+                    client,
+                    target,
+                    object,
+                    cluster_shard_index,
+                    kd,
+                    md,
+                    stripe_block_size,
+                    temp_path.as_path(),
+                )
+                .await
+            }
+        }
+        Err(err) => Err(err),
+    };
+    let _ = fs::remove_dir_all(&temp_root).await;
+    stored
+}
+
 pub(crate) async fn delete_remote_cluster_shard(
     client: &reqwest::Client,
     endpoint: &str,
@@ -747,7 +1115,7 @@ pub(crate) async fn delete_remote_cluster_shard(
 ) -> Result<usize, AppError> {
     let base = endpoint.trim_end_matches('/');
     let url = format!(
-        "{}/v4/n2/internal/delete/{}/{}/{}",
+        "{}/n2/internal/delete/{}/{}/{}",
         base, fragment, version_id, cluster_shard_index
     );
     let response = add_internal_peer_headers(client.delete(url))
@@ -789,30 +1157,80 @@ pub(crate) async fn send_reconstructed_stream_err(
 }
 
 impl ClusterShardReadSource {
-    fn cluster_shard_index(&self) -> usize {
+    pub(crate) fn cluster_shard_index(&self) -> usize {
         match self {
-            ClusterShardReadSource::Memory(source) => source.cluster_shard_index,
+            ClusterShardReadSource::Local(source) => source.cluster_shard_index,
             ClusterShardReadSource::Remote(source) => source.cluster_shard_index,
+        }
+    }
+
+    pub(crate) fn into_byte_stream(self, max_bytes: u64) -> ClusterShardByteStream {
+        match self {
+            ClusterShardReadSource::Local(source) => {
+                let limit = (source.size_bytes as u64).min(max_bytes);
+                Box::pin(ReaderStream::new(source.file.take(limit)))
+            }
+            ClusterShardReadSource::Remote(source) => Box::pin(futures_util::stream::try_unfold(
+                (source.stream, max_bytes as usize),
+                |(mut stream, mut remaining)| async move {
+                    if remaining == 0 {
+                        return Ok(None);
+                    }
+                    loop {
+                        let Some(next) = stream.next().await else {
+                            return Ok(None);
+                        };
+                        let chunk = next.map_err(|err| {
+                            io::Error::new(
+                                io::ErrorKind::Other,
+                                format!("read remote cluster shard stream failed: {err}"),
+                            )
+                        })?;
+                        if chunk.is_empty() {
+                            continue;
+                        }
+                        let emit = if chunk.len() > remaining {
+                            chunk.slice(..remaining)
+                        } else {
+                            chunk
+                        };
+                        remaining = remaining.saturating_sub(emit.len());
+                        return Ok(Some((emit, (stream, remaining))));
+                    }
+                },
+            )),
         }
     }
 
     fn size_bytes(&self) -> usize {
         match self {
-            ClusterShardReadSource::Memory(source) => source.bytes.len(),
+            ClusterShardReadSource::Local(source) => source.size_bytes,
             ClusterShardReadSource::Remote(source) => source.size_bytes,
         }
     }
 
     async fn read_block(&mut self, stripe_block_size: usize) -> Result<Vec<u8>, AppError> {
         match self {
-            ClusterShardReadSource::Memory(source) => {
+            ClusterShardReadSource::Local(source) => {
                 let mut block = vec![0u8; stripe_block_size];
-                if source.cursor >= source.bytes.len() {
+                if source.cursor >= source.size_bytes {
                     return Ok(block);
                 }
-                let copy_len = (source.bytes.len() - source.cursor).min(stripe_block_size);
-                block[..copy_len]
-                    .copy_from_slice(&source.bytes[source.cursor..source.cursor + copy_len]);
+                let copy_len = (source.size_bytes - source.cursor).min(stripe_block_size);
+                let mut filled = 0usize;
+                while filled < copy_len {
+                    let n = source
+                        .file
+                        .read(&mut block[filled..copy_len])
+                        .await
+                        .map_err(|e| AppError::Io(e, "read local cluster shard".to_string()))?;
+                    if n == 0 {
+                        return Err(AppError::InternalServerError(
+                            "local cluster shard stream ended early".to_string(),
+                        ));
+                    }
+                    filled = filled.saturating_add(n);
+                }
                 source.cursor = source.cursor.saturating_add(copy_len);
                 Ok(block)
             }

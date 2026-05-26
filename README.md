@@ -21,8 +21,8 @@ This repository contains the storage platform stack built around four runtime co
 
 > - `N1` (`1.3.1`)
   Primary N1 storage kernel with an N1 namespace, two-level fanned immutable `.objects/<hh>/<hh>/@o_<object-id>` records, zero-decode listing, object-level repair/status, the N1 blob/shard/parity plane, and the native `n1://` protocol for internal tools. See `N1_DOCUMENTATION.md`.
-> - `N2` (`0.4.0`)
-  Multi-node clustering and placement layer built on top of the `N1` storage kernel, with real-prefix namespace directories, symlink object entries, immutable filesystem `.nmtd` cluster metadata, one cluster EC pass, and an S3-compatible path-style object surface.
+> - `N2` (`0.7.1`)
+  Multi-node clustering and placement layer built on top of the `N1` storage kernel, with real-prefix namespace directories, symlink object entries, stable object-id `.nmtd` cluster metadata, one cluster EC pass, LOA `/n2/...` APIs, native `n2://`, and cluster/node/fragment/object health. See `N2_DOCUMENTATION.md` and `N2_ARCHITECTURE.md`.
 > - `NS` (`1.0.0`)
   Standalone NAS Lite / SMB service with fragment-backed auth, configurable share roots, backing-filesystem capacity, and optional cold-sync backup to `N1`.
 > - `Registry` (`0.9.1`)
@@ -42,7 +42,7 @@ The platform is designed to separate storage durability from user-facing metadat
 Current route namespaces are intentionally split:
 
 - `N1` stable runtime and operator routes live under `/n1/...`
-- `N2` cluster routes live under `/v4/n2/...`
+- `N2` cluster routes live under `/n2/...`
 - `NS` exposes SMB on its configured TCP bind address and port.
 - `Registry` product-facing routes live under `/v1/...`
 
@@ -91,7 +91,7 @@ N1 exposes two supported transport faces:
 
 ### N2
 
-`N2 0.4.0` is the multi-node layer for N1.
+`N2 0.7.1` is the multi-node layer for N1.
 
 It extends `N1` with:
 
@@ -103,7 +103,7 @@ It extends `N1` with:
 - real-prefix namespace directories with symlink object entries
 - filesystem `.nmtd` cluster object metadata
 - one cluster-level EC pass; local N1 shard storage is `kd=1`, `md=0`
-- S3-compatible path-style object operations under `/s3/...`
+- native `n2://` transport for internal tools and future N2-to-N2 clients
 
 Use `N2` when storage needs to span multiple nodes with cluster-managed placement and reconcile behavior. Use standalone `N1` when you want a single-node engine.
 
@@ -473,7 +473,7 @@ cargo run -p registry
 
 ### N2 Cluster
 
-Use `N2` when you need cluster-managed placement instead of a single storage node. `N2 0.4.0` uses the `N1` storage kernel locally, stores distributed object maps as `.nmtd`, uses real-prefix namespace directories for listing, and adds cluster membership, governance, placement, peer transport, S3-compatible path-style object routes, and reconcile flows. Multi-node `N2` must not be configured as loopback-only.
+Use `N2` when you need cluster-managed placement instead of a single storage node. `N2 0.7.1` uses the `N1` storage kernel locally, stores distributed object records as immutable `.nmtd` files under stable object-id directories, uses real-prefix namespace directories for listing and rename, and adds cluster membership, governance, placement, peer transport, native `n2://`, reconcile, object repair, and layered health flows. Multi-node `N2` must not be configured as loopback-only.
 
 ## Configuration Overview
 
@@ -493,8 +493,9 @@ Important settings:
 - `upload_config.data_shards`, `upload_config.parity_shards`
 - `[n2].node_id`, `[n2].node_endpoint`, `[n2].cluster_membership_file`
 - `[n2].kc`, `[n2].mc`
-- `[n2].kd=1`, `[n2].md=0` for N2 0.4 local shard storage
+- `[n2].kd=1`, `[n2].md=0` for N2 0.7 local shard storage
 - `[n2].cluster_commit_mode`
+- `[n2].repair_global_concurrency`, `[n2].repair_per_fragment_concurrency`
 
 Notes:
 
@@ -693,14 +694,14 @@ High-signal release tests used for `N1` include:
 - POSIX pagination, mkdir, rename, trash, recover
 - NS SMB read/write/mkdir/rename/delete flows
 
-High-signal proof used for the N2 rewrite includes:
+High-signal proof expected for the N2 rewrite includes:
 
-- native `/v4/n2` upload/download over two real nodes
-- `.nmtd` object-map replication on local and remote index roots
-- S3 path-style put/head/get/list/delete under `/s3`
+- LOA `/n2` upload/download over two real nodes
+- native `n2://` upload/download/list/placement over two real nodes
+- `.nmtd` object-record replication on local and remote index roots
 - remote-node-loss read from the surviving node
-- verification that legacy `.n2map` and `cshard.meta` files are not created
+- verification that object records use stable `@o_<object-id>` directories with max-ULID heads
 
-`N2 0.4.0` adds the one-EC local shard path and N2 namespace symlink mirror. It needs a fresh two-node proof before being considered for the 1.0 release gate.
+`N2 0.7.1` adds bounded repair gates and streaming shard repair on top of the N2 0.7 health model. Focused tests now cover object repair through streamed shard reconstruction instead of whole-shard in-memory copies. A focused two-node real-device proof passed on 2026-05-26 for upload, download hash match, shard-loss degradation, automatic object repair, node outage, and node rejoin. Longer soak, larger-object, and multi-object proof remain the next release-gate work.
 
 If you are touching a subsystem boundary, prefer adding a focused regression test in that subsystem plus a workflow test when the behavior spans storage, namespace, and maintenance.

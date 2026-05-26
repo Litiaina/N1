@@ -42,6 +42,11 @@ struct ClusterViewQuery {
 }
 
 #[derive(serde::Deserialize)]
+struct ClusterHealthQuery {
+    deep: Option<bool>,
+}
+
+#[derive(serde::Deserialize)]
 struct PlacementQuery {
     uid: Option<String>,
     version_id: Option<String>,
@@ -165,6 +170,40 @@ async fn membership_get_handler(headers: HeaderMap) -> impl IntoResponse {
     (StatusCode::OK, Json(body)).into_response()
 }
 
+async fn cluster_health_handler(
+    headers: HeaderMap,
+    Query(query): Query<ClusterHealthQuery>,
+) -> impl IntoResponse {
+    if !authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let body = json!({
+        "level": "healthy",
+        "view": {
+            "node_id": "node-a",
+            "node_endpoint": "https://node-a:50001",
+            "membership_epoch": 7_u64,
+            "expected_epoch": null,
+            "total_nodes": 2_usize,
+            "active_nodes": 2_usize,
+            "local_node_present": true,
+            "local_node_active": true,
+            "write_ready": true,
+            "reasons": []
+        },
+        "expected_shards": 2_usize,
+        "required_shards": 1_usize,
+        "reachable_active_nodes": 2_usize,
+        "unreachable_active_nodes": 0_usize,
+        "storage_ready_nodes": 2_usize,
+        "nodes": [],
+        "deep": query.deep.unwrap_or(false),
+        "fragments": [],
+        "reasons": []
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
 async fn membership_get_refresh_handler(headers: HeaderMap) -> impl IntoResponse {
     if authorized_with(&headers, STALE_TOKEN) {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -252,10 +291,7 @@ async fn spawn_server(router: Router) -> (String, JoinHandle<()>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_cluster_view_skips_auth_and_renders() {
-    let router = Router::new().route(
-        "/v4/n2/cluster/view/public",
-        get(public_cluster_view_handler),
-    );
+    let router = Router::new().route("/n2/cluster/view/public", get(public_cluster_view_handler));
     let (base_url, handle) = spawn_server(router).await;
 
     let output = Command::cargo_bin("litiaina-n2-cli")
@@ -285,10 +321,43 @@ async fn public_cluster_view_skips_auth_and_renders() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cluster_health_uses_n2_health_endpoint_and_renders() {
+    let router = Router::new()
+        .route("/n1/auth/fragment", post(auth_handler))
+        .route("/n2/health/cluster", get(cluster_health_handler));
+    let (base_url, handle) = spawn_server(router).await;
+
+    let output = Command::cargo_bin("litiaina-n2-cli")
+        .unwrap()
+        .args([
+            "--url",
+            &base_url,
+            "--secret",
+            SECRET,
+            "health",
+            "--deep-scan",
+        ])
+        .output()
+        .unwrap();
+
+    handle.abort();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("N2 Cluster Health"));
+    assert!(stdout.contains("level"));
+    assert!(stdout.contains("reachable_active"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn membership_get_can_emit_json() {
     let router = Router::new()
-        .route("/authenticate/fragment", post(auth_handler))
-        .route("/v4/n2/membership", get(membership_get_handler));
+        .route("/n1/auth/fragment", post(auth_handler))
+        .route("/n2/membership", get(membership_get_handler));
     let (base_url, handle) = spawn_server(router).await;
 
     let output = Command::cargo_bin("litiaina-n2-cli")
@@ -321,9 +390,9 @@ async fn membership_get_can_emit_json() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn placement_passes_query_and_renders_targets() {
     let router = Router::new()
-        .route("/authenticate/fragment", post(auth_handler))
+        .route("/n1/auth/fragment", post(auth_handler))
         .route(
-            "/v4/n2/placement/{fragment}/{object_key}",
+            "/n2/placement/{fragment}/{object_key}",
             get(placement_handler),
         );
     let (base_url, handle) = spawn_server(router).await;
@@ -369,9 +438,9 @@ async fn placement_passes_query_and_renders_targets() {
 async fn membership_get_refreshes_after_unauthorized_response() {
     let refresh_calls = Arc::new(AtomicUsize::new(0));
     let router = Router::new()
-        .route("/authenticate/fragment", post(auth_with_refresh_handler))
-        .route("/authenticate/refresh", post(refresh_handler))
-        .route("/v4/n2/membership", get(membership_get_refresh_handler))
+        .route("/n1/auth/fragment", post(auth_with_refresh_handler))
+        .route("/n1/auth/refresh", post(refresh_handler))
+        .route("/n2/membership", get(membership_get_refresh_handler))
         .with_state(refresh_calls.clone());
     let (base_url, handle) = spawn_server(router).await;
 

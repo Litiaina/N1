@@ -47,6 +47,19 @@ impl Proof {
                 return Err(format!("disk root does not exist: {}", root.display()).into());
             }
         }
+        if self.data_shards == 0 {
+            return Err("data_shards must be at least 1".into());
+        }
+        let total_shards = usize::from(self.data_shards) + usize::from(self.parity_shards);
+        if total_shards == 0 || total_shards > roots.len() {
+            return Err(format!(
+                "data_shards + parity_shards must fit active disk roots: data={} parity={} roots={}",
+                self.data_shards,
+                self.parity_shards,
+                roots.len()
+            )
+            .into());
+        }
         Ok(())
     }
 
@@ -181,7 +194,7 @@ stream_locality_bias_enabled=true
 monitor_interval_seconds=auto
 monitor_deep_scan_interval_seconds=auto
 max_part_size={}
-data_shards=1
+data_shards={}
 parity_shards={}
 stripe_block_size=262144
 "#,
@@ -194,6 +207,7 @@ stripe_block_size=262144
             self.args.out_dir.join("fs").display(),
             self.args.quota_backend,
             self.args.max_part_size,
+            self.data_shards,
             self.parity_shards
         );
         fs::write(self.args.out_dir.join("n1_config.ini"), config)?;

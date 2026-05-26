@@ -1,20 +1,11 @@
-use chrono::{Local, TimeZone};
-
 use crate::client::{
-    ClusterMembership, N2ClusterViewResponse, NodeDescriptor, ResolvePlacementResponse,
+    ClusterMembership, N2ClusterHealthResponse, N2ClusterViewResponse, NodeDescriptor,
+    ResolvePlacementResponse,
 };
 use cli_core::models::{
-    GcJobStatus, HealthResponse, ListUploadsResponse, RedistributionJobStatus, RepairJobStatus,
+    GcJobStatus, ListUploadsResponse, RedistributionJobStatus, RepairJobStatus,
     UploadStatusResponse,
 };
-
-fn format_timestamp(ts: i64) -> String {
-    Local
-        .timestamp_opt(ts, 0)
-        .single()
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|| ts.to_string())
-}
 
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -59,99 +50,6 @@ fn format_node(node: &NodeDescriptor) -> String {
         },
         node.epoch,
         node.endpoint
-    )
-}
-
-pub fn format_health(response: &HealthResponse) -> String {
-    let rows = vec![
-        ("sampled_at", format_timestamp(response.sampled_at)),
-        ("status", response.status.clone()),
-        ("summary", response.summary.clone()),
-        (
-            "cpu",
-            format!(
-                "{:.2}% on {} core(s)",
-                response.system.cpu_usage_percent, response.system.cpu_cores
-            ),
-        ),
-        (
-            "ram",
-            format!(
-                "{:.2}% ({} / {})",
-                response.system.ram_usage_percent,
-                human_bytes(response.system.ram_used_bytes),
-                human_bytes(response.system.ram_total_bytes)
-            ),
-        ),
-        (
-            "process_rss",
-            human_bytes(response.system.process_resident_bytes),
-        ),
-        (
-            "storage",
-            format!(
-                "{} free / {} raw",
-                human_bytes(response.storage.raw_available_bytes),
-                human_bytes(response.storage.raw_total_bytes)
-            ),
-        ),
-        (
-            "index_health",
-            response.consistency.index_mirror_health.clone(),
-        ),
-    ];
-
-    let mut out = format_rows("N2 Runtime Health", &rows);
-    if !response.disks.is_empty() {
-        out.push_str("\n\ndisks");
-        out.push_str("\n-----");
-        for disk in &response.disks {
-            let usage = match (disk.used_bytes, disk.total_bytes, disk.available_bytes) {
-                (Some(used), Some(total), Some(available)) => format!(
-                    "{} used / {} total / {} free ({:.2}%)",
-                    human_bytes(used),
-                    human_bytes(total),
-                    human_bytes(available),
-                    disk.usage_percent.unwrap_or(0.0)
-                ),
-                _ => "usage unavailable".to_string(),
-            };
-            let latency = disk
-                .latency_ms
-                .map(|value| format!("{value}ms"))
-                .unwrap_or_else(|| "-".to_string());
-            let error = disk.error.clone().unwrap_or_else(|| "-".to_string());
-            out.push_str(&format!(
-                "\n{} [{}] latency={} usage={} path={} error={}",
-                disk.role, disk.status, latency, usage, disk.path, error
-            ));
-        }
-    }
-    out
-}
-
-pub fn format_health_watch_line(response: &HealthResponse) -> String {
-    let disk_summary = response
-        .disks
-        .iter()
-        .map(|disk| {
-            let usage = disk
-                .usage_percent
-                .map(|value| format!("{value:.0}%"))
-                .unwrap_or_else(|| "?".to_string());
-            format!("{}:{}@{}", disk.role, disk.status, usage)
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "{}  status={} cpu={:.2}% ram={:.2}% uploads={} disks={} summary={}",
-        format_timestamp(response.sampled_at),
-        response.status,
-        response.system.cpu_usage_percent,
-        response.system.ram_usage_percent,
-        response.uploads.active_sessions,
-        disk_summary,
-        response.summary
     )
 }
 
@@ -316,6 +214,59 @@ pub fn format_cluster_view(response: &N2ClusterViewResponse) -> String {
                 },
             ),
         ],
+    )
+}
+
+pub fn format_cluster_health(response: &N2ClusterHealthResponse) -> String {
+    format_rows(
+        "N2 Cluster Health",
+        &[
+            ("level", response.level.clone()),
+            (
+                "membership_epoch",
+                response.view.membership_epoch.to_string(),
+            ),
+            ("write_ready", response.view.write_ready.to_string()),
+            (
+                "reachable_active",
+                format!(
+                    "{} reachable / {} unreachable",
+                    response.reachable_active_nodes, response.unreachable_active_nodes
+                ),
+            ),
+            (
+                "storage_ready_nodes",
+                response.storage_ready_nodes.to_string(),
+            ),
+            (
+                "shards",
+                format!(
+                    "required={} expected={}",
+                    response.required_shards, response.expected_shards
+                ),
+            ),
+            ("deep", response.deep.to_string()),
+            (
+                "reasons",
+                if response.reasons.is_empty() {
+                    "-".to_string()
+                } else {
+                    response.reasons.join("; ")
+                },
+            ),
+        ],
+    )
+}
+
+pub fn format_cluster_health_watch_line(response: &N2ClusterHealthResponse) -> String {
+    format!(
+        "level={} epoch={} reachable_active={} unreachable_active={} storage_ready={} write_ready={}",
+        response.level,
+        response.view.membership_epoch,
+        response.reachable_active_nodes,
+        response.unreachable_active_nodes,
+        response.storage_ready_nodes,
+        response.view.write_ready
     )
 }
 

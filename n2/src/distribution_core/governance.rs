@@ -342,7 +342,7 @@ async fn request_vote_from_peer(
     request: &GovernanceVoteRequest,
 ) -> Result<GovernanceVoteResponse, AppError> {
     let url = format!(
-        "{}/v4/n2/internal/governance/request-vote",
+        "{}/n2/internal/governance/request-vote",
         endpoint.trim_end_matches('/')
     );
     let response = client
@@ -382,7 +382,7 @@ async fn append_to_peer(
     request: &GovernanceAppendRequest,
 ) -> Result<GovernanceAppendResponse, AppError> {
     let url = format!(
-        "{}/v4/n2/internal/governance/append",
+        "{}/n2/internal/governance/append",
         endpoint.trim_end_matches('/')
     );
     let response = client
@@ -425,7 +425,7 @@ async fn abort_peer_pending(
     request: &GovernanceAbortRequest,
 ) {
     let url = format!(
-        "{}/v4/n2/internal/governance/abort",
+        "{}/n2/internal/governance/abort",
         endpoint.trim_end_matches('/')
     );
     let _ = client
@@ -979,7 +979,7 @@ mod tests {
         let state = Arc::new(AsyncMutex::new(MockGovernancePeer::default()));
         let app = Router::new()
             .route(
-                "/v4/n2/internal/governance/request-vote",
+                "/n2/internal/governance/request-vote",
                 post(
                     |headers: HeaderMap,
                      AxumState(state): AxumState<Arc<AsyncMutex<MockGovernancePeer>>>,
@@ -1009,7 +1009,7 @@ mod tests {
                 ),
             )
             .route(
-                "/v4/n2/internal/governance/append",
+                "/n2/internal/governance/append",
                 post(
                     |headers: HeaderMap,
                      AxumState(state): AxumState<Arc<AsyncMutex<MockGovernancePeer>>>,
@@ -1048,7 +1048,7 @@ mod tests {
                 ),
             )
             .route(
-                "/v4/n2/internal/governance/abort",
+                "/n2/internal/governance/abort",
                 post(
                     |headers: HeaderMap,
                      AxumState(state): AxumState<Arc<AsyncMutex<MockGovernancePeer>>>,

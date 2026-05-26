@@ -1,17 +1,20 @@
 use crate::distribution_core::cluster_shards::{
-    delete_local_cluster_shard, read_local_cluster_shard, store_local_cluster_shard_from_file,
+    delete_local_cluster_shard, open_local_cluster_shard_file, store_local_cluster_shard_from_file,
 };
 use crate::distribution_core::codec::normalize_n2_stripe_block_size;
-use crate::distribution_core::map_store::{
-    delete_n2_object_map_local, load_n2_object_map_local, persist_n2_object_map_local,
-};
 use crate::distribution_core::model::{
-    InternalStoreShardQuery, N2ClusterShardRef, N2ObjectMap, ObjectIdentity,
+    InternalStoreShardQuery, N2ClusterShardRef, N2ObjectRecord, ObjectIdentity,
+};
+use crate::distribution_core::object_index::{
+    delete_n2_object_record_local, load_n2_object_record_local, persist_n2_object_record_local,
+    rename_n2_namespace_entry_local,
 };
 use crate::distribution_core::peer::{
-    InternalMapDeleteQuery, InternalMapDeleteResponse, InternalMapReadQuery,
-    InternalMapUpsertResponse, InternalShardAbortResponse, InternalShardChunkAck,
-    InternalShardDeleteResponse, InternalShardSessionResponse, validate_internal_peer_request,
+    InternalNamespaceRenameRequest, InternalNamespaceRenameResponse,
+    InternalObjectRecordDeleteQuery, InternalObjectRecordDeleteResponse,
+    InternalObjectRecordReadQuery, InternalObjectRecordUpsertResponse, InternalShardAbortResponse,
+    InternalShardChunkAck, InternalShardDeleteResponse, InternalShardSessionResponse,
+    validate_internal_peer_request,
 };
 use crate::distribution_core::shard_session::{
     InternalShardUploadSession, internal_shard_upload_sessions,
@@ -20,11 +23,14 @@ use crate::enums::app_error_enum::AppError;
 use axum::Json as AxumJson;
 use axum::body::Body;
 use axum::extract::{Path, Query};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE};
+use axum::http::{
+    HeaderMap, HeaderValue, StatusCode, header::CONTENT_LENGTH, header::CONTENT_TYPE,
+};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use tokio::fs::{self, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::io::ReaderStream;
 use ulid::Ulid;
 
 pub async fn n2_internal_begin_shard(
@@ -51,6 +57,9 @@ pub async fn n2_internal_begin_shard(
     let object = ObjectIdentity {
         uid: query.uid.unwrap_or_else(|| fragment.clone()),
         fragment,
+        object_id: query
+            .object_id
+            .unwrap_or_else(|| format!("internal-{}", Ulid::new())),
         object_key: query
             .object_key
             .unwrap_or_else(|| "<internal-cshard-session>".to_string()),
@@ -205,6 +214,9 @@ pub async fn n2_internal_store_shard(
     let object = ObjectIdentity {
         uid: query.uid.unwrap_or_else(|| fragment.clone()),
         fragment: fragment.clone(),
+        object_id: query
+            .object_id
+            .unwrap_or_else(|| format!("internal-{}", Ulid::new())),
         object_key: query
             .object_key
             .unwrap_or_else(|| "<internal-cshard>".to_string()),
@@ -230,15 +242,19 @@ pub async fn n2_internal_read_shard(
     Path((fragment, version_id, cluster_shard_index)): Path<(String, String, usize)>,
 ) -> Result<impl IntoResponse, AppError> {
     validate_internal_peer_request(&headers).await?;
-    let bytes =
-        read_local_cluster_shard(fragment.as_str(), version_id.as_str(), cluster_shard_index)
+    let (file, size_bytes) =
+        open_local_cluster_shard_file(fragment.as_str(), version_id.as_str(), cluster_shard_index)
             .await?;
-    let mut response = Response::new(Body::from(bytes));
+    let stream = ReaderStream::new(file.take(size_bytes));
+    let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
+    if let Ok(value) = HeaderValue::from_str(size_bytes.to_string().as_str()) {
+        response.headers_mut().insert(CONTENT_LENGTH, value);
+    }
     Ok(response)
 }
 
@@ -253,49 +269,66 @@ pub async fn n2_internal_delete_shard(
     Ok(AxumJson(InternalShardDeleteResponse { deleted_paths }))
 }
 
-pub async fn n2_internal_upsert_map(
+pub async fn n2_internal_upsert_object_record(
     headers: HeaderMap,
-    AxumJson(map): AxumJson<N2ObjectMap>,
-) -> Result<AxumJson<InternalMapUpsertResponse>, AppError> {
+    AxumJson(record): AxumJson<N2ObjectRecord>,
+) -> Result<AxumJson<InternalObjectRecordUpsertResponse>, AppError> {
     validate_internal_peer_request(&headers).await?;
-    let writes = persist_n2_object_map_local(&map).await?;
-    Ok(AxumJson(InternalMapUpsertResponse {
+    let writes = persist_n2_object_record_local(&record).await?;
+    Ok(AxumJson(InternalObjectRecordUpsertResponse {
         local_mirrors_written: writes,
     }))
 }
 
-pub async fn n2_internal_read_map(
+pub async fn n2_internal_read_object_record(
     headers: HeaderMap,
     Path(fragment): Path<String>,
-    Query(query): Query<InternalMapReadQuery>,
-) -> Result<AxumJson<N2ObjectMap>, AppError> {
+    Query(query): Query<InternalObjectRecordReadQuery>,
+) -> Result<AxumJson<N2ObjectRecord>, AppError> {
     validate_internal_peer_request(&headers).await?;
     let object_key = query.object_key.trim();
     if object_key.is_empty() {
         return Err(AppError::BadRequest(
-            "object_key is required for internal map read".to_string(),
+            "object_key is required for internal object record read".to_string(),
         ));
     }
-    let map = load_n2_object_map_local(fragment.as_str(), object_key, query.version_id.as_deref())
-        .await?;
-    Ok(AxumJson(map))
+    let record =
+        load_n2_object_record_local(fragment.as_str(), object_key, query.version_id.as_deref())
+            .await?;
+    Ok(AxumJson(record))
 }
 
-pub async fn n2_internal_delete_map(
+pub async fn n2_internal_delete_object_record(
     headers: HeaderMap,
     Path(fragment): Path<String>,
-    Query(query): Query<InternalMapDeleteQuery>,
-) -> Result<AxumJson<InternalMapDeleteResponse>, AppError> {
+    Query(query): Query<InternalObjectRecordDeleteQuery>,
+) -> Result<AxumJson<InternalObjectRecordDeleteResponse>, AppError> {
     validate_internal_peer_request(&headers).await?;
     let object_key = query.object_key.trim();
     let version_id = query.version_id.trim();
     if object_key.is_empty() || version_id.is_empty() {
         return Err(AppError::BadRequest(
-            "object_key and version_id are required for internal map delete".to_string(),
+            "object_key and version_id are required for internal object record delete".to_string(),
         ));
     }
-    let deleted = delete_n2_object_map_local(fragment.as_str(), object_key, version_id).await?;
-    Ok(AxumJson(InternalMapDeleteResponse {
-        local_map_files_deleted: deleted,
+    let deleted = delete_n2_object_record_local(fragment.as_str(), object_key, version_id).await?;
+    Ok(AxumJson(InternalObjectRecordDeleteResponse {
+        local_metadata_files_deleted: deleted,
+    }))
+}
+
+pub async fn n2_internal_rename_namespace(
+    headers: HeaderMap,
+    AxumJson(request): AxumJson<InternalNamespaceRenameRequest>,
+) -> Result<AxumJson<InternalNamespaceRenameResponse>, AppError> {
+    validate_internal_peer_request(&headers).await?;
+    let moved = rename_n2_namespace_entry_local(
+        request.fragment.trim(),
+        request.source_object_key.trim().trim_matches('/'),
+        request.destination_object_key.trim().trim_matches('/'),
+    )
+    .await?;
+    Ok(AxumJson(InternalNamespaceRenameResponse {
+        local_namespace_entries_moved: moved,
     }))
 }

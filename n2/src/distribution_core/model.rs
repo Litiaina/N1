@@ -28,6 +28,7 @@ impl ClusterCommitMode {
 pub struct ObjectIdentity {
     pub uid: String,
     pub fragment: String,
+    pub object_id: String,
     pub object_key: String,
     pub version_id: String,
 }
@@ -36,7 +37,7 @@ impl ObjectIdentity {
     pub fn placement_key(&self) -> String {
         format!(
             "{}|{}|{}|{}",
-            self.uid, self.fragment, self.object_key, self.version_id
+            self.uid, self.fragment, self.object_id, self.version_id
         )
     }
 }
@@ -160,6 +161,177 @@ pub struct N2ClusterViewResponse {
     pub reasons: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum N2HealthLevel {
+    Healthy,
+    Degraded,
+    Critical,
+    Lost,
+}
+
+impl N2HealthLevel {
+    pub fn worst(self, other: Self) -> Self {
+        if self.rank() >= other.rank() {
+            self
+        } else {
+            other
+        }
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::Healthy => 0,
+            Self::Degraded => 1,
+            Self::Critical => 2,
+            Self::Lost => 3,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ClusterHealthQuery {
+    pub expected_epoch: Option<u64>,
+    pub deep: Option<bool>,
+    pub max_fragments: Option<usize>,
+    pub max_objects_per_fragment: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct FragmentHealthQuery {
+    pub max_objects: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ObjectHealthQuery {
+    pub version_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RepairN2ObjectQuery {
+    pub version_id: Option<String>,
+    pub expected_epoch: Option<u64>,
+    pub dry_run: Option<bool>,
+    pub cleanup_orphans: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct N2DiskRootHealth {
+    pub kind: String,
+    pub path: String,
+    pub exists: bool,
+    pub readable: bool,
+    pub writable: bool,
+    pub total_bytes: Option<u64>,
+    pub available_bytes: Option<u64>,
+    pub used_bytes: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct N2NodeHealthResponse {
+    pub node_id: String,
+    pub endpoint: String,
+    pub active: bool,
+    pub local: bool,
+    pub reachable: bool,
+    pub level: N2HealthLevel,
+    pub observed_at_unix: i64,
+    pub rss_bytes: Option<u64>,
+    pub index_roots: Vec<N2DiskRootHealth>,
+    pub blob_roots: Vec<N2DiskRootHealth>,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct N2ClusterShardHealth {
+    pub cluster_shard_index: usize,
+    pub node_id: String,
+    pub endpoint: String,
+    pub expected_node_id: Option<String>,
+    pub expected_endpoint: Option<String>,
+    pub reachable: bool,
+    pub present: bool,
+    pub stale_placement: bool,
+    pub size_bytes: Option<u64>,
+    pub expected_size_bytes: Option<u64>,
+    pub checksum: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct N2ObjectHealthResponse {
+    pub fragment: String,
+    pub object_key: String,
+    pub object_id: String,
+    pub version_id: String,
+    pub epoch: u64,
+    pub target_epoch: Option<u64>,
+    pub level: N2HealthLevel,
+    pub readable: bool,
+    pub repairable: bool,
+    pub needs_repair: bool,
+    pub needs_redistribution: bool,
+    pub required_shards: usize,
+    pub expected_shards: usize,
+    pub available_shards: usize,
+    pub missing_shards: usize,
+    pub stale_shards: usize,
+    pub total_size_bytes: u64,
+    pub shards: Vec<N2ClusterShardHealth>,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct N2ObjectHealthSummary {
+    pub object_key: String,
+    pub version_id: String,
+    pub level: N2HealthLevel,
+    pub readable: bool,
+    pub repairable: bool,
+    pub needs_repair: bool,
+    pub needs_redistribution: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct N2FragmentHealthResponse {
+    pub fragment: String,
+    pub level: N2HealthLevel,
+    pub max_objects: usize,
+    pub scanned_objects: usize,
+    pub healthy_objects: usize,
+    pub degraded_objects: usize,
+    pub critical_objects: usize,
+    pub lost_objects: usize,
+    pub repairable_objects: usize,
+    pub needs_repair_objects: usize,
+    pub failed_objects: usize,
+    pub objects: Vec<N2ObjectHealthSummary>,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct N2ClusterHealthResponse {
+    pub level: N2HealthLevel,
+    pub view: N2ClusterViewResponse,
+    pub expected_shards: usize,
+    pub required_shards: usize,
+    pub reachable_active_nodes: usize,
+    pub unreachable_active_nodes: usize,
+    pub storage_ready_nodes: usize,
+    pub nodes: Vec<N2NodeHealthResponse>,
+    pub deep: bool,
+    pub fragments: Vec<N2FragmentHealthResponse>,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct N2RepairObjectResponse {
+    pub before: N2ObjectHealthResponse,
+    pub reconcile: N2ReconcileObjectResult,
+    pub after: Option<N2ObjectHealthResponse>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct N2GovernanceStateResponse {
     pub current_term: u64,
@@ -230,6 +402,7 @@ pub struct GovernanceAbortResponse {
 #[derive(Clone, Debug, Deserialize)]
 pub struct InternalStoreShardQuery {
     pub uid: Option<String>,
+    pub object_id: Option<String>,
     pub object_key: Option<String>,
     pub kd: u8,
     pub md: u8,
@@ -256,7 +429,7 @@ pub struct N2ClusterShardRef {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct N2ObjectMap {
+pub struct N2ObjectRecord {
     pub epoch: u64,
     pub object: ObjectIdentity,
     pub params: CrossParams,
@@ -279,7 +452,7 @@ pub struct N2PutObjectResponse {
     pub committed_shards: usize,
     pub required_quorum: u8,
     pub required_commit_shards: usize,
-    pub object: N2ObjectMap,
+    pub object: N2ObjectRecord,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -327,7 +500,7 @@ pub struct N2DeleteObjectResponse {
     pub fragment: String,
     pub object_key: String,
     pub deleted_versions: usize,
-    pub deleted_map_files: usize,
+    pub deleted_metadata_files: usize,
     pub attempted_shard_deletes: usize,
     pub deleted_shard_paths: usize,
     pub shard_delete_failures: usize,
@@ -339,7 +512,7 @@ pub struct N2RenameObjectResponse {
     pub source_object_key: String,
     pub destination_object_key: String,
     pub moved_versions: usize,
-    pub deleted_old_map_files: usize,
+    pub metadata_records_rewritten: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]

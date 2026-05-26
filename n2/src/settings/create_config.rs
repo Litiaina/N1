@@ -7,6 +7,8 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
     conf.with_section(Some("server"))
         .set("host", "127.0.0.1")
         .set("https_port", "50001")
+        .set("native_protocol_enabled", "true")
+        .set("native_port", "50012")
         .set("cert_path", "")
         .set("key_path", "")
         .set("sharable_url", "");
@@ -66,9 +68,12 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("internal_token", "change-me-n2-internal-token")
         .set("cluster_commit_mode", "strict_full_placement")
         .set("auto_maintenance_mode", "off")
+        .set("auto_maintenance_interval_seconds", "300")
         .set("auto_maintenance_max_fragments", "64")
         .set("auto_maintenance_max_objects_per_fragment", "256")
         .set("auto_maintenance_cleanup_orphans", "true")
+        .set("repair_global_concurrency", "2")
+        .set("repair_per_fragment_concurrency", "1")
         .set("auto_cross_params", "true")
         .set("cluster_stripe_block_size", "262144")
         .set("remote_request_timeout_ms", "60000")
@@ -115,12 +120,15 @@ mod tests {
         );
         assert_eq!(n2.get("cluster_commit_mode"), Some("strict_full_placement"));
         assert_eq!(n2.get("auto_maintenance_mode"), Some("off"));
+        assert_eq!(n2.get("auto_maintenance_interval_seconds"), Some("300"));
         assert_eq!(n2.get("auto_maintenance_max_fragments"), Some("64"));
         assert_eq!(
             n2.get("auto_maintenance_max_objects_per_fragment"),
             Some("256")
         );
         assert_eq!(n2.get("auto_maintenance_cleanup_orphans"), Some("true"));
+        assert_eq!(n2.get("repair_global_concurrency"), Some("2"));
+        assert_eq!(n2.get("repair_per_fragment_concurrency"), Some("1"));
         assert_eq!(n2.get("auto_cross_params"), Some("true"));
         assert_eq!(n2.get("cluster_stripe_block_size"), Some("262144"));
         assert_eq!(n2.get("remote_request_timeout_ms"), Some("60000"));

@@ -27,25 +27,37 @@ pub struct InternalShardAbortResponse {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct InternalMapReadQuery {
+pub struct InternalObjectRecordReadQuery {
     pub object_key: String,
     pub version_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct InternalMapDeleteQuery {
+pub struct InternalObjectRecordDeleteQuery {
     pub object_key: String,
     pub version_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct InternalMapUpsertResponse {
+pub struct InternalObjectRecordUpsertResponse {
     pub local_mirrors_written: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct InternalMapDeleteResponse {
-    pub local_map_files_deleted: usize,
+pub struct InternalObjectRecordDeleteResponse {
+    pub local_metadata_files_deleted: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InternalNamespaceRenameRequest {
+    pub fragment: String,
+    pub source_object_key: String,
+    pub destination_object_key: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InternalNamespaceRenameResponse {
+    pub local_namespace_entries_moved: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

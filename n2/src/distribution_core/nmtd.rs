@@ -6,44 +6,72 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use ulid::Ulid;
 
-pub(crate) const OBJECT_METADATA_FILE: &str = ".nmtd";
-pub(crate) const OBJECT_LATEST_FILE: &str = ".nlatest";
+pub(crate) const OBJECT_METADATA_EXT: &str = "nmtd";
 pub(crate) const LOCAL_CLUSTER_SHARD_METADATA_FILE: &str = ".nmtd";
 pub(crate) const N2_OBJECTS_DIR: &str = "objects";
 pub(crate) const N2_NAMESPACE_DIR: &str = "namespace";
+pub(crate) const N2_OBJECT_ID_PREFIX: &str = "@o_";
 
 const N2_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS.add(b'%').add(b'/').add(b'\\').add(b'\0');
 
-pub(crate) fn object_key_hash(object_key: &str) -> String {
+pub(crate) fn new_object_id() -> String {
     let mut hasher = Sha256::new();
-    hasher.update(object_key.as_bytes());
+    hasher.update(Ulid::new().to_string().as_bytes());
     hex::encode(hasher.finalize())
 }
 
-pub(crate) fn map_dir_for_root(root: &Path, fragment: &str, key_hash: &str) -> PathBuf {
+pub(crate) fn normalize_object_id(object_id: &str) -> String {
+    object_id
+        .trim()
+        .trim_start_matches(N2_OBJECT_ID_PREFIX)
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+pub(crate) fn object_dir_name(object_id: &str) -> String {
+    format!("{}{}", N2_OBJECT_ID_PREFIX, normalize_object_id(object_id))
+}
+
+pub(crate) fn object_id_from_dir_name(name: &str) -> Option<String> {
+    name.strip_prefix(N2_OBJECT_ID_PREFIX)
+        .map(normalize_object_id)
+        .filter(|id| id.len() >= 8)
+}
+
+fn fanout_prefix(object_id: &str, start: usize) -> &str {
+    let end = (start + 2).min(object_id.len());
+    if start >= end {
+        "00"
+    } else {
+        &object_id[start..end]
+    }
+}
+
+pub(crate) fn object_dir_for_root(root: &Path, fragment: &str, object_id: &str) -> PathBuf {
+    let object_id = normalize_object_id(object_id);
     root.join(fragment)
         .join("n2")
         .join(N2_OBJECTS_DIR)
-        .join(&key_hash[0..2])
-        .join(&key_hash[2..4])
-        .join(&key_hash[4..6])
-        .join(&key_hash[6..8])
-        .join(key_hash)
+        .join(fanout_prefix(&object_id, 0))
+        .join(fanout_prefix(&object_id, 2))
+        .join(fanout_prefix(&object_id, 4))
+        .join(fanout_prefix(&object_id, 6))
+        .join(object_dir_name(&object_id))
 }
 
-pub(crate) fn map_path_for_root(
+pub(crate) fn record_path_for_root(
     root: &Path,
     fragment: &str,
-    key_hash: &str,
+    object_id: &str,
     version_id: &str,
 ) -> PathBuf {
-    map_dir_for_root(root, fragment, key_hash)
-        .join(version_id)
-        .join(OBJECT_METADATA_FILE)
-}
-
-pub(crate) fn latest_path_for_root(root: &Path, fragment: &str, key_hash: &str) -> PathBuf {
-    map_dir_for_root(root, fragment, key_hash).join(OBJECT_LATEST_FILE)
+    object_dir_for_root(root, fragment, object_id).join(format!(
+        "{}.{}",
+        version_id.trim(),
+        OBJECT_METADATA_EXT
+    ))
 }
 
 pub(crate) fn normalize_object_key(object_key: &str) -> String {

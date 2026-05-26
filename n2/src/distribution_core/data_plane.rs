@@ -1,33 +1,39 @@
 use crate::distribution_core::cluster_shards::{
-    ClusterShardReadSource, MemoryClusterShardSource, abort_coordinator_shard_session,
-    append_coordinator_shard_data, begin_local_coordinator_shard_session,
-    begin_remote_cluster_shard_session, commit_coordinator_shard_session,
-    delete_local_cluster_shard, delete_remote_cluster_shard, fetch_remote_cluster_shard,
-    flush_coordinator_shard_data, open_remote_cluster_shard_stream, read_local_cluster_shard,
-    reconstruct_object_stream_from_cluster_sources, store_local_cluster_shard_from_bytes,
-    store_remote_cluster_shard_bytes,
+    abort_coordinator_shard_session, append_coordinator_shard_data,
+    begin_local_coordinator_shard_session, begin_remote_cluster_shard_session,
+    collect_readable_cluster_shard_refs, commit_coordinator_shard_session,
+    delete_local_cluster_shard, delete_remote_cluster_shard, flush_coordinator_shard_data,
+    open_local_cluster_shard_stream, open_remote_cluster_shard_stream,
+    reconstruct_object_stream_from_cluster_sources, store_cluster_shard_from_available_sources,
+};
+#[cfg(test)]
+use crate::distribution_core::cluster_shards::{
+    read_local_cluster_shard, store_local_cluster_shard_from_bytes,
 };
 use crate::distribution_core::cluster_topology::{
     is_admin_claim, is_local_target, shard_matches_target,
 };
+#[cfg(test)]
+use crate::distribution_core::codec::reconstruct_cluster_shard_from_available;
 use crate::distribution_core::codec::{
     encode_cluster_stripe_blocks, normalize_n2_stripe_block_size,
-    reconstruct_cluster_shard_from_available,
 };
 use crate::distribution_core::config::{
     N2AutoMaintenanceMode, effective_cross_params, n2_runtime_config,
 };
-use crate::distribution_core::map_store::{
-    delete_n2_object_map_local, delete_n2_object_map_remote, list_fragment_n2_maps,
-    list_fragment_n2_namespace_page, list_n2_fragments, list_n2_maps_for_object,
-    load_n2_object_map, persist_n2_object_map,
-};
+use crate::distribution_core::health::inspect_fragment_health;
+use crate::distribution_core::maintenance_gate::acquire_fragment_repair_permit;
 use crate::distribution_core::model::{
     CrossParams, DeleteN2ObjectQuery, GetObjectQuery, ListN2ObjectsQuery, ListN2VersionsQuery,
     N2ClusterShardRef, N2DeleteObjectResponse, N2ListObjectVersionsResponse, N2ListObjectsResponse,
-    N2ObjectMap, N2ObjectSummary, N2ObjectVersionSummary, N2PutObjectResponse,
+    N2ObjectRecord, N2ObjectSummary, N2ObjectVersionSummary, N2PutObjectResponse,
     N2ReconcileObjectResult, N2ReconcileResponse, N2RenameObjectResponse, NodeDescriptor,
     ObjectIdentity, PutObjectQuery, ReconcileFragmentQuery, RenameN2ObjectRequest,
+};
+use crate::distribution_core::object_index::{
+    delete_n2_object_record_local, delete_n2_object_record_remote, list_fragment_n2_namespace_page,
+    list_fragment_n2_records, list_n2_fragments, list_n2_records_for_object, load_n2_object_record,
+    persist_n2_object_record, rename_n2_namespace_entry, resolve_or_create_n2_object_id_local,
 };
 use crate::distribution_core::object_request::{
     content_type_from_query_or_headers, parse_single_byte_range, required_cluster_commit_shards,
@@ -48,16 +54,19 @@ use axum::http::{
     header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG},
 };
 use axum::response::{IntoResponse, Response};
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use chrono::Utc;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::time::Duration;
 #[cfg(test)]
 use tokio::fs;
 use tokio::sync::Mutex;
+use tokio::time::sleep;
 use tracing::{info, warn};
 use ulid::Ulid;
 
@@ -129,22 +138,22 @@ async fn cleanup_committed_cluster_shards(
     }
 }
 
-async fn cleanup_failed_n2_object_map(http_client: &reqwest::Client, map: &N2ObjectMap) {
-    if let Err(err) = delete_n2_object_map_local(
-        map.object.fragment.as_str(),
-        map.object.object_key.as_str(),
-        map.object.version_id.as_str(),
+async fn cleanup_failed_n2_record(http_client: &reqwest::Client, record: &N2ObjectRecord) {
+    if let Err(err) = delete_n2_object_record_local(
+        record.object.fragment.as_str(),
+        record.object.object_key.as_str(),
+        record.object.version_id.as_str(),
     )
     .await
     {
         warn!(
-            "n2 strict cleanup local map delete failed fragment={} object_key={} version={} err={}",
-            map.object.fragment, map.object.object_key, map.object.version_id, err
+            "n2 strict cleanup local object record delete failed fragment={} object_key={} version={} err={}",
+            record.object.fragment, record.object.object_key, record.object.version_id, err
         );
     }
 
     let local_endpoint = normalize_endpoint(&n2_runtime_config().node_endpoint);
-    let mut remote_endpoints = map
+    let mut remote_endpoints = record
         .shards
         .iter()
         .map(|s| s.endpoint.clone())
@@ -155,23 +164,27 @@ async fn cleanup_failed_n2_object_map(http_client: &reqwest::Client, map: &N2Obj
     remote_endpoints.sort();
 
     for endpoint in remote_endpoints {
-        if let Err(err) = delete_n2_object_map_remote(
+        if let Err(err) = delete_n2_object_record_remote(
             http_client,
             endpoint.as_str(),
-            map.object.fragment.as_str(),
-            map.object.object_key.as_str(),
-            map.object.version_id.as_str(),
+            record.object.fragment.as_str(),
+            record.object.object_key.as_str(),
+            record.object.version_id.as_str(),
         )
         .await
         {
             warn!(
-                "n2 strict cleanup remote map delete failed fragment={} object_key={} version={} endpoint={} err={}",
-                map.object.fragment, map.object.object_key, map.object.version_id, endpoint, err
+                "n2 strict cleanup remote object record delete failed fragment={} object_key={} version={} endpoint={} err={}",
+                record.object.fragment,
+                record.object.object_key,
+                record.object.version_id,
+                endpoint,
+                err
             );
         }
     }
 
-    cleanup_committed_cluster_shards(http_client, &map.object, &map.shards).await;
+    cleanup_committed_cluster_shards(http_client, &record.object, &record.shards).await;
 }
 
 pub async fn put_n2_object(
@@ -181,6 +194,28 @@ pub async fn put_n2_object(
     Query(query): Query<PutObjectQuery>,
     body: Body,
 ) -> Result<AxumJson<N2PutObjectResponse>, AppError> {
+    let body_stream = body.into_data_stream().map(|chunk_result| {
+        chunk_result.map_err(|e| {
+            AppError::Io(
+                std::io::Error::new(std::io::ErrorKind::Other, e),
+                "read n2 upload stream".to_string(),
+            )
+        })
+    });
+    put_n2_object_stream(claims, headers, fragment, object_key, query, body_stream).await
+}
+
+pub async fn put_n2_object_stream<S>(
+    claims: Claims,
+    headers: HeaderMap,
+    fragment: String,
+    object_key: String,
+    query: PutObjectQuery,
+    mut body_stream: S,
+) -> Result<AxumJson<N2PutObjectResponse>, AppError>
+where
+    S: Stream<Item = Result<Bytes, AppError>> + Unpin,
+{
     if !claims.write {
         return Err(AppError::Forbidden("Write permission required".to_string()));
     }
@@ -213,10 +248,15 @@ pub async fn put_n2_object(
 
     let uid = query.uid.unwrap_or_else(|| claims.fragment.clone());
     let version_id = query.version_id.unwrap_or_else(|| Ulid::new().to_string());
+    let normalized_object_key = object_key.trim_start_matches('/').to_string();
+    let object_id =
+        resolve_or_create_n2_object_id_local(fragment.as_str(), normalized_object_key.as_str())
+            .await?;
     let object = ObjectIdentity {
         uid,
         fragment: fragment.clone(),
-        object_key: object_key.trim_start_matches('/').to_string(),
+        object_id,
+        object_key: normalized_object_key,
         version_id: version_id.clone(),
     };
     let placement = resolve_placement(object.clone(), kc, mc).await?;
@@ -297,14 +337,8 @@ pub async fn put_n2_object(
     let remote_flush_threshold =
         N2_REMOTE_CHUNK_FLUSH_MIN_BYTES.max(stripe_block_size.saturating_mul(4));
 
-    let mut body_stream = body.into_data_stream();
     while let Some(chunk_result) = body_stream.next().await {
-        let chunk = chunk_result.map_err(|e| {
-            AppError::Io(
-                std::io::Error::new(std::io::ErrorKind::Other, e),
-                "read n2 upload stream".to_string(),
-            )
-        })?;
+        let chunk = chunk_result?;
         if chunk.is_empty() {
             continue;
         }
@@ -482,7 +516,7 @@ pub async fn put_n2_object(
     committed.sort_by_key(|s| s.cluster_shard_index);
 
     let now = Utc::now().timestamp();
-    let object_map = N2ObjectMap {
+    let object_record = N2ObjectRecord {
         epoch: placement.epoch,
         object: object.clone(),
         params: CrossParams { kc, mc, kd, md },
@@ -495,16 +529,16 @@ pub async fn put_n2_object(
         shards: committed,
     };
 
-    if let Err(err) = persist_n2_object_map(&object_map).await {
+    if let Err(err) = persist_n2_object_record(&object_record).await {
         warn!(
-            "n2 map persistence failed after shard commit fragment={} object_key={} version={} mode={} err={}",
+            "n2 record persistence failed after shard commit fragment={} object_key={} version={} mode={} err={}",
             object.fragment,
             object.object_key,
             object.version_id,
             commit_mode.as_str(),
             err
         );
-        cleanup_failed_n2_object_map(&http_client, &object_map).await;
+        cleanup_failed_n2_record(&http_client, &object_record).await;
         return Err(err);
     }
 
@@ -513,25 +547,25 @@ pub async fn put_n2_object(
         object.fragment,
         object.object_key,
         object.version_id,
-        object_map.total_size_bytes,
-        object_map.write_quorum,
+        object_record.total_size_bytes,
+        object_record.write_quorum,
         required_commit_shards,
         nc,
-        object_map.shards.len(),
+        object_record.shards.len(),
         commit_mode.as_str(),
         cluster_view.membership_epoch
     );
 
     Ok(AxumJson(N2PutObjectResponse {
-        epoch: object_map.epoch,
+        epoch: object_record.epoch,
         version_id,
-        total_size_bytes: object_map.total_size_bytes,
+        total_size_bytes: object_record.total_size_bytes,
         commit_mode,
         planned_shards: nc,
-        committed_shards: object_map.shards.len(),
-        required_quorum: object_map.write_quorum,
+        committed_shards: object_record.shards.len(),
+        required_quorum: object_record.write_quorum,
         required_commit_shards,
-        object: object_map,
+        object: object_record,
     }))
 }
 
@@ -550,7 +584,7 @@ pub async fn get_n2_object(
         ));
     }
 
-    let map = load_n2_object_map(
+    let record = load_n2_object_record(
         fragment.as_str(),
         object_key.as_str(),
         query.version_id.as_deref(),
@@ -566,35 +600,28 @@ pub async fn get_n2_object(
             AppError::InternalServerError(format!("build n2 http client failed: {}", e))
         })?;
 
-    let kc = usize::from(map.params.kc);
-    let mc = usize::from(map.params.mc);
+    let kc = usize::from(record.params.kc);
+    let mc = usize::from(record.params.mc);
     let mut shard_sources = Vec::new();
-    for shard in &map.shards {
+    for shard in &record.shards {
         let result = if is_local_target(&NodeDescriptor {
             node_id: shard.node_id.clone(),
             endpoint: shard.endpoint.clone(),
-            epoch: map.epoch,
+            epoch: record.epoch,
             active: true,
         }) {
-            read_local_cluster_shard(
-                map.object.fragment.as_str(),
-                map.object.version_id.as_str(),
+            open_local_cluster_shard_stream(
+                record.object.fragment.as_str(),
+                record.object.version_id.as_str(),
                 shard.cluster_shard_index,
             )
             .await
-            .map(|bytes| {
-                ClusterShardReadSource::Memory(MemoryClusterShardSource {
-                    cluster_shard_index: shard.cluster_shard_index,
-                    bytes,
-                    cursor: 0,
-                })
-            })
         } else {
             open_remote_cluster_shard_stream(
                 &http_client,
                 shard.endpoint.as_str(),
-                map.object.fragment.as_str(),
-                map.object.version_id.as_str(),
+                record.object.fragment.as_str(),
+                record.object.version_id.as_str(),
                 shard.cluster_shard_index,
                 shard.size_bytes as usize,
             )
@@ -605,9 +632,9 @@ pub async fn get_n2_object(
             Ok(source) => shard_sources.push(source),
             Err(e) => warn!(
                 "n2 shard read failed fragment={} object_key={} version={} shard={} node={} endpoint={} err={}",
-                map.object.fragment,
-                map.object.object_key,
-                map.object.version_id,
+                record.object.fragment,
+                record.object.object_key,
+                record.object.version_id,
                 shard.cluster_shard_index,
                 shard.node_id,
                 shard.endpoint,
@@ -624,7 +651,7 @@ pub async fn get_n2_object(
         )));
     }
 
-    let range = match parse_single_byte_range(&headers, map.total_size_bytes) {
+    let range = match parse_single_byte_range(&headers, record.total_size_bytes) {
         Ok(v) => v,
         Err(e) => return Err(e),
     };
@@ -632,32 +659,72 @@ pub async fn get_n2_object(
         (
             StatusCode::PARTIAL_CONTENT,
             end.saturating_sub(start).saturating_add(1),
-            Some(format!("bytes {}-{}/{}", start, end, map.total_size_bytes)),
+            Some(format!(
+                "bytes {}-{}/{}",
+                start, end, record.total_size_bytes
+            )),
         )
     } else {
-        (StatusCode::OK, map.total_size_bytes, None)
+        (StatusCode::OK, record.total_size_bytes, None)
     };
+
+    if kc == 1 && range.is_none() {
+        if let Some(source_idx) = shard_sources
+            .iter()
+            .position(|source| source.cluster_shard_index() == 0)
+        {
+            let source = shard_sources.swap_remove(source_idx);
+            let mut response = Response::new(Body::from_stream(
+                source.into_byte_stream(record.total_size_bytes),
+            ));
+            *response.status_mut() = StatusCode::OK;
+            let content_type_header = HeaderValue::from_str(record.content_type.as_str())
+                .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, content_type_header);
+            if let Ok(v) =
+                HeaderValue::from_str(format!("\"{}\"", record.object.version_id).as_str())
+            {
+                response.headers_mut().insert(ETAG, v);
+            }
+            if let Ok(name) = axum::http::HeaderName::from_bytes(X_AMZ_VERSION_ID_HEADER.as_bytes())
+            {
+                if let Ok(v) = HeaderValue::from_str(record.object.version_id.as_str()) {
+                    response.headers_mut().insert(name, v);
+                }
+            }
+            response
+                .headers_mut()
+                .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            if let Ok(v) = HeaderValue::from_str(record.total_size_bytes.to_string().as_str()) {
+                response.headers_mut().insert(CONTENT_LENGTH, v);
+            }
+            return Ok(response);
+        }
+    }
+
     let stream = reconstruct_object_stream_from_cluster_sources(
         kc,
         mc,
-        map.stripe_block_size,
-        map.total_size_bytes,
+        record.stripe_block_size,
+        record.total_size_bytes,
         shard_sources,
         range,
     );
 
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
-    let content_type_header = HeaderValue::from_str(map.content_type.as_str())
+    let content_type_header = HeaderValue::from_str(record.content_type.as_str())
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
     response
         .headers_mut()
         .insert(CONTENT_TYPE, content_type_header);
-    if let Ok(v) = HeaderValue::from_str(format!("\"{}\"", map.object.version_id).as_str()) {
+    if let Ok(v) = HeaderValue::from_str(format!("\"{}\"", record.object.version_id).as_str()) {
         response.headers_mut().insert(ETAG, v);
     }
     if let Ok(name) = axum::http::HeaderName::from_bytes(X_AMZ_VERSION_ID_HEADER.as_bytes()) {
-        if let Ok(v) = HeaderValue::from_str(map.object.version_id.as_str()) {
+        if let Ok(v) = HeaderValue::from_str(record.object.version_id.as_str()) {
             response.headers_mut().insert(name, v);
         }
     }
@@ -715,16 +782,16 @@ pub async fn list_n2_objects(
     .await?;
 
     let objects = page
-        .maps
+        .records
         .into_iter()
-        .map(|map| N2ObjectSummary {
-            object_key: map.object.object_key,
-            latest_version_id: map.object.version_id,
-            epoch: map.epoch,
-            total_size_bytes: map.total_size_bytes,
-            content_type: map.content_type,
-            committed_at: map.committed_at,
-            shard_count: map.shards.len(),
+        .map(|record| N2ObjectSummary {
+            object_key: record.object.object_key,
+            latest_version_id: record.object.version_id,
+            epoch: record.epoch,
+            total_size_bytes: record.total_size_bytes,
+            content_type: record.content_type,
+            committed_at: record.committed_at,
+            shard_count: record.shards.len(),
         })
         .collect::<Vec<_>>();
 
@@ -761,18 +828,18 @@ pub async fn list_n2_object_versions(
         ));
     }
     let limit = query.limit.unwrap_or(256).clamp(1, 10_000);
-    let mut maps = list_n2_maps_for_object(fragment.as_str(), key.as_str(), 100_000).await?;
-    maps.truncate(limit);
+    let mut records = list_n2_records_for_object(fragment.as_str(), key.as_str(), 100_000).await?;
+    records.truncate(limit);
 
-    let versions = maps
+    let versions = records
         .into_iter()
-        .map(|map| N2ObjectVersionSummary {
-            version_id: map.object.version_id,
-            epoch: map.epoch,
-            total_size_bytes: map.total_size_bytes,
-            content_type: map.content_type,
-            committed_at: map.committed_at,
-            shard_count: map.shards.len(),
+        .map(|record| N2ObjectVersionSummary {
+            version_id: record.object.version_id,
+            epoch: record.epoch,
+            total_size_bytes: record.total_size_bytes,
+            content_type: record.content_type,
+            committed_at: record.committed_at,
+            shard_count: record.shards.len(),
         })
         .collect::<Vec<_>>();
 
@@ -807,13 +874,13 @@ pub async fn delete_n2_object(
         ));
     }
 
-    let mut maps = list_n2_maps_for_object(fragment.as_str(), key.as_str(), 100_000).await?;
-    if maps.is_empty() {
+    let mut records = list_n2_records_for_object(fragment.as_str(), key.as_str(), 100_000).await?;
+    if records.is_empty() {
         return Err(AppError::NotFound);
     }
     if let Some(version_id) = query.version_id.as_ref().map(|v| v.trim().to_string()) {
-        maps.retain(|m| m.object.version_id == version_id);
-        if maps.is_empty() {
+        records.retain(|m| m.object.version_id == version_id);
+        if records.is_empty() {
             return Err(AppError::NotFound);
         }
     }
@@ -829,22 +896,22 @@ pub async fn delete_n2_object(
             AppError::InternalServerError(format!("build n2 http client failed: {}", e))
         })?;
 
-    let mut deleted_map_files = 0usize;
+    let mut deleted_metadata_files = 0usize;
     let mut attempted_shard_deletes = 0usize;
     let mut deleted_shard_paths = 0usize;
     let mut shard_delete_failures = 0usize;
 
-    for map in &maps {
-        deleted_map_files = deleted_map_files.saturating_add(
-            delete_n2_object_map_local(
-                map.object.fragment.as_str(),
-                map.object.object_key.as_str(),
-                map.object.version_id.as_str(),
+    for record in &records {
+        deleted_metadata_files = deleted_metadata_files.saturating_add(
+            delete_n2_object_record_local(
+                record.object.fragment.as_str(),
+                record.object.object_key.as_str(),
+                record.object.version_id.as_str(),
             )
             .await?,
         );
 
-        let mut remote_endpoints = map
+        let mut remote_endpoints = record
             .shards
             .iter()
             .map(|s| s.endpoint.clone())
@@ -854,24 +921,24 @@ pub async fn delete_n2_object(
             .collect::<Vec<_>>();
         remote_endpoints.sort();
         for endpoint in remote_endpoints {
-            match delete_n2_object_map_remote(
+            match delete_n2_object_record_remote(
                 &http_client,
                 endpoint.as_str(),
-                map.object.fragment.as_str(),
-                map.object.object_key.as_str(),
-                map.object.version_id.as_str(),
+                record.object.fragment.as_str(),
+                record.object.object_key.as_str(),
+                record.object.version_id.as_str(),
             )
             .await
             {
                 Ok(removed) => {
-                    deleted_map_files = deleted_map_files.saturating_add(removed);
+                    deleted_metadata_files = deleted_metadata_files.saturating_add(removed);
                 }
                 Err(err) => {
                     warn!(
-                        "n2 remote map delete failed fragment={} object_key={} version={} endpoint={} err={}",
-                        map.object.fragment,
-                        map.object.object_key,
-                        map.object.version_id,
+                        "n2 remote object record delete failed fragment={} object_key={} version={} endpoint={} err={}",
+                        record.object.fragment,
+                        record.object.object_key,
+                        record.object.version_id,
                         endpoint,
                         err
                     );
@@ -881,19 +948,19 @@ pub async fn delete_n2_object(
     }
 
     if purge_shards {
-        for map in &maps {
-            for shard in &map.shards {
+        for record in &records {
+            for shard in &record.shards {
                 attempted_shard_deletes = attempted_shard_deletes.saturating_add(1);
                 let target = NodeDescriptor {
                     node_id: shard.node_id.clone(),
                     endpoint: shard.endpoint.clone(),
-                    epoch: map.epoch,
+                    epoch: record.epoch,
                     active: true,
                 };
                 let deleted = if is_local_target(&target) {
                     delete_local_cluster_shard(
-                        map.object.fragment.as_str(),
-                        map.object.version_id.as_str(),
+                        record.object.fragment.as_str(),
+                        record.object.version_id.as_str(),
                         shard.cluster_shard_index,
                     )
                     .await
@@ -901,8 +968,8 @@ pub async fn delete_n2_object(
                     delete_remote_cluster_shard(
                         &http_client,
                         shard.endpoint.as_str(),
-                        map.object.fragment.as_str(),
-                        map.object.version_id.as_str(),
+                        record.object.fragment.as_str(),
+                        record.object.version_id.as_str(),
                         shard.cluster_shard_index,
                     )
                     .await
@@ -915,9 +982,9 @@ pub async fn delete_n2_object(
                         shard_delete_failures = shard_delete_failures.saturating_add(1);
                         warn!(
                             "n2 shard delete failed fragment={} object_key={} version={} shard={} node={} endpoint={} err={}",
-                            map.object.fragment,
-                            map.object.object_key,
-                            map.object.version_id,
+                            record.object.fragment,
+                            record.object.object_key,
+                            record.object.version_id,
                             shard.cluster_shard_index,
                             shard.node_id,
                             shard.endpoint,
@@ -932,8 +999,8 @@ pub async fn delete_n2_object(
     Ok(AxumJson(N2DeleteObjectResponse {
         fragment,
         object_key: key,
-        deleted_versions: maps.len(),
-        deleted_map_files,
+        deleted_versions: records.len(),
+        deleted_metadata_files,
         attempted_shard_deletes,
         deleted_shard_paths,
         shard_delete_failures,
@@ -983,7 +1050,7 @@ pub async fn rename_n2_object(
     }
     ensure_cluster_write_ready(request.expected_epoch).await?;
 
-    let destination_exists = list_n2_maps_for_object(
+    let destination_exists = list_n2_records_for_object(
         request.fragment.as_str(),
         request.destination_object_key.as_str(),
         1,
@@ -996,82 +1063,42 @@ pub async fn rename_n2_object(
         )));
     }
 
-    let source_maps = list_n2_maps_for_object(
+    let source_records = list_n2_records_for_object(
         request.fragment.as_str(),
         request.source_object_key.as_str(),
         100_000,
     )
     .await?;
-    if source_maps.is_empty() {
+    if source_records.is_empty() {
         return Err(AppError::NotFound);
     }
 
     let cfg = n2_runtime_config();
     let local_endpoint = normalize_endpoint(&cfg.node_endpoint);
-    let http_client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_millis(cfg.remote_request_timeout_ms))
-        .build()
-        .map_err(|e| {
-            AppError::InternalServerError(format!("build n2 http client failed: {}", e))
-        })?;
+    let moved_versions = source_records.len();
+    let mut remote_endpoints = source_records
+        .iter()
+        .flat_map(|record| record.shards.iter().map(|s| s.endpoint.clone()))
+        .filter(|endpoint| normalize_endpoint(endpoint) != local_endpoint)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    remote_endpoints.sort();
 
-    let mut deleted_old_map_files = 0usize;
-    let mut moved_versions = 0usize;
-    for mut map in source_maps {
-        let old_object_key = map.object.object_key.clone();
-        let old_version = map.object.version_id.clone();
-        let mut remote_endpoints = map
-            .shards
-            .iter()
-            .map(|s| s.endpoint.clone())
-            .filter(|endpoint| normalize_endpoint(endpoint) != local_endpoint)
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        remote_endpoints.sort();
-
-        map.object.object_key = request.destination_object_key.clone();
-        persist_n2_object_map(&map).await?;
-
-        deleted_old_map_files = deleted_old_map_files.saturating_add(
-            delete_n2_object_map_local(
-                request.fragment.as_str(),
-                old_object_key.as_str(),
-                old_version.as_str(),
-            )
-            .await?,
-        );
-        for endpoint in remote_endpoints {
-            match delete_n2_object_map_remote(
-                &http_client,
-                endpoint.as_str(),
-                request.fragment.as_str(),
-                old_object_key.as_str(),
-                old_version.as_str(),
-            )
-            .await
-            {
-                Ok(removed) => {
-                    deleted_old_map_files = deleted_old_map_files.saturating_add(removed);
-                }
-                Err(err) => {
-                    warn!(
-                        "n2 remote old-map delete failed fragment={} source_key={} version={} endpoint={} err={}",
-                        request.fragment, old_object_key, old_version, endpoint, err
-                    );
-                }
-            }
-        }
-        moved_versions = moved_versions.saturating_add(1);
-    }
+    rename_n2_namespace_entry(
+        request.fragment.as_str(),
+        request.source_object_key.as_str(),
+        request.destination_object_key.as_str(),
+        &remote_endpoints,
+    )
+    .await?;
 
     Ok(AxumJson(N2RenameObjectResponse {
         fragment: request.fragment,
         source_object_key: request.source_object_key,
         destination_object_key: request.destination_object_key,
         moved_versions,
-        deleted_old_map_files,
+        metadata_records_rewritten: 0,
     }))
 }
 
@@ -1082,9 +1109,14 @@ async fn reconcile_n2_fragment_internal(
     cleanup_orphans: bool,
     max_objects: usize,
 ) -> Result<N2ReconcileResponse, AppError> {
+    let _repair_permit = if dry_run {
+        None
+    } else {
+        Some(acquire_fragment_repair_permit(fragment).await?)
+    };
     let cluster_view = ensure_cluster_write_ready(expected_epoch).await?;
     let cfg = n2_runtime_config();
-    let maps = list_fragment_n2_maps(fragment, max_objects).await?;
+    let records = list_fragment_n2_records(fragment, max_objects).await?;
 
     let http_client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -1094,56 +1126,31 @@ async fn reconcile_n2_fragment_internal(
             AppError::InternalServerError(format!("build n2 http client failed: {}", e))
         })?;
 
-    let mut results = Vec::with_capacity(maps.len());
+    let mut results = Vec::with_capacity(records.len());
     let mut updated_objects = 0usize;
     let mut failed_objects = 0usize;
 
-    for mut map in maps {
-        let old_epoch = map.epoch;
+    for mut record in records {
+        let old_epoch = record.epoch;
         let reconcile = async {
             let placement =
-                resolve_placement(map.object.clone(), map.params.kc, map.params.mc).await?;
-            let kc = usize::from(map.params.kc);
-            let nc = usize::from(map.params.kc) + usize::from(map.params.mc);
-            let previous_shards = map.shards.clone();
-            let mut available_shard_bytes: HashMap<usize, Vec<u8>> = HashMap::new();
+                resolve_placement(record.object.clone(), record.params.kc, record.params.mc).await?;
+            let kc = usize::from(record.params.kc);
+            let nc = usize::from(record.params.kc) + usize::from(record.params.mc);
+            let previous_shards = record.shards.clone();
+            let mut readable_shards = collect_readable_cluster_shard_refs(
+                &http_client,
+                record.object.fragment.as_str(),
+                record.object.version_id.as_str(),
+                &record.shards,
+            )
+            .await;
 
-            for shard in &map.shards {
-                if available_shard_bytes.contains_key(&shard.cluster_shard_index) {
-                    continue;
-                }
-                let result = if is_local_target(&NodeDescriptor {
-                    node_id: shard.node_id.clone(),
-                    endpoint: shard.endpoint.clone(),
-                    epoch: map.epoch,
-                    active: true,
-                }) {
-                    read_local_cluster_shard(
-                        map.object.fragment.as_str(),
-                        map.object.version_id.as_str(),
-                        shard.cluster_shard_index,
-                    )
-                    .await
-                } else {
-                    fetch_remote_cluster_shard(
-                        &http_client,
-                        shard.endpoint.as_str(),
-                        map.object.fragment.as_str(),
-                        map.object.version_id.as_str(),
-                        shard.cluster_shard_index,
-                    )
-                    .await
-                };
-                if let Ok(bytes) = result {
-                    available_shard_bytes.insert(shard.cluster_shard_index, bytes);
-                }
-            }
-
-            if available_shard_bytes.len() < kc {
+            if readable_shards.len() < kc {
                 return Err(AppError::InternalServerError(format!(
                     "insufficient readable shards for reconcile: need {}, have {}",
                     kc,
-                    available_shard_bytes.len()
+                    readable_shards.len()
                 )));
             }
 
@@ -1155,10 +1162,16 @@ async fn reconcile_n2_fragment_internal(
 
             for idx in 0..nc {
                 let target = &placement.targets[idx];
-                if let Some(existing) = map
+                if let Some(existing) = record
                     .shards
                     .iter()
-                    .find(|s| s.cluster_shard_index == idx && shard_matches_target(s, target))
+                    .find(|s| {
+                        s.cluster_shard_index == idx
+                            && shard_matches_target(s, target)
+                            && readable_shards
+                                .iter()
+                                .any(|shard| shard.cluster_shard_index == idx)
+                    })
                 {
                     next_shards.push(existing.clone());
                     continue;
@@ -1169,45 +1182,24 @@ async fn reconcile_n2_fragment_internal(
                     continue;
                 }
 
-                let shard_bytes = if let Some(existing) = available_shard_bytes.get(&idx) {
-                    existing.clone()
-                } else {
-                    let rebuilt = reconstruct_cluster_shard_from_available(
-                        usize::from(map.params.kc),
-                        usize::from(map.params.mc),
-                        map.stripe_block_size,
-                        idx,
-                        &available_shard_bytes,
-                    )?;
-                    available_shard_bytes.insert(idx, rebuilt.clone());
-                    rebuilt
-                };
-
-                let stored = if is_local_target(target) {
-                    store_local_cluster_shard_from_bytes(
-                        &shard_bytes,
-                        &map.object,
-                        idx,
-                        map.params.kd,
-                        map.params.md,
-                        map.stripe_block_size,
-                    )
-                    .await?
-                } else {
-                    store_remote_cluster_shard_bytes(
-                        &http_client,
-                        target,
-                        &map.object,
-                        idx,
-                        map.params.kd,
-                        map.params.md,
-                        map.stripe_block_size,
-                        shard_bytes,
-                    )
-                    .await?
-                };
+                let stored = store_cluster_shard_from_available_sources(
+                    &http_client,
+                    target,
+                    &record.object,
+                    idx,
+                    record.params.kd,
+                    record.params.md,
+                    record.stripe_block_size,
+                    usize::from(record.params.kc),
+                    usize::from(record.params.mc),
+                    &readable_shards,
+                )
+                .await?;
 
                 next_shards.push(stored);
+                readable_shards.push(next_shards.last().cloned().ok_or_else(|| {
+                    AppError::InternalServerError("stored shard ref missing".to_string())
+                })?);
                 repaired_shards = repaired_shards.saturating_add(1);
             }
 
@@ -1232,23 +1224,23 @@ async fn reconcile_n2_fragment_internal(
                     })
                     .cloned()
                     .collect::<Vec<_>>();
-                map.shards = next_shards;
-                map.epoch = placement.epoch;
-                map.committed_at = Utc::now().timestamp();
-                persist_n2_object_map(&map).await?;
+                record.shards = next_shards;
+                record.epoch = placement.epoch;
+                record.committed_at = Utc::now().timestamp();
+                persist_n2_object_record(&record).await?;
 
                 if cleanup_orphans && !stale_shards.is_empty() {
                     for stale in stale_shards {
                         let target = NodeDescriptor {
                             node_id: stale.node_id.clone(),
                             endpoint: stale.endpoint.clone(),
-                            epoch: map.epoch,
+                            epoch: record.epoch,
                             active: true,
                         };
                         let cleanup_result = if is_local_target(&target) {
                             delete_local_cluster_shard(
-                                map.object.fragment.as_str(),
-                                map.object.version_id.as_str(),
+                                record.object.fragment.as_str(),
+                                record.object.version_id.as_str(),
                                 stale.cluster_shard_index,
                             )
                             .await
@@ -1256,8 +1248,8 @@ async fn reconcile_n2_fragment_internal(
                             delete_remote_cluster_shard(
                                 &http_client,
                                 stale.endpoint.as_str(),
-                                map.object.fragment.as_str(),
-                                map.object.version_id.as_str(),
+                                record.object.fragment.as_str(),
+                                record.object.version_id.as_str(),
                                 stale.cluster_shard_index,
                             )
                             .await
@@ -1271,9 +1263,9 @@ async fn reconcile_n2_fragment_internal(
                                 cleanup_failures = cleanup_failures.saturating_add(1);
                                 warn!(
                                     "n2 reconcile orphan cleanup failed fragment={} object_key={} version={} shard={} node={} endpoint={} err={}",
-                                    map.object.fragment,
-                                    map.object.object_key,
-                                    map.object.version_id,
+                                    record.object.fragment,
+                                    record.object.object_key,
+                                    record.object.version_id,
                                     stale.cluster_shard_index,
                                     stale.node_id,
                                     stale.endpoint,
@@ -1307,8 +1299,8 @@ async fn reconcile_n2_fragment_internal(
                     updated_objects = updated_objects.saturating_add(1);
                 }
                 results.push(N2ReconcileObjectResult {
-                    object_key: map.object.object_key.clone(),
-                    version_id: map.object.version_id.clone(),
+                    object_key: record.object.object_key.clone(),
+                    version_id: record.object.version_id.clone(),
                     old_epoch,
                     target_epoch,
                     planned_shards,
@@ -1327,11 +1319,11 @@ async fn reconcile_n2_fragment_internal(
                 failed_objects = failed_objects.saturating_add(1);
                 warn!(
                     "n2 reconcile failed fragment={} object_key={} version={} err={}",
-                    map.object.fragment, map.object.object_key, map.object.version_id, err
+                    record.object.fragment, record.object.object_key, record.object.version_id, err
                 );
                 results.push(N2ReconcileObjectResult {
-                    object_key: map.object.object_key.clone(),
-                    version_id: map.object.version_id.clone(),
+                    object_key: record.object.object_key.clone(),
+                    version_id: record.object.version_id.clone(),
                     old_epoch,
                     target_epoch: old_epoch,
                     planned_shards: 0,
@@ -1385,6 +1377,34 @@ async fn run_n2_auto_maintenance_once(
     };
 
     for fragment in fragments {
+        if !dry_run {
+            match inspect_fragment_health(fragment.as_str(), max_objects_per_fragment).await {
+                Ok(health)
+                    if health.needs_repair_objects == 0
+                        && !health
+                            .objects
+                            .iter()
+                            .any(|object| object.needs_redistribution) =>
+                {
+                    summary.fragments_scanned = summary.fragments_scanned.saturating_add(1);
+                    continue;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    summary.fragments_scanned = summary.fragments_scanned.saturating_add(1);
+                    summary.failed_fragments = summary.failed_fragments.saturating_add(1);
+                    warn!(
+                        "n2 auto maintenance health preflight failed reason={} fragment={} epoch={} mode={} err={}",
+                        reason,
+                        fragment,
+                        expected_epoch,
+                        mode.as_str(),
+                        err
+                    );
+                    continue;
+                }
+            }
+        }
         match reconcile_n2_fragment_internal(
             fragment.as_str(),
             Some(expected_epoch),
@@ -1506,6 +1526,31 @@ pub fn schedule_n2_auto_maintenance(reason: &'static str, expected_epoch: u64) {
     });
 }
 
+pub fn start_n2_auto_maintenance_loop() {
+    if matches!(
+        n2_runtime_config().auto_maintenance_mode,
+        N2AutoMaintenanceMode::Off
+    ) {
+        return;
+    }
+
+    tokio::spawn(async move {
+        loop {
+            let interval =
+                Duration::from_secs(n2_runtime_config().auto_maintenance_interval_seconds.max(5));
+            sleep(interval).await;
+            match crate::distribution_core::state::get_membership().await {
+                Ok(membership) => {
+                    schedule_n2_auto_maintenance("periodic", membership.epoch);
+                }
+                Err(err) => {
+                    warn!("n2 periodic auto maintenance skipped: {}", err);
+                }
+            }
+        }
+    });
+}
+
 pub async fn reconcile_n2_fragment(
     claims: Claims,
     Path(fragment): Path<String>,
@@ -1539,23 +1584,26 @@ mod tests {
     use super::*;
     use crate::core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
     use crate::distribution_core::codec::reconstruct_object_from_cluster_shards;
-    use crate::distribution_core::map_store::load_n2_object_map_local;
+    use crate::distribution_core::health::{
+        get_n2_cluster_health, get_n2_fragment_health, get_n2_internal_node_health,
+        get_n2_internal_shard_health, get_n2_node_health, get_n2_object_health, repair_n2_object,
+    };
     use crate::distribution_core::model::{
-        ClusterCommitMode, DeleteN2ObjectQuery, GetObjectQuery, InternalStoreShardQuery,
-        ListN2ObjectsQuery, ListN2VersionsQuery, PutObjectQuery, ReconcileFragmentQuery,
-        RenameN2ObjectRequest, UpsertMembershipRequest,
+        ClusterCommitMode, ClusterHealthQuery, DeleteN2ObjectQuery, FragmentHealthQuery,
+        GetObjectQuery, InternalStoreShardQuery, ListN2ObjectsQuery, ListN2VersionsQuery,
+        N2HealthLevel, ObjectHealthQuery, PutObjectQuery, ReconcileFragmentQuery,
+        RenameN2ObjectRequest, RepairN2ObjectQuery, UpsertMembershipRequest,
     };
-    use crate::distribution_core::nmtd::{
-        LOCAL_CLUSTER_SHARD_METADATA_FILE, map_path_for_root, object_key_hash,
-    };
+    use crate::distribution_core::nmtd::{LOCAL_CLUSTER_SHARD_METADATA_FILE, record_path_for_root};
+    use crate::distribution_core::object_index::load_n2_object_record_local;
     use crate::distribution_core::peer::{
-        INTERNAL_TOKEN_HEADER, InternalMapReadQuery, InternalShardAbortResponse,
-        InternalShardChunkAck, InternalShardSessionResponse,
+        INTERNAL_TOKEN_HEADER, InternalObjectRecordReadQuery, InternalShardAbortResponse,
+        InternalShardChunkAck, InternalShardSessionResponse, normalize_endpoint,
     };
     use crate::distribution_core::peer_api::{
         n2_internal_abort_shard, n2_internal_begin_shard, n2_internal_commit_shard,
-        n2_internal_delete_map, n2_internal_delete_shard, n2_internal_read_map,
-        n2_internal_read_shard, n2_internal_store_shard, n2_internal_upsert_map,
+        n2_internal_delete_object_record, n2_internal_delete_shard, n2_internal_read_object_record,
+        n2_internal_read_shard, n2_internal_store_shard, n2_internal_upsert_object_record,
         n2_internal_write_shard_chunk,
     };
     use crate::distribution_core::state::{
@@ -1675,38 +1723,49 @@ mod tests {
     async fn spawn_internal_session_server() -> (String, tokio::task::JoinHandle<()>) {
         let app = Router::new()
             .route(
-                "/v4/n2/internal/session/begin/{fragment}/{version_id}/{cluster_shard_index}",
+                "/n2/internal/session/begin/{fragment}/{version_id}/{cluster_shard_index}",
                 post(n2_internal_begin_shard),
             )
             .route(
-                "/v4/n2/internal/session/chunk/{session_id}",
+                "/n2/internal/session/chunk/{session_id}",
                 put(n2_internal_write_shard_chunk),
             )
             .route(
-                "/v4/n2/internal/session/commit/{session_id}",
+                "/n2/internal/session/commit/{session_id}",
                 post(n2_internal_commit_shard),
             )
             .route(
-                "/v4/n2/internal/session/abort/{session_id}",
+                "/n2/internal/session/abort/{session_id}",
                 post(n2_internal_abort_shard),
             )
             .route(
-                "/v4/n2/internal/read/{fragment}/{version_id}/{cluster_shard_index}",
+                "/n2/internal/read/{fragment}/{version_id}/{cluster_shard_index}",
                 get(n2_internal_read_shard),
             )
             .route(
-                "/v4/n2/internal/store/{fragment}/{version_id}/{cluster_shard_index}",
+                "/n2/internal/store/{fragment}/{version_id}/{cluster_shard_index}",
                 post(n2_internal_store_shard),
             )
             .route(
-                "/v4/n2/internal/delete/{fragment}/{version_id}/{cluster_shard_index}",
+                "/n2/internal/delete/{fragment}/{version_id}/{cluster_shard_index}",
                 axum::routing::delete(n2_internal_delete_shard),
             )
-            .route("/v4/n2/internal/map/upsert", post(n2_internal_upsert_map))
-            .route("/v4/n2/internal/map/{fragment}", get(n2_internal_read_map))
             .route(
-                "/v4/n2/internal/map/{fragment}",
-                axum::routing::delete(n2_internal_delete_map),
+                "/n2/internal/object-record/upsert",
+                post(n2_internal_upsert_object_record),
+            )
+            .route(
+                "/n2/internal/object-record/{fragment}",
+                get(n2_internal_read_object_record),
+            )
+            .route(
+                "/n2/internal/object-record/{fragment}",
+                axum::routing::delete(n2_internal_delete_object_record),
+            )
+            .route("/n2/internal/health/node", get(get_n2_internal_node_health))
+            .route(
+                "/n2/internal/health/shard/{fragment}/{version_id}/{cluster_shard_index}",
+                get(get_n2_internal_shard_health),
             );
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1723,7 +1782,7 @@ mod tests {
     async fn spawn_commit_failure_session_server() -> (String, tokio::task::JoinHandle<()>) {
         let app = Router::new()
             .route(
-                "/v4/n2/internal/session/begin/{fragment}/{version_id}/{cluster_shard_index}",
+                "/n2/internal/session/begin/{fragment}/{version_id}/{cluster_shard_index}",
                 post(
                     |AxumPath((_fragment, _version_id, _cluster_shard_index)): AxumPath<(
                         String,
@@ -1739,7 +1798,7 @@ mod tests {
                 ),
             )
             .route(
-                "/v4/n2/internal/session/chunk/{session_id}",
+                "/n2/internal/session/chunk/{session_id}",
                 put(|AxumPath(session_id): AxumPath<String>| async move {
                     Ok::<AxumJson<InternalShardChunkAck>, StatusCode>(AxumJson(
                         InternalShardChunkAck {
@@ -1750,7 +1809,7 @@ mod tests {
                 }),
             )
             .route(
-                "/v4/n2/internal/session/commit/{session_id}",
+                "/n2/internal/session/commit/{session_id}",
                 post(|| async move {
                     Err::<AxumJson<N2ClusterShardRef>, StatusCode>(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1758,7 +1817,7 @@ mod tests {
                 }),
             )
             .route(
-                "/v4/n2/internal/session/abort/{session_id}",
+                "/n2/internal/session/abort/{session_id}",
                 post(|AxumPath(session_id): AxumPath<String>| async move {
                     Ok::<AxumJson<InternalShardAbortResponse>, StatusCode>(AxumJson(
                         InternalShardAbortResponse {
@@ -1993,6 +2052,7 @@ mod tests {
             AxumPath((fragment.clone(), version_id.clone(), 0usize)),
             AxumQuery(InternalStoreShardQuery {
                 uid: Some(fragment.clone()),
+                object_id: Some("session-roundtrip-object".to_string()),
                 object_key: Some("videos/session-roundtrip.bin".to_string()),
                 kd: 1,
                 md: 0,
@@ -2062,6 +2122,7 @@ mod tests {
             AxumPath((fragment, version_id, 0usize)),
             AxumQuery(InternalStoreShardQuery {
                 uid: None,
+                object_id: Some("session-abort-object".to_string()),
                 object_key: Some("videos/session-abort.bin".to_string()),
                 kd: 1,
                 md: 0,
@@ -2112,6 +2173,7 @@ mod tests {
             )),
             AxumQuery(InternalStoreShardQuery {
                 uid: None,
+                object_id: None,
                 object_key: None,
                 kd: 1,
                 md: 0,
@@ -2144,6 +2206,7 @@ mod tests {
             )),
             AxumQuery(InternalStoreShardQuery {
                 uid: None,
+                object_id: None,
                 object_key: None,
                 kd: 1,
                 md: 0,
@@ -2225,26 +2288,19 @@ mod tests {
         assert_eq!(put_result.0.required_commit_shards, 2);
         assert_eq!(put_result.0.committed_shards, 2);
 
-        let key_hash = object_key_hash(object_key.as_str());
         let index_roots = INDEX_STORE_DISKS.get().expect("index roots initialized");
         let mut nmtd_mirrors = 0usize;
         for root in index_roots {
             let root = StdPath::new(root);
-            let nmtd_path = map_path_for_root(
+            let nmtd_path = record_path_for_root(
                 root,
                 fragment.as_str(),
-                key_hash.as_str(),
+                put_result.0.object.object.object_id.as_str(),
                 put_result.0.version_id.as_str(),
             );
             if fs::try_exists(&nmtd_path).await.expect("check .nmtd") {
                 nmtd_mirrors = nmtd_mirrors.saturating_add(1);
             }
-            assert!(
-                !fs::try_exists(nmtd_path.with_extension("n2map"))
-                    .await
-                    .unwrap_or(false),
-                "N2 0.4 metadata must not create legacy .n2map files"
-            );
         }
         assert!(
             nmtd_mirrors > 0,
@@ -2396,15 +2452,15 @@ mod tests {
             other => panic!("expected strict placement conflict, got {:?}", other),
         }
 
-        let map_result = load_n2_object_map_local(
+        let record_result = load_n2_object_record_local(
             fragment.as_str(),
             object_key.as_str(),
             Some(version_id.as_str()),
         )
         .await;
         assert!(
-            matches!(map_result, Err(AppError::NotFound)),
-            "strict failure must not leave an authoritative map behind"
+            matches!(record_result, Err(AppError::NotFound)),
+            "strict failure must not leave an authoritative record behind"
         );
 
         for cluster_shard_index in 0..2 {
@@ -2501,7 +2557,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn n2_map_read_falls_back_to_remote_replica_when_local_maps_are_missing() {
+    async fn n2_record_read_falls_back_to_remote_replica_when_local_records_are_missing() {
         let _guard = STORAGE_TEST_LOCK.lock().await;
         ensure_n2_test_storage_roots().await;
         ensure_auth_env_for_tests();
@@ -2515,7 +2571,7 @@ mod tests {
         .expect("set single-node membership");
 
         let fragment = format!("frag-{}", Ulid::new());
-        let object_key = "videos/map-fallback.bin".to_string();
+        let object_key = "videos/record-fallback.bin".to_string();
         let payload = sample_bytes(1_200_000, 99);
         let put = put_n2_object(
             full_claims(fragment.as_str()),
@@ -2537,17 +2593,17 @@ mod tests {
         .await
         .expect("put object");
 
-        let remote_map = Arc::new(put.0.object.clone());
+        let remote_record = Arc::new(put.0.object.clone());
         let internal_token = n2_runtime_config().internal_token.clone();
         let app = Router::new().route(
-            "/v4/n2/internal/map/{fragment}",
+            "/n2/internal/object-record/{fragment}",
             get({
-                let remote_map = Arc::clone(&remote_map);
+                let remote_record = Arc::clone(&remote_record);
                 let internal_token = internal_token.clone();
                 move |headers: HeaderMap,
                       AxumPath(route_fragment): AxumPath<String>,
-                      AxumQuery(query): AxumQuery<InternalMapReadQuery>| {
-                    let remote_map = Arc::clone(&remote_map);
+                      AxumQuery(query): AxumQuery<InternalObjectRecordReadQuery>| {
+                    let remote_record = Arc::clone(&remote_record);
                     let internal_token = internal_token.clone();
                     async move {
                         let token_ok = headers
@@ -2558,29 +2614,34 @@ mod tests {
                         if !token_ok {
                             return Err(StatusCode::FORBIDDEN);
                         }
-                        if route_fragment != remote_map.object.fragment
-                            || query.object_key.trim() != remote_map.object.object_key
+                        if route_fragment != remote_record.object.fragment
+                            || query.object_key.trim() != remote_record.object.object_key
                         {
                             return Err(StatusCode::NOT_FOUND);
                         }
                         if let Some(version_id) = query.version_id.as_ref() {
-                            if version_id.trim() != remote_map.object.version_id {
+                            if version_id.trim() != remote_record.object.version_id {
                                 return Err(StatusCode::NOT_FOUND);
                             }
                         }
-                        Ok::<AxumJson<N2ObjectMap>, StatusCode>(AxumJson((*remote_map).clone()))
+                        Ok::<AxumJson<N2ObjectRecord>, StatusCode>(AxumJson(
+                            (*remote_record).clone(),
+                        ))
                     }
                 }
             }),
         );
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("bind map fallback server");
-        let map_endpoint = format!("http://{}", listener.local_addr().expect("map server addr"));
-        let map_server = tokio::spawn(async move {
+            .expect("bind record fallback server");
+        let record_endpoint = format!(
+            "http://{}",
+            listener.local_addr().expect("record server addr")
+        );
+        let record_server = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
-                .expect("serve map fallback server");
+                .expect("serve record fallback server");
         });
 
         upsert_membership(UpsertMembershipRequest {
@@ -2588,23 +2649,23 @@ mod tests {
             nodes: vec![
                 local_node_descriptor(),
                 NodeDescriptor {
-                    node_id: format!("map-replica-{}", Ulid::new()),
-                    endpoint: map_endpoint.clone(),
+                    node_id: format!("record-replica-{}", Ulid::new()),
+                    endpoint: record_endpoint.clone(),
                     epoch: 0,
                     active: true,
                 },
             ],
         })
         .await
-        .expect("set membership with map replica endpoint");
+        .expect("set membership with record replica endpoint");
 
-        let removed = delete_n2_object_map_local(
+        let removed = delete_n2_object_record_local(
             fragment.as_str(),
             object_key.as_str(),
             put.0.version_id.as_str(),
         )
         .await
-        .expect("delete local map copies");
+        .expect("delete local record copies");
         assert!(removed > 0);
 
         let response = get_n2_object(
@@ -2616,7 +2677,7 @@ mod tests {
             }),
         )
         .await
-        .expect("get object via remote map fallback")
+        .expect("get object via remote record fallback")
         .into_response();
         let got = to_bytes(response.into_body(), usize::MAX)
             .await
@@ -2628,7 +2689,7 @@ mod tests {
             nodes: previous_membership.nodes,
         })
         .await;
-        map_server.abort();
+        record_server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2691,6 +2752,44 @@ mod tests {
         .await
         .expect("put version 2");
 
+        let source_v1_record =
+            load_n2_object_record_local(fragment.as_str(), source_key.as_str(), Some(v1.as_str()))
+                .await
+                .expect("load source v1 record");
+        let source_object_id = source_v1_record.object.object_id.clone();
+        let index_roots = INDEX_STORE_DISKS.get().expect("index roots initialized");
+        for root in index_roots {
+            let object_dir = record_path_for_root(
+                StdPath::new(root),
+                fragment.as_str(),
+                source_object_id.as_str(),
+                v1.as_str(),
+            )
+            .parent()
+            .expect("object dir")
+            .to_path_buf();
+            assert!(
+                fs::try_exists(object_dir.join(format!("{}.nmtd", v1)))
+                    .await
+                    .expect("check v1 nmtd")
+            );
+            assert!(
+                fs::try_exists(object_dir.join(format!("{}.nmtd", v2)))
+                    .await
+                    .expect("check v2 nmtd")
+            );
+            assert!(
+                fs::read_dir(&object_dir)
+                    .await
+                    .expect("read object dir")
+                    .next_entry()
+                    .await
+                    .expect("first object record entry")
+                    .is_some(),
+                "N2 object dir must contain immutable .nmtd records"
+            );
+        }
+
         let before = list_n2_object_versions(
             full_claims(fragment.as_str()),
             AxumPath((fragment.clone(), source_key.clone())),
@@ -2712,6 +2811,7 @@ mod tests {
         .await
         .expect("rename n2 object");
         assert_eq!(rename.0.moved_versions, 2);
+        assert_eq!(rename.0.metadata_records_rewritten, 0);
 
         let old_versions = list_n2_object_versions(
             full_claims(fragment.as_str()),
@@ -2730,6 +2830,16 @@ mod tests {
         .await
         .expect("list new key versions");
         assert_eq!(new_versions.0.versions.len(), 2);
+
+        let renamed_v1_record = load_n2_object_record_local(
+            fragment.as_str(),
+            destination_key.as_str(),
+            Some(v1.as_str()),
+        )
+        .await
+        .expect("load renamed v1 record");
+        assert_eq!(renamed_v1_record.object.object_id, source_object_id);
+        assert_eq!(renamed_v1_record.object.object_key, destination_key);
 
         let listed = list_n2_objects(
             full_claims(fragment.as_str()),
@@ -2850,7 +2960,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn n2_reconcile_cleans_orphan_shards_when_map_has_stale_entries() {
+    async fn n2_reconcile_cleans_orphan_shards_when_record_has_stale_entries() {
         let _guard = STORAGE_TEST_LOCK.lock().await;
         ensure_n2_test_storage_roots().await;
         ensure_auth_env_for_tests();
@@ -2886,33 +2996,33 @@ mod tests {
         .await
         .expect("put local-only object");
 
-        let map = load_n2_object_map_local(
+        let record = load_n2_object_record_local(
             fragment.as_str(),
             object_key.as_str(),
             Some(put.0.version_id.as_str()),
         )
         .await
-        .expect("load map");
+        .expect("load record");
         let original_cshard =
             read_local_cluster_shard(fragment.as_str(), put.0.version_id.as_str(), 0)
                 .await
                 .expect("read original cshard");
         let stale_ref = store_local_cluster_shard_from_bytes(
             original_cshard.as_slice(),
-            &map.object,
+            &record.object,
             1,
-            map.params.kd,
-            map.params.md,
-            map.stripe_block_size,
+            record.params.kd,
+            record.params.md,
+            record.stripe_block_size,
         )
         .await
         .expect("store stale cshard");
-        let mut stale_map = map.clone();
-        stale_map.shards.push(stale_ref);
-        stale_map.shards.sort_by_key(|s| s.cluster_shard_index);
-        persist_n2_object_map(&stale_map)
+        let mut stale_record = record.clone();
+        stale_record.shards.push(stale_ref);
+        stale_record.shards.sort_by_key(|s| s.cluster_shard_index);
+        persist_n2_object_record(&stale_record)
             .await
-            .expect("persist stale map");
+            .expect("persist stale record");
 
         let stale_before =
             read_local_cluster_shard(fragment.as_str(), put.0.version_id.as_str(), 1)
@@ -3211,16 +3321,16 @@ mod tests {
         assert!(reconcile.results[0].repaired_shards > 0);
         assert!(reconcile.results[0].target_epoch >= reconcile.results[0].old_epoch);
 
-        let map = load_n2_object_map_local(
+        let record = load_n2_object_record_local(
             fragment.as_str(),
             object_key.as_str(),
             Some(put.0.version_id.as_str()),
         )
         .await
-        .expect("load map after reconcile");
-        assert_eq!(map.epoch, reconcile.results[0].target_epoch);
-        assert_eq!(map.shards.len(), 5);
-        let mut shard_indexes = map
+        .expect("load record after reconcile");
+        assert_eq!(record.epoch, reconcile.results[0].target_epoch);
+        assert_eq!(record.shards.len(), 5);
+        let mut shard_indexes = record
             .shards
             .iter()
             .map(|shard| shard.cluster_shard_index)
@@ -3330,7 +3440,7 @@ mod tests {
             N2AutoMaintenanceMode::Observe,
             16,
             64,
-            true,
+            false,
         )
         .await
         .expect("observe auto maintenance");
@@ -3338,15 +3448,15 @@ mod tests {
         assert_eq!(observe.fragments_scanned, 1);
         assert_eq!(observe.fragments_with_planned_changes, 1);
 
-        let observed_map = load_n2_object_map_local(
+        let observed_record = load_n2_object_record_local(
             fragment.as_str(),
             object_key.as_str(),
             Some(put.0.version_id.as_str()),
         )
         .await
-        .expect("load observed map");
-        assert_eq!(observed_map.epoch, put.0.object.epoch);
-        assert_eq!(observed_map.shards.len(), put.0.object.shards.len());
+        .expect("load observed record");
+        assert_eq!(observed_record.epoch, put.0.object.epoch);
+        assert_eq!(observed_record.shards.len(), put.0.object.shards.len());
 
         let repair = run_n2_auto_maintenance_once(
             "test-repair",
@@ -3354,7 +3464,7 @@ mod tests {
             N2AutoMaintenanceMode::RepairAndRedistribute,
             16,
             64,
-            true,
+            false,
         )
         .await
         .expect("repair auto maintenance");
@@ -3363,15 +3473,15 @@ mod tests {
         assert_eq!(repair.fragments_with_planned_changes, 1);
         assert_eq!(repair.failed_fragments, 0);
 
-        let repaired_map = load_n2_object_map_local(
+        let repaired_record = load_n2_object_record_local(
             fragment.as_str(),
             object_key.as_str(),
             Some(put.0.version_id.as_str()),
         )
         .await
-        .expect("load repaired map");
-        assert_eq!(repaired_map.epoch, after_topology_change.epoch);
-        assert_eq!(repaired_map.shards.len(), put.0.object.shards.len());
+        .expect("load repaired record");
+        assert_eq!(repaired_record.epoch, after_topology_change.epoch);
+        assert_eq!(repaired_record.shards.len(), put.0.object.shards.len());
 
         let response = get_n2_object(
             full_claims(fragment.as_str()),
@@ -3396,5 +3506,221 @@ mod tests {
         .await;
         remote_a_server.abort();
         remote_b_server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn n2_health_reports_node_cluster_fragment_and_object_state() {
+        let _guard = STORAGE_TEST_LOCK.lock().await;
+        ensure_n2_test_storage_roots().await;
+        reset_n2_test_storage_contents().await;
+        ensure_auth_env_for_tests();
+
+        let previous_membership = get_membership().await.expect("current membership");
+        let fragment = format!("frag-{}", Ulid::new());
+        upsert_membership(UpsertMembershipRequest {
+            epoch: None,
+            nodes: vec![local_node_descriptor()],
+        })
+        .await
+        .expect("single-node membership");
+
+        let object_key = "videos/health-local.bin".to_string();
+        let payload = sample_bytes(512 * 1024, 101);
+        let put = put_n2_object(
+            full_claims(fragment.as_str()),
+            HeaderMap::new(),
+            AxumPath((fragment.clone(), object_key.clone())),
+            AxumQuery(PutObjectQuery {
+                uid: Some(fragment.clone()),
+                version_id: None,
+                expected_epoch: None,
+                kc: Some(1),
+                mc: Some(0),
+                kd: Some(1),
+                md: Some(0),
+                stripe_block_size: Some(128 * 1024),
+                content_type: Some("application/octet-stream".to_string()),
+            }),
+            Body::from(payload),
+        )
+        .await
+        .expect("put object");
+
+        let node = get_n2_node_health(full_claims(fragment.as_str()))
+            .await
+            .expect("node health")
+            .0;
+        assert!(node.reachable);
+        assert!(!node.index_roots.is_empty());
+        assert!(!node.blob_roots.is_empty());
+
+        let object = get_n2_object_health(
+            full_claims(fragment.as_str()),
+            AxumPath((fragment.clone(), object_key.clone())),
+            AxumQuery(ObjectHealthQuery {
+                version_id: Some(put.0.version_id.clone()),
+            }),
+        )
+        .await
+        .expect("object health")
+        .0;
+        assert_eq!(object.level, N2HealthLevel::Healthy);
+        assert!(object.readable);
+        assert_eq!(object.available_shards, 1);
+
+        let fragment_health = get_n2_fragment_health(
+            full_claims(fragment.as_str()),
+            AxumPath(fragment.clone()),
+            AxumQuery(FragmentHealthQuery {
+                max_objects: Some(10),
+            }),
+        )
+        .await
+        .expect("fragment health")
+        .0;
+        assert_eq!(fragment_health.level, N2HealthLevel::Healthy);
+        assert_eq!(fragment_health.scanned_objects, 1);
+
+        let cluster = get_n2_cluster_health(
+            full_claims(fragment.as_str()),
+            AxumQuery(ClusterHealthQuery {
+                expected_epoch: None,
+                deep: Some(true),
+                max_fragments: Some(10),
+                max_objects_per_fragment: Some(10),
+            }),
+        )
+        .await
+        .expect("cluster health")
+        .0;
+        assert!(cluster.reachable_active_nodes >= 1);
+        assert!(!cluster.nodes.is_empty());
+        assert!(cluster.fragments.iter().any(|f| f.fragment == fragment));
+
+        let _ = upsert_membership(UpsertMembershipRequest {
+            epoch: None,
+            nodes: previous_membership.nodes,
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn n2_object_health_and_repair_restore_missing_local_shard_from_remote() {
+        let _guard = STORAGE_TEST_LOCK.lock().await;
+        ensure_n2_test_storage_roots().await;
+        reset_n2_test_storage_contents().await;
+        ensure_auth_env_for_tests();
+
+        let previous_membership = get_membership().await.expect("current membership");
+        let (remote_endpoint, remote_server) = spawn_internal_session_server().await;
+        let fragment = format!("frag-{}", Ulid::new());
+        upsert_membership(UpsertMembershipRequest {
+            epoch: None,
+            nodes: vec![
+                local_node_descriptor(),
+                NodeDescriptor {
+                    node_id: "remote-health-repair".to_string(),
+                    endpoint: remote_endpoint.clone(),
+                    epoch: 0,
+                    active: true,
+                },
+            ],
+        })
+        .await
+        .expect("two-node membership");
+
+        let object_key = "videos/repair-object.bin".to_string();
+        let payload = sample_bytes(2 * 1024 * 1024, 77);
+        let put = put_n2_object(
+            full_claims(fragment.as_str()),
+            HeaderMap::new(),
+            AxumPath((fragment.clone(), object_key.clone())),
+            AxumQuery(PutObjectQuery {
+                uid: Some(fragment.clone()),
+                version_id: None,
+                expected_epoch: None,
+                kc: Some(1),
+                mc: Some(1),
+                kd: Some(1),
+                md: Some(0),
+                stripe_block_size: Some(128 * 1024),
+                content_type: Some("application/octet-stream".to_string()),
+            }),
+            Body::from(payload.clone()),
+        )
+        .await
+        .expect("put redundant object");
+
+        let local_endpoint = normalize_endpoint(n2_runtime_config().node_endpoint.as_str());
+        let local_shard = put
+            .0
+            .object
+            .shards
+            .iter()
+            .find(|shard| normalize_endpoint(shard.endpoint.as_str()) == local_endpoint)
+            .expect("one shard is local")
+            .cluster_shard_index;
+        let deleted =
+            delete_local_cluster_shard(fragment.as_str(), put.0.version_id.as_str(), local_shard)
+                .await
+                .expect("delete local shard");
+        assert!(deleted > 0);
+
+        let degraded = get_n2_object_health(
+            full_claims(fragment.as_str()),
+            AxumPath((fragment.clone(), object_key.clone())),
+            AxumQuery(ObjectHealthQuery {
+                version_id: Some(put.0.version_id.clone()),
+            }),
+        )
+        .await
+        .expect("degraded object health")
+        .0;
+        assert_eq!(degraded.level, N2HealthLevel::Degraded);
+        assert!(degraded.readable);
+        assert!(degraded.repairable);
+        assert_eq!(degraded.missing_shards, 1);
+
+        let repair = repair_n2_object(
+            full_claims(fragment.as_str()),
+            AxumPath((fragment.clone(), object_key.clone())),
+            AxumQuery(RepairN2ObjectQuery {
+                version_id: Some(put.0.version_id.clone()),
+                expected_epoch: None,
+                dry_run: Some(false),
+                cleanup_orphans: Some(true),
+            }),
+        )
+        .await
+        .expect("object repair")
+        .0;
+        assert_eq!(repair.reconcile.status, "reconciled");
+        assert!(repair.reconcile.repaired_shards >= 1);
+        let after = repair.after.expect("post-repair health");
+        assert_eq!(after.level, N2HealthLevel::Healthy, "{after:#?}");
+        assert_eq!(after.available_shards, 2);
+
+        let response = get_n2_object(
+            full_claims(fragment.as_str()),
+            HeaderMap::new(),
+            AxumPath((fragment.clone(), object_key.clone())),
+            AxumQuery(GetObjectQuery {
+                version_id: Some(put.0.version_id.clone()),
+            }),
+        )
+        .await
+        .expect("read repaired object")
+        .into_response();
+        let got = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read repaired body");
+        assert_eq!(got.as_ref(), payload.as_slice());
+
+        let _ = upsert_membership(UpsertMembershipRequest {
+            epoch: None,
+            nodes: previous_membership.nodes,
+        })
+        .await;
+        remote_server.abort();
     }
 }

@@ -482,6 +482,7 @@ impl Proof {
     ) -> ProofResult<Value> {
         self.stop_server()?;
         self.active_disk_count = 1;
+        self.data_shards = 1;
         self.parity_shards = 0;
         self.write_config()?;
         self.start_server("one-disk").await?;
@@ -499,7 +500,8 @@ impl Proof {
 
         self.stop_server()?;
         self.active_disk_count = self.index_roots.len();
-        self.parity_shards = 1;
+        self.data_shards = self.args.data_shards;
+        self.parity_shards = self.args.parity_shards;
         self.write_config()?;
         self.start_server("two-disk-again").await?;
         self.auth().await?;
@@ -519,6 +521,7 @@ impl Proof {
     ) -> ProofResult<Value> {
         self.stop_server()?;
         self.active_disk_count = 1;
+        self.data_shards = 1;
         self.parity_shards = 0;
         self.write_config()?;
         self.start_server("redistribution-interrupt-one-disk")
@@ -550,7 +553,8 @@ impl Proof {
 
         self.stop_server()?;
         self.active_disk_count = self.index_roots.len();
-        self.parity_shards = 1;
+        self.data_shards = self.args.data_shards;
+        self.parity_shards = self.args.parity_shards;
         self.write_config()?;
         self.start_server("redistribution-interrupt-two-disk")
             .await?;

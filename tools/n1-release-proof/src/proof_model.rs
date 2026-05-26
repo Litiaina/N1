@@ -25,6 +25,10 @@ struct Args {
     quota_backend: String,
     #[arg(long, default_value_t = DEFAULT_MAX_PART_SIZE)]
     max_part_size: u64,
+    #[arg(long, default_value_t = 1)]
+    data_shards: u16,
+    #[arg(long, default_value_t = 1)]
+    parity_shards: u16,
     #[arg(long, default_value = "n1-release-proof-master")]
     master_key: String,
     #[arg(long, default_value = "n1-release-proof-fragment")]
@@ -116,6 +120,7 @@ struct Proof {
     token: String,
     summary: Value,
     active_disk_count: usize,
+    data_shards: u16,
     parity_shards: u16,
 }
 
@@ -152,6 +157,8 @@ impl Proof {
             .timeout(request_timeout)
             .build()?;
         let base_url = format!("https://127.0.0.1:{}", args.port);
+        let data_shards = args.data_shards;
+        let parity_shards = args.parity_shards;
         Ok(Self {
             args,
             stamp,
@@ -164,7 +171,8 @@ impl Proof {
             token: String::new(),
             summary: json!({}),
             active_disk_count: 0,
-            parity_shards: 1,
+            data_shards,
+            parity_shards,
         })
     }
 

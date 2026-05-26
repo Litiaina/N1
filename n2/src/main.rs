@@ -20,7 +20,9 @@ use crate::core::upload::{
     UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
 };
 use crate::distribution_core::config::{n2_runtime_config, resolve_effective_cross_params};
-use crate::distribution_core::data_plane::schedule_n2_auto_maintenance;
+use crate::distribution_core::data_plane::{
+    schedule_n2_auto_maintenance, start_n2_auto_maintenance_loop,
+};
 use crate::distribution_core::governance::{governance_state_view, initialize_governance_runtime};
 use crate::distribution_core::state::{get_cluster_view, get_membership};
 use crate::fs::cleanup_manager::interval_cleanup;
@@ -50,8 +52,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod distribution_core;
+mod protocol;
 mod routes;
-mod s3;
 mod settings;
 mod validation;
 fn detect_cpu_cores() -> usize {
@@ -265,14 +267,14 @@ fn normalize_fs_backed_disk_paths(role: &str, paths: Vec<String>) -> Vec<String>
             let ft = meta.file_type();
             if ft.is_block_device() || ft.is_char_device() {
                 panic!(
-                    "{} entry '{}' is a device. N2 0.4 uses the N1 storage kernel and requires directory paths.",
+                    "{} entry '{}' is a device. N2 uses the N1 storage kernel and requires directory paths.",
                     role, trimmed
                 );
             }
         }
         if !meta.is_dir() {
             panic!(
-                "{} entry '{}' is not a directory. N2 0.4 uses the N1 storage kernel and requires directory paths.",
+                "{} entry '{}' is not a directory. N2 uses the N1 storage kernel and requires directory paths.",
                 role, trimmed
             );
         }
@@ -882,6 +884,21 @@ pub async fn run_server() {
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(50001);
 
+    let native_protocol_enabled = server_section
+        .get("native_protocol_enabled")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true);
+
+    let native_port = server_section
+        .get("native_port")
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(50012);
+
     let cert_path = server_section
         .get("cert_path")
         .map(|v| v.to_string())
@@ -973,6 +990,7 @@ pub async fn run_server() {
         .await
         .unwrap_or_else(|e| panic!("N2 startup could not read governance state: {}", e));
     schedule_n2_auto_maintenance("startup", startup_membership.epoch);
+    start_n2_auto_maintenance_loop();
 
     tracing::info!(
         "N2 governance: term={} commit_index={} applied_membership_epoch={}",
@@ -1248,6 +1266,21 @@ pub async fn run_server() {
         .expect("Failed to load TLS certificates");
 
     let storage_addr = SocketAddr::from((ip, https_port));
+    if native_protocol_enabled {
+        let native_addr = SocketAddr::from((ip, native_port));
+        let native_listener = protocol::bind_native_protocol(native_addr)
+            .await
+            .unwrap_or_else(|err| {
+                panic!("Failed to bind N2 native protocol {}: {}", native_addr, err)
+            });
+        tokio::spawn(protocol::serve_native_protocol(
+            native_listener,
+            native_addr,
+        ));
+    } else {
+        tracing::warn!("N2 native protocol is disabled by configuration");
+    }
+
     let storage_router = serve_storage_routes().await;
     let serve_storage = storage_router.fallback(handler_404);
 
