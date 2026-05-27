@@ -19,7 +19,7 @@
 
 This repository contains the storage platform stack built around four runtime components:
 
-> - `N1` (`1.3.1`)
+> - `N1` (`1.3.2`)
   Primary N1 storage kernel with an N1 namespace, two-level fanned immutable `.objects/<hh>/<hh>/@o_<object-id>` records, zero-decode listing, object-level repair/status, the N1 blob/shard/parity plane, and the native `n1://` protocol for internal tools. See `N1_DOCUMENTATION.md`.
 > - `N2` (`0.11.0`)
   Standalone distributed object storage with node-level placement, peer shard transport, distributed upload/read, namespace quorum apply, cluster health, repair, and manual rebalance execution. N1 and N2 are independent Litiaina storage systems with shared design principles, not parent/child runtimes. See `N2_DOCUMENTATION.md` and `N2_ARCHITECTURE.md`.
@@ -56,7 +56,7 @@ The current N1 line retires the old Standard/indexdb engine from the active work
 - SMB/NAS serving has moved out of `N1` into standalone `NS`, keeping `N1` focused on storage-kernel responsibilities.
 - `NS 1.0.0` keeps the live SMB path local to disk, uses dynamic fragment authentication, supports recursive folder deletion semantics expected by Windows clients, and cold-syncs large files to `N1` through multipart upload.
 - Per-fragment N1 index replicas are copied across configured index roots, monitored by health, and repaired when a rebuilt index disk is missing or stale.
-- Trash entries are generation-addressed with `trash_entry_id`, so repeated deletes of the same visible path remain individually recoverable or purgeable without path ambiguity.
+- Trash is namespace-native: soft delete moves the exact file or folder path into `.trash`, trash listing reads `.trash`, recover moves the path back to live namespace, and GC later reclaims headless object metadata and blobs.
 - fragment-bound Registry listing and stats now prefer `N1` namespace truth instead of stale Registry projection.
 - Registry folder trash/recover delegates to N1 POSIX namespace lifecycle, including empty folders, instead of emulating directory delete with object-key prefix loops.
 - Registry quota reservations are tracked as explicit durable pending reservations and reconciled against committed object usage on finalize and cancel paths.
@@ -67,7 +67,7 @@ The current N1 line retires the old Standard/indexdb engine from the active work
 
 ### N1
 
-`N1 1.3.1` is the primary N1 storage kernel and the default N1 face for new deployments.
+`N1 1.3.2` is the primary N1 storage kernel and the default N1 face for new deployments.
 
 It keeps the N1 object/blob plane, repair model, redistribution model, GC model, and public route shape, with active storage authority in explicit N1 planes:
 

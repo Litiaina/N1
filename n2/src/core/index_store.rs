@@ -39,8 +39,6 @@ const RECEIPT_SUFFIX: &str = ".receipt";
 const PART_META_PREFIX: &str = "part_";
 pub(crate) const OBJECT_DIR_PREFIX: &str = "@o_";
 const INTENTS_DIR: &str = ".intents";
-const TRASH_ENTRIES_DIR: &str = ".trash-entries";
-const TRASH_ENTRY_SUFFIX: &str = ".trash.ndx";
 const TRASH_JOBS_DIR: &str = ".trash-jobs";
 pub(crate) const BLOB_DIR: &str = N2_BLOB_DIR;
 
@@ -115,7 +113,6 @@ struct ReplicaScore {
     meta_present: u64,
     object_records: u64,
     namespace_links: u64,
-    trash_markers: u64,
     upload_records: u64,
 }
 
@@ -210,7 +207,6 @@ fn reserved_user_segment(segment: &str) -> bool {
         || segment.starts_with(GC_DIR)
         || segment.starts_with(REPAIR_DIR)
         || segment.starts_with(INTENTS_DIR)
-        || segment.starts_with(TRASH_ENTRIES_DIR)
         || segment.starts_with(TRASH_JOBS_DIR)
 }
 
@@ -227,7 +223,6 @@ pub(crate) fn internal_namespace_entry_name(name: &str) -> bool {
                 | GC_DIR
                 | REPAIR_DIR
                 | INTENTS_DIR
-                | TRASH_ENTRIES_DIR
                 | TRASH_JOBS_DIR
                 | FRAGMENT_META_FILE
         )
@@ -846,10 +841,6 @@ fn create_empty_marker(path: &Path) -> Result<(), AppError> {
         .map_err(|e| io_err(e, "create N2 marker"))
 }
 
-fn path_exists_no_follow(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok()
-}
-
 fn write_metadata_to_roots(metadata: &ObjectMetadata) -> Result<(), AppError> {
     ensure_fragment_dirs(&metadata.fragment)?;
     let bytes = encode(metadata)?;
@@ -1204,73 +1195,7 @@ pub fn list_trash_versions(
     Ok(out)
 }
 
-fn trash_entry_marker_name(trash_entry_id: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(trash_entry_id.as_bytes());
-    format!("{}{}", hex::encode(hasher.finalize()), TRASH_ENTRY_SUFFIX)
-}
-
-fn trash_entries_dir(root: &Path, fragment: &str) -> PathBuf {
-    root.join(fragment).join(TRASH_DIR).join(TRASH_ENTRIES_DIR)
-}
-
-pub(crate) fn write_trash_record(fragment: &str, record: &TrashRecord) -> Result<(), AppError> {
-    let bytes = encode(record)?;
-    let file_name = trash_entry_marker_name(&record.trash_entry_id);
-    for root in index_roots() {
-        write_atomic(&trash_entries_dir(&root, fragment).join(&file_name), &bytes)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn remove_trash_record(fragment: &str, trash_entry_id: &str) -> Result<bool, AppError> {
-    let file_name = trash_entry_marker_name(trash_entry_id);
-    let mut removed = false;
-    for root in index_roots() {
-        removed |= remove_file_if_exists(&trash_entries_dir(&root, fragment).join(&file_name))?;
-    }
-    Ok(removed)
-}
-
-fn trash_anchor_exists(fragment: &str, source_relative_path: &str) -> bool {
-    existing_fragment_roots(fragment)
-        .into_iter()
-        .any(|root| path_exists_no_follow(&root.join(TRASH_DIR).join(source_relative_path)))
-}
-
-fn scan_trash_record_markers(fragment: &str) -> Result<Vec<TrashRecord>, AppError> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for root in index_roots() {
-        let dir = trash_entries_dir(&root, fragment);
-        if !dir.is_dir() {
-            continue;
-        }
-        for name in read_dir_names(&dir)? {
-            if !name.ends_with(TRASH_ENTRY_SUFFIX) {
-                continue;
-            }
-            let record: TrashRecord = decode(
-                &fs::read(dir.join(name)).map_err(|e| io_err(e, "read N2 trash entry marker"))?,
-            )?;
-            if !trash_anchor_exists(fragment, &record.source_relative_path) {
-                continue;
-            }
-            if seen.insert(record.trash_entry_id.clone()) {
-                out.push(record);
-            }
-        }
-    }
-    out.sort_by(|a, b| a.source_relative_path.cmp(&b.source_relative_path));
-    Ok(out)
-}
-
 pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, AppError> {
-    let marker_records = scan_trash_record_markers(fragment)?;
-    if !marker_records.is_empty() {
-        return Ok(marker_records);
-    }
-
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for fragment_root in existing_fragment_roots(fragment) {
@@ -1285,9 +1210,6 @@ pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, App
                 continue;
             }
             for name in read_dir_names(&dir)? {
-                if name == TRASH_ENTRIES_DIR {
-                    continue;
-                }
                 if internal_namespace_entry_name(&name) && name != OBJECTS_DIR {
                     continue;
                 }
@@ -1325,18 +1247,6 @@ pub(crate) fn scan_trash_records(fragment: &str) -> Result<Vec<TrashRecord>, App
                         });
                     }
                 } else if child.is_dir() {
-                    let (object_keys, version_ids, deleted_at) = collect_trash_refs_under(&child)?;
-                    if !object_keys.is_empty() && seen.insert(child_rel.clone()) {
-                        out.push(TrashRecord {
-                            trash_entry_id: child_rel.clone(),
-                            original_path: child_rel.clone(),
-                            source_relative_path: child_rel.clone(),
-                            kind: TrashKind::Directory,
-                            object_keys,
-                            version_ids,
-                            deleted_at_unix: deleted_at,
-                        });
-                    }
                     stack.push((child, child_rel));
                 }
             }
@@ -1357,66 +1267,6 @@ pub fn list_trash_heads(fragment: &str) -> Result<Vec<ObjectMetadata>, AppError>
         }
     }
     Ok(out)
-}
-
-fn collect_trash_refs_under(dir: &Path) -> Result<(Vec<String>, Vec<String>, i64), AppError> {
-    let mut object_keys = BTreeSet::new();
-    let mut version_ids = BTreeSet::new();
-    let mut deleted_at = Utc::now().timestamp();
-    let mut stack = vec![(dir.to_path_buf(), String::new())];
-    let fragment_root = dir
-        .ancestors()
-        .find(|ancestor| ancestor.file_name().and_then(|name| name.to_str()) == Some(TRASH_DIR))
-        .and_then(Path::parent)
-        .map(Path::to_path_buf);
-    let index_root = fragment_root
-        .as_ref()
-        .and_then(|root| root.parent())
-        .map(Path::to_path_buf);
-    let fragment = fragment_root
-        .as_ref()
-        .and_then(|root| root.file_name())
-        .and_then(|name| name.to_str())
-        .map(str::to_string);
-    while let Some((current, rel)) = stack.pop() {
-        if !current.is_dir() {
-            continue;
-        }
-        for name in read_dir_names(&current)? {
-            if internal_namespace_entry_name(&name) && name != OBJECTS_DIR {
-                continue;
-            }
-            let child = current.join(&name);
-            let child_rel = if rel.is_empty() {
-                name.clone()
-            } else {
-                format!("{rel}/{name}")
-            };
-            if let (Some(root), Some(fragment)) = (index_root.as_ref(), fragment.as_deref()) {
-                if let Some(object_id) = read_namespace_symlink_object_id(root, fragment, &child)? {
-                    let object_dir = object_index_dir(root, fragment, &object_id)?;
-                    for ndx_name in read_dir_names(&object_dir)? {
-                        if parse_ndx_file_name(&ndx_name).is_none() {
-                            continue;
-                        }
-                        let meta = decode_metadata_file(&object_dir.join(&ndx_name))?;
-                        deleted_at = meta.created_at;
-                        object_keys.insert(object_id.clone());
-                        version_ids.insert(meta.version_id);
-                    }
-                    continue;
-                }
-            }
-            if child.is_dir() {
-                stack.push((child, child_rel));
-            }
-        }
-    }
-    Ok((
-        object_keys.into_iter().collect(),
-        version_ids.into_iter().collect(),
-        deleted_at,
-    ))
 }
 
 pub fn list_trash_catalog(fragment: &str) -> Result<Vec<TrashCatalogEntry>, AppError> {
@@ -1914,6 +1764,39 @@ pub fn drop_fragment_trash_namespace(fragment: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+pub(crate) fn retire_fragment_trash_namespace(fragment: &str) -> Result<Vec<PathBuf>, AppError> {
+    let suffix = format!("{}-{}", Utc::now().timestamp_millis(), std::process::id());
+    let mut retired_roots = Vec::new();
+
+    for root in index_roots() {
+        let fragment_root = root.join(fragment);
+        fs::create_dir_all(&fragment_root).map_err(|e| io_err(e, "create N2 fragment root"))?;
+
+        let trash_root = fragment_root.join(TRASH_DIR);
+        let retired_parent = fragment_root.join(GC_DIR);
+        fs::create_dir_all(&retired_parent)
+            .map_err(|e| io_err(e, "create N2 retired trash root"))?;
+
+        if trash_root.exists() {
+            let retired_root = retired_parent.join(format!("{TRASH_DIR}.retired.{suffix}"));
+            if retired_root.exists() {
+                fs::remove_dir_all(&retired_root)
+                    .map_err(|e| io_err(e, "replace retired N2 trash namespace"))?;
+            }
+            renameat(CWD, &trash_root, CWD, &retired_root).map_err(|e| {
+                AppError::InternalServerError(format!("retire N2 trash namespace: {e}"))
+            })?;
+            retired_roots.push(retired_root);
+        }
+
+        fs::create_dir_all(&trash_root).map_err(|e| io_err(e, "recreate N2 trash namespace"))?;
+        sync_dir(&fragment_root);
+        sync_dir(&retired_parent);
+    }
+
+    Ok(retired_roots)
+}
+
 pub fn clear_fragment_trash_for_partitions(
     fragment: &str,
     _touched_partitions: &BTreeSet<u16>,
@@ -2039,22 +1922,6 @@ fn count_upload_records(root: &Path, fragment: &str) -> u64 {
     count
 }
 
-fn count_trash_markers(root: &Path, fragment: &str) -> u64 {
-    let dir = trash_entries_dir(root, fragment);
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return 0;
-    };
-    entries
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.ends_with(TRASH_ENTRY_SUFFIX))
-        })
-        .count() as u64
-}
-
 fn count_namespace_links(root: &Path, fragment: &str) -> u64 {
     collect_symlink_object_ids_under(root, fragment, &root.join(fragment), true)
         .map(|ids| ids.len() as u64)
@@ -2066,7 +1933,6 @@ fn replica_score(root: &Path, fragment: &str) -> ReplicaScore {
         meta_present: u64::from(root.join(fragment).join(FRAGMENT_META_FILE).is_file()),
         object_records: count_object_index_records(root, fragment),
         namespace_links: count_namespace_links(root, fragment),
-        trash_markers: count_trash_markers(root, fragment),
         upload_records: count_upload_records(root, fragment),
     }
 }
@@ -2075,7 +1941,6 @@ fn replica_index_records(score: &ReplicaScore) -> u64 {
     score
         .object_records
         .saturating_add(score.namespace_links)
-        .saturating_add(score.trash_markers)
         .saturating_add(score.upload_records)
 }
 
@@ -3439,7 +3304,6 @@ mod tests {
                 GC_DIR,
                 REPAIR_DIR,
                 INTENTS_DIR,
-                TRASH_ENTRIES_DIR,
                 TRASH_JOBS_DIR,
                 BLOB_DIR,
                 FRAGMENT_META_FILE,

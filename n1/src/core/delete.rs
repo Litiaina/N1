@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,9 +16,10 @@ use tracing::{info, warn};
 
 use crate::core::disk_manager::ObjectPathManager;
 use crate::core::index;
+use crate::core::index_store;
 use crate::core::operation_gate::{MaintenanceAccessMode, acquire_maintenance_mode};
 use crate::enums::app_error_enum::AppError;
-use crate::namespace::models::NamespaceMutationSummary;
+use crate::namespace::models::{NamespaceEntryKind, NamespaceMutationSummary};
 use crate::namespace::runtime::global_namespace_runtime;
 use crate::routes::storage_routes::AppState;
 use crate::structs::auth_structs::Claims;
@@ -395,48 +396,6 @@ pub async fn resume_persistent_trash_jobs(state: Arc<AppState>) -> Result<usize,
     Ok(resumed)
 }
 
-fn get_trash_root(disk_root: &std::path::Path, fragment_hash: &str) -> std::path::PathBuf {
-    disk_root.join(fragment_hash).join(".trash")
-}
-
-async fn retire_trash_roots(
-    trash_roots: &[std::path::PathBuf],
-) -> Vec<(String, Option<std::path::PathBuf>, Option<String>)> {
-    let suffix = format!("{}-{}", Utc::now().timestamp_millis(), std::process::id());
-    stream::iter(trash_roots.iter().cloned().map(|trash_root| {
-        let suffix = suffix.clone();
-        async move {
-            let root_label = trash_root.display().to_string();
-            let Some(fragment_root) = trash_root.parent() else {
-                return (
-                    root_label,
-                    None,
-                    Some("trash root missing parent".to_string()),
-                );
-            };
-            let retired_root = fragment_root.join(
-                trash_root
-                    .file_name()
-                    .map(|name| format!("{}.retired.{}", name.to_string_lossy(), suffix))
-                    .unwrap_or_else(|| format!(".trash.retired.{}", suffix)),
-            );
-            if !fs::try_exists(&trash_root).await.unwrap_or(false) {
-                return (root_label, None, None);
-            }
-            if fs::try_exists(&retired_root).await.unwrap_or(false) {
-                let _ = fs::remove_dir_all(&retired_root).await;
-            }
-            match fs::rename(&trash_root, &retired_root).await {
-                Ok(_) => (root_label, Some(retired_root), None),
-                Err(err) => (root_label, None, Some(err.to_string())),
-            }
-        }
-    }))
-    .buffer_unordered(4)
-    .collect::<Vec<_>>()
-    .await
-}
-
 fn spawn_background_trash_purge(retired_roots: Vec<std::path::PathBuf>) {
     if retired_roots.is_empty() {
         return;
@@ -713,80 +672,43 @@ pub async fn empty_trash(
 
 async fn run_empty_trash_job(state: Arc<AppState>, fragment: String) -> Result<(), AppError> {
     let _maintenance_guard = acquire_maintenance_mode(MaintenanceAccessMode::ReadOnly);
-    let path_manager = ObjectPathManager::new();
-    let index_roots = path_manager.get_all_index_roots();
 
     mutate_trash_job_status(&EMPTY_TRASH_STATUS, |status| {
-        status.phase = "Loading trash control plane".to_string();
+        status.phase = "Retiring trash namespace".to_string();
     })
     .await;
 
-    let total_objects = global_namespace_runtime()
-        .list_objects_page(
-            &fragment,
-            &HashMap::from([("limit".to_string(), "1000".to_string())]),
-            true,
-        )
-        .await?
-        .objects
-        .len() as u64;
-    let mut trash_targets = BTreeSet::new();
-    for root in &index_roots {
-        trash_targets.insert(get_trash_root(root, &fragment));
-    }
+    let fragment_for_worker = fragment.clone();
+    let retired_roots = tokio::task::spawn_blocking(move || {
+        index_store::retire_fragment_trash_namespace(&fragment_for_worker)
+    })
+    .await
+    .map_err(|err| AppError::InternalServerError(format!("N1 trash retire worker: {err}")))??;
+
+    let retired_count = retired_roots.len() as u64;
 
     mutate_trash_job_status(&EMPTY_TRASH_STATUS, |status| {
-        status.phase = "Clearing trash metadata".to_string();
-        status.total_objects = total_objects;
-        status.total_trash_roots = trash_targets.len() as u64;
+        status.total_trash_roots = retired_count;
+        status.processed_trash_roots = retired_count;
+        status.processed_objects = 0;
+        status.successful_objects = 0;
+        status.phase = "Trash namespace retired; blob bytes will be reclaimed by GC".to_string();
         status.current_object = None;
     })
     .await;
 
-    let summary = match global_namespace_runtime().empty_trash(&fragment).await {
-        Ok(summary) => summary,
-        Err(AppError::NotFound) => {
-            mutate_trash_job_status(&EMPTY_TRASH_STATUS, |status| {
-                status.is_running = false;
-                status.phase = "Completed".to_string();
-                status.current_object = None;
-            })
-            .await;
-            clear_persistent_trash_job_record(&fragment).await;
-            return Ok(());
-        }
-        Err(err) => return Err(err),
-    };
-    mutate_trash_job_status(&EMPTY_TRASH_STATUS, |status| {
-        status.processed_objects = summary.affected_paths as u64;
-        status.successful_objects = summary.affected_paths as u64;
-        status.phase = "Trash metadata cleared; blob bytes will be reclaimed by GC".to_string();
-    })
-    .await;
-
-    mutate_trash_job_status(&EMPTY_TRASH_STATUS, |status| {
-        status.phase = "Retiring trash roots".to_string();
-    })
-    .await;
-
-    let root_results = retire_trash_roots(&trash_targets.into_iter().collect::<Vec<_>>()).await;
-    let retired_roots = root_results
-        .iter()
-        .filter_map(|(_, retired_root, _)| retired_root.clone())
-        .collect::<Vec<_>>();
-
-    for (root_label, _retired_root, maybe_error) in root_results {
-        mutate_trash_job_status(&EMPTY_TRASH_STATUS, |status| {
-            status.processed_trash_roots = status.processed_trash_roots.saturating_add(1);
-            status.current_object = Some(root_label.clone());
-            if let Some(err) = &maybe_error {
-                status.last_error = Some(err.clone());
-            }
-        })
-        .await;
-    }
-
     spawn_background_trash_purge(retired_roots);
+
+    let summary = NamespaceMutationSummary {
+        operation: "empty_trash".to_string(),
+        kind: NamespaceEntryKind::Directory,
+        affected_paths: retired_count as usize,
+        affected_objects: 0,
+        source_path: None,
+        destination_path: None,
+        trash_entry_id: None,
+        deleted_at_unix: Some(Utc::now().timestamp()),
+    };
 
     mutate_trash_job_status(&EMPTY_TRASH_STATUS, |status| {
         status.is_running = false;

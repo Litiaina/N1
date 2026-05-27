@@ -84,7 +84,7 @@ The full LTS proof should include:
 - disk wipe, disk removal/re-add, repair, and health refresh
 - redistribution after disk topology changes
 - GC after hard delete and orphaned upload cancellation
-- trash/recover with duplicate path names using `trash_entry_id`
+- trash/recover with path-based namespace truth and no second trash metadata plane
 - 10k+ object namespace storm
 - four concurrent users on one fragment doing upload, mkdir, rename, move, trash, recover, and listing
 - four concurrent users across four fragments

@@ -18,7 +18,7 @@ The workspace `n1_native_client` crate is the canonical Rust client implementati
 
 ## Native Protocol Plane
 
-N1 1.3.1 uses `n1://` protocol `n1/0.4` as the native N1 protocol plane beside HTTPS. The protocol exists so N1-owned tools can talk to the storage kernel without paying HTTP/TLS overhead or JSON response duplication. It covers namespace/control operations and the native data plane: one-shot upload, multipart init/part/finalize, upload status/list, object chunk download, object streaming download/view, object status/repair, GC, repair, redistribution, quota, and health. The native listener is required at startup; if its port cannot bind, N1 should fail startup instead of silently running without the low-level face.
+N1 1.3.2 uses `n1://` protocol `n1/0.4` as the native N1 protocol plane beside HTTPS. The protocol exists so N1-owned tools can talk to the storage kernel without paying HTTP/TLS overhead or JSON response duplication. It covers namespace/control operations and the native data plane: one-shot upload, multipart init/part/finalize, upload status/list, object chunk download, object streaming download/view, object status/repair, GC, repair, redistribution, quota, and health. The native listener is required at startup; if its port cannot bind, N1 should fail startup instead of silently running without the low-level face.
 
 The native plane is intentionally thin:
 
