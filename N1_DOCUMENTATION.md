@@ -24,6 +24,12 @@ Build N1:
 cargo build -p n1 --release
 ```
 
+Check the exact N1 binary version without starting the server:
+
+```bash
+./target/release/litiaina-n1 --version
+```
+
 Run directly for development:
 
 ```bash

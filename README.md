@@ -84,6 +84,12 @@ Folders are real directories. File names are namespace symlinks whose payload is
 
 Use `N1` when the goal is the Linux-first, IO-bound N1 storage kernel.
 
+Check a deployed N1 binary without starting the server:
+
+```bash
+litiaina-n1 --version
+```
+
 N1 exposes two supported transport faces:
 
 - HTTPS `/n1/...` for consumer APIs, browser clients, and broad compatibility.

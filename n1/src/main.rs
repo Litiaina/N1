@@ -600,7 +600,64 @@ fn validate_runtime_paths(config: &Ini) -> Result<(), String> {
     Ok(())
 }
 
+enum StartupCommand {
+    RunServer,
+    PrintedAndExit,
+    Invalid,
+}
+
+fn print_version() {
+    println!("litiaina-n1 {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "native_protocol {}",
+        crate::protocol::types::N1_NATIVE_PROTOCOL_VERSION
+    );
+}
+
+fn print_usage(binary: &str) {
+    println!("Usage: {binary} [--version|-V|--help|-h]");
+    println!();
+    println!("N1 server binary. Run with no arguments to start the server.");
+    println!("Use litiaina-n1-cli for admin and maintenance commands.");
+    println!();
+    println!("Options:");
+    println!("  -V, --version    Print N1 build version and native protocol version");
+    println!("  -h, --help       Print this help");
+}
+
+fn handle_startup_args() -> StartupCommand {
+    let mut args = std::env::args();
+    let binary = args.next().unwrap_or_else(|| "litiaina-n1".to_string());
+    let rest: Vec<String> = args.collect();
+    if rest.is_empty() {
+        return StartupCommand::RunServer;
+    }
+    if rest.len() == 1 {
+        match rest[0].as_str() {
+            "--version" | "-V" | "version" => {
+                print_version();
+                return StartupCommand::PrintedAndExit;
+            }
+            "--help" | "-h" | "help" => {
+                print_usage(&binary);
+                return StartupCommand::PrintedAndExit;
+            }
+            _ => {}
+        }
+    }
+
+    eprintln!("Unsupported litiaina-n1 argument(s): {}", rest.join(" "));
+    eprintln!("Run `{binary} --help` for supported options.");
+    StartupCommand::Invalid
+}
+
 fn main() {
+    match handle_startup_args() {
+        StartupCommand::RunServer => {}
+        StartupCommand::PrintedAndExit => return,
+        StartupCommand::Invalid => std::process::exit(2),
+    }
+
     let runtime_config = runtime_thread_config(detect_cpu_cores());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -641,11 +698,6 @@ async fn async_main(runtime_config: RuntimeThreadConfig) {
 
     let _guard = init_tracing().expect("Failed to initialize tracing subscriber");
     raise_open_file_limit_for_storage();
-
-    if std::env::args_os().nth(1).is_some() {
-        eprintln!("litiaina-n1 runs the server only. Use `litiaina-n1-cli` for admin commands.");
-        std::process::exit(2);
-    }
 
     let current_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     tracing::info!("╔════════════════════════════════════════════════╗");
