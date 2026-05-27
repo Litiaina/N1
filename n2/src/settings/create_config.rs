@@ -7,16 +7,30 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
     conf.with_section(Some("server"))
         .set("host", "127.0.0.1")
         .set("https_port", "50001")
-        .set("native_protocol_enabled", "true")
-        .set("native_port", "50012")
+        .set("native_port", "50002")
         .set("cert_path", "")
-        .set("key_path", "")
-        .set("sharable_url", "");
+        .set("key_path", "");
 
     conf.with_section(Some("disk_config"))
         .set("index_store_disks", "")
         .set("blob_store_disks", "")
         .set("fs_storage_path", "");
+
+    conf.with_section(Some("cluster_config"))
+        .set("node_id", "node-1")
+        .set("node_endpoint", "https://127.0.0.1:50001")
+        .set("native_endpoint", "n2://127.0.0.1:50002")
+        .set("membership_file", "n2_membership.json")
+        .set("cluster_layout_mode", "auto")
+        .set("fixed_data_shards", "")
+        .set("fixed_parity_shards", "")
+        .set("auto_rebalance", "false");
+
+    conf.with_section(Some("quota_config"))
+        .set("fragment_quota_backend", "xfs_project");
+
+    conf.with_section(Some("index_config"))
+        .set("partition_count", "64");
 
     conf.with_section(Some("garbage_collector"))
         .set("cleanup_interval_seconds", "3600")
@@ -37,8 +51,6 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("view_limit_burst_size", "100")
         .set("upload_limit_per_second", "300")
         .set("upload_limit_burst_size", "3000")
-        .set("sharing_limit_per_second", "50")
-        .set("sharing_limit_burst_size", "100")
         .set("global_limit_per_second", "200")
         .set("global_limit_burst_size", "300");
 
@@ -61,27 +73,6 @@ pub fn create_default_config_ini<P: AsRef<Path>>(path: P) -> io::Result<()> {
         .set("parity_shards", "0")
         .set("stripe_block_size", "262144");
 
-    conf.with_section(Some("n2"))
-        .set("node_id", "node-1")
-        .set("node_endpoint", "https://127.0.0.1:50001")
-        .set("cluster_membership_file", "n2_cluster_membership.json")
-        .set("internal_token", "change-me-n2-internal-token")
-        .set("cluster_commit_mode", "strict_full_placement")
-        .set("auto_maintenance_mode", "off")
-        .set("auto_maintenance_interval_seconds", "300")
-        .set("auto_maintenance_max_fragments", "64")
-        .set("auto_maintenance_max_objects_per_fragment", "256")
-        .set("auto_maintenance_cleanup_orphans", "true")
-        .set("repair_global_concurrency", "2")
-        .set("repair_per_fragment_concurrency", "1")
-        .set("auto_cross_params", "true")
-        .set("cluster_stripe_block_size", "262144")
-        .set("remote_request_timeout_ms", "60000")
-        .set("kc", "1")
-        .set("mc", "0")
-        .set("kd", "1")
-        .set("md", "0");
-
     conf.write_to_file(path)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }
@@ -93,49 +84,28 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn default_n2_config_includes_n2_section() {
+    fn default_config_includes_cluster_section() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "n2-default-config-{}-{}.ini",
+            "n2-default-config-no-n2-{}-{}.ini",
             std::process::id(),
             unique
         ));
 
         create_default_config_ini(&path).expect("create default config");
         let ini = Ini::load_from_file(&path).expect("load generated config");
-        let n2 = ini.section(Some("n2")).expect("n2 section");
-
-        assert_eq!(n2.get("node_id"), Some("node-1"));
-        assert_eq!(n2.get("node_endpoint"), Some("https://127.0.0.1:50001"));
-        assert_eq!(
-            n2.get("cluster_membership_file"),
-            Some("n2_cluster_membership.json")
-        );
-        assert_eq!(
-            n2.get("internal_token"),
-            Some("change-me-n2-internal-token")
-        );
-        assert_eq!(n2.get("cluster_commit_mode"), Some("strict_full_placement"));
-        assert_eq!(n2.get("auto_maintenance_mode"), Some("off"));
-        assert_eq!(n2.get("auto_maintenance_interval_seconds"), Some("300"));
-        assert_eq!(n2.get("auto_maintenance_max_fragments"), Some("64"));
-        assert_eq!(
-            n2.get("auto_maintenance_max_objects_per_fragment"),
-            Some("256")
-        );
-        assert_eq!(n2.get("auto_maintenance_cleanup_orphans"), Some("true"));
-        assert_eq!(n2.get("repair_global_concurrency"), Some("2"));
-        assert_eq!(n2.get("repair_per_fragment_concurrency"), Some("1"));
-        assert_eq!(n2.get("auto_cross_params"), Some("true"));
-        assert_eq!(n2.get("cluster_stripe_block_size"), Some("262144"));
-        assert_eq!(n2.get("remote_request_timeout_ms"), Some("60000"));
-        assert_eq!(n2.get("kc"), Some("1"));
-        assert_eq!(n2.get("mc"), Some("0"));
-        assert_eq!(n2.get("kd"), Some("1"));
-        assert_eq!(n2.get("md"), Some("0"));
+        let cluster = ini
+            .section(Some("cluster_config"))
+            .expect("cluster_config section");
+        assert_eq!(cluster.get("cluster_layout_mode"), Some("auto"));
+        assert_eq!(cluster.get("membership_file"), Some("n2_membership.json"));
+        let index = ini
+            .section(Some("index_config"))
+            .expect("index_config section");
+        assert_eq!(index.get("partition_count"), Some("64"));
 
         let _ = fs::remove_file(path);
     }

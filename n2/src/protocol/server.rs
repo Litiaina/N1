@@ -1,188 +1,36 @@
-use crate::distribution_core::api::{
-    get_n2_cluster_view, get_n2_cluster_view_public, get_n2_governance_state, get_n2_membership,
-    put_n2_membership, resolve_n2_placement, rollback_n2_membership,
-};
-use crate::distribution_core::data_plane::{
-    delete_n2_object, get_n2_object, list_n2_object_versions, list_n2_objects,
-    put_n2_object_stream, reconcile_n2_fragment, rename_n2_object,
-};
-use crate::distribution_core::health::{
-    get_n2_cluster_health, get_n2_fragment_health, get_n2_node_health, get_n2_object_health,
-    repair_n2_object,
-};
-use crate::distribution_core::model::{
-    ClusterHealthQuery, ClusterViewQuery, DeleteN2ObjectQuery, FragmentHealthQuery, GetObjectQuery,
-    ListN2ObjectsQuery, ListN2VersionsQuery, ObjectHealthQuery, PutObjectQuery,
-    ReconcileFragmentQuery, RenameN2ObjectRequest, RepairN2ObjectQuery, ResolvePlacementQuery,
-    UpsertMembershipRequest,
+use crate::core::upload::{AdaptiveIoGuard, acquire_upload_io_guard_for_query};
+use crate::distribution::peer::{
+    NativePeerShardPayload, native_peer_bytes_response, native_peer_get_shard_bytes,
+    native_peer_put_shard_reader,
 };
 use crate::enums::app_error_enum::AppError;
-use crate::fs::fs_constants::MAX_FILE_SIZE;
-use crate::middleware::auth_middleware::authorize_fragment_core;
-use crate::structs::auth_structs::AuthorizationRequest;
-use axum::Json as AxumJson;
-use axum::body::to_bytes;
-use axum::extract::{Path, Query};
-use axum::http::{
-    HeaderMap, HeaderValue,
-    header::{CONTENT_LENGTH, CONTENT_TYPE, RANGE},
+use crate::protocol::auth::NativeSession;
+use crate::protocol::frame::{read_request_body, read_request_control, write_response};
+use crate::protocol::ops::{
+    NativeExecutionError, execute_native_op, execute_native_streaming_reader, native_body_bytes,
+    op_response, prepare_native_download_stream, stream_native_download_plan,
 };
-use axum::response::{IntoResponse, Response};
-use bytes::Bytes;
-use futures_util::{StreamExt, stream};
-use n1::protocol::auth::NativeSession;
-use n1::protocol::frame::{read_request_body, read_request_control, write_response};
-use n1::protocol::types::{
-    NativeAuthFragmentRequest, NativeBearerRequest, NativeOpResponse, NativeRequest, NativeResponse,
+use crate::protocol::types::{
+    MAX_NATIVE_BODY_BYTES, N2_NATIVE_PROTOCOL_VERSION, NativeAuthFragmentRequest,
+    NativeBearerRequest, NativeOpResponse, NativeRequest, NativeResponse,
 };
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use crate::routes::storage_routes::AppState;
 use serde_json::{Value, json};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::task::Poll;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_util::io::ReaderStream;
 use tracing::{debug, info, warn};
 
-const N2_NATIVE_PROTOCOL_VERSION: &str = "n2/0.1";
-const NATIVE_RESPONSE_COLLECT_LIMIT: usize = 16 * 1024 * 1024;
-const NATIVE_UPLOAD_DRAIN_BUFFER_BYTES: usize = 256 * 1024;
-const NATIVE_UPLOAD_READER_BUFFER_BYTES: usize = 256 * 1024;
-const N2_NATIVE_MAX_UPLOAD_BODY_BYTES: u64 = MAX_FILE_SIZE as u64;
-
-#[derive(Debug)]
-struct NativeExecutionError(NativeOpResponse, Vec<u8>);
-
-impl std::fmt::Display for NativeExecutionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "native n2 operation failed with status {}",
-            self.0.status
-        )
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct FragmentObjectPayload {
-    fragment: String,
-    object_key: String,
-    #[serde(default)]
-    version_id: Option<String>,
-    #[serde(default)]
-    range: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ListObjectsPayload {
-    fragment: String,
-    #[serde(default)]
-    limit: Option<usize>,
-    #[serde(default)]
-    continuation: Option<String>,
-    #[serde(default)]
-    prefix: Option<String>,
-    #[serde(default)]
-    delimiter: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct PutObjectPayload {
-    fragment: String,
-    object_key: String,
-    #[serde(default)]
-    uid: Option<String>,
-    #[serde(default)]
-    version_id: Option<String>,
-    #[serde(default)]
-    expected_epoch: Option<u64>,
-    #[serde(default)]
-    kc: Option<u8>,
-    #[serde(default)]
-    mc: Option<u8>,
-    #[serde(default)]
-    kd: Option<u8>,
-    #[serde(default)]
-    md: Option<u8>,
-    #[serde(default)]
-    stripe_block_size: Option<usize>,
-    #[serde(default)]
-    content_type: Option<String>,
-    #[serde(default)]
-    expect_continue: bool,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct DeleteObjectPayload {
-    fragment: String,
-    object_key: String,
-    #[serde(default)]
-    version_id: Option<String>,
-    #[serde(default)]
-    expected_epoch: Option<u64>,
-    #[serde(default)]
-    purge_shards: Option<bool>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ReconcilePayload {
-    fragment: String,
-    #[serde(default)]
-    max_objects: Option<usize>,
-    #[serde(default)]
-    dry_run: Option<bool>,
-    #[serde(default)]
-    expected_epoch: Option<u64>,
-    #[serde(default)]
-    cleanup_orphans: Option<bool>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ClusterHealthPayload {
-    #[serde(default)]
-    expected_epoch: Option<u64>,
-    #[serde(default)]
-    deep: Option<bool>,
-    #[serde(default)]
-    max_fragments: Option<usize>,
-    #[serde(default)]
-    max_objects_per_fragment: Option<usize>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct FragmentHealthPayload {
-    fragment: String,
-    #[serde(default)]
-    max_objects: Option<usize>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct RepairObjectPayload {
-    fragment: String,
-    object_key: String,
-    #[serde(default)]
-    version_id: Option<String>,
-    #[serde(default)]
-    expected_epoch: Option<u64>,
-    #[serde(default)]
-    dry_run: Option<bool>,
-    #[serde(default)]
-    cleanup_orphans: Option<bool>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct RollbackMembershipPayload {
-    epoch: u64,
-}
+const NATIVE_UPLOAD_DRAIN_BUFFER_BYTES: usize = 128 * 1024;
 
 pub async fn bind_native_protocol(addr: SocketAddr) -> io::Result<TcpListener> {
     TcpListener::bind(addr).await
 }
 
-pub async fn serve_native_protocol(listener: TcpListener, addr: SocketAddr) {
+pub async fn serve_native_protocol(listener: TcpListener, addr: SocketAddr, state: Arc<AppState>) {
     info!("Native protocol => n2://{}", addr);
 
     loop {
@@ -194,8 +42,9 @@ pub async fn serve_native_protocol(listener: TcpListener, addr: SocketAddr) {
                         peer, err
                     );
                 }
+                let state = state.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, peer).await {
+                    if let Err(err) = handle_connection(stream, peer, state).await {
                         debug!("N2 native connection {} closed: {}", peer, err);
                     }
                 });
@@ -205,7 +54,11 @@ pub async fn serve_native_protocol(listener: TcpListener, addr: SocketAddr) {
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, peer: SocketAddr) -> Result<(), String> {
+async fn handle_connection(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    state: Arc<AppState>,
+) -> Result<(), String> {
     let mut session = NativeSession::default();
     loop {
         let Some(request) = read_request_control(&mut stream)
@@ -215,7 +68,7 @@ async fn handle_connection(mut stream: TcpStream, peer: SocketAddr) -> Result<()
             return Ok(());
         };
 
-        match handle_request(&mut session, peer, request, &mut stream).await {
+        match handle_request(&state, &mut session, peer, request, &mut stream).await {
             NativeRequestOutcome::Response(response) => {
                 write_response(&mut stream, &response)
                     .await
@@ -232,6 +85,7 @@ enum NativeRequestOutcome {
 }
 
 async fn handle_request(
+    state: &Arc<AppState>,
     session: &mut NativeSession,
     _peer: SocketAddr,
     request: NativeRequest,
@@ -272,7 +126,7 @@ async fn handle_request(
         "auth.fragment" => {
             match payload_as::<NativeAuthFragmentRequest>(request.payload.as_deref()) {
                 Ok(payload) => auth_fragment(session, &id, payload).await,
-                Err(err) => NativeResponse::err(id, "bad_request", err.to_string()),
+                Err(err) => NativeResponse::err(id, "bad_request", err),
             }
         }
         "session.info" => {
@@ -290,420 +144,249 @@ async fn handle_request(
             };
             NativeResponse::ok(id, payload)
         }
-        "object.get" | "object.download" => {
-            return match execute_native_download(session, request.payload.as_deref(), stream, &id)
-                .await
-            {
-                Ok(()) => NativeRequestOutcome::Written,
-                Err(err) => {
-                    NativeRequestOutcome::Response(NativeResponse::operation(id, err.0, err.1))
-                }
-            };
+        "peer.shard.put" => {
+            return handle_peer_shard_put(id, request, stream).await;
         }
-        "object.put" => {
-            return match execute_native_put(session, request, stream, &id).await {
-                Ok(response) => NativeRequestOutcome::Response(response),
-                Err(err) => {
-                    NativeRequestOutcome::Response(NativeResponse::operation(id, err.0, err.1))
-                }
-            };
+        "peer.shard.get" => {
+            return handle_peer_shard_get(id, request).await;
         }
-        op => {
-            let body = if let Some(body) = request.body {
-                Some(body.into_vec())
-            } else if let Some(body_len) = request.body_len.filter(|value| *value > 0) {
-                match read_request_body(stream, body_len).await {
-                    Ok(body) => Some(body),
-                    Err(err) => {
-                        return NativeRequestOutcome::Response(NativeResponse::err(
-                            id,
-                            "bad_request",
-                            format!("read native body failed: {err}"),
-                        ));
+        op => match payload_value(request.payload.as_deref()) {
+            Ok(payload) => {
+                if request.body.is_none()
+                    && request.body_len.unwrap_or(0) == 0
+                    && native_op_streams_response_body(op)
+                {
+                    return match execute_native_streaming_response_body(
+                        session.clone(),
+                        op,
+                        payload,
+                        stream,
+                        &id,
+                    )
+                    .await
+                    {
+                        Ok(()) => NativeRequestOutcome::Written,
+                        Err(err) => NativeRequestOutcome::Response(NativeResponse::operation(
+                            id, err.0, err.1,
+                        )),
+                    };
+                }
+
+                let result = if request.body.is_none()
+                    && request.body_len.unwrap_or(0) > 0
+                    && native_op_accepts_streaming_body(op)
+                {
+                    execute_native_streaming_body(
+                        state.clone(),
+                        session.clone(),
+                        op.to_string(),
+                        payload,
+                        request.body_len.unwrap_or(0),
+                        stream,
+                        &id,
+                    )
+                    .await
+                } else {
+                    let body = if let Some(body) = request.body {
+                        Some(body.into_vec())
+                    } else if let Some(body_len) = request.body_len.filter(|value| *value > 0) {
+                        match read_request_body(stream, body_len).await {
+                            Ok(body) => Some(body),
+                            Err(err) => {
+                                return NativeRequestOutcome::Response(NativeResponse::err(
+                                    id,
+                                    "bad_request",
+                                    format!("read native body failed: {err}"),
+                                ));
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    execute_native_op(state.clone(), session, op, payload, body).await
+                };
+
+                match result {
+                    Ok(Some((payload, body))) => NativeResponse::operation(id, payload, body),
+                    Ok(None) => {
+                        NativeResponse::err(id, "unknown_op", format!("unsupported op '{op}'"))
                     }
+                    Err(err) => NativeResponse::operation(id, err.0, err.1),
                 }
-            } else {
-                None
-            };
-            match execute_native_control_op(session, op, request.payload.as_deref(), body).await {
-                Ok((status, body)) => NativeResponse::operation(id, op_response(status), body),
-                Err(err) => NativeResponse::operation(id, err.0, err.1),
             }
-        }
+            Err(err) => NativeResponse::err(id, "bad_request", err),
+        },
     };
     NativeRequestOutcome::Response(response)
 }
 
-async fn execute_native_control_op(
-    session: &NativeSession,
-    op: &str,
-    payload: Option<&str>,
-    _body: Option<Vec<u8>>,
-) -> Result<(u16, Vec<u8>), NativeExecutionError> {
-    match op {
-        "cluster.view.public" => {
-            let query = payload_as::<ClusterViewQuery>(payload)?;
-            let response = get_n2_cluster_view_public(Query(query)).await?;
-            Ok(json_body(200, &response.0))
+async fn handle_peer_shard_put(
+    id: String,
+    request: NativeRequest,
+    stream: &mut TcpStream,
+) -> NativeRequestOutcome {
+    let payload = match payload_as::<NativePeerShardPayload>(request.payload.as_deref()) {
+        Ok(payload) => payload,
+        Err(err) => {
+            if let Some(remaining) = request.body_len.filter(|value| *value > 0) {
+                let _ = drain_native_remaining(stream, remaining).await;
+            }
+            return NativeRequestOutcome::Response(NativeResponse::err(id, "bad_request", err));
         }
-        "cluster.view" => {
-            let claims = require_claims(session)?;
-            let query = payload_as::<ClusterViewQuery>(payload)?;
-            let response = get_n2_cluster_view(claims, Query(query)).await?;
-            Ok(json_body(200, &response.0))
-        }
-        "health.cluster" => {
-            let claims = require_claims(session)?;
-            let request = payload_as::<ClusterHealthPayload>(payload)?;
-            let query = ClusterHealthQuery {
-                expected_epoch: request.expected_epoch,
-                deep: request.deep,
-                max_fragments: request.max_fragments,
-                max_objects_per_fragment: request.max_objects_per_fragment,
-            };
-            let response = get_n2_cluster_health(claims, Query(query)).await?;
-            Ok(json_body(200, &response.0))
-        }
-        "health.node" => {
-            let claims = require_claims(session)?;
-            let response = get_n2_node_health(claims).await?;
-            Ok(json_body(200, &response.0))
-        }
-        "health.fragment" => {
-            let claims = require_claims(session)?;
-            let request = payload_as::<FragmentHealthPayload>(payload)?;
-            let query = FragmentHealthQuery {
-                max_objects: request.max_objects,
-            };
-            let response =
-                get_n2_fragment_health(claims, Path(request.fragment), Query(query)).await?;
-            Ok(json_body(200, &response.0))
-        }
-        "health.object" | "object.health" | "object.status" => {
-            let claims = require_claims(session)?;
-            let request = payload_as::<FragmentObjectPayload>(payload)?;
-            let query = ObjectHealthQuery {
-                version_id: request.version_id,
-            };
-            let response = get_n2_object_health(
-                claims,
-                Path((request.fragment, request.object_key)),
-                Query(query),
-            )
-            .await?;
-            Ok(json_body(200, &response.0))
-        }
-        "governance.state" => {
-            let claims = require_claims(session)?;
-            let response = get_n2_governance_state(claims).await?;
-            Ok(json_body(200, &response.0))
-        }
-        "membership.get" => {
-            let claims = require_claims(session)?;
-            let response = get_n2_membership(claims).await?;
-            Ok(json_body(200, &response.0))
-        }
-        "membership.put" => {
-            let claims = require_claims(session)?;
-            let request = payload_as::<UpsertMembershipRequest>(payload)?;
-            let response = put_n2_membership(claims, AxumJson(request)).await?;
-            Ok(json_body(200, &response.0))
-        }
-        "membership.rollback" => {
-            let claims = require_claims(session)?;
-            let request = payload_as::<RollbackMembershipPayload>(payload)?;
-            let response = rollback_n2_membership(claims, Path(request.epoch)).await?;
-            Ok(json_body(200, &response.0))
-        }
-        "placement.resolve" => {
-            let claims = require_claims(session)?;
-            let request = payload_as::<FragmentObjectPayload>(payload)?;
-            let query = ResolvePlacementQuery {
-                uid: None,
-                version_id: request.version_id,
-                kc: None,
-                mc: None,
-            };
-            let response = resolve_n2_placement(
-                claims,
-                Path((request.fragment, request.object_key)),
-                Query(query),
-            )
-            .await?;
-            Ok(json_body(200, &response.0))
-        }
-        "object.list" => {
-            let claims = require_claims(session)?;
-            let request = payload_as::<ListObjectsPayload>(payload)?;
-            let query = ListN2ObjectsQuery {
-                limit: request.limit,
-                continuation: request.continuation,
-                prefix: request.prefix,
-                delimiter: request.delimiter,
-            };
-            let response = list_n2_objects(claims, Path(request.fragment), Query(query)).await?;
-            Ok(json_body(200, &response.0))
-        }
-        "object.versions" => {
-            let claims = require_claims(session)?;
-            let request = payload_as::<FragmentObjectPayload>(payload)?;
-            let query = ListN2VersionsQuery { limit: None };
-            let response = list_n2_object_versions(
-                claims,
-                Path((request.fragment, request.object_key)),
-                Query(query),
-            )
-            .await?;
-            Ok(json_body(200, &response.0))
-        }
-        "object.delete" => {
-            let claims = require_claims(session)?;
-            let request = payload_as::<DeleteObjectPayload>(payload)?;
-            let query = DeleteN2ObjectQuery {
-                version_id: request.version_id,
-                expected_epoch: request.expected_epoch,
-                purge_shards: request.purge_shards,
-            };
-            let response = delete_n2_object(
-                claims,
-                Path((request.fragment, request.object_key)),
-                Query(query),
-            )
-            .await?;
-            Ok(json_body(200, &response.0))
-        }
-        "object.rename" => {
-            let claims = require_claims(session)?;
-            let request = payload_as::<RenameN2ObjectRequest>(payload)?;
-            let response = rename_n2_object(claims, AxumJson(request)).await?;
-            Ok(json_body(200, &response.0))
-        }
-        "reconcile.fragment" => {
-            let claims = require_claims(session)?;
-            let request = payload_as::<ReconcilePayload>(payload)?;
-            let query = ReconcileFragmentQuery {
-                max_objects: request.max_objects,
-                dry_run: request.dry_run,
-                expected_epoch: request.expected_epoch,
-                cleanup_orphans: request.cleanup_orphans,
-            };
-            let response =
-                reconcile_n2_fragment(claims, Path(request.fragment), Query(query)).await?;
-            Ok(json_body(200, &response.0))
-        }
-        "repair.object" | "object.repair" => {
-            let claims = require_claims(session)?;
-            let request = payload_as::<RepairObjectPayload>(payload)?;
-            let query = RepairN2ObjectQuery {
-                version_id: request.version_id,
-                expected_epoch: request.expected_epoch,
-                dry_run: request.dry_run,
-                cleanup_orphans: request.cleanup_orphans,
-            };
-            let response = repair_n2_object(
-                claims,
-                Path((request.fragment, request.object_key)),
-                Query(query),
-            )
-            .await?;
-            Ok(json_body(200, &response.0))
-        }
-        _ => Err(native_error(404, format!("unsupported n2:// op '{op}'"))),
+    };
+    let body_len = request.body_len.unwrap_or(0);
+    let (result, remaining) = {
+        let mut body_reader = NativeSocketReader {
+            stream,
+            remaining: body_len,
+        };
+        let result = native_peer_put_shard_reader(payload, &mut body_reader, body_len).await;
+        (result, body_reader.remaining)
+    };
+    if remaining > 0 {
+        let _ = drain_native_remaining(stream, remaining).await;
+    }
+    match result {
+        Ok(info) => NativeRequestOutcome::Response(NativeResponse::ok(id, info)),
+        Err(err) => NativeRequestOutcome::Response(native_app_error_response(id, err)),
     }
 }
 
-async fn execute_native_put(
-    session: &NativeSession,
-    request: NativeRequest,
+async fn handle_peer_shard_get(id: String, request: NativeRequest) -> NativeRequestOutcome {
+    let payload = match payload_as::<NativePeerShardPayload>(request.payload.as_deref()) {
+        Ok(payload) => payload,
+        Err(err) => {
+            return NativeRequestOutcome::Response(NativeResponse::err(id, "bad_request", err));
+        }
+    };
+    match native_peer_get_shard_bytes(payload).await {
+        Ok(bytes) => NativeRequestOutcome::Response(native_peer_bytes_response(id, bytes)),
+        Err(err) => NativeRequestOutcome::Response(native_app_error_response(id, err)),
+    }
+}
+
+fn native_app_error_response(id: String, err: AppError) -> NativeResponse {
+    NativeResponse::operation(
+        id,
+        op_response(native_app_error_status(&err)),
+        native_body_bytes(&json!({ "error": err.to_string() })),
+    )
+}
+
+fn native_app_error_status(err: &AppError) -> u16 {
+    match err {
+        AppError::Forbidden(_) => 403,
+        AppError::Unauthorized => 401,
+        AppError::BadRequest(_) => 400,
+        AppError::PayloadTooLarge(_) => 413,
+        AppError::Conflict(_) => 409,
+        AppError::NotFound => 404,
+        AppError::ServiceUnavailable(_) => 503,
+        _ => 500,
+    }
+}
+
+async fn execute_native_streaming_body(
+    state: Arc<AppState>,
+    session: NativeSession,
+    op: String,
+    mut payload: Value,
+    body_len: u64,
     stream: &mut TcpStream,
     request_id: &str,
-) -> Result<NativeResponse, NativeExecutionError> {
-    let claims = require_claims(session)?;
-    let payload = payload_as::<PutObjectPayload>(request.payload.as_deref())?;
-    let body_len = request.body_len.unwrap_or_else(|| {
-        request
-            .body
-            .as_ref()
-            .map(|body| body.len() as u64)
-            .unwrap_or(0)
-    });
-    if body_len > N2_NATIVE_MAX_UPLOAD_BODY_BYTES {
-        return Err(native_error(
+) -> Result<Option<(NativeOpResponse, Vec<u8>)>, NativeExecutionError> {
+    if body_len as u128 > MAX_NATIVE_BODY_BYTES as u128 {
+        return Err(native_protocol_error(
             413,
-            format!("native upload body exceeds {N2_NATIVE_MAX_UPLOAD_BODY_BYTES} bytes"),
+            format!("native body exceeds {MAX_NATIVE_BODY_BYTES} bytes"),
         ));
     }
 
-    if payload.expect_continue {
-        let continue_response =
-            NativeResponse::operation(request_id.to_string(), op_response(100), Vec::new());
-        write_response(stream, &continue_response)
-            .await
-            .map_err(|err| native_error(500, format!("native continue write failed: {err}")))?;
-    }
-
-    let mut headers = HeaderMap::new();
-    if let Some(content_type) = payload.content_type.as_ref() {
-        if let Ok(value) = HeaderValue::from_str(content_type) {
-            headers.insert(CONTENT_TYPE, value);
-        }
-    }
-
-    let query = PutObjectQuery {
-        uid: payload.uid,
-        version_id: payload.version_id,
-        expected_epoch: payload.expected_epoch,
-        kc: payload.kc,
-        mc: payload.mc,
-        kd: payload.kd,
-        md: payload.md,
-        stripe_block_size: payload.stripe_block_size,
-        content_type: payload.content_type,
-    };
-
-    let fragment = payload.fragment;
-    let object_key = payload.object_key;
-
-    let result = if let Some(body) = request.body {
-        let body_stream = stream::iter(vec![Ok(Bytes::from(body.into_vec()))]);
-        put_n2_object_stream(claims, headers, fragment, object_key, query, body_stream).await
-    } else if body_len > 0 {
-        let (result, remaining) = {
-            let mut body_reader = NativeSocketReader {
-                stream,
-                remaining: body_len,
-            };
-            let body_stream =
-                ReaderStream::with_capacity(&mut body_reader, NATIVE_UPLOAD_READER_BUFFER_BYTES)
-                    .map(|chunk_result| {
-                        chunk_result.map_err(|err| {
-                            AppError::Io(err, "read native n2 upload body".to_string())
-                        })
-                    });
-            let result =
-                put_n2_object_stream(claims, headers, fragment, object_key, query, body_stream)
-                    .await;
-            (result, body_reader.remaining)
-        };
-        if remaining > 0 {
-            drain_native_remaining(stream, remaining)
-                .await
-                .map_err(|err| {
-                    native_error(400, format!("drain native upload body failed: {err}"))
-                })?;
-        }
-        result
-    } else {
-        let body_stream = stream::empty::<Result<Bytes, AppError>>();
-        put_n2_object_stream(claims, headers, fragment, object_key, query, body_stream).await
-    };
-
-    let response = result?;
-    Ok(NativeResponse::operation(
-        request_id.to_string(),
-        op_response(200),
-        native_body_bytes(&response.0),
-    ))
-}
-
-async fn execute_native_download(
-    session: &NativeSession,
-    payload: Option<&str>,
-    stream: &mut TcpStream,
-    request_id: &str,
-) -> Result<(), NativeExecutionError> {
-    let claims = require_claims(session)?;
-    let request = payload_as::<FragmentObjectPayload>(payload)?;
-    let mut headers = HeaderMap::new();
-    if let Some(range) = request.range.as_ref() {
-        if let Ok(value) = HeaderValue::from_str(range) {
-            headers.insert(RANGE, value);
-        }
-    }
-    let query = GetObjectQuery {
-        version_id: request.version_id,
-    };
-    let response = get_n2_object(
-        claims,
-        headers,
-        Path((request.fragment, request.object_key)),
-        Query(query),
-    )
-    .await?
-    .into_response();
-    stream_response(response, stream, request_id).await
-}
-
-async fn stream_response(
-    response: Response,
-    stream: &mut TcpStream,
-    request_id: &str,
-) -> Result<(), NativeExecutionError> {
-    let status = response.status().as_u16();
-    let mut payload_headers = serde_json::Map::new();
-    for (name, value) in response.headers() {
-        if let Ok(value) = value.to_str() {
-            payload_headers.insert(name.as_str().to_string(), Value::String(value.to_string()));
-        }
-    }
-
-    let body_len = response
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok());
-    let payload = json!({
-        "headers": payload_headers,
-    });
-
-    if let Some(body_len) = body_len {
-        let native_response = NativeResponse {
-            id: request_id.to_string(),
-            ok: status < 400,
-            status: Some(status),
-            payload: Some(serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into())),
-            body: None,
-            body_len: Some(body_len),
-            error: None,
-        };
-        write_response(stream, &native_response)
-            .await
-            .map_err(|err| {
-                native_error(500, format!("native download control write failed: {err}"))
-            })?;
-        let mut body_stream = response.into_body().into_data_stream();
-        while let Some(chunk_result) = body_stream.next().await {
-            let chunk = chunk_result.map_err(|err| {
-                native_error(500, format!("native download body read failed: {err}"))
-            })?;
-            if !chunk.is_empty() {
-                stream.write_all(&chunk).await.map_err(|err| {
-                    native_error(500, format!("native download socket write failed: {err}"))
-                })?;
+    let pre_gate = if bool_value(payload.get("expect_continue")).unwrap_or(false) {
+        let guard = acquire_native_upload_continue_gate(&session, &op, &payload).await?;
+        if guard.is_some() {
+            if let Value::Object(ref mut map) = payload {
+                map.insert("io_gate".to_string(), Value::Bool(false));
             }
         }
-        stream.flush().await.map_err(|err| {
-            native_error(500, format!("native download socket flush failed: {err}"))
-        })?;
-        Ok(())
-    } else {
-        let bytes = to_bytes(response.into_body(), NATIVE_RESPONSE_COLLECT_LIMIT)
-            .await
-            .map_err(|err| native_error(500, format!("native body collect failed: {err}")))?;
-        let native_response = NativeResponse {
-            id: request_id.to_string(),
-            ok: status < 400,
-            status: Some(status),
-            payload: Some(serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into())),
-            body: Some(serde_bytes::ByteBuf::from(bytes.to_vec())),
-            body_len: None,
-            error: None,
-        };
-        write_response(stream, &native_response)
+        let continue_response = NativeResponse::operation(
+            request_id.to_string(),
+            NativeOpResponse { status: 100 },
+            Vec::new(),
+        );
+        write_response(stream, &continue_response)
             .await
             .map_err(|err| {
-                native_error(500, format!("native download response write failed: {err}"))
-            })
+                native_protocol_error(500, format!("native continue write failed: {err}"))
+            })?;
+        guard
+    } else {
+        None
+    };
+
+    let (result, remaining) = {
+        let mut body_reader = NativeSocketReader {
+            stream,
+            remaining: body_len,
+        };
+        let result = execute_native_streaming_reader(
+            state,
+            &session,
+            &op,
+            payload,
+            &mut body_reader,
+            body_len,
+        )
+        .await;
+        (result, body_reader.remaining)
+    };
+
+    if remaining > 0 {
+        if let Err(err) = drain_native_remaining(stream, remaining).await {
+            return Err(native_protocol_error(
+                400,
+                format!("drain native upload body failed: {err}"),
+            ));
+        }
+    }
+
+    drop(pre_gate);
+    result
+}
+
+async fn execute_native_streaming_response_body(
+    session: NativeSession,
+    op: &str,
+    payload: Value,
+    stream: &mut TcpStream,
+    request_id: &str,
+) -> Result<(), NativeExecutionError> {
+    match op {
+        "object.download_stream" | "download.stream" | "object.view_stream" => {
+            let plan = prepare_native_download_stream(&session, payload)
+                .await
+                .map_err(native_app_error_for_continue)?;
+            let response = NativeResponse {
+                id: request_id.to_string(),
+                ok: true,
+                status: Some(200),
+                payload: Some(serde_json::to_string(&plan.payload).unwrap_or_else(|_| "{}".into())),
+                body: None,
+                body_len: Some(plan.body_len),
+                error: None,
+            };
+            write_response(stream, &response).await.map_err(|err| {
+                native_protocol_error(500, format!("native download control write failed: {err}"))
+            })?;
+            stream_native_download_plan(stream, plan)
+                .await
+                .map_err(native_app_error_for_continue)?;
+            Ok(())
+        }
+        _ => Err(native_protocol_error(
+            400,
+            format!("op '{op}' does not stream a native response body"),
+        )),
     }
 }
 
@@ -717,37 +400,39 @@ impl AsyncRead for NativeSocketReader<'_> {
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+    ) -> std::task::Poll<io::Result<()>> {
         let this = self.get_mut();
         if this.remaining == 0 {
-            return Poll::Ready(Ok(()));
+            return std::task::Poll::Ready(Ok(()));
         }
 
         let cap = buf.remaining();
         if cap == 0 {
-            return Poll::Ready(Ok(()));
+            return std::task::Poll::Ready(Ok(()));
         }
 
         let allowed = this.remaining.min(cap as u64) as usize;
         let mut limited = buf.take(allowed);
         match Pin::new(&mut *this.stream).poll_read(cx, &mut limited) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(())) => {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(Ok(())) => {
                 let read = limited.filled().len();
                 if read == 0 {
-                    return Poll::Ready(Err(io::Error::new(
+                    return std::task::Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
-                        "native n2 upload body ended early",
+                        "native upload body ended early",
                     )));
                 }
+                // The limited child ReadBuf filled bytes inside the parent unfilled
+                // region. Reflect that initialization before advancing the parent.
                 unsafe {
                     buf.assume_init(read);
                 }
                 buf.advance(read);
                 this.remaining = this.remaining.saturating_sub(read as u64);
-                Poll::Ready(Ok(()))
+                std::task::Poll::Ready(Ok(()))
             }
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),
         }
     }
 }
@@ -760,7 +445,7 @@ async fn drain_native_remaining(stream: &mut TcpStream, mut remaining: u64) -> i
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "native n2 upload body ended early",
+                "native upload body ended early",
             ));
         }
         remaining = remaining.saturating_sub(read as u64);
@@ -768,13 +453,130 @@ async fn drain_native_remaining(stream: &mut TcpStream, mut remaining: u64) -> i
     Ok(())
 }
 
-fn require_claims(
+fn native_op_accepts_streaming_body(op: &str) -> bool {
+    matches!(
+        op,
+        "upload.one_shot"
+            | "object.upload.one_shot"
+            | "multipart.put_part"
+            | "upload.multipart.put_part"
+    )
+}
+
+fn native_op_streams_response_body(op: &str) -> bool {
+    matches!(
+        op,
+        "object.download_stream" | "download.stream" | "object.view_stream"
+    )
+}
+
+async fn acquire_native_upload_continue_gate(
     session: &NativeSession,
-) -> Result<crate::structs::auth_structs::Claims, NativeExecutionError> {
-    session
-        .claims()
-        .cloned()
-        .ok_or_else(|| native_error(401, "native n2 operation requires authentication"))
+    op: &str,
+    payload: &Value,
+) -> Result<Option<AdaptiveIoGuard>, NativeExecutionError> {
+    let Some(claims) = session.claims() else {
+        return Err(native_protocol_error(
+            401,
+            "native upload requires authentication",
+        ));
+    };
+    if !claims.write {
+        return Err(native_protocol_error(403, "Write permission required"));
+    }
+
+    let io_gate_override = bool_value(payload.get("io_gate"));
+    if matches!(io_gate_override, Some(false)) {
+        return Ok(None);
+    }
+
+    let context = match op {
+        "upload.one_shot" | "object.upload.one_shot" => {
+            let object_key =
+                string_value(payload.get("object_key")).unwrap_or_else(|| "<missing>".to_string());
+            format!(
+                "native continue fragment={}, object_key={}",
+                claims.fragment, object_key
+            )
+        }
+        "multipart.put_part" | "upload.multipart.put_part" => {
+            let version_id =
+                string_value(payload.get("version_id")).unwrap_or_else(|| "<missing>".to_string());
+            let part_index = payload
+                .get("part_index")
+                .and_then(Value::as_u64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<missing>".to_string());
+            format!(
+                "native continue fragment={}, version={}, part={}",
+                claims.fragment, version_id, part_index
+            )
+        }
+        _ => return Ok(None),
+    };
+
+    acquire_upload_io_guard_for_query(io_gate_override, &claims.fragment, &context)
+        .await
+        .map_err(native_app_error_for_continue)
+}
+
+fn native_app_error_for_continue(err: AppError) -> NativeExecutionError {
+    let status = match err {
+        AppError::Forbidden(_) => 403,
+        AppError::Unauthorized => 401,
+        AppError::BadRequest(_) => 400,
+        AppError::PayloadTooLarge(_) => 413,
+        AppError::Conflict(_) => 409,
+        AppError::NotFound => 404,
+        AppError::ServiceUnavailable(_) => 503,
+        _ => 500,
+    };
+    native_protocol_error(status, err)
+}
+
+fn native_protocol_error(status: u16, error: impl std::fmt::Display) -> NativeExecutionError {
+    NativeExecutionError(
+        crate::protocol::ops::op_response(status),
+        crate::protocol::ops::native_body_bytes(&json!({ "error": error.to_string() })),
+    )
+}
+
+fn bool_value(value: Option<&Value>) -> Option<bool> {
+    match value? {
+        Value::Bool(value) => Some(*value),
+        Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        },
+        Value::Number(value) => value.as_u64().map(|value| value != 0),
+        _ => None,
+    }
+}
+
+fn string_value(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(value) => Some(value.clone()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn payload_value(payload: Option<&str>) -> Result<Value, String> {
+    match payload {
+        Some(payload) if !payload.trim().is_empty() => {
+            serde_json::from_str(payload).map_err(|err| format!("invalid payload json: {err}"))
+        }
+        _ => Ok(Value::Null),
+    }
+}
+
+fn payload_as<T>(payload: Option<&str>) -> Result<T, String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_value(payload_value(payload)?).map_err(|err| err.to_string())
 }
 
 async fn auth_fragment(
@@ -782,94 +584,37 @@ async fn auth_fragment(
     id: &str,
     payload: NativeAuthFragmentRequest,
 ) -> NativeResponse {
-    let body = match authorize_fragment_core(AuthorizationRequest {
-        fragment: payload.fragment,
-        secret: payload.secret,
-        read: payload.read,
-        write: payload.write,
-        modify: payload.modify,
-        delete: payload.delete,
-        expires_in: payload.expires_in,
-    })
+    let body = match crate::middleware::auth_middleware::authorize_fragment_core(
+        crate::structs::auth_structs::AuthorizationRequest {
+            fragment: payload.fragment,
+            secret: payload.secret,
+            read: payload.read,
+            write: payload.write,
+            modify: payload.modify,
+            delete: payload.delete,
+            expires_in: payload.expires_in,
+        },
+    )
     .await
     {
         Ok(body) => body,
         Err(err) => {
             return NativeResponse::operation(
                 id,
-                op_response(401),
-                native_body_bytes(&json!({"error": format!("{err:?}")})),
+                crate::protocol::ops::auth_error_response(&err),
+                crate::protocol::ops::native_body_bytes(&json!({
+                    "error": crate::protocol::ops::auth_error_message(&err)
+                })),
             );
         }
     };
     let token = body.access_token.clone();
-    if let Err(err) = session.set_bearer(token) {
+    if let Err(err) = session.set_bearer(token.to_string()) {
         return NativeResponse::err(id, "auth.invalid_token", err);
     }
-    NativeResponse::operation(id, op_response(200), native_body_bytes(&body))
-}
-
-fn payload_value(payload: Option<&str>) -> Result<Value, NativeExecutionError> {
-    match payload {
-        Some(payload) if !payload.trim().is_empty() => serde_json::from_str(payload)
-            .map_err(|err| native_error(400, format!("invalid payload json: {err}"))),
-        _ => Ok(Value::Null),
-    }
-}
-
-fn payload_as<T>(payload: Option<&str>) -> Result<T, NativeExecutionError>
-where
-    T: DeserializeOwned,
-{
-    serde_json::from_value(payload_value(payload)?).map_err(|err| native_error(400, err))
-}
-
-fn json_body<T: Serialize>(status: u16, value: &T) -> (u16, Vec<u8>) {
-    (status, native_body_bytes(value))
-}
-
-fn native_body_bytes<T: Serialize>(value: &T) -> Vec<u8> {
-    rmp_serde::to_vec(value).unwrap_or_else(|_| Vec::new())
-}
-
-fn op_response(status: u16) -> NativeOpResponse {
-    NativeOpResponse { status }
-}
-
-fn native_error(status: u16, error: impl std::fmt::Display) -> NativeExecutionError {
-    NativeExecutionError(
-        op_response(status),
-        native_body_bytes(&json!({"error": error.to_string()})),
+    NativeResponse::operation(
+        id,
+        crate::protocol::ops::op_response(200),
+        crate::protocol::ops::native_body_bytes(&body),
     )
-}
-
-impl From<AppError> for NativeExecutionError {
-    fn from(err: AppError) -> Self {
-        let status = match err {
-            AppError::BadRequest(_) => 400,
-            AppError::Unauthorized => 401,
-            AppError::Forbidden(_) => 403,
-            AppError::NotFound => 404,
-            AppError::Conflict(_) => 409,
-            AppError::PayloadTooLarge(_) => 413,
-            AppError::RangeNotSatisfiable => 416,
-            AppError::InsufficientStorage => 507,
-            AppError::ServiceUnavailable(_) => 503,
-            AppError::Timeout(_) => 408,
-            AppError::Io(_, _) | AppError::Multipart(_) | AppError::InternalServerError(_) => 500,
-        };
-        native_error(status, err)
-    }
-}
-
-impl From<serde_json::Error> for NativeExecutionError {
-    fn from(err: serde_json::Error) -> Self {
-        native_error(400, err)
-    }
-}
-
-impl From<rmp_serde::encode::Error> for NativeExecutionError {
-    fn from(err: rmp_serde::encode::Error) -> Self {
-        native_error(500, err)
-    }
 }

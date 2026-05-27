@@ -2268,31 +2268,38 @@ dependencies = [
 
 [[package]]
 name = "n2"
-version = "0.7.1"
+version = "0.11.0"
 dependencies = [
  "argon2",
+ "async_zip",
  "axum",
  "axum-extra",
  "axum-server",
+ "base64",
  "bytes",
  "chrono",
  "core_affinity",
  "crc32fast",
+ "dashmap",
  "dotenv",
  "futures-util",
  "governor",
+ "headers",
  "hex",
+ "hmac",
  "hostname",
  "io-uring",
  "jsonwebtoken",
  "libc",
- "n1",
+ "md4",
+ "mime_guess",
  "once_cell",
  "percent-encoding",
  "rand 0.8.5",
  "reqwest",
  "rmp-serde",
  "rust-ini",
+ "rustix",
  "rustls",
  "serde",
  "serde_bytes",
@@ -2301,6 +2308,7 @@ dependencies = [
  "simd-erasure-core",
  "tokio",
  "tokio-stream",
+ "tokio-tar",
  "tokio-util",
  "tower",
  "tower-http",
@@ -2311,21 +2319,6 @@ dependencies = [
  "ulid",
  "uuid",
  "walkdir",
-]
-
-[[package]]
-name = "n2_cli"
-version = "0.3.0"
-dependencies = [
- "assert_cmd",
- "axum",
- "chrono",
- "clap",
- "cli_core",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]

@@ -1,9 +1,11 @@
-pub use n1::{core, enums, fs, handlers, middleware, statics, structs, utils, websocket};
+pub use n2::*;
 
 use crate::core::adaptive_concurrency::{
     ADAPTIVE_CONCURRENCY_ENABLED_ATOMIC, ADAPTIVE_CONCURRENCY_INTERVAL_MS_ATOMIC,
 };
 use crate::core::disk_manager::{BLOB_STORE_DISKS, FS_STORAGE_ROOT, INDEX_STORE_DISKS};
+use crate::core::fragment_metadata::set_configured_index_partition_count;
+use crate::core::io_scheduler::{DiskIoSchedulerConfig, configure_disk_io_scheduler};
 use crate::core::monitoring::{
     MONITOR_DEEP_SCAN_INTERVAL_SECS_ATOMIC, MONITOR_INTERVAL_SECS_ATOMIC,
 };
@@ -19,16 +21,12 @@ use crate::core::upload::{
     PARITY_SHARDS_ATOMIC, STRIPE_SIZE_ATOMIC, UPLOAD_IO_GATE_ENABLED_ATOMIC,
     UPLOAD_STRICT_DURABILITY_DEFAULT_ATOMIC, WRITER_BUFFER_SIZE_ATOMIC,
 };
-use crate::distribution_core::config::{n2_runtime_config, resolve_effective_cross_params};
-use crate::distribution_core::data_plane::{
-    schedule_n2_auto_maintenance, start_n2_auto_maintenance_loop,
-};
-use crate::distribution_core::governance::{governance_state_view, initialize_governance_runtime};
-use crate::distribution_core::state::{get_cluster_view, get_membership};
+use crate::distribution::init_cluster_runtime;
 use crate::fs::cleanup_manager::interval_cleanup;
 use crate::fs::fs_constants::STORAGE_ROOT;
 use crate::handlers::error_handlers::handler_404;
-use crate::routes::storage_routes::serve_storage_routes;
+use crate::protocol::{bind_native_protocol, serve_native_protocol};
+use crate::routes::storage_routes::{apply_runtime_http_layers, build_storage_routes_unbound};
 use crate::settings::constants::{CONFIG_FILE, ENV_FILE};
 use crate::utils::date_time_formatter::LocalTimer;
 use crate::validation::enforce_init_settings::{ensure_config_file, ensure_env_file};
@@ -36,7 +34,6 @@ use axum::Router;
 use axum_server::tls_rustls::RustlsConfig;
 use chrono::Local;
 use ini::Ini;
-use n1::settings::constants::{CONFIG_FILE as EDGE_CONFIG_FILE, ENV_FILE as EDGE_ENV_FILE};
 use std::collections::HashSet;
 use std::fs as stdfs;
 use std::fs::OpenOptions;
@@ -51,15 +48,41 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
-mod distribution_core;
-mod protocol;
-mod routes;
-mod settings;
-mod validation;
 fn detect_cpu_cores() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeThreadConfig {
+    worker_threads: usize,
+    max_blocking_threads: usize,
+    thread_stack_bytes: usize,
+}
+
+fn parse_env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
+fn runtime_thread_config(cpu_cores: usize) -> RuntimeThreadConfig {
+    let worker_threads = parse_env_usize("N2_RUNTIME_WORKER_THREADS")
+        .unwrap_or_else(|| cpu_cores.clamp(2, 16))
+        .clamp(1, 64);
+    let max_blocking_threads = parse_env_usize("N2_RUNTIME_MAX_BLOCKING_THREADS")
+        .unwrap_or_else(|| cpu_cores.saturating_mul(4).clamp(16, 32))
+        .clamp(8, 128);
+    let thread_stack_bytes = parse_env_usize("N2_RUNTIME_THREAD_STACK_BYTES")
+        .unwrap_or(1024 * 1024)
+        .clamp(512 * 1024, 8 * 1024 * 1024);
+
+    RuntimeThreadConfig {
+        worker_threads,
+        max_blocking_threads,
+        thread_stack_bytes,
+    }
 }
 
 fn align_up_4k(v: usize) -> usize {
@@ -78,17 +101,23 @@ fn adaptive_max_concurrent_io(
     blob_disks: usize,
     ram_bytes: Option<u64>,
 ) -> usize {
-    let core_cap = (cpu_cores.saturating_mul(6)).clamp(6, 192);
-    let disk_cap = (blob_disks.max(1).saturating_mul(12)).clamp(6, 192);
+    let core_cap = (cpu_cores.saturating_mul(2)).clamp(1, 64);
+    let disk_cap = match blob_disks {
+        0 | 1 => 1,
+        2 => 2,
+        3 => 4,
+        4 => 6,
+        _ => blob_disks.saturating_mul(2),
+    }
+    .clamp(1, 64);
     let ram_cap = match ram_gib(ram_bytes) {
-        0..=4 => 8,
-        5..=8 => 16,
-        9..=16 => 24,
-        17..=32 => 32,
-        33..=64 => 48,
-        _ => 64,
+        0..=4 => 2,
+        5..=8 => 4,
+        9..=16 => 8,
+        17..=32 => 20,
+        _ => 24,
     };
-    core_cap.min(disk_cap).min(ram_cap).clamp(4, 192)
+    core_cap.min(disk_cap).min(ram_cap).clamp(1, 64)
 }
 
 fn adaptive_writer_buffer_size(
@@ -150,28 +179,67 @@ fn adaptive_upload_memory_budget_bytes(
     total_shards: usize,
 ) -> usize {
     let mut budget: usize = match ram_gib(ram_bytes) {
-        0..=4 => 48usize * 1024 * 1024,
-        5..=8 => 64usize * 1024 * 1024,
-        9..=16 => 96usize * 1024 * 1024,
-        17..=32 => 128usize * 1024 * 1024,
-        33..=64 => 192usize * 1024 * 1024,
-        _ => 256usize * 1024 * 1024,
+        0..=4 => 32usize * 1024 * 1024,
+        5..=8 => 48usize * 1024 * 1024,
+        9..=16 => 64usize * 1024 * 1024,
+        17..=32 => 80usize * 1024 * 1024,
+        _ => 96usize * 1024 * 1024,
     };
 
     if cpu_cores >= 24 {
-        budget = budget.saturating_add(32usize * 1024 * 1024);
+        budget = budget.saturating_add(16usize * 1024 * 1024);
     }
     if total_shards >= 4 {
-        budget = budget.saturating_add(32usize * 1024 * 1024);
+        budget = budget.saturating_add(16usize * 1024 * 1024);
     }
 
     if blob_disks <= 1 {
-        budget = budget.min(96usize * 1024 * 1024);
+        budget = budget.min(64usize * 1024 * 1024);
     } else if blob_disks == 2 {
-        budget = budget.min(160usize * 1024 * 1024);
+        budget = budget.min(96usize * 1024 * 1024);
     }
 
-    budget.clamp(48usize * 1024 * 1024, 384usize * 1024 * 1024)
+    budget.clamp(32usize * 1024 * 1024, 128usize * 1024 * 1024)
+}
+
+fn raise_open_file_limit_for_storage() {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
+    if rc != 0 {
+        tracing::warn!("Open-file limit: unable to inspect process limit");
+        return;
+    }
+
+    let mut limit = unsafe { limit.assume_init() };
+    if limit.rlim_cur == libc::RLIM_INFINITY {
+        return;
+    }
+
+    let desired = if limit.rlim_max == libc::RLIM_INFINITY {
+        1_048_576 as libc::rlim_t
+    } else {
+        limit.rlim_max
+    };
+    if desired <= limit.rlim_cur {
+        return;
+    }
+
+    let previous = limit.rlim_cur;
+    limit.rlim_cur = desired;
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+    if rc == 0 {
+        tracing::info!(
+            "Open-file limit: raised soft limit from {} to {} for N2 storage index",
+            previous,
+            desired
+        );
+    } else {
+        tracing::warn!(
+            "Open-file limit: unable to raise soft limit from {} to {}; N2 index directory concurrency may be capped",
+            previous,
+            desired
+        );
+    }
 }
 
 fn estimate_upload_part_working_set_bytes(
@@ -218,12 +286,11 @@ fn adaptive_stream_readahead_bytes(chunk_size: usize, ram_bytes: Option<u64>) ->
 
 fn adaptive_stream_memory_budget_bytes(ram_bytes: Option<u64>) -> usize {
     match ram_gib(ram_bytes) {
-        0..=4 => 48 * 1024 * 1024,
-        5..=8 => 64 * 1024 * 1024,
-        9..=16 => 96 * 1024 * 1024,
-        17..=32 => 128 * 1024 * 1024,
-        33..=64 => 192 * 1024 * 1024,
-        _ => 256 * 1024 * 1024,
+        0..=4 => 32 * 1024 * 1024,
+        5..=8 => 48 * 1024 * 1024,
+        9..=16 => 64 * 1024 * 1024,
+        17..=32 => 80 * 1024 * 1024,
+        _ => 96 * 1024 * 1024,
     }
 }
 
@@ -234,14 +301,14 @@ fn adaptive_stream_max_concurrency(
     chunk_size: usize,
     readahead_bytes: usize,
 ) -> usize {
-    let core_cap = (cpu_cores.saturating_mul(12)).clamp(12, 768);
-    let disk_cap = (blob_disks.max(1).saturating_mul(64)).clamp(16, 768);
+    let core_cap = (cpu_cores.saturating_mul(8)).clamp(8, 256);
+    let disk_cap = (blob_disks.max(1).saturating_mul(32)).clamp(8, 256);
     let per_stream = chunk_size
         .saturating_add(readahead_bytes)
         .saturating_add(64 * 1024)
         .max(1);
-    let mem_cap = (adaptive_stream_memory_budget_bytes(ram_bytes) / per_stream).clamp(8, 768);
-    core_cap.min(disk_cap).min(mem_cap).clamp(8, 768)
+    let mem_cap = (adaptive_stream_memory_budget_bytes(ram_bytes) / per_stream).clamp(4, 256);
+    core_cap.min(disk_cap).min(mem_cap).clamp(4, 256)
 }
 
 fn normalize_fs_backed_disk_paths(role: &str, paths: Vec<String>) -> Vec<String> {
@@ -267,14 +334,14 @@ fn normalize_fs_backed_disk_paths(role: &str, paths: Vec<String>) -> Vec<String>
             let ft = meta.file_type();
             if ft.is_block_device() || ft.is_char_device() {
                 panic!(
-                    "{} entry '{}' is a device. N2 uses the N1 storage kernel and requires directory paths.",
+                    "{} entry '{}' is a device. N2 requires mounted directory paths.",
                     role, trimmed
                 );
             }
         }
         if !meta.is_dir() {
             panic!(
-                "{} entry '{}' is not a directory. N2 uses the N1 storage kernel and requires directory paths.",
+                "{} entry '{}' is not a directory. N2 requires directory paths.",
                 role, trimmed
             );
         }
@@ -328,35 +395,18 @@ fn detect_unique_storage_devices(paths: &[String]) -> usize {
 }
 
 fn adaptive_concurrency_interval_ms(cpu_cores: usize, ram_bytes: Option<u64>) -> usize {
-    if cpu_cores <= 2 || ram_gib(ram_bytes) <= 4 {
-        1500
-    } else if cpu_cores <= 4 || ram_gib(ram_bytes) <= 8 {
-        1200
-    } else if cpu_cores <= 8 {
-        1000
-    } else {
-        750
-    }
+    let _ = (cpu_cores, ram_bytes);
+    60_000
 }
 
 fn adaptive_monitor_interval_seconds(cpu_cores: usize, ram_bytes: Option<u64>) -> usize {
-    if cpu_cores <= 2 || ram_gib(ram_bytes) <= 4 {
-        5
-    } else if cpu_cores <= 4 || ram_gib(ram_bytes) <= 8 {
-        3
-    } else {
-        2
-    }
+    let _ = (cpu_cores, ram_bytes);
+    300
 }
 
 fn adaptive_monitor_deep_scan_interval_seconds(cpu_cores: usize, ram_bytes: Option<u64>) -> usize {
-    if cpu_cores <= 2 || ram_gib(ram_bytes) <= 4 {
-        180
-    } else if cpu_cores <= 4 || ram_gib(ram_bytes) <= 8 {
-        120
-    } else {
-        60
-    }
+    let _ = (cpu_cores, ram_bytes);
+    3600
 }
 
 fn parse_usize_or_auto(raw: Option<&str>, key: &str, auto_value: usize) -> usize {
@@ -391,13 +441,25 @@ fn is_auto_or_empty(raw: Option<&str>) -> bool {
     }
 }
 
+fn parse_index_partition_count(raw: Option<&str>) -> u16 {
+    match raw.map(str::trim) {
+        None | Some("") => {
+            panic!("index_config.partition_count must be explicitly set to one of: 32, 64, 256")
+        }
+        Some(v) => match v.parse::<u16>() {
+            Ok(32 | 64 | 256) => v.parse::<u16>().expect("validated above"),
+            _ => panic!("index_config.partition_count must be one of: 32, 64, 256"),
+        },
+    }
+}
+
 pub fn init_tracing() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
     let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stderr());
 
     tracing_subscriber::registry()
         .with(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,n2=trace,litiaina_n2=trace,axum=info,hyper=info".into()),
+                .unwrap_or_else(|_| "info,litiaina_n2=trace,axum=info,hyper=info".into()),
         )
         .with(
             fmt::layer()
@@ -413,269 +475,6 @@ pub fn init_tracing() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
         .try_init()?;
 
     Ok(guard)
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    host.parse::<IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
-}
-
-fn parse_https_url(raw: &str, label: &str) -> Result<reqwest::Url, String> {
-    let parsed = reqwest::Url::parse(raw)
-        .map_err(|e| format!("{label} '{}' is not a valid URL: {}", raw, e))?;
-    if parsed.scheme() != "https" {
-        return Err(format!("{label} '{}' must use https", raw));
-    }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| format!("{label} '{}' is missing a host", raw))?;
-    if host.trim().is_empty() {
-        return Err(format!("{label} '{}' is missing a usable host", raw));
-    }
-    if parsed.port_or_known_default().is_none() {
-        return Err(format!("{label} '{}' is missing a port", raw));
-    }
-    Ok(parsed)
-}
-
-fn ensure_edge_kernel_runtime_alias(
-    source: &Path,
-    alias: &Path,
-    label: &str,
-) -> Result<(), String> {
-    if alias.exists() {
-        return Ok(());
-    }
-    if !source.exists() {
-        return Err(format!("{label} source '{}' is missing", source.display()));
-    }
-    if let Some(parent) = alias.parent() {
-        stdfs::create_dir_all(parent).map_err(|err| {
-            format!(
-                "{label} parent '{}' could not be created: {}",
-                parent.display(),
-                err
-            )
-        })?;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::symlink;
-
-        match symlink(source, alias) {
-            Ok(_) => return Ok(()),
-            Err(err) => {
-                tracing::warn!(
-                    "N2 N1-kernel runtime guard could not create symlink '{}' -> '{}': {}. Falling back to a copy.",
-                    alias.display(),
-                    source.display(),
-                    err
-                );
-            }
-        }
-    }
-
-    stdfs::copy(source, alias).map_err(|err| {
-        format!(
-            "{label} '{}' could not be created from '{}': {}",
-            alias.display(),
-            source.display(),
-            err
-        )
-    })?;
-    Ok(())
-}
-
-fn ensure_edge_kernel_runtime_files() -> Result<(), String> {
-    ensure_edge_kernel_runtime_alias(
-        Path::new(ENV_FILE),
-        Path::new(EDGE_ENV_FILE),
-        "N2 N1-kernel env runtime file",
-    )?;
-    ensure_edge_kernel_runtime_alias(
-        Path::new(CONFIG_FILE),
-        Path::new(EDGE_CONFIG_FILE),
-        "N2 N1-kernel config runtime file",
-    )?;
-    Ok(())
-}
-
-async fn validate_n2_startup_layout(config: &Ini, local_blob_roots: usize) {
-    let cfg = n2_runtime_config();
-    if !cfg.membership_file.exists() {
-        panic!(
-            "N2 startup guard requires a membership file at '{}'. Multi-node N2 will not auto-invent membership.",
-            cfg.membership_file.display()
-        );
-    }
-    ensure_readable_file(cfg.membership_file.as_path(), "N2 membership file").unwrap_or_else(|e| {
-        panic!(
-            "N2 startup guard rejected membership file '{}': {}",
-            cfg.membership_file.display(),
-            e
-        )
-    });
-    if cfg.internal_token.trim().is_empty()
-        || cfg.internal_token.trim() == "change-me-n2-internal-token"
-        || cfg.internal_token.trim().len() < 24
-    {
-        panic!(
-            "N2 startup guard requires a non-placeholder [n2].internal_token with at least 24 characters"
-        );
-    }
-    let local_endpoint = parse_https_url(&cfg.node_endpoint, "N2 node_endpoint")
-        .unwrap_or_else(|e| panic!("N2 startup guard rejected node_id='{}': {}", cfg.node_id, e));
-    let cluster_view = get_cluster_view(None).await.unwrap_or_else(|e| {
-        panic!(
-            "N2 startup guard failed to load cluster membership from '{}': {}",
-            cfg.membership_file.display(),
-            e
-        )
-    });
-
-    if !cluster_view.write_ready {
-        let reason = if cluster_view.reasons.is_empty() {
-            "cluster view is not write-ready".to_string()
-        } else {
-            cluster_view.reasons.join("; ")
-        };
-        panic!(
-            "N2 startup guard rejected node_id='{}' endpoint='{}': {}",
-            cfg.node_id, cfg.node_endpoint, reason
-        );
-    }
-
-    let membership = get_membership().await.unwrap_or_else(|e| {
-        panic!(
-            "N2 startup guard failed to read membership from '{}': {}",
-            cfg.membership_file.display(),
-            e
-        )
-    });
-
-    let server_section = config
-        .section(Some("server"))
-        .unwrap_or_else(|| panic!("Missing [server] section in {}", CONFIG_FILE));
-    let bind_host = server_section.get("host").unwrap_or("127.0.0.1").trim();
-    if cluster_view.active_nodes > 1 && is_loopback_host(bind_host) {
-        panic!(
-            "N2 startup guard rejected [server].host='{}' for a {}-node cluster. Multi-node N2 must not bind only to loopback.",
-            bind_host, cluster_view.active_nodes
-        );
-    }
-
-    let membership_local = membership
-        .nodes
-        .iter()
-        .find(|node| node.node_id == cfg.node_id)
-        .unwrap_or_else(|| {
-            panic!(
-                "N2 startup guard could not find local node_id='{}' in membership",
-                cfg.node_id
-            )
-        });
-
-    let membership_local_endpoint =
-        parse_https_url(&membership_local.endpoint, "membership local endpoint").unwrap_or_else(
-            |e| {
-                panic!(
-                    "N2 startup guard rejected membership entry for node_id='{}': {}",
-                    cfg.node_id, e
-                )
-            },
-        );
-
-    if membership_local_endpoint.as_str().trim_end_matches('/')
-        != local_endpoint.as_str().trim_end_matches('/')
-    {
-        panic!(
-            "N2 startup guard rejected node_id='{}': [n2].node_endpoint '{}' does not match membership endpoint '{}'",
-            cfg.node_id, cfg.node_endpoint, membership_local.endpoint
-        );
-    }
-
-    if cluster_view.active_nodes > 1 && is_loopback_host(local_endpoint.host_str().unwrap_or("")) {
-        panic!(
-            "N2 startup guard rejected [n2].node_endpoint='{}' for a multi-node cluster. Use a routable LAN/WAN address, not loopback.",
-            cfg.node_endpoint
-        );
-    }
-
-    let mut normalized_endpoints = HashSet::new();
-    for node in membership.nodes.iter().filter(|node| node.active) {
-        let endpoint = parse_https_url(&node.endpoint, "active membership endpoint")
-            .unwrap_or_else(|e| {
-                panic!(
-                    "N2 startup guard rejected active node '{}': {}",
-                    node.node_id, e
-                )
-            });
-        let normalized = endpoint.as_str().trim_end_matches('/').to_ascii_lowercase();
-        if !normalized_endpoints.insert(normalized) {
-            panic!(
-                "N2 startup guard rejected membership: duplicate active endpoint '{}'",
-                node.endpoint
-            );
-        }
-        if cluster_view.active_nodes > 1 && is_loopback_host(endpoint.host_str().unwrap_or("")) {
-            panic!(
-                "N2 startup guard rejected active node '{}': endpoint '{}' is loopback-only in a multi-node cluster",
-                node.node_id, node.endpoint
-            );
-        }
-    }
-
-    let (resolved, source) =
-        resolve_effective_cross_params(cluster_view.active_nodes, local_blob_roots).unwrap_or_else(
-            |e| {
-                panic!(
-                    "N2 startup guard rejected cluster layout for node_id='{}': active_nodes={} local_blob_roots={} error={}",
-                    cfg.node_id, cluster_view.active_nodes, local_blob_roots, e
-                )
-            },
-        );
-
-    tracing::info!(
-        "N2 layout: source={} membership_epoch={} active_nodes={} resolved kc={} mc={} kd={} md={} commit_mode={} auto_maintenance_mode={}",
-        source,
-        cluster_view.membership_epoch,
-        cluster_view.active_nodes,
-        resolved.kc,
-        resolved.mc,
-        resolved.kd,
-        resolved.md,
-        cfg.cluster_commit_mode.as_str(),
-        cfg.auto_maintenance_mode.as_str()
-    );
-
-    if source == "configured" && cluster_view.active_nodes > 1 && resolved.mc == 0 {
-        tracing::warn!(
-            "N2 cluster is running with mc=0 across {} active node(s); one node loss can make clustered objects unavailable",
-            cluster_view.active_nodes
-        );
-    }
-    if cluster_view.active_nodes > 1
-        && resolved.mc > 0
-        && matches!(
-            cfg.cluster_commit_mode,
-            crate::distribution_core::model::ClusterCommitMode::Quorum
-        )
-    {
-        tracing::warn!(
-            "N2 cluster commit mode is quorum while mc={} across {} active node(s); successful writes may land with fewer immediately committed copies than kc+mc. Set [n2].cluster_commit_mode=strict_full_placement if you want hard placement guardrails.",
-            resolved.mc,
-            cluster_view.active_nodes
-        );
-    }
-    tracing::info!(
-        "N2 local shard storage: one cluster EC layer, local N1 shard objects use kd=1 md=0 across {} blob root(s)",
-        local_blob_roots
-    );
 }
 
 fn warn_if_running_as_root(binary: &str) {
@@ -765,7 +564,7 @@ fn validate_runtime_paths(config: &Ini) -> Result<(), String> {
     );
     ensure_existing_writable_dir(&fs_storage_path, "N2 fs_storage_path")?;
 
-    let refresh_store_root = std::env::var("N1_REFRESH_STORE_ROOT")
+    let refresh_store_root = std::env::var("N2_REFRESH_STORE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| fs_storage_path.join(".auth").join("refresh_sessions"));
     stdfs::create_dir_all(&refresh_store_root).map_err(|err| {
@@ -802,8 +601,21 @@ fn validate_runtime_paths(config: &Ini) -> Result<(), String> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let runtime_config = runtime_thread_config(detect_cpu_cores());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(runtime_config.worker_threads)
+        .max_blocking_threads(runtime_config.max_blocking_threads)
+        .thread_stack_size(runtime_config.thread_stack_bytes)
+        .thread_name("n2-runtime")
+        .build()
+        .expect("Failed to build N2 runtime");
+
+    runtime.block_on(async_main(runtime_config));
+}
+
+async fn async_main(runtime_config: RuntimeThreadConfig) {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install 'ring' as the default TLS provider.");
@@ -828,12 +640,8 @@ async fn main() {
         return;
     }
 
-    if let Err(e) = ensure_edge_kernel_runtime_files() {
-        eprintln!("N2 startup failed: {}", e);
-        return;
-    }
-
     let _guard = init_tracing().expect("Failed to initialize tracing subscriber");
+    raise_open_file_limit_for_storage();
 
     if std::env::args_os().nth(1).is_some() {
         eprintln!("litiaina-n2 runs the server only. Use `litiaina-n2-cli` for admin commands.");
@@ -841,9 +649,9 @@ async fn main() {
     }
 
     let current_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    tracing::info!("╔══════════════════════════════════════╗");
-    tracing::info!("║         L I T I A I N A  N 2         ║");
-    tracing::info!("╚══════════════════════════════════════╝");
+    tracing::info!("╔════════════════════════════════════════════════╗");
+    tracing::info!("║              L I T I A I N A  N 2              ║");
+    tracing::info!("╚════════════════════════════════════════════════╝");
     tracing::info!("│ Version        : {}", env!("CARGO_PKG_VERSION"));
     tracing::info!("│ Status         : ONLINE");
     tracing::info!("│ Start Time     : {}", current_time);
@@ -855,6 +663,12 @@ async fn main() {
     tracing::info!(
         "│ Working Dir    : {}",
         std::env::current_dir().unwrap_or_default().display()
+    );
+    tracing::info!(
+        "│ Runtime        : worker_threads={} blocking_threads={} stack={}KiB",
+        runtime_config.worker_threads,
+        runtime_config.max_blocking_threads,
+        runtime_config.thread_stack_bytes / 1024
     );
     tracing::info!("╞═════════ ACTIVE CONNECTIONS ═════════╡");
 
@@ -883,22 +697,10 @@ pub async fn run_server() {
         .get("https_port")
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(50001);
-
-    let native_protocol_enabled = server_section
-        .get("native_protocol_enabled")
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(true);
-
     let native_port = server_section
         .get("native_port")
         .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(50012);
-
+        .unwrap_or(50002);
     let cert_path = server_section
         .get("cert_path")
         .map(|v| v.to_string())
@@ -961,6 +763,27 @@ pub async fn run_server() {
     BLOB_STORE_DISKS
         .set(blob_disks)
         .expect("Double initialization of BLOB_STORE_DISKS!");
+    tracing::info!("Storage mode: N2 storage kernel with explicit .blobs payload roots");
+
+    let https_endpoint = format!("https://{}:{}", host, https_port);
+    let native_endpoint = format!("n2://{}:{}", host, native_port);
+    let cluster_runtime = init_cluster_runtime(
+        &config,
+        fs_storage_path,
+        INDEX_STORE_DISKS.get().expect("index roots initialized"),
+        BLOB_STORE_DISKS.get().expect("blob roots initialized"),
+        &https_endpoint,
+        &native_endpoint,
+    )
+    .unwrap_or_else(|err| panic!("N2 cluster runtime initialization failed: {}", err));
+    tracing::info!(
+        "Cluster runtime: local_node={} membership_epoch={} nodes={} membership_file={} auto_rebalance={}",
+        cluster_runtime.local_node_id,
+        cluster_runtime.membership.epoch,
+        cluster_runtime.membership.nodes.len(),
+        cluster_runtime.membership_path.display(),
+        cluster_runtime.auto_rebalance
+    );
 
     let quota_section = config.section(Some("quota_config"));
     let fragment_quota_backend =
@@ -976,35 +799,22 @@ pub async fn run_server() {
         panic!("N2 startup quota validation failed: {}", err);
     }
 
-    validate_n2_startup_layout(&config, blob_disk_count).await;
-    let startup_membership = get_membership().await.unwrap_or_else(|e| {
-        panic!(
-            "N2 startup could not load membership after validation completed: {}",
-            e
-        )
-    });
-    initialize_governance_runtime()
-        .await
-        .unwrap_or_else(|e| panic!("N2 startup could not initialize governance runtime: {}", e));
-    let governance_state = governance_state_view()
-        .await
-        .unwrap_or_else(|e| panic!("N2 startup could not read governance state: {}", e));
-    schedule_n2_auto_maintenance("startup", startup_membership.epoch);
-    start_n2_auto_maintenance_loop();
-
-    tracing::info!(
-        "N2 governance: term={} commit_index={} applied_membership_epoch={}",
-        governance_state.current_term,
-        governance_state.commit_index,
-        governance_state.last_applied_membership_epoch
-    );
-
-    tracing::info!("Storage mode: N2 .nmtd metadata plane over the N1 storage kernel");
-
-    let upload_section = config.section(Some("upload_config"));
     let cpu_cores = detect_cpu_cores();
     let detected_ram_bytes = detect_total_ram_bytes();
     let detected_ram_gib = ram_gib(detected_ram_bytes);
+
+    let index_section = config.section(Some("index_config"));
+    let configured_index_partition_count =
+        parse_index_partition_count(index_section.and_then(|s| s.get("partition_count")));
+    set_configured_index_partition_count(configured_index_partition_count)
+        .expect("index_config.partition_count must be one of: 32, 64, 256");
+
+    tracing::info!(
+        "Index layout: N2 namespace + object index, partition_count={} for intent routing",
+        configured_index_partition_count
+    );
+
+    let upload_section = config.section(Some("upload_config"));
 
     let data_shards_value = upload_section
         .and_then(|s| s.get("data_shards"))
@@ -1077,6 +887,10 @@ pub async fn run_server() {
     ADAPTIVE_IO_TARGET_ATOMIC
         .set(AtomicUsize::new(max_io_semaphore))
         .expect("Double initialization of ADAPTIVE_IO_TARGET_ATOMIC");
+    let disk_io_scheduler =
+        DiskIoSchedulerConfig::from_runtime(max_io_semaphore, effective_blob_disks_for_auto);
+    configure_disk_io_scheduler(disk_io_scheduler)
+        .expect("Double initialization of N2 disk IO scheduler");
 
     let max_part_size = upload_section
         .and_then(|s| s.get("max_part_size"))
@@ -1108,13 +922,14 @@ pub async fn run_server() {
         upload_section.and_then(|s| s.get("upload_part_strict_durability_default")),
         false,
     );
-    let upload_io_gate_enabled = parse_bool_or_default(
+    let configured_upload_io_gate_enabled = parse_bool_or_default(
         upload_section.and_then(|s| s.get("upload_io_gate_enabled")),
         true,
     );
+    let upload_io_gate_enabled = configured_upload_io_gate_enabled;
 
     tracing::info!(
-        "Upload tuning: cpu_cores={}, ram_gib={}, blob_paths={}, blob_devices={}, auto_effective_disks={}, ec={}D+{}P, max_concurrent_io={} (configured={} budget_cap={} per_upload_est={}KiB budget={}MiB effective_budget={}MiB), writer_buffer_size={}, part_durability_strict_default={}, io_gate_enabled={}",
+        "Upload tuning: cpu_cores={}, ram_gib={}, blob_paths={}, blob_devices={}, auto_effective_disks={}, ec={}D+{}P, max_concurrent_io={} (configured={} budget_cap={} per_upload_est={}KiB budget={}MiB effective_budget={}MiB), disk_scheduler={{total:{}, foreground:{}, background:{}, fg_fragment:{}, bg_fragment:{}}}, writer_buffer_size={}, part_durability_strict_default={}, io_gate_enabled={}",
         cpu_cores,
         detected_ram_gib,
         blob_disk_count,
@@ -1128,6 +943,11 @@ pub async fn run_server() {
         per_upload_bytes / 1024,
         upload_memory_budget_bytes / (1024 * 1024),
         effective_upload_budget_bytes / (1024 * 1024),
+        disk_io_scheduler.total_permits,
+        disk_io_scheduler.foreground_permits,
+        disk_io_scheduler.background_permits,
+        disk_io_scheduler.foreground_per_fragment_permits,
+        disk_io_scheduler.background_per_fragment_permits,
         writer_buffer_size,
         upload_part_strict_durability_default,
         upload_io_gate_enabled
@@ -1266,30 +1086,26 @@ pub async fn run_server() {
         .expect("Failed to load TLS certificates");
 
     let storage_addr = SocketAddr::from((ip, https_port));
-    if native_protocol_enabled {
-        let native_addr = SocketAddr::from((ip, native_port));
-        let native_listener = protocol::bind_native_protocol(native_addr)
-            .await
-            .unwrap_or_else(|err| {
-                panic!("Failed to bind N2 native protocol {}: {}", native_addr, err)
-            });
-        tokio::spawn(protocol::serve_native_protocol(
-            native_listener,
-            native_addr,
-        ));
-    } else {
-        tracing::warn!("N2 native protocol is disabled by configuration");
-    }
-
-    let storage_router = serve_storage_routes().await;
-    let serve_storage = storage_router.fallback(handler_404);
+    let native_addr = SocketAddr::from((ip, native_port));
+    let native_listener = bind_native_protocol(native_addr)
+        .await
+        .expect("Failed to bind required N2 native protocol listener");
+    let (storage_router, app_state) = build_storage_routes_unbound();
+    let native_state = app_state.clone();
+    let serve_storage = apply_runtime_http_layers(storage_router)
+        .with_state(app_state)
+        .fallback(handler_404);
 
     let fs_root = FS_STORAGE_ROOT
         .get()
-        .cloned()
-        .unwrap_or_else(|| STORAGE_ROOT.to_string());
+        .unwrap_or(&STORAGE_ROOT.to_string())
+        .to_string();
     tokio::spawn(async move {
         interval_cleanup(&fs_root).await;
+    });
+
+    tokio::spawn(async move {
+        serve_native_protocol(native_listener, native_addr, native_state).await;
     });
 
     serve(storage_addr, serve_storage, cert).await;

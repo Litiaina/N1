@@ -1,22 +1,1556 @@
-use crate::middleware::rate_limiter_middleware::RateLimitLayers;
-use crate::routes::native::{protected_n2_routes, public_n2_routes};
-use crate::routes::peer::internal_n2_routes;
-use axum::Router;
-use n1::routes::storage_routes::{
-    StorageRouteOptions, apply_runtime_http_layers, build_storage_routes_unbound_with_options,
+use crate::core::adaptive_concurrency::run_adaptive_concurrency_loop;
+use crate::core::archive::{
+    download_logical_archive as download_logical_archive_impl,
+    download_manifest_archive as download_manifest_archive_impl,
+    download_selected_archive as download_selected_archive_impl,
 };
+use crate::core::delete::{
+    BulkObjectFailure, BulkObjectKeysRequest, BulkObjectOperationResponse,
+    delete_object_version as delete_object_version_impl, get_empty_trash_status_api,
+    get_recover_all_trash_status_api, recover_object_version as recover_object_version_impl,
+    resume_persistent_trash_jobs,
+};
+use crate::core::download::{
+    download_object as download_object_impl, download_object_chunk as download_object_chunk_impl,
+};
+use crate::core::fragment_manager::{
+    create_fragment, delete_fragment, get_fragment_hash, update_fragment, verify_fragment_existence,
+};
+use crate::core::garbage_collector::{
+    get_gc_status_api, run_garbage_collector, run_lifecycle_manager, stop_garbage_collector,
+};
+use crate::core::maintenance::sync_fragment_metadata;
+use crate::core::monitoring::{get_system_health, run_system_monitor};
+use crate::core::operation_gate::{
+    enforce_quiesced_mode_on_reads, enforce_read_only_fast_mode_on_mutations,
+};
+use crate::core::redistribution::{
+    get_redist_status_api, stop_redistribution_job_api, trigger_redistribution_job_api,
+};
+use crate::core::repair_manager::{
+    get_repair_status_api, inspect_object_status, parse_check_mode, repair_object,
+    stop_repair_job_api, trigger_repair_job_api,
+};
+use crate::core::retrieve::{
+    get_object as get_object_impl, get_object_metadata_direct, list_fragments,
+    stream_object as stream_object_impl,
+};
+use crate::core::storage_capacity_parser::{
+    ResizeFragmentQuotaRequest, get_capacity_usage as get_capacity_usage_impl,
+    get_fragment_quota_usage as get_fragment_quota_usage_impl,
+    resize_fragment_quota as resize_fragment_quota_impl,
+};
+use crate::core::sync::initialize_fragment_storage_api;
+use crate::core::upload::{
+    FinalizeUploadResult, cancel_upload_session as cancel_upload_session_impl,
+    get_upload_status as get_upload_status_impl, list_active_uploads as list_active_uploads_impl,
+};
+use crate::core::{index, index_store};
+use crate::distribution::namespace::{
+    NamespaceMutationKind, PeerNamespaceApplyRequest, build_namespace_peer_routes,
+    commit_upload_quorum, replicate_namespace_quorum,
+};
+use crate::distribution::peer::build_peer_routes;
+use crate::distribution::routes::build_cluster_routes;
+use crate::distribution::upload::{
+    finalize_cluster_upload, initiate_cluster_upload, put_cluster_part, upload_cluster_one_shot,
+};
+use crate::enums::app_error_enum::AppError;
+use crate::fs::fs_constants::MAX_FILE_SIZE;
+use crate::middleware::auth_middleware::{
+    authorize_fragment, logout_refresh_token, refresh_access_token, validate_access,
+};
+use crate::middleware::rate_limiter_middleware::RateLimitLayers;
+use crate::namespace::runtime::{global_namespace_runtime, logical_not_found};
+use crate::posix::routes::{build_posix_read_routes, build_posix_write_routes};
+use crate::structs::auth_structs::Claims;
+use crate::url::signed_read::{
+    SignedReadUrlRequest, mint_signed_read_url, read_object_via_signed_url,
+};
+use crate::websocket::handler::ws_handler;
+use crate::websocket::manager::{WsConnectionManager, register_global_ws_manager};
+use crate::websocket::ws_structs::{NamespaceChangeEvent, StorageEventPayload};
+use axum::body::to_bytes;
+use axum::http::{HeaderName, Method, StatusCode};
+use axum::middleware::from_fn;
+use axum::response::IntoResponse;
+use axum::routing::{delete, get, patch, post, put};
+use axum::{
+    Json as AxumJson, Router,
+    extract::{DefaultBodyLimit, Path, Query, State},
+};
+use futures_util::StreamExt;
+use serde::de::DeserializeOwned;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
+use std::time::Duration;
+use tower_http::cors::{Any, CorsLayer};
 
-pub async fn serve_storage_routes() -> Router {
+fn request_content_length(headers: &axum::http::HeaderMap) -> Result<u64, AppError> {
+    headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| AppError::BadRequest("Content-Length header required".into()))
+}
+
+fn request_content_type(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "application/octet-stream".to_string())
+}
+
+pub struct AppState {
+    pub ws_manager: WsConnectionManager,
+}
+
+impl AppState {
+    pub fn emit(&self, uid: &str, payload: StorageEventPayload) {
+        self.ws_manager.publish(uid, payload);
+    }
+}
+
+async fn parse_json_response<T: DeserializeOwned>(
+    response: axum::response::Response,
+    context: &str,
+) -> Result<T, AppError> {
+    let bytes = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("{context} body read failed: {e}")))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| AppError::InternalServerError(format!("{context} json decode failed: {e}")))
+}
+
+pub(crate) async fn resolve_logical_read_key(
+    fragment: &str,
+    requested_path: &str,
+) -> Result<String, AppError> {
+    let requested = requested_path.trim_start_matches('/').trim();
+    if let Some(entry) = global_namespace_runtime()
+        .entry(fragment, requested)
+        .await?
+    {
+        if entry.kind != crate::namespace::models::NamespaceEntryKind::File
+            || !entry.lifecycle.is_live()
+        {
+            return Err(logical_not_found());
+        }
+        return entry.object_id.ok_or_else(|| {
+            AppError::InternalServerError("logical file is missing physical object id".to_string())
+        });
+    }
+    index_store::normalize_object_id(requested).map_err(|_| logical_not_found())
+}
+
+fn download_filename_for_logical_path(requested_path: &str, resolved_key: &str) -> Option<String> {
+    let requested = requested_path.trim_start_matches('/').trim();
+    let resolved = resolved_key.trim_start_matches('/').trim();
+    if requested.is_empty() || requested == resolved {
+        return None;
+    }
+    std::path::Path::new(requested)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn looks_like_flat_storage_object_id(requested_path: &str) -> bool {
+    let normalized = requested_path.trim_start_matches('/');
+    !normalized.is_empty()
+        && !normalized.contains('/')
+        && normalized.len() == 64
+        && normalized.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub(crate) async fn resolve_logical_write_key(
+    fragment: &str,
+    requested_path: &str,
+) -> Result<String, AppError> {
+    if looks_like_flat_storage_object_id(requested_path) {
+        if let Some(entry) = global_namespace_runtime()
+            .entry(fragment, requested_path)
+            .await?
+        {
+            if entry.kind != crate::namespace::models::NamespaceEntryKind::File {
+                return Err(AppError::Conflict(format!(
+                    "logical path '{}' already exists as a directory",
+                    requested_path.trim_start_matches('/')
+                )));
+            }
+            return entry.object_id.ok_or_else(|| {
+                AppError::InternalServerError(
+                    "logical file is missing physical object id".to_string(),
+                )
+            });
+        }
+        return Ok(requested_path.trim_start_matches('/').to_string());
+    }
+    global_namespace_runtime()
+        .select_object_id_for_write(fragment, requested_path)
+        .await
+}
+
+fn upload_request_matches_session(
+    params: &crate::core::disk_manager::InitiateUploadParams,
+    state: &crate::core::index::IndexSessionState,
+) -> bool {
+    let part_size_matches = match params.part_size_bytes {
+        Some(requested) if requested > 0 => {
+            state.manifest.part_size_bytes == 0 || state.manifest.part_size_bytes == requested
+        }
+        _ => true,
+    };
+    let content_type_matches = params
+        .content_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|requested| requested == state.manifest.content_type)
+        .unwrap_or(true);
+
+    state.finalized_at.is_none()
+        && state.aborted_at.is_none()
+        && state.manifest.total_size_bytes == params.total_size_bytes
+        && state.manifest.expected_parts == params.expected_parts
+        && part_size_matches
+        && content_type_matches
+}
+
+pub(crate) async fn find_reusable_pending_upload(
+    fragment: &str,
+    logical_path: &str,
+    params: &crate::core::disk_manager::InitiateUploadParams,
+) -> Result<Option<crate::core::disk_manager::InitiateUploadResponse>, AppError> {
+    let normalized = crate::namespace::paths::normalize_path(logical_path)
+        .map_err(|err| AppError::BadRequest(err.to_string()))?;
+    let mut bindings = global_namespace_runtime()
+        .list_pending_uploads(fragment)
+        .await?
+        .into_iter()
+        .filter(|binding| binding.logical_path == normalized)
+        .collect::<Vec<_>>();
+    bindings.sort_by(|a, b| b.created_at_unix.cmp(&a.created_at_unix));
+
+    for binding in bindings {
+        let Some(state) = index::load_session(fragment, &binding.version_id).await? else {
+            let _ = global_namespace_runtime()
+                .clear_pending_upload(fragment, &binding.version_id)
+                .await;
+            continue;
+        };
+
+        if upload_request_matches_session(params, &state) {
+            return Ok(Some(crate::core::disk_manager::InitiateUploadResponse {
+                session_id: binding.session_id,
+                version_id: binding.version_id,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+async fn apply_logical_upload_binding_to_status(
+    fragment: &str,
+    status: &mut crate::core::disk_manager::UploadStatusResponse,
+) -> Result<(), AppError> {
+    let Some(version_id) = status.version_id.as_deref() else {
+        return Ok(());
+    };
+    if let Some(binding) = global_namespace_runtime()
+        .pending_upload(fragment, version_id)
+        .await?
+    {
+        status.physical_object_key = status
+            .object_key
+            .take()
+            .or_else(|| Some(binding.physical_object_id.clone()));
+        status.object_key = Some(binding.logical_path);
+    }
+    Ok(())
+}
+
+async fn apply_logical_upload_bindings_to_sessions(
+    fragment: &str,
+    sessions: &mut [crate::core::upload::ActiveSessionInfo],
+) -> Result<(), AppError> {
+    for session in sessions.iter_mut() {
+        if let Some(binding) = global_namespace_runtime()
+            .pending_upload(fragment, &session.version_id)
+            .await?
+        {
+            session.physical_object_key = session
+                .object_key
+                .take()
+                .or_else(|| Some(binding.physical_object_id.clone()));
+            session.object_key = Some(binding.logical_path);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn commit_logical_upload_from_meta(
+    fragment: &str,
+    logical_path: &str,
+    physical_object_id: &str,
+    metadata: &crate::core::disk_manager::ObjectMetadata,
+) -> Result<String, AppError> {
+    commit_upload_quorum(fragment, logical_path, physical_object_id, metadata).await
+}
+
+pub(crate) fn emit_logical_file_uploaded(
+    state: &Arc<AppState>,
+    fragment: &str,
+    logical_path: &str,
+    physical_object_id: &str,
+    metadata: &crate::core::disk_manager::ObjectMetadata,
+) {
+    state.emit(
+        fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::file_upsert(
+            fragment,
+            logical_path,
+            physical_object_id,
+            metadata.total_size_bytes,
+            &metadata.version_id,
+            &metadata.content_type,
+            metadata.created_at,
+        )),
+    );
+}
+
+async fn mint_signed_read_url_scoped(
+    claims: Claims,
+    AxumJson(mut req): AxumJson<SignedReadUrlRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let requested = req.object_key.clone();
+    let resolved = resolve_logical_read_key(&claims.fragment, &requested).await?;
+    if req.filename.is_none() {
+        req.filename = download_filename_for_logical_path(&requested, &resolved);
+    }
+    req.object_key = resolved;
+    mint_signed_read_url(claims, AxumJson(req)).await
+}
+
+async fn get_capacity_usage_scoped(claims: Claims) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    get_capacity_usage_impl(claims, Path(fragment)).await
+}
+
+async fn get_fragment_quota_usage_scoped(claims: Claims) -> Result<impl IntoResponse, AppError> {
+    get_fragment_quota_usage_impl(claims).await
+}
+
+async fn run_fragment_gc(
+    State(state): State<Arc<AppState>>,
+    Path(fragment): Path<String>,
+    Query(mut params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    params.insert("fragment".to_string(), fragment);
+    run_garbage_collector(State(state), Query(params)).await
+}
+
+async fn trigger_fragment_repair_job(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Path(fragment): Path<String>,
+    Query(mut params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    params.insert("fragment".to_string(), fragment);
+    trigger_repair_job_api(claims, State(state), Query(params)).await
+}
+
+async fn trigger_fragment_redistribution_job(
+    claims: Claims,
+    State(state): State<Arc<AppState>>,
+    Path(fragment): Path<String>,
+    Query(mut params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    params.insert("fragment".to_string(), fragment);
+    trigger_redistribution_job_api(claims, State(state), Query(params)).await
+}
+
+async fn get_fragment_health(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Path(fragment): Path<String>,
+    Query(mut params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    params.insert("fragment".to_string(), fragment);
+    get_system_health(State(state), claims, Query(params)).await
+}
+
+async fn resize_fragment_quota_scoped(
+    claims: Claims,
+    Path(fragment): Path<String>,
+    AxumJson(payload): AxumJson<ResizeFragmentQuotaRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    resize_fragment_quota_impl(claims, axum::extract::Path(fragment), AxumJson(payload)).await
+}
+
+async fn list_objects_scoped(
+    claims: Claims,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+    Ok(AxumJson(
+        global_namespace_runtime()
+            .list_objects_page(&fragment, &params, false)
+            .await?,
+    ))
+}
+
+async fn list_trash_objects_scoped(
+    claims: Claims,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+    Ok(AxumJson(
+        global_namespace_runtime()
+            .list_objects_page(&fragment, &params, true)
+            .await?,
+    ))
+}
+
+async fn list_object_versions_scoped(
+    claims: Claims,
+    Path(object_key): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+    let requested_path = object_key;
+    let physical = resolve_logical_read_key(&fragment, &requested_path).await?;
+    let mut versions = index::list_live_object_versions_metadata(&fragment, &physical).await?;
+    for metadata in &mut versions {
+        metadata.object_key = requested_path.clone();
+        metadata.strip_internal_layout();
+    }
+    Ok(AxumJson(versions))
+}
+
+async fn get_object_scoped(
+    claims: Claims,
+    Path(object_key): Path<String>,
+    req: axum::http::Request<axum::body::Body>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
+    get_object_impl(claims, Path((fragment, physical)), req).await
+}
+
+async fn stream_object_scoped(
+    claims: Claims,
+    headers: axum::http::HeaderMap,
+    Path(object_key): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
+    stream_object_impl(claims, headers, Path((fragment, physical))).await
+}
+
+async fn get_object_metadata_scoped(
+    claims: Claims,
+    Path(object_key): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+    let requested_path = object_key;
+    let physical = resolve_logical_read_key(&fragment, &requested_path).await?;
+    let mut metadata = get_object_metadata_direct(&fragment, &physical)
+        .await?
+        .without_internal_layout();
+    metadata.object_key = requested_path;
+    Ok(AxumJson(metadata))
+}
+
+async fn download_object_scoped(
+    claims: Claims,
+    Query(mut query): Query<crate::core::disk_manager::ObjectKeyQuery>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    let requested = query.object_key.clone();
+    let resolved = resolve_logical_read_key(&fragment, &requested).await?;
+    if query.filename.is_none() {
+        query.filename = download_filename_for_logical_path(&requested, &resolved);
+    }
+    query.object_key = resolved;
+    download_object_impl(claims, Path(fragment), Query(query), headers).await
+}
+
+async fn download_object_chunk_scoped(
+    claims: Claims,
+    Query(mut params): Query<crate::core::disk_manager::ChunkQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    params.object_key = resolve_logical_read_key(&fragment, &params.object_key).await?;
+    download_object_chunk_impl(claims, Path(fragment), Query(params)).await
+}
+
+async fn download_selected_archive_scoped(
+    claims: Claims,
+    AxumJson(req): AxumJson<crate::core::disk_manager::DownloadArchiveRequest>,
+) -> Result<axum::response::Response, AppError> {
+    let fragment = claims.fragment.clone();
+    if !req.export_all
+        && (!req.keys.is_empty()
+            || req
+                .prefix
+                .as_deref()
+                .is_some_and(|prefix| !prefix.trim().is_empty())
+            || req.prefixes.iter().any(|prefix| !prefix.trim().is_empty()))
+    {
+        return download_logical_archive_impl(fragment, req).await;
+    }
+    Ok(
+        download_selected_archive_impl(claims, Path(fragment), AxumJson(req))
+            .await?
+            .into_response(),
+    )
+}
+
+async fn download_manifest_archive_scoped(
+    claims: Claims,
+    Query(query): Query<crate::core::disk_manager::DownloadArchiveManifestQuery>,
+    body: axum::body::Body,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    download_manifest_archive_impl(claims, Path(fragment), Query(query), body).await
+}
+
+async fn empty_trash_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    if !claims.delete {
+        return Err(AppError::Forbidden("Delete permission required".into()));
+    }
+    let summary = global_namespace_runtime().empty_trash(&fragment).await?;
+    replicate_namespace_quorum(PeerNamespaceApplyRequest {
+        kind: NamespaceMutationKind::EmptyTrash,
+        fragment: fragment.clone(),
+        source_path: None,
+        destination_path: None,
+        object_id: None,
+        version_id: None,
+        metadata: None,
+    })
+    .await?;
+    state.emit(
+        &fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment,
+            summary.clone(),
+        )),
+    );
+    Ok((
+        StatusCode::OK,
+        AxumJson(serde_json::json!({
+            "operation": summary.operation,
+            "affected_paths": summary.affected_paths,
+            "affected_objects": summary.affected_objects,
+            "trash_entry_id": summary.trash_entry_id,
+            "deleted_at_unix": summary.deleted_at_unix,
+        })),
+    ))
+}
+
+async fn delete_object_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Path(object_key): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    let summary = global_namespace_runtime()
+        .trash(&fragment, &object_key)
+        .await?;
+    replicate_namespace_quorum(PeerNamespaceApplyRequest {
+        kind: NamespaceMutationKind::Trash,
+        fragment: fragment.clone(),
+        source_path: Some(object_key.clone()),
+        destination_path: None,
+        object_id: None,
+        version_id: None,
+        metadata: None,
+    })
+    .await?;
+    state.emit(
+        &fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment,
+            summary.clone(),
+        )),
+    );
+    Ok((
+        StatusCode::OK,
+        AxumJson(serde_json::json!({
+            "operation": summary.operation,
+            "affected_paths": summary.affected_paths,
+            "affected_objects": summary.affected_objects,
+            "trash_entry_id": summary.trash_entry_id,
+            "deleted_at_unix": summary.deleted_at_unix,
+        })),
+    ))
+}
+
+async fn delete_object_version_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Path((version_id, object_key)): Path<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
+    delete_object_version_impl(State(state), claims, Path((fragment, version_id, physical))).await
+}
+
+async fn delete_object_permanently_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Path(object_key): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    if !claims.delete {
+        return Err(AppError::Forbidden("Delete permission required".into()));
+    }
+    let summary = global_namespace_runtime()
+        .purge_trash_path(&fragment, &object_key)
+        .await?;
+    replicate_namespace_quorum(PeerNamespaceApplyRequest {
+        kind: NamespaceMutationKind::Purge,
+        fragment: fragment.clone(),
+        source_path: Some(object_key.clone()),
+        destination_path: None,
+        object_id: None,
+        version_id: None,
+        metadata: None,
+    })
+    .await?;
+    state.emit(
+        &fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment,
+            summary.clone(),
+        )),
+    );
+    Ok((
+        StatusCode::OK,
+        AxumJson(serde_json::json!({
+            "operation": summary.operation,
+            "affected_paths": summary.affected_paths,
+            "affected_objects": summary.affected_objects,
+            "trash_entry_id": summary.trash_entry_id,
+        })),
+    ))
+}
+
+async fn recover_object_version_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Path((version_id, object_key)): Path<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
+    recover_object_version_impl(State(state), claims, Path((fragment, version_id, physical))).await
+}
+
+async fn recover_object_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Path(object_key): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    let summary = global_namespace_runtime()
+        .recover(&fragment, &object_key)
+        .await?;
+    replicate_namespace_quorum(PeerNamespaceApplyRequest {
+        kind: NamespaceMutationKind::Recover,
+        fragment: fragment.clone(),
+        source_path: Some(object_key.clone()),
+        destination_path: None,
+        object_id: None,
+        version_id: None,
+        metadata: None,
+    })
+    .await?;
+    state.emit(
+        &fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment,
+            summary.clone(),
+        )),
+    );
+    Ok((
+        StatusCode::OK,
+        AxumJson(serde_json::json!({
+            "operation": summary.operation,
+            "affected_paths": summary.affected_paths,
+            "affected_objects": summary.affected_objects,
+        })),
+    ))
+}
+
+async fn get_object_repair_status_scoped(
+    claims: Claims,
+    Path(object_key): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.read {
+        return Err(AppError::Forbidden("Read permission required".into()));
+    }
+    let fragment = claims.fragment.clone();
+    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
+    let metadata = get_object_metadata_direct(&fragment, &physical).await?;
+    let mut status = inspect_object_status(&metadata, parse_check_mode(&params)).await?;
+    status.object_key = object_key.trim_start_matches('/').to_string();
+    Ok(AxumJson(status))
+}
+
+async fn repair_object_scoped(
+    claims: Claims,
+    Path(object_key): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.write || !claims.modify {
+        return Err(AppError::Forbidden(
+            "Write and Modify permission required".into(),
+        ));
+    }
+    let fragment = claims.fragment.clone();
+    let physical = resolve_logical_read_key(&fragment, &object_key).await?;
+    let metadata = get_object_metadata_direct(&fragment, &physical).await?;
+    let mut status = repair_object(&metadata, parse_check_mode(&params)).await?;
+    status.object_key = object_key.trim_start_matches('/').to_string();
+    Ok(AxumJson(status))
+}
+
+async fn bulk_delete_objects_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    AxumJson(payload): AxumJson<BulkObjectKeysRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.write {
+        return Err(AppError::Forbidden("Write permission required".into()));
+    }
+    let fragment = claims.fragment.clone();
+    let requested = payload.object_keys.len();
+    let unique_keys = payload
+        .object_keys
+        .into_iter()
+        .filter(|key| !key.trim().is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if unique_keys.is_empty() {
+        return Err(AppError::BadRequest("object_keys must not be empty".into()));
+    }
+
+    let mut succeeded = 0usize;
+    let mut not_found = 0usize;
+    let mut failed = Vec::new();
+    for object_key in &unique_keys {
+        match global_namespace_runtime()
+            .trash(&fragment, object_key)
+            .await
+        {
+            Ok(_) => {
+                replicate_namespace_quorum(PeerNamespaceApplyRequest {
+                    kind: NamespaceMutationKind::Trash,
+                    fragment: fragment.clone(),
+                    source_path: Some(object_key.clone()),
+                    destination_path: None,
+                    object_id: None,
+                    version_id: None,
+                    metadata: None,
+                })
+                .await?;
+                succeeded = succeeded.saturating_add(1);
+            }
+            Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
+            Err(err) => failed.push(BulkObjectFailure {
+                object_key: object_key.clone(),
+                error: err.to_string(),
+            }),
+        }
+    }
+    if succeeded > 0 {
+        state.emit(
+            &fragment,
+            StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::bulk(
+                &fragment,
+                "bulk_delete",
+                succeeded,
+            )),
+        );
+    }
+    Ok((
+        StatusCode::OK,
+        AxumJson(BulkObjectOperationResponse {
+            requested,
+            unique: unique_keys.len(),
+            succeeded,
+            not_found,
+            failed,
+        }),
+    ))
+}
+
+async fn bulk_recover_objects_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    AxumJson(payload): AxumJson<BulkObjectKeysRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.write {
+        return Err(AppError::Forbidden(
+            "Write permission required to recover".into(),
+        ));
+    }
+    let fragment = claims.fragment.clone();
+    let requested = payload.object_keys.len();
+    let unique_keys = payload
+        .object_keys
+        .into_iter()
+        .filter(|key| !key.trim().is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if unique_keys.is_empty() {
+        return Err(AppError::BadRequest("object_keys must not be empty".into()));
+    }
+
+    let mut succeeded = 0usize;
+    let mut not_found = 0usize;
+    let mut failed = Vec::new();
+    for object_key in &unique_keys {
+        match global_namespace_runtime()
+            .recover(&fragment, object_key)
+            .await
+        {
+            Ok(_) => {
+                replicate_namespace_quorum(PeerNamespaceApplyRequest {
+                    kind: NamespaceMutationKind::Recover,
+                    fragment: fragment.clone(),
+                    source_path: Some(object_key.clone()),
+                    destination_path: None,
+                    object_id: None,
+                    version_id: None,
+                    metadata: None,
+                })
+                .await?;
+                succeeded = succeeded.saturating_add(1);
+            }
+            Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
+            Err(err) => failed.push(BulkObjectFailure {
+                object_key: object_key.clone(),
+                error: err.to_string(),
+            }),
+        }
+    }
+    if succeeded > 0 {
+        state.emit(
+            &fragment,
+            StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::bulk(
+                &fragment,
+                "bulk_recover",
+                succeeded,
+            )),
+        );
+    }
+    Ok((
+        StatusCode::OK,
+        AxumJson(BulkObjectOperationResponse {
+            requested,
+            unique: unique_keys.len(),
+            succeeded,
+            not_found,
+            failed,
+        }),
+    ))
+}
+
+async fn bulk_permanent_delete_objects_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    AxumJson(payload): AxumJson<BulkObjectKeysRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.delete {
+        return Err(AppError::Forbidden("Delete permission required".into()));
+    }
+    let fragment = claims.fragment.clone();
+    let requested = payload.object_keys.len();
+    let unique_keys = payload
+        .object_keys
+        .into_iter()
+        .filter(|key| !key.trim().is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if unique_keys.is_empty() {
+        return Err(AppError::BadRequest("object_keys must not be empty".into()));
+    }
+
+    let mut succeeded = 0usize;
+    let mut not_found = 0usize;
+    let mut failed = Vec::new();
+    for object_key in &unique_keys {
+        match global_namespace_runtime()
+            .purge_trash_path(&fragment, object_key)
+            .await
+        {
+            Ok(_) => {
+                replicate_namespace_quorum(PeerNamespaceApplyRequest {
+                    kind: NamespaceMutationKind::Purge,
+                    fragment: fragment.clone(),
+                    source_path: Some(object_key.clone()),
+                    destination_path: None,
+                    object_id: None,
+                    version_id: None,
+                    metadata: None,
+                })
+                .await?;
+                succeeded = succeeded.saturating_add(1);
+            }
+            Err(AppError::NotFound) => not_found = not_found.saturating_add(1),
+            Err(err) => failed.push(BulkObjectFailure {
+                object_key: object_key.clone(),
+                error: err.to_string(),
+            }),
+        }
+    }
+    if succeeded > 0 {
+        state.emit(
+            &fragment,
+            StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::bulk(
+                &fragment,
+                "bulk_delete_permanent",
+                succeeded,
+            )),
+        );
+    }
+    Ok((
+        StatusCode::OK,
+        AxumJson(BulkObjectOperationResponse {
+            requested,
+            unique: unique_keys.len(),
+            succeeded,
+            not_found,
+            failed,
+        }),
+    ))
+}
+
+async fn recover_all_trash_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    if !claims.write {
+        return Err(AppError::Forbidden(
+            "Write permission required to recover all".into(),
+        ));
+    }
+    let summary = global_namespace_runtime().recover_all(&fragment).await?;
+    state.emit(
+        &fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &fragment,
+            summary.clone(),
+        )),
+    );
+    Ok((
+        StatusCode::OK,
+        AxumJson(serde_json::json!({
+            "operation": summary.operation,
+            "affected_paths": summary.affected_paths,
+            "affected_objects": summary.affected_objects,
+        })),
+    ))
+}
+
+async fn rename_object_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    AxumJson(payload): AxumJson<crate::core::disk_manager::RenameObjectRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if !claims.modify {
+        return Err(AppError::Forbidden("Modify permission required".into()));
+    }
+    if payload.source_fragment != claims.fragment || payload.destination_fragment != claims.fragment
+    {
+        return Err(AppError::Forbidden("Access denied to this fragment".into()));
+    }
+
+    let summary = global_namespace_runtime()
+        .rename(
+            &claims.fragment,
+            &payload.source_key,
+            &payload.destination_key,
+        )
+        .await?;
+    replicate_namespace_quorum(PeerNamespaceApplyRequest {
+        kind: NamespaceMutationKind::Rename,
+        fragment: claims.fragment.clone(),
+        source_path: Some(payload.source_key.clone()),
+        destination_path: Some(payload.destination_key.clone()),
+        object_id: None,
+        version_id: None,
+        metadata: None,
+    })
+    .await?;
+
+    state.emit(
+        &claims.fragment,
+        StorageEventPayload::NamespaceChanged(NamespaceChangeEvent::from_summary(
+            &claims.fragment,
+            summary,
+        )),
+    );
+    Ok(StatusCode::OK)
+}
+
+async fn initiate_object_upload_scoped(
+    claims: Claims,
+    Path(object_key): Path<String>,
+    AxumJson(params): AxumJson<crate::core::disk_manager::InitiateUploadParams>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    if let Some(existing) = find_reusable_pending_upload(&fragment, &object_key, &params).await? {
+        return Ok((StatusCode::CREATED, AxumJson(existing)).into_response());
+    }
+    let physical = resolve_logical_write_key(&fragment, &object_key).await?;
+    let parsed =
+        initiate_cluster_upload(claims, fragment.clone(), physical.clone(), params).await?;
+    global_namespace_runtime()
+        .bind_pending_upload(
+            &fragment,
+            &object_key,
+            &physical,
+            &parsed.version_id,
+            &parsed.session_id,
+        )
+        .await?;
+    Ok((StatusCode::CREATED, AxumJson(parsed)).into_response())
+}
+
+async fn upload_object_one_shot_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    headers: axum::http::HeaderMap,
+    Path(object_key): Path<String>,
+    Query(query): Query<crate::core::disk_manager::UploadPartQuery>,
+    body: axum::body::Body,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    let physical = resolve_logical_write_key(&fragment, &object_key).await?;
+    let content_length = request_content_length(&headers)?;
+    let content_type = request_content_type(&headers);
+    let body_stream = body.into_data_stream().map(|chunk_result| {
+        chunk_result.map_err(|e| {
+            AppError::Io(
+                std::io::Error::new(std::io::ErrorKind::Other, e),
+                "cluster upload body read".into(),
+            )
+        })
+    });
+    let mut parsed = upload_cluster_one_shot(
+        claims,
+        fragment.clone(),
+        physical.clone(),
+        content_type,
+        query,
+        body_stream,
+        content_length,
+    )
+    .await?;
+    let committed_physical =
+        commit_logical_upload_from_meta(&fragment, &object_key, &physical, &parsed).await?;
+    parsed.object_key = object_key;
+    emit_logical_file_uploaded(
+        &state,
+        &fragment,
+        &parsed.object_key,
+        &committed_physical,
+        &parsed,
+    );
+    parsed.strip_internal_layout();
+    Ok((StatusCode::CREATED, AxumJson(parsed)).into_response())
+}
+
+async fn get_upload_status_scoped(
+    claims: Claims,
+    Path(version_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    let response = get_upload_status_impl(claims, Path((fragment.clone(), version_id)))
+        .await?
+        .into_response();
+    let mut parsed: crate::core::disk_manager::UploadStatusResponse =
+        parse_json_response(response, "upload status").await?;
+    apply_logical_upload_binding_to_status(&fragment, &mut parsed).await?;
+    Ok(AxumJson(parsed))
+}
+
+async fn list_active_uploads_scoped(
+    claims: Claims,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    let response = list_active_uploads_impl(claims, Path(fragment.clone()), Query(params))
+        .await?
+        .into_response();
+    let mut parsed: crate::core::upload::ListUploadsResponse =
+        parse_json_response(response, "active uploads").await?;
+    apply_logical_upload_bindings_to_sessions(&fragment, &mut parsed.sessions).await?;
+    Ok(AxumJson(parsed))
+}
+
+async fn object_upload_part_scoped(
+    claims: Claims,
+    headers: axum::http::HeaderMap,
+    Path((version_id, part_index)): Path<(String, u64)>,
+    Query(query): Query<crate::core::disk_manager::UploadPartQuery>,
+    body: axum::body::Body,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    let content_length = request_content_length(&headers)?;
+    let body_stream = body.into_data_stream().map(|chunk_result| {
+        chunk_result.map_err(|e| {
+            AppError::Io(
+                std::io::Error::new(std::io::ErrorKind::Other, e),
+                "cluster multipart body read".into(),
+            )
+        })
+    });
+    put_cluster_part(
+        claims,
+        fragment,
+        version_id,
+        part_index,
+        query,
+        body_stream,
+        content_length,
+    )
+    .await?;
+    Ok(StatusCode::OK)
+}
+
+async fn finalize_object_upload_scoped(
+    State(state): State<Arc<AppState>>,
+    claims: Claims,
+    Path((version_id, session_id)): Path<(String, String)>,
+    Query(key_query): Query<crate::core::disk_manager::ObjectKeyQuery>,
+    AxumJson(params): AxumJson<crate::core::disk_manager::InitiateUploadParams>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    let binding = global_namespace_runtime()
+        .pending_upload(&fragment, &version_id)
+        .await?;
+    let physical = binding
+        .as_ref()
+        .map(|value| value.physical_object_id.clone())
+        .unwrap_or_else(|| key_query.object_key.clone());
+    let result = finalize_cluster_upload(
+        claims,
+        fragment.clone(),
+        version_id.clone(),
+        session_id,
+        physical.clone(),
+        params,
+    )
+    .await?;
+    let mut parsed = match result {
+        FinalizeUploadResult::Complete(metadata) => metadata,
+        FinalizeUploadResult::Incomplete(incomplete) => {
+            return Ok((StatusCode::CONFLICT, AxumJson(incomplete)).into_response());
+        }
+    };
+    let logical_path = binding
+        .as_ref()
+        .map(|value| value.logical_path.clone())
+        .unwrap_or(key_query.object_key);
+    let committed_physical =
+        commit_logical_upload_from_meta(&parsed.fragment, &logical_path, &physical, &parsed)
+            .await?;
+    global_namespace_runtime()
+        .clear_pending_upload(&parsed.fragment, &parsed.version_id)
+        .await?;
+    parsed.object_key = logical_path;
+    emit_logical_file_uploaded(
+        &state,
+        &fragment,
+        &parsed.object_key,
+        &committed_physical,
+        &parsed,
+    );
+    parsed.strip_internal_layout();
+    Ok((StatusCode::OK, AxumJson(parsed)).into_response())
+}
+
+async fn cancel_upload_session_scoped(
+    claims: Claims,
+    Path(version_id): Path<String>,
+    Query(key_query): Query<crate::core::disk_manager::ObjectKeyQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let fragment = claims.fragment.clone();
+    let binding = global_namespace_runtime()
+        .pending_upload(&fragment, &version_id)
+        .await?;
+    let physical = binding
+        .as_ref()
+        .map(|value| value.physical_object_id.clone())
+        .unwrap_or(key_query.object_key);
+    let response = cancel_upload_session_impl(
+        claims,
+        Path((fragment.clone(), version_id.clone())),
+        Query(crate::core::disk_manager::ObjectKeyQuery {
+            object_key: physical,
+            version_id: None,
+            filename: None,
+        }),
+    )
+    .await;
+    if response.is_ok() {
+        let _ = global_namespace_runtime()
+            .clear_pending_upload(&fragment, &version_id)
+            .await;
+    }
+    response
+}
+
+fn build_cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_headers([
+            HeaderName::from_static("authorization"),
+            HeaderName::from_static("uid"),
+            HeaderName::from_static("content-type"),
+            HeaderName::from_static("digest"),
+            HeaderName::from_static("buffer"),
+            HeaderName::from_static("range"),
+            HeaderName::from_static("upgrade"),
+            HeaderName::from_static("connection"),
+            HeaderName::from_static("sec-websocket-key"),
+            HeaderName::from_static("sec-websocket-version"),
+            HeaderName::from_static("sec-websocket-protocol"),
+        ])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .max_age(Duration::from_secs(86400))
+}
+
+pub fn apply_runtime_http_layers(router: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
+    router
+        .layer(DefaultBodyLimit::max(MAX_FILE_SIZE))
+        .layer(build_cors_layer())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct StorageRouteOptions {
+    pub include_object_storage: bool,
+}
+
+impl Default for StorageRouteOptions {
+    fn default() -> Self {
+        Self {
+            include_object_storage: true,
+        }
+    }
+}
+
+pub fn build_storage_routes_unbound_with_options(
+    options: StorageRouteOptions,
+) -> (Router<Arc<AppState>>, Arc<AppState>) {
     let layers = RateLimitLayers::new();
-    let (base_router, app_state) = build_storage_routes_unbound_with_options(StorageRouteOptions {
-        include_object_storage: false,
+    let ws_manager = WsConnectionManager::new();
+    register_global_ws_manager(ws_manager.clone());
+
+    let app_state = Arc::new(AppState { ws_manager });
+
+    let trash_resume_state = Arc::clone(&app_state);
+    tokio::spawn(async move {
+        match resume_persistent_trash_jobs(trash_resume_state).await {
+            Ok(resumed) if resumed > 0 => {
+                tracing::info!("Resumed {} persistent trash maintenance job(s)", resumed);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to resume persistent trash maintenance jobs: {}",
+                    err
+                );
+            }
+        }
     });
 
-    apply_runtime_http_layers(
-        base_router
-            .merge(public_n2_routes(&layers))
-            .merge(protected_n2_routes(&layers))
-            .merge(internal_n2_routes(&layers)),
-    )
-    .with_state(app_state)
+    let lifecycle_state = Arc::clone(&app_state);
+    tokio::spawn(async move {
+        run_lifecycle_manager(lifecycle_state).await;
+    });
+
+    let monitoring_state = Arc::clone(&app_state);
+    tokio::spawn(async move {
+        run_system_monitor(monitoring_state).await;
+    });
+
+    tokio::spawn(async move {
+        run_adaptive_concurrency_loop().await;
+    });
+
+    let object_storage_routes = {
+        let read_ops = Router::new()
+            .route("/n2/capacity/usage", get(get_capacity_usage_scoped))
+            .route("/n2/capacity/quota", get(get_fragment_quota_usage_scoped))
+            .route("/n2/fragments", get(list_fragments))
+            .route("/n2/objects", get(list_objects_scoped))
+            .route("/n2/objects/signed-url", post(mint_signed_read_url_scoped))
+            .route("/n2/trash", get(list_trash_objects_scoped))
+            .route(
+                "/n2/objects/versions/{*object_key}",
+                get(list_object_versions_scoped),
+            )
+            .route("/n2/objects/get/{*object_key}", get(get_object_scoped))
+            .route(
+                "/n2/objects/stream/{*object_key}",
+                get(stream_object_scoped),
+            )
+            .route(
+                "/n2/objects/meta/{*object_key}",
+                get(get_object_metadata_scoped),
+            )
+            .route(
+                "/n2/objects/status/{*object_key}",
+                get(get_object_repair_status_scoped),
+            )
+            .route("/n2/objects/download", get(download_object_scoped))
+            .route(
+                "/n2/objects/download/chunk",
+                get(download_object_chunk_scoped),
+            )
+            .route(
+                "/n2/objects/archive",
+                post(download_selected_archive_scoped),
+            )
+            .route(
+                "/n2/objects/archive/manifest",
+                post(download_manifest_archive_scoped),
+            )
+            .merge(build_posix_read_routes());
+
+        let read_ops = layers
+            .layer_view(read_ops)
+            .layer(from_fn(enforce_quiesced_mode_on_reads));
+
+        let write_ops = Router::new()
+            .route("/n2/fragments/{:fragment}", delete(delete_fragment))
+            .route("/n2/fragments/{:fragment}", patch(update_fragment))
+            .route(
+                "/n2/fragments/{:fragment}/quota",
+                patch(resize_fragment_quota_scoped),
+            )
+            .route(
+                "/n2/trash/empty",
+                delete(empty_trash_scoped).post(empty_trash_scoped),
+            )
+            .route("/n2/objects/rename", post(rename_object_scoped))
+            .route("/n2/objects/bulk-delete", post(bulk_delete_objects_scoped))
+            .route(
+                "/n2/objects/permanent/bulk-delete",
+                post(bulk_permanent_delete_objects_scoped),
+            )
+            .route("/n2/objects/{*object_key}", delete(delete_object_scoped))
+            .route(
+                "/n2/objects/version/{:version_id}/{*object_key}",
+                delete(delete_object_version_scoped),
+            )
+            .route(
+                "/n2/objects/permanent/{*object_key}",
+                delete(delete_object_permanently_scoped),
+            )
+            .route(
+                "/n2/objects/repair/{*object_key}",
+                post(repair_object_scoped),
+            )
+            .route(
+                "/n2/objects/recover/version/{:version_id}/{*object_key}",
+                post(recover_object_version_scoped),
+            )
+            .route(
+                "/n2/objects/bulk-recover",
+                post(bulk_recover_objects_scoped),
+            )
+            .route(
+                "/n2/objects/recover/{*object_key}",
+                post(recover_object_scoped),
+            )
+            .route("/n2/trash/recover-all", post(recover_all_trash_scoped))
+            .route(
+                "/n2/upload/multipart/init/{*object_key}",
+                post(initiate_object_upload_scoped),
+            )
+            .route(
+                "/n2/upload/one-shot/{*object_key}",
+                post(upload_object_one_shot_scoped),
+            )
+            .route(
+                "/n2/upload/multipart/{:version_id}",
+                get(get_upload_status_scoped),
+            )
+            .route("/n2/upload/multipart", get(list_active_uploads_scoped))
+            .route(
+                "/n2/upload/multipart/{:version_id}/{:part_index}",
+                put(object_upload_part_scoped),
+            )
+            .route(
+                "/n2/upload/multipart/{:version_id}/{:session_id}/finalize",
+                post(finalize_object_upload_scoped),
+            )
+            .route(
+                "/n2/upload/multipart/{:version_id}",
+                delete(cancel_upload_session_scoped),
+            )
+            .merge(build_posix_write_routes());
+
+        let maintenance_ops = Router::new()
+            .route(
+                "/n2/maintenance/fragment/cleanup",
+                post(sync_fragment_metadata),
+            )
+            .route(
+                "/n2/maintenance/fragment/init",
+                post(initialize_fragment_storage_api),
+            )
+            .route("/n2/maintenance/repair/start", post(trigger_repair_job_api))
+            .route("/n2/maintenance/repair/stop", post(stop_repair_job_api))
+            .route("/n2/maintenance/repair/status", get(get_repair_status_api))
+            .route("/n2/maintenance/gc/start", post(run_garbage_collector))
+            .route(
+                "/n2/maintenance/fragments/{:fragment}/gc/start",
+                post(run_fragment_gc),
+            )
+            .route("/n2/maintenance/gc/stop", post(stop_garbage_collector))
+            .route("/n2/maintenance/gc/status", get(get_gc_status_api))
+            .route(
+                "/n2/maintenance/trash/recover/status",
+                get(get_recover_all_trash_status_api),
+            )
+            .route(
+                "/n2/maintenance/trash/empty/status",
+                get(get_empty_trash_status_api),
+            )
+            .route(
+                "/n2/maintenance/redistribution/start",
+                post(trigger_redistribution_job_api),
+            )
+            .route(
+                "/n2/maintenance/fragments/{:fragment}/redistribution/start",
+                post(trigger_fragment_redistribution_job),
+            )
+            .route(
+                "/n2/maintenance/redistribution/stop",
+                post(stop_redistribution_job_api),
+            )
+            .route(
+                "/n2/maintenance/redistribution/status",
+                get(get_redist_status_api),
+            )
+            .route(
+                "/n2/maintenance/fragments/{:fragment}/repair/start",
+                post(trigger_fragment_repair_job),
+            )
+            .route(
+                "/n2/maintenance/fragments/{:fragment}/health",
+                get(get_fragment_health),
+            )
+            .route("/n2/maintenance/health", get(get_system_health))
+            .merge(build_cluster_routes());
+
+        let maintenance_ops = layers.layer_global(maintenance_ops);
+
+        let write_ops = layers
+            .layer_upload(write_ops)
+            .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
+
+        let protected_routes = Router::new()
+            .merge(read_ops)
+            .merge(write_ops)
+            .merge(maintenance_ops)
+            .layer(from_fn(validate_access));
+
+        Router::new().merge(protected_routes)
+    };
+
+    let ws_routes = { Router::new().route("/ws", get(ws_handler)) };
+
+    let global_routes = Router::new()
+        .route("/n2/fragments/check", get(verify_fragment_existence))
+        .route("/n2/fragments/hash", get(get_fragment_hash))
+        .route("/n2/objects/signed-read", get(read_object_via_signed_url))
+        .merge(build_peer_routes())
+        .merge(build_namespace_peer_routes());
+    let global_routes = layers.layer_global(global_routes);
+
+    let create_fragment_route = Router::new().route("/n2/fragments", post(create_fragment));
+    let create_fragment_route = layers
+        .layer_auth(create_fragment_route)
+        .layer(from_fn(enforce_read_only_fast_mode_on_mutations));
+
+    let fragment_auth_route = Router::new().route("/n2/auth/fragment", post(authorize_fragment));
+    let fragment_auth_route = layers.layer_auth(fragment_auth_route);
+
+    let refresh_auth_route = Router::new().route("/n2/auth/refresh", post(refresh_access_token));
+    let refresh_auth_route = layers.layer_auth(refresh_auth_route);
+
+    let logout_auth_route = Router::new().route("/n2/auth/logout", post(logout_refresh_token));
+    let logout_auth_route = layers.layer_auth(logout_auth_route);
+
+    let ping_route = Router::new().route("/n2/ping", get(ping));
+    let ping_route = layers.layer_global(ping_route);
+
+    let mut router = Router::new()
+        .merge(ping_route)
+        .merge(fragment_auth_route)
+        .merge(refresh_auth_route)
+        .merge(logout_auth_route)
+        .merge(global_routes)
+        .merge(create_fragment_route)
+        .merge(ws_routes);
+
+    if options.include_object_storage {
+        router = router.merge(object_storage_routes);
+    }
+
+    (router, app_state)
+}
+
+pub fn build_storage_routes_unbound() -> (Router<Arc<AppState>>, Arc<AppState>) {
+    build_storage_routes_unbound_with_options(StorageRouteOptions::default())
+}
+
+pub async fn serve_storage_routes() -> Router {
+    let (router, app_state) = build_storage_routes_unbound();
+    apply_runtime_http_layers(router).with_state(app_state)
+}
+
+async fn ping() -> &'static str {
+    "pong"
 }

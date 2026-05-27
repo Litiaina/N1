@@ -9,7 +9,7 @@ pub fn ensure_env_file() -> io::Result<()> {
     let env_path = Path::new(ENV_FILE);
 
     if env_path.exists() {
-        info!("N2 env file already exists — skipping creation.");
+        info!(".env file already exists — skipping creation.");
         return Ok(());
     }
 
@@ -27,7 +27,7 @@ pub fn ensure_env_file() -> io::Result<()> {
     fs::rename(&temp_path, &env_path)?;
 
     info!(
-        "Created N2 env file at '{}'. Please configure it with your environment variables.",
+        "Created .env file at '{}'. Please configure it with your environment variables.",
         env_path.display()
     );
 
@@ -39,7 +39,7 @@ pub fn ensure_config_file() -> io::Result<()> {
 
     if config_path.exists() {
         info!(
-            "N2 configuration file '{}' already exists — skipping creation.",
+            "Configuration file '{}' already exists — skipping creation.",
             CONFIG_FILE
         );
         return Ok(());
@@ -58,7 +58,7 @@ pub fn ensure_config_file() -> io::Result<()> {
 
     fs::rename(&temp_path, &config_path)?;
     info!(
-        "Created default '{}' file with N2 runtime settings.",
+        "Created default '{}' file with standard settings.",
         CONFIG_FILE
     );
 

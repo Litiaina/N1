@@ -46,10 +46,6 @@ pub fn create_env_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     writeln!(file, "REFRESH_TOKEN_TTL_SECS=604800")?;
     writeln!(file)?;
 
-    writeln!(file, "# Secret key used for URL signing and validation")?;
-    writeln!(file, "URL_SIGNING_SECRET=")?;
-    writeln!(file)?;
-
     writeln!(file, "# Storage authentication key")?;
     writeln!(file, "AUTH_KEY=")?;
     writeln!(file)?;
@@ -73,7 +69,7 @@ pub fn create_env_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     fs::rename(&tmp_path, &path)?;
 
     info!(
-        "Created new N2 env file at '{}'. Please configure it before running the server.",
+        "Created new .env file at '{}'. Please configure it before running the server.",
         path.display()
     );
 

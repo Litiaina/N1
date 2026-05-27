@@ -38,12 +38,14 @@ standard/n1.env
 # Config variables
 config.ini
 n1_config.ini
+n2_config.ini
 .ini.*
 arc/n1_config.ini
 arc/n1_config.ini.bak.*
 standard/n1_config.ini
 standard/n1_config.ini.bak.*
 .n1-bench/
+.n2-bench/
 
 # Local runtime/test artifacts
 .n1-local/
